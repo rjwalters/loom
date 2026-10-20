@@ -28,12 +28,12 @@ use super::authz::{
     CheckConclusion, DenyReason, HandoffError, Revocation, REQUIRED_CHECK_CONTEXT,
 };
 use super::events::{secs_between, EventKind, EventSink, QueueEvent};
-use super::forge::{read_facts, LifecycleForge};
-use super::grants::{reason_token, CommentGrantStore, GrantRecord};
+use super::forge::{read_facts, LifecycleForge, RemovalEvent};
+use super::grants::{marker_re, reason_token, CommentGrantStore, GrantRecord};
 use super::group_authz::StatusApi;
 use super::mode::MergeMode;
 use super::ops::{self, DequeueOutcome, EnqueueOutcome, PrState, QueueApi, QueueError};
-use super::removal::{classify, drop_prose, route, RemovalKind};
+use super::removal::{classify, drop_prose, infra_only, route, RemovalKind};
 
 /// Everything a lifecycle step needs.
 pub struct Ctx<'a> {
@@ -289,12 +289,17 @@ fn reconcile_drop(
             Err(e) => Reconciled::Undetermined(format!("revoke stale grant: {e}")),
         };
     };
-    let kind = classify(ev.reason.as_deref());
+    let kind = refine_infra(ctx, pr, rec, ev, classify(ev.reason.as_deref()));
     let prose = drop_prose(kind, ev.reason.as_deref(), Some(&ev.created_at));
     // Revoke (with the verified reason) BEFORE any label transition. The
     // revoke marker is also the dedup point: a later pass sees `Revoked` and
     // never re-routes or re-comments this drop.
-    if let Err(e) = store.revoke_with(pr, &format!("dropped-{}", kind.as_str()), &prose) {
+    let marker = if kind == RemovalKind::DroppedInfra {
+        kind.as_str().to_string() // already `dropped-infra`; the bound reads it back
+    } else {
+        format!("dropped-{}", kind.as_str())
+    };
+    if let Err(e) = store.revoke_with(pr, &marker, &prose) {
         return Reconciled::Undetermined(format!("revoke after drop: {e}"));
     }
     let r = route(kind);
@@ -309,6 +314,69 @@ fn reconcile_drop(
         raw: ev.reason.clone(),
         route_error,
     }
+}
+
+/// Downgrade a `check-failure` drop to `dropped-infra` (#12573) only when the
+/// group commit's failed checks are all infrastructure and this head has not
+/// already had its one infra retry. Every ambiguity — no group commit, a read
+/// error, a non-infra or in-progress run, an earlier infra drop — keeps
+/// `kind`. The earlier-drop bound reads the revoke markers, which are the
+/// durable per-head record.
+fn refine_infra(
+    ctx: &Ctx<'_>,
+    pr: u32,
+    rec: &GrantRecord,
+    ev: &RemovalEvent,
+    kind: RemovalKind,
+) -> RemovalKind {
+    let (RemovalKind::CheckFailure, GrantRecord::Live { sha, .. }) = (kind, rec) else {
+        return kind;
+    };
+    let Some(commit) = ev.before_commit.as_deref().filter(|c| !c.is_empty()) else {
+        return kind;
+    };
+    match ctx.forge.group_check_runs(commit) {
+        Ok(runs) if infra_only(&runs) => {}
+        Ok(_) => return kind,
+        Err(e) => {
+            log::warn!("merge-queue: PR #{pr}: group check runs unreadable ({e}); not infra");
+            return kind;
+        }
+    }
+    match ctx.forge.trusted_comments(pr) {
+        Ok(bodies) if !infra_retry_spent(&bodies, pr, sha) => RemovalKind::DroppedInfra,
+        _ => kind,
+    }
+}
+
+/// True when an earlier `dropped-infra` revoke already covers head `sha`.
+fn infra_retry_spent(bodies: &[String], pr: u32, sha: &str) -> bool {
+    let mut grant_sha: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for body in bodies {
+        for c in marker_re().captures_iter(body) {
+            if c[2].parse::<u32>().ok() != Some(pr) {
+                continue;
+            }
+            let Ok(nonce) = c[4].parse::<u64>() else {
+                continue;
+            };
+            match &c[1] {
+                "grant" => {
+                    if let Some(s) = c.get(3) {
+                        grant_sha.insert(nonce, s.as_str().to_string());
+                    }
+                }
+                _ => {
+                    if c.get(5).map(|m| m.as_str()) == Some("dropped-infra")
+                        && grant_sha.get(&nonce).is_some_and(|s| s == sha)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Why [`handoff`] did not leave the PR queued.
@@ -344,6 +412,11 @@ impl std::fmt::Display for HandoffFailure {
                 } else {
                     required.join(", ")
                 }
+            ),
+            HandoffFailure::Authz(HandoffError::WriterCannotPostStatuses(why)) => write!(
+                f,
+                "[WRITER_CANNOT_POST_STATUSES] {why}; no grant was written or revoked and any \
+                 existing queue entry is untouched"
             ),
             HandoffFailure::Authz(e) => write!(f, "[AUTHZ_REFUSED] {e:?}"),
             HandoffFailure::Telemetry { error, revoked } => write!(

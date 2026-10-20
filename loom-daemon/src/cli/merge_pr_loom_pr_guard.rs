@@ -12,7 +12,7 @@
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
-//! | `loom:pr` present | [`loom_daemon::merge_pr::loom_pr_guard::CLEAN`] | 0 |
+//! | `loom:pr` present | [`crate::merge_pr::loom_pr_guard::CLEAN`] | 0 |
 //! | `loom:pr` absent, `--allow-unapproved` | the override warning | 0 |
 //! | `loom:pr` absent, no override | the refusal | 1 |
 //!
@@ -27,8 +27,8 @@
 //! entirely by the shell wrapper around this call, exactly as it already
 //! wraps `_check_verdict_label_contradiction`.
 
+use crate::merge_pr::loom_pr_guard::{assess, Verdict, CLEAN};
 use anyhow::Result;
-use loom_daemon::merge_pr::loom_pr_guard::{assess, Verdict, CLEAN};
 use std::io::Read;
 
 #[derive(clap::Args)]

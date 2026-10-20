@@ -1,5 +1,7 @@
-//! The captain's roster: which tailnet node is which fleet `host_id`, and each
-//! host's `maxConcurrent` (#12449).
+//! The captain's roster: which tailnet node is which fleet `host_id`, and
+//! whether each host is in fleet mode (#12449). It no longer carries a
+//! host's `maxConcurrent`: the captain applies no capacity limit, the worker
+//! bounds its own claims (#12864).
 //!
 //! Read from the fleet store's compiled `fleet.json`
 //! ([`crate::fleet_store::compiled`]), the same document every other fleet
@@ -25,11 +27,9 @@
 //!   no `host_id` or no `tailnet_node`, is unresolved
 //!   ([`Roster::unresolved`]): nothing maps to it, so it cannot call, and the
 //!   server warns at start. A node no dispatcher maps is refused `403`.
-//! - **Its cap:** `autonomous.workFinder.maxConcurrent`, resolved per host as
-//!   a host renders it: `config.hosts.<host>.local` over
-//!   `config.hosts.<host>.defaults` over `config.defaults`.
-//! - **Whether it is in fleet mode:** `fleetDispatch.enabled`, resolved the
-//!   same way. The grace window ends early once every fleet-mode host that
+//! - **Whether it is in fleet mode:** `fleetDispatch.enabled`, resolved per
+//!   host as a host renders it: `config.hosts.<host>.local` over
+//!   `config.hosts.<host>.defaults` over `config.defaults`. The grace window ends early once every fleet-mode host that
 //!   can call has heartbeated; a host not in fleet mode, or unresolved, never
 //!   calls, so waiting for it would only ever run the window to its time
 //!   bound.
@@ -57,8 +57,6 @@ pub struct RosterHost {
     /// an unresolved dispatcher (no host record, `host_id` or node): the
     /// host cannot call.
     pub tailnet_node: Option<String>,
-    /// `autonomous.workFinder.maxConcurrent` for the host, when configured.
-    pub max_concurrent: Option<u32>,
     /// `fleetDispatch.enabled` for the host.
     pub fleet_mode: bool,
 }
@@ -98,13 +96,6 @@ impl Roster {
                     } else {
                         d.tailnet_node.clone()
                     },
-                    max_concurrent: tiered(
-                        doc,
-                        &d.name,
-                        &["autonomous", "workFinder", "maxConcurrent"],
-                    )
-                    .and_then(Value::as_u64)
-                    .and_then(|n| u32::try_from(n).ok()),
                     fleet_mode: tiered(doc, &d.name, &["fleetDispatch", "enabled"])
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
@@ -131,12 +122,6 @@ impl Roster {
                     .is_some_and(|n| n == full || n == short)
             })
             .map(|(id, _)| id.as_str())
-    }
-
-    /// `host`'s `maxConcurrent`.
-    #[must_use]
-    pub fn max_concurrent(&self, host: &str) -> Option<u32> {
-        self.hosts.get(host).and_then(|h| h.max_concurrent)
     }
 
     /// Every roster host id.
@@ -258,16 +243,15 @@ mod tests {
             "dispatch": {"dispatchers": dispatchers},
             "hosts": hosts,
             "config": {
-                "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 20}}},
+                "defaults": {"fleetDispatch": {"enabled": false}},
                 "hosts": {
                     "worker-a": {
-                        "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 30}}},
-                        "local": {"autonomous": {"workFinder": {"maxConcurrent": 40}},
-                                  "fleetDispatch": {"enabled": true, "url": "http://c:1"}}
+                        "defaults": {"fleetDispatch": {"enabled": false}},
+                        "local": {"fleetDispatch": {"enabled": true, "url": "http://c:1"}}
                     },
                     "worker-b": {
-                        "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 8}}},
-                        "local": {"fleetDispatch": {"enabled": true}}
+                        "defaults": {"fleetDispatch": {"enabled": true}},
+                        "local": {"fleetDispatch": {"enabled": null}}
                     }
                 }
             }
@@ -322,7 +306,17 @@ mod tests {
     }
 
     #[test]
-    fn max_concurrent_and_fleet_mode_follow_the_render_tiers_by_name() {
+    fn config_follows_the_render_tiers_by_name() {
+        let doc = fleet_json(json!([]), json!([]));
+        let enabled =
+            |host: &str| tiered(&doc, host, &["fleetDispatch", "enabled"]).and_then(Value::as_bool);
+        assert_eq!(enabled("worker-a"), Some(true), "local wins");
+        assert_eq!(enabled("worker-b"), Some(true), "a null local falls through to host defaults");
+        assert_eq!(enabled("worker-c"), Some(false), "fleet defaults last");
+    }
+
+    #[test]
+    fn fleet_mode_follows_the_render_tiers_by_name() {
         let roster = Roster::from_compiled(&fleet_json(
             json!(["worker-a", "worker-b", "worker-c"]),
             json!([
@@ -332,10 +326,6 @@ mod tests {
             ]),
         ))
         .unwrap();
-        assert_eq!(roster.max_concurrent("id-a"), Some(40), "local wins");
-        assert_eq!(roster.max_concurrent("id-b"), Some(8), "host defaults next");
-        assert_eq!(roster.max_concurrent("id-c"), Some(20), "fleet defaults last");
-        assert_eq!(roster.max_concurrent("stranger"), None);
         // worker-b is in fleet mode but cannot call, so grace never waits on it.
         let fleet_mode: Vec<String> = roster.fleet_mode_hosts().into_iter().collect();
         assert_eq!(fleet_mode, vec!["id-a".to_string()]);

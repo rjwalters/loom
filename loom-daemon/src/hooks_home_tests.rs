@@ -198,8 +198,7 @@ fn source_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// The hooks `provision_loom_hooks` wires: its `_PHOOK_NAMES` array, plus
-/// `presence-beat.sh`, which `_phook_presence_apply` wires separately.
+/// The hooks `provision_loom_hooks` wires: its `_PHOOK_NAMES` array.
 fn wired_hook_names() -> BTreeSet<String> {
     let text = std::fs::read_to_string(source_root().join("scripts/install/provision-hooks.sh"))
         .expect("read provision-hooks.sh");
@@ -208,12 +207,11 @@ fn wired_hook_names() -> BTreeSet<String> {
         .nth(1)
         .and_then(|rest| rest.split(')').next())
         .expect("provision-hooks.sh has a _PHOOK_NAMES=( ... ) array");
-    let mut names: BTreeSet<String> = block
+    let names: BTreeSet<String> = block
         .split_whitespace()
         .filter(|w| !w.starts_with('#'))
         .map(str::to_string)
         .collect();
-    names.insert("presence-beat.sh".to_string());
     names
 }
 
@@ -255,7 +253,7 @@ fn the_embedded_payload_carries_the_wired_hooks_and_their_libraries() {
     let dir = materialize(&tmp.path().join("hh"), archive, env!("CARGO_PKG_VERSION")).unwrap();
 
     let wired = wired_hook_names();
-    assert!(wired.len() >= 11, "too few wired hooks parsed: {wired:?}");
+    assert!(wired.len() >= 10, "too few wired hooks parsed: {wired:?}");
     for name in &wired {
         let path = dir.join("defaults/hooks").join(name);
         let mode = std::fs::metadata(&path)

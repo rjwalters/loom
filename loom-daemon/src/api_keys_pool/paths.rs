@@ -199,13 +199,8 @@ pub fn resolve_provider_root_in(
     Ok(roots.first().cloned().unwrap_or_default())
 }
 
-/// Every provider that has a directory under any of `workspace`'s pool roots,
-/// sorted and de-duplicated. Pair each with [`resolve_provider_root`].
-pub fn list_workspace_providers(workspace: &Path) -> Result<Vec<String>, PoolReadError> {
-    list_providers_in(&pool_roots(workspace))
-}
-
-/// [`list_workspace_providers`] over an explicit root list.
+/// Every provider that has a directory under any of `roots`, sorted and
+/// de-duplicated. Pair each with [`resolve_provider_root`].
 pub fn list_providers_in(roots: &[PathBuf]) -> Result<Vec<String>, PoolReadError> {
     let mut names = Vec::new();
     for root in roots {

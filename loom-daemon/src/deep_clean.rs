@@ -348,6 +348,9 @@ pub fn evaluate(
 pub enum SweepOutcome {
     /// The artifacts were swept (possibly an empty list — nothing was there).
     Swept(Vec<ReclaimedArtifact>),
+    /// The workspace sets `clean.keepBuildArtifacts` (#12694): nothing was
+    /// removed, and these existing directories were deliberately left alone.
+    Kept(Vec<ReclaimedArtifact>),
     /// A safety gate deferred the removal to a later tick, with the reason.
     Deferred(String),
 }
@@ -368,6 +371,8 @@ pub struct DeepCleanReport {
     /// What was reclaimed (empty when the trigger did not fire, or when the
     /// checkout had no artifacts to reclaim).
     pub reclaimed: Vec<ReclaimedArtifact>,
+    /// Directories left in place by `clean.keepBuildArtifacts` (#12694).
+    pub kept: Vec<ReclaimedArtifact>,
     /// Free GB on the repo's volume as measured for the trigger.
     pub free_gb: Option<u64>,
     /// When this evaluation happened.
@@ -387,12 +392,23 @@ impl DeepCleanReport {
         if self.reclaimed.is_empty() {
             return "nothing".to_string();
         }
-        self.reclaimed
-            .iter()
-            .map(|a| format!("{}/ ({})", a.name, a.size_human))
-            .collect::<Vec<_>>()
-            .join(", ")
+        artifact_list(&self.reclaimed)
     }
+
+    /// Same format as [`Self::reclaimed_summary`] for the kept directories, or
+    /// `None` when nothing was kept.
+    #[must_use]
+    pub fn kept_summary(&self) -> Option<String> {
+        (!self.kept.is_empty()).then(|| artifact_list(&self.kept))
+    }
+}
+
+fn artifact_list(artifacts: &[ReclaimedArtifact]) -> String {
+    artifacts
+        .iter()
+        .map(|a| format!("{}/ ({})", a.name, a.size_human))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Everything one [`run_pass`] needs besides its two injected I/O seams —
@@ -454,6 +470,7 @@ pub fn run_pass(
             trigger: DeepCleanTrigger::Disabled,
             deferred: Some("refused: scheduled deep pass requires safe:true, force:false".into()),
             reclaimed: Vec::new(),
+            kept: Vec::new(),
             free_gb: None,
             at: now,
         };
@@ -466,13 +483,14 @@ pub fn run_pass(
     };
     let trigger = evaluate(enabled, free_gb, floor_gb, last_fired, now, min_interval_secs);
 
-    let (reclaimed, deferred) = if trigger.fires() {
+    let (reclaimed, kept, deferred) = if trigger.fires() {
         match sweep(repo_root) {
-            SweepOutcome::Swept(artifacts) => (artifacts, None),
-            SweepOutcome::Deferred(reason) => (Vec::new(), Some(reason)),
+            SweepOutcome::Swept(artifacts) => (artifacts, Vec::new(), None),
+            SweepOutcome::Kept(kept) => (Vec::new(), kept, None),
+            SweepOutcome::Deferred(reason) => (Vec::new(), Vec::new(), Some(reason)),
         }
     } else {
-        (Vec::new(), None)
+        (Vec::new(), Vec::new(), None)
     };
 
     DeepCleanReport {
@@ -480,6 +498,7 @@ pub fn run_pass(
         trigger,
         deferred,
         reclaimed,
+        kept,
         free_gb,
         at: now,
     }
@@ -561,6 +580,7 @@ pub fn production_sweep(repo_root: &Path) -> SweepOutcome {
     drop(lease);
 
     let mut reclaimed = Vec::new();
+    let mut kept = Vec::new();
     for outcome in outcomes {
         match outcome {
             ArtifactOutcome::Reclaimed(a) => reclaimed.push(a),
@@ -576,8 +596,14 @@ pub fn production_sweep(repo_root: &Path) -> SweepOutcome {
             ArtifactOutcome::Protected(p) => {
                 log::warn!("deep_clean: {} kept {}", repo_root.display(), p.reason())
             }
+            ArtifactOutcome::Kept(a) => kept.push(a),
             ArtifactOutcome::Absent(_) => {}
         }
+    }
+    if !kept.is_empty() {
+        let bytes_note = artifact_list(&kept);
+        log::warn!("deep_clean: kept {bytes_note} in {} (keepBuildArtifacts)", repo_root.display());
+        return SweepOutcome::Kept(kept);
     }
     SweepOutcome::Swept(reclaimed)
 }
@@ -655,6 +681,8 @@ pub struct DeepCleanState {
     pub last_fired_at: Option<DateTime<Utc>>,
     /// What that firing pass reclaimed ([`DeepCleanReport::reclaimed_summary`]).
     pub last_reclaimed: Option<String>,
+    /// What `clean.keepBuildArtifacts` left in place on that pass (#12694).
+    pub last_kept: Option<String>,
 }
 
 type StateMap = BTreeMap<PathBuf, DeepCleanState>;
@@ -687,6 +715,7 @@ pub fn publish(report: &DeepCleanReport) {
     if report.trigger.fires() && report.deferred.is_none() {
         entry.last_fired_at = Some(report.at);
         entry.last_reclaimed = Some(report.reclaimed_summary());
+        entry.last_kept = report.kept_summary();
     }
 }
 
@@ -733,6 +762,7 @@ pub fn status_snapshot() -> Vec<crate::types::DeepCleanRepoStatus> {
             last_free_gb: s.last_free_gb,
             last_fired_at: s.last_fired_at,
             last_reclaimed: s.last_reclaimed,
+            last_kept: s.last_kept,
         })
         .collect()
 }
@@ -781,8 +811,19 @@ mod tests {
     /// The real primary-checkout removal, without the build-slot acquisition
     /// (which is machine-global and belongs to `production_sweep`).
     fn real_sweep(p: &Path) -> SweepOutcome {
+        let outcomes = clean::sweep_primary_checkout_artifacts(p, false);
+        let kept: Vec<_> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ArtifactOutcome::Kept(a) => Some(a.clone()),
+                _ => None,
+            })
+            .collect();
+        if !kept.is_empty() {
+            return SweepOutcome::Kept(kept);
+        }
         SweepOutcome::Swept(
-            clean::sweep_primary_checkout_artifacts(p, false)
+            outcomes
                 .into_iter()
                 .filter_map(|o| match o {
                     ArtifactOutcome::Reclaimed(a) => Some(a),
@@ -998,6 +1039,38 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
+    fn a_pressured_pass_in_a_keep_workspace_reclaims_nothing() {
+        reset_state_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        fs::write(tmp.path().join(".loom/config.json"), r#"{"clean":{"keepBuildArtifacts":true}}"#)
+            .unwrap();
+        fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+
+        let opts = deep_clean_options(0);
+        let report = run_pass(tmp.path(), &inputs(&opts), &|_| Some(2), &real_sweep);
+
+        assert!(report.trigger.fires());
+        assert!(tmp.path().join("node_modules/pkg").is_dir());
+        assert!(!report.reclaimed_anything());
+        assert!(report
+            .kept_summary()
+            .unwrap()
+            .starts_with("node_modules/ ("));
+
+        publish(&report);
+        let state = snapshot();
+        assert!(state[0]
+            .1
+            .last_kept
+            .as_deref()
+            .unwrap()
+            .contains("node_modules/"));
+        reset_state_for_test();
+    }
+
+    #[test]
     fn an_unpressured_pass_removes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("target")).unwrap();
@@ -1075,6 +1148,7 @@ mod tests {
             },
             deferred: None,
             reclaimed: Vec::new(),
+            kept: Vec::new(),
             free_gb: Some(118),
             at: t(0),
         });
@@ -1098,6 +1172,7 @@ mod tests {
             },
             deferred: None,
             reclaimed: vec![artifact("target")],
+            kept: Vec::new(),
             free_gb: Some(2),
             at: t(60),
         });
@@ -1120,6 +1195,7 @@ mod tests {
             },
             deferred: Some("could not hold the machine build slot".to_string()),
             reclaimed: Vec::new(),
+            kept: Vec::new(),
             free_gb: Some(2),
             at: t(0),
         });

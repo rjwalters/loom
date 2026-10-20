@@ -442,16 +442,6 @@ pub struct SourceReport {
     pub adoption: Option<&'static str>,
 }
 
-impl SourceReport {
-    /// Add this report's fields to an evidence JSON object.
-    pub fn extend_evidence(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
-        obj.insert("source_commit".into(), self.source_commit.clone().into());
-        obj.insert("source_anchor".into(), self.source_anchor.clone().into());
-        obj.insert("source_check".into(), self.source_check.map(str::to_string).into());
-        obj.insert("adoption_record".into(), self.adoption.map(str::to_string).into());
-    }
-}
-
 pub struct GateInputs<'a> {
     pub slug: &'a str,
     pub tag: &'a str,

@@ -8,11 +8,9 @@
 //!
 //! - `execution` — a whole execution's usage (a daemon sweep's terminal
 //!   transition, a role-runner tick);
-//! - `attempt` — one role attempt's usage (an in-session subagent via
-//!   `loom-daemon usage-record`).
+//! - `attempt` — one role attempt's usage (a role-runner tick).
 //!
-//! A daemon-dispatched sweep can carry both in one trace (its `claude -p`
-//! child records attempts too), so a consumer totals a `loom.sweep_id` from
+//! A trace can carry both, so a consumer totals a `loom.sweep_id` from
 //! its `execution` spans when present, else from the sum of its `attempt`
 //! spans — never both.
 //!

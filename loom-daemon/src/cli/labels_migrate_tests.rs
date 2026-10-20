@@ -317,7 +317,7 @@ fn an_unowned_label_is_add_only_in_every_mode() {
 
 #[test]
 fn priority_high_is_owned_so_it_is_relabelled_then_deleted() {
-    let reg = loom_daemon::label_registry::Registry::embedded();
+    let reg = crate::label_registry::Registry::embedded();
     let entry = reg
         .retired
         .iter()
@@ -491,7 +491,7 @@ fn gh_helpers_encode_and_classify() {
 #[test]
 fn the_embedded_registry_carries_the_retired_map() {
     // The embedded map is what a consumer repo (no labels.json) migrates by.
-    let reg = loom_daemon::label_registry::Registry::embedded();
+    let reg = crate::label_registry::Registry::embedded();
     assert!(reg.retired.iter().any(|r| r.name == STAR && r.owned));
     assert!(reg
         .retired
@@ -625,7 +625,7 @@ fn a_failed_also_remove_leaves_the_old_label_for_the_rerun() {
 
 #[test]
 fn the_registry_retires_needs_revision_onto_triage_without_curated() {
-    let reg = loom_daemon::label_registry::Registry::embedded();
+    let reg = crate::label_registry::Registry::embedded();
     assert!(reg.get(REVISE).is_none(), "loom:needs-revision is no longer declared");
     let r = reg
         .get_retired(REVISE)

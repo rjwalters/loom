@@ -38,12 +38,16 @@
 //!    `(repo, item, step)` (below);
 //! 3. `not_eligible` when the step's role is not in the host's last reported
 //!    `roles_ok` (Phase 1 decides eligibility by `roles_ok` only; a step name
-//!    this build does not know has no role, so it is `not_eligible` too);
-//! 4. `cap` when the host's granted and live rows reach
-//!    `min(free_slots + live, maxConcurrent)`: the last heartbeat's counts,
-//!    clamped by the fleet config, so a wrong report cannot hoard. A host
-//!    that has not heartbeated this epoch is bounded by `maxConcurrent`
-//!    alone, and refused when that is unknown too.
+//!    this build does not know has no role, so it is `not_eligible` too).
+//!
+//! The captain applies **no capacity limit** (#12864). Its rows for a host
+//! live until the worker releases them or their TTL ends, so a count of them
+//! runs above what the host is actually running; refusing on that count
+//! (the former `cap` refusal) stalled hosts that had free slots. Capacity is
+//! the worker's own: it claims only for the free slots its tick computed
+//! (`maxConcurrent` less what it already runs), and a full worker does not ask.
+//! [`RefusalReason::Cap`] stays in the wire enum for mixed-version fleets,
+//! but this table never emits it.
 //!
 //! # The no-progress cooldown (#12541)
 //!
@@ -63,6 +67,16 @@
 //! Soft, like every row: a captain restart forgets the holds, and the hosts'
 //! local ledgers are the only brake until the next no-progress release.
 //!
+//! # Attempt lineage (#12875)
+//!
+//! The table remembers, per `(repo, item, step)`, how many assignments have
+//! ended, the last one's id and how it ended (`released` by its worker, or
+//! `expired` with its TTL). The next grant of that triple carries them as a
+//! [`Lineage`], so the worker's `loom.dispatch.step` span can be joined to
+//! the attempt it replaces. A renewal is not a new attempt. The record is
+//! bounded ([`LINEAGE_MAX`], and dropped after [`LINEAGE_MAX_AGE`]) and soft:
+//! a captain restart forgets it and `attempt` starts again at one.
+//!
 //! # A claim on an item the host already holds
 //!
 //! Only a duplicate claim for the **same** `(item, step)` (spec §5.3) is an
@@ -78,6 +92,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 
 use super::proto::{HeartbeatRequest, LiveStep, RefusalReason, REFUSE_CLAIM_LOST};
 use crate::step_role::StepRole;
@@ -110,10 +126,18 @@ pub const ASSIGNMENT_TTL_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// The default start-up grace window.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(90);
 
+/// The most `(repo, item, step)` lineage records kept; the oldest end goes
+/// first (#12875).
+pub const LINEAGE_MAX: usize = 4096;
+/// How long a lineage record outlives the end it records (#12875): the
+/// no-progress ladder's last rung, so a retry after a long hold still joins.
+pub const LINEAGE_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+/// The most expired assignments buffered for the server to report between
+/// two drains (#12875).
+const EXPIRED_BUFFER_MAX: usize = 1024;
+
 /// `retry_after_s` of a `held` refusal, at most.
 const HELD_RETRY_MAX_SECS: u64 = 60;
-/// `retry_after_s` of a `cap` refusal: about one heartbeat.
-const CAP_RETRY_SECS: u64 = 30;
 /// `retry_after_s` of a `not_eligible` refusal.
 const NOT_ELIGIBLE_RETRY_SECS: u64 = 60;
 
@@ -131,6 +155,22 @@ pub const DEFAULT_NO_PROGRESS_LADDER: [Duration; 4] = [
 /// (`proto::ReleaseRequest`), and the plain words a later client may send
 /// for the same thing. Everything else, including an unknown token, holds.
 pub const PROGRESS_OUTCOMES: [&str; 4] = ["verdict", "merged", "moved", "success"];
+
+/// The `release` outcome of a step that ended waiting on CI (Judge
+/// `ci_pending`) or on a retry (Champion `requeued`, any gate, #12551): neither
+/// progress nor a failure to find work. It arms [`Policy::ci_wait`], not the escalating
+/// ladder, and leaves the streak and the item's other holds alone.
+pub const CI_WAIT_OUTCOME: &str = "ci_wait";
+
+/// The `release` outcome of a step whose host was lost to an EC2 spot
+/// reclaim or rebalance (#12876). Not progress, but not the item's fault
+/// either: the row ends and nothing is held, so the next draw may take it.
+pub const HOST_LOST_OUTCOME: &str = "host_lost";
+
+/// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
+/// the item every ~90 s while CI runs, short enough that its next step is
+/// drawn within minutes of CI finishing.
+pub const DEFAULT_CI_WAIT: Duration = Duration::from_secs(5 * 60);
 
 /// Whether a `release` with `outcome` moved its item (no cooldown).
 /// Conservative: only a clear success skips the hold.
@@ -152,6 +192,8 @@ pub struct Policy {
     /// after the `n+1`th consecutive no-progress release, the last rung
     /// repeating. A zero rung arms no hold.
     pub no_progress: [Duration; 4],
+    /// The flat hold after a [`CI_WAIT_OUTCOME`] release (#12551).
+    pub ci_wait: Duration,
 }
 
 impl Policy {
@@ -187,6 +229,7 @@ impl Policy {
             hold_ttl: lease,
             grace,
             no_progress: DEFAULT_NO_PROGRESS_LADDER,
+            ci_wait: DEFAULT_CI_WAIT,
         }
     }
 }
@@ -198,6 +241,7 @@ impl Default for Policy {
             hold_ttl: FORGE_LEASE_TTL,
             grace: DEFAULT_GRACE,
             no_progress: DEFAULT_NO_PROGRESS_LADDER,
+            ci_wait: DEFAULT_CI_WAIT,
         }
     }
 }
@@ -233,6 +277,43 @@ pub struct HostState {
     pub live_reported: u32,
     pub roles_ok: BTreeSet<String>,
     pub last_seen: Mono,
+    /// The earliest `started_at` among the steps the last heartbeat listed:
+    /// a worker-supplied wall-clock fact, stored as sent (#12873). `None`
+    /// when the heartbeat listed no step, or none with a start (an older
+    /// worker).
+    pub oldest_live_started_at: Option<DateTime<Utc>>,
+}
+
+/// How recent a host's last heartbeat must be for its reported facts to be
+/// exported as gauges (#12873): four missed 30 s heartbeats.
+pub const HEARTBEAT_FRESH: Duration = Duration::from_secs(120);
+
+/// What a host's last fresh heartbeat reported (#12873).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    pub free_slots: u32,
+    pub live_reported: u32,
+    pub oldest_live_started_at: Option<DateTime<Utc>>,
+}
+
+/// One host's gauges (#12873): its row counts, and what it reported when its
+/// last heartbeat is fresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostGauges {
+    pub granted: u32,
+    pub live: u32,
+    /// `None` for a host that never heartbeated, or whose last heartbeat is
+    /// older than the freshness bound: no reported point, never a `0`.
+    pub reported: Option<Reported>,
+}
+
+/// The table's gauge snapshot (#12873).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableGauges {
+    /// Every host with a row or a fresh heartbeat.
+    pub hosts: BTreeMap<String, HostGauges>,
+    /// Held rows, fleet-wide (a held row has no host).
+    pub held: u32,
 }
 
 /// A claim's decision.
@@ -243,10 +324,16 @@ pub enum ClaimDecision {
         ttl_s: u64,
         /// `true` when this re-granted the host's own existing grant.
         renewed: bool,
+        /// The assignment this grant replaces, when the triple has one
+        /// (#12875). Never set on a renewal.
+        lineage: Option<Lineage>,
     },
     Refused {
         reason: RefusalReason,
         held_by: Option<String>,
+        /// The holder's assignment id, on a `held` refusal from a live row
+        /// (#12740). Telemetry only: never on the wire.
+        holder_assignment_id: Option<String>,
         retry_after_s: u64,
     },
 }
@@ -280,13 +367,71 @@ impl Expired {
     }
 }
 
-/// A no-progress hold on one `(repo, item, step)` (module docs).
+/// How an assignment ended (#12875).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrevEnd {
+    /// The worker released it, or gave it back with a `refuse`.
+    Released,
+    /// Its TTL ended with no release.
+    Expired,
+    /// The host was lost (a spot interruption): the worker released it with
+    /// [`HOST_LOST_OUTCOME`] (#12876).
+    HostLost,
+}
+
+impl PrevEnd {
+    /// The `loom.dispatch.prev_end` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::Expired => "expired",
+            Self::HostLost => "host_lost",
+        }
+    }
+}
+
+/// What a grant replaces: set on every grant after the first of its
+/// `(repo, item, step)` (module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    /// Assignments of the triple that ended before this grant.
+    pub attempt: u32,
+    pub prev_assignment_id: String,
+    pub prev_end: PrevEnd,
+}
+
+/// The last end recorded for one `(repo, item, step)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineageRecord {
+    ended: u32,
+    prev_assignment_id: String,
+    prev_end: PrevEnd,
+    at: Mono,
+}
+
+/// An assignment row that expired (#12875): what the captain reports as
+/// `cause=lease_expired`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredAssignment {
+    pub host: Option<String>,
+    pub repo: String,
+    pub item: u64,
+    pub step: String,
+    pub assignment_id: String,
+}
+
+/// A no-progress hold on one `(repo, item, step)` (module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cooldown {
     /// Claims for the triple are refused `held` until then.
     pub until: Mono,
     /// Consecutive no-progress releases of the triple.
     pub streak: u32,
+    /// The outcome of the release that set the hold (#12707).
+    pub set_by_outcome: String,
+    /// The assignment whose release set the hold (#12707).
+    pub set_by_assignment_id: String,
 }
 
 /// The assignment table. See the module docs.
@@ -301,6 +446,8 @@ pub struct Table {
     by_id: BTreeMap<String, (String, u64)>,
     hosts: BTreeMap<String, HostState>,
     cooldowns: BTreeMap<(String, u64, String), Cooldown>,
+    lineage: BTreeMap<(String, u64, String), LineageRecord>,
+    expired_rows: Vec<ExpiredAssignment>,
     next_id: u64,
 }
 
@@ -325,6 +472,8 @@ impl Table {
             by_id: BTreeMap::new(),
             hosts: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
+            lineage: BTreeMap::new(),
+            expired_rows: Vec::new(),
             next_id: 0,
         }
     }
@@ -372,13 +521,54 @@ impl Table {
         self.cooldowns
             .get(&(repo.to_string(), item, step.to_string()))
             .filter(|c| c.until > now)
-            .copied()
+            .cloned()
     }
 
     /// What the table last heard from `host`.
     #[must_use]
     pub fn host(&self, host: &str) -> Option<&HostState> {
         self.hosts.get(host)
+    }
+
+    /// The gauge snapshot at `now` (#12873): granted and live rows per host
+    /// for every host with a row or a heartbeat within `fresh`, `0`
+    /// included; the reported facts only for a fresh host; the held rows
+    /// fleet-wide. A host that stopped heartbeating keeps its row counts
+    /// while its rows last (they are the stale claims). Pure.
+    #[must_use]
+    pub fn host_gauges(&self, now: Mono, fresh: Duration) -> TableGauges {
+        let mut gauges = TableGauges::default();
+        for (host, state) in &self.hosts {
+            if now.0.saturating_sub(state.last_seen.0) <= fresh {
+                gauges.hosts.insert(
+                    host.clone(),
+                    HostGauges {
+                        reported: Some(Reported {
+                            free_slots: state.free_slots,
+                            live_reported: state.live_reported,
+                            oldest_live_started_at: state.oldest_live_started_at,
+                        }),
+                        ..HostGauges::default()
+                    },
+                );
+            }
+        }
+        for row in self.rows.values() {
+            let host = match (&row.host, row.state) {
+                (_, RowState::Held) | (None, _) => {
+                    gauges.held += 1;
+                    continue;
+                }
+                (Some(host), _) => host,
+            };
+            let entry = gauges.hosts.entry(host.clone()).or_default();
+            match row.state {
+                RowState::Granted => entry.granted += 1,
+                RowState::Live => entry.live += 1,
+                RowState::Held => {}
+            }
+        }
+        gauges
     }
 
     /// Whether claims are still refused with `grace` at `now`. Closes the
@@ -410,15 +600,66 @@ impl Table {
             if let Some(row) = self.remove(&key) {
                 match row.state {
                     RowState::Held => expired.holds += 1,
-                    RowState::Granted | RowState::Live => expired.assignments += 1,
+                    RowState::Granted | RowState::Live => {
+                        expired.assignments += 1;
+                        self.note_ended(&key, &row, PrevEnd::Expired, now);
+                        if self.expired_rows.len() < EXPIRED_BUFFER_MAX {
+                            self.expired_rows.push(ExpiredAssignment {
+                                host: row.host,
+                                repo: key.0,
+                                item: key.1,
+                                step: row.step,
+                                assignment_id: row.assignment_id,
+                            });
+                        }
+                    }
                 }
             }
         }
+        self.lineage.retain(|_, l| l.at.plus(LINEAGE_MAX_AGE) > now);
         // A streak is forgotten once its hold has been over for the
         // ladder's last rung (module docs), which also bounds the map.
         let forget = self.policy.no_progress[self.policy.no_progress.len() - 1];
         self.cooldowns.retain(|_, c| c.until.plus(forget) > now);
         expired
+    }
+
+    /// The assignments that expired since the last call, oldest first. An
+    /// expiry inside another call (a claim expires first) is kept here too,
+    /// so none is missed; held rows are not assignments and are not listed
+    /// (#12875).
+    pub fn take_expired(&mut self) -> Vec<ExpiredAssignment> {
+        std::mem::take(&mut self.expired_rows)
+    }
+
+    /// Record that `row`, at `key`, ended as `end`.
+    fn note_ended(&mut self, key: &(String, u64), row: &Row, end: PrevEnd, now: Mono) {
+        let triple = (key.0.clone(), key.1, row.step.clone());
+        let ended = self
+            .lineage
+            .get(&triple)
+            .map_or(0, |l| l.ended)
+            .saturating_add(1);
+        self.lineage.insert(
+            triple,
+            LineageRecord {
+                ended,
+                prev_assignment_id: row.assignment_id.clone(),
+                prev_end: end,
+                at: now,
+            },
+        );
+        while self.lineage.len() > LINEAGE_MAX {
+            let oldest = self
+                .lineage
+                .iter()
+                .min_by_key(|(_, l)| l.at)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => self.lineage.remove(&k),
+                None => break,
+            };
+        }
     }
 
     /// Apply `host`'s heartbeat at `now`: record its slots and roles, and
@@ -432,6 +673,7 @@ impl Table {
                 live_reported: u32::try_from(hb.live.len()).unwrap_or(u32::MAX),
                 roles_ok: hb.roles_ok.iter().cloned().collect(),
                 last_seen: now,
+                oldest_live_started_at: hb.live.iter().filter_map(|l| l.started_at).min(),
             },
         );
         let deadline = now.plus(self.policy.assignment_ttl);
@@ -490,8 +732,8 @@ impl Table {
         );
     }
 
-    /// Decide `host`'s claim of `(repo, item)` for `step` at `now`.
-    /// `max_concurrent` is the host's `maxConcurrent` from the fleet config.
+    /// Decide `host`'s claim of `(repo, item)` for `step` at `now`. No
+    /// capacity check: the worker bounds its own claims (#12864).
     pub fn claim(
         &mut self,
         now: Mono,
@@ -499,7 +741,34 @@ impl Table {
         repo: &str,
         item: u64,
         step: &str,
-        max_concurrent: Option<u32>,
+    ) -> ClaimDecision {
+        self.claim_traced(now, host, repo, item, step).0
+    }
+
+    /// [`Self::claim`], plus the no-progress hold when a refusal came from
+    /// it (#12551), not from another host's live claim that merely coexists
+    /// with a hold.
+    pub fn claim_traced(
+        &mut self,
+        now: Mono,
+        host: &str,
+        repo: &str,
+        item: u64,
+        step: &str,
+    ) -> (ClaimDecision, Option<Cooldown>) {
+        let mut cooled = None;
+        let d = self.decide_claim(now, host, repo, item, step, &mut cooled);
+        (d, cooled)
+    }
+
+    fn decide_claim(
+        &mut self,
+        now: Mono,
+        host: &str,
+        repo: &str,
+        item: u64,
+        step: &str,
+        cooled: &mut Option<Cooldown>,
     ) -> ClaimDecision {
         self.expire(now);
         if self.in_grace(now) {
@@ -520,17 +789,20 @@ impl Table {
                     assignment_id: row.assignment_id.clone(),
                     ttl_s: self.policy.assignment_ttl.as_secs(),
                     renewed: true,
+                    lineage: None,
                 };
             }
             if !own {
                 let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
-                return refused(RefusalReason::Held, row.host.clone(), retry);
+                return held_by_row(row, retry);
             }
             replaces_own = true;
         }
         // The fleet-wide no-progress hold (#12541): whoever asks.
         if let Some(c) = self.cooldown(now, repo, item, step) {
-            return refused(RefusalReason::Held, None, now.secs_until(c.until, 1));
+            let retry = now.secs_until(c.until, 1);
+            *cooled = Some(c);
+            return refused(RefusalReason::Held, None, retry);
         }
         let Ok(parsed) = step.parse::<StepRole>() else {
             return refused(RefusalReason::NotEligible, None, NOT_ELIGIBLE_RETRY_SECS);
@@ -544,29 +816,29 @@ impl Table {
                 .map(|(_, row)| row)
             {
                 let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
-                return refused(RefusalReason::Held, row.host.clone(), retry);
+                return held_by_row(row, retry);
             }
         }
-        let state = self.hosts.get(host);
-        if let Some(state) = state {
+        if let Some(state) = self.hosts.get(host) {
             if !state.roles_ok.contains(parsed.role_name()) {
                 return refused(RefusalReason::NotEligible, None, NOT_ELIGIBLE_RETRY_SECS);
             }
         }
-        let reported = state.map(|s| s.free_slots.saturating_add(s.live_reported));
-        let limit = match (reported, max_concurrent) {
-            (Some(r), Some(m)) => Some(r.min(m)),
-            (Some(r), None) => Some(r),
-            (None, m) => m,
-        };
-        // The row being replaced frees its slot for the new step.
-        let held = self.held_by(host).saturating_sub(u32::from(replaces_own));
-        if limit.is_none_or(|l| held >= l) {
-            return refused(RefusalReason::Cap, None, CAP_RETRY_SECS);
-        }
+        // No capacity check here (#12864): the worker asked only because it
+        // has a free slot by its own limits.
         if replaces_own {
-            self.remove(&key);
+            if let Some(old) = self.remove(&key) {
+                self.note_ended(&key, &old, PrevEnd::Released, now);
+            }
         }
+        let lineage = self
+            .lineage
+            .get(&(repo.to_string(), item, step.to_string()))
+            .map(|l| Lineage {
+                attempt: l.ended,
+                prev_assignment_id: l.prev_assignment_id.clone(),
+                prev_end: l.prev_end,
+            });
         let id = self.new_id("a");
         self.insert(
             key,
@@ -583,6 +855,7 @@ impl Table {
             assignment_id: id,
             ttl_s: self.policy.assignment_ttl.as_secs(),
             renewed: false,
+            lineage,
         }
     }
 
@@ -619,7 +892,9 @@ impl Table {
             }
             return RefuseOutcome::Unknown;
         }
-        self.remove(&key);
+        if let Some(row) = self.remove(&key) {
+            self.note_ended(&key, &row, PrevEnd::Released, now);
+        }
         RefuseOutcome::Dropped
     }
 
@@ -650,7 +925,34 @@ impl Table {
         let Some(row) = self.remove(&key) else {
             return false;
         };
+        let host_lost = outcome.trim() == HOST_LOST_OUTCOME;
+        let end = if host_lost {
+            PrevEnd::HostLost
+        } else {
+            PrevEnd::Released
+        };
+        self.note_ended(&key, &row, end, now);
         let (repo, item) = key;
+        if host_lost {
+            return true;
+        }
+        if outcome.trim() == CI_WAIT_OUTCOME {
+            let triple = (repo, item, row.step);
+            let until = now.plus(self.policy.ci_wait);
+            let prior = self.cooldowns.get(&triple).cloned();
+            if !self.policy.ci_wait.is_zero() && prior.as_ref().is_none_or(|c| c.until < until) {
+                self.cooldowns.insert(
+                    triple,
+                    Cooldown {
+                        until,
+                        streak: prior.map_or(0, |c| c.streak),
+                        set_by_outcome: CI_WAIT_OUTCOME.to_string(),
+                        set_by_assignment_id: assignment_id.to_string(),
+                    },
+                );
+            }
+            return true;
+        }
         if release_progressed(outcome) {
             self.cooldowns
                 .retain(|(r, i, _), _| !(*r == repo && *i == item));
@@ -671,6 +973,8 @@ impl Table {
             Cooldown {
                 until: now.plus(hold),
                 streak,
+                set_by_outcome: outcome.trim().to_string(),
+                set_by_assignment_id: assignment_id.to_string(),
             },
         );
         true
@@ -704,6 +1008,18 @@ fn refused(reason: RefusalReason, held_by: Option<String>, retry_after_s: u64) -
     ClaimDecision::Refused {
         reason,
         held_by,
+        holder_assignment_id: None,
+        retry_after_s,
+    }
+}
+
+/// A `held` refusal naming the live row that holds the item (#12740).
+fn held_by_row(row: &Row, retry_after_s: u64) -> ClaimDecision {
+    ClaimDecision::Refused {
+        reason: RefusalReason::Held,
+        held_by: row.host.clone(),
+        // A claim-lost hold has no host, so no holder either.
+        holder_assignment_id: row.host.as_ref().map(|_| row.assignment_id.clone()),
         retry_after_s,
     }
 }

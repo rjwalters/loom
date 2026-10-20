@@ -35,6 +35,14 @@ fn skipped_reason(env: &Env<'_>, root: &Path, net: &Net, low_disk: bool) -> Opti
     }
 }
 
+/// The head the workspace half heard for `root`'s `branch` within
+/// [`remote::HEARD_MAX_AGE`], with its age in seconds: a cache read, so a pass
+/// that may not use the network can still name a recent tip (#12565).
+fn cached_head(root: &Path, branch: Option<&str>) -> Option<(String, String, u64)> {
+    let branch = branch?;
+    super::heard_within_aged(root, remote::HEARD_MAX_AGE).filter(|(b, _, _)| b == branch)
+}
+
 /// The record for one checkout this pass reached. `head` is the remote head the
 /// pass learned for it, `branch` the default branch it resolved.
 pub(super) fn reached(
@@ -48,10 +56,17 @@ pub(super) fn reached(
 ) -> CheckoutFreshnessRecord {
     let mut prompt = prompt_tree::read(root);
     let mut repo = None;
+    let mut tip_age_s = None;
     if let Some(tree) = prompt.as_mut() {
         let expected = remote::Expected::for_root(root);
-        let heard = branch.zip(head);
+        let cached = head.is_none().then(|| cached_head(root, branch)).flatten();
+        let heard = branch
+            .zip(head)
+            .or_else(|| cached.as_ref().map(|(b, h, _)| (b.as_str(), h.as_str())));
         remote::fill(root, tree, &expected, heard);
+        if tree.remote_tip.is_some() {
+            tip_age_s = cached.map(|(_, _, age)| age);
+        }
         repo = tree
             .remote_repo
             .clone()
@@ -70,6 +85,7 @@ pub(super) fn reached(
         captured_at: now,
         repo,
         pass_skipped_reason: reason.map(str::to_string),
+        remote_tip_age_s: tip_age_s,
         prompt,
     }
 }
@@ -84,6 +100,7 @@ pub(super) fn deferred(root: &Path, now: DateTime<Utc>) -> CheckoutFreshnessReco
         captured_at: now,
         repo: origin.repo.filter(|_| !origin.foreign),
         pass_skipped_reason: Some("budget".to_string()),
+        remote_tip_age_s: None,
         prompt: None,
     }
 }

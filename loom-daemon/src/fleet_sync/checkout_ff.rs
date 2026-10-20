@@ -196,12 +196,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord;
 
+#[cfg(test)]
+pub(in crate::fleet_sync) use host::note_remote_head_at;
 pub use host::BUSY_NOTE;
 pub(super) use host::{after_resync, announce, note_remote_head, startup};
 #[cfg(test)]
 pub(in crate::fleet_sync) use host::{boot_step, online_at_boot, timer_step, Stepped};
 pub use host::{health_states, hold_for_move, GateProbe, MoveHold};
-pub(crate) use host::{heard_within, hold_for_self_update};
+pub(crate) use host::{heard_within, heard_within_aged, hold_for_self_update};
 
 /// Event-bus topic a checkout state transition is published on.
 pub const TOPIC: &str = "fleet_sync.checkout";

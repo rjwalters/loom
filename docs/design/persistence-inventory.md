@@ -7,6 +7,14 @@ readers, the authority, the schema/version field, the recovery behaviour and a
 proposed disposition. It then proposes a target journal schema with one writer
 per concern.
 
+> **SUPERSEDED (operator ruling, 2026-10-19, #9908 closed as not planned;
+> unwound by #12848).** The journals described in section 9 (J1 execution,
+> J2 telemetry, J3 configuration-snapshot) and their shadow-write code
+> (`loom_daemon::journal`, `telemetry::journal_shadow`, `config_journal`,
+> `LOOM_TELEMETRY_JOURNAL*`) were removed. The daemon produces telemetry and
+> session transcripts only. Sections 1-8 remain as a store inventory; sections
+> 9-14 are kept as history only and describe no live code.
+
 **Status: proposal for curation.** This phase changes documentation only. It
 creates no runtime store, migrates no reader, deletes no format, and changes no
 forge authority. Phase 4, which retires old formats, still needs the
@@ -156,7 +164,7 @@ prove a claim *dead on this host* (`worktree_ops/orphan_recovery.rs:15-18`).
 | T12 | Forge call stats sink | `<host tmp>/loom-forge-call-stats/calls-<hour>.jsonl` (`forge_call_stats.rs:804`, `forge_call_stats_sink.rs:11`) | `forge_call_stats_sink.rs:23` | `forge_call_stats_ingest.rs` | Per-host and owner-only by design | Row schema | Pruned after `RETAIN_HOURS` (`forge_call_stats.rs:93`) | **RETAIN** (Q3: high volume, deliberately in host tmp) |
 | T13 | `gh` invocation failures | `<host tmp>/loom-gh-invocations/failures-<hour>.jsonl` (`gh_invocation/telemetry.rs:526`, `:549`) | `gh_invocation/telemetry.rs:561` | Ingest | Per-host | Row | Hourly files | **RETAIN** (with T12) |
 | T14 | Pick journal | `<host tmp>/loom-pick-journal/<role>-<n>.jsonl` (`observability/pick_journal.rs:103`) | `observability/pick_journal.rs:237` | Ingest | Per-tick diagnostics | Row | Tmp | **RETAIN** |
-| T15 | Trace joins / attended output | `<ws>/.loom/logs/trace-joins/` (`observability/runtime_usage/join.rs:40`); attended `session.output` lock and queue files under `<ws>/.loom/logs/live-output-attended/` (`observability/session_output/attended.rs:523`) | Same modules | Exporter | Derived join artifacts | Row | Locked segments | **RETAIN** (derived, bounded) |
+| T15 | Trace joins | `<ws>/.loom/logs/trace-joins/` (`observability/runtime_usage/join.rs:40`) | Same modules | Exporter | Derived join artifacts | Row | Locked segments | **RETAIN** (derived, bounded) |
 | T16 | Activity database | `~/.loom/activity.db` (`daemon_service.rs:259`, `limit_calibration.rs:343`), SQLite with 23 `CREATE TABLE IF NOT EXISTS` tables (19 from `activity/schema.rs:17` onward, 4 in `activity/tuning.rs`) | IPC handlers, transcript ingest, weekly-point sampler, tuning | `loom-daemon stats`, usage report, limit calibration. **`loom-api` reads `<workspace>/.loom/activity.db` instead** (`loom-api/src/main.rs:59`, `:194`) | Analytics store | `CREATE TABLE IF NOT EXISTS` plus ad-hoc `PRAGMA table_info` migrations (`activity/schema.rs:613-643`) | SQLite | **RETAIN** (analytics, not a journal). **FIX**: `loom-api` path divergence. E6 deleted. |
 | T17 | Release signature evidence | `<repo>/.loom/logs/signature-evidence.jsonl` (`release_fetch/evidence.rs:67`, `:430-438`) | `release_fetch/evidence.rs:445` | Release adoption | Security audit | Schema-versioned records | Append without fsync. Rotates to one `.1` file past a size cap (`release_fetch/evidence.rs:449-453`). | **RETAIN** (audit; separate trust domain) |
 

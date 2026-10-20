@@ -258,6 +258,17 @@ fn a_failed_kind_probe_skips_only_that_owner_names_it_and_retries_next_cycle() {
     let status = state::load_status(&state_dir(dir.path()));
     assert!(status.owners[0].error.is_some() && status.owners[0].kind.is_none());
 
+    // An owner skip is not a cycle failure: health is `degraded` and names
+    // the skipped owners, with no failure count accrued.
+    assert_eq!(status.consecutive_failures, 0);
+    match state::classify(&status, status.last_attempt_at.unwrap(), 120) {
+        state::Health::Degraded { failing_owners, .. } => {
+            let names: Vec<_> = failing_owners.iter().map(|(o, _)| o.as_str()).collect();
+            assert_eq!(names, ["ghost", "robot"]);
+        }
+        other => panic!("expected degraded, got {other:?}"),
+    }
+
     let api = two_owner_api();
     run_cycle(&with_ghost(dir.path(), kinds), &api).unwrap();
     let paths = requested(&api);

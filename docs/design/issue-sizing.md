@@ -183,8 +183,6 @@ A test file takes its subject's status.
 | `defaults/scripts/tests/test-sweep-experiment.sh` | Its test | live |
 | `defaults/docs/model-cost-experiment.md` | Experiment design (#3725, #9122) | live (observe recording) |
 | `docs/model-selection-retune.md` | Cheap-first retune (#3718) | inert-unless-configured |
-| `defaults/scripts/experiments/README.md` | Cites `sweep.modelExperiment` as flag precedent | dead |
-| `defaults/scripts/experiments/judge-fanout-experiment.sh` | Same | dead |
 | `docs/research/dynamic-workflows-evaluation.md` | Same | dead |
 | `loom-daemon/tests/native_tools.rs` | Fixture config `autonomous.modelExperiment`, a key path nothing reads | dead |
 

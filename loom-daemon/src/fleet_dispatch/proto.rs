@@ -11,6 +11,7 @@
 //! | [`CLAIM_PATH`] | [`ClaimRequest`] | [`ClaimResponse`] |
 //! | [`REFUSE_PATH`] | [`RefuseRequest`] | [`AckResponse`] |
 //! | [`RELEASE_PATH`] | [`ReleaseRequest`] | [`AckResponse`] |
+//! | [`NEXT_PATH`] | [`NextRequest`] | [`NextResponse`] |
 //!
 //! A `claim` refusal is an **answer** (HTTP 200, `granted: false`), never a
 //! failure. Non-200 statuses carry an [`ErrorResponse`]: `400` malformed,
@@ -22,6 +23,7 @@
 //! name ([`crate::step_role::StepRole::as_str`]) in a plain string so a live
 //! entry from a newer worker cannot poison a whole heartbeat.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// `POST` path of the heartbeat.
@@ -33,8 +35,17 @@ pub const REFUSE_PATH: &str = "/v1/refuse";
 /// `POST` path of a release.
 pub const RELEASE_PATH: &str = "/v1/release";
 
-/// Every Phase 1 path.
-pub const PATHS: [&str; 4] = [HEARTBEAT_PATH, CLAIM_PATH, REFUSE_PATH, RELEASE_PATH];
+/// `POST` path of a work request (#12817).
+pub const NEXT_PATH: &str = "/v1/next";
+
+/// Every path.
+pub const PATHS: [&str; 5] = [
+    HEARTBEAT_PATH,
+    CLAIM_PATH,
+    REFUSE_PATH,
+    RELEASE_PATH,
+    NEXT_PATH,
+];
 
 /// The `refuse` reason that holds the item for the forge lease TTL: someone
 /// outside fleet mode won the forge order. Every other reason drops the row.
@@ -110,6 +121,12 @@ pub struct LiveStep {
     /// Present only for a step the captain granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_id: Option<String>,
+    /// When the step started on the worker (its registry entry's
+    /// `started_at`, #12873). Additive: an older worker omits it and reads
+    /// as `None`; an older captain ignores it. The captain's
+    /// `loom.fleet_dispatch.oldest_live_age_sec` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// `POST /v1/heartbeat`: the host's live set, free slots and runnable roles.
@@ -157,6 +174,10 @@ pub enum RefusalReason {
     NotEligible,
     /// The host is at its cap.
     Cap,
+    /// A no-progress hold on the `(repo, item, step)` (#12541), as opposed
+    /// to [`Self::Held`], another host's live claim (#12551). A worker
+    /// that predates it reads it as [`Self::Other`] and still refuses.
+    Cooldown,
     /// A reason this build does not know (a newer server). Never sent by
     /// this server.
     #[serde(other)]
@@ -172,6 +193,7 @@ impl RefusalReason {
             Self::Grace => "grace",
             Self::NotEligible => "not_eligible",
             Self::Cap => "cap",
+            Self::Cooldown => "cooldown",
             Self::Other => "other",
         }
     }
@@ -198,6 +220,18 @@ pub struct ClaimResponse {
     /// Seconds before asking about this item again is worthwhile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_s: Option<u64>,
+    /// Count of earlier grants of this `(repo, item, step)`, set on a grant
+    /// that follows one (#12875). Absent on a first grant and for older
+    /// captains; older workers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// The assignment this grant replaces (#12875).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_assignment_id: Option<String>,
+    /// How that assignment ended: `released`, `expired` or `host_lost`
+    /// (#12875).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_end: Option<String>,
 }
 
 impl ClaimResponse {
@@ -212,7 +246,22 @@ impl ClaimResponse {
             reason: None,
             held_by: None,
             retry_after_s: None,
+            attempt: None,
+            prev_assignment_id: None,
+            prev_end: None,
         }
+    }
+
+    /// This grant, carrying the lineage of the assignment it replaces
+    /// (#12875).
+    #[must_use]
+    pub fn with_lineage(mut self, lineage: Option<&super::table::Lineage>) -> Self {
+        if let Some(l) = lineage {
+            self.attempt = Some(l.attempt);
+            self.prev_assignment_id = Some(l.prev_assignment_id.clone());
+            self.prev_end = Some(l.prev_end.as_str().to_string());
+        }
+        self
     }
 
     /// A refusal.
@@ -231,6 +280,9 @@ impl ClaimResponse {
             reason: Some(reason),
             held_by,
             retry_after_s: Some(retry_after_s),
+            attempt: None,
+            prev_assignment_id: None,
+            prev_end: None,
         }
     }
 }
@@ -252,6 +304,44 @@ pub struct ReleaseRequest {
     pub host_id: String,
     pub assignment_id: String,
     pub outcome: String,
+}
+
+/// `POST /v1/next`: "this host has `free_slots` free; what should it run?"
+/// Sent when capacity becomes available, never on a fixed period (#12817).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextRequest {
+    pub host_id: String,
+    /// The worker's own free slots: the most assignments it is offered.
+    pub free_slots: u32,
+    /// Roles the host can run now.
+    pub roles_ok: Vec<String>,
+}
+
+/// One item the captain offers a host. A candidate, never a reason to skip
+/// the worker's gates, live pre-check or forge pre-claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assignment {
+    pub assignment_id: String,
+    /// `owner/name`.
+    pub repo: String,
+    pub item: u64,
+    /// The step wire name.
+    pub step: String,
+    /// Seconds the grant lives without a heartbeat renewing it.
+    pub ttl_s: u64,
+}
+
+/// The answer to `next`. An empty `assignments` is an answer, not an error:
+/// nothing fits this host now, and the worker draws nothing locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextResponse {
+    pub server_epoch: String,
+    /// Seconds since the captain's queue last read the full worklist; absent
+    /// before the first read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_age_s: Option<u64>,
+    #[serde(default)]
+    pub assignments: Vec<Assignment>,
 }
 
 /// The answer to `refuse` and `release`.
@@ -322,11 +412,69 @@ mod tests {
             RefusalReason::Grace,
             RefusalReason::NotEligible,
             RefusalReason::Cap,
+            RefusalReason::Cooldown,
         ] {
             assert_eq!(serde_json::to_value(r).unwrap(), json!(r.as_str()));
         }
         let r: RefusalReason = serde_json::from_value(json!("queue_full")).unwrap();
         assert_eq!(r, RefusalReason::Other);
+    }
+
+    /// #12873: `LiveStep.started_at` is additive in both directions. An old
+    /// worker's step (no field) reads as `None` and re-serialises without
+    /// it; a new worker's step round-trips; an old captain (the pre-#12873
+    /// shape, no `deny_unknown_fields`) reads a new worker's step.
+    #[test]
+    fn a_live_steps_started_at_is_optional_both_ways() {
+        let old_worker = json!({"repo": "acme/w", "item": 7, "step": "builder"});
+        let step: LiveStep = serde_json::from_value(old_worker.clone()).unwrap();
+        assert_eq!(step.started_at, None);
+        assert_eq!(serde_json::to_value(&step).unwrap(), old_worker);
+
+        let new_worker = json!({"repo": "acme/w", "item": 7, "step": "builder",
+                                "started_at": "2026-10-20T01:00:00Z", "future": 1});
+        let step: LiveStep = serde_json::from_value(new_worker).unwrap();
+        let at: DateTime<Utc> = "2026-10-20T01:00:00Z".parse().unwrap();
+        assert_eq!(step.started_at, Some(at));
+        let wire = serde_json::to_value(&step).unwrap();
+        assert_eq!(wire["started_at"], "2026-10-20T01:00:00Z");
+        assert_eq!(serde_json::from_value::<LiveStep>(wire.clone()).unwrap(), step);
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldCaptainLiveStep {
+            repo: String,
+            item: u64,
+            step: String,
+            #[serde(default)]
+            assignment_id: Option<String>,
+        }
+        let old: OldCaptainLiveStep = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.item, 7);
+    }
+
+    #[test]
+    fn next_round_trips_and_an_empty_answer_is_valid() {
+        let req: NextRequest = serde_json::from_value(
+            json!({"host_id": "w", "free_slots": 3, "roles_ok": ["builder"], "x": 1}),
+        )
+        .unwrap();
+        assert_eq!(req.free_slots, 3);
+        let empty: NextResponse = serde_json::from_value(json!({"server_epoch": "e"})).unwrap();
+        assert!(empty.assignments.is_empty() && empty.queue_age_s.is_none());
+        let resp = NextResponse {
+            server_epoch: "e".into(),
+            queue_age_s: Some(4),
+            assignments: vec![Assignment {
+                assignment_id: "a-1".into(),
+                repo: "a/b".into(),
+                item: 7,
+                step: "builder".into(),
+                ttl_s: 1200,
+            }],
+        };
+        let wire = serde_json::to_value(&resp).unwrap();
+        assert_eq!(serde_json::from_value::<NextResponse>(wire).unwrap(), resp);
     }
 
     #[test]

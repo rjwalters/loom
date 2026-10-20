@@ -8,8 +8,8 @@
 //! Exit `0` when an artifact resolved, `1` when none did. `1` is **data**, not
 //! an error: the daemon's tick falls back to its source path on it.
 
+use crate::release_resolve::{build_time_repo, emit, resolve, Inputs};
 use anyhow::Result;
-use loom_daemon::release_resolve::{build_time_repo, emit, resolve, Inputs};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -76,8 +76,8 @@ impl ReleaseResolveArgs {
         // Exactly one line on stdout, and nothing else ever written there.
         println!("{}", emit::to_json(&resolution));
         std::process::exit(match resolution {
-            loom_daemon::release_resolve::Resolution::Resolved(_) => 0,
-            loom_daemon::release_resolve::Resolution::Unresolved(_) => 1,
+            crate::release_resolve::Resolution::Resolved(_) => 0,
+            crate::release_resolve::Resolution::Unresolved(_) => 1,
         });
     }
 }

@@ -39,8 +39,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS;
-use loom_daemon::work_finder::{read_work_finder_config, resolve_extra_skip_labels_with_config};
+use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
+use crate::work_finder::{read_work_finder_config, resolve_extra_skip_labels_with_config};
 
 #[derive(clap::Args)]
 pub(crate) struct SkipLabelsArgs {

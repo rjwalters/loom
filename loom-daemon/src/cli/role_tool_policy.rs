@@ -1,7 +1,7 @@
 //! `loom-daemon role-tool-policy` — the shell-facing half of the per-role
 //! tool-restriction allowlist (Issue #8322, for #8256).
 //!
-//! [`loom_daemon::role_tool_policy`] is the mechanism; this is the surface the
+//! [`crate::role_tool_policy`] is the mechanism; this is the surface the
 //! two `contract`-category spawn scripts call instead of re-implementing it in
 //! `jq` and bash. See that module's doc for the parity requirements. This one
 //! documents the CLI contract those scripts depend on.
@@ -63,7 +63,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::role_tool_policy::{resolve_role_name, RoleToolPolicy};
+use crate::role_tool_policy::{resolve_role_name, RoleToolPolicy};
 
 /// No restriction applies, or the role could not be resolved. Not an error.
 pub(crate) const EX_NO_RESTRICTION: i32 = 1;
@@ -299,7 +299,7 @@ impl RoleToolPolicyCommand {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::role_tool_policy::Allowlist;
+    use crate::role_tool_policy::Allowlist;
 
     fn args(role: &str, dir: &std::path::Path) -> PolicyArgs {
         PolicyArgs {

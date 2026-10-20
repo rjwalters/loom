@@ -1,6 +1,6 @@
 //! `loom-daemon overlap-replay validate | outcomes | score` (#9785) — the
 //! historical Augment replay harness. All logic lives in
-//! [`loom_daemon::overlap_replay`]; this file is argument parsing, output
+//! [`crate::overlap_replay`]; this file is argument parsing, output
 //! rendering, and the orchestration glue between the manifest, the frozen
 //! prediction artifacts, the outcomes stage and the report writers.
 //!
@@ -13,9 +13,9 @@ use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use loom_daemon::overlap_replay::artifact::{self, FrozenPrediction, PredictionStatus};
-use loom_daemon::overlap_replay::manifest::SnapshotValidity;
-use loom_daemon::overlap_replay::{self, outcome, report, score};
+use crate::overlap_replay::artifact::{self, FrozenPrediction, PredictionStatus};
+use crate::overlap_replay::manifest::SnapshotValidity;
+use crate::overlap_replay::{self, outcome, report, score};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum OverlapReplayCommand {

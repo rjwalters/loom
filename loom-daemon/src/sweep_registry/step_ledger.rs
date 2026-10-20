@@ -195,6 +195,26 @@ impl SweepRegistry {
         self.persist_step_ledger();
     }
 
+    /// The captain refused `(item, step)` as cooling down for `hold_secs`
+    /// (#12704): arm the same window here, so the next ticks' draw drops the
+    /// pair (`Exclusion::CoolingDown`) instead of asking the captain again.
+    /// Host-local, not broadcast: the captain already answers every host.
+    pub fn arm_captain_hold(&mut self, item: u32, step: StepRole, hold_secs: u32) {
+        let now = Utc::now();
+        let secs = i64::from(hold_secs);
+        if secs == 0 {
+            return;
+        }
+        self.step_ledger.arm(
+            item,
+            step,
+            now + chrono::Duration::seconds(secs),
+            CooldownCause::CaptainHold,
+            now,
+        );
+        self.persist_step_ledger();
+    }
+
     fn step_ledger_path(&self) -> std::path::PathBuf {
         self.config.logs_dir().join(STEP_LEDGER_FILE)
     }

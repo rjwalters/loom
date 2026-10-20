@@ -3,7 +3,7 @@
 //!
 //! A sibling module rather than more lines in `status_render.rs` (an
 //! over-threshold ledger entry — `.loom/docs/file-size-policy.md`), matching
-//! how [`super::forge_events_line`], [`super::holds`] and
+//! how [`super::holds`] and
 //! [`super::model_class`] already live here. Moved verbatim apart from the
 //! #9015 annotation described below.
 //!
@@ -17,9 +17,9 @@
 //! SigNoz. So the `OK` line names its scope, and when the endpoint is on this
 //! machine it says outright that delivery past that hop is unverified here.
 
+use crate::health::format_window;
+use crate::types::{ObservabilityExportState as State, ObservabilityExportStatus};
 use chrono::{DateTime, Utc};
-use loom_daemon::health::format_window;
-use loom_daemon::types::{ObservabilityExportState as State, ObservabilityExportStatus};
 
 /// Render the one-line export summary as of `now` (passed in, so the tests are
 /// deterministic).
@@ -138,8 +138,8 @@ fn downstream_caveat(s: &ObservabilityExportStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::render;
+    use crate::types::{ObservabilityExportState, ObservabilityExportStatus};
     use chrono::{DateTime, Utc};
-    use loom_daemon::types::{ObservabilityExportState, ObservabilityExportStatus};
 
     fn render_now() -> DateTime<Utc> {
         "2026-08-03T12:00:00Z".parse().unwrap()

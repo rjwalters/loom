@@ -142,6 +142,18 @@ impl ExportStatus {
         guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
     }
 
+    /// The sink answered 410 (#12812): it is retired, not failing. Clears the
+    /// failure streak so a prior transient run cannot escalate or read as
+    /// degraded.
+    pub fn record_retired(&self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("observability export status mutex poisoned");
+        guard.sink_retired = true;
+        guard.consecutive_failures = 0;
+    }
+
     /// A status cell for an exporter that never started because a required
     /// piece of config could not be resolved (Issue #5337) — `enabled: true`
     /// but no endpoint, no ingest key file, or an unreadable/empty ingest key

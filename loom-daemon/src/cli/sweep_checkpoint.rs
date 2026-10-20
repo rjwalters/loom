@@ -3,7 +3,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use loom_daemon::telemetry::SweepResult;
 use serde_json::{json, Value};
 
 const PHASES: &[&str] = &[
@@ -133,18 +132,15 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
         // Telemetry only (#9935): the checkpoint file, which drives resume,
         // is never read or written, and tracing stays best effort.
         let (role, attempt, model) = parse_begin(&args[2..])?;
-        loom_daemon::observability::lifecycle::checkpoint_begun(root, issue, role, attempt, model);
+        crate::observability::lifecycle::checkpoint_begun(root, issue, role, attempt, model);
         return Ok(());
     }
     if command == "write" {
         let mut record = parse_write(&args[2..])?;
         escalation::carry_forward(&target, &mut record)?;
         persist(&dir, &target, &record)?;
-        // Default-off shadow append (#11347); the legacy file stays authoritative
-        // and a journal failure never reaches this command's result.
-        loom_daemon::journal::execution::checkpoint_written(&target, root, issue, &record);
         // Telemetry remains best effort, and only follows a successful durable write.
-        loom_daemon::observability::lifecycle::checkpoint_completed(
+        crate::observability::lifecycle::checkpoint_completed(
             root,
             issue,
             record["phase"].as_str().unwrap_or_default(),
@@ -163,15 +159,6 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     }
     if command == "delete" {
         escalation::reset_on_delete(&dir, &target, &args[2..])?;
-        // Every delete marks the issue terminal (merged, or found closed), so
-        // an in-session sweep still driving it has ended (#11563).
-        let pr = std::fs::read(&target)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| v["pr_number"].as_u64())
-            .and_then(|n| u32::try_from(n).ok());
-        let ws = root.to_string_lossy();
-        super::presence::on_sweep_finished(&ws, issue.into(), SweepResult::Success, pr);
         return match std::fs::remove_file(&target) {
             Ok(()) => {
                 std::fs::File::open(&dir)

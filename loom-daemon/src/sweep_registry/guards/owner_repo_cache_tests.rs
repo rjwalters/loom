@@ -112,14 +112,14 @@ fn resolve_owner_repo_loom_repo_override_never_spawns_gh() {
     );
 }
 
-/// W4-C: the reads that verify this daemon's own just-made write — the
-/// lease read-back behind `resolve_lease_order` / `confirm_sole_claim`, and
-/// the label read after a flip — never take a reader route, even with a
-/// reader on offer and a repo every source agrees on. A reader may lag the
-/// write, and those callers fail open after a few retries.
+/// #12555: the reads that verify this daemon's own just-made write — the
+/// lease read-back behind `resolve_lease_order` / `confirm_sole_claim`, the
+/// label read after a flip, the claim timeline — take the reader route like
+/// every other daemon read (they were writer-pinned before; the writer is
+/// never used for reads, #12394). Their freshness guards live in the callers.
 #[test]
 #[serial]
-fn own_write_read_backs_never_derive_a_reader_route() {
+fn own_write_read_backs_take_the_reader_route() {
     use crate::forge_identity::{Placement, RouteDecision};
     use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
     use crate::gh_invocation::test_routing::{install, seen, TestRouting};
@@ -147,6 +147,10 @@ fn own_write_read_backs_never_derive_a_reader_route() {
     ] {
         let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
         assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
-        assert!(mine.iter().all(|s| s.route_slug.is_none()), "{op} derived: {mine:?}");
+        assert!(
+            mine.iter()
+                .all(|s| s.route_slug.as_deref() == Some("acme/widget")),
+            "{op} did not derive: {mine:?}"
+        );
     }
 }

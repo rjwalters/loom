@@ -1,176 +1,22 @@
-//! The SigNoz read client: keyset-paged `JSONEachRow` reads from the
-//! telemetry store, through the telemetry-reader (#10196 R6, #11357).
+//! The SigNoz read client: reads from the telemetry store, through the
+//! telemetry-reader (#10196 R6, #11357).
 //!
 //! This is transport only. It knows nothing about what a query selects or
-//! what a row means: callers bring their own SQL and their own row parser.
-//! It moved here from `eta/fleet_signoz_refresh.rs` so it survives the ETA
-//! subsystem's removal (#11098); nothing in this module may depend on the
-//! `eta` module.
-//!
-//! # The paging contract
-//!
-//! Every query a [`SignozRead`] serves pages by the keyset
-//! `(knowable_time_ns, record_id)` — the [`RowCursor`] — oldest first, and
-//! returns `JSONEachRow`. The bound parameters are [`PageQuery::params`]:
-//! each caller filter by its own name, plus `since_ns`, `until_ns`,
-//! `after_ns`, `after_id` and `limit`.
-//!
-//! # Two transports
-//!
-//! - [`TelemetryReader`]: the telemetry-reader's `POST /v1/query`, the SQL as
-//!   the body and bound `param_*` URL parameters, no credential
-//!   ([`SqlPages`] pairs it with one query).
-//! - [`FileRows`]: the rows of an export an operator ran with
-//!   `clickhouse-client`, served under the same filters, order and keyset —
-//!   and the recorded-fixture reader tests use.
+//! what a row means: callers bring their own SQL, their bound parameters and
+//! their own row parser. It moved here from `eta/fleet_signoz_refresh.rs` so
+//! it survives the ETA subsystem's removal (#11098); nothing in this module
+//! may depend on the `eta` module.
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::Path;
 
-/// The paging position of one row: `(knowable_time_ns, record_id)` exactly
-/// as the query orders by, so a continuation resumes after it even when the
-/// row itself is rejected by its caller.
-pub type RowCursor = (i64, String);
-
-/// One page request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageQuery {
-    /// Exact-match column filters, compared case-insensitively. Each is bound
-    /// as a query parameter of the same name, and [`FileRows`] applies it to
-    /// the row's column of the same name.
-    pub filters: Vec<(String, String)>,
-    /// Oldest knowable-at, inclusive.
-    pub since: DateTime<Utc>,
-    /// Newest knowable-at, inclusive.
-    pub until: DateTime<Utc>,
-    /// Resume strictly after this cursor; `None` on the first page.
-    pub after: Option<RowCursor>,
-    /// Rows per page.
-    pub limit: u32,
-}
-
-impl PageQuery {
-    /// The value of filter `name`, if the query has one.
-    #[must_use]
-    pub fn filter(&self, name: &str) -> Option<&str> {
-        self.filters
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// The bound query parameters: every filter, then the window, keyset and
-    /// page size.
-    #[must_use]
-    pub fn params(&self) -> Vec<(String, String)> {
-        let (after_ns, after_id) = self.after.clone().unwrap_or((0, String::new()));
-        let ns = |at: DateTime<Utc>| at.timestamp_nanos_opt().unwrap_or(0).max(0).to_string();
-        let mut params = self.filters.clone();
-        params.extend([
-            ("since_ns".to_string(), ns(self.since)),
-            ("until_ns".to_string(), ns(self.until)),
-            ("after_ns".to_string(), after_ns.max(0).to_string()),
-            ("after_id".to_string(), after_id),
-            ("limit".to_string(), self.limit.to_string()),
-        ]);
-        params
-    }
-}
-
-/// Why a page could not be read.
+/// Why a query could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadError {
     /// The backend did not answer (connection, timeout, bad endpoint).
     Unavailable(String),
     /// It answered with an error status.
     Refused(String),
-}
-
-/// The fetch seam: one page of a query's `JSONEachRow` output.
-pub trait SignozRead {
-    /// Read one page.
-    ///
-    /// # Errors
-    ///
-    /// The page could not be read.
-    fn page(&mut self, query: &PageQuery) -> Result<String, ReadError>;
-}
-
-/// Rows from a `JSONEachRow` export, served page by page under the query's
-/// filters, the `[since, until]` window on `knowable_time_ns`, and the
-/// `(knowable_time_ns, record_id)` keyset.
-#[derive(Debug, Clone)]
-pub struct FileRows {
-    rows: Vec<(RowCursor, Value, String)>,
-}
-
-impl FileRows {
-    /// Parse `text`. Rows no query would return in any order (no
-    /// `knowable_time_ns` / `record_id`) are a malformed export.
-    ///
-    /// # Errors
-    ///
-    /// A line is not a JSON object or lacks the paging columns.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let mut rows = Vec::new();
-        for (n, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: Value =
-                serde_json::from_str(line).map_err(|e| format!("line {}: not JSON: {e}", n + 1))?;
-            let ns = match value.get("knowable_time_ns") {
-                Some(Value::Number(v)) => v.as_i64(),
-                Some(Value::String(s)) => s.trim().parse().ok(),
-                _ => None,
-            }
-            .ok_or_else(|| format!("line {}: no integer knowable_time_ns", n + 1))?;
-            let id = match value.get("record_id") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Null) => String::new(),
-                _ => return Err(format!("line {}: no record_id column", n + 1)),
-            };
-            rows.push(((ns, id), value, line.to_string()));
-        }
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(FileRows { rows })
-    }
-
-    /// [`Self::parse`] the file at `path`.
-    ///
-    /// # Errors
-    ///
-    /// Unreadable, or malformed as for [`Self::parse`].
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        Self::parse(&text)
-    }
-}
-
-impl SignozRead for FileRows {
-    fn page(&mut self, query: &PageQuery) -> Result<String, ReadError> {
-        let since = query.since.timestamp_nanos_opt().unwrap_or(0);
-        let until = query.until.timestamp_nanos_opt().unwrap_or(i64::MAX);
-        let lines: Vec<&str> = self
-            .rows
-            .iter()
-            .filter(|(cursor, value, _)| {
-                query.filters.iter().all(|(name, want)| {
-                    value
-                        .get(name)
-                        .and_then(Value::as_str)
-                        .is_some_and(|have| have.eq_ignore_ascii_case(want))
-                }) && cursor.0 >= since
-                    && cursor.0 <= until
-                    && query.after.as_ref().is_none_or(|after| cursor > after)
-            })
-            .take(query.limit as usize)
-            .map(|(_, _, line)| line.as_str())
-            .collect();
-        Ok(lines.join("\n"))
-    }
 }
 
 /// The telemetry-reader (an authenticated query broker): `POST <base>/v1/query`
@@ -227,24 +73,6 @@ impl TelemetryReader {
             url.set_query(None);
         }
         Ok(url)
-    }
-
-    /// [`Self::url_with`] `query`'s [`PageQuery::params`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Self::url_with`].
-    pub fn url(&self, query: &PageQuery) -> Result<reqwest::Url, ReadError> {
-        self.url_with(&query.params())
-    }
-
-    /// `POST` `sql` with `query`'s parameters bound; the response body.
-    ///
-    /// # Errors
-    ///
-    /// The reader is unreachable or answered with an error status.
-    pub fn post(&self, sql: &str, query: &PageQuery) -> Result<String, ReadError> {
-        self.post_with(sql, &query.params())
     }
 
     /// `POST` `sql` with `params` bound; the response body.
@@ -373,22 +201,6 @@ impl EndpointConfig {
             &crate::config_resolver::resolve_effective_config(repo_root),
             std::env::var(ENDPOINT_ENV).ok().as_deref(),
         )
-    }
-}
-
-/// One query over [`TelemetryReader`]: every page `POST`s `sql` with the
-/// page's parameters bound.
-#[derive(Debug, Clone)]
-pub struct SqlPages {
-    /// The transport.
-    pub http: TelemetryReader,
-    /// The keyset-paged query (see the module's paging contract).
-    pub sql: &'static str,
-}
-
-impl SignozRead for SqlPages {
-    fn page(&mut self, query: &PageQuery) -> Result<String, ReadError> {
-        self.http.post(self.sql, query)
     }
 }
 

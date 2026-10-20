@@ -34,6 +34,17 @@
 //! It runs through `GhInvocation::writer_identity`, the same explicit,
 //! allow-listed marker as an asker-dependent probe, so it is not booked as a
 //! read-on-the-writer error.
+//!
+//! A read the facade cannot route at all (no repo it can derive, a checkout
+//! whose sources disagree) skips this chain. For a reader-only read
+//! ([`GhInvocation::is_reader_only`]) — since #12584 every forge read whose
+//! site did not pin the writer with `writer_identity`, whatever builder made
+//! it — running it as built would be the writer, so it is shed instead (same
+//! `forge.read.shed` span and `o=shed` row), unless the host has no reader
+//! pool at all. A writer credential a site handed such a read
+//! (`gh_config_dir`, `without_token_env`, a writer `identity_role`) is set
+//! aside first ([`GhInvocation::route_site_credential`]) and only restored
+//! on that no-pool path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -122,6 +133,9 @@ impl GhInvocation {
         now: SystemTime,
     ) -> Result<GhCompletion, ExecError> {
         let Some(slug) = self.reader_slug() else {
+            if self.unroutable_reader_only() {
+                return self.shed_unroutable(lookup, now);
+            }
             return self.execute_direct();
         };
         let host = super::super::accounting::resolved_identity(&self).origin;
@@ -155,10 +169,26 @@ impl GhInvocation {
                 }
                 RouteDecision::NoPool => {
                     let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
-                    return Ok(self.shed_read(class, &owner, resource, until, last_app.as_deref()));
+                    let why = ShedWhy::Router("the reader pool went away");
+                    return Ok(self.shed_read(
+                        class,
+                        &owner,
+                        resource,
+                        until,
+                        last_app.as_deref(),
+                        why,
+                    ));
                 }
-                RouteDecision::Exhausted { until, .. } => {
-                    return Ok(self.shed_read(class, &owner, resource, until, last_app.as_deref()));
+                RouteDecision::Exhausted { until, cause } => {
+                    let why = ShedWhy::Router(cause.as_str());
+                    return Ok(self.shed_read(
+                        class,
+                        &owner,
+                        resource,
+                        until,
+                        last_app.as_deref(),
+                        why,
+                    ));
                 }
                 RouteDecision::Reader { dir, app_id, .. } => (dir, app_id),
             };
@@ -169,7 +199,15 @@ impl GhInvocation {
                     .map_or(now + crate::forge_read_pool::DEFAULT_WITHDRAWAL, |f| {
                         until_after(f, now)
                     });
-                return Ok(self.shed_read(class, &owner, resource, until, Some(app_id.as_str())));
+                let why = ShedWhy::Router("every reader offered already failed this read");
+                return Ok(self.shed_read(
+                    class,
+                    &owner,
+                    resource,
+                    until,
+                    Some(app_id.as_str()),
+                    why,
+                ));
             }
             let first = self
                 .clone()
@@ -220,7 +258,15 @@ impl GhInvocation {
                     // answer, and the reader stays on the repo's other reads.
                     served::CoverageRefusal::Shed => {
                         let until = until_after(failure, now);
-                        return Ok(self.shed_read(class, &owner, resource, until, Some(&app_id)));
+                        let why = ShedWhy::Router("a covering reader answered 404 for one item");
+                        return Ok(self.shed_read(
+                            class,
+                            &owner,
+                            resource,
+                            until,
+                            Some(&app_id),
+                            why,
+                        ));
                     }
                     served::CoverageRefusal::Withdraw => {}
                 }
@@ -263,9 +309,73 @@ impl GhInvocation {
     }
 
     /// A read on a host with no reader pool: the writer, through the
-    /// explicit `writer_identity` marker.
-    fn writer_only_read(self) -> Result<GhCompletion, ExecError> {
+    /// explicit `writer_identity` marker. The one place a
+    /// [`GhInvocation::reader_only`] read may reach the writer, so its flag
+    /// is lifted here first (the builder would ignore the pin otherwise).
+    fn writer_only_read(mut self) -> Result<GhCompletion, ExecError> {
+        // A credential the site chose (#12584) is the right owner's writer.
+        self.restore_site_credential();
+        self.reader_only = false;
         self.writer_identity().execute_direct()
+    }
+
+    /// A reader-only read ([`GhInvocation::is_reader_only`]: every forge
+    /// read its site did not pin to the writer, #12584) the facade found no
+    /// reader route for, which would otherwise run on the writer (#12555):
+    /// no derivable repo, a checkout whose sources disagree, an argv shape
+    /// the derivation does not route. A reader credential the site chose
+    /// itself is already routed and is left alone; any other was set aside
+    /// by [`GhInvocation::route_site_credential`].
+    fn unroutable_reader_only(&self) -> bool {
+        self.is_reader_only()
+            && self.intent == super::super::AccessIntent::Read
+            && matches!(self.contract, super::super::OutputContract::Captured { .. })
+            && self.role.is_none()
+            && self.config_dir.is_none()
+            && !self.strip_token_env
+    }
+
+    /// [`Self::unroutable_reader_only`]'s answer: shed, unless this host has
+    /// no reader pool at all (then the writer, as for every read). The repo
+    /// the accounting row would name (the target, `LOOM_REPO`, the
+    /// checkout's remote) is asked of the router only to tell "no pool" from
+    /// "a pool that cannot route this read"; the read is never sent to a
+    /// reader under it, since `gh` itself might resolve another repo.
+    fn shed_unroutable(
+        self,
+        lookup: ReaderLookup<'_>,
+        now: SystemTime,
+    ) -> Result<GhCompletion, ExecError> {
+        let id = super::super::accounting::resolved_identity(&self);
+        let resource = Resource::of_pool(super::super::accounting::static_pool(&self.args));
+        let pooled = match id.repo.as_deref() {
+            Some(slug) => {
+                let affinity = super::super::affinity_key(&self.args);
+                let request = RouteRequest {
+                    owner_repo: slug,
+                    host: id.origin.as_deref(),
+                    resource,
+                    affinity_key: Some(&affinity),
+                    class: self.read_class,
+                };
+                !matches!(lookup(&request), RouteDecision::NoPool)
+            }
+            None => host_has_read_pool(),
+        };
+        if !pooled {
+            return self.writer_only_read();
+        }
+        let owner = id
+            .repo
+            .as_deref()
+            .map(|s| crate::credential_preflight::owner_of_nwo(s).to_ascii_lowercase())
+            .unwrap_or_else(|| "-".to_string());
+        let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+        log::debug!(
+            "gh_invocation: {} has no reader route; shed, not sent to the writer (#12555)",
+            self.operation.as_str()
+        );
+        Ok(self.shed_read(self.read_class, &owner, resource, until, None, ShedWhy::NoRoute))
     }
 
     /// No reader can serve this read: shed it, whatever its class and cause.
@@ -277,8 +387,9 @@ impl GhInvocation {
         resource: Resource,
         until: SystemTime,
         app: Option<&str>,
+        why: ShedWhy,
     ) -> GhCompletion {
-        self.record_read_shed(class, owner, resource, until, app);
+        self.record_read_shed(class, owner, resource, until, app, why);
         GhCompletion::Shed {
             owner: owner.to_string(),
             resource,
@@ -297,6 +408,7 @@ impl GhInvocation {
         resource: Resource,
         until: SystemTime,
         app: Option<&str>,
+        why: ShedWhy,
     ) {
         super::super::accounting::record_shed(self, app, owner, resource, until);
         #[cfg(test)]
@@ -314,22 +426,75 @@ impl GhInvocation {
         let op = self.operation.as_str();
         let until_s = chrono::DateTime::<chrono::Utc>::from(until)
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if shed_log_due(op, SystemTime::now()) {
+        let now = SystemTime::now();
+        if shed_log_due(op, now) {
+            // #12630: name the cause, and for a router answer what it saw of
+            // each reader (withdrawal, token directory, bucket-book reading
+            // and its source), so a shed run is diagnosable from the log.
+            let readers = match why {
+                ShedWhy::NoRoute => None,
+                ShedWhy::Router(_) => self
+                    .reader_slug()
+                    .or_else(|| super::super::accounting::resolved_identity(self).repo)
+                    .and_then(|slug| {
+                        crate::forge_identity::route::describe_readers(&slug, resource, now)
+                    }),
+            };
             log::info!(
                 "gh_invocation: {op} shed — no reader can serve {owner} {} \
-                 until {until_s}; deferred, not sent to the writer {SHED_MARKER} \
+                 until {until_s} ({}{}); deferred, not sent to the writer {SHED_MARKER} \
                  (logged at most every {}s per operation)",
                 resource.as_str(),
+                why.describe(),
+                readers.map_or_else(String::new, |r| format!(" — {r}")),
                 SHED_LOG_EVERY.as_secs()
             );
         } else {
             log::debug!(
                 "gh_invocation: {op} shed — no reader can serve {owner} {} \
-                 until {until_s} {SHED_MARKER}",
-                resource.as_str()
+                 until {until_s} ({}) {SHED_MARKER}",
+                resource.as_str(),
+                why.describe()
             );
         }
     }
+}
+
+/// Why a read was shed, for its log line (#12630).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShedWhy {
+    /// The facade derived no repository for the read, so no reader was
+    /// asked (a checkout whose local sources disagree, an argv shape it does
+    /// not route).
+    NoRoute,
+    /// The router's answer: an [`crate::forge_identity::ExhaustCause`], or
+    /// what the read chain found.
+    Router(&'static str),
+}
+
+impl ShedWhy {
+    /// The cause as the log line names it.
+    #[must_use]
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::NoRoute => "no reader route: the read's repository could not be derived, \
+                              so no reader was asked"
+                .to_string(),
+            Self::Router(cause) => format!("router: {cause}"),
+        }
+    }
+}
+
+/// Whether this host has any reader pool or live read gateway: the test
+/// [`GhInvocation::shed_unroutable`] falls back to when it has no repo to ask
+/// the router about, and the line between "no pool, the writer is the only
+/// credential" and "the readers cannot serve this, shed" for a site that
+/// picks its own credentials (#12584).
+#[must_use]
+pub fn host_has_read_pool() -> bool {
+    crate::forge_gateway::any_live()
+        || crate::forge_identity::workspace_root()
+            .is_some_and(|ws| !crate::forge_identity::cached(ws).readers.is_empty())
 }
 
 /// The `forge.read.class` value.
