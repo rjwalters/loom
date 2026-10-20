@@ -6,6 +6,9 @@
 //!   `loom.repo` / `loom.issue` or `loom.pr_number` when an item is named.
 //!   `loom.fleet_dispatch.side` is `captain` here; the worker's span of the
 //!   same name says `worker`.
+//! - The same span, with endpoint `expire`, result `expired` and reason
+//!   `lease_expired`, once per assignment row that expires (#12875): the host,
+//!   repo, item, step and assignment id the counter below does not carry.
 //! - Counters, accumulated and flushed as delta points by the server's sweep
 //!   task: `loom.fleet_dispatch.refusals` by `reason` (claim refusals and
 //!   `refuse` tokens, `kind` = `claim` / `refuse`; `reason` is bounded to the
@@ -47,6 +50,14 @@ pub const KEYS: [&str; 16] = [
     "loom.fleet_dispatch.hold_set_by_assignment_id",
 ];
 
+/// `loom.fleet_dispatch.endpoint` of the span the captain emits when an
+/// assignment expires: no request, so no route (#12875).
+pub const EXPIRE_ENDPOINT: &str = "expire";
+/// `loom.fleet_dispatch.result` of that span.
+pub const RESULT_EXPIRED: &str = "expired";
+/// `loom.fleet_dispatch.reason` of that span: why the assignment ended.
+pub const CAUSE_LEASE_EXPIRED: &str = "lease_expired";
+
 /// The wall-clock end of a hold that has `retry_after_s` left, as RFC 3339
 /// UTC (#12707). The table's monotonic deadline never leaves the process.
 #[must_use]
@@ -78,7 +89,7 @@ pub struct Call {
     /// The request path (a fixed route, or `other`).
     pub endpoint: String,
     pub status: u16,
-    /// `granted` / `refused` / `ok` / `error`.
+    /// `granted` / `refused` / `ok` / `error` / `expired`.
     pub result: &'static str,
     /// The refusal reason, `refuse` token, release outcome or error class.
     pub reason: Option<String>,

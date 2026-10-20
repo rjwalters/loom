@@ -171,6 +171,19 @@ pub struct Grant {
     repo: String,
     item: u64,
     step: String,
+    /// The assignment this grant replaces, when the captain named one
+    /// (#12875).
+    pub lineage: Option<GrantLineage>,
+}
+
+/// What a grant says about the attempt it replaces (#12875): the
+/// `loom.dispatch.attempt`, `loom.dispatch.prev_assignment_id` and
+/// `loom.dispatch.prev_end` of the step's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantLineage {
+    pub attempt: u32,
+    pub prev_assignment_id: String,
+    pub prev_end: String,
 }
 
 /// What the captain said about one claim.
@@ -302,7 +315,7 @@ fn repo_of(root: &Path) -> String {
 /// A claim answer, typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
-    Granted(String),
+    Granted(String, Option<GrantLineage>),
     Refused(RefusalReason, Refusal),
 }
 
@@ -312,7 +325,16 @@ enum Decision {
 fn decide(r: &ClaimResponse) -> Option<Decision> {
     if r.granted {
         let id = r.assignment_id.clone().filter(|id| !id.is_empty())?;
-        Some(Decision::Granted(id))
+        // All three or none: a partial answer names no attempt.
+        let lineage = match (r.attempt, &r.prev_assignment_id, &r.prev_end) {
+            (Some(attempt), Some(prev), Some(end)) if !prev.is_empty() => Some(GrantLineage {
+                attempt,
+                prev_assignment_id: prev.clone(),
+                prev_end: end.clone(),
+            }),
+            _ => None,
+        };
+        Some(Decision::Granted(id, lineage))
     } else {
         Some(Decision::Refused(
             r.reason.unwrap_or(RefusalReason::Other),
@@ -356,7 +378,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
         ..CallFacts::default()
     };
     let ask = match answer {
-        Ok((epoch, Decision::Granted(assignment_id))) => {
+        Ok((epoch, Decision::Granted(assignment_id, lineage))) => {
             observe(true, None);
             facts.status = Some(200);
             facts.result = client::RESULT_GRANTED;
@@ -368,6 +390,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
                 repo: request.repo,
                 item: request.item,
                 step: request.step,
+                lineage,
             })
         }
         Ok((epoch, Decision::Refused(reason, refusal))) => {

@@ -45,7 +45,7 @@ use super::proto::{
     RELEASE_PATH,
 };
 use super::roster::{Roster, RosterSource};
-use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
+use super::table::{ClaimDecision, ExpiredAssignment, Mono, Policy, RefuseOutcome, Table};
 use super::telemetry::{self, Call, Counters, HoldFacts};
 
 /// The span reason of a claim refused `held` by a no-progress hold
@@ -186,7 +186,42 @@ impl<I: Identity> Server<I> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expired = table.expire(now);
         counters.expired(expired);
-        f(&mut table, now, &mut counters)
+        let out = f(&mut table, now, &mut counters);
+        // After `f`: a claim inside it expires rows first, and they are
+        // reported here too.
+        let rows = table.take_expired();
+        drop(counters);
+        drop(table);
+        for row in &rows {
+            self.report_expired(row);
+        }
+        out
+    }
+
+    /// Emit the captain's span for an assignment that expired (#12875):
+    /// `cause=lease_expired`, naming the host, repo, item, step and
+    /// assignment id.
+    fn report_expired(&self, row: &ExpiredAssignment) {
+        log::info!(
+            "fleet-dispatch: assignment {} ({} #{} {}) on {} expired",
+            row.assignment_id,
+            row.repo,
+            row.item,
+            row.step,
+            row.host.as_deref().unwrap_or("-")
+        );
+        let call = Call {
+            host: row.host.clone(),
+            endpoint: telemetry::EXPIRE_ENDPOINT.to_string(),
+            status: 0,
+            result: telemetry::RESULT_EXPIRED,
+            reason: Some(telemetry::CAUSE_LEASE_EXPIRED.to_string()),
+            server_epoch: self.epoch.clone(),
+            assignment_id: Some(row.assignment_id.clone()),
+            item: Some((row.repo.clone(), row.item, row.step.clone())),
+            ..Call::default()
+        };
+        telemetry::emit_call(&call, chrono::Utc::now(), self.next_seq());
     }
 
     /// Expire due rows and flush the counters as metric points.
@@ -299,11 +334,13 @@ impl<I: Identity> Server<I> {
             ClaimDecision::Granted {
                 assignment_id,
                 ttl_s,
+                lineage,
                 ..
             } => {
                 call.result = "granted";
                 call.assignment_id = Some(assignment_id.clone());
                 ClaimResponse::granted(&self.epoch, assignment_id, ttl_s)
+                    .with_lineage(lineage.as_ref())
             }
             ClaimDecision::Refused {
                 reason,

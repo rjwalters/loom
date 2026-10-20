@@ -716,6 +716,20 @@ it reaching zero, #10888): `loom.merge.redate_prs{state}`
 merge-chain head that `main` keeps moving under. Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**Retried fleet dispatches (#12875).** When the fleet-dispatch captain
+grants an item and step again after an earlier assignment of the same repo,
+item and step ended, the worker's `loom.dispatch.step` span carries
+`loom.dispatch.attempt` (earlier assignments that ended),
+`loom.dispatch.prev_assignment_id` (the earlier step's `loom.assignment.id`)
+and `loom.dispatch.prev_end` (`released` or `expired`; `host_lost` is reserved
+for the spot watcher, #12876). A first or renewed grant carries none. Each
+expired assignment also gets a captain `loom.fleet_dispatch.call` span with
+endpoint `expire`, result `expired`, reason `lease_expired`, naming the host,
+item, step and assignment id, so expiries are attributable per host and item.
+The captain keeps the lineage in memory, bounded to 4096 steps and 24 h; a
+captain restart resets `attempt`. Keys:
+[`telemetry-schema.md`](telemetry-schema.md).
+
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
 out earlier (`workspace_halted`, `parked`,
