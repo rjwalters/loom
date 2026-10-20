@@ -18,6 +18,10 @@ use std::path::PathBuf;
 
 mod cli;
 mod daemon_service;
+// The lib's test-only env guard, compiled into this bin's test build too.
+#[cfg(test)]
+#[path = "env_test_support.rs"]
+mod env_test_support;
 
 /// Loom daemon - terminal multiplexing and workspace orchestration
 #[derive(Parser)]
