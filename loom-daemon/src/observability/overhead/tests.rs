@@ -45,6 +45,8 @@ const ALLOWED_KEYS: &[&str] = &[
     "loom.host.load_per_core",
     "loom.host.logical_cpus",
     "loom.host.loadavg_1m",
+    "loom.host.start.loadavg_1m",
+    "loom.host.start.load_per_core",
     "loom.host.cpu_budget_cores",
     "loom.host.sweeps_in_flight",
 ];

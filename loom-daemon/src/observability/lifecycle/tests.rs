@@ -1213,3 +1213,119 @@ fn only_a_steps_sweep_id_marks_a_step_journal() {
     assert_eq!(step_sweep_id(&journal.active().unwrap()), None);
     assert!(!running_step(dir.path(), &journal));
 }
+
+// ---------------------------------------------------------------------------
+// #12884: the open-time load sample survives the close on the drained span
+// ---------------------------------------------------------------------------
+
+fn publish_load(load_per_core: f64) {
+    crate::host_status::publish(&host_record(&[("cpu_load_per_core", load_per_core)]));
+}
+
+/// Asserts a drained, export-bounded span carries `open` under the start key
+/// and `close` under the plain (close-time) key, and that the raw load average
+/// keeps a start copy whenever the host measures one.
+fn assert_start_and_close_load(
+    span: &crate::telemetry::trace::SpanRecord,
+    open: &str,
+    close: &str,
+) {
+    let exported = span.clone().bounded();
+    let attrs = &exported.attributes;
+    let name = span.name;
+    assert_eq!(
+        attrs
+            .get("loom.host.start.load_per_core")
+            .map(String::as_str),
+        Some(open),
+        "{name:?}: start key must keep the open-time sample"
+    );
+    assert_eq!(
+        attrs.get("loom.host.load_per_core").map(String::as_str),
+        Some(close),
+        "{name:?}: plain key is the close-time sample"
+    );
+    assert_eq!(
+        attrs.contains_key("loom.host.start.loadavg_1m"),
+        attrs.contains_key("loom.host.loadavg_1m"),
+        "{name:?}: the load average keeps a start copy exactly when it is measured"
+    );
+}
+
+#[test]
+fn drained_sweep_and_phase_spans_keep_the_open_load_beside_the_close_load() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let store = TraceStore::new(root_dir);
+    let saved = store.load_or_create(root_dir, "sweep-12884").unwrap();
+    let journal = Journal::for_context(&store.path(root_dir, "sweep-12884"));
+    publish_load(0.5);
+    prepare_execution(&mut Command::new("true"), root_dir, "sweep-12884", None);
+    checkpoint_begin_observation(&journal, &saved.context, None, 12884, "builder", None, None)
+        .unwrap();
+    publish_load(3.25);
+    finish_execution(root_dir, "sweep-12884", "success", TraceAttributes::new()).unwrap();
+    crate::host_status::clear_latest();
+    let spans = drained_spans(&journal);
+    for name in [SpanName::Sweep, SpanName::Phase, SpanName::RoleAttempt] {
+        let span = spans.iter().find(|s| s.name == name).unwrap();
+        assert_start_and_close_load(span, "0.500", "3.250");
+    }
+}
+
+#[test]
+fn a_checkpoint_completion_keeps_the_begin_load_and_a_synthetic_one_its_only_sample() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    publish_load(0.5);
+    checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
+    publish_load(3.25);
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        1,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    // No begin for issue 2: the synthetic phase opens and closes on one sample.
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        2,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    crate::host_status::clear_latest();
+    let spans = drained_spans(&journal);
+    assert_eq!(spans.len(), 4);
+    for span in &spans {
+        let close = "3.250";
+        let open = if span.attributes["loom.issue"] == "1" {
+            "0.500"
+        } else {
+            close
+        };
+        assert_start_and_close_load(span, open, close);
+    }
+}
