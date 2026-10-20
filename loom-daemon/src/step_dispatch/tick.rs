@@ -57,7 +57,8 @@
 //! and spending passes on them ended every tick at `pass_limit` with its
 //! slots empty. `captain_cap` ends
 //! the tick's draws, since the captain would refuse every later claim the
-//! same way. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
+//! same way; only an older captain sends it, since #12864 the captain
+//! applies no capacity limit and the worker's own budget is the only one. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
 //! loss is free.
 //!
 //! An **unverifiable claim** ([`REFUSAL_CLAIM_UNVERIFIED`]) is the exception
@@ -86,6 +87,7 @@ use crate::telemetry::kinds::pick_decision::{PickItemExclusion, PickSkipReason};
 use crate::types::QueueDisposition as Qd;
 use crate::work_finder::ready_queue::TickQueueRow;
 use crate::work_finder::step_item::{Lane, PassReason};
+use crate::work_finder::RepoDepth;
 use crate::work_finder::{PriorityCandidate, TickReport};
 
 /// At most this many item draws fill one slot (design §4.2 step 4).
@@ -152,6 +154,8 @@ pub const REFUSAL_CAPTAIN_HELD: &str = "captain_held";
 pub const REFUSAL_CAPTAIN_COOLDOWN: &str = "captain_cooldown";
 /// The fleet-dispatch server's refusal of a host at its cap (#12450): every
 /// later claim this tick would be refused the same way, so the draw ends.
+/// The captain no longer sends it (#12864); kept for an older captain in a
+/// mixed-version fleet.
 pub const REFUSAL_CAPTAIN_CAP: &str = "captain_cap";
 
 /// Why a tick's draw loop stopped (#12410): the tick span's
@@ -173,7 +177,8 @@ pub enum TickStop {
     SpawnHold,
     /// The fleet-dispatch captain refused a claim with `cap` (#12450): this
     /// host is at its fleet cap, so every repo left the draw. Without its own
-    /// stop the tick would read `pool_drained`, which it was not.
+    /// stop the tick would read `pool_drained`, which it was not. Only an
+    /// older captain sends `cap`; since #12864 the captain never does.
     CaptainCap,
     /// The pool's total weight overflowed ([`DrawError::WeightOverflow`]).
     WeightOverflow,
@@ -344,6 +349,24 @@ pub fn disposition_of(reason: &str) -> Qd {
     }
 }
 
+/// `ws`'s drawable pool by step and its exclusions by reason (#12734). A
+/// held workspace draws nothing, so its pool is empty. Pure.
+fn repo_depth(ws: &StepWorkspace) -> RepoDepth {
+    let mut depth = RepoDepth {
+        repo: ws.repo.clone(),
+        ..RepoDepth::default()
+    };
+    if !ws.halted {
+        for c in &ws.weighing.pool {
+            *depth.pool.entry(c.step.as_str()).or_default() += 1;
+        }
+    }
+    for (reason, &n) in &ws.weighing.excluded {
+        *depth.excluded.entry(reason.as_str()).or_default() += n;
+    }
+    depth
+}
+
 /// Take out of `w`'s pool every item `claims` names (this host's live runs
 /// and the peers' live claims), each a `claimed` pass, and every merge step
 /// ([`MERGE_STEPS`]) but the one being merged while this host or a peer has
@@ -425,7 +448,9 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 &mut report.skipped_host_constraint
             }
             E::BuildBackoff => &mut report.deferred_build_backoff,
-            E::CoolingDown | E::Pass(PassReason::CiPending) => &mut report.skipped_noop_cooldown,
+            E::CoolingDown | E::Pass(PassReason::CiPending | PassReason::HeldAtHead) => {
+                &mut report.skipped_noop_cooldown
+            }
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
                 PassReason::Frozen
@@ -494,6 +519,7 @@ pub fn run(
             .copied()
             .unwrap_or(0);
         report.seen += ws.weighing.pool.len() + ws.weighing.excluded.values().sum::<usize>();
+        report.depth.push(repo_depth(ws));
         report
             .vi_demotions
             .extend(ws.weighing.demotions.iter().cloned());
@@ -504,7 +530,7 @@ pub fn run(
                 detail: None,
                 updated_at: None,
                 held_until: None,
-                story_points: None,
+                story_points: c.item.story_points,
                 step: Some(c.step),
             });
         }
@@ -652,6 +678,7 @@ pub fn run(
                             repo_items: terms.repo.items,
                             in_flight_repo: terms.repo.in_flight,
                         }),
+                        story_points: picked.item.story_points,
                     },
                     key,
                 });

@@ -12,7 +12,6 @@ mod capacity_line;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
-mod forge_events_line;
 mod holds;
 mod host_update_line;
 mod last_tick_line;
@@ -25,11 +24,11 @@ mod session_containers_line;
 mod task_liveness_line;
 mod telemetry_banner;
 
-use loom_daemon::daemon_install_state;
-use loom_daemon::self_update;
-use loom_daemon::status_section::{SectionSet, StatusSection as Section};
-use loom_daemon::types::{DaemonStatusReport, SweepKind};
-use loom_daemon::worktree_disk_status::{self, WorktreeDiskSummary};
+use crate::daemon_install_state;
+use crate::self_update;
+use crate::status_section::{SectionSet, StatusSection as Section};
+use crate::types::{DaemonStatusReport, SweepKind};
+use crate::worktree_disk_status::{self, WorktreeDiskSummary};
 
 /// The capacity figures the whole status view shares, resolved from a single
 /// source so the summary, the healthy-tokens cap input, and the per-token table
@@ -38,7 +37,7 @@ use loom_daemon::worktree_disk_status::{self, WorktreeDiskSummary};
 /// Preference order:
 /// 1. **fresh probe** — when a client-side `loom-daemon tokens check --json` succeeded
 ///    (the *same* data that renders the per-token table), the health counts are
-///    derived from it via [`loom_daemon::capacity::summarize_probe`], applying
+///    derived from it via [`crate::capacity::summarize_probe`], applying
 ///    the near-ceiling threshold uniformly. This is the accurate *current*
 ///    capacity and matches the table row-for-row.
 /// 2. **daemon ranking** — when no fresh probe is available but the daemon
@@ -98,7 +97,7 @@ fn resolve_capacity(
                     (status, util_7d)
                 })
                 .collect();
-            let cap = loom_daemon::capacity::summarize_probe(pairs.iter().copied());
+            let cap = crate::capacity::summarize_probe(pairs.iter().copied());
             let token_axis_limit = cap.healthy;
             // #5270: the token axis no longer participates in the cap on any
             // auth path — a fresh client-side probe changes the *reported*
@@ -218,7 +217,7 @@ pub(crate) fn build_status_json_value(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) -> serde_json::Value {
@@ -242,7 +241,7 @@ pub(crate) fn build_status_json_value_for(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
     sections: &SectionSet,
@@ -338,14 +337,6 @@ pub(crate) fn build_status_json_value_for(
         // `exempt`, with an optional `detail` (the exemption reason).
         //   loom-daemon status --json | jq -e '.otlp_export.state == "ok"'
         "otlp_export": report.otlp_export,
-        // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
-        // daemon of this vintage and always carrying a `state`, so a watch
-        // loop asserts rather than infers:
-        //   loom-daemon status --json | jq -e '.forge_events.state == "healthy"'
-        // States: disabled | misconfigured | connecting | failing |
-        // auth_failed | host_mismatch | backoff | healthy. `null` only from a
-        // pre-ADR-0021 daemon.
-        "forge_events": report.forge_events,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is
@@ -618,6 +609,10 @@ pub(crate) fn build_status_json_value_for(
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
+            // Issue #9736: running version, last successful check, pending
+            // age, next attempt, blocking reason, thresholds. `null` from an
+            // older daemon and while the loop has not ticked.
+            "freshness": report.auto_update_freshness,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -748,7 +743,7 @@ pub(crate) fn build_status_json_value_for(
     // host with no `fleet.repo` emits exactly the payload it always did.
     let fleet_store = sections
         .has(Section::FleetStore)
-        .then(loom_daemon::fleet_sync::probe_status);
+        .then(crate::fleet_sync::probe_status);
     if let Some(s) = fleet_store.flatten() {
         value["fleet_store"] = fleet_store_line::json(Some(&s));
     }
@@ -771,7 +766,7 @@ pub(crate) fn print_status_json(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
     sections: &SectionSet,
@@ -1311,7 +1306,7 @@ fn worktree_disk_lines(worktree_disk: Option<&[WorktreeDiskSummary]>) -> Option<
 /// generic `container(...)` prefix it always did.
 ///
 /// This is a CLIENT-SIDE, render-time read of the sweep's own per-sweep log
-/// (`loom_daemon::sweep_registry::containment_signal::detect_containment`) —
+/// (`crate::sweep_registry::containment_signal::detect_containment`) —
 /// deliberately NOT a `SweepInfo` field. `log_path` is always an absolute,
 /// workspace-rooted path (`SweepRegistryConfig::logs_dir()` joins the
 /// workspace root), so this works from any cwd the CLI happens to run from,
@@ -1319,8 +1314,8 @@ fn worktree_disk_lines(worktree_disk: Option<&[WorktreeDiskSummary]>) -> Option<
 /// (same host, same filesystem the daemon itself wrote it to). Best-effort:
 /// a missing/unreadable log (e.g. a very recent dispatch, or a rotated log)
 /// degrades to `-`, never an error, since `detect_containment` never fails.
-fn format_containment_column(s: &loom_daemon::types::SweepInfo) -> String {
-    use loom_daemon::sweep_registry::containment_signal::detect_containment;
+fn format_containment_column(s: &crate::types::SweepInfo) -> String {
+    use crate::sweep_registry::containment_signal::detect_containment;
 
     let header_anchor = format!("sweep_id={}", s.sweep_id);
     let signal = detect_containment(&s.log_path, &header_anchor);
@@ -1361,7 +1356,7 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
             let fallback = s
                 .kind
                 .role()
-                .map_or("-", loom_daemon::step_role::StepRole::as_str);
+                .map_or("-", crate::step_role::StepRole::as_str);
             let mut phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
             if s.overflow {
                 // #9244: the host's single over-limit starred sweep.
@@ -1435,12 +1430,12 @@ fn render_role_runner_host_header_line(report: &DaemonStatusReport) -> String {
     match report.role_runner_host_env_override {
         Some(true) => format!(
             "\nRole runner (host): ON — env {}=<truthy> overrides every root's own config",
-            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+            crate::role_runner::ROLE_RUNNER_ENABLE_ENV
         ),
         Some(false) => format!(
             "\nRole runner (host): OFF — env {}=<falsy> overrides every root's own config \
              (a root's own autonomous.roleRunner.enabled=true is ignored while this is set)",
-            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+            crate::role_runner::ROLE_RUNNER_ENABLE_ENV
         ),
         None => {
             let enabled_count = report
@@ -1547,7 +1542,7 @@ fn render_roster_lines(report: &DaemonStatusReport) -> Vec<String> {
 /// prevent structurally — the two hosts resolving *different keys* for the
 /// same workspace.
 #[must_use]
-fn render_role_runner_shard_repo_line(r: &loom_daemon::types::RepoStatus) -> Option<String> {
+fn render_role_runner_shard_repo_line(r: &crate::types::RepoStatus) -> Option<String> {
     let shard = r.role_runner_shard.as_ref()?;
     let (owner, count) = (shard.owning_shard?, shard.shard_count?);
     let verdict = if shard.owned_here {
@@ -1556,7 +1551,7 @@ fn render_role_runner_shard_repo_line(r: &loom_daemon::types::RepoStatus) -> Opt
         format!(
             "role slice owned by shard {owner} of {count}, NOT this host — this root's role \
              ticks run on the peer holding {}={owner} (#6374)",
-            loom_daemon::role_shard::SHARD_INDEX_ENV
+            crate::role_shard::SHARD_INDEX_ENV
         )
     };
     Some(format!(
@@ -1579,7 +1574,7 @@ fn render_role_runner_shard_repo_line(r: &loom_daemon::types::RepoStatus) -> Opt
 ///   own `autonomous.roleRunner.enabled` (or the built-in default) decided,
 ///   so the original #4377 config-edit instruction is still correct.
 #[must_use]
-fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Option<String> {
+fn render_role_runner_disabled_line(r: &crate::types::RepoStatus) -> Option<String> {
     if r.role_runner_enabled || r.role_runner_on_idle_roles.is_empty() {
         return None;
     }
@@ -1590,7 +1585,7 @@ fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Optio
              disabled by the host-wide env override {} (this root's own .loom/config.json is \
              overridden, editing it will not help) — see the \"Role runner (host)\" line above \
              (#6470)",
-            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+            crate::role_runner::ROLE_RUNNER_ENABLE_ENV
         ))
     } else {
         Some(format!(
@@ -1606,10 +1601,10 @@ fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Optio
 /// e.g. `hermit: 31h since last tick, PROMOTED (max wait 24h)`. Empty
 /// (`vec![]`, no lines printed) when the repo has no such roles configured —
 /// this is purely additive surfacing of
-/// [`loom_daemon::types::RepoStatus::role_runner_on_idle_promotions`], never
+/// [`crate::types::RepoStatus::role_runner_on_idle_promotions`], never
 /// a gate.
 #[must_use]
-fn render_role_runner_on_idle_promotion_lines(r: &loom_daemon::types::RepoStatus) -> Vec<String> {
+fn render_role_runner_on_idle_promotion_lines(r: &crate::types::RepoStatus) -> Vec<String> {
     r.role_runner_on_idle_promotions
         .iter()
         .map(|p| {
@@ -1670,7 +1665,7 @@ pub(crate) fn print_status_human(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) {
@@ -2133,14 +2128,10 @@ pub(crate) fn print_status_human(
         println!("\n{banner}");
     }
 
-    // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
-    // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
-    // are five different answers that would otherwise all render as nothing.
-    println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
     // Fleet-store sync (#9596): what the last startup/timer pass found — the
     // drift the timer detects but deliberately does not write. Nothing at all
     // on a host with no `fleet.repo`.
-    fleet_store_line::print(loom_daemon::fleet_sync::probe_status().as_ref());
+    fleet_store_line::print(crate::fleet_sync::probe_status().as_ref());
     // Pending-restart marker (#9597): a restart-required `fleet-config
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
@@ -2531,7 +2522,7 @@ pub(crate) fn print_status_human(
             );
             println!("  {:-<75}", "");
             for s in snapshots {
-                use loom_daemon::pipeline_snapshot::format_count;
+                use crate::pipeline_snapshot::format_count;
                 println!(
                     "  {:>6}  {:>8}  {:>6}  {:>7}  {:>5}  {:>9}  {}",
                     format_count(s.queued),
@@ -2622,6 +2613,23 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
+        if let Some(f) = &report.auto_update_freshness {
+            let when = |t: Option<chrono::DateTime<chrono::Utc>>| {
+                t.map_or_else(
+                    || "never".to_string(),
+                    |t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                )
+            };
+            println!(
+                "  Running {}; last successful check {}; next attempt {}",
+                f.running_version,
+                when(f.last_success),
+                when(f.next_check)
+            );
+            if let (Some(target), Some(since)) = (&f.pending_target, f.pending_since) {
+                println!("  Newer release {target} pending since {}", when(Some(since)));
+            }
+        }
         if let Some(why) = report.auto_update_floor_not_rolling {
             println!("  Below the fleet floor, NOT rolling ({}): {}", why.as_str(), why.describe());
         }
@@ -2669,7 +2677,7 @@ fn print_token_usage_table(value: &serde_json::Value) {
             .and_then(serde_json::Value::as_f64);
         // Apply the same near-ceiling override the summary uses so a 99%-7d
         // `available` row never renders `available` here (#3936).
-        let status = loom_daemon::capacity::effective_probe_status(raw_status, util_7d);
+        let status = crate::capacity::effective_probe_status(raw_status, util_7d);
         let fmt_pct = |key: &str| {
             acct.get(key)
                 .and_then(serde_json::Value::as_f64)
@@ -3072,7 +3080,7 @@ mod token_starvation_render_tests {
     //! "tokens bind the cap."
     use super::{ranking_diverges_from_starvation, resolve_capacity};
     use crate::cli::status::sample_report::sample_report;
-    use loom_daemon::types::CapacityReport;
+    use crate::types::CapacityReport;
 
     #[test]
     fn resolve_capacity_probe_tier_reports_token_bound_on_zero_healthy() {
@@ -3188,8 +3196,8 @@ mod in_flight_repo_column_tests {
     //! already carried the owning workspace root (`repo`, Issue #3929).
     use super::{format_repo_column, render_in_flight_table};
     use crate::cli::status::sample_report::sample_report;
+    use crate::types::{SweepInfo, SweepKind, SweepState};
     use chrono::Utc;
-    use loom_daemon::types::{SweepInfo, SweepKind, SweepState};
     use std::path::PathBuf;
 
     /// A minimal in-flight entry for a given issue/repo pair, mirroring the
@@ -3317,8 +3325,8 @@ mod containment_column_tests {
     //! render path actually wires `log_path`/`sweep_id` through correctly.
     use super::{format_containment_column, render_in_flight_table};
     use crate::cli::status::sample_report::sample_report;
+    use crate::types::{SweepInfo, SweepKind, SweepState};
     use chrono::Utc;
-    use loom_daemon::types::{SweepInfo, SweepKind, SweepState};
     use std::path::PathBuf;
 
     fn mk(sweep_id: &str, issue: u32, log_path: PathBuf) -> SweepInfo {
@@ -3440,7 +3448,7 @@ mod status_protection_tests {
         build_is_stale, build_status_json_value, deep_clean_lines, render_build_status_line,
     };
     use crate::cli::status::sample_report::sample_report;
-    use loom_daemon::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
+    use crate::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
     use std::path::PathBuf;
 
     fn protection(
@@ -3462,8 +3470,8 @@ mod status_protection_tests {
 
     /// The `update` argument's fixture — an "unknown" self-update status is
     /// enough for these tests (they assert only on the `protection` object).
-    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-        loom_daemon::self_update::SelfUpdateStatus {
+    fn no_update() -> crate::self_update::SelfUpdateStatus {
+        crate::self_update::SelfUpdateStatus {
             built_commit: "abc1234".to_string(),
             source_commit: None,
             update_available: None,
@@ -3576,12 +3584,11 @@ mod status_protection_tests {
     #[test]
     fn observability_host_id_mismatch_names_both_identities_in_json() {
         let mut report = sample_report();
-        report.observability_host_id_mismatch =
-            Some(loom_daemon::types::ObservabilityHostIdMismatch {
-                daemon_host_id: "robb-studio".to_string(),
-                ingest_host_id: "robb-pro".to_string(),
-                first_seen_at: chrono::Utc::now(),
-            });
+        report.observability_host_id_mismatch = Some(crate::types::ObservabilityHostIdMismatch {
+            daemon_host_id: "robb-studio".to_string(),
+            ingest_host_id: "robb-pro".to_string(),
+            first_seen_at: chrono::Utc::now(),
+        });
         let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         let m = &value["observability_host_id_mismatch"];
         assert_eq!(m["daemon_host_id"], "robb-studio");
@@ -3596,9 +3603,9 @@ mod status_protection_tests {
     /// A healthy export record pushing to `endpoint`. The human-readable line
     /// is covered in `status_render::observability_line`'s own tests; these two
     /// pin the `--json` contract a watch loop reads.
-    fn healthy_export(endpoint: &str) -> loom_daemon::types::ObservabilityExportStatus {
-        let mut status = loom_daemon::types::ObservabilityExportStatus {
-            state: loom_daemon::types::ObservabilityExportState::Healthy,
+    fn healthy_export(endpoint: &str) -> crate::types::ObservabilityExportStatus {
+        let mut status = crate::types::ObservabilityExportStatus {
+            state: crate::types::ObservabilityExportState::Healthy,
             host_id: Some("robb-studio".to_string()),
             endpoint: Some(endpoint.to_string()),
             exporter: Some("https".to_string()),
@@ -3658,8 +3665,8 @@ mod status_protection_tests {
     // Artifact reclaim / deep-clean visibility (#5919)
     // ===================================================================
 
-    fn deep_clean_entry(root: &str) -> loom_daemon::types::DeepCleanRepoStatus {
-        loom_daemon::types::DeepCleanRepoStatus {
+    fn deep_clean_entry(root: &str) -> crate::types::DeepCleanRepoStatus {
+        crate::types::DeepCleanRepoStatus {
             root: std::path::PathBuf::from(root),
             last_evaluated_at: Some(
                 chrono::DateTime::parse_from_rfc3339("2026-08-10T21:19:10Z")
@@ -3730,7 +3737,7 @@ mod status_protection_tests {
     #[test]
     fn deep_clean_status_without_last_kept_still_deserializes() {
         let json = r#"{"root":"/r","last_evaluated_at":null,"last_reason":null,"last_free_gb":null,"last_fired_at":null,"last_reclaimed":null}"#;
-        let s: loom_daemon::types::DeepCleanRepoStatus = serde_json::from_str(json).unwrap();
+        let s: crate::types::DeepCleanRepoStatus = serde_json::from_str(json).unwrap();
         assert_eq!(s.last_kept, None);
     }
 
@@ -3838,14 +3845,11 @@ mod status_protection_tests {
         assert_eq!(b["running_built_at"], "2026-08-03T02:09:51Z");
         // The disk side is this TEST binary's own compile-time build — the
         // exact quantity `render_build_status_line` also compares against.
-        assert_eq!(b["disk_commit"], loom_daemon::self_update::BUILT_COMMIT);
-        assert_eq!(b["disk_built_at"], loom_daemon::self_update::BUILT_AT_RAW);
+        assert_eq!(b["disk_commit"], crate::self_update::BUILT_COMMIT);
+        assert_eq!(b["disk_built_at"], crate::self_update::BUILT_AT_RAW);
         assert_eq!(
             b["stale"],
-            serde_json::json!(build_is_stale(
-                Some("5111b74a"),
-                loom_daemon::self_update::BUILT_COMMIT
-            ))
+            serde_json::json!(build_is_stale(Some("5111b74a"), crate::self_update::BUILT_COMMIT))
         );
     }
 
@@ -4002,7 +4006,7 @@ mod status_protection_tests {
         // collision would not break *this* command directly, but would make
         // "was this the mismatch, or was it something else" ambiguous for any
         // script that greps a bare exit code instead of `--json`.
-        use loom_daemon::daemon_install_state::{
+        use crate::daemon_install_state::{
             EXIT_ALIVE_BUT_UNRESPONSIVE, EXIT_AUTONOMY_MISMATCH, EXIT_EXPECTED_BUT_DEAD,
             EXIT_NOT_EXPECTED,
         };
@@ -4027,8 +4031,8 @@ mod role_agent_render_tests {
     //! backward-compatible.
     use super::{build_status_json_value, render_role_agent_line};
     use crate::cli::status::sample_report::sample_report;
-    use loom_daemon::self_update::SelfUpdateStatus;
-    use loom_daemon::types::DaemonStatusReport;
+    use crate::self_update::SelfUpdateStatus;
+    use crate::types::DaemonStatusReport;
 
     fn no_update() -> SelfUpdateStatus {
         SelfUpdateStatus {
@@ -4156,8 +4160,8 @@ mod journal_adoption_render_tests {
         }
     }
 
-    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-        loom_daemon::self_update::SelfUpdateStatus {
+    fn no_update() -> crate::self_update::SelfUpdateStatus {
+        crate::self_update::SelfUpdateStatus {
             built_commit: "abc".to_string(),
             source_commit: None,
             update_available: None,
@@ -4228,8 +4232,8 @@ mod stash_status_render_tests {
     use super::{build_status_json_value, format_stash_age};
     use crate::cli::status::sample_report::sample_report;
 
-    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-        loom_daemon::self_update::SelfUpdateStatus {
+    fn no_update() -> crate::self_update::SelfUpdateStatus {
+        crate::self_update::SelfUpdateStatus {
             built_commit: "abc1234".to_string(),
             source_commit: None,
             update_available: None,
@@ -4242,7 +4246,7 @@ mod stash_status_render_tests {
         total: usize,
         quarantine: usize,
         oldest_age_secs: Option<u64>,
-    ) -> loom_daemon::types::RepoStatus {
+    ) -> crate::types::RepoStatus {
         repo_with_stashes_full(total, quarantine, oldest_age_secs, 0, None)
     }
 
@@ -4254,8 +4258,8 @@ mod stash_status_render_tests {
         oldest_age_secs: Option<u64>,
         non_quarantine_unrecoverable_count: usize,
         non_quarantine_unrecoverable_oldest_age_secs: Option<u64>,
-    ) -> loom_daemon::types::RepoStatus {
-        loom_daemon::types::RepoStatus {
+    ) -> crate::types::RepoStatus {
+        crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
             weight: 100,
@@ -4352,11 +4356,11 @@ mod worktree_footprint_render_tests {
     //! `worktree_disk_status`'s own tests cover the collection side.
     use super::{build_status_json_value, worktree_disk_lines};
     use crate::cli::status::sample_report::sample_report;
-    use loom_daemon::worktree_disk_status::WorktreeDiskSummary;
+    use crate::worktree_disk_status::WorktreeDiskSummary;
     use std::path::PathBuf;
 
-    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-        loom_daemon::self_update::SelfUpdateStatus {
+    fn no_update() -> crate::self_update::SelfUpdateStatus {
+        crate::self_update::SelfUpdateStatus {
             built_commit: "abc1234".to_string(),
             source_commit: None,
             update_available: None,
@@ -4498,7 +4502,7 @@ mod role_runner_diagnostic_source_render_tests {
     //! line and the per-root diagnostic line.
     use super::{render_role_runner_disabled_line, render_role_runner_host_header_line};
     use crate::cli::status::sample_report::sample_report;
-    use loom_daemon::types::{DaemonStatusReport, RepoStatus};
+    use crate::types::{DaemonStatusReport, RepoStatus};
 
     /// `pub(super)` so the sibling #6374 shard-render tests can build a
     /// baseline [`RepoStatus`] from the same place rather than duplicating
@@ -4641,7 +4645,7 @@ mod role_runner_shard_render_tests {
     //! never silent about a configuration the operator asked for.
     use super::{render_role_runner_shard_header_line, render_role_runner_shard_repo_line};
     use crate::cli::status::sample_report::sample_report;
-    use loom_daemon::types::{
+    use crate::types::{
         DaemonStatusReport, RepoStatus, RoleRunnerShardPosture, RoleRunnerShardStatus,
     };
 

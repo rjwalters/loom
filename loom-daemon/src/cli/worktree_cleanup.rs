@@ -27,7 +27,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::cleanup;
+use crate::worktree_cli::cleanup;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeCleanupArgs {

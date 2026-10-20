@@ -27,7 +27,7 @@ fn preparer<'a>(root: &std::path::Path, issue: Option<u64>) -> containment::Prep
         JobKind::Sweep,
         issue,
         "containment-proof".into(),
-        Box::new(|_| None),
+        Box::new(|_, _| None),
     )
 }
 
@@ -38,7 +38,7 @@ fn preparer<'a>(root: &std::path::Path, issue: Option<u64>) -> containment::Prep
 /// Keyed exactly as Codex keys it: the hooks.json path under the session's
 /// `CODEX_HOME` mount point, plus the position of Loom's managed entry. Trust
 /// under any other key is not trust for Loom's hook, and admission ignores it.
-fn establish_hook_trust(profile: &std::path::Path) {
+pub(super) fn establish_hook_trust(profile: &std::path::Path) {
     let hooks: serde_json::Value =
         serde_json::from_slice(&std::fs::read(profile.join("hooks.json")).unwrap()).unwrap();
     let key = loom_daemon::tokens_pool::codex_hooks::loom_trust_keys(
@@ -57,7 +57,12 @@ fn establish_hook_trust(profile: &std::path::Path) {
     .unwrap();
 }
 
-fn environment(f: &Fixture, root: &std::path::Path, name: &str, gh_host: &str) -> Environment {
+pub(super) fn environment(
+    f: &Fixture,
+    root: &std::path::Path,
+    name: &str,
+    gh_host: &str,
+) -> Environment {
     let [gh_bin, write_scope_cache] = f.write_scope_env();
     Environment::set(&[
         gh_bin,
@@ -83,7 +88,7 @@ fn environment(f: &Fixture, root: &std::path::Path, name: &str, gh_host: &str) -
 /// Prepare the registry-shaped workspace the daemon dispatches from: a real Git
 /// checkout pointed at the disposable forge, carrying the shipped role/runtime
 /// manifests and adapters.
-fn registry_workspace(f: &Fixture) -> std::path::PathBuf {
+pub(super) fn registry_workspace(f: &Fixture) -> std::path::PathBuf {
     let root = f.root.path().join("registry");
     checked(
         Command::new("git")

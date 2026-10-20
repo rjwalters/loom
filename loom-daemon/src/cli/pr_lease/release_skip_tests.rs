@@ -5,7 +5,7 @@
 //! backstop keeps bounding a PR whose CI never finishes.
 
 use super::*;
-use loom_daemon::judge_backstop::SKIP_CI_PENDING;
+use crate::judge_backstop::SKIP_CI_PENDING;
 
 const GREEN: &str = r#"{"total_count":1,"check_runs":[{"status":"completed","started_at":"2026-10-14T05:00:00Z"}]}"#;
 
@@ -26,7 +26,7 @@ fn release_at(checks: &str, reason: Option<&str>) -> (String, bool) {
     fs::write(dir.path().join("checks"), checks).unwrap();
     let judge = on("host-a", "run-1");
     assert_eq!(ctx(dir.path(), judge.clone()).claim(), EXIT_HELD);
-    assert_eq!(ctx(dir.path(), judge).release(reason, None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), judge).release(reason, None, None), EXIT_HELD);
     let held = ctx(dir.path(), on("host-b", "run-2")).claim() == backstop::EXIT_BACKSTOP;
     (patched(dir.path()), held)
 }

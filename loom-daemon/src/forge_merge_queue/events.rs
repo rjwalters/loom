@@ -133,7 +133,6 @@ pub const LOG_RELATIVE_PATH: &str = ".loom/logs/merge-queue-events.jsonl";
 
 /// File-backed sink under a workspace root.
 pub struct FileEventSink {
-    root: PathBuf,
     log: PathBuf,
     seen: PathBuf,
 }
@@ -142,7 +141,6 @@ impl FileEventSink {
     #[must_use]
     pub fn for_root(root: &Path) -> Self {
         Self {
-            root: root.to_path_buf(),
             log: root.join(LOG_RELATIVE_PATH),
             seen: root.join(".loom/state/merge-queue/seen"),
         }
@@ -185,20 +183,6 @@ impl EventSink for FileEventSink {
             let _ = std::fs::remove_file(&marker);
             return Err(format!("{}: {e}", self.log.display()));
         }
-        // #11348: recorded and durable in the legacy log — shadow it into the
-        // J2 `merge_queue` stream. The `seen` dedupe above stays authoritative.
-        crate::telemetry::journal_shadow::shadow_append(
-            &self.root,
-            crate::telemetry::journal_shadow::TelemetryStream::MergeQueue,
-            || {
-                let kind = serde_json::to_value(ev.kind).ok()?;
-                crate::telemetry::journal_shadow::ShadowRecord::of(
-                    kind.as_str()?,
-                    Some(ev.key()),
-                    ev,
-                )
-            },
-        );
         // #12653: export the appended record to OTLP. Emitting only here, after
         // the `seen` marker and the append, keeps the JSONL dedupe the single
         // authority: a duplicate returned early and never reaches this line.

@@ -1,7 +1,8 @@
 # Daemon roll: restore the previous binary when the candidate fails to start
 
-**Status:** design only (issue #11433, operator ruling 2026-10-17). Nothing here is implemented, and approving
-this document does not approve the implementation: that needs its own `loom:issue`.
+**Status:** implemented by #12776 (operator-selected scope, 2026-10-18) for the operator and `fleet roll` paths,
+launchd and systemd only. Designed in #11433 (operator ruling 2026-10-17). Where the implementation differs from the
+design below it is called out as **Implemented:**; §10 lists what is not covered.
 **Traced on:** `origin/main` @ `00c23e593`, 2026-10-17. Line-level facts are cited as `file::symbol`; re-verify
 before relying on them.
 
@@ -80,9 +81,21 @@ Add a `restore` function beside `publish` in `provision/txn.rs`, and call it fro
 
 **Action:** copy `<dest>.previous` to a fresh staging file with `provision::stage`'s mechanics (mode 755, fsync),
 then `rename(2)` it over `dest`. Copy rather than rename `.previous` itself, so the recovery copy survives a failed
-restore and a second attempt. Installs are not serialized against each other today (`provision.rs::publish` leaves that to #9734), so a
-restore can race a concurrent install; precondition 3 is the only guard, and it narrows the window without closing
-it. Then re-run the existing supervised restart exactly once against the restored `dest`, through the same
+restore and a second attempt. **Implemented:** the check-then-rename above has a time-of-check/time-of-use gap against any concurrent
+publisher, so the hashes alone were not enough. `provision::publish` and `txn::restore` now both hold one
+exclusive `flock` on `.<dest-name>.install.lock` beside `dest` (`provision.rs::DestLock`) for their whole duration.
+Every writer of `dest`, `<dest>.previous` and the record goes through `publish` (`install_to`, and
+`install-binary publish` which the machine-level provision script calls), so one lock excludes all of them. The
+kernel drops the lock when its holder dies; the lock file is never deleted. Ownership is bound to the install this
+invocation made, taken from that invocation's own publish transaction and never re-read from the record afterwards
+(the lock is released when `publish` returns, so a later re-read could adopt a second publisher's record). On the
+`LOOM_DAEMON_BIN` path `install_to_published` returns the `Published { record }` that `publish` wrote under the lock,
+and `Published::identity()` reduces it to `(started_at, target.sha256, previous.sha256)`. On the machine-script path
+`publish` runs in a subprocess (`loom-daemon install-binary publish`): it appends that same identity, with its `dest`,
+as one JSON line to the file named by `LOOM_INSTALL_IDENTITY_SINK`, which `provision_machine_daemon` creates and reads
+back (last line whose `dest` equals the provisioned destination exactly; no line means no restore). `restore` requires
+the record, `dest` and `<dest>.previous` to still match that identity, so a publisher B that lands after A's publish
+makes A refuse, whether B's candidate differs or has an identical checksum (`started_at` differs). Then re-run the existing supervised restart exactly once against the restored `dest`, through the same
 `restart_flow` branch, so drain, compatibility checks and paused-work recovery behave as they do for any restart.
 
 **No new persistent state.** The record is not rewritten. A restored `dest` is recognizable because its sha256 no
@@ -97,8 +110,18 @@ its measured verdict, not the script's exit code.
 | Outcome | Meaning | Exit |
 |---|---|---|
 | nothing-to-restore | A precondition in §4 failed (fresh install, missing or mismatched `.previous`, `dest` not the candidate) | **7**, unchanged, with one added line saying which precondition failed |
-| restored | `dest` is back to the previous bytes and the supervised restart produced a new live pid | **9** (new). Nonzero: the update did not take |
+| restored | `dest` is back to the previous bytes and the supervised restart produced a new live pid | **9** (new). Nonzero: the update did not take. Never 0, even though a daemon is running |
 | restore-failed | Restore or the second restart failed; the host may be down | **10** (new). The message names `<dest>.previous` and the exact manual command |
+
+**Implemented:** the "second restart" is the supervisor verb the failed attempt already fell back to
+(`launchctl kickstart` / `systemctl --user reset-failed && start`), run once against the restored `dest`, not a
+second `loom-daemon restart` (the daemon that would serve that IPC request is the one that is down). On systemd the
+restore runs only after the self-heal was attempted on a non-`active` unit; the "`active` but pid unobserved" exit 7
+is left alone, because that daemon may be running the candidate. A restore that was refused stays exit 7 and prints
+"Not restoring the previous binary: <precondition>". `fleet roll` counts exit 9 and 10 as `FAILED` (without that
+its process-start-vs-binary-mtime verdict would read a restored host as rolled). Callers audited: `auto_update.rs`
+never reaches the restart (`--no-restart`) and maps unknown codes to `Retryable`; `fleet add-worker` only carries
+the code in an error.
 
 Callers that branch on 7 today see 7 in every case that is not newly restored. Only a caller that opts into
 reading 9 or 10 sees a difference. The module-doc exit table gets two rows.
@@ -157,7 +180,23 @@ supervisor:
 
 Each traced claim in §1–§3 can be reproduced with the cited `git grep` or file read at the traced SHA.
 
-## 9. Not done here
+## 9. Not done here (by the design; #12776 implements §4–§5)
 
 Implementation, a live roll, deployment, credentials and spend. No change to the tick, to `fleet roll`, or to any
 existing exit code.
+
+## 10. Cases the implementation does not cover (#12776)
+
+- The daemon-tick path (`--no-restart`, pause-and-roll): no updater process outlives the daemon. Tracked
+  separately; **#12610** (a floor rollback does not cancel an armed pause-and-roll) is non-overlapping and no code
+  here depends on it.
+- A candidate that starts a pid and crashes later, or fails readiness: health is "a new pid", nothing more.
+- An updater killed, or a host rebooted, between publish and restore: `.previous` and the record remain for a manual
+  restore.
+- A fresh install (no `.previous`), or an unusable record: exit 7 with the reason.
+- Hosts managed by a pidfile (no launchd/systemd): `pidfile_restart` has no exit-7 branch and is not changed.
+- Systemd units that are `active` on an unobserved pid: not restored (see §5).
+- Restoring twice returns one step back only; one previous binary is kept, and it is not proven healthy.
+- A writer that ignores the lock (a hand-run `cp`/`mv` over `dest`) is not excluded; `publish` still warns when it
+  sees its file displaced, and `restore` refuses when `dest` is not the candidate. Restore also restarts only
+  through the supervisor; drain and compatibility checks apply to the first restart, not the restore's.

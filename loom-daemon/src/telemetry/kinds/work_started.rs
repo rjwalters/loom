@@ -25,6 +25,10 @@
 //!   Judge, Doctor or Champion agent issued on a PR (its claim label, verdict
 //!   or merge), from the tick's pick journal. `started_at` is when the agent
 //!   issued that write.
+//! - **A step this host spawned** (`source` [`source::STEP`]): an issue-acting
+//!   Builder or Curator step whose claim was accepted and whose child
+//!   launched. A `sweep.builder` start with `source=step` is the exit from
+//!   `ready_wait` (#12904). PR-acting steps are covered by the role tick.
 //!
 //! **OTLP only.** **Provenance is required.**
 
@@ -46,6 +50,9 @@ pub mod source {
     pub const SWEEP_OBSERVED: &str = "sweep_observed";
     /// A role-runner agent's first forge write on the item in its tick.
     pub const ROLE_ACT: &str = "role_act";
+    /// A step's spawn succeeded: its claim was accepted and its child
+    /// launched (Issue #12904). `started_at` is the spawn instant.
+    pub const STEP: &str = "step";
 }
 
 /// `role` values.

@@ -25,7 +25,7 @@
 //! | restarting (2nd+ consecutive pass) | WARN once as a **crash loop**; never reused, never stopped |
 //! | stopped, host-mounted | resume via [`SessionLifecycle::start_with_workspace`] (the `accounts session start` path) |
 //! | missing, host-mounted | recreate ([`recreate_container`]) with the workspace/image of the last operator `start` ([`session_hold::LAST_START_FILE`]), else the label last seen on it, else (logged as a guess) [`default_mount_workspace`]; never `/` |
-//! | stopped/missing, private-clone | skip and WARN once — never recreated host-mounted |
+//! | stopped/missing, private-clone, configured (`workspace.json`) | recover in place ([`private_workspace::recover`], #12772): `docker start` a stopped container, or recreate a missing one against its surviving volume and the image last seen on it; under the exclusive account lease, never `prepare`, never an empty volume, never a substituted image. Not configured or undecidable: skip and WARN once — never recreated host-mounted |
 //!
 //! After a resume/recreate the pass calls [`refresh_session_health_uncached`]
 //! for the restarted accounts (bypassing the probe cache), so a dead
@@ -328,6 +328,9 @@ pub enum Outcome {
         workspace: PathBuf,
     },
     PrivateCloneSkipped,
+    /// A configured private-clone session was stopped or missing and was
+    /// recovered in place against its surviving volume (#12772).
+    PrivateRecovered,
     /// Running with mount drift and idle: removed and recreated against
     /// `workspace` with the current registry roots (#10364).
     DriftRecreated {
@@ -390,6 +393,7 @@ impl Outcome {
         matches!(
             self,
             Self::Resumed
+                | Self::PrivateRecovered
                 | Self::Recreated { .. }
                 | Self::DriftRecreated { .. }
                 | Self::SkewRecreated { .. }
@@ -506,12 +510,19 @@ impl AccountIndex {
 }
 
 /// What one pass reads besides the containers themselves.
+pub type PrivateRecovery<'a> =
+    dyn Fn(&AccountDescriptor, Option<&str>, &dyn Fn() -> bool) -> anyhow::Result<()> + 'a;
+
 pub struct PassInputs<'a> {
     /// Holds and `enabled=false` across every registered root.
     pub index: &'a AccountIndex,
     /// Whether an account is configured for private-clone mode (`Err`:
     /// cannot be ruled out, treated as private).
     pub is_private_clone: &'a dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    /// Recover a stopped or missing configured private session: given the
+    /// account, the last recorded image (`None`: unknown) and a hold probe it
+    /// must call at the mutation boundary. Never provisions or resets work.
+    pub recover_private: &'a PrivateRecovery<'a>,
     /// The guessed workspace for a missing container with no recorded start.
     pub fallback_workspace: &'a Path,
     /// The workspace registry's roots **now**: what a drifted container's
@@ -924,16 +935,32 @@ fn reconcile_one<R: ContainerRunner>(
             Outcome::CrashLoop
         }
         Decision::PrivateClone => {
-            if !mem.private_reported {
-                log::warn!(
-                    "session_reconcile: {container} (account {name}) is a private-clone session \
-                     and is not running; it is never recreated host-mounted. Restart it with \
-                     `loom-daemon accounts session start {name} --private-clone <URL> --base \
-                     <BRANCH>`"
-                );
-                mem.private_reported = true;
+            // Recover only a session positively known to be configured
+            // private; an undecidable mode stays a fail-closed skip.
+            if !matches!((ctx.is_private_clone)(account), Ok(true)) {
+                if !mem.private_reported {
+                    log::warn!(
+                        "session_reconcile: {container} (account {name}) is a private-clone \
+                         session that cannot be recovered unattended (not configured or mode \
+                         undecidable); it is never recreated host-mounted"
+                    );
+                    mem.private_reported = true;
+                }
+                return Ok(Outcome::PrivateCloneSkipped);
             }
-            Outcome::PrivateCloneSkipped
+            // The image a missing private container is recreated from is the
+            // one last seen on *this* container, never the recorded operator
+            // start: `LAST_START_FILE` is written only by host-mounted starts
+            // (`start_with_workspace`), so for a private account it can only
+            // describe an earlier host-mounted era of the same account.
+            (ctx.recover_private)(account, mem.image.as_deref(), &is_held)?;
+            mem.awaiting_confirm = true;
+            log::warn!(
+                "session_reconcile: {container}: private-clone session was {}; recovered it \
+                 against its existing volume",
+                describe(state.as_ref())
+            );
+            Outcome::PrivateRecovered
         }
         Decision::Resume { workspace } => {
             // Never `docker start` a container that mounts a denied path.
@@ -1078,9 +1105,21 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None);
             let is_private_clone =
                 |a: &AccountDescriptor| private_workspace::configured(root, &a.id.name);
+            let recover_private =
+                |a: &AccountDescriptor, image: Option<&str>, held: &dyn Fn() -> bool| {
+                    private_workspace::recover(root, &a.id.name, image, &|| {
+                        if held() {
+                            Err(OperatorHeld.into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .map(drop)
+                };
             let inputs = PassInputs {
                 index: &index,
                 is_private_clone: &is_private_clone,
+                recover_private: &recover_private,
                 fallback_workspace: &fallback_workspace,
                 registered: readable.then_some(registered.as_slice()),
                 denials_for: &drift::Denials::load,

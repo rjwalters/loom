@@ -270,7 +270,7 @@ pub fn gather_liveness_evidence(
 /// mirroring the `evidence.available == false` short-circuit in
 /// [`check_untracked_building`] — absent evidence means treat the claim as
 /// ALIVE (#3651).
-fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
+pub(super) fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
     match gh::probe_open_linked_pr(repo_root, issue) {
         OpenPrProbe::Open(pr) => {
             eprintln!(

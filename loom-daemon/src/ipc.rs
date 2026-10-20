@@ -303,6 +303,32 @@ pub fn in_flight_sweep_ids(
     ids
 }
 
+/// The in-flight sweeps with the workspace root each one belongs to (#12876).
+#[must_use]
+pub fn in_flight_sweeps(
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+) -> Vec<crate::host_loss::InFlight> {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let mut out = Vec::new();
+    for root in &workspace_registry.effective_roots(fallback_root) {
+        let registry = workspace_pool.get_or_provision(root);
+        let sr = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        out.extend(
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| crate::host_loss::InFlight {
+                    root: root.clone(),
+                    sweep_id: info.sweep_id,
+                }),
+        );
+    }
+    out
+}
+
 /// Cancel every in-flight sweep across all managed roots via the existing
 /// [`SweepRegistry::cancel`] path (Issue #4090, `--force-after-timeout`).
 /// Returns the number cancelled. Blocking cancel is acceptable here: this runs
@@ -1684,6 +1710,7 @@ pub fn build_daemon_status_for(
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
         auto_update_floor_not_rolling: au.floor_not_rolling, // #11042
+        auto_update_freshness: au.freshness,                 // #9736
         host_update,
         auto_update_config_enabled: crate::auto_update::loop_mode::current()
             .map(crate::auto_update::loop_mode::LoopMode::config_enabled),
@@ -1723,12 +1750,6 @@ pub fn build_daemon_status_for(
         otlp_export: Some(crate::observability::otlp_health::check_global(
             &crate::observability::read_config(workspace_root),
         )),
-        // Forge event-feed consumer (ADR-0021, #8765) — same process-global
-        // snapshot pattern. Always `Some` from a daemon of this vintage: a
-        // consumer that never started reports `disabled`, so "is my cursor
-        // advancing, and if not, why" is always answered rather than inferred
-        // from an absent warning.
-        forge_events: Some(crate::forge_events::global_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).

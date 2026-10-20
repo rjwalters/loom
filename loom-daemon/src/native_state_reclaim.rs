@@ -389,7 +389,7 @@ impl NativeStateReclaimReport {
         if self.removed_bytes == 0 {
             return "nothing".to_string();
         }
-        crate::tmpfs_reclaim::human_size(self.removed_bytes)
+        crate::fs_util::human_size(self.removed_bytes)
     }
 }
 

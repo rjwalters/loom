@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::upstream;
+use crate::worktree_cli::upstream;
 
 /// Which of the two retired `worktree.sh` blocks to run. Kebab-case on the
 /// command line: `local-branch`, `registered-worktree`.
