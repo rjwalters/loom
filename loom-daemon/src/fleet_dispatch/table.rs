@@ -38,12 +38,16 @@
 //!    `(repo, item, step)` (below);
 //! 3. `not_eligible` when the step's role is not in the host's last reported
 //!    `roles_ok` (Phase 1 decides eligibility by `roles_ok` only; a step name
-//!    this build does not know has no role, so it is `not_eligible` too);
-//! 4. `cap` when the host's granted and live rows reach
-//!    `min(free_slots + live, maxConcurrent)`: the last heartbeat's counts,
-//!    clamped by the fleet config, so a wrong report cannot hoard. A host
-//!    that has not heartbeated this epoch is bounded by `maxConcurrent`
-//!    alone, and refused when that is unknown too.
+//!    this build does not know has no role, so it is `not_eligible` too).
+//!
+//! The captain applies **no capacity limit** (#12864). Its rows for a host
+//! live until the worker releases them or their TTL ends, so a count of them
+//! runs above what the host is actually running; refusing on that count
+//! (the former `cap` refusal) stalled hosts that had free slots. Capacity is
+//! the worker's own: it claims only for the free slots its tick computed
+//! (`maxConcurrent`, RAM, disk and load), and a full worker does not ask.
+//! [`RefusalReason::Cap`] stays in the wire enum for mixed-version fleets,
+//! but this table never emits it.
 //!
 //! # The no-progress cooldown (#12541)
 //!
@@ -79,6 +83,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use super::proto::{HeartbeatRequest, LiveStep, RefusalReason, REFUSE_CLAIM_LOST};
 use crate::step_role::StepRole;
 
@@ -112,8 +118,6 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(90);
 
 /// `retry_after_s` of a `held` refusal, at most.
 const HELD_RETRY_MAX_SECS: u64 = 60;
-/// `retry_after_s` of a `cap` refusal: about one heartbeat.
-const CAP_RETRY_SECS: u64 = 30;
 /// `retry_after_s` of a `not_eligible` refusal.
 const NOT_ELIGIBLE_RETRY_SECS: u64 = 60;
 
@@ -248,6 +252,43 @@ pub struct HostState {
     pub live_reported: u32,
     pub roles_ok: BTreeSet<String>,
     pub last_seen: Mono,
+    /// The earliest `started_at` among the steps the last heartbeat listed:
+    /// a worker-supplied wall-clock fact, stored as sent (#12873). `None`
+    /// when the heartbeat listed no step, or none with a start (an older
+    /// worker).
+    pub oldest_live_started_at: Option<DateTime<Utc>>,
+}
+
+/// How recent a host's last heartbeat must be for its reported facts to be
+/// exported as gauges (#12873): four missed 30 s heartbeats.
+pub const HEARTBEAT_FRESH: Duration = Duration::from_secs(120);
+
+/// What a host's last fresh heartbeat reported (#12873).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    pub free_slots: u32,
+    pub live_reported: u32,
+    pub oldest_live_started_at: Option<DateTime<Utc>>,
+}
+
+/// One host's gauges (#12873): its row counts, and what it reported when its
+/// last heartbeat is fresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostGauges {
+    pub granted: u32,
+    pub live: u32,
+    /// `None` for a host that never heartbeated, or whose last heartbeat is
+    /// older than the freshness bound: no reported point, never a `0`.
+    pub reported: Option<Reported>,
+}
+
+/// The table's gauge snapshot (#12873).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableGauges {
+    /// Every host with a row or a fresh heartbeat.
+    pub hosts: BTreeMap<String, HostGauges>,
+    /// Held rows, fleet-wide (a held row has no host).
+    pub held: u32,
 }
 
 /// A claim's decision.
@@ -400,6 +441,47 @@ impl Table {
         self.hosts.get(host)
     }
 
+    /// The gauge snapshot at `now` (#12873): granted and live rows per host
+    /// for every host with a row or a heartbeat within `fresh`, `0`
+    /// included; the reported facts only for a fresh host; the held rows
+    /// fleet-wide. A host that stopped heartbeating keeps its row counts
+    /// while its rows last (they are the stale claims). Pure.
+    #[must_use]
+    pub fn host_gauges(&self, now: Mono, fresh: Duration) -> TableGauges {
+        let mut gauges = TableGauges::default();
+        for (host, state) in &self.hosts {
+            if now.0.saturating_sub(state.last_seen.0) <= fresh {
+                gauges.hosts.insert(
+                    host.clone(),
+                    HostGauges {
+                        reported: Some(Reported {
+                            free_slots: state.free_slots,
+                            live_reported: state.live_reported,
+                            oldest_live_started_at: state.oldest_live_started_at,
+                        }),
+                        ..HostGauges::default()
+                    },
+                );
+            }
+        }
+        for row in self.rows.values() {
+            let host = match (&row.host, row.state) {
+                (_, RowState::Held) | (None, _) => {
+                    gauges.held += 1;
+                    continue;
+                }
+                (Some(host), _) => host,
+            };
+            let entry = gauges.hosts.entry(host.clone()).or_default();
+            match row.state {
+                RowState::Granted => entry.granted += 1,
+                RowState::Live => entry.live += 1,
+                RowState::Held => {}
+            }
+        }
+        gauges
+    }
+
     /// Whether claims are still refused with `grace` at `now`. Closes the
     /// window for good once it has ended.
     pub fn in_grace(&mut self, now: Mono) -> bool {
@@ -451,6 +533,7 @@ impl Table {
                 live_reported: u32::try_from(hb.live.len()).unwrap_or(u32::MAX),
                 roles_ok: hb.roles_ok.iter().cloned().collect(),
                 last_seen: now,
+                oldest_live_started_at: hb.live.iter().filter_map(|l| l.started_at).min(),
             },
         );
         let deadline = now.plus(self.policy.assignment_ttl);
@@ -509,8 +592,8 @@ impl Table {
         );
     }
 
-    /// Decide `host`'s claim of `(repo, item)` for `step` at `now`.
-    /// `max_concurrent` is the host's `maxConcurrent` from the fleet config.
+    /// Decide `host`'s claim of `(repo, item)` for `step` at `now`. No
+    /// capacity check: the worker bounds its own claims (#12864).
     pub fn claim(
         &mut self,
         now: Mono,
@@ -518,10 +601,8 @@ impl Table {
         repo: &str,
         item: u64,
         step: &str,
-        max_concurrent: Option<u32>,
     ) -> ClaimDecision {
-        self.claim_traced(now, host, repo, item, step, max_concurrent)
-            .0
+        self.claim_traced(now, host, repo, item, step).0
     }
 
     /// [`Self::claim`], plus the no-progress hold when a refusal came from
@@ -534,14 +615,12 @@ impl Table {
         repo: &str,
         item: u64,
         step: &str,
-        max_concurrent: Option<u32>,
     ) -> (ClaimDecision, Option<Cooldown>) {
         let mut cooled = None;
-        let d = self.decide_claim(now, host, repo, item, step, max_concurrent, &mut cooled);
+        let d = self.decide_claim(now, host, repo, item, step, &mut cooled);
         (d, cooled)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn decide_claim(
         &mut self,
         now: Mono,
@@ -549,7 +628,6 @@ impl Table {
         repo: &str,
         item: u64,
         step: &str,
-        max_concurrent: Option<u32>,
         cooled: &mut Option<Cooldown>,
     ) -> ClaimDecision {
         self.expire(now);
@@ -600,23 +678,13 @@ impl Table {
                 return refused(RefusalReason::Held, row.host.clone(), retry);
             }
         }
-        let state = self.hosts.get(host);
-        if let Some(state) = state {
+        if let Some(state) = self.hosts.get(host) {
             if !state.roles_ok.contains(parsed.role_name()) {
                 return refused(RefusalReason::NotEligible, None, NOT_ELIGIBLE_RETRY_SECS);
             }
         }
-        let reported = state.map(|s| s.free_slots.saturating_add(s.live_reported));
-        let limit = match (reported, max_concurrent) {
-            (Some(r), Some(m)) => Some(r.min(m)),
-            (Some(r), None) => Some(r),
-            (None, m) => m,
-        };
-        // The row being replaced frees its slot for the new step.
-        let held = self.held_by(host).saturating_sub(u32::from(replaces_own));
-        if limit.is_none_or(|l| held >= l) {
-            return refused(RefusalReason::Cap, None, CAP_RETRY_SECS);
-        }
+        // No capacity check here (#12864): the worker asked only because it
+        // has a free slot by its own limits.
         if replaces_own {
             self.remove(&key);
         }

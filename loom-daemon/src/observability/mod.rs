@@ -1301,6 +1301,12 @@ pub fn spawn_task(
     // `daemon_event`'s module doc for why it is a separate subscriber rather
     // than folded into `collector`.
     let daemon_event_handle = daemon_event::spawn_task(bus, fanout.clone(), host_id.clone());
+    // Host shape (#12874): a one-shot IMDSv2 probe for `host.type` /
+    // `cloud.*` on the resource. Spawned and never awaited — startup is not
+    // delayed, and batches exported before it lands just lack the keys.
+    // Linux only: fleet EC2 hosts are Linux; a Mac reads `hw.model` instead.
+    #[cfg(target_os = "linux")]
+    crate::host_shape::spawn_imds_probe();
     let collector_handle = collector::spawn_task(
         bus,
         fanout,

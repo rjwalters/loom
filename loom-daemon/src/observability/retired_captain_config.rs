@@ -96,6 +96,56 @@ pub fn warn_retired_ingest_config(root: &Path) -> Vec<String> {
     keys
 }
 
+/// The removed `forgeEvents` block's top-level keys in `effective`, as full
+/// dotted paths, sorted (#12809). The block drove the dashboard event-feed
+/// client, its early-tick consumers and feed-based poll gating, all removed.
+/// Pure.
+#[must_use]
+pub fn retired_forge_events_keys(effective: &serde_json::Value) -> Vec<String> {
+    let Some(block) = effective.get(RETIRED_FORGE_EVENTS_BLOCK) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = match block.as_object() {
+        Some(obj) if !obj.is_empty() => obj
+            .keys()
+            .map(|k| format!("{RETIRED_FORGE_EVENTS_BLOCK}.{k}"))
+            .collect(),
+        _ => vec![RETIRED_FORGE_EVENTS_BLOCK.to_string()],
+    };
+    keys.sort();
+    keys
+}
+
+/// The removed `forgeEvents` block (#12809).
+pub const RETIRED_FORGE_EVENTS_BLOCK: &str = "forgeEvents";
+
+/// Prefix of the removed `LOOM_FORGE_EVENTS_*` environment variables.
+const RETIRED_FORGE_EVENTS_ENV_PREFIX: &str = "LOOM_FORGE_EVENTS_";
+
+/// Log one warning when the workspace at `root` (or the process environment)
+/// still carries the removed `forgeEvents` config or `LOOM_FORGE_EVENTS_*`
+/// variables (#12809). Called once at daemon startup; nothing reads them, so
+/// startup is never affected. Returns the names warned about.
+pub fn warn_retired_forge_events_config(root: &Path) -> Vec<String> {
+    let mut names =
+        retired_forge_events_keys(&crate::config_resolver::resolve_effective_config(root));
+    let mut env: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with(RETIRED_FORGE_EVENTS_ENV_PREFIX))
+        .collect();
+    env.sort();
+    names.extend(env);
+    if !names.is_empty() {
+        log::warn!(
+            "config: ignoring {} (the dashboard event-feed client, its early-tick consumers \
+             and feed-based poll gating were removed, #12809; every loop polls on its own \
+             timer) — delete them from the host config",
+            names.join(", ")
+        );
+    }
+    names
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -114,6 +164,33 @@ mod tests {
         let otlp = json!({"observability": {"endpoint": "http://127.0.0.1:4318"}});
         assert!(retired_ingest_keys(&otlp).is_empty());
         assert!(retired_ingest_keys(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_legacy_forge_events_config_is_named_and_startup_proceeds() {
+        let legacy = json!({"forgeEvents": {"enabled": true, "pollGating": true}});
+        assert_eq!(
+            retired_forge_events_keys(&legacy),
+            ["forgeEvents.enabled", "forgeEvents.pollGating"]
+        );
+        assert_eq!(retired_forge_events_keys(&json!({"forgeEvents": {}})), ["forgeEvents"]);
+        assert!(retired_forge_events_keys(&json!({})).is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            json!({"forgeEvents": {"enabled": true, "events": {"workFinderTick": true}}})
+                .to_string(),
+        )
+        .unwrap();
+        let warned = warn_retired_forge_events_config(dir.path());
+        assert!(warned.contains(&"forgeEvents.enabled".to_string()), "{warned:?}");
+        assert!(warned.contains(&"forgeEvents.events".to_string()), "{warned:?}");
+        // The daemon's other config readers still load the same file.
+        assert!(crate::observability::read_config(dir.path())
+            .ingest_key_file
+            .is_none());
     }
 
     #[test]

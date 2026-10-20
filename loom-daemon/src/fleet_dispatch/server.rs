@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -47,6 +48,7 @@ use super::proto::{
 use super::roster::{Roster, RosterSource};
 use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
 use super::telemetry::{self, Call, Counters, HoldFacts};
+use crate::telemetry::ops::MetricPoint;
 
 /// The span reason of a claim refused `held` by a no-progress hold
 /// ([`super::table`], #12541). On the wire it is [`RefusalReason::Cooldown`]
@@ -189,17 +191,23 @@ impl<I: Identity> Server<I> {
         f(&mut table, now, &mut counters)
     }
 
-    /// Expire due rows and flush the counters as metric points.
+    /// Expire due rows, then flush the counters and the table's gauges
+    /// (#12873) as metric points, both read under the one table lock.
     pub fn sweep(&self) {
-        self.with_table(|_, _, _| ());
-        let points = self
-            .counters
-            .lock()
-            .map(|mut c| c.take_points())
-            .unwrap_or_default();
+        let points = self.sweep_points(Utc::now());
         if !points.is_empty() {
             crate::observability::ops::emit_metrics(points);
         }
+    }
+
+    /// [`Self::sweep`]'s points at wall-clock `wall_now`, after expiry.
+    pub fn sweep_points(&self, wall_now: DateTime<Utc>) -> Vec<MetricPoint> {
+        self.with_table(|table, now, counters| {
+            let mut points = counters.take_points();
+            let gauges = table.host_gauges(now, super::table::HEARTBEAT_FRESH);
+            points.extend(super::telemetry::gauge_points(&gauges, wall_now));
+            points
+        })
     }
 
     /// Resolve `peer` to its roster host id. `Err` is the reply to send.
@@ -277,9 +285,8 @@ impl<I: Identity> Server<I> {
     fn claim(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
         let req: ClaimRequest = self.parse(host, body)?;
         call.item = Some((req.repo.clone(), req.item, req.step.clone()));
-        let max = self.roster().max_concurrent(host);
         let decision = self.with_table(|t, now, counters| {
-            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step, max);
+            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step);
             if let ClaimDecision::Refused { reason, .. } = &mut d {
                 if let Some(hold) = cooled {
                     counters.claim_cooled();
