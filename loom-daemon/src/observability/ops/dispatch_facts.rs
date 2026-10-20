@@ -37,6 +37,7 @@ use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::RepoVisibility;
 use crate::types::CapView;
 use crate::work_finder::halt_cause::since::RootHalt;
+use crate::work_finder::RepoDepth;
 use crate::work_finder::TickReport;
 
 /// Span attribute values are bounded to this many characters at export
@@ -196,6 +197,7 @@ pub fn pass_attributes(
     let mut out = vec![
         ("loom.dispatch.draws".to_string(), p.draws.to_string()),
         ("loom.dispatch.draws_unspawned".into(), p.draws_unspawned.to_string()),
+        ("loom.dispatch.merge_deferred".into(), p.merge_deferred.to_string()),
         ("loom.dispatch.budget".into(), p.budget.to_string()),
     ];
     if !p.by_reason.is_empty() {
@@ -218,11 +220,38 @@ pub fn tick_points(report: &TickReport, cap: Option<CapView>) -> Vec<MetricPoint
                 .label("kind", "configured"),
         );
     }
+    points.extend(depth_points(&report.depth));
     if report.pr_open_prefiltered > 0 {
         points.push(MetricPoint::int(
             MetricName::DispatchPrOpenPrefiltered,
             int(report.pr_open_prefiltered),
         ));
+    }
+    points
+}
+
+/// The step tick's dispatchable depth (#12734): `loom.dispatch.pool_items`
+/// by `repo` and `step`, `loom.dispatch.excluded_items` by `repo` and
+/// `reason`. Non-zero counts only, so absence means zero. Labels are the
+/// registered workspace slugs and the closed `Step` / `Exclusion` names. Pure.
+#[must_use]
+pub fn depth_points(depth: &[RepoDepth]) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
+    for d in depth {
+        for (step, &n) in d.pool.iter().filter(|(_, n)| **n > 0) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchPoolItems, int(n))
+                    .label("repo", d.repo.as_str())
+                    .label("step", *step),
+            );
+        }
+        for (reason, &n) in d.excluded.iter().filter(|(_, n)| **n > 0) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchExcludedItems, int(n))
+                    .label("repo", d.repo.as_str())
+                    .label("reason", *reason),
+            );
+        }
     }
     points
 }
@@ -245,6 +274,16 @@ pub fn fallback_repo_ref(root: &Path) -> Option<QueueRepoRef> {
     let visibility =
         crate::telemetry::visibility::cached_visibility(&repo).unwrap_or(RepoVisibility::Private);
     Some(QueueRepoRef { repo, visibility })
+}
+
+/// `root`'s `owner/name`, through the collector's cache, else
+/// [`fallback_repo_ref`]; never a forge call (#12450's claim names its repo
+/// with it).
+#[must_use]
+pub fn repo_for_root(root: &Path) -> Option<String> {
+    super::super::repo_ref::cached_repo_ref(&root.display().to_string())
+        .or_else(|| fallback_repo_ref(root))
+        .map(|r| r.repo)
 }
 
 /// The held repos of the work finder's last tick, each named through the
@@ -338,8 +377,9 @@ mod tests {
             passes: Some(crate::step_dispatch::gather_budget::TickPasses {
                 draws: 9,
                 draws_unspawned: 2,
+                merge_deferred: 7,
                 by_reason: [
-                    ("merge_in_flight".to_string(), 2),
+                    ("backstop_hold".to_string(), 2),
                     ("claim_lost".to_string(), 3),
                 ]
                 .into_iter()
@@ -353,7 +393,8 @@ mod tests {
         let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
         assert_eq!(get("loom.dispatch.draws"), Some("9"));
         assert_eq!(get("loom.dispatch.draws_unspawned"), Some("2"));
-        assert_eq!(get("loom.dispatch.passes"), Some("claim_lost=3,merge_in_flight=2"));
+        assert_eq!(get("loom.dispatch.merge_deferred"), Some("7"));
+        assert_eq!(get("loom.dispatch.passes"), Some("backstop_hold=2,claim_lost=3"));
         assert_eq!(get("loom.dispatch.budget"), Some("30"));
         assert_eq!(get("loom.dispatch.stop"), Some("pass_limit"));
         for (key, _) in &attrs {
@@ -466,6 +507,42 @@ mod tests {
         .unwrap();
         assert!(named.len() <= MAX_ATTRIBUTE_CHARS, "{}", named.len());
         assert!(named.split(',').all(|e| e.ends_with("=drain")), "{named}");
+    }
+
+    #[test]
+    fn depth_points_carry_pool_and_exclusions_within_closed_sets() {
+        use crate::step_dispatch::item_draw::Exclusion;
+        use crate::work_finder::step_item::{PassReason, Step};
+        let depth = RepoDepth {
+            repo: "o/a".into(),
+            pool: [(Step::Builder.as_str(), 2), (Step::Judge.as_str(), 0)].into(),
+            excluded: [
+                (Exclusion::Pass(PassReason::Blocked).as_str(), 5),
+                (Exclusion::MergeInFlight.as_str(), 1),
+            ]
+            .into(),
+        };
+        let held = RepoDepth {
+            repo: "o/b".into(),
+            ..RepoDepth::default()
+        };
+        let points = depth_points(&[depth, held]);
+        let pool = MetricPoint::int(MetricName::DispatchPoolItems, 2)
+            .label("repo", "o/a")
+            .label("step", "builder");
+        let blocked = MetricPoint::int(MetricName::DispatchExcludedItems, 5)
+            .label("repo", "o/a")
+            .label("reason", "blocked");
+        let merging = MetricPoint::int(MetricName::DispatchExcludedItems, 1)
+            .label("repo", "o/a")
+            .label("reason", "merge_in_flight");
+        assert_eq!(points, vec![pool, blocked, merging]);
+        for p in &points {
+            assert!(p
+                .labels
+                .keys()
+                .all(|k| crate::telemetry::ops::OPS_METRIC_LABEL_KEYS.contains(&k.as_str())));
+        }
     }
 
     #[test]

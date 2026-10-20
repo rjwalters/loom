@@ -109,7 +109,7 @@ The classifier (`work_finder/step_item.rs`, `classify`) checks these rows in ord
 | linked PR `loom:changes-requested` | Doctor |
 | linked PR `loom:review-requested` | Judge |
 | linked PR `loom:pr` | Champion merge |
-| PR with no workflow label | none |
+| PR with no workflow label | Champion triage (#12499): it adds `loom:review-requested`, or blocks, or asks the operator; a draft: none (`draft`) |
 | issue `loom:epic` | none (Champion's non-item run) |
 | `loom:architect` / `loom:hermit` / `loom:auditor` proposal, not curated or promoted | none (Champion's non-item run) |
 | `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
@@ -204,7 +204,7 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 | landed (`verdict:closed`) | Reclassify the item. No more Builder steps. |
 | `noop` | Cooldown per `(item, step)` |
 | fast `failed` | Builder: the #11872 ladder. Every other step (Curator, Champion promote, Judge, Doctor, Champion merge): a ledger-local doubling window capped at 24 h, never the issue quarantine, whose release restores `loom:issue` (#11969) |
-| Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker |
+| Champion re-evaluation left the item held or blocked | Ladder of 1, 1, 1, 2, 4, 8, 24, 48, 96 h, then 7 d (#12513; 6 h → 7 d before it), **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker. A marker whose `next=` is further off than its rung's delay (written under the old ladder) is due now, once. Not counted toward the repeat cap, unless the forge write failed: then the rung's window is held locally (restored after a restart) and the run counts (#12516) |
 | `refused`, `pool_gate` or `claimed` | A short cooldown per `(item, step)`, in force before the next tick |
 | `refused`, `claim_lost` | Redraw; counted. A second in a row on the same `(item, step)` arms the refusal cooldown, doubling to 24 h (#11969) |
 | any other `refused` | Reclassify the item |
@@ -252,7 +252,7 @@ The stalled and idle rules key on `loom.step.actionable{repo}`, which every disp
 ## 9. Open items
 
 - **Stage term.** None today (ruling 2): the weight is `actionable × priority × stage-age`. Whether one is ever added is decided on production data, by the operator; the `step-slots-idle` alert and `pick.decision` show whether a stage starves.
-- **Sessions.** Implemented, **off by default** (#11913): `step_dispatch/session_ledger.rs` is a host-local ledger (`.loom/step-sessions.json`) of `(item, role) → (host, session_id, ended_at, context_size)`, written when a step ends (`step_end::settle`) and read at dispatch (`step_spawn::step_session_resume`). A Judge resumes only a Judge, never an author's session. A Builder retry resumes its own, and a Doctor its own last session, else the Builder's. A resume needs the same host, a record younger than the TTL (default 1 h), a transcript under the context cap (default 2 MiB) and a reachable session store; otherwise the step runs fresh and the ledger logs a written handoff. Affinity is a preference: `affinity_wait` is nonzero only inside the grace window (default 10 min) for a record another host holds, and never gates eligibility. Enable with `LOOM_STEP_SESSION_RESUME=1` or `autonomous.stepSessionResume.enabled` (`graceSecs`, `ttlSecs`, `contextCapBytes` tune it). Resumed steps set `loom.step.resumed=true`. Still open, and waiting on the resume-vs-fresh experiment (tracked outside this repo): whether to flip the default, and the final TTL and cap values. Only Claude sessions are ledgered; the Doctor→Builder fallback matches records by item number, so it applies once a PR step and its issue share one.
+- **Sessions.** Implemented, **off by default** (#11913): `step_dispatch/session_ledger.rs` is a host-local ledger (`.loom/step-sessions.json`) of `(item, role) → (host, session_id, ended_at, context_size)`, written when a step ends (`step_end::settle`) and read at dispatch (`step_spawn::step_session_resume`). A Judge resumes only a Judge, never an author's session. A Builder retry resumes its own, and a Doctor its own last session, else the Builder's. A resume needs the same host, a record younger than the TTL (default 1 h), a transcript under the context cap (default 2 MiB) and a reachable session store; otherwise the step runs fresh and the ledger logs a written handoff. Enable with `LOOM_STEP_SESSION_RESUME=1` or `autonomous.stepSessionResume.enabled` (`ttlSecs`, `contextCapBytes` tune it). Resumed steps set `loom.step.resumed=true`. Still open, and waiting on the resume-vs-fresh experiment (tracked outside this repo): whether to flip the default, and the final TTL and cap values. Only Claude sessions are ledgered; the Doctor→Builder fallback matches records by item number, so it applies once a PR step and its issue share one.
 - **Merge queue.** Phase C's live verification (#10257) runs on the live fleet.
 
 ## 10. Children

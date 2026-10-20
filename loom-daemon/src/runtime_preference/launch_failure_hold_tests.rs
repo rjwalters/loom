@@ -54,6 +54,7 @@ fn zai() -> Tap {
     Tap {
         runtime: "opencode".into(),
         model_profile: Some("zai-flash".into()),
+        model: None,
     }
 }
 

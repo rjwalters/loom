@@ -879,7 +879,11 @@ impl SweepRegistry {
             return OpenPrProbe::ProbeFailed;
         };
         let gh = self.resolved_gh();
-        let mut cmd = self.gh_inv("guard.open_pr_graphql", AccessIntent::Read, &gh);
+        // GraphQL names its repo in the query, not the path: say which, so
+        // the reader route serves it (#12555) instead of a shed.
+        let mut cmd = self
+            .gh_inv("guard.open_pr_graphql", AccessIntent::Read, &gh)
+            .reader_repo(&format!("{owner}/{repo}"));
         cmd = cmd.args(crate::worktree_ops::gh::open_linked_pr_args(&owner, &repo, issue));
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and `issue_is_closed_or_pr` (#3937).
@@ -1129,11 +1133,10 @@ impl SweepRegistry {
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        // W4-C: read back after this daemon's own flip, so the writer that
-        // made it answers (a reader may lag the write).
+        // #12555: a reader or the gateway answers, never the writer (#12394),
+        // even right after this daemon's own flip (see `gh_call::read`).
         let mut cmd = self.gh_inv("guard.issue_labels", AccessIntent::Read, &gh);
         cmd = cmd
-            .writer_identity()
             .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
@@ -1505,13 +1508,15 @@ impl SweepRegistry {
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        // W4-C: verifies this daemon's own just-written lease (and its
-        // callers fail open after a few retries), so the writer reads it.
-        // #12389 keeps it there on purpose: it is the read half of the
-        // claim-then-verify tie-break, inside the same critical section as
-        // the lease write, and a lagging reader would hide the new comment.
+        // #12555: a reader or the gateway answers, never the writer (#12394).
+        // This is the read half of the claim-then-verify tie-break, and its
+        // freshness guard is the tie-break's own: a read that does not show
+        // this daemon's just-written lease is retried, then unverified
+        // (`resolve_lease_order_with`), never taken as an answer; a peer's
+        // earlier lease the read misses is the confirmation re-reads' job, and
+        // the writer would read a peer's write no fresher.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
-        cmd = cmd.writer_identity().arg("api")
+        cmd = cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
             .arg("--paginate")
             .arg("--jq")
@@ -1630,13 +1635,28 @@ impl SweepRegistry {
     /// is FAIL-OPEN — an unreadable timeline is not evidence of anything.
     ///
     /// [`read_lease_comments`]: Self::read_lease_comments
+    #[cfg(test)]
     pub(crate) fn resolve_lease_order(
         &self,
         issue: u32,
         sweep_id: &str,
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
-        self.resolve_lease_order_with(issue, sweep_id, episode_start, false)
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, false, true)
+    }
+
+    /// [`resolve_lease_order`](Self::resolve_lease_order) that FAILS CLOSED
+    /// (#12571) like [`resolve_lease_order_strict`](Self::resolve_lease_order_strict)
+    /// but KEEPS the leaseless-label leg, for the issue-sweep claim: an
+    /// unreadable forge or an invisible own comment is
+    /// [`LeaseOrderDecision::Unverified`], never a blind `Proceed`.
+    pub(crate) fn resolve_lease_order_fail_closed(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        episode_start: DateTime<Utc>,
+    ) -> LeaseOrderDecision {
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, true, true)
     }
 
     /// [`resolve_lease_order`](Self::resolve_lease_order) that FAILS CLOSED
@@ -1651,7 +1671,7 @@ impl SweepRegistry {
         sweep_id: &str,
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
-        self.resolve_lease_order_with(issue, sweep_id, episode_start, true)
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, true, false)
     }
 
     fn resolve_lease_order_with(
@@ -1660,6 +1680,7 @@ impl SweepRegistry {
         sweep_id: &str,
         episode_start: DateTime<Utc>,
         fail_closed: bool,
+        leaseless_leg: bool,
     ) -> LeaseOrderDecision {
         // What an unverifiable read resolves to once retries are spent.
         let unverifiable = if fail_closed {
@@ -1746,10 +1767,10 @@ impl SweepRegistry {
                     renewal_cutoff,
                     fail_closed,
                 );
-                if fail_closed {
-                    confirmed
-                } else {
+                if leaseless_leg {
                     confirmed.or_leaseless_claim(self, issue, episode_start, sole)
+                } else {
+                    confirmed
                 }
             };
         }
@@ -3161,6 +3182,34 @@ exit 0
         assert_eq!(
             registry.resolve_lease_order(9822, "sweep-mine", Utc::now()),
             LeaseOrderDecision::Proceed
+        );
+    }
+
+    /// #12571: the issue-sweep tie-break fails CLOSED on an unreadable forge.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_fail_closed_is_unverified_when_the_read_fails() {
+        let dir = tempdir().unwrap();
+        let registry = lease_order_unit_registry(dir.path(), "boom", 1);
+        assert_eq!(
+            registry.resolve_lease_order_fail_closed(9826, "sweep-mine", Utc::now()),
+            LeaseOrderDecision::Unverified
+        );
+    }
+
+    /// #12571: ...and when its own lease comment never becomes visible.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_fail_closed_is_unverified_when_its_own_comment_is_not_found() {
+        let dir = tempdir().unwrap();
+        let stdout = format!(
+            r#"{{"id":1,"created_at":"{now}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}"#,
+            now = Utc::now().to_rfc3339(),
+        );
+        let registry = lease_order_unit_registry(dir.path(), &stdout, 0);
+        assert_eq!(
+            registry.resolve_lease_order_fail_closed(9827, "sweep-mine", Utc::now()),
+            LeaseOrderDecision::Unverified
         );
     }
 

@@ -194,7 +194,6 @@ impl NotifyClearedBlockersArgs {
 }
 
 /// The issues a merged PR closed, per the forge's own `closingIssuesReferences`.
-/// Also how a Judge's checkout finds its issue (`attend_hook`, #10120).
 pub(super) fn pr_close_targets(
     pr: i64,
     repo: Option<&str>,

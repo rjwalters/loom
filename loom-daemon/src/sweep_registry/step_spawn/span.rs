@@ -31,6 +31,8 @@
 //! | `cancelled` | an operator or the daemon cancelled the step |
 //! | `step-outcome-failed` | the session's `LOOM_STEP_OUTCOME` said `class=failed` |
 //! | `exit-<code>` | the step exited non-zero |
+//! | `no-pr` | a Builder step exited 0 with `class=noop`: no PR (#12500) |
+//! | `no-outcome-line` | a Builder step exited 0 and wrote no outcome line (#12500) |
 //! | `exit-unobserved` | the step exited, its status is unknown, and it wrote no outcome line |
 
 use std::path::Path;
@@ -59,15 +61,27 @@ pub(crate) fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> Role
             code,
             "step session reported LOOM_STEP_OUTCOME class=failed",
         ),
-        StepEnd::Exited(Some(code)) => RoleFailure::new(
+        StepEnd::Exited(Some(code)) if code != 0 => RoleFailure::new(
             format!("exit-{code}"),
             Some(code),
             &format!("step exited with code {code}"),
         ),
-        StepEnd::Exited(None) => RoleFailure::new(
+        StepEnd::Exited(None) if line.is_none() => RoleFailure::new(
             "exit-unobserved",
             None,
             "step exited with no observed status and no outcome line",
+        ),
+        // A clean exit that tick_outcome still fails (#12500): a Builder step
+        // that opened no PR, or wrote no outcome line.
+        StepEnd::Exited(code) if line.is_none() => RoleFailure::new(
+            "no-outcome-line",
+            code,
+            "step exited without writing a LOOM_STEP_OUTCOME line",
+        ),
+        StepEnd::Exited(code) => RoleFailure::new(
+            "no-pr",
+            code,
+            "builder step exited without opening a PR (LOOM_STEP_OUTCOME class=noop)",
         ),
     }
 }

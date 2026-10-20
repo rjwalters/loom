@@ -64,7 +64,6 @@ pub mod phase_tap_usage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
-pub mod journal_shadow;
 pub mod ops;
 pub mod provenance;
 pub mod queue_snapshot;
@@ -1489,7 +1488,7 @@ pub struct HostHealthRecord {
     /// `worktree_root_free_gb` as a percentage instead of a bare absolute
     /// number that is not comparable across a heterogeneous fleet (Issue
     /// #5356). Sourced from the same `df -Pk` sample as the free-space
-    /// reading (`crate::disk_headroom::worktree_root_disk_gb`).
+    /// reading (`crate::disk_headroom::worktree_root_disk_bytes`).
     ///
     /// Follows the exact "unknown != zero" contract `worktree_root_free_gb`
     /// already established: **omitted**, never a fabricated `0`, when the

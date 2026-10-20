@@ -285,6 +285,65 @@ fn primary_checkout_sweep_dry_run_removes_nothing() {
     assert!(tmp.path().join("target").is_dir());
 }
 
+// --- clean.keepBuildArtifacts (#12694) --------------------------------
+
+fn write_keep_config(root: &Path, body: &str) {
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(root.join(".loom/config.json"), body).unwrap();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn keep_build_artifacts_leaves_existing_dirs_and_reports_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_keep_config(tmp.path(), r#"{"clean":{"keepBuildArtifacts":true}}"#);
+    std::fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+
+    for dry_run in [false, true] {
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), dry_run);
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o, ArtifactOutcome::Kept(_))));
+        assert_eq!(outcomes.len(), PRIMARY_CHECKOUT_ARTIFACTS.len());
+        assert!(tmp.path().join("node_modules/pkg").is_dir());
+        assert!(tmp.path().join("target").is_dir());
+    }
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn keep_build_artifacts_still_reports_absent_dirs_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_keep_config(tmp.path(), r#"{"clean":{"keepBuildArtifacts":true}}"#);
+    std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+
+    let outcomes = sweep_primary_checkout_artifacts(tmp.path(), false);
+    assert!(matches!(outcomes[0], ArtifactOutcome::Absent(_))); // target
+    assert!(matches!(outcomes[1], ArtifactOutcome::Kept(_))); // node_modules
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn keep_build_artifacts_non_boolean_or_false_is_ignored() {
+    for body in [
+        r#"{"clean":{"keepBuildArtifacts":"true"}}"#,
+        r#"{"clean":{"keepBuildArtifacts":false}}"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_keep_config(tmp.path(), body);
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), false);
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ArtifactOutcome::Reclaimed(_))),
+            "{body}"
+        );
+        assert!(!tmp.path().join("node_modules").exists(), "{body}");
+    }
+}
+
 // --- live-binary protection (#6127) ----------------------------------
 
 /// Copy the host's `sleep` into `<dir>/<name>` and run it, so a live
@@ -2178,4 +2237,37 @@ fn quarantine_dirty_worktree_returns_none_when_nothing_to_stash() {
     init_repo_with_seed_commit(dir.path());
 
     assert_eq!(quarantine_dirty_worktree(dir.path(), "issue=1 reason=test"), None);
+}
+
+#[test]
+fn spawn_loop_revert_keeps_building_on_issue_with_open_linked_pr() {
+    // #12733: #10 has an open (parked, `loom:blocked`) PR; #11 has none.
+    let mut edited = Vec::new();
+    let reverted = revert_orphan_building_labels(
+        vec![10, 11],
+        false,
+        |n| n == 10,
+        |n| {
+            edited.push(n);
+            Ok(())
+        },
+    );
+    assert_eq!(edited, vec![11]);
+    assert_eq!(reverted, 1);
+}
+
+#[test]
+fn spawn_loop_revert_dry_run_skips_open_pr_issue_and_writes_nothing() {
+    let mut edited = Vec::new();
+    let reverted = revert_orphan_building_labels(
+        vec![10],
+        true,
+        |_| true,
+        |n| {
+            edited.push(n);
+            Ok(())
+        },
+    );
+    assert!(edited.is_empty());
+    assert_eq!(reverted, 0);
 }

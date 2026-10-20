@@ -1132,3 +1132,68 @@ fn required_only_alone_emits_no_settle_red_note() {
         "{notes:?}"
     );
 }
+
+/// #12526: Champion posts `loom/merge-authorization` only after the Judge
+/// approves, so the Judge's own CI verdict must not wait on it.
+mod authorization_context {
+    use super::verdict::{decide, Decision, Rollup};
+    use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT as AUTHZ;
+
+    fn rollup(failing: &[&str], pending: &[&str], seen: &[&str]) -> Rollup {
+        let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        Rollup {
+            total: seen.len() as u64,
+            failing: v(failing),
+            pending: v(pending),
+            seen: seen.iter().map(|s| (*s).to_string()).collect(),
+            failed_detail: Vec::new(),
+        }
+    }
+
+    fn req() -> Vec<String> {
+        vec!["CI".to_string(), AUTHZ.to_string()]
+    }
+
+    #[test]
+    fn absent_authorization_does_not_hold_green() {
+        let r = rollup(&[], &[], &["CI"]);
+        for required_only in [false, true] {
+            assert_eq!(decide(&r, Some(&req()), required_only), Decision::Green);
+        }
+    }
+
+    #[test]
+    fn pending_authorization_does_not_hold_green() {
+        let r = rollup(&[], &[AUTHZ], &["CI", AUTHZ]);
+        for required_only in [false, true] {
+            assert_eq!(decide(&r, Some(&req()), required_only), Decision::Green);
+        }
+    }
+
+    #[test]
+    fn failed_authorization_is_red_in_both_modes() {
+        let r = rollup(&[AUTHZ], &[], &["CI", AUTHZ]);
+        for required_only in [false, true] {
+            assert_eq!(
+                decide(&r, Some(&req()), required_only),
+                Decision::Red(vec![AUTHZ.to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn absent_authorization_with_pending_or_red_ci_still_gates() {
+        let pending = rollup(&[], &["CI"], &["CI"]);
+        let red = rollup(&["CI"], &[], &["CI"]);
+        for required_only in [false, true] {
+            assert_eq!(
+                decide(&pending, Some(&req()), required_only),
+                Decision::Pending(vec!["CI".to_string()])
+            );
+            assert_eq!(
+                decide(&red, Some(&req()), required_only),
+                Decision::Red(vec!["CI".to_string()])
+            );
+        }
+    }
+}

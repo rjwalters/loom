@@ -612,3 +612,128 @@ fn a_roll_that_took_is_forgotten_after_the_startup_grace() {
     guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store());
     assert_eq!(st.attempt.record(), None, "cleared after the grace");
 }
+
+/// #12420: the tick record carries the host's state and who would choose the
+/// target, read from the same facts `status` shows.
+mod host_observation {
+    use super::*;
+
+    const RUNNING: &str = env!("CARGO_PKG_VERSION");
+
+    fn artifact(version: &str, on_disk: Option<&str>) -> ArtifactResolution {
+        match newer(version, RUNNING) {
+            ArtifactResolution::Resolved(mut info) => {
+                info.on_disk_version = on_disk.map(str::to_string);
+                // Same published bytes: a same-version artifact is up to date.
+                info.installed_sha256 = info.asset_sha256.clone();
+                ArtifactResolution::Resolved(info)
+            }
+            other => other,
+        }
+    }
+
+    fn tick_record(
+        artifact: ArtifactResolution,
+        settle: Duration,
+    ) -> (TickSummary, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = ScriptedProbe::new(artifact);
+        let status = AutoUpdateStatus::new(true);
+        let tune = tuning(Duration::from_secs(900), settle);
+        let summary = guarded_tick(
+            &mut state(&dir),
+            &status,
+            &mut probe,
+            &Trigger::default(),
+            &tune,
+            &no_store(),
+        );
+        let record = tick_telemetry::record(
+            &summary,
+            0,
+            "host-a",
+            Utc::now(),
+            Duration::from_millis(5),
+            crate::telemetry::provenance::Provenance::current(),
+        );
+        (
+            summary,
+            record
+                .host_state
+                .expect("the record carries the host state"),
+            record
+                .target_source
+                .expect("the record carries the target source"),
+        )
+    }
+
+    #[test]
+    fn an_up_to_date_host_records_h0() {
+        let (_, state, source) = tick_record(artifact(RUNNING, Some(RUNNING)), NOW);
+        assert_eq!((state.as_str(), source.as_str()), ("H0", "autoUpdate"));
+    }
+
+    #[test]
+    fn a_newer_release_inside_the_settle_window_records_h1() {
+        let (_, state, source) =
+            tick_record(artifact("999.0.0", Some(RUNNING)), Duration::from_secs(600));
+        assert_eq!((state.as_str(), source.as_str()), ("H1", "autoUpdate"));
+    }
+
+    #[test]
+    fn a_staged_binary_records_h3() {
+        let (_, state, _) =
+            tick_record(artifact("999.0.0", Some("999.0.0")), Duration::from_secs(600));
+        assert_eq!(state, "H3");
+    }
+
+    #[test]
+    fn an_unreadable_on_disk_version_records_unknown() {
+        let (_, state, _) = tick_record(artifact(RUNNING, None), NOW);
+        assert_eq!(state, "unknown");
+    }
+
+    #[test]
+    fn the_tick_that_arms_a_roll_records_h4() {
+        let (summary, state, _) = tick_record(artifact("999.0.0", Some(RUNNING)), NOW);
+        assert!(summary.roll_armed);
+        assert_eq!(state, "H4");
+    }
+
+    #[test]
+    fn a_fetch_in_progress_reads_h2_and_the_tick_close_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = AutoUpdateStatus::new(true);
+        let st = state(&dir);
+        let resolved = artifact(RUNNING, Some(RUNNING));
+        status.publish(st.snapshot(true, Utc::now(), "tick".into(), &resolved));
+        assert_eq!(
+            update_observation::observe(&status.snapshot(), None, false, RUNNING)
+                .state
+                .as_str(),
+            "H0"
+        );
+        status.set_fetching();
+        assert_eq!(
+            update_observation::observe(&status.snapshot(), None, false, RUNNING)
+                .state
+                .as_str(),
+            "H2"
+        );
+        status.publish(st.snapshot(true, Utc::now(), "tick".into(), &resolved));
+        assert!(!status.snapshot().observation.fetching);
+    }
+
+    #[test]
+    fn observing_changes_no_status_the_loop_publishes() {
+        // Same tick, with and without the observation read: the note and the
+        // decision are the loop's own and are untouched by it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = ScriptedProbe::new(artifact(RUNNING, Some(RUNNING)));
+        let status = AutoUpdateStatus::new(true);
+        let summary =
+            run_tick(&mut state(&dir), &status, &mut probe, &Trigger::default(), NOW, NOW);
+        assert_eq!(summary.decision, TickDecisionKind::Skip);
+        assert!(summary.observed.is_none(), "run_tick leaves the observation to the loop");
+    }
+}

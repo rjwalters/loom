@@ -117,7 +117,10 @@ fn int(value: Option<&Value>) -> i64 {
 /// Every key either kind exports, beyond the two `log_record_for` adds.
 fn allowed(key: &str) -> bool {
     PASS_LOG_ATTRIBUTE_KEYS.contains(&key)
-        || matches!(key, "loom.repo" | "loom.role" | "loom.kind" | "loom.record_id")
+        || matches!(
+            key,
+            "loom.repo" | "loom.role" | "loom.kind" | "loom.record_id" | "loom.sweep_id"
+        )
 }
 
 #[test]
@@ -315,6 +318,7 @@ fn a_step_verdict_maps_every_step_fact() {
     r.verdict = "refused".to_string();
     r.reason = Some("ci_failing".to_string());
     r.step = StepFacts {
+        sweep_id: Some("step-champion_merge-9-1".to_string()),
         head_sha: Some("abc1234".to_string()),
         step: Some("champion_pr".to_string()),
         class: Some("refused".to_string()),
@@ -336,14 +340,17 @@ fn a_step_verdict_maps_every_step_fact() {
             complete: true,
         }),
     };
+    r.detail = Some("merge_rc7".to_string());
     let a = attrs(&log(TelemetryRecord::PassVerdict(r.clone())));
     assert!(a.keys().all(|k| allowed(k)), "{:?}", a.keys());
     for (key, want) in [
+        ("loom.pass.reason_detail", "merge_rc7"),
         ("loom.pass.verdict", "refused"),
         ("loom.pass.reason", "ci_failing"),
         ("loom.pass.head_sha", "abc1234"),
         ("loom.pass.step", "champion_pr"),
         ("loom.pass.class", "refused"),
+        ("loom.sweep_id", "step-champion_merge-9-1"),
         ("loom.pass.reason_set", "champion_merge_v1"),
         ("loom.pass.ledger_class", "failed"),
         ("loom.pass.ledger_reason", "unclassified"),

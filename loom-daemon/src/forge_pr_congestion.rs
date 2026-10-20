@@ -412,9 +412,10 @@ const MAX_LINKED: usize = 20;
 /// Run `gh api graphql` and return the response's top-level `data` object,
 /// failing closed on subprocess failure, GraphQL-level `errors`, or a
 /// missing `data`.
-fn gh_graphql_data(root: &Path, query: &str) -> Result<serde_json::Value> {
-    // #10089: counted via the facade (`congestion.graphql`); it supplies the
-    // #5401 cross-owner GH_CONFIG_DIR from `root`.
+fn gh_graphql_data(root: &Path, slug: &str, query: &str) -> Result<serde_json::Value> {
+    // #10089: counted via the facade (`congestion.graphql`). Reader-only
+    // (#12394, #12584): the query is about `slug`, which a GraphQL argv does
+    // not spell for the facade, so the reader route names it.
     let outcome = crate::gh_invocation::GhInvocation::new(
         crate::gh_invocation::Operation::new("congestion.graphql"),
         crate::gh_invocation::AccessIntent::Read,
@@ -422,6 +423,7 @@ fn gh_graphql_data(root: &Path, query: &str) -> Result<serde_json::Value> {
         FORGE_CMD_TIMEOUT,
     )
     .args(["api", "graphql", "-f", &format!("query={query}")])
+    .reader_repo(slug)
     .current_dir(root)
     .run();
     let stdout = match outcome {
@@ -469,7 +471,7 @@ labels(first: 20) {{ nodes {{ name }} }} }} }} }} \
 review: search(query: \"repo:{owner}/{repo} is:pr is:open label:{REVIEW_LABEL}\", \
 type: ISSUE, first: 1) {{ issueCount }} }}"
     );
-    let data = gh_graphql_data(root, &q)?;
+    let data = gh_graphql_data(root, &format!("{owner}/{repo}"), &q)?;
     let top: TopData = serde_json::from_value(data)
         .context("unexpected GraphQL data shape for the queue search")?;
     let approved = top
@@ -505,7 +507,7 @@ fn fetch_points(
         aliases.push((alias, *n));
     }
     let q = format!("query {{ repository(owner: \"{owner}\", name: \"{repo}\") {{{fields}}}}}");
-    let data = gh_graphql_data(root, &q)?;
+    let data = gh_graphql_data(root, &format!("{owner}/{repo}"), &q)?;
     let top: TopData = serde_json::from_value(data)
         .context("unexpected GraphQL data shape for the points lookup")?;
     let repository = top

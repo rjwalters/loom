@@ -149,7 +149,7 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `observability::read_config` feeds `observer_tasks::spawn` once at
     // bring-up (exporter wiring, `observability::spawn_task`).
     ("observability", Reloadability::RestartRequired),
-    // `ci_telemetry::spawn_task_on` resolves the config once (owners,
+    // `ci_telemetry::spawn_task` resolves the config once (owners,
     // interval, excluded repos) before the ticker is built; only the
     // captain gate inside the tick is live (see `fleet.captain`).
     ("autonomous.ciTelemetry", Reloadability::RestartRequired),
@@ -180,6 +180,10 @@ const TABLE: &[(&str, Reloadability)] = &[
     // (`health::codesign::assess_codesign_identity`, the provisioning
     // scripts); the daemon holds no copy.
     ("codesign", Reloadability::Live),
+    // Read from the workspace's effective config on every claim, every
+    // reaper heartbeat and every step tick's budget (#12450) —
+    // `fleet_dispatch::endpoint`, never cached.
+    ("fleetDispatch", Reloadability::Live),
     // No `loom-daemon` process reads it: ratification keys are consumed by
     // the branch-update/sign-off scripts, fresh on each invocation.
     ("ratification", Reloadability::Live),
@@ -225,6 +229,12 @@ pub fn partition(paths: &[String]) -> (Vec<String>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_dispatch_flag_and_url_are_live() {
+        assert_eq!(classify("fleetDispatch.enabled"), Reloadability::Live);
+        assert_eq!(classify("fleetDispatch.url"), Reloadability::Live);
+    }
 
     #[test]
     fn role_runner_subtree_is_live() {

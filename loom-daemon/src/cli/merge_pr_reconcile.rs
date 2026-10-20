@@ -168,7 +168,16 @@ impl ReconcileChildArgs {
         // shell passes `${child_issue:+--child-issue "$child_issue"}`, but a
         // hand invocation may well pass `--child-issue ""`.
         let issue = self.child_issue.filter(|s| !s.is_empty());
-        let decision = child_route(issue.as_deref(), &labels);
+        let mut decision = child_route(issue.as_deref(), &labels);
+        // AC7 (#12759): `loom:building` alone defers every Loom-built child
+        // forever; only a live lease means a Builder is on the branch.
+        if decision.route == loom_daemon::merge_pr::reconcile::Route::Defer {
+            if let Some(n) = issue.as_deref().and_then(|i| i.parse::<u32>().ok()) {
+                let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let state = loom_daemon::merge_pr::reconcile::read_lease_state(&root, n);
+                decision = loom_daemon::merge_pr::reconcile::route_with_lease(decision, &state);
+            }
+        }
         let mut out = std::io::stdout().lock();
         writeln!(out, "LOOM-RECONCILE-CHILD {}", decision.route.token())?;
         if decision.route == loom_daemon::merge_pr::reconcile::Route::Defer {

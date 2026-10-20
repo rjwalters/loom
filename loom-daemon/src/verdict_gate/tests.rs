@@ -34,6 +34,8 @@ fn input<'a>(
         overrule,
         now: now(),
         window_secs: DEFAULT_WINDOW_SECS,
+        review_started: None,
+        issues: None,
     }
 }
 
@@ -302,4 +304,137 @@ fn a_posted_verdict_missing_from_the_reread_is_unread_and_a_deduped_caller_is_st
         Reconciled::Unread
     );
     assert_eq!(reconcile(VerdictKind::Approved, HEAD, 0, 0, "", Some(&cs)), Reconciled::Stable);
+}
+
+// --- #12614: approvals against a stale read of the spec ---------------------
+
+const STARTED: &str = "2026-10-06T13:00:00Z";
+
+fn started() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(STARTED)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn human(id: u64, at: &str) -> Value {
+    json!({"id": id, "body": "rescoped, review against the new body", "created_at": at,
+           "html_url": format!("https://example/c/{id}"),
+           "user": {"login": "operator", "type": "User"}, "author_association": "OWNER"})
+}
+
+fn issue(number: u64, reviewed: &str, now_body: &str, comments: Vec<Value>) -> IssueSnapshot {
+    IssueSnapshot {
+        number,
+        expected_body_sha: Some(body_sha(reviewed)),
+        body: Some(now_body.to_string()),
+        comments: Some(comments),
+    }
+}
+
+fn gate(
+    verdict: VerdictKind,
+    pr_comments: &[Value],
+    started_at: Option<DateTime<Utc>>,
+    issues: Option<&[IssueSnapshot]>,
+) -> Decision {
+    let l = labels(&[]);
+    let mut i = input(verdict, Some(pr_comments), Some(&l), "");
+    i.review_started = started_at;
+    i.issues = issues;
+    decide(&i)
+}
+
+#[test]
+fn human_pr_comment_after_review_start_refuses_and_names_it() {
+    let c = [human(77, "2026-10-06T13:05:00Z")];
+    let d = gate(VerdictKind::Approved, &c, Some(started()), Some(&[]));
+    assert!(
+        matches!(&d, Decision::Refuse(m) if m.contains("comment 77") && m.contains("operator")
+            && m.contains("2026-10-06T13:05:00")),
+        "{d:?}"
+    );
+    assert_eq!(d.render().1, EXIT_REFUSE);
+}
+
+#[test]
+fn human_pr_comment_before_review_start_proceeds() {
+    let c = [human(77, "2026-10-06T12:59:59Z")];
+    let d = gate(VerdictKind::Approved, &c, Some(started()), Some(&[]));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+}
+
+#[test]
+fn bot_and_loom_marker_comments_after_start_do_not_refuse() {
+    let bot = json!({"id": 1, "body": "Judge note", "created_at": "2026-10-06T13:05:00Z",
+        "user": {"login": "loom-fleet-dispatch[bot]", "type": "Bot"},
+        "author_association": "NONE"});
+    // A marker comment posted through a human token is still fleet traffic.
+    let lease = json!({"id": 2, "body": "<!-- loom:lease host=h sweep=s -->\nlease",
+        "created_at": "2026-10-06T13:06:00Z",
+        "user": {"login": "operator", "type": "User"}, "author_association": "OWNER"});
+    let c = [bot, lease];
+    let d = gate(VerdictKind::Approved, &c, Some(started()), Some(&[]));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+}
+
+#[test]
+fn linked_issue_body_change_refuses_and_names_the_issue() {
+    let iss = [issue(12509, "old design", "new daemon-only design", vec![])];
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(
+        matches!(&d, Decision::Refuse(m) if m.contains("issue #12509's body changed")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn unchanged_issue_body_proceeds() {
+    let iss = [issue(12509, "same\n", "same", vec![])];
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+}
+
+#[test]
+fn human_issue_comment_after_start_refuses() {
+    let iss = [issue(9, "b", "b", vec![human(5, "2026-10-06T13:30:00Z")])];
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(
+        matches!(&d, Decision::Refuse(m) if m.contains("issue #9") && m.contains("comment 5")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn unread_linked_issue_fails_closed_on_approval() {
+    let unread = [IssueSnapshot {
+        number: 3,
+        expected_body_sha: None,
+        body: None,
+        comments: None,
+    }];
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&unread));
+    assert!(matches!(&d, Decision::Refuse(m) if m.contains("issue #3")), "{d:?}");
+    let d = gate(VerdictKind::Approved, &[], Some(started()), None);
+    assert!(matches!(d, Decision::Refuse(_)), "undetermined issues never pass");
+}
+
+#[test]
+fn changes_requested_is_never_refused_by_the_stale_read_check() {
+    let c = [human(77, "2026-10-06T13:05:00Z")];
+    let iss = [issue(1, "old", "new", vec![])];
+    let d = gate(VerdictKind::ChangesRequested, &c, Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+}
+
+#[test]
+fn without_review_started_behaviour_is_unchanged() {
+    let c = [human(77, "2026-10-06T13:05:00Z")];
+    let d = gate(VerdictKind::Approved, &c, None, None);
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+}
+
+#[test]
+fn closing_issues_parses_keywords() {
+    assert_eq!(closing_issues("Closes #12\nfixes: #3, Resolved #12, part of #99"), vec![3, 12]);
+    assert!(closing_issues("Part of #5").is_empty());
 }

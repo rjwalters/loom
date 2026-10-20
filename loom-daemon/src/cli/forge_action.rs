@@ -31,6 +31,92 @@ pub(crate) struct PriorityLabelsCli {
     audit_pr: Option<String>,
 }
 
+/// `forge create-issue` flags (a separate `Args` struct, see `PriorityLabelsCli`).
+#[derive(Args, Debug)]
+pub(crate) struct CreateIssueCli {
+    #[arg(long, short = 't')]
+    title: String,
+    /// Issue body as literal text.
+    #[arg(long, short = 'b', conflicts_with = "body_file")]
+    body: Option<String>,
+    /// Read the body from PATH (`-` = stdin).
+    #[arg(long, short = 'F', value_name = "PATH")]
+    body_file: Option<PathBuf>,
+    /// Label (repeatable; comma lists accepted). `loom:issue` / `loom:curated`
+    /// are refused; with no `loom:` label, `loom:triage` is added.
+    #[arg(long = "label", short = 'l', value_name = "LABEL")]
+    labels: Vec<String>,
+    /// Target `owner/repo` (default: the checkout's origin).
+    #[arg(long, short = 'R', value_name = "OWNER/REPO")]
+    repo: Option<String>,
+    /// Machine-readable result and errors on stdout.
+    #[arg(long)]
+    json: bool,
+}
+
+fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
+    use loom_daemon::forge_create_issue::{create, CreateError, RealGh, Request};
+    let fail = |e: &CreateError, json: bool| -> ! {
+        if json {
+            println!("{}", e.to_json());
+        } else {
+            eprintln!("loom-daemon forge create-issue: {}: {}", e.kind(), e.message());
+        }
+        std::process::exit(e.exit_code());
+    };
+    let usage = |msg: String| -> ! {
+        if a.json {
+            println!(
+                "{}",
+                serde_json::json!({"error": "invalid_args", "message": msg, "may_exist": false})
+            );
+        } else {
+            eprintln!("loom-daemon forge create-issue: {msg}");
+        }
+        std::process::exit(2);
+    };
+    // Label guard first: a refusal makes no forge call, not even a probe.
+    if let Err(e) = loom_daemon::forge_create_issue::normalize_labels(&a.labels) {
+        fail(&e, a.json);
+    }
+    let body = match (&a.body, &a.body_file) {
+        (Some(b), _) => b.clone(),
+        (None, Some(p)) if p.as_os_str() == "-" => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+            s
+        }
+        (None, Some(p)) => std::fs::read_to_string(p)
+            .unwrap_or_else(|e| usage(format!("cannot read --body-file {}: {e}", p.display()))),
+        (None, None) => String::new(),
+    };
+    if a.title.trim().is_empty() {
+        usage("--title must not be empty".into());
+    }
+    // #9548: Loom writes only to repos it manages; the verdict names the repo.
+    let cwd = std::env::current_dir()?;
+    let repo = match loom_daemon::write_scope::may_write_from(&cwd, a.repo.as_deref()) {
+        loom_daemon::write_scope::Verdict::Allow(nwo) => nwo,
+        loom_daemon::write_scope::Verdict::Deny(why) => {
+            fail(&CreateError::RestFailed(format!("refusing the write (#9548): {why}")), a.json)
+        }
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(60))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let req = Request {
+        repo,
+        title: a.title.clone(),
+        body,
+        labels: a.labels.clone(),
+    };
+    match create(&RealGh, &req, &since) {
+        Ok(c) if a.json => println!("{}", serde_json::json!({"number": c.number, "url": c.url})),
+        Ok(c) => println!("{}", c.url),
+        Err(e) => fail(&e, a.json),
+    }
+    Ok(())
+}
+
 /// Sub-actions for `loom-daemon forge`.
 ///
 /// The `issue`/`pr`/`auth` variants capture their trailing args verbatim and
@@ -45,7 +131,7 @@ pub(crate) enum ForgeAction {
     /// GraphQL-backed and has **no REST fallback** — it dies on GraphQL-quota
     /// exhaustion exactly like `gh issue create`, and is not an escape hatch
     /// from it (#5047). To file an issue that survives an exhausted GraphQL
-    /// pool, use `.loom/scripts/create-issue.sh`.
+    /// pool, use `.loom/scripts/create-issue.sh` (or `forge create-issue`).
     Issue {
         #[arg(
             trailing_var_arg = true,
@@ -598,6 +684,22 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge promotion-author --number N [--repo R]` (#10827) — the author gate
+    /// on automatic promotion to `loom:issue`. Line 1 of stdout is `TRUSTED`,
+    /// `UNTRUSTED <login>` or `UNKNOWN <reason>` (the issue author judged by the
+    /// comment-trust predicate); for the last two the rest is the one-time
+    /// explanatory comment, marker first. Only `TRUSTED` permits promotion;
+    /// exits 0 whenever it decided and 1 when the issue could not be read
+    /// (still printing `UNKNOWN`), so a failed read is never an all-clear.
+    #[command(name = "promotion-author")]
+    PromotionAuthor {
+        #[arg(long, value_name = "N")]
+        number: u64,
+        /// `owner/name` (default: the cwd's repo).
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
+
     /// `forge claim-liveness --number N --label L --claimed-at TS` (#10235) —
     /// print the newest liveness evidence the claim reconciler honors beyond the
     /// claim-activity marker (trusted Judge-progress comment for
@@ -679,6 +781,16 @@ pub(crate) enum ForgeAction {
         /// How recent a same-verdict marker must be to dedupe against.
         #[arg(long, default_value_t = loom_daemon::verdict_gate::DEFAULT_WINDOW_SECS)]
         window_secs: i64,
+        /// RFC 3339 time the Judge began this review (#12614). With it, an
+        /// approval is refused when a trusted human comment on the PR or a
+        /// linked issue is newer, or a linked issue body no longer matches
+        /// `--issue-body-sha`. Absent: unchanged behaviour, with a warning.
+        #[arg(long)]
+        review_started: Option<String>,
+        /// `N=HASH` (repeatable): issue N's body as the Judge reviewed it,
+        /// sha256 of the body without trailing newlines (#12614).
+        #[arg(long = "issue-body-sha")]
+        issue_body_sha: Vec<String>,
     },
 
     /// `forge verdict-labels <pr> --repo R --verdict V` (#10581) — apply the
@@ -823,6 +935,15 @@ pub(crate) enum ForgeAction {
         patch_created: Option<String>,
     },
 
+    /// `forge create-issue --title T (--body B | --body-file P|-) [--label L]...
+    /// [--repo NWO] [--json]` (#12504): file an issue, surviving GraphQL
+    /// exhaustion (REST fallback, labels atomic). Prints the URL, or
+    /// `{"number","url"}` with `--json`. Every failure exits non-zero (2 =
+    /// refused label / bad args, 1 = creation failed) and, with `--json`,
+    /// prints `{"error","message","may_exist"}` on stdout.
+    #[command(name = "create-issue")]
+    CreateIssue(CreateIssueCli),
+
     /// `forge parent body|link` (#10012 §4) — the logic behind
     /// `create-issue.sh --parent N`: the `loom:parent` marker, the parent's
     /// red-main marker, the native sub-issue link.
@@ -882,6 +1003,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action.0),
+        ForgeAction::CreateIssue(a) => return handle_create_issue(a),
         ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
@@ -938,6 +1060,9 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
+        ForgeAction::PromotionAuthor { number, repo } => {
+            return super::forge_identity_cmd::promotion_author(number, repo.as_deref());
+        }
         ForgeAction::VerdictBodyCheck => return super::forge_verdict_cmd::verdict_body_check(),
         ForgeAction::VerdictGate {
             pr,
@@ -946,6 +1071,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             sha,
             overrules_prior,
             window_secs,
+            review_started,
+            issue_body_sha,
         } => {
             return super::forge_verdict_cmd::verdict_gate(
                 pr,
@@ -954,6 +1081,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &sha,
                 &overrules_prior,
                 window_secs,
+                review_started.as_deref(),
+                &issue_body_sha,
             );
         }
         ForgeAction::VerdictLock { action, pr, repo } => {
@@ -1328,6 +1457,8 @@ mod write_target_tests {
             sha: "a".repeat(40),
             overrules_prior: String::new(),
             window_secs: 600,
+            review_started: None,
+            issue_body_sha: Vec::new(),
         };
         assert_eq!(write_target(&gate), None);
     }

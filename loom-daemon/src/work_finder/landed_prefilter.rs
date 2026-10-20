@@ -415,16 +415,24 @@ const TRIAGE_LABEL: &str = crate::intake_reconcile::TRIAGE_LABEL;
 
 /// Route issue `issue`, landed by `pr`, to Curator keep-or-close.
 pub fn route_to_curator<F: LandedForge + ?Sized>(forge: &mut F, issue: u32, pr: u32) -> Route {
-    match forge.route_marked(issue, pr) {
-        Ok(true) => return Route::Kept,
-        Ok(false) => {}
+    let marked = match forge.route_marked(issue, pr) {
+        Ok(marked) => marked,
         Err(_) => return Route::Unrouted("comment read failed"),
-    }
+    };
     let labels = match forge.labels(issue) {
         Ok(Some(labels)) => labels,
         Ok(None) => return Route::Unrouted("not an open issue"),
         Err(_) => return Route::Unrouted("label read failed"),
     };
+    if marked {
+        // The marker is this router's own record, not a Curator decision
+        // (#12713): kept only once Curator took `loom:triage` off.
+        return if labels.iter().any(|l| l == TRIAGE_LABEL) {
+            Route::Unrouted("routed, awaiting Curator")
+        } else {
+            Route::Kept
+        };
+    }
     if !labels.iter().any(|l| l == ISSUE_LABEL) {
         return Route::Unrouted("no loom:issue label");
     }
@@ -543,6 +551,16 @@ impl LandedCache {
     }
 }
 
+/// Whether `issue` still carries `loom:triage`, the router's own label that
+/// only a Curator action removes (#12713). An unreadable answer is "yes".
+fn awaiting_curator<F: LandedForge + ?Sized>(forge: &mut F, issue: u32) -> bool {
+    match forge.labels(issue) {
+        Ok(Some(labels)) => labels.iter().any(|l| l == TRIAGE_LABEL),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 /// Ask about `ask` and record each answer, routing every new landing to
 /// Curator. Returns the issues the forge answered for.
 fn settle<F: LandedForge + ?Sized>(
@@ -565,7 +583,15 @@ fn settle<F: LandedForge + ?Sized>(
         answered.push(issue);
         let verdict = match verdict {
             None => Verdict::NotLanded,
-            Some(pr) if cache.handed.get(&issue) == Some(&pr) => Verdict::Kept(pr),
+            // Handed to Curator already: kept only once Curator took
+            // `loom:triage` off; until then still landed (#12713).
+            Some(pr) if cache.handed.get(&issue) == Some(&pr) => {
+                if awaiting_curator(forge, issue) {
+                    Verdict::Landed(pr)
+                } else {
+                    Verdict::Kept(pr)
+                }
+            }
             Some(pr) => {
                 fresh.push((issue, pr));
                 Verdict::Landed(pr)

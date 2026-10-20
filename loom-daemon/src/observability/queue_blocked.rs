@@ -128,7 +128,7 @@ pub fn append(record: &mut QueueSnapshotRecord, rows: Vec<QueueSnapshotRow>) {
 }
 
 /// Where one workspace's blocked listing comes from.
-enum Rows {
+pub(super) enum Rows {
     /// The tick's snapshot (mirror mode, #12307); nothing is listed.
     Snapshot(Vec<RestIssue>),
     /// Mirror mode, and the snapshot has not read the repo: no rows, like a
@@ -138,7 +138,7 @@ enum Rows {
     List,
 }
 
-fn snapshot_rows(root: &Path) -> Rows {
+pub(super) fn snapshot_rows(root: &Path) -> Rows {
     use crate::discovery::published::{lookup, Lookup};
     match lookup(root) {
         Lookup::Repo(repo) => Rows::Snapshot(repo.rows.clone()),

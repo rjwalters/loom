@@ -197,6 +197,7 @@ mod tests {
             docker_desktop: false,
             repository: "https://example.invalid/repo".into(),
             base: "main".into(),
+            repositories: vec![],
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
@@ -210,6 +211,7 @@ mod tests {
             base_revision: String::new(),
             host_pid: 1,
             control: "b".repeat(64),
+            repository: String::new(),
         };
         let env = child_env(
             &[

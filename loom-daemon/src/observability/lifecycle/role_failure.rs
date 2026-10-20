@@ -38,6 +38,11 @@ pub const UNCLASSIFIED: &str = "unclassified:after-launch";
 /// The fallback class for a tick that failed before its launch with no site
 /// having noted why (#12028).
 pub const UNCLASSIFIED_PRE_LAUNCH: &str = "unclassified:pre-launch";
+/// The class of a launched tick the version roll stopped (#12481). It is an
+/// interruption, not a failure to launch, so it never rides the span (which
+/// closes `interrupted`); it only keeps `role_tick.outcome` from exporting
+/// [`UNCLASSIFIED_PRE_LAUNCH`] for a tick that did launch.
+pub const ROLL_INTERRUPTED: &str = "roll-interrupted";
 /// The fallback class for a failed step-engine step, which has no role-runner
 /// launch site to note one (#12028).
 pub const UNCLASSIFIED_STEP: &str = "unclassified:step";
@@ -150,6 +155,20 @@ pub fn for_outcome(outcome: &RoleTickOutcome, noted: Option<RoleFailure>) -> Opt
     }
 }
 
+/// The failure a tick the version roll stopped reports for `role_tick.outcome`
+/// (#12481): [`ROLL_INTERRUPTED`] for a `Failure` (whatever class a site noted
+/// is a consequence of the stop), `None` for every other outcome.
+#[must_use]
+pub fn for_roll_stopped(outcome: &RoleTickOutcome) -> Option<RoleFailure> {
+    matches!(outcome, RoleTickOutcome::Failure(_)).then(|| {
+        RoleFailure::new(
+            ROLL_INTERRUPTED,
+            None,
+            "role tick was stopped by a version roll; not a launch failure",
+        )
+    })
+}
+
 /// The tick that failed before its launch, for `role_tick.outcome` (#12028):
 /// the noted class for a `Failure`, else the [`UNCLASSIFIED_PRE_LAUNCH`]
 /// fallback; `None` for every other outcome.
@@ -231,6 +250,70 @@ pub mod pre_launch {
     /// Note `site` as the cause of the in-flight tick's failure.
     pub fn note(site: PreLaunch) {
         note_role_failure(RoleFailure::new(site.class, None, site.message));
+    }
+}
+
+/// The fixed classes of a failed step-engine step, one per failing branch of
+/// `step_spawn::capture::tick_outcome` (#12480). Each pairs a closed-vocabulary
+/// class with a fixed message, so neither the free-form failure text nor the
+/// exit code can reach the class.
+pub mod step {
+    use super::RoleFailure;
+
+    /// One failed-step branch's class and fixed message.
+    #[derive(Debug, Clone, Copy)]
+    pub struct StepSite {
+        pub class: &'static str,
+        pub message: &'static str,
+    }
+
+    pub const TIMED_OUT: StepSite = StepSite {
+        class: "step-timed-out",
+        message: "step killed at its role timeout",
+    };
+    pub const CANCELLED: StepSite = StepSite {
+        class: "step-cancelled",
+        message: "step cancelled by an operator or a roll",
+    };
+    pub const OUTCOME_FAILED: StepSite = StepSite {
+        class: "step-outcome-failed",
+        message: "step session reported a failed outcome",
+    };
+    pub const EXIT_NONZERO: StepSite = StepSite {
+        class: "step-exit-nonzero",
+        message: "step exited with a non-zero status",
+    };
+    pub const STATUS_UNKNOWN: StepSite = StepSite {
+        class: "step-status-unknown",
+        message: "step exited with no status and no outcome line",
+    };
+
+    pub const NO_PR: StepSite = StepSite {
+        class: "step-no-pr",
+        message: "builder step exited cleanly but opened no PR",
+    };
+    pub const NO_OUTCOME_LINE: StepSite = StepSite {
+        class: "step-no-outcome-line",
+        message: "step exited cleanly but wrote no outcome line",
+    };
+
+    /// Every step class, for the contract tests.
+    pub const ALL: &[StepSite] = &[
+        TIMED_OUT,
+        CANCELLED,
+        OUTCOME_FAILED,
+        EXIT_NONZERO,
+        STATUS_UNKNOWN,
+        NO_PR,
+        NO_OUTCOME_LINE,
+    ];
+
+    impl StepSite {
+        /// The failure this site reports, with the exit code when it has one.
+        #[must_use]
+        pub fn failure(self, exit_code: Option<i32>) -> RoleFailure {
+            RoleFailure::new(self.class, exit_code, self.message)
+        }
     }
 }
 

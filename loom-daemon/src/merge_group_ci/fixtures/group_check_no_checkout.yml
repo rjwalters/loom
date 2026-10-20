@@ -1,0 +1,21 @@
+# Fixture: a merge-group status workflow that runs `group-check` on a bare
+# runner. write_scope refuses the status write without a `.loom/` checkout.
+name: Merge-queue group check
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  statuses: write
+  contents: read
+
+jobs:
+  group-check:
+    name: Merge authorization
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check merge-group authorization
+        run: |
+          "$RUNNER_TEMP/loom-daemon" forge merge-queue group-check \
+            --commit "${{ github.event.merge_group.head_sha }}" --repo "$GH_REPO"

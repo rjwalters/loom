@@ -218,9 +218,11 @@ fn repo_slug(cwd: &Path) -> Option<String> {
 /// Run the one search request for `path`, recorded under the inventoried
 /// `issue.search` operation.
 ///
-/// Pinned to the writer credential: the facade's reader-then-writer shape
-/// would answer a refused reader with a second search on the writer, and the
-/// contract here is one request.
+/// Reader-only (#12394, #12584): the query is scoped to `slug`
+/// (`repo:<slug>`), so a reader for that repo serves it; the search argv
+/// names no repository the facade could derive, so the route is named
+/// explicitly. With no reader to serve it the search is shed (no request),
+/// never retried on the writer: the contract here is still one request.
 fn run_search(cwd: &Path, slug: &str, path: &str) -> Result<String, String> {
     use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     let outcome = GhInvocation::new(
@@ -231,7 +233,7 @@ fn run_search(cwd: &Path, slug: &str, path: &str) -> Result<String, String> {
     )
     .forge_op(loom_daemon::forge_call_stats::ops::ISSUE_SEARCH)
     .identity_scope(None, Some(slug))
-    .writer_identity()
+    .reader_repo(slug)
     .current_dir(cwd)
     .args(["api", path])
     .run();

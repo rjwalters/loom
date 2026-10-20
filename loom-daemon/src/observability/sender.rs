@@ -151,6 +151,9 @@ pub async fn try_flush<E: Exporter>(
         );
     }
     status.record_signals(&outcome.signals);
+    if outcome.retired {
+        status.record_retired();
+    }
     if outcome.exported > 0 {
         status.record_success(outcome.exported);
         // Per-kind liveness (#12120): the acked prefix is what landed.

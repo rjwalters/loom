@@ -472,6 +472,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         is_pull_request: is_pr,
         open_sub_issues: None,
         labels_at: None,
+        draft: false,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(

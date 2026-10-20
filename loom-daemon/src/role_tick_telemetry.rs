@@ -171,10 +171,12 @@ impl ResolvedLaunch {
     }
 
     /// Record the prompt tree of `root` (#11989): a role session's
-    /// `/loom:<role>` prompt is read from that checkout's working tree.
+    /// `/loom:<role>` prompt is read from that checkout's working tree. The
+    /// remote facts come from the tip the daemon last heard (#12509), never
+    /// from a remote question.
     #[must_use]
     pub fn with_prompt_tree(mut self, root: &Path) -> Self {
-        self.prompt = prompt_tree::read(root);
+        self.prompt = prompt_tree::remote::read_with_heard(root);
         self
     }
 
@@ -309,13 +311,15 @@ pub fn emit_for_tick_correlated(
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
 /// record marked `source = "step"` with the step's sweep id, so it is never
-/// counted as a role-runner tick.
+/// counted as a role-runner tick. `failure` is the class the step's end
+/// derived (#12480); `None` on a failure falls back to `unclassified:step`.
 pub fn emit_for_step(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
+    failure: Option<crate::observability::lifecycle::RoleFailure>,
     sweep_id: &str,
 ) {
     emit_tick(
@@ -325,7 +329,7 @@ pub fn emit_for_step(
         outcome,
         resolved,
         None,
-        None,
+        failure,
         Some(sweep_id.to_string()),
     );
 }
@@ -872,13 +876,7 @@ fn emit_correlated(
         TelemetryRecord::RoleTickOutcome(record),
     );
     envelope.trace_context = trace.as_ref().map(|t| t.context.clone());
-    // #11348: shadow into the J2 `role_tick` stream only after this succeeds.
-    if let Err(e) = crate::telemetry::journal_shadow::after_legacy(
-        &tick.root,
-        crate::telemetry::journal_shadow::TelemetryStream::RoleTick,
-        || crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope),
-        |()| crate::telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
-    ) {
+    if let Err(e) = crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope) {
         log::warn!(
             "role_tick_telemetry: failed to append {} tick record for {} at {}: {e} — \
              best-effort, never fatal to the tick (#8056)",
@@ -995,17 +993,6 @@ pub fn result_label(result: RoleTickResult) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into())
-}
-
-/// [`RoleTickResult::spawned`] read back off a [`result_label`] string, for
-/// the emit sites that carry the label rather than the enum (the story copies,
-/// #9168). `None` for a label no [`RoleTickResult`] round-trips from — an
-/// unparseable label is "undetermined", never a guessed `false` (#9420).
-#[must_use]
-pub fn label_spawned(label: &str) -> Option<bool> {
-    serde_json::from_value::<RoleTickResult>(serde_json::Value::String(label.to_owned()))
-        .ok()
-        .map(RoleTickResult::spawned)
 }
 
 pub mod deferred;

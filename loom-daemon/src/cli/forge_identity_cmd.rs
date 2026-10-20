@@ -112,7 +112,8 @@ pub(crate) fn token(repo: &str, access: &str, force: bool) -> Result<()> {
             None => fallback_reason = Some("no reader configured".to_string()),
         }
     }
-    let Some(writer) = roster.writer.as_ref() else {
+    let owner = repo.split_once('/').map_or(repo, |(o, _)| o);
+    let Some(writer) = forge_identity::writer_for_owner(&roster, owner) else {
         println!("{}", json!({"status": "not_configured", "access": access}));
         return Ok(());
     };
@@ -191,6 +192,15 @@ pub(crate) fn identities(as_json: bool) -> Result<()> {
     );
     if roster.readers.is_empty() {
         println!("readers: <none: reads use the writer>");
+    }
+    for w in &roster.writers {
+        println!(
+            "writer:  {} for owners {}",
+            show(w),
+            w.owners
+                .as_ref()
+                .map_or_else(|| "<none>".into(), |o| o.join(", "))
+        );
     }
     for r in &roster.readers {
         println!("reader:  {}", show(r));
@@ -346,6 +356,32 @@ pub(crate) fn may_write(repo: Option<String>) -> Result<()> {
             std::process::exit(1)
         }
     }
+}
+
+/// `forge promotion-author --number N [--repo R]` (#10827): the author gate on
+/// automatic promotion — see [`loom_daemon::promotion_author`]. Prints the
+/// verdict token, then the one-time notice body when the issue is held. Exits 1
+/// when the issue could not be read, so a caller cannot take silence for trust.
+pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
+    use loom_daemon::promotion_author::{classify, notice_body};
+    let root = workspace();
+    let repo = repo.unwrap_or("{owner}/{repo}");
+    let issue = loom_daemon::comment_trust::records::fetch_issue_object(
+        repo,
+        &number.to_string(),
+        &root,
+        false,
+    );
+    let gate = classify(&loom_daemon::comment_trust::TrustPolicy::for_root(&root), issue.as_ref());
+    println!("{}", gate.token());
+    let body = notice_body(&gate);
+    if !body.is_empty() {
+        print!("{body}");
+    }
+    if issue.is_none() {
+        std::process::exit(1)
+    }
+    Ok(())
 }
 
 #[cfg(test)]
