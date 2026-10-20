@@ -186,6 +186,8 @@ pub mod dispatch_tap;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
 pub mod eager_reclaim;
+#[cfg(test)]
+pub(crate) mod env_test_support;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
