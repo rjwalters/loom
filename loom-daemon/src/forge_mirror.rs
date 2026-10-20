@@ -439,6 +439,41 @@ pub enum PassOutcome {
 /// the key.
 pub type KeyReader<'a> = dyn Fn(&KeyRef, &AwsAccess<'_>) -> Result<String, String> + 'a;
 
+/// Read `cfg`'s key through `read_key`, resolving the AWS region it needs.
+fn read_cfg_key(cfg: &MirrorConfig, read_key: &KeyReader<'_>) -> Result<String, String> {
+    let region = match &cfg.key_ref {
+        KeyRef::Ssm(_) => crate::aws_ssm::resolve_region(cfg.region.as_deref(), &|k| {
+            std::env::var(k).ok().filter(|v| !v.is_empty())
+        }),
+        KeyRef::File(_) => None,
+    };
+    let aws = AwsAccess {
+        region: region.as_deref(),
+        profile: &cfg.aws_profile,
+    };
+    read_key(&cfg.key_ref, &aws)
+}
+
+/// The mirror `effective` configures, with its key read, apart from the
+/// process-global [`active`] (a caller that runs its own feed, e.g. the
+/// fleet-dispatch captain). `Ok(None)` while `forge.mirror` is unset or
+/// unusable; `Err` names why the key could not be read (never the key).
+///
+/// # Errors
+///
+/// The key reader's reason.
+pub fn build_active(effective: &Value, read_key: &KeyReader<'_>) -> Result<Option<Active>, String> {
+    let (cfg, warnings) = parse(effective);
+    for w in warnings {
+        log::warn!("forge_mirror: {w} — 2am#4367");
+    }
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let key = read_cfg_key(&cfg, read_key)?;
+    Ok(Some(Active::new(&cfg, key)))
+}
+
 /// The refresh loop's memory between passes.
 #[derive(Debug, Default)]
 pub struct Refresher {
@@ -514,17 +549,7 @@ impl Refresher {
                 return PassOutcome::Unchanged;
             }
         }
-        let region = match &cfg.key_ref {
-            KeyRef::Ssm(_) => crate::aws_ssm::resolve_region(cfg.region.as_deref(), &|k| {
-                std::env::var(k).ok().filter(|v| !v.is_empty())
-            }),
-            KeyRef::File(_) => None,
-        };
-        let aws = AwsAccess {
-            region: region.as_deref(),
-            profile: &cfg.aws_profile,
-        };
-        match read_key(&cfg.key_ref, &aws) {
+        match read_cfg_key(&cfg, read_key) {
             Ok(key) => {
                 if self.fingerprint.as_deref() != Some(fp.as_str()) {
                     log::info!(

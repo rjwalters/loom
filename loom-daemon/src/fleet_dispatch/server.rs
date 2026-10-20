@@ -793,6 +793,67 @@ pub fn spawn_queue_feed<I: Identity>(
     })
 }
 
+/// The effective-config key for the queue's full-refresh period (§13.4).
+pub const QUEUE_REFRESH_KEY: &str = "fleetDispatch.queueRefreshSecs";
+
+/// The queue's full-refresh period from `effective`, and a warning when the
+/// value is unusable. Absent is the default silently; a non-integer or `0`
+/// falls back to the default with the warning. Pure.
+#[must_use]
+pub fn queue_refresh_in(effective: &serde_json::Value) -> (Duration, Option<String>) {
+    let default = Duration::from_secs(DEFAULT_REFRESH_SECS);
+    let Some(raw) = crate::config_resolver::get_path(effective, QUEUE_REFRESH_KEY) else {
+        return (default, None);
+    };
+    match raw.as_u64().filter(|secs| *secs > 0) {
+        Some(secs) => (Duration::from_secs(secs), None),
+        None => (
+            default,
+            Some(format!(
+                "{QUEUE_REFRESH_KEY} = {raw} must be a positive whole number of seconds; \
+                 using {DEFAULT_REFRESH_SECS}"
+            )),
+        ),
+    }
+}
+
+/// Start the captain's queue from `effective`: apply
+/// `fleetDispatch.queueRefreshSecs`, build the mirror from `forge.mirror`
+/// (key read through `read_key`) and spawn [`spawn_queue_feed`]. The caller
+/// owns the handle for the process lifetime. An unset or unusable mirror
+/// logs a warning and leaves the queue off; it is never a startup failure.
+pub fn start_queue_feed<I: Identity>(
+    server: &Arc<Server<I>>,
+    effective: &serde_json::Value,
+    read_key: &crate::forge_mirror::KeyReader<'_>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (refresh, warning) = queue_refresh_in(effective);
+    if let Some(warning) = warning {
+        log::warn!("fleet-dispatch: {warning}");
+    }
+    server.set_queue_refresh(refresh);
+    let active = match crate::forge_mirror::build_active(effective, read_key) {
+        Ok(Some(active)) => active,
+        Ok(None) => {
+            log::warn!("fleet-dispatch: forge.mirror is unset; the fleet queue stays empty");
+            return None;
+        }
+        Err(e) => {
+            log::warn!("fleet-dispatch: the mirror key could not be read ({e}); the fleet queue stays empty");
+            return None;
+        }
+    };
+    let http = match crate::forge_mirror::client::build_http() {
+        Ok(http) => http,
+        Err(e) => {
+            log::warn!("fleet-dispatch: no mirror HTTP client ({e}); the fleet queue stays empty");
+            return None;
+        }
+    };
+    let origin = active.base_url.clone();
+    Some(spawn_queue_feed(Arc::clone(server), active, http, origin))
+}
+
 /// Spawn the expiry/counter sweep and the roster reload.
 pub fn spawn_maintenance<I: Identity>(
     server: Arc<Server<I>>,
