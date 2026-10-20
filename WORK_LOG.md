@@ -16,10 +16,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-20
 
+- **PR #12931**: feat(fleet-dispatch): captain next endpoint and capacity-driven request backoff
+- **PR #12929**: build(deps): bump hono from 4.13.7 to 4.13.13 in /mcp-loom
+- **PR #12928**: feat: add fleet-config apply-floor for daemon-less hosts below the fleet floor
 - **PR #12923**: fix: emit every eligibility/disposition row and document rank as comparator order
 - **PR #12922**: feat: emit hold-age gauges from the discovery snapshot
 - **PR #12917**: ci: run macOS shell legs on Homebrew bash 5, document bash >= 4 floor
 - **PR #12859**: refactor: dedupe worktree_cli git_ok/git_stdout helpers onto wip.rs
+- **Issue #12926** (closed): Attended (no-daemon) hosts never converge the loom-daemon CLI to the fleet floor
+- **Issue #12198** (closed): ci-daily: macOS shell flake leg never completes green — decide fix, advisory or remove
 - **Issue #12920** (closed): telemetry: remove the 256-row caps on dispatch_eligibility/disposition; stop presenting rank/work_ahead as queue position
 - **Issue #12916** (closed): Decision: drop bash 3.2 support (require bash >= 4) or gate it per-PR
 - **Issue #12788** (closed): Dedupe git_ok/git_stdout helpers in worktree_cli onto wip.rs

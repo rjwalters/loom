@@ -746,3 +746,43 @@ fn substitutions_inside_parameter_expansions_are_analyzed() {
     assert_clean(r#"echo "${v:-$(echo hi)}" ${w:-fallback} ${#x} "${y%.txt}""#);
     assert_clean(r#"echo "${v:-`date`}""#);
 }
+
+#[test]
+fn heredoc_body_is_data_unless_a_shell_or_file_takes_it() {
+    assert_clean("cat <<'EOF'\nssh host\nEOF");
+    assert_clean("cat <<-EOF\n\tssh host\n\tEOF");
+    assert!(hits_cap("bash <<EOF\nssh host\nEOF", "remote-shell"));
+    assert!(hits_cap("cat > /tmp/x <<EOF\nssh host\nEOF", "remote-shell"));
+    assert!(hits_cap("cat <<EOF\nhi\nEOF\nssh host", "remote-shell"));
+    // Unterminated: the body runs to the end of input and stays data.
+    assert_clean("cat <<EOF\nssh host");
+}
+
+#[test]
+fn shift_operators_do_not_open_a_heredoc() {
+    for cmd in [
+        "(( x = 1 << 3 ))\nssh host",
+        "((x=1<<3))\nssh host",
+        "(( n <<= 1 ))\nssh host",
+        "n=1; (( n <<= 1 ))\nssh host",
+        "x=1\necho a << 3\nssh host",
+        "echo a <<= 1\nssh host",
+        "(( x = $(ssh host) << 1 ))",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd:?}");
+    }
+    assert_clean("(( x = 1 << 3 ))\necho done");
+    // A real heredoc and nested subshells are unaffected.
+    assert_clean("cat <<EOF\nssh host\nEOF");
+    assert!(hits_cap("((ssh host); true)", "remote-shell"));
+}
+
+#[test]
+fn gh_pr_merge_detection_is_not_a_role_capability() {
+    assert!(executes_gh_pr_merge("gh pr merge 1"));
+    assert!(executes_gh_pr_merge("gh -R o/r pr merge 1"));
+    assert!(executes_gh_pr_merge("bash -c 'gh pr merge 1'"));
+    assert!(!executes_gh_pr_merge("echo 'gh pr merge 1'"));
+    assert!(!executes_gh_pr_merge("gh pr view 1"));
+    assert_clean("gh pr merge 1");
+}
