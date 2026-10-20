@@ -374,8 +374,8 @@ pub enum PrevEnd {
     Released,
     /// Its TTL ended with no release.
     Expired,
-    /// The host was lost (a spot interruption). Reserved for the spot
-    /// watcher (#12876); this table never writes it.
+    /// The host was lost (a spot interruption): the worker released it with
+    /// [`HOST_LOST_OUTCOME`] (#12876).
     HostLost,
 }
 
@@ -925,9 +925,15 @@ impl Table {
         let Some(row) = self.remove(&key) else {
             return false;
         };
-        self.note_ended(&key, &row, PrevEnd::Released, now);
+        let host_lost = outcome.trim() == HOST_LOST_OUTCOME;
+        let end = if host_lost {
+            PrevEnd::HostLost
+        } else {
+            PrevEnd::Released
+        };
+        self.note_ended(&key, &row, end, now);
         let (repo, item) = key;
-        if outcome.trim() == HOST_LOST_OUTCOME {
+        if host_lost {
             return true;
         }
         if outcome.trim() == CI_WAIT_OUTCOME {

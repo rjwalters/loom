@@ -744,8 +744,8 @@ grants an item and step again after an earlier assignment of the same repo,
 item and step ended, the worker's `loom.dispatch.step` span carries
 `loom.dispatch.attempt` (earlier assignments that ended),
 `loom.dispatch.prev_assignment_id` (the earlier step's `loom.assignment.id`)
-and `loom.dispatch.prev_end` (`released` or `expired`; `host_lost` is reserved
-for the spot watcher, #12876). A first or renewed grant carries none. Each
+and `loom.dispatch.prev_end` (`released`, `expired`, or `host_lost` when the
+worker released it because its host was lost to a spot interruption, #12876). A first or renewed grant carries none. Each
 expired assignment also gets a captain `loom.fleet_dispatch.call` span with
 endpoint `expire`, result `expired`, reason `lease_expired`, naming the host,
 item, step and assignment id, so expiries are attributable per host and item.

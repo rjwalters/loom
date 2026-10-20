@@ -676,7 +676,16 @@ fn a_host_lost_release_ends_the_row_and_holds_nothing() {
     assert!(t.release_outcome(at(150), A, &id, HOST_LOST_OUTCOME));
     assert!(t.row("acme/w", 9).is_none(), "the row ends at once");
     assert!(t.cooldown(at(150), "acme/w", 9, "builder").is_none(), "no hold armed");
-    granted_id(&t.claim(at(151), B, "acme/w", 9, "builder"));
+    let next = t.claim(at(151), B, "acme/w", 9, "builder");
+    assert_eq!(
+        lineage_of(&next),
+        Some(Lineage {
+            attempt: 1,
+            prev_assignment_id: id,
+            prev_end: PrevEnd::HostLost,
+        }),
+        "#12875: the next grant names the lost assignment"
+    );
 }
 
 #[test]
