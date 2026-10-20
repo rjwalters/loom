@@ -59,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::client::{self, CallError, CallFacts};
@@ -543,10 +544,12 @@ pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
 }
 
 /// One reaper tick of the registry at `root`, whose live steps are `live`
-/// (`(sweep_id, item, role)`): record them, release any assignment whose
-/// step is gone without an end, and send the host's heartbeat when one is
-/// due. A no-op while the flag is off and nothing was ever granted.
-pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
+/// (`(sweep_id, item, role, started_at)`): record them, release any
+/// assignment whose step is gone without an end, and send the host's
+/// heartbeat when one is due. `started_at` rides the heartbeat as
+/// [`LiveStep::started_at`] (#12873). A no-op while the flag is off and
+/// nothing was ever granted.
+pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>)]) {
     let url = host_endpoint(root);
     let (vanished, heartbeat) = {
         let mut s = state();
@@ -568,7 +571,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
         let repo = repo_of(root);
         let steps: Vec<(String, LiveStep)> = live
             .iter()
-            .map(|(id, item, role)| {
+            .map(|(id, item, role, started_at)| {
                 let assignment_id = s.assignments.get(id).map(|a| a.grant.assignment_id.clone());
                 (
                     id.clone(),
@@ -577,6 +580,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
                         item: u64::from(*item),
                         step: role.as_str().to_string(),
                         assignment_id,
+                        started_at: Some(*started_at),
                     },
                 )
             })

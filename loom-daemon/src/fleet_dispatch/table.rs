@@ -83,6 +83,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use super::proto::{HeartbeatRequest, LiveStep, RefusalReason, REFUSE_CLAIM_LOST};
 use crate::step_role::StepRole;
 
@@ -255,6 +257,43 @@ pub struct HostState {
     pub live_reported: u32,
     pub roles_ok: BTreeSet<String>,
     pub last_seen: Mono,
+    /// The earliest `started_at` among the steps the last heartbeat listed:
+    /// a worker-supplied wall-clock fact, stored as sent (#12873). `None`
+    /// when the heartbeat listed no step, or none with a start (an older
+    /// worker).
+    pub oldest_live_started_at: Option<DateTime<Utc>>,
+}
+
+/// How recent a host's last heartbeat must be for its reported facts to be
+/// exported as gauges (#12873): four missed 30 s heartbeats.
+pub const HEARTBEAT_FRESH: Duration = Duration::from_secs(120);
+
+/// What a host's last fresh heartbeat reported (#12873).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    pub free_slots: u32,
+    pub live_reported: u32,
+    pub oldest_live_started_at: Option<DateTime<Utc>>,
+}
+
+/// One host's gauges (#12873): its row counts, and what it reported when its
+/// last heartbeat is fresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostGauges {
+    pub granted: u32,
+    pub live: u32,
+    /// `None` for a host that never heartbeated, or whose last heartbeat is
+    /// older than the freshness bound: no reported point, never a `0`.
+    pub reported: Option<Reported>,
+}
+
+/// The table's gauge snapshot (#12873).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableGauges {
+    /// Every host with a row or a fresh heartbeat.
+    pub hosts: BTreeMap<String, HostGauges>,
+    /// Held rows, fleet-wide (a held row has no host).
+    pub held: u32,
 }
 
 /// A claim's decision.
@@ -407,6 +446,47 @@ impl Table {
         self.hosts.get(host)
     }
 
+    /// The gauge snapshot at `now` (#12873): granted and live rows per host
+    /// for every host with a row or a heartbeat within `fresh`, `0`
+    /// included; the reported facts only for a fresh host; the held rows
+    /// fleet-wide. A host that stopped heartbeating keeps its row counts
+    /// while its rows last (they are the stale claims). Pure.
+    #[must_use]
+    pub fn host_gauges(&self, now: Mono, fresh: Duration) -> TableGauges {
+        let mut gauges = TableGauges::default();
+        for (host, state) in &self.hosts {
+            if now.0.saturating_sub(state.last_seen.0) <= fresh {
+                gauges.hosts.insert(
+                    host.clone(),
+                    HostGauges {
+                        reported: Some(Reported {
+                            free_slots: state.free_slots,
+                            live_reported: state.live_reported,
+                            oldest_live_started_at: state.oldest_live_started_at,
+                        }),
+                        ..HostGauges::default()
+                    },
+                );
+            }
+        }
+        for row in self.rows.values() {
+            let host = match (&row.host, row.state) {
+                (_, RowState::Held) | (None, _) => {
+                    gauges.held += 1;
+                    continue;
+                }
+                (Some(host), _) => host,
+            };
+            let entry = gauges.hosts.entry(host.clone()).or_default();
+            match row.state {
+                RowState::Granted => entry.granted += 1,
+                RowState::Live => entry.live += 1,
+                RowState::Held => {}
+            }
+        }
+        gauges
+    }
+
     /// Whether claims are still refused with `grace` at `now`. Closes the
     /// window for good once it has ended.
     pub fn in_grace(&mut self, now: Mono) -> bool {
@@ -458,6 +538,7 @@ impl Table {
                 live_reported: u32::try_from(hb.live.len()).unwrap_or(u32::MAX),
                 roles_ok: hb.roles_ok.iter().cloned().collect(),
                 last_seen: now,
+                oldest_live_started_at: hb.live.iter().filter_map(|l| l.started_at).min(),
             },
         );
         let deadline = now.plus(self.policy.assignment_ttl);

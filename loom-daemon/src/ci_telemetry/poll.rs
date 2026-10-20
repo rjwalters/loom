@@ -47,8 +47,6 @@ use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
 use crate::telemetry::TelemetryEnvelope;
 
-pub mod targeted;
-
 /// Everything a cycle needs, resolved up front (a seam for tests: `now`,
 /// `host_id`, and the lookback are injectable).
 #[derive(Debug, Clone)]
@@ -815,9 +813,7 @@ enum RunOutcome {
 
 /// Record one **completed** run attempt: list its jobs, resolve suite spans,
 /// commit job units then the run unit, emit, and record
-/// the wanted job logs. Shared by the repo sweep ([`poll_repo`]) and the
-/// feed-driven single-run path ([`targeted`], #9201) so the two can never
-/// record a run differently. Never touches the watermark — that is the
+/// the wanted job logs. Never touches the watermark — that is the
 /// sweep's alone.
 #[allow(clippy::too_many_arguments)]
 fn record_run(

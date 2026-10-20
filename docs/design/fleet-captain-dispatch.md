@@ -81,7 +81,7 @@ The design builds on these and must not duplicate them.
 | Session ledger | `step_dispatch/session_ledger.rs` (#11913) | Soft host affinity: a later step on an item may resume the session that ran there. |
 | Discovery | `discovery/` (#12306, #12311) | One `TickSnapshot` per tick. Mirror tier: one ETagged `GET /v1/mirror/worklist`; gateway and `gh` tiers capped at the backstop pace (`discovery/fallback.rs`). Never serves claim, lease, label or merge reads. |
 | Mirror change stream | `forge_mirror/wake.rs` (#10892) | Pulls `GET /v1/changes` with a persisted per-repo cursor; each change becomes a wake prompt. |
-| Gate-read invariant | `forge_events/poll_gate.rs`, invariants 1–3 | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
+| Gate-read invariant | ADR-0021 invariants 1–3 (the `poll_gate` module was removed, #12809) | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
 | Forge call purpose | `gh_invocation/purpose.rs` (#12310) | `loom.forge.purpose` = discovery \| gate \| write on every forge call. The measure for this design. |
 | Issue lease | `defaults/docs/lease-record.md`, `defaults/docs/lease-renewal.md` | `<!-- loom:lease host=… sweep=… -->`; liveness is the comment's forge `updated_at`; TTL 15 min (`claim_reconciliation::resolve_lease_ttl_minutes`), renewed about every 5 min. **Four writers**: daemon dispatch, in-session sweeps, `worktree.sh`, hand claims. |
 | Step (PR-phase) lease | `sweep_registry/step_spawn/lease.rs` (#11906, #9401) | `<!-- loom:pr-lease role=… host=… sweep=… step=… -->`: pre-claim, renew while the session lives, reap at step end. |
@@ -132,7 +132,7 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 → `{"server_epoch": "…", "grace": false}`
 
 - A worker sends it **every 30 s**, riding the existing reaper heartbeat (the cadence `SweepRegistry::readvertise_peer_claims` runs on), so a host with a long tick still renews.
-- **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart.
+- **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart. An optional `started_at` (RFC 3339 UTC, #12873) gives each step's start, for the captain's `oldest_live_age_sec` gauge; an older peer omits or ignores it.
 - **`free_slots`** is the worker's own count, bounded by its own `maxConcurrent`, RAM, disk and load terms. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
 - **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted, or behind the load brake or a disk back-off, is left out. Static fit comes from the fleet config (section 7).
 
