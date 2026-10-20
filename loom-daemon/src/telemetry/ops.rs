@@ -67,6 +67,13 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
+    // #12038: `loom.forge.hold_items` / `hold_age_seconds`: the artifact
+    // (issue | pr), the hold label's short name, how the start was known
+    // (labels_at | unknown) and the age statistic (oldest | p50 | p90).
+    "artifact",
+    "hold",
+    "basis",
+    "stat",
     // #12734: `loom.dispatch.pool_items{repo, step}`, a closed set (`Step`).
     "step",
     // #12827: `loom.queue.host_shard{shard_count}`, the host's configured
@@ -541,6 +548,14 @@ pub enum MetricName {
     /// labelled `repo`, sampled every work-finder tick (#11909).
     #[serde(rename = "loom.step.actionable")]
     StepActionable,
+    /// Open items carrying a hold or park label, labelled `repo`,
+    /// `artifact`, `hold`, `basis` (#12038, #12369).
+    #[serde(rename = "loom.forge.hold_items")]
+    ForgeHoldItems,
+    /// Seconds held (from `labels_at`), labelled `repo`, `artifact`,
+    /// `hold`, `stat` (#12038, #12369).
+    #[serde(rename = "loom.forge.hold_age_seconds")]
+    ForgeHoldAgeSeconds,
     /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
     /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
     /// (over the per-call row cap) — Issue #9222.
@@ -800,6 +815,8 @@ impl MetricName {
             Self::DispatchRunningOldestAgeSec => "loom.dispatch.running_oldest_age_sec",
             Self::DispatchRunningByAge => "loom.dispatch.running_by_age",
             Self::StepActionable => "loom.step.actionable",
+            Self::ForgeHoldItems => "loom.forge.hold_items",
+            Self::ForgeHoldAgeSeconds => "loom.forge.hold_age_seconds",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
             Self::GithubRateLimitUsed => "github.ratelimit.used",
@@ -935,7 +952,8 @@ impl MetricName {
             Self::DispatchRunningOldestAgeSec | Self::FleetDispatchOldestLiveAgeSec => "s",
             Self::FleetDispatchRows => "{row}",
             Self::FleetDispatchLiveReported => "{step}",
-            Self::StepActionable => "{item}",
+            Self::StepActionable | Self::ForgeHoldItems => "{item}",
+            Self::ForgeHoldAgeSeconds => "s",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset => "s",
@@ -1041,6 +1059,12 @@ impl MetricName {
             }
             Self::DispatchRunningByAge => "Live steps per running-age bucket, by role (pool=step).",
             Self::StepActionable => "Items the step tick could draw this tick, per repo.",
+            Self::ForgeHoldItems => {
+                "Open items per repo carrying a hold or park label, by artifact, hold and basis."
+            }
+            Self::ForgeHoldAgeSeconds => {
+                "Seconds a hold label has been applied (oldest, p50, p90), by repo, artifact and hold."
+            }
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }

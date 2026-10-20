@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hold-age gauges re-homed on the discovery snapshot** (#12369, follow-up to #12038). `loom.forge.hold_items` and `loom.forge.hold_age_seconds{stat=oldest|p50|p90}` (per `repo`, `artifact`, `hold`) are emitted again, once per tick, from the step driver's discovery snapshot (aged from `labels_at`) instead of the stage-dwell sampler deleted in #12316. No forge calls; a repo the tick could not read (`tier = none`) emits nothing. The gauges were never released. See `defaults/docs/telemetry-schema.md`.
+
 ### Changed
 
 - **Champion standing authorizations are read from the resolved effective config** (#12591, follow-up to #12529). A class declared only in the fleet / repo-class tier now reaches the Champion; before, only the repo's committed `.loom/config.json` was read. New read-only verb `loom-daemon config get <dotted.key> [--json] [--workspace PATH]` prints `{key, found, value, tier, source}` (`tier` is `local`, `fleet-repo`, `project`, `committed` or `defaults`; exit 1 when no tier sets the key). `champion-pr-merge.md` loads `champion.standingAuthorizations` through it (`standing_auth_load_config`), falls back to the committed file when the verb is missing or errors, and treats a non-array value as no classes (fail closed). No change for a repo whose classes are committed.
