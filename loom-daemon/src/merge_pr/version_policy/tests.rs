@@ -99,3 +99,114 @@ fn command_substitution_strips_only_trailing_newlines() {
     assert_eq!(strip_trailing_newlines("a\n\nb\n\n\n"), "a\n\nb");
     assert_eq!(strip_trailing_newlines(""), "");
 }
+
+/// Real-repo fixture for the stale-base cases (#12949): an `origin` plus a
+/// working clone carrying the repo's own checker.
+mod stale_base {
+    use super::*;
+    use std::process::Command;
+
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write_manifest(w: &Path, version: &str, dep: &str) {
+        std::fs::write(w.join("VERSION"), format!("{version}\n")).unwrap();
+        std::fs::write(
+            w.join("mcp-loom/package.json"),
+            format!(
+                "{{\n  \"name\": \"m\",\n  \"version\": \"{version}.0.0\",\n  \"dependencies\": {{\"a\": \"{dep}\"}}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Branch `feat` forks at version 1176 and `main` then bumps to 1198.
+    /// `edit` runs on `feat` before it is committed; returns `(tmp, clone, feat sha)`.
+    fn fixture(edit: impl Fn(&Path)) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let w = tmp.path().join("w");
+        sh(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        sh(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), w.to_str().unwrap()]);
+        sh(&w, &["checkout", "-q", "-b", "main"]);
+        std::fs::create_dir_all(w.join("defaults/scripts")).unwrap();
+        std::fs::create_dir_all(w.join("mcp-loom")).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(CHECKER_REL);
+        let dst = w.join(CHECKER_REL);
+        std::fs::copy(&src, &dst).unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_manifest(&w, "1176", "1.0.0");
+        sh(&w, &["add", "-A"]);
+        sh(&w, &["commit", "-q", "-m", "base"]);
+        sh(&w, &["push", "-q", "origin", "main"]);
+
+        sh(&w, &["checkout", "-q", "-b", "feat"]);
+        edit(&w);
+        sh(&w, &["commit", "-q", "-am", "feat"]);
+        sh(&w, &["push", "-q", "origin", "feat"]);
+        let head = sh(&w, &["rev-parse", "feat"]);
+
+        sh(&w, &["checkout", "-q", "main"]);
+        write_manifest(&w, "1198", "1.0.0");
+        sh(&w, &["commit", "-q", "-am", "post-merge version bump"]);
+        sh(&w, &["push", "-q", "origin", "main"]);
+        (tmp, w, head)
+    }
+
+    fn run(w: &Path, head: &str) -> Report {
+        evaluate(&Inputs {
+            repo_root: w,
+            default_branch: "main",
+            branch: "feat",
+            head_sha: head,
+            pr_number: "12802",
+            dry_run: false,
+        })
+    }
+
+    #[test]
+    fn a_dependency_only_manifest_edit_on_a_stale_base_passes() {
+        let (_tmp, w, head) = fixture(|w| {
+            // Only the dependency line changes; the version value stays at the fork point's.
+            let p = w.join("mcp-loom/package.json");
+            let s = std::fs::read_to_string(&p)
+                .unwrap()
+                .replace("\"1.0.0\"", "\"1.0.1\"");
+            std::fs::write(p, s).unwrap();
+        });
+        let r = run(&w, &head);
+        assert_eq!(r.verdict, Verdict::Pass, "{:?}", r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn a_real_version_edit_on_a_stale_base_is_still_refused() {
+        let (_tmp, w, head) = fixture(|w| write_manifest(w, "1177", "1.0.0"));
+        let r = run(&w, &head);
+        let Verdict::Block(msg) = r.verdict else {
+            panic!("a hand-edited VERSION must block: {:?}", r.warnings);
+        };
+        // Own change is computed from the merge base (1176), not main's tip (1198).
+        assert!(msg.contains("'1176' -> '1177'"), "{msg}");
+    }
+}
