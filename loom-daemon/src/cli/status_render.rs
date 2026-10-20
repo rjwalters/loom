@@ -12,7 +12,6 @@ mod capacity_line;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
-mod forge_events_line;
 mod holds;
 mod host_update_line;
 mod last_tick_line;
@@ -338,14 +337,6 @@ pub(crate) fn build_status_json_value_for(
         // `exempt`, with an optional `detail` (the exemption reason).
         //   loom-daemon status --json | jq -e '.otlp_export.state == "ok"'
         "otlp_export": report.otlp_export,
-        // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
-        // daemon of this vintage and always carrying a `state`, so a watch
-        // loop asserts rather than infers:
-        //   loom-daemon status --json | jq -e '.forge_events.state == "healthy"'
-        // States: disabled | misconfigured | connecting | failing |
-        // auth_failed | host_mismatch | backoff | healthy. `null` only from a
-        // pre-ADR-0021 daemon.
-        "forge_events": report.forge_events,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is
@@ -618,6 +609,10 @@ pub(crate) fn build_status_json_value_for(
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
+            // Issue #9736: running version, last successful check, pending
+            // age, next attempt, blocking reason, thresholds. `null` from an
+            // older daemon and while the loop has not ticked.
+            "freshness": report.auto_update_freshness,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -2133,10 +2128,6 @@ pub(crate) fn print_status_human(
         println!("\n{banner}");
     }
 
-    // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
-    // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
-    // are five different answers that would otherwise all render as nothing.
-    println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
     // Fleet-store sync (#9596): what the last startup/timer pass found — the
     // drift the timer detects but deliberately does not write. Nothing at all
     // on a host with no `fleet.repo`.
@@ -2622,6 +2613,23 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
+        if let Some(f) = &report.auto_update_freshness {
+            let when = |t: Option<chrono::DateTime<chrono::Utc>>| {
+                t.map_or_else(
+                    || "never".to_string(),
+                    |t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                )
+            };
+            println!(
+                "  Running {}; last successful check {}; next attempt {}",
+                f.running_version,
+                when(f.last_success),
+                when(f.next_check)
+            );
+            if let (Some(target), Some(since)) = (&f.pending_target, f.pending_since) {
+                println!("  Newer release {target} pending since {}", when(Some(since)));
+            }
+        }
         if let Some(why) = report.auto_update_floor_not_rolling {
             println!("  Below the fleet floor, NOT rolling ({}): {}", why.as_str(), why.describe());
         }

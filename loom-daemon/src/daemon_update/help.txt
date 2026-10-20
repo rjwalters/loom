@@ -462,6 +462,19 @@ Exit codes:
      confirm the pending roll) the historical advice still applies — re-run
      once the in-flight sweep(s) finish, or re-run with
      --force-after-timeout to force the roll through immediately.
+  9  the new binary never started and the PREVIOUS binary was restored
+     (#12776, launchd/systemd, operator and `fleet roll` runs only). After an
+     exit-7 condition the script copies <dest>.previous back over the
+     destination (once, only if the install record, <dest>.previous and the
+     destination still match the install THIS run made) and starts it once.
+     The previous daemon is running, but the update did NOT take: this is a
+     failure, never exit 0. <dest>.previous is kept.
+  10  the new binary never started AND the restore, or the start of the
+     restored binary, failed (#12776). The host may have no running daemon.
+     <dest>.previous is intact; the message names it and the manual command.
+     When the restore is refused instead (fresh install, missing or corrupt
+     <dest>.previous, record or destination not this run's), nothing is
+     written and the exit stays 7, with a line naming the failed precondition.
 
 See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this

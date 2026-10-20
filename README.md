@@ -215,6 +215,7 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
   platform, Linux is the primary fleet-worker platform.
 - Git repository
 - tmux (`brew install tmux`)
+- bash >= 4 (`brew install bash` on macOS; stock macOS ships 3.2)
 - [Claude Code](https://claude.ai/code) for AI agents
 
 ### Install Options

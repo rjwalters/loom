@@ -296,10 +296,11 @@ fn index_block(months: &[String]) -> Block {
     }
 }
 
-/// Months newest first.
+/// Distinct months, newest first.
 fn months_desc<'a>(months: impl Iterator<Item = &'a String>) -> Vec<String> {
     let mut v: Vec<String> = months.cloned().collect();
     v.sort_unstable_by(|a, b| b.cmp(a));
+    v.dedup();
     v
 }
 

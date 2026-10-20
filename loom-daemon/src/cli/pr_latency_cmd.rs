@@ -6,7 +6,7 @@
 //! Every number here is a difference between two label transitions, and Loom
 //! persists **no** label-transition history: the cycle-time rollup (#8665)
 //! starts at `sweep.started` and says so explicitly in its own question doc,
-//! and `forge_events` is a read-only wake signal. Deriving each segment from
+//! and no wake signal is a history. Deriving each segment from
 //! `issues/<n>/timeline` per run is therefore the only option that does not
 //! first require building a transitions store — see `defaults/docs/pr-latency.md`
 //! for that decision in full. `claim_reconciliation` already derives verdict

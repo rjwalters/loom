@@ -52,25 +52,7 @@ fn a_timed_out_steps_lease_is_reaped_by_its_sweep_identity() {
     assert_eq!(ctx(dir.path(), fresh).claim(), EXIT_HELD, "the claim is free again");
 }
 
-/// Restores the named env vars on drop.
-struct EnvGuard(Vec<(&'static str, Option<String>)>);
-
-impl EnvGuard {
-    fn save(names: &[&'static str]) -> Self {
-        Self(names.iter().map(|n| (*n, std::env::var(n).ok())).collect())
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.0 {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 /// A session in a Codex container has its own hostname. The step child
 /// carries the daemon's `LOOM_LEASE_HOST_ID` (`apply_step_env`, forwarded by

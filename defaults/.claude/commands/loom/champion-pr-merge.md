@@ -1029,6 +1029,28 @@ PR_JSON=$(cat "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-$PR_NUMB
 HOLD_BODY=$(jq -r --arg m "$HOLD_MARKER" \
   '[.comments[] | select(.body | startswith($m))] | last | .body // ""' <<<"$PR_JSON")
 
+# ONE definition of "an operator release instruction", shared by release paths
+# (b) and (f) so the two can never drift (#12594). **Instruction-shaped
+# phrasing, mechanically enforced**: the trigger phrase must OPEN the comment's
+# leading clause (the first sentence of its first line, minus an optional
+# "@mention " / "please " courtesy prefix), and that clause must not be a
+# question. A plain substring match is not good enough — it reads "please do
+# NOT merge anyway", "do not clear the hold yet" and "is it ok to merge?" as
+# release signals, i.e. it releases the hold on the very comments where a human
+# just reinforced it. Anchoring is what rules those out: any negation or
+# interrogative lead-in ("do not", "don't", "never", "can we", "should I")
+# necessarily sits *before* the phrase, so the phrase is no longer the leading
+# clause. Prepended to a jq program: `jq "$RELEASE_DEFS"'<program>'`.
+RELEASE_DEFS='
+  def lead: sub("^[[:space:]]+"; "") | split("\n")[0]
+    | match("^[^.?!]*[.?!]?").string
+    | sub("^@[A-Za-z0-9_-]+[[:space:]]+"; "")
+    | sub("^please[[:space:]]*,?[[:space:]]*"; ""; "i");
+  def is_release_instruction: lead as $l
+    | ($l | test("\\?[[:space:]]*$") | not)
+    and ($l | test("^(clear|clearing|cleared|lift|lifting|lifted|override|overriding)([[:space:]]+(this[[:space:]]+|the[[:space:]]+)?hold\\b|[[:space:]]*[:,.—-]|[[:space:]]*$)|^merge[[:space:]]+(it[[:space:]]+)?anyway\\b|^ok[[:space:]]+to[[:space:]]+merge\\b|^proceed[[:space:]]+with[[:space:]]+(the[[:space:]]+)?merge\\b"; "i"));
+'
+
 if [ -z "$HOLD_BODY" ]; then
   PRIOR_HOLD=false          # never held — today's behavior, unchanged
   HOLD_AT=""; HOLD_HEAD=""; RELEASE_REASON=""; HOLD_OVERRIDE=false
@@ -1053,36 +1075,16 @@ else
     HOLD_OVERRIDE=true
   fi
 
-  # (b) An operator comment posted AFTER the hold that explicitly clears it.
-  #     **Instruction-shaped phrasing, mechanically enforced**: the trigger
-  #     phrase must OPEN the comment's leading clause (its first sentence), and
-  #     that clause must not be a question. A plain substring match is not good
-  #     enough — it reads "please do NOT merge anyway", "do not clear the hold
-  #     yet" and "is it ok to merge?" as release signals, i.e. it releases the
-  #     hold on the very comments where a human just reinforced it. Anchoring is
-  #     what rules those out: any negation or interrogative lead-in ("do not",
-  #     "don't", "never", "can we", "should I") necessarily sits *before* the
-  #     phrase, so the phrase is no longer the leading clause. Never a
-  #     Champion-authored comment either — Champion must not release its own hold.
+  # (b) An operator comment posted AFTER the hold that explicitly clears it:
+  #     an `is_release_instruction` comment (the shared RELEASE_DEFS above —
+  #     anchored trigger phrase, not a question). Never a Champion-authored
+  #     comment either — Champion must not release its own hold.
   if [ -z "$RELEASE_REASON" ]; then
-    CLEARED=$(jq -r --arg at "$HOLD_AT" '
+    CLEARED=$(jq -r --arg at "$HOLD_AT" "$RELEASE_DEFS"'
       [ .comments[]
         | select(.createdAt > $at)
         | select((.body | test("champion:|Automated by Champion role")) | not)
-        | . as $c
-        # Leading clause = first sentence of the first line (up to the first
-        # . ? or !), minus an optional "@mention " / "please " courtesy prefix.
-        | ( $c.body
-            | sub("^[[:space:]]+"; "")
-            | split("\n")[0]
-            | match("^[^.?!]*[.?!]?").string
-            | sub("^@[A-Za-z0-9_-]+[[:space:]]+"; "")
-            | sub("^please[[:space:]]*,?[[:space:]]*"; ""; "i") ) as $lead
-        # Interrogative mood is a question, not an instruction.
-        | select($lead | test("\\?[[:space:]]*$") | not)
-        # Trigger phrase anchored at the start of that clause.
-        | select($lead | test("^(clear|clearing|cleared|lift|lifting|lifted|override|overriding)([[:space:]]+(this[[:space:]]+|the[[:space:]]+)?hold\\b|[[:space:]]*[:,.—-]|[[:space:]]*$)|^merge[[:space:]]+(it[[:space:]]+)?anyway\\b|^ok[[:space:]]+to[[:space:]]+merge\\b|^proceed[[:space:]]+with[[:space:]]+(the[[:space:]]+)?merge\\b"; "i"))
-        | $c
+        | select(.body | is_release_instruction)
       ] | last
       | if . == null then "" else "\(.author.login) at \(.createdAt): \(.body | split("\n")[0])" end' <<<"$PR_JSON")
     if [ -n "$CLEARED" ]; then
@@ -1149,13 +1151,92 @@ else
   fi
 fi
 
+# (f) Operator-named release condition (#12594). A trusted comment opening with
+#     `<!-- loom:release-condition -->` (the condition text follows, on that
+#     line or the next) binds like a hold until a LATER comment closes it.
+#     Latest condition wins (an amendment replaces it; a closing comment older
+#     than the newest condition does not close it). It needs no prior hold
+#     marker, and it overrides release paths (b)-(e) — a new head, a Judge
+#     re-review, a label removal or an unrelated clearing comment must not drop
+#     an operator's condition — but NOT `loom:auto-merge-ok` (a), the explicit
+#     human override. Champion never decides a condition is met.
+#
+#     What CLOSES it: a trusted comment after the condition, by a person — an
+#     App-spelled author (`x[bot]`) never counts, so an unattended fleet role
+#     cannot record an operator's condition as met — not Champion-authored, that
+#     either
+#       - opens with `<!-- loom:release-condition-met -->`, or
+#       - is a release instruction (RELEASE_DEFS: `clear the hold — …`,
+#         `override: …`, `ok to merge — …`) whose body CITES the condition
+#         (the word "condition" anywhere in it). That is the operator's own
+#         form — "the hold may be cleared by a comment beginning `clear the
+#         hold —` that cites it" — and the same phrase the daemon redraws a
+#         held-at-head PR on (#12901). A `clear the hold` that does not cite
+#         the condition releases only the merge-risk hold, which (f) then
+#         re-imposes (the condition stays open, and is named in the notice).
+#     The Champion exclusions differ by direction, on purpose: a CONDITION is
+#     ignored only when Champion signed it (`*Automated by Champion role*`) —
+#     the broad `champion:` test would void an operator's condition that
+#     quotes a marker name, which fails open; a CLOSING comment is ignored on
+#     the broad test, which fails closed.
+COND_AT=$(jq -r '
+  [ .comments[]
+    | select((.body | test("Automated by Champion role")) | not)
+    | select(.body | startswith("<!-- loom:release-condition -->")) ] | last | .createdAt // ""' <<<"$PR_JSON")
+OPEN_CONDITION=false; COND_TEXT=""
+if [ -n "$COND_AT" ]; then
+  COND_MET=$(jq -r --arg at "$COND_AT" "$RELEASE_DEFS"'
+    [ .comments[]
+      | select(.createdAt > $at)
+      | select(((.author.login // "") | endswith("[bot]")) | not)
+      | select((.body | test("champion:|Automated by Champion role")) | not)
+      | select(.body | startswith("<!-- loom:release-condition-met -->")
+                      or (is_release_instruction and test("\\bcondition"; "i"))) ] | length' <<<"$PR_JSON")
+  if [ "$COND_MET" -eq 0 ]; then
+    OPEN_CONDITION=true
+    COND_TEXT=$(jq -r --arg at "$COND_AT" '
+      [ .comments[] | select(.createdAt == $at)
+        | select(.body | startswith("<!-- loom:release-condition -->")) ] | last | .body
+      | ltrimstr("<!-- loom:release-condition -->") | split("\n")
+      | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)) | .[0:3] | join(" ")' <<<"$PR_JSON")
+  fi
+fi
+# The label is read here, not through HOLD_OVERRIDE: with no hold marker (a)
+# never ran, and `loom:auto-merge-ok` must override a condition either way.
+if [ "$OPEN_CONDITION" = true ] \
+   && ! jq -e '[.labels[].name] | any(. == "loom:auto-merge-ok")' >/dev/null <<<"$PR_JSON"; then
+  PRIOR_HOLD=true
+  RELEASE_REASON=""
+  MANUAL_RELEASE_SINCE_HOLD=false   # a human label removal does not satisfy the condition
+  LABEL_REPAIR=false                # the condition, not Champion's marker, is the hold
+else
+  OPEN_CONDITION=false              # closed, or overridden by the label: the rows below apply as usual
+fi
+
 if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
   MERGE_BLOCKED_BY_HOLD=true
+  if [ "$OPEN_CONDITION" = true ]; then
+    # Name the condition once per condition comment (idempotent: the marker
+    # carries the condition's createdAt, so an amendment posts a new notice).
+    COND_MARKER="<!-- champion:release-condition-hold cond=$COND_AT -->"
+    if ! jq -e --arg m "$COND_MARKER" '[.comments[].body] | any(startswith($m))' >/dev/null <<<"$PR_JSON"; then
+      ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$COND_MARKER
+**Champion: Holding for an Operator Release Condition**
+
+Not merging: an operator-named release condition is still open — $COND_TEXT
+
+It survives new pushes, re-reviews, label removal and clearing comments that do not cite it. A person (not a fleet App) closes it with a comment that opens \`clear the hold — <evidence>\` and names the release condition it meets, or with one that opens with \`<!-- loom:release-condition-met -->\` followed by the evidence. \`loom:auto-merge-ok\` still overrides. Champion never decides a condition is met.
+
+---
+*Automated by Champion role*" >/dev/null 2>&1 || true
+    fi
+    echo "STICKY HOLD: #$PR_NUMBER has an open operator release condition ($COND_TEXT) — not merging"
+  fi
   # Label missing, no removal on record: restore it, so a sticky-held PR
   # never reads as plain approved and stays in the census (#11416).
   [ "$LABEL_REPAIR" = true ] && loom-daemon park-record apply --pr "$PR_NUMBER" \
     --reason "champion merge-risk hold" --by champion >/dev/null 2>&1 || true
-  echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
+  [ "$OPEN_CONDITION" = true ] || echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
   # Post NOTHING (the hold notice is already on the PR — see Hold behavior's
   # idempotency guard) and do NOT merge this PR this pass, whatever the axes say.
   #
@@ -1173,6 +1254,7 @@ fi
 |---|---|
 | `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
 | `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates criteria #4/#5/#6. |
+| `OPEN_CONDITION=true` (#12594), no `loom:auto-merge-ok` | **HOLD the merge** whatever (b)-(e) and the axes say — `PRIOR_HOLD=true`, `RELEASE_REASON=""`, `MERGE_BLOCKED_BY_HOLD=true`, even with no hold marker on the PR. The notice names the condition (once per condition comment). Closed only by a later trusted comment from a person (never an `x[bot]` author, never Champion) that opens with `<!-- loom:release-condition-met -->`, or that is a release instruction (`clear the hold — …`, `override: …`, `ok to merge — …`) citing the condition (the word "condition" in its body); then the rows below apply as usual. A clearing comment that does not cite it releases nothing: the condition is the hold. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | Criterion #2 **PASS** by override — the axes are not re-scored. Continue to #3. Step 2's reversal block is **mandatory**. |
 | `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
 
@@ -1186,7 +1268,13 @@ the *same* diff on a *different* read.
 containing `champion:` or `*Automated by Champion role*`. A hold is released by a
 human/Judge signal or by the code moving — never by Champion talking to itself.
 That exclusion is also what keeps Champion's own rejection/janitor comments from
-tripping release path (b) or (d).
+tripping release path (b) or (d). Path (f) applies it to the comment that
+*closes* a condition (fail-closed), but only the `*Automated by Champion role*`
+signature to the comment that *opens* one: a condition an operator wrote is not
+voided because it quotes `champion:merge-risk-hold` (that would fail open). A
+condition is also closed only by a person's comment — an App-spelled author
+(`x[bot]`, how `forge trusted-comments --gh-shape` spells the fleet's own
+Apps) is trusted to hold, never to record an operator's condition as met.
 
 **Edge cases the precheck already covers** (no extra handling needed):
 
@@ -2262,7 +2350,15 @@ EOF
 # reversal-comment pass. merge-pr.sh refuses loom:pr + loom:blocked (#8112),
 # so the label must be off before Step 3. The park record stays in the body.
 if [ -n "$HOLD_REVERSAL_BLOCK" ]; then
-  gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true
+  if gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null; then
+    RELEASE_FAILED=""
+  else
+    RELEASE_FAILED="--failed"
+  fi
+  # #12665: journal the release as a `hold.transition` (no forge write; a no-op
+  # outside a role tick). $HOLD_AT is the hold's own timestamp from the precheck.
+  loom-daemon park-record released --pr "$PR_NUMBER" --entered-at "${HOLD_AT:-}" \
+    $RELEASE_FAILED >/dev/null 2>&1 || true
 fi
 "$GH_READ" --clear-cache   # your own write must not be masked by your own cache
 ```
