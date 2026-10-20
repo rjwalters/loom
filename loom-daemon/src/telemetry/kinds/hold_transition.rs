@@ -39,6 +39,7 @@ pub const HOLD_TRANSITION_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.hold.episode_id",
     "loom.hold.entered_at",
     "loom.hold.entered_at_lower_bound",
+    "loom.hold.confidence_pct",
     "loom.hold.version",
     "loom.hold.revision",
     "loom.hold.provenance_complete",
@@ -48,6 +49,9 @@ pub const HOLD_TRANSITION_LOG_ATTRIBUTE_KEYS: &[&str] = &[
 pub mod transition {
     pub const ADD: &str = "add";
     pub const REMOVE: &str = "remove";
+    /// A merge-risk judgment that wrote no label (#12950): the record carries
+    /// the confidence and, in `reason_code`, the outcome.
+    pub const DECISION: &str = "decision";
 }
 
 /// `reason_code` values.
@@ -56,6 +60,10 @@ pub mod reason {
     pub const CRITICAL_FILE_HOLD: &str = "critical-file-hold";
     pub const CHAMPION_PARK: &str = "champion-park";
     pub const HOLD_RELEASED: &str = "hold-released";
+    /// Champion cleared its own merge-risk hold on confidence (#12950).
+    pub const MERGE_RISK_SELF_RELEASE: &str = "merge-risk-self-release";
+    /// Criterion #2 passed with no hold involved (#12950).
+    pub const MERGE_RISK_PASS: &str = "merge-risk-pass";
 }
 
 /// The `hold.transition` record.
@@ -83,6 +91,11 @@ pub struct HoldTransitionRecord {
     /// record that names this episode.
     #[serde(default)]
     pub entered_at_lower_bound: bool,
+    /// Champion's confidence that a human would release, as a whole percent
+    /// (0-100), on a merge-risk decision (#12950). Absent on every other
+    /// transition. Integral so the record stays `Eq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_pct: Option<u8>,
     /// When the write happened.
     pub event_at: DateTime<Utc>,
     /// When the daemon drained the journal.

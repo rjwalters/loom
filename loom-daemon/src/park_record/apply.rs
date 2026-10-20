@@ -307,6 +307,7 @@ fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
         "champion_role",
         confirmed,
         None,
+        None,
     );
 }
 

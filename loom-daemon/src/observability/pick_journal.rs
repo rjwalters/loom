@@ -129,6 +129,10 @@ pub enum JournalEntry {
         /// When the hold began, when the caller knows it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entered_at: Option<DateTime<Utc>>,
+        /// Champion's merge-risk confidence in whole percent (#12950), on a
+        /// `decision`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence_pct: Option<u8>,
     },
 }
 
@@ -651,6 +655,7 @@ pub fn record_hold(
     trigger: &str,
     confirmed: bool,
     entered_at: Option<DateTime<Utc>>,
+    confidence_pct: Option<u8>,
 ) {
     if journal_path().is_none() {
         return;
@@ -664,6 +669,7 @@ pub fn record_hold(
             trigger: trigger.to_string(),
             confirmed,
             entered_at,
+            confidence_pct,
         });
     }
 }

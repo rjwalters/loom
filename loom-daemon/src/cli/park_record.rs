@@ -49,6 +49,33 @@ pub(crate) enum ParkRecordCommand {
     /// `remove` for a `loom:blocked` removal the caller just made. Writes
     /// nothing to the forge; a no-op outside a role tick. Exit 0 always.
     Released(ReleasedArgs),
+
+    /// Journal a Champion merge-risk decision with its confidence (#12950):
+    /// a `hold.transition` of kind `decision`. Writes nothing to the forge; a
+    /// no-op outside a role tick. Exit 0 always.
+    Decision(DecisionArgs),
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum DecisionOutcome {
+    Hold,
+    SelfRelease,
+    Pass,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct DecisionArgs {
+    /// The PR the decision was made on.
+    #[arg(long, value_name = "N")]
+    pub pr: u64,
+
+    /// What criterion #2 decided.
+    #[arg(long, value_enum)]
+    pub outcome: DecisionOutcome,
+
+    /// Confidence (0-1) that a human would release the PR.
+    #[arg(long, value_name = "0-1")]
+    pub confidence: Option<f64>,
 }
 
 #[derive(clap::Args)]
@@ -158,6 +185,10 @@ impl ParkRecordCommand {
                 args.run();
                 Ok(())
             }
+            ParkRecordCommand::Decision(args) => {
+                args.run();
+                Ok(())
+            }
         }
     }
 }
@@ -206,6 +237,32 @@ impl ReleasedArgs {
             &token(&self.trigger),
             !self.failed,
             entered_at,
+            None,
+        );
+    }
+}
+
+impl DecisionArgs {
+    fn run(self) {
+        use loom_daemon::telemetry::kinds::hold_transition::{reason, transition};
+        // A non-finite or out-of-range value is dropped, never exported.
+        let confidence_pct = self
+            .confidence
+            .filter(|c| c.is_finite() && (0.0..=1.0).contains(c))
+            .map(|c| (c * 100.0).round() as u8);
+        let reason_code = match self.outcome {
+            DecisionOutcome::Hold => reason::MERGE_RISK_HOLD,
+            DecisionOutcome::SelfRelease => reason::MERGE_RISK_SELF_RELEASE,
+            DecisionOutcome::Pass => reason::MERGE_RISK_PASS,
+        };
+        loom_daemon::observability::pick_journal::record_hold(
+            self.pr,
+            transition::DECISION,
+            reason_code,
+            "champion_role",
+            true,
+            None,
+            confidence_pct,
         );
     }
 }
