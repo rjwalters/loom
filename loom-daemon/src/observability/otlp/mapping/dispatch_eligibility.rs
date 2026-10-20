@@ -168,7 +168,8 @@ mod tests {
         ))
         .expect("eligible record exports as a log");
         assert!(
-            attr_string(&eligible, "loom.eta.dispatch_eligibility.eligibility").contains("eligible"),
+            attr_string(&eligible, "loom.eta.dispatch_eligibility.eligibility")
+                .contains("eligible"),
             "eligible verdict must be a queryable attribute"
         );
         assert!(
