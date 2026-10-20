@@ -476,8 +476,12 @@ pub fn stale_read(
     pr_comments: &[Value],
     issues: Option<&[IssueSnapshot]>,
 ) -> Option<String> {
-    let remedy = "re-review against the current spec (read the comment or issue body first), \
-                  then approve with a fresh --review-started";
+    let remedy = "re-review against the current spec (read the comment or edit first). The \
+                  start is the dispatch time, so a retry in this same dispatch is refused \
+                  again: if the PR still meets the spec, end without a verdict and let a fresh \
+                  dispatch approve it; if it no longer does, post changes-requested (never \
+                  refused). Only a manual run with no dispatch epoch and no lease may retry \
+                  with a fresh --review-started";
     let at = started.to_rfc3339();
     let mut why: Vec<String> = Vec::new();
     if let Some(d) = human_comment_after(pr_comments, started) {

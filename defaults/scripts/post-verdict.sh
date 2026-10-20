@@ -119,9 +119,11 @@
 #       issue is newer, a human edited a linked issue body after it, or a body
 #       no longer matches its --issue-body-sha; the refusal (exit 7) names the
 #       comment or edit. The gate's start is the dispatch epoch in $LOOM_SWEEP_ID
-#       (or the PR's judge lease); this value can only move it earlier (#12714).
-#       Re-review against the current spec, then retry. With no start resolvable
-#       at all (no epoch, no lease, no flag) the approval is refused.
+#       (or the PR's judge lease); this value can only move it earlier (#12714),
+#       so a retry in the same dispatch is refused again: re-review against the
+#       current spec and either end without a verdict (a fresh dispatch approves)
+#       or post changes-requested. With no start resolvable at all (no epoch, no
+#       lease, no flag) the approval is refused.
 #
 #   --issue-body-sha N=HASH   (repeatable) Issue N's body as you reviewed it:
 #       `printf %s "$(gh api repos/OWNER/REPO/issues/N --jq .body)" | sha256sum | cut -d' ' -f1`.
