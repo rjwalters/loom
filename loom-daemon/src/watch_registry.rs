@@ -793,8 +793,7 @@ pub fn resolve_expiry(config: &WatchMonitorConfig) -> Duration {
 // ============================================================================
 
 /// The monitor loop itself, split into a sibling module per the file-size
-/// ratchet (`.loom/docs/file-size-policy.md`) when #8766 gave it a second
-/// input (the `forge.event` early-tick seam) rather than growing this file.
+/// ratchet (`.loom/docs/file-size-policy.md`).
 mod monitor_loop;
 
 pub use monitor_loop::spawn_watch_monitor_task;

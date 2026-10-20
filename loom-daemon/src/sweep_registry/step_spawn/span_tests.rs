@@ -24,7 +24,19 @@ fn line(class: StepOutcomeClass) -> StepOutcomeLine {
 
 fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttributes) {
     let outcome = super::super::capture::tick_outcome(StepRole::Judge, end, line);
-    sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None)
+    sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None, None)
+}
+
+/// #12957: a sized step's close carries its points; an unsized one has no
+/// attribute, never `0`.
+#[test]
+fn a_sized_steps_close_carries_its_story_points() {
+    let outcome = super::super::capture::tick_outcome(StepRole::Judge, StepEnd::TimedOut, None);
+    let close = |points| {
+        sweep_close(StepEnd::TimedOut, None, &outcome, StepRole::Judge, None, None, points).1
+    };
+    assert_eq!(close(Some(13))["loom.story_points"], "13");
+    assert!(!close(None).contains_key("loom.story_points"));
 }
 
 #[test]
@@ -158,6 +170,26 @@ fn a_steps_end_closes_its_sweep_span_with_the_real_outcome() {
     assert_eq!(sweep.attributes["loom.effort"], "high");
     assert!(!sweep.attributes.contains_key("loom.recovered"));
     assert_ne!(sweep.attributes["loom.result"], "process_lost");
+    assert!(!sweep.attributes.contains_key("loom.story_points"), "an unsized step");
+}
+
+/// #12957: the points the step was spawned with reach its `loom.sweep` close
+/// through the registry, past the export allowlist.
+#[test]
+fn a_sized_steps_end_closes_its_sweep_span_with_its_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    traced(dir.path());
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 12_957, StepRole::Doctor, pid);
+    reg.step_points.insert(id.clone(), 8);
+    let journal = open_sweep_span(dir.path(), &id, pid);
+
+    reg.end_step(&id, 12_957, StepRole::Doctor, Utc::now(), StepEnd::Exited(Some(0)));
+
+    let spans = drained(&journal);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].attributes["loom.story_points"], "8");
 }
 
 #[test]

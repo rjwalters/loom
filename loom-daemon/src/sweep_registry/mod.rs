@@ -123,7 +123,6 @@ mod fast_fail_park;
 mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
-mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
 pub mod lease_step;
@@ -894,6 +893,12 @@ pub struct SweepRegistry {
     /// about, so the refusal logs once rather than every tick. A role leaves
     /// the set when its command file is seen again.
     missing_command_warned: HashSet<&'static str>,
+    /// #12957: each live step's story points, keyed by sweep id, from its
+    /// spawn request: the step's `loom.sweep` close and the
+    /// `running_by_points` gauge read them. In memory only, so a step this
+    /// daemon did not spawn (adopted after a restart) reads as unsized.
+    /// Pruned to the registry's entries on every insert.
+    step_points: HashMap<SweepId, u32>,
 }
 
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
@@ -1112,6 +1117,7 @@ impl SweepRegistry {
             inflight_idempotency: HashMap::new(),
             roll_gate: roll_gate::RollGate::default(),
             missing_command_warned: HashSet::new(),
+            step_points: HashMap::new(),
         };
         registry.restore_step_ledger();
         registry
@@ -1687,7 +1693,8 @@ mod tests {
     // RAII guard: saves and clears every host-identity input (`LOOM_HOST_ID`,
     // `HOSTNAME`, `LOOM_HOST_ID_FILE`, `LOOM_CONFIG_DEFAULTS_FILE`) and
     // restores the ambient values on drop.
-    use crate::host_identity::tests::EnvGuard as HostIdentityEnvGuard;
+    use crate::env_test_support::EnvGuard as HostIdentityEnvGuard;
+    use crate::host_identity::tests::GUARDED_ENV as HOST_IDENTITY_ENV;
 
     /// Issue #5063 / #11530: `fleet.hostId` > `LOOM_HOST_ID` > the persisted
     /// id, blanks ignored, and never `$HOSTNAME`. Holds `loom_config_env`
@@ -1697,7 +1704,7 @@ mod tests {
     fn host_identity_env_precedence() {
         #[serial]
         fn inner() {
-            let _guard = HostIdentityEnvGuard::clear();
+            let _guard = HostIdentityEnvGuard::clear(HOST_IDENTITY_ENV);
             let dir = tempfile::tempdir().unwrap();
             let id_file = dir.path().join("host-id");
             std::fs::write(&id_file, "persisted-studio\n").unwrap();

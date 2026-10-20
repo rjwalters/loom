@@ -6,29 +6,9 @@
 use super::*;
 use serial_test::serial;
 
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+use crate::env_test_support::EnvGuard;
 
-impl EnvGuard {
-    fn clear() -> Self {
-        let keys = [ENABLED_ENV, "LOOM_SWEEP_CONTAINERIZED", RELAY_HEADERS_ENV];
-        let previous = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
-        for key in keys {
-            std::env::remove_var(key);
-        }
-        Self(previous)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+const GUARDED_ENV: &[&str] = &[ENABLED_ENV, "LOOM_SWEEP_CONTAINERIZED", RELAY_HEADERS_ENV];
 
 /// A workspace whose config carries `block` as its whole content.
 fn workspace(config: &str) -> tempfile::TempDir {
@@ -83,7 +63,7 @@ fn token_of(command: &Command) -> String {
 #[test]
 #[serial]
 fn the_relay_is_off_unless_its_own_switch_is_set() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     // An `otlp` exporter configured and enabled is not the relay's opt-in.
     let exporting = workspace(
         r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
@@ -99,7 +79,7 @@ fn the_relay_is_off_unless_its_own_switch_is_set() {
 #[test]
 #[serial]
 fn the_env_override_wins_in_both_directions() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     std::env::set_var(ENABLED_ENV, "0");
     assert!(!enabled(workspace(OPTED_IN).path()));
     std::env::set_var(ENABLED_ENV, "true");
@@ -109,7 +89,7 @@ fn the_env_override_wins_in_both_directions() {
 #[test]
 #[serial]
 fn with_no_receiver_running_a_launch_gets_nothing_from_loom() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     // Opted in, admitted for a wired harness — and still nothing, because
     // this process started no receiver. This is the whole of what a session
     // on a machine without a relaying daemon sees.
@@ -136,7 +116,7 @@ fn with_no_receiver_running_a_launch_gets_nothing_from_loom() {
 #[test]
 #[serial]
 fn a_session_started_outside_the_daemon_gets_no_exporter_environment() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut launched = Command::new("/bin/true");
@@ -159,7 +139,7 @@ fn a_session_started_outside_the_daemon_gets_no_exporter_environment() {
 #[test]
 #[serial]
 fn a_workspace_that_did_not_opt_in_is_left_untouched_by_a_running_relay() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace("{}");
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -175,7 +155,7 @@ fn a_workspace_that_did_not_opt_in_is_left_untouched_by_a_running_relay() {
 #[test]
 #[serial]
 fn a_wired_child_is_pointed_at_the_loopback_receiver_with_its_own_token() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -215,7 +195,7 @@ fn a_wired_child_is_pointed_at_the_loopback_receiver_with_its_own_token() {
 #[test]
 #[serial]
 fn every_launch_gets_a_different_token_bound_to_its_own_session() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut first = Command::new("/bin/true");
@@ -238,7 +218,7 @@ fn every_launch_gets_a_different_token_bound_to_its_own_session() {
 #[test]
 #[serial]
 fn the_token_is_never_in_the_registry_or_its_debug_output() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -253,7 +233,7 @@ fn the_token_is_never_in_the_registry_or_its_debug_output() {
 #[test]
 #[serial]
 fn dropping_a_lease_ends_the_session() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -268,7 +248,7 @@ fn dropping_a_lease_ends_the_session() {
 #[test]
 #[serial]
 fn a_sweep_session_lives_until_its_execution_ends_and_no_other_does() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut first = Command::new("/bin/true");
@@ -292,7 +272,7 @@ fn a_sweep_session_lives_until_its_execution_ends_and_no_other_does() {
 #[test]
 #[serial]
 fn a_token_past_its_maximum_lifetime_is_refused() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -317,7 +297,7 @@ fn a_token_past_its_maximum_lifetime_is_refused() {
 #[test]
 #[serial]
 fn a_containerized_launch_is_not_wired() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let relay = relay();
     // By the child's own environment…
     let root = workspace(OPTED_IN);
@@ -367,7 +347,7 @@ fn a_receiver_address_off_loopback_is_refused() {
 #[test]
 #[serial]
 fn registrations_stop_at_the_session_ceiling() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     for index in 0..MAX_SESSIONS {
@@ -388,7 +368,7 @@ fn registrations_stop_at_the_session_ceiling() {
 #[test]
 #[serial]
 fn the_forge_slug_is_bound_once_known_and_never_guessed_from_the_path() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -405,7 +385,7 @@ fn the_forge_slug_is_bound_once_known_and_never_guessed_from_the_path() {
 #[test]
 #[serial]
 fn a_dispatched_sweep_is_bound_to_its_issue_and_sweep_until_that_sweep_ends() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -453,7 +433,7 @@ fn a_dispatched_sweep_is_bound_to_its_issue_and_sweep_until_that_sweep_ends() {
 #[test]
 #[serial]
 fn a_role_tick_is_bound_to_its_role_for_exactly_as_long_as_its_lease() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let relay = relay();
     let mut command = Command::new("/bin/true");
@@ -489,7 +469,7 @@ fn a_role_tick_is_bound_to_its_role_for_exactly_as_long_as_its_lease() {
 #[tokio::test]
 #[serial]
 async fn the_forge_slug_is_looked_up_off_the_launch_path_once_per_workspace() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let lookup: RepoLookup = {
@@ -534,7 +514,7 @@ async fn the_forge_slug_is_looked_up_off_the_launch_path_once_per_workspace() {
 #[tokio::test]
 #[serial]
 async fn a_workspace_whose_slug_cannot_be_resolved_is_not_looked_up_on_every_request() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let root = workspace(OPTED_IN);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let lookup: RepoLookup = {

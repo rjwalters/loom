@@ -1,6 +1,6 @@
 //! OTLP attributes for a `daemon.event` record (#8760): `loom.topic`, the
 //! payload whole as compact JSON in `loom.payload`, and (#12230) each payload
-//! scalar named in [`TYPED_PAYLOAD_KEYS`] again as a typed attribute.
+//! scalar (number, bool or string) named in [`TYPED_PAYLOAD_KEYS`] again as a typed attribute.
 //!
 //! The payload's shape varies per topic, so it travels as one string; a
 //! duration inside that string can be read in SigNoz only by parsing JSON per
@@ -16,8 +16,10 @@ use super::{kv, kv_string};
 use crate::telemetry::DaemonEventRecord;
 
 /// Every `loom.payload.<field>` carried as a typed attribute.
-const TYPED_PAYLOAD_KEYS: &[&[&str]] =
-    &[crate::work_finder::startup_gate::FIRST_TICK_LOG_ATTRIBUTE_KEYS];
+const TYPED_PAYLOAD_KEYS: &[&[&str]] = &[
+    crate::work_finder::startup_gate::FIRST_TICK_LOG_ATTRIBUTE_KEYS,
+    crate::observability::daemon_lifecycle::START_LOG_ATTRIBUTE_KEYS,
+];
 
 pub(super) fn attributes(r: &DaemonEventRecord) -> Vec<KeyValue> {
     let mut attributes = vec![
@@ -37,6 +39,7 @@ pub(super) fn attributes(r: &DaemonEventRecord) -> Vec<KeyValue> {
         }
         let typed = match value {
             serde_json::Value::Bool(b) => any_value::Value::BoolValue(*b),
+            serde_json::Value::String(text) => any_value::Value::StringValue(text.clone()),
             serde_json::Value::Number(n) => match n.as_i64() {
                 Some(i) => any_value::Value::IntValue(i),
                 None => match n.as_f64() {
