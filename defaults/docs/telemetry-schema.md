@@ -3983,9 +3983,10 @@ allowlists), plus `loom.repo` / `loom.repo.visibility`. No absolute path is
 exported. Nothing is emitted when `fleet.autoApply` is off (the pass applies
 nothing), when the pass has no changes, or for an apply that failed.
 
-`skip:not-cloned` repeats every timer pass while the repo stays uncloned (one
-row per missing repo per pass); a repeating row is the proof the repo is still
-unregistered. A repo the pass cloned and registered is `register`; one whose
+`skip:not-cloned` is emitted when a repo enters the uncloned set, not on every
+timer pass while it stays there (#12910); the dedupe is in-process, so a daemon
+restart re-emits the set once and a repo that leaves and re-enters emits again.
+Other actions are never deduplicated. A repo the pass cloned and registered is `register`; one whose
 clone failed, was refused or deferred is `skip:not-cloned`.
 
 | Field | Type | Notes |
