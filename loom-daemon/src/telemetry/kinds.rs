@@ -168,6 +168,10 @@ pub mod auto_update_tick;
 /// eligibility boundary.
 pub mod dispatch_eligibility;
 
+/// `eta.stage_entry` (#12869) — an item's observed arrival in a pipeline
+/// stage, diffed from the discovery snapshot.
+pub mod stage_entry;
+
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
@@ -574,6 +578,13 @@ macro_rules! telemetry_kind_table {
             /// attributes. Replaces the POST to loom-ui's
             /// `/api/alerts/external`. OTLP-only. See [`alert_transition`].
             AlertTransition = "alert.transition" => $crate::telemetry::kinds::alert_transition::AlertTransitionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One item's observed arrival in a pipeline stage (Issue #12869),
+            /// diffed from the step driver's per-tick discovery snapshot:
+            /// the arrival (inflow) fact `eta.stage_outcome`'s reconstructed
+            /// `entered_at` could not give. OTLP-only. See [`stage_entry`].
+            StageEntry = "eta.stage_entry" => $crate::telemetry::kinds::stage_entry::StageEntryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

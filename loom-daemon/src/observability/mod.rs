@@ -137,6 +137,7 @@ pub mod session_analysis;
 pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
+pub mod stage_entry_fact;
 pub mod standalone_ops;
 pub mod step_verdict;
 pub mod tracing;
@@ -1275,6 +1276,9 @@ pub fn spawn_task(
     // decision per waiting ready item, OTLP-only, sampled by the collector
     // below on the same cadence as `queue.snapshot`.
     dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.stage_entry` (#12869): arrivals diffed from the step driver's
+    // per-tick discovery snapshot, OTLP-only.
+    stage_entry_fact::register_sink(otlp_queues.clone(), &host_id);
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
