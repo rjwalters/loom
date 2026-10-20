@@ -1,0 +1,17 @@
+# Synthetic reduction of the offline plan job edited by 2AMLogic/2am#4649,
+# #5185, #5252, #5253, rjwalters/loom#12402 and 2AMLogic/loom-ui#4732.
+name: claude-bot-deploy-plan
+on:
+  pull_request:
+jobs:
+  plan:
+    name: deploy plan (offline, no credentials)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render the plan
+        run: ./scripts/render-plan.sh --dry-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
