@@ -162,11 +162,13 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 
 Unreachable, a timeout (short, about 2 s) or a `5xx` is a **failure** and counts toward fallback (section 9). A `403` (the host is not in the node map, or its `host_id` does not match) also fails open and counts toward the hysteresis, and the worker logs it at `ERROR`, so a mapping mistake is loud rather than a silent permanent fallback. A `claim` refusal is an answer, never a failure; a `grace` refusal sends that one claim down today's forge-lease path without counting as a failure. Nothing is retried within the tick.
 
-### 5.6 `next` (Phase 2 proposal)
+### 5.6 `next` (Phase 2; contract accepted 2026-10-19, built in #12817)
 
 `{"host_id", "free_slots", "roles_ok"}` (the heartbeat's host state) → `{"server_epoch", "queue_age_s", "assignments": [{"assignment_id", "repo", "item", "step", "ttl_s", "seed"}]}`.
 
 - An **empty** list is an answer: nothing fits this host now. The worker does **not** draw locally on an empty answer; that would bring the race back exactly when work is scarce.
+- **When a worker asks.** There is no fixed polling period. A worker asks when capacity becomes available, with at most one request in flight and capacity notifications coalesced into one. An empty answer schedules the next request with exponential backoff: nominal delays 30, 60, 120 s, 120 s after that, each multiplied by `(1 − jitter·u)` (`u` uniform in `[0,1)`, independent per host and per delay), so the actual delay never exceeds 120 s and keeps its spread at the cap. The first request after start waits a random `[0, startupSecs)`. Receiving work resets the backoff; repeated capacity checks do not; no free slots stops requests. A rise in free slots may bring the next request forward, but never closer than `initial·(1 − jitter)` to the previous one. A failed call is not an empty answer: it neither escalates nor resets the backoff, and the fallback hysteresis of §9 owns it. Keys, validation and reload behavior: `fleetDispatch.request.*` in `defaults/docs/daemon-reference.md`; tune them through fleet-gitops. This is local capacity scheduling, not a dashboard or event wake: the captain still follows GitHub through the Cloudflare mirror.
+- The captain answers from the queue (§10) as a `claim` would: it skips an item that already has a row, one the host's `roles_ok` does not cover, one a hold refuses, and answers empty in the grace window. It fills up to `free_slots` in rounds of at most one item per repo, and each offered item is granted (a row, as for `claim`). `queue_age_s` is absent until the first full worklist read.
 - `seed` (`loom-draw/v3` minute, tick and draw index) lets `pick.decision` replay the draw from the captain's record.
 - Each assignment goes through the same path as a drawn item: gates, live pre-check, pre-claim, `spawn_batch`. An assignment is a candidate, never a reason to skip a check. `refuse` and `release` close it as in Phase 1.
 
@@ -341,7 +343,7 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 
 ### 13.2 Phase 2: the captain assigns from the fleet queue
 
-The queue (section 10), the fleet ledger (section 8) and `next`. Configured workers call `next` each tick; `claim` remains for fallback and older workers. Roll out host by host.
+The queue (section 10), the fleet ledger (section 8) and `next`. Configured workers call `next` when capacity becomes available, with jittered exponential backoff on empty answers (§5.6), not on a tick; `claim` remains for fallback and older workers. Roll out host by host.
 
 **Exit:** over a week, `claim_lost` near 0 on captain-sourced ticks; few `pass_limit` / `slot_draws` stops with free slots; worker discovery at the backstop pace only; a host able to hold about 100 sessions reaches it when the backlog allows.
 
@@ -356,7 +358,7 @@ Phase 1 adds two per-host keys, live-reloadable and set from the fleet config's 
 - `fleetDispatch.enabled` (bool): this host uses the captain. Off by default and on every standalone install.
 - `fleetDispatch.url`: the captain's tailnet URL.
 
-Setting them on two hosts is the Phase 1 A/B; setting them in the fleet defaults puts every host in fleet mode. Phase 2 proposes one more, `fleetDispatch.queueRefreshSecs` (the full-refresh period, default 600), read by the captain.
+Setting them on two hosts is the Phase 1 A/B; setting them in the fleet defaults puts every host in fleet mode. Phase 2 proposes one more, `fleetDispatch.queueRefreshSecs` (the full-refresh period, default 600), read by the captain, and adds the worker's work-request backoff block `fleetDispatch.request.{initialBackoffSecs, maxBackoffSecs, jitter, startupSecs}` (defaults 30, 120, 0.5, 30; #12817, §5.6).
 
 ### 13.5 Follow-up issues
 

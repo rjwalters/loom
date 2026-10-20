@@ -769,3 +769,176 @@ async fn the_feed_follows_changes_refreshes_in_full_on_period_and_recovers_a_los
     until("the lossy-stream recovery", || s.queue_len() == 3).await;
     feed.abort();
 }
+
+// ---------------------------------------------------------------------------
+// `next` (#12817)
+// ---------------------------------------------------------------------------
+
+/// `slug`'s open `loom:issue` items `numbers` (each a Builder candidate).
+fn next_snapshot(slug: &str, numbers: &[u32]) -> RepoSnapshot {
+    let mut snap = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+    snap.slug = slug.to_string();
+    let template = snap.rows[0].clone();
+    snap.rows = numbers
+        .iter()
+        .map(|n| RestIssue {
+            number: *n,
+            ..template.clone()
+        })
+        .collect();
+    snap
+}
+
+fn next_body(host: &str, free: u32, roles: &[&str]) -> Value {
+    json!({"host_id": host, "free_slots": free, "roles_ok": roles})
+}
+
+/// Ask `next` as `host`; the parsed answer.
+fn ask_next(s: &Server<StaticIdentity>, host: &str, free: u32, roles: &[&str]) -> Value {
+    let (reply, call) =
+        s.handle(host, "/v1/next", next_body(host, free, roles).to_string().as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(call.endpoint, "/v1/next");
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+fn offered(answer: &Value) -> Vec<(String, u64)> {
+    answer["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["repo"].as_str().unwrap().to_string(), a["item"].as_u64().unwrap()))
+        .collect()
+}
+
+#[test]
+fn next_grants_up_to_free_slots_in_rounds_of_one_item_per_repo() {
+    let s = open_server("node-a");
+    let (w, x) = (next_snapshot("acme/w", &[1, 2, 3]), next_snapshot("acme/x", &[10, 11]));
+    s.queue().refresh_repos([&w, &x]);
+    let answer = ask_next(&s, A, 3, &["builder"]);
+    assert_eq!(answer["server_epoch"], "epoch-test");
+    // Round one takes one per repo, round two the next of the first.
+    assert_eq!(
+        offered(&answer),
+        [
+            ("acme/w".into(), 1),
+            ("acme/x".into(), 10),
+            ("acme/w".into(), 2)
+        ]
+    );
+    for a in answer["assignments"].as_array().unwrap() {
+        assert_eq!(a["step"], "builder");
+        assert!(a["ttl_s"].as_u64().unwrap() > 0);
+        assert!(!a["assignment_id"].as_str().unwrap().is_empty());
+    }
+    // The grants are rows: another host's claim is held, and A's own claim
+    // returns the same assignment id.
+    let (reply, _) = s.handle(
+        B,
+        "/v1/claim",
+        json!({"host_id": B, "repo": "acme/w",
+        "item": 1, "step": "builder"})
+        .to_string()
+        .as_bytes(),
+    );
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], "held");
+    // Nothing offered twice: the rest of the queue comes next.
+    let more = ask_next(&s, A, 10, &["builder"]);
+    assert_eq!(offered(&more), [("acme/w".into(), 3), ("acme/x".into(), 11)]);
+    assert!(offered(&ask_next(&s, A, 10, &["builder"])).is_empty());
+}
+
+#[test]
+fn next_answers_empty_without_an_error_when_nothing_fits() {
+    let s = open_server("node-a");
+    // An empty queue.
+    let empty = ask_next(&s, A, 4, &["builder"]);
+    assert!(offered(&empty).is_empty());
+    assert_eq!(empty["server_epoch"], "epoch-test");
+    // Queue present, but no slots, or the role is not runnable.
+    s.queue().refresh_repos([&next_snapshot("acme/w", &[1])]);
+    assert!(offered(&ask_next(&s, A, 0, &["builder"])).is_empty());
+    assert!(offered(&ask_next(&s, A, 4, &["judge"])).is_empty());
+    assert!(offered(&ask_next(&s, A, 4, &[])).is_empty());
+    assert_eq!(s.queue_len(), 1, "an empty answer drops nothing");
+    assert_eq!(offered(&ask_next(&s, A, 1, &["builder"])), [("acme/w".into(), 1)]);
+}
+
+#[test]
+fn next_skips_items_another_host_holds_or_a_hold_covers() {
+    let s = open_server("node-a");
+    s.queue()
+        .refresh_repos([&next_snapshot("acme/w", &[1, 2, 3])]);
+    let (reply, _) = s.handle(
+        B,
+        "/v1/claim",
+        json!({"host_id": B, "repo": "acme/w",
+        "item": 1, "step": "builder"})
+        .to_string()
+        .as_bytes(),
+    );
+    let id = serde_json::from_str::<Value>(&reply.body).unwrap()["assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // B's item 1 is skipped; a no-progress release holds item 2 fleet-wide.
+    let (reply, _) = s.handle(A, "/v1/claim", claim_body(A, 2, "builder").to_string().as_bytes());
+    let id2 = serde_json::from_str::<Value>(&reply.body).unwrap()["assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rel = json!({"host_id": A, "assignment_id": id2, "outcome": "failed"});
+    s.handle(A, "/v1/release", rel.to_string().as_bytes());
+    assert_eq!(offered(&ask_next(&s, A, 5, &["builder"])), [("acme/w".into(), 3)]);
+    // B's own `next` does not re-offer its running item either.
+    let _ = id;
+    assert!(offered(&ask_next(&s, B, 5, &["builder"])).is_empty());
+}
+
+#[test]
+fn next_is_empty_during_grace_and_a_restart_forgets_the_queue() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    s.queue().refresh_repos([&next_snapshot("acme/w", &[1])]);
+    clock.set(10);
+    assert!(offered(&ask_next(&s, A, 3, &["builder"])).is_empty(), "grace: nothing granted");
+    clock.set(91);
+    assert_eq!(offered(&ask_next(&s, A, 3, &["builder"])).len(), 1);
+    // A restarted captain: a new epoch on the answer, soft state gone.
+    let restarted = Arc::new(Server::new(
+        identity("node-a"),
+        Arc::new(ManualClock::default()),
+        roster(),
+        Policy::default(),
+        "epoch-after".into(),
+    ));
+    let answer = ask_next(&restarted, A, 3, &["builder"]);
+    assert_eq!(answer["server_epoch"], "epoch-after");
+    assert!(offered(&answer).is_empty());
+    assert!(answer.get("queue_age_s").is_none(), "no full read yet");
+}
+
+#[test]
+fn next_reports_the_queue_age_once_a_full_read_answered() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    s.queue().not_modified(clock.now());
+    clock.set(145);
+    assert_eq!(ask_next(&s, A, 1, &["builder"])["queue_age_s"], 45);
+}
+
+#[tokio::test]
+async fn next_over_http_rejects_a_body_naming_another_host() {
+    let s = open_server("node-a");
+    s.queue().refresh_repos([&next_snapshot("acme/w", &[5])]);
+    let addr = listen(Arc::clone(&s)).await;
+    let (status, body) = post(addr, "/v1/next", &next_body(B, 1, &["builder"])).await;
+    assert_eq!((status, body["server_epoch"].as_str()), (403, Some("epoch-test")));
+    let (status, body) = post(addr, "/v1/next", &next_body(A, 1, &["builder"])).await;
+    assert_eq!(status, 200);
+    assert_eq!(offered(&body), [("acme/w".into(), 5)]);
+    let (status, _) = post(addr, "/v1/next", &json!({"host_id": A})).await;
+    assert_eq!(status, 400);
+}
