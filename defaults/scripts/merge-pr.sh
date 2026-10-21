@@ -1916,8 +1916,8 @@ _post_merge_cleanup() {
   [[ "${CLEANUP_PRIMARY_CHECKOUT:-true}" == "true" ]] || base+=(--no-cleanup-primary)
   [[ "${LOOM_PRESERVE_WORKTREE:-0}" != "1" ]] || base+=(--preserve-env)
   [[ -z "$WORKTREE_PATH_OVERRIDE" ]] || base+=(--worktree-path "$WORKTREE_PATH_OVERRIDE")
-  local facts=() out="" rc=0 attempt level text need
-  for attempt in 1 2 3 4; do
+  local facts=() out="" rc=0 level text need
+  for _ in 1 2 3 4; do
     rc=0; out="$("$bin" "${base[@]}" ${facts[@]+"${facts[@]}"})" || rc=$?
     [[ $rc -eq 3 && "$out" == "LOOM-NEED "* ]] || break
     need="${out#LOOM-NEED }"
