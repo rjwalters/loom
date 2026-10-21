@@ -3692,6 +3692,7 @@ absent measurement as "unknown", never as zero/full.
 | `managed_repos[]` | `loom.host.managed_repo` (1 per repo, `repo`, `visibility`); `weight` as `loom.host.managed_repo_weight` (`repo`), only when known |
 | `protection.state` | `loom.host.protection` (1, `state`) |
 | `built_at` | `loom.host.built_at_seconds` (Unix seconds) |
+| `is_captain` | `loom.host.is_captain` (1 = this host believes it is captain, 0 = a captain is declared and it is not this host); no point when `fleet.captain` is undeclared (`None`) |
 | `build_commit` | Resource `loom.daemon.revision` (full SHA) |
 | `roles.persistent[]` | `loom.host.role_persistent_failure` (failures) and `loom.host.role_persistent_failure_last_at_seconds`, both `role` + `workspace` (directory name, never the path); `detail` is not exported |
 | `worktree_root_total_gb` | `loom.host.worktree_volume.total_bytes` (`metric.points`, same `df -Pk` sample; GB = bytes / 1024^3, floored) |

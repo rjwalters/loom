@@ -15,9 +15,10 @@
 //! | `built_at` | `loom.host.built_at_seconds` | Unix seconds | — |
 //! | `roles.persistent[]` | `loom.host.role_persistent_failure` | failures | `role`, `workspace` |
 //! | `roles.persistent[].last_at` | `loom.host.role_persistent_failure_last_at_seconds` | Unix seconds | `role`, `workspace` |
+//! | `is_captain` | `loom.host.is_captain` | 1 captain, 0 not | — |
 //!
 //! Absent stays absent ("unknown != zero"): no `protection`, `built_at` or
-//! `weight` means no point. `loom.host.active_sweeps` is always emitted, since
+//! `weight` or `is_captain` (no `fleet.captain` declared) means no point. `loom.host.active_sweeps` is always emitted, since
 //! the producer always reads the registry (`collect_active_sweep_ids`), so 0
 //! is a real "no sweeps in flight".
 //!
@@ -151,6 +152,18 @@ pub(super) fn samples(r: &HostHealthRecord, time_unix_nano: u64) -> Vec<MetricSa
             "s",
             Vec::new(),
             int(built_at.timestamp()),
+            time_unix_nano,
+        ));
+    }
+
+    if let Some(is_captain) = r.is_captain {
+        out.push(sample(
+            "loom.host.is_captain",
+            "1 when this host's daemon believes it is the fleet captain, 0 when a captain is \
+             declared and it is not this host; absent when no captain is declared.",
+            "1",
+            Vec::new(),
+            int(i64::from(is_captain)),
             time_unix_nano,
         ));
     }
