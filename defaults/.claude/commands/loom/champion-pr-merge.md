@@ -1385,9 +1385,25 @@ else
   # it instead of looping on a concern they were never shown.
   if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$HOLD_MARKER\"))")" = "true" ]; then
     echo "Merge-risk hold already posted for #$PR_NUMBER — hold stands, no comment"
+    # #12933: the daemon drew this hold because the standing-authorization
+    # digest moved (or a legacy record has none). The hold stands, so record
+    # the current digest ONCE at this head — the daemon reads the LAST trusted
+    # `champion:hold-state` record — or every later tick redraws it, the no-op
+    # loop #12901 removed. Not a notice (no $HOLD_MARKER) and not a release
+    # phrase, so the hold on record and the state machine are unchanged.
+    HOLD_AUTH=$(loom-daemon config get champion.standingAuthorizations --digest 2>/dev/null)
+    RECORDED_AUTH=$(jq -r '[.comments[].body | capture("<!-- champion:hold-state head=[0-9a-f]+(?: auth=(?<a>[0-9a-f]+))?")] | last | .a // ""' <<<"$PR_JSON")
+    if [ -n "$HOLD_AUTH" ] && [ "$RECORDED_AUTH" != "$HOLD_AUTH" ]; then
+      ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "<!-- champion:hold-state head=$HEAD_SHA auth=$HOLD_AUTH -->
+**Champion: hold re-read under changed standing authorizations (#12933)** — re-evaluated at this head; the hold notice above still applies. The digest is recorded so this re-read happens once per policy change."
+    fi
   else
+    # Standing-authorization digest (#12933): a later change to
+    # `champion.standingAuthorizations` differs from it and re-reads this hold once.
+    HOLD_AUTH=$(loom-daemon config get champion.standingAuthorizations --digest 2>/dev/null)
+    HOLD_AUTH_FIELD=""; [ -n "$HOLD_AUTH" ] && HOLD_AUTH_FIELD=" auth=$HOLD_AUTH"
     ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$HOLD_MARKER
-<!-- champion:hold-state head=$HEAD_SHA -->
+<!-- champion:hold-state head=$HEAD_SHA${HOLD_AUTH_FIELD} -->
 **Champion: Holding for Human Merge**
 
 Judge-approved and passing the mechanical safety criteria, but not

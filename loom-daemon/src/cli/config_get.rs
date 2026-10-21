@@ -39,6 +39,10 @@ enum ConfigCommand {
         /// Accepted for symmetry with other verbs; output is always JSON.
         #[arg(long)]
         json: bool,
+        /// Print only the short digest of `champion.standingAuthorizations`
+        /// (the `auth=` value Champion records in a hold marker, #12933).
+        #[arg(long)]
+        digest: bool,
         /// Repo root to resolve against. Defaults to the current directory.
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
@@ -47,6 +51,18 @@ enum ConfigCommand {
 
 pub(crate) fn dispatch(args: ConfigArgs) -> Result<()> {
     match args.command {
+        ConfigCommand::Get {
+            key,
+            workspace,
+            digest: true,
+            ..
+        } => {
+            if key != "champion.standingAuthorizations" {
+                bail!("--digest is only defined for champion.standingAuthorizations");
+            }
+            println!("{}", crate::champion_hold::standing_auth_digest(Path::new(&workspace)));
+            Ok(())
+        }
         ConfigCommand::Get { key, workspace, .. } => {
             let report = lookup(Path::new(&workspace), &key)?;
             println!("{report}");

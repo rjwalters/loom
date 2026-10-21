@@ -273,8 +273,41 @@ mod held_at_head {
         released: &[u32],
     ) -> (usize, Verdict) {
         let mut items = held_pr();
-        let n = hold_at_recorded_head(&mut items, heads, hold, &released.iter().copied().collect());
+        let n = hold_at_recorded_head(
+            &mut items,
+            heads,
+            hold,
+            &HashMap::new(),
+            None,
+            &released.iter().copied().collect(),
+        );
         (n, items[0].verdict)
+    }
+
+    /// At its held head, with `recorded` the digest the hold wrote (`None`
+    /// for a legacy hold) and `current` the repo's digest now.
+    fn run_auth(recorded: Option<&str>, current: Option<&str>) -> usize {
+        let mut items = held_pr();
+        let auths: HashMap<u32, String> =
+            recorded.map(|a| (5, a.to_string())).into_iter().collect();
+        hold_at_recorded_head(&mut items, &map(HEAD), &map(HEAD), &auths, current, &HashSet::new())
+    }
+
+    #[test]
+    fn an_unchanged_digest_keeps_the_hold() {
+        assert_eq!(run_auth(Some("aa11"), Some("aa11")), 1);
+    }
+
+    #[test]
+    fn a_changed_digest_or_a_legacy_hold_is_drawn_once() {
+        assert_eq!(run_auth(Some("aa11"), Some("bb22")), 0);
+        assert_eq!(run_auth(None, Some("bb22")), 0);
+    }
+
+    #[test]
+    fn no_current_digest_keeps_the_head_only_rule() {
+        assert_eq!(run_auth(Some("aa11"), None), 1);
+        assert_eq!(run_auth(None, None), 1);
     }
 
     #[test]
