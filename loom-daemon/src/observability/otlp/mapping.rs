@@ -10,6 +10,7 @@ mod ci;
 mod daemon_event;
 mod daemon_exit;
 mod dispatch_eligibility;
+mod dispatch_state;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -634,6 +635,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
+        | TelemetryRecord::DispatchState(_)
         | TelemetryRecord::StageOccupancy(_)
         | TelemetryRecord::StageEntry(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
@@ -659,6 +661,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
+                .or_else(|| dispatch_state::log_parts(r))
                 .or_else(|| stage_occupancy::log_parts(r))
                 .or_else(|| stage_entry::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;
