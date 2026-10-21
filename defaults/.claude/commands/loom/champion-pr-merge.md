@@ -641,7 +641,12 @@ standing_auth_fetch_diff() {
 #   critical criterion #3: only a class with "coversCriticalFiles": true or
 #            "criticalFilesOnly": true, and no kept-set path, may waive the
 #            critical-file FAIL. A criticalFilesOnly class matches only the
-#            critical-file hits (CRITICAL_PATTERNS, from criterion #3).
+#            critical-file hits (CRITICAL_PATTERNS, from criterion #3), and
+#            (#12994) CLAIMS just the hits its filePatterns match and its
+#            excludeFilePatterns do not; the classes that pass every gate on
+#            their claimed hits are unioned, and the PR is ELIGIBLE only when
+#            the union is exactly the critical-file hits (STANDING_AUTH_ID is
+#            then the comma-joined contributing class ids).
 # Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID, and STANDING_AUTH_SCOPE ("all"
 # or "critical") / STANDING_AUTH_COVERED (the files the class matched). Every
 # check fails closed. Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval),
@@ -650,6 +655,7 @@ standing_auth_fetch_diff() {
 standing_auth_eval() {
   local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
+  local UNION_NAMES="" UNION_FILES="" UNION_IDS="" CLAIMED_NAMES CLAIMED_JSON
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
   STANDING_AUTH_SCOPE=""
@@ -748,6 +754,37 @@ standing_auth_eval() {
     # excludeFilePatterns glob. In critical mode no CHANGED file at all may
     # be a kept-set path, whichever scope the class uses.
     local ALL_MATCH=1 file pattern FILE_MATCHED
+    if [ "$ONLY_CRIT" -eq 1 ]; then
+      # #12994: claim the critical-file hits this class's patterns cover
+      # (and its excludes do not) instead of requiring all of them, so
+      # several criticalFilesOnly classes can jointly cover one PR. An entry
+      # is claimed only when its filename AND previous_filename are.
+      CLAIMED_NAMES=""
+      while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        FILE_MATCHED=0
+        while IFS= read -r pattern; do
+          [ -z "$pattern" ] && continue
+          # shellcheck disable=SC2053
+          if [[ "$file" == $pattern ]]; then
+            FILE_MATCHED=1
+            break
+          fi
+        done <<<"$PATTERNS"
+        while [ "$FILE_MATCHED" -eq 1 ] && IFS= read -r pattern; do
+          [ -z "$pattern" ] && continue
+          # shellcheck disable=SC2053
+          [[ "$file" == $pattern ]] && FILE_MATCHED=0
+        done <<<"$EXCLUDES"
+        [ "$FILE_MATCHED" -eq 1 ] && CLAIMED_NAMES+="$file"$'\n'
+      done <<<"$CRIT_MATCH_FILES"
+      [ -n "$CLAIMED_NAMES" ] || continue
+      CLAIMED_JSON=$(printf '%s' "$CLAIMED_NAMES" | jq -R 'select(length > 0)' | jq -s -c .) || continue
+      CLASS_DIFF=$(printf '%s' "$CRIT_DIFF" | jq -c --argjson n "$CLAIMED_JSON" \
+        '[.[] | select((.filename as $f | $n | index($f) != null) and ((.previous_filename // null) == null or (.previous_filename as $f | $n | index($f) != null)))]') || continue
+      printf '%s' "$CLASS_DIFF" | jq -e 'length > 0' >/dev/null 2>&1 || continue
+      CLASS_FILES=$(printf '%s' "$CLASS_DIFF" | jq -r '.[] | .filename, (.previous_filename // empty)') || continue
+    else
     while IFS= read -r file; do
       [ -z "$file" ] && continue
       FILE_MATCHED=0
@@ -772,6 +809,7 @@ standing_auth_eval() {
         fi
       done <<<"$EXCLUDES"
     done <<<"$CLASS_FILES"
+    fi
     [ "$ALL_MATCH" -eq 0 ] && continue
     if [ "$mode" = "critical" ]; then
       while IFS= read -r file; do
@@ -796,8 +834,7 @@ standing_auth_eval() {
     if [ -n "$FORBIDDEN" ]; then
       local LINES_JSON DIFF_HIT=0 rx rc
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
-      CLASS_DIFF="$DIFF_JSON"
-      [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
+      [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
       printf '%s' "$CLASS_DIFF" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
       LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
       while IFS= read -r rx; do
@@ -850,14 +887,25 @@ standing_auth_eval() {
     done <<<"$CONDITIONS"
 
     if [ "$CONDITIONS_HOLD" -eq 1 ]; then
+      if [ "$ONLY_CRIT" -eq 1 ]; then
+        # #12994: a passing criticalFilesOnly class contributes its claimed
+        # hits to the union; a failing one (any `continue` above) adds nothing.
+        UNION_NAMES+="$CLASS_FILES"$'\n'
+        UNION_FILES+="$(printf '%s' "$CLASS_DIFF" | jq -r '.[].filename')"$'\n'
+        UNION_IDS="${UNION_IDS:+$UNION_IDS,}$CLASS_ID"
+        if [ "$(printf '%s\n' "$UNION_NAMES" | grep -v '^$' | LC_ALL=C sort -u)" = "$(printf '%s\n' "$CRIT_MATCH_FILES" | LC_ALL=C sort -u)" ]; then
+          STANDING_AUTH_RESULT="ELIGIBLE"
+          STANDING_AUTH_ID="$UNION_IDS"
+          STANDING_AUTH_SCOPE="critical"
+          STANDING_AUTH_COVERED=$(printf '%s\n' "$UNION_FILES" | grep -v '^$' | LC_ALL=C sort -u)
+          return 0
+        fi
+        continue
+      fi
       STANDING_AUTH_RESULT="ELIGIBLE"
       STANDING_AUTH_ID="$CLASS_ID"
       STANDING_AUTH_SCOPE="all"
       STANDING_AUTH_COVERED="$AUTH_FILES"
-      if [ "$ONLY_CRIT" -eq 1 ]; then
-        STANDING_AUTH_SCOPE="critical"
-        STANDING_AUTH_COVERED=$(printf '%s' "$CRIT_DIFF" | jq -r '.[].filename')
-      fi
       return 0
     fi
   done

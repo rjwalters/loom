@@ -729,6 +729,46 @@ case "$out" in *"FAIL: Critical file modified: .github/workflows/loom-judge.yml"
 assert_eq "FAIL" "$r" "criterion #3 block: a kept-set workflow restores the FAIL"
 
 echo
+echo "--- #12994: several criticalFilesOnly classes jointly cover one PR (union) ---"
+
+MANIFEST="package.json"
+WF_MAN_DOC="$(printf '%s\n%s\n%s' "$WF" "$MANIFEST" "$DOC")"
+wf_cls() { printf '{"id":"wf","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval"],"criticalFilesOnly":true%s}' "$1"; }
+man_cls() { printf '{"id":"manifest","filePatterns":["package.json"],"conditions":["judgeApproval"%s],"criticalFilesOnly":true%s}' "$1" "$2"; }
+cfg2() { printf '{"champion":{"standingAuthorizations":[%s,%s]}}' "$1" "$2"; }
+UNION_API="$(jq -n -c --arg wf "$WF" --arg m "$MANIFEST" --arg d "$DOC" \
+    '[{filename:$wf,patch:"@@ -1 +1 @@\n+# c"},{filename:$m,patch:"@@ -1 +1 @@\n+\"v\": 1"},{filename:$d,patch:"@@ -1 +1 @@\n+p"}]')"
+
+out="$(SHOW_SCOPE=1 run_eval critical "$(cfg2 "$(wf_cls '')" "$(man_cls '' '')")" "$WF_MAN_DOC" "$UNION_API" green "loom:pr")"
+assert_eq "ELIGIBLE:wf,manifest:critical:$WF,$MANIFEST" "$out" \
+    "workflow class + manifest class jointly cover workflow + package.json: ELIGIBLE, both ids and files reported"
+
+out="$(run_eval critical "$(cfg2 "$(man_cls '' '')" "$(wf_cls '')")" "$WF_MAN_DOC" "$UNION_API" green "loom:pr")"
+assert_eq "ELIGIBLE:manifest,wf" "$out" "class order does not matter for the union"
+
+out="$(run_eval critical "$(cfg2 "$(wf_cls '')" "$(man_cls ',"greenCi"' '')")" "$WF_MAN_DOC" "$UNION_API" red "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a manifest class failing greenCi contributes nothing: the manifest stays uncovered"
+
+out="$(run_eval critical "$(cfg2 "$(wf_cls '')" "$(man_cls '' ',"forbiddenDiffPatterns":["\"v\""]')")" "$WF_MAN_DOC" "$UNION_API" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a manifest class tripping forbiddenDiffPatterns on its claimed hit contributes nothing"
+
+out="$(run_eval critical "$(cfg2 "$(wf_cls '')" "$(man_cls '' ',"excludeFilePatterns":["package.json"]')")" "$WF_MAN_DOC" "$UNION_API" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a hit matching a class's excludeFilePatterns is not claimed by it"
+
+out="$(run_eval critical "$(cfg2 "$(wf_cls '')" '{"id":"junk","filePatterns":["nothing/*"],"conditions":["judgeApproval"],"criticalFilesOnly":true}')" "$WF_MAN_DOC" "$UNION_API" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a critical hit matched by no class is still held"
+
+out="$(run_eval critical "$(cfg2 "$(wf_cls '')" "$(man_cls '' '')")" "$WF_MAN_DOC" "$UNION_API" green "")"
+assert_eq "NOT ELIGIBLE:" "$out" "without Judge approval at head neither class contributes"
+
+THREE='{"champion":{"standingAuthorizations":[{"id":"a","filePatterns":[".github/workflows/*.yml","package.json"],"conditions":["judgeApproval"],"criticalFilesOnly":true},{"id":"b","filePatterns":["package.json"],"conditions":["judgeApproval"],"criticalFilesOnly":true},{"id":"c","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval"],"criticalFilesOnly":true}]}}'
+out="$(run_eval critical "$THREE" "$WF_MAN_DOC" "$UNION_API" green "loom:pr")"
+assert_eq "ELIGIBLE:a" "$out" "three classes with overlap: the first class covering everything still wins alone, as before"
+
+out="$(run_eval critical "$(cfg2 "$(wf_cls '')" "$(wf_cls '')")" "$WF_MAN_DOC" "$UNION_API" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "two classes covering the same file do not cover the other"
+
+echo
 echo "--- Doc pins: #12528 ---"
 assert_doc_contains "$CHAMPION_MD" '`coversCriticalFiles` (#12528' "champion-pr-merge.md documents coversCriticalFiles"
 assert_doc_contains "$CHAMPION_MD" '`excludeFilePatterns` (#12528' "champion-pr-merge.md documents excludeFilePatterns"

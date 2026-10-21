@@ -572,6 +572,16 @@ changed file. It waives criterion #3 only and is never eligible for criterion
 | `src/ci.yml` renamed to `.github/workflows/ci.yml` | the previous name is outside the class: #3 **FAIL**, hold |
 | `docs/guide.md` alone | no critical-file hit: the class does not apply, #3 passes on its own |
 
+**Joint coverage (#12994)**: a `criticalFilesOnly` class *claims* only the
+critical-file hits its `filePatterns` match and its `excludeFilePatterns` do
+not, and judges its conditions and `forbiddenDiffPatterns` on that claimed set.
+Classes that pass every gate are unioned; #3 passes only when the union is
+exactly the PR's critical-file hits. A class that fails any gate contributes
+nothing, and a hit no class claims keeps the hold. With a workflow class and a
+manifest class, a PR touching `.github/workflows/ci.yml` plus `package.json`
+passes (`STANDING_AUTH_ID` lists both ids); if the manifest class fails
+`greenCi`, `package.json` is uncovered and the PR is held.
+
 **Action** (single authoritative policy — implemented in
 `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment →
 Standing operator authorization (#6850)"): see that section for the config
