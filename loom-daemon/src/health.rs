@@ -32,7 +32,7 @@
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
 //! | pool_hold | [`crate::types::DaemonStatusReport::pool_exhaustion_holds`] (published by [`crate::work_finder::pool_preflight::active_hold_statuses`], Issues #7708/#7990) — its own bucket, deliberately NOT folded into `tokens` |
-//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
+//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
 //! [`HealthInputs`] and returns a [`HealthReport`] — so every verdict rule

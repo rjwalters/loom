@@ -20,7 +20,7 @@ writing) will additionally push these records to a cloud backend.
 
 - [Scope: daemon work only (#12536)](#scope-daemon-work-only-12536)
 - [Envelope](#envelope)
-- [`/ingest` response (the bound-`host_id` echo)](#ingest-response-the-bound-host_id-echo)
+- [`/ingest` response (removed, #12813)](#ingest-response-removed-12813)
 - [`RepoVisibility` contract — private by default](#repovisibility-contract--private-by-default)
 - [Exported-facts contract (external ETA consumers, #11098)](#exported-facts-contract-external-eta-consumers-11098)
 - [Span join-facts contract (external provenance join, #11982)](#span-join-facts-contract-external-provenance-join-11982)
@@ -126,48 +126,15 @@ on that one line by construction (#8915 vs #8909, 2026-09-25). Row `12` is the
 terminal row for that practice: a new kind declares
 `gate: NEW_KIND_SCHEMA_VERSION` in its registry row and appends nothing here.
 
-## `/ingest` response (the bound-`host_id` echo)
+## `/ingest` response (removed, #12813)
 
-A push is a bare JSON array of envelopes; the backend answers a **2xx with a
-JSON object**:
-
-```json
-{ "accepted": 50, "host_id": "fleet-host-abc" }
-```
-
-| Field      | Type    | Notes |
-|------------|---------|-------|
-| `accepted` | integer | How many envelopes from this batch were persisted. Whole-batch semantics: a batch is either fully accepted or rejected with a non-2xx. |
-| `host_id`  | string  | **The host id the authenticated ingest key is bound to** — i.e. the identity the batch's rows were actually filed under. Added by issue #4830. |
-
-`host_id` here is *not* echoed from the request. Every record is persisted
-under the identity bound to the presented key, never the envelope's own
-(client-supplied, opaque) `host_id` field — so this echo is what a host was
-actually recorded as, which is exactly the value that differs when the wrong
-host's key file has been installed on a machine.
-
-**How the exporter uses it.** `loom-daemon`'s exporter compares this value
-against the identity the daemon resolved for itself (`$LOOM_HOST_ID`, else
-`$HOSTNAME`, else `hostname`) and on a disagreement logs a WARN **once per
-daemon lifetime** and reports an `observability DEGRADED` section in
-`loom-daemon health`. Nothing about the export changes: the batch stays acked
-and the backend keeps filing under the key's binding, which remains
-authoritative. See `2AMLogic/loom-ui:docs/deploy-runbook.md` §8.
-
-**Compatibility.** The field is purely additive — no `schema_version` rev is
-involved (that integer versions the *record* envelope, not this response).
-Both directions are safe:
-
-- an exporter that ignores the response body behaves exactly as before;
-- a backend that does not send `host_id` (anything predating #4830) is treated
-  by the exporter as "no identity to verify" and is **silently** skipped — it
-  never produces a recurring "cannot verify" warning.
-
-**Star intents (removed, #11104).** A loom-ui backend may still append
-`operator_priority_intents` (#9244 C) to the response. The daemon ignores the
-field whatever its shape; it never fails the ack or skips the `host_id`
-check. loom-ui sets priority labels on GitHub directly. The exporter still
-reads at most 64 KiB of the response.
+The native JSON-over-HTTPS exporter pushed a bare JSON array of envelopes to a
+backend `/ingest` route and read back `{ "accepted": N, "host_id": "…" }`, whose
+`host_id` echo drove the daemon's host-identity mismatch check (#4830). The
+exporter, that check, and the `observability_host_id_mismatch` status field were
+removed in #12813: the daemon does not talk to the dashboard, and OTLP/HTTP
+success responses carry only `partial_success`. Envelope `schema_version`s are
+unchanged by the removal.
 
 ## `RepoVisibility` contract — private by default
 
@@ -312,8 +279,8 @@ records (`tokens.snapshot`, `host.health`) do not.
 
 **The authoritative list of kinds is the registry**,
 `loom-daemon/src/telemetry/kinds.rs` — one row per kind carrying its wire tag,
-payload type, gate version, OTLP routing class, and whether the native HTTPS
-`/ingest` backend accepts it, plus a prose description. That file *generates* the
+payload type, gate version, OTLP routing class, and whether the removed native
+HTTPS `/ingest` backend accepted it (#12813), plus a prose description. That file *generates* the
 Rust enum and the wire tags, so it cannot drift from what a daemon emits; the
 `TELEMETRY_KINDS` constant is the same table at runtime. There is deliberately no
 second hand-maintained index of the kind set here (#8921 removed the one that
@@ -1781,8 +1748,8 @@ Field tables, the chunking contract, the scrub-class list and the
 The generic operational-metrics carrier (Issue #8860): a batch of points any
 daemon loop emits through `loom-daemon/src/observability/ops.rs`, instead of
 inventing a record kind per signal. Envelopes carry `schema_version: 10`.
-**OTLP-only** — the native HTTPS `/ingest` exporter drops it, like
-`trace.span`, so the Cloudflare backend never sees it.
+**OTLP-only** — the removed native HTTPS `/ingest` exporter dropped it, like
+`trace.span`.
 
 | Field | Type | Notes |
 |---|---|---|

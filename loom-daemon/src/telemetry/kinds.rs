@@ -52,7 +52,7 @@
 //! | payload | The record struct carried by the variant. |
 //! | `gate:` | The envelope `schema_version` this kind's envelopes carry. |
 //! | `otlp:` | Which OTLP signal shape this kind exports as ([`TelemetryKindOtlp`]). |
-//! | `native:` | Whether the native HTTPS `/ingest` backend accepts it. |
+//! | `native:` | Whether the removed native HTTPS `/ingest` backend accepted it (#12813: no exporter reads it any more; kept as the kind's wire-compat record). |
 
 use std::fmt;
 
@@ -141,7 +141,8 @@ pub struct TelemetryKindMeta {
     pub schema_version: u32,
     /// How this kind exports over OTLP.
     pub otlp: TelemetryKindOtlp,
-    /// Whether the native HTTPS `/ingest` backend accepts this kind.
+    /// Whether the removed native HTTPS `/ingest` backend accepted this kind
+    /// (#12813: no exporter reads it any more).
     pub native_ingest: bool,
 }
 
@@ -280,7 +281,7 @@ pub fn export_coverage(
 }
 
 /// The sorted wire `kind` tags the given exporters (by
-/// `ExporterKind::name`: `"https"`, `"otlp"`) carry, derived from the registry
+/// `ExporterKind::name`: `"otlp"`, or the retired `"https"`) carry, derived from the registry
 /// rows (Issue #10196). `https` carries `native_ingest` kinds; `otlp` carries
 /// every kind whose class is not [`TelemetryKindOtlp::NotExported`]. Unknown
 /// exporter names contribute nothing.

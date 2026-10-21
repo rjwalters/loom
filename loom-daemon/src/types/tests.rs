@@ -376,7 +376,6 @@ fn running_exporter(uptime_secs: i64) -> ObservabilityExportStatus {
     ObservabilityExportStatus {
         state: ObservabilityExportState::Starting,
         host_id: Some("robb-studio".to_string()),
-        ingest_host_id: None,
         endpoint: Some("https://dashboard.example/ingest".to_string()),
         exporter: Some("https".to_string()),
         started_at: Some(export_now() - chrono::Duration::seconds(uptime_secs)),
@@ -450,27 +449,6 @@ fn an_acked_batch_with_agreeing_ids_is_healthy() {
 }
 
 #[test]
-fn a_disagreeing_ingest_id_is_a_mismatch_even_while_exporting() {
-    // #4830's condition, expressed on the positive surface: data IS
-    // landing, under the wrong identity.
-    let mut status = running_exporter(4 * 3600);
-    status.last_success_at = Some(export_now() - chrono::Duration::seconds(12));
-    status.ingest_host_id = Some("robb-pro".to_string());
-    assert_eq!(status.classify(export_now()), ObservabilityExportState::HostIdMismatch);
-    assert!(ObservabilityExportState::HostIdMismatch.is_problem());
-}
-
-#[test]
-fn an_echoed_id_that_agrees_is_not_a_mismatch() {
-    // Defensive: only a *disagreement* is a mismatch. An echo equal to the
-    // daemon's own id must stay healthy.
-    let mut status = running_exporter(4 * 3600);
-    status.last_success_at = Some(export_now());
-    status.ingest_host_id = Some("robb-studio".to_string());
-    assert_eq!(status.classify(export_now()), ObservabilityExportState::Healthy);
-}
-
-#[test]
 fn consecutive_failures_classify_as_failing() {
     let mut status = running_exporter(4 * 3600);
     status.last_success_at = Some(export_now() - chrono::Duration::seconds(7200));
@@ -480,19 +458,6 @@ fn consecutive_failures_classify_as_failing() {
     assert!(ObservabilityExportState::Failing.is_problem());
     // "Never worked" vs "worked, then broke" stays legible.
     assert_eq!(status.last_success_age_secs(export_now()), Some(7200));
-}
-
-#[test]
-fn a_mismatch_outranks_a_transient_flush_failure() {
-    // Precedence documented on `classify`: the config-shaped fault that
-    // cannot self-recover wins; the failure facts remain readable in the
-    // `last_failure_*` fields either way.
-    let mut status = running_exporter(4 * 3600);
-    status.last_success_at = Some(export_now() - chrono::Duration::seconds(60));
-    status.ingest_host_id = Some("robb-pro".to_string());
-    status.consecutive_failures = 2;
-    assert_eq!(status.classify(export_now()), ObservabilityExportState::HostIdMismatch);
-    assert_eq!(status.consecutive_failures, 2);
 }
 
 #[test]
@@ -515,7 +480,6 @@ fn export_state_serializes_snake_case_for_watch_loops() {
         (ObservabilityExportState::Starting, "\"starting\""),
         (ObservabilityExportState::NeverExported, "\"never_exported\""),
         (ObservabilityExportState::Healthy, "\"healthy\""),
-        (ObservabilityExportState::HostIdMismatch, "\"host_id_mismatch\""),
         (ObservabilityExportState::Failing, "\"failing\""),
     ] {
         assert_eq!(serde_json::to_string(&state).unwrap(), wire);

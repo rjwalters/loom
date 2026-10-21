@@ -1732,7 +1732,6 @@ pub fn build_daemon_status_for(
         // Observability host-identity mismatch (#4830) — same process-global
         // snapshot pattern again, registered only when the exporter actually
         // starts, so a disabled/keyless exporter always reads `None`.
-        observability_host_id_mismatch: crate::observability::global_host_id_mismatch(),
         // Positive export-liveness signal (#5083) — the counterpart to the
         // anomaly-only field above. Always `Some` from a daemon of this
         // vintage: an exporter that never started reports `disabled`, which is

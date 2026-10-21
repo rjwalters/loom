@@ -46,9 +46,6 @@ pub struct BatchOutcome {
     /// kind the exporter deliberately does not send is routing, not loss.
     pub lost: BTreeMap<String, u64>,
     pub error: Option<ExportError>,
-    /// The sink answered 410: it is retired (#12812). The batch is acknowledged
-    /// (dropped, not lost) and the sender records no failure.
-    pub retired: bool,
 }
 impl BatchOutcome {
     pub fn accepted(envelopes: usize) -> Self {
