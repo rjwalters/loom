@@ -14,7 +14,7 @@
 //! around a listing whose `gh` calls are made several helpers down — else its
 //! [`ReadClass`] name (`gate` by default, `hygiene`, `observability`).
 //!
-//! The scope is thread-local like [`super::caller_scope`]: the facade builds
+//! The scope is thread-local: the facade builds
 //! each invocation on its caller's thread, and [`super::GhInvocation::new`]
 //! reads the scope there.
 

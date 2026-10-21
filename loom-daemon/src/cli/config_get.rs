@@ -23,7 +23,7 @@ use crate::config_resolver::{
 
 /// `loom-daemon config` arguments.
 #[derive(Args)]
-pub(crate) struct ConfigArgs {
+pub struct ConfigArgs {
     #[command(subcommand)]
     command: ConfigCommand,
 }
@@ -49,7 +49,7 @@ enum ConfigCommand {
     },
 }
 
-pub(crate) fn dispatch(args: ConfigArgs) -> Result<()> {
+pub fn dispatch(args: ConfigArgs) -> Result<()> {
     match args.command {
         ConfigCommand::Get {
             key,

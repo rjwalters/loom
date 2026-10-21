@@ -522,6 +522,26 @@ behavior is byte-for-byte unchanged from before #6850.
   matching line disqualifies the PR from the class. **Fail closed**: an
   unreadable diff, a changed file the API returns no patch for (binary, or
   too large to inline), or an invalid regex also disqualifies it.
+- `privilegedContentPatterns` (#12954, optional) — regexes (jq `test()`, the
+  same engine and fail-closed rules as `forbiddenDiffPatterns`) matched, one
+  line at a time, against the **full contents at the PR head SHA** of every
+  file the class covers (every changed file, or the critical-file hits of a
+  `criticalFilesOnly` class), not against the changed lines. One matching line
+  means the file holds a privilege (a secret, a deploy or publish step, a
+  write permission, a privileged trigger), whatever its name, and
+  disqualifies the PR from the class; a file that matches none is covered
+  whatever its name. This classifies by capability, so a class can drop the
+  `*deploy*` / `*release*` / `*publish*` name excludes. It does not replace
+  `forbiddenDiffPatterns`, which still catches a PR that *adds* a privilege.
+  **Fail closed**: unreadable or empty content, a file the contents API cannot
+  serve (too large), a `removed` file, an invalid regex, a head SHA that moved
+  while the files were read, or a value that is not an array of non-empty
+  strings also disqualifies it. Absent or `[]` is today's class, unchanged. No
+  default list is built in; the class owns it (example in
+  `champion-reference.md`). Whole-line YAML comments (`^\s*#`) are not
+  scanned — a comment grants nothing, and the 2026-10-20 fixtures carry
+  comments such as "no id-token: write" — while trailing comments and every
+  other line are.
 - **Kept set — never satisfiable by a class (#12528).** In criterion #3 mode
   the matcher also disqualifies any PR touching a path of the kept set,
   whatever the class says and with or without `coversCriticalFiles`: kept-set
@@ -635,6 +655,46 @@ standing_auth_fetch_diff() {
   DIFF_JSON=$(printf '%s' "$raw" | jq -s -c 'add // []' 2>/dev/null) || return 1
 }
 
+# standing_auth_content_clear <files-json> <regexes>   (#12954)
+# 0 = every file in <files-json> was read at the PR head SHA and no line of it
+# matches any privilegedContentPatterns regex. Anything else (a removed or
+# unreadable or empty file, an invalid regex, a head SHA that moved) = 1.
+standing_auth_content_clear() {
+  local files_json="$1" regexes="$2" sha1 sha2 path enc body rx rc
+  [ -n "$regexes" ] || return 0
+  printf '%s' "$files_json" | jq -e 'length > 0 and all(.[]; (.status // "") != "removed")' >/dev/null 2>&1 || return 1
+  while IFS= read -r rx; do
+    [ -z "$rx" ] && continue
+    jq -n -e --arg rx "$rx" '"" | test($rx)' >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -le 1 ] || return 1
+  done <<<"$regexes"
+  sha1=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || return 1
+  [ -n "$sha1" ] || return 1
+  while IFS= read -r path; do
+    [ -z "$path" ] && continue
+    enc=$(jq -rn --arg p "$path" '$p | split("/") | map(@uri) | join("/")') || return 1
+    body=$(gh api -H "Accept: application/vnd.github.raw" "repos/{owner}/{repo}/contents/${enc}?ref=$sha1" 2>/dev/null) || return 1
+    [ -n "$body" ] || return 1
+    while IFS= read -r rx; do
+      [ -z "$rx" ] && continue
+      # A whole-line YAML comment grants nothing, so it is not scanned: the
+      # 2026-10-20 fixtures hold comments such as "no id-token: write" that
+      # would otherwise read as the privilege they deny. Trailing comments
+      # and every other line stay scanned. The one shape this misses is a
+      # whole-line `#` inside a `run: |` block (Actions interpolates it); a
+      # PR that adds one is caught by forbiddenDiffPatterns, which scan the
+      # changed lines unstripped.
+      printf '%s' "$body" | jq -R -s -e --arg rx "$rx" 'split("\n") | map(select(test("^\\s*#") | not)) | any(.[]; test($rx))' >/dev/null 2>&1
+      rc=$?
+      # rc 1 = no privileged line; 0 = a privileged line; else error.
+      [ "$rc" -eq 1 ] || return 1
+    done <<<"$regexes"
+  done < <(printf '%s' "$files_json" | jq -r '.[].filename')
+  sha2=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || return 1
+  [ "$sha1" = "$sha2" ]
+}
+
 # standing_auth_eval <any|critical>
 #   any      criterion #2: a class satisfies the four-axis judgment. A class
 #            with "criticalFilesOnly" set (#12648) is never eligible here.
@@ -648,7 +708,7 @@ standing_auth_fetch_diff() {
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is criterion #3's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
-  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN
+  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
@@ -696,6 +756,11 @@ standing_auth_eval() {
     CONDITIONS=$(jq -r ".champion.standingAuthorizations[$i].conditions // [] | .[]" "$CONFIG_FILE")
     EXCLUDES=$(jq -r ".champion.standingAuthorizations[$i].excludeFilePatterns // [] | .[]" "$CONFIG_FILE")
     FORBIDDEN=$(jq -r ".champion.standingAuthorizations[$i].forbiddenDiffPatterns // [] | .[]" "$CONFIG_FILE")
+    # privilegedContentPatterns (#12954): absent/null/[] is today's class; anything
+    # but an array of non-empty strings is malformed and skips the entry (a
+    # silently ignored key would read as "no privilege found").
+    jq -e ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | type == \"array\" and all(.[]; type == \"string\" and length > 0)" "$CONFIG_FILE" >/dev/null 2>&1 || continue
+    PRIVILEGED=$(jq -r ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | .[]" "$CONFIG_FILE")
 
     # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
     # `true` makes a class that waives criterion #3 for the critical-file hits
@@ -736,7 +801,7 @@ standing_auth_eval() {
     local UNKNOWN_CONDITION=0 cond
     while IFS= read -r cond; do
       case "$cond" in
-        judgeApproval | greenCi) ;;
+        judgeApproval | greenCi | authorIsDependabot | noMajorBump) ;;
         *) UNKNOWN_CONDITION=1 ;;
       esac
     done <<<"$CONDITIONS"
@@ -815,6 +880,16 @@ standing_auth_eval() {
       [ "$DIFF_HIT" -eq 1 ] && continue
     fi
 
+    # privilegedContentPatterns (#12954): capability, read from each covered
+    # file's full contents at the PR head SHA rather than from its name or its
+    # changed lines. Any privileged line, or any unreadable file, disqualifies.
+    if [ -n "$PRIVILEGED" ]; then
+      [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
+      CLASS_DIFF="$DIFF_JSON"
+      [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
+      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" || continue
+    fi
+
     # File list matches this class and every condition is recognized --
     # now actually VERIFY each condition mechanically, in THIS pass. Never
     # assume; a standing authorization shortcuts the axis judgment only,
@@ -844,6 +919,32 @@ standing_auth_eval() {
             FAILING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
             PENDING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
             { [ -n "$FAILING" ] || [ -n "$PENDING" ]; } && CONDITIONS_HOLD=0
+          fi
+          ;;
+        authorIsDependabot)
+          # (#12948) The PR author's forge login, read live from the PR
+          # object -- never a comment, title or label claim. A failed or
+          # empty read fails closed. Only the exact bot login qualifies;
+          # `user.type` must also be Bot, so a human account cannot match by
+          # name alone.
+          PR_AUTHOR=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '[.user.login, .user.type] | join(" ")' 2>/dev/null) || PR_AUTHOR=""
+          [ "$PR_AUTHOR" = "dependabot[bot] Bot" ] || CONDITIONS_HOLD=0
+          ;;
+        noMajorBump)
+          # (#12948) Opt-out of semver majors. Reads the version move from
+          # the PR title Dependabot writes ("Bump X from A to B"); a major
+          # is a change of the first component (of the second, for 0.x). A
+          # title that does not parse (group bump, hand-edited title) fails
+          # closed: it is held, not assumed minor.
+          PR_TITLE=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.title' 2>/dev/null) || PR_TITLE=""
+          if [[ "$PR_TITLE" =~ [Bb]ump\ .*\ from\ v?([0-9]+)\.?([0-9]*)[^\ ]*\ to\ v?([0-9]+)\.?([0-9]*) ]]; then
+            if [ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[3]}" ]; then
+              CONDITIONS_HOLD=0
+            elif [ "${BASH_REMATCH[1]}" = "0" ] && [ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]; then
+              CONDITIONS_HOLD=0
+            fi
+          else
+            CONDITIONS_HOLD=0
           fi
           ;;
       esac
@@ -2467,6 +2568,38 @@ echo "CHAMPION-MERGE-OUTCOME pr=$PR_NUMBER rc=$MERGE_RC"
 outcome is **unknown**: neither failure nor re-queue. Never infer `MERGE_RC`;
 re-read the PR (a killed call may have merged and lost only its report), then
 go to "No exit code at all" in "Error Handling".
+
+### Step 3.5: Rebase conflicting Dependabot siblings (#12948)
+
+Only after Step 3 printed `CHAMPION-MERGE-OUTCOME ... rc=0` for a PR authored by
+`dependabot[bot]`. Sibling bumps in one repo conflict on the lockfile once the
+first merges; Dependabot rebases on request. Comment `@dependabot rebase` once
+on each open Dependabot PR that now reports a conflict. Nothing else: do not
+touch labels, do not push, do not merge them here. They re-enter the ordinary
+evaluation when they come back green. If `main` goes red after a Dependabot
+merge, that is Auditor or Builder work (revert or fix forward); it is not a
+reason to pre-hold the next bump.
+
+```bash
+PR_NUMBER=$1
+AUTHOR=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '[.user.login, .user.type] | join(" ")' 2>/dev/null)
+if [ "$AUTHOR" = "dependabot[bot] Bot" ]; then
+  gh api "repos/{owner}/{repo}/pulls?state=open&per_page=100" --paginate \
+    --jq '.[] | select(.user.login == "dependabot[bot]" and .user.type == "Bot") | .number' 2>/dev/null |
+  while read -r SIB; do
+    [ "$SIB" = "$PR_NUMBER" ] && continue
+    # `mergeable` is computed lazily: null = not yet known, so skip it this pass.
+    [ "$(gh api "repos/{owner}/{repo}/pulls/$SIB" --jq '.mergeable' 2>/dev/null)" = "false" ] || continue
+    MARK="<!-- champion:dependabot-rebase pr=$SIB after=$PR_NUMBER -->"
+    gh api "repos/{owner}/{repo}/issues/$SIB/comments" --paginate --jq '.[].body' 2>/dev/null | grep -qF "$MARK" && continue
+    ./.loom/scripts/post-comment.sh "$SIB" --pr --body "@dependabot rebase
+
+Champion: #$PR_NUMBER merged and this bump now conflicts. Requesting a rebase.
+
+$MARK"
+  done
+fi
+```
 
 ### Step 4: Verify Issue Auto-Close
 

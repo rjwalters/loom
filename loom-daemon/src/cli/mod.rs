@@ -41,6 +41,9 @@ pub(crate) mod codex_usage_cli;
 pub(crate) mod command_analysis;
 pub mod common;
 pub(crate) mod config_get;
+// The `loom-tools` bin (src/bin/loom_tools.rs) is a separate crate and reaches
+// the shared slice handlers only through these re-exports (#12938).
+pub use config_get::{dispatch as config_get_dispatch, ConfigArgs};
 mod daemon_start;
 mod daemon_update;
 pub(crate) mod dep_classify;
@@ -84,6 +87,7 @@ pub(crate) mod lease_ensure;
 pub(crate) mod lease_release;
 pub(crate) mod lease_renewer;
 pub(crate) mod legacy_script_cmds;
+pub use legacy_script_cmds::{handle_checkpoint_command, handle_strip_ansi_command};
 pub(crate) mod merge_group_ci_cmd;
 mod merge_pr_cleanup_paths;
 mod merge_pr_closed_building;
@@ -101,6 +105,7 @@ mod merge_pr_merge_route;
 mod merge_pr_partial_comment;
 mod merge_pr_partial_conflict;
 mod merge_pr_partial_reset;
+mod merge_pr_post_merge_cleanup;
 mod merge_pr_pr_state;
 mod merge_pr_reconcile;
 mod merge_pr_redate_report;

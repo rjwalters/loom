@@ -90,6 +90,18 @@ tokio-test = "0.4"
 serial_test = "4.0"
 criterion = "0.8"
 
+# Explicit so `loom-daemon` keeps its name and path now that a second bin exists.
+[[bin]]
+name = "loom-daemon"
+path = "src/main.rs"
+
+# Tools-only entry point (#12938, epic #12708): the shared slice commands behind
+# a mode gate. It links the library, never `daemon_service` (private to the
+# `loom-daemon` bin crate), so the daemon entry point is not in this artifact.
+[[bin]]
+name = "loom-tools"
+path = "src/bin/loom_tools.rs"
+
 [[bench]]
 name = "terminal_benchmarks"
 harness = false
