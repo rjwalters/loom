@@ -4,7 +4,7 @@
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
-//! | clean | [`loom_daemon::merge_pr::labels::CLEAN`] | 0 |
+//! | clean | [`crate::merge_pr::labels::CLEAN`] | 0 |
 //! | contradictory | the refusal | 1 |
 //! | sequencing hold only, under `--sequenced-hold-repo` | `LOOM-SEQUENCED-HOLD pr=<N> after=<M>`, then the refusal | 7 |
 //! | could not answer | — | 2 |
@@ -74,17 +74,17 @@ impl VerdictContradictionArgs {
             }
         };
 
-        match loom_daemon::merge_pr::labels::contradiction(&labels) {
+        match crate::merge_pr::labels::contradiction(&labels) {
             Some(blocker) => {
                 let hold = self
                     .sequenced_hold_repo
                     .as_deref()
                     .filter(|r| !r.is_empty())
-                    .filter(|_| loom_daemon::merge_pr::labels::sequenced_hold_only(&labels));
+                    .filter(|_| crate::merge_pr::labels::sequenced_hold_only(&labels));
                 if let Some(nwo) = hold {
                     println!(
                         "{}",
-                        loom_daemon::merge_pr::labels::sequenced_hold_line(
+                        crate::merge_pr::labels::sequenced_hold_line(
                             &self.pr,
                             sequenced_after(nwo, &self.pr)
                         )
@@ -92,18 +92,13 @@ impl VerdictContradictionArgs {
                 }
                 print!(
                     "{}",
-                    loom_daemon::merge_pr::labels::message(
-                        &self.pr,
-                        blocker,
-                        &labels,
-                        &self.head_sha
-                    )
+                    crate::merge_pr::labels::message(&self.pr, blocker, &labels, &self.head_sha)
                 );
                 println!();
                 std::process::exit(if hold.is_some() { 7 } else { 1 })
             }
             None => {
-                println!("{}", loom_daemon::merge_pr::labels::CLEAN);
+                println!("{}", crate::merge_pr::labels::CLEAN);
                 std::process::exit(0)
             }
         }
@@ -113,10 +108,9 @@ impl VerdictContradictionArgs {
 /// The predecessor named by the PR's live trusted `loom:sequence` marker, or
 /// `None` on any read/parse failure (display only — never changes the hold).
 fn sequenced_after(nwo: &str, pr: &str) -> Option<u32> {
-    use loom_daemon::merge_pr::sequence;
+    use crate::merge_pr::sequence;
     let pr: u32 = pr.parse().ok()?;
     let root = std::env::current_dir().ok()?;
-    let bodies =
-        sequence::fetch_trusted_bodies(&loom_daemon::gh_invocation::gh_bin(), &root, nwo, pr)?;
+    let bodies = sequence::fetch_trusted_bodies(&crate::gh_invocation::gh_bin(), &root, nwo, pr)?;
     sequence::parse_live(&bodies).map(|m| m.after)
 }

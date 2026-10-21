@@ -8,7 +8,6 @@
 //! argv builders here, deliberately separate so neither path's gate or command
 //! can silently become the other's.
 
-use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -181,22 +180,6 @@ pub fn recheck_alive(recheck: &Recheck, mut alive: impl FnMut() -> Option<u32>) 
 #[must_use]
 pub fn systemctl_available() -> bool {
     super::supervisor::systemctl_available()
-}
-
-/// Whether `launchctl` is usable on this host.
-#[must_use]
-pub fn launchctl_available() -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("launchctl").is_file()))
-}
-
-/// Advisory: the path a caller should report when neither supervisor is present.
-#[must_use]
-pub fn no_supervisor_detail(cli_dir: &Path) -> String {
-    format!(
-        "no supervisor command available on this host — relaunch by hand with {}",
-        cli_dir.join("loom-daemon-start.sh").display()
-    )
 }
 
 #[cfg(test)]

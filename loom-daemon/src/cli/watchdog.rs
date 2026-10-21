@@ -31,9 +31,9 @@ impl WatchdogArgs {
     /// undetermined, 2 usage.
     pub(crate) fn run(self) -> Result<()> {
         if self.help {
-            print!("{}", loom_daemon::watchdog::HELP_BANNER);
+            print!("{}", crate::watchdog::HELP_BANNER);
             std::process::exit(0);
         }
-        std::process::exit(loom_daemon::watchdog::tick(self.verbose));
+        std::process::exit(crate::watchdog::tick(self.verbose));
     }
 }

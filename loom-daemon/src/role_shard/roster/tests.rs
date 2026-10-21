@@ -49,7 +49,7 @@ fn rejects_malformed_issue_refs() {
 #[test]
 #[serial]
 fn disabled_by_default() {
-    let _e = EnvGuard::capture();
+    let _e = EnvGuard::clear(ROSTER_ENV);
     let config = resolve_roster_config_from(None);
     assert_eq!(config.state, RosterState::Disabled);
     assert!(!config.is_active());
@@ -61,7 +61,7 @@ fn disabled_by_default() {
 #[test]
 #[serial]
 fn enabled_with_no_issue_is_misconfigured_not_silently_unsharded() {
-    let _e = EnvGuard::capture();
+    let _e = EnvGuard::clear(ROSTER_ENV);
     let block = serde_json::json!({ "enabled": true });
     let config = resolve_roster_config_from(Some(&block));
     assert_eq!(config.state, RosterState::MisconfiguredNoIssue);
@@ -72,7 +72,7 @@ fn enabled_with_no_issue_is_misconfigured_not_silently_unsharded() {
 #[test]
 #[serial]
 fn enabled_with_a_valid_issue_is_active() {
-    let _e = EnvGuard::capture();
+    let _e = EnvGuard::clear(ROSTER_ENV);
     let block = serde_json::json!({ "enabled": true, "issue": "rjwalters/loom#42" });
     let config = resolve_roster_config_from(Some(&block));
     assert!(config.is_active());
@@ -82,7 +82,7 @@ fn enabled_with_a_valid_issue_is_active() {
 #[test]
 #[serial]
 fn ttl_is_floored_at_3x_heartbeat() {
-    let _e = EnvGuard::capture();
+    let _e = EnvGuard::clear(ROSTER_ENV);
     let block = serde_json::json!({
         "enabled": true,
         "issue": "rjwalters/loom#42",
@@ -98,7 +98,7 @@ fn ttl_is_floored_at_3x_heartbeat() {
 #[test]
 #[serial]
 fn an_explicit_ttl_above_the_floor_is_kept() {
-    let _e = EnvGuard::capture();
+    let _e = EnvGuard::clear(ROSTER_ENV);
     let block = serde_json::json!({
         "enabled": true,
         "issue": "rjwalters/loom#42",
@@ -112,7 +112,7 @@ fn an_explicit_ttl_above_the_floor_is_kept() {
 #[test]
 #[serial]
 fn env_overrides_config_for_every_knob() {
-    let _e = EnvGuard::capture();
+    let _e = EnvGuard::clear(ROSTER_ENV);
     let block = serde_json::json!({
         "enabled": false,
         "issue": "someone/else#1",
@@ -127,37 +127,15 @@ fn env_overrides_config_for_every_knob() {
     assert_eq!(config.heartbeat_secs, 60);
 }
 
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
-}
+use crate::env_test_support::EnvGuard;
 
-impl EnvGuard {
-    fn capture() -> Self {
-        let names = [
-            ROSTER_ENABLED_ENV,
-            ROSTER_ISSUE_ENV,
-            ROSTER_HEARTBEAT_SECS_ENV,
-            ROSTER_TTL_SECS_ENV,
-            ROSTER_SETTLE_SECS_ENV,
-        ];
-        let saved = names.iter().map(|n| (*n, std::env::var(*n).ok())).collect();
-        for n in names {
-            std::env::remove_var(n);
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
+const ROSTER_ENV: &[&str] = &[
+    ROSTER_ENABLED_ENV,
+    ROSTER_ISSUE_ENV,
+    ROSTER_HEARTBEAT_SECS_ENV,
+    ROSTER_TTL_SECS_ENV,
+    ROSTER_SETTLE_SECS_ENV,
+];
 
 // ---- Marker parsing ----
 
@@ -870,7 +848,7 @@ fn settle_secs_is_floored_at_ttl_secs() {
     // The no-overlap argument needs settle >= ttl: a host holding a stale
     // view keeps acting until its OWN record expires (up to ttl after its
     // last read), so nobody may act under a new ring before then.
-    let _e = EnvGuard::capture();
+    let _e = EnvGuard::clear(ROSTER_ENV);
     let block = serde_json::json!({
         "enabled": true,
         "issue": "rjwalters/loom#42",

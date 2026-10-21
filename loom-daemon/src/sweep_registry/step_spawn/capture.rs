@@ -98,8 +98,12 @@ pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> 
     text[start..].lines().rev().find_map(parse_outcome_line)
 }
 
-/// The `reason`s that mean "waiting on CI": Judge's `ci_pending`, and the
-/// Champion `requeued` outcome, which the telemetry projects as `ci_pending`.
+/// The `reason`s held as `ci_wait`: Judge's `ci_pending`, and the Champion
+/// `requeued` outcome word. The captain is fed the outcome line's own reason,
+/// not the telemetry projection, so a Champion `requeued` holds for any gate
+/// (`ci_pending`, `merge_rc<N>`, `pin_missing`): not merged, still approved,
+/// retry shortly. A Champion `skipped` stop is not listed and climbs the
+/// no-progress ladder.
 const CI_WAIT_REASONS: [&str; 2] = ["ci_pending", "requeued"];
 
 /// The captain release outcome for a step that ended `class` / `reason`: the
@@ -345,6 +349,7 @@ impl SweepRegistry {
             role,
             info.and_then(|i| i.model.as_deref()),
             info.and_then(|i| i.effort.as_deref()),
+            self.step_points(sweep_id),
         );
         self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached

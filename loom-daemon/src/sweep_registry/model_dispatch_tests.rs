@@ -359,3 +359,161 @@ fn a_read_only_credential_refuses_the_dispatch() {
     }
     assert!(!record.exists(), "nothing may launch on a refused root");
 }
+
+// ---- #12748: a Builder step's drawn model is the launched model ------------
+
+fn builder_launch(
+    root: &Path,
+    config: &Value,
+) -> std::result::Result<
+    crate::sweep_registry::step_spawn::StepLaunch,
+    crate::sweep_registry::step_spawn::StepRefusal,
+> {
+    step_launch(root, config, crate::step_role::StepRole::Builder)
+}
+
+fn step_launch(
+    root: &Path,
+    config: &Value,
+    role: crate::step_role::StepRole,
+) -> std::result::Result<
+    crate::sweep_registry::step_spawn::StepLaunch,
+    crate::sweep_registry::step_spawn::StepRefusal,
+> {
+    let (registry, _, _, _ws) = fixture(root, config);
+    let _pool = crate::write_scope_test_support::SharedTokenPool::one_account();
+    let kind = SweepKind::Step { item: 8715, role };
+    // The hermetic fixture skips admission; a draw only exists with it.
+    let mut step_config = registry.config.clone();
+    step_config.skip_label_flip = false;
+    SweepRegistry::resolve_step_launch(&step_config, role, &kind)
+}
+
+fn draw_config(model_config: &str, draw: Value) -> Value {
+    draw_config_for("builder", model_config, draw)
+}
+
+/// `role`'s configured model is `model_config`; its attempt-1 table is `draw`.
+fn draw_config_for(role: &str, model_config: &str, draw: Value) -> Value {
+    let mut config = fallback_config();
+    config["autonomous"] = json!({"model": model_config, "roleRunner": {"model": model_config}});
+    config["runtimes"]["roleDraw"] = json!({ role: [{"attempt": 1, "draw": draw}] });
+    config
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_builder_draw_naming_a_model_is_the_launched_model_not_the_configured_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    // Configured/default `sonnet`; the table draws `opus` with certainty.
+    let config = draw_config("sonnet", json!({"claude/opus": 100}));
+    let launch = builder_launch(dir.path(), &config).unwrap();
+    assert_eq!(launch.model.as_deref(), Some("opus"));
+    let stamp = launch.admission.admitted.unwrap().preference.unwrap();
+    assert_eq!(stamp.model.as_deref(), Some("opus"), "selected and launched agree");
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_builder_without_a_draw_keeps_the_configured_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let mut config = draw_config("sonnet", json!({"claude/opus": 100}));
+    config["runtimes"]
+        .as_object_mut()
+        .unwrap()
+        .remove("roleDraw");
+    let launch = builder_launch(dir.path(), &config).unwrap();
+    assert_eq!(launch.model.as_deref(), Some("sonnet"));
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_drawn_runtime_without_a_model_keeps_the_configured_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = draw_config("sonnet", json!({"claude": 100}));
+    let launch = builder_launch(dir.path(), &config).unwrap();
+    assert_eq!(launch.model.as_deref(), Some("sonnet"));
+}
+
+#[test]
+#[serial_test::serial]
+fn an_explicit_pin_outranks_the_draw_and_a_conflicting_draw_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let (registry, _, _, _ws) = fixture(dir.path(), &fallback_config());
+    let kind = SweepKind::Step {
+        item: 8715,
+        role: crate::step_role::StepRole::Builder,
+    };
+    let config = &registry.config;
+    // A request pin keeps its documented precedence over the draw.
+    assert_eq!(
+        DispatchModel::Request(Some("pinned"))
+            .resolve_drawn(config, &kind, "claude", Some("opus"))
+            .unwrap()
+            .as_deref(),
+        Some("pinned")
+    );
+    // An unpinned draw is the model.
+    assert_eq!(
+        DispatchModel::Autonomous
+            .resolve_drawn(config, &kind, "claude", Some("opus"))
+            .unwrap()
+            .as_deref(),
+        Some("opus")
+    );
+    // A Claude-shaped draw on Codex is refused, never silently replaced.
+    let why = DispatchModel::Autonomous
+        .resolve_drawn(config, &kind, "codex", Some("sonnet"))
+        .unwrap_err();
+    assert!(why.contains("sonnet"), "{why}");
+    // No draw: the unchanged resolver (native profile keeps its profile).
+    assert_eq!(
+        DispatchModel::Autonomous
+            .resolve_drawn(config, &kind, "opencode", None)
+            .unwrap(),
+        DispatchModel::Autonomous.resolve_for_runtime(config, &kind, Some("opencode"))
+    );
+}
+
+// ---- #12753: the same binding for a non-Builder stage and a walked draw ----
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_non_builder_draw_naming_a_model_differs_from_its_configured_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    let config = draw_config_for("curator", "sonnet", json!({"claude/opus": 100}));
+    let launch = step_launch(dir.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    assert_eq!(launch.model.as_deref(), Some("opus"), "the drawn model, not `sonnet`");
+    let stamp = launch.admission.admitted.unwrap().preference.unwrap();
+    assert_eq!(stamp.model.as_deref(), Some("opus"), "selected and launched agree");
+    // Control: the same stage with no draw keeps the configured model.
+    let mut undrawn = config;
+    undrawn["runtimes"]
+        .as_object_mut()
+        .unwrap()
+        .remove("roleDraw");
+    let launch = step_launch(dir.path(), &undrawn, crate::step_role::StepRole::Curator).unwrap();
+    assert_eq!(launch.model.as_deref(), Some("sonnet"));
+}
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn an_unavailable_draw_candidate_walks_to_the_next_candidates_own_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    // No Codex seat is provisioned, so the heavily weighted first pick cannot
+    // serve; the walk must land on Claude and launch Claude's own drawn model,
+    // not the unavailable candidate's and not the configured one.
+    let config =
+        draw_config_for("curator", "sonnet", json!({"codex/gpt-5.5": 1000, "claude/opus": 1}));
+    let launch = step_launch(dir.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    let admitted = launch.admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "claude");
+    assert_eq!(launch.model.as_deref(), Some("opus"));
+    assert_eq!(admitted.preference.unwrap().model.as_deref(), Some("opus"));
+}

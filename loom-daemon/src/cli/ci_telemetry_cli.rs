@@ -2,7 +2,7 @@
 //! telemetry for the configured forge owners (orgs and users, #9188). Reached through the flattened
 //! [`super::telemetry::TelemetryCommand`], so it is top-level.
 //!
-//! The logic lives in [`loom_daemon::ci_telemetry`]; this file is argument
+//! The logic lives in [`crate::ci_telemetry`]; this file is argument
 //! parsing, exit codes and rendering only.
 
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 
-use loom_daemon::ci_telemetry::{
+use crate::ci_telemetry::{
     self, api::GhCliApi, export, journal::Journal, ledger::Ledger, poll, state,
 };
 
@@ -92,8 +92,8 @@ enum CiTelemetryAction {
 
 fn resolve_root(workspace: Option<&Path>) -> Result<PathBuf> {
     let found = match workspace {
-        Some(path) => loom_daemon::repo_root::find_repo_root(path),
-        None => loom_daemon::repo_root::find_repo_root_from_cwd(),
+        Some(path) => crate::repo_root::find_repo_root(path),
+        None => crate::repo_root::find_repo_root_from_cwd(),
     };
     found.ok_or_else(|| {
         anyhow!("not inside a Loom workspace (no enclosing repo with a .loom/ directory)")
@@ -193,6 +193,17 @@ fn status(root: &Path, json: bool) -> Result<()> {
         state::Health::Stale { age_secs } => {
             serde_json::json!({ "state": "stale", "last_ok_age_secs": age_secs })
         }
+        state::Health::Degraded {
+            age_secs,
+            failing_owners,
+        } => serde_json::json!({
+            "state": "degraded",
+            "last_ok_age_secs": age_secs,
+            "failing_owners": failing_owners
+                .iter()
+                .map(|(owner, error)| serde_json::json!({ "owner": owner, "error": error }))
+                .collect::<Vec<_>>(),
+        }),
         state::Health::Failing {
             since,
             error,
@@ -287,6 +298,17 @@ fn status(root: &Path, json: bool) -> Result<()> {
         state::Health::Stale { age_secs } => format!(
             "STALE — last successful poll {age_secs}s ago (more than 3x the {}s interval)",
             resolved.interval_secs
+        ),
+        state::Health::Degraded {
+            age_secs,
+            failing_owners,
+        } => format!(
+            "DEGRADED — last poll {age_secs}s ago; owner(s) skipped: {}",
+            failing_owners
+                .iter()
+                .map(|(owner, error)| format!("{owner} ({error})"))
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
         state::Health::Failing {
             since,

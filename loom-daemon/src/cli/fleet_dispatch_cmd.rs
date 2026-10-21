@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 
-use loom_daemon::fleet_dispatch::{
+use crate::fleet_dispatch::{
     self,
     identity::{TailscaleWhois, DEFAULT_TAILSCALE_SOCKET},
     roster::{FleetStoreRoster, RosterSource},
@@ -120,14 +120,12 @@ async fn serve(
     let addr: std::net::IpAddr = bind
         .parse()
         .map_err(|e| anyhow!("invalid --bind address {bind:?}: {e}"))?;
-    loom_daemon::serve::validate_bind(addr, true).map_err(|e| anyhow!(e))?;
-    let root = loom_daemon::worktree_ops::repo::resolve_repo_root(workspace)
+    crate::serve::validate_bind(addr, true).map_err(|e| anyhow!(e))?;
+    let root = crate::worktree_ops::repo::resolve_repo_root(workspace)
         .with_context(|| format!("resolving workspace {workspace}"))?;
 
-    let gate = loom_daemon::fleet_captain::resolve_gate_for_root(
-        &root,
-        &loom_daemon::sweep_registry::host_identity(),
-    );
+    let gate =
+        crate::fleet_captain::resolve_gate_for_root(&root, &crate::sweep_registry::host_identity());
     if !gate.is_armed() {
         let message = gate.message("fleet-dispatch serve");
         if !no_captain_gate {
@@ -153,12 +151,12 @@ async fn serve(
         );
     }
 
-    let observability = loom_daemon::observability::read_config(&root);
+    let observability = crate::observability::read_config(&root);
     let _exporters =
-        loom_daemon::observability::standalone_ops::start(&observability, &root, "fleet-dispatch");
+        crate::observability::standalone_ops::start(&observability, &root, "fleet-dispatch");
 
     let policy = Policy::for_lease_ttl_minutes(
-        loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes(),
+        crate::claim_reconciliation::resolve_lease_ttl_minutes(),
         Duration::from_secs(grace_secs),
     )
     .with_no_progress(no_progress);
@@ -183,6 +181,10 @@ async fn serve(
         policy.no_progress.map(|d| d.as_secs())
     );
     let _maintenance = server::spawn_maintenance(Arc::clone(&server), source, opts);
+    let effective = crate::config_resolver::resolve_effective_config(&root);
+    let _queue_feed = server::start_queue_feed(&server, &effective, &|key_ref, aws| {
+        key_ref.read(aws, crate::forge_mirror::CONFIG_KEY)
+    });
     server::run(listener, server, opts).await
 }
 

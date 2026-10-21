@@ -156,6 +156,30 @@ pub fn sample() -> HostPressure {
     }
 }
 
+/// The host's total physical memory in bytes — only the `mem_total_bytes`
+/// half of [`sample`], without its `vm_stat` / PSI / `vmstat` reads, for a
+/// caller that needs the static size and nothing else (`host_shape`, #12874).
+/// `None` when it cannot be measured, never `0`.
+#[must_use]
+pub fn mem_total_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u64("hw.memsize").filter(|&b| b > 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        parse_meminfo(&text)
+            .mem_total_kb
+            .filter(|&kb| kb > 0)
+            .map(|kb| kb.saturating_mul(1024))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// Per-second rates of the two cumulative swap counters between successive
 /// samples.
 ///
@@ -193,12 +217,6 @@ pub fn swap_rates(
         ),
         None => (None, None),
     }
-}
-
-/// True when a byte-rate `Option` carries a usable, finite, non-negative rate.
-#[must_use]
-pub fn valid_rate(r: f64) -> bool {
-    r.is_finite() && r >= 0.0
 }
 
 #[cfg(target_os = "macos")]

@@ -47,8 +47,6 @@ use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
 use crate::telemetry::TelemetryEnvelope;
 
-pub mod targeted;
-
 /// Everything a cycle needs, resolved up front (a seam for tests: `now`,
 /// `host_id`, and the lookback are injectable).
 #[derive(Debug, Clone)]
@@ -363,7 +361,12 @@ fn record_outcome(
             if report.logs_fetched {
                 status.last_log_fetch_at = Some(ctx.now);
             }
-            if report.repo_errors.is_empty() {
+            // An owner skipped at discovery is recorded as a `repo_errors`
+            // entry too, but the cycle still polled the other owners: it is
+            // not a cycle failure. `classify` reads `status.owners` and
+            // reports `degraded`, naming the skipped owner, instead.
+            let skipped_owners = report.owners.iter().filter(|o| o.error.is_some()).count();
+            if report.repo_errors.len() <= skipped_owners {
                 status.last_ok_at = Some(ctx.now);
                 status.consecutive_failures = 0;
                 status.backoff_until = None;
@@ -815,9 +818,7 @@ enum RunOutcome {
 
 /// Record one **completed** run attempt: list its jobs, resolve suite spans,
 /// commit job units then the run unit, emit, and record
-/// the wanted job logs. Shared by the repo sweep ([`poll_repo`]) and the
-/// feed-driven single-run path ([`targeted`], #9201) so the two can never
-/// record a run differently. Never touches the watermark — that is the
+/// the wanted job logs. Never touches the watermark — that is the
 /// sweep's alone.
 #[allow(clippy::too_many_arguments)]
 fn record_run(

@@ -146,8 +146,8 @@ pub fn reclaim_at_sweep_end(
                 remove: &super::owner::remove_marker_last,
             };
             for dir in dirs {
-                let size = crate::target_orphan_reclaim::newest_mtime_and_size(&dir)
-                    .map_or(0, |(_, bytes)| bytes);
+                let size =
+                    crate::fs_util::newest_mtime_and_size(&dir).map_or(0, |(_, bytes)| bytes);
                 log_outcome(&owned_id, &dir, size, &reclaim_with(&dir, pgid, &probes));
             }
         });

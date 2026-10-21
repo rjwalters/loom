@@ -5,14 +5,14 @@
 //! Exit 0 = proceed (nothing printed); exit 1 = block, with the refusal on
 //! stdout. Any lookup failure exits 0: the guard fails open, like every other
 //! lookup-based preflight, and the real merge path remains the arbiter. The
-//! decision lives in [`loom_daemon::merge_pr::workflow_scope`].
+//! decision lives in [`crate::merge_pr::workflow_scope`].
 
+use crate::cmd_out::DEFAULT_TIMEOUT;
+use crate::forge_call_stats::ops::PR_DIFF_AND_FILES;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::merge_pr::workflow_scope::{assess, touches_workflows, Verdict, SKIP_ENV};
+use crate::script_helpers::run_gh;
 use anyhow::Result;
-use loom_daemon::cmd_out::DEFAULT_TIMEOUT;
-use loom_daemon::forge_call_stats::ops::PR_DIFF_AND_FILES;
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::merge_pr::workflow_scope::{assess, touches_workflows, Verdict, SKIP_ENV};
-use loom_daemon::script_helpers::run_gh;
 
 #[derive(clap::Args)]
 pub(crate) struct WorkflowScopeArgs {

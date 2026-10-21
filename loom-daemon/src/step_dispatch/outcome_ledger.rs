@@ -27,7 +27,8 @@
 //!
 //! Champion's other outcomes fold as: `merged`, `rejected`, `promoted`,
 //! `revise`, `operator`, `closed`, and a `--pr` triage's `triaged`,
-//! `triage-blocked`, `triage-operator` (#12499) → `verdict`; `requeued` → `noop`;
+//! `triage-blocked`, `triage-operator` (#12499) → `verdict`; `requeued` and
+//! `skipped` (a stop before Step 2, #12715) → `noop`;
 //! `head-moved`, `not-eligible` → `refused` (a state refusal); `failed` →
 //! `failed`.
 //!
@@ -224,7 +225,7 @@ pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
     let class = match (on_pr, outcome) {
         (true, "merged" | "rejected" | "triaged" | "triage-blocked" | "triage-operator")
         | (false, "promoted" | "revise" | "operator" | "closed") => Verdict,
-        (true, "held" | "requeued") | (false, "blocked") => Noop,
+        (true, "held" | "requeued" | "skipped") | (false, "blocked") => Noop,
         (true, "head-moved") | (_, "not-eligible") => Refused,
         (true, "failed") => Failed,
         _ => return None,
@@ -289,7 +290,10 @@ pub struct PostState {
 /// chooses between classes the post-state allows.
 ///
 /// - No post-state (`None`: the forge read failed) is `failed`, reason
-///   `probe_failed`: the session's own line is never trusted alone.
+///   `probe_failed`: the session's own line is never trusted alone. The one
+///   exception is a Champion `requeued` / `skipped` (#12715): it wrote nothing
+///   by contract, so there is no post-state to read, and the line stands as
+///   the `noop` it is.
 /// - A claim still held after exit is `failed`.
 /// - A Champion `not-eligible` on an open item stays that state refusal,
 ///   moved or not: it wrote nothing, so the post-state's move is not its
@@ -303,7 +307,10 @@ pub struct PostState {
 pub fn classify(line: Option<&StepOutcome>, post: Option<PostState>) -> StepOutcome {
     let failed_unclassified = StepOutcome::new(OutcomeClass::Failed, UNCLASSIFIED);
     let Some(post) = post else {
-        return StepOutcome::new(OutcomeClass::Failed, PROBE_FAILED);
+        return match line {
+            Some(l) if is_no_write_stop(l) => l.clone(),
+            _ => StepOutcome::new(OutcomeClass::Failed, PROBE_FAILED),
+        };
     };
     if post.claim_held {
         return match line {
@@ -342,6 +349,12 @@ pub const NO_WRITE_REFUSAL: &str = "not_eligible";
 /// Whether `line` is a refusal that wrote nothing ([`NO_WRITE_REFUSAL`]).
 fn is_no_write_refusal(line: &StepOutcome) -> bool {
     line.class == OutcomeClass::Refused && line.reason == NO_WRITE_REFUSAL
+}
+
+/// Whether `line` is a Champion stop that, by contract, wrote nothing and is
+/// neither a failure nor a verdict: `requeued` or `skipped` (#12715).
+fn is_no_write_stop(line: &StepOutcome) -> bool {
+    line.class == OutcomeClass::Noop && matches!(line.reason.as_str(), "requeued" | "skipped")
 }
 
 /// What the engine does with an `(item, step)` after its step ended.
@@ -451,6 +464,9 @@ pub enum CooldownCause {
     /// window, held here instead. Unlike [`Self::ForgeLadder`] it is restored
     /// after a restart, since the forge has nothing to read back.
     ForgeLadderFallback,
+    /// A captain's `cooldown` refusal (#12704): its hold, so the next tick
+    /// does not ask again before it ends.
+    CaptainHold,
 }
 
 /// Counters the ledger keeps (for `pick.decision` and the gates).

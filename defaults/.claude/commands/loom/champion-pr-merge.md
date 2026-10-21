@@ -133,7 +133,7 @@ case "$HRC $HC" in
   "0 "*" state=clear "*|"0 "*" state=champion-hold "*|"2 ") ;;
   "0 "*" state=stray-operator "*) gh pr edit "$PR_NUMBER" --remove-label "loom:operator" ;;
   "0 "*" state=contradiction "*) OTHER_VERDICT_LABEL=${HC##* detail=} ;;
-  *) echo "SKIP #$PR_NUMBER: ${HC:-rc=$HRC} — no merge, no comment"; continue ;;
+  *) echo "SKIP #$PR_NUMBER: ${HC:-rc=$HRC} — no merge, no comment"; continue ;;  # single-PR step: outcome=skipped reason=janitor_rc3
 esac
 
 if [ -n "$OTHER_VERDICT_LABEL" ]; then
@@ -200,7 +200,7 @@ VERDICT_RC=$?
 |------|---------|--------|
 | `0` | **FRESH** — the approval was rendered against the current head SHA | Proceed to criterion 1. |
 | `10` | No verdict label (raced away between listing and now) | **Skip this PR** — it is no longer merge-eligible. |
-| `11` | **UNVERIFIABLE** — no trusted marker could be confirmed for this verdict (on `loom:pr` this now means markers `could not be authenticated`: loom-daemon lacks `forge trusted-comments`, #9548) | **Do NOT merge** a `loom:pr` PR on `11`: skip it and report it in the completion summary. `post-verdict.sh` marks every verdict (#6382), so an approval with no confirmed marker approves no known tree (#9258: one merged with the literal body `@-`). |
+| `11` | **UNVERIFIABLE** — no trusted marker could be confirmed for this verdict (on `loom:pr` this now means markers `could not be authenticated`: loom-daemon lacks `forge trusted-comments`, #9548) | **Do NOT merge** a `loom:pr` PR on `11`: skip it (a single-PR step: `outcome=skipped reason=verdict_rc11`) and report it in the completion summary. `post-verdict.sh` marks every verdict (#6382), so an approval with no confirmed marker approves no known tree (#9258: one merged with the literal body `@-`). |
 | `12` | **STALE** — the approval covers a tree that is gone, or (#9258) it carried no trusted marker at all, so it never covered a known tree. Never anchored | **Do NOT merge.** The guard already removed `loom:pr`, re-queued the PR as `loom:review-requested`, and posted a comment naming both SHAs. `continue` to the next PR. |
 | any other | `gh`/environment error | **Do NOT merge.** Treat exactly like any other `gh` failure in this document — skip the PR this pass and retry next tick. Never read an error as "the approval is fine". |
 
@@ -265,7 +265,7 @@ printf '%s\n' "$P" "$K" "$C" | jq -s '.[0] as $p | {labels: [$p.labels[] | {name
   mergeable: (if $p.mergeable == true then "MERGEABLE" elif $p.mergeable == false then "CONFLICTING" else "UNKNOWN" end),
   createdAt: $p.created_at, updatedAt: $p.updated_at, additions: $p.additions, deletions: $p.deletions,
   commits: [.[1:-1][][] | {oid: .sha, committedDate: .commit.committer.date}], comments: .[-1]}' > "$PR_FACTS" \
-  || { rm -f "$PR_FACTS"; echo "SKIP #$PR_NUMBER: PR facts unread (or comments unauthenticated) — no merge, no comment"; continue; }
+  || { rm -f "$PR_FACTS"; echo "SKIP #$PR_NUMBER: PR facts unread (or comments unauthenticated) — no merge, no comment"; continue; }  # single-PR step: outcome=skipped reason=facts_unread
 ```
 
 The other blocks re-derive the path with the same `PR_FACTS=` line, because
@@ -492,6 +492,24 @@ behavior is byte-for-byte unchanged from before #6850.
   passes #3 too, and the rationale names the class id. A non-boolean value
   (`"true"`, `1`) is not `true`. Without the flag, behavior is byte-for-byte
   unchanged: the class never touches #3.
+- `criticalFilesOnly` (#12648, optional, default `false`) — a literal `true`
+  makes the class waive **criterion #3 only, for the critical files it
+  names**, and nothing else. Its `filePatterns` and `excludeFilePatterns` are
+  matched against the PR's **critical-file hits** alone (the changed files
+  criterion #3 flags, via its `CRITICAL_PATTERNS`, plus each one's
+  `previous_filename` on a rename), and its `forbiddenDiffPatterns` against
+  those files' added/removed lines; the other changed files are not matched.
+  Every critical-file hit must match, and the PR needs at least one. The kept
+  set still applies to **every** changed file, and conditions and fail-closed
+  reads are unchanged. Such a class is **never eligible for criterion #2**:
+  the PR still goes through the four-axis judgment, which can hold it, so the
+  non-critical files are judged as before. It implies `coversCriticalFiles`
+  (that key is not needed). `false` or absent is today's class; any other
+  value (`"true"`, `1`) is malformed and the entry is skipped in both
+  criteria. A version-bearing file that is a critical-file hit (see the
+  version-only carve-out) counts as a hit here too, so it must match as well.
+  Use it for the common mixed PR: one workflow file plus docs or scripts, held
+  only by the workflow file.
 - `excludeFilePatterns` (#12528, optional) — globs, matched like
   `filePatterns`. A PR with **any** changed file matching one is disqualified
   from the class (e.g. `.github/workflows/*publish*`, `*release*`,
@@ -534,7 +552,8 @@ behavior is byte-for-byte unchanged from before #6850.
   critical "$FILES"` re-reads the PR's files once (slurped, so every page is
   one array) and requires: the count equals the PR's `changed_files`, and the
   set of `filename`s equals criterion #3's own `$FILES`. Any mismatch (a
-  partial read, a head that moved between reads) disqualifies the PR.
+  partial read, a head that moved between reads) disqualifies the PR. The
+  critical-file hits of a `criticalFilesOnly` class come from this same read.
 
 **Why this criterion re-checks conditions that are also criteria #1 and #6**:
 those criteria still run independently later in this same pass and still
@@ -545,7 +564,9 @@ authorized class AND every stated condition holds" is this section's own
 gate (per the issue's acceptance criteria): it must never read as "matches
 an authorized class -> assume the rest of the PR is fine". A standing
 authorization only ever waives *this criterion's* four-axis judgment —
-nothing else, and never criteria #1/#3/#4/#5/#6.
+nothing else, and never criteria #1/#3/#4/#5/#6 (except #3 for a class that
+opts in, below). A `criticalFilesOnly` class (#12648) never waives this
+criterion: `standing_auth_eval any` skips it.
 
 ```bash
 PR_NUMBER=<number>
@@ -615,18 +636,24 @@ standing_auth_fetch_diff() {
 }
 
 # standing_auth_eval <any|critical>
-#   any      criterion #2: a class satisfies the four-axis judgment.
-#   critical criterion #3: only a class with "coversCriticalFiles": true, and
-#            no kept-set path, may waive the critical-file FAIL.
-# Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID. Every check fails closed.
-# Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval), read_ci_checks (greenCi)
-# and, in "any" mode, FAST_PATH_FILES. In critical mode $2 is criterion #3's own
-# $FILES.
+#   any      criterion #2: a class satisfies the four-axis judgment. A class
+#            with "criticalFilesOnly" set (#12648) is never eligible here.
+#   critical criterion #3: only a class with "coversCriticalFiles": true or
+#            "criticalFilesOnly": true, and no kept-set path, may waive the
+#            critical-file FAIL. A criticalFilesOnly class matches only the
+#            critical-file hits (CRITICAL_PATTERNS, from criterion #3).
+# Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID, and STANDING_AUTH_SCOPE ("all"
+# or "critical") / STANDING_AUTH_COVERED (the files the class matched). Every
+# check fails closed. Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval),
+# read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
+# mode $2 is criterion #3's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
   local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN
-  local MATCH_FILES CHANGED_COUNT
+  local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
+  STANDING_AUTH_SCOPE=""
+  STANDING_AUTH_COVERED=""
   DIFF_JSON=""
   [ -f "$CONFIG_FILE" ] || return 0
   jq -e '(.champion.standingAuthorizations // []) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 || return 0
@@ -643,6 +670,17 @@ standing_auth_eval() {
     AUTH_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[].filename') || return 0
     [ "$(printf '%s\n' "$AUTH_FILES" | LC_ALL=C sort -u)" = "$(printf '%s\n' "$crit_files" | LC_ALL=C sort -u)" ] || return 0
     MATCH_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[] | .filename, (.previous_filename // empty)') || return 0
+    # Critical-file hits (#12648), for criticalFilesOnly classes: the entries
+    # whose filename (or previous_filename) contains a CRITICAL_PATTERNS entry,
+    # the same substring test criterion #3's loop applies. No patterns in
+    # scope, or a failed read, leaves CRIT_DIFF empty and every
+    # criticalFilesOnly class ineligible (fail closed).
+    # Diff on stdin, patterns as the (small) argument: --argjson of a >128 KiB diff hits MAX_ARG_STRLEN on Linux.
+    CRIT_PATS_JSON=$(printf '%s\n' ${CRITICAL_PATTERNS[@]+"${CRITICAL_PATTERNS[@]}"} | jq -R 'select(length > 0)' | jq -s -c .) || CRIT_PATS_JSON='[]'
+    CRIT_DIFF=$(printf '%s' "$DIFF_JSON" | jq -c --argjson p "$CRIT_PATS_JSON" \
+      '[.[] | . as $f | select(any($p[]; . as $q | (($f.filename | contains($q)) or (($f.previous_filename // "") | contains($q)))))]' 2>/dev/null) || CRIT_DIFF=""
+    printf '%s' "$CRIT_DIFF" | jq -e 'length > 0' >/dev/null 2>&1 || CRIT_DIFF=""
+    [ -z "$CRIT_DIFF" ] || CRIT_MATCH_FILES=$(printf '%s' "$CRIT_DIFF" | jq -r '.[] | .filename, (.previous_filename // empty)') || CRIT_DIFF=""
   else
     # Reuse the SAME freshly-fetched file list the docs-only fast path above
     # just read (FAST_PATH_FILES) -- no second network call, and the same
@@ -659,9 +697,29 @@ standing_auth_eval() {
     EXCLUDES=$(jq -r ".champion.standingAuthorizations[$i].excludeFilePatterns // [] | .[]" "$CONFIG_FILE")
     FORBIDDEN=$(jq -r ".champion.standingAuthorizations[$i].forbiddenDiffPatterns // [] | .[]" "$CONFIG_FILE")
 
+    # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
+    # `true` makes a class that waives criterion #3 for the critical-file hits
+    # only and is NEVER eligible for criterion #2, so the PR still gets the
+    # four-axis judgment. Any other value is malformed: skipped in both modes.
+    CFO=$(jq -c ".champion.standingAuthorizations[$i].criticalFilesOnly" "$CONFIG_FILE")
+    ONLY_CRIT=0
+    case "$CFO" in
+      null | false) ;;
+      true) [ "$mode" = "critical" ] || continue; ONLY_CRIT=1 ;;
+      *) continue ;;
+    esac
+
     # Critical mode: only an explicit boolean true opts the class in.
-    if [ "$mode" = "critical" ]; then
+    if [ "$mode" = "critical" ] && [ "$ONLY_CRIT" -eq 0 ]; then
       [ "$(jq -r ".champion.standingAuthorizations[$i].coversCriticalFiles == true" "$CONFIG_FILE")" = "true" ] || continue
+    fi
+
+    # The files the class's patterns must cover: every changed file, or for a
+    # criticalFilesOnly class the critical-file hits alone (none -> skip).
+    CLASS_FILES="$MATCH_FILES"
+    if [ "$ONLY_CRIT" -eq 1 ]; then
+      [ -n "$CRIT_DIFF" ] || continue
+      CLASS_FILES="$CRIT_MATCH_FILES"
     fi
 
     # Fail safe: a malformed entry (no id, no patterns, or no conditions)
@@ -684,9 +742,11 @@ standing_auth_eval() {
     done <<<"$CONDITIONS"
     [ "$UNKNOWN_CONDITION" -eq 1 ] && continue
 
-    # Exact-subset match: every changed file must match at least one
-    # pattern in THIS class, and (#12528) no changed file may match an
-    # excludeFilePatterns glob or, in critical mode, a kept-set path.
+    # Exact-subset match: every file in scope (every changed file, or the
+    # critical-file hits of a criticalFilesOnly class) must match at least
+    # one pattern in THIS class and (#12528) none may match an
+    # excludeFilePatterns glob. In critical mode no CHANGED file at all may
+    # be a kept-set path, whichever scope the class uses.
     local ALL_MATCH=1 file pattern FILE_MATCHED
     while IFS= read -r file; do
       [ -z "$file" ] && continue
@@ -711,7 +771,11 @@ standing_auth_eval() {
           break 2
         fi
       done <<<"$EXCLUDES"
-      if [ "$mode" = "critical" ]; then
+    done <<<"$CLASS_FILES"
+    [ "$ALL_MATCH" -eq 0 ] && continue
+    if [ "$mode" = "critical" ]; then
+      while IFS= read -r file; do
+        [ -z "$file" ] && continue
         for pattern in "${KEPT_SET_PATTERNS[@]}"; do
           # shellcheck disable=SC2053
           if [[ "$file" == $pattern ]]; then
@@ -719,20 +783,23 @@ standing_auth_eval() {
             break 2
           fi
         done
-      fi
-    done <<<"$MATCH_FILES"
-    [ "$ALL_MATCH" -eq 0 ] && continue
+      done <<<"$MATCH_FILES"
+      [ "$ALL_MATCH" -eq 0 ] && continue
+    fi
 
     # forbiddenDiffPatterns (#12528): a regex (jq test(), one engine on every
-    # host) matched against every added/removed line of every changed file,
-    # from the files API read in THIS pass. A file with no patch (binary, too
-    # large for the API to inline, a pure rename), an unreadable diff, or an
-    # invalid regex all disqualify.
+    # host) matched against every added/removed line of every changed file
+    # (of every critical-file hit, for a criticalFilesOnly class: #12648),
+    # from the files API read in THIS pass. A file in scope with no patch
+    # (binary, too large for the API to inline, a pure rename), an unreadable
+    # diff, or an invalid regex all disqualify.
     if [ -n "$FORBIDDEN" ]; then
       local LINES_JSON DIFF_HIT=0 rx rc
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
-      printf '%s' "$DIFF_JSON" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
-      LINES_JSON=$(printf '%s' "$DIFF_JSON" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
+      CLASS_DIFF="$DIFF_JSON"
+      [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
+      printf '%s' "$CLASS_DIFF" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
+      LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
       while IFS= read -r rx; do
         [ -z "$rx" ] && continue
         # Validate the regex on its own: `any` over zero lines never compiles it.
@@ -785,6 +852,12 @@ standing_auth_eval() {
     if [ "$CONDITIONS_HOLD" -eq 1 ]; then
       STANDING_AUTH_RESULT="ELIGIBLE"
       STANDING_AUTH_ID="$CLASS_ID"
+      STANDING_AUTH_SCOPE="all"
+      STANDING_AUTH_COVERED="$AUTH_FILES"
+      if [ "$ONLY_CRIT" -eq 1 ]; then
+        STANDING_AUTH_SCOPE="critical"
+        STANDING_AUTH_COVERED=$(printf '%s' "$CRIT_DIFF" | jq -r '.[].filename')
+      fi
       return 0
     fi
   done
@@ -806,12 +879,110 @@ If `$STANDING_AUTH_RESULT` is anything other than `ELIGIBLE` (including "no
 `champion.standingAuthorizations` configured"), fall through to the normal
 four-axis judgment below.
 
+**Vetted CI-workflow change (#12677, operator ruling 2026-10-17).** A change
+to a CI workflow is not red on blast radius *because it is a workflow* when
+`ci_workflow_blast_eval` returns `WF_BLAST=green`:
+
+- no changed or renamed workflow file is in the kept set, or has
+  publish, release, deploy or merge in its name (case-insensitive);
+- every workflow file has a non-empty patch, and no added or removed workflow
+  line matches, case-insensitively, the words `permissions`, `secrets`,
+  `publish`, `release`, `deploy` or `merge` (the last four ignore YAML
+  comments), or `id-token`,
+  `pull_request_target`, `workflow_run`, `github.token`, `GITHUB_TOKEN`;
+- the PR carries `loom:pr` (criterion #1 has already checked that the approval
+  is for this head) and CI is green right now, with at least one passing
+  check and none pending, failing or cancelled.
+
+The rest of the PR is still judged on all four axes as usual. `WF_BLAST=red`
+keeps the "CI workflows" entry red, and the rationale names `WF_BLAST_REASON`;
+`WF_BLAST=none` means no workflow file changed. Every failed or incomplete read
+is red.
+
+```bash
+# ci_workflow_blast_eval: sets WF_BLAST (none|green|red) and WF_BLAST_REASON.
+# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, read_ci_checks. Always reads the
+# PR's files afresh and checks the list is complete (count == changed_files).
+ci_workflow_blast_eval() {
+  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON NOCOMMENT_JSON SCAN_JSON rx rc
+  WF_BLAST=red
+  WF_BLAST_REASON=""
+  [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { WF_BLAST_REASON="kept set not loaded"; return 0; }
+  standing_auth_fetch_diff || { WF_BLAST_REASON="files API unreadable"; return 0; }
+  CHANGED_COUNT=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.changed_files' 2>/dev/null) \
+    || { WF_BLAST_REASON="changed_files unreadable"; return 0; }
+  printf '%s' "$DIFF_JSON" | jq -e --argjson n "${CHANGED_COUNT:-null}" 'type == "array" and length == $n' >/dev/null 2>&1 \
+    || { WF_BLAST_REASON="files API list incomplete"; return 0; }
+  WF_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[] | .filename, (.previous_filename // empty) | select(ascii_downcase | startswith(".github/workflows/"))' 2>/dev/null) \
+    || { WF_BLAST_REASON="files API unreadable"; return 0; }
+  if [ -z "$WF_FILES" ]; then
+    WF_BLAST=none
+    return 0
+  fi
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    lf=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
+    case "${lf##*/}" in
+      *publish* | *release* | *deploy* | *merge*)
+        WF_BLAST_REASON="$f is a publish/release/deploy/merge workflow"
+        return 0
+        ;;
+    esac
+    for pattern in "${KEPT_SET_PATTERNS[@]}"; do
+      # Lowercased: Loom-Champion.yml is as much a kept-set path as champion.yml.
+      # shellcheck disable=SC2053
+      if [[ "$f" == $pattern || "$lf" == $pattern ]]; then
+        WF_BLAST_REASON="$f is in the kept set ($pattern)"
+        return 0
+      fi
+    done
+  done <<<"$WF_FILES"
+  # Every workflow file needs a non-empty patch: a binary, oversized or
+  # pure-rename entry cannot be checked line by line.
+  LINES_JSON=$(printf '%s' "$DIFF_JSON" | jq -c '
+    [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))]
+    | if all(.[]; ((.patch // "") | length) > 0) then [.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]] else error("no patch") end' 2>/dev/null) \
+    || { WF_BLAST_REASON="a workflow file has no readable patch"; return 0; }
+  # The publish/release/deploy/merge words skip YAML comments (#12934): a
+  # whole-line comment is dropped; a trailing ` #...` is cut only on a line with
+  # no quote at all, so `echo "#release"` and any line not parsed safely stay
+  # scanned whole. Every other regex scans the raw lines.
+  NOCOMMENT_JSON=$(printf '%s' "$LINES_JSON" | jq -c '
+    [.[] | select(test("^\\s*#") | not)
+         | if test("[\"\u0027]") then . elif test("\\s#") then sub("\\s#.*$"; "") else . end]' 2>/dev/null) \
+    || { WF_BLAST_REASON="workflow lines unparseable"; return 0; }
+  for rx in '\bpermissions\b' '\bsecrets\b' 'id-token' 'pull_request_target' 'workflow_run' \
+    'github\.token' 'github_token' '\b(publish|release|deploy|merge)\b'; do
+    SCAN_JSON=$LINES_JSON
+    case "$rx" in *publish*) SCAN_JSON=$NOCOMMENT_JSON ;; esac
+    printf '%s' "$SCAN_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
+    rc=$?
+    # rc 1 = no such line; 0 = a hit; anything else = an error. Only 1 passes.
+    [ "$rc" -eq 1 ] || { WF_BLAST_REASON="a workflow line matches '$rx'"; return 0; }
+  done
+  echo "$LABELS" | grep -q "loom:pr" || { WF_BLAST_REASON="no loom:pr approval"; return 0; }
+  read_ci_checks "$PR_NUMBER"
+  # Green = at least one passing check and nothing pending, failing or
+  # cancelled: a workflow edit that skips every job must not pass on its own CI.
+  if [ "$NO_CHECKS" != "false" ] \
+    || ! printf '%s\n' "$CHECKS" | jq -e 'any(.[]; .bucket == "pass") and all(.[]; .bucket == "pass" or .bucket == "skipping")' >/dev/null 2>&1; then
+    WF_BLAST_REASON="CI is not green"
+    return 0
+  fi
+  WF_BLAST=green
+  WF_BLAST_REASON="vetted workflow change: $(printf '%s' "$WF_FILES" | sort -u | tr '\n' ' ')"
+}
+
+ci_workflow_blast_eval
+echo "WF_BLAST=$WF_BLAST${WF_BLAST_REASON:+ ($WF_BLAST_REASON)}"
+```
+
 **The four risk axes** — answer each; **any red answer holds the PR**:
 
 | Axis | Green (safe to auto-merge) | Red (hold for a human) |
 |------|----------------------------|------------------------|
 | **Diff composition** | The bulk of the diff is tests, docs/markdown, fixtures, or a self-contained new module not yet wired into an existing path. The load-bearing hunks are few and you can name them. | Load-bearing hunks change the *existing* behavior of a shared runtime path, and you cannot enumerate them — or the diff is dense enough that you skimmed rather than read it. |
-| **Blast radius** | Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature. | Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows, or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature. |
+| **Blast radius** | Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature. | Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows (unless `WF_BLAST=green`, #12677), or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature. |
 | **Judge review depth** | The Judge's verdict cites specifics from the diff — named files/functions, concrete behavior, what was run or verified. | A short generic approval ("LGTM", "looks good") with no evidence the diff was read, or a review that explicitly defers verification of some part ("did not check X"). |
 | **Revertability** | `git revert -m 1 <merge-sha>` fully undoes it: no data/schema migration, no published artifact, no state written outside the repo. | The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect. |
 
@@ -820,9 +991,9 @@ four-axis judgment below.
 **Claim/label machinery is not red by itself (#11416).** Loom's own claim, lease, label-transition, dispatch and hand-back code is judged like any other code. Writing labels or claims *when it runs* is not a one-way action: `git revert` restores the old writer, and the state it wrote is re-derivable (janitors, lease reapers, `loom-recover-orphans` and the next tick repair a stranded claim or misrouted label). "Reverting cannot undo forge labels already changed" or "a defect could strand work fleet-wide" is **not** a red reason. Judge-approved + CI green + revert restores the behavior -> green on blast radius and revertability. "Mediates merging" in the table means kept-set item 2, nothing wider. **Kept set** — only these stay red, held for an operator (name the item in the hold bullet):
 1. **Irreversible migration, no rollback step**: a bulk relabel, or a rename/delete in `.github/labels.yml`, of live labels without a restore step; a lease/checkpoint/registry format the previous release cannot read.
 2. **The merge gate itself** — code whose output decides *whether a PR merges*: criteria #1-#6 and the sticky-hold logic (this file, `champion-critical-file-hold.md`); `merge-pr.sh`'s verdict/label/ordering guards; any code that writes or invalidates a verdict label or marker (`post-verdict.sh`, `verdict-staleness-guard.sh`, the daemon's `reconcile_pr_verdicts`, `check-review-feedback.sh`) or decides whose markers and comments are trusted (`comment_trust.rs`, `forge trusted-comments`). The gate cannot vouch for a change to itself. Writing a verdict label (the Judge's `loom:pr` approval) is part of the gate, not a role hand-back; only routing that cannot make a PR mergeable (Builder/Doctor hand-backs, claims) is outside it.
-3. **The other red entries in the table above**, unchanged. Criterion #3 critical files fail #3 regardless, except where a `coversCriticalFiles` class applies (criterion #3 below).
+3. **The other red entries in the table above**, unchanged. A CI-workflow change with `WF_BLAST=green` (#12677) is not red for being a workflow; the rest of its diff is judged as usual. Criterion #3 critical files fail #3 regardless, except where a `coversCriticalFiles` or `criticalFilesOnly` class applies (criterion #3 below). A `criticalFilesOnly` class (#12648) does not change this judgment: the PR is judged on these axes as usual.
 
-**No standing authorization satisfies the kept set (#12528).** Items 1 and 2 and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for criterion #3 by a class, with or without `coversCriticalFiles`: the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
+**No standing authorization satisfies the kept set (#12528).** Items 1 and 2 and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for criterion #3 by a class, with or without `coversCriticalFiles` or `criticalFilesOnly`: the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
 
 **Decision rule**:
 - Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to criterion #3 — the axes are not judged for this PR (see "Docs-only fast path" above).
@@ -875,6 +1046,28 @@ PR_JSON=$(cat "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-$PR_NUMB
 HOLD_BODY=$(jq -r --arg m "$HOLD_MARKER" \
   '[.comments[] | select(.body | startswith($m))] | last | .body // ""' <<<"$PR_JSON")
 
+# ONE definition of "an operator release instruction", shared by release paths
+# (b) and (f) so the two can never drift (#12594). **Instruction-shaped
+# phrasing, mechanically enforced**: the trigger phrase must OPEN the comment's
+# leading clause (the first sentence of its first line, minus an optional
+# "@mention " / "please " courtesy prefix), and that clause must not be a
+# question. A plain substring match is not good enough — it reads "please do
+# NOT merge anyway", "do not clear the hold yet" and "is it ok to merge?" as
+# release signals, i.e. it releases the hold on the very comments where a human
+# just reinforced it. Anchoring is what rules those out: any negation or
+# interrogative lead-in ("do not", "don't", "never", "can we", "should I")
+# necessarily sits *before* the phrase, so the phrase is no longer the leading
+# clause. Prepended to a jq program: `jq "$RELEASE_DEFS"'<program>'`.
+RELEASE_DEFS='
+  def lead: sub("^[[:space:]]+"; "") | split("\n")[0]
+    | match("^[^.?!]*[.?!]?").string
+    | sub("^@[A-Za-z0-9_-]+[[:space:]]+"; "")
+    | sub("^please[[:space:]]*,?[[:space:]]*"; ""; "i");
+  def is_release_instruction: lead as $l
+    | ($l | test("\\?[[:space:]]*$") | not)
+    and ($l | test("^(clear|clearing|cleared|lift|lifting|lifted|override|overriding)([[:space:]]+(this[[:space:]]+|the[[:space:]]+)?hold\\b|[[:space:]]*[:,.—-]|[[:space:]]*$)|^merge[[:space:]]+(it[[:space:]]+)?anyway\\b|^ok[[:space:]]+to[[:space:]]+merge\\b|^proceed[[:space:]]+with[[:space:]]+(the[[:space:]]+)?merge\\b"; "i"));
+'
+
 if [ -z "$HOLD_BODY" ]; then
   PRIOR_HOLD=false          # never held — today's behavior, unchanged
   HOLD_AT=""; HOLD_HEAD=""; RELEASE_REASON=""; HOLD_OVERRIDE=false
@@ -899,36 +1092,16 @@ else
     HOLD_OVERRIDE=true
   fi
 
-  # (b) An operator comment posted AFTER the hold that explicitly clears it.
-  #     **Instruction-shaped phrasing, mechanically enforced**: the trigger
-  #     phrase must OPEN the comment's leading clause (its first sentence), and
-  #     that clause must not be a question. A plain substring match is not good
-  #     enough — it reads "please do NOT merge anyway", "do not clear the hold
-  #     yet" and "is it ok to merge?" as release signals, i.e. it releases the
-  #     hold on the very comments where a human just reinforced it. Anchoring is
-  #     what rules those out: any negation or interrogative lead-in ("do not",
-  #     "don't", "never", "can we", "should I") necessarily sits *before* the
-  #     phrase, so the phrase is no longer the leading clause. Never a
-  #     Champion-authored comment either — Champion must not release its own hold.
+  # (b) An operator comment posted AFTER the hold that explicitly clears it:
+  #     an `is_release_instruction` comment (the shared RELEASE_DEFS above —
+  #     anchored trigger phrase, not a question). Never a Champion-authored
+  #     comment either — Champion must not release its own hold.
   if [ -z "$RELEASE_REASON" ]; then
-    CLEARED=$(jq -r --arg at "$HOLD_AT" '
+    CLEARED=$(jq -r --arg at "$HOLD_AT" "$RELEASE_DEFS"'
       [ .comments[]
         | select(.createdAt > $at)
         | select((.body | test("champion:|Automated by Champion role")) | not)
-        | . as $c
-        # Leading clause = first sentence of the first line (up to the first
-        # . ? or !), minus an optional "@mention " / "please " courtesy prefix.
-        | ( $c.body
-            | sub("^[[:space:]]+"; "")
-            | split("\n")[0]
-            | match("^[^.?!]*[.?!]?").string
-            | sub("^@[A-Za-z0-9_-]+[[:space:]]+"; "")
-            | sub("^please[[:space:]]*,?[[:space:]]*"; ""; "i") ) as $lead
-        # Interrogative mood is a question, not an instruction.
-        | select($lead | test("\\?[[:space:]]*$") | not)
-        # Trigger phrase anchored at the start of that clause.
-        | select($lead | test("^(clear|clearing|cleared|lift|lifting|lifted|override|overriding)([[:space:]]+(this[[:space:]]+|the[[:space:]]+)?hold\\b|[[:space:]]*[:,.—-]|[[:space:]]*$)|^merge[[:space:]]+(it[[:space:]]+)?anyway\\b|^ok[[:space:]]+to[[:space:]]+merge\\b|^proceed[[:space:]]+with[[:space:]]+(the[[:space:]]+)?merge\\b"; "i"))
-        | $c
+        | select(.body | is_release_instruction)
       ] | last
       | if . == null then "" else "\(.author.login) at \(.createdAt): \(.body | split("\n")[0])" end' <<<"$PR_JSON")
     if [ -n "$CLEARED" ]; then
@@ -995,13 +1168,92 @@ else
   fi
 fi
 
+# (f) Operator-named release condition (#12594). A trusted comment opening with
+#     `<!-- loom:release-condition -->` (the condition text follows, on that
+#     line or the next) binds like a hold until a LATER comment closes it.
+#     Latest condition wins (an amendment replaces it; a closing comment older
+#     than the newest condition does not close it). It needs no prior hold
+#     marker, and it overrides release paths (b)-(e) — a new head, a Judge
+#     re-review, a label removal or an unrelated clearing comment must not drop
+#     an operator's condition — but NOT `loom:auto-merge-ok` (a), the explicit
+#     human override. Champion never decides a condition is met.
+#
+#     What CLOSES it: a trusted comment after the condition, by a person — an
+#     App-spelled author (`x[bot]`) never counts, so an unattended fleet role
+#     cannot record an operator's condition as met — not Champion-authored, that
+#     either
+#       - opens with `<!-- loom:release-condition-met -->`, or
+#       - is a release instruction (RELEASE_DEFS: `clear the hold — …`,
+#         `override: …`, `ok to merge — …`) whose body CITES the condition
+#         (the word "condition" anywhere in it). That is the operator's own
+#         form — "the hold may be cleared by a comment beginning `clear the
+#         hold —` that cites it" — and the same phrase the daemon redraws a
+#         held-at-head PR on (#12901). A `clear the hold` that does not cite
+#         the condition releases only the merge-risk hold, which (f) then
+#         re-imposes (the condition stays open, and is named in the notice).
+#     The Champion exclusions differ by direction, on purpose: a CONDITION is
+#     ignored only when Champion signed it (`*Automated by Champion role*`) —
+#     the broad `champion:` test would void an operator's condition that
+#     quotes a marker name, which fails open; a CLOSING comment is ignored on
+#     the broad test, which fails closed.
+COND_AT=$(jq -r '
+  [ .comments[]
+    | select((.body | test("Automated by Champion role")) | not)
+    | select(.body | startswith("<!-- loom:release-condition -->")) ] | last | .createdAt // ""' <<<"$PR_JSON")
+OPEN_CONDITION=false; COND_TEXT=""
+if [ -n "$COND_AT" ]; then
+  COND_MET=$(jq -r --arg at "$COND_AT" "$RELEASE_DEFS"'
+    [ .comments[]
+      | select(.createdAt > $at)
+      | select(((.author.login // "") | endswith("[bot]")) | not)
+      | select((.body | test("champion:|Automated by Champion role")) | not)
+      | select(.body | startswith("<!-- loom:release-condition-met -->")
+                      or (is_release_instruction and test("\\bcondition"; "i"))) ] | length' <<<"$PR_JSON")
+  if [ "$COND_MET" -eq 0 ]; then
+    OPEN_CONDITION=true
+    COND_TEXT=$(jq -r --arg at "$COND_AT" '
+      [ .comments[] | select(.createdAt == $at)
+        | select(.body | startswith("<!-- loom:release-condition -->")) ] | last | .body
+      | ltrimstr("<!-- loom:release-condition -->") | split("\n")
+      | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)) | .[0:3] | join(" ")' <<<"$PR_JSON")
+  fi
+fi
+# The label is read here, not through HOLD_OVERRIDE: with no hold marker (a)
+# never ran, and `loom:auto-merge-ok` must override a condition either way.
+if [ "$OPEN_CONDITION" = true ] \
+   && ! jq -e '[.labels[].name] | any(. == "loom:auto-merge-ok")' >/dev/null <<<"$PR_JSON"; then
+  PRIOR_HOLD=true
+  RELEASE_REASON=""
+  MANUAL_RELEASE_SINCE_HOLD=false   # a human label removal does not satisfy the condition
+  LABEL_REPAIR=false                # the condition, not Champion's marker, is the hold
+else
+  OPEN_CONDITION=false              # closed, or overridden by the label: the rows below apply as usual
+fi
+
 if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
   MERGE_BLOCKED_BY_HOLD=true
+  if [ "$OPEN_CONDITION" = true ]; then
+    # Name the condition once per condition comment (idempotent: the marker
+    # carries the condition's createdAt, so an amendment posts a new notice).
+    COND_MARKER="<!-- champion:release-condition-hold cond=$COND_AT -->"
+    if ! jq -e --arg m "$COND_MARKER" '[.comments[].body] | any(startswith($m))' >/dev/null <<<"$PR_JSON"; then
+      ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$COND_MARKER
+**Champion: Holding for an Operator Release Condition**
+
+Not merging: an operator-named release condition is still open — $COND_TEXT
+
+It survives new pushes, re-reviews, label removal and clearing comments that do not cite it. A person (not a fleet App) closes it with a comment that opens \`clear the hold — <evidence>\` and names the release condition it meets, or with one that opens with \`<!-- loom:release-condition-met -->\` followed by the evidence. \`loom:auto-merge-ok\` still overrides. Champion never decides a condition is met.
+
+---
+*Automated by Champion role*" >/dev/null 2>&1 || true
+    fi
+    echo "STICKY HOLD: #$PR_NUMBER has an open operator release condition ($COND_TEXT) — not merging"
+  fi
   # Label missing, no removal on record: restore it, so a sticky-held PR
   # never reads as plain approved and stays in the census (#11416).
   [ "$LABEL_REPAIR" = true ] && loom-daemon park-record apply --pr "$PR_NUMBER" \
     --reason "champion merge-risk hold" --by champion >/dev/null 2>&1 || true
-  echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
+  [ "$OPEN_CONDITION" = true ] || echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
   # Post NOTHING (the hold notice is already on the PR — see Hold behavior's
   # idempotency guard) and do NOT merge this PR this pass, whatever the axes say.
   #
@@ -1019,6 +1271,7 @@ fi
 |---|---|
 | `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
 | `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates criteria #4/#5/#6. |
+| `OPEN_CONDITION=true` (#12594), no `loom:auto-merge-ok` | **HOLD the merge** whatever (b)-(e) and the axes say — `PRIOR_HOLD=true`, `RELEASE_REASON=""`, `MERGE_BLOCKED_BY_HOLD=true`, even with no hold marker on the PR. The notice names the condition (once per condition comment). Closed only by a later trusted comment from a person (never an `x[bot]` author, never Champion) that opens with `<!-- loom:release-condition-met -->`, or that is a release instruction (`clear the hold — …`, `override: …`, `ok to merge — …`) citing the condition (the word "condition" in its body); then the rows below apply as usual. A clearing comment that does not cite it releases nothing: the condition is the hold. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | Criterion #2 **PASS** by override — the axes are not re-scored. Continue to #3. Step 2's reversal block is **mandatory**. |
 | `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
 
@@ -1032,7 +1285,13 @@ the *same* diff on a *different* read.
 containing `champion:` or `*Automated by Champion role*`. A hold is released by a
 human/Judge signal or by the code moving — never by Champion talking to itself.
 That exclusion is also what keeps Champion's own rejection/janitor comments from
-tripping release path (b) or (d).
+tripping release path (b) or (d). Path (f) applies it to the comment that
+*closes* a condition (fail-closed), but only the `*Automated by Champion role*`
+signature to the comment that *opens* one: a condition an operator wrote is not
+voided because it quotes `champion:merge-risk-hold` (that would fail open). A
+condition is also closed only by a person's comment — an App-spelled author
+(`x[bot]`, how `forge trusted-comments --gh-shape` spells the fleet's own
+Apps) is trusted to hold, never to record an operator's condition as met.
 
 **Edge cases the precheck already covers** (no extra handling needed):
 
@@ -1280,7 +1539,12 @@ standing_auth_load_config             # resolved effective config (#12591)
 STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit criterion #2's ELIGIBLE
 STANDING_AUTH_ID=""
 standing_auth_eval critical "$FILES"
-if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
+if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ] && [ "$STANDING_AUTH_SCOPE" = "critical" ]; then
+  # criticalFilesOnly class (#12648): only this criterion is waived, for the
+  # critical files named. Criterion #2 judged the whole PR on the four axes.
+  echo "PASS (standing authorization '$STANDING_AUTH_ID', #12648): criterion #3 satisfied by a criticalFilesOnly class — critical files: $STANDING_AUTH_COVERED"
+  exit 0
+elif [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12528): criterion #3 satisfied by a coversCriticalFiles class — changed files: $AUTH_FILES"
   # Name STANDING_AUTH_ID in the rationale. $CRITERION3_RESULT is "PASS".
   exit 0
@@ -1328,6 +1592,8 @@ generalize this pattern to any other critical file or any other kind of
 exactly a version-string line change.
 
 **Standing-authorization class (#12528)**: the check-loop runs `standing_auth_eval critical` (defined under criterion #2) before it can emit FAIL. A `champion.standingAuthorizations` class with `"coversCriticalFiles": true` whose `filePatterns` cover **every** changed file, with no changed file in `excludeFilePatterns`, no added/removed line matching `forbiddenDiffPatterns`, no kept-set path, and every `conditions` entry (`judgeApproval`, `greenCi`) holding now, passes this criterion and names the class id. Any one file outside the class, an excluded file, a forbidden diff line, an unreadable diff or a kept-set path restores today's FAIL and the durable hold below. A class without the flag, or no class at all, changes nothing. The check is mechanical, never a judgment call.
+
+**Critical-files-only class (#12648)**: a class with `"criticalFilesOnly": true` is matched against the **critical-file hits** only: the changed files this criterion's `CRITICAL_PATTERNS` flag, and the `previous_filename` of each on a rename. If every hit matches the class's `filePatterns`, no hit matches `excludeFilePatterns`, no added/removed line of a hit's patch matches `forbiddenDiffPatterns` (a hit with no patch fails closed), no changed file at all is a kept-set path, and every condition holds now, this criterion passes and the PASS line names the class (`#12648`) and the critical files. The other changed files are not matched against the class; criterion #2 judged them, and the whole PR, on the four axes, because such a class is never eligible there. A rename into a covered path from outside the class or from a kept-set path, a forbidden line in the workflow patch, or an excluded workflow restores the FAIL and the durable hold. An open hold episode closes through the ordinary PASS row.
 
 **Rationale**: Changes to these files require careful human review due to high impact.
 
@@ -2101,7 +2367,15 @@ EOF
 # reversal-comment pass. merge-pr.sh refuses loom:pr + loom:blocked (#8112),
 # so the label must be off before Step 3. The park record stays in the body.
 if [ -n "$HOLD_REVERSAL_BLOCK" ]; then
-  gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true
+  if gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null; then
+    RELEASE_FAILED=""
+  else
+    RELEASE_FAILED="--failed"
+  fi
+  # #12665: journal the release as a `hold.transition` (no forge write; a no-op
+  # outside a role tick). $HOLD_AT is the hold's own timestamp from the precheck.
+  loom-daemon park-record released --pr "$PR_NUMBER" --entered-at "${HOLD_AT:-}" \
+    $RELEASE_FAILED >/dev/null 2>&1 || true
 fi
 "$GH_READ" --clear-cache   # your own write must not be masked by your own cache
 ```
@@ -2193,6 +2467,19 @@ observation over time), so this is where "PR merged" becomes "issue done".
 ```bash
 PR_NUMBER=$1
 
+# Per-repo switch (#12703): `champion.outOfBandAcGate`, resolved through the
+# daemon's config tiers (fleet / repo-class / .loom/config.json). Only an
+# explicit boolean `false` turns the gate off; absent, unreadable, a missing
+# verb or any non-boolean value keeps it ON (fail closed).
+ac_gate_enabled() {
+  local out
+  command -v loom-daemon >/dev/null 2>&1 || return 0
+  out=$(loom-daemon config get champion.outOfBandAcGate --json 2>/dev/null) || return 0
+  printf '%s' "$out" | jq -e '.found == true and .value == false' >/dev/null 2>&1 && return 1
+  return 0
+}
+if ac_gate_enabled; then AC_GATE=on; else AC_GATE=off; fi
+
 # GitHub's own parser (closingIssuesReferences): the set it auto-closes on
 # merge. Ignores `Updates #N`, `See #N`, code fences, `Discloses #N` (#3267) —
 # but is NOT negation-aware, hence the #1057 check in the loop.
@@ -2222,9 +2509,15 @@ for issue in $LINKED_ISSUES; do
   # Exit codes: 0 CLEAR / 10 NO-AC / 11 SATISFIED (current-SHA marker present)
   #             12 UNVERIFIED / 13 STALE-MARKER / 1 ERROR.
   # 0, 10 and 11 fall through to the unchanged close logic below.
-  AC_REPORT=$(./.loom/scripts/classify-ac-verification.sh \
-    --issue "$issue" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA")
-  AC_RC=$?
+  # `champion.outOfBandAcGate=false` (#12703): skip the classifier entirely
+  # (exit 10 = NO-AC, which falls through to the unchanged close logic).
+  if [ "$AC_GATE" = "off" ]; then
+    AC_REPORT=""; AC_RC=10
+  else
+    AC_REPORT=$(./.loom/scripts/classify-ac-verification.sh \
+      --issue "$issue" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA")
+    AC_RC=$?
+  fi
 
   # 1 (ERROR) is grouped with 12/13 deliberately: "the classifier could not
   # run" is not "the criteria are met". Fail closed — see item 5 below.
@@ -2276,6 +2569,19 @@ the pipeline noticed it had not been performed. The shape generalizes: any issue
 of the form "X was silently missed / dropped / not observed" has it, because the
 thing to verify is an **absence**, and an absence is exactly what a unit test
 cannot distinguish from a correctly-passing filter.
+
+**Per-repo switch: `champion.outOfBandAcGate` (#12703).** Boolean, **absent =
+`true`** (the gate as described below). A repo that tests on its live deployment
+and does not want a human hold waiting on a confirmation of a real run sets it
+`false` through the normal config tiers (for fleet-gitops: the repo's override
+in `fleet.yml`; no new plumbing, same resolution as `champion.standingAuthorizations`).
+First use case: 2AMLogic/loom-ui. With `false`, Step 4 runs neither the
+classifier nor `hold_issue_on_unverified_ac` for any linked issue: no
+`loom:operator` is added for an out-of-band criterion and the issue closes as
+normal. Only an explicit boolean `false` disables the gate; absent, unreadable,
+a missing `loom-daemon config` verb or a non-boolean value (including the
+string `"false"`) leaves it on. The gate text below stays in this file and is
+inert when the switch is off.
 
 **What the gate does.** `./.loom/scripts/classify-ac-verification.sh` reads the
 linked issue's body, extracts its acceptance-criteria checklist, classifies each

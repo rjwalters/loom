@@ -301,29 +301,12 @@ pub fn plan_id(members: &[(u32, &str)]) -> String {
     format!("seq-{}", &digest[..8])
 }
 
-/// Connected components of the shared-file overlap graph over `eligible`.
-///
-/// `files` maps PR number → its changed paths. PRs without an entry (a
-/// failed files read) are singletons — a failed read must not widen a group
-/// by pretending to know the files.
-#[must_use]
-pub fn overlap_components(
-    eligible: &[&SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-) -> Vec<Vec<u32>> {
-    overlap_components_with(eligible, files, &conflict::assume_conflict)
-}
-
 /// Order one component's members: constraint edges first (trusted markers
 /// among members, stacked bases), then oldest-first with a stable number
 /// tiebreak. `None` on a constraint cycle — the caller skips the component
 /// whole rather than applying a partial order.
-#[must_use]
-pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> Option<Vec<u32>> {
-    order_component_with(members, constraints, &BTreeSet::new())
-}
-
-/// [`order_component`] with the placeable-set ranking: among members that
+///
+/// Ranking over the placeable set: among members that
 /// are placeable right now (no unplaced constraint predecessor), ready
 /// members go first (#10371, [`ready::tier`]); within a tier a `stalled`
 /// member goes last and a higher priority level goes first (#10060,
@@ -385,19 +368,9 @@ pub fn order_component_with(
 /// Followers with no pinnable head SHA yield no edge: an unpinned hold
 /// cannot be re-checked safely. Edges carry [`EdgeReason::SharedFiles`]
 /// except where the follower's base branch IS the predecessor's head branch
-/// ([`EdgeReason::StackedBase`]).
-#[must_use]
-pub fn plan_group(
-    plan: &str,
-    order: &[u32],
-    by_number: &BTreeMap<u32, SequencePr>,
-    files: &BTreeMap<u32, BTreeSet<String>>,
-) -> SequenceGroup {
-    plan_group_with(plan, order, by_number, files, &conflict::assume_conflict)
-}
-
-/// [`plan_group`] where a shared file yields an edge only when `conflicts`
-/// says the pair really conflicts (#10350); stacking is unconditional.
+/// ([`EdgeReason::StackedBase`]). A shared file yields an edge only when
+/// `conflicts` says the pair really conflicts (#10350); stacking is
+/// unconditional.
 #[must_use]
 pub fn plan_group_with(
     plan: &str,
@@ -457,16 +430,7 @@ pub fn plan_group_with(
 /// come from `markers` (trusted, by follower) and from base-branch stacking
 /// among members. Components of size 1 are not groups. Stalled no-verdict
 /// PRs are judged against the wall clock and [`stall_hours`].
-#[must_use]
-pub fn plan_repo(
-    open_prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    markers: &BTreeMap<u32, SequenceMarker>,
-) -> Vec<SequenceGroup> {
-    plan_repo_checked(open_prs, files, markers, &conflict::assume_conflict)
-}
-
-/// [`plan_repo`] with the real-conflict predicate (#10350) — the live pass.
+/// With the real-conflict predicate (#10350) — the live pass.
 #[must_use]
 pub fn plan_repo_checked(
     open_prs: &[SequencePr],
@@ -478,7 +442,7 @@ pub fn plan_repo_checked(
     plan_repo_conflicts(open_prs, files, markers, &stalled, conflicts)
 }
 
-/// [`plan_repo`] with an explicit stalled set (deterministic for tests).
+/// [`plan_repo_checked`] with an explicit stalled set (deterministic for tests).
 #[must_use]
 pub fn plan_repo_with(
     open_prs: &[SequencePr],
