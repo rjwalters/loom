@@ -613,7 +613,6 @@ loom_daemon_exec_checked() {
 #
 # Sets $LOOM_SLICE_BIN and $LOOM_SLICE_KIND (globals, so no subshell hides the
 # trace line). Returns 0 when something resolved, 1 otherwise.
-# shellcheck disable=SC2034  # LOOM_SLICE_KIND is read by lib/script-helper.sh
 
 # The commands loom-tools serves. Others keep resolving the daemon only.
 loom_tools_serves() {
@@ -658,6 +657,7 @@ loom_tools_daemon_fallback_allowed() {
 }
 
 # loom_locate_slice_bin <repo_root> <subcommand>
+# shellcheck disable=SC2034  # LOOM_SLICE_KIND is read by lib/script-helper.sh
 loom_locate_slice_bin() {
     local root="$1" sub="$2" bin=""
     LOOM_SLICE_BIN=""
@@ -703,6 +703,7 @@ loom_locate_slice_bin() {
 # writer: resync refuses and says which two disagree.
 #
 # _loom_payload_identity_of <bin> <tools|daemon> -- echo the identity or nothing.
+# requires-daemon: capabilities optional   only loom-tools serves it; an old binary prints nothing and resync fails open
 _loom_payload_identity_of() {
     local bin="$1" kind="$2" json=""
     [[ -n "$bin" && -x "$bin" ]] || return 0
