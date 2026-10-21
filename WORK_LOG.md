@@ -15,6 +15,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #13016**: refactor: dedupe RepoVisibility string mapping into as_str()
+- **PR #12980**: feat: export pick.decision as a bounded summary and archive the full record
+- **Issue #12817** (closed): Captain next assignment and worker poll loop on a fleet-gitops cadence (Phase 2 slice 3)
+- **Issue #13005** (closed): Dedupe RepoVisibility→str mapping: 11 copies into one as_str()
+- **Issue #12974** (closed): pick.decision: bounded ≤16 KB summary record + local payload archive keyed by tick_id
 - **PR #13004**: docs: restore stand_down doc comment moved onto floor_withdrawn
 - **PR #13001**: feat: resolve loom-tools first for slice stubs and add loom-tools capabilities
 - **PR #12958**: feat: classify workflow standing-class edits by head-SHA content
