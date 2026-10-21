@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
+- **Issue #12396** (closed): CI misses release-only build failures: check the macOS target and the release's test step on every PR
 - **PR #13035**: refactor: remove the native /ingest exporter and queue.snapshot
 - **Issue #12813** (closed): Daemon: remove the /ingest exporter, ingest key and native-only queue.snapshot
 - **PR #12865**: docs: assess checkpoint writes against worktree-isolation guard
