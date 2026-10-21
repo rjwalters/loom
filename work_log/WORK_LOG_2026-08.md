@@ -2,6 +2,48 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-08-21
+
+- **Issue #6158** (closed): Efficacy review: after ~100 PRs, verify #6148's live-process gate still reclaims disk (over-detection fails silently)
+- **Issue #5883** (closed): Recurring Judge rejection pattern: concurrent duplicate PRs racing the same issue (3 instances, #5105/#5199/#5256)
+- **PR #6692**: fix(daemon): release the registry lock across the work-finder's dispatch poll
+- **Issue #6688** (closed): loom-daemon status/health IPC round-trips take 8-22s+ under normal role-runner/work-finder load (repeated 5s timeouts)
+- **PR #6689**: fix(curator): sort issue-selection queries oldest-first
+- **Issue #6642** (closed): curator: select oldest-first so raw-issue age is bounded — an active curator currently ages 3-day-old issues past newer ones, mimicking curator-death
+- **Issue #6686** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **PR #6680**: loom-daemon: forward the build-cache env group into sweep children (#6667)
+- **Issue #6667** (closed): loom-daemon: forward RUSTC_WRAPPER/SCCACHE_BUCKET into dispatched sweep children
+- **PR #6679**: fix(daemon): name the uncommitted-files consequence of workspace add's auto-init
+- **Issue #6636** (closed): workspace add auto-runs init and leaves the Loom surfaces UNCOMMITTED in a tracked fleet repo without saying so — name the follow-up or offer --install
+- **Issue #6676** (closed): Guard rm-scope: same-command literal-path assignment not resolved before catastrophic rm confinement check
+- **PR #6678**: fix(guard): resolve same-command literal-path rm targets before scope check
+- **Issue #6675** (closed): Recurring Judge rejection pattern: defaults/ VERSION-bump gate fails despite an existing builder-pr.md checklist item (6 instances in ~36h)
+- **PR #6677**: docs(builder-pr): wire defaults/ VERSION-bump gate as an actual pre-PR command
+- **Issue #6663** (closed): 11 main_health_gate tests read a process-global credential-staleness cache poisoned by a live GitHub App mint in a sibling test — nondeterministic RED on any fleet host
+- **PR #6673**: test(daemon): inject credential freshness into main_health_gate tests instead of reading the process global
+- **Issue #6627** (closed): Guide: re-verify GUIDE_DOCS_PR_EXCLUDE against origin/main before use — consumer-side patch is dropped on every resync
+- **PR #6660**: feat(guide): re-verify GUIDE_DOCS_PR_EXCLUDE against origin/main before use
+- **Issue #6662** (closed): test-provision-daemon.sh fails intermittently on the self-hosted runner and the suite runner's 40-line tail hides the assertion
+- **PR #6672**: fix(ci): anchor failure excerpts on the first FAIL line and fix a SIGPIPE race in codesign identity matching
+- **Issue #6661** (closed): check-host-sleep.sh: the #6311 preventSleep note is unreachable on a Linux host without systemd, so its test only passes where systemd exists
+- **PR #6668**: fix(scripts): stub systemctl in check-host-sleep test, not just systemd-inhibit
+- **Issue #6665** (closed): tests/install/test-provision-daemon.sh: 3 sub-test failures on the fleet's self-hosted CI runner
+- **Issue #6644** (closed): role_runner tests decide_root_tick_admits_and_returns_a_guard_when_configured / root_tick_decision_panic_is_isolated_and_does_not_propagate fail when LOOM_ROLE_RUNNER is set in the ambient env
+- **PR #6666**: test(daemon): scope LOOM_ROLE_RUNNER in the two decide_root_tick tests
+- **Issue #6625** (closed): Three loom-daemon tests assume an isolated host — pid 1 not ours, unthrottled CPU, and a private /proc/loadavg — and fail in any container, including the fleet's self-hosted CI runner (#6624)
+- **PR #6664**: test(daemon): remove isolated-host assumptions from three loom-daemon tests
+- **Issue #6614** (closed): 401-revoked OAuth mid-flight: wrapper retries the same revoked token 5x per child; work-finder then crash-loops on an empty pool with no backoff
+- **PR #6630**: fix(tokens): classify revoked OAuth 401 as fatal and pause dispatch on an empty pool
+- **Issue #6641** (closed): Flaky test: restore_label_to_ready_does_not_add_loom_issue_when_target_is_pr races on LOOM_REPO (missing #[serial])
+- **PR #6643**: fix: add #[serial] to restore_label_to_ready_does_not_add_loom_issue_when_target_is_pr
+- **Issue #6618** (closed): loom-daemon restart --help omits the plist/unit-edit gotcha (detection + docs already shipped in #4995/PR #5008)
+- **PR #6638**: docs: warn restart --help doesn't pick up hand-edited unit/plist
+- **Issue #6620** (closed): guard worktree-write-confinement: an unquoted '2>/dev/null' after cp SOURCE paths is resolved as a write to '<repo>/2>/dev/null' — fd redirects and cp sources misread as write targets (sibling of #6472/#6484)
+- **Issue #6616** (closed): Consumer org named in shipped default: defaults/scripts/tests/test-merge-pr-worktree-awk.sh comment carries consumer identity into every install
+- **PR #6633**: docs: genericize consumer-org reference in worktree-awk test comment
+- **Issue #6615** (closed): Queued dispatch_sweep requests (and their pre-spawn label flips) are silently lost when the daemon dies before spawning
+- **PR #6629**: fix(daemon): reclaim orphaned loom:building claims immediately at startup
+
 ### 2026-08-20
 
 - **Issue #6601** (closed): champion: epic Phase-1 issues created twice — approval-time creation and the phase scanner both fired (epic 2am#372, product#79-81 then #84-86)
