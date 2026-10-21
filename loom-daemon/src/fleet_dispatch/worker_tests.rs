@@ -393,6 +393,75 @@ fn roles_ok_names_each_role_once() {
     assert!(roles.contains(&"champion".to_string()));
 }
 
+// ---- #12817: a `next` grant stands in for the claim ----------------------
+
+fn offered_grant(url: &str, id: &str, item: u64, step: &str) -> Candidate {
+    Candidate {
+        repo: repo_of(Path::new("/nonexistent")),
+        item,
+        step: step.parse().unwrap(),
+        grant: Grant {
+            assignment_id: id.to_string(),
+            url: url.to_string(),
+            repo: repo_of(Path::new("/nonexistent")),
+            item,
+            step: step.to_string(),
+            lineage: None,
+        },
+    }
+}
+
+/// The claim of an offered item takes the captain's grant and asks nothing;
+/// an item never offered asks as before.
+#[test]
+#[serial]
+fn a_claim_of_an_offered_item_uses_the_grant_and_asks_nothing() {
+    reset_for_test();
+    let dir = tempdir().unwrap();
+    let server = granting();
+    enable(dir.path(), &server.url(), true);
+    let mut c = offered_grant(&server.url(), "n-1", 7, "judge");
+    c.grant.repo = repo_of(dir.path());
+    offer(&[c]);
+    let Ask::Granted(grant) = claim(dir.path(), 7, StepRole::Judge) else {
+        panic!("granted");
+    };
+    assert_eq!(grant.assignment_id, "n-1");
+    assert!(server.requests_to(proto::CLAIM_PATH).is_empty());
+    // Taken once: the same claim again asks the captain.
+    let Ask::Granted(again) = claim(dir.path(), 7, StepRole::Judge) else {
+        panic!("granted");
+    };
+    assert_eq!(again.assignment_id, "a-1");
+    assert_eq!(server.requests_to(proto::CLAIM_PATH).len(), 1);
+}
+
+/// An offer no claim took is refused back, once, and not kept.
+#[test]
+#[serial]
+fn an_offer_no_claim_took_is_declined_once() {
+    reset_for_test();
+    let dir = tempdir().unwrap();
+    let server = granting();
+    enable(dir.path(), &server.url(), true);
+    offer(&[
+        offered_grant(&server.url(), "n-1", 7, "judge"),
+        offered_grant(&server.url(), "n-2", 8, "doctor"),
+    ]);
+    // Offering the same item again replaces it.
+    offer(&[offered_grant(&server.url(), "n-3", 7, "judge")]);
+    assert_eq!(decline_offered("not_eligible"), 2);
+    assert_eq!(decline_offered("not_eligible"), 0);
+    std::thread::sleep(Duration::from_millis(200));
+    let sent = server.requests_to(proto::REFUSE_PATH);
+    let ids: BTreeSet<String> = sent
+        .iter()
+        .map(|r| r["assignment_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, BTreeSet::from(["n-2".to_string(), "n-3".to_string()]));
+    assert!(sent.iter().all(|r| r["reason"] == "not_eligible"));
+}
+
 // ---- #12493: the flag is the host's, read from the daemon workspace ------
 
 /// Write `fleetDispatch` into `host`'s host-local tier only.
