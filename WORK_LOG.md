@@ -15,6 +15,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #13039**: refactor: remove dead native_ingest column from telemetry kind registry
+- **Issue #13037** (closed): Remove dead native_ingest registry column left over from the /ingest exporter removal
+- **PR #13038**: chore: remove departed collaborator from live config and shipped defaults
 - **PR #12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
 - **Issue #12396** (closed): CI misses release-only build failures: check the macOS target and the release's test step on every PR
 - **PR #13035**: refactor: remove the native /ingest exporter and queue.snapshot
