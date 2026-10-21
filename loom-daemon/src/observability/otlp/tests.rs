@@ -119,9 +119,8 @@ fn base_endpoint_trailing_slash_is_tolerated() {
 #[tokio::test]
 async fn non_2xx_status_from_either_endpoint_is_a_rejected_error() {
     // Bind-then-drop to get a loopback port nothing is listening on —
-    // reuses `exporter.rs`'s unreachable-sink pattern for the transport
-    // error path (rejected-status is already covered by
-    // `HttpsExporter`'s own tests at the `post` granularity).
+    // covers the transport error path (rejected-status is covered at the
+    // `post` granularity by the tests below).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);

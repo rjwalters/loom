@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use chrono::{DateTime, Utc};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{Admission, TickReport};

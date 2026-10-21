@@ -5,7 +5,7 @@
 //! which is over `.loom/docs/file-size-policy.md`'s threshold and frozen —
 //! same split as `section_inventory` and `auto_update_stale_repo`. Pure move
 //! apart from the #9015 test at the end; `use super::*` keeps every fixture
-//! (`now`, `healthy_inputs`, `mismatched_inputs`) shared with the parent so the
+//! (`now`, `healthy_inputs`) shared with the parent so the
 //! two suites cannot drift over what "healthy" means.
 
 use super::*;
@@ -19,7 +19,6 @@ fn exporting_inputs(
     let mut export = crate::types::ObservabilityExportStatus {
         state: crate::types::ObservabilityExportState::Starting,
         host_id: Some("robb-studio".to_string()),
-        ingest_host_id: None,
         endpoint: Some("https://dashboard.example/ingest".to_string()),
         exporter: Some("https".to_string()),
         started_at: Some(now() - chrono::Duration::hours(4)),
@@ -178,39 +177,11 @@ fn a_failing_exporter_is_a_degraded_observability_note() {
 }
 
 #[test]
-fn a_mismatch_still_wins_and_now_carries_the_export_facts() {
-    // #4830 regression guard: the mismatch note is unchanged, and the
-    // positive facts ride along in `detail.export` so a machine consumer
-    // reading a DEGRADED section still learns whether anything is landing.
-    let mut inputs = mismatched_inputs(3600);
-    inputs.status.as_mut().unwrap().observability_export =
-        Some(crate::types::ObservabilityExportStatus {
-            state: crate::types::ObservabilityExportState::HostIdMismatch,
-            host_id: Some("robb-studio".to_string()),
-            ingest_host_id: Some("robb-pro".to_string()),
-            last_success_at: Some(now() - chrono::Duration::seconds(12)),
-            records_exported: 77,
-            started_at: Some(now() - chrono::Duration::hours(4)),
-            ..Default::default()
-        });
-    let section = assess_observability(&inputs).expect("section present");
-    assert_eq!(section.verdict, Verdict::Degraded);
-    // Unchanged #4830 keys.
-    assert_eq!(section.detail["daemon_host_id"], "robb-studio");
-    assert_eq!(section.detail["ingest_host_id"], "robb-pro");
-    assert_eq!(section.detail["first_seen_age_secs"], 3600);
-    // Additive #5083 payload.
-    assert_eq!(section.detail["export"]["records_exported"], 77);
-    assert_eq!(section.detail["export"]["state"], "host_id_mismatch");
-}
-
-#[test]
 fn a_pre_5083_daemon_reporting_no_export_field_renders_nothing() {
     // An older daemon cannot answer, so the section stays absent — the
     // pre-#5083 baseline, never a fabricated "never exported".
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
     status.observability_export = None;
-    status.observability_host_id_mismatch = None;
     assert!(assess_observability(&inputs).is_none());
 }

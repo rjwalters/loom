@@ -66,7 +66,7 @@ pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod ops;
 pub mod provenance;
-pub mod queue_snapshot;
+pub mod queue_repo;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
@@ -89,7 +89,6 @@ pub use kinds::{
 pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
 pub use phase_tap_usage::PhaseTapUsageRow;
-pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -326,7 +325,8 @@ macro_rules! define_telemetry_record {
                 }
             }
 
-            /// Whether the native HTTPS `/ingest` backend accepts this kind.
+            /// Whether the removed native HTTPS `/ingest` backend accepted this
+            /// kind (#12813: no exporter reads it any more).
             /// `false` for OTLP-only kinds (`trace.span`, `metric.points`).
             #[must_use]
             pub fn accepted_by_native_ingest(&self) -> bool {
@@ -1617,7 +1617,7 @@ pub struct HostHealthRecord {
     /// list as proof of silence. `#[serde(default)]` so an older record decodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exported_kinds: Vec<String>,
-    /// Exporter names that actually started in this process (`"https"`, `"otlp"`;
+    /// Exporter names that actually started in this process (`"otlp"`;
     /// [`crate::observability::ExporterKind::name`]), sorted. Same
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
