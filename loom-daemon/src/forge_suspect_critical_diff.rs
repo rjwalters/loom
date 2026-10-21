@@ -178,6 +178,31 @@ fn table_segments(name: &str) -> Vec<String> {
     segs
 }
 
+/// The key part of a `key = value` line (text before the first unquoted `=`).
+fn line_key(content: &str) -> Option<&str> {
+    let mut quote = None::<char>;
+    for (i, c) in content.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '=') => return Some(&content[..i]),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A dotted key (`dependencies.serde = ..`) or inline-table key
+/// (`dependencies = { .. }`) that names a dependency-ish segment.
+fn key_names_suspect_segment(content: &str) -> bool {
+    line_key(content).is_some_and(|k| {
+        table_segments(k)
+            .iter()
+            .any(|s| CARGO_SUSPECT_SEGMENTS.contains(&s.as_str()))
+    })
+}
+
 fn classify_table(name: &str) -> Section {
     let segs = table_segments(name);
     let suspect = segs
@@ -527,6 +552,7 @@ where
                         }
                     };
                     let hit = suspect
+                        || key_names_suspect_segment(content)
                         || re_build.is_match(content)
                         || if target && re_path.is_match(content) {
                             // A target's own `path =`: only inline-table sources count.
@@ -775,6 +801,30 @@ mod tests {
     fn mixed_bin_edit_and_hidden_build_line_is_suspect() {
         let p = "@@ -1,4 +1,8 @@\n [package]\n name = \"x\"\n+build = \"evil.rs\"\n \n+[[bin]]\n+name = \"ok\"\n+path = \"src/ok.rs\"";
         assert_eq!(suspect("Cargo.toml", p).line, "+build = \"evil.rs\"");
+    }
+
+    /// Dotted-key and inline-table dependency/feature definitions inside a
+    /// non-suspect table (or at the top level) are suspect lines.
+    #[test]
+    fn dotted_and_inline_dependency_keys_are_suspect() {
+        for (header, added) in [
+            ("[workspace]", "+dependencies.serde = \"1\""),
+            ("[package]", "+features.x = []"),
+            ("[workspace]", "+dependencies = { serde = \"1\" }"),
+            ("[workspace]", "+patch.crates-io.x = { version = \"1\" }"),
+            ("[package]", "+\"dev-dependencies\".x = \"1\""),
+        ] {
+            let p = format!("@@ -1,1 +1,2 @@\n {header}\n{added}");
+            assert_eq!(suspect("Cargo.toml", &p).line, added, "{p}");
+        }
+    }
+
+    #[test]
+    fn headerless_top_level_dotted_dependency_is_suspect() {
+        let head = "name = \"x\"\ndependencies.serde = \"1\"\n";
+        let p = "@@ -1,1 +1,2 @@\n name = \"x\"\n+dependencies.serde = \"1\"";
+        let r = classify("Cargo.toml", Some(p), || Ok(head.to_string()));
+        assert!(matches!(r, Err(Reason::Suspect(_))), "{r:?}");
     }
 
     #[test]
