@@ -2851,6 +2851,49 @@ fi
 echo ""
 
 
+# Test: install / resync never touch a consumer's work documents (#12636).
+# Guide rotates WORK_LOG.md / WORK_PLAN.md into month archives
+# (work_log/WORK_LOG_YYYY-MM.md, work_plan/WORK_PLAN_YYYY-MM.md, #12589).
+# These are consumer-owned: install-loom.sh and resync-installed.sh must never
+# create, overwrite or delete them. Neither script references them today; this
+# locks that in (structurally, and behaviorally against a fixture repo).
+echo "Test: install/resync never create, overwrite or delete work documents (#12636)"
+WORKDOC_SCRIPTS_REFS=$(grep -nE 'WORK_LOG|WORK_PLAN|work_log|work_plan' \
+  "$LOOM_ROOT/install.sh" "$LOOM_ROOT/scripts/install-loom.sh" \
+  "$LOOM_ROOT/defaults/scripts/resync-installed.sh" "$LOOM_ROOT"/scripts/install/*.sh 2>/dev/null || true)
+if [[ -z "$WORKDOC_SCRIPTS_REFS" ]]; then
+  pass "install/resync scripts do not reference WORK_LOG/WORK_PLAN or their archive dirs (#12636)"
+else
+  fail "install/resync scripts reference work documents (#12636): $WORKDOC_SCRIPTS_REFS"
+fi
+
+WORKDOC_REPO="$TEST_DIR/workdoc-preserve-test"
+create_temp_repo "$WORKDOC_REPO"
+mkdir -p "$WORKDOC_REPO/work_log" "$WORKDOC_REPO/work_plan"
+printf '# Work Log\n\ncustom hand-written log\n' > "$WORKDOC_REPO/WORK_LOG.md"
+printf '# Work Plan\n\ncustom hand-written plan\n' > "$WORKDOC_REPO/WORK_PLAN.md"
+printf 'archived log\n' > "$WORKDOC_REPO/work_log/WORK_LOG_2026-08.md"
+printf 'archived plan\n' > "$WORKDOC_REPO/work_plan/WORK_PLAN_2026-08.md"
+printf 'hand note\n' > "$WORKDOC_REPO/work_log/notes.md"
+WORKDOC_BEFORE=$(cd "$WORKDOC_REPO" && find . -path ./.git -prune -o -type f \( -name 'WORK_*' -o -path './work_*' \) -print | LC_ALL=C sort | xargs sha256sum)
+
+simulate_loom_install "$WORKDOC_REPO"
+simulate_loom_install "$WORKDOC_REPO"  # reinstall / resync pass
+DAEMON_BIN_12636="$LOOM_ROOT/target/release/loom-daemon"
+if [[ -x "$DAEMON_BIN_12636" ]]; then
+  "$DAEMON_BIN_12636" init --force --defaults "$LOOM_ROOT/defaults" "$WORKDOC_REPO" >/dev/null 2>&1 || true
+else
+  warn "loom-daemon release binary not built — #12636 covers simulated install only"
+fi
+
+WORKDOC_AFTER=$(cd "$WORKDOC_REPO" && find . -path ./.git -prune -o -type f \( -name 'WORK_*' -o -path './work_*' \) -print | LC_ALL=C sort | xargs sha256sum)
+if [[ "$WORKDOC_BEFORE" == "$WORKDOC_AFTER" ]]; then
+  pass "work documents and archive files are byte-identical after install and reinstall (#12636)"
+else
+  fail "install/reinstall changed, created or deleted work documents (#12636)"
+fi
+echo ""
+
 # ==========================================================================
 # Dogfood commands scoped-symlink (issue #3682)
 # ==========================================================================

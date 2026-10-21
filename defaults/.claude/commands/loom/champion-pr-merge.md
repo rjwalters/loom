@@ -365,6 +365,9 @@ to skip Champion's own check.
 # shared — a divergence between the two copies is a visible drift, not a
 # silent gap; see test-docs-only-fast-path.sh which pins both).
 DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")
+# Archive files (#12636): ONLY the month-rotated archives, month 01-12, one
+# directory deep. Never a directory or *.md allowance.
+DOCS_FAST_PATH_ARCHIVE_RE='^(work_log/WORK_LOG|work_plan/WORK_PLAN)_[0-9]{4}-(0[1-9]|1[0-2])\.md$'
 
 docs_only_fast_path_check() {
   local file matched
@@ -379,6 +382,9 @@ docs_only_fast_path_check() {
         break
       fi
     done
+    if [ "$matched" -ne 1 ] && [[ "$file" =~ $DOCS_FAST_PATH_ARCHIVE_RE ]]; then
+      matched=1
+    fi
     if [ "$matched" -ne 1 ]; then
       echo "NOT ELIGIBLE: $file"
       return 0
