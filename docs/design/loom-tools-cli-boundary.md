@@ -671,7 +671,17 @@ seam):
   `forge-helpers.sh`, `merge-pr.sh`).
 - Whether `ForgeAction` and `quarantine`/`noop-cooldown` depend on binary-root
   types beyond the files named in 3.6.
-- Release size and build-time effect of a second bin: not measured, no claim made.
+- Release size of the second bin, measured (#12940) from `cargo build --release
+  --bins -j2 --features otlp` at `6aa459a5c` on `x86_64-unknown-linux-gnu`
+  (the release job's profile, unstripped, as uploaded): `loom-daemon`
+  83,862,304 bytes (80.0 MiB; 30,536,847 gzipped), `loom-tools` 15,618,712
+  bytes (14.9 MiB; 8,706,809 gzipped). Both carry the same embedded install
+  payload (about 4.5 MB of that, `build.rs`), so a tools-only machine downloads
+  roughly 19% of the daemon's bytes. Not measured: the two Darwin/aarch64
+  triples (no runner here; the first release run records them in its job
+  summary), and the wall-clock effect of the second bin (the one cold
+  `cargo build` covering both took 6m24s on a shared host, which is not a
+  comparison against a daemon-only build).
 - Gitea: the Rust facade declines (`EX_FORGE_DECLINED`); the Phase 3 decision
   (port or retain a bounded shell adapter) is open and must be made before the
   forge write family moves. Counted: 23 library files mention `ForgeType::Gitea`
