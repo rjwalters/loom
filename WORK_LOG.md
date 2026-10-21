@@ -15,6 +15,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #12987**: chore: post-merge-cleanup drill (#12510), do not review
+- **PR #12982**: test: bind each shared-pool account's admission to its own repository clone in Docker
+- **PR #12981**: refactor: dedupe byte formatting onto fs_util::human_size
+- **PR #12935**: feat: redraw Champion holds once when standing authorizations change
+- **Issue #12977** (closed): Remove duplicate human_bytes copies; use fs_util::human_size
+- **Issue #12933** (closed): Re-read Champion holds once when standingAuthorizations change (follow-up to #12901)
+- **Issue #11273** (closed): audit-agents phase 6: evidence-backed action classification
 - **PR #12961**: feat(fleet-dispatch): spawn captain-offered items through the step tick's gates
 - **PR #12936**: fix(champion): ignore YAML comments in workflow blast keyword scan
 - **PR #12718**: fix: take verdict-gate review start from dispatch and fail closed
