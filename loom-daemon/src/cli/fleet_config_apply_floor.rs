@@ -1,7 +1,7 @@
 //! `loom-daemon fleet-config apply-floor` — bring the installed CLI binary up
 //! to the fleet floor on a host that has no daemon (Issue #12926).
 //!
-//! The floor roll (#10698, [`loom_daemon::auto_update::floor_roll`]) runs
+//! The floor roll (#10698, [`crate::auto_update::floor_roll`]) runs
 //! inside a running daemon, so an attended host declared
 //! `loom-daemon: expected: absent` has no actor that converges its binary.
 //! This verb is that actor, as a composition of the existing pieces: store
@@ -26,13 +26,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 
-use loom_daemon::auto_update::floor_roll::{floor_verdict, FloorVerdict, Release};
-use loom_daemon::daemon_update::{artifact, provision};
-use loom_daemon::fleet_store::fetch::{self, Policy, Snapshot};
-use loom_daemon::fleet_store::floor::{self, FloorRead};
-use loom_daemon::fleet_store::gh::GhTransport;
-use loom_daemon::fleet_store::{self as store};
-use loom_daemon::fleet_sync::FloorKnowledge;
+use crate::auto_update::floor_roll::{floor_verdict, FloorVerdict, Release};
+use crate::daemon_update::{artifact, provision};
+use crate::fleet_store::fetch::{self, Policy, Snapshot};
+use crate::fleet_store::floor::{self, FloorRead};
+use crate::fleet_store::gh::GhTransport;
+use crate::fleet_store::{self as store};
+use crate::fleet_sync::FloorKnowledge;
 
 /// The version of the binary that is running, i.e. the installed CLI.
 pub(crate) const INSTALLED_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -230,11 +230,11 @@ pub(crate) fn run(workspace: &Path, dry_run: bool) -> ! {
         eprintln!("loom-daemon fleet-config: error: {e:#}");
         2
     });
-    loom_daemon::daemon_update::exit(code)
+    crate::daemon_update::exit(code)
 }
 
 fn run_inner(workspace: &Path, dry_run: bool) -> Result<i32> {
-    let effective = loom_daemon::config_resolver::resolve_effective_config(workspace);
+    let effective = crate::config_resolver::resolve_effective_config(workspace);
     let Some(location) = store::resolve_location(&effective, &|k| std::env::var(k).ok())? else {
         println!("no fleet store configured for {}: nothing to apply", workspace.display());
         return Ok(0);

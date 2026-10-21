@@ -28,7 +28,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::worktree_preserve::{decide, render, Context, Kind};
+use crate::merge_pr::worktree_preserve::{decide, render, Context, Kind};
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreePreserveArgs {

@@ -438,9 +438,9 @@ while the host is up, `host_silent` means the host is down.
 
 `pass-queries.sql` (#10752) answers "what did the daemon's hold-cleanup pass
 do?" from the `pass.summary` / `pass.verdict` logs and the `invoke github`
-spans stamped with `github.caller`: (1) per mechanism and repo over 24 h, the
+spans: (1) per mechanism and repo over 24 h, the
 passes run and refused, blocks released and re-parked, skips by reason, write
-cap hits and the GitHub calls by operation, in one statement; (2) the newest
+cap hits and the repo's GitHub calls by operation (all callers), in one statement; (2) the newest
 verdict per artifact, which says why each one is still held; (3) every
 `loom:blocked` removal the loom-ui webhook export saw, matched to the pass
 verdict that made it (empty when no pass did). Run it like the queries above:

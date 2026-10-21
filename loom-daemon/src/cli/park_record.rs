@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::park_record::{self, BlockerRef, ParkRecord};
+use crate::park_record::{self, BlockerRef, ParkRecord};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ParkRecordCommand {
@@ -213,7 +213,7 @@ impl RenderArgs {
 
 impl ReleasedArgs {
     fn run(self) {
-        use loom_daemon::telemetry::kinds::hold_transition::{reason, transition};
+        use crate::telemetry::kinds::hold_transition::{reason, transition};
         let token = |t: &str| {
             let ok = !t.is_empty()
                 && t.len() <= 40
@@ -230,7 +230,7 @@ impl ReleasedArgs {
             .as_deref()
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
             .map(|d| d.with_timezone(&chrono::Utc));
-        loom_daemon::observability::pick_journal::record_hold(
+        crate::observability::pick_journal::record_hold(
             self.pr,
             transition::REMOVE,
             reason::HOLD_RELEASED,
@@ -270,8 +270,8 @@ impl DecisionArgs {
 impl ApplyArgs {
     /// Never returns: exits with the command's own code.
     fn run(self) -> Result<()> {
-        use loom_daemon::operator_decision::cli::{default_repo_root, GhForge};
-        use loom_daemon::park_record::apply::{apply, ApplyRequest};
+        use crate::operator_decision::cli::{default_repo_root, GhForge};
+        use crate::park_record::apply::{apply, ApplyRequest};
         let is_pr = self.issue.is_none() && self.pr.is_some();
         let req = ApplyRequest {
             number: self.issue.or(self.pr).unwrap_or_default(),
@@ -286,7 +286,7 @@ impl ApplyArgs {
         };
         let mut forge = GhForge::new(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
-        loom_daemon::park_record::apply::journal_applied(&req, is_pr, code);
+        crate::park_record::apply::journal_applied(&req, is_pr, code);
         std::process::exit(code)
     }
 }

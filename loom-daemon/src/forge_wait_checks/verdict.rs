@@ -61,6 +61,25 @@ pub struct Rollup {
     pub failed_detail: Vec<Failed>,
 }
 
+impl Rollup {
+    /// [`Rollup::pending`] without [`REQUIRED_CHECK_CONTEXT`], which never
+    /// holds a wait (#12526) — the one filter every verdict path shares.
+    #[must_use]
+    pub fn blocking_pending(&self) -> Vec<String> {
+        without_authorization(&self.pending)
+    }
+}
+
+/// `names` minus [`REQUIRED_CHECK_CONTEXT`] (#12552).
+#[must_use]
+pub fn without_authorization(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.as_str() != REQUIRED_CHECK_CONTEXT)
+        .cloned()
+        .collect()
+}
+
 /// Merge a complete check-runs payload (`{total_count, check_runs}`, every
 /// page already folded in) and a combined-status payload into one rollup.
 ///
@@ -185,12 +204,7 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
         .filter(|c| c.as_str() != REQUIRED_CHECK_CONTEXT && !r.seen.contains(*c))
         .cloned()
         .collect();
-    let pending: Vec<String> = r
-        .pending
-        .iter()
-        .filter(|p| p.as_str() != REQUIRED_CHECK_CONTEXT)
-        .cloned()
-        .collect();
+    let pending = r.blocking_pending();
     if required_only && !req.is_empty() {
         let mut waiting: Vec<String> = pending
             .iter()
@@ -239,10 +253,11 @@ pub fn decide_settled(r: &Rollup, required: Option<&[String]>, required_only: bo
     if !matches!(d, Decision::Red(_)) {
         return d;
     }
-    if r.pending.is_empty() {
+    let pending = r.blocking_pending();
+    if pending.is_empty() {
         d
     } else {
-        Decision::Pending(r.pending.clone())
+        Decision::Pending(pending)
     }
 }
 

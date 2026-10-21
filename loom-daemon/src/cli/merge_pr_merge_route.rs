@@ -5,7 +5,7 @@
 //! # Protocol
 //!
 //! Reads `$MERGE_RESPONSE` (raw bytes) on stdin. Prints one route block and
-//! exits 0 — see [`loom_daemon::merge_pr::merge_route::Route::render`]:
+//! exits 0 — see [`crate::merge_pr::merge_route::Route::render`]:
 //! `LOOM-MERGE-ROUTE AWAIT <sleep>` / `SYNC <sleep> <next-delay>` followed by
 //! keyed narration lines, or `LOOM-MERGE-ROUTE FAIL` followed by the verbatim
 //! refusal message.
@@ -21,8 +21,8 @@
 
 use std::io::{Read, Write};
 
+use crate::merge_pr::merge_route::{decide, Inputs, Kind};
 use anyhow::Result;
-use loom_daemon::merge_pr::merge_route::{decide, Inputs, Kind};
 
 #[derive(clap::ValueEnum, Clone, Copy)]
 enum KindArg {

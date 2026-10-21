@@ -1,8 +1,8 @@
-use anyhow::{Context, Result};
-use loom_daemon::{
+use crate::{
     comment_trust::TrustPolicy,
     pr_planning::{self, PrRole},
 };
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]

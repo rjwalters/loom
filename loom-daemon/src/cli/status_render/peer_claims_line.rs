@@ -14,13 +14,13 @@
 //! since 2026-09-23, and `loom-daemon status` reported
 //! `advertised=3765 received=0` with no verdict, no marker, and no reason — six
 //! days of a completely inert cross-host coordination channel presenting as
-//! normal output. See `loom_daemon::peer_claims::send_health` for the full trace.
+//! normal output. See `crate::peer_claims::send_health` for the full trace.
 //!
 //! Kept in its own sibling module (the `status_render/*_line.rs` convention)
 //! because `status_render.rs` is over the size ratchet
 //! (`scripts/file-size-baseline.txt`).
 
-use loom_daemon::types::PeerCoordinationHealth;
+use crate::types::PeerCoordinationHealth;
 
 /// Render the peer-coordination verdict line that belongs beneath the
 /// counters — a `DEGRADED` marker plus the verdict's own `reason` sentence.
@@ -112,7 +112,7 @@ mod tests {
         let line = render_coordination_verdict(&PeerCoordinationHealth {
             degraded: true,
             degraded_for_secs: Some(518_400),
-            reason: Some(loom_daemon::peer_claims::publish_blocked_reason(
+            reason: Some(crate::peer_claims::publish_blocked_reason(
                 "[500 / M_UNKNOWN] no forward extremities",
                 3765,
             )),

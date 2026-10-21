@@ -88,6 +88,8 @@ pub struct Gathered {
     pub inputs: Vec<DrawInput>,
     /// The Champion re-evaluation ladder's due times, from the bodies.
     pub ladder: Vec<(u32, StepRole, DateTime<Utc>)>,
+    /// The same ladder records' rung and raw `next`, by item number (#12918).
+    pub reevals: HashMap<u32, super::reeval_ladder::Reeval>,
     /// Creation times by number.
     pub created_at: HashMap<u32, String>,
     /// The open-PR listing answered. When it did not, a PR linked only by
@@ -324,6 +326,31 @@ pub fn ladder_due(rows: &[RestIssue], now: DateTime<Utc>) -> Vec<(u32, StepRole,
         .collect()
 }
 
+/// The ladder record each row's body carries, by number (#12918): the one
+/// [`ladder_due`] reads (a PR's `champion_merge`, an issue's
+/// `champion_promote`), with its rung and its raw `next`. Read at `now` for
+/// the choice between several records, as [`ladder_due`] does.
+#[must_use]
+pub fn ladder_state(
+    rows: &[RestIssue],
+    now: DateTime<Utc>,
+) -> HashMap<u32, super::reeval_ladder::Reeval> {
+    rows.iter()
+        .filter_map(|r| {
+            let role = if r.is_pull_request {
+                StepRole::ChampionMerge
+            } else {
+                StepRole::ChampionPromote
+            };
+            let record = super::reeval_ladder::parse(r.body.as_deref()?)
+                .into_iter()
+                .filter(|e| e.step == role)
+                .max_by_key(|e| e.due_at(now))?;
+            Some((r.number, record))
+        })
+        .collect()
+}
+
 /// Turn every Judge step whose PR head has CI pending into a
 /// [`PassReason::CiPending`] pass (#12042), and return how many it held.
 /// `heads` maps a PR to its head SHA (a PR with none is drawn unread);
@@ -368,11 +395,20 @@ pub fn hold_ci_pending(
 /// `hold_heads` maps a PR to [`PullMarkers::hold_head`] (already `None` once a
 /// release comment followed); `released` names the PRs carrying
 /// `loom:auto-merge-ok`. Fails open: a PR with no recorded or current head is
-/// drawn. A recorded SHA may be abbreviated, so heads match on prefix. Pure.
+/// drawn. A recorded SHA may be abbreviated, so heads match on prefix.
+///
+/// A change in the repo's standing authorizations is a release signal too
+/// (#12933): `hold_auths` maps a PR to the digest its hold recorded
+/// ([`PullMarkers::hold_auth`]) and `current_auth` is the repo's digest now.
+/// A hold whose digest differs, or that recorded none, is drawn once; its
+/// re-hold records the current digest. `current_auth` of `None` (no digest
+/// available) keeps the head-only rule. Pure.
 pub fn hold_at_recorded_head(
     items: &mut [Item],
     heads: &HashMap<u32, String>,
     hold_heads: &HashMap<u32, String>,
+    hold_auths: &HashMap<u32, String>,
+    current_auth: Option<&str>,
     released: &HashSet<u32>,
 ) -> usize {
     let mut held = 0usize;
@@ -387,6 +423,9 @@ pub fn hold_at_recorded_head(
         let (Some(head), Some(recorded)) = (heads.get(&pr), hold_heads.get(&pr)) else {
             continue;
         };
+        if current_auth.is_some_and(|cur| hold_auths.get(&pr).map(String::as_str) != Some(cur)) {
+            continue;
+        }
         if !recorded.is_empty() && (head.starts_with(recorded) || recorded.starts_with(head)) {
             item.verdict = Verdict::Pass(PassReason::HeldAtHead);
             held += 1;
@@ -545,6 +584,10 @@ pub fn list(
         .iter()
         .filter_map(|p| p.markers.hold_head.clone().map(|h| (p.number, h)))
         .collect();
+    let hold_auths: HashMap<u32, String> = pulls
+        .iter()
+        .filter_map(|p| p.markers.hold_auth.clone().map(|a| (p.number, a)))
+        .collect();
     let linked_by_pr: Vec<u32> = pulls
         .iter()
         .flat_map(|p| {
@@ -617,7 +660,14 @@ pub fn list(
         .filter(|r| r.is_pull_request && has(&r.labels, "loom:auto-merge-ok"))
         .map(|r| r.number)
         .collect();
-    let at_head = hold_at_recorded_head(&mut items, &heads, &hold_heads, &released);
+    let at_head = hold_at_recorded_head(
+        &mut items,
+        &heads,
+        &hold_heads,
+        &hold_auths,
+        Some(crate::champion_hold::standing_auth_digest(root).as_str()),
+        &released,
+    );
     if at_head > 0 {
         log::debug!("work_finder: {slug}: {at_head} held PR(s) unchanged since their hold");
     }
@@ -656,6 +706,7 @@ pub fn finish(
     }
     Gathered {
         ladder: ladder_due(&rows, now),
+        reevals: ladder_state(&rows, now),
         created_at: rows
             .iter()
             .filter_map(|r| r.created_at.clone().map(|c| (r.number, c)))

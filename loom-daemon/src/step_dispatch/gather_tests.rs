@@ -117,6 +117,42 @@ fn the_ladder_and_the_red_fix_marker_are_read_from_bodies() {
     assert!(!has_red_fix_marker(Some("quoting <!-- loom:main-red-fix --> inline")));
 }
 
+/// #12918: the rung and the raw `next` of the marker, for a PR's merge ladder
+/// and an issue's promote ladder; a row with no marker has no entry.
+#[test]
+fn ladder_state_reads_rung_and_next_for_both_artifacts() {
+    let pr_next = "2026-10-20T00:00:00Z";
+    let issue_next = "2026-10-20T06:00:00Z";
+    let rows = vec![
+        row(
+            70,
+            &["loom:pr"],
+            &format!("<!-- loom:reeval step=champion_merge rung=2 next={pr_next} -->"),
+            true,
+        ),
+        row(
+            71,
+            &["loom:curated"],
+            &format!("body\n<!-- loom:reeval step=champion_promote rung=3 next={issue_next} -->\n"),
+            false,
+        ),
+        row(72, &["loom:pr"], "", true),
+        // A promote marker on a PR is not that PR's ladder.
+        row(
+            73,
+            &["loom:pr"],
+            &format!("<!-- loom:reeval step=champion_promote rung=1 next={pr_next} -->"),
+            true,
+        ),
+    ];
+    let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+    let state = ladder_state(&rows, t(pr_next) - chrono::Duration::minutes(30));
+    assert_eq!((state[&70].rung, state[&70].next), (2, t(pr_next)));
+    assert_eq!((state[&71].rung, state[&71].next), (3, t(issue_next)));
+    assert!(!state.contains_key(&72));
+    assert!(!state.contains_key(&73));
+}
+
 // ------------------------------------------------- the Judge CI hold (#12042)
 
 mod ci_hold {
@@ -273,8 +309,41 @@ mod held_at_head {
         released: &[u32],
     ) -> (usize, Verdict) {
         let mut items = held_pr();
-        let n = hold_at_recorded_head(&mut items, heads, hold, &released.iter().copied().collect());
+        let n = hold_at_recorded_head(
+            &mut items,
+            heads,
+            hold,
+            &HashMap::new(),
+            None,
+            &released.iter().copied().collect(),
+        );
         (n, items[0].verdict)
+    }
+
+    /// At its held head, with `recorded` the digest the hold wrote (`None`
+    /// for a legacy hold) and `current` the repo's digest now.
+    fn run_auth(recorded: Option<&str>, current: Option<&str>) -> usize {
+        let mut items = held_pr();
+        let auths: HashMap<u32, String> =
+            recorded.map(|a| (5, a.to_string())).into_iter().collect();
+        hold_at_recorded_head(&mut items, &map(HEAD), &map(HEAD), &auths, current, &HashSet::new())
+    }
+
+    #[test]
+    fn an_unchanged_digest_keeps_the_hold() {
+        assert_eq!(run_auth(Some("aa11"), Some("aa11")), 1);
+    }
+
+    #[test]
+    fn a_changed_digest_or_a_legacy_hold_is_drawn_once() {
+        assert_eq!(run_auth(Some("aa11"), Some("bb22")), 0);
+        assert_eq!(run_auth(None, Some("bb22")), 0);
+    }
+
+    #[test]
+    fn no_current_digest_keeps_the_head_only_rule() {
+        assert_eq!(run_auth(Some("aa11"), None), 1);
+        assert_eq!(run_auth(None, None), 1);
     }
 
     #[test]

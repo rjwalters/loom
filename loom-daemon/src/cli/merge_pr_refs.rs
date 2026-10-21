@@ -23,7 +23,7 @@ use std::io::Read;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::refs;
+use crate::merge_pr::refs;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum MergePrRefsCommand {
