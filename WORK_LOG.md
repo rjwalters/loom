@@ -15,6 +15,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #12961**: feat(fleet-dispatch): spawn captain-offered items through the step tick's gates
+- **PR #12936**: fix(champion): ignore YAML comments in workflow blast keyword scan
+- **PR #12718**: fix: take verdict-gate review start from dispatch and fail closed
+- **PR #12696**: feat: accept approve/request-changes aliases in post-verdict.sh
+- **PR #12670**: feat: let month-rotated work-log/plan archives pass the docs-only fast path
+- **PR #12559**: fix: exempt merge-authorization context from wait-checks zero-rows, settled and idle paths
+- **Issue #12934** (closed): ci_workflow_blast_eval: ignore YAML comment lines in the release/deploy keyword scan
+- **Issue #12714** (closed): Verdict gate: take review start from dispatch, fail closed, follow Part-of links (#12624 misses the #12512 case)
+- **Issue #12692** (closed): post-verdict.sh: accept `approve` as an alias or name the valid verdicts in the error
+- **Issue #12636** (closed): WORK_LOG archival (4/4): narrow archive paths in Judge/Champion docs-only allowlists, telemetry, imagine seed, install/resync guard
+- **Issue #12552** (closed): forge wait-checks: apply the loom/merge-authorization exemption to the zero-rows and settled/idle paths too (#12532 follow-up)
 - **PR #12968**: docs: document uv cache prune knob in worker disk-full runbook
 - **Issue #12460** (closed): Bound shared tool caches (uv) and prune non-live codex profiles
 
