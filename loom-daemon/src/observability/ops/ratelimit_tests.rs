@@ -482,7 +482,7 @@ fn an_app_host_books_its_probe_and_emits_no_owner_less_point() {
             ("acme-10343", "graphql", Some(100), Source::Probe),
         ]
     );
-    let exported = bucket_points(&book, "app-1034301");
+    let exported = bucket_points(&book, &["app-1034301".to_string()]);
     assert_eq!(exported.len(), 6);
     for p in &exported {
         let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();

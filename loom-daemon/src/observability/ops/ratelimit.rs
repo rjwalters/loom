@@ -389,17 +389,18 @@ pub fn quota_points(
 /// Gauges for every believed bucket-book reading (W1), labelled
 /// `resource`, `account`, `owner`, `installation` (#10571, `-` when no
 /// sidecar named one) and `role` — one series per billed bucket. `role` is
-/// `writer` for the workspace's writer App (`writer_account`: the App
-/// minted into the primary credential directory, else the roster's —
-/// [`writer_account_for`]) and `reader` for any other App.
+/// `writer` for any of the workspace's writer Apps (`writer_accounts`: the App
+/// minted into the primary credential directory plus every roster writer,
+/// per-owner ones included — [`writer_accounts_for`], #12446) and `reader`
+/// for any other App.
 #[must_use]
 pub fn bucket_points(
     readings: &[(crate::forge_bucket_book::BucketKey, crate::forge_bucket_book::Reading)],
-    writer_account: &str,
+    writer_accounts: &[String],
 ) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     for (key, reading) in readings {
-        let role = if key.account == writer_account {
+        let role = if writer_accounts.contains(&key.account) {
             "writer"
         } else {
             "reader"
@@ -581,6 +582,19 @@ pub fn writer_account_for(workspace_root: &Path) -> String {
     primary_identity(workspace_root).account
 }
 
+/// Every writer account label for [`bucket_points`]' `role`: the primary
+/// directory's ([`writer_account_for`]) plus each roster writer's (#12446).
+#[must_use]
+pub fn writer_accounts_for(workspace_root: &Path) -> Vec<String> {
+    let mut accounts = vec![writer_account_for(workspace_root)];
+    for a in crate::forge_bucket_book::writer_accounts(workspace_root) {
+        if !accounts.contains(&a) {
+            accounts.push(a);
+        }
+    }
+    accounts
+}
+
 /// An ambient host's account label: the `gh` login (one core call).
 fn resolve_account() -> String {
     forge::viewer_login().map_or_else(|| "unknown".to_string(), |l| login_account_label(&l))
@@ -677,7 +691,7 @@ pub async fn record(workspace_root: &Path) {
             },
             || account(now),
         );
-        (points, writer_account_for(&root))
+        (points, writer_accounts_for(&root))
     })
     .await;
     let Ok((points, writer)) = sampled else {

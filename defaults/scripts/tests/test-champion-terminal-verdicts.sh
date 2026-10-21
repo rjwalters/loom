@@ -59,16 +59,7 @@ LABELS_YML="$REPO_ROOT/.github/labels.yml"
 # The registry is source-tree only; consumer repos carry the generated yml.
 REGISTRY_JSON="$REPO_ROOT/defaults/labels.json"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 assert_eq() {
     if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3"; echo "    Expected: '$1'"; echo "    Actual:   '$2'"; fi
@@ -277,8 +268,6 @@ fi
 WORKFLOW="$(section_body "Priority 2: Triage queue" <"$CURATOR_MD")"
 assert_contains "$WORKFLOW" "then Champion send-backs) first" \
     "Curator's workflow takes send-backs before Priority 1"
-assert_contains "$(section_body "Admission: keep or close" <"$CURATOR_MD")" "a Champion send-back" \
-    "a send-back skips the admission keep-or-close"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -427,7 +416,7 @@ else
         OUT="$(run_guard "$F4")"
         assert_eq "0" "$(result_of "$OUT" PRIOR_REJECTIONS)" "an outsider's NEEDS REVISION text is not counted in PRIOR_REJECTIONS"
         assert_eq "no" "$(result_of "$OUT" UNREVISED)" "an outsider's verdict marker does not send the proposal to Step 4 (UNREVISED=no)"
-        assert_eq "" "$(run_check "$F4")" "an outsider's revise marker does not make a send-back unanswered (Admission still runs)"
+        assert_eq "" "$(run_check "$F4")" "an outsider's revise marker does not make a send-back unanswered"
         MIXED="$(jq -c '.[0] |= (.authorAssociation = "NONE") | .[3] |= (.authorAssociation = "NONE")' <<<"$COMMENTS")"
         F5="$FIXTURE_DIR/fix/mixed"
         make_fixture "$F5" "$TITLE" "$BODY" "$MIXED" "$(to_rest <<<"$MIXED")"

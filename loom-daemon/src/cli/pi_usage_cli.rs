@@ -9,7 +9,7 @@
 //! 1. **Backfill.** A Pi sweep or role tick that ran before this reader landed
 //!    published labels but no `tokens_by_model`. Its log still holds the
 //!    stream, so this gets the numbers out — a table, or `--json`.
-//! 2. **Verification.** It calls the same [`loom_daemon::pi_usage`] functions
+//! 2. **Verification.** It calls the same [`crate::pi_usage`] functions
 //!    the sweep and role-tick journals do, against the same log, so running it
 //!    after a Pi sweep shows exactly what that sweep's `tokens_by_model`
 //!    carries — how #8594's "matches the numbers in Pi's own stream for that
@@ -17,7 +17,7 @@
 //!
 //! Read-only: the reader opens nothing but a `.loom/logs/sweep-issue-<N>.log`
 //! or `role-<role>.log` (its single open is gated on
-//! [`loom_daemon::pi_usage::is_launch_log_path`]), so Pi's agent directory and
+//! [`crate::pi_usage::is_launch_log_path`]), so Pi's agent directory and
 //! its auth store are unreachable from here. This command adds no read of its
 //! own.
 //!
@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use loom_daemon::pi_usage::{self, PiMessageUsage};
+use crate::pi_usage::{self, PiMessageUsage};
 
 /// `loom-daemon pi-usage` arguments.
 #[derive(clap::Args)]
@@ -158,9 +158,9 @@ impl PiUsageArgs {
         };
         Ok(match (&self.role, self.issue) {
             (Some(role), _) => {
-                loom_daemon::role_runner::role_log_path(&root.join(".loom").join("logs"), role)
+                crate::role_runner::role_log_path(&root.join(".loom").join("logs"), role)
             }
-            (None, Some(issue)) => loom_daemon::launch_record::sweep_log_path(&root, issue),
+            (None, Some(issue)) => crate::launch_record::sweep_log_path(&root, issue),
             (None, None) => anyhow::bail!("pass --issue <N> or --role <ROLE>"),
         })
     }
@@ -172,7 +172,7 @@ impl PiUsageArgs {
             return Ok(None);
         }
         let now = Utc::now();
-        let since = loom_daemon::sweep_outcome_summary::parse_since(&self.since, now)?;
+        let since = crate::sweep_outcome_summary::parse_since(&self.since, now)?;
         let until = match &self.until {
             Some(raw) => DateTime::parse_from_rfc3339(raw)
                 .with_context(|| format!("--until {raw:?} is not RFC3339"))?

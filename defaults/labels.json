@@ -579,7 +579,7 @@
       "hard_exclusion": false,
       "champion_path": false,
       "human_gated": false,
-      "merge_hold": false,
+      "merge_hold": true,
       "operator_hold": false,
       "contradicts_approval": 2,
       "stale_after_minutes": null,

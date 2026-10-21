@@ -75,6 +75,8 @@ pub const PASS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pass.reason_set",
     "loom.pass.proposal_label",
     "loom.pass.body_hash",
+    // #12715: the step's raw reason token.
+    "loom.pass.reason_detail",
     "loom.pass.unevaluated_reason",
     "loom.pass.unevaluated_reasons",
     "loom.pass.budget.bucket",
@@ -291,6 +293,9 @@ pub struct PassVerdictRecord {
 /// empty. Only what was knowable at `evaluated_at` is ever filled.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepFacts {
+    /// The step's sweep id (#12715), so a verdict joins to its session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
     /// The head the role evaluated, when the run recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
@@ -302,7 +307,7 @@ pub struct StepFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
     /// The closed reason set the projection's `reason` comes from
-    /// (`champion_merge_v1`, `champion_promotion_v1`).
+    /// (`champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_set: Option<String>,
     /// The outcome ledger's own classification of the step

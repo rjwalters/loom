@@ -92,6 +92,49 @@ path = "defaults/scripts/lib/worktree-forge-pr-check.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+
+[[operation]]
+id = "pr.edit-base"
+group = "pr-creation-discovery-state"
+summary = "Change an open PR's base branch (orphan-stack retarget, post-merge child retarget)."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "number", "base"]
+outputs = ["base_ref"]
+required_fields = ["base_ref"]
+actor = "daemon"
+permissions = ["pull_requests:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-edit-base"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "normal"
+github = { commands = [
+  "gh pr edit --base",
+], routes = [
+  "PATCH repos/{owner}/{repo}/pulls/{number}",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "partial"
+unknowns = [
+  "whether a provider re-bases or re-targets the PR's comparison range when its base changes; GitHub recomputes the diff against the new base, which is what the stacked-PR repair relies on",
+]
+notes = "Moving a child off a parent branch BEFORE that branch is deleted is what keeps the forge from closing the child unrecoverably (#9372)."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/retarget_children.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
 
 [[operation]]
 id = "pr.list-open"

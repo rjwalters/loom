@@ -202,7 +202,9 @@ pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> u
         Ok(listed) => listed,
         Err(e)
             if e.downcast_ref::<crate::forge_etag_store::ReadShed>()
-                .is_some() =>
+                .is_some()
+                || e.downcast_ref::<crate::forge_etag_store::TickDeadlineReached>()
+                    .is_some() =>
         {
             log::debug!(
                 "intake_reconcile: open-issue listing deferred in {} ({e}); skipped this pass",

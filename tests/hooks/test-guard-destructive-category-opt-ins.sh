@@ -79,6 +79,33 @@ assert_deny "SQL exec-gate: sqlite3 heredoc body" \
 DROP TABLE t;
 EOF" "$SQL_ABSENT_REPO"
 
+assert_deny "SQL exec-gate wrapper: time sqlite3" \
+    "time sqlite3 db 'DROP TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: nohup psql" \
+    "nohup psql -c 'DROP TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: timeout 30 mysql" \
+    "timeout 30 mysql -e 'DROP DATABASE d'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: sudo -u USER psql" \
+    "sudo -u pg psql -c 'DROP TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: nice -n 10 sqlite3" \
+    "nice -n 10 sqlite3 db 'TRUNCATE TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: xargs sqlite3" \
+    "xargs -I{} sqlite3 {} 'DROP TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: absolute-path sudo" \
+    "/usr/bin/sudo sqlite3 db 'DROP TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: stacked wrappers" \
+    "sudo -u pg env X=1 time psql -c 'DROP TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate wrapper: pipeline into wrapped sqlite3" \
+    "echo 'DROP TABLE t;' | time sqlite3 db" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate wrapper: time git log -S" \
+    "time git log -S 'DROP TABLE' --oneline" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate wrapper: sudo -u USER grep" \
+    "sudo -u pg grep 'DROP TABLE' f" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate wrapper: bare wrapper" \
+    "time" "$SQL_ABSENT_REPO"
+assert_allow "SQL config-off: wrapped sqlite3 allowed" \
+    "time sqlite3 db 'DROP TABLE t'" "$SQL_OFF_REPO"
+
 # --- Opt-out via config: all five SQL cases pass through as allow ---
 assert_allow "SQL config-off: allow DROP DATABASE" \
     "psql -c 'DROP DATABASE mydb;'" "$SQL_OFF_REPO"

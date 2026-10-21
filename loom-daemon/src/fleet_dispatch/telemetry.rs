@@ -1,0 +1,552 @@
+//! The captain's fleet-dispatch telemetry (#12449; spec #12452 §12).
+//!
+//! - One `loom.fleet_dispatch.call` span per call: the calling host, the
+//!   endpoint, latency, the HTTP status, the result (`granted` / `refused` /
+//!   `ok` / `error`), the reason, `server_epoch`, the assignment id, and
+//!   `loom.repo` / `loom.issue` or `loom.pr_number` when an item is named.
+//!   `loom.fleet_dispatch.side` is `captain` here; the worker's span of the
+//!   same name says `worker`.
+//! - The same span, with endpoint `expire`, result `expired` and reason
+//!   `lease_expired`, once per assignment row that expires (#12875): the host,
+//!   repo, item, step and assignment id the counter below does not carry.
+//! - Counters, accumulated and flushed as delta points by the server's sweep
+//!   task: `loom.fleet_dispatch.refusals` by `reason` (claim refusals and
+//!   `refuse` tokens, `kind` = `claim` / `refuse`; `reason` is bounded to the
+//!   known tokens, anything else is `other`),
+//!   `loom.fleet_dispatch.expired` by `kind` (`assignment` / `hold`) and
+//!   `loom.fleet_dispatch.claim_lost_after_grant`.
+//! - Gauges read from the table on the same sweep ([`gauge_points`], #12873):
+//!   `loom.fleet_dispatch.rows{host, state}` (`granted` / `live`, `0`
+//!   included, for every host with a row or a fresh heartbeat),
+//!   `loom.fleet_dispatch.rows{state="held"}` (fleet-wide, no `host`), and,
+//!   for a host whose last heartbeat is within
+//!   [`super::table::HEARTBEAT_FRESH`] only, `free_slots_reported{host}`,
+//!   `live_reported{host}` and `oldest_live_age_sec{host}` (the last only
+//!   when the heartbeat carried a step start). `rows{state="live"}` minus
+//!   `live_reported` is a host's stale-claim count. Ages use the captain's
+//!   wall clock against the workers' `started_at`; cross-host skew (NTP,
+//!   seconds) is negligible at minute scale, and a start ahead of the
+//!   captain reads `0`.
+//!
+//! Everything goes through the daemon's ops sink
+//! ([`crate::observability::ops`]); with no OTLP exporter it is a no-op.
+
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Utc};
+
+use super::proto::{RefusalReason, REFUSE_REASONS};
+use crate::step_role::StepRole;
+use crate::telemetry::ops::{MetricName, MetricPoint};
+use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
+
+/// Span attribute keys the call span carries beyond the lifecycle allowlist.
+/// Listed in [`crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS`] and the
+/// gateway collector's `keep_keys`.
+pub const KEYS: [&str; 17] = [
+    "loom.fleet_dispatch.side",
+    "loom.fleet_dispatch.host",
+    "loom.fleet_dispatch.endpoint",
+    "loom.fleet_dispatch.latency_ms",
+    "loom.fleet_dispatch.status",
+    "loom.fleet_dispatch.result",
+    "loom.fleet_dispatch.reason",
+    "loom.fleet_dispatch.server_epoch",
+    "loom.assignment.id",
+    "loom.fleet_dispatch.step",
+    "loom.fleet_dispatch.retry_after_s",
+    "loom.fleet_dispatch.held_by",
+    "loom.fleet_dispatch.hold_until",
+    "loom.fleet_dispatch.hold_rung",
+    "loom.fleet_dispatch.hold_set_by_outcome",
+    "loom.fleet_dispatch.hold_set_by_assignment_id",
+    "loom.fleet_dispatch.holder_assignment_id",
+];
+
+/// `loom.fleet_dispatch.endpoint` of the span the captain emits when an
+/// assignment expires: no request, so no route (#12875).
+pub const EXPIRE_ENDPOINT: &str = "expire";
+/// `loom.fleet_dispatch.result` of that span.
+pub const RESULT_EXPIRED: &str = "expired";
+/// `loom.fleet_dispatch.reason` of that span: why the assignment ended.
+pub const CAUSE_LEASE_EXPIRED: &str = "lease_expired";
+
+/// The wall-clock end of a hold that has `retry_after_s` left, as RFC 3339
+/// UTC (#12707). The table's monotonic deadline never leaves the process.
+#[must_use]
+pub fn hold_until(now: DateTime<Utc>, retry_after_s: u64) -> String {
+    let until = i64::try_from(retry_after_s)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .and_then(|d| now.checked_add_signed(d))
+        .unwrap_or(now);
+    until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// The no-progress hold behind a `cooldown` refusal (#12707).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldFacts {
+    /// The consecutive no-progress releases (the ladder rung).
+    pub rung: u32,
+    /// The outcome of the release that set the hold.
+    pub set_by_outcome: String,
+    /// The assignment whose release set the hold.
+    pub set_by_assignment_id: String,
+}
+
+/// One call, as the span reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Call {
+    /// The calling host, once identified.
+    pub host: Option<String>,
+    /// The request path (a fixed route, or `other`).
+    pub endpoint: String,
+    pub status: u16,
+    /// `granted` / `refused` / `ok` / `error` / `expired`.
+    pub result: &'static str,
+    /// The refusal reason, `refuse` token, release outcome or error class.
+    pub reason: Option<String>,
+    pub server_epoch: String,
+    pub assignment_id: Option<String>,
+    /// `(repo, item, step)` when the call names an item.
+    pub item: Option<(String, u64, String)>,
+    pub latency_ms: u64,
+    /// The host holding the item, on a refusal that knows it (#12707).
+    pub held_by: Option<String>,
+    /// The holder's assignment id, on a `held` refusal from a live row (#12740).
+    pub holder_assignment_id: Option<String>,
+    /// Seconds before asking again is worthwhile, on a refusal (#12707).
+    pub retry_after_s: Option<u64>,
+    /// The no-progress hold that refused a claim (#12707).
+    pub hold: Option<HoldFacts>,
+}
+
+/// The span for `call`, received at `started_at`. Its own root trace; `seq`
+/// keeps two calls in one instant apart. Pure.
+#[must_use]
+pub fn span(call: &Call, started_at: DateTime<Utc>, seq: u64) -> SpanRecord {
+    let name = SpanName::FleetDispatchCall;
+    let instant = crate::telemetry::trace::instant(started_at);
+    let seq = seq.to_string();
+    let host = call.host.as_deref().unwrap_or("-");
+    let context = TraceContext::derived(
+        name.as_str(),
+        &[
+            "captain",
+            host,
+            call.endpoint.as_str(),
+            instant.as_str(),
+            seq.as_str(),
+        ],
+    );
+    let mut a = TraceAttributes::new();
+    a.insert("loom.fleet_dispatch.side".into(), "captain".into());
+    a.insert("loom.fleet_dispatch.host".into(), host.to_string());
+    a.insert("loom.fleet_dispatch.endpoint".into(), call.endpoint.clone());
+    a.insert("loom.fleet_dispatch.latency_ms".into(), call.latency_ms.to_string());
+    a.insert("loom.fleet_dispatch.status".into(), call.status.to_string());
+    a.insert("loom.fleet_dispatch.result".into(), call.result.to_string());
+    if let Some(reason) = &call.reason {
+        a.insert("loom.fleet_dispatch.reason".into(), reason.clone());
+    }
+    a.insert("loom.fleet_dispatch.server_epoch".into(), call.server_epoch.clone());
+    if let Some(id) = &call.assignment_id {
+        a.insert("loom.assignment.id".into(), id.clone());
+    }
+    if let Some((repo, item, step)) = &call.item {
+        a.insert("loom.repo".into(), repo.clone());
+        let on_pr = step.parse::<StepRole>().is_ok_and(StepRole::acts_on_pr);
+        let key = if on_pr {
+            "loom.pr_number"
+        } else {
+            "loom.issue"
+        };
+        a.insert(key.into(), item.to_string());
+        a.insert("loom.fleet_dispatch.step".into(), step.clone());
+    }
+    if let Some(held_by) = &call.held_by {
+        a.insert("loom.fleet_dispatch.held_by".into(), held_by.clone());
+    }
+    if let Some(id) = &call.holder_assignment_id {
+        a.insert("loom.fleet_dispatch.holder_assignment_id".into(), id.clone());
+    }
+    if let Some(retry) = call.retry_after_s {
+        a.insert("loom.fleet_dispatch.retry_after_s".into(), retry.to_string());
+        if call.hold.is_some() {
+            a.insert("loom.fleet_dispatch.hold_until".into(), hold_until(started_at, retry));
+        }
+    }
+    if let Some(hold) = &call.hold {
+        a.insert("loom.fleet_dispatch.hold_rung".into(), hold.rung.to_string());
+        a.insert("loom.fleet_dispatch.hold_set_by_outcome".into(), hold.set_by_outcome.clone());
+        a.insert(
+            "loom.fleet_dispatch.hold_set_by_assignment_id".into(),
+            hold.set_by_assignment_id.clone(),
+        );
+    }
+    crate::telemetry::trace::provenance::stamp(&mut a);
+    let ended_at = started_at
+        + chrono::Duration::milliseconds(i64::try_from(call.latency_ms).unwrap_or(i64::MAX / 2));
+    SpanRecord {
+        context,
+        parent_span_id: None,
+        name,
+        started_at,
+        ended_at,
+        status: if call.result == "error" {
+            SpanStatus::Error
+        } else {
+            SpanStatus::Ok
+        },
+        attributes: a,
+        events: Vec::new(),
+        links: Vec::new(),
+    }
+}
+
+/// Counters accumulated between flushes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// `(kind, reason)` → count.
+    pub refusals: BTreeMap<(&'static str, String), i64>,
+    pub expired_assignments: i64,
+    pub expired_holds: i64,
+    pub claim_lost_after_grant: i64,
+}
+
+impl Counters {
+    /// Count a claim refusal.
+    pub fn claim_refused(&mut self, reason: RefusalReason) {
+        *self
+            .refusals
+            .entry(("claim", reason.as_str().to_string()))
+            .or_default() += 1;
+    }
+
+    /// Count a claim refused `held` by a no-progress hold (#12541), under
+    /// its own reason instead of the plain `held`.
+    pub fn claim_cooled(&mut self) {
+        *self
+            .refusals
+            .entry(("claim", super::server::NO_PROGRESS_REASON.to_string()))
+            .or_default() += 1;
+    }
+
+    /// Count a `refuse` call's token: one of [`REFUSE_REASONS`], or `other`.
+    /// The token is worker-supplied, so it is never a label as sent.
+    pub fn refused(&mut self, reason: &str) {
+        let label = REFUSE_REASONS
+            .iter()
+            .find(|r| **r == reason)
+            .copied()
+            .unwrap_or(RefusalReason::Other.as_str());
+        *self
+            .refusals
+            .entry(("refuse", label.to_string()))
+            .or_default() += 1;
+    }
+
+    /// Count an expiry pass's removals.
+    pub fn expired(&mut self, e: super::table::Expired) {
+        self.expired_assignments += i64::from(e.assignments);
+        self.expired_holds += i64::from(e.holds);
+    }
+
+    /// The delta points since the last flush, resetting the counters.
+    pub fn take_points(&mut self) -> Vec<MetricPoint> {
+        let c = std::mem::take(self);
+        let mut points: Vec<MetricPoint> = c
+            .refusals
+            .into_iter()
+            .map(|((kind, reason), n)| {
+                MetricPoint::int(MetricName::FleetDispatchRefusals, n)
+                    .label("kind", kind)
+                    .label("reason", reason)
+            })
+            .collect();
+        for (kind, n) in [
+            ("assignment", c.expired_assignments),
+            ("hold", c.expired_holds),
+        ] {
+            if n > 0 {
+                points.push(
+                    MetricPoint::int(MetricName::FleetDispatchExpired, n).label("kind", kind),
+                );
+            }
+        }
+        if c.claim_lost_after_grant > 0 {
+            points.push(MetricPoint::int(
+                MetricName::FleetDispatchClaimLostAfterGrant,
+                c.claim_lost_after_grant,
+            ));
+        }
+        points
+    }
+}
+
+/// The table's gauge points at wall-clock `now` (module docs, #12873). Pure.
+#[must_use]
+pub fn gauge_points(gauges: &super::table::TableGauges, now: DateTime<Utc>) -> Vec<MetricPoint> {
+    let count = |n: u32| i64::from(n);
+    let mut points = Vec::new();
+    for (host, g) in &gauges.hosts {
+        for (state, n) in [("granted", g.granted), ("live", g.live)] {
+            points.push(
+                MetricPoint::int(MetricName::FleetDispatchRows, count(n))
+                    .label("host", host.as_str())
+                    .label("state", state),
+            );
+        }
+        let Some(reported) = &g.reported else {
+            continue;
+        };
+        points.push(
+            MetricPoint::int(
+                MetricName::FleetDispatchFreeSlotsReported,
+                count(reported.free_slots),
+            )
+            .label("host", host.as_str()),
+        );
+        points.push(
+            MetricPoint::int(MetricName::FleetDispatchLiveReported, count(reported.live_reported))
+                .label("host", host.as_str()),
+        );
+        if let Some(started) = reported.oldest_live_started_at {
+            let age = (now - started).num_seconds().max(0);
+            points.push(
+                MetricPoint::int(MetricName::FleetDispatchOldestLiveAgeSec, age)
+                    .label("host", host.as_str()),
+            );
+        }
+    }
+    points.push(
+        MetricPoint::int(MetricName::FleetDispatchRows, count(gauges.held)).label("state", "held"),
+    );
+    points
+}
+
+/// Emit `call`'s span through the ops sink (a no-op without one).
+pub fn emit_call(call: &Call, started_at: DateTime<Utc>, seq: u64) {
+    if crate::observability::ops::spans_exported() {
+        crate::observability::ops::emit_span(span(call, started_at, seq));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn claim_call() -> Call {
+        Call {
+            host: Some("worker-a".into()),
+            endpoint: "/v1/claim".into(),
+            status: 200,
+            result: "refused",
+            reason: Some("held".into()),
+            server_epoch: "e1".into(),
+            assignment_id: None,
+            item: Some(("acme/w".into(), 42, "judge".into())),
+            latency_ms: 3,
+            ..Call::default()
+        }
+    }
+
+    #[test]
+    fn the_call_span_names_every_fact_and_survives_the_export_allowlist() {
+        let s = span(&claim_call(), Utc::now(), 1);
+        assert_eq!(s.name.as_str(), "loom.fleet_dispatch.call");
+        let attr = |k: &str| s.attributes.get(k).cloned();
+        assert_eq!(attr("loom.fleet_dispatch.side").as_deref(), Some("captain"));
+        assert_eq!(attr("loom.fleet_dispatch.host").as_deref(), Some("worker-a"));
+        assert_eq!(attr("loom.fleet_dispatch.endpoint").as_deref(), Some("/v1/claim"));
+        assert_eq!(attr("loom.fleet_dispatch.result").as_deref(), Some("refused"));
+        assert_eq!(attr("loom.fleet_dispatch.reason").as_deref(), Some("held"));
+        assert_eq!(attr("loom.fleet_dispatch.server_epoch").as_deref(), Some("e1"));
+        assert_eq!(attr("loom.fleet_dispatch.latency_ms").as_deref(), Some("3"));
+        assert_eq!(attr("loom.repo").as_deref(), Some("acme/w"));
+        assert_eq!(attr("loom.pr_number").as_deref(), Some("42"), "a Judge acts on a PR");
+        assert!(s.validate().is_ok());
+        for key in KEYS {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
+                "{key} is dropped at export"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_row_refusal_exports_the_holders_assignment_id() {
+        let mut call = claim_call();
+        call.held_by = Some("worker-b".into());
+        call.holder_assignment_id = Some("a-7".into());
+        let s = span(&call, Utc::now(), 1);
+        assert_eq!(
+            s.attributes
+                .get("loom.fleet_dispatch.holder_assignment_id")
+                .map(String::as_str),
+            Some("a-7")
+        );
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn a_cooldown_refusal_carries_the_hold_with_a_wall_clock_end() {
+        let mut call = claim_call();
+        call.retry_after_s = Some(1800);
+        call.hold = Some(HoldFacts {
+            rung: 2,
+            set_by_outcome: "noop".into(),
+            set_by_assignment_id: "a-9".into(),
+        });
+        let at: DateTime<Utc> = "2026-10-17T12:00:00Z".parse().unwrap();
+        let s = span(&call, at, 1);
+        let attr = |k: &str| s.attributes.get(k).cloned();
+        assert_eq!(attr("loom.fleet_dispatch.step").as_deref(), Some("judge"));
+        assert_eq!(attr("loom.fleet_dispatch.retry_after_s").as_deref(), Some("1800"));
+        assert_eq!(attr("loom.fleet_dispatch.hold_until").as_deref(), Some("2026-10-17T12:30:00Z"));
+        assert_eq!(attr("loom.fleet_dispatch.hold_rung").as_deref(), Some("2"));
+        assert_eq!(attr("loom.fleet_dispatch.hold_set_by_outcome").as_deref(), Some("noop"));
+        assert_eq!(attr("loom.fleet_dispatch.hold_set_by_assignment_id").as_deref(), Some("a-9"));
+        assert_eq!(attr("loom.fleet_dispatch.held_by"), None, "a hold names no host");
+        assert_eq!(attr("loom.fleet_dispatch.holder_assignment_id"), None);
+        assert!(s.validate().is_ok());
+        let plain = span(&claim_call(), at, 2);
+        assert!(!plain
+            .attributes
+            .contains_key("loom.fleet_dispatch.hold_until"));
+    }
+
+    #[test]
+    fn an_issue_step_names_its_issue_and_an_error_is_an_error_span() {
+        let mut call = claim_call();
+        call.item = Some(("acme/w".into(), 7, "builder".into()));
+        call.result = "error";
+        let s = span(&call, Utc::now(), 2);
+        assert_eq!(s.attributes.get("loom.issue").map(String::as_str), Some("7"));
+        assert_eq!(s.status, SpanStatus::Error);
+    }
+
+    #[test]
+    fn counters_flush_as_labelled_deltas_once() {
+        let mut c = Counters::default();
+        c.claim_refused(RefusalReason::Held);
+        c.claim_refused(RefusalReason::Held);
+        c.refused("claim_lost");
+        c.expired(super::super::table::Expired {
+            assignments: 2,
+            holds: 1,
+        });
+        c.claim_lost_after_grant += 1;
+        let points = c.take_points();
+        assert_eq!(points.len(), 5);
+        let held = points
+            .iter()
+            .find(|p| p.labels.get("reason").map(String::as_str) == Some("held"))
+            .unwrap();
+        assert_eq!(held.name, MetricName::FleetDispatchRefusals);
+        assert_eq!(held.labels.get("kind").map(String::as_str), Some("claim"));
+        assert!(c.take_points().is_empty(), "flushed counters reset");
+    }
+
+    /// #12873: a fresh host gets rows and reported points; a stale host
+    /// keeps only its rows; held is fleet-wide with no host; no start, no
+    /// age; a start ahead of the captain reads 0.
+    #[test]
+    fn gauge_points_follow_the_absent_vs_zero_rules() {
+        use super::super::table::{HostGauges, Reported, TableGauges};
+        let now: DateTime<Utc> = "2026-10-20T12:00:00Z".parse().unwrap();
+        let reported = |started: Option<&str>| {
+            Some(Reported {
+                free_slots: 3,
+                live_reported: 1,
+                oldest_live_started_at: started.map(|s| s.parse().unwrap()),
+            })
+        };
+        let gauges = TableGauges {
+            hosts: BTreeMap::from([
+                (
+                    "fresh".to_string(),
+                    HostGauges {
+                        granted: 1,
+                        live: 2,
+                        reported: reported(Some("2026-10-20T11:30:00Z")),
+                    },
+                ),
+                (
+                    "stale".to_string(),
+                    HostGauges {
+                        granted: 0,
+                        live: 4,
+                        reported: None,
+                    },
+                ),
+                (
+                    "old-worker".to_string(),
+                    HostGauges {
+                        reported: reported(None),
+                        ..HostGauges::default()
+                    },
+                ),
+                (
+                    "ahead".to_string(),
+                    HostGauges {
+                        reported: reported(Some("2026-10-20T12:00:09Z")),
+                        ..HostGauges::default()
+                    },
+                ),
+            ]),
+            held: 0,
+        };
+        let points = gauge_points(&gauges, now);
+        let find = |name: MetricName, host: Option<&str>, state: Option<&str>| {
+            points
+                .iter()
+                .find(|p| {
+                    p.name == name
+                        && p.labels.get("host").map(String::as_str) == host
+                        && p.labels.get("state").map(String::as_str) == state
+                })
+                .map(|p| match p.value {
+                    crate::telemetry::ops::MetricValue::Int(v) => v,
+                    crate::telemetry::ops::MetricValue::Double(_) => panic!("int gauges"),
+                })
+        };
+        let rows = MetricName::FleetDispatchRows;
+        assert_eq!(find(rows, Some("fresh"), Some("granted")), Some(1));
+        assert_eq!(find(rows, Some("fresh"), Some("live")), Some(2));
+        assert_eq!(find(rows, Some("stale"), Some("live")), Some(4));
+        assert_eq!(find(rows, Some("stale"), Some("granted")), Some(0), "0, not absent");
+        assert_eq!(find(rows, None, Some("held")), Some(0), "held is fleet-wide, 0 included");
+        let free = MetricName::FleetDispatchFreeSlotsReported;
+        let live = MetricName::FleetDispatchLiveReported;
+        let age = MetricName::FleetDispatchOldestLiveAgeSec;
+        assert_eq!(find(free, Some("fresh"), None), Some(3));
+        assert_eq!(find(live, Some("fresh"), None), Some(1));
+        assert_eq!(find(age, Some("fresh"), None), Some(1800));
+        for name in [free, live, age] {
+            assert_eq!(find(name, Some("stale"), None), None, "a stale host reports nothing");
+        }
+        assert_eq!(find(live, Some("old-worker"), None), Some(1));
+        assert_eq!(find(age, Some("old-worker"), None), None, "no start, no age");
+        assert_eq!(find(age, Some("ahead"), None), Some(0), "a start ahead clamps to 0");
+        for p in &points {
+            assert_eq!(crate::telemetry::ops::bounded_labels(&p.labels), p.labels);
+        }
+    }
+
+    #[test]
+    fn an_unknown_refuse_token_is_counted_as_other() {
+        let mut c = Counters::default();
+        c.refused("head_moved");
+        for junk in ["x-1", "x-2", "", "claim_lost "] {
+            c.refused(junk);
+        }
+        let labels: Vec<(&str, &str, i64)> = c
+            .refusals
+            .iter()
+            .map(|((k, r), n)| (*k, r.as_str(), *n))
+            .collect();
+        assert_eq!(labels, vec![("refuse", "head_moved", 1), ("refuse", "other", 4)]);
+    }
+}

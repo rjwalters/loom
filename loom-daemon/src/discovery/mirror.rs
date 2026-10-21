@@ -1,15 +1,18 @@
-//! The Mirror backend: one worklist request per tick, conditional on the
-//! last ETag (module docs of [`super`]). No fallback to the forge.
+//! The Mirror tier: one worklist request per tick, conditional on the last
+//! ETag (module docs of [`super`]). The cache is one in-memory
+//! `(etag, body)`, replaced on every `200`, dropped on restart, never merged
+//! with change-stream events and never persisted. It only ever answers a
+//! `304`: a failed request does not reuse it, the tick falls to the next tier
+//! instead ([`super::fallback`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
-use super::snapshot::RepoSnapshot;
+use super::snapshot::{RepoSnapshot, RepoStatus};
 use super::worklist::{self, Worklist};
-use crate::forge_mirror::client::{self, Conditional, MirrorError};
+use crate::forge_mirror::client::{self, Conditional, Freshness, MirrorError};
 
 /// The worklist path.
 pub const PATH: &str = "/v1/mirror/worklist";
@@ -38,24 +41,87 @@ pub struct MirrorBackend {
 /// One tick's view of the worklist.
 pub struct TickWorklist {
     worklist: Option<Arc<Worklist>>,
-    error: Option<String>,
+    /// Why there is no worklist this tick.
+    failure: Option<Failure>,
     pub latency_ms: u64,
     pub not_modified: bool,
-    pub reused_previous: bool,
     max_staleness: Duration,
 }
 
-fn request(etag: Option<&str>) -> Fetched {
-    let started = Instant::now();
-    let outcome = match crate::forge_mirror::active() {
-        None => Err(MirrorError::Transport("the mirror is not live".into())),
-        Some(active) => {
-            client::get_json_conditional_blocking(&active, PATH, etag, REQUEST_DEADLINE)
+/// A failed worklist request: its class (the span's `.worklist.error_class`)
+/// and its text (logged, never put on a span).
+#[derive(Debug, Clone)]
+pub struct Failure {
+    pub class: &'static str,
+    pub detail: String,
+}
+
+impl Failure {
+    fn of(e: &MirrorError) -> Self {
+        let class = match e {
+            MirrorError::Transport(_) => "transport",
+            MirrorError::Auth(_) => "auth",
+            MirrorError::Status(_) => "status",
+            MirrorError::Malformed(_) => "malformed",
+        };
+        Self {
+            class,
+            detail: e.to_string(),
         }
-    };
+    }
+}
+
+/// Why the worklist could not answer for a repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Miss {
+    /// The request failed, or nothing is cached for a `304`.
+    NoWorklist(&'static str),
+    /// The worklist omits the repo: the key may not read it.
+    NotInWorklist,
+    /// The worklist names the repo with a `status` that is not `ok`.
+    Status(RepoStatus),
+    /// The mirror cannot vouch for the repo ([`Freshness::Unknown`]): its
+    /// `items` may be empty or partial, so they are not the truth.
+    Unvouched,
+}
+
+impl Miss {
+    /// The tick's `fallback_reason` for this miss.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::NoWorklist(class) => class,
+            Self::NotInWorklist | Self::Status(_) | Self::Unvouched => "repo_status",
+        }
+    }
+
+    /// The `status` bucket the miss counts under.
+    #[must_use]
+    pub fn status(&self) -> RepoStatus {
+        match self {
+            Self::NoWorklist(_) => RepoStatus::Error,
+            Self::NotInWorklist | Self::Unvouched => RepoStatus::Unknown,
+            Self::Status(s) => *s,
+        }
+    }
+}
+
+fn request_from(active: &crate::forge_mirror::Active, etag: Option<&str>) -> Fetched {
+    let started = Instant::now();
+    let outcome = client::get_json_conditional_blocking(active, PATH, etag, REQUEST_DEADLINE);
     Fetched {
         outcome,
         latency: started.elapsed(),
+    }
+}
+
+fn request(etag: Option<&str>) -> Fetched {
+    match crate::forge_mirror::active() {
+        None => Fetched {
+            outcome: Err(MirrorError::Transport("the mirror is not live".into())),
+            latency: Duration::ZERO,
+        },
+        Some(active) => request_from(&active, etag),
     }
 }
 
@@ -65,25 +131,44 @@ impl MirrorBackend {
         self.fetch_with(now, request)
     }
 
+    /// [`Self::fetch`] against a mirror the caller holds (its own URL and
+    /// key), not the process-global one. The cache and its ETag are this
+    /// backend's, so a caller keeps one backend per mirror.
+    pub fn fetch_from(
+        &mut self,
+        active: &crate::forge_mirror::Active,
+        now: DateTime<Utc>,
+    ) -> TickWorklist {
+        self.fetch_bounded(now, active.max_staleness, |etag| request_from(active, etag))
+    }
+
     /// [`Self::fetch`] with the request given.
     pub fn fetch_with(
         &mut self,
+        now: DateTime<Utc>,
+        send: impl FnOnce(Option<&str>) -> Fetched,
+    ) -> TickWorklist {
+        let max_staleness = crate::forge_mirror::active()
+            .map_or(Duration::from_secs(crate::forge_mirror::DEFAULT_MAX_STALENESS_SECS), |a| {
+                a.max_staleness
+            });
+        self.fetch_bounded(now, max_staleness, send)
+    }
+
+    fn fetch_bounded(
+        &mut self,
         _now: DateTime<Utc>,
+        max_staleness: Duration,
         send: impl FnOnce(Option<&str>) -> Fetched,
     ) -> TickWorklist {
         let etag = self.last.as_ref().and_then(|c| c.etag.clone());
         let Fetched { outcome, latency } = send(etag.as_deref());
         let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
-        let max_staleness = crate::forge_mirror::active()
-            .map_or(Duration::from_secs(crate::forge_mirror::DEFAULT_MAX_STALENESS_SECS), |a| {
-                a.max_staleness
-            });
         let mut tick = TickWorklist {
             worklist: None,
-            error: None,
+            failure: None,
             latency_ms,
             not_modified: false,
-            reused_previous: false,
             max_staleness,
         };
         let failure = match outcome {
@@ -93,7 +178,10 @@ impl MirrorBackend {
                     tick.not_modified = true;
                     return tick;
                 }
-                None => "worklist answered 304 with nothing cached".to_string(),
+                None => Failure {
+                    class: "malformed",
+                    detail: "worklist answered 304 with nothing cached".to_string(),
+                },
             },
             Ok(Conditional::Modified { etag, body }) => match worklist::decode(body) {
                 Ok(list) => {
@@ -105,58 +193,74 @@ impl MirrorBackend {
                     });
                     return tick;
                 }
-                Err(e) => e.to_string(),
+                Err(e) => Failure::of(&e),
             },
-            Err(e) => e.to_string(),
+            Err(e) => Failure::of(&e),
         };
-        // No fallback to the forge: the previous snapshot stands in, or
-        // every repo reads as unavailable this tick.
-        if let Some(last) = &self.last {
-            log::warn!(
-                "discovery: worklist request failed ({failure}); using the previous snapshot"
-            );
-            tick.worklist = Some(last.worklist.clone());
-            tick.reused_previous = true;
-        } else {
-            log::warn!("discovery: worklist request failed ({failure}); no previous snapshot");
-        }
-        tick.error = Some(failure);
+        log::warn!(
+            "discovery: worklist request failed ({}); this tick falls to the next tier",
+            failure.detail
+        );
+        tick.failure = Some(failure);
         tick
     }
 }
 
 impl TickWorklist {
-    /// One repo's snapshot.
+    /// One repo's snapshot from the worklist.
+    ///
+    /// A stale repo (known and reconciled, evidence older than the bound) is
+    /// still served; one the mirror cannot vouch for at all is not.
     ///
     /// # Errors
     ///
-    /// No worklist at all, or the repo is not in it (the key may read a
-    /// subset of repos).
-    pub fn repo(&self, slug: &str, _now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>> {
+    /// [`Miss`]: the caller falls to the next tier for this repo alone. The
+    /// worklist is absent or omits the repo, the repo's `status` is not `ok`,
+    /// or its watermark reads [`Freshness::Unknown`] (not known, moved or
+    /// deleted, never reconciled, or naming another repo): [`Miss::Unvouched`].
+    pub fn repo(&self, slug: &str, now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>, Miss> {
         let Some(list) = &self.worklist else {
-            return Err(anyhow!(
-                "mirror discovery: no worklist ({})",
-                self.error.as_deref().unwrap_or("unavailable")
-            ));
+            return Err(Miss::NoWorklist(self.failure.as_ref().map_or("transport", |f| f.class)));
         };
-        list.repos
-            .get(&slug.to_ascii_lowercase())
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!("mirror discovery: {slug} is not in the worklist (the key may not read it)")
-            })
+        let slug = slug.to_ascii_lowercase();
+        let repo = list.repos.get(&slug).ok_or(Miss::NotInWorklist)?;
+        let unvouched = list
+            .marks
+            .get(&slug)
+            .is_none_or(|m| m.freshness(&slug, self.max_staleness, now) == Freshness::Unknown);
+        if unvouched {
+            return Err(Miss::Unvouched);
+        }
+        match repo.status {
+            RepoStatus::Ok => Ok(repo.clone()),
+            other => Err(Miss::Status(other)),
+        }
     }
 
+    /// The repos the worklist carries (lowercase slugs); empty with no
+    /// worklist.
     #[must_use]
-    pub fn repo_count(&self) -> usize {
-        self.worklist.as_ref().map_or(0, |w| w.repos.len())
-    }
-
-    #[must_use]
-    pub fn item_count(&self) -> usize {
+    pub fn slugs(&self) -> Vec<String> {
         self.worklist
             .as_ref()
-            .map_or(0, |w| w.repos.values().map(|r| r.rows.len()).sum())
+            .map_or_else(Vec::new, |w| w.repos.keys().cloned().collect())
+    }
+
+    /// `ok`, `not_modified` or `error`.
+    #[must_use]
+    pub fn outcome(&self) -> &'static str {
+        if self.failure.is_some() {
+            "error"
+        } else if self.not_modified {
+            "not_modified"
+        } else {
+            "ok"
+        }
+    }
+
+    #[must_use]
+    pub fn error_class(&self) -> Option<&'static str> {
+        self.failure.as_ref().map(|f| f.class)
     }
 
     /// Age of the stalest repo's newest evidence.

@@ -48,6 +48,7 @@ pub fn parse_explicit_tap(
             Ok(Some(Tap {
                 runtime: runtime.to_string(),
                 model_profile: profile.map(str::to_string),
+                model: None,
             }))
         }
     }

@@ -9,7 +9,7 @@
 //! 60s for ~25 minutes, all failing, plus role sessions spawned straight into
 //! the same wall).
 //!
-//! This breaker is deliberately simpler than [`crate::host_breaker`] (no
+//! This breaker is deliberately simpler than `crate::host_breaker` (removed, #12406) (no
 //! sustain counter — a single unambiguous rate-limit failure is proof enough):
 //!
 //! - Any gh call site that fails feeds its error text to
@@ -50,7 +50,7 @@ mod report_tests;
 
 /// Env var toggling the rate-limit breaker. `0`/`false`/`no`/`off` disables;
 /// truthy forces on. Overrides config. Defaults ON — a safety backstop,
-/// mirroring [`crate::host_breaker::HOST_BREAKER_ENABLE_ENV`].
+/// mirroring `crate::host_breaker::HOST_BREAKER_ENABLE_ENV` (removed, #12406).
 pub const RATE_LIMIT_BREAKER_ENABLE_ENV: &str = "LOOM_RATE_LIMIT_BREAKER";
 
 /// Env var overriding the fallback cooldown (seconds) used when the reset
@@ -105,7 +105,7 @@ pub struct RateLimitBreakerConfigFile {
 
 /// Read `.loom/config.json → autonomous.rateLimitBreaker`, soft-failing every
 /// field to `None` on a missing file, malformed JSON, or a missing block.
-/// Mirrors [`crate::host_breaker::read_host_breaker_config`].
+/// Mirrors `crate::host_breaker::read_host_breaker_config` (removed, #12406).
 #[must_use]
 pub fn read_rate_limit_breaker_config(repo_root: &Path) -> RateLimitBreakerConfigFile {
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
@@ -573,7 +573,7 @@ impl SharedRateLimitBreaker {
 }
 
 /// Process-global breaker handle, mirroring
-/// [`crate::host_breaker`]'s registration shape. Registered once at daemon
+/// `crate::host_breaker` (removed, #12406)'s registration shape. Registered once at daemon
 /// startup (before the startup reconciliation passes — every gh-polling
 /// consumer starts after it). Unset reads as "not suppressed".
 static GLOBAL: OnceLock<Arc<SharedRateLimitBreaker>> = OnceLock::new();
@@ -708,7 +708,7 @@ pub fn global_observe_failure_ctx(
 /// Emit the state-change `daemon.rate_limit_breaker.state` event for a
 /// transition (the trip/release log line is handled by
 /// [`global_observe_failure`] / the loop's release logging). Fire-and-forget,
-/// matching [`crate::host_breaker::emit_transition_event`].
+/// matching `crate::host_breaker::emit_transition_event` (removed, #12406).
 pub fn emit_transition_event(event_bus: &Arc<crate::event_bus::EventBus>, transition: &Transition) {
     if let Err(e) = event_bus.publish_generic(
         "daemon.rate_limit_breaker.state",

@@ -16,7 +16,7 @@
 //!
 //! Population, text and evidence: [`batch`]'s REST + ETag gatherer, the one
 //! `check-stale-blocked` runs, through [`notify::gather_cited`] (#10515). That
-//! filter runs [`loom_daemon::stale_blocked::cited_among`] (`dep_recheck`'s
+//! filter runs [`crate::stale_blocked::cited_among`] (`dep_recheck`'s
 //! prose extractor and `## Dependencies` parser) over each artifact's text, so
 //! the closing-PR and blocker-state reads run only for the artifacts that cite
 //! a closed number. Classification: the advisory's own [`classify`]. No second
@@ -55,10 +55,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use loom_daemon::cmd_out::CmdOutcome;
-use loom_daemon::script_helpers::run_gh;
-use loom_daemon::stale_blocked::notify::{self, marker_for};
-use loom_daemon::stale_blocked::{batch, budget, classify, Artifact, Verdict};
+use crate::cmd_out::CmdOutcome;
+use crate::script_helpers::run_gh;
+use crate::stale_blocked::notify::{self, marker_for};
+use crate::stale_blocked::{batch, budget, classify, Artifact, Verdict};
 
 use super::stale_blocked::DEFAULT_LIMIT;
 
@@ -133,7 +133,7 @@ impl NotifyClearedBlockersArgs {
         closed.dedup();
 
         let mut forge = batch::GhStaleBlockedForge::new(&root, repo);
-        let fleet = loom_daemon::forge_identity::FleetLogins::for_root(&root);
+        let fleet = crate::forge_identity::FleetLogins::for_root(&root);
         let opts = batch::Options {
             limit: self.limit,
             no_prs: self.no_prs,
@@ -194,7 +194,6 @@ impl NotifyClearedBlockersArgs {
 }
 
 /// The issues a merged PR closed, per the forge's own `closingIssuesReferences`.
-/// Also how a Judge's checkout finds its issue (`attend_hook`, #10120).
 pub(super) fn pr_close_targets(
     pr: i64,
     repo: Option<&str>,

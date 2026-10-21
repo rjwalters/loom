@@ -462,6 +462,48 @@ fn a_cli_routes_only_through_a_checked_gh_and_outside_an_outage() {
     assert_eq!(cli_base(env, gh_s, now + Duration::from_secs(3600)), Some(base));
 }
 
+/// #12389: inside an agent session the facade's `gh` is the front (a
+/// `loom-daemon`), which execs the next `gh`. A CLI there checks the marker
+/// against that one, not against the front, and finds nothing to check when
+/// there is no next `gh`.
+#[test]
+fn a_cli_under_the_front_checks_the_gh_the_front_execs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".loom").join(DIR_NAME);
+    std::fs::create_dir_all(&base).unwrap();
+    set_mode(&base, 0o700);
+    let real = tmp.path().join("gh-real");
+    std::fs::write(&real, "").unwrap();
+    let shim = tmp.path().join("shim");
+    std::fs::create_dir(&shim).unwrap();
+    let front = tmp.path().join("loom-daemon");
+    std::fs::write(&front, "").unwrap();
+    std::os::unix::fs::symlink(&front, shim.join("gh")).unwrap();
+    std::fs::write(
+        base.join("gh-ok"),
+        std::fs::canonicalize(&real)
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    let env = Some(base.clone().into_os_string());
+    let now = SystemTime::now();
+    let via_front = shim.join("gh");
+    let via_front = via_front.to_str().unwrap();
+
+    let next = || Some(real.clone());
+    assert_eq!(cli_base_with(env.clone(), via_front, now, &next), Some(base.clone()));
+    // Without the front lookup the front itself is checked, and fails.
+    assert_eq!(cli_base(env.clone(), via_front, now), None);
+    // A front with no `gh` behind it: nothing will answer, nothing routes.
+    assert_eq!(cli_base_with(env.clone(), via_front, now, &|| None), None);
+    // The next `gh` is not the one the daemon checked.
+    let other = tmp.path().join("gh-other");
+    std::fs::write(&other, "").unwrap();
+    assert_eq!(cli_base_with(env, via_front, now, &|| Some(other.clone())), None);
+}
+
 fn set_mode(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();

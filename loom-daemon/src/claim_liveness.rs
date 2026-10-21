@@ -44,7 +44,7 @@ pub fn registry_minutes(label: &str) -> Option<u32> {
 }
 
 /// Namespace of Loom's own labels, built so the label-literal guard sees no
-/// bare literal (the pattern `observability/captain_gauges/facts.rs` uses).
+/// bare literal.
 const LOOM_PREFIX: &str = concat!("loom", ":");
 
 /// The env var overriding `label`'s staleness (`loom:curating` →

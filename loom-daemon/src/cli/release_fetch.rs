@@ -54,10 +54,10 @@
 //!      the pre-port function's `return 1`: ITS OWN caller prints the
 //!      generic "Artifact download failed" line and exits 1.
 
-use anyhow::Result;
-use loom_daemon::release_fetch::{
+use crate::release_fetch::{
     evidence, fetch_and_verify_with_evidence, FetchInputs, FetchOutcome, SignaturePolicy,
 };
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]

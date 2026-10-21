@@ -277,6 +277,10 @@ pub struct ReapReport {
     pub failed: Vec<u32>,
     /// Worktrees a safety gate preserved, keyed by the gate's own wording.
     pub skipped: Vec<(u32, String)>,
+    /// Bytes the removed worktrees held (#12461). Measured before removal and
+    /// only while an ops sink is registered, so `0` means "not measured" as
+    /// much as "nothing removed".
+    pub bytes_removed: u64,
     /// Free GB on the worktree-root volume, or `None` when unmeasurable
     /// (#4164 — unknown is never treated as zero).
     pub free_gb: Option<u64>,
@@ -475,11 +479,13 @@ pub fn reclaim_kept_pr_worktree_artifacts(
 /// Log an `issue-<N>` artifact-reclaim pass's outcome
 /// ([`artifact_reclaim::log_report`]).
 pub fn log_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
+    publish_reclaim(repo_root, report, "issue");
     artifact_reclaim::log_report(repo_root, report, "issue");
 }
 
 /// Log a `pr-<N>` artifact-reclaim pass's outcome (#5939).
 pub fn log_pr_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
+    publish_reclaim(repo_root, report, "pr");
     artifact_reclaim::log_report(repo_root, report, "pr");
 }
 
@@ -822,6 +828,40 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     report
 }
 
+/// Export one removal pass as a `reaper.pass` span (#12461).
+fn publish_reap(repo_root: &Path, report: &ReapReport, class: &str) {
+    use crate::observability::ops::reaper;
+    reaper::publish(
+        repo_root,
+        &reaper::Pass {
+            class,
+            phase: reaper::PHASE_REAP,
+            scanned: report.scanned,
+            removed: report.removed.len(),
+            failed: report.failed.len(),
+            preserved: report.skipped.iter().map(|(_, why)| why.as_str()).collect(),
+            bytes: report.bytes_removed,
+        },
+    );
+}
+
+/// Export one artifact-reclaim pass as a `reaper.pass` span (#12461).
+fn publish_reclaim(repo_root: &Path, report: &ReclaimReport, class: &str) {
+    use crate::observability::ops::reaper;
+    reaper::publish(
+        repo_root,
+        &reaper::Pass {
+            class,
+            phase: reaper::PHASE_RECLAIM,
+            scanned: report.scanned,
+            removed: report.removed.len(),
+            failed: report.failed.len(),
+            preserved: report.skipped.iter().map(|(_, why)| why.as_str()).collect(),
+            bytes: report.bytes_freed(),
+        },
+    );
+}
+
 /// Log a `pr-<N>` reap pass's outcome — the PR counterpart of [`log_report`].
 /// Deliberately does not repeat the disk-headroom warning: [`reap_repo`] runs
 /// this pass and the issue-keyed pass on the same tick, and the disk probe is
@@ -836,6 +876,7 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
 /// exactly the property the removal ledger exists to guarantee. The per-PR
 /// *reasons* stay at debug, where the volume is.
 pub fn log_pr_report(repo_root: &Path, report: &ReapReport) {
+    publish_reap(repo_root, report, "pr");
     let preserved: Vec<u32> = report.skipped.iter().map(|(pr, _)| *pr).collect();
     if report.removed.is_empty() && report.failed.is_empty() {
         log::info!(
@@ -879,6 +920,7 @@ pub fn log_pr_report(repo_root: &Path, report: &ReapReport) {
 /// per repo) buys back exactly that: which issues the reaper looked at, and
 /// which it kept. The per-issue *reasons* stay at debug, where the volume is.
 pub fn log_report(repo_root: &Path, report: &ReapReport, warn_below_gb: u64) {
+    publish_reap(repo_root, report, "issue");
     let preserved: Vec<u32> = report.skipped.iter().map(|(issue, _)| *issue).collect();
     if report.removed.is_empty() && report.failed.is_empty() {
         log::info!(
@@ -1320,11 +1362,24 @@ mod tests {
     /// Populate `issue-<N>`'s worktree with a `target/` and `node_modules/`
     /// directory plus an untouchable `Cargo.lock` file, so tests can assert
     /// on what a reclaim pass did and did not remove.
+    /// Make `wt` a git repo: the fixed-name reclaim path asks git whether an
+    /// artifact directory holds tracked files, and keeps it when git cannot say.
+    fn git_init(wt: &Path) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
     fn populate_build_artifacts(repo: &Path, issue: u32) {
         let wt = repo.join(".loom/worktrees").join(format!("issue-{issue}"));
         fs::create_dir_all(wt.join("target/debug")).unwrap();
         fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
         fs::write(wt.join("Cargo.lock"), b"lockfile").unwrap();
+        git_init(&wt);
     }
 
     // ===================================================================
@@ -1342,6 +1397,34 @@ mod tests {
         assert_eq!(report.removed, vec![100, 101]);
         assert!(report.failed.is_empty());
         assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_pass_over_a_fixture_repo_exports_one_reaper_span_with_its_counts() {
+        // #12461: issue-100 is removed (2 KiB held), issue-101 is unmanaged and
+        // preserved. The log seam exports the pass; the span's counts match.
+        let repo = make_repo(&[(100, true), (101, false)]);
+        fs::write(repo.path().join(".loom/worktrees/issue-100/blob"), vec![0u8; 2048]).unwrap();
+        let ((report, ()), captured) = crate::observability::ops::capture::capture(|| {
+            let (report, _) = run_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+            log_report(repo.path(), &report, 0);
+            (report, ())
+        });
+        assert_eq!(report.removed, vec![100]);
+        assert_eq!(captured.spans.len(), 1);
+        let span = &captured.spans[0];
+        assert_eq!(span.name.as_str(), "reaper.pass");
+        let a = &span.attributes;
+        assert_eq!(a["loom.reaper.class"], "issue");
+        assert_eq!(a["loom.reaper.phase"], "reap");
+        assert_eq!(a["loom.reaper.scanned"], "2");
+        assert_eq!(a["loom.reaper.removed"], "1");
+        assert_eq!(a["loom.reaper.failed"], "0");
+        assert_eq!(a["loom.reaper.preserved"], "1");
+        assert_eq!(a["loom.reaper.preserved.unmanaged"], "1");
+        assert!(a["loom.reaper.bytes"].parse::<u64>().unwrap() >= 2048);
+        assert!(a.contains_key("loom.daemon.revision"));
     }
 
     #[test]
@@ -2064,6 +2147,7 @@ mod tests {
                 removed: vec![5312],
                 failed: vec![5349],
                 skipped: vec![(5350, "PR still open".to_string())],
+                bytes_removed: 0,
                 free_gb: None,
             },
         );
@@ -2111,6 +2195,7 @@ mod tests {
         fs::create_dir_all(wt.join("target/debug")).unwrap();
         fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
         fs::write(wt.join("Cargo.lock"), b"lockfile").unwrap();
+        git_init(&wt);
     }
 
     #[test]
@@ -2201,6 +2286,7 @@ mod tests {
             let wt = repo.path().join(".loom/worktrees").join(name);
             fs::create_dir_all(wt.join("target")).unwrap();
             fs::write(wt.join(".loom-managed"), "").unwrap();
+            git_init(&wt);
         }
         let spec = ProbeSpec {
             pr_status: PrStatus::Open,
@@ -2686,6 +2772,7 @@ mod tests {
             removed: vec![1, 2],
             failed: vec![3],
             skipped: vec![(4, "PR still open".to_string())],
+            bytes_removed: 0,
             free_gb: Some(10),
         };
         assert_eq!(report.summary(), "scanned=5 removed=2 failed=1 skipped=1");

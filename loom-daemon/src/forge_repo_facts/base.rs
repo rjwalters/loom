@@ -86,7 +86,8 @@ pub(crate) struct BaseRepo {
     /// Why this repo: `remote \`origin\``, `GH_REPO`, `gh repo set-default`.
     pub(crate) via: String,
     /// The local answer may differ from gh's: several remotes, a set-default
-    /// pin, a non-`github.com` (alias or GHE) host, a `GH_REPO` that differs
+    /// pin (other than the sole remote pinned to itself, which cannot change
+    /// gh's answer), a non-`github.com` (alias or GHE) host, a `GH_REPO` that differs
     /// from origin, or a `url.*.insteadOf` rewrite. Such a root is
     /// cross-checked against gh before its fact is used.
     pub(crate) ambiguous: bool,
@@ -221,6 +222,24 @@ fn host_for(nwo: &str, remotes: &[Remote], gh_repo: Option<&str>, via_env: bool)
         .map_or_else(|| "github.com".to_string(), |r| r.host.clone())
 }
 
+/// Whether a `remote.<name>.gh-resolved = value` pin names the one repository
+/// gh could pick anyway: the checkout's **sole** remote, pinned to itself
+/// (`base`, which `gh repo set-default` writes for a remote it chose, or that
+/// remote's own `owner/repo`). Such a pin cannot change gh's answer, so it is
+/// no ambiguity. Running `gh repo set-default` once in a single-remote
+/// checkout writes exactly this, and counting it as a pin made every
+/// untargeted read there unroutable, so it was shed (#12630).
+fn names_itself(name: &str, value: &str, remotes: &[Remote], remote_count: usize) -> bool {
+    if remote_count != 1 {
+        return false;
+    }
+    let Some(remote) = remotes.iter().find(|r| r.name == name) else {
+        return false;
+    };
+    let value = value.trim();
+    value.eq_ignore_ascii_case("base") || value.eq_ignore_ascii_case(&remote.nwo)
+}
+
 /// Resolve the base repo from a snapshot.
 pub(super) fn resolve(snap: &Snapshot, gh_repo: Option<&str>) -> Option<BaseRepo> {
     let remote_text: String = snap
@@ -240,10 +259,11 @@ pub(super) fn resolve(snap: &Snapshot, gh_repo: Option<&str>) -> Option<BaseRepo
         .iter()
         .filter_map(|(_, k, _)| k.strip_prefix("remote.")?.strip_suffix(".url"))
         .collect();
-    let pinned = snap
-        .entries
-        .iter()
-        .any(|(_, k, _)| k.starts_with("remote.") && k.ends_with(".gh-resolved"));
+    let pinned = snap.entries.iter().any(|(_, k, v)| {
+        k.strip_prefix("remote.")
+            .and_then(|k| k.strip_suffix(".gh-resolved"))
+            .is_some_and(|name| !names_itself(name, v, &remotes, remote_names.len()))
+    });
     let rewrites = snap.entries.iter().any(|(_, k, _)| {
         k.starts_with("url.") && (k.ends_with(".insteadof") || k.ends_with(".pushinsteadof"))
     });

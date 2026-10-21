@@ -15,8 +15,9 @@
 //!
 //! - [`sweep_close`] is the close a step's end records: the same
 //!   `loom.result` its `role_tick.outcome` reports (`success` / `failure`),
-//!   the step's role, and on a failure a [`StepFailure`] class from the closed
-//!   vocabulary below. [`SweepRegistry::end_step`] journals it at the moment
+//!   the step's role, its story points when the item is sized
+//!   (`loom.story_points`, #12957), and on a failure a [`StepFailure`] class
+//!   from the closed vocabulary below. [`SweepRegistry::end_step`] journals it at the moment
 //!   it sees the end. A step a roll stopped closes as `interrupted_by_roll`,
 //!   as a role tick does.
 //! - [`step_still_running`] is what orphan recovery asks before it closes a
@@ -31,6 +32,8 @@
 //! | `cancelled` | an operator or the daemon cancelled the step |
 //! | `step-outcome-failed` | the session's `LOOM_STEP_OUTCOME` said `class=failed` |
 //! | `exit-<code>` | the step exited non-zero |
+//! | `no-pr` | a Builder step exited 0 with `class=noop`: no PR (#12500) |
+//! | `no-outcome-line` | a Builder step exited 0 and wrote no outcome line (#12500) |
 //! | `exit-unobserved` | the step exited, its status is unknown, and it wrote no outcome line |
 
 use std::path::Path;
@@ -59,22 +62,35 @@ pub(crate) fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> Role
             code,
             "step session reported LOOM_STEP_OUTCOME class=failed",
         ),
-        StepEnd::Exited(Some(code)) => RoleFailure::new(
+        StepEnd::Exited(Some(code)) if code != 0 => RoleFailure::new(
             format!("exit-{code}"),
             Some(code),
             &format!("step exited with code {code}"),
         ),
-        StepEnd::Exited(None) => RoleFailure::new(
+        StepEnd::Exited(None) if line.is_none() => RoleFailure::new(
             "exit-unobserved",
             None,
             "step exited with no observed status and no outcome line",
+        ),
+        // A clean exit that tick_outcome still fails (#12500): a Builder step
+        // that opened no PR, or wrote no outcome line.
+        StepEnd::Exited(code) if line.is_none() => RoleFailure::new(
+            "no-outcome-line",
+            code,
+            "step exited without writing a LOOM_STEP_OUTCOME line",
+        ),
+        StepEnd::Exited(code) => RoleFailure::new(
+            "no-pr",
+            code,
+            "builder step exited without opening a PR (LOOM_STEP_OUTCOME class=noop)",
         ),
     }
 }
 
 /// The `loom.result` and close attributes of a step's `loom.sweep` span.
 /// `outcome` is the tick outcome the step's `role_tick.outcome` reports
-/// ([`super::capture::tick_outcome`]), so the two agree. Pure.
+/// ([`super::capture::tick_outcome`]), so the two agree. `story_points` are
+/// the step's spawn-time points (#12957), absent when unsized. Pure.
 #[must_use]
 pub(crate) fn sweep_close(
     end: StepEnd,
@@ -83,6 +99,7 @@ pub(crate) fn sweep_close(
     role: StepRole,
     model: Option<&str>,
     effort: Option<&str>,
+    story_points: Option<u32>,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -91,6 +108,12 @@ pub(crate) fn sweep_close(
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             close.insert(key.into(), value.to_owned());
         }
+    }
+    if let Some(points) = story_points {
+        close.insert(
+            crate::observability::ops::dispatch_step::STORY_POINTS.into(),
+            points.to_string(),
+        );
     }
     if matches!(outcome, RoleTickOutcome::Failure(_)) {
         close.extend(step_failure(end, line).attributes());
