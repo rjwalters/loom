@@ -1,19 +1,19 @@
 //! `loom-daemon api-keys` handler (issue #8401): secret-safe lifecycle
-//! commands over [`loom_daemon::api_keys_pool`], mirroring the verb shape of
+//! commands over [`crate::api_keys_pool`], mirroring the verb shape of
 //! `loom-daemon accounts` (Codex) and `loom-daemon tokens` (Claude OAuth).
 //!
 //! **No verb accepts key material on the command line.** `add` reads the key
 //! from `--key-file` or standard input, because argv is visible to every
 //! process on the host and lands in shell history. `list` and `health` are
 //! secret-free by construction — they render
-//! [`loom_daemon::api_keys_pool::ApiKeyAccount`], which cannot hold a value.
+//! [`crate::api_keys_pool::ApiKeyAccount`], which cannot hold a value.
 
 use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::path::PathBuf;
 
 use super::tokens::resolve_tokens_workspace;
-use loom_daemon::api_keys_pool::{
+use crate::api_keys_pool::{
     bad_marks, limits,
     paths::{
         default_env_name, is_conventional_env_name, per_repo_api_keys_dir, pool_roots,
@@ -185,7 +185,7 @@ pub enum ApiKeysAction {
     },
     /// Record an exhaustion/rate-limit mark against an account (issue #8401)
     /// — normally produced by classifying a harness's own error output
-    /// (`loom_daemon::api_keys_pool::classify`), but may be invoked directly
+    /// (`crate::api_keys_pool::classify`), but may be invoked directly
     /// to simulate one. A bad-marked account drops out of selection until
     /// its reset horizon, the same way a disabled one does.
     MarkBad {
@@ -568,7 +568,7 @@ fn set_enabled(
 /// never depends on what is already registered — it is where new accounts go.
 fn write_root(workspace: &std::path::Path, shared: bool) -> Result<PathBuf> {
     if shared {
-        loom_daemon::api_keys_pool::paths::shared_api_keys_dir().context(
+        crate::api_keys_pool::paths::shared_api_keys_dir().context(
             "the shared machine-level pool is disabled (LOOM_SHARED_API_KEYS_DIR is empty)",
         )
     } else {
@@ -636,7 +636,7 @@ fn print_sync_outcome(outcome: &sync::SyncOutcome, json: bool) -> Result<()> {
 
 /// One `health` line for the last successful sync of a pool root, or `None` on
 /// a host that has never synced (where the line would be noise).
-fn describe_last_sync(state: &loom_daemon::api_keys_pool::SyncState) -> String {
+fn describe_last_sync(state: &crate::api_keys_pool::SyncState) -> String {
     let when = chrono::DateTime::from_timestamp(
         i64::try_from(state.last_success_at).unwrap_or(i64::MAX),
         0,
@@ -683,7 +683,7 @@ fn humanize_age(seconds: i64) -> String {
 /// Validates the provider name first so a malformed one is never joined onto a
 /// path.
 fn provider_root(workspace: &std::path::Path, provider: &str, shared: bool) -> Result<PathBuf> {
-    loom_daemon::api_keys_pool::paths::validate_provider(provider).map_err(anyhow::Error::msg)?;
+    crate::api_keys_pool::paths::validate_provider(provider).map_err(anyhow::Error::msg)?;
     if shared {
         return shared_root();
     }
@@ -703,7 +703,7 @@ fn acting_roots(workspace: &std::path::Path, shared: bool) -> Result<Vec<PathBuf
 /// disabled — never a silent fall back to the per-repo pool, which would make
 /// `--shared` act on exactly the pool the operator was trying to reach past.
 fn shared_root() -> Result<PathBuf> {
-    loom_daemon::api_keys_pool::paths::shared_api_keys_dir()
+    crate::api_keys_pool::paths::shared_api_keys_dir()
         .context("the shared machine-level pool is disabled (LOOM_SHARED_API_KEYS_DIR is empty)")
 }
 
@@ -748,14 +748,14 @@ fn note_shadowed_shared_providers(workspace: &std::path::Path) {
     };
     let shadowed: Vec<String> = shared_roots
         .iter()
-        .filter_map(|root| loom_daemon::api_keys_pool::paths::list_providers(root).ok())
+        .filter_map(|root| crate::api_keys_pool::paths::list_providers(root).ok())
         .flatten()
         .filter(|provider| {
             // Shadowed exactly when the per-repo pool holds accounts for the
             // same provider — the precedence rule `resolve_provider_root`
             // applies, asked about one provider at a time.
-            loom_daemon::api_keys_pool::paths::list_account_files(
-                &loom_daemon::api_keys_pool::paths::provider_dir(per_repo, provider),
+            crate::api_keys_pool::paths::list_account_files(
+                &crate::api_keys_pool::paths::provider_dir(per_repo, provider),
             )
             .is_ok_and(|files| !files.is_empty())
         })
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn the_health_sync_line_names_the_source_and_the_time() {
-        let state = loom_daemon::api_keys_pool::SyncState {
+        let state = crate::api_keys_pool::SyncState {
             last_success_at: 1_700_000_000,
             source: "cmd:/opt/loom/fetch-keys.sh".to_string(),
             accounts: 3,
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn shared_accounts_shadowed_by_a_per_repo_pool_are_reachable_with_shared() {
-        use loom_daemon::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV;
+        use crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV;
 
         let shared_dir = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -1114,7 +1114,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn shared_refuses_rather_than_falling_back_when_the_shared_pool_is_disabled() {
-        use loom_daemon::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV;
+        use crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV;
 
         let repo = tempfile::tempdir().unwrap();
         std::env::set_var(SHARED_API_KEYS_DIR_ENV, "");

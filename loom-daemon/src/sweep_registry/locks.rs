@@ -1,7 +1,6 @@
 //! Per-issue claim-lock lifecycle (`.loom/locks/issue-<N>/owner.json`) and
 //! startup reconstruction of registry state from disk.
 
-use super::journal_shadow::LockNs;
 use super::*;
 
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
@@ -368,7 +367,6 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write lock owner.json")?;
-                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -424,7 +422,6 @@ impl SweepRegistry {
             .with_context(|| format!("read lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse lock owner.json")?;
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -438,7 +435,6 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -463,12 +459,10 @@ impl SweepRegistry {
         if owner.overflow {
             return Ok(());
         }
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.overflow = true;
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -515,7 +509,6 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write PR lock owner.json")?;
-                self.shadow_owner_acquired(LockNs::Pr, pr, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
@@ -542,7 +535,6 @@ impl SweepRegistry {
             .with_context(|| format!("read PR lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse PR lock owner.json")?;
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -550,7 +542,6 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write PR lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Pr, pr, &before, &owner);
         Ok(())
     }
 
@@ -596,7 +587,7 @@ impl SweepRegistry {
             return LockReleaseOutcome::Superseded;
         }
         match std::fs::remove_dir_all(&lock) {
-            Ok(()) => self.shadow_owner_released(LockNs::Pr, pr, Some(sweep_id)),
+            Ok(()) => {}
             Err(e) => {
                 log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
             }
@@ -616,7 +607,6 @@ impl SweepRegistry {
         if lock.exists() {
             std::fs::remove_dir_all(&lock)
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
-            self.shadow_owner_released(LockNs::Issue, issue, None);
         }
         Ok(())
     }
@@ -665,7 +655,7 @@ impl SweepRegistry {
             return LockReleaseOutcome::HolderAlive;
         }
         match std::fs::remove_dir_all(&lock) {
-            Ok(()) => self.shadow_owner_released(LockNs::Issue, issue, Some(sweep_id)),
+            Ok(()) => {}
             Err(e) => log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display()),
         }
         LockReleaseOutcome::Released
@@ -805,10 +795,7 @@ impl SweepRegistry {
                 std::fs::write(lock.join("owner.json"), json).context("write lock owner.json")
             });
         match takeover {
-            Ok(()) => {
-                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, false);
-                Some(watchdog_sweep_id)
-            }
+            Ok(()) => Some(watchdog_sweep_id),
             Err(e) => {
                 log::warn!(
                     "midbuild-watchdog: could not take over issue #{issue}'s stale claim lock at \
@@ -950,9 +937,7 @@ impl SweepRegistry {
                     .and_then(|s| serde_json::from_str(&s).ok());
                 let Some(owner) = owner else {
                     // No owner.json — treat as stale, remove.
-                    if std::fs::remove_dir_all(&path).is_ok() {
-                        self.shadow_owner_released(LockNs::Issue, issue, None);
-                    }
+                    let _ = std::fs::remove_dir_all(&path);
                     continue;
                 };
                 let alive =
@@ -1019,9 +1004,7 @@ impl SweepRegistry {
                     if step.is_none() {
                         daemon_owned_dead.insert(issue);
                     }
-                    if std::fs::remove_dir_all(&path).is_ok() {
-                        self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
-                    }
+                    let _ = std::fs::remove_dir_all(&path);
                     if let Some((role, item)) = step {
                         let started_at = Self::lock_started_at(&owner);
                         self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);

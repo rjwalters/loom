@@ -40,12 +40,18 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         crate::tokens_pool::private_workspace::JobKind::Role,
                         None,
                         format!("role-{role}-{}", uuid::Uuid::new_v4()),
-                        Box::new(move |runtime: &str| {
-                            let (model, _) = reconcile_unpinned_model_with_runtime(
-                                runtime,
-                                model_hint.0.clone(),
-                                model_hint.1.clone(),
-                            );
+                        Box::new(move |runtime: &str, drawn: Option<&str>| {
+                            // Same precedence as the launch below (#12748):
+                            // the runner's override, then the draw's model,
+                            // then the resolved hint.
+                            let (model, source) = match (model_hint.1 == "override", drawn) {
+                                (false, Some(drawn)) => {
+                                    (drawn.to_string(), "role-draw".to_string())
+                                }
+                                _ => model_hint.clone(),
+                            };
+                            let (model, _) =
+                                reconcile_unpinned_model_with_runtime(runtime, model, source);
                             (!model.is_empty()).then_some(model)
                         }),
                     );
@@ -57,7 +63,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     ) {
                         Err(rejection) if rejection.containment_eligible() => {
                             use crate::runtime_preference::ContainmentPreparer;
-                            containment.contain(role, None, rejection)
+                            containment.contain(role, None, None, rejection)
                         }
                         other => other,
                     }

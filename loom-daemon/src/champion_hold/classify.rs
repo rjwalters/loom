@@ -19,6 +19,7 @@
 //! | [`PrClass::Contradiction`] | `loom:pr` beside `loom:changes-requested` / `loom:review-requested` | the janitor repairs it (strips `loom:pr`) |
 //! | [`PrClass::ChampionHold`] | `loom:blocked` with a standing hold marker | leaves it; criteria #2/#3 decide |
 //! | [`PrClass::StrayOperator`] | a hold, plus a fleet-added `loom:operator` and no capped-hold recommendation | removes `loom:operator`; the hold stands |
+//! | [`PrClass::StackedOnLoomBranch`] | otherwise clear, but based on a Loom stack branch | skips the PR: no merge attempt, no comment, no label change |
 //! | [`PrClass::Clear`] | none of these | the 6 criteria run |
 //!
 //! A foreign park is checked first: a PR another actor parked is theirs, even
@@ -31,6 +32,27 @@
 //! label, so the approved hold is stranded. Only the fleet's own add is
 //! stray: a human's `loom:operator`, and the capped-hold inbox route (#11905),
 //! are holds for a person and stay ([`classify_operator`]).
+//!
+//! A stacked child (#12761) targets its parent's head branch, not the default
+//! branch. Merging it there moves the parent PR's head under its approval (or,
+//! once the parent is gone, lands it on a dead branch), and its
+//! `Closes #<child>` never fires (a non-default-branch merge). The merge
+//! sequencer's `StackedBase` edge guards it only above `TRIGGER_OPEN_PRS` open
+//! PRs, and only after a claim-reconcile tick. So a PR that would otherwise be
+//! [`PrClass::Clear`] is [`PrClass::StackedOnLoomBranch`] whenever its base is
+//! a [stackable](crate::merge_pr::stacked_children::is_stackable_parent_branch)
+//! Loom branch (`feature/issue-<N>`, `feature/harness-ops-<N>`), whatever the
+//! state of the parent PR that heads it ([`stacked_base`],
+//! [`with_stacked_base`]). The parent is deliberately not looked up: an open
+//! parent, a merged parent whose branch survived, and a parent closed unmerged
+//! are all a merge Champion must not make. Liveness holds without the lookup:
+//! when the parent lands, GitHub (branch deleted) or the merged-parent
+//! reconcile (branch kept) retargets the child to the default branch, and it
+//! is clear again. A closed parent's orphan stays skipped until #12760's pass
+//! or a human retargets it. Any other base (the default branch, `release/*`,
+//! `develop`, ...) is untouched: a deliberate non-default base still merges. A
+//! hold, park or contradiction keeps its own state: none of them merges
+//! either, and each has its own handling.
 //!
 //! [`merge_failed_marker`] is the second half: the "Merge Failed" notice is
 //! posted at most once per head.
@@ -52,7 +74,7 @@ pub const CONTRADICTING_VERDICTS: [&str; 2] = ["loom:changes-requested", "loom:r
 pub const MERGE_FAILED_MARKER_PREFIX: &str = "<!-- champion:merge-failed head=";
 
 /// What Champion does with a PR (see the module table).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrClass {
     /// Nothing for the janitor: the 6 criteria run.
     Clear,
@@ -65,27 +87,33 @@ pub enum PrClass {
     /// Champion's own hold carrying a fleet-added `loom:operator` (#11970):
     /// remove `loom:operator`, leave the hold.
     StrayOperator(HoldKind),
+    /// Based on the named Loom stack branch (#12761), whether or not an open
+    /// PR still heads it: skip, silently, until this is retargeted.
+    StackedOnLoomBranch(String),
 }
 
 impl PrClass {
     /// The `state=` token.
     #[must_use]
-    pub fn state(self) -> &'static str {
+    pub fn state(&self) -> &'static str {
         match self {
             PrClass::Clear => "clear",
             PrClass::ChampionHold(_) => "champion-hold",
             PrClass::ForeignPark => "foreign-park",
             PrClass::Contradiction(_) => "contradiction",
             PrClass::StrayOperator(_) => "stray-operator",
+            PrClass::StackedOnLoomBranch(_) => "stacked-on-loom-branch",
         }
     }
 
     /// The stdout line: `LOOM-CHAMPION-HOLD state=<s> pr=<N> detail=<d>`.
-    /// `detail` is the contradicting label, the hold kind, or `-`.
+    /// `detail` is the contradicting label, the hold kind, the stacked base
+    /// branch, or `-`.
     #[must_use]
-    pub fn line(self, pr: u64) -> String {
+    pub fn line(&self, pr: u64) -> String {
         let detail = match self {
-            PrClass::Contradiction(label) => label,
+            PrClass::Contradiction(label) => *label,
+            PrClass::StackedOnLoomBranch(base) => base.as_str(),
             PrClass::ChampionHold(HoldKind::MergeRisk)
             | PrClass::StrayOperator(HoldKind::MergeRisk) => "merge-risk",
             PrClass::ChampionHold(HoldKind::CriticalFile)
@@ -224,6 +252,35 @@ pub fn classify_operator<L: AsRef<str>, C: AsRef<str>>(
             PrClass::StrayOperator(kind)
         }
         class => class,
+    }
+}
+
+/// The PR's Loom stack base from its REST pull object
+/// (`GET repos/{o}/{r}/pulls/{n}`, #12761): `Some(Some(branch))` for a
+/// [stackable](crate::merge_pr::stacked_children::is_stackable_parent_branch)
+/// base, `Some(None)` for any other (the default branch, `release/*`, ...).
+/// `None` when `base.ref` is missing or empty: an unknown base is never an
+/// unstacked one.
+#[must_use]
+pub fn stacked_base(pull: &Value) -> Option<Option<String>> {
+    let branch = pull.pointer("/base/ref").and_then(Value::as_str)?.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    Some(
+        crate::merge_pr::stacked_children::is_stackable_parent_branch(branch)
+            .then(|| branch.to_string()),
+    )
+}
+
+/// `class`, except that a [`PrClass::Clear`] PR based on the Loom stack
+/// branch `stacked_base` is [`PrClass::StackedOnLoomBranch`]. Every other
+/// state stands.
+#[must_use]
+pub fn with_stacked_base(class: PrClass, stacked_base: Option<&str>) -> PrClass {
+    match (class, stacked_base) {
+        (PrClass::Clear, Some(base)) => PrClass::StackedOnLoomBranch(base.to_string()),
+        (class, _) => class,
     }
 }
 
@@ -450,6 +507,100 @@ mod tests {
             PrClass::ChampionHold(HoldKind::CriticalFile).line(7),
             "LOOM-CHAMPION-HOLD state=champion-hold pr=7 detail=critical-file"
         );
+    }
+
+    fn pull(base: &str) -> Value {
+        serde_json::json!({
+            "number": 2,
+            "base": {"ref": base, "label": format!("acme:{base}"), "repo": {"owner": {"login": "acme"}}},
+        })
+    }
+
+    /// The CLI's composition, over canned REST reads: labels and the PR's
+    /// pull object (#12761). No parent lookup.
+    fn classify_stacked(labels: &[&str], pull: &Value) -> Option<PrClass> {
+        let class = classify(labels, &NONE);
+        Some(with_stacked_base(class, stacked_base(pull)?.as_deref()))
+    }
+
+    #[test]
+    fn an_approved_child_of_an_open_parent_is_not_clear() {
+        // Two open PRs: parent #1 (feature/issue-1 -> main) and its approved
+        // child #2 (-> feature/issue-1). The sequencer does not run at <= 2
+        // open PRs, so this state is the only thing between #2 and a merge.
+        let class = classify_stacked(&["loom:pr"], &pull("feature/issue-1"));
+        assert_eq!(class, Some(PrClass::StackedOnLoomBranch("feature/issue-1".into())));
+        assert_eq!(
+            class.unwrap().line(2),
+            "LOOM-CHAMPION-HOLD state=stacked-on-loom-branch pr=2 detail=feature/issue-1"
+        );
+        assert_eq!(
+            classify_stacked(&["loom:pr"], &pull("feature/harness-ops-350")),
+            Some(PrClass::StackedOnLoomBranch("feature/harness-ops-350".into()))
+        );
+    }
+
+    #[test]
+    fn a_default_or_non_loom_base_is_unaffected() {
+        for base in [
+            "main",
+            "release/1.2",
+            "develop",
+            "feature/issue-1-extra",
+            "feature/other-3",
+        ] {
+            assert_eq!(stacked_base(&pull(base)), Some(None), "{base}");
+            assert_eq!(classify_stacked(&["loom:pr"], &pull(base)), Some(PrClass::Clear), "{base}");
+        }
+    }
+
+    #[test]
+    fn a_landed_parent_does_not_clear_the_child() {
+        // A merged parent whose branch survived: the base is still a Loom
+        // stack branch, so the child stays skipped until it is retargeted
+        // (a merge here would land on a branch that already landed).
+        assert_eq!(
+            classify_stacked(&["loom:pr"], &pull("feature/issue-1")),
+            Some(PrClass::StackedOnLoomBranch("feature/issue-1".into()))
+        );
+    }
+
+    #[test]
+    fn a_closed_unmerged_parent_does_not_clear_the_child() {
+        // The parent was closed and its branch kept: the decision reads only
+        // the child's base, so a dead parent is skipped exactly like a live one.
+        assert_eq!(
+            classify_stacked(&["loom:pr"], &pull("feature/harness-ops-7")),
+            Some(PrClass::StackedOnLoomBranch("feature/harness-ops-7".into()))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_base_is_never_clear() {
+        assert_eq!(stacked_base(&serde_json::json!({"number": 2})), None);
+        assert_eq!(stacked_base(&serde_json::json!({"base": {"ref": ""}})), None);
+        assert_eq!(stacked_base(&serde_json::json!({"message": "Bad credentials"})), None);
+        let unread = serde_json::json!({"message": "Bad credentials"});
+        assert_eq!(classify_stacked(&["loom:pr"], &unread), None);
+        // No owner is needed any more: there is no head= lookup to build.
+        assert_eq!(
+            stacked_base(&serde_json::json!({"base": {"ref": "feature/issue-1"}})),
+            Some(Some("feature/issue-1".into()))
+        );
+    }
+
+    #[test]
+    fn a_hold_park_or_contradiction_keeps_its_own_state() {
+        let base = Some("feature/issue-1");
+        for class in [
+            PrClass::ForeignPark,
+            PrClass::ChampionHold(HoldKind::MergeRisk),
+            PrClass::StrayOperator(HoldKind::CriticalFile),
+            PrClass::Contradiction("loom:changes-requested"),
+        ] {
+            assert_eq!(with_stacked_base(class.clone(), base), class);
+        }
+        assert_eq!(with_stacked_base(PrClass::Clear, None), PrClass::Clear);
     }
 
     #[test]

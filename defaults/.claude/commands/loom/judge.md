@@ -184,7 +184,7 @@ own discipline:
 
 - **Never wait indefinitely on a single tool call.** Long-running commands
   (a scoped `cargo test`, `gh pr checks --watch`) MUST be given an explicit
-  timeout — e.g. `forge wait-checks <n> --timeout 20`, not `--watch` with no
+  timeout — e.g. `loom-daemon forge wait-checks <n> --timeout 20`, not `--watch` with no
   bound; wrap a build in `timeout <secs> …`. If it does not return, treat the
   check as **inconclusive** and proceed to a verdict rather than blocking.
 - **Emit progress as you go.** Print a short line at each step (checkout, check,
@@ -419,7 +419,7 @@ pre-write state:
 | Pre-Iteration Environment Check (`gh repo view`) | Liveness probe — a cached success hides a broken environment |
 | Stale `loom:reviewing` Claim Check (`claim-staleness.sh`: claim timeline + comment reads) | Claim arbitration — 30s of staleness is exactly the window a competing claim lands in (the script makes these reads itself; never re-issue them through the cache) |
 | **Verdict-Time CAS Recheck** (`gh pr view $N --json labels`) | The entire mechanism is "observe writes that landed *during* my review"; a cached label set defeats it |
-| `forge wait-checks` / `gh pr checks` + `gh pr view --json mergeStateStatus` before a verdict | Verdict gating — never approve on a stale green |
+| `loom-daemon forge wait-checks` / `gh pr checks` + `gh pr view --json mergeStateStatus` before a verdict | Verdict gating — never approve on a stale green |
 
 `gh pr checks` and `gh repo view` are passthrough inside the wrapper anyway, so
 those two hold even if wrapped by accident; the rest rely on this list.
@@ -712,7 +712,7 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
       bare `gh pr comment`, NOT a bare `gh pr edit --add-label "loom:pr"`,
       and NOT `gh pr review` — it is the sole merge-gating writer (#12136)
 - [ ] I understand `gh pr review --approve` WILL fail with "cannot approve your own PR"
-- [ ] All CI checks pass (verified via `forge wait-checks`)
+- [ ] All CI checks pass (verified via `loom-daemon forge wait-checks`)
 - [ ] Merge state is CLEAN or BEHIND (verified via `gh pr view --json mergeStateStatus`; BEHIND is reviewed as-is, see "BEHIND: review as-is")
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] `post-verdict.sh` exited 0 (it applied the verdict label; exit 8 = run its repair command)
@@ -1317,7 +1317,7 @@ Local tests passing is not sufficient - you MUST verify that GitHub Actions CI w
 **Every `gh` read in this section is plain — never `"$GH_READ"`.** CI
 status and merge state are the reads a verdict is gated on, so they must
 observe current state unconditionally; a cached green from 30 seconds ago can
-predate the push that broke the build. (`forge wait-checks` revalidates every
+predate the push that broke the build. (`loom-daemon forge wait-checks` revalidates every
 read via ETag, so it is live too.) See "Cached Forge Reads" for the full policy.
 
 ### How to Check CI Status
@@ -1333,6 +1333,8 @@ Branch on the first stdout line:
 - ❌ `-RED` - "When CI Fails"
 - ⏳ `-TIMEOUT` / `-HEAD-MOVED` - Pending (see "When CI is Pending")
 - `-ERROR` or no sentinel (Gitea / older binary) - run `gh pr checks <PR_NUMBER>` once
+
+**Unknown is never green.** If the required-context lookup fails (rate limit, 403/429, unreadable branch protection), `wait-checks` reports `-TIMEOUT … (required-contexts-unknown)` or `-ERROR`: the result is *unknown*, not passing. It cannot authorize approval; treat it as pending ("When CI is Pending") and never approve on a guess. The reader and its REST fallback are unchanged.
 
 **Step 2: Verify merge state**
 
@@ -1369,10 +1371,10 @@ If checks are still running, **do not block on them or approve on a guess**: in 
 2. **Release your claim** — remove `loom:reviewing`; release the lease with `--skip-reason ci-pending` (below).
 3. **Skip and continue the batch** — next PR; a later tick re-evaluates this one once CI settles.
 
-**Pending-CI skip check.** `loom-daemon forge wait-checks <PR_NUMBER> --timeout 0` is a single ETag'd poll (no wait) that also handles the empty-rollup trap (#6169). Branch on the first **stdout** line:
+**Pending-CI skip check.** Reuse Step 1's snapshot: `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20` is a short ETag'd poll that also handles the empty-rollup trap (#6169); `--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has nothing to wait for. Branch on the first **stdout** line:
 
 ```bash
-first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 0 2>/dev/null | head -n1)"
+first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1)"
 case "$first" in
   LOOM-CHECKS-TIMEOUT*)   # still pending: release and skip; PR stays loom:review-requested
     gh pr comment <number> --body "CI still running; skipping until it settles."
@@ -1412,7 +1414,7 @@ esac
 
 ### Why CI Verification Matters
 
-Issue #1441: a Judge approved on local-test green while CI was still failing, costing several Doctor passes. Approve only after `post-verdict.sh` accepts the head; `forge wait-checks` is for evidence, not authority.
+Issue #1441: a Judge approved on local-test green while CI was still failing, costing several Doctor passes. Approve only after `post-verdict.sh` accepts the head; `loom-daemon forge wait-checks` is for evidence, not authority.
 
 ## Formal Review & Inline Thread Reconciliation (REQUIRED Before Approval, #7647)
 
@@ -1657,11 +1659,15 @@ ineligible; only the repo-root file qualifies):
 
 ```bash
 # Docs-only fast path (#6134): eligible ONLY if every changed file is EXACTLY
-# one of these three root-level filenames. This is the same allowlist
+# one of these three root-level filenames, or a month-rotated archive (#12636,
+# DOCS_FAST_PATH_ARCHIVE_RE below). This is the same allowlist
 # Champion's criterion #2 re-derives independently (see champion-pr-merge.md)
 # — the two checks are mirrored, not shared, so a change to one without the
 # other is a visible drift, not a silent gap.
 DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")
+# Archive files (#12636): ONLY the month-rotated archives, month 01-12, one
+# directory deep. Never a directory or *.md allowance.
+DOCS_FAST_PATH_ARCHIVE_RE='^(work_log/WORK_LOG|work_plan/WORK_PLAN)_[0-9]{4}-(0[1-9]|1[0-2])\.md$'
 
 docs_only_fast_path_check() {
   # Reads a newline-separated file list on stdin. Echoes "ELIGIBLE" if every
@@ -1680,6 +1686,9 @@ docs_only_fast_path_check() {
         break
       fi
     done
+    if [ "$matched" -ne 1 ] && [[ "$file" =~ $DOCS_FAST_PATH_ARCHIVE_RE ]]; then
+      matched=1
+    fi
     if [ "$matched" -ne 1 ]; then
       echo "NOT ELIGIBLE: $file"
       return 0

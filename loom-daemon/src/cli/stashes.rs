@@ -9,16 +9,16 @@
 
 use anyhow::Result;
 
-use loom_daemon::issue_state_read::client::{DaemonLink, LocalRead, RoutedLookup, SocketLink};
-use loom_daemon::quarantine_stash_status::StashOrigin;
-use loom_daemon::repo_root::resolve_repo_root;
-use loom_daemon::stash_issue_state::{IssueStateSummary, RecordingLookup};
-use loom_daemon::stash_retirement::{
+use crate::issue_state_read::client::{DaemonLink, LocalRead, RoutedLookup, SocketLink};
+use crate::quarantine_stash_status::StashOrigin;
+use crate::repo_root::resolve_repo_root;
+use crate::stash_issue_state::{IssueStateSummary, RecordingLookup};
+use crate::stash_retirement::{
     self, AnyStashEntry, DropOutcome, IssueStateLookup, PathVerdict, QuarantineStashEntry,
     RetireVerdict, RetirementReport, RETIREMENT_LOG_RELPATH,
 };
 
-use crate::StashesAction;
+use crate::cli::StashesAction;
 
 pub(crate) fn handle_stashes_command(action: StashesAction) -> Result<()> {
     match action {
@@ -59,13 +59,13 @@ pub(crate) struct BuildTreesArgs {
 }
 
 fn build_trees(args: &BuildTreesArgs) -> Result<()> {
-    use loom_daemon::generated_artifact::status;
+    use crate::generated_artifact::status;
     use std::io::{Read, Write};
 
     let start = std::path::Path::new(&args.workspace);
     let top = status::worktree_top(start)
         .ok_or_else(|| anyhow::anyhow!("not inside a git worktree: {}", start.display()))?;
-    let dirs = loom_daemon::generated_artifact::worktree_build_tree_dirs(&top);
+    let dirs = crate::generated_artifact::worktree_build_tree_dirs(&top);
     let mut out = std::io::stdout().lock();
     if args.filter_status {
         let mut input = String::new();
@@ -118,7 +118,7 @@ fn run(
 /// The daemon link for `repo_root`, or `None` when its `origin` has no
 /// supported slug (then only the standalone read applies).
 fn daemon_link(repo_root: &std::path::Path) -> Option<SocketLink> {
-    let slug = loom_daemon::release_resolve::host::repo_slug(repo_root)?;
+    let slug = crate::release_resolve::host::repo_slug(repo_root)?;
     let socket = super::common::resolve_socket_path().ok()?;
     Some(SocketLink {
         socket,

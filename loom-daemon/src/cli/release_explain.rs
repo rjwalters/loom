@@ -16,8 +16,8 @@
 //! subcommand", exit `2`) as "no classification available" and keeps its own
 //! flat reason, so a missing or old daemon can never fail `--fetch`.
 
+use crate::release_resolve::explain_no_artifact;
 use anyhow::Result;
-use loom_daemon::release_resolve::explain_no_artifact;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]

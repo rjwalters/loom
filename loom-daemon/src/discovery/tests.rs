@@ -812,6 +812,36 @@ fn against_a_fake_server_a_tick_is_one_request_and_the_next_is_a_304() {
 
 #[test]
 #[serial]
+fn a_caller_held_mirror_reads_the_worklist_without_the_global() {
+    let (base, seen) = serve(vec![
+        (200, Some("\"w1\""), worklist_body().to_string()),
+        (304, None, String::new()),
+    ]);
+    crate::forge_mirror::set_active(None);
+    let own = crate::forge_mirror::Active::with_key(
+        base,
+        "2ge_captain_key_0123456789abcdef".to_string(),
+        Duration::from_secs(600),
+        Duration::from_secs(30),
+    );
+    let mut backend = mirror::MirrorBackend::default();
+
+    let first = backend.fetch_from(&own, now());
+    assert!(!first.not_modified);
+    assert_eq!(first.repo("acme/widgets", now()).unwrap().rows.len(), 2);
+
+    let second = backend.fetch_from(&own, now());
+    assert!(second.not_modified);
+    assert_eq!(second.repo("acme/widgets", now()).unwrap().rows.len(), 2);
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].1, None);
+    assert_eq!(seen[1].1.as_deref(), Some("\"w1\""));
+}
+
+#[test]
+#[serial]
 fn an_inactive_mirror_falls_to_the_next_tier() {
     crate::forge_mirror::set_active(None);
     let mut d = Discovery::default();
@@ -822,7 +852,7 @@ fn an_inactive_mirror_falls_to_the_next_tier() {
     assert_eq!(snap.stats().worklist_error_class, Some("transport"));
 }
 
-/// The snapshot answers `ReadKind::Discovery` only (`poll_gate` invariant 3):
+/// The snapshot answers `ReadKind::Discovery` only (ADR-0021 invariant 3):
 /// no claim, label-transition or merge module names it, so no such decision
 /// can read it. The listing readers that moved onto it (#12307) are named
 /// here; each keeps its write-gating checks (`scan_issue`, `mergeable_of`, PR
@@ -867,20 +897,36 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         "claim_reconciliation/open_pr_listing_tests.rs",
         "observability/queue_blocked.rs",
         "observability/queue_blocked_tests.rs",
+        // The eta.stage_entry producer diffs the published snapshot; no forge call.
+        "observability/stage_entry_fact.rs",
+        "observability/stage_entry_fact_tests.rs",
         "quarantine_reconciliation/listing.rs",
         // The gather concurrency is the Direct backend's alone.
         "step_dispatch/gather_budget.rs",
         "observability/ops/dispatch_facts.rs",
+        // The hold-age gauges read the published snapshot's labels only; no
+        // claim, label-transition or merge read (invariant 3).
+        "observability/ops/hold_age.rs",
+        "observability/ops/hold_age_tests.rs",
         "step_dispatch/driver.rs",
         "step_dispatch/gather.rs",
+        // Whole-tick Gitea fixture seeds discovery; no live snapshot read.
+        "step_dispatch/tick_tests.rs",
         "work_finder.rs",
         "work_finder/tick_report.rs",
+        // The captain's fleet queue reads the worklist/change stream only; it
+        // makes no claim, label-transition or merge read (invariant 3).
+        "fleet_dispatch/queue.rs",
+        "fleet_dispatch/queue_tests.rs",
+        "fleet_dispatch/server.rs",
+        // Server refusal regressions seed discovery fixtures; no live snapshot read.
+        "fleet_dispatch/server_tests.rs",
     ]
     .iter()
     .map(|s| (*s).to_string())
     .collect();
     assert_eq!(
         users, expected,
-        "a new snapshot reader needs review against poll_gate invariant 3"
+        "a new snapshot reader needs review against ADR-0021 invariant 3"
     );
 }

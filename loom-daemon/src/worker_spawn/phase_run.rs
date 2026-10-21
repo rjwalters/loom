@@ -834,7 +834,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn missing_worktree_is_created_by_script() {
-        let _env = EnvGuard::clear();
+        let _env = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         write_exec(
             &dir.path().join(".loom/scripts/worktree.sh"),
@@ -844,41 +844,23 @@ mod tests {
         assert!(wt.ends_with("issue-42") && wt.is_dir());
     }
 
-    /// Saves, clears and restores the env this module reads (serial tests).
-    struct EnvGuard(Vec<(&'static str, Option<String>)>);
-    impl EnvGuard {
-        fn clear() -> Self {
-            let keys = [
-                "LOOM_RUNTIME",
-                "LOOM_ROLE",
-                "LOOM_MODEL_PROFILE",
-                crate::launch_env::PREFERENCE_MARKER_ENV,
-                "LOOM_RUNTIME_BUILDER",
-                "LOOM_RUNTIME_DOCTOR",
-                "LOOM_WORKTREE_ROOT",
-                "LOOM_SWEEP_CLAIM_OWNED",
-                // #11400: the zai-flash tap needs a seat from the fixture.
-                "ZAI_API_KEY",
-                "LOOM_NATIVE_AUTH_FILE",
-                crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV,
-            ];
-            let prior = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-            for k in keys {
-                std::env::remove_var(k);
-            }
-            Self(prior)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in self.0.drain(..) {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+    use crate::env_test_support::EnvGuard;
+
+    /// The env this module reads; cleared per (serial) test.
+    const GUARDED_ENV: &[&str] = &[
+        "LOOM_RUNTIME",
+        "LOOM_ROLE",
+        "LOOM_MODEL_PROFILE",
+        crate::launch_env::PREFERENCE_MARKER_ENV,
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_RUNTIME_DOCTOR",
+        "LOOM_WORKTREE_ROOT",
+        "LOOM_SWEEP_CLAIM_OWNED",
+        // #11400: the zai-flash tap needs a seat from the fixture.
+        "ZAI_API_KEY",
+        "LOOM_NATIVE_AUTH_FILE",
+        crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV,
+    ];
 
     fn write_exec(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -894,7 +876,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn claude_orchestrator_env_does_not_capture_builder_or_doctor() {
-        let _env = EnvGuard::clear();
+        let _env = EnvGuard::clear(GUARDED_ENV);
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let dir = tempfile::tempdir().unwrap();
         for kind in ["roles", "runtimes"] {
@@ -981,6 +963,7 @@ mod tests {
         crate::runtime_preference::Tap {
             runtime: "opencode".into(),
             model_profile: Some("zai-flash".into()),
+            model: None,
         }
     }
 
@@ -991,7 +974,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn explicit_tap_steers_builder_and_doctor_across_retries() {
-        let _env = EnvGuard::clear();
+        let _env = EnvGuard::clear(GUARDED_ENV);
         let dir = explicit_tap_fixture(true);
         // The Claude-only preference has no token pool in this fixture, so
         // without a record the launch is (correctly) unservable: the tap
@@ -1018,7 +1001,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn unavailable_explicit_tap_is_refused_not_replaced() {
-        let _env = EnvGuard::clear();
+        let _env = EnvGuard::clear(GUARDED_ENV);
         let dir = explicit_tap_fixture(false);
         crate::dispatch_tap::save(dir.path(), 42, &zai_flash()).unwrap();
         for role in [Role::Builder, Role::Doctor] {
@@ -1046,7 +1029,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn ensure_worktree_honours_the_configured_root() {
-        let _env = EnvGuard::clear();
+        let _env = EnvGuard::clear(GUARDED_ENV);
         let ext = tempfile::tempdir().unwrap();
         for via_env in [true, false] {
             let dir = tempfile::tempdir().unwrap();

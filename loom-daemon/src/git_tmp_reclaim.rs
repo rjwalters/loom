@@ -54,6 +54,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::fs_util::human_size;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -569,20 +571,6 @@ impl GitTmpReclaimReport {
             human_size(self.totals.bytes),
             self.totals.kept_young,
         )
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    const K: f64 = 1024.0;
-    let b = bytes as f64;
-    if b >= K * K * K {
-        format!("{:.1}G", b / (K * K * K))
-    } else if b >= K * K {
-        format!("{:.1}M", b / (K * K))
-    } else if b >= K {
-        format!("{:.1}K", b / K)
-    } else {
-        format!("{bytes}B")
     }
 }
 

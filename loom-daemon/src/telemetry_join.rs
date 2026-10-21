@@ -408,7 +408,6 @@ pub async fn join<S: ProbeSender + Sync>(
         captured_at: Utc::now(),
         host: plan.host.clone(),
         exporters: vec![],
-        fact_id_missing_total: 0,
     };
     let envelope = TelemetryEnvelope::new(plan.host.clone(), TelemetryRecord::HostExport(record));
     let probe_needle = probe_needle(&envelope)?;

@@ -120,6 +120,10 @@ pub struct ClaimFacts {
     pub claim_ms: u64,
     /// The last line of the claim's stderr, sanitised and bounded.
     pub stderr_tail: Option<String>,
+    /// What a refused Builder claim's rollback did (#12822): `none`,
+    /// `lease_yielded`, `label_restored`, `both` or `failed`. `None` when no
+    /// rollback ran (a role-keyed claim, which reaps its own leases).
+    pub rollback: Option<&'static str>,
 }
 
 /// What a pre-claim's exit says. Pure.
@@ -321,12 +325,13 @@ impl SweepRegistry {
 pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimFacts, StepRefusal> {
     let Some(mut cmd) = cmd else {
         let mut refusal = StepRefusal::new("claim_unverified", "no loom-daemon binary");
-        refusal.claim = Some(ClaimFacts {
+        refusal.claim = Some(Box::new(ClaimFacts {
             outcome: "no_binary",
             exit_code: None,
             claim_ms: 0,
             stderr_tail: None,
-        });
+            rollback: None,
+        }));
         return Err(refusal);
     };
     let (run, elapsed, tail) = run_bounded(&mut cmd, CLAIM_TIMEOUT);
@@ -335,6 +340,7 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
         exit_code: run.code(),
         claim_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         stderr_tail: tail,
+        rollback: None,
     };
     match claim_verdict(&run) {
         Ok(()) => Ok(facts),
@@ -342,7 +348,7 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
             if let Some(tail) = &facts.stderr_tail {
                 refusal.detail = format!("{} (stderr: {tail})", refusal.detail);
             }
-            refusal.claim = Some(facts);
+            refusal.claim = Some(Box::new(facts));
             Err(refusal)
         }
     }

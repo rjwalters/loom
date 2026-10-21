@@ -6,23 +6,14 @@
 //! `loom.token_ranking.*` attributes, so "how many metered probes did this host
 //! send today" is a plain sum over `loom.token_ranking.api_key_probe_count`.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::kinds::token_ranking_refresh::{
     AccountOutcome, RoundOutcome, TokenRankingRefreshRecord,
 };
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 /// A failed round, or a round that spent money on an API-key probe, is a
 /// warning. Everything else is info.

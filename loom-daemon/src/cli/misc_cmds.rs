@@ -5,7 +5,7 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 
-use loom_daemon::role_validation;
+use crate::role_validation;
 
 /// Arguments for `loom-daemon init [PATH]`. Lives here rather than inline in
 /// `main.rs`'s `Commands` enum so `main.rs` stays under its file-size ratchet.
@@ -30,7 +30,7 @@ pub(crate) struct InitArgs {
     /// Omitting the flag (or passing `default`) is the stock install; it
     /// never REMOVES a marker already on disk.
     #[arg(long, value_name = "MODE", default_value = "default")]
-    pub(crate) mode: loom_daemon::init::InstallMode,
+    pub(crate) mode: crate::init::InstallMode,
 
     /// Print what would be done without making changes
     #[arg(long)]
@@ -81,7 +81,7 @@ pub(crate) fn run_init(args: InitArgs) -> Result<()> {
         println!("  Mode:      session (no tmux agent pool, no daemon-tier work generation)");
     }
 
-    match loom_daemon::init::initialize_workspace_with_mode(workspace_str, &defaults, force, mode) {
+    match crate::init::initialize_workspace_with_mode(workspace_str, &defaults, force, mode) {
         Ok(report) => {
             if report.is_self_install {
                 println!("\nLoom source repository detected!");
@@ -263,7 +263,7 @@ pub(crate) fn handle_update_gitignore_command(workspace: &str) -> Result<()> {
         std::env::current_dir()?.join(workspace_path)
     };
 
-    loom_daemon::init::update_gitignore(&absolute_workspace)
+    crate::init::update_gitignore(&absolute_workspace)
         .map_err(|e| anyhow!("Failed to update .gitignore: {e}"))?;
 
     println!(
@@ -279,7 +279,7 @@ pub(crate) fn handle_validate_command(
     strict: bool,
     verbose: bool,
 ) -> Result<()> {
-    use loom_daemon::config_resolver;
+    use crate::config_resolver;
     use role_validation::{format_validation_result, validate_from_config, ValidationMode};
 
     let workspace_path = std::path::Path::new(workspace);
@@ -421,10 +421,10 @@ pub(crate) fn handle_sweep_outcomes_command(
     pending_export: bool,
     json: bool,
 ) -> Result<()> {
-    use loom_daemon::observability::backfill;
-    use loom_daemon::sweep_outcomes;
-    use loom_daemon::telemetry;
-    use loom_daemon::worktree_ops::repo;
+    use crate::observability::backfill;
+    use crate::sweep_outcomes;
+    use crate::telemetry;
+    use crate::worktree_ops::repo;
 
     let repo_root = repo::resolve_repo_root(workspace)?;
     let path = sweep_outcomes::default_outcome_telemetry_path(&repo_root);
@@ -529,10 +529,10 @@ pub(crate) fn handle_sweep_outcomes_command(
 }
 
 /// Parse `loom-daemon sweep-outcomes --result <VALUE>` into a
-/// [`loom_daemon::telemetry::SweepResult`]. Case-insensitive; accepts both
+/// [`crate::telemetry::SweepResult`]. Case-insensitive; accepts both
 /// `cancelled` and `canceled` spellings.
-fn parse_sweep_result_arg(s: &str) -> Result<loom_daemon::telemetry::SweepResult> {
-    use loom_daemon::telemetry::SweepResult;
+fn parse_sweep_result_arg(s: &str) -> Result<crate::telemetry::SweepResult> {
+    use crate::telemetry::SweepResult;
     match s.to_ascii_lowercase().as_str() {
         "success" => Ok(SweepResult::Success),
         "failure" => Ok(SweepResult::Failure),
