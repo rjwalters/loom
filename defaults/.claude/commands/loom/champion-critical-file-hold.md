@@ -34,7 +34,7 @@ path; `judgeApproval` and `greenCi` holding) passes #3, so this tick receives
 `$CRITERION3_RESULT="PASS"` and writes no hold. Any open episode closes through
 the ordinary PASS row (cleared notice + remove `loom:blocked`), naming the class
 id. One file outside the class, an excluded file, a forbidden line or an
-unreadable diff restores the FAIL and this whole machine. The kept set (the
+unreadable diff restores the FAIL and this whole machine. A `dependabot-bumps` class (`authorIsDependabot`, manifest and lockfile `filePatterns`; #12948) is the fleet-default example: Dependabot's own manifest bumps pass #3, a human PR with the same diff does not. The kept set (the
 merge gate, guard hooks, credential selection, installers/updaters,
 migrations) is never satisfiable by a class.
 
