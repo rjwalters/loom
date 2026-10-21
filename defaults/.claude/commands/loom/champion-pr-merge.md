@@ -1477,7 +1477,7 @@ its critical-file caveat, or its role as sticky-hold release path (a).
 **Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read** — an existing key in `.loom/config.json` is inert and can be deleted. A repo that used a low value to keep Champion conservative should rely instead on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running the auto-merge pass.
 
 ### 3. Critical File Exclusion Check
-- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below)
+- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below), a `Cargo.toml` / `package.json` edit with no suspect line (see "Suspect-line carve-out" below), or a workflow change with `WF_BLAST=green`
 
 **Critical file patterns** (do NOT auto-merge if PR modifies any of these):
 - `Cargo.toml` - root dependency changes
@@ -1540,6 +1540,34 @@ version_only_diff() {
   loom-daemon forge version-only-diff "$number" "$file" >/dev/null || return 1
 }
 
+# Suspect-line carve-out (#12999): a Cargo.toml / package.json hit passes when no
+# changed line touches a suspect surface (dependency/patch/replace/features
+# tables, build/links/git/registry/path source keys, package.json dependency
+# keys and install lifecycle scripts) -- e.g. new [[bin]] entries (#12976). The
+# decision is `loom-daemon forge suspect-critical-diff`: exit 0 AND a literal
+# `SUSPECT=0` line is the ONLY pass. A suspect line exits 1 and prints
+# SUSPECT_LINE= / SUSPECT_SECTION= (kept for the FAIL line and the hold
+# comment); anything else -- patch missing/empty, unparseable hunk, forge error,
+# 2 (a daemon predating the verb), 126/127 (no binary) -- is a hold with no line.
+CRITERION3_SUSPECT_LINE=""; CRITERION3_SUSPECT_SECTION=""
+suspect_critical_diff() {
+  local file="$1" number="$2" out rc
+  case "${file##*/}" in Cargo.toml|package.json) ;; *) return 1 ;; esac
+  out=$(loom-daemon forge suspect-critical-diff "$number" "$file" 2>/dev/null); rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qx 'SUSPECT=0'; then return 0; fi
+  CRITERION3_SUSPECT_LINE=$(printf '%s\n' "$out" | sed -n 's/^SUSPECT_LINE=//p' | head -1)
+  CRITERION3_SUSPECT_SECTION=$(printf '%s\n' "$out" | sed -n 's/^SUSPECT_SECTION=//p' | head -1)
+  return 1
+}
+
+# A .github/workflows/* hit passes only when criterion #2's ci_workflow_blast_eval
+# returned WF_BLAST=green (#12677). Not defined, red, or none-with-a-hit: hold.
+wf_blast_green() {
+  type ci_workflow_blast_eval >/dev/null 2>&1 || return 1
+  [ -n "${WF_BLAST:-}" ] || ci_workflow_blast_eval
+  [ "${WF_BLAST:-}" = green ]
+}
+
 # Standing-authorization class check (#12528), BEFORE any FAIL is emitted: a
 # class with "coversCriticalFiles": true that matches the whole PR (exact
 # subset, no excludeFilePatterns / forbiddenDiffPatterns / kept-set hit,
@@ -1580,8 +1608,12 @@ while IFS= read -r file; do
     if [[ "$file" == *"$pattern"* ]]; then
       if version_only_diff "$file" <number>; then
         echo "PASS (version-only carve-out): $file"
+      elif suspect_critical_diff "$file" <number>; then
+        echo "PASS (no suspect line, #12999): $file"
+      elif [[ "$file" == *".github/workflows/"* ]] && wf_blast_green; then
+        echo "PASS (WF_BLAST=green, #12677): $file"
       else
-        echo "FAIL: Critical file modified: $file"
+        echo "FAIL: Critical file modified: $file${CRITERION3_SUSPECT_LINE:+ -- suspect line [$CRITERION3_SUSPECT_SECTION]: $CRITERION3_SUSPECT_LINE}"
         exit 1
       fi
       continue 2
@@ -1607,6 +1639,8 @@ generalize this pattern to any other critical file or any other kind of
 "trivial-looking" diff — it is scoped to exactly these 6 filenames and
 exactly a version-string line change.
 
+**Suspect-line carve-out (#12999, operator ruling 2026-10-21)**: a critical-file hit is not a blanket veto on every edit to it. For a `Cargo.toml`-family or `package.json`-family hit that `version_only_diff` did not clear, the check-loop calls `suspect_critical_diff`, which wraps `loom-daemon forge suspect-critical-diff <pr> <file>`. Only a clean exit 0 with `SUSPECT=0` passes. It holds when a changed line is in a dependency, dev/build/target dependency, `[patch.*]`, `[replace]` or `[features]` table, is a `build =` / `links =` / `git =` / `registry =` / `path =` source key (a target table's own `path =` under `[[bin]]`, `[[bench]]`, `[[test]]`, `[[example]]` or `[lib]` is not one), or, in `package.json`, sits under `dependencies` / `devDependencies` / `optionalDependencies` / `peerDependencies` / `overrides` / `resolutions` or is a `preinstall` / `install` / `postinstall` / `prepare` script. A suspect hit emits the FAIL line with the matched line and its section, and passes that line on to the hold comment as `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION`. Every other outcome is a hold: no patch, an unparseable hunk, an unreadable head file for a hunk whose section the patch does not show, a forge error, exit 2 from an older daemon, 126/127 for no binary. A `.github/workflows/*` hit passes only on `WF_BLAST=green` (criterion #2's `ci_workflow_blast_eval`); red, none, or an unreadable read holds. `migrations/` and `_migration.py` hits still hold on any change. The carve-out never widens `CRITICAL_PATTERNS` and never judges anything but these two manifest families; `Cargo.lock` and `package-lock.json` keep today's version-only treatment.
+
 **Standing-authorization class (#12528)**: the check-loop runs `standing_auth_eval critical` (defined under criterion #2) before it can emit FAIL. A `champion.standingAuthorizations` class with `"coversCriticalFiles": true` whose `filePatterns` cover **every** changed file, with no changed file in `excludeFilePatterns`, no added/removed line matching `forbiddenDiffPatterns`, no kept-set path, and every `conditions` entry (`judgeApproval`, `greenCi`) holding now, passes this criterion and names the class id. Any one file outside the class, an excluded file, a forbidden diff line, an unreadable diff or a kept-set path restores today's FAIL and the durable hold below. A class without the flag, or no class at all, changes nothing. The check is mechanical, never a judgment call.
 
 **Critical-files-only class (#12648)**: a class with `"criticalFilesOnly": true` is matched against the **critical-file hits** only: the changed files this criterion's `CRITICAL_PATTERNS` flag, and the `previous_filename` of each on a rename. If every hit matches the class's `filePatterns`, no hit matches `excludeFilePatterns`, no added/removed line of a hit's patch matches `forbiddenDiffPatterns` (a hit with no patch fails closed), no changed file at all is a kept-set path, and every condition holds now, this criterion passes and the PASS line names the class (`#12648`) and the critical files. The other changed files are not matched against the class; criterion #2 judged them, and the whole PR, on the four axes, because such a class is never eligible there. A rename into a covered path from outside the class or from a kept-set path, a forbidden line in the workflow patch, or an excluded workflow restores the FAIL and the durable hold. An open hold episode closes through the ordinary PASS row.
@@ -1621,7 +1655,7 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 
 **Durable hold on FAIL, not a transient retry (#6879, #9016)**: a critical-file FAIL is a **one-way terminal state** — nothing about a diff's critical-file-ness changes without a human decision or a later push that narrows the diff — so it gets its own durable hold, never the shared "Transient failures" template in "PR Rejection Workflow" (`critical-file` is not one of that section's `CRITERION_KEY` values).
 
-Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITERION3_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise). That file owns the whole state machine: the `loom:blocked` label and its reason-only park record (#11861, was `loom:operator`), the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:blocked` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
+Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITERION3_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise), plus `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION` when the FAIL named a suspect line. That file owns the whole state machine: the `loom:blocked` label and its reason-only park record (#11861, was `loom:operator`), the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:blocked` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
 
 A FAIL skips Steps 2-3 for this PR this pass in **every** one of those states, including a released one — releasing the hold hands the merge to the operator, never back to Champion — and `loom:auto-merge-ok` does not release it (that override is scoped to criterion #2).
 
