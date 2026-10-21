@@ -29,8 +29,8 @@ async fn trace_transport_posts_valid_spans_and_counts_filtered_spans_separately(
     assert_eq!(outcome.signals["spans"].accepted, 1);
     assert_eq!(outcome.signals["spans"].dropped, 1);
     let requests = sink.requests();
-    assert_eq!(requests[0].0, "/v1/traces");
-    let json: serde_json::Value = serde_json::from_slice(&requests[0].1).unwrap();
+    assert_eq!(requests[0].path, "/v1/traces");
+    let json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(
         json["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
@@ -57,7 +57,7 @@ async fn successful_trace_prefix_is_not_retried_after_log_failure() {
     assert_eq!(
         sink.requests()
             .iter()
-            .filter(|(path, _)| path == "/v1/traces")
+            .filter(|request| request.path == "/v1/traces")
             .count(),
         1
     );
@@ -175,10 +175,12 @@ async fn shutdown_does_not_repost_partial_logs_while_metrics_are_in_flight() {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
-                        let Some((path, _)) = read_request(&mut stream) else {
+                        let Some(request) =
+                            crate::observability::test_sink::read_request(&mut stream)
+                        else {
                             continue;
                         };
-                        if path == "/v1/metrics" {
+                        if request.path == "/v1/metrics" {
                             held_metrics.push(stream);
                             metrics.notify_one();
                         } else {
