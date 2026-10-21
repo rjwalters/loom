@@ -3750,8 +3750,9 @@ Never the failure exit **1**; each means "the merge did not happen":
 - **3** — the head moved between the fresh head-SHA read and the merge call.
 - **4** — retired (#12063 slice 1): `merge-pr.sh` no longer re-dates checks, so
   it never emits 4. Still re-queued if seen, for mixed versions mid-roll.
-- **5** — the forge refused the merge call: a required status check is pending
-  or red on this head (#12063). Nothing waits; re-queuing is cheap.
+- **5** — a required status check is missing or pending on this head (#10688), or
+  the forge refused the merge call over a pending/red one (#12063). Nothing
+  waits; re-queuing is cheap.
 - **7** — `merge-pr.sh` ran: a sequencing hold (`LOOM-SEQUENCED-HOLD`,
   #11330), never a stall. Or Step 3's: `merge-queue step` gave no direct
   verdict, so `merge-pr.sh` never ran (#10256). QUEUED / DROPPED / HANDED-OFF /

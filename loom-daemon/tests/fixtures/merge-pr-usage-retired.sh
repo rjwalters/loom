@@ -64,7 +64,13 @@ Options:
                          records an audit PR comment. Operator asserts
                          responsibility.
   --allow-red-required <context>
-                         No-op (#12063): accepted and ignored with a warning.
+                         Repeatable. Merge over a red REQUIRED status-check
+                         context, for exactly the named context(s). Otherwise
+                         a merge refuses (exit 1) on any red required context
+                         and holds (exit 5) on a missing or pending one, even
+                         with a token that could bypass branch protection
+                         (#10688). Warns and, on a real merge, records an
+                         audit PR comment.
   --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard.
                          By default the script refuses to merge (exit 1) a
                          PR whose current head does not carry the loom:pr
@@ -143,7 +149,7 @@ Precedence (highest wins):
 
 Exit codes:
   0 = merged (or --help) · 1 = failed
-  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = held: a required status check is pending or red on this head (#12063) — neither is a failure; retry later
+  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = held: a required status check is missing, pending or red on this head (#10688, #12063) — neither is a failure; retry later
   4 = retired (#12063): no longer emitted
   7 = held by a sequencing order, loom:pr + loom:sequenced only (#11330; prints LOOM-SEQUENCED-HOLD pr=N after=M) — nothing written; retry later
   8 = --expected-head refused: the PR head is not the SHA the caller evaluated (#11859; prints LOOM-EXPECTED-HEAD-MISMATCH pr=N expected=S actual=S) — nothing written; re-evaluate, never retry blind

@@ -778,6 +778,12 @@ pub(crate) enum MergePrCommand {
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
 
+    /// Refuse a plain merge whose head has a required context that concluded
+    /// red (#10688); hold (exit 3) on a missing/pending one.
+    /// `--allow-red-required <ctx>` overrides named contexts with an audit
+    /// comment. Exit 0 = clean/bypassed, 1 = refuse, 2 = forge unreadable.
+    RequiredChecks(super::merge_pr_required_checks::RequiredChecksArgs),
+
     /// Read-only report of which required checks and paths forced the #8508
     /// re-dates (#9746), from the trailers on the re-date commits reachable
     /// from `--ref` (default origin/main) within `--since` (default 24h).
@@ -1066,6 +1072,7 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
+            MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::LoomPrOverrideComment(args) => args.run(),

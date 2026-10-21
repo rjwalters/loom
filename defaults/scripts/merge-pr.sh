@@ -34,7 +34,14 @@
 #   --allow-red-tree       Proceed past a failing repo `merge.treeChecks` gate (warns +
 #                          audit comment). See #10026.
 #   --allow-red-required <context>
-#                          No-op (#12063 slice 2); accepted and ignored with a warning.
+#                          Repeatable. Merge over a red REQUIRED status-check
+#                          context, for exactly the named context(s). Without
+#                          it a merge refuses (exit 1) when any required
+#                          context concluded red, and holds (exit 5) when one
+#                          is missing or pending — even with a token that
+#                          could bypass branch protection. Warns and, on a
+#                          real merge, posts a PR audit comment, like
+#                          --allow-unapproved. See #10688.
 #   --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard,
 #                          which otherwise hard-blocks merging a PR whose
 #                          current head carries no loom:pr label (no
@@ -118,8 +125,9 @@
 #       detection trap" in the doc above for why ancestry can't verify this.
 #   4 = retired (#12063 slice 1): the #8248 freshness guard and its #8508
 #       re-date remedy are gone; never emitted.
-#   5 = held: the forge refused the merge call because a required status
-#       check is pending or red on this head (#12063 slice 2). Re-queue.
+#   5 = held: a required context is missing or pending on this head (#10688),
+#       or the forge refused the merge call because a required status check is
+#       pending or red (#12063 slice 2). Re-queue.
 #   7 = held by a sequencing order (#11330): the PR carries loom:pr +
 #       loom:sequenced and no other blocker. Prints `LOOM-SEQUENCED-HOLD
 #       pr=<N> after=<M>`; the predecessor landing clears it (#9378). Re-queue
@@ -332,9 +340,10 @@ CLEANUP_PRIMARY_CHECKOUT=true; DRY_RUN=false; WORKTREE_PATH_OVERRIDE=""; ALLOW_S
 # ALLOW_UNAPPROVED (#7419): bypasses the loom:pr review-signal guard
 # (_check_loom_pr_label below). Off by default — a missing loom:pr label
 # hard-blocks the merge unless the operator explicitly opts in here.
-# ALLOW_RED_TREE (#10026): bypasses _check_tree_checks. MERGE_METHOD_REQUESTED (#8845): explicit
+# ALLOW_RED_TREE (#10026): bypasses _check_tree_checks. ALLOW_RED_REQUIRED (#10688): contexts
+# _check_required_checks may merge over red. MERGE_METHOD_REQUESTED (#8845): explicit
 # --merge-method override, resolved against REPO_MERGE_METHOD once parsing is done.
-ALLOW_UNAPPROVED=false; ALLOW_RED_TREE=false; MERGE_METHOD_REQUESTED=""; EXPECTED_HEAD_SHA=""
+ALLOW_UNAPPROVED=false; ALLOW_RED_TREE=false; ALLOW_RED_REQUIRED=(); MERGE_METHOD_REQUESTED=""; EXPECTED_HEAD_SHA=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -352,7 +361,7 @@ while [[ $# -gt 0 ]]; do
     --allow-stacked-children) ALLOW_STACKED_CHILDREN=true; shift ;;
     --allow-unapproved) ALLOW_UNAPPROVED=true; shift ;;
     --allow-red-tree) ALLOW_RED_TREE=true; shift ;;
-    --allow-red-required) [[ $# -lt 2 || -z "$2" ]] && error "--allow-red-required requires a context name"; warning "--allow-red-required is a no-op (#12063 slice 2): GitHub gates required checks"; shift 2 ;;
+    --allow-red-required) [[ $# -lt 2 || -z "$2" ]] && error "--allow-red-required requires a context name"; ALLOW_RED_REQUIRED+=("$2"); shift 2 ;;
     # #8845's --merge-method arm is paid for by flattening the `*)` positional
     # arm below onto one line — the shell-budget ratchet's option 2
     # (.loom/docs/shell-language-policy.md), same offsetting convention
@@ -848,6 +857,14 @@ _check_verdict_label_contradiction
 # #10026: repo-declared merge.treeChecks run on the merge tree (base + PR head) by `loom-daemon merge-pr tree-checks`. Strict no-op (no daemon call) unless .loom/config.json declares checks; once declared it fails CLOSED, so a missing/older daemon refuses (deliberately no requires-daemon floor: repos that do not opt in are unaffected). --allow-red-tree warns; the daemon records the audit comment. See defaults/docs/merge-tree-checks.md.
 _check_tree_checks() { local n msg rc=0 base_ref flags=(); n="$(jq -r '(.merge.treeChecks // []) | length' "${REPO_ROOT:-.}/.loom/config.json" 2>/dev/null)" || true; [[ -f "${REPO_ROOT:-.}/.loom/config.json" && "$n" != "0" ]] || return 0; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ "$DRY_RUN" != "true" ]] || flags+=(--dry-run); [[ "$ALLOW_RED_TREE" != "true" ]] || flags+=(--allow-red-tree); msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr tree-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "${base_ref:-${DEFAULT_BRANCH_NAME:-main}}" --config "${REPO_ROOT:-.}/.loom/config.json" ${flags[@]+"${flags[@]}"})" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-TREE-CHECKS-CLEAN" ]] && return 0; [[ $rc -eq 0 && "$msg" == "LOOM-TREE-CHECKS-BYPASSED"* ]] && { warning "$msg"; return 0; }; [[ $rc -eq 1 ]] || msg="Merge blocked: PR #$PR_NUMBER's merge.treeChecks gate (#10026) could not run (exit $rc): $msg. A gate that cannot run refuses the merge; fix the cause (build/roll loom-daemon, config, fetch); --allow-red-tree overrides only a failing check, not a gate that cannot run."; [[ "$DRY_RUN" != "true" ]] || { warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; }; error "$msg"; }
 _check_tree_checks
+# #10688: no required context may be red, missing or pending on the PLAIN path (called below, after the
+# merge-precondition read; --auto's wait loop already refuses red required checks via checks-failure),
+# where branch protection is the only other guard and a bypass-capable (admin) token walks through it.
+# Logic: `loom-daemon merge-pr required-checks` (merge_pr/checks_failure/required.rs); GitHub-only like
+# the forge read. Red -> exit 1 unless every red context is named by --allow-red-required (the daemon
+# posts the audit comment); missing/pending -> HOLD exit 5; unreadable forge -> exit 1. FAIL-OPEN on a
+# daemon predating the verb (warns; branch protection stays the guard), so no requires-daemon floor raise.
+_check_required_checks() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 a f=() base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; for a in ${ALLOW_RED_REQUIRED[@]+"${ALLOW_RED_REQUIRED[@]}"}; do f+=(--allow-red-required "$a"); done; [[ "$DRY_RUN" != "true" ]] || f+=(--dry-run); msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr required-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "${MERGE_PRECONDITION_SHA:-$PR_HEAD_SHA}" --base-ref "${base_ref:-${DEFAULT_BRANCH_NAME:-main}}" ${f[@]+"${f[@]}"})" || rc=$?; case "$rc:$msg" in "0:LOOM-REQUIRED-CHECKS-CLEAN") return 0 ;; "0:LOOM-REQUIRED-CHECKS-BYPASSED "*) warning "${msg#LOOM-REQUIRED-CHECKS-BYPASSED }"; return 0 ;; "3:LOOM-REQUIRED-CHECKS-HOLD "*) msg="Merge held: PR #$PR_NUMBER — ${msg#LOOM-REQUIRED-CHECKS-HOLD }"; [[ "$DRY_RUN" != "true" ]] || { warning "[dry-run] Would HOLD merge of PR #$PR_NUMBER (exit 5): $msg"; return 0; }; warning "$msg" >&2; warning "Exiting 5: not merged this pass (#10688). Re-attempt on a later pass." >&2; exit 5 ;; "1:Merge blocked:"*) ;; "2:LOOM-REQUIRED-CHECKS-UNREADABLE "*) msg="Merge blocked: PR #$PR_NUMBER's required-context conclusion gate (#10688) could not read the forge: ${msg#LOOM-REQUIRED-CHECKS-UNREADABLE }. An unreadable gate is not permission to merge; re-run once the forge API is healthy." ;; *) warning "Required-context conclusion gate (#10688) did not run ('merge-pr required-checks' exited $rc${msg:+: $msg}); proceeding with branch protection as the only check. Roll loom-daemon to a build carrying 'merge-pr required-checks' to restore it."; return 0 ;; esac; [[ "$DRY_RUN" != "true" ]] || { warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; }; error "$msg"; }
 
 # ---------------------------------------------------------------------------
 # Partial-increment closing-keyword conflict detection (#4569, extended by
@@ -1641,7 +1658,7 @@ _MPS_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || 
 _MPS_FRESH_SHA="$(echo "$_MPS_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
 # #11859: under --expected-head the fresh read must equal the caller's SHA, and the caller's SHA is what the forge merge call is gated on.
 [[ -n "$_MPS_FRESH_SHA" ]] && MERGE_PRECONDITION_SHA="$_MPS_FRESH_SHA"; _check_expected_head "$MERGE_PRECONDITION_SHA"; MERGE_PRECONDITION_SHA="${EXPECTED_HEAD_SHA:-$MERGE_PRECONDITION_SHA}"
-unset _MPS_JSON _MPS_FRESH_SHA
+unset _MPS_JSON _MPS_FRESH_SHA; _check_required_checks
 
 # Re-pin refs/loom/parent/<branch> to the SHA actually being merged (#8010
 # item 3), when the merge-ordering guard above pinned one. That guard pinned

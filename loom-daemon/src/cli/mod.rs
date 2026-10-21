@@ -106,6 +106,7 @@ mod merge_pr_reconcile;
 mod merge_pr_redate_report;
 mod merge_pr_refs;
 mod merge_pr_remove_gate;
+mod merge_pr_required_checks;
 mod merge_pr_response;
 mod merge_pr_retarget_children;
 mod merge_pr_sequence;

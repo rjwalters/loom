@@ -294,10 +294,13 @@ echo "Testing the merge-pr floor covers every fail-closed sub-subcommand (#8967)
 # (ci-result 0.19.763 and stale-checks 0.19.221 were fail-closed rows until
 # #12063 slice 1 deleted both gates, and checks-failure 0.19.465 until slice 2 deleted
 # the wait that called it, which LOWERED the floor to partial-conflict.)
+# required-checks (#10688) is `open`: a binary without the verb warns and leaves branch protection as
+# the guard. Its forge-read failures DO refuse, but only a binary that has the verb can report one.
 # tree-checks (#10026) is `open` BY CONSTRUCTION: _check_tree_checks only calls it when .loom/config.json
 # declares merge.treeChecks (opt-in), so no repo that has not opted in is gated on a daemon carrying it; an
 # opted-in repo on an older binary is refused (fail closed) and told to roll the host.
 MERGE_PR_VERB_TABLE="verdict-contradiction closed 0.19.172
+required-checks open -
 tree-checks open -
 loom-pr-guard closed 0.19.375
 classify-response closed 0.19.456

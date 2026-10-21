@@ -168,7 +168,6 @@ scripts/tests/test-merge-pr-auto-queued-stacked-children.sh
 scripts/tests/test-merge-pr-check-runs-404-fallback.sh
 scripts/tests/test-merge-pr-head-sync-retry.sh
 scripts/tests/test-merge-pr-rate-limit-fallback.sh
-scripts/tests/test-merge-pr-required-checks.sh
 scripts/tests/test-merge-pr-stale-mergeable.sh
 scripts/tests/test-merge-pr-unstable-fallback.sh
 scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh

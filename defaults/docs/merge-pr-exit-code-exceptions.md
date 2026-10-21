@@ -28,10 +28,10 @@ failure — the safe degradation for a caller older than a new code.
 | exit | retryable? | cause | caller action |
 |---|---|---|---|
 | `0` | — | Merged. | Done. |
-| `1` | no | Everything else: a real refusal or failure, including a merge the forge refused as unmergeable (conflict, not allowed). | Failure handling (Champion's "Merge Failed" comment). |
+| `1` | no | Everything else: a real refusal or failure, including a merge the forge refused as unmergeable (conflict, not allowed) and a red required context (#10688; `--allow-red-required <context>` overrides one named context). | Failure handling (Champion's "Merge Failed" comment). |
 | `3` | yes | The PR's head moved between the fresh head-SHA read and the merge call (#5579) — someone else moved it. | Re-queue; the verdict does not carry to the new head (#5686). |
 | `4` | yes | Retired (#12063): never emitted. Was the #8508 re-date push. | Re-queue if seen from an older script. |
-| `5` | yes | Held: the forge refused the merge call because a required status check is pending or red on this head (#12063). `merge-pr.sh` waits for nothing; GitHub is the gate. Nobody moved the head. | Re-queue. |
+| `5` | yes | Held: a required context is missing or pending on this head (#10688, caught before the call so a bypass-capable token cannot walk past it), or the forge refused the merge call because a required status check is pending or red (#12063). `merge-pr.sh` waits for nothing. Nobody moved the head. | Re-queue. |
 | `7` | yes | `merge-pr.sh`: the PR carries `loom:pr` + `loom:sequenced` and no other blocker; stdout carries `LOOM-SEQUENCED-HOLD pr=<N> after=<M>` (#11330). Or *(Champion Step 3 only)* `forge merge-queue step` gave no `LOOM-MERGE-QUEUE-DIRECT` verdict (#10256, #10628). | Re-queue, like 6. The sequencing hold clears when `<M>` lands (`merge-pr sequence-eval`); a queue stall is surfaced by Step 3. |
 | `8` | no, re-evaluate | Only with `--expected-head <sha>` (#11859): the PR head is not the SHA the caller evaluated, on the first uncached read or the merge precondition read. stdout carries `LOOM-EXPECTED-HEAD-MISMATCH pr=<N> expected=<sha> actual=<sha\|unknown>`. Nothing was merged or written. | Not a failure comment. The caller's evaluation describes another tree: re-run the evaluation on the current head (a targeted Champion ends its step with `outcome=head-moved`). Never retry the same `--expected-head`. |
 | `10` | yes | *(Champion Step 3 only)* `loom-daemon champion-hold classify` did not answer `state=clear`: a Champion hold, another actor's `loom:blocked` park, a verdict contradiction, a PR whose base is a Loom stack branch (`feature/issue-N` or `feature/harness-ops-N`), open parent or not (#12761), or an unreadable state (#11932). `merge-pr.sh` never ran. | No "Merge Failed"; skip silently. A park is someone's decision, not a failure. |
@@ -90,12 +90,20 @@ remain for the #10888 before/after measurement.
 
 `merge-pr.sh` makes one merge call and waits for nothing. Before #12063 slice 2,
 `--auto` polled the head's check-runs for up to `LOOM_AUTO_MERGE_TIMEOUT`
-(#8410, #8896), a plain merge ran its own required-context gate (#10688), and a
-stale-mergeable pre-read and a branch self-sync sat in front of the call. All of
-that is deleted: GitHub's ruleset decides whether the required checks at the
-approved head are acceptable, and `--auto`, `--allow-red-required` and
-`LOOM_AUTO_MERGE_*` are accepted and ignored (`--auto` and `--allow-red-required`
-print a one-line warning).
+(#8410, #8896), and a stale-mergeable pre-read and a branch self-sync sat in
+front of the call. All of that is deleted: GitHub's ruleset decides whether the
+required checks at the approved head are acceptable, and `--auto` and
+`LOOM_AUTO_MERGE_*` are accepted and ignored (`--auto` prints a one-line
+warning).
+
+**Kept: the required-context conclusion gate (#10688).** `_check_required_checks`
+(`loom-daemon merge-pr required-checks`) still runs once before the call. A
+bypass-capable (admin) token walks through the ruleset's required checks
+(2AMLogic/2am#3112), so the script itself refuses (exit 1) a red required
+context and holds (exit 5) a missing or pending one;
+`--allow-red-required <context>` overrides exactly the named contexts and
+records an audit comment. It is GitHub-only and fails open on a daemon that
+predates the verb.
 
 When the forge refuses the call because a required status check is pending or
 red, the script exits **5**: nothing merged, the head did not move, the verdict
