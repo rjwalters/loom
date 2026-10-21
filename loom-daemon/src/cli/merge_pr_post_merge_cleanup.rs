@@ -21,7 +21,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::post_merge_cleanup::{
+use crate::merge_pr::post_merge_cleanup::{
     run, Facts, Inputs, Landed, Outcome, SystemHost, DONE, NEED_EXIT,
 };
 
