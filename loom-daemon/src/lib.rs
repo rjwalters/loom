@@ -459,6 +459,7 @@ pub mod tmpfs_visibility;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;
+pub mod tools_mode;
 pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;
