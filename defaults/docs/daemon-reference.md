@@ -3428,10 +3428,8 @@ dashboard has a matching "Ready queue" panel. The single-workspace tick path doe
 not record rows. Each row also carries daemon-derived `state` and `reason`
 strings, so clients do not keep their own copy of the mapping. With
 observability export on, the queue also reaches SigNoz as
-`loom.queue.issues{state,reason}` gauges and reaches the fleet backend as a
-`queue.snapshot` record (phase 2; see
+`loom.queue.issues{state,reason}` gauges (see
 [`observability.md` §3c](observability.md#3c-operational-signals-from-daemon-loops-issue-8860)).
-The fleet dashboard view is phase 3.
 
 **Dispatch plan (#9288).** Each row also carries `position`, `plan_state`
 (`running` / `next` / `queued` / `blocked`), `gate`, `keys` and
@@ -3444,8 +3442,8 @@ The fleet dashboard view is phase 3.
 `#<position> <plan_state>[/<gate>]` per row plus a `Plan:` slot line.
 `--json` adds `plan`, and its `ordering` is the daemon's own key list rather
 than a hard-coded string. `loom:curated` / `loom:triage` are unordered and never
-listed. The single-workspace tick has no plan (`plan: null`). Field reference:
-[`telemetry-schema.md` § `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+listed. The single-workspace tick has no plan (`plan: null`). The plan attributes ride the
+`loom.queue.*` span attributes ([`telemetry-schema.md`](telemetry-schema.md)).
 Folding several hosts' plans into one fleet order (`merge_plans`, #9310) is a
 separate rule: [`dispatch-plan.md`](dispatch-plan.md).
 
@@ -4757,7 +4755,7 @@ they were the largest GitHub read cost a host made on its own initiative.
   decode, but nothing sends them. `telemetry-replay` and its `--check` read only
   records already in the store. A consumer that needs fleet state computes it
   from the facts the daemon still exports (`sweep.*`, `stage.work_started`,
-  `pick.decision`, `queue.snapshot`, `host.health`) and from the forge's label
+  `pick.decision`, `host.health`) and from the forge's label
   history.
 
 Neither loop had a config key, so no fleet configuration needs to change.
@@ -8148,8 +8146,8 @@ Full module-level rationale (including why `evaluate()` stays pure while
 
 #### Forge-read gauges (per host)
 
-The `queue.snapshot` blocked rows list each repo's `loom:blocked` issues, and
-every host produces them itself. The fleet-captain producer that once did this
+The queue's blocked rows listed each repo's `loom:blocked` issues, and
+every host produced them itself. The fleet-captain producer that once did this
 for the fleet (W12, `fleet.captainGauges`, #10673) was removed in #11406: it
 covered the 2 of 61 repos the captain managed, and both had starred issues, so
 stand-down saved almost nothing. A host config that still carries a

@@ -776,7 +776,7 @@ span on a disposition transition (including first sight), on a periodic
 refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
 once as a terminal `left_queue` record when it leaves a repo whose listing
 succeeded. Sampled from the collector's periodic pass (the same cadence as
-`queue.snapshot`), never the tick loop, so a disposition lasting less than one
+the other queue samples), never the tick loop, so a disposition lasting less than one
 collector interval can be missed; a 10-minute-or-longer lookback still always
 contains the current state of every queued issue. Every queued row becomes a
 span (no volume cap: a cap would make which items carry facts depend on
@@ -802,7 +802,7 @@ vocabulary (`loom.queue.disposition`'s wire values):
 | Operator term | Disposition(s) |
 |---|---|
 | "build back-off" / "WIP limit" (PR debt high) | `deferred_build_backoff` (decisions reason `build_backoff`, tick result `build_backoff_held`, #9410) |
-| "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
+| "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
 | "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full). `deferred_ramp_cap`, `deferred_saturation` and `deferred_repo_cap` are retired (#12406; old payloads decode as `unknown`), as is `deferred_out_of_slice` (repo sharding, #11682) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
 | "waiting on overlapping work" (same files) | `deferred_file_overlap` (#9781): its `## Affected Files` share a path with same-repo work admitted earlier this tick or already in flight; the row's `detail` (and the `pick.decision` skip's `detail`) names the shared paths. A one-tick scheduling deferral, never a label or hold — see `daemon-reference.md` §"Same-repo file-overlap deferral" |
 | "repo locked by an open PR" | `open_pr` (the #4123 guard's `pr-open-skip`). Since #9674 the repo's `open_pr` rows carry the repo-level `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` / `lockout.duration_seconds` attributes, so rank which repo's lockout is starving the most ready work by grouping those spans on `loom.repo` |
@@ -1070,8 +1070,10 @@ label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 test enforces this. The gateway also needs its `config.yaml` refreshed, as
 [execution traces](tracing.md) describes, before new label keys survive it.
 
-**The ready queue (Issue #8852, phase 2)** is exported to both sinks, split by
-cardinality:
+**The ready queue (Issue #8852, phase 2)** is exported to SigNoz (OTLP) only. The
+per-issue rows once travelled as a native `queue.snapshot` record; it was
+removed in #12813 with the `/ingest` exporter, and the dispatch-plan fields now
+ride the `loom.queue.*` span attributes:
 
 - **SigNoz (OTLP):** every work-finder tick emits `loom.queue.issues{state,reason}`
   gauges, one per queue disposition with zeros included, plus
@@ -1079,24 +1081,6 @@ cardinality:
   (#11139, a partial listing). These use the labels already on the
   allowlist, so no gateway change is needed. They never carry an issue number
   or a repo.
-- **Fleet dashboard (native HTTPS):** the per-issue rows travel as the
-  `queue.snapshot` record, sampled on the `host.health` interval whenever the
-  work finder has ticked since the last snapshot. Each row carries its forge
-  `owner/repo` and its own `visibility` tag. The OTLP exporter never receives
-  this record. Since #9288 each row also carries its dispatch-plan fields
-  (`position`, `plan_state`, `gate`, …) and the record carries a `plan` block.
-  That block holds the host's slots, tick interval, shard posture, `scope` and
-  key `ordering`. These are per-host plan data only: no gauge or label is
-  added on the OTLP side, and `loom:curated` / `loom:triage` stay unordered.
-
-Both are derived from the same rows as `loom-daemon queue`. See
-[`telemetry-schema.md` → `queue.snapshot`](telemetry-schema.md#queuesnapshot).
-
-**Phase 3** renders the record on the fleet dashboard: per-host backlog /
-running / ready / blocked counts with a freshness badge (`idle` = recent tick,
-empty queue; `stale` = no new tick for 15 minutes; `no queue data` = the host
-never sent one), and a fleet-wide work queue listing every issue
-with its host, phase, waiting time, blocking reason and issue / PR links.
 
 ### Size-bounded `pick.decision` logs (#12974)
 

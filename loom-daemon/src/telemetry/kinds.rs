@@ -421,11 +421,6 @@ macro_rules! telemetry_kind_table {
             MetricPoints = "metric.points" => $crate::telemetry::MetricPointsRecord,
                 gate: 10, otlp: OpsPoints, native: false;
 
-            /// The work finder's ranked ready queue as of its last tick (Issue #8852,
-            /// phase 2). Native-HTTPS only; see [`queue_snapshot`].
-            QueueSnapshot = "queue.snapshot" => $crate::telemetry::QueueSnapshotRecord,
-                gate: 11, otlp: NotExported, native: true;
-
             /// One live agent-output event during an in-flight run (Issue
             /// #9764) — readable, producer-redacted, issue-scoped. The second
             /// kind whose OTLP body is text the daemon did not author, so it

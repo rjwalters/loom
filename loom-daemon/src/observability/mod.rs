@@ -129,7 +129,6 @@ pub mod pick_journal;
 pub mod pick_payload_archive;
 pub mod queue;
 pub mod queue_blocked;
-pub mod queue_snapshot;
 pub mod repo_ref;
 pub mod request_headers;
 pub mod retired_captain_config;
@@ -1092,8 +1091,6 @@ pub fn spawn_task(
         std::collections::BTreeMap::new();
     // The OTLP-only subset, for the `ops` sink (Issue #8860).
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
-    // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
-    let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The OTLP sinks whose senders started, for the agent relay (#10964).
     let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
@@ -1226,8 +1223,6 @@ pub fn spawn_task(
                 headers_file: entry.headers_file.clone(),
             });
             otlp_queues.push(queue.clone());
-        } else {
-            native_queues.push(queue.clone());
         }
         export_queues.insert(name.to_string(), queue.clone());
         queues.push(queue);
@@ -1300,11 +1295,6 @@ pub fn spawn_task(
         ops_handles.push(ops::liveness::spawn_task());
         // IPC request latency by kind (#10765), on its own ticker too.
         ops_handles.push(ops::ipc_latency::spawn_task());
-    }
-    // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
-    // HTTPS queues only, sampled by the collector below.
-    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
-        queue_snapshot::register_global_sink(sink);
     }
     // `daemon.start` (#11197): exactly one lifecycle record per process,
     // offered once the exporters are up — every disabled/under-configured

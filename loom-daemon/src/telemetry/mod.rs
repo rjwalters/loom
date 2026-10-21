@@ -66,7 +66,7 @@ pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod ops;
 pub mod provenance;
-pub mod queue_snapshot;
+pub mod queue_repo;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
@@ -89,7 +89,6 @@ pub use kinds::{
 pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
 pub use phase_tap_usage::PhaseTapUsageRow;
-pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
