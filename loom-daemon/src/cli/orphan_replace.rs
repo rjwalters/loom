@@ -1,5 +1,5 @@
 //! `loom-daemon orphan-replace` — the git half of Doctor's orphan-stack
-//! replacement recipe (#12767). The rules live in [`loom_daemon::orphan_replace`];
+//! replacement recipe (#12767). The rules live in [`crate::orphan_replace`];
 //! this file only parses arguments and prints.
 //!
 //! Exit codes: 0 done (JSON on stdout), 1 refused (`REFUSED <TOKEN>: <why>` on
@@ -9,9 +9,9 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use crate::orphan_replace::{self as replace, CloseDecision, Failure, Orphan};
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use loom_daemon::orphan_replace::{self as replace, CloseDecision, Failure, Orphan};
 
 #[derive(Args, Debug)]
 pub(crate) struct OrphanArgs {

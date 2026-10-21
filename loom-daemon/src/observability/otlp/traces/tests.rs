@@ -109,9 +109,7 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
     use crate::gh_invocation::ParentContext;
     use crate::gh_invocation::{AccessIntent, GhBinSource, GhInvocation, GhTarget, Operation};
     let parent = TraceContext::derived("sweep", &["acme/widgets", "sweep-issue-9-1"]);
-    // #10752: `github.caller` is only stamped inside a caller scope and
-    // `github.number` only on a write whose argv names an issue/PR.
-    let _scope = crate::gh_invocation::caller_scope::enter("stale_blocked_release");
+    // #10752: `github.number` only on a write whose argv names an issue/PR.
     let inv = GhInvocation::new(
         Operation::new("api.graphql"),
         AccessIntent::Write,

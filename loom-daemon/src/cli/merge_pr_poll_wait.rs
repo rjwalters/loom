@@ -24,8 +24,8 @@
 
 use std::io::Read;
 
+use crate::merge_pr::poll_wait::{decide, Inputs, Kind};
 use anyhow::Result;
-use loom_daemon::merge_pr::poll_wait::{decide, Inputs, Kind};
 
 #[derive(clap::ValueEnum, Clone, Copy)]
 enum KindArg {

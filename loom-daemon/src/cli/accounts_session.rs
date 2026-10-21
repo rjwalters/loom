@@ -42,7 +42,7 @@ pub(crate) enum SessionAction {
         json: bool,
     },
     /// Run one supervised job with an exclusive account lease (private mode).
-    Job(loom_daemon::tokens_pool::private_workspace::JobArgs),
+    Job(crate::tokens_pool::private_workspace::JobArgs),
     /// Tear down the container cleanly. Refuses an in-flight `docker exec`
     /// unless `--force` (the #5119 restart-safety contract: never a raw
     /// SIGKILL of active work).
@@ -96,7 +96,7 @@ pub(crate) fn handle_session_command(
     action: SessionAction,
     workspace: std::path::PathBuf,
 ) -> Result<()> {
-    use loom_daemon::tokens_pool::session_lifecycle::{
+    use crate::tokens_pool::session_lifecycle::{
         ProcessContainerRunner, SessionLifecycle, SessionStatus,
     };
 
@@ -105,8 +105,8 @@ pub(crate) fn handle_session_command(
     /// #10661): an operator start lifts an operator hold in each one's
     /// profile for the account, and status reads them (issue #10453).
     fn peer_roots(workspace: &std::path::Path) -> Vec<PathBuf> {
-        use loom_daemon::tokens_pool::session_hold_roots as roots;
-        let registered = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+        use crate::tokens_pool::session_hold_roots as roots;
+        let registered = crate::workspace_registry::WorkspaceRegistry::load_default()
             .map(|registry| registry.roots())
             .unwrap_or_default();
         let fallback = roots::recorded_daemon_fallback_root();
@@ -121,7 +121,7 @@ pub(crate) fn handle_session_command(
         name: &str,
         image: Option<&str>,
     ) -> Result<()> {
-        use loom_daemon::tokens_pool::{docker_cli, operator_interrupt, session_lifecycle};
+        use crate::tokens_pool::{docker_cli, operator_interrupt, session_lifecycle};
         if let Err(error) = operator_interrupt::install() {
             eprintln!("note: Ctrl-C will not reach the `docker` command ({error:#})");
         }
@@ -136,7 +136,7 @@ pub(crate) fn handle_session_command(
     fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
         // The reconciler's fail-closed removal record (#10364), read from the
         // profile so `SessionStatus` itself is unchanged.
-        let removal = loom_daemon::tokens_pool::session_drift_removal::read(std::slice::from_ref(
+        let removal = crate::tokens_pool::session_drift_removal::read(std::slice::from_ref(
             &status.codex_home,
         ));
         if json {
@@ -188,7 +188,7 @@ pub(crate) fn handle_session_command(
         Ok(())
     }
 
-    use loom_daemon::tokens_pool::private_workspace as private;
+    use crate::tokens_pool::private_workspace as private;
     fn print_private(status: &private::Status, json: bool) -> Result<()> {
         if json {
             println!("{}", serde_json::to_string_pretty(status)?);
@@ -250,7 +250,7 @@ pub(crate) fn handle_session_command(
                 return print_private(&private::stop(&workspace, &name, force)?, json);
             }
             let peers = peer_roots(&workspace);
-            let lock = loom_daemon::tokens_pool::session_dispatch_lock::for_operator_stop;
+            let lock = crate::tokens_pool::session_dispatch_lock::for_operator_stop;
             let workspace_for_lock = workspace.clone();
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
                 .with_peer_roots(peers);
@@ -264,21 +264,18 @@ pub(crate) fn handle_session_command(
                 // itself to report; a failed `docker inspect` must not abort
                 // the stop, so the container name is resolved from the
                 // accounts registry, not from `status` (no docker call).
-                let resolved = loom_daemon::tokens_pool::account_registry::account_inventory(
+                let resolved = crate::tokens_pool::account_registry::account_inventory(
                     &workspace_for_lock,
-                    loom_daemon::tokens_pool::account_registry::AccountProvider::Codex,
+                    crate::tokens_pool::account_registry::AccountProvider::Codex,
                 )
                 .ok()
                 .and_then(|inventory| {
                     inventory.into_iter().find(|a| {
-                        loom_daemon::tokens_pool::account_registry::account_matches_reference(
-                            a, &name,
-                        )
+                        crate::tokens_pool::account_registry::account_matches_reference(a, &name)
                     })
                 })
                 .map_or_else(|| name.clone(), |account| account.id.name);
-                let container =
-                    loom_daemon::tokens_pool::session_lifecycle::container_name(&resolved);
+                let container = crate::tokens_pool::session_lifecycle::container_name(&resolved);
                 Some(lock(&container)?)
             };
             print_session_status(&lifecycle.stop(&name, force)?, json)

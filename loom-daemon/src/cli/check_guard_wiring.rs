@@ -9,7 +9,7 @@
 //! `.loom/docs/shell-language-policy.md` is unconditional: new executable logic
 //! is a `loom-daemon` subcommand. This is that move — the same one
 //! [`super::points_marker_check`] made for #9056, and the one this issue's own
-//! guard *decision* ([`loom_daemon::mcp_tool_guard`]) made from the start.
+//! guard *decision* ([`crate::mcp_tool_guard`]) made from the start.
 //!
 //! # Where it runs
 //!
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::guard_wiring;
+use crate::guard_wiring;
 
 #[derive(clap::Args)]
 pub(crate) struct CheckGuardWiringArgs {

@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 
-use loom_daemon::activity::transcript_ingest::{ingest, IngestOptions, IngestStats};
-use loom_daemon::activity::ActivityDb;
-use loom_daemon::transcript_tokens::claude_projects_dir;
+use crate::activity::transcript_ingest::{ingest, IngestOptions, IngestStats};
+use crate::activity::ActivityDb;
+use crate::transcript_tokens::claude_projects_dir;
 
 /// `loom-daemon ingest-transcripts` — reached through
 /// [`super::telemetry::TelemetryCommand`], which is flattened, so this is a

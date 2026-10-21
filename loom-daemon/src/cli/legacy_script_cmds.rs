@@ -9,14 +9,14 @@ use anyhow::Result;
 use std::path::Path;
 use std::path::PathBuf;
 
-use loom_daemon::script_helpers;
+use crate::script_helpers;
 
-use crate::CheckpointAction;
+use crate::cli::CheckpointAction;
 
 use super::sweep_experiment::SweepExperimentAction;
 
 /// `loom-daemon strip-ansi [--file PATH]` — backs `strip-ansi.sh`.
-pub(crate) fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
+pub fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
     use script_helpers::log_filter;
 
     if let Some(path) = file {
@@ -95,7 +95,7 @@ fn checkpoint_worktree(worktree: Option<&str>) -> PathBuf {
 }
 
 /// `loom-daemon checkpoint <write|read|clear|stages>` — backs `checkpoint.sh`.
-pub(crate) fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> {
+pub fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> {
     use script_helpers::checkpoints;
 
     match action {
@@ -164,7 +164,7 @@ pub(crate) fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> 
                         checkpoints::IssueStatus::Unknown,
                         |n| {
                             checkpoints::IssueStatus::from_gh_state(
-                                &loom_daemon::worktree_ops::gh::issue_state_rest(&path, n),
+                                &crate::worktree_ops::gh::issue_state_rest(&path, n),
                             )
                         },
                     );
@@ -393,7 +393,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
 #[cfg(test)]
 mod tests {
     use crate::cli::whole_cli_parse::try_parse_cli;
-    use crate::Commands;
+    use crate::cli::Commands;
 
     /// #11665: `resolve-model` keeps its alias / `--task-alias` /
     /// `--downgrade` / `--generation` surface unchanged.

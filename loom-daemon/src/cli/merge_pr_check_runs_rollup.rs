@@ -1,6 +1,6 @@
 //! `loom-daemon merge-pr check-runs-rollup` (#8191 slice): the per-poll read
 //! of a check-runs rollup inside `_wait_for_checks_then_sync_merge` — see
-//! [`loom_daemon::merge_pr::check_runs_rollup`].
+//! [`crate::merge_pr::check_runs_rollup`].
 //!
 //! # Protocol
 //!
@@ -28,15 +28,15 @@
 //!
 //! When the payload names its `repository` and `head_sha` (as
 //! `forge_get_check_runs` does) and could hold a superseded twin workflow
-//! run's residue — see [`loom_daemon::merge_pr::superseded_runs`] — this verb
+//! run's residue — see [`crate::merge_pr::superseded_runs`] — this verb
 //! reads the head's workflow runs and drops that twin's check-runs before
 //! classifying. Any doubt (no names, a failed read, a doubtful runs payload)
 //! classifies the payload unchanged, i.e. exactly as before.
 
+use crate::merge_pr::check_runs_rollup::classify;
+use crate::merge_pr::stale_checks::fetch::fetch_workflow_runs;
+use crate::merge_pr::superseded_runs as twins;
 use anyhow::Result;
-use loom_daemon::merge_pr::check_runs_rollup::classify;
-use loom_daemon::merge_pr::stale_checks::fetch::fetch_workflow_runs;
-use loom_daemon::merge_pr::superseded_runs as twins;
 use serde_json::Value;
 use std::io::{Read, Write};
 
@@ -88,7 +88,7 @@ fn without_superseded_twins(text: String) -> String {
     if !suspect {
         return text;
     }
-    let gh = loom_daemon::gh_invocation::gh_bin();
+    let gh = crate::gh_invocation::gh_bin();
     match fetch_workflow_runs(&gh, &nwo, &sha).and_then(|p| twins::superseded_suites(&p, &sha)) {
         Ok(superseded) => {
             let n = twins::drop_superseded(&mut doc, &superseded);

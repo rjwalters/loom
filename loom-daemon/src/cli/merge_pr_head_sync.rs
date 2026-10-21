@@ -26,10 +26,10 @@
 //! the deterministic seam the shell suite drives, and a debugging facility
 //! (paste a real head's parents, see which clause refused).
 
-use anyhow::Result;
-use loom_daemon::merge_pr::head_sync::{
+use crate::merge_pr::head_sync::{
     classify, foreign_message, retry_message, Evidence, Verdict, RETRY,
 };
+use anyhow::Result;
 use std::io::Read;
 
 #[derive(clap::Args)]
@@ -86,7 +86,7 @@ impl HeadSyncRetryArgs {
                 }
             }
         } else {
-            match loom_daemon::merge_pr::head_sync::fetch::live_inputs(&self.repo, &self.pr) {
+            match crate::merge_pr::head_sync::fetch::live_inputs(&self.repo, &self.pr) {
                 Ok(live) => Evidence {
                     response: buf,
                     mismatch_confirmed: self.mismatch_confirmed,

@@ -149,6 +149,9 @@ pub struct StepDriver {
     provider: StageEntryProvider,
     next_start: usize,
     starvation: Starvation,
+    /// The host's capacity-driven work requests to the fleet-dispatch captain
+    /// (#12817), made on first use; idle while fleet mode is off.
+    requests: Option<crate::fleet_dispatch::request::Loop>,
 }
 
 impl Default for StepDriver {
@@ -158,6 +161,7 @@ impl Default for StepDriver {
             provider: StageEntryProvider::load(default_cache_path(), DEFAULT_EVENTS_BUDGET),
             next_start: 0,
             starvation: Starvation::default(),
+            requests: None,
         }
     }
 }
@@ -337,6 +341,42 @@ pub(crate) fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
 }
 
 impl StepDriver {
+    /// Report this tick's capacity to the work-request loop and, when it is
+    /// due, ask the captain for items (#12817). The loop's own schedule
+    /// decides whether a request goes out (capacity-driven, backed off on
+    /// empty answers), so most ticks send nothing. What the captain offers is
+    /// kept for the spawn's claim ([`worker::offer`]) and returned for the
+    /// tick to draw through its gates first.
+    fn request_work(
+        &mut self,
+        root: Option<&PathBuf>,
+        free_slots: usize,
+        exhausted: &BTreeSet<String>,
+    ) -> Vec<tick::Offer> {
+        let Some(root) = root else {
+            return Vec::new();
+        };
+        let requests = self
+            .requests
+            .get_or_insert_with(|| crate::fleet_dispatch::request::Loop::start(root));
+        requests.note_capacity(
+            u32::try_from(free_slots).unwrap_or(u32::MAX),
+            &crate::fleet_dispatch::worker::roles_ok(exhausted),
+        );
+        let step = requests.step(root);
+        crate::fleet_dispatch::worker::offer(&step.candidates);
+        step.candidates
+            .iter()
+            .filter_map(|c| {
+                Some(tick::Offer {
+                    repo: c.repo.clone(),
+                    item: u32::try_from(c.item).ok()?,
+                    role: c.step,
+                })
+            })
+            .collect()
+    }
+
     /// Run one step tick (module docs). Its forge reads and spawns block, so
     /// on the daemon's multi-thread runtime it runs under `block_in_place`
     /// rather than stalling a worker.
@@ -579,6 +619,7 @@ impl StepDriver {
         let draw_started = Instant::now();
         let free_slots = input.max_concurrent.saturating_sub(total);
         crate::fleet_dispatch::worker::note_capacity(free_slots, &exhausted_roles);
+        let offers = self.request_work(input.roots.first(), free_slots, &exhausted_roles);
         // #12450: a host in fleet-dispatch fallback draws one round, with no
         // free `claim_lost`; unchanged with the flag off.
         let (free_slots, fallback) = input.roots.first().map_or((free_slots, false), |root| {
@@ -588,7 +629,7 @@ impl StepDriver {
                 input.spawn_concurrency.max(1),
             )
         });
-        let result = tick::run(
+        let result = tick::run_with_offers(
             workspaces,
             StepTickLimits {
                 free_slots,
@@ -603,7 +644,14 @@ impl StepDriver {
                 .first()
                 .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root)),
             &mut spawner,
+            &offers,
         );
+        // An offer the tick did not claim failed a gate or found no slot:
+        // give it back so its row does not sit out the captain's TTL.
+        let declined = crate::fleet_dispatch::worker::decline_offered("not_eligible");
+        if declined > 0 {
+            log::info!("fleet_dispatch: gave back {declined} offered item(s) the gates refused");
+        }
         let draw_total = draw_started.elapsed();
         let mut report = result.report;
         report.gather = Some(gather);
