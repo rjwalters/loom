@@ -1,5 +1,5 @@
 //! `loom-daemon target-dir-gc` handler (Issue #8459) — CLI front-end for
-//! [`loom_daemon::target_dir_gc`]. Purely file-based; does not require a
+//! [`crate::target_dir_gc`]. Purely file-based; does not require a
 //! running daemon (mirrors `Clean`/`Cleanup`/`RecoverOrphans`).
 
 use std::path::Path;
@@ -8,7 +8,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
 
-use loom_daemon::target_dir_gc::{self, GcReport};
+use crate::target_dir_gc::{self, GcReport};
 
 pub(crate) fn handle_target_dir_gc_command(
     target_dir: &str,

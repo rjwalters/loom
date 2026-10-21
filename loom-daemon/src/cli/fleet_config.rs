@@ -1,6 +1,6 @@
 //! `loom-daemon fleet-config` — read the operator's fleet state store.
 //!
-//! Thin clap → [`loom_daemon::fleet_store`] wiring. It lives here rather than
+//! Thin clap → [`crate::fleet_store`] wiring. It lives here rather than
 //! in `main.rs` because `main.rs` is frozen by the file-size ratchet; the
 //! variant there is one line.
 //!
@@ -14,17 +14,17 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
 
-use loom_daemon::fleet_store::fetch::{self, Freshness, Loaded, Policy};
-use loom_daemon::fleet_store::gh::GhTransport;
-use loom_daemon::fleet_store::propose;
-use loom_daemon::fleet_store::reload;
-use loom_daemon::fleet_store::render::{self, Drift};
-use loom_daemon::fleet_store::roster::{self, Change, Registered};
-use loom_daemon::fleet_store::{self as store, state, StoreLocation};
-use loom_daemon::workspace_registry::{self as registry, MaintainOnlySource, WorkspaceRegistry};
+use crate::fleet_store::fetch::{self, Freshness, Loaded, Policy};
+use crate::fleet_store::gh::GhTransport;
+use crate::fleet_store::propose;
+use crate::fleet_store::reload;
+use crate::fleet_store::render::{self, Drift};
+use crate::fleet_store::roster::{self, Change, Registered};
+use crate::fleet_store::{self as store, state, StoreLocation};
+use crate::workspace_registry::{self as registry, MaintainOnlySource, WorkspaceRegistry};
 
 use super::workspace_fleet::{handle_workspace_command_by, WorkspaceRoot};
-use crate::WorkspaceAction;
+use crate::cli::WorkspaceAction;
 
 /// `loom-daemon fleet-config` arguments.
 #[derive(Args)]
@@ -56,10 +56,10 @@ enum FleetConfigCommand {
     /// is unreachable.
     ///
     /// Every changed key is classified live-reloadable or restart-required
-    /// (#9597, [`loom_daemon::fleet_store::reload`]). A live-reloadable
+    /// (#9597, [`crate::fleet_store::reload`]). A live-reloadable
     /// change is confirmed against a running daemon over IPC (`DaemonStatus`)
     /// with no restart; a restart-required change is recorded in
-    /// [`loom_daemon::fleet_store::pending_restart`] so `loom-daemon status`
+    /// [`crate::fleet_store::pending_restart`] so `loom-daemon status`
     /// keeps reporting it until the daemon that was running at render time
     /// actually restarts.
     Render {
@@ -104,6 +104,17 @@ enum FleetConfigCommand {
         /// Use the cached snapshot without contacting the forge.
         #[arg(long)]
         offline: bool,
+    },
+    /// Replace the installed `loom-daemon` binary with a release at or above
+    /// the fleet floor (`loom_min_version`), on a host with no daemon to roll
+    /// itself (#12926). Reads the floor from a store snapshot the forge
+    /// confirms current now, then resolve -> verified fetch -> atomic install,
+    /// keeping one `<binary>.previous`. Never starts, restarts or signals a
+    /// daemon. Daemon hosts keep using the floor roll.
+    ApplyFloor {
+        /// Print the decision; download and write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Open a PR against the store instead of hand-editing it (#9599).
     /// Always a branch + PR — never a direct push. Edits `fleet.yml`, the
@@ -190,8 +201,13 @@ impl Ctx {
 }
 
 fn run(args: FleetConfigArgs) -> Result<i32> {
-    let workspace = loom_daemon::worktree_ops::repo::resolve_repo_root(&args.workspace)
+    let workspace = crate::worktree_ops::repo::resolve_repo_root(&args.workspace)
         .with_context(|| format!("resolving workspace {}", args.workspace))?;
+    if let FleetConfigCommand::ApplyFloor { dry_run } = args.command {
+        // Resolves its own store location: no store is a no-op here, not an
+        // error, and it never returns (it exits after cleaning its scratch).
+        super::fleet_config_apply_floor::run(&workspace, dry_run);
+    }
     let location = store::require_location(&workspace)?;
     let cache = store::default_cache_dir(&location)?;
     let transport = GhTransport::new(&workspace, &location.repo);
@@ -215,6 +231,9 @@ fn run(args: FleetConfigArgs) -> Result<i32> {
             json,
             offline,
         } => cmd_state(&ctx, host, json, offline),
+        FleetConfigCommand::ApplyFloor { .. } => {
+            unreachable!("handled before the store is required")
+        }
         FleetConfigCommand::Propose { command } => match command {
             ProposeCommand::State {
                 state,
@@ -242,7 +261,7 @@ fn policy(offline: bool) -> Policy {
 }
 
 fn resolve_host(explicit: Option<String>) -> Result<String> {
-    let own = loom_daemon::sweep_registry::host_identity();
+    let own = crate::sweep_registry::host_identity();
     let host = explicit.unwrap_or_else(|| own.clone());
     store::validate_host(&host)?;
     if host != own {
@@ -323,15 +342,13 @@ fn cmd_render(
 ) -> Result<i32> {
     let host = resolve_host(host)?;
     let loaded = ctx.load(policy(offline))?;
-    let machine_path = loom_daemon::config_resolver::private_defaults_path().ok_or_else(|| {
+    let machine_path = crate::config_resolver::private_defaults_path().ok_or_else(|| {
         anyhow!(
             "the machine tier is disabled ({} is set to the empty string)",
-            loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV
+            crate::config_resolver::PRIVATE_DEFAULTS_ENV
         )
     })?;
-    let local_path = ctx
-        .workspace
-        .join(loom_daemon::config_resolver::LOCAL_CONFIG_REL);
+    let local_path = ctx.workspace.join(crate::config_resolver::LOCAL_CONFIG_REL);
     let targets = render::render(&loaded.snapshot, &host, &machine_path, &local_path)?;
     // The lossy-reduction guard (2am#1653): a machine-tier target that would
     // DROP top-level blocks the file on disk carries is refused unless the
@@ -378,7 +395,15 @@ fn cmd_render(
             print_drift(t, d);
         }
         print_reload_classification(&targets, &drifts);
-        return Ok(render::check_exit_code(&drifts));
+        let mut code = render::check_exit_code(&drifts);
+        if let Some(line) = super::fleet_config_apply_floor::cli_below_floor_line(
+            &loaded.snapshot,
+            super::fleet_config_apply_floor::INSTALLED_VERSION,
+        ) {
+            println!("DRIFT — {line}");
+            code = code.max(1);
+        }
+        return Ok(code);
     }
     let drifts: Vec<Drift> = targets.iter().map(render::drift).collect();
     let (live, restart_required) = classify_drifted_paths(&targets, &drifts);
@@ -602,7 +627,7 @@ fn cmd_propose_state(
     // could target a commit that has already moved on.
     let loaded = ctx.load(Policy::FailClosed)?;
     let source = propose::source::load(&ctx.transport, &ctx.location.repo, &loaded.snapshot)?;
-    let by = by.unwrap_or_else(loom_daemon::sweep_registry::host_identity);
+    let by = by.unwrap_or_else(crate::sweep_registry::host_identity);
     let since = Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
     let after =
         propose::edit_state(&source.text, host.as_deref(), run_state, &reason, &by, &since)?;
@@ -622,15 +647,13 @@ fn cmd_propose_weight(ctx: &Ctx, repo: String, weight: u32, dry_run: bool) -> Re
 fn cmd_propose_adopt(ctx: &Ctx, host: Option<String>, dry_run: bool) -> Result<i32> {
     let host = resolve_host(host)?;
     let loaded = ctx.load(Policy::FailClosed)?;
-    let machine_path = loom_daemon::config_resolver::private_defaults_path().ok_or_else(|| {
+    let machine_path = crate::config_resolver::private_defaults_path().ok_or_else(|| {
         anyhow!(
             "the machine tier is disabled ({} is set to the empty string)",
-            loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV
+            crate::config_resolver::PRIVATE_DEFAULTS_ENV
         )
     })?;
-    let local_path = ctx
-        .workspace
-        .join(loom_daemon::config_resolver::LOCAL_CONFIG_REL);
+    let local_path = ctx.workspace.join(crate::config_resolver::LOCAL_CONFIG_REL);
     let source = propose::source::load(&ctx.transport, &ctx.location.repo, &loaded.snapshot)?;
     let Some(after) =
         propose::adopt::plan(&loaded.snapshot, &source.text, &host, &machine_path, &local_path)?

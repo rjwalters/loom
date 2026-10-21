@@ -120,6 +120,14 @@
 //! If you add a test that touches the tmux server, or any other machine-global
 //! resource, put it in the group — do not rely on `#[serial]`.
 
+// The `status --json` builder (`cli::status_render`) is one large
+// `serde_json::json!` invocation; each field this repo has added over time
+// pushes the macro's token-tree munching recursion a little deeper. #6470
+// added two more fields (`role_runner_env_override` /
+// `role_runner_host_env_override`) and tripped the default (128) limit —
+// bump it here rather than trimming the JSON shape to fit an arbitrary
+// compiler default.
+#![recursion_limit = "512"]
 // These modules were originally private to the binary crate. Exposing them as
 // a library (to allow unit tests to run without the binary's tokio runtime)
 // triggers public-API clippy lints that don't apply to internal-use code.
@@ -155,6 +163,7 @@ pub mod ci_telemetry;
 pub mod claim_liveness;
 pub mod claim_reconciliation;
 pub mod classify_error;
+pub mod cli;
 pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;

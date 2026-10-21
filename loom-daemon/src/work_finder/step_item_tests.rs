@@ -274,3 +274,57 @@ fn retired_labels_fold_through_the_registry() {
         labels(&["loom:issue"])
     );
 }
+
+/// #12957: an item carries its issue's story points; a PR item its closing
+/// issue's; an unsized item, a stacked label or a PR that only links by
+/// `Part of` carries none (absent, never 0). Points never change a verdict.
+#[test]
+fn items_carry_their_story_points_from_the_labels_in_hand() {
+    let issue = |number: u32, l: &[&str]| IssueInput {
+        number,
+        labels: labels(l),
+        ..IssueInput::default()
+    };
+    let pull = |number: u32, body: &str| PullInput {
+        number,
+        labels: labels(&["loom:review-requested"]),
+        body: Some(body.into()),
+        same_repo: true,
+        ..PullInput::default()
+    };
+    let items = classify(&Inputs {
+        issues: vec![
+            issue(1, &["loom:issue", "points:5"]),
+            issue(2, &["loom:issue"]),
+            issue(3, &["loom:issue", "points:3", "points:8"]),
+            issue(4, &["loom:building", "points:13"]),
+            issue(5, &["loom:epic", "points:8"]),
+        ],
+        pulls: vec![pull(40, "Closes #4"), pull(50, "Part of #5")],
+        ..Inputs::default()
+    });
+    let by_issue = |n: u32| items.iter().find(|i| i.issue == Some(n)).unwrap();
+    assert_eq!(by_issue(1).step(), Some(Step::Builder));
+    assert_eq!(by_issue(1).story_points, Some(5));
+    assert_eq!(by_issue(2).story_points, None, "unsized is absent, not 0");
+    assert_eq!(by_issue(3).story_points, None, "a stacked label is omitted");
+    // A Judge step on PR 40 carries the points of #4, the issue it closes.
+    let judge = by_issue(4);
+    assert_eq!((judge.step(), judge.pr), (Some(Step::Judge), Some(40)));
+    assert_eq!(judge.story_points, Some(13));
+    // PR 50 joins the epic only through `Part of`: no closing issue, no size.
+    let part_of = by_issue(5);
+    assert_eq!(part_of.pr, Some(50));
+    assert_eq!(part_of.story_points, None);
+
+    // A PR-only item (a second PR closing an issue another PR joined) reads
+    // the issue it closes too.
+    let items = classify(&Inputs {
+        issues: vec![issue(6, &["loom:building", "points:2"])],
+        pulls: vec![pull(60, "Closes #6"), pull(61, "Closes #6")],
+        ..Inputs::default()
+    });
+    let second = items.iter().find(|i| i.pr == Some(61)).unwrap();
+    assert_eq!(second.issue, None);
+    assert_eq!(second.story_points, Some(2));
+}

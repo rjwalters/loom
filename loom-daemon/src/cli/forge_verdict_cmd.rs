@@ -1,13 +1,13 @@
 //! `loom-daemon forge verdict-gate | verdict-labels` (#10581): the I/O half of
-//! [`loom_daemon::verdict_gate`], called by `post-verdict.sh` before and after
+//! [`crate::verdict_gate`], called by `post-verdict.sh` before and after
 //! it posts a verdict comment. Reads and writes go through REST (`gh api`),
 //! never GraphQL, so they survive an exhausted GraphQL pool.
 
 use std::path::Path;
 
+use crate::claim_reconciliation::VerdictKind;
+use crate::verdict_gate::{self as gate, Decision, GateInput};
 use anyhow::Result;
-use loom_daemon::claim_reconciliation::VerdictKind;
-use loom_daemon::verdict_gate::{self as gate, Decision, GateInput};
 use serde_json::Value;
 
 fn verdict_or_exit(cmd: &str, verdict: &str) -> VerdictKind {
@@ -20,7 +20,7 @@ fn verdict_or_exit(cmd: &str, verdict: &str) -> VerdictKind {
 /// The PR's label names, live (uncached). `None` when the read failed.
 fn read_labels(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
     let path = format!("repos/{repo}/issues/{pr}/labels?per_page=100");
-    let out = loom_daemon::script_helpers::run_gh(&["api", &path], root, false);
+    let out = crate::script_helpers::run_gh(&["api", &path], root, false);
     let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
     gate::label_names(&doc)
 }
@@ -31,10 +31,10 @@ pub(crate) fn verdict_body_check() -> Result<()> {
     use std::io::Read;
     let mut body = String::new();
     let result = match std::io::stdin().read_to_string(&mut body) {
-        Ok(_) => loom_daemon::verdict_body::check(&body),
-        Err(_) => Err(loom_daemon::verdict_body::Reject::Empty),
+        Ok(_) => crate::verdict_body::check(&body),
+        Err(_) => Err(crate::verdict_body::Reject::Empty),
     };
-    let (line, code) = loom_daemon::verdict_body::render(result);
+    let (line, code) = crate::verdict_body::render(result);
     println!("{line}");
     std::process::exit(code)
 }
@@ -48,12 +48,8 @@ fn read_linked_issues(
     hashes: &[(u64, String)],
     root: &Path,
 ) -> Option<Vec<gate::IssueSnapshot>> {
-    let pr_obj = loom_daemon::comment_trust::records::fetch_issue_object(
-        repo,
-        &pr.to_string(),
-        root,
-        false,
-    )?;
+    let pr_obj =
+        crate::comment_trust::records::fetch_issue_object(repo, &pr.to_string(), root, false)?;
     let body = pr_obj.get("body").and_then(Value::as_str).unwrap_or("");
     let mut numbers = gate::closing_issues(body);
     numbers.extend(hashes.iter().map(|(n, _)| *n));
@@ -64,8 +60,7 @@ fn read_linked_issues(
             .into_iter()
             .map(|n| {
                 let ns = n.to_string();
-                let obj =
-                    loom_daemon::comment_trust::records::fetch_issue_object(repo, &ns, root, false);
+                let obj = crate::comment_trust::records::fetch_issue_object(repo, &ns, root, false);
                 gate::IssueSnapshot {
                     number: n,
                     expected_body_sha: hashes.iter().find(|(h, _)| *h == n).map(|(_, v)| v.clone()),
@@ -75,7 +70,7 @@ fn read_linked_issues(
                             .unwrap_or("")
                             .to_string()
                     }),
-                    comments: loom_daemon::comment_trust::records::fetch_trusted_comments(
+                    comments: crate::comment_trust::records::fetch_trusted_comments(
                         repo, &ns, root, false,
                     ),
                 }
@@ -123,12 +118,8 @@ pub(crate) fn verdict_gate(
         (Some(_), VerdictKind::Approved) => read_linked_issues(repo, pr, &hashes, &root),
         _ => Some(Vec::new()),
     };
-    let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
-        repo,
-        &pr.to_string(),
-        &root,
-        false,
-    );
+    let comments =
+        crate::comment_trust::records::fetch_trusted_comments(repo, &pr.to_string(), &root, false);
     let labels = read_labels(repo, pr, &root);
     let decision = gate::decide(&GateInput {
         verdict: kind,
@@ -180,22 +171,17 @@ pub(crate) fn verdict_reconcile(
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-reconcile", verdict);
     let root = super::forge_identity_cmd::workspace();
-    let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
-        repo,
-        &pr.to_string(),
-        &root,
-        false,
-    );
+    let comments =
+        crate::comment_trust::records::fetch_trusted_comments(repo, &pr.to_string(), &root, false);
     let outcome =
         gate::reconcile(kind, sha, seen_opposite, seen_same_max_id, nonce, comments.as_deref());
     // The loser of an identical-verdict race withdraws its own comment, so
     // exactly one stands. A failed delete is an unconfirmed state, not a pass.
     if let gate::Reconciled::Duplicate(id) = &outcome {
         let path = format!("repos/{repo}/issues/comments/{id}");
-        let deleted =
-            loom_daemon::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false)
-                .ok_output()
-                .is_some();
+        let deleted = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false)
+            .ok_output()
+            .is_some();
         if !deleted {
             println!(
                 "{} UNREAD duplicate comment {id} could not be withdrawn",
@@ -226,7 +212,7 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
     // Never delete the source/claim labels unless the add landed: a failed
     // POST followed by the DELETEs would drop the PR out of its queue with
     // no verdict label to replace it.
-    if loom_daemon::script_helpers::run_gh(&argv, &root, false)
+    if crate::script_helpers::run_gh(&argv, &root, false)
         .ok_output()
         .is_none()
     {
@@ -242,7 +228,7 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
     // is what decides success, so the individual results are not consulted.
     for l in remove {
         let path = format!("{base}/{}", l.replace(':', "%3A"));
-        let _ = loom_daemon::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false);
+        let _ = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false);
     }
     let problems = match read_labels(repo, pr, &root) {
         Some(labels) => gate::label_problems(kind, &labels),

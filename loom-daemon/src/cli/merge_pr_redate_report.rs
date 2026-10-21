@@ -3,7 +3,7 @@
 //! writes into each re-date commit's body.
 //!
 //! Read-only: local `git log` only, no fetch, no forge call, no write. See
-//! `loom_daemon::merge_pr::redate::report` for what is counted and why `main`
+//! `crate::merge_pr::redate::report` for what is counted and why `main`
 //! is a sufficient source on a merge-commit repo. The per-PR rows (#10163,
 //! `chains` in `--json`) come from `redate::chain_telemetry`, which also reads
 //! remote-tracking PR branches so a PR that has not landed still shows.
@@ -13,11 +13,11 @@
 //! | report produced (possibly empty) | the table, or JSON with `--json` | 0 |
 //! | bad `--since`, or `git log` failed | reason on stderr | 1 |
 
-use anyhow::{anyhow, Result};
-use loom_daemon::merge_pr::redate::chain_telemetry;
-use loom_daemon::merge_pr::redate::report::{
+use crate::merge_pr::redate::chain_telemetry;
+use crate::merge_pr::redate::report::{
     aggregate, count_other_redates, parse_log, render_text, run_git_log,
 };
+use anyhow::{anyhow, Result};
 
 #[derive(clap::Args)]
 pub(crate) struct RedateReportArgs {
@@ -37,11 +37,11 @@ pub(crate) struct RedateReportArgs {
 
 impl RedateReportArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let window = loom_daemon::health::parse_since(&self.since).map_err(|e| anyhow!(e))?;
+        let window = crate::health::parse_since(&self.since).map_err(|e| anyhow!(e))?;
         let since = chrono::Utc::now()
             - chrono::TimeDelta::from_std(window).map_err(|e| anyhow!("--since: {e}"))?;
         let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let dir = loom_daemon::repo_root::find_repo_root_from_cwd()
+        let dir = crate::repo_root::find_repo_root_from_cwd()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let raw = run_git_log(&dir, &self.git_ref, since).map_err(|e| anyhow!(e))?;

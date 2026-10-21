@@ -1,7 +1,7 @@
 //! `loom-daemon config get <key>` — read one key of the resolved effective
 //! config (#12591).
 //!
-//! Thin clap wiring over [`loom_daemon::config_resolver`]; `main.rs` is frozen
+//! Thin clap wiring over [`crate::config_resolver`]; `main.rs` is frozen
 //! by the file-size ratchet, so the variant there is one line.
 //!
 //! Prints one JSON object: `{"key", "found", "value", "tier", "source"}`.
@@ -16,7 +16,7 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
-use loom_daemon::config_resolver::{
+use crate::config_resolver::{
     get_path, resolve_effective_config, source_of, FLEET_REPO_CONFIG_REL, LEGACY_CONFIG_REL,
     LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
 };
@@ -120,9 +120,9 @@ mod tests {
     }
 
     fn lookup_isolated(root: &Path, key: &str) -> Value {
-        std::env::set_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let v = lookup(root, key).unwrap();
-        std::env::remove_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV);
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         v
     }
 

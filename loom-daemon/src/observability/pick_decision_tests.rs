@@ -736,6 +736,7 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
             verdict: Verdict::Step(Step::Judge),
             lane: Lane::Normal,
             send_back: false,
+            story_points: None,
         },
         step: Step::Judge,
         terms: weight_terms(
