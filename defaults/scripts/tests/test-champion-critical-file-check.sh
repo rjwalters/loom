@@ -937,6 +937,7 @@ echo
 echo "Criterion #3 waiver record (#13031):"
 BULLET_BLOCK=$(awk '/^if \[ -n "\$\{CRITERION3_WAIVER_ID:-\}" \]; then$/{f=1} f{print} f&&/^fi$/{exit}' "$CHAMPION_MD")
 render_bullet() {
+    # shellcheck disable=SC2034 # consumed by the eval'd BULLET_BLOCK
     ( CRITERION3_WAIVER_ID="$1" CRITERION3_WAIVER_SCOPE="$2" CRITERION3_WAIVED_FILES="$3"
       eval "$BULLET_BLOCK"; printf '%s' "$CRITICAL_BULLET" )
 }
