@@ -232,6 +232,8 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.authorization.evaluated`](#mergeauthorizationevaluated--one-merge-group-authorization-evaluation) | log, OTLP only | `forge_merge_queue/group_run.rs` (`run_group_check`) |
 | [`hold.transition`](#holdtransition--a-hold-label-applied-to-or-removed-from-a-pr) | log, OTLP only | `park_record/apply.rs` (`journal_hold_add`), `cli/park_record.rs` (`released`), drained by `observability/hold_transition.rs` |
+| [`merge.lane_wait`](#mergelane_wait--a-merge-step-held-behind-another-prs-merge) | log, OTLP only | `step_dispatch/driver.rs` (after `shape_pool`), `observability/lane_wait.rs` |
+| [`champion.run`](#championrun--what-one-champion-merge-or-hold-reevaluate-run-decided) | log, OTLP only | `observability/step_verdict.rs` (`emit_drain`), `observability/champion_run.rs` |
 | [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
 | [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) | log, OTLP only | `forge_merge_queue/group_run.rs` (`tick_groups`, from `preflight::github_preflight`) |
 | [`eta.dispatch_eligibility`](#etadispatch_eligibility--why-a-ready-item-is-or-is-not-schedulable) | log, OTLP only | `observability/dispatch_eligibility.rs` (collector sample of the last work-finder tick) |
@@ -4635,6 +4637,78 @@ Attributes: `loom.merge_queue.check_response_timeout_minutes` /
 `regime_ambiguous` / `version` / `revision` / `provenance_complete`
 (`MERGE_QUEUE_REGIME_LOG_ATTRIBUTE_KEYS`, kept by the collector's
 `transform/privacy` `keep_keys`, contract-tested).
+
+
+### `merge.lane_wait` — a merge step held behind another PR's merge
+
+One OTLP log (INFO) each time a PR's Champion merge step (`champion_merge` or
+`champion_hold_reevaluate`) enters or leaves the wait behind a merge already in
+flight in the same repo (Issue #13029). Today the tick only counts these
+(`loom.dispatch.merge_deferred`, `excluded_items{reason=merge_in_flight}`); a
+count cannot give a wait duration. The record is derived from the exclusion the
+tick already makes (`step_dispatch/driver.rs`, right after `shape_pool`), diffed
+against the previous tick's view held in memory, so there is no forge read and
+no new poller. **OTLP-only** (`native: false`).
+
+`phase=enter` is emitted on the first tick that drops the PR behind a blocker;
+a change of blocker while the wait continues is another `enter` that keeps the
+original `wait_started_at`. `phase=leave` is emitted on the first tick the PR is
+no longer dropped: `left_as=admitted` (back in the drawable pool, or running)
+or `gone` (no longer a candidate in the repo), with `wait_secs` =
+`observed_at - wait_started_at`. After a daemon restart the first observation
+starts a fresh wait with `wait_started_at_lower_bound: true` (the duration is a
+lower bound). A repo the tick did not list (halted, listing failed) is not
+observed, so its open waits stay open until the next observed tick.
+
+Attributes: `loom.repo`, `loom.pr_number` (the waiting PR) and
+`loom.merge_lane.phase` / `step` / `blocker_pr` / `blocker_source` (`local` or
+`peer`) / `wait_started_at` / `wait_started_at_lower_bound` / `left_as` and
+`wait_secs` (leave only) / `version` / `revision` / `provenance_complete`
+(`MERGE_LANE_WAIT_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). Log time is the observing
+tick. Wait duration per PR is one query: `phase=leave`, `wait_secs`, grouped by
+`loom.repo`.
+
+
+### `champion.run` — what one Champion merge or hold-reevaluate run decided
+
+One OTLP log (INFO) per `champion_merge`-role step end on a PR (Issue #13029):
+the run's outcome and the standing-authorization policy it read (#12933). A hold
+re-evaluation and PR triage run as the same role, so they are covered too. It is
+built in `emit_drain` from the pick journal and the `pass.verdict` the step end
+already produces, plus the digest the hold recorded when the item was drawn
+(carried from the classifier through the spawn request); no forge read.
+**OTLP-only** (`native: false`).
+
+`loom.champion.outcome` is `merged`, `held` (a hold was applied or stands),
+`released` (a hold was removed), `error` (the step failed, or a hold write was
+attempted and failed) or `other` (requeued, rejected, head moved, not eligible,
+triage: none of the first four). `loom.champion.verdict_reason` is the run's
+`pass.verdict` reason for every outcome. `loom.champion.hold_class` is the
+`hold.transition` `reason_code` (`merge-risk-hold`, `critical-file-hold`,
+`champion-park`, `hold-released`) of the run's last hold write; absent when it
+wrote none. `loom.champion.auth_before` is the digest the standing hold recorded
+when drawn (absent: no hold, a legacy hold, or a step this daemon did not
+spawn); `auth_after` is the digest of the effective
+`champion.standingAuthorizations` at the step's end; `digest_recorded` is true
+when the run wrote a `champion:hold-state` record carrying an `auth=` digest.
+`loom.champion.sweep_id` joins the record to the step's session and its
+`loom.fleet_dispatch.call` span.
+
+Attributes: `loom.repo`, `loom.pr_number` and the `loom.champion.*` keys above
+plus `version` / `revision` / `provenance_complete`
+(`CHAMPION_RUN_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`
+`keep_keys`, contract-tested). Log time is the step's end.
+
+**`champion_merge` call outcome (one query).** The `loom.fleet_dispatch.call`
+span has no `outcome` key; its keys are `loom.fleet_dispatch.result`
+(`granted` / `refused` / `ok` / `error`), `loom.fleet_dispatch.reason` and
+`loom.fleet_dispatch.step`. A query on `outcome` reads empty. Whether a
+`champion_merge` claim was granted or refused, and why:
+`loom.fleet_dispatch.step = "champion_merge"` grouped by
+`loom.fleet_dispatch.result`, `loom.fleet_dispatch.reason`. What the granted run
+then did: `champion.run` on `loom.champion.sweep_id` = the span's
+`loom.assignment.id`'s sweep, grouped by `loom.champion.outcome`.
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused
