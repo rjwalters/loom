@@ -10,15 +10,14 @@
 //! - **`pass.summary`**, one per pass per workspace: the `mechanism`, repo,
 //!   host, deciding build, mode, outcome, counts by verdict and by skip reason,
 //!   whether the write cap was hit, the duration and the GitHub calls the pass
-//!   made (its [`crate::gh_invocation::caller_scope`]).
+//!   made.
 //! - **`pass.verdict`**, one per artifact: repo#n, the verdict and its reason,
 //!   the blockers with the state the pass read, and the labels it changed.
 //!   `role` is empty for a daemon pass. A role's verdicts (Guide's unblock
 //!   outcomes, Champion's promotion verdicts) fit the same record with `role`
 //!   set and their own `mechanism`, `verdict` and `reason` vocabulary.
 //!
-//! `mechanism` is the name the pass's GitHub calls carry as `github.caller`
-//! on their `invoke github` spans (and its `forge_call_stats` caller), so a
+//! `mechanism` is the pass's `forge_call_stats` caller, so a
 //! pass, its verdicts and its forge cost join on one string.
 //!
 //! **OTLP only**, like the other post-#8921 log kinds. The body is the
