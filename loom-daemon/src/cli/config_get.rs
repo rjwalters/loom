@@ -60,7 +60,7 @@ pub(crate) fn dispatch(args: ConfigArgs) -> Result<()> {
             if key != "champion.standingAuthorizations" {
                 bail!("--digest is only defined for champion.standingAuthorizations");
             }
-            println!("{}", loom_daemon::champion_hold::standing_auth_digest(Path::new(&workspace)));
+            println!("{}", crate::champion_hold::standing_auth_digest(Path::new(&workspace)));
             Ok(())
         }
         ConfigCommand::Get { key, workspace, .. } => {
