@@ -244,7 +244,7 @@ impl ReleasedArgs {
 
 impl DecisionArgs {
     fn run(self) {
-        use loom_daemon::telemetry::kinds::hold_transition::{reason, transition};
+        use crate::telemetry::kinds::hold_transition::{reason, transition};
         // A non-finite or out-of-range value is dropped, never exported.
         let confidence_pct = self
             .confidence
@@ -255,7 +255,7 @@ impl DecisionArgs {
             DecisionOutcome::SelfRelease => reason::MERGE_RISK_SELF_RELEASE,
             DecisionOutcome::Pass => reason::MERGE_RISK_PASS,
         };
-        loom_daemon::observability::pick_journal::record_hold(
+        crate::observability::pick_journal::record_hold(
             self.pr,
             transition::DECISION,
             reason_code,
