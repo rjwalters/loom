@@ -280,6 +280,28 @@ retired Python `loom-tools` package (ADR-0013) and now only provides
 inherits an ambiguous name. Epic Phase 2 resolves it; the rename is a
 compatibility edit across `agent-spawn.sh` and `agent-wait.sh`, which source it.
 
+#### 4.3.1 Tools-first order and `capabilities --json` (#12939)
+
+For `strip-ansi` and `checkpoint` the locator resolves, in order: a
+`LOOM_DAEMON_BIN` pin (explicit, still names the daemon; `LOOM_TOOLS_BIN`
+overrides it), then `loom-tools` (`LOOM_TOOLS_BIN`, `PATH`, the machine
+install, a repo build), then `loom-daemon` as a logged **transitional**
+fallback. The fallback is off under `LOOM_MODE=session` and when
+`LOOM_TOOLS_DAEMON_FALLBACK=0`; with nothing resolvable the stub exits
+non-zero. Other commands resolve the daemon only.
+
+`loom-tools capabilities --json [--repo PATH]` prints the same object as
+`loom-daemon install-compat show --json` (one Rust builder,
+`install_compat::capabilities_json`), plus `"binary": "loom-tools"`. Keys:
+`schema_version` (1), `running`, `supports_installed`, `requires_daemon`,
+`payload_identity`, `invoked_files`, `installed`, `classification`. Removing
+or renaming a key bumps `schema_version`.
+
+`payload_identity` is compared for equality only. `resync-installed.sh`
+refuses when tools and daemon report different identities, or when the tools
+binary's `requires_daemon` is older than the payload being installed. Newer
+tools than the payload (rollback) proceeds; an unreadable identity fails open.
+
 ### 4.4 Handlers that reach daemon workspace-registry state
 
 Listed in 3.6. They are **C** and stay in `loom-daemon` unless a verb is
