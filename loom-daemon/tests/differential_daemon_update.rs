@@ -880,6 +880,29 @@ const SYMLINKED_DEST_HELP_BLOCK: &str =
 /// `LOOM_DAEMON_BIN_DIR` entry, which follows the `LOOM_DAEMON_BIN` entry.
 const SYMLINKED_DEST_ANCHOR: &str = "  LOOM_DAEMON_BIN_DIR ";
 
+/// The exit-code 9 and 10 entries #12776 added to `--help`, spelled out here
+/// independently of `help.txt` so the class below verifies the EXACT intended
+/// text rather than "whatever the port prints".
+const RESTORE_EXIT_CODES_HELP_BLOCK: &str =
+    "  9  the new binary never started and the PREVIOUS binary was restored
+     (#12776, launchd/systemd, operator and `fleet roll` runs only). After an
+     exit-7 condition the script copies <dest>.previous back over the
+     destination (once, only if the install record, <dest>.previous and the
+     destination still match the install THIS run made) and starts it once.
+     The previous daemon is running, but the update did NOT take: this is a
+     failure, never exit 0. <dest>.previous is kept.
+  10  the new binary never started AND the restore, or the start of the
+     restored binary, failed (#12776). The host may have no running daemon.
+     <dest>.previous is intact; the message names it and the manual command.
+     When the restore is refused instead (fresh install, missing or corrupt
+     <dest>.previous, record or destination not this run's), nothing is
+     written and the exit stays 7, with a line naming the failed precondition.
+";
+
+/// The line the exit-code block sits directly in front of: the blank line
+/// before `See also:`, which follows the last exit-code entry.
+const RESTORE_EXIT_CODES_ANCHOR: &str = "\nSee also: loom-daemon-start.sh";
+
 /// Divergence classes, each recognised by MECHANISM.
 // Every class so far is a documented `--help` addition, so the shared
 // `HelpDocuments` prefix names the mechanism rather than repeating the type.
@@ -931,6 +954,11 @@ enum Divergence {
     /// [`IDENTICAL_TO_ORIGIN_INSERTS`] blocks, each before its single anchor.
     /// rc and stderr identical. Documentation only; anything else unexplained.
     HelpDocumentsIdenticalToOriginSafeAbort,
+    /// MECHANISM: #12776 documented exit codes 9 and 10 (restore of the
+    /// previous binary after a failed start) in `--help`: exactly
+    /// [`RESTORE_EXIT_CODES_HELP_BLOCK`], after the exit-8 entry and before
+    /// `See also:`. rc and stderr identical. Documentation only.
+    HelpDocumentsRestoreExitCodes,
     /// MECHANISM: #11069 stopped the stale-entry-point advisory from telling
     /// the operator to `rm` entries `--prune-stale-entry-points` would not
     /// remove (it had told them to delete provisioning's rollback copy). For
@@ -965,7 +993,7 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
     // `--help` now carries several documented additions, so accept any
     // combination of them — never anything else.
     // Each class is one or more (anchor, block) insertions, applied together.
-    let additions: [(Divergence, &[(&str, &str)]); 5] = [
+    let additions: [(Divergence, &[(&str, &str)]); 6] = [
         (Divergence::HelpDocumentsTagPin, &[(TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE)]),
         (
             Divergence::HelpDocumentsSymlinkedDest,
@@ -979,6 +1007,10 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
         (
             Divergence::HelpDocumentsIdenticalToOriginSafeAbort,
             &IDENTICAL_TO_ORIGIN_INSERTS,
+        ),
+        (
+            Divergence::HelpDocumentsRestoreExitCodes,
+            &[(RESTORE_EXIT_CODES_ANCHOR, RESTORE_EXIT_CODES_HELP_BLOCK)],
         ),
     ];
     for mask in 1u8..(1 << additions.len()) {
@@ -1584,3 +1616,8 @@ use identical_to_origin_help::IDENTICAL_TO_ORIGIN_INSERTS;
 
 #[path = "differential_daemon_update/stale_remediation.rs"]
 mod stale_remediation;
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

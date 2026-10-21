@@ -240,6 +240,20 @@ pub fn apply(
     }
 }
 
+/// Journal a decision [`apply`] filed on an existing issue (exit `0`, not a
+/// dry run) for the role run's verdict record (#12027). Best-effort and a
+/// no-op outside a journaled run: it never changes output or exit.
+pub fn journal_applied(req: &ApplyRequest, code: i32) {
+    if let (exit::OK, false, Target::Existing(issue)) = (code, req.dry_run, &req.target) {
+        crate::observability::pick_journal::record_applied(
+            *issue,
+            false,
+            "escalated",
+            "operator_decision",
+        );
+    }
+}
+
 /// Read `--input`: a path, or `-` for stdin.
 pub fn read_input(path: &Path) -> Result<String, String> {
     if path.as_os_str() == "-" {
@@ -269,8 +283,10 @@ pub struct GhForge {
     write_ok: Option<Result<(), String>>,
     /// `Some(gh)`: vet writes under the workspace's own per-owner credential
     /// with this `gh` (#11437), as the tick's gate does. `None` (the default,
-    /// CLI callers) vets under the process credential.
+    /// CLI callers) vets under the credential the write carries.
     root_credential_gh: Option<PathBuf>,
+    /// The call site a refusal's `write_scope.refused` record names.
+    call_site: &'static str,
 }
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -292,16 +308,20 @@ fn encode_segment(s: &str) -> String {
 }
 
 /// The write-scope verdict for `repo` (or the root's origin): under the
-/// root's own credential when `gh` is given (#11437), else the process's.
+/// root's own credential when `gh` is given (#11437), else under the
+/// credential the write itself will carry (#12606: the per-owner writer the
+/// `gh` facade resolves for `root` and `repo`, else the process's). A refusal
+/// is exported as `write_scope.refused` with call site `what`.
 fn scope_verdict(
     root: &std::path::Path,
     repo: Option<&str>,
     gh: Option<&std::path::Path>,
+    what: &str,
 ) -> crate::write_scope::Verdict {
     match (gh, repo.map(str::trim).filter(|r| !r.is_empty())) {
-        (Some(gh), Some(r)) => crate::write_scope::repo_writable_with(root, r, gh),
-        (Some(gh), None) => crate::write_scope::root_writable_with(root, gh),
-        (None, _) => crate::write_scope::may_write_from(root, repo),
+        (Some(gh), Some(r)) => crate::write_scope::repo_writable_with_at(root, r, gh, what),
+        (Some(gh), None) => crate::write_scope::root_writable_with_at(root, gh, what),
+        (None, _) => crate::write_scope::may_write_from_at(root, repo, what),
     }
 }
 
@@ -313,26 +333,25 @@ impl GhForge {
             repo,
             write_ok: None,
             root_credential_gh: None,
+            call_site: "operator_decision.forge",
         }
     }
 
-    /// Like [`Self::new`], but writes are vetted under the root's own
-    /// per-owner credential probed with `gh_bin` (#11437) — the credential
-    /// the tick's gate admitted the root under, and the one the write uses.
+    /// Name the call site a refused write's `write_scope.refused` record
+    /// carries (#12606).
     #[must_use]
-    pub fn for_root_credential(repo_root: PathBuf, repo: Option<String>, gh_bin: PathBuf) -> Self {
-        Self {
-            root_credential_gh: Some(gh_bin),
-            ..Self::new(repo_root, repo)
-        }
+    pub fn with_call_site(mut self, what: &'static str) -> Self {
+        self.call_site = what;
+        self
     }
 
     /// Refuse a forge write the write scope denies (#9548).
     fn check_write(&mut self) -> Result<(), String> {
         let (root, repo) = (&self.repo_root, self.repo.as_deref());
         let gh = self.root_credential_gh.as_deref();
+        let what = self.call_site;
         self.write_ok
-            .get_or_insert_with(|| match scope_verdict(root, repo, gh) {
+            .get_or_insert_with(|| match scope_verdict(root, repo, gh, what) {
                 crate::write_scope::Verdict::Allow(_) => Ok(()),
                 crate::write_scope::Verdict::Deny(why) => {
                     Err(format!("refusing the write (#9548): {why}"))
@@ -501,4 +520,49 @@ impl Forge for GhForge {
 #[must_use]
 pub fn default_repo_root() -> PathBuf {
     crate::repo_root::find_repo_root_from_cwd().unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod journal_tests {
+    use super::*;
+    use crate::observability::pick_journal::{parse, set_test_journal, JournalEntry};
+
+    fn journaled(req: &ApplyRequest, code: i32) -> Vec<JournalEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        set_test_journal(Some(path.clone()));
+        journal_applied(req, code);
+        set_test_journal(None);
+        parse(&std::fs::read_to_string(&path).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_landed_decision_on_an_issue_journals_one_escalated_write() {
+        let req = ApplyRequest {
+            target: Target::Existing(42),
+            also_labels: Vec::new(),
+            remove_labels: Vec::new(),
+            dry_run: false,
+        };
+        assert!(matches!(
+            journaled(&req, exit::OK).as_slice(),
+            [JournalEntry::Applied { number: 42, action, by, .. }]
+                if action == "escalated" && by == "operator_decision"
+        ));
+        assert!(journaled(&req, exit::FORGE).is_empty(), "a failed apply");
+        assert!(journaled(&req, exit::REFUSED).is_empty(), "a refused apply");
+        let dry = ApplyRequest {
+            dry_run: true,
+            ..req.clone()
+        };
+        assert!(journaled(&dry, exit::OK).is_empty(), "a dry run wrote nothing");
+        let new = ApplyRequest {
+            target: Target::New {
+                title: "t".to_string(),
+            },
+            ..req
+        };
+        assert!(journaled(&new, exit::OK).is_empty(), "a new filing is no verdict");
+    }
 }

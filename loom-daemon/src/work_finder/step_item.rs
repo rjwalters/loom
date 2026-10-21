@@ -27,13 +27,16 @@
 //! # Pure
 //!
 //! No forge call, no environment read, no clock. Everything the classifier
-//! reads arrives in [`Inputs`]; the facts that need the forge (whether a
-//! dependency park's blockers have closed, which merged PRs close an issue,
-//! whether a PR sits in the merge queue, trusted comment markers) are computed
+//! reads arrives in [`Inputs`]; the facts that need the forge (which merged
+//! PRs close an issue, whether a PR sits in the merge queue, trusted comment markers) are computed
 //! by the caller. The adapters at the bottom of this file derive the
 //! body-borne facts with the parsers that already own them, so a caller never
 //! re-implements one. The fixture `loom-daemon/tests/fixtures/
 //! step-item-classifier.json` pins the table for a later TypeScript twin.
+//!
+//! Each item also carries its story points ([`Item::story_points`], #12957),
+//! read from the issue labels already in [`Inputs`] through
+//! [`crate::story_points`]: a telemetry fact the verdict never reads.
 //!
 //! # The table (design §4.1)
 //!
@@ -55,14 +58,14 @@
 //! | PR `loom:changes-requested` | Doctor |
 //! | PR `loom:review-requested` | Judge |
 //! | PR `loom:pr` | Champion merge |
-//! | PR with none of those | pass `no_stage` |
+//! | PR with none of those | Champion triage; a draft passes `draft` |
 //! | issue `loom:epic` | pass `epic` |
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
-//! | `loom:curated` + `loom:blocked`, **dependency park**, every blocker closed | Champion re-evaluate |
+//! | `loom:curated` (not `loom:issue`) + `loom:blocked`, **dependency park** | Champion re-evaluate |
 //! | any other blocked issue | pass `blocked` |
-//! | landed: a merged **closing** PR, issue still open | Curator keep-or-close |
+//! | landed: a merged **closing** PR (or one built on the issue's `feature/issue-N` branch into the default branch, #12251), issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
 //! | `loom:issue` | Builder |
 //! | `loom:curated` | Champion promote |
@@ -85,12 +88,21 @@
 //!   already saw and kept (the trusted route marker naming that PR) does not
 //!   route it again.
 //! - **Park kinds.** Only a *dependency* park — a park record naming a blocker
-//!   — is re-evaluable when its blockers close. A quarantine (and the
+//!   — is re-evaluable. Champion re-checks its blockers on every draw and
+//!   lifts the park or leaves it (#12078); the classifier does not ask the
+//!   forge first, and the Champion re-evaluation ladder
+//!   (`step_dispatch::reeval_ladder`) spaces the draws of a park that stays.
+//!   A quarantine (and the
 //!   fast-fail park, which parks through the quarantine, #11854), the PR-less
 //!   hold, a Champion hold record and an unstated park name no blocker, so
 //!   Champion `--issue`'s "every blocker closed" check would be vacuously true
 //!   for them (`champion-targeted.md`, `--issue` step 1). A hold record beside
 //!   a dependency record keeps the hold's kind: fail closed.
+//! - **Triage.** An unlabelled PR (hand-opened, or a role stopped before
+//!   labelling it) is Champion's, not Judge's (#12499): Champion adds
+//!   `loom:review-requested`, or blocks it with a reason, or asks the
+//!   operator. Each of those is a row above this one, so a triaged PR is
+//!   never triaged again. A draft is the author's and passes `draft`.
 //! - **Claims.** The registry's `claim` labels. On an item with an open PR the
 //!   issue's `loom:building` is **not** a claim: it stays on the issue until
 //!   the closing merge (#6199), so reading it as one would pass every PR.
@@ -168,11 +180,6 @@ pub struct IssueInput {
     /// The kind of `loom:blocked` park the body declares ([`park_kind`]).
     #[serde(default)]
     pub park: ParkKind,
-    /// A [`ParkKind::Dependency`] park whose every named blocker is a closed
-    /// issue or a merged PR (the caller reads the forge). Ignored for every
-    /// other kind.
-    #[serde(default)]
-    pub blockers_closed: bool,
     /// The capabilities a [`ParkKind::Capability`] park declares
     /// ([`declared_capabilities`]). ANDed.
     #[serde(default)]
@@ -202,7 +209,8 @@ pub struct MergedLink {
 #[serde(rename_all = "snake_case")]
 pub enum LinkKind {
     /// In the issue's closes-graph (a closing keyword or a Development-sidebar
-    /// link), merged after the issue was last reopened.
+    /// link), or built on the issue's Builder branch `feature/issue-N` into
+    /// the default branch (#12251), merged after the issue was last reopened.
     Closes,
     /// A partial-increment reference (`Part of #N`, `Contributes to #N`), or a
     /// closing merge older than the issue's last reopen.
@@ -269,6 +277,9 @@ pub struct PullInput {
     /// The PR is in GitHub's merge queue: it is never drawn again for merge.
     #[serde(default)]
     pub queued: bool,
+    /// The PR is a draft (#12499): an unlabelled one is not drawn for review.
+    #[serde(default)]
+    pub draft: bool,
     /// Markers read from the PR's trusted comments.
     #[serde(default)]
     pub markers: PullMarkers,
@@ -284,6 +295,15 @@ pub struct PullMarkers {
     /// ([`crate::champion_hold::doctor_cycle_capped`]).
     #[serde(default)]
     pub doctor_cycle_capped: bool,
+    /// The head SHA the standing hold recorded
+    /// ([`crate::champion_hold::unreleased_hold_head`]); `None` when there is
+    /// no parseable record, or a release signal followed it (fail open).
+    #[serde(default)]
+    pub hold_head: Option<String>,
+    /// The standing-authorization digest that hold recorded beside its head
+    /// (#12933); `None` for a legacy hold, which is redrawn once.
+    #[serde(default)]
+    pub hold_auth: Option<String>,
 }
 
 /// One repository's lanes this tick.
@@ -319,6 +339,13 @@ pub struct Item {
     pub lane: Lane,
     /// [`IssueMarkers::send_back`].
     pub send_back: bool,
+    /// The item's story points (#12957), a telemetry fact and never a draw
+    /// term: its issue's single legal `points:*` label, or for an item with
+    /// a PR, the label of the open issue the PR closes (its lowest closing
+    /// link, the one it joins). `None` when unsized or the label is a defect
+    /// ([`crate::story_points`]): absent, never `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
 }
 
 impl Item {
@@ -392,6 +419,10 @@ pub enum Step {
     Doctor,
     ChampionMerge,
     ChampionHoldReevaluate,
+    /// An open, non-draft PR with no stage label and no hold (#12499):
+    /// Champion sends it to review, blocks it or asks the operator, one label
+    /// transition, so it never comes back here.
+    ChampionTriage,
 }
 
 impl Step {
@@ -408,6 +439,7 @@ impl Step {
             Step::Doctor => "doctor",
             Step::ChampionMerge => "champion_merge",
             Step::ChampionHoldReevaluate => "champion_hold_reevaluate",
+            Step::ChampionTriage => "champion_triage",
         }
     }
 
@@ -419,7 +451,8 @@ impl Step {
             Step::ChampionPromote
             | Step::ChampionReevaluate
             | Step::ChampionMerge
-            | Step::ChampionHoldReevaluate => "champion",
+            | Step::ChampionHoldReevaluate
+            | Step::ChampionTriage => "champion",
             Step::Builder => "builder",
             Step::Judge => "judge",
             Step::Doctor => "doctor",
@@ -431,7 +464,11 @@ impl Step {
     pub fn acts_on_pr(self) -> bool {
         matches!(
             self,
-            Step::Judge | Step::Doctor | Step::ChampionMerge | Step::ChampionHoldReevaluate
+            Step::Judge
+                | Step::Doctor
+                | Step::ChampionMerge
+                | Step::ChampionHoldReevaluate
+                | Step::ChampionTriage
         )
     }
 }
@@ -452,6 +489,18 @@ pub enum PassReason {
     Epic,
     Proposal,
     NoStage,
+    /// An open draft PR with no stage label (#12499): unfinished, never Judged.
+    Draft,
+    /// A Judge step whose PR head has CI still running (#12042). The
+    /// classifier never answers it: the step tick's gather applies it from a
+    /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
+    /// copy of the #12003 Judge gate.
+    CiPending,
+    /// A Champion-held PR still at the head its hold recorded, with no
+    /// release signal (#12900). The classifier never answers it: the step
+    /// tick's gather applies it (`step_dispatch::gather::hold_at_recorded_head`),
+    /// because a `PullInput` carries no head SHA.
+    HeldAtHead,
 }
 
 impl PassReason {
@@ -471,6 +520,9 @@ impl PassReason {
             Self::Epic => "epic",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
+            Self::Draft => "draft",
+            Self::CiPending => "ci_pending",
+            Self::HeldAtHead => "held_at_head",
         }
     }
 }
@@ -538,26 +590,68 @@ pub fn classify(inputs: &Inputs) -> Vec<Item> {
             .collect()
     };
 
+    // The listed open issue a PR closes (its lowest closing link): whose
+    // points a PR step carries (#12957).
+    let closes_of = |pr: &PullInput| -> Option<&IssueInput> {
+        links[&pr.number]
+            .iter()
+            .find(|(_, k)| **k == LinkageKind::Closes)
+            .and_then(|(n, _)| by_number.get(n).copied())
+    };
+
     let mut items = Vec::with_capacity(by_number.len() + pulls.len());
     for (&n, &issue) in &by_number {
-        let item = if let Some(pr) = joined.get(&n).and_then(|&p| pr_of(p)) {
+        let (mut item, sized) = if let Some(pr) = joined.get(&n).and_then(|&p| pr_of(p)) {
             let mut linked = linked_of(pr);
             linked.retain(|i| i.number != n);
             linked.insert(0, issue);
-            classify_item(Some(issue), Some(pr), false, &linked, inputs)
+            let item = classify_item(Some(issue), Some(pr), false, &linked, inputs);
+            (item, closes_of(pr))
         } else if let Some(pr) = linking.get(&n).and_then(|&p| pr_of(p)) {
-            classify_item(Some(issue), Some(pr), true, &[issue], inputs)
+            // Another item's PR: this item is still its own issue.
+            let item = classify_item(Some(issue), Some(pr), true, &[issue], inputs);
+            (item, Some(issue))
         } else {
-            classify_item(Some(issue), None, false, &[issue], inputs)
+            let item = classify_item(Some(issue), None, false, &[issue], inputs);
+            (item, Some(issue))
         };
+        item.story_points = sized.and_then(story_points);
         items.push(item);
     }
     for pr in &pulls {
         if !primary.contains(&pr.number) {
-            items.push(classify_item(None, Some(pr), false, &linked_of(pr), inputs));
+            let mut item = classify_item(None, Some(pr), false, &linked_of(pr), inputs);
+            item.story_points = closes_of(pr).and_then(story_points);
+            items.push(item);
         }
     }
     items
+}
+
+/// `issue`'s story points ([`Item::story_points`]). A stacked or
+/// out-of-vocabulary label is warned about once per process and issue (the
+/// classifier runs every tick), then logged at debug.
+fn story_points(issue: &IssueInput) -> Option<u32> {
+    use crate::story_points::{classify_points_labels, resolve_story_points, PointsLabels};
+    use std::sync::{Mutex, OnceLock};
+    match classify_points_labels(&issue.labels) {
+        PointsLabels::One(points) => Some(points),
+        PointsLabels::Absent => None,
+        defect => {
+            static WARNED: OnceLock<Mutex<BTreeSet<(u32, String)>>> = OnceLock::new();
+            let fresh = WARNED
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((issue.number, format!("{defect:?}")));
+            if fresh {
+                resolve_story_points(issue.number, &issue.labels)
+            } else {
+                log::debug!("issue #{}: story points omitted ({defect:?})", issue.number);
+                None
+            }
+        }
+    }
 }
 
 /// The issue a PR with links `l` joins: its lowest closing link, else its
@@ -607,6 +701,7 @@ fn classify_item(
         verdict,
         lane,
         send_back: issue.is_some_and(|i| i.markers.send_back),
+        story_points: None,
     }
 }
 
@@ -687,8 +782,13 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
         step(ItemState::ReviewRequested, Step::Judge)
     } else if has(labels, APPROVED) {
         step(ItemState::Approved, Step::ChampionMerge)
+    } else if pr.draft {
+        (ItemState::NoStage, Verdict::Pass(PassReason::Draft))
     } else {
-        (ItemState::NoStage, Verdict::Pass(PassReason::NoStage))
+        // No stage label and no hold (#12499, operator ruling): Champion
+        // triages it once, and its one label transition (review-requested,
+        // blocked or operator) takes the PR to a row above for good.
+        step(ItemState::NoStage, Step::ChampionTriage)
     }
 }
 
@@ -718,7 +818,7 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
                 pass(ItemState::Blocked, PassReason::CapabilityMissing)
             };
         }
-        if has(labels, CURATED) && issue.park == ParkKind::Dependency && issue.blockers_closed {
+        if has(labels, CURATED) && !has(labels, READY) && issue.park == ParkKind::Dependency {
             return step(ItemState::Blocked, Step::ChampionReevaluate);
         }
         return pass(ItemState::Blocked, PassReason::Blocked);
@@ -925,9 +1025,12 @@ impl PullMarkers {
     #[must_use]
     pub fn from_trusted(trusted: &TrustedComments) -> Self {
         let bodies = trusted.bodies();
+        let (hold_head, hold_auth) = crate::champion_hold::unreleased_hold(bodies).unzip();
         Self {
             champion_hold: crate::champion_hold::standing_hold(bodies).is_some(),
             doctor_cycle_capped: crate::champion_hold::doctor_cycle_capped(bodies),
+            hold_head,
+            hold_auth: hold_auth.flatten(),
         }
     }
 }
@@ -953,6 +1056,7 @@ impl PullInput {
             same_repo,
             author_untrusted,
             queued,
+            draft: row.draft,
             markers,
         }
     }

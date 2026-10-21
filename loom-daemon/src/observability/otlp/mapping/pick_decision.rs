@@ -153,4 +153,50 @@ mod tests {
         let log = log_record_for(&envelope).expect("pick.decision exports as a log");
         assert!(!log.attributes.iter().any(|a| a.key == "loom.repo"));
     }
+
+    /// #12083: a skipped row's disposition, halt cause and hold expiry reach
+    /// the OTLP log body, the surface the consumer reads.
+    #[test]
+    fn a_skipped_row_exports_disposition_halt_cause_and_held_until() {
+        use crate::telemetry::kinds::pick_decision::{PickQueueSkip, PickSkipReason};
+        use crate::types::QueueDisposition;
+        use chrono::TimeZone;
+        let until = Utc.with_ymd_and_hms(2026, 10, 14, 12, 30, 0).unwrap();
+        let skipped = |number, disposition, detail: Option<&str>, held_until| {
+            (
+                PickCandidate {
+                    rank: number,
+                    repo: "o/r".into(),
+                    number,
+                    stage: "loom:issue".into(),
+                    sort_key: None,
+                },
+                PickVerdict::SkippedQueue(PickQueueSkip {
+                    reason: PickSkipReason::from_disposition(disposition)
+                        .expect("a skip disposition"),
+                    disposition,
+                    detail: detail.map(str::to_string),
+                    held_until,
+                }),
+            )
+        };
+        let record = PickDecisionRecord::build(
+            tick(),
+            vec![
+                skipped(1, QueueDisposition::WorkspaceHalted, Some("drain"), None),
+                skipped(2, QueueDisposition::DispatchBackoff, None, Some(until)),
+            ],
+        );
+        let envelope = TelemetryEnvelope::new("h", TelemetryRecord::PickDecision(record));
+        let log = log_record_for(&envelope).expect("pick.decision exports as a log");
+        let body = format!("{:?}", log.body);
+        for needle in [
+            r#"disposition\":\"workspace_halted"#,
+            r#"detail\":\"drain"#,
+            r#"disposition\":\"dispatch_backoff"#,
+            "2026-10-14T12:30:00Z",
+        ] {
+            assert!(body.contains(needle), "{needle} missing from {body}");
+        }
+    }
 }

@@ -4,32 +4,13 @@ use std::process::Command;
 #[path = "support/write_scope_root.rs"]
 mod write_scope_root;
 
-#[test]
-fn interactive_creation_is_explicit_and_unknown_is_the_default() {
-    let root = tempfile::tempdir().unwrap();
-    let marker = |origin: Option<&str>| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
-        cmd.args(["provenance", "pr-marker", "--repo-root"])
-            .arg(root.path())
-            .env_remove("LOOM_WORK_ORIGIN")
-            .env_remove("GITHUB_ACTIONS");
-        if let Some(origin) = origin {
-            cmd.args(["--origin", origin]);
-        }
-        let out = cmd.output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).unwrap()
-    };
-    assert!(marker(None).contains("origin=unknown"));
-    assert!(marker(Some("interactive")).contains("origin=interactive"));
-    assert!(marker(Some("autonomous")).contains("origin=autonomous"));
-}
-
-fn record(origin: &str) -> String {
-    format!("<!-- loom:provenance v1 build=unknown unknown unknown prompts=unknown unknown sweep=none story=none trace=unknown host=unknown base=unknown run=none origin={origin} -->")
-}
 fn row(number: u64, origin: &str, label: &str) -> serde_json::Value {
-    serde_json::json!({"number":number,"state":"open","draft":false,"created_at":format!("2026-09-{number:02}"),"body":record(origin),"user":{"login":"operator","type":"User"},"author_association":"OWNER","labels":[{"name":label}]})
+    let (user, assoc) = if origin == "interactive" {
+        (serde_json::json!({"login":"operator","type":"User"}), "OWNER")
+    } else {
+        (serde_json::json!({"login":"loom-fleet[bot]","type":"Bot"}), "NONE")
+    };
+    serde_json::json!({"number":number,"state":"open","draft":false,"created_at":format!("2026-09-{number:02}"),"body":"","user":user,"author_association":assoc,"labels":[{"name":label}]})
 }
 fn cli(root: &std::path::Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
@@ -116,7 +97,7 @@ fn script(path: &std::path::Path, body: &str) {
 
 #[cfg(unix)]
 #[test]
-fn real_creation_adoption_and_autonomous_repair_preserve_interactive_origin() {
+fn real_creation_writes_no_provenance_marker_and_author_decides_origin() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let gh = root.join("gh");
@@ -166,16 +147,13 @@ exit 1
     };
     run("interactive", "Human-driven change");
     let body = std::fs::read_to_string(root.join("body.txt")).unwrap();
-    assert!(body.contains("origin=interactive"));
-    // Repair/recreation preserves the body marker despite autonomous context.
-    run("autonomous", &body);
-    assert_eq!(std::fs::read_to_string(root.join("body.txt")).unwrap(), body);
-    // Existing-PR adoption never writes a replacement origin/body.
+    assert_eq!(body, "Human-driven change");
+    assert!(!body.contains("loom:provenance"));
+    // Existing-PR adoption never writes a replacement body.
     std::fs::write(root.join("existing"), "").unwrap();
     run("autonomous", "replacement body");
     assert_eq!(std::fs::read_to_string(root.join("body.txt")).unwrap(), body);
     let mut pr = row(7, "interactive", "loom:changes-requested");
-    pr["body"] = serde_json::json!(body);
     let input = root.join("pulls.json");
     for (role, label) in [
         ("doctor", "loom:changes-requested"),
@@ -237,21 +215,6 @@ case "$*" in *page=2*) cat page2;; *) cat page1;; esac
     for code in ["10", "11", "12"] {
         assert_eq!(queue(false, code).as_array().unwrap().len(), 100);
     }
-}
-
-#[test]
-fn actions_capture_is_autonomous_even_under_interactive_environment() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = cli(dir.path())
-        .args(["provenance", "pr-marker"])
-        .env("GITHUB_ACTIONS", "true")
-        .env("LOOM_WORK_ORIGIN", "interactive")
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    assert!(String::from_utf8(out.stdout)
-        .unwrap()
-        .contains("origin=autonomous"));
 }
 
 #[cfg(unix)]
@@ -445,3 +408,8 @@ case "$*" in *comments*) cat comments.json;; *) cat pulls.json;; esac
     comments(&head, "outsider", 3);
     assert_eq!(queue("1").0, 1, "an outsider's records are prose");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -54,7 +54,9 @@ pub(crate) fn prepare(
         JobKind::Sweep,
         issue,
         owner.clone(),
-        Box::new(|runtime: &str| model.resolve_for_runtime(&config, kind, Some(runtime))),
+        Box::new(|runtime: &str, _drawn: Option<&str>| {
+            model.resolve_for_runtime(&config, kind, Some(runtime))
+        }),
     );
     let admission = match crate::runtime_preference::resolve_for_dispatch_with(
         &config.workspace_root,

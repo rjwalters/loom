@@ -28,6 +28,7 @@
 //! | `sweep.global.dispatch`   | Daemon | `{sweep_id, kind, runtime?, runtime_source?}` |
 //! | `sweep.global.runtime_rejected` | Daemon | `{kind, role, runtime, runtime_source, unmet_capabilities, reason}` |
 //! | `sweep.global.completed`  | Daemon | `{sweep_id, outcome}` |
+//! | `step.item.{N}.ended`     | Step tick settle pass | `{item, role, class, reason, ran_for_sec, repo?}` |
 //! | `epic.issue.{N}.decompose` | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
@@ -37,9 +38,8 @@
 //! | `daemon.drain.completed` | Drain supervisor | `{in_flight}` (always 0) |
 //! | `daemon.drain.aborted`   | Daemon (IPC) | `{was_draining}` |
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
-//! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
+//! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
-//! | `forge.event` | `forge_events.rs` feed consumer (#8765); `forge_mirror/wake.rs` change-stream puller (2am#4367 P5) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}`; mirror: `{source: "github-events-mirror", count, types, repos, missed}` |
 //! | `operator_priority.escalation` | `fleet_alert` (#10164; the star-liveness publisher, #9321, was removed by #11104) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
@@ -68,6 +68,12 @@
 //! needed its own structured, secret-free representation rather than being
 //! invisible on the bus. It is emitted once per refused dispatch attempt (not
 //! on a state-change/dedup schedule) because each attempt is itself the event.
+//! The `step.item.{N}.ended` topic was authorized by **#12152**: a step
+//! (#11898) is not an issue sweep and never emits `sweep.issue.{N}.exited`,
+//! so after the step-dispatch cutover nothing on the bus said a step had
+//! ended, and the narration sink's public-feed `completion` (which keyed on
+//! `.exited`) went quiet. It is published once per ended step, after the
+//! step ledger classified it, and carries the ledger's `class` / `reason`.
 //! Per-death classification (`death_class`) rides the existing frozen
 //! `sweep.issue.{N}.exited` / `.crashed` topics as an additive payload field
 //! rather than a new topic (#4386). The bus accepts arbitrary topic
@@ -82,27 +88,9 @@
 //! ([`crate::observability::daemon_event`]) — purely additive export
 //! coverage, not a change to this taxonomy or any topic string.
 //!
-//! The `forge.event` topic was authorized by **#8767** (epic #8764) for the
-//! forge event-plane feed consumer. Publisher: `loom-daemon/src/forge_events.rs`
-//! (#8765) — one `Event::Generic` per non-empty verified feed page. Payload:
-//! `{source: "forge-event-feed", host_id: string, count: u64, first_seq: u64,
-//! last_seq: u64, types: string[]}`, `types` being the page's event-type names
-//! sorted and deduplicated. The payload is a **routing hint only, never
-//! decision input** — it carries counts, sequence bounds and event-type names
-//! but no forge state, so a consumer that wants state re-reads the forge
-//! through its normal rate-limited clients and must be idempotent under the
-//! per-page dedup contract (a prompt may arrive with the events themselves
-//! absent from the bus — the on-disk journal is the copy, the prompt is a
-//! "check now"). Invariant source: `docs/adr/0021-forge-event-plane.md`
-//! (ADR-0021); implementation: `loom-daemon/src/forge_events.rs`.
-//!
-//! Subscribers (#8766, Phase 2) live in [`crate::forge_events::wake`] — the
-//! work-finder tick, the queue-head wake, and the in-flight PR watch — and are
-//! each **default off** behind their own `forgeEvents.events.*` flag. A
-//! subscriber may only cause an **early tick of a loop that already exists**
-//! — it never carries a payload field into a decision — which is how the
-//! "never drive an external write without a forge-verified re-read" condition
-//! below is satisfied structurally: the early tick *is* the loop's own re-read.
+//! The `forge.event` topic (#8767) has no publisher or subscriber since the
+//! 2026-10-19 ruling (#12809) removed the dashboard feed client and its
+//! early-tick consumers; the `Event::Generic` carrier remains for other topics.
 //!
 //! The `operator_priority.escalation` topic was authorized by **#9321** (the
 //! delivery half of #9244/#9301) so an operator ask reaches the human in the
@@ -131,8 +119,8 @@
 //! **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
 //! listed in this inventory, (b) carries a `source` field naming its producing
 //! subsystem on every payload, and (c) never triggers a write to external
-//! state without a forge-verified re-read in the consumer. `forge.event`
-//! satisfies all three; every future prompt topic must too.
+//! state without a forge-verified re-read in the consumer. Every prompt topic
+//! must satisfy all three.
 //!
 //! # Durability (Issue #4644)
 //!
@@ -268,8 +256,7 @@ impl Default for EventBus {
 /// the underlying [`broadcast::Sender`], not a second, independent bus. An
 /// event published through any clone reaches every subscriber of every clone.
 ///
-/// This exists for long-lived owned tasks (issue #8765's
-/// [`crate::forge_events`] poll loop is the first) that need to publish for
+/// This exists for long-lived owned tasks that need to publish for
 /// the life of the process and would otherwise have to be handed an
 /// `Arc<EventBus>` — which the daemon's wiring already moves into the IPC
 /// server. It is **not** the way to add a subscriber: call

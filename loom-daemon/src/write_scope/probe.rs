@@ -61,6 +61,11 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The `Insufficient` detail for a repository outside the App installation.
+/// Shared by the probes and by the refusal-class mapping, so the class is
+/// derived from the typed verdict rather than parsed from a sentence.
+pub(crate) const NOT_IN_INSTALLATION: &str = "not in this App installation";
+
 /// What the probe established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Permission {
@@ -124,12 +129,15 @@ impl GhProbe {
         Self { gh, config_dir }
     }
 
-    /// Counted through the `gh` facade as `write_scope.probe` (#10089). The
-    /// explicit `config_dir` is the credential under test, so it overrides
-    /// the facade's working-directory lookup; `None` inherits the process's.
-    fn api(&self, args: &[&str]) -> Result<String, String> {
+    /// One probe read. A read-for-write: it must run on the credential of the
+    /// write it gates (#12606), so it is pinned to that writer
+    /// (`writer_identity`, the asker-dependent exception
+    /// `tests/writer_read_guard.rs` lists for this file) and is never
+    /// reader-only. A reader would answer for its own installation and refuse
+    /// every repository it does not cover.
+    pub(crate) fn invocation(&self, args: &[&str]) -> crate::gh_invocation::GhInvocation {
         use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-        let inv = GhInvocation::new(
+        GhInvocation::new(
             Operation::new("write_scope.probe"),
             AccessIntent::Read,
             GhTarget::None,
@@ -140,8 +148,14 @@ impl GhProbe {
         // Asker-dependent: the probe measures THIS credential's write scope.
         .writer_identity()
         .arg("api")
-        .args(args);
-        match inv.run() {
+        .args(args)
+    }
+
+    /// Counted through the `gh` facade as `write_scope.probe` (#10089). The
+    /// explicit `config_dir` is the credential under test, so it overrides
+    /// the facade's working-directory lookup; `None` inherits the process's.
+    fn api(&self, args: &[&str]) -> Result<String, String> {
+        match self.invocation(args).run() {
             crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => {
                 Ok(String::from_utf8_lossy(&o.stdout).into_owned())
             }
@@ -227,7 +241,7 @@ impl GhProbe {
             (_, Ok(list)) if list.lines().any(|l| l.trim().eq_ignore_ascii_case(repo)) => {
                 Permission::Write
             }
-            (_, Ok(_)) => Permission::Insufficient("not in this App installation".into()),
+            (_, Ok(_)) => Permission::Insufficient(NOT_IN_INSTALLATION.into()),
             (Ok(Some(p)), Err(_)) => p,
             (Ok(None), Err(e)) => Permission::Unknown(format!("unparseable permissions ({e})")),
             (Err(e), Err(_)) => Permission::Unknown(e),
@@ -658,6 +672,12 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
             }
         }
         let p = self.inner.permission(repo);
+        // #12074: an Unknown because the work-finder tick's read deadline
+        // passed says nothing about the credential; caching it would make
+        // passes outside the tick read Deny for a minute.
+        if matches!(p, Permission::Unknown(_)) && crate::gh_invocation::read_deadline::passed() {
+            return with_grace(p, last_write, now);
+        }
         match &p {
             Permission::Write => last_write = Some(now),
             Permission::Insufficient(_) => last_write = None,

@@ -181,6 +181,39 @@ pub fn deny_real_gh(cmd: &mut Command) {
     if std::env::var_os("LOOM_GH_BIN").is_none() {
         cmd.env("LOOM_GH_BIN", gh_stub_path());
     }
+    prepend_gh_stub_to_path(cmd);
+}
+
+/// Put [`gh_stub_path`]'s dir ahead of the inherited `PATH` so a bare
+/// `Command::new("gh")` in the spawned daemon (e.g. startup's credential
+/// preflight) resolves to the loud-failing stub, not the real `gh` and not the
+/// `live_gh_guard` stand-in that would fail the whole test binary (#12163). A
+/// later `.env("PATH", ..)` on the same command replaces it outright.
+#[allow(dead_code)]
+pub fn prepend_gh_stub_to_path(cmd: &mut Command) {
+    let dir = gh_stub_path()
+        .parent()
+        .expect("stub has a parent dir")
+        .to_path_buf();
+    let mut dirs = vec![dir];
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    cmd.env("PATH", std::env::join_paths(dirs).expect("join PATH"));
+}
+
+/// Point *this process's* `LOOM_GH_BIN` at [`gh_stub_path`], once, for tests
+/// that reach `gh` in-process through `gh_invocation` (which honors it) and
+/// through children that inherit the environment (#12163). Unlike a `PATH`
+/// rewrite it leaves the `live_gh_guard` self-tests' view of `PATH` alone.
+#[allow(dead_code)]
+pub fn stub_gh_bin_in_process() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("LOOM_GH_BIN").is_none() {
+            std::env::set_var("LOOM_GH_BIN", gh_stub_path());
+        }
+    });
 }
 
 /// Point a spawned daemon's `LOOM_DOCKER_BIN` at a path that does not exist
@@ -352,6 +385,7 @@ impl TestClient {
     /// creating the socket and calling `listen(2)` while `num-cpus` sibling test
     /// processes run. The previous 5-attempt budget (~0.75s) was calibrated for
     /// `cargo test`'s one-binary-at-a-time model.
+    #[allow(dead_code)]
     pub async fn connect(socket_path: &Path) -> Result<Self> {
         let max_retries = 8;
         let mut retry_delay = Duration::from_millis(50);
@@ -809,4 +843,35 @@ impl Drop for RealFallbackRecordGuard {
             self.path.display()
         );
     }
+}
+
+/// Fresh, empty, canonicalized scratch directory under the system temp dir,
+/// unique per `(prefix, tag, process, thread)`.
+///
+/// Shared by the `worktree_*_differential` tests, which each used to carry a
+/// byte-identical copy differing only in `prefix`.
+#[allow(dead_code)]
+pub fn unique_tmpdir(prefix: &str, tag: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!(
+        "{prefix}-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("create tmpdir");
+    std::fs::canonicalize(&base).expect("canonicalize tmpdir")
+}
+
+/// Make a `git` invocation hermetic: no user/system config, fixed identity,
+/// and a stable locale/terminal. Shared by the `worktree_*_differential` tests.
+#[allow(dead_code)]
+pub fn hermetic_git(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Loom Test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Loom Test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .env("LC_ALL", "C")
+        .env("TERM", "dumb")
 }

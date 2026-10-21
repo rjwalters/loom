@@ -295,12 +295,10 @@ pub struct RunIdentity {
 /// How the agent behind a run was started (#10116), exported verbatim as
 /// `loom.session.output.launch`.
 ///
-/// The two values come from two producers. The daemon's bus-driven producer
-/// only ever opens runs for sweeps it dispatched, so it stamps
-/// [`Launch::Daemon`]. The attended tailer (`loom-daemon live-output-attend`,
-/// started from an agent's own claim step) stamps [`Launch::Attended`]. It
-/// refuses to start in a process tree the daemon launched
-/// (`LOOM_WORK_ORIGIN=autonomous`), so one run is never reported under both.
+/// The daemon's bus-driven producer only opens runs for sweeps it dispatched,
+/// so it stamps [`Launch::Daemon`]. [`Launch::Attended`] is historical: the
+/// attended tailer was removed (#12536, daemon work only is recorded) and
+/// the variant stays so records exported before then still decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Launch {

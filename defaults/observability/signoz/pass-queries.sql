@@ -1,7 +1,8 @@
 -- Pass activity (Issue #10752): what the daemon's artifact passes did, from
 -- their `pass.summary` / `pass.verdict` logs and the `invoke github` spans
--- their caller scope stamps with `github.caller`. Today one pass emits them:
--- the `loom:blocked` release pass (#10556), mechanism `stale_blocked_release`.
+-- their caller scope stamps with `github.caller`. Until #11301 one pass emitted
+-- them: the `loom:blocked` release pass (#10556), mechanism
+-- `stale_blocked_release`. Nothing emits them now; these read stored history.
 -- Role verdicts (Guide, Champion) are planned to land in the same records with
 -- `loom.role` set.
 --

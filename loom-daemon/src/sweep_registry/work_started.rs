@@ -8,7 +8,11 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use super::*;
-use crate::telemetry::kinds::work_started::{source, sweep_role_for_marker, WorkStartedRecord};
+use crate::step_role::StepRole;
+use crate::telemetry::kinds::fleet_state::FleetStage;
+use crate::telemetry::kinds::work_started::{
+    role, source, sweep_role_for_marker, WorkStartedRecord,
+};
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
 
@@ -80,6 +84,56 @@ impl SweepRegistry {
             dispatch_origin: facts.and_then(|f| f.dispatch_origin.clone()),
             started_at,
             source: how.to_string(),
+            observed_at: now,
+            loom: Provenance::current(),
+        }));
+    }
+}
+
+/// The stage and role a spawned issue-acting step begins work in. `None` for a
+/// PR-acting step (its role tick owns the start, `role_act`) and for
+/// `ChampionPromote` (an issue promotion is not stage work).
+const fn step_stage_role(step: StepRole) -> Option<(FleetStage, &'static str)> {
+    match step {
+        StepRole::Builder => Some((FleetStage::SweepBuilder, role::BUILDER)),
+        StepRole::Curator => Some((FleetStage::SweepCurator, role::CURATOR)),
+        StepRole::ChampionPromote
+        | StepRole::Judge
+        | StepRole::Doctor
+        | StepRole::ChampionMerge => None,
+    }
+}
+
+impl SweepRegistry {
+    /// Emit `stage.work_started` (`source=step`) for a step whose claim was
+    /// accepted and whose child launched (Issue #12904). A Builder step's start
+    /// is the exit from `ready_wait`. Called once, from the spawn's success
+    /// path: a refused or unwound claim never reaches it, and lease renewal and
+    /// adoption do not call it. A no-op without an OTLP exporter.
+    pub(super) fn emit_step_work_started(&self, sweep_id: &str, item: u32, step: StepRole) {
+        if !crate::observability::ops::records_exported() {
+            return;
+        }
+        let Some((stage, role)) = step_stage_role(step) else {
+            return;
+        };
+        let Some(repo) = self.journal_repo_slug() else {
+            return;
+        };
+        let now = Utc::now();
+        let facts = self.start_facts.get(sweep_id);
+        crate::observability::ops::emit_record(TelemetryRecord::WorkStarted(WorkStartedRecord {
+            repo: repo.to_ascii_lowercase(),
+            issue: Some(item),
+            pr_number: None,
+            stage,
+            role: role.to_string(),
+            sweep_id: sweep_id.to_string(),
+            attempt_index: facts.and_then(|f| f.attempt_index),
+            stage_attempt: 1,
+            dispatch_origin: facts.and_then(|f| f.dispatch_origin.clone()),
+            started_at: self.entries.get(sweep_id).map_or(now, |i| i.started_at),
+            source: source::STEP.to_string(),
             observed_at: now,
             loom: Provenance::current(),
         }));

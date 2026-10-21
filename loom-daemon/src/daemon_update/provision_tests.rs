@@ -15,11 +15,14 @@ fn tmpdir() -> tempfile::TempDir {
         .unwrap()
 }
 
-/// Every entry in `dir`, sorted, so a stray temp file shows up by name.
+/// Every entry in `dir`, sorted, so a stray temp file shows up by name. The
+/// destination's install lock file (#12776) is deliberate and persistent, so
+/// it is not residue.
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.ends_with(".install.lock"))
         .collect();
     names.sort();
     names

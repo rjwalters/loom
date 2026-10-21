@@ -449,7 +449,14 @@ pub(crate) async fn run_drain_supervisor(
                 drain.close_paused_interval(Utc::now());
                 if then_exit {
                     log::warn!("{}", drain_complete_log_line(true, "", verify_poll_secs));
-                    crate::observability::shutdown::exit(drain_exit_code(true)).await;
+                    crate::observability::shutdown::exit(
+                        drain_exit_code(true),
+                        crate::observability::daemon_exit::ExitCause::Drain {
+                            then_exit: true,
+                            origin,
+                        },
+                    )
+                    .await;
                 }
                 // This path only runs after `handle_drain_request` proved
                 // supervision, so `detect_supervisor()` should still be `Some`
@@ -462,7 +469,14 @@ pub(crate) async fn run_drain_supervisor(
                 // daemon that is about to exit.
                 let sup = crate::restart_verify::detect_and_spawn_verifier(std::process::id());
                 log::warn!("{}", drain_complete_log_line(false, &sup, verify_poll_secs));
-                crate::observability::shutdown::exit(drain_exit_code(false)).await;
+                crate::observability::shutdown::exit(
+                    drain_exit_code(false),
+                    crate::observability::daemon_exit::ExitCause::Drain {
+                        then_exit: false,
+                        origin,
+                    },
+                )
+                .await;
             }
             DrainTick::TimedOutRefuse => {
                 // Issue #9588. An OPERATOR drain — then-exit or relaunch — never
@@ -506,7 +520,14 @@ pub(crate) async fn run_drain_supervisor(
                          cancelled {cancelled} sweep(s); exiting {EXIT_SHUTDOWN} and staying down \
                          (then_exit — Issue #4343 teardown)"
                     );
-                    crate::observability::shutdown::exit(drain_exit_code(true)).await;
+                    crate::observability::shutdown::exit(
+                        drain_exit_code(true),
+                        crate::observability::daemon_exit::ExitCause::Drain {
+                            then_exit: true,
+                            origin,
+                        },
+                    )
+                    .await;
                 }
                 // Same detection/fallback as the `DrainTick::Complete` relaunch
                 // branch above; this path only reaches here after
@@ -518,7 +539,14 @@ pub(crate) async fn run_drain_supervisor(
                      {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch. {}",
                     crate::restart_verify::relaunch_verify_note(&sup, verify_poll_secs)
                 );
-                crate::observability::shutdown::exit(drain_exit_code(false)).await;
+                crate::observability::shutdown::exit(
+                    drain_exit_code(false),
+                    crate::observability::daemon_exit::ExitCause::Drain {
+                        then_exit: false,
+                        origin,
+                    },
+                )
+                .await;
             }
         }
     }

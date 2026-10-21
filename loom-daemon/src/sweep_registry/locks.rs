@@ -1,7 +1,6 @@
 //! Per-issue claim-lock lifecycle (`.loom/locks/issue-<N>/owner.json`) and
 //! startup reconstruction of registry state from disk.
 
-use super::journal_shadow::LockNs;
 use super::*;
 
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
@@ -368,7 +367,6 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write lock owner.json")?;
-                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -424,7 +422,6 @@ impl SweepRegistry {
             .with_context(|| format!("read lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse lock owner.json")?;
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -438,7 +435,6 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -463,12 +459,10 @@ impl SweepRegistry {
         if owner.overflow {
             return Ok(());
         }
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.overflow = true;
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -515,7 +509,6 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write PR lock owner.json")?;
-                self.shadow_owner_acquired(LockNs::Pr, pr, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
@@ -542,7 +535,6 @@ impl SweepRegistry {
             .with_context(|| format!("read PR lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse PR lock owner.json")?;
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -550,7 +542,6 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write PR lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Pr, pr, &before, &owner);
         Ok(())
     }
 
@@ -596,7 +587,7 @@ impl SweepRegistry {
             return LockReleaseOutcome::Superseded;
         }
         match std::fs::remove_dir_all(&lock) {
-            Ok(()) => self.shadow_owner_released(LockNs::Pr, pr, Some(sweep_id)),
+            Ok(()) => {}
             Err(e) => {
                 log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
             }
@@ -616,7 +607,6 @@ impl SweepRegistry {
         if lock.exists() {
             std::fs::remove_dir_all(&lock)
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
-            self.shadow_owner_released(LockNs::Issue, issue, None);
         }
         Ok(())
     }
@@ -665,7 +655,7 @@ impl SweepRegistry {
             return LockReleaseOutcome::HolderAlive;
         }
         match std::fs::remove_dir_all(&lock) {
-            Ok(()) => self.shadow_owner_released(LockNs::Issue, issue, Some(sweep_id)),
+            Ok(()) => {}
             Err(e) => log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display()),
         }
         LockReleaseOutcome::Released
@@ -805,10 +795,7 @@ impl SweepRegistry {
                 std::fs::write(lock.join("owner.json"), json).context("write lock owner.json")
             });
         match takeover {
-            Ok(()) => {
-                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, false);
-                Some(watchdog_sweep_id)
-            }
+            Ok(()) => Some(watchdog_sweep_id),
             Err(e) => {
                 log::warn!(
                     "midbuild-watchdog: could not take over issue #{issue}'s stale claim lock at \
@@ -950,13 +937,15 @@ impl SweepRegistry {
                     .and_then(|s| serde_json::from_str(&s).ok());
                 let Some(owner) = owner else {
                     // No owner.json — treat as stale, remove.
-                    if std::fs::remove_dir_all(&path).is_ok() {
-                        self.shadow_owner_released(LockNs::Issue, issue, None);
-                    }
+                    let _ = std::fs::remove_dir_all(&path);
                     continue;
                 };
                 let alive =
                     pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at);
+                // #11898: an issue step holds this same lock; its owner's
+                // sweep id says so, and it is adopted as the step it is.
+                let step = crate::step_role::StepRole::parse_sweep_id(&owner.sweep_id)
+                    .filter(|(role, item)| *item == issue && !role.acts_on_pr());
                 // #10832: a roll's H4 pause stopped this agent on purpose and
                 // left its lock for H5, which resumes the saved session or
                 // requeues it. Crash recovery must not get there first: keep
@@ -1010,13 +999,24 @@ impl SweepRegistry {
                     if let Some(pgid) = owner.pgid {
                         self.reap_orphaned_group(&owner.sweep_id, Some(issue), pgid);
                     }
-                    daemon_owned_dead.insert(issue);
-                    if std::fs::remove_dir_all(&path).is_ok() {
-                        self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
+                    // A dead step has no checkpoint to recover; its claim goes
+                    // back per role instead (#11898).
+                    if step.is_none() {
+                        daemon_owned_dead.insert(issue);
+                    }
+                    let _ = std::fs::remove_dir_all(&path);
+                    if let Some((role, item)) = step {
+                        let started_at = Self::lock_started_at(&owner);
+                        self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
                     }
                     continue;
                 }
-                let log_path = self.compute_log_path(issue);
+                let (kind, log_path) = match step {
+                    Some((role, item)) => {
+                        (SweepKind::Step { item, role }, self.compute_step_log_path(item, role))
+                    }
+                    None => (SweepKind::Issue(issue), self.compute_log_path(issue)),
+                };
                 let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
                     .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
                 let repo = Some(self.config.workspace_root.display().to_string());
@@ -1060,7 +1060,7 @@ impl SweepRegistry {
                     owner.sweep_id.clone(),
                     SweepInfo {
                         sweep_id: owner.sweep_id.clone(),
-                        kind: SweepKind::Issue(issue),
+                        kind,
                         pid: owner.owner_pid,
                         pgid,
                         token_name,
@@ -1104,6 +1104,12 @@ impl SweepRegistry {
                 admitted += 1;
             }
         }
+
+        // #11898: PR steps hold `pr-<N>` locks, which the loop above skips.
+        admitted += self.adopt_pr_steps(only);
+        // #11909: the adopted steps' slots reach `busy_slots` now, not only
+        // at the next spawn.
+        self.publish_step_slots();
 
         // Checkpoints for daemon-owned sweeps whose process is gone -> Crashed
         // entries (so list_sweeps shows them; the next dispatch resumes via the

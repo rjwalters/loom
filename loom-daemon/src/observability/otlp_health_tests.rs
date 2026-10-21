@@ -14,6 +14,7 @@ fn base() -> OtlpHealthInputs {
         last_drop_growth_at: None,
         window: Duration::minutes(15),
         last_failure_detail: None,
+        kind_last_export: Default::default(),
     }
 }
 
@@ -180,6 +181,7 @@ fn serializes_snake_case_and_omits_empty_detail() {
         state: OtlpExportState::NoExporter,
         detail: None,
         since: None,
+        kinds: Vec::new(),
     })
     .unwrap();
     assert_eq!(v, serde_json::json!({"state": "no_exporter"}));
@@ -294,6 +296,7 @@ fn since_serializes_when_set() {
         state: OtlpExportState::Failing,
         detail: None,
         since: Some(t(0)),
+        kinds: Vec::new(),
     };
     let v = serde_json::to_value(&h).unwrap();
     assert_eq!(v["since"], serde_json::json!("2026-10-10T00:00:00Z"));
@@ -312,4 +315,112 @@ fn failure_detail_is_scrubbed_of_credential_values() {
     // A plain status detail passes through unchanged.
     let plain = "OTLP HTTP 403 (credential refused; batch held until the credential is fixed)";
     assert_eq!(sanitize_failure_detail(plain), plain);
+}
+
+// ---- Issue #12120: per-kind silence -------------------------------------
+
+fn all_exported_at(at: DateTime<Utc>) -> std::collections::BTreeMap<String, DateTime<Utc>> {
+    crate::telemetry::kinds::exported_kinds_for(&["otlp".to_string()])
+        .into_iter()
+        .map(|k| (k, at))
+        .collect()
+}
+
+fn fresh_inputs(now: DateTime<Utc>) -> OtlpHealthInputs {
+    OtlpHealthInputs {
+        started_at: Some(now - Duration::hours(100)),
+        last_success_at: Some(now),
+        kind_last_export: all_exported_at(now),
+        ..base()
+    }
+}
+
+#[test]
+fn fresh_kinds_are_ok_and_listed() {
+    let now = t(60 * 100);
+    let h = evaluate(&fresh_inputs(now), now);
+    assert_eq!(h.state, OtlpExportState::Ok);
+    assert!(h
+        .kinds
+        .iter()
+        .any(|k| k.kind == "host.health" && k.last_export_at == Some(now)));
+    assert!(h.silent_kinds().is_empty());
+}
+
+#[test]
+fn a_stale_watched_kind_flags_silent_kinds() {
+    let now = t(60 * 100);
+    let mut i = fresh_inputs(now);
+    i.kind_last_export
+        .insert("host.health".to_string(), now - Duration::hours(25));
+    let h = evaluate(&i, now);
+    assert_eq!(h.state, OtlpExportState::SilentKinds);
+    assert_eq!(h.silent_kinds(), vec!["host.health"]);
+    assert!(h.needs_attention());
+    assert!(h.summary().unwrap().contains("host.health"));
+}
+
+#[test]
+fn a_kind_just_inside_the_threshold_is_not_flagged() {
+    let now = t(60 * 100);
+    let mut i = fresh_inputs(now);
+    i.kind_last_export
+        .insert("host.health".to_string(), now - Duration::hours(23));
+    assert_eq!(evaluate(&i, now).state, OtlpExportState::Ok);
+}
+
+#[test]
+fn an_exempt_kind_is_never_flagged() {
+    let now = t(60 * 100);
+    let mut i = fresh_inputs(now);
+    i.kind_last_export.remove("sweep.phase");
+    i.started_at = Some(now - Duration::hours(1000));
+    assert_eq!(evaluate(&i, now).state, OtlpExportState::Ok);
+}
+
+#[test]
+fn restart_with_no_export_yet_is_healthy_inside_24h_and_flagged_after() {
+    let now = t(60 * 100);
+    let mut i = fresh_inputs(now);
+    i.kind_last_export.remove("host.health");
+    i.started_at = Some(now - Duration::hours(2));
+    let young = evaluate(&i, now);
+    assert_eq!(young.state, OtlpExportState::Ok);
+    assert_eq!(
+        young
+            .kinds
+            .iter()
+            .find(|k| k.kind == "host.health")
+            .unwrap()
+            .last_export_at,
+        None
+    );
+    i.started_at = Some(now - Duration::hours(30));
+    assert_eq!(evaluate(&i, now).state, OtlpExportState::SilentKinds);
+}
+
+#[test]
+fn not_configured_reports_no_exporter_with_no_kinds() {
+    let now = t(60 * 100);
+    let mut i = fresh_inputs(now);
+    i.otlp_planned = false;
+    let h = evaluate(&i, now);
+    assert_eq!(h.state, OtlpExportState::NoExporter);
+    assert!(h.kinds.is_empty());
+}
+
+#[test]
+fn failing_outranks_silent_kinds_but_still_lists_kinds() {
+    let now = t(60 * 100);
+    let mut i = fresh_inputs(now);
+    i.last_success_at = Some(now - Duration::hours(2));
+    let h = evaluate(&i, now);
+    assert_eq!(h.state, OtlpExportState::Failing);
+    assert!(!h.kinds.is_empty());
+}
+
+#[test]
+fn an_older_record_without_kinds_decodes() {
+    let h: OtlpExportHealth = serde_json::from_str(r#"{"state":"ok"}"#).unwrap();
+    assert!(h.kinds.is_empty());
 }

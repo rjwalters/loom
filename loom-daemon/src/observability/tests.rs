@@ -772,12 +772,12 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
-    // (The ETA tasks were removed with the ETA subsystem, #11098.)
-    // Issue #11161: the `fleet.state` pass after each work-finder tick.
+    // (The ETA tasks were removed with the ETA subsystem, #11098, and the
+    // `fleet.state` tick pass with its producer, #11301.)
     assert_eq!(
         handles.len(),
-        8,
-        "collector + daemon_event + turnaround + two senders + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
+        7,
+        "collector + daemon_event + turnaround + two senders + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -852,11 +852,11 @@ async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {
     // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
-    // Issue #11161: the `fleet.state` pass after each work-finder tick.
+    // (The `fleet.state` tick pass was removed with its producer, #11301.)
     assert_eq!(
         handles.len(),
-        7,
-        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
+        6,
+        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
     );
     for handle in handles {
         handle.abort();

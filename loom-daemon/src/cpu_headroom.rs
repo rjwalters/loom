@@ -6,7 +6,7 @@
 //!
 //! Until #4512 this module also computed a *concurrency term*: `cpu_headroom =
 //! (logical_cpus × cpuUtilizationTarget − consumed_cores) / estCoresPerSweep`,
-//! folded into [`crate::work_finder::resolve_dynamic_max_concurrent`]'s
+//! folded into `crate::work_finder::resolve_dynamic_max_concurrent` (removed, #12406)'s
 //! `min(...)`. That term is **deleted**. It priced every sweep as if it were a
 //! build (`estCoresPerSweep`), so it throttled the ~90% of sweep wall-clock
 //! that is API-wait (curator / builder / judge conversations) in order to
@@ -208,7 +208,7 @@ pub fn load_per_core() -> Option<f64> {
 /// operator may raise it.
 ///
 /// This is deliberately distinct from — and well below — the host-distress
-/// circuit breaker's [`crate::host_breaker::DEFAULT_HOST_BREAKER_LOAD_PER_CORE`]
+/// circuit breaker's `crate::host_breaker::DEFAULT_HOST_BREAKER_LOAD_PER_CORE` (removed, #12406)
 /// (`2.5`): the two thresholds measure the **same** normalized ratio
 /// ([`load_per_core_from`]) but encode different policies. `0.9` is "the host is
 /// full enough that the gate should wait a cycle rather than add its own build",

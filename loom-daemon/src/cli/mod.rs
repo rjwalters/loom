@@ -1,21 +1,23 @@
 //! `loom-daemon` CLI subcommand handlers (Issue #4712).
 //!
-//! `main.rs` keeps only the clap `Cli`/`Commands` derive tree and the thin
-//! dispatch match (`handle_cli_command`); every subcommand's handler body
+//! `root` holds the clap `Cli`/`Commands` derive tree and the thin dispatch
+//! match (`handle_cli_command`); every subcommand's handler body
 //! lives in one of these submodules, grouped by family. `daemon_service`
 //! (a sibling of this module, not nested under it) owns the daemon's own
 //! bootstrap/service-loop body, which is not a CLI subcommand handler.
-
-// The bin test binary gets the same pre-`main` live-`gh` guard as the lib
-// test binary (#10138). `main.rs` is size-frozen, so it is mounted here.
-#[cfg(test)]
-#[path = "../live_gh_guard.rs"]
-mod live_gh_guard;
 
 // Whole-`Cli` parsing for tests, on an 8 MiB thread like the binary's main
 // thread (#10616). `main.rs` is size-frozen, so it is mounted here.
 #[cfg(test)]
 pub(crate) mod whole_cli_parse;
+
+pub mod root;
+pub(crate) use root::AccountsAction;
+pub use root::{
+    handle_cli_command, CheckpointAction, ClaudeConfigAction, CleanupAction, Cli, Commands,
+    DispatchBackoffAction, FleetAction, NoopCooldownAction, PinAction, QuarantineAction,
+    StashesAction, TokensAction, WatchAction, WorkspaceAction,
+};
 
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
@@ -23,12 +25,10 @@ pub(crate) mod accounts_session;
 mod affected_files_check;
 mod agent_skills;
 pub(crate) mod api_keys;
-pub(crate) mod attend_hook;
 mod branch_update;
-pub(crate) mod cancel;
+pub mod cancel;
 pub(crate) mod cargo_target_dir;
 mod champion_hold_cmd;
-mod check_dependabot_labels;
 mod check_guard_wiring;
 mod check_private_control_version;
 mod check_renovate_labels;
@@ -38,18 +38,22 @@ pub(crate) mod cleanup_ops;
 pub(crate) mod codex_hooks;
 pub(crate) mod codex_sandbox_noop_cli;
 pub(crate) mod codex_usage_cli;
-pub(crate) mod common;
+pub(crate) mod command_analysis;
+pub mod common;
+pub(crate) mod config_get;
 mod daemon_start;
 mod daemon_update;
 pub(crate) mod dep_classify;
 pub(crate) mod dep_recheck;
-pub(crate) mod dispatch;
-pub(crate) mod dispatch_backoff;
+pub mod dispatch;
+pub mod dispatch_backoff;
 mod duplicate_closed_search;
 mod duplicate_scan;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_config;
+mod fleet_config_apply_floor;
 mod fleet_config_reload;
+pub(crate) mod fleet_dispatch_cmd;
 pub(crate) mod fleet_experiment;
 pub(crate) mod fleet_send;
 pub(crate) mod forge_action;
@@ -63,13 +67,13 @@ mod forge_verdict_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
-pub(crate) mod health;
+pub mod health;
+mod hooks_home_cmd;
 pub(crate) mod host;
 mod host_id_cmd;
 pub(crate) mod inflight;
 mod install_binary;
 pub(crate) mod install_compat_cli;
-pub(crate) mod journal_cli;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
 mod labels_migrate;
@@ -77,13 +81,13 @@ mod labels_migrate_holds;
 mod labels_undeclared;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
+pub(crate) mod lease_release;
 pub(crate) mod lease_renewer;
 pub(crate) mod legacy_script_cmds;
 pub(crate) mod merge_group_ci_cmd;
 mod merge_pr_check_runs_rollup;
 mod merge_pr_check_runs_streak;
 mod merge_pr_checks_failure;
-mod merge_pr_ci_result;
 mod merge_pr_cleanup_paths;
 mod merge_pr_closed_building;
 mod merge_pr_closed_by_merge;
@@ -105,7 +109,6 @@ mod merge_pr_partial_reset;
 mod merge_pr_poll_wait;
 mod merge_pr_pr_state;
 mod merge_pr_reconcile;
-mod merge_pr_redate;
 mod merge_pr_redate_report;
 mod merge_pr_refs;
 mod merge_pr_remove_gate;
@@ -116,7 +119,6 @@ mod merge_pr_retries_used;
 mod merge_pr_revalidate_head;
 mod merge_pr_sequence;
 mod merge_pr_stacked_children;
-mod merge_pr_stale_checks;
 mod merge_pr_tree_checks;
 mod merge_pr_usage;
 mod merge_pr_version_policy;
@@ -126,13 +128,14 @@ mod merge_pr_worktree_teardown;
 mod merge_pr_worktrees;
 mod merge_pr_zero_checks;
 pub(crate) mod misc_cmds;
-pub(crate) mod noop_cooldown;
+pub mod noop_cooldown;
 mod notify_cleared_blockers;
 pub(crate) mod opencode_usage_cli;
 pub(crate) mod operator_decision;
+pub(crate) mod orphan_replace;
 pub(crate) mod overlap_replay;
 mod park_record;
-pub(crate) mod peer_claims_cmd;
+pub mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;
 mod points_marker_check;
 mod pr_latency_cmd;
@@ -140,18 +143,15 @@ mod pr_latency_render;
 pub(crate) mod pr_lease;
 pub(crate) mod preflight;
 pub(crate) mod premise_check;
-pub(crate) mod presence;
-pub(crate) mod provenance;
 pub(crate) mod push_lease;
-pub(crate) mod quarantine;
+pub mod quarantine;
 mod ram_scope_limit;
-pub(crate) mod ready_queue_cmd;
+pub mod ready_queue_cmd;
 pub(crate) mod reconcile_stack;
 pub(crate) mod release_explain;
 pub(crate) mod release_fetch;
 pub(crate) mod release_resolve;
-mod release_stale_blocked;
-pub(crate) mod restart;
+pub mod restart;
 mod resync_payload_cmd;
 mod resync_pin_cmd;
 pub(crate) mod retry_classify;
@@ -161,13 +161,13 @@ pub(crate) mod roll_pause_cli;
 mod runtime_launch_cmd;
 pub(crate) mod script_ports;
 mod secret_scan_cmd;
-pub(crate) mod serve_cmd;
-mod shell_budget;
+pub mod serve_cmd;
 mod skip_labels;
+pub(crate) mod stack_parent;
 mod stale_blocked;
 pub(crate) mod stashes;
 pub(crate) mod stats;
-pub(crate) mod status;
+pub mod status;
 pub(crate) mod status_render;
 mod sweep_checkpoint;
 pub(crate) mod sweep_experiment;
@@ -180,8 +180,10 @@ pub(crate) mod tokens_weekly_points;
 pub(crate) mod transcript_archive_cli;
 pub(crate) mod transcript_ingest_cli;
 pub(crate) mod usage_report_cli;
-pub(crate) mod watch;
+pub mod watch;
 mod watchdog;
+mod work_docs_archive;
+mod work_plan_archive;
 pub(crate) mod workspace_fleet;
 pub(crate) mod worktree_base;
 pub(crate) mod worktree_branch_conflict;

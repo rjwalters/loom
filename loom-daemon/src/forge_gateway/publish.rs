@@ -194,6 +194,9 @@ pub struct Refresher {
     at: Option<Instant>,
     published: BTreeSet<String>,
     logged: HashSet<String>,
+    /// The `gh` (path, version) the last successful pass published with, so a
+    /// replaced `gh` is reported on the next refresh (#12147).
+    gh_seen: Option<(PathBuf, GhVersion)>,
 }
 
 impl Refresher {
@@ -201,6 +204,12 @@ impl Refresher {
         if self.logged.insert(key.clone()) {
             f(&key);
         }
+    }
+
+    /// The `gh` the last successful pass published with.
+    #[must_use]
+    pub fn gh_seen(&self) -> Option<&(PathBuf, GhVersion)> {
+        self.gh_seen.as_ref()
     }
 
     /// One pass for the workspace at `ws` against its live config.
@@ -315,6 +324,17 @@ impl Refresher {
             log::warn!("forge_gateway: could not write {GH_MARKER} in {}", base.display());
         }
         let set: BTreeSet<String> = owners.iter().cloned().collect();
+        // The version is re-probed on every due pass; what used to hide an
+        // upgraded `gh` was this line logging only when the owner set moved.
+        let gh_now = (gh_path.to_path_buf(), version);
+        let gh_changed = self.gh_seen.as_ref().is_some_and(|prev| *prev != gh_now);
+        if gh_changed {
+            log::info!(
+                "forge_gateway: gh changed to {} (gh {version}) — 2am#4367",
+                gh_path.display()
+            );
+        }
+        self.gh_seen = Some(gh_now);
         if set != self.published {
             log::info!(
                 "forge_gateway: gateway read profiles live for [{}] via {} (gh {version}) — 2am#4367",

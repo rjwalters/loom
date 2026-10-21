@@ -61,6 +61,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.operation",
     "github.access_intent",
+    // #12310: what the call was for (discovery | gate | write | hygiene |
+    // observability).
+    "loom.forge.purpose",
     "github.target",
     "github.outcome",
     "github.exit_code",
@@ -267,12 +270,53 @@ fn delivery(parent: &ParentContext) -> Delivery {
     }
 }
 
-/// The ambient execution context: the validated `LOOM_TRACEPARENT` a traced
-/// sweep exports to its children. Loom's own namespaced variable only — a
+/// The ambient execution context: this thread's daemon parent
+/// ([`enter_parent`]), else the validated `LOOM_TRACEPARENT` a traced sweep
+/// exports to its children. Loom's own namespaced variable only — a
 /// third-party `TRACEPARENT` is never adopted as a Loom parent.
 #[must_use]
 pub fn ambient_parent() -> Option<TraceContext> {
-    ambient().0
+    thread_parent().or_else(|| ambient().0)
+}
+
+thread_local! {
+    static THREAD_PARENT: std::cell::RefCell<Option<TraceContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// This thread's daemon parent ([`enter_parent`]), if any.
+#[must_use]
+pub fn thread_parent() -> Option<TraceContext> {
+    THREAD_PARENT.with(|p| p.borrow().clone())
+}
+
+/// Restores the previous thread parent when dropped. `!Send`: the parent is
+/// this thread's, so holding it across an `.await` is a compile error.
+#[must_use = "the parent ends when the guard is dropped"]
+pub struct ParentGuard {
+    previous: Option<TraceContext>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for ParentGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        THREAD_PARENT.with(|p| *p.borrow_mut() = previous);
+    }
+}
+
+/// Parent every `invoke github` span this thread opens to `parent` until the
+/// guard drops (#12256): the work-finder tick installs its own
+/// `loom.dispatch.tick` context, so the forge calls a tick waited on are
+/// children of its span rather than roots of their own traces. The daemon
+/// has no process-wide parent ([`ParentContext::ambient`]), so the scope is
+/// per thread; a worker thread the tick starts installs it again.
+pub fn enter_parent(parent: Option<TraceContext>) -> ParentGuard {
+    let previous = THREAD_PARENT.with(|p| p.replace(parent));
+    ParentGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
 }
 
 /// The ambient execution's `(parent, trace journal)` — what a short-lived CLI
@@ -403,6 +447,7 @@ impl InvocationSpan {
         let mut attributes: TraceAttributes = [
             ("github.operation", inv.operation.as_str().to_string()),
             ("github.access_intent", inv.intent.as_str().to_string()),
+            ("loom.forge.purpose", inv.purpose().as_str().to_string()),
             ("github.target", inv.target.bounded()),
             ("github.outcome", outcome.as_str().to_string()),
             ("github.invocation", self.invocation.clone()),
@@ -418,6 +463,9 @@ impl InvocationSpan {
         }
         for (key, value) in billing.attributes() {
             attributes.insert(key.to_string(), value);
+        }
+        if let Some(reason) = billing.fallback_reason {
+            attributes.insert("loom.discovery.fallback_reason".into(), reason.to_string());
         }
         for (key, value) in super::route::classify(&argv(inv)).attributes() {
             attributes.insert(key.to_string(), value.to_string());

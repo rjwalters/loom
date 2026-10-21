@@ -443,9 +443,9 @@ fn park_escalation(
          This proposal was escalated for a **timing** finding, not a merits one: its only \
          recurring finding was an open dependency ({}). `loom:operator` now means a human \
          must act, and no role acts on it, so a wait on another change is a `loom:blocked` \
-         park instead. The body now names each blocker in a park record; the daemon's \
-         stale-blocked release pass lifts the park when they close, and Champion \
-         re-evaluates the proposal then.\n\n\
+         park instead. The body now names each blocker in a park record. It stays \
+         blocked until a human, Guide or Champion lifts the park once they close, and \
+         Champion re-evaluates the proposal then.\n\n\
          Removed {removed}. If this proposal genuinely needs a human decision, re-add \
          `loom:operator` with a decision block.\n\n\
          ---\n*Automated by `loom-daemon labels migrate --holds`*",

@@ -5,7 +5,7 @@
 //! A subcommand rather than more lines in that script because the script is
 //! `contract`-category shell, which epic #7810's `shell-budget` gate ratchets
 //! down, never up (`.loom/docs/shell-language-policy.md`). The logic lives in
-//! [`loom_daemon::renovate_labels`].
+//! [`crate::renovate_labels`].
 //!
 //! Runs in CI's `Installer Integration Tests` job, next to the Dependabot
 //! check, which already downloads the shared debug binary.
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::renovate_labels;
+use crate::renovate_labels;
 
 #[derive(clap::Args)]
 pub(crate) struct CheckRenovateLabelsArgs {

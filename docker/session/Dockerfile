@@ -54,7 +54,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # test-image.sh, including the real-engine hook check, against the new CLI. CODEX_MIN_VERSION is the
 # runtime-adapter floor this build enforces regardless of which version is
 # pinned above it; bump both deliberately together when the floor moves.
-ARG CODEX_VERSION=0.162.1
+ARG CODEX_VERSION=0.163.0
 ARG CODEX_MIN_VERSION=0.146.0
 
 # Node.js LTS release, pinned + checksum-verified below — Codex CLI's only
@@ -109,6 +109,24 @@ RUN apt-get update -qq \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm -f /tmp/node.tar.xz \
     && node --version && npm --version
+
+# --- uv (Python project runner) ---------------------------------------
+# python3 and git are already in loom-worker; uv is the missing piece for a
+# Judge/Auditor session to run a Python repo's tests (`uv run pytest`). Pinned
+# static multi-arch binary copied from Astral's official image — not the
+# unpinned `curl | sh` installer.
+#
+# UV_PROJECT_ENVIRONMENT keeps uv's venv out of the mounted checkout, whose
+# `.venv` may be a macOS one that exec-fails on Linux. It lives under /tmp
+# because private-workspace sessions run `--read-only --user 1000:1000` with
+# only /tmp (tmpfs) and the workspace volume writable, so a path under
+# /home/loom would be read-only there; /tmp is writable in both session
+# shapes. UV_CACHE_DIR is moved for the same reason (default ~/.cache/uv).
+# The env dir is shared by every project in the container, so uv recreates it
+# when switching repos.
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /usr/local/bin/
+ENV UV_PROJECT_ENVIRONMENT=/tmp/loom-uv-venv
+ENV UV_CACHE_DIR=/tmp/loom-uv-cache
 
 USER loom
 WORKDIR /home/loom

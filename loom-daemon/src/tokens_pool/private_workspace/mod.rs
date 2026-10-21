@@ -15,13 +15,15 @@ mod docker;
 pub mod export;
 mod lease;
 mod lifecycle;
+#[cfg(test)]
+mod recover_tests;
 mod repository;
 #[cfg(test)]
 mod tests;
 pub mod transport;
 mod worker_setup;
 
-pub use lifecycle::{configured, run_job, start, status, stop};
+pub use lifecycle::{configured, recover, run_job, start, status, stop};
 pub use repository::WorkerCommand;
 
 use anyhow::{bail, Context, Result};
@@ -30,6 +32,9 @@ use std::path::{Path, PathBuf};
 
 pub const ROOT: &str = "/workspace";
 pub const REPO: &str = "/workspace/repo";
+/// Parent of every additional repository clone an account holds beyond the
+/// legacy primary at [`REPO`] (#10795). Lives on the account's own volume.
+pub const WORK_ROOT: &str = "/workspace/work";
 pub const MODE: &str = "private-clone";
 pub const PROTOCOL: &str = "loom-private-workspace-v1";
 const PROFILE: &str = "/home/loom/.codex-profile";
@@ -52,11 +57,133 @@ pub struct Config {
     pub engine: String,
     #[serde(default)]
     pub docker_desktop: bool,
+    /// The primary repository, cloned at [`REPO`]. Kept as-is so a volume,
+    /// container label and credential scope created before multi-repository
+    /// sessions (#10795) stay valid byte for byte.
     pub repository: String,
     pub base: String,
+    /// Further repositories registered on this account, each cloned lazily at
+    /// `WORK_ROOT/<slug>`. Absent in state written before #10795.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<Registered>,
     pub volume: String,
     pub profile: PathBuf,
     pub gh_config: Option<PathBuf>,
+}
+
+/// One additional repository of an account (registered, not necessarily cloned).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Registered {
+    pub repository: String,
+    pub base: String,
+    pub slug: String,
+}
+
+/// The clone one operation acts on: where it lives and what it must be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Target {
+    pub repository: String,
+    pub base: String,
+    pub path: String,
+    /// `None` for the legacy primary at [`REPO`].
+    pub slug: Option<String>,
+}
+
+impl Config {
+    pub(super) fn primary(&self) -> Target {
+        Target {
+            repository: self.repository.clone(),
+            base: self.base.clone(),
+            path: REPO.to_owned(),
+            slug: None,
+        }
+    }
+
+    /// Resolve the requested repository (default: the primary) to its clone.
+    /// An unregistered repository is refused, never registered implicitly.
+    pub(super) fn target(&self, requested: Option<&str>) -> Result<Target> {
+        let Some(requested) = requested else {
+            return Ok(self.primary());
+        };
+        if same_repository(&self.repository, requested) {
+            return Ok(self.primary());
+        }
+        let registered = self
+            .repositories
+            .iter()
+            .find(|r| same_repository(&r.repository, requested))
+            .context("repository is not registered on this private account; run session start --private-clone URL for it while the account is idle")?;
+        Ok(Target {
+            repository: registered.repository.clone(),
+            base: registered.base.clone(),
+            path: format!("{WORK_ROOT}/{}", registered.slug),
+            slug: Some(registered.slug.clone()),
+        })
+    }
+}
+
+/// Canonical identity of a forge repository: the key two spellings of one
+/// repository share, and the collision-safe directory name derived from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RepoId {
+    /// Credential-free clone URL, without a trailing `.git`.
+    pub url: String,
+    /// Lowercase `host[:port]/owner/name`.
+    pub key: String,
+    /// `owner-name-<8 hex of sha256(key)>`: one path component, the same
+    /// basename under different owners (or hosts) never shares it.
+    pub slug: String,
+}
+
+fn safe_segment(segment: &str) -> bool {
+    segment
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+pub(super) fn identify(value: &str) -> Result<RepoId> {
+    use sha2::{Digest, Sha256};
+    let url = reqwest::Url::parse(&repository_url(value)?)?;
+    let authority = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or("")),
+        None => url.host_str().unwrap_or("").to_owned(),
+    };
+    let segments: Vec<&str> = url.path().trim_matches('/').split('/').collect();
+    // A forge may sit under a path prefix (a Gitea sub-path install), so the
+    // whole path is the identity and the last two segments name the directory.
+    let [.., owner, name] = segments[..] else {
+        bail!("private clones need an https://host/owner/name repository URL");
+    };
+    let name_segment = name.strip_suffix(".git").unwrap_or(name);
+    if !segments.iter().all(|s| safe_segment(s)) || name_segment.is_empty() {
+        bail!("repository path contains characters that are unsafe as a path component");
+    }
+    let path = segments[..segments.len() - 1].join("/");
+    let key = format!("{authority}/{path}/{name_segment}").to_ascii_lowercase();
+    let digest = hex::encode(Sha256::digest(key.as_bytes()));
+    Ok(RepoId {
+        url: format!("https://{authority}/{path}/{name_segment}"),
+        slug: format!(
+            "{}-{}-{}",
+            owner.to_ascii_lowercase(),
+            name_segment.to_ascii_lowercase(),
+            &digest[..8]
+        ),
+        key,
+    })
+}
+
+/// Whether two spellings name one repository. An unparseable one only matches
+/// itself byte for byte (a legacy URL shape is never reinterpreted).
+pub(super) fn same_repository(a: &str, b: &str) -> bool {
+    match (identify(a), identify(b)) {
+        (Ok(a), Ok(b)) => a.key == b.key,
+        _ => a == b,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +211,10 @@ pub struct JobArgs {
     pub owner: String,
     #[arg(long)]
     pub issue: Option<u64>,
+    /// Repository the job acts on; defaults to the account's primary. Must
+    /// already be registered with `session start --private-clone`.
+    #[arg(long)]
+    pub repository: Option<String>,
     /// Existing issue helpers may create a worktree inside the private clone.
     #[arg(long)]
     pub branch: Option<String>,

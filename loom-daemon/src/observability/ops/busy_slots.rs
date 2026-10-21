@@ -27,12 +27,42 @@
 //! (`/loom:sweep --prs`, dispatched only by hand) is in neither pool and is
 //! not counted. A step (`SweepKind::Step`, #11898) draws from the sweep pool
 //! (design #11894 §4.4), so it is in the tick's occupancy and counted under
-//! `role="sweep"`, one slot per step, whatever its role.
+//! `role="sweep"`, one slot per step, whatever its role. Those same slots are
+//! also broken down by the step's role (#11906) as
+//! `busy_slots{role=<role>, pool="step"}`, `0` included for every step role:
+//! a breakdown of the `sweep` total, never added to it, and never part of
+//! the role pool's `Σ busy_slots{role≠"sweep"}` (that sum reads only the
+//! points without a `pool` label). The registries publish their live steps
+//! ([`set_steps`]); with none published, no step point is emitted.
+//!
+//! The same published steps carry each step's start time (its registry
+//! entry's `started_at`), so the tick also reports how long the step pool's
+//! work has been running (#12873): `loom.dispatch.running_oldest_age_sec
+//! {role, pool="step"}`, the oldest live step's age per role (no point for a
+//! role with no live step, never `0`), and `loom.dispatch.running_by_age
+//! {role, pool="step", age}`, live steps per fixed age bucket
+//! ([`AGE_BUCKETS`]), `0` included for every step role and bucket. Ages are
+//! computed at the tick (`now` minus each start), so they advance between
+//! spawn and end events. A roll-resumed step's age restarts at the resume
+//! (its registry entry is new).
+//!
+//! Each published step also carries its story points (#12957, the spawn
+//! request's, resolved by `crate::story_points`), so the tick reports how
+//! much large work the host runs: `loom.dispatch.running_by_points{role,
+//! pool="step", points}`, live steps per points class ([`POINTS_CLASSES`]:
+//! the vocabulary plus `unsized`), `0` included for every step role and
+//! class. It is a count by class, never a sum of points (points are
+//! ordinal, #11669), and `Σ_points running_by_points{role}` =
+//! `busy_slots{role, pool="step"}`. A step this daemon did not spawn (one
+//! adopted after a restart) counts as `unsized`. Facts only: nothing reads
+//! points to pick, budget or time out work.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::TickReport;
@@ -97,6 +127,193 @@ pub fn busy_points(
     points
 }
 
+/// The `pool` label value of a step's per-role series (#11906).
+pub const STEP_POOL: &str = "step";
+
+/// Each step role name's live steps, as their start times (#12873).
+pub type StepStarts = BTreeMap<&'static str, Vec<DateTime<Utc>>>;
+
+/// The step points for live steps by role name: one per step role name,
+/// `0` included, counted from each role's start times. Pure.
+#[must_use]
+pub fn step_points(running: &StepStarts) -> Vec<MetricPoint> {
+    let mut by_role: BTreeMap<&str, usize> = step_role_names().map(|role| (role, 0)).collect();
+    for (role, starts) in running {
+        *by_role.entry(role).or_insert(0) += starts.len();
+    }
+    by_role
+        .into_iter()
+        .map(|(role, count)| {
+            MetricPoint::int(MetricName::DispatchBusySlots, int(count))
+                .label("role", role)
+                .label("pool", STEP_POOL)
+        })
+        .collect()
+}
+
+fn step_role_names() -> impl Iterator<Item = &'static str> {
+    crate::step_role::StepRole::ALL
+        .iter()
+        .map(|role| role.role_name())
+}
+
+/// Upper edge of the `lt_15m` age bucket.
+pub const AGE_EDGE_15M: Duration = Duration::from_secs(15 * 60);
+/// Upper edge of the `15m_1h` age bucket.
+pub const AGE_EDGE_1H: Duration = Duration::from_secs(60 * 60);
+/// Upper edge of the `1h_4h` age bucket; `ge_4h` is everything from here.
+pub const AGE_EDGE_4H: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// The `age` label values of `loom.dispatch.running_by_age`, youngest first.
+pub const AGE_BUCKETS: [&str; 4] = ["lt_15m", "15m_1h", "1h_4h", "ge_4h"];
+
+/// The [`AGE_BUCKETS`] index of a step `age_secs` old.
+fn age_bucket(age_secs: u64) -> usize {
+    [AGE_EDGE_15M, AGE_EDGE_1H, AGE_EDGE_4H]
+        .iter()
+        .position(|edge| age_secs < edge.as_secs())
+        .unwrap_or(AGE_BUCKETS.len() - 1)
+}
+
+/// Seconds from `started` to `now`; `0` for a start in the future (a clock
+/// step backwards).
+fn age_secs(now: DateTime<Utc>, started: DateTime<Utc>) -> u64 {
+    u64::try_from((now - started).num_seconds()).unwrap_or(0)
+}
+
+/// The running-age points of the live steps `running` at `now` (#12873):
+/// per step role name, the oldest step's age (only for a role with a live
+/// step) and the count in every [`AGE_BUCKETS`] bucket (`0` included). Pure.
+#[must_use]
+pub fn age_points(now: DateTime<Utc>, running: &StepStarts) -> Vec<MetricPoint> {
+    let mut by_role: BTreeMap<&str, Vec<u64>> =
+        step_role_names().map(|role| (role, Vec::new())).collect();
+    for (role, starts) in running {
+        by_role
+            .entry(role)
+            .or_default()
+            .extend(starts.iter().map(|started| age_secs(now, *started)));
+    }
+    let mut points = Vec::new();
+    for (role, ages) in by_role {
+        if let Some(oldest) = ages.iter().max() {
+            points.push(
+                MetricPoint::int(
+                    MetricName::DispatchRunningOldestAgeSec,
+                    i64::try_from(*oldest).unwrap_or(i64::MAX),
+                )
+                .label("role", role)
+                .label("pool", STEP_POOL),
+            );
+        }
+        let mut buckets = [0_usize; AGE_BUCKETS.len()];
+        for age in &ages {
+            buckets[age_bucket(*age)] += 1;
+        }
+        for (age, count) in AGE_BUCKETS.iter().zip(buckets) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchRunningByAge, int(count))
+                    .label("role", role)
+                    .label("pool", STEP_POOL)
+                    .label("age", *age),
+            );
+        }
+    }
+    points
+}
+
+/// The `points` label value of a live step with no resolved story points.
+pub const POINTS_UNSIZED: &str = "unsized";
+
+/// The `points` label values of `loom.dispatch.running_by_points`: the
+/// story-point vocabulary, then [`POINTS_UNSIZED`].
+pub const POINTS_CLASSES: [&str; 7] = ["1", "2", "3", "5", "8", "13", POINTS_UNSIZED];
+
+/// One live step as its registry publishes it (#12957).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveStep {
+    /// Its registry entry's `started_at`.
+    pub started_at: DateTime<Utc>,
+    /// Its story points, `None` when unsized or unknown.
+    pub points: Option<u32>,
+}
+
+/// Each step role name's live steps.
+pub type LiveSteps = BTreeMap<&'static str, Vec<LiveStep>>;
+
+/// The [`POINTS_CLASSES`] index of a step sized `points`. A value outside the
+/// vocabulary cannot arrive (`crate::story_points` never resolves one) and
+/// would read as unsized.
+fn points_class(points: Option<u32>) -> usize {
+    points
+        .and_then(|p| POINTS_CLASSES.iter().position(|c| *c == p.to_string()))
+        .unwrap_or(POINTS_CLASSES.len() - 1)
+}
+
+/// The size points of the live steps `running` (#12957): per step role name,
+/// the count in every [`POINTS_CLASSES`] class, `0` included. Pure.
+#[must_use]
+pub fn size_points(running: &LiveSteps) -> Vec<MetricPoint> {
+    let mut by_role: BTreeMap<&str, [usize; POINTS_CLASSES.len()]> = step_role_names()
+        .map(|role| (role, [0; POINTS_CLASSES.len()]))
+        .collect();
+    for (role, steps) in running {
+        let counts = by_role.entry(role).or_default();
+        for step in steps {
+            counts[points_class(step.points)] += 1;
+        }
+    }
+    let mut points = Vec::new();
+    for (role, counts) in by_role {
+        for (class, count) in POINTS_CLASSES.iter().zip(counts) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchRunningByPoints, int(count))
+                    .label("role", role)
+                    .label("pool", STEP_POOL)
+                    .label("points", *class),
+            );
+        }
+    }
+    points
+}
+
+/// `running`'s start times by role, for [`step_points`] and [`age_points`].
+#[must_use]
+pub fn step_starts(running: &LiveSteps) -> StepStarts {
+    running
+        .iter()
+        .map(|(role, steps)| (*role, steps.iter().map(|s| s.started_at).collect()))
+        .collect()
+}
+
+/// Each registry's live steps by role name, keyed by workspace root.
+static STEPS: Mutex<BTreeMap<PathBuf, LiveSteps>> = Mutex::new(BTreeMap::new());
+
+/// Record `root`'s live steps by role name, each as its start time and story
+/// points (the sweep registry, on every spawn, end and reaper tick).
+pub fn set_steps(root: &Path, running: LiveSteps) {
+    STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf(), running);
+}
+
+/// Every published registry's live steps, merged by role; `None` when no
+/// registry has published.
+fn published_steps() -> Option<LiveSteps> {
+    let steps = STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if steps.is_empty() {
+        return None;
+    }
+    let mut total = LiveSteps::new();
+    for (role, live) in steps.values().flatten() {
+        total.entry(*role).or_default().extend(live.iter().copied());
+    }
+    Some(total)
+}
+
 /// How long a resolved role ceiling is reused before the roots' configs are
 /// read again. The ceiling is a config value, not load: re-reading every
 /// root's `.loom/config.json` on every tick buys nothing, while this bound
@@ -146,7 +363,14 @@ pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
     let roles = running
         .as_ref()
         .map(|running| (running, cached_role_ceiling(roots)));
-    super::emit_metrics(busy_points(report.occupancy, roles));
+    let mut points = busy_points(report.occupancy, roles);
+    if let Some(live) = published_steps() {
+        let steps = step_starts(&live);
+        points.extend(step_points(&steps));
+        points.extend(age_points(Utc::now(), &steps));
+        points.extend(size_points(&live));
+    }
+    super::emit_metrics(points);
 }
 
 #[cfg(test)]

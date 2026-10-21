@@ -43,6 +43,43 @@
 //!   execution and accounting row, so the ledger charges what GitHub
 //!   charges.
 //!
+//! # Crate-wide test-isolation invariant for `LOOM_REPO` (#8496)
+//!
+//! `LOOM_REPO` is process-global, and roughly a dozen test modules mutate it
+//! (`peer_claims::repo_slug_tests`, `claim_reconciliation::repo_env_tests`,
+//! `quarantine_reconciliation`, and the `sweep_registry` guards / dispatch /
+//! reaper / watchdog / outcome-journal test modules). **Every one of those
+//! tests MUST use the crate-default, unnamed `#[serial]` key** — `serial_test`
+//! only mutually excludes tests that share the *same* key, so a second key is a
+//! second, concurrently-running group and a `remove_var("LOOM_REPO")` landing
+//! between another group's `set_var` and its read silently changes that test's
+//! repo identity. Same race class as the `LOOM_GH_BIN` split fixed in #8465 /
+//! #8480.
+//!
+//! **Why the default key and not a dedicated `loom_repo_env` one** (the shape
+//! #8465 / #8480 used for `LOOM_GH_BIN`): most of those bare `#[serial]`
+//! attributes are *already* load-bearing for other shared state they happen to
+//! touch as well — a fake `gh` on `PATH`, the process cwd, `HOME` (#4547).
+//! Moving them to a `LOOM_REPO`-specific key would keep this variable safe
+//! while silently un-serialising all of that against the rest of the default
+//! group. The variable with exactly one writer group (`LOOM_GH_BIN`) is the
+//! one that can afford a private key; this one cannot.
+//!
+//! The one test that also needs `loom_config_env` (for `LOOM_GH_BIN`) —
+//! `role_collision::tests::rest_queue_source_parses_the_live_listing_shape` —
+//! holds **both** locks by nesting a `#[serial]` body inside the
+//! `#[serial(loom_config_env)]` test, because multi-key `#[serial(a, b)]` cannot
+//! name the default group (its key is the empty string; attribute keys are
+//! parsed as identifiers). See that test's own doc comment for the lock order.
+//!
+//! # `gh api` has no `--repo` flag (#8263)
+//!
+//! Only the porcelain subcommands (`gh issue`, `gh pr`, `gh repo`) accept
+//! `--repo`; `gh api` exits `unknown flag: --repo`. A `gh api` call resolves
+//! its repo from the cwd remote or the `GH_REPO` env var, which this facade
+//! sets from the typed target / `LOOM_REPO` override. `tests/gh_api_repo_flag.rs`
+//! fails CI if a `gh api` builder appends `--repo`.
+//!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
 //! plan).
@@ -53,9 +90,12 @@ pub mod api_kind;
 pub mod billing;
 pub mod caller_scope;
 pub(crate) mod cwd_route;
+pub mod discovery_isolation;
 mod outcome;
 pub(crate) mod own_writes;
 mod paged;
+pub mod purpose;
+pub mod read_deadline;
 mod reader_route;
 pub mod resolver;
 pub mod route;
@@ -65,7 +105,9 @@ pub mod transparent;
 pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
-pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
+pub use purpose::ForgePurpose;
+pub(crate) use reader_route::ShedWhy;
+pub use reader_route::{host_has_read_pool, SHED_MARKER};
 
 #[cfg(test)]
 mod tests;
@@ -266,6 +308,11 @@ pub enum GhCompletion {
         resource: crate::forge_bucket_book::Resource,
         until: std::time::SystemTime,
     },
+    /// Not run (#12641): the work-finder tick stopped this read (deadline
+    /// passed, or discovery ended). No request was sent and no reader budget
+    /// was involved. Classified as
+    /// [`crate::cmd_out::Unavailable::DeadlineReached`].
+    DeadlineReached,
 }
 
 /// Set to `1` on every child the facade spawns (W5): this execution is
@@ -294,6 +341,50 @@ pub struct EnvEntry {
     pub value: Option<OsString>,
 }
 
+/// A credential a site chose for a read, set aside while the read is routed
+/// to a reader (#12584, [`GhInvocation::route_site_credential`]).
+#[derive(Debug, Clone)]
+struct SiteCredential {
+    config_dir: Option<PathBuf>,
+    strip_token_env: bool,
+    role: Option<crate::forge_identity::IdentityRole>,
+}
+
+/// A `gh` command answered locally, which sends no forge request (the agent
+/// front's ledger list, `agent_gh::ledger::caller_of`): not a read the
+/// reader-only rule governs.
+#[must_use]
+pub fn is_local_command(args: &[OsString]) -> bool {
+    match args.first().and_then(|a| a.to_str()) {
+        None => true,
+        Some(first) => matches!(
+            first,
+            "help"
+                | "version"
+                | "--version"
+                | "--help"
+                | "-h"
+                | "completion"
+                | "config"
+                | "alias"
+                | "extension"
+                | "auth"
+        ),
+    }
+}
+
+/// `gh api rate_limit`: free against every budget, and an answer about the
+/// asking credential itself (a bucket probe), so never reader-only.
+#[must_use]
+pub fn is_rate_limit_reading(args: &[OsString]) -> bool {
+    accounting::api_endpoint(args).is_some_and(|e| {
+        e.trim_start_matches('/')
+            .split('?')
+            .next()
+            .is_some_and(|p| p.trim_end_matches('/') == "rate_limit")
+    })
+}
+
 /// A single `gh` invocation, built and executed through the facade.
 #[derive(Debug, Clone)]
 pub struct GhInvocation {
@@ -317,6 +408,16 @@ pub struct GhInvocation {
     stdin_input: Vec<u8>,
     /// Never route this read to a reader App (#9872).
     writer_only: bool,
+    /// This read may never run on the ambient writer credential (#12555),
+    /// whatever else the site pinned: [`GhInvocation::reader_only`]. Every
+    /// other forge read is reader-only too unless the site pinned the writer
+    /// (#12584, [`GhInvocation::is_reader_only`]).
+    reader_only: bool,
+    /// The credential a site chose itself for a reader-only read, set aside
+    /// while the read is routed to a reader (#12584,
+    /// [`GhInvocation::route_site_credential`]); restored only on a host
+    /// with no reader pool, where it is the only credential there is.
+    site_credential: Option<SiteCredential>,
     /// The identity role the accounting row records; `None` = writer.
     role: Option<crate::forge_identity::IdentityRole>,
     /// The #9777 call identity this execution is accounted under (#9831).
@@ -339,6 +440,10 @@ pub struct GhInvocation {
     /// fleet store fetch, which must work while the gateway is broken so the
     /// gateway can be unset ([`GhInvocation::gateway_exempt`]).
     gateway_exempt: bool,
+    /// A listing the daemon makes to find work (#12310): the site said so
+    /// ([`GhInvocation::discovery`]) or built the call inside a
+    /// [`purpose::discovery`] scope. Meaningful for reads only.
+    discovery: bool,
 }
 
 impl GhInvocation {
@@ -367,12 +472,15 @@ impl GhInvocation {
             stripped_env: Vec::new(),
             stdin_input: Vec::new(),
             writer_only: false,
+            reader_only: false,
+            site_credential: None,
             role: None,
             identity: crate::forge_call_stats::CallIdentity::default(),
             route_slug: None,
             read_class: ReadClass::Gate,
             disagree_counted: false,
             gateway_exempt: false,
+            discovery: purpose::in_discovery_scope(),
         }
     }
 
@@ -501,25 +609,197 @@ impl GhInvocation {
 
     /// Keep this read on the writer credential (#9872): for a read whose
     /// answer depends on **who** asks — a permission or write-scope probe,
-    /// `viewer`, `/user` — which a reader App would answer for itself.
+    /// `viewer`, `/user`, the installation's own repository list — which a
+    /// reader App would answer for itself.
+    ///
+    /// The only way a read reaches the writer on a host with a reader pool
+    /// (#12584), so every file that calls it is listed, with its reason, in
+    /// `tests/writer_read_guard.rs`. Has no effect on an explicit
+    /// [`GhInvocation::reader_only`] read: those can never be pinned to the
+    /// writer (#12555).
     #[must_use]
     pub fn writer_identity(mut self) -> Self {
-        self.writer_only = true;
+        self.writer_only = !self.reader_only;
         self
     }
 
-    /// Classify this read for reader exhaustion (W4-C). The default,
-    /// [`ReadClass::Gate`], keeps today's writer fallback; a
-    /// [`ReadClass::Hygiene`] or [`ReadClass::Observability`] read is shed
-    /// ([`GhCompletion::Shed`]) instead of spending the writer's bucket when
-    /// every reader for its owner and resource is withdrawn. Mark a read
-    /// non-`Gate` only when its consumer maps "no answer" to skip / unknown
-    /// and nothing it decides (a dispatch, claim, merge, reap, label flip)
-    /// rests on it.
+    /// This read is served by a reader App or the read gateway, or shed — it
+    /// never runs on the ambient writer credential (#12555, the #12394
+    /// ruling: "the writer should not be used for reads"), and not even
+    /// [`GhInvocation::writer_identity`] can pin it there. Set by the
+    /// in-process daemon read helpers (`claim_reconciliation::gh_call::read`,
+    /// `SweepRegistry::gh_inv(.., AccessIntent::Read, ..)`).
+    ///
+    /// Since #12584 every forge read behaves this way unless its site pinned
+    /// the writer ([`GhInvocation::is_reader_only`]); this marker only adds
+    /// that the pin is ignored too.
+    ///
+    /// - A read the facade cannot route to a reader (no repo derivable, or
+    ///   the checkout's sources disagree) is shed with the usual
+    ///   `forge.read.shed` telemetry instead of being sent to the writer.
+    /// - The one exception is the one [`GhInvocation::execute`] already
+    ///   makes for every read: a host with **no reader pool and no gateway at
+    ///   all**, where the writer is the only credential there is.
+    /// - A reader credential the site chose itself
+    ///   ([`GhInvocation::gh_config_dir`] with
+    ///   [`GhInvocation::identity_role`] `Reader`) is left alone; any other
+    ///   chosen credential is set aside and the read is routed
+    ///   ([`GhInvocation::route_site_credential`]).
+    ///
+    /// Meaningful for [`AccessIntent::Read`] only.
+    #[must_use]
+    pub fn reader_only(mut self) -> Self {
+        self.reader_only = true;
+        self.writer_only = false;
+        self
+    }
+
+    /// Whether this invocation may never run on the writer credential on a
+    /// host with a reader pool (#12394, #12584): an explicit
+    /// [`GhInvocation::reader_only`] read, or **any** [`AccessIntent::Read`]
+    /// of the forge whose site did not pin the writer with
+    /// [`GhInvocation::writer_identity`] — whatever builder made it and
+    /// whatever credential it was handed.
+    ///
+    /// Two argv shapes are not forge reads and keep their credential: a
+    /// command `gh` answers locally ([`is_local_command`]: `--version`,
+    /// `auth`, `config`, …) and `gh api rate_limit`, which is free and
+    /// reports the asking credential's own budget.
+    #[must_use]
+    pub fn is_reader_only(&self) -> bool {
+        self.reader_only
+            || (self.intent == AccessIntent::Read
+                && !self.writer_only
+                && !is_local_command(&self.args)
+                && !is_rate_limit_reading(&self.args))
+    }
+
+    /// Set aside a credential the site chose for a reader-only read (#12584):
+    /// an explicit [`GhInvocation::gh_config_dir`],
+    /// [`GhInvocation::without_token_env`] or a non-reader
+    /// [`GhInvocation::identity_role`] names the writer (an App's per-owner
+    /// directory, a store's writer token, the process's own login), and the
+    /// writer is never used for reads (#12394). The read is then routed like
+    /// any other: to a reader, or shed. Only on a host with **no reader
+    /// pool** is the chosen credential restored, since there it is the only
+    /// one there is and the site picked the right owner's.
+    ///
+    /// A credential declared a reader's ([`IdentityRole::Reader`], a site
+    /// that routes its own reads) is kept. Applied by every execution
+    /// before the route is derived.
+    ///
+    /// [`IdentityRole::Reader`]: crate::forge_identity::IdentityRole::Reader
+    #[must_use]
+    pub(crate) fn route_site_credential(mut self) -> Self {
+        let chosen = self.config_dir.is_some() || self.strip_token_env || self.role.is_some();
+        if chosen
+            && self.site_credential.is_none()
+            && self.role != Some(crate::forge_identity::IdentityRole::Reader)
+            && matches!(self.contract, OutputContract::Captured { .. })
+            && self.is_reader_only()
+        {
+            log::debug!(
+                "gh_invocation: {} is a read on a credential its site chose; routed to a \
+                 reader instead (#12584)",
+                self.operation.as_str()
+            );
+            self.site_credential = Some(SiteCredential {
+                config_dir: self.config_dir.take(),
+                strip_token_env: std::mem::take(&mut self.strip_token_env),
+                role: self.role.take(),
+            });
+        }
+        self
+    }
+
+    /// Put back the credential [`GhInvocation::route_site_credential`] set
+    /// aside: the no-reader-pool path only.
+    fn restore_site_credential(&mut self) {
+        if let Some(c) = self.site_credential.take() {
+            self.config_dir = c.config_dir;
+            self.strip_token_env = c.strip_token_env;
+            self.role = c.role;
+        }
+    }
+
+    /// Whether a site-chosen credential was set aside for routing (tests).
+    #[cfg(test)]
+    pub(crate) fn has_site_credential_set_aside(&self) -> bool {
+        self.site_credential.is_some()
+    }
+
+    /// Name the repository this read is about when its argv does not (a
+    /// GraphQL query with a literal owner and name): the reader attempt is
+    /// routed for `slug`, exactly like a derived route (W4-C). Never changes
+    /// the target, so a writer attempt's environment is unchanged. For a
+    /// read only: the derivation's mutation guard does not see a GraphQL
+    /// document, so never set it on a `mutation`.
+    #[must_use]
+    pub fn reader_repo(mut self, slug: &str) -> Self {
+        self.route_slug = Some(slug.to_string());
+        self
+    }
+
+    /// Classify this read for the reader router (W4-C). Every class is shed
+    /// ([`GhCompletion::Shed`]) when no reader can serve it: the writer is
+    /// never used for reads (#12394). The class decides how early: the
+    /// default, [`ReadClass::Gate`], takes any usable reader whatever its
+    /// projected budget, while a [`ReadClass::Hygiene`] or
+    /// [`ReadClass::Observability`] read also needs headroom (the router's
+    /// `shedPct` reserve), so it is shed first and the readers' last budget
+    /// is kept for decision-gating reads. Mark a read non-`Gate` only when
+    /// its consumer maps "no answer" to skip / unknown and nothing it decides
+    /// (a dispatch, claim, merge, reap, label flip) rests on it.
     #[must_use]
     pub fn read_class(mut self, class: ReadClass) -> Self {
         self.read_class = class;
         self
+    }
+
+    /// Mark this read as **discovery** (#12310): a listing made to find work.
+    /// Tags `loom.forge.purpose = discovery` on its span and metric and, on a
+    /// `gh api` call, sends the `loom.forge.purpose: discovery` request header
+    /// so the read gateway can refuse it first when a pool runs low. Set it
+    /// next to [`GhInvocation::read_class`]; leave a read that gates a write
+    /// untagged.
+    #[must_use]
+    pub fn discovery(mut self) -> Self {
+        self.discovery = true;
+        self
+    }
+
+    /// What this call is for (#12310): a write is `write`; a read is
+    /// `discovery` only when its site said so, else its [`ReadClass`] name.
+    #[must_use]
+    pub fn purpose(&self) -> ForgePurpose {
+        if self.intent == AccessIntent::Write {
+            ForgePurpose::Write
+        } else if self.discovery {
+            ForgePurpose::Discovery
+        } else {
+            ForgePurpose::of_read(self.read_class)
+        }
+    }
+
+    /// The argv handed to `gh`: [`GhInvocation::args`] plus, on a `discovery`
+    /// `gh api` call, the purpose header. No other call sends it.
+    #[must_use]
+    pub(crate) fn spawn_args(&self) -> Vec<OsString> {
+        let mut args = self.args.clone();
+        if self.purpose() == ForgePurpose::Discovery && args.first().is_some_and(|a| a == "api") {
+            args.splice(
+                1..1,
+                [
+                    OsString::from("-H"),
+                    OsString::from(format!(
+                        "{}: {}",
+                        purpose::HEADER_NAME,
+                        purpose::DISCOVERY_VALUE
+                    )),
+                ],
+            );
+        }
+        args
     }
 
     /// This read's [`ReadClass`].
@@ -604,7 +884,7 @@ impl GhInvocation {
     /// - `GH_REPO`: the typed target, else — on the **reader** attempt of a
     ///   derived route only (W4-C, [`cwd_route`]) — the derived repo, else
     ///   the machine-global `LOOM_REPO` override
-    ///   (`gh_repo_env::apply_loom_repo_override`'s contract). A writer
+    ///   (see the `LOOM_REPO` section in the module docs). A writer
     ///   attempt never sees the derived repo.
     /// - `LOOM_TRACEPARENT` / `TRACEPARENT`: set together from
     ///   `child_context` — the invocation's own span when it is exported, so
@@ -629,18 +909,15 @@ impl GhInvocation {
     ) -> Vec<EnvEntry> {
         let mut plan = Vec::new();
         let slug = self.target.slug();
-        let config_dir = self
-            .config_dir
-            .clone()
-            .or_else(|| {
-                self.cwd
-                    .as_deref()
-                    .and_then(crate::credential_preflight::gh_config_dir_for_root)
-            })
-            .or_else(|| {
-                slug.as_deref()
-                    .and_then(crate::credential_preflight::gh_config_dir_for_owner_slug)
-            });
+        // The write-scope gate probes the same resolution
+        // (`credential_preflight::gh_config_dir_for_call`, #12606), so a
+        // write is vetted under the credential it carries.
+        let config_dir = self.config_dir.clone().or_else(|| {
+            crate::credential_preflight::gh_config_dir_for_call(
+                self.cwd.as_deref(),
+                slug.as_deref(),
+            )
+        });
         if let Some(dir) = config_dir {
             plan.push(EnvEntry {
                 key: "GH_CONFIG_DIR",
@@ -687,7 +964,7 @@ impl GhInvocation {
     /// Assemble the child. Private: the facade owns execution.
     fn command(&self, program: &str, child_context: Option<&TraceContext>) -> Command {
         let mut cmd = Command::new(program);
-        cmd.args(&self.args);
+        cmd.args(self.spawn_args());
         cmd.env(BOOKED_ENV, "1");
         if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
@@ -720,6 +997,15 @@ impl GhInvocation {
         if self.intent == AccessIntent::Write {
             own_writes::note(&self.args, self.target.slug().as_deref());
         }
+        // #12074: past the work-finder tick's deadline a read is not sent.
+        if self.intent == AccessIntent::Read && read_deadline::passed() {
+            return Ok(self.deadline_shed());
+        }
+        // #12310: the gateway refused a discovery read for its quota reserve
+        // earlier in this tick; the rest of the tick's discovery is not sent.
+        if self.purpose() == ForgePurpose::Discovery && purpose::discovery_ended() {
+            return Ok(self.deadline_shed());
+        }
         #[cfg(test)]
         if let Some(routed) = test_routing::run(&self) {
             return routed;
@@ -730,16 +1016,14 @@ impl GhInvocation {
         let lookup = move |req: &crate::forge_identity::RouteRequest<'_>| {
             route(req, std::time::SystemTime::now())
         };
-        // `LOOM_READ_ROUTING=legacy`: the pre-W4-C path exactly — no
-        // derivation, no read class, the unconditional writer fallback.
-        if crate::forge_identity::RoutingMode::current()
-            == crate::forge_identity::RoutingMode::Legacy
-        {
-            return self.execute_routed(&lookup, &reader_route::withdraw_reader);
-        }
-        let policy = reader_route::ShedPolicy::current();
         self.with_derived_route()
-            .execute_routed_v2(&lookup, &reader_route::withdraw_reader, policy)
+            .execute_routed_v2(&lookup, &reader_route::withdraw_reader)
+    }
+
+    /// A read the tick deadline stopped (#12074): shed, nothing sent.
+    fn deadline_shed(&self) -> GhCompletion {
+        log::debug!("gh: {} not sent: the tick deadline passed (#12074)", self.operation.as_str());
+        GhCompletion::DeadlineReached
     }
 
     /// Run exactly once under the credential already chosen (no routing).
@@ -770,7 +1054,20 @@ impl GhInvocation {
     }
 
     /// Run this argv exactly once under its [`OutputContract`].
-    fn execute_once(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
+    fn execute_once(
+        mut self,
+        program: &str,
+        source: GhBinSource,
+    ) -> Result<GhCompletion, ExecError> {
+        // #12074: a read inside a tick deadline gets only the time left.
+        if let (AccessIntent::Read, OutputContract::Captured { timeout }) =
+            (self.intent, self.contract)
+        {
+            match read_deadline::clamp(timeout) {
+                Some(timeout) => self.contract = OutputContract::Captured { timeout },
+                None => return Ok(self.deadline_shed()),
+            }
+        }
         let span = telemetry::InvocationSpan::open(&self);
         let mut cmd = self.command(program, span.child_context(&self.parent));
         match self.contract {
@@ -785,6 +1082,9 @@ impl GhInvocation {
                 };
                 let billing = accounting::record(&self, outcome, captured);
                 span.finish(&self, source, outcome, code, &billing);
+                if let Ok(Completion::Exited(out)) = &result {
+                    crate::forge_gateway::outage::note_attempt(self.config_dir.as_deref(), out);
+                }
                 result.map(GhCompletion::Captured)
             }
             OutputContract::Passthrough => {
@@ -825,6 +1125,10 @@ impl GhInvocation {
 #[cfg(test)]
 #[path = "test_routing.rs"]
 pub(crate) mod test_routing;
+
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "w4c_sites_tests.rs"]

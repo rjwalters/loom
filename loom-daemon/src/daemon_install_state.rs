@@ -2870,9 +2870,19 @@ mod tests {
             ),
         );
 
-        let provisioned = with_path_prefix(stub_dir.path(), || {
-            launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, Some("custom/1"))
-        });
+        // The probe is bounded by the production `PROBE_TIMEOUT`; on a starved
+        // host the stub can miss it, which degrades to `None` (unknown). Ask
+        // again until the probe answers, with a generous bound. Only the
+        // answer is asserted, never how long it took.
+        let give_up = Instant::now() + Duration::from_secs(90);
+        let provisioned = loop {
+            let answer = with_path_prefix(stub_dir.path(), || {
+                launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, Some("custom/1"))
+            });
+            if answer.is_some() || Instant::now() >= give_up {
+                break answer;
+            }
+        };
 
         assert_eq!(
             provisioned,

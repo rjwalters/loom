@@ -2,6 +2,8 @@
 
 This guide shows how to integrate Loom workspace initialization into continuous integration and deployment pipelines.
 
+> This guide covers CI for *consumer* repositories. Which checks gate merges into this repository, and which layer is the authority for each, is in the [CI Contract](ci-contract.md).
+
 ## Table of Contents
 
 - [Overview](#overview)

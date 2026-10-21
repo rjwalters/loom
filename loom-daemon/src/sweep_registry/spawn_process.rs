@@ -222,12 +222,14 @@ impl SweepRegistry {
         // `PrSet` one. Both the rationale and the clearing (#7915) live in
         // [`child_env_markers::apply_issue_scoped_markers`].
         child_env_markers::apply_issue_scoped_markers(&mut cmd, kind);
+        // The issue this run's telemetry belongs to: a sweep's issue, an
+        // issue step's item, a PR step's linked issue (#11898).
+        let issue = self.step_issue(kind);
         crate::observability::tracing::prepare_child(
             &mut cmd,
             &self.config.workspace_root,
             sweep_id,
-            // A step is keyed by its item, as a sweep by its issue (#11898).
-            kind.item_number(),
+            issue,
         );
         // #9215: opt-in, default-off — hand the child's OWN Claude Code session
         // the OTel env it needs to emit `claude_code.llm_request` /
@@ -247,25 +249,16 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
             runtime_admission.map(|a| a.runtime.as_str()),
-            // A step is keyed by its item, as a sweep by its issue (#11898).
-            kind.item_number(),
+            issue,
             sweep_id,
-        );
-        // #9027: stamp the sweep's commits with the D33 provenance trailers
-        // (a git-env hooksPath override that chains to the repo's own hooks).
-        crate::provenance::hooks::prepare_child(
-            &mut cmd,
-            &self.config.workspace_root,
-            // A step is keyed by its item, as a sweep by its issue (#11898).
-            kind.item_number(),
         );
         // #8908: let the transcript-ingest pass join this issue's
         // `session.summary` logs to the execution's trace.
-        if let Some(item) = kind.item_number() {
+        if let Some(issue) = issue {
             crate::observability::runtime_usage::join::open(
                 &self.config.workspace_root,
                 sweep_id,
-                item,
+                issue,
             );
         }
         cmd
@@ -386,6 +379,17 @@ impl SweepRegistry {
         if let Some(selection) = selection {
             selection.apply(&mut cmd);
         }
+        // #11906: a step's lease file, pick journal and curation provenance.
+        if let SweepKind::Step { role, .. } = kind {
+            super::step_spawn::apply_step_env(
+                &mut cmd,
+                &self.config.workspace_root,
+                sweep_id,
+                *role,
+                model,
+                runtime_admission.map(|a| a.runtime.as_str()),
+            );
+        }
         // #10830: name this agent for pause-and-roll (item id, pause dir,
         // pinned Claude session id, scope unit). Inert until a roll asks.
         let session = match resume {
@@ -407,6 +411,19 @@ impl SweepRegistry {
         };
         if let Some(session) = &session {
             session.apply_env(&mut cmd);
+            // #11913: a step's session, for the ledger its end writes.
+            let id = session
+                .resume
+                .as_ref()
+                .map(|r| r.session_id.clone())
+                .or_else(|| session.claude_session_id.clone());
+            if let (SweepKind::Step { .. }, Some(session_id)) = (kind, id) {
+                crate::step_dispatch::session_ledger::note_session(
+                    &self.config.workspace_root,
+                    sweep_id,
+                    crate::step_dispatch::session_ledger::NotedSession { session_id },
+                );
+            }
         }
         let child = crate::observability::lifecycle::spawn_child(
             &mut cmd,

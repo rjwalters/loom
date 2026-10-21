@@ -158,10 +158,19 @@ fn chat_tool_calls(event: &Value, role: Option<&str>) -> usize {
         .count()
 }
 
+/// The tool name of a tool-use event: top-level fields first, then nested
+/// under `part` — OpenCode's `--format json` shape
+/// (`{"type":"tool_use","part":{"type":"tool","tool":"loom_bash",…}}`).
 fn tool_name(event: &Value) -> Option<&str> {
     TOOL_NAME_FIELDS
         .iter()
         .find_map(|field| event.get(*field).and_then(Value::as_str))
+        .or_else(|| {
+            let part = event.get("part")?;
+            TOOL_NAME_FIELDS
+                .iter()
+                .find_map(|field| part.get(*field).and_then(Value::as_str))
+        })
 }
 
 fn is_denial(event: &Value) -> bool {
@@ -327,6 +336,28 @@ mod tests {
         assert_eq!(outcome.loom_tool_uses, 1);
         assert_eq!(outcome.denials, 1);
         assert!(!outcome.is_toolless_failure());
+    }
+
+    #[test]
+    fn opencode_nested_part_tool_use_with_a_loom_tool_counts() {
+        // Verbatim OpenCode `--format json` shape: the tool name sits under
+        // `part`, not at the top level (#11549).
+        let stream = "\
+            {\"type\":\"tool_use\",\"timestamp\":1791767321693,\"sessionID\":\"ses_x\",\"part\":{\"type\":\"tool\",\"tool\":\"loom_bash\",\"callID\":\"call_1\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls\"},\"output\":\"ok\"}}}\n\
+        ";
+        let outcome = classify_native_stream(stream);
+        assert_eq!(outcome.loom_tool_uses, 1);
+        assert!(!outcome.observed_a_toolless_run());
+    }
+
+    #[test]
+    fn opencode_nested_part_tool_use_with_an_unguarded_tool_does_not_count() {
+        let stream = "\
+            {\"type\":\"tool_use\",\"timestamp\":1791767321693,\"sessionID\":\"ses_x\",\"part\":{\"type\":\"tool\",\"tool\":\"write\",\"callID\":\"call_2\",\"state\":{\"status\":\"completed\",\"input\":{\"filePath\":\"a\"},\"output\":\"ok\"}}}\n\
+        ";
+        let outcome = classify_native_stream(stream);
+        assert_eq!(outcome.loom_tool_uses, 0);
+        assert!(outcome.observed_a_toolless_run());
     }
 
     #[test]

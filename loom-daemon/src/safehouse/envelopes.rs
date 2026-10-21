@@ -54,6 +54,12 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             repo,
             ..
         } => Some(dispatch_envelope(repo.as_deref(), *issue)),
+        // A step is not narrated as an issue dispatch (#11898): its item may be
+        // a PR, and one item is advanced by several steps.
+        Event::SweepGlobalDispatch {
+            kind: SweepKind::Step { .. } | SweepKind::PrSet(_),
+            ..
+        } => None,
         Event::SweepPhase {
             issue,
             phase,

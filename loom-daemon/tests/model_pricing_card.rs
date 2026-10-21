@@ -77,3 +77,8 @@ fn fable_is_priced_as_fable_not_as_opus() {
     assert!((fable.0 - 2.0 * opus.0).abs() < f64::EPSILON);
     assert!((fable.1 - 2.0 * opus.1).abs() < f64::EPSILON);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

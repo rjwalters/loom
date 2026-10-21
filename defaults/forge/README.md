@@ -83,7 +83,7 @@ prohibitions (a guard that recognises `gh pr merge` in order to deny it is the
 opposite of a caller), and role prompts (instructions, not call sites — they are
 inventoried as `kind = "role-prompt"` callers instead).
 
-The baseline is a one-way ratchet, like `scripts/check-file-size-budget.sh`:
+The baseline is a one-way ratchet:
 counts may only go down and entries may only be removed. Regenerate it with
 
 ```bash

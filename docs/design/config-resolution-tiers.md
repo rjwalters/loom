@@ -56,6 +56,15 @@ the repo's own files. A repo with no such file resolves exactly as before. See
 [`defaults/docs/fleet-config-lifecycle.md`](../../defaults/docs/fleet-config-lifecycle.md)
 § "The per-repo fleet tier".
 
+**Conflict report (#11703).** `loom-daemon validate` lists every leaf key that a
+fleet tier (tier 1 or tier 4) sets to a different value than another tier. Each
+entry shows every value with its tier file, highest precedence first; the first
+is the value in effect, so a shadowed repo value is never silent. Equal values
+and disagreements among non-fleet tiers are not reported. The report goes to
+stderr in text mode and is omitted from `--format json` output. It reads the
+precedence order from `tier_paths_by_precedence`, so it follows any change to
+the merge order.
+
 A missing file, an unreadable file, or malformed JSON at **any** tier
 soft-fails to "that tier contributes nothing" (an empty object) — it never
 raises, never aborts the daemon/script, and never blocks the other tiers from

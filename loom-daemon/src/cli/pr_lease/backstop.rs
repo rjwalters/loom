@@ -1,12 +1,12 @@
 //! The PR-lease half of the Judge no-verdict backstop (#11855): `release`
 //! records a Judge pass that ended without a verdict, and `claim` refuses a
 //! Judge a PR those records hold. The rules live in
-//! [`loom_daemon::judge_backstop`].
+//! [`crate::judge_backstop`].
 
+use crate::forge_call_stats::ops;
+use crate::gh_invocation::AccessIntent;
+use crate::judge_backstop::{self as backstop, CiRead, CiState};
 use chrono::{DateTime, Utc};
-use loom_daemon::forge_call_stats::ops;
-use loom_daemon::gh_invocation::AccessIntent;
-use loom_daemon::judge_backstop as backstop;
 
 use super::{Ctx, Gh, Role, Row};
 
@@ -38,75 +38,39 @@ impl Gh {
         Some((open, head, labels))
     }
 
-    /// Whether `sha` has CI still in progress that is young enough to
-    /// exempt this pass ([`ci_pending`]). Unreadable counts as not pending:
-    /// the backstop stays a best-effort bound.
-    pub(crate) fn checks_pending(&self, sha: &str) -> bool {
-        ci_pending(sha, Utc::now(), |op, path| {
+    /// `sha`'s CI as the backstop sees it ([`backstop::ci_state`]).
+    pub(crate) fn ci_state(&self, sha: &str) -> CiState {
+        backstop::ci_state(sha, Utc::now(), |kind, path| {
+            let (name, op) = match kind {
+                CiRead::CheckRuns => ("pr_lease.checks_pending", ops::CI_CHECK_RUNS_FOR_SHA),
+                CiRead::CommitStatus => ("pr_lease.commit_status", ops::CI_COMMIT_STATUS),
+            };
             let out = self
-                .inv(op, AccessIntent::Read, ops::CI_CHECK_RUNS_FOR_SHA)
-                .args(["api", path])
+                .inv(name, AccessIntent::Read, op)
+                .args(["api", &format!("repos/{{owner}}/{{repo}}/{path}")])
                 .run();
             serde_json::from_slice(&out.ok_output()?.stdout).ok()
         })
     }
 }
 
-/// Whether `sha`'s CI is still pending young enough to exempt a pass
-/// ([`backstop::pending_exempts`]), read through `get(op, path)`: every page
-/// of its check runs, up to [`backstop::MAX_CHECK_RUN_PAGES`], then its
-/// legacy commit statuses (#11903). Stops at the first read that exempts,
-/// so the usual cost is one call; an unreadable read counts as not pending.
-pub(crate) fn ci_pending(
-    sha: &str,
-    now: DateTime<Utc>,
-    mut get: impl FnMut(&'static str, &str) -> Option<serde_json::Value>,
-) -> bool {
-    let base = format!(
-        "repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page={}",
-        backstop::CI_PAGE
-    );
-    let mut read = 0;
-    for page in 1..=backstop::MAX_CHECK_RUN_PAGES {
-        let path = if page == 1 {
-            base.clone()
-        } else {
-            format!("{base}&page={page}")
-        };
-        let Some(v) = get("pr_lease.checks_pending", &path) else {
-            break;
-        };
-        if backstop::pending_exempts(&backstop::pending_check_runs(&v), now) {
-            return true;
-        }
-        read += backstop::check_runs_listed(&v);
-        if !backstop::more_check_runs(&v, read) {
-            break;
-        }
-    }
-    let status =
-        format!("repos/{{owner}}/{{repo}}/commits/{sha}/status?per_page={}", backstop::CI_PAGE);
-    get("pr_lease.commit_status", &status)
-        .is_some_and(|v| backstop::pending_exempts(&backstop::pending_statuses(&v), now))
-}
-
 /// The fields a Judge release appends to its marker: the no-verdict record
 /// when the PR is still waiting for review with no verdict, else nothing (a
 /// verdict landed, the PR closed, or its state could not be read). A pass that
-/// deferred because the head's checks are still running (`checks_pending`,
-/// asked only once a record is otherwise due) is not a blocked pass: CI
-/// settling changes neither the head nor the labels, so a record would hold
-/// the PR from Judge long after CI went green.
+/// deferred because the head's checks are still running (`ci_exempts`, asked
+/// only once a record is otherwise due; [`CiState::exempts`]) is not a
+/// blocked pass: CI settling changes neither the head nor the labels, so a
+/// record would hold the PR from Judge long after CI went green.
 pub(crate) fn release_fields(
     role: Role,
     state: Option<(bool, String, Vec<String>)>,
-    checks_pending: impl FnOnce(&str) -> bool,
+    ci_exempts: impl FnOnce(&str) -> bool,
 ) -> String {
     match state {
         Some((open, head, labels))
             if role == Role::Judge
                 && backstop::ended_without_verdict(open, &labels)
-                && !checks_pending(&head) =>
+                && !ci_exempts(&head) =>
         {
             backstop::released_fields(&head, &labels)
         }
@@ -131,6 +95,44 @@ pub(crate) fn reaped_release_fields(
             backstop::reaped_fields(&head, &labels, reason)
         }
         _ => String::new(),
+    }
+}
+
+/// The `outcome=` field a Champion release records (#12616): the step's
+/// `CHAMPION-STEP` outcome word, or `none` when it wrote no line (a step that
+/// died). A merge leaves the release as it was. Anything but `[A-Za-z0-9_-]`
+/// is dropped so the word cannot break the marker. A `requeued` / `skipped`
+/// outcome also records the gate it stopped at, `reason=<token>` (#12715);
+/// `unspecified` when the step named none.
+pub(crate) fn champion_outcome_fields(
+    role: Role,
+    outcome: Option<&str>,
+    stop_reason: Option<&str>,
+) -> String {
+    if role != Role::Champion {
+        return String::new();
+    }
+    let token = |raw: Option<&str>, max: usize| -> String {
+        raw.unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .take(max)
+            .collect()
+    };
+    let word = token(outcome, 32);
+    match word.as_str() {
+        "merged" => String::new(),
+        "" => " outcome=none".to_string(),
+        w @ ("requeued" | "skipped") => {
+            let reason = token(stop_reason, 32);
+            let reason = if reason.is_empty() {
+                "unspecified"
+            } else {
+                &reason
+            };
+            format!(" outcome={w} reason={reason}")
+        }
+        w => format!(" outcome={w}"),
     }
 }
 
@@ -175,6 +177,29 @@ impl Ctx {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// [`backstop::ci_state`] with `Gh::ci_state`'s op names and full paths.
+    fn ci_state(
+        sha: &str,
+        now: DateTime<Utc>,
+        mut get: impl FnMut(&str, &str) -> Option<serde_json::Value>,
+    ) -> CiState {
+        backstop::ci_state(sha, now, |kind, path| {
+            let op = match kind {
+                CiRead::CheckRuns => "pr_lease.checks_pending",
+                CiRead::CommitStatus => "pr_lease.commit_status",
+            };
+            get(op, &format!("repos/{{owner}}/{{repo}}/{path}"))
+        })
+    }
+
+    fn ci_pending(
+        sha: &str,
+        now: DateTime<Utc>,
+        get: impl FnMut(&str, &str) -> Option<serde_json::Value>,
+    ) -> bool {
+        ci_state(sha, now, get) == CiState::Young
+    }
 
     const HEAD: &str = "3333333333333333333333333333333333333333";
 
@@ -307,6 +332,44 @@ mod tests {
         // A short page ends the paging even when total_count says more.
         let (_, asked) = read_ci(&[runs(500, 40, None)], None, now);
         assert_eq!(asked.len(), 2);
+    }
+
+    /// #11972: stuck CI (pending, but all of it past the window or
+    /// unstamped) is told apart from settled CI, and only a `ci-pending`
+    /// skip is exempted by settled CI.
+    #[test]
+    fn ci_state_tells_stuck_from_settled() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 14, 6, 0, 0).unwrap();
+        let one =
+            |run: serde_json::Value| serde_json::json!({"total_count": 1, "check_runs": [run]});
+        let state = |page: serde_json::Value, combined: Option<serde_json::Value>| {
+            ci_state(HEAD, now, |_, path| {
+                if path.contains("/status?") {
+                    combined.clone()
+                } else {
+                    Some(page.clone())
+                }
+            })
+        };
+        let queued = one(serde_json::json!({"status": "queued", "started_at": null}));
+        assert_eq!(state(queued, None), CiState::Stuck);
+        let stale =
+            one(serde_json::json!({"status": "in_progress", "started_at": "2026-10-13T20:00:00Z"}));
+        assert_eq!(state(stale, None), CiState::Stuck);
+        let young =
+            one(serde_json::json!({"status": "in_progress", "started_at": "2026-10-14T05:30:00Z"}));
+        assert_eq!(state(young, None), CiState::Young);
+        assert_eq!(state(runs(1, 1, None), None), CiState::Settled);
+        // A stale pending legacy status is stuck too.
+        let stale_status = status(serde_json::json!([
+            {"state": "pending", "context": "b", "created_at": "2026-10-13T20:00:00Z"},
+        ]));
+        assert_eq!(state(runs(1, 1, None), Some(stale_status)), CiState::Stuck);
+        for skipped in [false, true] {
+            assert!(CiState::Young.exempts(skipped));
+            assert!(!CiState::Stuck.exempts(skipped));
+            assert_eq!(CiState::Settled.exempts(skipped), skipped);
+        }
     }
 
     #[test]

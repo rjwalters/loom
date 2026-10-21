@@ -1,33 +1,17 @@
-//! Wakes from the mirror's change stream (loom#10892; 2AMLogic/2am#4367 P5).
+//! The mirror's change-stream pull (loom#10892; 2AMLogic/2am#4367 P5).
 //!
 //! While a mirror is live, the daemon pulls `GET /v1/changes` for the repos it
 //! serves every `changePollSecs`, keeping its own cursor per repo (persisted
-//! under `$HOME/.loom/forge-mirror/`). Each pull that returns a change becomes
-//! one `forge.event` bus prompt ([`crate::forge_events::BUS_TOPIC`], `source`
-//! [`MIRROR_SOURCE`]), so every loop whose `forgeEvents.events.*` consumer is
-//! armed ticks early through the same [`crate::forge_events::wake`] seam the
-//! per-host feed uses, under the same spacing floor and coalescing.
+//! under `$HOME/.loom/forge-mirror/`) and recording the change-to-pull latency.
+//! Since the 2026-10-19 ruling (#12809) a pull wakes no loop and gates no
+//! poll: every loop runs on its own timer, so a dead stream, a stale cursor or
+//! an unset mirror changes nothing but this telemetry.
 //!
-//! ADR-0021's invariants hold as written:
-//!
-//! 1. **A change is a nudge, never a command.** The prompt carries routing
-//!    hints only (`count`, webhook-style `types`, and the `repos` that changed
-//!    as invalidation keys). No title, number, label or state reaches a
-//!    decision: the loop it ticks re-reads through its own path.
-//! 2. **Polling is the floor.** Nothing here changes any loop's cadence. A
-//!    dead stream, a stale cursor or an unset mirror leaves every loop on its
-//!    timer, so the failure mode is latency only.
-//! 3. **Decision reads are never served from here.** Nothing in this file
-//!    reads state for a claim, a label transition or a merge.
-//! 4. **The key never leaves the process** except as the bearer header.
-//!
-//! Delivery is at-least-once: a restart resumes from the persisted cursor and
-//! may re-read changes it already saw, which costs at most one extra early
-//! tick. A repo with no cursor yet (first run, a new repo, a different
-//! mirror origin) is baselined at its latest change without a prompt, so a
-//! restart never replays history. A cursor the stream truncated, or one past
-//! the repo's latest change (the mirror's log was reset), re-baselines and
-//! prompts once, since changes may have been missed.
+//! A repo with no cursor yet (first run, a new repo, a different mirror
+//! origin) is baselined at its latest change, so a restart never replays
+//! history. A cursor the stream truncated, or one past the repo's latest
+//! change (the mirror's log was reset), re-baselines and sets
+//! [`Nudge::missed`], since changes may have been missed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -36,15 +20,9 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use super::client::{self, ChangesPage, MirrorError};
 use super::{Active, Refresher, CHECK_INTERVAL};
-use crate::event_bus::EventBus;
-use crate::types::Event;
-
-/// The `source` of a `forge.event` prompt built from the change stream.
-pub const MIRROR_SOURCE: &str = "github-events-mirror";
 
 /// Repos per `/v1/changes` request (the mirror's maximum).
 pub const MAX_REPOS_PER_REQUEST: usize = 20;
@@ -55,8 +33,8 @@ pub const CHANGE_LIMIT: u32 = 200;
 /// Most follow-up pages one chunk reads per pass; the rest wait one cadence.
 pub const MAX_PAGES_PER_PASS: usize = 5;
 
-/// The types a missed-changes prompt carries: every kind the change stream
-/// reports, so each armed consumer re-reads.
+/// The types a missed-changes pass carries: every kind the change stream
+/// reports.
 pub const MISSED_TYPES: [&str; 3] = ["issues", "pull_request", "check_run"];
 
 /// The persisted cursors: one `seq` per repo, for one mirror origin.
@@ -113,9 +91,7 @@ pub fn save_cursors(path: &Path, cursors: &Cursors) -> std::io::Result<()> {
     crate::roll_pause::write_atomic(path, &body)
 }
 
-/// The webhook event name a change kind stands for, so the existing
-/// consumers' type filters ([`crate::forge_events::wake::WORK_FINDER_EVENT_TYPES`]
-/// and friends) apply unchanged.
+/// The webhook-style event name a change kind stands for.
 #[must_use]
 pub fn webhook_type(kind: &str, item_type: Option<&str>) -> Option<&'static str> {
     match kind {
@@ -128,7 +104,7 @@ pub fn webhook_type(kind: &str, item_type: Option<&str>) -> Option<&'static str>
     }
 }
 
-/// What one pass learned: the prompt to publish, and the telemetry.
+/// What one pass learned.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Nudge {
     /// Changes read (each repo's `kinds`, before dedupe).
@@ -144,22 +120,10 @@ pub struct Nudge {
 }
 
 impl Nudge {
-    /// Whether this pass prompts the loops.
+    /// Whether this pass read any change or lost track of some.
     #[must_use]
     pub fn prompts(&self) -> bool {
         self.count > 0 || self.missed
-    }
-
-    /// The `forge.event` payload: routing hints and invalidation keys only.
-    #[must_use]
-    pub fn payload(&self) -> serde_json::Value {
-        json!({
-            "source": MIRROR_SOURCE,
-            "count": self.count.max(usize::from(self.missed)),
-            "types": self.types.iter().collect::<Vec<_>>(),
-            "repos": self.repos.iter().collect::<Vec<_>>(),
-            "missed": self.missed,
-        })
     }
 }
 
@@ -218,7 +182,7 @@ pub fn apply(
             // Missed changes, or the log restarted: re-read once, from now on.
             cursors.repos.insert(repo.clone(), latest);
             nudge.missed = true;
-            // Anything may have changed: wake every consumer's loop.
+            // Anything may have changed.
             nudge.types.extend(MISSED_TYPES);
             nudge.repos.insert(repo);
             continue;
@@ -252,9 +216,9 @@ async fn changes(
         "wake",
         "-",
         if page.is_ok() {
-            super::discovery::Outcome::Hit
+            crate::forge_mirror::Outcome::Hit
         } else {
-            super::discovery::Outcome::Error
+            crate::forge_mirror::Outcome::Error
         },
     );
     client::decode(page?)
@@ -265,7 +229,7 @@ async fn changes(
 ///
 /// Returns what was learned *and* the first failed request, if any: the pass
 /// stops at a failure, but cursors already advanced stay advanced, so the
-/// changes read before it are in the nudge and must still be published.
+/// changes read before it are in the nudge and must still be recorded.
 pub async fn pass(
     http: &reqwest::Client,
     active: &Active,
@@ -304,26 +268,10 @@ async fn pass_into(
     Ok(())
 }
 
-/// Publish a pass's prompt and invalidate the poll gate's holds for the repos
-/// that changed (over-reporting costs calls, never correctness).
-pub fn publish(bus: &EventBus, nudge: &Nudge) {
-    if !nudge.prompts() {
-        return;
-    }
-    for repo in &nudge.repos {
-        super::discovery::release_hold(repo);
-    }
-    let events: Vec<serde_json::Value> = nudge.repos.iter().map(|r| json!({ "repo": r })).collect();
-    crate::forge_events::poll_gate::ingest_page(&events, nudge.missed && events.is_empty());
+/// Record a pass's change-to-pull latencies.
+pub fn record(nudge: &Nudge) {
     for (repo, kind, secs) in &nudge.latencies {
         crate::observability::ops::forge_mirror::record_change(repo, kind, *secs);
-    }
-    if let Err(error) = bus.publish(Event::Generic {
-        topic: crate::forge_events::BUS_TOPIC.to_string(),
-        payload: nudge.payload(),
-    }) {
-        // No subscriber is the normal case while every consumer is off.
-        log::debug!("forge_mirror: forge.event published with {error}");
     }
 }
 
@@ -342,7 +290,7 @@ fn served_repos(workspace_root: &Path, pool: &crate::workspace_pool::WorkspacePo
     }
     let set: BTreeSet<String> = roots
         .iter()
-        .filter_map(|r| super::discovery::resolve_repo(Some(r), None))
+        .filter_map(|r| super::resolve_repo(Some(r), None))
         .collect();
     set.into_iter().collect()
 }
@@ -350,10 +298,9 @@ fn served_repos(workspace_root: &Path, pool: &crate::workspace_pool::WorkspacePo
 /// The daemon's mirror task: refresh `forge.mirror` every [`CHECK_INTERVAL`]
 /// (publishing the live mirror for the discovery reads) and, while one is
 /// live, pull the change stream every `changePollSecs`. With `forge.mirror`
-/// unset it only re-reads the config: no request, no file, no prompt.
+/// unset it only re-reads the config: no request, no file.
 pub fn spawn(
     workspace_root: PathBuf,
-    bus: EventBus,
     pool: Arc<crate::workspace_pool::WorkspacePool>,
 ) -> tokio::task::JoinHandle<()> {
     super::set_active(None);
@@ -393,7 +340,7 @@ pub fn spawn(
             pulled = Some(Instant::now());
             if http.is_none() {
                 http = client::build_http()
-                    .map_err(|e| log::warn!("forge_mirror: {e}; no wakes"))
+                    .map_err(|e| log::warn!("forge_mirror: {e}; no change stream"))
                     .ok();
             }
             let Some(h) = http.as_ref() else {
@@ -411,18 +358,15 @@ pub fn spawn(
             c.repos.retain(|r, _| repos.contains(r));
             let before = c.clone();
             let (nudge, result) = pass(h, &active, &repos, c).await;
-            // Publish what was read even when a later request failed: the
+            // Record what was read even when a later request failed: the
             // cursors already moved past those changes.
-            publish(&bus, &nudge);
+            record(&nudge);
             match result {
                 Ok(()) => last_error = None,
                 Err(e) => {
                     let class = e.to_string();
                     if last_error.as_deref() != Some(class.as_str()) {
-                        log::warn!(
-                            "forge_mirror: change stream pull failed ({class}); loops keep \
-                             their cadence — 2am#4367"
-                        );
+                        log::warn!("forge_mirror: change stream pull failed ({class}) — 2am#4367");
                         last_error = Some(class);
                     }
                 }

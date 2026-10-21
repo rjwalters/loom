@@ -157,6 +157,12 @@ impl RunJson {
         self.status.as_deref() == Some("completed")
     }
 
+    /// Waiting for a runner (#11993). An absent `status` is not counted.
+    #[must_use]
+    pub fn is_queued(&self) -> bool {
+        self.status.as_deref() == Some("queued")
+    }
+
     #[must_use]
     pub fn workflow(&self) -> String {
         self.name.clone().unwrap_or_else(|| "unnamed".to_string())

@@ -47,6 +47,21 @@ fn a_user_token_is_decided_by_leg_one() {
     assert!(matches!(from_snapshot(&Answer::PerRepo, failed), Some(Permission::Unknown(_))));
 }
 
+/// #11957: an all-`false` role under a not-an-installation snapshot is no
+/// verdict. An App token misread as a user token gets exactly that on every
+/// repository, so it must not become a refusal cached for the probe TTL.
+#[test]
+fn a_per_repo_role_of_none_is_unknown_not_a_cached_refusal() {
+    use crate::write_scope::probe::classify_repo_permissions;
+    for body in ["{}", r#"{"admin":false,"push":false,"pull":false}"#] {
+        let all_false = || Ok(classify_repo_permissions(body));
+        assert!(
+            matches!(from_snapshot(&Answer::PerRepo, all_false), Some(Permission::Unknown(_))),
+            "{body}"
+        );
+    }
+}
+
 /// With no snapshot to be had, a verified leg-1 WRITE stands, and an App
 /// token's all-false `permissions` is never turned into a cached refusal or
 /// a grant.

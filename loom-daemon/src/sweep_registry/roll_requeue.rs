@@ -256,6 +256,11 @@ pub(crate) fn refresh_lease_once(
         .arg(sweep_id)
         .current_dir(workspace_root)
         .stdin(Stdio::null());
+    // Vet and perform the lease write under the root owner's credential, not the
+    // daemon's process-global one (#5401): on a cross-owner root the latter is
+    // refused by the write-scope probe. The recovery variant covers a roll that
+    // runs soon after a daemon start, before the root is registered (#6722).
+    crate::credential_preflight::apply_gh_config_for_root_with_recovery(&mut cmd, workspace_root);
     match reaper::output_with_timeout(cmd, timeout) {
         Ok(Some(out)) if out.status.success() => Ok(()),
         Ok(Some(out)) => Err(format!(
@@ -273,6 +278,44 @@ pub(crate) fn refresh_lease_once(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A stub `renew-once` helper that records the `GH_CONFIG_DIR` it ran under;
+    /// returns that recorded value (`""` when the child inherited none).
+    fn gh_config_dir_seen_by_refresh(root: &Path) -> String {
+        let script = root.join(dispatch::LEASE_RENEW_SCRIPT_REL);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        let out = root.join("seen");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s' \"${{GH_CONFIG_DIR-}}\" > \"{}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        refresh_lease_once(root, "h", 7, "sweep-7", Duration::from_secs(10)).unwrap();
+        std::fs::read_to_string(out).unwrap()
+    }
+
+    /// The `renew-once` child runs under the root owner's `GH_CONFIG_DIR` for a
+    /// registered cross-owner root, and inherits the process one otherwise.
+    #[test]
+    #[serial_test::serial]
+    fn lease_refresh_child_carries_the_root_owners_gh_config_dir() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let cross = dir.path().join("cross");
+        let same = dir.path().join("same");
+        let owner_dir = dir.path().join("gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(&cross, &owner_dir);
+
+        assert_eq!(gh_config_dir_seen_by_refresh(&cross), owner_dir.display().to_string());
+        let inherited = std::env::var("GH_CONFIG_DIR").unwrap_or_default();
+        assert_eq!(gh_config_dir_seen_by_refresh(&same), inherited);
+
+        crate::credential_preflight::clear_owner_root_registry();
+    }
 
     fn notice(reason: &str) -> RollRequeueNotice {
         RollRequeueNotice {

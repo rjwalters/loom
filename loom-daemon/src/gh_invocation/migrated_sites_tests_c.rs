@@ -2,34 +2,8 @@
 //! #10089 (increment 6): the merge-consolidation and `forge comment`
 //! `--patch-created` read spawns reach `forge_call_stats`, one row each.
 
-use crate::forge_call_stats;
+use crate::gh_invocation::test_support::{calls, rows_after, stub};
 use crate::merge_pr::consolidate::{default_branch, fetch_component};
-use crate::types::ForgeCallCounts;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
-fn rows_after(body: impl FnOnce()) -> Vec<ForgeCallCounts> {
-    let sink = tempfile::tempdir().unwrap();
-    forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
-    body();
-    let report = forge_call_stats::status_report(chrono::Utc::now(), None);
-    forge_call_stats::set_test_sink_dir(None);
-    report.host_window.unwrap_or_default()
-}
-
-fn calls(rows: &[ForgeCallCounts], caller: &str) -> u64 {
-    rows.iter()
-        .filter(|r| r.caller == caller)
-        .map(|r| r.ok + r.error)
-        .sum()
-}
 
 #[test]
 #[serial_test::serial]

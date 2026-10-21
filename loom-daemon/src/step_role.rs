@@ -23,8 +23,10 @@
 //! keep-or-close, Champion re-evaluate, Champion hold re-evaluation, …). Each
 //! of those runs as one of the six roles here: keep-or-close as
 //! [`StepRole::Curator`], re-evaluate as [`StepRole::ChampionPromote`], hold
-//! re-evaluation as [`StepRole::ChampionMerge`]. Unifying the two enums, or
-//! adding `From<Step> for StepRole`, is left to the child that lands second.
+//! re-evaluation and PR triage (#12499) as [`StepRole::ChampionMerge`]: both
+//! are Champion on a PR, invoked `--pr N`, holding the PR lease with no claim
+//! label. `From<Step> for StepRole` is that fold (#11900); the two enums stay
+//! separate.
 //!
 //! # Wire form
 //!
@@ -48,8 +50,8 @@ pub enum StepRole {
     Judge,
     /// Doctor on a PR: claim `loom:treating` plus the PR lease.
     Doctor,
-    /// Champion merging (or re-evaluating a hold on) a PR: the PR lease with
-    /// `step=champion_merge`, no claim label.
+    /// Champion merging (or re-evaluating a hold on, or triaging, #12499) a
+    /// PR: the PR lease with `step=champion_merge`, no claim label.
     ChampionMerge,
 }
 
@@ -133,10 +135,50 @@ impl StepRole {
             .find(|r| r.claim_label() == Some(label))
     }
 
-    /// The `/loom:<role> <item>` prompt a fresh step session starts with.
+    /// The step and item a step's sweep id names (`step-<role>-<item>-<ts>`,
+    /// optionally `-r<n>` for a roll resume; `generate_sweep_id`). The kind
+    /// is recoverable from the id alone, so a lock's owner says whether its
+    /// holder is a step (#11898: startup adoption). Pure.
+    #[must_use]
+    pub fn parse_sweep_id(id: &str) -> Option<(StepRole, u32)> {
+        let mut parts = id.strip_prefix("step-")?.split('-');
+        let role = parts.next()?.parse().ok()?;
+        let item = parts.next()?.parse().ok()?;
+        Some((role, item))
+    }
+
+    /// The prompt a fresh step session starts with: `/loom:<role> <item>`,
+    /// except Champion, whose targeted modes take a flag naming the item's
+    /// kind (`champion-targeted.md`): `--pr N` for a merge, `--issue N` for a
+    /// promotion. A bare `/loom:champion N` is refused there (#11906).
     #[must_use]
     pub fn prompt(self, item: u32) -> String {
-        format!("/loom:{} {item}", self.role_name())
+        match self {
+            StepRole::ChampionMerge => format!("/loom:champion --pr {item}"),
+            StepRole::ChampionPromote => format!("/loom:champion --issue {item}"),
+            StepRole::Curator | StepRole::Builder | StepRole::Judge | StepRole::Doctor => {
+                format!("/loom:{} {item}", self.role_name())
+            }
+        }
+    }
+}
+
+/// The classifier's finer step folded onto the role that runs it (the module
+/// doc's "Relation to the item classifier"): the outcome ledger (#11900) keys
+/// on `(item, StepRole)`, the same pair a step claim and its peer ad carry.
+impl From<crate::work_finder::step_item::Step> for StepRole {
+    fn from(step: crate::work_finder::step_item::Step) -> Self {
+        use crate::work_finder::step_item::Step;
+        match step {
+            Step::Curator | Step::CuratorKeepOrClose => StepRole::Curator,
+            Step::ChampionPromote | Step::ChampionReevaluate => StepRole::ChampionPromote,
+            Step::Builder => StepRole::Builder,
+            Step::Judge => StepRole::Judge,
+            Step::Doctor => StepRole::Doctor,
+            Step::ChampionMerge | Step::ChampionHoldReevaluate | Step::ChampionTriage => {
+                StepRole::ChampionMerge
+            }
+        }
     }
 }
 
@@ -171,6 +213,29 @@ mod tests {
             assert_eq!(role.as_str().parse::<StepRole>().unwrap(), role);
         }
         assert!("sweep".parse::<StepRole>().is_err());
+    }
+
+    /// Every classifier step folds onto the role whose claim it takes.
+    #[test]
+    fn classifier_steps_fold_onto_their_role() {
+        use crate::work_finder::step_item::Step;
+        let table = [
+            (Step::Curator, StepRole::Curator),
+            (Step::CuratorKeepOrClose, StepRole::Curator),
+            (Step::ChampionPromote, StepRole::ChampionPromote),
+            (Step::ChampionReevaluate, StepRole::ChampionPromote),
+            (Step::Builder, StepRole::Builder),
+            (Step::Judge, StepRole::Judge),
+            (Step::Doctor, StepRole::Doctor),
+            (Step::ChampionMerge, StepRole::ChampionMerge),
+            (Step::ChampionHoldReevaluate, StepRole::ChampionMerge),
+            (Step::ChampionTriage, StepRole::ChampionMerge),
+        ];
+        for (step, role) in table {
+            assert_eq!(StepRole::from(step), role, "{step:?}");
+            assert_eq!(step.role(), role.role_name());
+            assert_eq!(step.acts_on_pr(), role.acts_on_pr(), "{step:?}");
+        }
     }
 
     /// Design §5's restore table, row by row.
@@ -231,6 +296,8 @@ mod tests {
         assert!(!StepRole::ChampionPromote.acts_on_pr());
         assert!(StepRole::ChampionMerge.acts_on_pr());
         assert_eq!(StepRole::Judge.prompt(42), "/loom:judge 42");
+        assert_eq!(StepRole::ChampionMerge.prompt(42), "/loom:champion --pr 42");
+        assert_eq!(StepRole::ChampionPromote.prompt(7), "/loom:champion --issue 7");
     }
 }
 

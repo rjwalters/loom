@@ -3137,17 +3137,25 @@ fn concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll() 
 #[serial]
 fn concurrent_status_read_is_not_blocked_behind_work_finder_dispatch_poll() {
     let dir = tempdir().unwrap();
-    let poll_delay = Duration::from_millis(700);
+    // Ordering proof, not a timing proxy (Issue #11650): the stub touches
+    // `in_poll` once it is running (so `begin_issue_dispatch` has returned
+    // and the registry lock is released), then holds the poll open until the
+    // test touches `release`. The wait is bounded so a regression that
+    // blocks the read cannot hang the suite.
+    let in_poll = dir.path().join("in-poll");
+    let release = dir.path().join("release");
     let script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nsleep {:.2}\n\
+        "#!/usr/bin/env bash\nset -euo pipefail\ntouch '{}'\n\
+             for _ in $(seq 400); do [ -e '{}' ] && break; sleep 0.05; done\n\
              echo \"spawn-claude: using OAuth account 'agent-6688' (mode=random)\" >&2\n\
              sleep 5\n",
-        poll_delay.as_secs_f64()
+        in_poll.display(),
+        release.display()
     );
     let registry = Arc::new(Mutex::new(lifecycle_registry(dir.path(), &script)));
 
-    // Kick off the dispatch (which will be mid-poll, holding NO lock,
-    // for ~poll_delay) on its own thread — exactly the shape
+    // Kick off the dispatch (which will be mid-poll, holding NO lock, until
+    // `release` appears) on its own thread — exactly the shape
     // `RegistryDispatcher::dispatch` runs it in (a synchronous call with
     // no `.await` of its own).
     let dispatch_registry = Arc::clone(&registry);
@@ -3163,28 +3171,40 @@ fn concurrent_status_read_is_not_blocked_behind_work_finder_dispatch_poll() {
         .expect("dispatch_issue_releasing_poll_lock should succeed")
     });
 
-    // Give the dispatch a moment to get past `begin_issue_dispatch`
-    // (guard chain + spawn) and into the unlocked poll before racing a
-    // status-style read against it.
-    std::thread::sleep(Duration::from_millis(150));
+    // Wait until the stub is provably inside the poll.
+    let wait_start = Instant::now();
+    while !in_poll.exists() {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(30),
+            "dispatch stub never reached the account-selection poll"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
+    // A status-style read must complete while the poll is still open. If the
+    // dispatch held the registry lock across the poll, the read could only
+    // finish after the stub's own bounded wait (~20s) — well past this
+    // deadline — so the assertion is on ordering, not on host speed.
+    let (tx, rx) = std::sync::mpsc::channel();
     let read_registry = Arc::clone(&registry);
-    let read_start = Instant::now();
     let read_handle = std::thread::spawn(move || {
         let sr = read_registry.lock().unwrap();
         let _ = sr.list(None);
+        let _ = tx.send(());
     });
+    rx.recv_timeout(Duration::from_secs(10)).expect(
+        "a concurrent status-style read did not complete while the dispatch was in the \
+         account-selection poll — looks blocked behind the registry lock (Issue #6688)",
+    );
+    assert!(
+        !dispatch_handle.is_finished(),
+        "dispatch finished before the status-style read did — the read was not concurrent \
+         with the poll (Issue #6688)"
+    );
     read_handle
         .join()
         .expect("status-style read thread panicked");
-    let read_elapsed = read_start.elapsed();
-
-    assert!(
-        read_elapsed < poll_delay / 2,
-        "a concurrent status-style read took {read_elapsed:?} — should complete in well \
-             under the {poll_delay:?} account-selection poll delay if the dispatch released \
-             the registry lock for the poll (Issue #6688); looks blocked behind it instead"
-    );
+    std::fs::write(&release, b"").unwrap();
 
     let outcome = dispatch_handle.join().expect("dispatch thread panicked");
     assert!(outcome.was_new);

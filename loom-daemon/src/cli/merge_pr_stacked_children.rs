@@ -42,7 +42,7 @@
 //!
 //! # Why this verb does not fail closed
 //!
-//! Argued in full in [`loom_daemon::merge_pr::stacked_children`]'s module docs:
+//! Argued in full in [`crate::merge_pr::stacked_children`]'s module docs:
 //! the guard establishes a postcondition for a best-effort cleanup step, not a
 //! verdict about whether this tree may merge, and the fail-closed
 //! `verdict-contradiction` gate runs on the same binary later in the same
@@ -53,7 +53,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::stacked_children::{
+use crate::merge_pr::stacked_children::{
     blocked_message, children_json, decide, discover_open_children, invalid_ref_message,
     parse_children, pinned_message, try_establish_pin, Child, Inputs, Outcome, PinRefusal,
 };
@@ -171,7 +171,7 @@ impl StackedChildrenArgs {
     /// The branch-shape gate is applied first so a non-issue parent branch costs
     /// no forge call at all, matching the retired shell's ordering.
     fn children(&self) -> Vec<Child> {
-        if !loom_daemon::merge_pr::stacked_children::is_stackable_parent_branch(&self.branch) {
+        if !crate::merge_pr::stacked_children::is_stackable_parent_branch(&self.branch) {
             return Vec::new();
         }
         let raw = if self.from_stdin {

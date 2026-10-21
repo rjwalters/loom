@@ -1815,6 +1815,10 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
         return;
     }
 
+    // #11194: report-only visibility for directories no cleanup class owns.
+    // Runs in `--dry-run` too; never removes, adopts, or feeds eligibility.
+    super::unrecognized_report::report(repo_root, &worktrees_dir);
+
     // #5895 (AC1): deregister worktrees whose directory is already gone
     // *before* enumerating and attempting removal, so a registration git can
     // already see is stale never reaches the removal loop as a candidate
@@ -3034,6 +3038,24 @@ pub enum ArtifactOutcome {
     /// The directory exists and was deliberately **kept**: a live process is
     /// executing a binary inside it (issue #6127).
     Protected(ProtectedArtifact),
+    /// The directory exists and was deliberately **kept** because the workspace
+    /// sets `clean.keepBuildArtifacts` (issue #12694): the primary checkout is
+    /// itself a runtime dependency (e.g. other agents load its `node_modules/`
+    /// by absolute path), so reclaiming it breaks them.
+    Kept(ReclaimedArtifact),
+}
+
+/// Config key (`.loom/config.json`) that opts a workspace's primary checkout
+/// out of [`sweep_primary_checkout_artifacts`] — boolean, default `false`.
+pub const KEEP_BUILD_ARTIFACTS_KEY: &str = "clean.keepBuildArtifacts";
+
+/// Whether `repo_root` opted out of artifact sweeps. Anything but a literal
+/// JSON `true` (absent, non-boolean) is `false`.
+fn keep_build_artifacts(repo_root: &Path) -> bool {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, KEEP_BUILD_ARTIFACTS_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from a
@@ -3066,6 +3088,14 @@ pub enum ArtifactOutcome {
 /// escape hatch a scheduled job could set would reintroduce exactly the bug.
 /// The reclaim is not lost, only deferred until the program is stopped.
 ///
+/// # The opt-out (issue #12694)
+///
+/// A workspace whose primary checkout is a runtime dependency sets
+/// `clean.keepBuildArtifacts: true`; every existing artifact directory is then
+/// reported as [`ArtifactOutcome::Kept`] (under `dry_run` too, so a preview
+/// matches reality). It lives here, in the shared engine, so the CLI and the
+/// daemon's disk-pressure pass can never disagree about it.
+///
 /// Whole-directory granularity is deliberate too — a partial sweep that deleted
 /// everything under `target/` *except* the live binary would leave a build tree
 /// in a state neither cargo nor the operator can reason about, to save disk in
@@ -3073,10 +3103,18 @@ pub enum ArtifactOutcome {
 #[must_use]
 pub fn sweep_primary_checkout_artifacts(repo_root: &Path, dry_run: bool) -> Vec<ArtifactOutcome> {
     let mut outcomes = Vec::with_capacity(PRIMARY_CHECKOUT_ARTIFACTS.len());
+    let keep = keep_build_artifacts(repo_root);
     for name in PRIMARY_CHECKOUT_ARTIFACTS {
         let dir = repo_root.join(name);
         if !dir.is_dir() {
             outcomes.push(ArtifactOutcome::Absent((*name).to_string()));
+            continue;
+        }
+        if keep {
+            outcomes.push(ArtifactOutcome::Kept(ReclaimedArtifact {
+                name: (*name).to_string(),
+                size_human: dir_size_human(&dir),
+            }));
             continue;
         }
         // Checked under `dry_run` too: a preview that claims it "would remove"
@@ -3117,6 +3155,9 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
             // an unexpectedly small reclaim, and it belongs in the same log the
             // scheduled `--deep --safe -y` job already captures.
             ArtifactOutcome::Protected(p) => println!("SKIPPED {}", p.reason()),
+            ArtifactOutcome::Kept(a) => {
+                println!("SKIPPED {}/ kept (keepBuildArtifacts, {})", a.name, a.size_human);
+            }
         }
         println!();
     }
@@ -3267,13 +3308,34 @@ fn revert_stale_building_labels_spawn_loop(repo_root: &Path, dry_run: bool) -> u
         return 0;
     }
 
+    revert_orphan_building_labels(
+        orphans,
+        dry_run,
+        |n| super::orphan_recovery::open_linked_pr_blocks_reset(repo_root, n),
+        |n| gh::edit_labels(repo_root, n, "loom:building", "loom:issue"),
+    )
+}
+
+/// Revert `loom:building` -> `loom:issue` on each orphan unless an open linked
+/// PR (or an unverifiable probe) vetoes it (issue #12733). The probe and the
+/// label write are injected so the veto is testable without a forge.
+fn revert_orphan_building_labels(
+    orphans: Vec<u32>,
+    dry_run: bool,
+    open_pr_blocks: impl Fn(u32) -> bool,
+    mut edit_labels: impl FnMut(u32) -> anyhow::Result<()>,
+) -> usize {
     let mut reverted = 0usize;
     for issue_num in orphans {
+        if open_pr_blocks(issue_num) {
+            println!("  Keeping `loom:building` on #{issue_num}: open linked PR (#12733)");
+            continue;
+        }
         if dry_run {
             println!("  Would revert label on #{issue_num}: building -> issue");
             continue;
         }
-        match gh::edit_labels(repo_root, issue_num, "loom:building", "loom:issue") {
+        match edit_labels(issue_num) {
             Ok(()) => {
                 println!("  Reverted #{issue_num}: building -> issue");
                 reverted += 1;

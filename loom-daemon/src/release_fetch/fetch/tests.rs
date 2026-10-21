@@ -24,17 +24,8 @@ pub(super) fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     p
 }
 
-pub(super) fn tempdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "loom-daemon-fetch-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+pub(super) fn tempdir() -> crate::release_fetch::TestDir {
+    crate::release_fetch::TestDir::new("fetch")
 }
 
 pub(super) fn with_fake_bin<F: FnOnce()>(bindir: &Path, f: F) {

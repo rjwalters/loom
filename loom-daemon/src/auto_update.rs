@@ -217,12 +217,6 @@ pub const DEFAULT_AUTO_UPDATE_SETTLE_SECS: u64 = 600;
 /// "stampedes on every busy period".
 pub const DEFAULT_AUTO_UPDATE_DEFER_DEADLINE_SECS: u64 = 21_600;
 
-/// `nice` value applied to the rebuild subprocess when it runs under the gate-4
-/// deadline override, so a build forced onto a saturated host yields CPU to the
-/// in-flight sweeps instead of competing with them. `19` is the maximum (lowest
-/// priority) niceness on Linux and macOS.
-const LOW_PRIORITY_NICE: i32 = 19;
-
 /// First backoff delay after a retryable build failure. Subsequent failures
 /// double it, capped at [`BACKOFF_CEILING`].
 const BACKOFF_BASE: Duration = Duration::from_secs(60);
@@ -285,6 +279,10 @@ pub struct AutoUpdateConfig {
     /// priority (#4929). A zero/invalid value is dropped to `None`; `0` is
     /// intentionally *not* "never defer" — use a small positive value.
     pub defer_deadline_secs: Option<u64>,
+    /// #9736: no successful check for this long is a health finding.
+    pub overdue_secs: Option<u64>,
+    /// #9736: a newer release unapplied this long is a health finding.
+    pub converge_deadline_secs: Option<u64>,
     /// #10885: the removed keys this block still sets (see
     /// [`removed_settings`]). They are ignored; this only feeds the warning.
     pub removed_keys: Vec<&'static str>,
@@ -315,6 +313,14 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .filter(|&s| s > 0),
         defer_deadline_secs: block
             .get("deferDeadlineSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        overdue_secs: block
+            .get("overdueSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        converge_deadline_secs: block
+            .get("convergeDeadlineSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         removed_keys: removed_settings::keys_in(block),
@@ -413,6 +419,12 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo_ticks: u32,
     /// The repo that streak's most recent tick queried.
     pub stale_repo: Option<String>,
+    /// #11042: why a host below the fleet floor is not rolling, or `None`.
+    pub floor_not_rolling: Option<not_rolling::FloorNotRolling>,
+    /// #9736: last successful check, pending age and thresholds.
+    pub freshness: Option<freshness::FreshnessReport>,
+    /// #12420: what the last tick saw of the host's update state (read-only).
+    pub observation: update_observation::LoopFacts,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -444,6 +456,16 @@ impl AutoUpdateStatus {
             .lock()
             .expect("auto-update status mutex poisoned")
             .clone()
+    }
+
+    /// #12420: mark a release artifact fetch as running, so `status` can say
+    /// H2 while it does. The tick's closing publish clears it.
+    fn set_fetching(&self) {
+        self.inner
+            .lock()
+            .expect("auto-update status mutex poisoned")
+            .observation
+            .fetching = true;
     }
 
     /// Overwrite the published snapshot.
@@ -601,8 +623,20 @@ pub mod tuning;
 pub use tuning::TickTuning;
 /// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
 pub mod loop_mode;
+
+/// Whether the loop is making progress at all: last successful check and
+/// unapplied-release age, with the assessment `health` and the alert share
+/// (#9736).
+pub mod freshness;
+/// Low-priority (`nice`) setup for the rebuild subprocess.
+mod nice;
+/// #11042: the unsupervised re-download guard and the typed not-rolling reason.
+pub mod not_rolling;
+use nice::nice_child;
 /// #10880: the failed-roll guard (attempt record, gate, held-roll alert).
 pub mod roll_attempt;
+/// #12420: the read-only host-update state projection.
+pub mod update_observation;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -949,7 +983,7 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
 /// →Retryable.
 ///
 /// `low_priority` (#4929) niced the whole build subtree to
-/// [`LOW_PRIORITY_NICE`] via a `pre_exec` `setpriority(2)` — inherited by
+/// [`nice::LOW_PRIORITY_NICE`] via a `pre_exec` `setpriority(2)` — inherited by
 /// `cargo`/`rustc`, so a rebuild forced past gate 4's deadline yields CPU to
 /// the in-flight sweeps rather than stampeding them.
 ///
@@ -1075,31 +1109,6 @@ fn run_update_script_with(
     let _ = std::fs::remove_file(&log_path);
     outcome
 }
-
-/// Nice the child (and, by inheritance, the `cargo`/`rustc` processes it
-/// spawns) down to [`LOW_PRIORITY_NICE`] before `exec`. Best-effort: a failing
-/// `setpriority` is deliberately ignored — a build at normal priority is far
-/// better than no build at all, which is the starvation this whole path exists
-/// to end (#4929).
-#[cfg(unix)]
-fn nice_child(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `pre_exec` runs between fork and exec, where only
-    // async-signal-safe work is permitted. `setpriority(2)` is a bare syscall
-    // wrapper — it allocates nothing, takes no locks, and touches no libc
-    // global state — so it is safe in that window.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setpriority(libc::PRIO_PROCESS, 0, LOW_PRIORITY_NICE);
-            Ok(())
-        });
-    }
-}
-
-/// Non-unix hosts have no `setpriority`; the build simply runs at normal
-/// priority (the daemon's supervised install targets are macOS/Linux).
-#[cfg(not(unix))]
-fn nice_child(_command: &mut Command) {}
 
 /// Map a `loom-daemon-update.sh` exit code to a [`RebuildOutcome`], attaching a
 /// [`failure_digest`] of the captured output on any non-success.
@@ -1248,8 +1257,12 @@ pub struct AutoUpdateState {
     repo_ahead: floor_roll::repo_ahead::RepoAheadState,
     /// #10713: where this state is persisted (disabled unless attached).
     persist: persisted_state::Persistence,
+    /// #11042: the target an unsupervised host installed and could not roll to.
+    unsupervised: not_rolling::UnsupervisedStage,
     /// #10880: the last version roll armed, persisted, and its retry gate.
     attempt: roll_attempt::AttemptGuard,
+    /// #9736: last successful check and unapplied-release clocks.
+    freshness: freshness::Freshness,
 }
 
 impl AutoUpdateState {
@@ -1810,6 +1823,7 @@ impl AutoUpdateState {
             }
             ArtifactResolution::Unresolved(_) => (None, None),
         };
+        let freshness = self.freshness.report(last_check, &note);
         AutoUpdateStatusSnapshot {
             enabled,
             last_check: Some(last_check),
@@ -1822,6 +1836,14 @@ impl AutoUpdateState {
             artifact_published_at,
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
+            floor_not_rolling: None,
+            freshness: Some(freshness),
+            observation: update_observation::LoopFacts::of_tick(
+                artifact,
+                &self.floor,
+                &self.repo_ahead,
+                env!("CARGO_PKG_VERSION"),
+            ),
         }
     }
 }
@@ -1901,6 +1923,7 @@ fn backoff_delay(failures: u32) -> Duration {
 // which added panic recovery, a tick watchdog, liveness and `auto_update.tick`
 // telemetry; this file is over the file-size ratchet threshold.
 mod runner;
+mod stall_recheck;
 mod tick_telemetry;
 #[cfg(test)]
 use runner::run_tick;

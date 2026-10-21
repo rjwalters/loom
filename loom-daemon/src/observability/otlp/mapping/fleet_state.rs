@@ -82,14 +82,14 @@ mod tests {
                 visibility: RepoVisibility::Public,
                 main_ci: None,
                 halt: None,
-                in_flight: None,
-                cap: None,
-                deferred_repo_cap: None,
+
                 queue_depth: None,
                 queue_flow: None,
                 triage_depth: None,
                 triage_flow: None,
                 curator: None,
+                pending_queue: None,
+                operator_recency: None,
                 ready_complete: false,
                 ready_replace: true,
                 census: Some(FleetPrCensus {

@@ -17,6 +17,11 @@ pub struct Job {
     /// identity, which every recheck refuses rather than treating as proven.
     #[serde(default)]
     pub control: String,
+    /// Canonical repository this job acts on (#10795). Empty means the legacy
+    /// primary; the account lease stays one-per-seat either way, so jobs on
+    /// different clones of one account still exclude each other.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repository: String,
 }
 
 /// Secret-free provenance of a containment admission (#8787), written beside

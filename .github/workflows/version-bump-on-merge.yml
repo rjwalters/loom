@@ -15,7 +15,7 @@ name: Version Bump on Merge
 # gate: it now REJECTS a PR that hand-edits a version-bearing file's value,
 # since that value change should only ever come from this workflow.
 #
-# Self-trigger note: the bump commit this workflow pushes never touches
+# Self-trigger note: the bump commit this workflow publishes never touches
 # `defaults/` (it only rewrites the version-bearing files themselves --
 # `package.json`, `mcp-loom/package.json`, `Cargo.toml`,
 # `VERSION`, `.loom/install-metadata.json` if present, plus the derived
@@ -26,11 +26,24 @@ name: Version Bump on Merge
 # push that happens to share that identity, for no benefit, since the path
 # filter already makes the loop structurally impossible.
 #
-# The repository's main ruleset permits the loom-fleet-dispatch App to push
-# version commits. The default GITHUB_TOKEN cannot bypass that ruleset on a
-# user-owned repository (#7829). Provision the two named App secrets before
-# activation; missing credentials must fail rather than fall back to a
-# different identity. This workflow does not change repository rules.
+# Publishing (2AMLogic/2am#4617 slice 3, rulings on #12063): this workflow
+# never pushes. It used to push the bump commit with a `loom-fleet-dispatch`
+# App token, which needed a bypass on main's ruleset that could also skip
+# required checks. Now the bump is POSTed to the fleet publisher
+# (https://fleet-publish.2amlogic.com/v1/publish_version_bump), which holds
+# the only key (`loom-fleet-publisher`) and commits exactly the version files,
+# exactly one patch step, compare-and-swap on the parent we name. The caller
+# is authenticated by this job's GitHub Actions OIDC token; the publisher pins
+# repository, this workflow file at refs/heads/main, a GitHub-hosted runner
+# and event_name push / schedule / workflow_dispatch. No secret is read here.
+# There is no fallback to a direct push: a refusal fails the run red.
+#
+# Two jobs, because every step of a job holding `id-token: write` can mint a
+# token for that audience (PR review of 2AMLogic/2am#4621). `bump-version`
+# needs the toolchain actions (cargo and npm regenerate the lockfiles) and
+# gets no id-token; `publish` has `id-token: write` and runs NO action at all,
+# only its own shell: it clones main with plain git, re-runs the cadence gate,
+# applies the computed bump and calls the publisher.
 #
 # Releasing is not this workflow's job (#10826): a version in a bump commit is
 # released only if that commit, or a later `main` commit carrying the same
@@ -43,8 +56,8 @@ name: Version Bump on Merge
 # every `defaults/` merge cut a version (52 bumps, ~955 workflow runs in one
 # day), each bump commit its own `main` CI run plus a release. Now merges
 # inside the window just accumulate, unreleased; scripts/version-bump-gate.sh
-# decides, from local git history only (no forge calls -- the bypass ledger
-# pins this workflow at one `gh api` call), whether this run bumps:
+# decides, from local git history only (no forge calls: this workflow makes
+# no `gh` call at all and is off the bypass ledger), whether this run bumps:
 #   push              bump if the window has elapsed, else `deferred:` (exit 0)
 #   schedule (hourly) the catch-up for a quiet day: bump if the window has
 #                     elapsed AND defaults/ changed since the last bump
@@ -91,21 +104,20 @@ permissions:
   contents: read
 
 jobs:
+  # Computes the bump; publishes nothing and holds no id-token. Its outputs
+  # are the gate's verdict, the main SHA the bump was computed on, the new
+  # version and the bump itself as a gzip+base64 `git diff` of the version
+  # files (a few KB; the publish job re-applies it to the same files).
   bump-version:
-    name: Bump VERSION (at most once per release interval)
+    name: Compute the version bump (at most once per release interval)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+      parent: ${{ steps.bump.outputs.parent }}
+      version: ${{ steps.bump.outputs.version }}
+      patch: ${{ steps.bump.outputs.patch }}
     steps:
-      - name: Create repository-scoped version publisher token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.LOOM_FLEET_DISPATCH_APP_ID }}
-          private-key: ${{ secrets.LOOM_FLEET_DISPATCH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: write
-
       # No `ref:`/pinned sha here -- always check out the CURRENT tip of
       # `main` at run start. For a queued run that matters: it must bump from
       # wherever `main` actually is now, not from the commit that originally
@@ -114,13 +126,14 @@ jobs:
       # Full commit history (trees, no blobs): the gate looks up the last
       # bump, which after a quiet stretch can be weeks back. With depth 1 the
       # lookup would see one commit and decide wrongly; the gate refuses a
-      # shallow clone outright.
+      # shallow clone outright. Nothing in this job pushes, so the read-only
+      # token is not persisted either.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
           filter: blob:none
-          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
       # Before any toolchain setup or mutation. Exit 0 with decision=deferred
       # or nothing leaves VERSION alone; an unreadable history or a bad
@@ -167,36 +180,121 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Bump version and push (retries on a racing push to main)
+      # scripts/version.sh does the bump exactly as before (cargo and npm
+      # regenerate the lockfiles, which is why the toolchain actions are
+      # here and not in the publish job). Nothing is committed: the
+      # publisher builds the commit from the files.
+      - name: Compute the version bump (no commit, no push)
+        id: bump
         if: steps.gate.outputs.decision == 'bump'
+        run: |
+          set -euo pipefail
+
+          # The only paths the publisher accepts; .loom/install-metadata.json
+          # only where it exists (version.sh skips it otherwise).
+          files=(VERSION package.json mcp-loom/package.json mcp-loom/package-lock.json
+                 Cargo.toml Cargo.lock)
+          if [ -f .loom/install-metadata.json ]; then
+            files+=(.loom/install-metadata.json)
+          fi
+
+          parent="$(git rev-parse origin/main)"
+          if [ "$(git rev-parse HEAD)" != "$parent" ]; then
+            echo "ERROR: checkout HEAD is not origin/main ($parent); refusing to compute a bump on another commit." >&2
+            exit 1
+          fi
+
+          ./scripts/version.sh bump patch
+          version="$(./scripts/version.sh show)"
+
+          # The bump may change version files and nothing else: anything
+          # else would be silently dropped from the published commit.
+          stray="$(git status --porcelain --untracked-files=all -- . \
+            | cut -c4- | grep -vxF -f <(printf '%s\n' "${files[@]}") || true)"
+          if [ -n "$stray" ]; then
+            echo "ERROR: version.sh changed files outside the version set:" >&2
+            echo "$stray" >&2
+            exit 1
+          fi
+
+          patch="$(git diff --binary HEAD -- "${files[@]}" | gzip -9n | base64 -w0)"
+          {
+            echo "parent=$parent"
+            echo "version=$version"
+            echo "patch=$patch"
+          } >>"$GITHUB_OUTPUT"
+          echo "Computed bump to $version on $parent ($(git diff --name-only HEAD -- "${files[@]}" | wc -l) files)" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Publishes the bump through the fleet publisher. `id-token: write` lives
+  # here and only here, and this job runs no action (no `uses:`): every step
+  # of a job that may mint an OIDC token could mint one, so the only code in
+  # it is this file's shell, the repo's own gate script, git, curl and jq.
+  publish:
+    name: Publish the bump through fleet-publish (never a direct push)
+    needs: bump-version
+    if: needs.bump-version.outputs.decision == 'bump'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Publish version bump (re-checks the gate on the current tip)
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           EVENT_NAME: ${{ github.event_name }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
           FORCE_REASON: ${{ inputs.reason }}
           ACTOR: ${{ github.triggering_actor }}
           RELEASE_MIN_INTERVAL: ${{ vars.RELEASE_MIN_INTERVAL }}
+          BUMP_PARENT: ${{ needs.bump-version.outputs.parent }}
+          BUMP_VERSION: ${{ needs.bump-version.outputs.version }}
+          BUMP_PATCH: ${{ needs.bump-version.outputs.patch }}
+          PUBLISH_URL: https://fleet-publish.2amlogic.com/v1/publish_version_bump
         run: |
           set -euo pipefail
 
-          bot_login="${APP_SLUG}[bot]"
-          bot_id="$(gh api "users/$bot_login" --jq '.id')"
-          git config user.name "$bot_login"
-          git config user.email "${bot_id}+${bot_login}@users.noreply.github.com"
+          die() {
+            echo "ERROR: $*" >&2
+            echo "**Version bump not published:** $*" >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          # The publisher pins ref refs/heads/main; say so here rather than
+          # as a 403 wrong_ref after the work.
+          [ "$GITHUB_REF" = "refs/heads/main" ] || die "runs only on refs/heads/main (got $GITHUB_REF)"
+
+          files=(VERSION package.json mcp-loom/package.json mcp-loom/package-lock.json
+                 Cargo.toml Cargo.lock .loom/install-metadata.json)
+
+          work="$RUNNER_TEMP/publish"
+          mkdir -p "$work"
+          printf '%s' "$BUMP_PATCH" | base64 -d | gunzip >"$work/bump.patch"
+
+          # Plain git, no action: rjwalters/loom is public, so this read needs
+          # no credential. Full history, no blobs, for the gate (as above);
+          # the working tree is only the gate script and the version files.
+          git clone --quiet --filter=blob:none --no-checkout --branch main \
+            "https://github.com/${GITHUB_REPOSITORY}.git" "$work/repo"
+          cd "$work/repo"
+          git sparse-checkout set --no-cone /scripts/version-bump-gate.sh "${files[@]/#//}"
+
+          message="chore: bump version to $BUMP_VERSION"
+          if [ "$FORCE" = "true" ]; then
+            message+=$'\n\n'"Forced-by: $ACTOR"$'\n\n'"Reason: $FORCE_REASON"
+          fi
 
           attempts=5
           for attempt in $(seq 1 "$attempts"); do
-            # Re-sync to the current tip every attempt, not just the first --
-            # a losing race means another push landed on main while we were
-            # bumping, so the bump itself (not just the push) must be redone
-            # against the new tip.
-            git fetch origin main
-            git checkout -B main origin/main
+            # Re-read main every attempt: after a 409 head_moved or an
+            # ambiguous outcome the publisher expects us to decide again.
+            git fetch --quiet origin main
+            git checkout --quiet -f -B main origin/main
+            head="$(git rev-parse origin/main)"
 
-            # Re-check the gate against the new tip: a bump that landed while
-            # we raced (a forced dispatch, a queued run) must make this run
-            # defer rather than bump a second time inside the window.
+            # Re-check the gate against the current tip: a bump that landed
+            # meanwhile (ours after an ambiguous outcome, a forced dispatch, a
+            # queued run) makes this run stop rather than bump twice.
             gate_rc=0
             gate="$(bash scripts/version-bump-gate.sh --event "$EVENT_NAME" --force "$FORCE" \
               --reason "$FORCE_REASON" --actor "$ACTOR" --ref origin/main)" || gate_rc=$?
@@ -208,33 +306,96 @@ jobs:
             fi
             if ! grep -qx 'decision=bump' <<<"$gate"; then
               echo "$gate"
-              echo "Gate no longer says bump on the current tip -- not bumping." | tee -a "$GITHUB_STEP_SUMMARY"
+              if [ "$(git show origin/main:VERSION)" = "$BUMP_VERSION" ]; then
+                echo "main is already at $BUMP_VERSION (an earlier attempt landed) -- done." | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo "Gate no longer says bump on the current tip -- not bumping." | tee -a "$GITHUB_STEP_SUMMARY"
+              fi
               exit 0
             fi
 
-            ./scripts/version.sh bump patch
-            new_version="$(./scripts/version.sh show)"
-
-            git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
-                   Cargo.toml Cargo.lock VERSION
-            if [ -f .loom/install-metadata.json ]; then
-              git add .loom/install-metadata.json
-            fi
-            if [ "$FORCE" = "true" ]; then
-              git commit -m "chore: bump version to $new_version" \
-                -m "Forced-by: $ACTOR" -m "Reason: $FORCE_REASON"
-            else
-              git commit -m "chore: bump version to $new_version"
-            fi
-
-            if git push origin HEAD:main; then
-              echo "Pushed version bump to $new_version"
-              exit 0
+            # The bump was computed on BUMP_PARENT. If main has moved but no
+            # version file changed, the same bump IS the bump of the new tip
+            # (byte-identical inputs), so it is sent with the new tip as its
+            # parent. If a version file changed, the bump has to be recomputed
+            # with the toolchain, which this job deliberately lacks.
+            parent="$BUMP_PARENT"
+            if [ "$head" != "$BUMP_PARENT" ]; then
+              if git diff --quiet "$BUMP_PARENT" "$head" -- "${files[@]}"; then
+                parent="$head"
+              elif [ "$FORCE" = "true" ]; then
+                die "a version file changed on main since the bump was computed; dispatch the forced bump again"
+              else
+                echo "A version file changed on main since the bump was computed -- not publishing; the next run (push or the hourly schedule) recomputes it." \
+                  | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
             fi
 
-            echo "Push attempt $attempt/$attempts failed (main moved under us) -- retrying" >&2
-            sleep $((attempt * 3))
+            git apply "$work/bump.patch"
+            [ "$(cat VERSION)" = "$BUMP_VERSION" ] || die "the applied bump does not set VERSION to $BUMP_VERSION"
+
+            # The request: only the files the bump changed (the publisher
+            # refuses an unchanged one), each base64-encoded from disk.
+            changed=()
+            while IFS= read -r path; do changed+=("$path"); done \
+              < <(git diff --name-only HEAD -- "${files[@]}")
+            : >"$work/files.jsonl"
+            for path in "${changed[@]}"; do
+              base64 -w0 "$path" >"$work/content.b64"
+              jq -cn --arg path "$path" --rawfile b64 "$work/content.b64" \
+                '{path: $path, content_b64: $b64}' >>"$work/files.jsonl"
+            done
+            jq -n --arg parent "$parent" --arg version "$BUMP_VERSION" --arg message "$message" \
+              --slurpfile files "$work/files.jsonl" \
+              '{parent: $parent, version: $version, message: $message, files: $files}' >"$work/body.json"
+
+            # A fresh OIDC token per attempt (they are short-lived). Both
+            # bearer values travel to curl on stdin (--config -), never argv.
+            oidc="$(printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              | curl -sS --fail --max-time 30 --config - \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://fleet-publish.2amlogic.com" \
+              | jq -r '.value // empty')" || oidc=""
+            [ -n "$oidc" ] || die "could not mint a GitHub Actions OIDC token (is id-token: write granted?)"
+            echo "::add-mask::$oidc"
+
+            rm -f "$work/response.json"
+            code="$(printf 'header = "Authorization: Bearer %s"\n' "$oidc" \
+              | curl -sS --max-time 90 --config - -X POST \
+                  -H 'Content-Type: application/json' \
+                  --data-binary "@$work/body.json" \
+                  -o "$work/response.json" -w '%{http_code}' \
+                  "$PUBLISH_URL")" || code="000"
+            unset oidc
+
+            error="$(jq -r '.error // empty' "$work/response.json" 2>/dev/null || true)"
+            reason="$(jq -r '.reason // empty' "$work/response.json" 2>/dev/null || true)"
+            request_id="$(jq -r '.request_id // empty' "$work/response.json" 2>/dev/null || true)"
+            outcome="HTTP $code ${error:-no error code}${reason:+ ($reason)}${request_id:+ request_id=$request_id}"
+
+            case "$code:$error" in
+              200:*)
+                commit="$(jq -r '.commit' "$work/response.json")"
+                reconciled="$(jq -r '.reconciled' "$work/response.json")"
+                echo "Published version bump to $BUMP_VERSION: $commit (parent $parent, reconciled=$reconciled)" \
+                  | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              # Main moved under the compare-and-swap, or the outcome is
+              # unknown (the bump may have landed): re-read main and decide
+              # again, as the publisher asks.
+              409:* | 503:upstream_ambiguous | 000:*)
+                echo "Attempt $attempt/$attempts: $outcome -- re-reading main" >&2
+                ;;
+              # Transient, nothing written.
+              502:upstream_error | 503:oidc_unavailable | 429:*)
+                echo "Attempt $attempt/$attempts: $outcome -- retrying" >&2
+                ;;
+              *)
+                die "the publisher refused the bump: $outcome"
+                ;;
+            esac
+            sleep $((attempt * 5))
           done
 
-          echo "ERROR: failed to push the version bump after $attempts attempts -- main kept moving faster than we could bump it." >&2
-          exit 1
+          die "no publish after $attempts attempts -- main kept moving or the publisher kept failing"

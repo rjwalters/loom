@@ -1,8 +1,8 @@
 //! The Token-capacity block's below-cap diagnosis line (Issue #9131).
 //!
 //! Below the dispatch cap, `status` used to print "not capacity-bound … the
-//! limiter is work availability" unconditionally (modulo the #4903 brake and
-//! #4386 pre-flight substitutions). On a drain-paused host that line sat a
+//! limiter is work availability" unconditionally (modulo the #4386
+//! pre-flight substitution). On a drain-paused host that line sat a
 //! few rows above `Drain: DRAINING` while `loom-daemon queue` reported every
 //! ready row `blocked: repo dispatch held (…)` and the tick `HALTED` — a host
 //! with a full queue described as short of work.
@@ -13,7 +13,7 @@
 //! the same vocabulary as the queue's `HaltCause` (`work_finder::halt_cause`):
 //!
 //! - **host-wide**: `drain` (`report.draining` — never `drain_note`, which
-//!   outlives the drain) and `breaker` (`host_breaker.suppressed`);
+//!   outlives the drain);
 //! - **workspace-scoped**: `main_red` (`per_repo[].health_gate_halted`, else
 //!   the daemon workspace's `main_health_gate_halted`), `token_pool`
 //!   (`pool_exhaustion_holds`), and `preflight_advisory`.
@@ -26,7 +26,7 @@
 //! the status wire; all are workspace-scoped, so omitting them can only leave
 //! the "unheld workspaces" clause slightly optimistic, never misname the host.
 
-use loom_daemon::types::DaemonStatusReport;
+use crate::types::DaemonStatusReport;
 
 /// The line to print below the dispatch cap, or `None` to print nothing (the
 /// pre-flight advisory case with no other hold — #4386: the warning at the top
@@ -37,10 +37,6 @@ pub(crate) fn below_cap_line(
     dispatch_cap: usize,
     resources: &str,
 ) -> Option<String> {
-    // #4903: the saturation brake already carries its own full diagnosis.
-    if let Some(note) = super::saturation_hold_note(report, dispatch_cap) {
-        return Some(note);
-    }
     let n = report.in_flight.len();
     let mut host_wide = host_wide_holds(report);
     let mut scoped = Vec::new();
@@ -106,14 +102,6 @@ fn host_wide_holds(report: &DaemonStatusReport) -> Vec<String> {
             "drain (`restart --drain` armed — new dispatch paused until in-flight reaches 0)"
                 .to_string(),
         );
-    }
-    if let Some(hb) = report.host_breaker.as_ref().filter(|hb| hb.suppressed) {
-        let phase = if hb.phase == "cooldown" {
-            "COOLING DOWN"
-        } else {
-            "OPEN"
-        };
-        holds.push(format!("host breaker {phase}"));
     }
     holds
 }

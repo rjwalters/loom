@@ -50,6 +50,16 @@
 //! head nor labels); one stuck longer is. Every page of the head's check
 //! runs counts, up to [`MAX_CHECK_RUN_PAGES`] (#11903).
 //!
+//! A pass that stood down *because* CI was pending says so on its release
+//! (`--skip-reason` [`SKIP_CI_PENDING`], #11972), and is not recorded if CI
+//! finished between its check and its release: re-reading CI at release time
+//! once found a green head 12 s after the pass skipped, recorded
+//! `verdict=none` and held the PR from Judge for an hour. Its release still
+//! reads CI, for the age bound alone: if everything still pending is past
+//! [`PENDING_EXEMPT_HOURS`] or has no start stamp (stuck, not settling, the
+//! CI the PR planner serves, #12003) the pass is recorded as before. A
+//! release without a skip reason (an older prompt) is unchanged.
+//!
 //! Only trusted authors' records count (the caller filters): a record
 //! suppresses review, so an outsider must not be able to post one.
 //!
@@ -93,6 +103,19 @@ pub fn pending_exempts(started: &[String], now: DateTime<Utc>) -> bool {
         DateTime::parse_from_rfc3339(s.trim())
             .is_ok_and(|t| now - t.with_timezone(&Utc) < Duration::hours(PENDING_EXEMPT_HOURS))
     })
+}
+
+/// The `lease pr release --skip-reason` of a Judge pass that stood down
+/// because the head's CI was still pending (#11972).
+pub const SKIP_CI_PENDING: &str = "ci-pending";
+
+/// Whether a release's own skip reason says the pass stood down for pending
+/// CI ([`SKIP_CI_PENDING`]), which also exempts it once CI has concluded (but
+/// never on stuck CI; module docs). No reason, or one this binary does not
+/// know, keeps the default.
+#[must_use]
+pub fn skipped_for_pending_ci(reason: Option<&str>) -> bool {
+    reason.map(str::trim) == Some(SKIP_CI_PENDING)
 }
 
 /// The page size of the check-run and commit-status reads (GitHub's max).
@@ -153,6 +176,95 @@ pub fn check_runs_listed(page: &Value) -> usize {
 pub fn more_check_runs(page: &Value, read: usize) -> bool {
     let total = page.get("total_count").and_then(Value::as_u64).unwrap_or(0);
     check_runs_listed(page) == CI_PAGE && (read as u64) < total
+}
+
+/// A head's CI as the release reads it (#11972).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiState {
+    /// Something still pending started inside the exemption window
+    /// ([`pending_exempts`]).
+    Young,
+    /// Something is still pending, but every pending run or status is past
+    /// the window or has no start stamp: CI that is stuck, not settling.
+    Stuck,
+    /// Nothing pending was read: CI concluded (or could not be read).
+    Settled,
+}
+
+impl CiState {
+    /// Whether a Judge pass that ended without a verdict at this CI is
+    /// exempt from the no-verdict record. By default only young pending CI
+    /// exempts. A pass that said it stood down for pending CI
+    /// (`--skip-reason ci-pending`) is also exempt once CI has settled since
+    /// (the race #11972 fixes), but never on stuck CI: `forge wait-checks`
+    /// has no age cap, so stuck CI would exempt every pass, and the PR
+    /// planner serves exactly those PRs (#12003); recording them keeps the
+    /// loop bounded.
+    #[must_use]
+    pub fn exempts(self, skipped_for_pending_ci: bool) -> bool {
+        match self {
+            Self::Young => true,
+            Self::Settled => skipped_for_pending_ci,
+            Self::Stuck => false,
+        }
+    }
+}
+
+/// Which read of [`ci_state`] a `get` call is, so each can carry its own
+/// forge-call-stats op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiRead {
+    /// One page of `commits/{sha}/check-runs`.
+    CheckRuns,
+    /// The legacy `commits/{sha}/status`.
+    CommitStatus,
+}
+
+/// `sha`'s [`CiState`], read through `get(kind, path)` with `path` relative
+/// to `repos/{o}/{r}/`: every page of its check runs, up to
+/// [`MAX_CHECK_RUN_PAGES`], then its legacy commit statuses (#11903). Stops at
+/// the first read that is [`CiState::Young`], so the usual cost is one call;
+/// an unreadable read contributes nothing.
+pub fn ci_state(
+    sha: &str,
+    now: DateTime<Utc>,
+    mut get: impl FnMut(CiRead, &str) -> Option<Value>,
+) -> CiState {
+    let base = format!("commits/{sha}/check-runs?per_page={CI_PAGE}");
+    let mut stuck = false;
+    let mut read = 0;
+    for page in 1..=MAX_CHECK_RUN_PAGES {
+        let path = if page == 1 {
+            base.clone()
+        } else {
+            format!("{base}&page={page}")
+        };
+        let Some(v) = get(CiRead::CheckRuns, &path) else {
+            break;
+        };
+        let pending = pending_check_runs(&v);
+        if pending_exempts(&pending, now) {
+            return CiState::Young;
+        }
+        stuck |= !pending.is_empty();
+        read += check_runs_listed(&v);
+        if !more_check_runs(&v, read) {
+            break;
+        }
+    }
+    let status = format!("commits/{sha}/status?per_page={CI_PAGE}");
+    if let Some(v) = get(CiRead::CommitStatus, &status) {
+        let pending = pending_statuses(&v);
+        if pending_exempts(&pending, now) {
+            return CiState::Young;
+        }
+        stuck |= !pending.is_empty();
+    }
+    if stuck {
+        CiState::Stuck
+    } else {
+        CiState::Settled
+    }
 }
 
 /// The label whose presence means "still waiting for a Judge".

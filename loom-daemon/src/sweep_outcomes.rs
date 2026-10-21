@@ -333,8 +333,6 @@ pub fn append_outcome(path: &Path, record: &OutcomeRecord) -> Result<()> {
         .with_context(|| format!("opening outcomes journal {}", path.display()))?;
     writeln!(file, "{line}")
         .with_context(|| format!("appending to outcomes journal {}", path.display()))?;
-    // J1 shadow (#11346): after the legacy append, never instead of it.
-    crate::journal::execution::outcome_appended(path, record);
     Ok(())
 }
 
@@ -1181,15 +1179,21 @@ mod tests {
                 effort: None,
                 detail: None,
                 gated_pool: None,
+                failure_class: None,
                 preference_tier: None,
                 preference_tap: None,
                 role_draw: None,
+                prompt: None,
                 runtime: None,
                 provider: None,
                 profile: None,
                 tokens_by_model: None,
                 models_used: None,
                 actions: None,
+                source: None,
+                sweep_id: None,
+                deferred_by: None,
+                shard_owner: None,
             }),
         )
     }

@@ -47,6 +47,7 @@
 //! | [`launch`] | the launchd / systemd / nohup start paths |
 //! | [`platform`] | the label/domain/unit resolvers the lifecycle scripts share |
 //! | [`supervision_dropin`] | none: the daemon's startup systemd drop-in (#11111) |
+//! | [`systemd_autonomy`] | none: the unit no longer carries autonomy env (#11951) |
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,6 +64,7 @@ pub mod paths;
 pub mod platform;
 pub mod render;
 pub mod supervision_dropin;
+pub mod systemd_autonomy;
 pub mod unescape;
 pub mod watchdog_job;
 
@@ -386,6 +388,10 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         }
     };
 
+    // #11951: on systemd the unit carries no autonomy env, so the guard reads
+    // what will decide each loop after the re-render (drop-in, then config).
+    let systemd_layer = is_linux_systemd
+        .then(|| systemd_autonomy::Layer::read(&platform::systemd_unit_path(), &ctx.repo_root));
     let downgrade = autonomy::warn_autonomy_downgrade(&autonomy::DowngradeCheck {
         from_config: ctx.args.from_config,
         work_finder: (
@@ -401,6 +407,7 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         prior: &prior,
         intent_marker: &ctx.intent_marker,
         config_work_finder: config_work_finder(&ctx.repo_root),
+        systemd: systemd_layer.as_ref(),
     });
     if downgrade {
         autonomy::print_downgrade_refusal();
@@ -529,6 +536,8 @@ fn run_inspection_mode_and_exit(ctx: &Ctx) -> ! {
         }
     };
 
+    let systemd_layer = (!ctx.args.print_plist)
+        .then(|| systemd_autonomy::Layer::read(&platform::systemd_unit_path(), &ctx.repo_root));
     // Warn-only by construction on this path, so an operator sees the warning
     // whether they are inspecting or actually starting.
     let _ = autonomy::warn_autonomy_downgrade(&autonomy::DowngradeCheck {
@@ -546,6 +555,7 @@ fn run_inspection_mode_and_exit(ctx: &Ctx) -> ! {
         prior: &prior,
         intent_marker: &ctx.intent_marker,
         config_work_finder: config_work_finder(&ctx.repo_root),
+        systemd: systemd_layer.as_ref(),
     });
     guards::warn_scratch_workdir_drift(&ctx.repo_root);
     let _ = guards::guard_session_context_start(

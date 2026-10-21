@@ -1,11 +1,12 @@
 //! Runtime admission and traced invocation for scheduled roles.
 use super::*;
+use crate::observability::lifecycle::pre_launch;
 
 impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let trace_root = self.workspace_root.clone();
-        let (outcome, context) =
-            crate::observability::lifecycle::role_invocation(&trace_root, role, || {
+        let (outcome, context, unlaunched) =
+            crate::observability::lifecycle::role_invocation_classified(&trace_root, role, || {
                 let script = match self.resolve_spawn_bin() {
                     Ok(p) => p,
                     Err(e) => {
@@ -14,6 +15,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                             role,
                             &format!("spawn-bin unresolved: {e}"),
                         );
+                        pre_launch::note(pre_launch::SPAWN_BIN_UNRESOLVED);
                         return RoleTickOutcome::Failure(e);
                     }
                 };
@@ -38,12 +40,18 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         crate::tokens_pool::private_workspace::JobKind::Role,
                         None,
                         format!("role-{role}-{}", uuid::Uuid::new_v4()),
-                        Box::new(move |runtime: &str| {
-                            let (model, _) = reconcile_unpinned_model_with_runtime(
-                                runtime,
-                                model_hint.0.clone(),
-                                model_hint.1.clone(),
-                            );
+                        Box::new(move |runtime: &str, drawn: Option<&str>| {
+                            // Same precedence as the launch below (#12748):
+                            // the runner's override, then the draw's model,
+                            // then the resolved hint.
+                            let (model, source) = match (model_hint.1 == "override", drawn) {
+                                (false, Some(drawn)) => {
+                                    (drawn.to_string(), "role-draw".to_string())
+                                }
+                                _ => model_hint.clone(),
+                            };
+                            let (model, _) =
+                                reconcile_unpinned_model_with_runtime(runtime, model, source);
                             (!model.is_empty()).then_some(model)
                         }),
                     );
@@ -55,7 +63,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     ) {
                         Err(rejection) if rejection.containment_eligible() => {
                             use crate::runtime_preference::ContainmentPreparer;
-                            containment.contain(role, None, rejection)
+                            containment.contain(role, None, None, rejection)
                         }
                         other => other,
                     }
@@ -193,7 +201,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 );
                 self.resolved_launch = Some(
                     crate::role_tick_telemetry::ResolvedLaunch::new(&model, &effort)
-                        .with_preference(admission.as_ref().and_then(|a| a.preference.clone())),
+                        .with_preference(admission.as_ref().and_then(|a| a.preference.clone()))
+                        .with_prompt_tree(&self.workspace_root),
                 );
                 run_role_with_timeout(
                     &script,
@@ -215,6 +224,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 )
             });
         self.trace_context = context;
+        self.unlaunched_failure = unlaunched;
         outcome
     }
 
@@ -224,5 +234,9 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
 
     fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
         self.trace_context.clone()
+    }
+
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        self.unlaunched_failure.clone()
     }
 }

@@ -96,13 +96,15 @@
 use super::*;
 
 mod fingerprint;
+mod fleet_streak;
 mod hold;
 mod peer_expiry;
 
 pub(crate) use fingerprint::ParkKind;
 pub(crate) use hold::NoopCooldownTable;
 pub use hold::{
-    NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER, NOOP_HOLD_FAILED_COMMENT_MARKER,
+    standing_noop_hold_fingerprint, NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER,
+    NOOP_HOLD_FAILED_COMMENT_MARKER, NOOP_HOLD_FP_MARKER_PREFIX, NOOP_HOLD_RELEASED_COMMENT_MARKER,
 };
 
 /// Env var overriding how many consecutive unchanged no-op releases park an
@@ -354,6 +356,68 @@ impl SweepRegistry {
                  disabled), so a peer host may re-dispatch inside the window (#7477/#8912)"
             );
         }
+    }
+
+    /// Re-arm the no-op cooldown from the outcome journal after a restart
+    /// (Issue #11481). The window is in-memory only, so a pause-and-roll used
+    /// to release every issue sitting in one at once. The reap that followed
+    /// each self-reported no-op already journalled it as a
+    /// [`crate::telemetry::SweepDisposition::NoopAlreadyDone`] row, so the
+    /// journal's rows from the last cooldown window rebuild the table with no
+    /// new state file.
+    ///
+    /// Only an issue's **latest** row counts: a later landed or failed
+    /// dispatch proves the candidate is live again, exactly as
+    /// [`Self::clear_noop_cooldown`] would have. The remaining time is counted
+    /// from the row's `emitted_at`, so a window never outlives the one that
+    /// was armed. An issue already holding a window keeps it. Returns how many
+    /// windows were re-armed.
+    pub fn replay_noop_cooldown_from_journal(&mut self, now: DateTime<Utc>) -> usize {
+        if !self.noop_cooldown_config.enabled {
+            return 0;
+        }
+        let cooldown = chrono::Duration::from_std(self.noop_cooldown_config.cooldown)
+            .unwrap_or_else(|_| chrono::Duration::zero());
+        let path = self.config.resolve_outcome_telemetry_path();
+        let mut latest: HashMap<u32, (DateTime<Utc>, bool)> = HashMap::new();
+        for envelope in crate::sweep_outcomes::read_all_outcome_telemetry(&path) {
+            let crate::telemetry::TelemetryRecord::SweepOutcome(record) = envelope.record else {
+                continue;
+            };
+            let noop = record.disposition == crate::telemetry::SweepDisposition::NoopAlreadyDone;
+            let at = envelope.emitted_at;
+            match latest.get(&record.issue) {
+                Some((seen, _)) if *seen > at => {}
+                _ => {
+                    latest.insert(record.issue, (at, noop));
+                }
+            }
+        }
+        let mut replayed = 0;
+        for (issue, (at, noop)) in latest {
+            let until = at + cooldown;
+            if !noop || until <= now || self.noop_cooldown.contains_key(&issue) {
+                continue;
+            }
+            self.noop_cooldown.insert(
+                issue,
+                NoopCooldownState {
+                    recorded_at: at,
+                    until,
+                    consecutive: 1,
+                    reason: Some("replayed from the outcome journal after a restart".into()),
+                    released_by_sweep: None,
+                },
+            );
+            replayed += 1;
+            log::info!(
+                "sweep_registry: issue #{issue} no-op cooldown restored from the outcome journal \
+                 (recorded {}), next dispatch allowed in {}s (#11481)",
+                at.to_rfc3339(),
+                (until - now).num_seconds()
+            );
+        }
+        replayed
     }
 
     /// The id of the live (`Running`/`Pending`) sweep this host has running for
@@ -925,6 +989,101 @@ mod tests {
         assert_eq!(record.failure_class.as_deref(), Some(crate::telemetry::NO_PHASE_SIGNAL_CLASS));
         // ...and the reaper's own feed counted it toward the #10156 hold.
         assert_eq!(reg.noop_streak_count(89_125), 1);
+    }
+
+    // --- Restart replay from the outcome journal (#11481) ------------------
+
+    /// Journal one self-reported no-op for `issue` through the real reap path,
+    /// then back-date its row by `age_secs`. Returns the journal path.
+    fn journal_noop(dir: &Path, issue: u32, age_secs: i64) -> PathBuf {
+        let mut reg = no_progress_test_registry(dir, "OPEN", "", false);
+        let path = dir.join("test-sweep-outcome-telemetry.jsonl");
+        reg.config.outcome_telemetry_path = Some(path.clone());
+        insert_clean_exit_running(&mut reg, issue, 0);
+        reg.record_noop_release(issue, None);
+        reg.reap_once();
+        let stamp = (Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+        let rewritten: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["emitted_at"] = serde_json::Value::String(stamp.clone());
+                v.to_string()
+            })
+            .collect();
+        std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+        path
+    }
+
+    fn restarted_registry(dir: &Path, journal: PathBuf) -> SweepRegistry {
+        let mut reg = SweepRegistry::new(SweepRegistryConfig::new(dir.to_path_buf()));
+        reg.config.outcome_telemetry_path = Some(journal);
+        reg
+    }
+
+    #[test]
+    fn restart_replays_a_recent_noop_with_its_remaining_time() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_201, 600);
+        let mut reg = restarted_registry(dir.path(), journal);
+        assert!(reg.noop_cooldown_remaining(89_201, Utc::now()).is_none());
+
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 1);
+
+        let remaining = reg
+            .noop_cooldown_remaining(89_201, Utc::now())
+            .unwrap()
+            .as_secs();
+        assert!(
+            (2900..=3000).contains(&remaining),
+            "10 min into a 60 min window leaves ~50 min, got {remaining}s"
+        );
+    }
+
+    #[test]
+    fn restart_does_not_replay_an_expired_noop() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_202, 3700);
+        let mut reg = restarted_registry(dir.path(), journal);
+
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 0);
+        assert!(reg.noop_cooldown_remaining(89_202, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn restart_replay_respects_the_disabled_switch_and_a_missing_journal() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_203, 60);
+        let mut reg = restarted_registry(dir.path(), journal);
+        reg.set_noop_cooldown_config(NoopCooldownConfig {
+            enabled: false,
+            ..NoopCooldownConfig::default()
+        });
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 0);
+
+        let mut fresh = restarted_registry(dir.path(), dir.path().join("absent.jsonl"));
+        assert_eq!(fresh.replay_noop_cooldown_from_journal(Utc::now()), 0);
+    }
+
+    #[test]
+    fn restart_replay_keeps_a_live_window_and_skips_a_later_non_noop_row() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_204, 600);
+        let mut reg = restarted_registry(dir.path(), journal.clone());
+        reg.record_noop_release(89_204, None);
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 0, "live window kept");
+
+        // A newer, non-no-op row for the same issue proves it is live again.
+        let line = std::fs::read_to_string(&journal).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        v["emitted_at"] = serde_json::Value::String(Utc::now().to_rfc3339());
+        v["record"]["disposition"] = "landed".into();
+        let mut all = line;
+        all.push_str(&format!("{v}\n"));
+        std::fs::write(&journal, all).unwrap();
+        let mut again = restarted_registry(dir.path(), journal);
+        assert_eq!(again.replay_noop_cooldown_from_journal(Utc::now()), 0);
     }
 
     // --- Config resolution precedence (env > config > default) -------------

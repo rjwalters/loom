@@ -48,9 +48,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use super::super::lease_renewer::{self, Key, Store};
-use super::{
-    claim_state, lease_body, provenance_line, ClaimState, Ctx, Gh, Identity, Role, Row, GH_TIMEOUT,
-};
+use super::{claim_state, lease_body, ClaimState, Ctx, Gh, Identity, Role, Row, GH_TIMEOUT};
 
 /// Renewal cadence, shared with the issue renewer's knob.
 const INTERVAL_ENV: &str = "SWEEP_LEASE_RENEW_INTERVAL_SECS";
@@ -76,6 +74,9 @@ pub(crate) struct RenewLoopArgs {
     pub(crate) pr: u64,
     #[arg(long, value_enum)]
     pub(crate) role: Role,
+    /// The lease's step (#11898), when it names one.
+    #[arg(long)]
+    pub(crate) step: Option<crate::step_role::StepRole>,
     #[arg(long)]
     pub(crate) host: String,
     #[arg(long)]
@@ -84,7 +85,9 @@ pub(crate) struct RenewLoopArgs {
     pub(crate) comment_id: u64,
     #[arg(long)]
     pub(crate) watch_pid: u32,
-    #[arg(long)]
+    /// Accepted and ignored: renewers started by an older binary still pass it.
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
     pub(crate) story_issue: Option<u32>,
     #[arg(long, default_value_t = DEFAULT_MAX_AGE_SECS)]
     pub(crate) max_age: u64,
@@ -201,7 +204,7 @@ pub(crate) fn decide(
     clocks: Clocks,
     owner_code: i32,
     pr_state: Option<&(bool, Vec<String>)>,
-    label: &str,
+    label: Option<&str>,
     misses: &mut u32,
 ) -> Step {
     if !watch_alive {
@@ -225,6 +228,11 @@ pub(crate) fn decide(
     if !open {
         return Step::Stop("the PR is closed");
     }
+    // A claim with no label (the Champion merge step, #11898) has no
+    // label-absence backstop: the session, the cap and the item's state stop it.
+    let Some(label) = label else {
+        return Step::Renew;
+    };
     if labels.iter().any(|l| l == label) {
         *misses = 0;
         return Step::Renew;
@@ -284,7 +292,6 @@ pub(crate) fn spawn(
     ctx: &Ctx,
     comment_id: u64,
     watch_pid: u32,
-    story: Option<u32>,
     leased_at: DateTime<Utc>,
 ) -> String {
     let interval = std::env::var(INTERVAL_ENV)
@@ -300,6 +307,7 @@ pub(crate) fn spawn(
     command
         .args(["lease", "pr", "renew-loop", &ctx.common.pr.to_string()])
         .args(["--role", ctx.me.role.as_str()])
+        .args(ctx.me.step.map(|s| format!("--step={s}")))
         .args(["--host", &ctx.me.host, "--sweep-id", &ctx.me.sweep])
         .args(["--comment-id", &comment_id.to_string()])
         .args(["--watch-pid", &watch_pid.to_string()])
@@ -313,9 +321,6 @@ pub(crate) fn spawn(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(story) = story {
-        command.args(["--story-issue", &story.to_string()]);
-    }
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
@@ -363,6 +368,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         role: args.role,
         host: args.host.clone(),
         sweep: args.sweep_id.clone(),
+        step: args.step,
     };
     let say = |line: &str| note(&root, args.pr, args.role, line);
     let store = Store::from_env();
@@ -387,7 +393,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
     let watch = args.watch_pid;
     let watch_ident = lease_renewer::start_identity(watch);
     let alive = || {
-        loom_daemon::live_claim::pid_is_live_process(watch)
+        crate::live_claim::pid_is_live_process(watch)
             && (watch_ident.is_none() || lease_renewer::start_identity(watch) == watch_ident)
     };
     let gh = Gh {
@@ -399,9 +405,8 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         say(&format!("renewer stopping: refusing to write here (#9548): {why}"));
         return;
     }
-    let provenance = provenance_line(&root, &me, args.story_issue);
-    let policy = loom_daemon::comment_trust::TrustPolicy::for_root(&root);
-    let ttl_minutes = loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes();
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
     let ttl = chrono::Duration::seconds((ttl_minutes * 60.0) as i64);
     // Wall clock throughout (#9401 review): `Instant` stands still while a
     // Mac sleeps, so a lid-closed renewer would wake believing its lease fresh.
@@ -425,14 +430,8 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
             since_renewal_secs: wall_secs(now, last_renewed),
             ttl_secs: u64::try_from(ttl.num_seconds()).unwrap_or(0),
         };
-        let mut step = decide(
-            watch_alive,
-            clocks,
-            owner_code,
-            state.as_ref(),
-            me.role.claim_label(),
-            &mut misses,
-        );
+        let mut step =
+            decide(watch_alive, clocks, owner_code, state.as_ref(), me.claim_label(), &mut misses);
         if step == Step::Renew {
             let rows = gh.read_rows(args.pr, &policy);
             let state = rows
@@ -456,7 +455,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
                     say(&format!("renewer stopping: {why}"));
                     return;
                 }
-                let body = lease_body(&me, args.pr, Some(attempt), &provenance);
+                let body = lease_body(&me, args.pr, Some(attempt));
                 match gh.patch(args.comment_id, &body) {
                     Ok(()) => {
                         last_renewed = attempt;

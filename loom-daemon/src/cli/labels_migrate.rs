@@ -13,7 +13,7 @@
 //! - **Dry run by default.** Without `--apply` the command only reads: no
 //!   add, remove or delete reaches the forge.
 //! - **Write scope** (#9548): `--apply` is gated by
-//!   `loom_daemon::write_scope::may_write_from` before the first forge call
+//!   `crate::write_scope::may_write_from` before the first forge call
 //!   (read or write) for that repo; a refused repo exits 2 untouched.
 //! - **Open items only.** Loom never cleans labels off closed items (#2838).
 //! - **Add before remove.** Each item gains `replaced_by` before it loses the
@@ -47,9 +47,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use loom_daemon::cmd_out::{CmdOutcome, Unavailable};
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::label_registry::RetiredLabel;
+use crate::cmd_out::{CmdOutcome, Unavailable};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::label_registry::RetiredLabel;
 use serde::Serialize;
 
 /// Items the issues listing returns per page (GitHub's maximum).
@@ -664,7 +664,7 @@ pub(crate) fn enc(s: &str) -> String {
 /// Classify a failed gh call's text.
 pub(crate) fn classify(why: String) -> ForgeError {
     let lower = why.to_ascii_lowercase();
-    if loom_daemon::rate_limit_breaker::indicates_rate_limit(&why) || lower.contains("http 429") {
+    if crate::rate_limit_breaker::indicates_rate_limit(&why) || lower.contains("http 429") {
         ForgeError::RateLimited(why)
     } else if lower.contains("http 404") {
         ForgeError::NotFound(why)
@@ -764,7 +764,7 @@ pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>
             GhTarget::repo(&repo).map_err(|_| "--repo must be OWNER/NAME".to_string())?;
             Ok((vec![Target { repo, root: cwd }], Vec::new()))
         }
-        Scope::Here(root) => match loom_daemon::release_resolve::host::repo_slug(&root) {
+        Scope::Here(root) => match crate::release_resolve::host::repo_slug(&root) {
             Some(repo) => Ok((vec![Target { repo, root }], Vec::new())),
             None => Err(format!(
                 "{} has no GitHub origin; pass --repo OWNER/NAME or --all-workspaces",
@@ -772,13 +772,13 @@ pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>
             )),
         },
         Scope::AllWorkspaces => {
-            let reg = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+            let reg = crate::workspace_registry::WorkspaceRegistry::load_default()
                 .map_err(|e| format!("cannot read the workspace registry: {e}"))?;
             let roots = reg
                 .workspaces
                 .into_iter()
                 .map(|w| {
-                    let slug = loom_daemon::release_resolve::host::repo_slug(&w.root);
+                    let slug = crate::release_resolve::host::repo_slug(&w.root);
                     (w.root, slug)
                 })
                 .collect();
@@ -788,9 +788,9 @@ pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>
 }
 
 pub(crate) fn write_gate(t: &Target) -> Result<(), String> {
-    match loom_daemon::write_scope::may_write_from(Path::new(&t.root), Some(&t.repo)) {
-        loom_daemon::write_scope::Verdict::Allow(_) => Ok(()),
-        loom_daemon::write_scope::Verdict::Deny(why) => Err(why),
+    match crate::write_scope::may_write_from(Path::new(&t.root), Some(&t.repo)) {
+        crate::write_scope::Verdict::Allow(_) => Ok(()),
+        crate::write_scope::Verdict::Deny(why) => Err(why),
     }
 }
 

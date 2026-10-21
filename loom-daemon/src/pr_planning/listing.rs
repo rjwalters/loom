@@ -3,12 +3,15 @@
 use super::*;
 use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
+use crate::judge_backstop::CiRead;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 
 fn read(root: &Path, gh: &Path, op: ForgeOp, suffix: &str) -> Result<Value> {
+    // #12310: the planner's PR-queue and CI reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     let repo = std::env::var("LOOM_REPO").ok();
     let target = store::resolve_target(Some(root), repo.as_deref());
     let url = format!("repos/{}/{}", target.repo.as_deref().unwrap_or("{owner}/{repo}"), suffix);
@@ -192,14 +195,22 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     let mut queue = ordered_queue(rows, role, prefer_human_prs(root), &trust);
     if role == PrRole::Judge {
         let mut guarded = Vec::new();
+        let mut reads = 0;
         for row in queue {
-            if row["mode"] == "fallback" {
-                if guard_admits(root, &row)? {
-                    guarded.push(row);
-                }
-            } else if !backstop_holds(root, gh, &row, &trust) {
-                guarded.push(row);
+            if !judge_admits(root, gh, &row, &trust)? {
+                continue;
             }
+            // #11971: only the first rows a Judge pass would reach are worth
+            // a CI read; past that budget the queue is served as-is. Reads
+            // are counted, not served rows: when the top PRs are all pending
+            // none is served, and each would otherwise still cost a read.
+            if reads < super::ci_gate::CI_SCREENED_ROWS {
+                reads += 1;
+                if ci_pending_at_head(root, gh, &row) {
+                    continue;
+                }
+            }
+            guarded.push(row);
         }
         queue = guarded;
     }
@@ -285,16 +296,56 @@ pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
     // #11861: a Champion hold handed back by Doctor is Judge work.
     mark_champion_holds(root, gh, PrRole::Judge, &mut rows)?;
     for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
-        let served = if row["mode"] == "fallback" {
-            guard_admits(root, &row)?
-        } else {
-            !backstop_holds(root, gh, &row, &trust)
-        };
-        if served {
+        if judge_admits(root, gh, &row, &trust)? && !ci_pending_at_head(root, gh, &row) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Whether Judge's queue admits an ordered row before the CI read: a
+/// fallback row its guard admits, or a workflow row the no-verdict backstop
+/// does not hold. One rule for `fetch_queue` and [`has_judge_work`].
+fn judge_admits(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> Result<bool> {
+    if row["mode"] == "fallback" {
+        guard_admits(root, row)
+    } else {
+        Ok(!backstop_holds(root, gh, row, trust))
+    }
+}
+
+/// Whether CI is still running at this row's head (#11971,
+/// [`super::ci_gate`]): Judge would only release it. Unreadable, or a row
+/// with no head, is not pending. Says why on stderr (stdout is the queue).
+fn ci_pending_at_head(root: &Path, gh: &Path, row: &Value) -> bool {
+    let (Some(number), Some(head)) = (row["number"].as_u64(), row["head"]["sha"].as_str()) else {
+        return false;
+    };
+    let pending = ci_pending_at_sha(root, gh, head);
+    if pending {
+        eprintln!(
+            "Judge CI gate: PR #{number} skipped — CI is still running at head {} (#11971); \
+             it is served once CI concludes",
+            &head[..head.len().min(12)]
+        );
+    }
+    pending
+}
+
+/// Whether CI is still running at head `sha` of the repository at `root`
+/// ([`super::ci_gate`]'s rule: pending, started under 6 h ago), through the
+/// per-head cache. Unreadable is not pending. The one read behind both the
+/// role-runner gate above and the step draw's Judge hold (#12042).
+pub fn ci_pending_at_sha(root: &Path, gh: &Path, sha: &str) -> bool {
+    super::ci_gate::cached(root, sha, || {
+        super::ci_gate::ci_pending(sha, chrono::Utc::now(), |kind, path| {
+            let op = match kind {
+                CiRead::CheckRuns => ops::CI_CHECK_RUNS_FOR_SHA,
+                CiRead::CommitStatus => ops::CI_COMMIT_STATUS,
+            };
+            read(root, gh, op, path).ok()
+        })
+    })
 }
 
 /// Judge's role-runner gate on an empty labeled listing (#9389): is there a

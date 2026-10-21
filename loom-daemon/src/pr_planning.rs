@@ -8,12 +8,16 @@ use serde_json::{json, Value};
 use crate::comment_trust::TrustPolicy;
 use crate::provenance::origin::WorkOrigin;
 
+mod ci_gate;
+#[cfg(test)]
+mod ci_gate_tests;
 mod listing;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod workflow_shaped_tests;
-pub use listing::{fetch_queue, has_judge_fallback, has_judge_work};
+pub use ci_gate::{cached_answer as ci_pending_cached, ci_pending};
+pub use listing::{ci_pending_at_sha, fetch_queue, has_judge_fallback, has_judge_work};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PrRole {
@@ -31,6 +35,15 @@ impl PrRole {
             Self::Doctor => "doctor",
             Self::Champion => "champion",
         }
+    }
+
+    /// The role spelled as [`Self::as_str`] spells it; `None` for a role
+    /// without a PR queue.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Judge, Self::Doctor, Self::Champion]
+            .into_iter()
+            .find(|r| r.as_str() == name)
     }
 }
 

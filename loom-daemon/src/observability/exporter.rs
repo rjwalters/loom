@@ -159,6 +159,9 @@ pub struct HttpsExporter {
     /// Where a confirmed mismatch is published for `loom-daemon status` /
     /// `health` to read.
     host_id_status: Arc<HostIdStatus>,
+    /// Set once the sink answers 410 (#12812): the dashboard retired `/ingest`.
+    /// Later batches are dropped without a request.
+    retired: AtomicBool,
 }
 
 /// Per-request timeout — generous enough for a slow mobile/tethered fleet
@@ -192,6 +195,7 @@ impl HttpsExporter {
             host_id,
             mismatch_warned: AtomicBool::new(false),
             host_id_status,
+            retired: AtomicBool::new(false),
         })
     }
 
@@ -250,7 +254,27 @@ impl HttpsExporter {
 
 impl Exporter for HttpsExporter {
     async fn emit_batch_outcome(&self, envelopes: &[TelemetryEnvelope]) -> BatchOutcome {
+        let retired_outcome = || BatchOutcome {
+            acknowledged: envelopes.len(),
+            retired: true,
+            ..BatchOutcome::default()
+        };
+        if self.retired.load(Ordering::SeqCst) {
+            return retired_outcome();
+        }
         match self.emit_batch(envelopes).await {
+            Err(ExportError::Rejected { status: 410, .. }) => {
+                if !self.retired.swap(true, Ordering::SeqCst) {
+                    log::warn!(
+                        "observability: {} answered HTTP 410 — the dashboard /ingest endpoint is \
+                         retired; no longer sending to it and not counting it as a failure. \
+                         Remove observability.endpoint and observability.ingestKeyFile from the \
+                         host config.",
+                        self.endpoint
+                    );
+                }
+                retired_outcome()
+            }
             Ok(()) => {
                 let mut outcome = BatchOutcome::accepted(envelopes.len());
                 for envelope in envelopes {
@@ -575,12 +599,9 @@ mod tests {
                 worktree_root_free_gb: None,
                 worktree_root_total_gb: None,
                 active_sweep_ids: Vec::new(),
-                dispatch_halted: false,
-                halt_reason: None,
                 managed_repos: Vec::new(),
                 roles: crate::telemetry::RoleTickHealth::default(),
                 protection: None,
-                admission_brake: None,
                 is_captain: None,
                 armed_singleton_jobs: Vec::new(),
                 captainless_singleton_jobs: Vec::new(),
@@ -588,6 +609,8 @@ mod tests {
                 exporters: Vec::new(),
                 otlp_export: None,
                 memory: None,
+                agent_scopes: Vec::new(),
+                agent_scopes_total: None,
             }),
         )
     }
@@ -617,6 +640,40 @@ mod tests {
             ExportError::Rejected { status, .. } => assert_eq!(status, 500),
             other => panic!("expected Rejected, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_410_is_retired_not_a_failure_even_past_the_escalation_threshold() {
+        // #12812: after earlier transient failures, a 410 run longer than
+        // ESCALATE_AFTER_FAILURES must clear the streak, never escalate or
+        // read as degraded, and stop sending after the first answer.
+        use super::super::queue::DurableQueue;
+        use super::super::sender::{try_flush, FlushOutcome, ESCALATE_AFTER_FAILURES};
+        let sink = MockSink::start();
+        let exporter = test_exporter(sink.url(), "key");
+        let dir = tempfile::tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 100);
+        let status = super::super::ExportStatus::started("host-test", &sink.url(), "https", 30);
+
+        sink.set_status(500);
+        queue.push(one_envelope());
+        assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
+        assert_eq!(status.snapshot().consecutive_failures, 1);
+
+        sink.set_status(410);
+        for _ in 0..=ESCALATE_AFTER_FAILURES + 1 {
+            queue.push(one_envelope());
+            assert!(matches!(
+                try_flush(&queue, &exporter, 10, &status).await,
+                FlushOutcome::Sent(_)
+            ));
+        }
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.consecutive_failures, 0);
+        assert!(snapshot.sink_retired);
+        assert_eq!(snapshot.state, crate::types::ObservabilityExportState::Disabled);
+        assert!(queue.is_empty(), "retired batches are dropped, not left to grow the queue");
+        assert_eq!(sink.requests().len(), 2, "one 500, one 410, then no further requests");
     }
 
     #[tokio::test]

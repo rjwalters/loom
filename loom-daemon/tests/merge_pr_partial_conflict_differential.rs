@@ -284,3 +284,8 @@ Body: {:?}",
     // hit, or the comparison could be "empty == empty" throughout.
     assert_eq!(saw, [true; 4], "a rung of the ladder was never exercised");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

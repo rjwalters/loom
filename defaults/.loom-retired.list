@@ -143,3 +143,36 @@ scripts/tests/test-champion-needs-revision-routing.sh
 # its idempotency classifier has no caller; the script and its suite go.
 scripts/classify-capacity-defer.sh
 scripts/tests/test-classify-capacity-defer.sh
+
+# #9782 (2026-10-15) — every suite now registers a real write-scope fixture
+# (write-scope-fixture.sh); the allow-all forge may-write stub goes.
+scripts/tests/lib/write-scope-stub.sh
+
+# #12063 (2026-10-15) — merge-pr's freshness guard, re-date remedy and
+# ci-result gate removed (slice 1); their doc and shell suites go with them.
+docs/stale-check-inputs.md
+scripts/tests/test-merge-pr-ci-result.sh
+scripts/tests/test-merge-pr-stale-check-redate.sh
+scripts/tests/test-merge-pr-stale-required-checks.sh
+
+# #12106 (2026-10-15) — CI simplification: the Dependabot manifest-label check
+# and the pipefail ratchet's suite leave the PR path with their checkers.
+scripts/check-dependabot-labels.sh
+scripts/tests/test-check-dependabot-labels.sh
+scripts/tests/test-check-pipefail-early-exit.sh
+
+# #12121 (2026-10-16) — the operator presence hook is retired; operator
+# activity is inferred by consumers, not emitted.
+hooks/presence-beat.sh
+
+# #11983 (2026-10-16) — the stamp-only create-pr provenance test is removed.
+scripts/tests/test-create-pr-provenance.sh
+
+# #12709 (2026-10-18) — the unmeasured Judge fan-out experiment scaffold is
+# retired (PR #12743).
+scripts/experiments/README.md
+scripts/experiments/judge-fanout-corpus-runner.sh
+scripts/experiments/judge-fanout-experiment.sh
+scripts/experiments/judge-fanout-results-template.md
+scripts/experiments/judge-fanout-workflow.js
+scripts/tests/test-judge-fanout-experiment.sh

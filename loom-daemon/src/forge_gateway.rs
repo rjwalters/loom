@@ -43,11 +43,13 @@
 //! - the agent `gh` front sends the reads it can classify to the gateway
 //!   profile ([`crate::agent_gh::read_route`]); everything else stays on the
 //!   session's credential (the writer);
-//! - a CLI subcommand that calls [`enable_cli`] (`labels undeclared`,
-//!   `labels migrate`) routes its facade reads like the daemon's when it runs
-//!   with [`DIR_ENV`] set to the daemon's published directory: how a host job
-//!   (the fleet captain's label-drift) reads through the gateway while
-//!   holding no GitHub credential of its own;
+//! - every CLI subcommand ([`enable_cli_reads`], #12389) routes its facade
+//!   reads like the daemon's when it runs with [`DIR_ENV`] set to the
+//!   daemon's published directory: how a host job (the fleet captain's
+//!   label-drift) reads through the gateway while holding no GitHub
+//!   credential of its own, and how the `loom-daemon` commands an agent
+//!   session runs (`forge wait-checks`, `recover-orphans`, …) keep their
+//!   reads off the writer;
 //! - the writer profile is untouched: its token, no `api_host`.
 //!
 //! # Break-glass
@@ -68,7 +70,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::forge_identity::{Placement, RouteDecision, RouteRequest};
+use crate::forge_identity::{ExhaustCause, Placement, RouteDecision, RouteRequest};
 
 #[path = "forge_gateway/outage.rs"]
 pub mod outage;
@@ -92,7 +94,8 @@ pub const CONFIG_KEY: &str = "forge.gateway";
 pub const GATEWAY_APP_ID: &str = "gateway";
 
 /// Exported to agent sessions while the gateway is active: the directory
-/// holding the per-owner profiles. Absent (or removed) otherwise.
+/// holding the per-owner profiles. Absent (or removed) otherwise. Dispatched
+/// roles get it from [`crate::launch_env::apply_launch_env`] (#12207).
 pub const DIR_ENV: &str = "LOOM_GH_GATEWAY_DIR";
 
 /// `gh`'s update check is a request to `api.github.com` on its own schedule;
@@ -286,31 +289,92 @@ pub fn enable_front(next_gh: &Path) {
 }
 
 /// A CLI subcommand's half (2AMLogic/2am#4367 P4): a `loom-daemon
-/// <subcommand>` run by a host job (the fleet captain's label-drift job) is
-/// neither the daemon nor the agent front, so without this its reads never
-/// see the gateway and go to whatever `GH_CONFIG_DIR` it inherited. It
-/// honours [`DIR_ENV`] on the front's terms: only when the `gh` the facade
-/// will exec ([`crate::gh_invocation::resolver::resolve`]) is the one the
-/// daemon version-checked, and not during a front outage, from a checked base
-/// ([`publish::safe_base`]). The variable
-/// names a directory, never a key. A no-op in the daemon, whose own
+/// <subcommand>` run by a host job (the fleet captain's label-drift job) or
+/// by an agent session (`forge wait-checks`, `recover-orphans`,
+/// `check-stale-blocked`, …, #12389) is neither the daemon nor the agent
+/// front, so without this its reads never see the gateway and go to
+/// whatever `GH_CONFIG_DIR` it inherited — the writer. It
+/// honours [`DIR_ENV`] on the front's terms: only when the `gh` that will
+/// finally run is the one the daemon version-checked, and not during a
+/// front outage, from a checked base ([`publish::safe_base`]). Inside an
+/// agent session the facade's `gh` is the front itself, which execs the
+/// next `gh` on `PATH`, so that one is checked ([`cli_base_with`]). The
+/// variable names a directory, never a key. A no-op in the daemon, whose own
 /// published set always wins ([`profile_for`]), and once per process (also a
 /// no-op after [`enable_front`] ran in the same process); unset,
-/// nothing changes. A CLI that makes forge reads calls it before the first.
+/// nothing changes. Every CLI subcommand calls it before it parses its own
+/// arguments ([`enable_cli_reads`]).
 /// A gateway outage it hits is recorded beside the profiles
 /// ([`note_outage_from_front`]).
 pub fn enable_cli() {
     if DAEMON.get().is_some() {
         return;
     }
-    let program = crate::gh_invocation::resolver::resolve().program;
-    let _ = FRONT.set(cli_base(std::env::var_os(DIR_ENV), &program, SystemTime::now()));
+    let dir_env = std::env::var_os(DIR_ENV).filter(|v| !v.is_empty());
+    // Unset: nothing to check, and no `PATH` walk on every CLI start.
+    let base = dir_env.and_then(|dir| {
+        let program = crate::gh_invocation::resolver::resolve().program;
+        cli_base_with(Some(dir), &program, SystemTime::now(), &crate::agent_gh::next_gh::resolve)
+    });
+    let _ = FRONT.set(base);
+}
+
+/// The read routing every `loom-daemon <subcommand>` process gets (#12389):
+/// the gateway profiles ([`enable_cli`]) and the daemon's reader pool
+/// ([`crate::forge_identity::enable_front_readers`]) that its environment
+/// names, so its reads go to the gateway, then a reader. Both only adopt what the daemon exported
+/// ([`DIR_ENV`], [`crate::forge_identity::FRONT_ROOT_ENV`]) after the same
+/// checks the agent front applies; with neither set (a host shell, a test)
+/// nothing changes and every read stays on the writer.
+///
+/// A process that adopted either one is **reader-only** from then on
+/// ([`cli_reads_reader_only`], operator ruling #12394): its routable reads
+/// never fall back to the writer, they are shed and the command defers
+/// ("no answer"). Fresh-before-write reads pinned with
+/// [`crate::gh_invocation::GhInvocation::writer_identity`] are not routed at
+/// all and keep the writer.
+pub fn enable_cli_reads() {
+    enable_cli();
+    crate::forge_identity::enable_front_readers();
+    let routed = any_live() || crate::forge_identity::front_root().is_some();
+    let _ = CLI_READER_ONLY.set(DAEMON.get().is_none() && routed);
+}
+
+/// Set once by [`enable_cli_reads`]: this CLI process routes its reads and
+/// may not send them to the writer.
+static CLI_READER_ONLY: OnceLock<bool> = OnceLock::new();
+
+/// Whether this process is a CLI subcommand whose reads may not use the
+/// writer ([`enable_cli_reads`]). `false` in the daemon, in the agent front
+/// and in any process with no read route adopted.
+#[must_use]
+pub fn cli_reads_reader_only() -> bool {
+    CLI_READER_ONLY.get().copied().unwrap_or(false)
 }
 
 /// [`enable_cli`]'s decision: `program` is a path or a bare name looked up
 /// on `PATH`, as the facade will run it.
+#[cfg(test)]
 fn cli_base(dir_env: Option<OsString>, program: &str, now: SystemTime) -> Option<PathBuf> {
+    cli_base_with(dir_env, program, now, &|| None)
+}
+
+/// [`cli_base`] with the front's `next_gh` lookup injected: when `program`
+/// resolves to a `loom-daemon` (the agent `gh` front, first on an agent
+/// session's `PATH`), the `gh` that will answer is the one the front execs,
+/// so that is the one the daemon's marker must name.
+fn cli_base_with(
+    dir_env: Option<OsString>,
+    program: &str,
+    now: SystemTime,
+    next_gh: &dyn Fn() -> Option<PathBuf>,
+) -> Option<PathBuf> {
     let gh = publish::canonical_program(program)?;
+    let gh = if gh.file_name() == Some(std::ffi::OsStr::new("loom-daemon")) {
+        next_gh()?
+    } else {
+        gh
+    };
     front_base(dir_env, &gh, now)
 }
 
@@ -376,14 +440,45 @@ pub fn profile_for(owner: &str) -> Option<PathBuf> {
 }
 
 /// The variables an agent session gets: `GH_NO_UPDATE_NOTIFIER=1` always,
-/// and [`DIR_ENV`] set while the gateway is active, removed (`None`)
-/// otherwise so an inherited value can never route.
+/// [`DIR_ENV`] while the gateway is active, and the reader root
+/// ([`crate::forge_identity::FRONT_ROOT_ENV`]) the front's served reads fall
+/// back to. `None` removes a variable.
+///
+/// In the daemon, [`DIR_ENV`] is what it published, so an inherited value can
+/// never route. Anywhere else (the `loom-daemon worker` process
+/// `spawn-worker.sh` starts and then `exec`s into the agent) it is the value
+/// this process inherited from the daemon, when that is still a
+/// [`publish::safe_base`]. Before #12207 such a process computed `None`
+/// here, having published nothing itself, and stripped the variable from
+/// every dispatched agent: the front's reads then all went to the writer.
 #[must_use]
 pub fn agent_env() -> Vec<(&'static str, Option<OsString>)> {
+    let gateway = match DAEMON.get() {
+        Some(_) => active().map(|a| a.base.into_os_string()),
+        None => inherited_base(std::env::var_os(DIR_ENV)),
+    };
     vec![
         (NO_UPDATE_NOTIFIER_ENV, Some(OsString::from("1"))),
-        (DIR_ENV, active().map(|a| a.base.into_os_string())),
+        (DIR_ENV, gateway),
+        (
+            crate::forge_identity::FRONT_ROOT_ENV,
+            crate::forge_identity::agent_reader_root(),
+        ),
     ]
+}
+
+/// A non-daemon spawner's [`DIR_ENV`]: `inherited` when it names a
+/// [`publish::safe_base`], else `None`.
+fn inherited_base(inherited: Option<OsString>) -> Option<OsString> {
+    inherited.filter(|v| !v.is_empty() && publish::safe_base(Path::new(v)))
+}
+
+/// Whether the front may trust a profile directory it was pointed at by its
+/// environment (a gateway or a reader `GH_CONFIG_DIR`): see
+/// [`publish::safe_profile`].
+#[must_use]
+pub fn trusted_profile(dir: &Path) -> bool {
+    publish::safe_profile(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -393,9 +488,54 @@ pub fn agent_env() -> Vec<(&'static str, Option<OsString>)> {
 /// The read router the facade and the conditional reads use: the gateway
 /// profile for the repo's owner when one is live and not withdrawn, else
 /// [`crate::forge_identity::route_read`] unchanged.
+///
+/// A withdrawn gateway with no reader pool behind it is
+/// [`ExhaustCause::Withdrawn`], not [`RouteDecision::NoPool`]: "no pool"
+/// sends every read to the writer, and the gateway's outage withdrawal
+/// (#12101) would then put a gateway-only host's deferrable reads on the
+/// dispatch App for as long as it lasts (2026-10-15).
 #[must_use]
 pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
-    decide(req, now, &profile_for).unwrap_or_else(|| crate::forge_identity::route_read(req, now))
+    if let Some(decision) = decide(req, now, &profile_for) {
+        return decision;
+    }
+    let pool = crate::forge_identity::route_read(req, now);
+    let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo).to_ascii_lowercase();
+    let gateway_until = if owner.is_empty() || profile_for(&owner).is_none() {
+        None
+    } else {
+        withdrawn_until(&owner, req, now)
+    };
+    past_withdrawn_gateway(pool, gateway_until)
+}
+
+/// The reader pool's answer `pool`, unless it is [`RouteDecision::NoPool`]
+/// while the owner's gateway is withdrawn until `gateway_until`: then an
+/// [`ExhaustCause::Withdrawn`] exhaustion until then.
+#[must_use]
+pub fn past_withdrawn_gateway(
+    pool: RouteDecision,
+    gateway_until: Option<SystemTime>,
+) -> RouteDecision {
+    match (pool, gateway_until) {
+        (RouteDecision::NoPool, Some(until)) => RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::Withdrawn,
+        },
+        (pool, _) => pool,
+    }
+}
+
+/// When the gateway's App-wide or scoped withdrawal for `owner` ends, if one
+/// is live (a coverage withdrawal from one repo is not counted).
+fn withdrawn_until(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> Option<SystemTime> {
+    [
+        crate::forge_read_pool::withdrawn_until(GATEWAY_APP_ID, now),
+        crate::forge_read_pool::scoped_withdrawal_until(GATEWAY_APP_ID, owner, req.resource, now),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 /// The gateway's answer for `req`, with the profile lookup injected.

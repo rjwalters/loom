@@ -1,5 +1,6 @@
 //! Blocking role launch; runtime decision polling never performs Docker I/O.
 use super::*;
+use crate::observability::lifecycle::pre_launch;
 
 // #10003: an exit-0 Codex tick whose sandbox refused every tool call is a
 // failure, and arms the host-wide hold the preference walk falls through on.
@@ -38,6 +39,8 @@ pub(super) fn apply_role_observability(
     runtime: Option<&str>,
 ) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
+    // #12342: where the tick runs rides its span at open.
+    crate::observability::lifecycle::role_runtime::note_launch(cmd, runtime);
     let execution = crate::observability::lifecycle::role_command(cmd);
     if let Some(execution) = &execution {
         // #11855: where a won PR claim names this tick's PR.
@@ -101,6 +104,7 @@ pub(super) fn run_role_with_timeout(
     // before anything is spawned, and H5 requeues the run.
     if let Some(refused) = resume.and_then(|r| r.refuse(admission)) {
         note_pre_spawn_skip(&logs_dir, role, &refused);
+        pre_launch::note(pre_launch::RESUME_REFUSED);
         return RoleTickOutcome::Failure(refused);
     }
     // #9548: every scheduled role (Champion, Curator, Judge, Doctor, ...)
@@ -115,6 +119,7 @@ pub(super) fn run_role_with_timeout(
         let reason = "write scope refused (#9548): this installation may not write to the \
                       workspace's repository; see the write_scope log line for why";
         note_pre_spawn_skip(&logs_dir, role, reason);
+        pre_launch::note(pre_launch::WRITE_SCOPE_REFUSED);
         return RoleTickOutcome::Failure(reason.to_string());
     }
     // #8787: an admission that relied on private-clone containment must launch
@@ -140,10 +145,12 @@ pub(super) fn run_role_with_timeout(
         Ok(selection) => selection,
         Err(error) => {
             note_pre_spawn_skip(&logs_dir, role, &error.to_string());
+            pre_launch::note(pre_launch::SELECTION_PREPARE_FAILED);
             return RoleTickOutcome::Failure(error.to_string());
         }
     };
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        pre_launch::note(pre_launch::LOGS_DIR_FAILED);
         return RoleTickOutcome::Failure(format!(
             "could not create logs dir {}: {e}",
             logs_dir.display()
@@ -192,15 +199,19 @@ pub(super) fn run_role_with_timeout(
     {
         Ok(f) => f,
         Err(e) => {
+            pre_launch::note(pre_launch::LOG_OPEN_FAILED);
             return RoleTickOutcome::Failure(format!(
                 "could not open log {}: {e}",
                 log_path.display()
-            ))
+            ));
         }
     };
     let stderr_file = match out_file.try_clone() {
         Ok(f) => f,
-        Err(e) => return RoleTickOutcome::Failure(format!("could not clone log handle: {e}")),
+        Err(e) => {
+            pre_launch::note(pre_launch::LOG_HANDLE_FAILED);
+            return RoleTickOutcome::Failure(format!("could not clone log handle: {e}"));
+        }
     };
 
     let mut cmd = Command::new(script);
@@ -328,6 +339,7 @@ pub(super) fn run_role_with_timeout(
     if resume.is_some() && session.is_none() {
         let reason = "roll resume refused: the saved session id is not usable (#10832)";
         note_pre_spawn_skip(&logs_dir, role, reason);
+        pre_launch::note(pre_launch::RESUME_SESSION_UNUSABLE);
         return RoleTickOutcome::Failure(reason.to_string());
     }
     if let Some(session) = &session {
@@ -335,6 +347,8 @@ pub(super) fn run_role_with_timeout(
     }
     // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
     crate::observability::pick_journal::attach(&mut cmd, workspace_root, role);
+    // #12119: the serving PR queue, journaled by the daemon, not the agent.
+    crate::observability::pick_journal::record_queue_at_dispatch(&cmd, workspace_root, role);
     if let Some(selection) = &selection {
         selection.apply(&mut cmd);
     }
@@ -342,6 +356,7 @@ pub(super) fn run_role_with_timeout(
     // is held until the run is registered, so the pause's snapshot cannot
     // fall between this spawn and that registration.
     let Some(launch_permit) = crate::roll_pause::live_runs::begin_launch(workspace_root) else {
+        pre_launch::note(pre_launch::PAUSED_FOR_ROLL);
         return RoleTickOutcome::Failure(
             "role launch refused: the daemon is pausing every agent for a version roll (#10831)"
                 .to_string(),
@@ -513,7 +528,7 @@ pub(super) fn run_role_with_timeout(
                     // a fake saturated/unsaturated host can be asserted
                     // deterministically.
                     let load_per_core =
-                        load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
+                        load_per_core_override.or_else(crate::host_status::load_per_core_or_raw);
                     let outcome =
                         terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
                     // #11931: the agent never reached `lease pr release`; do

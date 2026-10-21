@@ -67,8 +67,7 @@ fn a_roster_mode_yield_leaves_dispatch_work_conserving() {
         (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
     ];
-    let report =
-        tick_multi_with_sharding(&mut workspaces, &[1, 1], 10, &[false, false], usize::MAX, false);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &[false, false]);
     assert_eq!(report.dispatched, 2, "a roster yield must never starve dispatch");
 
     crate::role_shard::roster::clear_roster_snapshot_for_tests();

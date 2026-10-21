@@ -24,8 +24,12 @@ pub const PR_NUMBER: &str = "loom.pr_number";
 /// The child's env var naming the file a won PR claim is written to.
 pub const PR_FILE_ENV: &str = "LOOM_ROLE_PR_FILE";
 
+/// The span attribute naming an issue target (already on the allowlist).
+pub const ISSUE: &str = "loom.issue";
+
 thread_local! {
     static NOTED: RefCell<Option<u64>> = const { RefCell::new(None) };
+    static NOTED_ISSUE: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
 /// The PR an explicit `/loom:judge <PR>` / `/loom:doctor <PR>` prompt names.
@@ -39,19 +43,38 @@ pub fn explicit_pr(role: &str, prompt: &str) -> Option<u64> {
     words.next()?.trim_start_matches('#').parse().ok()
 }
 
-/// Note the PR `prompt` names, for this thread's in-flight role tick.
+/// The issue an explicit `/loom:builder <N>` / `/loom:curator <N>` prompt names
+/// (#11982). Judge and Doctor prompts name a PR, not an issue.
+#[must_use]
+pub fn explicit_issue(role: &str, prompt: &str) -> Option<u64> {
+    if !matches!(role, "builder" | "curator") {
+        return None;
+    }
+    let mut words = prompt.split_whitespace();
+    words.next()?.strip_prefix("/loom:")?;
+    words.next()?.trim_start_matches('#').parse().ok()
+}
+
+/// Note the PR or issue `prompt` names, for this thread's in-flight role tick.
 pub fn note_prompt(role: &str, prompt: &str) {
     NOTED.with(|slot| *slot.borrow_mut() = explicit_pr(role, prompt));
+    NOTED_ISSUE.with(|slot| *slot.borrow_mut() = explicit_issue(role, prompt));
 }
 
 /// Drop any note left behind, so a tick starts clean.
 pub(super) fn clear() {
     NOTED.with(|slot| slot.borrow_mut().take());
+    NOTED_ISSUE.with(|slot| slot.borrow_mut().take());
 }
 
 /// Take this tick's prompt note, if any.
 pub(super) fn take() -> Option<u64> {
     NOTED.with(|slot| slot.borrow_mut().take())
+}
+
+/// Take this tick's prompt-named issue, if any.
+pub(super) fn take_issue() -> Option<u64> {
+    NOTED_ISSUE.with(|slot| slot.borrow_mut().take())
 }
 
 /// Where tick `execution` of `root` has its claimed PR handed back.

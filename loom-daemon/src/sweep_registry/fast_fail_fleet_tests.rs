@@ -158,11 +158,182 @@ fn a_break_clears_every_hosts_count() {
     peer_backoff(&b, &view, "host-c", 81, 1);
     assert_eq!(b.peer_fast_failure_streak(81), 3);
     let brk = ClaimAd::dispatch_backoff_armed(81, repo, "host-a".into(), 1, "ts".into(), 0)
-        .with_fast_fail_streak(0);
+        .as_fast_fail_break();
     view.lock()
         .unwrap()
         .observe_dispatch_backoff_at(&brk, Instant::now());
     assert_eq!(b.peer_fast_failure_streak(81), 0);
+}
+
+/// A pre-#11952 sender's break carries no marker: zero window and zero streak
+/// is still read as one.
+#[test]
+fn an_unmarked_legacy_break_still_clears_every_hosts_count() {
+    let dir = tempdir().unwrap();
+    let (b, view) = fleet_registry(dir.path());
+    let repo = peer_claims::repo_slug(&b.config().workspace_root);
+    peer_backoff(&b, &view, "host-a", 84, 2);
+    peer_backoff(&b, &view, "host-c", 84, 1);
+    let mut legacy = ClaimAd::dispatch_backoff_armed(84, repo, "host-a".into(), 1, "ts".into(), 0);
+    legacy.consecutive = Some(0);
+    assert_eq!(legacy.streak_break, None);
+    view.lock()
+        .unwrap()
+        .observe_dispatch_backoff_at(&legacy, Instant::now());
+    assert_eq!(b.peer_fast_failure_streak(84), 0);
+}
+
+/// #11952 case 1, the issue's acceptance test: B fast-fails once, A's
+/// progress break reaches B, B fails again. B's own count restarts at 1 and
+/// its ad says 1, not 2, so C needs three more failures, not one.
+#[test]
+fn a_break_resets_the_receivers_own_streak() {
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    let dir_c = tempdir().unwrap();
+    let (mut a, a_view) = fleet_registry(dir_a.path());
+    let (mut b, b_view) = fleet_registry(dir_b.path());
+    let (mut c, c_view) = fleet_registry(dir_c.path());
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(16);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(16);
+    a.set_peer_claim_publisher(tx_a);
+    b.set_peer_claim_publisher(tx_b);
+    let repo_b = peer_claims::repo_slug(&b.config().workspace_root);
+    let repo_c = peer_claims::repo_slug(&c.config().workspace_root);
+
+    b.charge_fast_failure("s", 85, "exit-1", false);
+    assert_eq!(b.fast_failure_streak(85), 1);
+    relay_as_repo(&mut rx_b, &c_view, "host-b", &repo_c);
+    assert_eq!(c.peer_fast_failure_streak(85), 1);
+
+    // A has a stale count to break (it saw B's), then makes real progress.
+    peer_backoff(&a, &a_view, "host-b", 85, 1);
+    a.break_fleet_fast_fail_streak(85);
+    let brk = rx_a.try_recv().unwrap();
+    assert_eq!(brk.streak_break, Some(true));
+    for (view, repo) in [(&b_view, &repo_b), (&c_view, &repo_c)] {
+        let mut ad = brk.clone();
+        ad.host = "host-a".into();
+        ad.repo = repo.clone();
+        view.lock()
+            .unwrap()
+            .observe_dispatch_backoff_at(&ad, Instant::now());
+    }
+    assert_eq!(b.fast_failure_streak(85), 0, "the break reached B's own count");
+    assert_eq!(c.peer_fast_failure_streak(85), 0);
+
+    b.charge_fast_failure("t", 85, "exit-1", false);
+    assert_eq!(b.fast_failure_streak(85), 1, "a fresh streak, not 2");
+    let ad = rx_b.try_recv().unwrap();
+    assert_eq!(ad.consecutive, Some(1), "B advertises 1, not the stale 2");
+    relay_as_repo(&mut rx_b, &c_view, "host-b", &repo_c);
+    c.charge_fast_failure("u", 85, "exit-1", false);
+    assert!(!c.is_quarantined(85), "B:1 + C:1 is two, not three");
+    let _ = (&mut a, &a_view);
+}
+
+/// #11952: a marked break resets only the fast-fail tally. A window a peer
+/// armed for another cause (here, a landed cooldown) keeps running, and so
+/// does the receiver's own local window.
+#[test]
+fn a_break_leaves_every_window_alone() {
+    let dir = tempdir().unwrap();
+    let (mut b, view) = fleet_registry(dir.path());
+    let repo = peer_claims::repo_slug(&b.config().workspace_root);
+    let landed =
+        ClaimAd::dispatch_backoff_armed(86, repo.clone(), "host-c".into(), 1, "ts".into(), 3600);
+    view.lock()
+        .unwrap()
+        .observe_dispatch_backoff_at(&landed, Instant::now());
+    b.charge_fast_failure("s", 86, "exit-1", false);
+    let local_before = b.dispatch_backoff_remaining(86, Utc::now());
+    assert!(local_before.is_some());
+
+    let brk = ClaimAd::dispatch_backoff_armed(86, repo.clone(), "host-a".into(), 1, "ts".into(), 0)
+        .as_fast_fail_break();
+    view.lock()
+        .unwrap()
+        .observe_dispatch_backoff_at(&brk, Instant::now());
+    assert!(
+        view.lock()
+            .unwrap()
+            .dispatch_backoff_issues_at(&repo, Instant::now())
+            .contains(&86),
+        "the peer's landed window survives the break"
+    );
+    assert!(b.dispatch_backoff_remaining(86, Utc::now()).is_some(), "so does B's own window");
+    assert_eq!(b.fast_failure_streak(86), 0, "only the streak is reset");
+}
+
+/// #11952: a break only resets a fast-failure record from before it. A
+/// failure recorded after the break is a new streak and counts.
+#[test]
+fn a_failure_after_the_break_still_counts() {
+    let dir = tempdir().unwrap();
+    let (mut b, view) = fleet_registry(dir.path());
+    let repo = peer_claims::repo_slug(&b.config().workspace_root);
+    let brk = ClaimAd::dispatch_backoff_armed(87, repo, "host-a".into(), 1, "ts".into(), 0)
+        .as_fast_fail_break();
+    view.lock()
+        .unwrap()
+        .observe_dispatch_backoff_at(&brk, Instant::now());
+    b.charge_fast_failure("s", 87, "exit-1", false);
+    b.charge_fast_failure("t", 87, "exit-1", false);
+    assert_eq!(b.fast_failure_streak(87), 2);
+    b.charge_fast_failure("u", 87, "exit-1", false);
+    assert!(b.is_quarantined(87), "three in a row after the break still park");
+}
+
+/// #11952 case 2, the base=0 forgery: a zero base is clamped, and an
+/// ordinary transient failure's ad is never a zero window with a zero streak,
+/// so neither a new peer nor an older one reads it as a break of every host's
+/// count.
+#[test]
+fn a_zero_base_never_forges_a_break() {
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    let mut a = registry(dir_a.path());
+    a.set_dispatch_backoff_config(DispatchBackoffConfig {
+        enabled: true,
+        base: Duration::ZERO,
+        max: Duration::ZERO,
+    });
+    assert_eq!(a.dispatch_backoff_config().base, Duration::from_secs(1), "clamped");
+    assert!(a.dispatch_backoff_config().max >= a.dispatch_backoff_config().base);
+    let (b, b_view) = fleet_registry(dir_b.path());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    a.set_peer_claim_publisher(tx);
+    let repo_b = peer_claims::repo_slug(&b.config().workspace_root);
+    peer_backoff(&b, &b_view, "host-c", 88, 2);
+
+    a.charge_fast_failure("s", 88, "no-usable-account", false);
+    let ad = rx.try_recv().unwrap();
+    assert_eq!(ad.consecutive, Some(0));
+    assert_eq!(ad.streak_break, Some(false));
+    assert!(ad.remaining_secs.unwrap() >= 1, "an older peer would read 0/0 as a break");
+    let mut relayed = ad;
+    relayed.host = "host-a".into();
+    relayed.repo = repo_b;
+    b_view
+        .lock()
+        .unwrap()
+        .observe_dispatch_backoff_at(&relayed, Instant::now());
+    assert_eq!(b.peer_fast_failure_streak(88), 2, "C's count survives A's transient failure");
+}
+
+/// #11952: the publisher itself never sends a zero ladder window, whatever
+/// delay it is handed.
+#[test]
+fn a_zero_delay_ladder_ad_is_advertised_as_one_second() {
+    let dir = tempdir().unwrap();
+    let mut reg = registry(dir.path());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    reg.set_peer_claim_publisher(tx);
+    reg.publish_dispatch_backoff_claim(89, Duration::ZERO, 0);
+    let ad = rx.try_recv().unwrap();
+    assert_eq!(ad.remaining_secs, Some(1));
+    assert!(!peer_claims::ClaimAd::from_body_str(&ad.to_body_json())
+        .is_some_and(|back| back.streak_break == Some(true)));
 }
 
 /// A zero streak on a positive window (a transient cause) still breaks only

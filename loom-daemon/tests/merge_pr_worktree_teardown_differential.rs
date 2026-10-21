@@ -462,3 +462,8 @@ fn the_live_wrapper_removes_nothing_when_the_verb_cannot_run() {
         assert!(!out.contains("OK: Worktree removed"), "{out}");
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

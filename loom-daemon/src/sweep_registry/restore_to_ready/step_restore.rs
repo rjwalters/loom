@@ -56,12 +56,15 @@ use super::*;
 use crate::step_role::StepRole;
 
 /// The labels `role` moves its item to on success. Seeing one at release means
-/// the step got that far.
+/// the step got that far. Champion promotion moves an issue to `loom:issue`
+/// (`promoted`) or back to `loom:triage` (`revise`, #11969): a revise that
+/// died before removing `loom:evaluating` must not get `loom:curated` back
+/// beside its `loom:triage`.
 #[must_use]
 pub(crate) fn advanced_labels(role: StepRole) -> &'static [&'static str] {
     match role {
         StepRole::Curator => &["loom:curated", "loom:issue"],
-        StepRole::ChampionPromote => &["loom:issue"],
+        StepRole::ChampionPromote => &["loom:issue", "loom:triage"],
         StepRole::Builder => &["loom:review-requested"],
         StepRole::Judge => &["loom:pr", "loom:changes-requested"],
         StepRole::Doctor => &["loom:review-requested"],
@@ -138,18 +141,39 @@ impl SweepRegistry {
             StepRole::Builder => self.restore_builder_step(item, sweep_id),
             StepRole::ChampionMerge => Ok(ClaimRelease::Released),
             StepRole::Curator | StepRole::ChampionPromote | StepRole::Judge | StepRole::Doctor => {
-                self.restore_role_step(item, role)
+                self.restore_role_step(item, role, sweep_id)
             }
         }
     }
 
     fn restore_builder_step(&self, issue: u32, sweep_id: &str) -> Result<ClaimRelease> {
+        let signals = self.release_issue_signals(issue);
+        let release = self.release_builder_step(issue, sweep_id, &signals);
+        // A Builder step moved its issue when its PR is open: the release's
+        // own verdict, so the ledger and the release agree (#11909).
+        let pr_open = matches!(release, Ok(ClaimRelease::HeldByOpenPr(_)));
+        let post = signals.closed.map(|closed| {
+            Self::step_post_state(StepRole::Builder, &signals.labels, closed, pr_open)
+        });
+        crate::sweep_registry::step_spawn::ended::note_post(
+            &self.config.workspace_root,
+            sweep_id,
+            post,
+        );
+        release
+    }
+
+    fn release_builder_step(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        signals: &outcome_journal::complexity_signal::IssueSignals,
+    ) -> Result<ClaimRelease> {
         // The same rule as `plan_step_release`, before the shared release
         // (which fails open to a restore on a failed read, as a sweep's crash
         // path wants): a Builder step that exited with `loom:building` gone
         // is finished, and an unreadable issue is not touched at all, since
         // removing `loom:building` blind could drop the open-PR hold (#11852).
-        let signals = self.release_issue_signals(issue);
         if signals.closed.is_none() {
             log::info!(
                 "sweep_registry: Builder step on #{issue} ended; the issue could not be read — \
@@ -177,11 +201,85 @@ impl SweepRegistry {
         self.restore_label_to_ready_checked(issue)
     }
 
-    fn restore_role_step(&self, item: u32, role: StepRole) -> Result<ClaimRelease> {
+    /// The outcome ledger's post-state of a `role` step on an item with
+    /// `labels` and `closed`, read before the release writes anything
+    /// (#11909). `pr_open`: a Builder's linked PR is open (the release's
+    /// open-PR hold decided it). Pure.
+    ///
+    /// Each claim label *replaces* its role's ready label, so "the ready
+    /// label is gone" proves nothing: a crashed step leaves exactly that.
+    /// The item moved only when it carries a label the role moves it *to*
+    /// ([`advanced_labels`], the release's own rule), a Builder's PR is
+    /// open, or a merge step's PR left `loom:pr` for a stage or a hold. A
+    /// claim still on an item that did not move is held: the step died
+    /// mid-work.
+    ///
+    /// The merge step's "for a stage or a hold" is there for Champion's PR
+    /// triage (#12499), which runs as the same role on a PR that never had
+    /// `loom:pr`: "no `loom:pr`" alone would read a triage that wrote nothing
+    /// as a verdict and redraw it every tick. Every merge-step move off
+    /// `loom:pr` that leaves the PR open lands on one (a rejection's
+    /// `loom:changes-requested`, the Verdict-State Janitor's surviving
+    /// verdict).
+    #[must_use]
+    pub fn step_post_state(
+        role: StepRole,
+        labels: &[String],
+        closed: bool,
+        pr_open: bool,
+    ) -> crate::step_dispatch::outcome_ledger::PostState {
+        let has = |l: &str| labels.iter().any(|x| x == l);
+        let claim = role.claim_label().is_some_and(has);
+        let moved = !closed
+            && match role {
+                StepRole::Builder => {
+                    pr_open
+                        || advanced_labels(role).iter().any(|l| has(l))
+                        || !claim && !has("loom:issue")
+                }
+                StepRole::ChampionMerge => {
+                    !has("loom:pr")
+                        && [
+                            "loom:review-requested",
+                            "loom:changes-requested",
+                            "loom:blocked",
+                            "loom:operator",
+                        ]
+                        .into_iter()
+                        .any(has)
+                }
+                _ => advanced_labels(role).iter().any(|l| has(l)),
+            };
+        crate::step_dispatch::outcome_ledger::PostState {
+            moved,
+            closed,
+            claim_held: claim && !moved && !closed,
+        }
+    }
+
+    /// The ledger's post-state from the release's own read, before any
+    /// restore write (`step_spawn::ended`, #11909).
+    fn note_step_post(
+        &self,
+        role: StepRole,
+        sweep_id: &str,
+        labels: &[String],
+        closed: Option<bool>,
+    ) {
+        let post = closed.map(|closed| Self::step_post_state(role, labels, closed, false));
+        crate::sweep_registry::step_spawn::ended::note_post(
+            &self.config.workspace_root,
+            sweep_id,
+            post,
+        );
+    }
+
+    fn restore_role_step(&self, item: u32, role: StepRole, sweep_id: &str) -> Result<ClaimRelease> {
         let (Some(claim), Some(ready)) = (role.claim_label(), role.restore_label()) else {
             return Ok(ClaimRelease::Released);
         };
         let signals = self.release_issue_signals(item);
+        self.note_step_post(role, sweep_id, &signals.labels, signals.closed);
         let plan = plan_step_release(role, &signals.labels, signals.closed);
         log::info!(
             "sweep_registry: {role} step on #{item} died — releasing `{claim}` ({plan:?}, \

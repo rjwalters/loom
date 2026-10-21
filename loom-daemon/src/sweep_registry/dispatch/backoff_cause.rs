@@ -21,7 +21,7 @@ use std::time::Duration;
 /// Whether an event of `cause` at `now` extends `prev`'s streak: `prev` was
 /// armed by the same cause, no longer ago than `max_secs` (a streak older
 /// than the ladder's cap has gone cold, as before).
-pub(super) fn continues(
+pub(in crate::sweep_registry) fn continues(
     prev: &DispatchBackoffState,
     cause: DispatchBackoffCause,
     now: DateTime<Utc>,

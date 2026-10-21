@@ -316,7 +316,7 @@ pub fn ok_message(checked: &[String]) -> String {
 /// Printed after the violations.
 pub fn failure_trailer(count: usize) -> String {
     format!(
-        "\ncheck-renovate-labels: {count} problem(s). Every Renovate `labels` array must include `{REQUIRED_LABEL}` (#9418; Dependabot-side equivalent: check-dependabot-labels.sh, #7577)."
+        "\ncheck-renovate-labels: {count} problem(s). Every Renovate `labels` array must include `{REQUIRED_LABEL}` (#9418)."
     )
 }
 
