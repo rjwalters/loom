@@ -17,9 +17,9 @@ mod loom_kind;
 mod record_id;
 mod start_facts;
 use crate::telemetry::{
-    HostHealthRecord, MemoryPressureSummary, PhaseDuration, RoleTickResult, SweepCompletedRecord,
-    SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
-    TokenSnapshotRecord,
+    HostHealthRecord, MemoryPressureSummary, PhaseDuration, RepoVisibility, RoleTickResult,
+    SweepCompletedRecord, SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord,
+    SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {

@@ -6,7 +6,7 @@ use super::*;
 use crate::observability::otlp::mapping::host_health::{
     HOST_HEALTH_DATAPOINT_KEYS, MAX_ACTIVE_SWEEP_IDS,
 };
-use crate::telemetry::{HostProtectionSummary, ManagedRepoEntry};
+use crate::telemetry::{HostProtectionSummary, ManagedRepoEntry, RepoVisibility};
 
 fn metrics_of(e: TelemetryEnvelope) -> Vec<Metric> {
     let request = build_metrics_request(&[e]).expect("host.health is a gauge kind");
