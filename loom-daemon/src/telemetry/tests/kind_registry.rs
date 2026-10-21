@@ -49,7 +49,6 @@ const FROZEN_GATES: &[(&str, Option<u32>)] = &[
     ("ci.duration", Some(8)),
     ("ci.job.log", Some(9)),
     ("metric.points", Some(10)),
-    ("queue.snapshot", Some(11)),
 ];
 
 fn repo_root() -> PathBuf {
@@ -210,7 +209,6 @@ fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
         ("sweep.completed", true, true),
         ("sweep.identity", true, true),
         ("pick.decision", true, false),
-        ("queue.snapshot", false, true),
         ("fleet.state", true, false),
         ("host.health", true, true),
         ("host.export", true, false),

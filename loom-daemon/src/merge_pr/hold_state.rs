@@ -79,7 +79,8 @@ pub const CLEAN: &str = "LOOM-HOLD-STATE-CLEAN";
 fn marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"champion:hold-state head=([0-9a-f]+)").expect("static hold-state pattern")
+        Regex::new(r"champion:hold-state head=([0-9a-f]+)(?: auth=([0-9a-f]+))?")
+            .expect("static hold-state pattern")
     })
 }
 
@@ -103,6 +104,20 @@ fn html_comment_spans(line: &str) -> Vec<&str> {
     spans
 }
 
+/// The most recent `champion:hold-state` marker: its head and, when the
+/// producer wrote one, its `auth=<digest>` (#12933).
+fn last_marker(comments: &str) -> Option<(String, Option<String>)> {
+    let mut last = None;
+    for line in comments.lines() {
+        for span in html_comment_spans(line) {
+            for caps in marker_re().captures_iter(span) {
+                last = Some((caps[1].to_string(), caps.get(2).map(|m| m.as_str().to_string())));
+            }
+        }
+    }
+    last
+}
+
 /// The head SHA the most recent `champion:hold-state` marker recorded.
 ///
 /// `comments` is every comment body on the PR, concatenated — what
@@ -111,15 +126,15 @@ fn html_comment_spans(line: &str) -> Vec<&str> {
 /// forge's chronological comment order.
 #[must_use]
 pub fn recorded_head(comments: &str) -> Option<String> {
-    let mut last = None;
-    for line in comments.lines() {
-        for span in html_comment_spans(line) {
-            for caps in marker_re().captures_iter(span) {
-                last = Some(caps[1].to_string());
-            }
-        }
-    }
-    last
+    last_marker(comments).map(|(head, _)| head)
+}
+
+/// The standing-authorization digest the most recent `champion:hold-state`
+/// marker recorded beside its head (`auth=<digest>`, #12933); `None` for a
+/// legacy marker that carries none.
+#[must_use]
+pub fn recorded_auth(comments: &str) -> Option<String> {
+    last_marker(comments).and_then(|(_, auth)| auth)
 }
 
 /// The staleness warning for this PR, or `None` when there is nothing to say.

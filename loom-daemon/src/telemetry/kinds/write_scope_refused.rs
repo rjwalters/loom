@@ -13,7 +13,8 @@
 //!
 //! # Scope
 //!
-//! Daemon passes only. Short-lived `loom-daemon forge ...` CLI processes have
+//! Daemon passes, the gates and the per-call checks the daemon's `GhForge`
+//! writes make (#12606). Short-lived `loom-daemon forge ...` CLI processes have
 //! no OTLP sink, so a refusal there is not recorded.
 //!
 //! **OTLP only.** The scalars ride as `loom.write_scope.*` attributes
@@ -33,6 +34,8 @@ use crate::telemetry::provenance::Provenance;
 pub const WRITE_SCOPE_REFUSED_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.write_scope.reason",
     "loom.write_scope.credential",
+    "loom.write_scope.credential_owner",
+    "loom.write_scope.repo_owner",
     "loom.write_scope.call_site",
     "loom.write_scope.version",
     "loom.write_scope.revision",
@@ -78,10 +81,21 @@ pub struct WriteScopeRefusedRecord {
     /// The refused `owner/repo`, when the gate knew it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// The refused repository's owner, when the repository is known: with
+    /// [`Self::credential_owner`] it shows a cross-owner write vetted under
+    /// another owner's writer (#12606).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_owner: Option<String>,
     /// A non-secret identity for the credential that was refused: its kind
     /// (`gh-process-default`, `gitea`) or its registered per-owner config
     /// directory name (`gh-config:<dir>`). Never a token or a fragment.
     pub credential: String,
+    /// The owner whose writer installation the credential holds: the owner
+    /// that registered its per-owner config directory, or `process` for the
+    /// process's own credential (the workspace-root owner's writer in the
+    /// daemon). Absent when unknown (a root-only registration, Gitea).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_owner: Option<String>,
     /// The `what` the pass handed the gate (a short pass name).
     pub call_site: String,
     /// Why it was refused.

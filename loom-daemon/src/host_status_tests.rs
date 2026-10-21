@@ -83,7 +83,51 @@ fn readings() -> Readings {
             tx_bytes: 0,
         }),
         volume_free_bytes: Some(1_000_000),
+        gpu: None,
     }
+}
+
+#[test]
+fn parse_nvidia_smi_aggregates_max_util_and_summed_memory() {
+    let g = parse_nvidia_smi("30, 1000, 16000\n80, 2000, 16000\n").unwrap();
+    assert!(approx(g.utilisation, 0.8));
+    assert_eq!(g.mem_used_bytes, 3000 * 1024 * 1024);
+    assert_eq!(g.mem_total_bytes, 32000 * 1024 * 1024);
+}
+
+#[test]
+fn parse_nvidia_smi_skips_na_rows_and_empty_is_absent() {
+    let g = parse_nvidia_smi("[N/A], 1000, 16000\n10, 500, 8000\n").unwrap();
+    assert!(approx(g.utilisation, 0.1));
+    assert_eq!(g.mem_total_bytes, 8000 * 1024 * 1024);
+    assert_eq!(parse_nvidia_smi(""), None);
+    assert_eq!(parse_nvidia_smi("[N/A], [N/A], [N/A]\n"), None);
+}
+
+#[test]
+fn gpu_signals_present_only_when_read_and_absent_never_zero() {
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    let r = s.step(&readings(), 0.0);
+    for k in [
+        "gpu_utilisation",
+        "gpu_mem_used_bytes",
+        "gpu_mem_total_bytes",
+    ] {
+        assert!(!r.raw.contains_key(k) && !r.filtered.contains_key(k), "{k}");
+    }
+    let mut with = readings();
+    with.gpu = Some(GpuReadings {
+        utilisation: 0.5,
+        mem_used_bytes: 10,
+        mem_total_bytes: 100,
+    });
+    let r = s.step(&with, 5.0);
+    assert!(approx(r.raw["gpu_utilisation"], 0.5));
+    assert!(r.filtered.contains_key("gpu_mem_used_bytes"));
+    // A later tick without a GPU reading drops the keys instead of emitting 0.
+    let r = s.step(&readings(), 10.0);
+    assert!(!r.raw.contains_key("gpu_utilisation"));
+    assert!(!r.filtered.contains_key("gpu_utilisation"));
 }
 
 #[test]
@@ -234,4 +278,128 @@ fn volume_free_bytes_reads_an_existing_ancestor_and_none_for_nothing() {
         .join("a")
         .join("b");
     assert!(volume_free_bytes(&dir).is_some(), "walks up to the existing /tmp");
+}
+
+// ---- #12114: admission readers see the filtered record ----
+
+#[test]
+fn filtered_readers_smooth_a_one_sample_load_spike() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    // Six calm ticks at 0.5/core, then one 2.0/core spike one tick later (the old raw gate
+    // threshold is 0.9/core).
+    let mut last = None;
+    for i in 0..6 {
+        last = Some(s.step(&readings(), f64::from(i) * 5.0));
+    }
+    let mut spike = readings();
+    spike.load_per_core = Some(2.0);
+    let record = s.step(&spike, 30.0);
+    publish(&record);
+    let raw = latest_raw("cpu_load_per_core").unwrap();
+    let filtered = filtered_load_per_core().unwrap();
+    clear_latest();
+    assert!(last.is_some());
+    assert!(raw >= 0.9, "a raw read trips the 0.9 gate threshold: {raw}");
+    assert!(filtered < 0.9, "the filtered read does not: {filtered}");
+    assert!(filtered > 0.5, "but it does move toward the spike: {filtered}");
+}
+
+#[test]
+fn filtered_readers_are_absent_until_published_and_never_zero() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    clear_latest();
+    assert_eq!(latest_filtered("cpu_load_per_core"), None);
+    assert_eq!(filtered_load_per_core(), None);
+    assert_eq!(filtered_loadavg_1m(8), None);
+    assert_eq!(filtered_cpu_idle_fraction(), None);
+}
+
+#[test]
+fn filtered_loadavg_and_idle_are_derived_from_the_filtered_signals() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    s.step(&readings(), 0.0);
+    let mut b = readings();
+    b.cpu = Some(CpuCounters {
+        idle: 150,
+        total: 300,
+    });
+    publish(&s.step(&b, 5.0));
+    let lpc = filtered_load_per_core().unwrap();
+    assert!(approx(filtered_loadavg_1m(8).unwrap(), lpc * 8.0));
+    // 50% utilisation over the second tick: idle is its complement.
+    assert!(approx(filtered_cpu_idle_fraction().unwrap(), 0.5));
+    clear_latest();
+}
+
+/// Serializes stub write + spawn: a concurrent fork that inherits the stub's
+/// still-open write fd makes `exec` fail with ETXTBSY.
+#[cfg(target_os = "linux")]
+static STUB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+fn stub_nvidia_smi(name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("loom-nvsmi-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nvidia-smi");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn query_nvidia_smi_times_out_and_returns_none() {
+    let _guard = STUB_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stub = stub_nvidia_smi("hang", "exec sleep 30");
+    let start = std::time::Instant::now();
+    let got = query_nvidia_smi(stub.to_str().unwrap(), std::time::Duration::from_millis(300));
+    assert!(matches!(got, Ok(None)), "{got:?}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn query_nvidia_smi_parses_stub_output() {
+    let _guard = STUB_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stub = stub_nvidia_smi("ok", "echo '30, 1000, 16000'");
+    let g = query_nvidia_smi(stub.to_str().unwrap(), std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(g.mem_total_bytes, 16000 * 1024 * 1024);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn query_nvidia_smi_nonzero_exit_and_missing_binary() {
+    let _guard = STUB_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stub = stub_nvidia_smi("fail", "echo '30, 1000, 16000'; exit 3");
+    let got = query_nvidia_smi(stub.to_str().unwrap(), std::time::Duration::from_secs(5));
+    assert!(matches!(got, Ok(None)));
+    let err =
+        query_nvidia_smi("/nonexistent/nvidia-smi", std::time::Duration::from_secs(1)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn raw_fallback_readers_serve_an_unpublished_host_and_defer_to_the_record() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    // No record (observability off, no sampler tick): the raw read answers.
+    clear_latest();
+    assert_eq!(load_per_core_or_raw().is_some(), crate::cpu_headroom::load_per_core().is_some());
+    assert_eq!(loadavg_1m_or_raw(8).is_some(), crate::cpu_headroom::read_loadavg_1m().is_some());
+    // A published record wins over the raw read.
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    publish(&s.step(&readings(), 0.0));
+    assert_eq!(load_per_core_or_raw(), filtered_load_per_core());
+    assert_eq!(loadavg_1m_or_raw(8), filtered_loadavg_1m(8));
+    clear_latest();
 }

@@ -79,7 +79,7 @@ rg -n 'Command::new\("curl"\)' loom-daemon/src -g '!*tests*'
 rg -ln 'reqwest::Client|Client::builder' loom-daemon/src -g '!*tests*'
 # observability/exporter.rs, observability/ops/quota/zai.rs, signoz_read.rs,
 # forge_events.rs, jev_merge_risk.rs, worker_spawn/egress_proxy/server.rs,
-# loom_ui_alerts/ (via observability/request_headers.rs), observability/otlp/
+# observability/otlp/
 
 # Sweep 6: no HTTP framework, no other HTTP client crate
 rg -n 'axum|ureq|isahc|hyper' loom-daemon/Cargo.toml        # no hits
@@ -114,15 +114,15 @@ listed under "Not an input". Sweep 6's "no HTTP framework" applies to
 
 | # | Input | Direction | Code location | Transport / peer | What it changes in daemon behavior | Gating config key (default) | Class | Replacement or follow-up |
 |---|---|---|---|---|---|---|---|---|
-| 6 | Forge event feed | out request, in response | `forge_events.rs` `spawn_task`, `FeedClient::poll_once`, `resolve_endpoint`, `resolve_event_key_file`; consumers in `forge_events/wake.rs` (`WORK_FINDER`, `CLAIM_RECONCILE`, `IN_FLIGHT_PR` descriptors); `ci_telemetry/feed.rs` | HTTPS `GET {endpoint}/v1/hosts/{host}/events?after=&limit=` with a per-host bearer key re-read from a file on every poll. Peer: the operator's Cloudflare Worker (HMAC-verified GitHub App deliveries) | Publishes one `forge.event` bus prompt per non-empty page. Each consumer turns it into an **early tick of a loop that already exists**: `EarlyTicker::tick` returns `()`, so no event content reaches a decision. `ci_telemetry` additionally uses a finished `workflow_run`'s `(repo, run_id)` key to fetch that run from the forge (telemetry only). A dead feed leaves exactly the polling floor | `forgeEvents.enabled` (`false`), `.endpoint`, `.hostId`, `.eventKeyFile`, `.pollIntervalSecs`, `.pageSize`; per consumer `forgeEvents.events.workFinderTick`, `.claimReconcileWake`, `.inFlightPrWatch` (all `false`) | `webhook-wake-only` | Kept per the operator amendment. `fleet.json` has no `forgeEvents` key on any host, so it is off fleet-wide today |
-| 7 | Event-gated polling | derived from row 6 | `forge_events/poll_gate.rs` `gated_list`, `PollGate::decide` | In-process, fed by row 6's events | Opposite direction from a wake: while the feed is `healthy`, a workspace with no event since its last poll **skips its discovery poll**, until a hard cap of `min(10 x base cadence, 15 min)`. Only `ReadKind::Discovery` can be skipped; claim, label-transition and merge reads always poll. Any non-healthy status restores the base cadence at once | `forgeEvents.pollGating` (`false`; env `LOOM_FORGE_EVENTS_POLL_GATING`) | `webhook-wake-only` | This is not strictly "a wake": it can delay a poll, never speed one up. Bounded to 15 minutes and fail-safe, but it is data from outside deciding to do less. See Open question 2 |
-| 7a | State mirror: discovery reads and change-stream wakes | out request, in response | `forge_mirror.rs` (config, `Refresher`), `forge_mirror/discovery.rs` `list_open` (called from `work_finder/forge.rs`), `forge_mirror/wake.rs` `spawn`, `pass` | HTTPS `GET {origin}/v1/mirror/items` and `GET {origin}/v1/changes` with a bearer key read from `forge.mirror.keyRef` (SSM or an owner-only file). Peer: the operator's state-mirror service | Discovery listings (work-finder candidates) are served from the mirror only while the repo's watermark is within `maxStalenessSecs` (cap 15 min); otherwise, and on any error, the listing reads the forge as before. Claim, label-transition and merge reads never use it. Change-stream pulls publish `forge.event` prompts (`source: github-events-mirror`) that tick armed consumers early, as row 6 | `forge.mirror` (unset: off), `.origin`, `.keyRef`, `.region`, `.maxStalenessSecs` (600), `.changePollSecs` (30); early ticks also need row 6's per-consumer flags | `webhook-wake-only` | Discovery state from outside, bounded by the watermark and falling back on any doubt; never a decision input. See [`forge-events.md`](forge-events.md) §8 |
+| 6 | ~~Forge event feed~~ | — | removed 2026-10-19 (#12809) | The dashboard per-host event-feed client, its `forge.event` early-tick consumers and the `ci_telemetry` feed path are gone | Nothing. A leftover `forgeEvents` block or `LOOM_FORGE_EVENTS_*` variable is ignored with one startup warning | — | `removed` | Plain polling at each loop's configured cadence; Cloudflare mirror reads (row 7a) are the retained data path |
+| 7 | ~~Event-gated polling~~ | — | removed 2026-10-19 (#12809) | `poll_gate` is gone; discovery polls are never skipped on an event's say-so | Nothing | — | `removed` | Ordinary polling at the configured cadence |
+| 7a | State mirror: discovery reads and change-stream pull | out request, in response | `forge_mirror.rs` (config, `Refresher`), `forge_mirror/discovery.rs` `list_open` (called from `work_finder/forge.rs`), `forge_mirror/wake.rs` `spawn`, `pass` | HTTPS `GET {origin}/v1/mirror/items` and `GET {origin}/v1/changes` with a bearer key read from `forge.mirror.keyRef` (SSM or an owner-only file). Peer: the operator's state-mirror service | Discovery listings (work-finder candidates) are served from the mirror only while the repo's watermark is within `maxStalenessSecs` (cap 15 min); otherwise, and on any error, the listing reads the forge as before. Claim, label-transition and merge reads never use it. The change-stream pull keeps per-repo cursors and records latency; it ticks no loop and gates no poll | `forge.mirror` (unset: off), `.origin`, `.keyRef`, `.region`, `.maxStalenessSecs` (600), `.changePollSecs` (30) | `webhook-wake-only` | Discovery state from outside, bounded by the watermark and falling back on any doubt; never a decision input. See [`forge-events.md`](forge-events.md) |
 
 ### Controls delivered by services
 
 | # | Input | Direction | Code location | Transport / peer | What it changes in daemon behavior | Gating config key (default) | Class | Replacement or follow-up |
 |---|---|---|---|---|---|---|---|---|
-| 8 | `/ingest` response: operator-priority and workspace-priority intents | in (response body) | `observability/exporter.rs` `HttpsExporter::emit_batch`, `handle_ack`, struct `IngestAck`; loom-ui side `src/routes/ingestRoute.ts` `ackWorkForHost` | HTTPS `POST` to `observability.endpoint` with the host ingest key | **Nothing today.** `IngestAck` deserializes only `host_id`. `operator_priority_intents` was retired by #11104 and a backend that still sends it is ignored (`a_retired_intents_field_on_the_ack_is_ignored`); the 64 KiB body bound remains so a misconfigured endpoint cannot be buffered into memory. Decision bounces never reached the daemon | `observability.enabled`, `observability.exporters` containing `"https"`, `.endpoint`, `.ingestKeyFile` | `removed` | Replacement: fleet-gitops config (`operator_levels` already exists; per-workspace priority follows it), tracked in the operator's fleet config repo. Daemon side is already done for the control fields; the rest of the `https` exporter goes with rjwalters/loom#11712 steps 1-2. **Correction for #11712 step 1:** there are no intent or bounce acks left to stop parsing, only the `host_id` echo (see "Not an input") |
+| 8 | ~~`/ingest` response: operator-priority and workspace-priority intents~~ | — | removed 2026-10-21 (#12813) | The exporter that read the ack was deleted; no daemon code reads a dashboard response | Nothing | — | `removed` | Priority controls as fleet config (outside this repo's scope) |
 | 9 | Safehouse peer claims (inbound room events) | in | `safehouse.rs` `spawn_peer_coordination` (dedicated inbound read task), `safehouse/claim_sink.rs` `PeerClaimSink::on_event`, `peer_claims.rs` `PeerClaimView`; consumed in `sweep_registry/guards.rs` (`detect_and_record_collision`) and `SweepRegistry::dispatch` | `AF_UNIX` NDJSON to the local `safehoused`, which holds a Matrix room. Peer: other hosts' claim advertisements | A live peer claim makes this host **back off an issue before dispatch**, retracting its own advertisement and lock. Soft, TTL-bound (`peerClaimTtlSecs`, 120) | `safehouse.enabled` (`false`; env `LOOM_SAFEHOUSE_ENABLED`), `safehouse.socket`, `safehouse.rooms.claims` (env `LOOM_SAFEHOUSE_ROOM_CLAIMS`) | `removed` | Replacement: `nothing`. ADR-0025 already decides the forge lease is the only cross-host claim. Covered by rjwalters/loom#11112 (safehouse removal) and #11712 step 3 |
 | 10 | Safehouse filing-lock mirror | in | `safehouse/claim_sink.rs` `mirror_filing_lock_to_disk`, `filing_lock.rs` `record_peer_hold` / `clear_peer_hold` | Same channel as row 9, a `FilingLock` / `FilingUnlock` ad | Writes a marker file whose mtime (local receipt time) ages out a **peer's hold on issue filing**, which the local filing lock then respects | same as row 9 | `removed` | Replacement: `nothing` (host-only serialization, which `filing_lock.rs` documents as the degraded mode). Covered by #11112 |
 | 11 | Safehouse ChatOps and Concierge | in | No module at this commit: `rg safehouse_chatops` finds tests and comments only. Residue: `types.rs` `dispatch_origin` doc, per-repo `.loom/config.json` `chatops` / `concierge` blocks, and `defaults/docs/safehouse.md` sections that still describe them | Was Matrix room text via `safehoused` | Was: typed verbs (dispatch, cancel, ...) and an LLM persona proposing them. The daemon-side parser is gone (#11112 slice 1) | `safehouse.chatops.*`, `safehouse.concierge.*` (`enabled: false` everywhere) | `removed` | Replacement: `nothing`. Residual cleanup (stale seeds, stale doc sections, config schema keys) belongs to #11112's remaining slices |
@@ -149,10 +149,8 @@ holds.
 
 | Item | Code location | Why it is not an input |
 |---|---|---|
-| `/ingest` `host_id` echo | `observability/exporter.rs` `check_host_identity` | The only field of the ack still parsed. A mismatch logs one WARN and sets `HostIdStatus`, shown in `loom-daemon status` / `health` (`observability_host_id_mismatch`). It never changes the export result or any dispatch decision. Goes away with the `https` exporter (#11712) |
 | OTLP exporter and its responses | `observability/otlp/{mod,transport}.rs` | Response policy keeps counts (`rejectedLogRecords` etc.) for loss accounting; receiver text is never copied. Telemetry delivery only |
-| Native `/ingest` batch and `queue.snapshot` | `observability/{exporter,queue_snapshot,sender}.rs` | Outbound telemetry |
-| loom-ui alerts | `loom_ui_alerts/` (`post`, `post_blocking`, `outbox`), `fleet_sync/loom_ui.rs`, `safehouse/loom_ui_watch.rs` | `POST {loom-ui}/api/alerts/external`. A 2xx is delivered, other 4xx are dropped and logged, 429/5xx are retried with backoff. The response never reaches a decision. Off with `LOOM_LOOM_UI_ALERTS=0` or without ingest config |
+| Alerts (`alert.transition`) | `alerts/` (`post`), `watchdog/loom_ui.rs`, `observability/standalone_ops.rs` (`deliver`) | Outbound telemetry only (#12806): OTLP log records through the OTLP exporter above (the watchdog through its own durable queue). Nothing is read back; the daemon no longer calls loom-ui's `/api/alerts/external` |
 | Safehouse narration (outbound) | `safehouse.rs` `spawn_sink` | Sweep lifecycle sent to the room. Failures degrade to a `warn!`; "Loom never blocks a sweep on safehouse". Removal is #11112; the inbound half is rows 9-10 |
 | SigNoz reads | `signoz_read.rs`, `telemetry_replay*.rs`, `cli/telemetry_replay.rs`, `config_resolver.rs` (endpoint resolve only) | `POST /v1/query` to the telemetry reader, driven only by the `telemetry-replay` CLI. No daemon loop calls it |
 | Z.ai quota | `observability/ops/quota/zai.rs`, `observability/collector/zai_accounts.rs` | `GET api.z.ai/.../quota/limit`, cached per seat; the result becomes `tokens.snapshot` account rows and pool gauges. Unknown stays unknown, never `0` |
@@ -184,10 +182,8 @@ makes the question moot, but any host with safehouse enabled has peer claims
    keep as a fifth acknowledged class (resource-limit observation), or remove
    by having a host configure fixed account limits in fleet-gitops. Also
    confirm the IPC socket mode: nothing in the code sets one.
-2. **Poll gating (row 7).** It is the only "wake" input that can make the daemon
-   do less. It is bounded (15 minutes, discovery reads only, restored on any
-   non-healthy status) and default off. Is that acceptable inside "wake-only",
-   or should the wake-only plane drop `pollGating`?
+2. **Poll gating (row 7).** Resolved 2026-10-19 (#12809): dropped, together with
+   the feed it depended on.
 3. **Code and artifact distribution (rows 15, 16).** Auto-update fetches a
    signed-or-checksummed binary and workspace sync pulls role prompts and
    scripts; neither is configuration. On a fleet host the trigger is operator
@@ -210,7 +206,7 @@ nothing to remove daemon-side.
 
 | Row | Covered by |
 |---|---|
-| 8 `/ingest` control fields | Daemon side done (#11104). `https` exporter removal: rjwalters/loom#11712 steps 1-2. Priority controls as fleet config (outside this repo's scope) |
+| 8 `/ingest` control fields | Daemon side done (#11104); the exporter itself was removed in #12813. Priority controls as fleet config (outside this repo's scope) |
 | 9, 10, 11 Safehouse | rjwalters/loom#11112 (safehouse removal, ADR-0025) and #11712 step 3 |
 | 12 loom-ui GitHub mirror | Nothing daemon-side; loom-ui removes its route |
 
@@ -222,7 +218,7 @@ ruled for hardening, a fleet-wide signature policy.
 ## Related
 
 - rjwalters/loom#11711 (this audit), #11712, #11112, #11104
-- [`forge-events.md`](forge-events.md) and ADR-0021 for rows 6-7
+- [`forge-events.md`](forge-events.md) (the retained state mirror) and ADR-0021 (rows 6-7, superseded)
 - [`lease-record.md`](lease-record.md) and ADR-0025 for the forge lease that replaces rows 9-10
 - [`fleet-config-lifecycle.md`](fleet-config-lifecycle.md) for rows 13-15
 - [`observability.md`](observability.md) for rows 8 and the telemetry items

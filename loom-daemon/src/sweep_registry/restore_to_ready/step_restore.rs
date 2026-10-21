@@ -210,8 +210,17 @@ impl SweepRegistry {
     /// label is gone" proves nothing: a crashed step leaves exactly that.
     /// The item moved only when it carries a label the role moves it *to*
     /// ([`advanced_labels`], the release's own rule), a Builder's PR is
-    /// open, or a merge step's PR left `loom:pr`. A claim still on an item
-    /// that did not move is held: the step died mid-work.
+    /// open, or a merge step's PR left `loom:pr` for a stage or a hold. A
+    /// claim still on an item that did not move is held: the step died
+    /// mid-work.
+    ///
+    /// The merge step's "for a stage or a hold" is there for Champion's PR
+    /// triage (#12499), which runs as the same role on a PR that never had
+    /// `loom:pr`: "no `loom:pr`" alone would read a triage that wrote nothing
+    /// as a verdict and redraw it every tick. Every merge-step move off
+    /// `loom:pr` that leaves the PR open lands on one (a rejection's
+    /// `loom:changes-requested`, the Verdict-State Janitor's surviving
+    /// verdict).
     #[must_use]
     pub fn step_post_state(
         role: StepRole,
@@ -228,7 +237,17 @@ impl SweepRegistry {
                         || advanced_labels(role).iter().any(|l| has(l))
                         || !claim && !has("loom:issue")
                 }
-                StepRole::ChampionMerge => !has("loom:pr"),
+                StepRole::ChampionMerge => {
+                    !has("loom:pr")
+                        && [
+                            "loom:review-requested",
+                            "loom:changes-requested",
+                            "loom:blocked",
+                            "loom:operator",
+                        ]
+                        .into_iter()
+                        .any(has)
+                }
                 _ => advanced_labels(role).iter().any(|l| has(l)),
             };
         crate::step_dispatch::outcome_ledger::PostState {

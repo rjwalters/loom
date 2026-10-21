@@ -32,7 +32,7 @@
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
 //! | pool_hold | [`crate::types::DaemonStatusReport::pool_exhaustion_holds`] (published by [`crate::work_finder::pool_preflight::active_hold_statuses`], Issues #7708/#7990) — its own bucket, deliberately NOT folded into `tokens` |
-//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
+//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
 //! [`HealthInputs`] and returns a [`HealthReport`] — so every verdict rule
@@ -2481,7 +2481,11 @@ mod auto_update_stale_repo;
 ///   [`Verdict::Degraded`] when
 ///   [`auto_update_stale_repo::stalled_summary`] fires (#8513) — a distinct
 ///   hard finding from the staleness checks above, since it can fire even
-///   while the SOURCE checkout is perfectly current.
+///   while the SOURCE checkout is perfectly current. Also
+///   [`Verdict::Degraded`] (#9736) when the loop has no recent successful
+///   release check, or a newer release stays unapplied past its deadline
+///   ([`crate::auto_update::freshness`]); neither needs a source checkout.
+///   A disabled loop stays Green: it returns before any of this.
 #[must_use]
 pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
     let Some(status) = &inputs.status else {
@@ -2521,6 +2525,10 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
         // place as everything else this section already reports.
         "stale_repo_ticks": status.auto_update_stale_repo_ticks,
         "stale_repo": status.auto_update_stale_repo,
+        // Issue #9736: the daemon-authoritative convergence view — the
+        // RUNNING daemon's version (not this CLI's `installed_version`),
+        // last successful check, pending age, next attempt, blocking reason.
+        "freshness": status.auto_update_freshness,
     });
 
     if !status.auto_update_enabled {
@@ -2549,6 +2557,13 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
     // those compare against the SOURCE checkout's HEAD, which says nothing
     // about a release-artifact-path wrong-repo resolution.
     if let Some(summary) = auto_update_stale_repo::stalled_summary(status) {
+        return HealthSection::new("auto_update", Verdict::Degraded, summary, detail);
+    }
+
+    // Issue #9736: an enabled loop that has not completed a check in too long,
+    // or has left a newer release unapplied past its deadline. Needs no git or
+    // source checkout, which is the blind spot the checks below leave.
+    if let Some(summary) = crate::auto_update::freshness::finding_for(status, inputs.at) {
         return HealthSection::new("auto_update", Verdict::Degraded, summary, detail);
     }
 

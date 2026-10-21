@@ -329,16 +329,6 @@ pub struct SpawnDeathIndex {
 }
 
 impl SpawnDeathIndex {
-    /// Build from the sibling journal of one workspace root. A missing
-    /// journal yields an empty index — the `< 60 s` heuristic still applies.
-    #[must_use]
-    pub fn from_workspace(workspace_root: &Path) -> Self {
-        let path = sweep_outcomes::default_outcomes_path(workspace_root);
-        let mut index = Self::default();
-        index.absorb(&sweep_outcomes::read_all(&path));
-        index
-    }
-
     /// Merge another workspace's sibling-journal records into this index.
     pub fn absorb(&mut self, records: &[sweep_outcomes::OutcomeRecord]) {
         for record in records {

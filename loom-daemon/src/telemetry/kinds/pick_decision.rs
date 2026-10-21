@@ -18,6 +18,13 @@
 //! that share `tick_id` and carry `chunk_index` / `chunk_count`; the union
 //! of the chunks in `chunk_index` order is exactly the original. The chunk
 //! size exists only because one OTLP/gRPC message is limited to about 4 MB.
+//!
+//! **Exported as a summary (#12974).** The record above is what is *archived*
+//! ([`crate::observability::pick_payload_archive`]); the log carries only its
+//! bounded [`summarize`](PickDecisionRecord::summarize) form, flagged by
+//! `payload_ref` (see [`super::pick_summary`]).
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -200,6 +207,7 @@ impl PickSkipReason {
         use PassReason as P;
         match exclusion {
             Exclusion::PoolExhausted => Self::Quota,
+            Exclusion::MergeInFlight => Self::InFlight,
             Exclusion::BuildBackoff | Exclusion::CoolingDown => Self::Backoff,
             Exclusion::Pass(reason) => match reason {
                 P::Frozen | P::Operator | P::HardExclusion => Self::OperatorHold,
@@ -208,8 +216,8 @@ impl PickSkipReason {
                 P::Sequenced => Self::OverlapChain,
                 P::Blocked => Self::Blocked,
                 P::CapabilityMissing => Self::HostConstraint,
-                P::Epic | P::Proposal | P::NoStage => Self::NoStep,
-                P::CiPending => Self::Backoff,
+                P::Epic | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
+                P::CiPending | P::HeldAtHead => Self::Backoff,
             },
         }
     }
@@ -419,7 +427,9 @@ pub struct PickItemRepo {
     pub pool_weight: u64,
 }
 
-/// A repo a per-repo cap took out of the item pool mid-tick.
+/// A repo a per-repo cap took out of the item pool mid-tick, or (with
+/// `steps`) the steps of a repo the tick took out: a repo that started a
+/// Champion merge draws no second one (#12494).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickItemClosure {
     /// Forge `owner/repo`.
@@ -427,6 +437,10 @@ pub struct PickItemClosure {
     /// Draws taken before it closed: it is absent from every draw with an
     /// index at least this.
     pub after_draw: u32,
+    /// The steps closed (`champion_merge`, ...), as `pools[].step` names
+    /// them; empty (and absent on the wire): the whole repo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<String>,
 }
 
 /// One item of the starting pool.
@@ -636,6 +650,19 @@ pub struct PickDecisionRecord {
     /// never idle or ready. Additive beside the legacy `outcome`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_result: Option<String>,
+    /// Set only on the exported **summary** (#12974): the run id (the
+    /// `tick_id`) under which the full record sits in the payload archive.
+    /// Its presence is what marks a record as a summary: `candidates`,
+    /// `skipped` and every draw list are then empty. Absent on the full
+    /// record and on an older daemon's records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_ref: Option<String>,
+    /// Summary only: `skipped[]` entries per [`PickSkipReason`] token.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped_counts: BTreeMap<String, usize>,
+    /// Summary only: the step engine's weight-0 items per skip-reason token.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusion_counts: BTreeMap<String, usize>,
 }
 
 /// One repository's lane computation (#10630): `lanes = clamp(ceil(debt / k),
@@ -724,6 +751,9 @@ impl PickDecisionRecord {
             repo: None,
             item_draw: None,
             dispatch_result: None,
+            payload_ref: None,
+            skipped_counts: BTreeMap::new(),
+            exclusion_counts: BTreeMap::new(),
         }
     }
 

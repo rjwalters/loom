@@ -2,7 +2,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::super::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation, ParentContext};
-use super::v2::ShedPolicy;
 use crate::forge_gateway::GATEWAY_APP_ID;
 use crate::forge_identity::{Failure, Placement, ReadClass, RouteDecision, RouteRequest};
 use crate::proc_exec::Completion;
@@ -78,6 +77,11 @@ impl Stub {
     /// Run one targeted read against a router offering the gateway first,
     /// then (`with_reader`) a reader, honouring the run's withdrawals.
     fn run(&self, with_reader: bool) -> (GhCompletion, Vec<(String, Failure)>) {
+        self.run_on(with_reader, "acme/r")
+    }
+
+    /// [`Stub::run`] for `repo` (`issues/1` of it).
+    fn run_on(&self, with_reader: bool, repo: &str) -> (GhCompletion, Vec<(String, Failure)>) {
         let withdrawn: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let log = RefCell::new(Vec::new());
         let lookup = |_: &RouteRequest<'_>| {
@@ -109,15 +113,15 @@ impl Stub {
         let inv = GhInvocation::new(
             Operation::new("issue.view"),
             AccessIntent::Read,
-            GhTarget::repo("acme/r").unwrap(),
+            GhTarget::repo(repo).unwrap(),
             Duration::from_secs(10),
         )
         .parent(ParentContext::Missing)
         .program(&self.gh)
-        .args(["api", "repos/acme/r/issues/1"])
+        .args(["api".to_string(), format!("repos/{repo}/issues/1")])
         .read_class(ReadClass::Gate);
         let out = inv
-            .execute_routed_v2_at(&lookup, &withdraw, ShedPolicy { shed: true }, SystemTime::now())
+            .execute_routed_v2_at(&lookup, &withdraw, SystemTime::now())
             .unwrap();
         (out, log.into_inner())
     }
@@ -137,35 +141,61 @@ fn an_unreachable_gateway_falls_back_to_the_reader() {
 }
 
 #[test]
-fn a_bad_gateway_with_no_reader_falls_back_to_the_writer() {
+fn a_bad_gateway_with_no_reader_is_shed_never_sent_to_the_writer() {
     let s = stub(BAD_GATEWAY, OK, OK);
     let (out, _) = s.run(false);
-    assert!(ok(&out), "{out:?}");
-    assert_eq!(s.calls(), ["gateway", "writer"]);
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(s.calls(), ["gateway"], "writer stub NOT invoked");
 }
 
-/// A real answer from GitHub through the gateway keeps today's rules: a 404
-/// is confirmed on the writer, never treated as an outage.
+/// A 404 from GitHub through the gateway is never an outage. It is the
+/// item's answer only with evidence the gateway covers the repo's family
+/// (W6); without it the gateway is withdrawn for the repo, the next reader
+/// serves the read, and with none left it is shed (#12394 review).
 #[test]
 fn a_not_found_through_the_gateway_is_not_an_outage() {
+    // No evidence, no reader: shed; the gateway is withdrawn for the repo.
     let s = stub(NOT_FOUND, OK, NOT_FOUND);
-    let (_, withdrawals) = s.run(false);
-    assert_eq!(s.calls(), ["gateway", "writer"]);
+    let (out, withdrawals) = s.run_on(false, "acme/gw-404-a");
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(s.calls(), ["gateway"], "writer stub NOT invoked");
     assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
+    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::Coverage)]);
+
+    // No evidence, a reader behind it: the reader serves the read.
+    let s = stub(NOT_FOUND, OK, NOT_FOUND);
+    let (out, withdrawals) = s.run_on(true, "acme/gw-404-b");
+    assert!(ok(&out), "{out:?}");
+    assert_eq!(s.calls(), ["gateway", "reader"]);
+    assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
+    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::Coverage)]);
+
+    // The gateway recently served the repo's `issues`: its 404 is the answer.
+    crate::forge_identity::served::note_reader_served(
+        GATEWAY_APP_ID,
+        "acme/gw-404-c",
+        "issues",
+        SystemTime::now(),
+    );
+    let s = stub(NOT_FOUND, OK, NOT_FOUND);
+    let (out, withdrawals) = s.run_on(true, "acme/gw-404-c");
+    assert!(matches!(out, GhCompletion::Captured(_)) && !ok(&out), "{out:?}");
+    assert_eq!(s.calls(), ["gateway"]);
     assert!(withdrawals.is_empty(), "{withdrawals:?}");
 }
 
 /// A relayed GitHub 5xx, and a non-`api` read's bare `HTTP 500` (gh prints
-/// nothing else for `pr view`), cannot be told from a gateway fault: they
-/// rerun on the writer, but never withdraw the gateway.
+/// nothing else for `pr view`), cannot be told from a gateway fault: with no
+/// reader left they are shed (never rerun on the writer) and never withdraw
+/// the gateway.
 #[test]
-fn an_unmarked_5xx_reruns_direct_and_does_not_withdraw() {
+fn an_unmarked_5xx_is_shed_and_does_not_withdraw() {
     const PR_VIEW_500: &str = "echo 'HTTP 500 (https://gw.example.com/graphql)' >&2; exit 1";
     for on_gw in [RELAYED_502, PR_VIEW_500] {
         let s = stub(on_gw, OK, OK);
         let (out, withdrawals) = s.run(false);
-        assert!(ok(&out), "{on_gw}: served by the rerun: {out:?}");
-        assert_eq!(s.calls(), ["gateway", "writer"], "{on_gw}");
+        assert!(matches!(out, GhCompletion::Shed { .. }), "{on_gw}: {out:?}");
+        assert_eq!(s.calls(), ["gateway"], "{on_gw}");
         assert!(crate::forge_gateway::outage::take_test_outages().is_empty(), "{on_gw}");
         assert!(withdrawals.is_empty(), "{on_gw}: {withdrawals:?}");
     }
@@ -182,18 +212,17 @@ fn a_gh_usage_error_is_neither_rerun_nor_an_outage() {
 }
 
 /// #12074 review: inside a work-finder tick's read scope, a gateway that
-/// keeps failing without signalling an outage (a relayed 5xx, a timeout) must
-/// not starve a Gate read. The readers are not out of budget, so the writer
-/// still serves it, on every tick.
+/// keeps failing without signalling an outage (a relayed 5xx, a timeout) is
+/// shed on every tick; the writer never serves it (#12394).
 #[test]
-fn a_scoped_read_past_a_failing_gateway_still_reaches_the_writer() {
+fn a_scoped_read_past_a_failing_gateway_is_shed_not_sent_to_the_writer() {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let _scope = super::super::read_deadline::enter(deadline, true);
+    let _scope = super::super::read_deadline::enter(deadline);
     for tick in 0..2 {
         let s = stub(RELAYED_502, OK, OK);
         let (out, _) = s.run(false);
-        assert!(ok(&out), "tick {tick}: {out:?}");
-        assert_eq!(s.calls(), ["gateway", "writer"], "tick {tick}");
+        assert!(matches!(out, GhCompletion::Shed { .. }), "tick {tick}: {out:?}");
+        assert_eq!(s.calls(), ["gateway"], "tick {tick}");
     }
 }
 

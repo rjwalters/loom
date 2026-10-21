@@ -10,6 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::supersede::ArmedRoll;
+use super::update_observation::HostUpdateObservation;
 use super::{ArtifactResolution, UpdateCheck};
 use crate::telemetry::kinds::auto_update_tick::{
     AutoUpdateTickRecord, DrainSnapshot, FloorNotRolling, RollHeld, TickDecisionKind,
@@ -51,6 +52,10 @@ pub struct TickSummary {
     /// #12425: the tick armed a same-binary restart for restart-required
     /// config.
     pub config_restart: Option<ConfigRestartFacts>,
+    /// #12420: the host's update state at the end of the tick and who would
+    /// choose its target. Set by the loop after the tick, from its published
+    /// status; `None` for a summary built without one.
+    pub observed: Option<HostUpdateObservation>,
 }
 
 /// What a `config_restart` tick reports: the trigger and how many paths
@@ -90,6 +95,7 @@ impl TickSummary {
             floor_not_rolling: None,
             roll_held: None,
             config_restart: None,
+            observed: None,
         }
     }
 
@@ -144,8 +150,22 @@ pub fn record(
         floor_stall: summary.floor_stall.clone(),
         floor_not_rolling: summary.floor_not_rolling,
         roll_held: summary.roll_held.clone(),
-        target_source: summary.config_restart.map(|c| c.source.to_string()),
         config_restart_paths: summary.config_restart.map(|c| c.paths as u64),
+        host_state: summary
+            .observed
+            .as_ref()
+            .map(|o| o.state.as_str().to_string()),
+        // A `config_restart` tick names its own trigger; any other tick
+        // reports who would choose the roll target.
+        target_source: summary
+            .config_restart
+            .map(|c| c.source.to_string())
+            .or_else(|| {
+                summary
+                    .observed
+                    .as_ref()
+                    .map(|o| o.target_source.as_str().to_string())
+            }),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,

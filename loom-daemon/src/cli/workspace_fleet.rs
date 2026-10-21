@@ -6,16 +6,16 @@ use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use loom_daemon::sweep_registry::SweepRegistryConfig;
+use crate::sweep_registry::SweepRegistryConfig;
 
-use loom_daemon::workspace_registry::MaintainOnlySource;
+use crate::workspace_registry::MaintainOnlySource;
 
-use crate::{FleetAction, WorkspaceAction};
+use crate::cli::{FleetAction, WorkspaceAction};
 
 /// Handle `loom-daemon calibrate` (issue #4390; measurement-only since #4512):
 /// measure the host + the currently-resolved knobs and print the
 /// `min(token axis, disk, maxConcurrent)` breakdown, which term binds, and the
-/// one-line tuning reading. See `loom_daemon::calibrate`.
+/// one-line tuning reading. See `crate::calibrate`.
 ///
 /// `--write` is **accepted but ignored** with a deprecation notice: #4512
 /// removed the CPU-headroom term the recommendation was derived from, so there
@@ -30,14 +30,14 @@ use crate::{FleetAction, WorkspaceAction};
 /// a log warning would go nowhere at all. stderr also keeps `--json`'s stdout
 /// payload clean for machine consumers.
 pub(crate) fn handle_calibrate_command(workspace: &str, write: bool, json: bool) -> Result<()> {
-    use loom_daemon::calibrate;
-    use loom_daemon::worktree_ops::repo;
+    use crate::calibrate;
+    use crate::worktree_ops::repo;
 
     let repo_root = repo::resolve_repo_root(workspace)?;
     let measurements = calibrate::measure(&repo_root);
 
-    if let Some(notice) = loom_daemon::work_finder::deprecated_cpu_knob_notice(
-        &loom_daemon::work_finder::read_work_finder_config(&repo_root),
+    if let Some(notice) = crate::work_finder::deprecated_cpu_knob_notice(
+        &crate::work_finder::read_work_finder_config(&repo_root),
     ) {
         eprintln!("loom-daemon calibrate: {notice}");
     }
@@ -62,11 +62,11 @@ pub(crate) fn handle_calibrate_command(workspace: &str, write: bool, json: bool)
 
 /// Handle `loom-daemon fleet …` (epic #4340). Thin clap→module wiring: all
 /// bootstrap logic (the step planner/executor, shell templates, fleet registry)
-/// lives in [`loom_daemon::fleet`].
+/// lives in [`crate::fleet`].
 pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
-    use loom_daemon::fleet::add_worker::{self, AddWorkerConfig};
-    use loom_daemon::fleet::drain::{self, DrainConfig};
-    use loom_daemon::fleet::spice_runner::{self, SpiceBootstrapConfig};
+    use crate::fleet::add_worker::{self, AddWorkerConfig};
+    use crate::fleet::drain::{self, DrainConfig};
+    use crate::fleet::spice_runner::{self, SpiceBootstrapConfig};
 
     match action {
         FleetAction::AddWorker {
@@ -177,7 +177,7 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             // `fleet::drain::flush_safehouse`'s doc comment for the real
             // supervised-stop flush check this now gates on (#3998).
             let cwd = std::env::current_dir().context("resolving cwd for safehouse config")?;
-            let safehouse_enabled = loom_daemon::safehouse::resolve_config(&cwd).enabled;
+            let safehouse_enabled = crate::safehouse::resolve_config(&cwd).enabled;
 
             let poll_interval = Duration::from_secs(drain::DEFAULT_POLL_INTERVAL_SECS);
             let max_polls = ((timeout / drain::DEFAULT_POLL_INTERVAL_SECS.max(1)) + 12) as u32;
@@ -207,7 +207,7 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
 
 /// Refuse a daemon-admin CLI action when the **invoking** repo (resolved
 /// from cwd the same way `calibrate`/`tokens select` already resolve it —
-/// see [`loom_daemon::worktree_ops::repo::resolve_repo_root`]) declares
+/// see [`crate::worktree_ops::repo::resolve_repo_root`]) declares
 /// `daemon.delegatedTo` (issue #5345). Prints a pointer to the delegate repo
 /// on stderr and exits non-zero — mirrors the existing
 /// `std::process::exit(1)` convention `handle_tokens_command`'s `Bootstrap`
@@ -217,10 +217,10 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
 /// any Loom repository, or when no delegation is configured — the default-off,
 /// behavior-preserving case for every repo today.
 fn refuse_if_daemon_admin_delegated(action_desc: &str) {
-    let Ok(repo_root) = loom_daemon::worktree_ops::repo::resolve_repo_root(".") else {
+    let Ok(repo_root) = crate::worktree_ops::repo::resolve_repo_root(".") else {
         return;
     };
-    if let Some(delegate) = loom_daemon::config_resolver::daemon_delegated_to(&repo_root) {
+    if let Some(delegate) = crate::config_resolver::daemon_delegated_to(&repo_root) {
         eprintln!("error: daemon admin is delegated to {delegate} — perform {action_desc} there.");
         std::process::exit(1);
     }
@@ -234,7 +234,7 @@ fn refuse_if_daemon_admin_delegated(action_desc: &str) {
 ///
 /// No-op (returns `Ok(())` without printing anything) when `sweep.md` is
 /// already present — the common case. Otherwise runs the same
-/// `loom_daemon::init::initialize_workspace` scaffolding `loom-daemon init`
+/// `crate::init::initialize_workspace` scaffolding `loom-daemon init`
 /// would, against the `"defaults"` directory (identical to
 /// [`crate::cli::misc_cmds::run_init`]'s own default `--defaults` value, so
 /// this resolves the same way `loom-daemon init <path>` would from the same
@@ -288,7 +288,7 @@ fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
         "  {} has no .claude/commands/loom/sweep.md — running `loom-daemon init` to install it...",
         canonical.display()
     );
-    match loom_daemon::init::initialize_workspace(canonical_str, "defaults", false) {
+    match crate::init::initialize_workspace(canonical_str, "defaults", false) {
         Ok(_report) => {
             println!(
                 "  Initialized {} — /loom:sweep is now installed; dispatch is no longer refused.",
@@ -321,13 +321,13 @@ fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
 /// command) and zero `docker` calls unless a profile is session-managed.
 /// The session reconciler recreates them once idle (`session_reconcile::drift`,
 /// #10364 Part B); the report says so and keeps the manual recreate.
-fn report_session_mount_drift(registry: &loom_daemon::workspace_registry::WorkspaceRegistry) {
-    let profile_root = loom_daemon::tokens_pool::paths::codex_profile_root();
+fn report_session_mount_drift(registry: &crate::workspace_registry::WorkspaceRegistry) {
+    let profile_root = crate::tokens_pool::paths::codex_profile_root();
     let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
         .ok()
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "docker".to_string());
-    for line in loom_daemon::tokens_pool::session_drift_report::report(
+    for line in crate::tokens_pool::session_drift_report::report(
         profile_root.as_deref(),
         &docker,
         &registry.roots(),
@@ -364,9 +364,9 @@ pub(crate) fn handle_workspace_command_by(
     action: WorkspaceAction,
     by: MaintainOnlySource,
 ) -> Result<()> {
-    use loom_daemon::workspace_registry::{AddOutcome, WorkspaceRegistry};
+    use crate::workspace_registry::{AddOutcome, WorkspaceRegistry};
 
-    let path = loom_daemon::workspace_registry::default_registry_path()?;
+    let path = crate::workspace_registry::default_registry_path()?;
 
     match action {
         WorkspaceAction::Hold(WorkspaceRoot { path: repo_path }) => {
@@ -398,7 +398,7 @@ pub(crate) fn handle_workspace_command_by(
             // and is idempotent on an already-registered workspace so a
             // pre-existing registry entry self-heals on the next `workspace
             // add` of the same path.
-            let claude_state_path = loom_daemon::terminal::claude_config_state_path();
+            let claude_state_path = crate::terminal::claude_config_state_path();
             match registry.add_and_trust(
                 std::path::Path::new(&repo_path),
                 overrides,
@@ -557,7 +557,7 @@ fn set_maintain_only(
     repo_path: &str,
     by: Option<MaintainOnlySource>,
 ) -> Result<()> {
-    use loom_daemon::workspace_registry::WorkspaceRegistry;
+    use crate::workspace_registry::WorkspaceRegistry;
     let mut registry = WorkspaceRegistry::load(registry_path)?;
     let root = std::path::Path::new(repo_path);
     let Some(changed) = registry.set_maintain_only(root, by, chrono::Utc::now()) else {
@@ -587,7 +587,7 @@ fn set_maintain_only(
 #[cfg(test)]
 mod tests {
     use super::auto_init_missing_sweep_command;
-    use loom_daemon::sweep_registry::SweepRegistryConfig;
+    use crate::sweep_registry::SweepRegistryConfig;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -685,8 +685,8 @@ mod tests {
     #[test]
     fn workspace_hold_and_release_set_the_mark_in_place() {
         use crate::cli::whole_cli_parse::try_parse_cli;
-        use crate::{Commands, WorkspaceAction};
-        use loom_daemon::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
+        use crate::cli::{Commands, WorkspaceAction};
+        use crate::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
 
         for verb in ["hold", "release"] {
             let cli = try_parse_cli(&["loom-daemon", "workspace", verb, "/x"]).expect("parses");

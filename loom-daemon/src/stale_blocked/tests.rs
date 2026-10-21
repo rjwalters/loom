@@ -556,7 +556,6 @@ fn held(by: &str, reason: &str) -> Option<Held> {
     Some(Held {
         by: Some(by.to_string()),
         reason: reason.to_string(),
-        at: None,
     })
 }
 

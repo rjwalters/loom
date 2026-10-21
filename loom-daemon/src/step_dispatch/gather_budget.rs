@@ -55,9 +55,13 @@ pub struct TickPhases {
 pub struct TickPasses {
     /// Item draws taken, across workspaces.
     pub draws: usize,
-    /// Draws that never reached the spawner: a repo at its cap or a second
-    /// merge in a repo.
+    /// Draws that never reached the spawner: a merge step drawn in a repo
+    /// before the round that spawned the repo's merge applied it.
     pub draws_unspawned: usize,
+    /// Merge steps held back, without a draw or a pass, because their repo
+    /// had a merge in flight (#12494): the tick span's
+    /// `loom.dispatch.merge_deferred`.
+    pub merge_deferred: usize,
     /// Passes by reason (`claim_lost`, `merge_in_flight`, ...).
     pub by_reason: std::collections::BTreeMap<String, usize>,
     /// The slots the tick could fill (its free slots).

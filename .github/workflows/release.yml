@@ -540,7 +540,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           LOOM_OTLP_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/loom-daemon
-        run: cargo test --package loom-daemon --release --features otlp --target ${{ matrix.target }} --test otlp_collector -- --ignored --nocapture
+        run: scripts/run-otlp-collector-test.sh --release --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |

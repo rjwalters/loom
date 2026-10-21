@@ -248,7 +248,13 @@ pub struct AutoUpdateTickRecord {
     /// Raises the record to ERROR when floor-driven, else WARN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_held: Option<RollHeld>,
-    /// #12425: the roll's `target_source` on a `config_restart` tick.
+    /// #12420: the host's update state at the end of the tick (`H0`–`H5`,
+    /// `H7`, `unknown`). Absent from a record written before the projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_state: Option<String>,
+    /// #12420: who would choose the roll target (`floor`, `repo-ahead`,
+    /// `autoUpdate`, `none`); #12425: `config_restart` on a tick that armed
+    /// a same-binary restart for restart-required config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_source: Option<String>,
     /// #12425: how many restart-required paths asked for the restart. A

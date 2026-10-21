@@ -166,7 +166,7 @@ pub use main_red_fix::RedMainLane;
 pub use operator_priority::OverflowSlot;
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
-pub use tick_report::{error_kind::DispatchErrorKind, Admission, TickReport};
+pub use tick_report::{error_kind::DispatchErrorKind, Admission, RepoDepth, TickReport};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{
@@ -1976,17 +1976,7 @@ pub fn spawn_multi_work_finder_task(
         // `configured_max` module) — no longer a frozen startup value.
         let mut configured_max_reload =
             ConfiguredMaxReloader::new(fallback_root.clone(), configured_max);
-        // An `Interval` that a `forge.event` prompt may also tick early
-        // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on
-        // for `fallback_root` — the daemon's primary workspace, which is also
-        // where every other machine-level knob is resolved from. When
-        // disarmed this is exactly `tokio::time::interval(interval)`: no bus
-        // subscription, no bridge task, no wake path.
-        let mut ticker = crate::forge_events::wake::EarlyTicker::for_work_finder(
-            interval,
-            &event_bus,
-            &fallback_root,
-        );
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
@@ -2110,13 +2100,22 @@ pub fn spawn_multi_work_finder_task(
             // due while free space is below the floor (#12406). Hygiene, not
             // admission: it never changes the cap.
             eager_trigger.tick(&fallback_root).await;
-            // Refresh the memoized CPU idle sample — **observational only**
+            // Read the filtered CPU idle (#12114) — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
             // / `calibrate`, which is how an operator tunes this machine's
             // `maxConcurrent`; it no longer gates admission.
-            let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
-            let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
+            // With no published record (observability off, so no sampler tick)
+            // fall back to the memoized raw sample, as before #12114.
+            let idle = match crate::host_status::filtered_cpu_idle_fraction() {
+                Some(idle) => Some(idle),
+                None => {
+                    let _ =
+                        tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache)
+                            .await;
+                    crate::cpu_headroom::cached_cpu_idle_fraction()
+                }
+            };
             // The cap, for the published summary and the tick span
             // (`ops::dispatch_facts`).
             tick_summary::record_cap(crate::types::CapView {
@@ -2126,7 +2125,7 @@ pub fn spawn_multi_work_finder_task(
             // read in between is bounded by the tick deadline and fails fast
             // past it; a listing does not fall through to the writer.
             let tick_deadline = std::time::Instant::now() + tick_budget;
-            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline, true);
+            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline);
 
             // `roots` was already resolved (registry reload + missing-root
             // filtering) by `refresh_local_workspace_state` above, before the

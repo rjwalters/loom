@@ -40,6 +40,7 @@ fn tuning() -> TickTuning {
         settle: Duration::from_secs(600),
         defer_deadline: DEFER,
         chase_enabled: false,
+        freshness: crate::auto_update::freshness::Thresholds::default(),
     }
 }
 

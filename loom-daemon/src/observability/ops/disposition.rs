@@ -10,11 +10,25 @@
 //! `loom.queue.priority_score` (the comparator keys that placed it, as one
 //! compact JSON object).
 //!
+//! # Dispatch-plan attributes (Issue #12827)
+//!
+//! Each queue-row span also carries the row's dispatch-plan fields that
+//! loom-ui's Backlog reads from `queue.snapshot`, so they have an OTLP
+//! carrier before that native kind is retired (#12813). See
+//! [`PlanAttributes`] for the field → attribute table. Every value is a
+//! closed set, a bounded integer, or a re-formatted timestamp; each is
+//! present only when the row has it ("absent stays absent"), and a
+//! `left_queue` span carries none of them. They ride the existing emissions
+//! (a transition or the refresh), never a new trigger, so like
+//! `loom.queue.candidate_rank` they hold the value as of the last emission:
+//! a plan-only change (a new position, a gate) is not re-sent until the
+//! row's disposition changes or the refresh window elapses.
+//!
 //! # Where this runs, and why not the tick loop
 //!
 //! Driven from the collector's periodic sample
-//! (`observability::collector::sample_snapshots`, the same cadence as
-//! [`super::super::queue_snapshot::record`]),
+//! (`observability::collector::sample_snapshots`, the same cadence as the
+//! other queue samples),
 //! reading [`crate::work_finder::last_tick_summary`] — never from the
 //! work-finder tick itself, which must never block on a `gh repo view` probe
 //! (see `queue_snapshot`'s module doc for the identical rationale). A
@@ -42,13 +56,12 @@
 //! incomplete repo, so a transient `gh` failure never reads as "the issue
 //! left the queue".
 //!
-//! # Cardinality bound
+//! # Dropped rows
 //!
-//! At most [`MAX_ROWS`] rows are turned into spans per [`record`] call;
-//! further rows are dropped and counted on
-//! [`MetricName::QueueDispositionRowsDropped`] with `reason = "truncated"`, as
-//! is a row whose repo root never resolved to a forge slug (`reason =
-//! "unresolved"`). A single-workspace-loop tick names every row `workspace
+//! Every row is turned into a span; none is dropped for volume, because a
+//! cap would make which items carry facts depend on iteration order. A row
+//! whose repo root never resolved to a forge slug is dropped and counted on
+//! [`MetricName::QueueDispositionRowsDropped`] (`reason = "unresolved"`). A single-workspace-loop tick names every row `workspace
 //! #N` (never an absolute path), which never resolves either — those rows are
 //! dropped the same way, exactly like `queue_snapshot`.
 //!
@@ -77,10 +90,12 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::telemetry::RepoVisibility;
-use crate::types::{PlanKey, QueueDisposition, WorkFinderTickSummary};
+use crate::types::{
+    PlanGate, PlanKey, PlanState, PlanStep, QueueDisposition, ReadyQueueRow, WorkFinderTickSummary,
+};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{PARK_LABELS, SKIP_LABELS};
 
@@ -88,10 +103,6 @@ use crate::work_finder::{PARK_LABELS, SKIP_LABELS};
 pub const REFRESH_SECS_ENV: &str = "LOOM_DISPATCH_DISPOSITION_REFRESH_SECS";
 /// Default refresh cadence: ten minutes.
 pub const DEFAULT_REFRESH_SECS: i64 = 600;
-
-/// Most rows turned into spans per [`record`] call. A row past this is
-/// dropped and counted with `reason = "truncated"`.
-pub const MAX_ROWS: usize = 256;
 
 /// How a row's span relates to the previous emission this process made for
 /// the same `(repo, issue)` key. The wire value of
@@ -115,6 +126,119 @@ impl Transition {
             Self::Changed => "changed",
             Self::Refresh => "refresh",
             Self::LeftQueue => "left_queue",
+        }
+    }
+}
+
+/// The literal a closed-vocabulary attribute exports for a value this build
+/// does not know (`PlanState::Unknown`, `PlanGate::Unknown`,
+/// `PlanStep::Unknown(_)`) — never the raw daemon or forge string.
+pub const UNKNOWN_VALUE: &str = "unknown";
+
+/// A row's dispatch-plan fields as span attributes (Issue #12827):
+///
+/// | Field (`queue.snapshot`) | Source | Attribute | Values |
+/// |---|---|---|---|
+/// | `plan_state` | `RowPlan::plan_state` | `loom.queue.plan_state` | `running`/`next`/`queued`/`blocked`/`unknown`; present whenever the tick published a plan |
+/// | `position` | `RowPlan::position` | `loom.queue.position` | 1-based integer ≤ the queue depth; only when the plan gave one |
+/// | `gate` | `RowPlan::gate` | `loom.queue.gate` | `capacity`/`build_backoff`/`file_overlap`/`unknown`; only when the plan names one |
+/// | `step` | `RowPlan::step` | `loom.queue.step` | a `Step` name or `unknown`; only when the row names one (absent = `builder`, as on the wire) |
+/// | `owning_shard` | `RowPlan::owning_shard` | `loom.queue.owning_shard` | integer < `shard_count`; only when sharding is configured |
+/// | `created_at` | `ReadyQueueRow::created_at` | `loom.queue.created_at` | RFC 3339 UTC, seconds precision; only when the listing supplied a parseable one |
+///
+/// Every field is `None` on a `left_queue` emission.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanAttributes {
+    pub plan_state: Option<&'static str>,
+    pub position: Option<u32>,
+    pub gate: Option<&'static str>,
+    pub step: Option<&'static str>,
+    pub owning_shard: Option<u32>,
+    pub created_at: Option<String>,
+}
+
+/// The wire name of a plan state, `unknown` for [`PlanState::Unknown`].
+#[must_use]
+pub fn plan_state_token(state: PlanState) -> &'static str {
+    match state {
+        PlanState::Running => "running",
+        PlanState::Next => "next",
+        PlanState::Queued => "queued",
+        PlanState::Blocked => "blocked",
+        PlanState::Unknown => UNKNOWN_VALUE,
+    }
+}
+
+/// The wire name of a plan gate, `unknown` for [`PlanGate::Unknown`].
+#[must_use]
+pub fn plan_gate_token(gate: PlanGate) -> &'static str {
+    match gate {
+        PlanGate::Capacity => "capacity",
+        PlanGate::BuildBackoff => "build_backoff",
+        PlanGate::FileOverlap => "file_overlap",
+        PlanGate::Unknown => UNKNOWN_VALUE,
+    }
+}
+
+/// The wire name of a plan step: a known [`crate::work_finder::step_item::Step`]
+/// name, or the literal `unknown` for [`PlanStep::Unknown`] — never the raw
+/// unknown string, which a newer daemon or a malformed payload controls.
+#[must_use]
+pub fn plan_step_token(step: &PlanStep) -> &'static str {
+    match step {
+        PlanStep::Known(step) => step.as_str(),
+        PlanStep::Unknown(_) => UNKNOWN_VALUE,
+    }
+}
+
+/// A listing's `createdAt`, re-formatted as RFC 3339 UTC with seconds
+/// precision — never the raw text. `None` when absent or unparseable.
+#[must_use]
+fn created_at_token(raw: Option<&str>) -> Option<String> {
+    let parsed = DateTime::parse_from_rfc3339(raw?.trim()).ok()?;
+    Some(
+        parsed
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+impl PlanAttributes {
+    /// The attributes for `row`. `plan_published` is whether the tick
+    /// published a dispatch plan at all: without one every row's
+    /// `plan_state` is the default `Unknown`, which says nothing, so it is
+    /// left absent rather than exported as `unknown`.
+    #[must_use]
+    pub fn from_row(row: &ReadyQueueRow, plan_published: bool) -> Self {
+        Self {
+            plan_state: plan_published.then(|| plan_state_token(row.plan.plan_state)),
+            position: row.plan.position,
+            gate: row.plan.gate.map(plan_gate_token),
+            step: row.plan.step.as_ref().map(plan_step_token),
+            owning_shard: row.plan.owning_shard,
+            created_at: created_at_token(row.created_at.as_deref()),
+        }
+    }
+
+    /// Insert each present attribute into `attributes`.
+    fn stamp(&self, attributes: &mut TraceAttributes) {
+        if let Some(state) = self.plan_state {
+            attributes.insert("loom.queue.plan_state".to_string(), state.to_string());
+        }
+        if let Some(position) = self.position {
+            attributes.insert("loom.queue.position".to_string(), position.to_string());
+        }
+        if let Some(gate) = self.gate {
+            attributes.insert("loom.queue.gate".to_string(), gate.to_string());
+        }
+        if let Some(step) = self.step {
+            attributes.insert("loom.queue.step".to_string(), step.to_string());
+        }
+        if let Some(shard) = self.owning_shard {
+            attributes.insert("loom.queue.owning_shard".to_string(), shard.to_string());
+        }
+        if let Some(created_at) = &self.created_at {
+            attributes.insert("loom.queue.created_at".to_string(), created_at.clone());
         }
     }
 }
@@ -156,6 +280,8 @@ pub struct DispositionRow {
     /// `work_finder::halt_cause` vocabulary (#9017) — see [`halt_cause_token`]
     /// (#9673).
     pub halt_cause: Option<String>,
+    /// The row's dispatch-plan fields (Issue #12827) — see [`PlanAttributes`].
+    pub plan: PlanAttributes,
 }
 
 /// One row's outcome for a [`record`] sample: enough to build its span.
@@ -185,6 +311,9 @@ pub struct Emission {
     /// Present only for a `WorkspaceHalted` row whose detail named a
     /// closed-vocabulary halt cause — see [`halt_cause_token`] (#9673).
     pub halt_cause: Option<String>,
+    /// The row's dispatch-plan fields (Issue #12827); all `None` on a
+    /// `left_queue` emission, whose row is no longer planned.
+    pub plan: PlanAttributes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +395,7 @@ impl DispositionTracker {
                     total_candidates: Some(row.total_candidates),
                     priority_score: row.priority_score.clone(),
                     halt_cause: row.halt_cause.clone(),
+                    plan: row.plan.clone(),
                 });
             }
         }
@@ -293,6 +423,7 @@ impl DispositionTracker {
                     total_candidates: None,
                     priority_score: None,
                     halt_cause: None,
+                    plan: PlanAttributes::default(),
                 });
                 // Dropped: not reinserted into `next`, so this key reads as
                 // "first sight" (`Changed`) if the issue ever reappears.
@@ -309,7 +440,6 @@ impl DispositionTracker {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DroppedCounts {
     pub unresolved: usize,
-    pub truncated: usize,
 }
 
 /// The label on `detail`, only for rows whose disposition carries a label in
@@ -333,7 +463,7 @@ fn allowed_park_label(disposition: QueueDisposition, detail: Option<&str>) -> Op
 /// The PR number in an `OpenPr` row's detail (`"open PR #<n>"`, the text
 /// `work_finder::tick_report::classify` formats) — structured extraction,
 /// never the free-form text itself. Mirrors
-/// `telemetry::queue_snapshot::exportable_detail`'s allowlist-by-disposition
+/// `telemetry::queue_repo::exportable_detail`'s allowlist-by-disposition
 /// rule.
 #[must_use]
 fn open_pr_number(disposition: QueueDisposition, detail: Option<&str>) -> Option<u32> {
@@ -384,14 +514,14 @@ fn halt_cause_token(disposition: QueueDisposition, detail: Option<&str>) -> Opti
 /// Build this tick's disposition rows from `summary`'s ranked queue, resolving
 /// each row's repo through `repos` (as [`super::super::repo_ref::resolve_repo_refs`]
 /// already resolved it). A row whose repo did not resolve is dropped and
-/// counted as `unresolved`; a row past [`MAX_ROWS`] is dropped and counted as
-/// `truncated`. Pure.
+/// counted as `unresolved`. Pure.
 #[must_use]
 pub fn build_rows(
     summary: &WorkFinderTickSummary,
     repos: &HashMap<String, QueueRepoRef>,
 ) -> (Vec<DispositionRow>, DroppedCounts) {
     let total_candidates = summary.queue.len();
+    let plan_published = summary.plan.is_some();
     let mut rows = Vec::new();
     let mut dropped = DroppedCounts::default();
     for row in &summary.queue {
@@ -399,10 +529,6 @@ pub fn build_rows(
             dropped.unresolved += 1;
             continue;
         };
-        if rows.len() >= MAX_ROWS {
-            dropped.truncated += 1;
-            continue;
-        }
         rows.push(DispositionRow {
             slug: repo.repo.clone(),
             visibility: repo.visibility,
@@ -423,6 +549,7 @@ pub fn build_rows(
             priority_score: priority_score(&row.plan.keys),
             story_points: row.story_points,
             halt_cause: halt_cause_token(row.disposition, row.detail.as_deref()),
+            plan: PlanAttributes::from_row(row, plan_published),
         });
     }
     (rows, dropped)
@@ -455,13 +582,6 @@ pub fn refresh_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_REFRESH_SECS)
 }
 
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
-
 fn int(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -474,12 +594,6 @@ pub fn dropped_points(dropped: DroppedCounts) -> Vec<MetricPoint> {
         points.push(
             MetricPoint::int(MetricName::QueueDispositionRowsDropped, int(dropped.unresolved))
                 .label("reason", "unresolved"),
-        );
-    }
-    if dropped.truncated > 0 {
-        points.push(
-            MetricPoint::int(MetricName::QueueDispositionRowsDropped, int(dropped.truncated))
-                .label("reason", "truncated"),
         );
     }
     points
@@ -530,7 +644,7 @@ pub fn build_span(
     };
     let mut attributes: TraceAttributes = [
         ("loom.repo", emission.slug.clone()),
-        ("loom.repo.visibility", visibility_str(emission.visibility).to_string()),
+        ("loom.repo.visibility", emission.visibility.as_str().to_string()),
         ("loom.issue", issue),
         ("loom.queue.disposition", emission.disposition.as_str().to_string()),
         ("loom.queue.state", emission.disposition.state().to_string()),
@@ -590,6 +704,12 @@ pub fn build_span(
     if let Some(cause) = &emission.halt_cause {
         attributes.insert("loom.queue.halt_cause".to_string(), cause.clone());
     }
+    // Issue #12827: the row's dispatch-plan fields. A `left_queue` emission
+    // is no longer planned: `diff` gives it an empty `PlanAttributes`, and it
+    // is skipped here too, so a hand-built one cannot leak a stale plan.
+    if emission.transition != Transition::LeftQueue {
+        emission.plan.stamp(&mut attributes);
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -621,7 +741,7 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
     let previous_sample = *LAST_SAMPLED_TICK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !super::super::queue_snapshot::is_new_tick(summary.at, previous_sample) {
+    if !super::super::repo_ref::is_new_tick(summary.at, previous_sample) {
         return;
     }
     let roots: HashSet<&str> = summary

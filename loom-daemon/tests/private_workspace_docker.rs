@@ -13,6 +13,8 @@ mod containment;
 mod control;
 #[path = "private_workspace_docker/dispatch.rs"]
 mod dispatch;
+#[path = "private_workspace_docker/recovery.rs"]
+mod recovery;
 
 #[track_caller]
 fn checked(output: Output) -> String {
@@ -324,6 +326,203 @@ WORKDIR /srv
         }
         f
     }
+}
+
+/// Publish a one-file bare repository on the fixture forge at `/srv/<owner>/<name>`.
+fn publish(f: &Fixture, owner: &str, name: &str) -> String {
+    let work = f.root.path().join(format!("publish-{owner}-{name}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap(),
+        )
+    };
+    git(&work, &["init", "-b", "main"]);
+    std::fs::write(work.join("file"), owner).unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-m", owner]);
+    let bare = f.root.path().join(format!("publish-{owner}-{name}.git"));
+    git(
+        &work,
+        &[
+            "clone",
+            "--bare",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    git(&bare, &["update-server-info"]);
+    docker(&["exec", &f.server, "mkdir", "-p", &format!("/srv/{owner}")]);
+    docker(&[
+        "cp",
+        bare.to_str().unwrap(),
+        &format!("{}:/srv/{owner}/{name}", f.server),
+    ]);
+    // `docker cp` keeps the host UID; git-http-backend refuses a foreign-owned repository.
+    docker(&[
+        "exec",
+        "--user",
+        "0",
+        &f.server,
+        "chown",
+        "-R",
+        "0:0",
+        &format!("/srv/{owner}"),
+    ]);
+    f.repository
+        .replace("/repo.git", &format!("/{owner}/{name}"))
+}
+
+#[test]
+#[ignore = "requires Docker; explicitly run by CI"]
+fn one_account_container_prepares_two_repositories_without_collision_or_host_mounts() {
+    let f = Fixture::new();
+    let a = &f.names[0];
+    f.start(a);
+    // Same basename, different owners: both must get their own clone.
+    let (one, two) = (publish(&f, "other", "second"), publish(&f, "zed", "second"));
+    let register = |url: &str| -> Value {
+        serde_json::from_str(&f.cli(&[
+            "session",
+            "start",
+            a,
+            "--private-clone",
+            url,
+            "--image",
+            &f.image,
+            "--json",
+        ]))
+        .unwrap()
+    };
+    assert_eq!(
+        register(&one)["config"]["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Registering is lazy: nothing is cloned until a job selects the repository.
+    assert_eq!(f.exec(a, "ls /workspace/work 2>/dev/null | wc -l").trim(), "0");
+    assert_eq!(
+        register(&two)["config"]["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    checked(
+        f.job(a, "role", "echo unfinished > /workspace/repo/keep")
+            .output()
+            .unwrap(),
+    );
+    let on = |url: &str, command: &str| {
+        checked(
+            f.command(&[
+                "session",
+                "job",
+                a,
+                "--kind",
+                "role",
+                "--owner",
+                "docker-proof",
+                "--repository",
+                url,
+                "--",
+                "sh",
+                "-c",
+                command,
+            ])
+            .output()
+            .unwrap(),
+        )
+    };
+    let first = on(&one, "pwd; cat file; echo mine > mine");
+    let second = on(&two, "pwd; cat file");
+    assert!(
+        first.contains("/workspace/work/other-second-") && first.contains("other"),
+        "{first}"
+    );
+    assert!(
+        second.contains("/workspace/work/zed-second-") && second.contains("zed"),
+        "{second}"
+    );
+    // Separate Git roots; the first clone's work is unchanged by preparing the second.
+    let roots = f.exec(
+        a,
+        "for d in /workspace/repo /workspace/work/*-second-*; do git -C $d rev-parse --show-toplevel; done",
+    );
+    assert_eq!(
+        roots
+            .lines()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "{roots}"
+    );
+    assert_eq!(f.exec(a, "cat /workspace/work/other-second-*/mine").trim(), "mine");
+    assert_eq!(f.exec(a, "cat /workspace/repo/keep").trim(), "unfinished");
+    // An unregistered repository is refused before any clone.
+    let refused = f
+        .command(&[
+            "session",
+            "job",
+            a,
+            "--kind",
+            "role",
+            "--owner",
+            "docker-proof",
+            "--repository",
+            &f.repository.replace("/repo.git", "/nobody/unknown"),
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not registered"));
+    // Actual HostConfig/mounts: no host checkout, no peer volume; credentials stay outside clones.
+    let mounts: Value = serde_json::from_str(&docker(&[
+        "inspect",
+        &format!("loom-codex-session-{a}"),
+        "--format",
+        "{{json .Mounts}}",
+    ]))
+    .unwrap();
+    let host_source = f.root.path().join("source");
+    for mount in mounts.as_array().unwrap() {
+        let source = mount["Source"].as_str().unwrap();
+        assert!(!source.starts_with(host_source.to_str().unwrap()), "{mount}");
+        assert!(
+            !mount["Destination"]
+                .as_str()
+                .unwrap()
+                .starts_with("/workspace/work"),
+            "{mount}"
+        );
+        if mount["Destination"] == "/workspace" {
+            assert_eq!(mount["Name"], format!("loom-codex-workspace-{a}"));
+        }
+    }
+    assert_eq!(
+        f.exec(
+            a,
+            &format!("grep -rl '{}' /workspace/work /workspace/repo || true", auth::PASSWORD)
+        )
+        .trim(),
+        ""
+    );
 }
 
 #[test]

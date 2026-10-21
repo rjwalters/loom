@@ -32,7 +32,8 @@ fn record() -> AutoUpdateTickRecord {
         floor_stall: None,
         floor_not_rolling: None,
         roll_held: None,
-        target_source: Some("config_restart".to_string()),
+        host_state: Some("H4".to_string()),
+        target_source: Some("floor".to_string()),
         config_restart_paths: Some(3),
         consecutive_failures: 0,
         duration_ms: 4200,
@@ -210,6 +211,8 @@ fn a_config_restart_tick_reports_source_and_count_and_warns_when_refused() {
     for (armed, severity) in [(true, SeverityNumber::Info), (false, SeverityNumber::Warn)] {
         let mut tick = record();
         tick.decision = TickDecisionKind::ConfigRestart;
+        tick.target_source = Some("config_restart".to_string());
+        tick.config_restart_paths = Some(3);
         tick.roll_armed = armed;
         tick.outcome = None;
         let envelope = TelemetryEnvelope::new("host", TelemetryRecord::AutoUpdateTick(tick));

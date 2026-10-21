@@ -3,40 +3,17 @@
 use super::*;
 use serial_test::serial;
 
-/// Saves and clears every input of [`resolve`] and [`lease_host_identity`]
-/// (`$HOSTNAME` included, which must no longer matter to [`resolve`]),
-/// restoring the ambient values on drop.
-pub(crate) struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
-}
+use crate::env_test_support::EnvGuard;
 
-impl EnvGuard {
-    pub(crate) fn clear() -> Self {
-        let keys = [
-            HOST_ID_ENV,
-            LEASE_HOST_ID_ENV,
-            HOST_ID_FILE_ENV,
-            "HOSTNAME",
-            crate::config_resolver::PRIVATE_DEFAULTS_ENV,
-        ];
-        let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in keys {
-            std::env::remove_var(k);
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, v) in &self.saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
+/// Every variable host resolution reads (`$HOSTNAME` included, which must no
+/// longer matter to [`resolve`]); cleared per test, restored on drop.
+pub(crate) const GUARDED_ENV: &[&str] = &[
+    HOST_ID_ENV,
+    LEASE_HOST_ID_ENV,
+    HOST_ID_FILE_ENV,
+    "HOSTNAME",
+    crate::config_resolver::PRIVATE_DEFAULTS_ENV,
+];
 
 /// Declares a test holding both env locks its inputs need: `loom_config_env`
 /// (outer, for `LOOM_CONFIG_DEFAULTS_FILE`) then the crate-default group
@@ -74,7 +51,7 @@ fn machine_tier(dir: &Path, json: &str) -> PathBuf {
 env_test! {
     /// AC: `fleet.hostId` beats `LOOM_HOST_ID`.
     fn config_beats_env() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var(HOST_ID_FILE_ENV, dir.path().join(HOST_ID_FILENAME));
         machine_tier(dir.path(), r#"{"fleet":{"hostId":"loom-worker-1"}}"#);
@@ -95,7 +72,7 @@ env_test! {
     /// AC: with no usable `fleet.hostId`, `LOOM_HOST_ID` wins; a whitespace-only
     /// `LOOM_HOST_ID` is ignored.
     fn env_wins_without_a_usable_config_value() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let id_file = dir.path().join(HOST_ID_FILENAME);
         std::fs::write(&id_file, "persisted-id\n").unwrap();
@@ -136,7 +113,7 @@ env_test! {
     /// is the persisted generated one — neither `$HOSTNAME` nor the `hostname`
     /// binary — and it does not follow `$HOSTNAME`.
     fn no_hostname_fallback() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state").join(HOST_ID_FILENAME);
         std::env::set_var(HOST_ID_FILE_ENV, &path);
@@ -161,7 +138,7 @@ env_test! {
     /// AC (persistence): repeated calls, and a call after dropping the in-process
     /// cache, return the same id; the file is owner-only with a trailing newline.
     fn persisted_id_survives_cache_drop_and_is_owner_only() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(HOST_ID_FILENAME);
         std::env::set_var(HOST_ID_FILE_ENV, &path);
@@ -192,7 +169,7 @@ env_test! {
 env_test! {
     /// AC: a pre-seeded file's value is returned verbatim (trimmed).
     fn a_pre_seeded_id_is_returned_verbatim() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(HOST_ID_FILENAME);
         std::fs::write(&path, "  joseph-superset\n\n").unwrap();
@@ -281,7 +258,7 @@ env_test! {
     /// AC: an unwritable id-file location resolves to `unknown-host`, never a
     /// hostname.
     fn an_unwritable_id_path_is_unknown_host() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         std::env::set_var("HOSTNAME", "studio");
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-dir");
@@ -317,7 +294,7 @@ env_test! {
     /// The lease chain is unchanged (`LOOM_HOST_ID` > `$HOSTNAME`) and ignores
     /// both `fleet.hostId` and the persisted id.
     fn lease_identity_keeps_the_legacy_chain() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         machine_tier(dir.path(), r#"{"fleet":{"hostId":"roster-name"}}"#);
         let id_file = dir.path().join(HOST_ID_FILENAME);
@@ -343,7 +320,7 @@ env_test! {
     /// #11740: a generated persisted id is replaced by the roster name, and the
     /// new id is what later resolutions (and a restart) return.
     fn adopt_roster_name_replaces_only_a_generated_id() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(HOST_ID_FILENAME);
         std::env::set_var(HOST_ID_FILE_ENV, &path);
@@ -371,7 +348,7 @@ env_test! {
     /// #11740: an explicit identity (env, config, operator-written file) is
     /// never second-guessed by a hostname match.
     fn adopt_roster_name_never_overrides_an_explicit_identity() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(HOST_ID_FILENAME);
         std::env::set_var(HOST_ID_FILE_ENV, &path);
@@ -422,7 +399,7 @@ env_test! {
     /// `LOOM_LEASE_HOST_ID` pins only the lease chain (#11906): a step child
     /// that carries it keeps the telemetry `host_identity()` of the daemon.
     fn lease_pin_leaves_the_telemetry_identity_alone() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
         let id_file = dir.path().join("host-id");
         std::fs::write(&id_file, "persisted-studio\n").unwrap();

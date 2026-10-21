@@ -634,7 +634,7 @@ fn a_newly_joined_host_runs_nothing_until_its_record_is_ttl_old() {
 #[test]
 #[serial]
 fn decide_reads_the_roster_from_config_and_the_snapshot_cache() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     let _roster_env = RosterEnvGuard::capture();
     clear_nwo_cache();
     roster::clear_generation_fence_for_tests();
