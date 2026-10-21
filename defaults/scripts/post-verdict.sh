@@ -103,6 +103,9 @@
 #
 #   PATH may be "-" to read the body from stdin.
 #
+#   Aliases (exact, lowercase): `approve` -> approved, `request-changes` ->
+#   changes-requested. Anything else is rejected (exit 2).
+#
 #   --reviews-reconciled TEXT   Explicit disposition of the outstanding formal
 #       reviews / inline threads that check-review-feedback.sh reported. Must
 #       cite every blocking review id it named. Ignored for
@@ -163,7 +166,10 @@
 set -uo pipefail
 
 usage() {
-  sed -n '2,145p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  # Print the whole leading comment block (line 2 to the first non-comment
+  # line). A hard-coded line range fell behind the header and cut --help off
+  # mid-sentence at exit code 8 (#12692).
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]:-$0}"
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -180,6 +186,12 @@ PR="$1"
 VERDICT="$2"
 SHA="$3"
 shift 3
+
+# Accept the natural imperatives; everything downstream sees canonical values.
+case "$VERDICT" in
+  approve) VERDICT="approved" ;;
+  request-changes) VERDICT="changes-requested" ;;
+esac
 
 BODY=""
 BODY_FILE=""
