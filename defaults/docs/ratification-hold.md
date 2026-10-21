@@ -15,7 +15,7 @@ ratification. Champion had no rule for it; it held these PRs only when its
 merge-risk judgment happened to notice an "authority act".
 
 The 2026-10-20 shadow evaluation of the new Champion (128 PRs) found judgment
-can miss it: it would have merged 2AMLogic/sky130-dsp-fft#6, a spec the
+can miss it: it would have merged a private design repo's spec PR, a spec the
 operator had explicitly ruled not to ratify, because every mechanical criterion
 passed. Operator direction (2026-10-20, attended `/fleet:decide`): "ratifying a
 spec is likely to stick around as we design chips and I think [it is] best held

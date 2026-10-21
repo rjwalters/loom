@@ -17,7 +17,7 @@ Rationale: `.loom/docs/ratification-hold.md`.
 - The detector is mechanical and a pure function of the PR's head contents:
   `loom-daemon champion-hold ratification --pr N`. Never re-derive it, and never
   replace it with merge-risk judgment (that is the observed miss: it would have
-  merged 2AMLogic/sky130-dsp-fft#6). It holds when a file the PR adds, modifies
+  merged a private design repo's spec PR). It holds when a file the PR adds, modifies
   or renames under `spec/**`, `decisions/**`, `docs/decisions/**`,
   `*decision*.md` (or a `champion.ratificationPaths` glob) carries a
   ratification phrase at the head. A repo extends the phrases with
@@ -86,7 +86,6 @@ case "$RT_ACTION" in
   defer) echo "#$PR_NUMBER: ratification check unreadable or inconclusive — not merging this tick" ;;
   stands)
     echo "Ratification hold already posted for #$PR_NUMBER — hold stands, no comment"
-    gh pr edit "$PR_NUMBER" --add-label "loom:blocked" >/dev/null 2>&1 || true
     rt_park
     ;;
   hold)
@@ -110,7 +109,6 @@ then merge with \`./.loom/scripts/merge-pr.sh $PR_NUMBER\`. A push that still de
 
 ---
 *Automated by Champion role*"
-    gh pr edit "$PR_NUMBER" --add-label "loom:blocked" >/dev/null 2>&1 || true
     rt_park
     ;;
   release)
