@@ -15,6 +15,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #12989**: refactor: remove dead gh_invocation caller_scope and github.caller key
+- **PR #12976**: feat: add loom-tools bin with strip-ansi, checkpoint and config get behind a mode gate
+- **PR #12953**: feat(champion): merge Dependabot manifest bumps via standing authorization
+- **PR #12927**: feat(telemetry): export per-item dispatch gate as eta.dispatch_state
+- **PR #12924**: feat: add Doctor and Curator step verdict projectors
+- **PR #10346**: fix(dispatch): retain attributed own claims before leaseless yield
+- **Issue #12986** (closed): Remove caller_scope: no production caller since #11301, github.caller is never emitted
+- **Issue #12948** (closed): Champion: merge Dependabot bumps by default and fix forward (operator direction 2026-10-20)
+- **Issue #12938** (closed): loom-tools Phase 2b: the loom-tools binary with strip-ansi, checkpoint and config get — epic #12708
+- **Issue #12921** (closed): telemetry: per-attempt step results for Doctor and Curator (pass.verdict step:doctor / step:curator)
+- **Issue #12918** (closed): telemetry: per-item dispatch state incl. weight-0 items + gate release times (cooldown, backoff, re-eval next) for ETA
+- **Issue #10337** (closed): Dispatcher yields to its own leaseless loom:building label and orphans the issue (3 starred issues 2026-10-05 00:40Z)
 - **PR #12987**: chore: post-merge-cleanup drill (#12510), do not review
 - **PR #12982**: test: bind each shared-pool account's admission to its own repository clone in Docker
 - **PR #12981**: refactor: dedupe byte formatting onto fs_util::human_size
