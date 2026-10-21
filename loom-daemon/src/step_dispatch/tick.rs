@@ -376,26 +376,34 @@ fn repo_depth(ws: &StepWorkspace) -> RepoDepth {
 ///
 /// [`Exclusion::MergeInFlight`]: super::item_draw::Exclusion::MergeInFlight
 pub fn exclude_claimed(w: &mut Weighing, claims: &DrawClaims) {
-    use super::item_draw::Exclusion;
+    use super::item_draw::{ExcludedItem, Exclusion};
     let mut claimed = 0usize;
     let mut deferred = 0usize;
+    let mut taken: Vec<ExcludedItem> = Vec::new();
     w.pool.retain(|c| {
         let target = c.target();
-        if claims.items.contains(&target) {
+        let exclusion = if claims.items.contains(&target) {
             claimed += 1;
-            return false;
-        }
-        let merging_elsewhere = is_merge_step(c.step)
+            Exclusion::Pass(PassReason::Claimed)
+        } else if is_merge_step(c.step)
             && claims
                 .merge_in_flight
                 .as_ref()
-                .is_some_and(|(pr, _)| *pr != target);
-        if merging_elsewhere {
+                .is_some_and(|(pr, _)| *pr != target)
+        {
             deferred += 1;
-            return false;
-        }
-        true
+            Exclusion::MergeInFlight
+        } else {
+            return true;
+        };
+        taken.push(ExcludedItem {
+            item: c.item.clone(),
+            exclusion,
+            gate_until: None,
+        });
+        false
     });
+    w.excluded_items.extend(taken);
     if claimed > 0 {
         *w.excluded
             .entry(Exclusion::Pass(PassReason::Claimed))
@@ -410,10 +418,21 @@ pub fn exclude_claimed(w: &mut Weighing, claims: &DrawClaims) {
 /// repo's open-PR listing failed, so a PR linked only by its branch is
 /// invisible and a Builder step could duplicate it. Pure.
 pub fn exclude_builders(w: &mut Weighing) -> usize {
-    use super::item_draw::Exclusion;
+    use super::item_draw::{ExcludedItem, Exclusion};
     let before = w.pool.len();
-    w.pool
-        .retain(|c| c.step != crate::work_finder::step_item::Step::Builder);
+    let mut taken: Vec<ExcludedItem> = Vec::new();
+    w.pool.retain(|c| {
+        if c.step != crate::work_finder::step_item::Step::Builder {
+            return true;
+        }
+        taken.push(ExcludedItem {
+            item: c.item.clone(),
+            exclusion: Exclusion::Pass(PassReason::SharedPr),
+            gate_until: None,
+        });
+        false
+    });
+    w.excluded_items.extend(taken);
     let removed = before - w.pool.len();
     if removed > 0 {
         *w.excluded
