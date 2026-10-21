@@ -582,13 +582,6 @@ pub fn refresh_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_REFRESH_SECS)
 }
 
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
-
 fn int(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -651,7 +644,7 @@ pub fn build_span(
     };
     let mut attributes: TraceAttributes = [
         ("loom.repo", emission.slug.clone()),
-        ("loom.repo.visibility", visibility_str(emission.visibility).to_string()),
+        ("loom.repo.visibility", emission.visibility.as_str().to_string()),
         ("loom.issue", issue),
         ("loom.queue.disposition", emission.disposition.as_str().to_string()),
         ("loom.queue.state", emission.disposition.state().to_string()),

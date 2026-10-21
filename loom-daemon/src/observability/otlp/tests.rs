@@ -1,157 +1,34 @@
 use super::*;
+use crate::observability::test_sink::{HttpSink, Reply};
 use crate::telemetry::{HostHealthRecord, SweepStartedRecord, TelemetryRecord};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::net::TcpListener;
 
-/// Every request the mock sink saw, as `(path, body)` — shared between the
-/// accept-loop thread and the asserting test. Aliased rather than written
-/// inline so `clippy::type_complexity` stays satisfied under
-/// `--all-targets`.
-type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
-
-/// A minimal two-path mock sink: records every request's path + body so
-/// tests can assert `OtlpExporter` posts to `/v1/logs` and `/v1/metrics`
-/// separately. Deliberately smaller than `exporter::tests::MockSink`
-/// (single status code, no kill/revive) — the retry/backoff behavior is
-/// already covered end-to-end for any `Exporter` by `sender.rs`'s tests.
-struct MockSink {
-    addr: SocketAddr,
-    requests: RecordedRequests,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
+/// Constructors for the sink these tests post to: it records every request's
+/// path + body so tests can assert `OtlpExporter` posts to `/v1/logs` and
+/// `/v1/metrics` separately, and can script per-request status/body/delay.
+/// Every request must carry the OTLP JSON content type and a Bearer
+/// `Authorization` header, or the sink's thread panics and records nothing.
+struct MockSink;
 
 impl MockSink {
-    fn start() -> Self {
+    fn start() -> HttpSink {
         Self::with_responses(Vec::new())
     }
 
-    fn with_responses(responses: Vec<(u16, String, Duration)>) -> Self {
+    fn with_responses(responses: Vec<Reply>) -> HttpSink {
         Self::with_content_type(responses, "application/json")
     }
 
-    fn with_content_type(
-        responses: Vec<(u16, String, Duration)>,
-        content_type: impl Into<String>,
-    ) -> Self {
-        let content_type = content_type.into();
-        let mut responses = std::collections::VecDeque::from(responses);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handle = {
-            let requests = requests.clone();
-            let shutdown = shutdown.clone();
-            std::thread::spawn(move || {
-                while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            stream.set_nonblocking(false).ok();
-                            if let Some((path, body)) = read_request(&mut stream) {
-                                // Record the request *before* writing the
-                                // response — same ordering, same reason, as
-                                // `exporter::tests::MockSink` (#7256).
-                                // `emit_batch(...).await` on the client side
-                                // unblocks as soon as the response bytes are
-                                // visible, which can race ahead of this
-                                // thread's next line; recording first
-                                // guarantees any caller that has observed the
-                                // response also observes the recorded request.
-                                requests.lock().unwrap().push((path, body));
-                                let (status, body, delay) = responses.pop_front().unwrap_or((
-                                    200,
-                                    "{}".to_string(),
-                                    Duration::ZERO,
-                                ));
-                                std::thread::sleep(delay);
-                                let response = format!("HTTP/1.1 {status} response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                                let _ = stream.write_all(response.as_bytes());
-                            }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })
-        };
-        MockSink {
-            addr,
-            requests,
-            shutdown,
-            handle: Some(handle),
-        }
+    fn with_content_type(responses: Vec<Reply>, content_type: impl Into<String>) -> HttpSink {
+        HttpSink::scripted(responses, &content_type.into(), (200, "{}".to_string()), |request| {
+            assert_eq!(request.values("content-type"), vec!["application/json"]);
+            assert!(request
+                .values("authorization")
+                .iter()
+                .any(|v| v.to_ascii_lowercase().starts_with("bearer ")));
+        })
     }
-
-    fn base_url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    fn requests(&self) -> Vec<(String, Vec<u8>)> {
-        self.requests.lock().unwrap().clone()
-    }
-}
-
-impl Drop for MockSink {
-    fn drop(&mut self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .ok();
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let header_end;
-    loop {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-            header_end = pos + 4;
-            break;
-        }
-    }
-    let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    assert!(header_text
-        .to_ascii_lowercase()
-        .contains("content-type: application/json"));
-    assert!(header_text
-        .to_ascii_lowercase()
-        .contains("authorization: bearer "));
-    let path = header_text
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("")
-        .to_string();
-    let content_length: usize = header_text
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|line| line.split_once(':').map(|x| x.1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    while buf.len() < header_end + content_length {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body = buf[header_end..(header_end + content_length).min(buf.len())].to_vec();
-    Some((path, body))
 }
 
 fn sweep_started_envelope() -> TelemetryEnvelope {
@@ -209,7 +86,10 @@ async fn emit_batch_posts_logs_and_metrics_to_their_own_paths_with_bearer_auth()
 
     let requests = sink.requests();
     assert_eq!(requests.len(), 2, "one lifecycle + one host-level envelope ⇒ two POSTs");
-    let paths: Vec<&str> = requests.iter().map(|(path, _)| path.as_str()).collect();
+    let paths: Vec<&str> = requests
+        .iter()
+        .map(|request| request.path.as_str())
+        .collect();
     assert!(paths.contains(&"/v1/logs"));
     assert!(paths.contains(&"/v1/metrics"));
 }
@@ -225,7 +105,7 @@ async fn emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch() {
 
     let requests = sink.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].0, "/v1/logs");
+    assert_eq!(requests[0].path, "/v1/logs");
 }
 
 #[test]
@@ -295,7 +175,7 @@ async fn partial_logs_are_acknowledged_before_metrics_retry() {
     assert_eq!(
         sink.requests()
             .iter()
-            .map(|r| r.0.as_str())
+            .map(|r| r.path.as_str())
             .collect::<Vec<_>>(),
         vec!["/v1/logs", "/v1/metrics", "/v1/metrics"]
     );
@@ -391,7 +271,7 @@ async fn credential_refusal_holds_then_recovers_in_fifo_order() {
     assert_eq!(queue.dropped_total(), 0);
     let delivered = sink.requests();
     assert_eq!(delivered.len(), 3, "one logs POST per attempt");
-    let last = &delivered[2].1;
+    let last = &delivered[2].body;
     let first_at = find_substring(last, &sweep_id_of(&first)).unwrap_or(usize::MAX);
     let second_at = find_substring(last, &sweep_id_of(&second)).unwrap_or(usize::MAX);
     let third_at = find_substring(last, &sweep_id_of(&third)).unwrap_or(usize::MAX);

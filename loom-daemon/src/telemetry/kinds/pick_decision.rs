@@ -18,6 +18,13 @@
 //! that share `tick_id` and carry `chunk_index` / `chunk_count`; the union
 //! of the chunks in `chunk_index` order is exactly the original. The chunk
 //! size exists only because one OTLP/gRPC message is limited to about 4 MB.
+//!
+//! **Exported as a summary (#12974).** The record above is what is *archived*
+//! ([`crate::observability::pick_payload_archive`]); the log carries only its
+//! bounded [`summarize`](PickDecisionRecord::summarize) form, flagged by
+//! `payload_ref` (see [`super::pick_summary`]).
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -643,6 +650,19 @@ pub struct PickDecisionRecord {
     /// never idle or ready. Additive beside the legacy `outcome`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_result: Option<String>,
+    /// Set only on the exported **summary** (#12974): the run id (the
+    /// `tick_id`) under which the full record sits in the payload archive.
+    /// Its presence is what marks a record as a summary: `candidates`,
+    /// `skipped` and every draw list are then empty. Absent on the full
+    /// record and on an older daemon's records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_ref: Option<String>,
+    /// Summary only: `skipped[]` entries per [`PickSkipReason`] token.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped_counts: BTreeMap<String, usize>,
+    /// Summary only: the step engine's weight-0 items per skip-reason token.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusion_counts: BTreeMap<String, usize>,
 }
 
 /// One repository's lane computation (#10630): `lanes = clamp(ceil(debt / k),
@@ -731,6 +751,9 @@ impl PickDecisionRecord {
             repo: None,
             item_draw: None,
             dispatch_result: None,
+            payload_ref: None,
+            skipped_counts: BTreeMap::new(),
+            exclusion_counts: BTreeMap::new(),
         }
     }
 

@@ -30,7 +30,6 @@
 
 use opentelemetry_proto::tonic::metrics::v1::number_data_point;
 
-use super::metadata::visibility_str;
 use super::{kv_string, MetricSample};
 use crate::telemetry::HostHealthRecord;
 
@@ -115,7 +114,7 @@ pub(super) fn samples(r: &HostHealthRecord, time_unix_nano: u64) -> Vec<MetricSa
             "1",
             vec![
                 kv_string("repo", repo.slug.clone()),
-                kv_string("visibility", visibility_str(repo.visibility)),
+                kv_string("visibility", repo.visibility.as_str()),
             ],
             int(1),
             time_unix_nano,

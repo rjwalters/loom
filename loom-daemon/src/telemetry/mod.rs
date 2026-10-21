@@ -130,6 +130,17 @@ pub enum RepoVisibility {
     Private,
 }
 
+impl RepoVisibility {
+    /// The wire string (`"public"` / `"private"`), matching the serde spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
 impl Default for RepoVisibility {
     /// Private, never public — the safe default for a missing tag. Fields
     /// tagged `#[serde(default)]` therefore decode a *missing* `visibility` to

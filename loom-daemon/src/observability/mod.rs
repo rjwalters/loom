@@ -126,6 +126,7 @@ pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
 pub mod pick_journal;
+pub mod pick_payload_archive;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
@@ -143,6 +144,8 @@ pub mod stage_entry_fact;
 pub mod stage_occupancy;
 pub mod standalone_ops;
 pub mod step_verdict;
+#[cfg(test)]
+pub(crate) mod test_sink;
 pub mod tracing;
 pub mod work_started;
 
