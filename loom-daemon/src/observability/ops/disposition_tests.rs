@@ -546,6 +546,8 @@ fn full_plan() -> PlanAttributes {
         gate: Some("capacity"),
         step: Some("judge"),
         owning_shard: Some(1),
+        level: Some("important"),
+        workspace_weight: Some(100),
         created_at: Some("2026-10-01T00:00:00Z".to_string()),
     }
 }
@@ -577,6 +579,8 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.queue.gate"], "capacity");
     assert_eq!(span.attributes["loom.queue.step"], "judge");
     assert_eq!(span.attributes["loom.queue.owning_shard"], "1");
+    assert_eq!(span.attributes["loom.queue.level"], "important");
+    assert_eq!(span.attributes["loom.queue.workspace_weight"], "100");
     assert_eq!(span.attributes["loom.queue.created_at"], "2026-10-01T00:00:00Z");
     assert!(span.validate().is_ok());
 }
@@ -778,13 +782,15 @@ fn refresh_secs_falls_back_to_the_default_on_bad_input() {
 use crate::types::{DispatchPlanContext, PlanGate, PlanState, PlanStep, RowPlan};
 use crate::work_finder::step_item::Step;
 
-/// The six #12827 span keys.
-const PLAN_KEYS: [&str; 6] = [
+/// The #12827 span keys, plus `level` and `workspace_weight` (#13007).
+const PLAN_KEYS: [&str; 8] = [
     "loom.queue.plan_state",
     "loom.queue.position",
     "loom.queue.gate",
     "loom.queue.step",
     "loom.queue.owning_shard",
+    "loom.queue.level",
+    "loom.queue.workspace_weight",
     "loom.queue.created_at",
 ];
 
@@ -819,6 +825,9 @@ fn build_rows_maps_a_full_plan_and_created_at() {
             gate: Some("build_backoff"),
             step: Some("champion_merge"),
             owning_shard: Some(2),
+            // The /ingest row's own values (`summary_row`: default, 100).
+            level: Some("default"),
+            workspace_weight: Some(100),
             // Re-formatted as UTC, never the raw text.
             created_at: Some("2026-10-01T00:00:00Z".to_string()),
         }
@@ -835,7 +844,14 @@ fn build_rows_leaves_every_plan_attribute_absent_without_a_plan() {
         ..Default::default()
     };
     let (rows, _) = build_rows(&summary, &repos);
-    assert_eq!(rows[0].plan, PlanAttributes::default());
+    // `level` and `workspace_weight` come from the row itself, not the plan
+    // (#13007), so they are set even without one.
+    let row_only = PlanAttributes {
+        level: Some("default"),
+        workspace_weight: Some(100),
+        ..PlanAttributes::default()
+    };
+    assert_eq!(rows[0].plan, row_only);
 
     // A published plan that gave this row no position, gate, step or shard:
     // only `plan_state` is set. `position` stays absent, never the rank.
@@ -847,7 +863,7 @@ fn build_rows_leaves_every_plan_attribute_absent_without_a_plan() {
         rows[0].plan,
         PlanAttributes {
             plan_state: Some("unknown"),
-            ..PlanAttributes::default()
+            ..row_only
         }
     );
     assert_eq!(rows[0].candidate_rank, 2, "the rank fallback stays on candidate_rank");
@@ -924,6 +940,14 @@ fn each_plan_attribute_is_present_only_when_set() {
         },
         PlanAttributes {
             owning_shard: Some(0),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            level: Some("very-important"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            workspace_weight: Some(0),
             ..PlanAttributes::default()
         },
         PlanAttributes {

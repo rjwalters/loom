@@ -234,6 +234,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.queue.gate",
     "loom.queue.step",
     "loom.queue.owning_shard",
+    "loom.queue.level",
+    "loom.queue.workspace_weight",
     "loom.queue.created_at",
     // Repo lockout weights on a pr-open-skip row's disposition/admission
     // spans (Issue #9674).
@@ -462,6 +464,10 @@ pub enum MetricName {
     /// backlog.
     #[serde(rename = "loom.queue.listing_incomplete_repos")]
     QueueListingIncompleteRepos,
+    /// Ready issues the last work-finder tick listed (`queue.snapshot`'s
+    /// `seen`).
+    #[serde(rename = "loom.queue.seen")]
+    QueueSeen,
     /// `already_landed` rows on the last tick by evidence, labelled `reason`
     /// (`forge_closed`, `forge_closed_not_planned`, `journal_landed`,
     /// `unknown`; #11858).
@@ -800,6 +806,7 @@ impl MetricName {
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
+            Self::QueueSeen => "loom.queue.seen",
             Self::QueueAlreadyLanded => "loom.queue.already_landed",
             Self::QueueHostShard => "loom.queue.host_shard",
             Self::LlmTokensInput => "loom.llm.tokens.input",
@@ -937,9 +944,10 @@ impl MetricName {
             | Self::QueueStarvedByReason
             | Self::QueueDispatchWaitSamples => "{issue}",
             Self::DispatchMaxConcurrent | Self::DispatchCapTerm => "{sweep}",
-            Self::QueueIssues | Self::QueueAlreadyLanded | Self::DispatchPrOpenPrefiltered => {
-                "{issue}"
-            }
+            Self::QueueIssues
+            | Self::QueueSeen
+            | Self::QueueAlreadyLanded
+            | Self::DispatchPrOpenPrefiltered => "{issue}",
             Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
             Self::QueueHostShard => "{shard}",
             Self::LlmTokensInput
@@ -1033,6 +1041,7 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
+            Self::QueueSeen => "Ready issues listed on the last work-finder tick.",
             Self::QueueListingIncompleteRepos => {
                 "Repos whose ready-issue listing came back partial last tick."
             }

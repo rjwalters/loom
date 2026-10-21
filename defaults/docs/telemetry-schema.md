@@ -217,7 +217,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation). A role tick's `loom.role_attempt` root also carries `loom.role_draw.pick`, `.attempt`, `.table_attempt`, `.layer` and optional `.model` when a `roleDraw` table decided the tick (`observability/lifecycle/role_draw.rs`, [role-draw.md](role-draw.md)); it also carries `loom.runtime`, `loom.engine` and, for a session-container run, `loom.session.container` and `loom.session.image_digest` (`observability/lifecycle/role_runtime.rs`, [observability.md](observability.md)) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
-| `loom.queue.issues`, `loom.queue.listing_failed_repos`, `loom.queue.listing_incomplete_repos` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
+| `loom.queue.issues`, `loom.queue.listing_failed_repos`, `loom.queue.listing_incomplete_repos`, `loom.queue.seen` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
 | `loom.queue.oldest_wait`, `loom.queue.starved[.by_reason]`, `loom.queue.dispatch_wait[.samples]` ([`metric.points`](#metricpoints)) | metric | `observability/ops/dwell.rs` |
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
@@ -1848,6 +1848,7 @@ Every other name is a **`Gauge`**:
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
 | `loom.queue.listing_incomplete_repos` | count | every work-finder tick |
+| `loom.queue.seen` (#13007) | count | every work-finder tick, `0` included; equals `queue.snapshot`'s `seen` |
 | `loom.queue.already_landed` (`reason` = `forge_closed`/`forge_closed_not_planned`/`journal_landed`/`unknown`, #11858) | count | every work-finder tick, `0` included |
 | `loom.queue.host_shard` (`shard_count`, #12827) | shard index | every work-finder tick whose dispatch plan has sharding configured and this host's index known; absent otherwise (never a `0` for "unsharded") |
 | `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
@@ -2254,6 +2255,8 @@ tick; otherwise a root of its own. Attributes:
 | `loom.queue.gate` | the admission gate holding a deferred row (#12827): `capacity` / `build_backoff` / `file_overlap` / `unknown` (a gate this build does not know, including the retired `out_of_slice`, `ramp`, `saturation`, `repo_cap`). Only when the plan names one; absent on a `left_queue` span |
 | `loom.queue.step` | the step the row advances its item by (#12827): a `Step` name (`builder`, `judge`, `doctor`, `champion_merge`, …) or the literal `unknown` for a step this build does not know — never the raw string. Only when the row names a step; absent means `builder`, as in `queue.snapshot`. Absent on a `left_queue` span |
 | `loom.queue.owning_shard` | the shard that owns the row's workspace (#12827), an integer below the host's `shard_count`; only when sharding is configured. Absent on a `left_queue` span |
+| `loom.queue.level` | the row's priority level (#13007; the successor to the retired `operator_priority`/`tier`): `default` / `important` / `very-important`, equal to `queue.snapshot`'s `level`. Present on every non-`left_queue` span |
+| `loom.queue.workspace_weight` | the owning workspace's draw weight (#13007, #11742), an integer equal to `queue.snapshot`'s `workspace_weight`. Present on every non-`left_queue` span |
 | `loom.queue.created_at` | the issue's creation time from the ready listing (#12827), re-formatted as RFC 3339 UTC with seconds precision (`2026-10-01T00:00:00Z`); only when the listing supplied a parseable one, never the raw text. Absent on a `left_queue` span |
 | `loom.queue.transition` | `changed` (first sight, or the disposition itself changed) / `refresh` (same disposition, resent after the refresh window) / `left_queue` (the row disappeared from a repo whose listing succeeded) |
 | `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
@@ -2264,17 +2267,17 @@ tick; otherwise a root of its own. Attributes:
 | `lockout.frozen_points_sum` | only for `open_pr` (Issue #9674): the summed story points of those blocked issues (`points:*` labels, `crate::story_points`); unsized issues contribute nothing — absent is never `0` |
 | `lockout.duration_seconds` | only for `open_pr` (Issue #9674): seconds since this daemon process first observed the repo locked — an observation **floor** on the true lockout age (a daemon restart restarts the clock; the daemon never probes the forge for PR timestamps). A failed listing never reads as a cleared lock |
 
-The six dispatch-plan attributes (#12827: `loom.queue.plan_state`, `position`,
-`gate`, `step`, `owning_shard`, `created_at`) carry the `queue.snapshot` row
+The dispatch-plan attributes (#12827: `loom.queue.plan_state`, `position`,
+`gate`, `step`, `owning_shard`, `created_at`; plus `level` and
+`workspace_weight`, #13007) carry the `queue.snapshot` row
 fields loom-ui's Backlog reads, so they have an OTLP carrier before #12813
 retires `queue.snapshot`. They ride the existing emissions (a transition or the
 refresh), with no new trigger, so like `loom.queue.candidate_rank` and
 `loom.queue.priority_score` they hold the value as of the span's emission: a
 change to the plan alone is seen at the next disposition change or refresh.
 None of them is a metric label, and the span count is unchanged. The other
-`queue.snapshot` row fields need no new carrier: `workspace_weight` is the
-repo's `loom.host.managed_repo_weight`, `seen` is `loom.dispatch.seen` on the
-`loom.dispatch.tick` span, and the `listing_failed` count is
+`queue.snapshot` row fields need no further carrier: `seen` is also the
+`loom.queue.seen` gauge (#13007), and the `listing_failed` count is
 `loom.queue.listing_failed_repos`. Retired with no carrier: `urgent` (always
 `false` since #9244; the label is the live signal), `operator_priority` /
 `operator_priority_at` (no daemon emits them; the priority level is the
