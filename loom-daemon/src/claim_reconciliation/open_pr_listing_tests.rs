@@ -54,23 +54,7 @@ fn write_script(path: &Path, body: &str) {
     }
 }
 
-/// Restore an env var on drop.
-struct EnvGuard(&'static str, Option<String>);
-impl EnvGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self(key, prev)
-    }
-}
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.1 {
-            Some(v) => std::env::set_var(self.0, v),
-            None => std::env::remove_var(self.0),
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 fn run_pass(root: &Path, gh: &Path) {
     let stats = run_reconciliation_pass_over_roots(&[root.to_path_buf()], gh, false, || false);

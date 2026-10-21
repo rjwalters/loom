@@ -254,6 +254,22 @@ pub fn plan(
 /// session's own credential. `read` is the front's classification. Never
 /// fails, never panics into the caller.
 pub fn book(args: &[OsString], cwd: Option<&Path>, profile: Option<&Path>, read: bool) {
+    book_as(args, cwd, profile, read, Outcome::Ok);
+}
+
+/// Book a read the front shed instead of exec'ing it on the writer (#12394):
+/// the same row as [`book`], `o=shed`.
+pub fn book_shed(args: &[OsString], cwd: Option<&Path>) {
+    book_as(args, cwd, None, true, Outcome::Shed);
+}
+
+fn book_as(
+    args: &[OsString],
+    cwd: Option<&Path>,
+    profile: Option<&Path>,
+    read: bool,
+    outcome: Outcome,
+) {
     let _ = std::panic::catch_unwind(|| {
         if std::env::var_os(crate::gh_invocation::BOOKED_ENV).is_some_and(|v| v == "1") {
             return;
@@ -285,7 +301,7 @@ pub fn book(args: &[OsString], cwd: Option<&Path>, profile: Option<&Path>, read:
                 row.caller,
                 &row.identity,
                 row.pool,
-                Outcome::Ok,
+                outcome,
                 None,
                 &row.attribution,
             );

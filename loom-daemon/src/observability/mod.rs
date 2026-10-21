@@ -107,12 +107,13 @@ pub mod agent_relay;
 pub mod backfill;
 pub mod claude_code_telemetry;
 pub mod collector;
-pub mod cycle_guard;
 pub mod daemon_event;
 pub mod daemon_exit;
 pub mod daemon_lifecycle;
+pub mod dispatch_eligibility;
 pub mod endpoint_policy;
 pub mod exporter;
+pub mod hold_transition;
 mod ingest_key;
 pub mod lifecycle;
 pub mod llm_billing;
@@ -130,12 +131,15 @@ pub mod queue_snapshot;
 pub mod repo_ref;
 pub mod request_headers;
 pub mod retired_captain_config;
+pub mod run_state_request;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
 pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
+pub mod stage_entry_fact;
+pub mod stage_occupancy;
 pub mod standalone_ops;
 pub mod step_verdict;
 pub mod tracing;
@@ -150,16 +154,13 @@ use crate::workspace_pool::WorkspacePool;
 
 use endpoint_policy::reserved_placeholder_host;
 use exporter::HttpsExporter;
-use ingest_key::{
-    entry_needs_key, read_ingest_key, resolve_for_planned, PlannedKey, NOT_CONFIGURED_DETAIL,
-};
+#[cfg(test)]
+use ingest_key::read_ingest_key;
+use ingest_key::{entry_needs_key, resolve_for_planned, PlannedKey, NOT_CONFIGURED_DETAIL};
 use queue::DurableQueue;
 
 // The ingest-key resolution lives in `ingest_key`; the `pub use` keeps the
-// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working
-// for `loom_ui_alerts` and the attended live-output tailer, and the private
-// `read_ingest_key` re-import keeps `super::super::read_ingest_key` alive
-// for the latter.
+// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working.
 pub use ingest_key::resolve_ingest_key_file;
 
 /// `observability.enabled` env override.
@@ -1273,6 +1274,16 @@ pub fn spawn_task(
     // start an exporter, least of all the managed HTTPS one.
     session_output::register_sink(otlp_queues.clone(), &host_id);
     ops_handles.extend(session_output::spawn_task(bus, workspace_root.clone()));
+    // `eta.dispatch_eligibility` (#12790): the dispatcher's schedulability
+    // decision per waiting ready item, OTLP-only, sampled by the collector
+    // below on the same cadence as `queue.snapshot`.
+    dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.stage_occupancy` (#12866): the pre-ready stage occupancy gauge,
+    // OTLP-only, sampled by the collector on the same cadence.
+    stage_occupancy::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.stage_entry` (#12869): arrivals diffed from the step driver's
+    // per-tick discovery snapshot, OTLP-only.
+    stage_entry_fact::register_sink(otlp_queues.clone(), &host_id);
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
@@ -1299,6 +1310,12 @@ pub fn spawn_task(
     // `daemon_event`'s module doc for why it is a separate subscriber rather
     // than folded into `collector`.
     let daemon_event_handle = daemon_event::spawn_task(bus, fanout.clone(), host_id.clone());
+    // Host shape (#12874): a one-shot IMDSv2 probe for `host.type` /
+    // `cloud.*` on the resource. Spawned and never awaited — startup is not
+    // delayed, and batches exported before it lands just lack the keys.
+    // Linux only: fleet EC2 hosts are Linux; a Mac reads `hw.model` instead.
+    #[cfg(target_os = "linux")]
+    crate::host_shape::spawn_imds_probe();
     let collector_handle = collector::spawn_task(
         bus,
         fanout,

@@ -11,8 +11,8 @@
 //! Brand-new logic, so it is native from the start per
 //! `.loom/docs/shell-language-policy.md` — the `generate-agent-skills.sh`
 //! precedent — rather than a script to be ported later. The classification
-//! itself lives in [`loom_daemon::stale_blocked`], and the forge reads in
-//! [`loom_daemon::stale_blocked::batch`] (#10480: one REST listing, REST + ETag
+//! itself lives in [`crate::stale_blocked`], and the forge reads in
+//! [`crate::stale_blocked::batch`] (#10480: one REST listing, REST + ETag
 //! comment and blocker-state reads, one GraphQL query per 100 issues); this
 //! module is the rendering. `notify-cleared-blockers` reads through the same
 //! gatherer (#10515).
@@ -26,7 +26,7 @@
 //! The same floors are re-checked between reads, from the forge's own
 //! answers. `--json` carries what the run spent as `forge_cost`; the human
 //! report prints the same numbers as one stderr line unless `--quiet`.
-//! The logic is [`loom_daemon::stale_blocked::budget`].
+//! The logic is [`crate::stale_blocked::budget`].
 //!
 //! # One repository per invocation (#9191)
 //!
@@ -47,7 +47,7 @@
 //! An advisory that can fail is an advisory that gets removed from the
 //! pre-flight. A forge read that did not answer is reported as *unevaluated* —
 //! its own line in the output, never folded into "clear" and never into
-//! "stale" — because [`loom_daemon::dep_recheck::forge`]'s whole fail-safe
+//! "stale" — because [`crate::dep_recheck::forge`]'s whole fail-safe
 //! posture is that a conclusion drawn from a failed read is worse than no
 //! conclusion. The one thing this command will not do is guess.
 //!
@@ -73,8 +73,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::park_record;
-use loom_daemon::stale_blocked::{batch, budget, classify, undeclared, Artifact, Verdict};
+use crate::park_record;
+use crate::stale_blocked::{batch, budget, classify, undeclared, Artifact, Verdict};
 
 /// How many open `loom:blocked` issues to examine by default.
 ///
@@ -158,7 +158,7 @@ impl StaleBlockedArgs {
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
         let mut forge = batch::GhStaleBlockedForge::new(&root, self.repo.as_deref());
-        let fleet = loom_daemon::forge_identity::FleetLogins::for_root(&root);
+        let fleet = crate::forge_identity::FleetLogins::for_root(&root);
         let opts = batch::Options {
             limit: self.limit,
             no_prs: self.no_prs,
@@ -630,7 +630,7 @@ mod tests {
         use crate::cli::whole_cli_parse::{on_stack, MAIN_THREAD_STACK};
         let (summary, long) = on_stack("stale-blocked-help", MAIN_THREAD_STACK, || {
             use clap::CommandFactory;
-            let mut cli = <crate::Cli as CommandFactory>::command();
+            let mut cli = <crate::cli::Cli as CommandFactory>::command();
             cli.build();
             let sub = cli
                 .find_subcommand_mut("check-stale-blocked")

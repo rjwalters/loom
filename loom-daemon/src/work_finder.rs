@@ -166,7 +166,7 @@ pub use main_red_fix::RedMainLane;
 pub use operator_priority::OverflowSlot;
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
-pub use tick_report::{error_kind::DispatchErrorKind, Admission, TickReport};
+pub use tick_report::{error_kind::DispatchErrorKind, Admission, RepoDepth, TickReport};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{
@@ -1976,17 +1976,7 @@ pub fn spawn_multi_work_finder_task(
         // `configured_max` module) — no longer a frozen startup value.
         let mut configured_max_reload =
             ConfiguredMaxReloader::new(fallback_root.clone(), configured_max);
-        // An `Interval` that a `forge.event` prompt may also tick early
-        // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on
-        // for `fallback_root` — the daemon's primary workspace, which is also
-        // where every other machine-level knob is resolved from. When
-        // disarmed this is exactly `tokio::time::interval(interval)`: no bus
-        // subscription, no bridge task, no wake path.
-        let mut ticker = crate::forge_events::wake::EarlyTicker::for_work_finder(
-            interval,
-            &event_bus,
-            &fallback_root,
-        );
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
@@ -2135,7 +2125,7 @@ pub fn spawn_multi_work_finder_task(
             // read in between is bounded by the tick deadline and fails fast
             // past it; a listing does not fall through to the writer.
             let tick_deadline = std::time::Instant::now() + tick_budget;
-            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline, true);
+            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline);
 
             // `roots` was already resolved (registry reload + missing-root
             // filtering) by `refresh_local_workspace_state` above, before the

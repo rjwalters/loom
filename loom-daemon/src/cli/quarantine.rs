@@ -3,16 +3,16 @@
 use anyhow::Result;
 use std::path::Path;
 
-use loom_daemon::types::{QuarantineEntry, Request, Response};
+use crate::types::{QuarantineEntry, Request, Response};
 
 use super::common::{query_daemon, resolve_socket_path};
-use crate::QuarantineAction;
+use crate::cli::QuarantineAction;
 
 /// Handle the `quarantine` subcommand (Issue #3939). Connects to the running
 /// daemon over its Unix socket and dispatches the requested action. The
 /// quarantine state is in the daemon's memory, so — unlike `workspace` — this
 /// cannot operate on a file when the daemon is down.
-pub(crate) async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
+pub async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     match action {
         QuarantineAction::Clear {

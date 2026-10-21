@@ -38,6 +38,13 @@
 //!   fallback ([`fallback`]). A `403` (this host's tailnet node is not
 //!   mapped to its `host_id`) is such a failure, logged at ERROR.
 //!
+//! # Work requests
+//!
+//! [`request_next`] asks the captain for assignments for the host's free
+//! slots (`/v1/next`, #12817); [`super::request`] decides *when* (on newly
+//! available capacity, with capped jittered backoff on empty answers, never
+//! a fixed period). An assignment is a [`Candidate`]: the step tick keeps its grant ([`offer`]), draws it through its gates first, and the spawn's [`claim`] takes the grant instead of asking again; an offer no claim took goes back with [`decline_offered`].
+//!
 //! # Heartbeat
 //!
 //! Each registry's reaper tick (30 s by default) records its repo's live steps
@@ -59,13 +66,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::client::{self, CallError, CallFacts};
 use super::fallback::{self, Hysteresis, Mode, Transition};
 use super::proto::{
     self, AckResponse, ClaimRequest, ClaimResponse, HeartbeatRequest, HeartbeatResponse, LiveStep,
-    RefusalReason, RefuseRequest, ReleaseRequest,
+    NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
 };
 use crate::step_role::StepRole;
 
@@ -171,6 +179,19 @@ pub struct Grant {
     repo: String,
     item: u64,
     step: String,
+    /// The assignment this grant replaces, when the captain named one
+    /// (#12875).
+    pub lineage: Option<GrantLineage>,
+}
+
+/// What a grant says about the attempt it replaces (#12875): the
+/// `loom.dispatch.attempt`, `loom.dispatch.prev_assignment_id` and
+/// `loom.dispatch.prev_end` of the step's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantLineage {
+    pub attempt: u32,
+    pub prev_assignment_id: String,
+    pub prev_end: String,
 }
 
 /// What the captain said about one claim.
@@ -182,7 +203,16 @@ pub enum Ask {
     /// path.
     FailOpen,
     Granted(Grant),
-    Refused(RefusalReason),
+    Refused(RefusalReason, Refusal),
+}
+
+/// What a claim refusal said beyond its reason (#12707).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refusal {
+    /// The host holding the item, when the captain named one.
+    pub held_by: Option<String>,
+    /// Seconds before asking again is worthwhile.
+    pub retry_after_s: Option<u64>,
 }
 
 /// The `loom.dispatch.step` reason of a captain refusal: a closed token.
@@ -192,7 +222,10 @@ pub fn refusal_token(reason: RefusalReason) -> &'static str {
         RefusalReason::Held => "captain_held",
         RefusalReason::Grace => "captain_grace",
         RefusalReason::NotEligible => "captain_not_eligible",
+        // A captain built from #12864 on never sends `cap`; kept so this
+        // worker still reads an older captain in a mixed-version fleet.
         RefusalReason::Cap => "captain_cap",
+        RefusalReason::Cooldown => "captain_cooldown",
         RefusalReason::Other => "captain_refused",
     }
 }
@@ -229,6 +262,11 @@ struct State {
     /// `(free_slots, roles_ok)` at the last step tick.
     capacity: Option<(u32, Vec<String>)>,
     last_heartbeat: Option<Instant>,
+    /// The `server_epoch` of the last `next` answer (#12817).
+    next_epoch: Option<String>,
+    /// Grants the captain offered in answer to a `next` that no claim has
+    /// consumed yet (#12817).
+    offered: Vec<Grant>,
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -290,8 +328,8 @@ fn repo_of(root: &Path) -> String {
 /// A claim answer, typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
-    Granted(String),
-    Refused(RefusalReason),
+    Granted(String, Option<GrantLineage>),
+    Refused(RefusalReason, Refusal),
 }
 
 /// Read a claim answer; `None` for a grant with no `assignment_id` (a
@@ -300,9 +338,24 @@ enum Decision {
 fn decide(r: &ClaimResponse) -> Option<Decision> {
     if r.granted {
         let id = r.assignment_id.clone().filter(|id| !id.is_empty())?;
-        Some(Decision::Granted(id))
+        // All three or none: a partial answer names no attempt.
+        let lineage = match (r.attempt, &r.prev_assignment_id, &r.prev_end) {
+            (Some(attempt), Some(prev), Some(end)) if !prev.is_empty() => Some(GrantLineage {
+                attempt,
+                prev_assignment_id: prev.clone(),
+                prev_end: end.clone(),
+            }),
+            _ => None,
+        };
+        Some(Decision::Granted(id, lineage))
     } else {
-        Some(Decision::Refused(r.reason.unwrap_or(RefusalReason::Other)))
+        Some(Decision::Refused(
+            r.reason.unwrap_or(RefusalReason::Other),
+            Refusal {
+                held_by: r.held_by.clone().filter(|h| !h.is_empty()),
+                retry_after_s: r.retry_after_s,
+            },
+        ))
     }
 }
 
@@ -322,6 +375,12 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
         item: u64::from(item),
         step: role.as_str().to_string(),
     };
+    // The captain already granted this item in answer to a `next`: the grant
+    // stands in for the claim, and the step goes on through the same gates,
+    // live pre-check and forge pre-claim as any other (#12817).
+    if let Some(grant) = take_offered(&request.repo, request.item, &request.step) {
+        return Ask::Granted(grant);
+    }
     let started = Instant::now();
     let answer = client::post_blocking::<_, ClaimResponse>(&url, proto::CLAIM_PATH, &request)
         .and_then(|r| {
@@ -338,7 +397,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
         ..CallFacts::default()
     };
     let ask = match answer {
-        Ok((epoch, Decision::Granted(assignment_id))) => {
+        Ok((epoch, Decision::Granted(assignment_id, lineage))) => {
             observe(true, None);
             facts.status = Some(200);
             facts.result = client::RESULT_GRANTED;
@@ -350,9 +409,10 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
                 repo: request.repo,
                 item: request.item,
                 step: request.step,
+                lineage,
             })
         }
-        Ok((epoch, Decision::Refused(reason))) => {
+        Ok((epoch, Decision::Refused(reason, refusal))) => {
             // `grace` is expected after every captain roll: it neither
             // counts as a failure nor resets one (spec §9.1).
             if reason != RefusalReason::Grace {
@@ -362,10 +422,13 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
             facts.result = client::RESULT_REFUSED;
             facts.reason = Some(reason.as_str().to_string());
             facts.server_epoch = Some(epoch);
+            facts.held_by.clone_from(&refusal.held_by);
+            facts.retry_after_s = refusal.retry_after_s;
+            facts.hold = reason == RefusalReason::Cooldown;
             if reason == RefusalReason::Grace {
                 Ask::FailOpen
             } else {
-                Ask::Refused(reason)
+                Ask::Refused(reason, refusal)
             }
         }
         Err(e) => {
@@ -469,6 +532,20 @@ pub fn release(sweep_id: &str, outcome: &str) {
     send_release(&assigned.grant, outcome);
 }
 
+/// This host is being lost (#12876): release every assignment it holds with
+/// `outcome`, so the captain's rows end now instead of at their TTL. Returns
+/// how many releases were sent.
+pub fn release_all(outcome: &str) -> usize {
+    let grants: Vec<Grant> = std::mem::take(&mut state().assignments)
+        .into_values()
+        .map(|a| a.grant)
+        .collect();
+    for grant in &grants {
+        send_release(grant, outcome);
+    }
+    grants.len()
+}
+
 fn send_release(grant: &Grant, outcome: &str) {
     let body = ReleaseRequest {
         host_id: host_id(),
@@ -495,23 +572,30 @@ fn send_release(grant: &Grant, outcome: &str) {
 /// through today's admission after a grant, and the captain does not yet
 /// use `roles_ok` to pick hosts.
 pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
+    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok(exhausted)));
+}
+
+/// The role names this host can run: every step role's, but `exhausted`.
+#[must_use]
+pub fn roles_ok(exhausted: &BTreeSet<String>) -> Vec<String> {
     // Several steps share a role name (the Champion's three): a set, so
     // each role is listed once, in a stable order.
-    let roles: Vec<String> = StepRole::ALL
+    StepRole::ALL
         .iter()
         .map(|r| r.role_name().to_string())
         .filter(|name| !exhausted.contains(name))
         .collect::<BTreeSet<String>>()
         .into_iter()
-        .collect();
-    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles));
+        .collect()
 }
 
 /// One reaper tick of the registry at `root`, whose live steps are `live`
-/// (`(sweep_id, item, role)`): record them, release any assignment whose
-/// step is gone without an end, and send the host's heartbeat when one is
-/// due. A no-op while the flag is off and nothing was ever granted.
-pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
+/// (`(sweep_id, item, role, started_at)`): record them, release any
+/// assignment whose step is gone without an end, and send the host's
+/// heartbeat when one is due. `started_at` rides the heartbeat as
+/// [`LiveStep::started_at`] (#12873). A no-op while the flag is off and
+/// nothing was ever granted.
+pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>)]) {
     let url = host_endpoint(root);
     let (vanished, heartbeat) = {
         let mut s = state();
@@ -533,7 +617,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
         let repo = repo_of(root);
         let steps: Vec<(String, LiveStep)> = live
             .iter()
-            .map(|(id, item, role)| {
+            .map(|(id, item, role, started_at)| {
                 let assignment_id = s.assignments.get(id).map(|a| a.grant.assignment_id.clone());
                 (
                     id.clone(),
@@ -542,6 +626,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
                         item: u64::from(*item),
                         step: role.as_str().to_string(),
                         assignment_id,
+                        started_at: Some(*started_at),
                     },
                 )
             })
@@ -653,6 +738,186 @@ pub fn tick_budget(root: &Path, free_slots: usize, spawn_concurrency: usize) -> 
         fallback::draw_budget(mode, free_slots, spawn_concurrency),
         mode == Mode::Fallback,
     )
+}
+
+/// One item the captain offered this host in answer to a `next` (#12817). A
+/// candidate: it still passes the worker's gates, live pre-check and forge
+/// pre-claim, and ends in [`refuse`] or [`release`] through its grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub grant: Grant,
+    pub repo: String,
+    pub item: u64,
+    pub step: StepRole,
+}
+
+/// What one request for work came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextOutcome {
+    /// Fleet dispatch is off for this host: nothing was sent.
+    Off,
+    /// This host is in fallback: the heartbeat probes, `next` waits.
+    Fallback,
+    /// The captain answered. `candidates` is empty when nothing fits, which
+    /// is an answer and not a failure.
+    Answered {
+        candidates: Vec<Candidate>,
+        /// The answer's `server_epoch` differs from the previous answer's:
+        /// the captain restarted and its table was rebuilt.
+        epoch_changed: bool,
+        queue_age_s: Option<u64>,
+    },
+    /// No usable answer: counted toward fallback like any failed call.
+    Failed,
+}
+
+/// Ask the captain for work for `free_slots` free slots (#12817). Blocks for
+/// at most about [`client::CALL_TIMEOUT`]. An answer, empty or not, counts as
+/// a success in the fallback hysteresis; a failure counts as one.
+#[must_use]
+pub fn request_next(root: &Path, free_slots: u32, roles_ok: &[String]) -> NextOutcome {
+    let Some(url) = host_endpoint(root) else {
+        return NextOutcome::Off;
+    };
+    if mode() == Mode::Fallback {
+        return NextOutcome::Fallback;
+    }
+    let request = NextRequest {
+        host_id: host_id(),
+        free_slots,
+        roles_ok: roles_ok.to_vec(),
+    };
+    let started = Instant::now();
+    let answer = client::post_blocking::<_, NextResponse>(&url, proto::NEXT_PATH, &request);
+    let mut facts = CallFacts {
+        endpoint: proto::NEXT_PATH,
+        latency: started.elapsed(),
+        ..CallFacts::default()
+    };
+    let outcome = match answer {
+        Ok(resp) => {
+            observe(true, None);
+            let candidates = candidates_of(&url, &resp);
+            let epoch_changed = {
+                let mut s = state();
+                let changed = s
+                    .next_epoch
+                    .as_deref()
+                    .is_some_and(|prev| prev != resp.server_epoch);
+                s.next_epoch = Some(resp.server_epoch.clone());
+                changed
+            };
+            if epoch_changed {
+                log::info!(
+                    "fleet_dispatch: the captain restarted (new epoch {}); work requests carry on",
+                    resp.server_epoch
+                );
+            }
+            facts.status = Some(200);
+            facts.server_epoch = Some(resp.server_epoch.clone());
+            if candidates.is_empty() {
+                facts.result = client::RESULT_OK;
+                facts.reason = Some("empty".to_string());
+            } else {
+                facts.result = client::RESULT_GRANTED;
+            }
+            NextOutcome::Answered {
+                candidates,
+                epoch_changed,
+                queue_age_s: resp.queue_age_s,
+            }
+        }
+        Err(e) => {
+            observe(false, Some(&e));
+            facts.status = e.status();
+            facts.result = client::RESULT_ERROR;
+            facts.reason = Some(e.token().to_string());
+            log::info!("fleet_dispatch: a work request got no answer ({e})");
+            NextOutcome::Failed
+        }
+    };
+    client::record(&facts);
+    outcome
+}
+
+/// The usable assignments of `resp`. One whose step this build does not know
+/// or that names no id or an item beyond `u32` is refused back to the captain
+/// at once so its row does not sit out its TTL.
+fn candidates_of(url: &str, resp: &NextResponse) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for a in &resp.assignments {
+        let grant = Grant {
+            assignment_id: a.assignment_id.clone(),
+            url: url.to_string(),
+            repo: a.repo.clone(),
+            item: a.item,
+            step: a.step.clone(),
+            lineage: None,
+        };
+        match (a.step.parse::<StepRole>(), a.assignment_id.is_empty()) {
+            (Ok(step), false) if u32::try_from(a.item).is_ok() => out.push(Candidate {
+                repo: a.repo.clone(),
+                item: a.item,
+                step,
+                grant,
+            }),
+            (_, true) => log::warn!("fleet_dispatch: dropped an assignment with no id"),
+            _ => {
+                log::warn!(
+                    "fleet_dispatch: refusing an assignment this build cannot run ({} #{} {})",
+                    a.repo,
+                    a.item,
+                    a.step
+                );
+                refuse(&grant, "unknown_step");
+            }
+        }
+    }
+    out
+}
+
+/// Keep the grants of `candidates` for the claims that follow: the step tick
+/// draws them through its gates, and the spawn's [`claim`] takes the grant
+/// instead of asking the captain again. Replaces an earlier offer of the same
+/// item; one the tick leaves unclaimed is given back by [`decline_offered`].
+pub fn offer(candidates: &[Candidate]) {
+    let mut s = state();
+    for c in candidates {
+        s.offered
+            .retain(|g| !same_item(g, &c.grant.repo, c.grant.item, &c.grant.step));
+        s.offered.push(c.grant.clone());
+    }
+}
+
+fn same_item(g: &Grant, repo: &str, item: u64, step: &str) -> bool {
+    g.item == item && g.step == step && g.repo.eq_ignore_ascii_case(repo)
+}
+
+/// The offered grant for `(repo, item, step)`, removed.
+fn take_offered(repo: &str, item: u64, step: &str) -> Option<Grant> {
+    let mut s = state();
+    let at = s
+        .offered
+        .iter()
+        .position(|g| same_item(g, repo, item, step))?;
+    Some(s.offered.remove(at))
+}
+
+/// Give back every offered grant no claim took (`reason` is the refusal
+/// token): the item did not pass this host's gates, or the tick had no slot
+/// for it, so its row must not sit out its TTL. Returns how many.
+pub fn decline_offered(reason: &str) -> usize {
+    let left = std::mem::take(&mut state().offered);
+    for grant in &left {
+        refuse(grant, reason);
+    }
+    left.len()
+}
+
+/// [`candidates_of`] for another module's tests.
+#[cfg(test)]
+pub(crate) fn candidates_for_test(url: &str, resp: &NextResponse) -> Vec<Candidate> {
+    candidates_of(url, resp)
 }
 
 /// Forget every grant, live set and mode (tests).

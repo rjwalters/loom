@@ -37,7 +37,7 @@ pub(crate) struct SelectArgs {
 /// exits the process with `EX_CONFIG` (78) rather than returning, preserving
 /// the exit code `spawn-claude.sh` keys on.
 pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
-    use loom_daemon::tokens_pool::{bad_tokens, select};
+    use crate::tokens_pool::{bad_tokens, select};
 
     let SelectArgs {
         workspace,
@@ -52,22 +52,22 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
     // `FromStr` rather than compared against two hardcoded string
     // literals, so the valid vocabulary has exactly one definition
     // and the error message enumerates it from that same place.
-    let provider: loom_daemon::tokens_pool::AccountProvider =
+    let provider: crate::tokens_pool::AccountProvider =
         provider.parse().map_err(|error| anyhow!("{error}"))?;
     let ws = resolve_tokens_workspace(&workspace)?;
     // Resolved workspace (issue #4948, suggested-fix option 3) —
     // always stderr so `--export`'s stdout stays eval-safe and
     // `--json`'s (non-`--export`) stdout stays a bare JSON object.
     eprintln!("Resolved workspace: {}", ws.display());
-    if provider == loom_daemon::tokens_pool::AccountProvider::Codex {
+    if provider == crate::tokens_pool::AccountProvider::Codex {
         // #8277: the same `--model` this arm's Claude sibling already
         // accepts (see `select_token_for_model_and_role` below) now also
         // narrows Codex selection past a class-scoped
         // `MODEL_CREDITS_EXHAUSTED` hold (#8058 Phase 2).
-        let selected = loom_daemon::tokens_pool::select_account(&ws, provider, model.as_deref())
+        let selected = crate::tokens_pool::select_account(&ws, provider, model.as_deref())
             .map_err(|error| anyhow!(error))?;
         let directory = match &selected.binding {
-            loom_daemon::tokens_pool::AccountBinding::CodexHome { directory } => directory,
+            crate::tokens_pool::AccountBinding::CodexHome { directory } => directory,
             _ => unreachable!("Codex selection returned a non-Codex binding"),
         };
         if export {
@@ -102,9 +102,9 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
         }
         return Ok(());
     }
-    debug_assert_eq!(provider, loom_daemon::tokens_pool::AccountProvider::Claude);
+    debug_assert_eq!(provider, crate::tokens_pool::AccountProvider::Claude);
     if auto_unpin {
-        if let Some(msg) = loom_daemon::tokens_pool::maybe_auto_unpin(&ws) {
+        if let Some(msg) = crate::tokens_pool::maybe_auto_unpin(&ws) {
             eprintln!("{msg}");
         }
     }

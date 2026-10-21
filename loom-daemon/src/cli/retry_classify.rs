@@ -3,16 +3,16 @@
 //! Backs the six classifiers in `claude-wrapper.sh` that #8037 ported, plus the
 //! `model-class` mark-scoping decision #8138 added, all of which now delegate
 //! to it.
-//! What each answers is documented on [`loom_daemon::retry_classify`]; the
+//! What each answers is documented on [`crate::retry_classify`]; the
 //! frozen argv / stdout / exit-code contract is on
-//! [`loom_daemon::retry_classify::cli`].
+//! [`crate::retry_classify::cli`].
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
 //! reason `DepRecheckCommand` does (#6969): `main.rs` is over
 //! `.loom/docs/file-size-policy.md`'s threshold and frozen.
 
+use crate::retry_classify::cli;
 use anyhow::Result;
-use loom_daemon::retry_classify::cli;
 use std::io::Read as _;
 
 /// Flags shared by the five predicates. The wrapper passes the same shape for

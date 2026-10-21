@@ -9,12 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::events::FileEventSink;
-use super::forge::{LifecycleForge, PrSnapshot, RemovalEvent};
+use super::forge::{GroupRun, LifecycleForge, PrSnapshot, RemovalEvent};
 use super::github::{safe_detail, GhQueueApi};
 use super::group_github::{group_transition_line, revoke_for_transition_groups};
 use super::lifecycle::{sweep, Ctx, Reconciled};
 use super::mode::{resolve_merge_mode, MergeMode};
 use super::ops::PrState;
+use super::status_command::{self, StatusCommand};
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
@@ -24,7 +25,7 @@ pub const REMOVALS_QUERY: &str = "query($owner: String!, $name: String!, $number
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       timelineItems(last: 20, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-        nodes { ... on RemovedFromMergeQueueEvent { reason createdAt } }
+        nodes { ... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid } } }
       }
     }
   }
@@ -36,6 +37,9 @@ pub struct GhLifecycleForge {
     root: PathBuf,
     owner: String,
     name: String,
+    /// `forge.mergeQueue.statusCommand` as read at construction: `Ok(None)`
+    /// when unset, `Err` when set but unusable (posts then refuse, #12679).
+    status_command: Result<Option<StatusCommand>, String>,
 }
 
 impl GhLifecycleForge {
@@ -49,13 +53,26 @@ impl GhLifecycleForge {
                 root: root.to_path_buf(),
                 owner,
                 name: repo,
+                status_command: status_command::resolve(root),
             }),
             _ => Err("repository must be an `owner/repo` slug".to_string()),
         }
     }
 
+    pub(super) fn gh(&self) -> &str {
+        &self.gh
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(super) fn owner(&self) -> &str {
         &self.owner
+    }
+
+    pub(super) fn status_command(&self) -> &Result<Option<StatusCommand>, String> {
+        &self.status_command
     }
 
     pub(super) fn repo_name(&self) -> &str {
@@ -154,6 +171,10 @@ pub fn parse_removals(data: &serde_json::Value) -> Result<Vec<RemovalEvent>, Str
             Some(RemovalEvent {
                 reason: n.get("reason").and_then(serde_json::Value::as_str).map(s),
                 created_at: n.get("createdAt")?.as_str()?.to_string(),
+                before_commit: n
+                    .pointer("/beforeCommit/oid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(s),
             })
         })
         .collect())
@@ -254,6 +275,98 @@ impl LifecycleForge for GhLifecycleForge {
         }
         parse_removals(&v)
     }
+
+    fn group_check_runs(&self, commit: &str) -> Result<Vec<GroupRun>, String> {
+        let text = self.ok(
+            "merge_queue.group_check_runs",
+            AccessIntent::Read,
+            &[
+                s("api"),
+                format!("repos/{}/commits/{commit}/check-runs?per_page=100", self.nwo()),
+            ],
+        )?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("unparseable check runs: {e}"))?;
+        // `per_page=100` without pagination: a larger list cannot be proven
+        // complete, so it is an error (the caller fails closed).
+        if v.get("total_count").and_then(serde_json::Value::as_u64) > Some(100) {
+            return Err("more than 100 check runs; completeness not confirmed".to_string());
+        }
+        parse_check_runs(&v)?
+            .into_iter()
+            .map(|(id, name, conclusion)| {
+                // Only a run that did not succeed needs its steps read.
+                let failed_steps = match conclusion.as_deref() {
+                    Some("cancelled" | "timed_out") => {
+                        let job = self.ok(
+                            "merge_queue.group_job",
+                            AccessIntent::Read,
+                            &[s("api"), format!("repos/{}/actions/jobs/{id}", self.nwo())],
+                        )?;
+                        let job: serde_json::Value = serde_json::from_str(&job)
+                            .map_err(|e| format!("unparseable job: {e}"))?;
+                        failed_steps(&job)?
+                    }
+                    _ => 0,
+                };
+                Ok(GroupRun {
+                    name,
+                    conclusion,
+                    failed_steps,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Decode `GET commits/<sha>/check-runs` into `(check-run id, name,
+/// conclusion)` rows. Pure.
+///
+/// # Errors
+///
+/// A shape it cannot read.
+pub fn parse_check_runs(
+    v: &serde_json::Value,
+) -> Result<Vec<(u64, String, Option<String>)>, String> {
+    let runs = v
+        .get("check_runs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("unexpected check-runs shape")?;
+    runs.iter()
+        .map(|r| {
+            let id = r
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("check run without an id")?;
+            let name = r
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("check run without a name")?;
+            let conclusion = r
+                .get("conclusion")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_ascii_lowercase);
+            Ok((id, name.to_string(), conclusion))
+        })
+        .collect()
+}
+
+/// Count the steps of an Actions job (`GET actions/jobs/<id>`) that ended
+/// `failure`. Pure.
+///
+/// # Errors
+///
+/// A job without a `steps` array.
+pub fn failed_steps(job: &serde_json::Value) -> Result<u32, String> {
+    let steps = job
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("job without steps")?;
+    let n = steps
+        .iter()
+        .filter(|st| st.get("conclusion").and_then(serde_json::Value::as_str) == Some("failure"))
+        .count();
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 /// `owner/repo` of the checkout at `root`.

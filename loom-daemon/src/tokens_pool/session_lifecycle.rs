@@ -336,6 +336,18 @@ pub fn check_mount_denials(
 /// nothing is cached yet; `Err` when a cached roster exists but cannot be
 /// read or parsed, so a broken firewall input fails closed.
 pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
+    Ok(firewalled_records(workspace)?
+        .into_iter()
+        .map(|(root, record)| root.join(&record.dir))
+        .collect())
+}
+
+/// The `firewall: true` roster records with the roster root they resolve
+/// against; same cache, same fail-closed contract as [`firewalled_repo_paths`]
+/// (private clones match them by forge identity rather than by path, #10795).
+pub fn firewalled_records(
+    workspace: &Path,
+) -> Result<Vec<(PathBuf, crate::fleet_store::roster::Record)>> {
     use crate::fleet_store::{self as store, fetch, roster};
     let effective = crate::config_resolver::resolve_effective_config(workspace);
     let Some(location) = store::resolve_location(&effective, &|k| std::env::var(k).ok())? else {
@@ -355,7 +367,7 @@ pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
         .records
         .iter()
         .filter(|record| record.firewall)
-        .map(|record| parsed.root.join(&record.dir))
+        .map(|record| (parsed.root.clone(), record.clone()))
         .collect())
 }
 

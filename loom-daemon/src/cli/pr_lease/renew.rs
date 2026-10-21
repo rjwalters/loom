@@ -76,7 +76,7 @@ pub(crate) struct RenewLoopArgs {
     pub(crate) role: Role,
     /// The lease's step (#11898), when it names one.
     #[arg(long)]
-    pub(crate) step: Option<loom_daemon::step_role::StepRole>,
+    pub(crate) step: Option<crate::step_role::StepRole>,
     #[arg(long)]
     pub(crate) host: String,
     #[arg(long)]
@@ -393,7 +393,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
     let watch = args.watch_pid;
     let watch_ident = lease_renewer::start_identity(watch);
     let alive = || {
-        loom_daemon::live_claim::pid_is_live_process(watch)
+        crate::live_claim::pid_is_live_process(watch)
             && (watch_ident.is_none() || lease_renewer::start_identity(watch) == watch_ident)
     };
     let gh = Gh {
@@ -405,8 +405,8 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         say(&format!("renewer stopping: refusing to write here (#9548): {why}"));
         return;
     }
-    let policy = loom_daemon::comment_trust::TrustPolicy::for_root(&root);
-    let ttl_minutes = loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes();
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
     let ttl = chrono::Duration::seconds((ttl_minutes * 60.0) as i64);
     // Wall clock throughout (#9401 review): `Instant` stands still while a
     // Mac sleeps, so a lid-closed renewer would wake believing its lease fresh.

@@ -192,6 +192,39 @@ fn an_empty_roster_a_foreign_host_or_no_owner_is_no_pool() {
 // ---- owners filter -------------------------------------------------------------
 
 #[test]
+fn a_pool_with_no_reader_for_the_owner_is_unavailable_not_no_pool() {
+    // The host HAS a reader pool, but every reader's `owners` excludes this
+    // owner: not "no pool" (which would put the read on the writer, #12394
+    // review), an Unavailable exhaustion the read chains shed.
+    let r = roster(vec![
+        reader("81041", Some(&["acme"])),
+        reader("81042", Some(&["acme"])),
+    ]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    let d = route_read_in(ws.path(), &r, &req("third-party/x", None), &v2(&cfg), now);
+    assert!(
+        matches!(
+            d,
+            RouteDecision::Exhausted {
+                cause: ExhaustCause::Unavailable,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    assert!(owner_uncovered_in(&r, "third-party", RoutingMode::Scoped));
+    assert!(!owner_uncovered_in(&r, "ACME", RoutingMode::Scoped));
+    // No pool at all, or legacy routing (no owners filter): never uncovered.
+    assert!(!owner_uncovered_in(&roster(vec![]), "third-party", RoutingMode::Scoped));
+    assert!(!owner_uncovered_in(&r, "third-party", RoutingMode::Legacy));
+    // The covered owner still routes to a reader.
+    let d = route_read_in(ws.path(), &r, &req("acme/x", None), &v2(&cfg), now);
+    assert!(matches!(d, RouteDecision::Reader { .. }), "{d:?}");
+}
+
+#[test]
 fn a_reader_limited_to_one_owner_leaves_other_owners_untouched() {
     let base = roster(vec![reader("81051", None), reader("81052", None)]);
     let mut with_third = base.clone();
@@ -765,9 +798,6 @@ fn a_credential_withdrawal_beside_a_budget_one_is_a_withdrawn_exhaustion() {
     // 2026-10-15: this mix was `Unavailable`, which sent every Hygiene and
     // Observability read to the writer. Both exclusions end on their own.
     assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
-    assert!(ReadClass::Hygiene.sheds(cause_of(&d)));
-    assert!(ReadClass::Observability.sheds(cause_of(&d)));
-    assert!(!ReadClass::Gate.sheds(cause_of(&d)));
 }
 
 #[test]
@@ -788,14 +818,12 @@ fn an_app_wide_withdrawal_beside_a_budget_one_is_withdrawn_and_a_stale_dir_unava
     assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
 
     // A stale token directory may never clear: Unavailable, even beside a
-    // withdrawal. Hygiene goes to the writer; Observability still sheds.
+    // withdrawal.
     let r = roster(vec![reader("81393", None), reader("81394", None)]);
     let ws = workspace(&r, &["other"]);
     forge_read_pool::withdraw_until("81393", until);
     let d = route_read_in(ws.path(), &r, &hygiene("acme/stale"), &v2(&cfg), now);
     assert_eq!(cause_of(&d), ExhaustCause::Unavailable);
-    assert!(!ReadClass::Hygiene.sheds(cause_of(&d)));
-    assert!(ReadClass::Observability.sheds(cause_of(&d)));
 }
 
 #[test]
@@ -913,4 +941,73 @@ fn the_front_uses_a_reader_only_when_its_directory_is_private() {
     assert_eq!(trusted_in_front(reader.clone(), &|_| true), reader);
     assert_eq!(trusted_in_front(reader, &|_| false), RouteDecision::NoPool);
     assert_eq!(trusted_in_front(RouteDecision::NoPool, &|_| false), RouteDecision::NoPool);
+}
+
+/// #12630: a shed's log line names, per reader, what the router saw — the
+/// withdrawal and its kind, a stale token directory, and the bucket-book
+/// reading with its source — so a "no reader can serve" run can be traced
+/// to the entry that caused it.
+#[test]
+fn describe_readers_names_each_readers_withdrawal_directory_and_book_reading() {
+    let now = SystemTime::now();
+    let (limited, stale, fine) = ("963001", "963002", "963003");
+    let r = roster(vec![
+        reader(limited, None),
+        reader(stale, None),
+        reader(fine, None),
+    ]);
+    let ws = workspace(&roster(vec![reader(limited, None), reader(fine, None)]), &["descr"]);
+    let at = epoch(now);
+    forge_read_pool::withdraw_scoped_budget_until(
+        limited,
+        "descr",
+        forge_read_pool::ResourceScope::Core,
+        now + Duration::from_secs(900),
+    );
+    forge_bucket_book::insert(
+        BucketKey::new("app-963001", "descr", Resource::Core),
+        Reading {
+            limit: Some(5000),
+            remaining: Some(0),
+            used: Some(5000),
+            reset_epoch: at + 900,
+            observed_at: at,
+            source: Source::Refusal,
+        },
+    );
+    forge_bucket_book::insert(
+        BucketKey::new("app-963003", "descr", Resource::Core),
+        Reading {
+            limit: Some(5000),
+            remaining: Some(4100),
+            used: Some(900),
+            reset_epoch: at + 1800,
+            observed_at: at,
+            source: Source::Header,
+        },
+    );
+    let line = describe_readers_in(ws.path(), &r, "descr/app", Resource::Core, now).unwrap();
+    let part = |app: &str| {
+        line.split("; ")
+            .find(|p| p.starts_with(&format!("app {app}:")))
+            .unwrap_or_else(|| panic!("{app} missing from {line}"))
+            .to_string()
+    };
+    let l = part(limited);
+    assert!(l.contains("withdrawn from descr core until"), "{l}");
+    assert!(l.contains("(rate limit)"), "{l}");
+    assert!(l.contains("book 0/5000") && l.ends_with("from refusal"), "{l}");
+    let s = part(stale);
+    assert!(s.contains("token directory stale or unpublished"), "{s}");
+    assert!(s.contains("no book reading"), "{s}");
+    let f = part(fine);
+    assert!(
+        f.contains("usable") && f.contains("book 4100/5000") && f.ends_with("from header"),
+        "{f}"
+    );
+
+    assert_eq!(
+        describe_readers_in(ws.path(), &roster(vec![]), "descr/app", Resource::Core, now),
+        None
+    );
 }

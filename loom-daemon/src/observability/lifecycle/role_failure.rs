@@ -288,6 +288,15 @@ pub mod step {
         message: "step exited with no status and no outcome line",
     };
 
+    pub const NO_PR: StepSite = StepSite {
+        class: "step-no-pr",
+        message: "builder step exited cleanly but opened no PR",
+    };
+    pub const NO_OUTCOME_LINE: StepSite = StepSite {
+        class: "step-no-outcome-line",
+        message: "step exited cleanly but wrote no outcome line",
+    };
+
     /// Every step class, for the contract tests.
     pub const ALL: &[StepSite] = &[
         TIMED_OUT,
@@ -295,6 +304,8 @@ pub mod step {
         OUTCOME_FAILED,
         EXIT_NONZERO,
         STATUS_UNKNOWN,
+        NO_PR,
+        NO_OUTCOME_LINE,
     ];
 
     impl StepSite {

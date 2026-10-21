@@ -458,13 +458,12 @@ fn a_failed_by_head_lookup_is_an_error_never_an_empty_answer() {
 #[path = "forge_pull_listing_edges_tests.rs"]
 mod edges;
 
-/// #12074 review: the step tick's open-PR listing is a Gate read again, so
-/// inside a tick with every reader out of budget it still reaches the writer
-/// (the router offered no reader, so nothing was tried): Builder steps are
-/// not held for a whole rate-limit window.
+/// #12394: the step tick's open-PR listing is a Gate read, and a Gate read is
+/// shed like any other when every reader is out of budget: no request goes to
+/// the writer, and the step gather answers from its last good listing.
 #[cfg(unix)]
 #[test]
-fn the_open_pr_listing_reaches_the_writer_when_readers_are_out_of_budget() {
+fn the_open_pr_listing_is_shed_not_sent_to_the_writer_when_readers_are_out_of_budget() {
     use crate::forge_identity::{ExhaustCause, RouteDecision};
     let dir = tempfile::tempdir().unwrap();
     let (gh, log) = write_fake_gh(dir.path(), 2);
@@ -473,9 +472,9 @@ fn the_open_pr_listing_reaches_the_writer_when_readers_are_out_of_budget() {
         cause: ExhaustCause::Budget,
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let _scope = crate::gh_invocation::read_deadline::enter(deadline, true);
+    let _scope = crate::gh_invocation::read_deadline::enter(deadline);
     let repo = format!("acme/pulls-budget-{}", std::process::id());
-    let pulls = list_open_pulls_cached_as("test", &gh, Some(dir.path()), Some(&repo), 3).unwrap();
-    assert_eq!(pulls.len(), 2);
-    assert_eq!(log_lines(&log).len(), 1, "served by the writer");
+    let pulls = list_open_pulls_cached_as("test", &gh, Some(dir.path()), Some(&repo), 3);
+    assert!(pulls.is_err(), "a shed listing is no listing");
+    assert!(log_lines(&log).is_empty(), "the writer was not asked");
 }

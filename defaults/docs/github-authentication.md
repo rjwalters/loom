@@ -243,9 +243,15 @@ exploration) starves the daemon.
   naming the account: its pool is shared with every PAT, OAuth token and `gh`
   login of that user. The report never carries a token value.
 - Reads by pool: `loom-daemon status --json | jq .forge_calls.identity_roles`
-  counts calls per identity role: `reader` (a reader App's pool), `writer`,
-  `writer-fallback` (a read a reader failed on, re-run on the writer) and
-  `unknown` (a call recorded outside the `gh` facade, or by an older binary).
+  counts calls per identity role: `reader` (a reader App's pool), `writer`
+  and `unknown` (a call recorded outside the `gh` facade, or by an older
+  binary). **The writer is never used for reads** (#12394): a read no reader
+  can serve is shed, not re-run on the writer, so `writer` rows should be
+  writes plus the few read-backs a write needs (listed in
+  `loom-daemon/tests/writer_read_guard.rs`); a read on the writer outside
+  that list logs an error. Older rows may still show `writer-fallback`.
+  Rule and exceptions: `daemon-reference.md` → "The writer is never used for
+  reads".
 - Calls by billed bucket (W1): `loom-daemon forge calls --by bucket` (or
   `--by caller|role|repo`, `--since 90m|3h`) rolls up this host's forge-call
   sink per `(account, cred_owner, resource, reset)`. Each row shows what this
@@ -644,7 +650,7 @@ over all reads. A rise means a classifier gap, not an outage.
 Discovery listings can also skip GitHub, and the gateway, entirely: with a
 state mirror configured (`forge.mirror`), the work finder
 reads fresh listings from it and fall back to the paths above. See
-[`forge-events.md` §8](forge-events.md#8-the-state-mirror-forgemirror-discovery-reads-and-wakes).
+[`forge-events.md`](forge-events.md#the-state-mirror-forgemirror-discovery-reads-and-the-change-stream).
 
 ### The cached-permission window: `403 … not accessible by integration` (#6074)
 

@@ -105,6 +105,33 @@ pub fn workspace_root() -> Option<&'static Path> {
     WORKSPACE_ROOT.get().map(PathBuf::as_path)
 }
 
+/// The root a read made for the checkout at `given` routes against: the one
+/// whose roster and **published reader directories** [`route_read`] uses —
+/// the daemon's workspace root, else the agent front's reader root, else
+/// `given` (a CLI process with neither).
+///
+/// [`spawn_reader_refresh`] publishes reader tokens under the daemon's
+/// workspace root only. A managed checkout's own `.loom/gh-config-by-owner`
+/// holds at most a writer token, so routing against it found every reader
+/// "stale" and shed the read without asking one (#12630).
+#[must_use]
+pub fn reader_root(given: &Path) -> PathBuf {
+    reader_root_with(given, published_reader_root())
+}
+
+/// The root this process's reader tokens are published under: the daemon's
+/// workspace root, else the agent front's reader root ([`reader_root`]).
+#[must_use]
+pub fn published_reader_root() -> Option<&'static Path> {
+    workspace_root().or_else(front_root)
+}
+
+/// [`reader_root`] with the published root injected.
+#[must_use]
+pub fn reader_root_with(given: &Path, published: Option<&Path>) -> PathBuf {
+    published.unwrap_or(given).to_path_buf()
+}
+
 /// Exported to agent sessions (#12207): the daemon's workspace root, whose
 /// roster and published reader directories the agent `gh` front's served
 /// reads may use when no gateway profile answers for the owner. A
@@ -915,21 +942,18 @@ pub fn apply_read_credential(
 pub enum IdentityRole {
     /// A reader App's own installation pool.
     Reader,
-    /// The writer credential, chosen up front (no usable reader, a write, or
-    /// a read pinned with `GhInvocation::writer_identity`).
+    /// The writer credential, chosen up front (no reader pool on the host, a
+    /// write, or a read pinned with `GhInvocation::writer_identity`).
     Writer,
-    /// The writer, re-running a read a reader failed on.
-    WriterFallback,
 }
 
 impl IdentityRole {
-    /// The accounting value: `reader` / `writer` / `writer-fallback`.
+    /// The accounting value: `reader` / `writer`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             IdentityRole::Reader => "reader",
             IdentityRole::Writer => "writer",
-            IdentityRole::WriterFallback => "writer-fallback",
         }
     }
 }
@@ -962,46 +986,23 @@ pub fn writer_bucket(owner: &str) -> Option<String> {
     .then(|| format!("{WRITER_BUCKET_PREFIX}{}", owner.to_ascii_lowercase()))
 }
 
-/// The writer bucket that serves `owner_repo` (#10334), mirroring how a
-/// writer `gh` call picks its credential (`GhInvocation::env_plan`): the
-/// owner's own writer when one is registered for it
-/// (`owner_writer_registered`, `credential_preflight::gh_config_dir_for_owner_slug`),
-/// else the primary writer, booked under the workspace's own owner
-/// (`primary_owner`). With the primary owner unknown, the repo's owner — the
-/// same owner a writer row without a credential owner is booked under.
-#[must_use]
-pub fn serving_writer_bucket(
-    owner_repo: &str,
-    owner_writer_registered: bool,
-    primary_owner: Option<&str>,
-) -> Option<String> {
-    let repo_owner = crate::credential_preflight::owner_of_nwo(owner_repo);
-    match primary_owner {
-        Some(primary) if !owner_writer_registered => writer_bucket(primary),
-        _ => writer_bucket(repo_owner),
-    }
-}
-
-/// The one reader-then-writer retry shape (#9537, shared since #9872 by
-/// `forge_etag_store::fetch_conditional` and the `GhInvocation` choke point).
+/// The one reader-only read shape (#12394; was `reader_then_writer`, #9537/#9872).
 ///
-/// With no `reader_dir`, `run` is called once on the writer. Otherwise it runs
-/// on the reader first; a success, or a failure that is not the credential's
-/// (`failure_of` → `None`), is returned as-is. On a rate limit or credential
-/// failure the reader
-/// is withdrawn (`withdraw`, handed the reader's failed result) and the read
-/// re-runs once on the writer (any [`Failure::is_app_wide`] failure: a rate
-/// limit or a refused credential; W4-A scopes the withdrawal, not this
-/// retry). On a
-/// 403/404 ([`Failure::Coverage`]) the read re-runs on the writer and the
-/// reader is withdrawn **only if the writer succeeds**: a resource missing for
-/// everyone must not take the repo's reader offline.
+/// **A read never falls through to the writer.** With no `reader_dir` (the
+/// host has no reader pool, [`RouteDecision::NoPool`]: the writer is the only
+/// credential there is) `run` is called once as [`IdentityRole::Writer`].
+/// Otherwise it runs on the reader once, and whatever that attempt answers is
+/// returned as-is: a success, or a failure the caller already maps to "no
+/// answer this tick". On a rate limit or credential failure the reader is
+/// withdrawn (`withdraw`, handed the reader's failed result) so the next read
+/// is routed past it; a 403/404 ([`Failure::Coverage`]) is the reader's own
+/// answer and withdraws nothing (nothing confirms the resource exists for
+/// anyone, and the writer is not asked).
 ///
 /// # Errors
 ///
-/// Whatever `run` returns; an `Err` from the reader attempt is not retried
-/// (it means the call could not be made, not that the reader was refused).
-pub fn reader_then_writer<T, E>(
+/// Whatever `run` returns.
+pub fn read_via_reader<T, E>(
     reader_dir: Option<&Path>,
     mut run: impl FnMut(Option<&Path>, IdentityRole) -> Result<T, E>,
     succeeded: impl Fn(&T) -> bool,
@@ -1015,18 +1016,12 @@ pub fn reader_then_writer<T, E>(
     if succeeded(&first) {
         return Ok(first);
     }
-    let Some(failure) = failure_of(&first) else {
-        return Ok(first);
-    };
-    if failure.is_app_wide() {
-        withdraw(failure, &first);
-        return run(None, IdentityRole::WriterFallback);
+    if let Some(failure) = failure_of(&first) {
+        if failure.is_app_wide() {
+            withdraw(failure, &first);
+        }
     }
-    let second = run(None, IdentityRole::WriterFallback)?;
-    if succeeded(&second) {
-        withdraw(failure, &first);
-    }
-    Ok(second)
+    Ok(first)
 }
 
 /// Whether a failed read is the credential's fault (see [`classify_failure`]).

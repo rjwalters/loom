@@ -75,6 +75,9 @@ fn lying_logs() -> serde_json::Value {
         {"key": "loom.relay.redaction", "value": {"stringValue": "none"}},
         {"key": "loom.fleet.config_sha", "value": {"stringValue": "forged-fedcba"}},
         {"key": "loom.daemon.revision", "value": {"stringValue": "forged-revision"}},
+        {"key": "cloud.provider", "value": {"stringValue": "forged-cloud"}},
+        {"key": "cloud.region", "value": {"stringValue": "forged-region"}},
+        {"key": "host.type", "value": {"stringValue": "forged-type"}},
         {"key": "service.version", "value": {"stringValue": "9.9.9-fixture"}},
         {"key": "os.type", "value": {"stringValue": "fixture-os"}}
     ]);
@@ -151,6 +154,32 @@ fn identity_comes_from_the_daemon_whatever_the_sender_claimed() {
     let exported = serde_json::to_string(request).unwrap();
     assert!(!exported.contains("forged"), "{exported}");
     assert!(!exported.contains("champion"), "{exported}");
+}
+
+/// #12874: `cloud.*` is daemon-owned — a sender's `cloud.region` is stripped
+/// and the daemon's own (from the IMDS cell) is the only one left.
+#[test]
+#[serial(loom_socket_path_env)]
+fn a_senders_cloud_keys_are_replaced_by_the_daemons() {
+    pin_config_sha_unknown();
+    crate::host_shape::set_cloud_for_test(Some(crate::host_shape::CloudShape {
+        provider: "aws",
+        instance_type: "c7i.2xlarge".to_string(),
+        region: "us-east-1".to_string(),
+    }));
+    let mut payload = decode_json(Signal::Logs, &lying_logs());
+    let bound_count = bind_and_scrub(&mut payload, &bound());
+    crate::host_shape::set_cloud_for_test(None);
+    assert_eq!(bound_count, 1);
+    let Payload::Logs(request) = &payload else {
+        panic!("logs in, logs out")
+    };
+    let pairs = resource_pairs(request.resource_logs[0].resource.as_ref().unwrap());
+    assert_eq!(one(&pairs, "cloud.region"), "us-east-1");
+    assert_eq!(one(&pairs, "cloud.provider"), "aws");
+    assert_eq!(one(&pairs, "host.type"), "c7i.2xlarge");
+    let exported = serde_json::to_string(request).unwrap();
+    assert!(!exported.contains("forged"), "{exported}");
 }
 
 #[test]
@@ -632,6 +661,8 @@ fn the_daemon_owned_filter_ignores_case() {
         "Host.Name",
         "HOST.ID",
         " host.id",
+        "cloud.region",
+        "Cloud.Provider",
     ] {
         assert!(daemon_owned(key), "{key}");
     }
