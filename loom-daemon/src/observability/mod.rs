@@ -144,6 +144,8 @@ pub mod stage_entry_fact;
 pub mod stage_occupancy;
 pub mod standalone_ops;
 pub mod step_verdict;
+#[cfg(test)]
+pub(crate) mod test_sink;
 pub mod tracing;
 pub mod work_started;
 
