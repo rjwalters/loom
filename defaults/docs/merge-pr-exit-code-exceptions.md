@@ -99,7 +99,7 @@ warning).
 **Kept: the required-context conclusion gate (#10688).** `_check_required_checks`
 (`loom-daemon merge-pr required-checks`) still runs once before the call. A
 bypass-capable (admin) token walks through the ruleset's required checks
-(2AMLogic/2am#3112), so the script itself refuses (exit 1) a red required
+(a ruleset-required-check bypass, see #10688), so the script itself refuses (exit 1) a red required
 context and holds (exit 5) a missing or pending one;
 `--allow-red-required <context>` overrides exactly the named contexts and
 records an audit comment. It is GitHub-only and fails open on a daemon that
