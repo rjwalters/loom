@@ -301,7 +301,7 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&st
     if problems.is_empty() {
         // Telemetry only (#12362): the verdict the run observed, from this
         // write; no forge call.
-        loom_daemon::observability::pick_journal::record_verdict(pr, journal_action(kind), sha);
+        crate::observability::pick_journal::record_verdict(pr, journal_action(kind), sha);
         println!("{} OK {}", gate::LABELS_SENTINEL, add.join(","));
         return Ok(());
     }
