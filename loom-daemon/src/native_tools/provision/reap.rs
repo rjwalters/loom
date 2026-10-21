@@ -43,6 +43,7 @@
 //! strands the previous one; each carries a [`LAST_USED`] marker and is removed
 //! after [`Policy::binding_max_idle`] without a launch.
 
+use crate::fs_util::human_size;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -382,20 +383,10 @@ pub fn summary(report: &Report, dry_run: bool) -> String {
         if report.sessions.len() == 1 { "y" } else { "ies" },
         report.bindings.len(),
         if report.bindings.len() == 1 { "" } else { "s" },
-        human_bytes(report.bytes),
+        human_size(report.bytes),
         report.kept,
         if report.kept == 1 { "" } else { "s" },
     )
-}
-
-fn human_bytes(bytes: u64) -> String {
-    let value = bytes as f64;
-    for (unit, scale) in [("G", 1u64 << 30), ("M", 1 << 20), ("K", 1 << 10)] {
-        if bytes >= scale {
-            return format!("{:.1}{unit}", value / scale as f64);
-        }
-    }
-    format!("{bytes}B")
 }
 
 #[cfg(test)]

@@ -168,6 +168,10 @@ pub mod auto_update_tick;
 /// eligibility boundary.
 pub mod dispatch_eligibility;
 
+/// `eta.dispatch_state` (#12918) — each classified open item's dispatch
+/// gate and its release time, from the step dispatcher's tick.
+pub mod dispatch_state;
+
 /// `eta.stage_entry` (#12869) — an item's observed arrival in a pipeline
 /// stage, diffed from the discovery snapshot.
 pub mod stage_entry;
@@ -204,6 +208,10 @@ pub mod host_status;
 
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
+
+/// Producer-liveness guard: every registered kind has a producer or is on an
+/// explicit producer-less allowlist (#12947, #11301 post-mortem).
+pub mod kind_producer;
 
 /// `scope.memory` (#12241) — one agent scope's memory limit, peak and OOM kills.
 pub mod scope_memory;
@@ -588,6 +596,15 @@ macro_rules! telemetry_kind_table {
             /// `ready_wait` signal the dwell facts could not see. OTLP-only.
             /// See [`dispatch_eligibility`].
             DispatchEligibility = "eta.dispatch_eligibility" => $crate::telemetry::kinds::dispatch_eligibility::DispatchEligibilityRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One classified open item's dispatch gate as of one step
+            /// dispatch tick (Issue #12918): in the draw pool or the
+            /// `Exclusion` that kept it out, the gate's release time
+            /// (`gate_until`) where it has one, and the Champion
+            /// re-evaluation ladder's rung and `next`. One row per item, no
+            /// cap. OTLP-only. See [`dispatch_state`].
+            DispatchState = "eta.dispatch_state" => $crate::telemetry::kinds::dispatch_state::DispatchStateRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One alert opening (or re-asserting) or resolving on this host

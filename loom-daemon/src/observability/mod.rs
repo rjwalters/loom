@@ -111,6 +111,7 @@ pub mod daemon_event;
 pub mod daemon_exit;
 pub mod daemon_lifecycle;
 pub mod dispatch_eligibility;
+pub mod dispatch_state;
 pub mod endpoint_policy;
 pub mod exporter;
 pub mod hold_transition;
@@ -1278,6 +1279,9 @@ pub fn spawn_task(
     // decision per waiting ready item, OTLP-only, sampled by the collector
     // below on the same cadence as `queue.snapshot`.
     dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.dispatch_state` (#12918): each classified item's dispatch gate and
+    // its release time, OTLP-only, emitted by the step driver's tick.
+    dispatch_state::register_sink(otlp_queues.clone(), &host_id);
     // `eta.stage_occupancy` (#12866): the pre-ready stage occupancy gauge,
     // OTLP-only, sampled by the collector on the same cadence.
     stage_occupancy::register_sink(otlp_queues.clone(), &host_id);

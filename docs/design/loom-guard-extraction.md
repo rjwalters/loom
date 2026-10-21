@@ -308,16 +308,18 @@ passes all five dispatcher probes".
 
 Findings that change the earlier text:
 
-1. **A missing or non-executable vendored engine is not reported.** With
+1. **A missing vendored engine was not reported (fixed here).** With
    `.loom/hooks/guard-destructive-generic.sh` deleted, the dispatcher fails open
-   (no decision, exit 0) and `check-guards-installed.sh` still exits 0; with the
-   file merely non-executable it also exits 0. The script only inspects hooks
-   named in `settings.json`, and the engine is a sibling file the dispatcher
-   `exec`s, not a wired hook. The earlier statement that zero-engine "is visible
-   rather than silent" was **wrong at this commit**. The shared component's
-   install contract therefore needs the engine (or its manifest) to be an
-   explicit check target; that is a design requirement (section 8, step 5), not
-   something this change implements.
+   (no decision, exit 0) and `check-guards-installed.sh` used to exit 0, because
+   it only inspected hooks named in `settings.json` and the engine is a sibling
+   the dispatcher `exec bash`es. `check-guards-installed.sh` now also requires
+   the engine to be readable next to the resolved dispatcher whenever
+   `guard-destructive.sh` is wired: exit 2 (`NO ENGINE`) unless a Repo Skills
+   guard exists to cover, in which case it prints `degraded`. A merely
+   non-executable engine stays exit 0 on purpose (the dispatcher needs only read
+   access). Receipt: `test-guard-install-matrix.sh` asserts exit 2 for the deleted
+   engine and `check-guards-installed.sh --self-test` covers both directions.
+   The shared component's manifest check should still subsume this later.
 2. **A missing wired project copy is `DEGRADED`, not `BROKEN`, when a machine
    checkout exists.** With `.loom/hooks/guard-destructive.sh` removed but
    `settings.json` still wiring it, the check exits 0 while `$LOOM_HOME` holds the
@@ -341,10 +343,10 @@ Constraints carried over, not changed:
 - User opt-outs and `guards.*` configuration live in `.loom/config.json` and
   env, not in the engine file, so replacing the engine preserves them.
 - If no compatible artifact is available: the bundled fallback runs; if that is
-  also unreadable the dispatcher exits 0 (existing fail-open). Measured: at
-  this commit `check-guards-installed.sh` does **not** report that state (finding
-  1 above), so zero-engine is currently silent, and the shared component must
-  add the check.
+  also unreadable the dispatcher exits 0 (existing fail-open). Measured:
+  `check-guards-installed.sh` now reports that state as `NO ENGINE` (exit 2)
+  when no Repo Skills guard covers it (finding 1 above); the shared component's
+  manifest check should subsume it.
 
 ## 7. tmpfs/ramfs build-directory protection
 
@@ -418,9 +420,9 @@ This preparation does not authorize, and this change does not do:
   `heredoc-subst` (section 4). Only the first assertions of each suite were
   read, so the classes in that table marked "candidate" are hypotheses. No
   claim is made that the historical "~311" figure is current or wrong.
-- `check-guards-installed.sh` does not check the engine file (section 6,
-  finding 1). Whether the fix belongs in that script or in the shared
-  component's manifest check is undecided.
+- `check-guards-installed.sh` now checks the engine file (section 6, finding 1).
+  Whether the shared component's manifest check should replace that probe is
+  undecided.
 - Whether the write-confinement and `--body @path` families belong in the
   shared engine or a Loom overlay (section 3). `mkdir-confinement`,
   `write-confinement` and `force-scope` show the largest Loom-specific

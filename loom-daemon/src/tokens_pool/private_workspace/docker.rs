@@ -1,23 +1,46 @@
 use super::*;
 use serde_json::{json, Value};
-use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use super::super::docker_cli;
+
+/// Budget for the long `exec`s (`setup`, `prepare`): a clone or fetch inside
+/// the session legitimately outlasts a reconcile-sized call.
+pub(super) const EXEC_TIMEOUT: Duration = docker_cli::DOCKER_RUN_TIMEOUT;
 
 /// Capture without forwarding Docker stderr: exec/auth errors may contain
 /// credential material. All callers report the operation, never its payload.
+///
+/// Bounded by [`docker_cli::timeout_for`], so a wedged engine fails the call
+/// with the typed [`docker_cli::DockerTimedOut`] instead of holding the lease
+/// (and the reconciler thread) forever.
 pub(super) fn command(args: &[&str]) -> Result<String> {
-    let output = Command::new("docker")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("Docker unavailable")?;
-    if !output.status.success() {
+    command_with(args, docker_cli::timeout_for(args))
+}
+
+/// [`command`] with an explicit budget, for calls longer than their
+/// subcommand's default (`exec` of `setup`/`prepare`).
+pub(super) fn command_with(args: &[&str], timeout: Duration) -> Result<String> {
+    // Every Docker call of this module goes through here, so a fake installed
+    // on this thread (`fake`, tests only) stands in for the whole engine.
+    #[cfg(test)]
+    if let Some(result) = fake::dispatch(args) {
+        return result;
+    }
+    let (success, stdout, _stderr) =
+        docker_cli::run_bounded("docker", args, timeout).map_err(|error| {
+            match error.downcast::<docker_cli::DockerTimedOut>() {
+                Ok(timed_out) => anyhow::Error::new(timed_out),
+                Err(error) => error.context("Docker unavailable"),
+            }
+        })?;
+    if !success {
         bail!(
-            "Docker {} failed ({}); inspect the session with Docker locally",
+            "Docker {} failed; inspect the session with Docker locally",
             args.first().unwrap_or(&"operation"),
-            output.status
         );
     }
-    String::from_utf8(output.stdout).context("Docker returned invalid text")
+    Ok(stdout)
 }
 
 pub(super) fn desktop() -> Result<bool> {
@@ -219,6 +242,18 @@ pub(super) fn idle(state: Option<&Value>, container: &str) -> Result<bool> {
         && processes.contains(&"/bin/sleep infinity"))
 }
 
+pub(super) fn volume_exists(volume: &str) -> Result<bool> {
+    let volumes = command(&["volume", "ls", "--format", "{{.Name}}"])?;
+    Ok(volumes.lines().any(|name| name == volume))
+}
+
+/// The recorded image must already be local: recovery never pulls or swaps one.
+pub(super) fn image_present(image: &str) -> Result<()> {
+    command(&["image", "inspect", "--format", "{{.Id}}", image])
+        .map(drop)
+        .with_context(|| format!("recorded session image {image} is not available locally"))
+}
+
 pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     let volumes = command(&["volume", "ls", "--format", "{{.Name}}"])?;
     if volumes.lines().any(|name| name == config.volume) {
@@ -325,13 +360,16 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
 }
 
 pub(super) fn setup(config: &Config) -> Result<()> {
-    let output = command(&[
-        "exec",
-        &config.container,
-        "loom-daemon",
-        "private-workspace",
-        "setup",
-    ])?;
+    let output = command_with(
+        &[
+            "exec",
+            &config.container,
+            "loom-daemon",
+            "private-workspace",
+            "setup",
+        ],
+        EXEC_TIMEOUT,
+    )?;
     report(&output)
 }
 
@@ -464,7 +502,7 @@ pub(super) fn prepare_target(
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);
     }
-    let output = command(&args).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
+    let output = command_with(&args, EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
     let result: Value = serde_json::from_str(&output)
         .context("private workspace endpoint unavailable; update the session image before reuse")?;
     if result["protocol"] != PROTOCOL {
@@ -508,4 +546,37 @@ fn bind_source_matches(config: &Config, mount: &Value, expected: &Path) -> bool 
         || (cfg!(target_os = "macos")
             && config.docker_desktop
             && mount["Source"] == format!("/host_mnt{expected}"))
+}
+
+/// Test seam: every Docker invocation of this module funnels through
+/// [`command`], so a fake installed on the current thread stands in for the
+/// whole engine (containers, volumes, images, execs) and no test touches a
+/// real Docker (#12772).
+#[cfg(test)]
+pub(super) mod fake {
+    use std::cell::RefCell;
+
+    pub(in super::super) type Handler = Box<dyn FnMut(&[&str]) -> anyhow::Result<String>>;
+
+    thread_local! {
+        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+    }
+
+    /// Route this thread's Docker calls to `handler` until the guard drops.
+    pub(in super::super) fn install(handler: Handler) -> Guard {
+        HANDLER.with(|h| *h.borrow_mut() = Some(handler));
+        Guard
+    }
+
+    pub(in super::super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HANDLER.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn dispatch(args: &[&str]) -> Option<anyhow::Result<String>> {
+        HANDLER.with(|h| h.borrow_mut().as_mut().map(|handler| handler(args)))
+    }
 }

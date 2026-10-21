@@ -158,44 +158,98 @@ fn the_next_request_carries_a_sha_that_changed_in_process() {
     });
 }
 
-/// The `daemon.start` record rides the existing `daemon.event` mapping: event
-/// name `daemon.event`, `loom.topic = "daemon.start"`, and the payload —
-/// carried whole as compact JSON — still names the build, supervisor,
-/// applied config SHA and pid.
+/// The `daemon.start` record rides the `daemon.event` mapping: event name
+/// `daemon.event`, `loom.topic = "daemon.start"`. Its payload is too long for
+/// the 256-byte string bound once it carries a real host id, version and
+/// timestamp, so every field also rides as a typed `loom.payload.<field>`
+/// attribute (#12942) and the collector keeps each one.
 #[test]
-fn daemon_start_maps_to_a_log_with_topic_and_full_payload() {
+fn daemon_start_maps_to_a_log_with_topic_and_typed_payload_fields() {
     let batch = vec![envelope(
-        "host-a",
-        crate::observability::daemon_lifecycle::start_record("systemd"),
+        "test-host-a.example.internal",
+        crate::observability::daemon_lifecycle::start_record(
+            "systemd",
+            &crate::observability::daemon_lifecycle::StartContext {
+                start_time_unix_ms: 1_785_000_000_123,
+                instance: "test-host-a.example.internal/1785000000".to_string(),
+                previous_version: Some("0.19.1198".to_string()),
+                reason: crate::observability::daemon_lifecycle::StartReason::Roll,
+            },
+        ),
     )];
     let logs = build_logs_request(&batch).unwrap();
     let log = &logs.resource_logs[0].scope_logs[0].log_records[0];
-    let attribute = |key: &str| {
+    let value = |key: &str| {
         log.attributes
             .iter()
             .find(|kv| kv.key == key)
             .and_then(|kv| kv.value.as_ref())
-            .and_then(|v| v.value.as_ref())
-            .and_then(|v| match v {
-                any_value::Value::StringValue(s) => Some(s.as_str()),
-                _ => None,
-            })
+            .and_then(|v| v.value.clone())
             .unwrap_or_else(|| panic!("{key} missing from the daemon.start log"))
     };
-    assert_eq!(attribute("loom.topic"), "daemon.start");
-    let payload: serde_json::Value =
-        serde_json::from_str(attribute("loom.payload")).expect("payload is compact JSON");
+    let string = |key: &str| match value(key) {
+        any_value::Value::StringValue(s) => s,
+        other => panic!("{key} is not a string: {other:?}"),
+    };
+    assert_eq!(string("loom.topic"), "daemon.start");
     let build = crate::telemetry::trace::provenance::daemon();
-    assert_eq!(payload["version"], build.version);
-    assert_eq!(payload["revision"], build.revision);
-    assert_eq!(payload["tree_state"], build.tree_state);
-    assert_eq!(payload["supervisor"], "systemd");
-    let sha = payload["config_sha"]
-        .as_str()
-        .expect("config_sha is a string");
+    assert_eq!(string("loom.payload.version"), build.version);
+    assert_eq!(string("loom.payload.revision"), build.revision);
+    assert_eq!(string("loom.payload.tree_state"), build.tree_state);
+    assert_eq!(string("loom.payload.supervisor"), "systemd");
+    let sha = string("loom.payload.config_sha");
     assert!(
         sha == "unknown" || sha == "none" || sha.len() == 40,
         "config_sha must be a SHA or an explicit sentinel, got {sha:?}"
     );
-    assert_eq!(payload["pid"], serde_json::json!(std::process::id()));
+    assert_eq!(
+        value("loom.payload.pid"),
+        any_value::Value::IntValue(i64::from(std::process::id()))
+    );
+    assert_eq!(
+        value("loom.payload.start_time_unix_ms"),
+        any_value::Value::IntValue(1_785_000_000_123)
+    );
+    assert_eq!(string("loom.payload.instance"), "test-host-a.example.internal/1785000000");
+    assert_eq!(string("loom.payload.previous_version"), "0.19.1198");
+    assert_eq!(string("loom.payload.start_reason"), "roll");
+}
+
+/// Every typed `daemon.start` attribute survives the collector's privacy
+/// allowlist, and the list names every payload field the record carries.
+#[test]
+fn the_collector_keeps_every_daemon_start_attribute() {
+    const CONFIG: &str =
+        include_str!("../../../../../../defaults/observability/collector/config.yaml");
+    let keep = CONFIG
+        .lines()
+        .find(|l| l.contains("keep_keys(attributes, [") && l.contains("loom.ci.chunk_index"))
+        .expect("the transform/privacy log keep_keys line");
+    for key in crate::observability::daemon_lifecycle::START_LOG_ATTRIBUTE_KEYS {
+        assert!(keep.contains(&format!("\"{key}\"")), "collector drops {key}");
+    }
+    let record = crate::observability::daemon_lifecycle::start_record(
+        "none",
+        &crate::observability::daemon_lifecycle::StartContext {
+            start_time_unix_ms: 0,
+            instance: "h/0".to_string(),
+            previous_version: Some("0".to_string()),
+            reason: crate::observability::daemon_lifecycle::StartReason::Cold,
+        },
+    );
+    let crate::telemetry::TelemetryRecord::DaemonEvent(event) = record else {
+        panic!("daemon.start is a daemon.event record")
+    };
+    for (field, value) in event.payload.as_object().expect("object payload") {
+        // `work_finder` is a nested object (or null): it stays in `loom.payload`.
+        if field == "work_finder" || value.is_null() && field != "previous_version" {
+            continue;
+        }
+        let key = format!("loom.payload.{field}");
+        assert!(
+            crate::observability::daemon_lifecycle::START_LOG_ATTRIBUTE_KEYS
+                .contains(&key.as_str()),
+            "{key} is not carried typed"
+        );
+    }
 }

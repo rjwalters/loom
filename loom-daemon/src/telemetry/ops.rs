@@ -84,6 +84,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // `loom.dispatch.running_by_age`'s `age` bucket (a closed set of four).
     "host",
     "age",
+    // #12957: `loom.dispatch.running_by_points`' `points` class
+    // (`1|2|3|5|8|13|unsized`, a closed set of seven).
+    "points",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -201,6 +204,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.in_flight_repo",
     "loom.step.model_selected",
     "loom.step.model_launched",
+    // #12957: the item's story points, on `loom.dispatch.step` and on the
+    // step's `loom.sweep` close (the key `sweep.started` already exports).
+    "loom.story_points",
     // `loom.dispatch.step` claim facts (Issue #12183).
     "loom.dispatch.claim_outcome",
     "loom.dispatch.claim_exit_code",
@@ -544,6 +550,10 @@ pub enum MetricName {
     /// and `age` (`lt_15m` / `15m_1h` / `1h_4h` / `ge_4h`), #12873.
     #[serde(rename = "loom.dispatch.running_by_age")]
     DispatchRunningByAge,
+    /// Live steps per story-point class, labelled `role`, `pool="step"` and
+    /// `points` (`1|2|3|5|8|13|unsized`), #12957. A count, never a sum.
+    #[serde(rename = "loom.dispatch.running_by_points")]
+    DispatchRunningByPoints,
     /// Items the step tick could draw (weight > 0, after the live claims),
     /// labelled `repo`, sampled every work-finder tick (#11909).
     #[serde(rename = "loom.step.actionable")]
@@ -814,6 +824,7 @@ impl MetricName {
             Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
             Self::DispatchRunningOldestAgeSec => "loom.dispatch.running_oldest_age_sec",
             Self::DispatchRunningByAge => "loom.dispatch.running_by_age",
+            Self::DispatchRunningByPoints => "loom.dispatch.running_by_points",
             Self::StepActionable => "loom.step.actionable",
             Self::ForgeHoldItems => "loom.forge.hold_items",
             Self::ForgeHoldAgeSeconds => "loom.forge.hold_age_seconds",
@@ -948,6 +959,7 @@ impl MetricName {
             | Self::DispatchRoleMaxConcurrent
             | Self::DispatchRoleIdleSlots
             | Self::DispatchRunningByAge
+            | Self::DispatchRunningByPoints
             | Self::FleetDispatchFreeSlotsReported => "{slot}",
             Self::DispatchRunningOldestAgeSec | Self::FleetDispatchOldestLiveAgeSec => "s",
             Self::FleetDispatchRows => "{row}",
@@ -1058,6 +1070,9 @@ impl MetricName {
                 "Seconds the oldest live step of a role has been running (pool=step)."
             }
             Self::DispatchRunningByAge => "Live steps per running-age bucket, by role (pool=step).",
+            Self::DispatchRunningByPoints => {
+                "Live steps per story-point class, by role (pool=step)."
+            }
             Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::ForgeHoldItems => {
                 "Open items per repo carrying a hold or park label, by artifact, hold and basis."

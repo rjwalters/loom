@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use loom_daemon::forge_probe::{run, verdict, LiveHttp, RunnerConfig};
+use crate::forge_probe::{run, verdict, LiveHttp, RunnerConfig};
 
 #[derive(clap::Args)]
 pub(crate) struct ForgeProbeArgs {

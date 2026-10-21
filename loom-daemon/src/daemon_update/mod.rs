@@ -32,8 +32,10 @@
 //! | 4 | build verification FAILED — the built binary embeds the wrong commit |
 //! | 5 | post-provision verification FAILED — the destination is not what this run produced |
 //! | 6 | supervised restart REFUSED by the running (old) binary |
-//! | 7 | restart ACK'd but the supervisor never relaunched, and the self-heal also failed |
+//! | 7 | restart ACK'd but the supervisor never relaunched, and the self-heal also failed — and no restore was possible (the reason is printed; #12776) |
 //! | 8 | drain fail-safe preserved — not a failure |
+//! | 9 | the candidate failed to start; the previous binary was RESTORED and its daemon is running. The update did NOT take (#12776) |
+//! | 10 | the candidate failed to start and the restore, or the restart onto the restored binary, failed; the host may be down (#12776) |
 //!
 //! The full behavioural reference is `--help`, rendered from `help.txt`, which
 //! is the script's own leading comment block verbatim.
@@ -858,14 +860,21 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         verify::verify_supervisor_matches_provisioned(dest, &s.sup);
     };
 
+    // The install this invocation made, for a restore after a failed start
+    // (#12776). Taken from this invocation's own publish, never re-read from
+    // the record afterwards (another publisher may have replaced it).
+    let mut install_identity: Option<(PathBuf, provision::txn::InstallIdentity)> = None;
+
     if let Some(explicit) = util::env_non_empty("LOOM_DAEMON_BIN") {
         // Explicit operator override — provision directly to that exact path
         // (the one loom-daemon-start.sh will resolve to next), rather than the
         // machine-level default.
         let dest = PathBuf::from(&explicit);
         selfrepl::announce_if_self(&dest);
-        if provision::install_to(&new_bin, &dest) {
+        if let Some(published) = provision::install_to_published(&new_bin, &dest) {
             out::ok(&format!("Provisioned loom-daemon -> {}", dest.display()));
+            // From the transaction this call made, read under the install lock.
+            install_identity = bind_install(&dest, published.identity());
         } else {
             out::err(&format!("Failed to provision to LOOM_DAEMON_BIN={}", dest.display()));
             exit(1);
@@ -877,7 +886,7 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         // rename (#10983) and why every check after it re-execs the path.
         selfrepl::announce_if_self(&provision_target);
         match provision::provision_machine_daemon(script, &new_bin, &s.roots.repo_root) {
-            provision::ProvisionOutcome::Provisioned(dest) => {
+            provision::ProvisionOutcome::Provisioned(dest, identity) => {
                 // provision_machine_daemon exports the destination it wrote to
                 // (even on the version-equality short-circuit) — verify that
                 // destination is the expected build so the short-circuit can no
@@ -888,6 +897,9 @@ fn stage_two(a: &Args, s: Stage) -> ! {
                 } else {
                     Some(&dest_path)
                 });
+                if !dest.is_empty() {
+                    install_identity = bind_install(&dest_path, identity);
+                }
             }
             provision::ProvisionOutcome::Failed => {
                 // Hard-fail: a soft warn here (the pre-#4053 behaviour) left
@@ -923,7 +935,26 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         drain_poll_secs: &s.drain_poll_secs,
         built_commit: &built_commit,
         final_line: s.final_line(),
+        install: install_identity.as_ref().map(|(d, i)| (d.as_path(), i)),
     })
+}
+
+/// Pair `dest` with the identity of the install this invocation's own
+/// publish made, printing the reason when there is nothing to bind a restore
+/// to (the restart then runs without one).
+fn bind_install(
+    dest: &Path,
+    identity: Result<provision::txn::InstallIdentity, String>,
+) -> Option<(PathBuf, provision::txn::InstallIdentity)> {
+    match identity {
+        Ok(id) => Some((dest.to_path_buf(), id)),
+        Err(why) => {
+            out::say(&format!(
+                "No restore will be attempted if the new daemon fails to start: {why}."
+            ));
+            None
+        }
+    }
 }
 
 /// `${VAR:-unknown}` for the handful of places the script rendered an

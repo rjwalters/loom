@@ -9,13 +9,78 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 ## Archives
 
 - [2026-08](work_log/WORK_LOG_2026-08.md)
-- [2026-08](work_log/WORK_LOG_2026-08.md)
 - [2026-07](work_log/WORK_LOG_2026-07.md)
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-21
+
+- **PR #12987**: chore: post-merge-cleanup drill (#12510), do not review
+- **PR #12982**: test: bind each shared-pool account's admission to its own repository clone in Docker
+- **PR #12981**: refactor: dedupe byte formatting onto fs_util::human_size
+- **PR #12935**: feat: redraw Champion holds once when standing authorizations change
+- **Issue #12977** (closed): Remove duplicate human_bytes copies; use fs_util::human_size
+- **Issue #12933** (closed): Re-read Champion holds once when standingAuthorizations change (follow-up to #12901)
+- **Issue #11273** (closed): audit-agents phase 6: evidence-backed action classification
+- **PR #12961**: feat(fleet-dispatch): spawn captain-offered items through the step tick's gates
+- **PR #12936**: fix(champion): ignore YAML comments in workflow blast keyword scan
+- **PR #12718**: fix: take verdict-gate review start from dispatch and fail closed
+- **PR #12696**: feat: accept approve/request-changes aliases in post-verdict.sh
+- **PR #12670**: feat: let month-rotated work-log/plan archives pass the docs-only fast path
+- **PR #12559**: fix: exempt merge-authorization context from wait-checks zero-rows, settled and idle paths
+- **Issue #12934** (closed): ci_workflow_blast_eval: ignore YAML comment lines in the release/deploy keyword scan
+- **Issue #12714** (closed): Verdict gate: take review start from dispatch, fail closed, follow Part-of links (#12624 misses the #12512 case)
+- **Issue #12692** (closed): post-verdict.sh: accept `approve` as an alias or name the valid verdicts in the error
+- **Issue #12636** (closed): WORK_LOG archival (4/4): narrow archive paths in Judge/Champion docs-only allowlists, telemetry, imagine seed, install/resync guard
+- **Issue #12552** (closed): forge wait-checks: apply the loom/merge-authorization exemption to the zero-rows and settled/idle paths too (#12532 follow-up)
+- **PR #12968**: docs: document uv cache prune knob in worker disk-full runbook
+- **Issue #12460** (closed): Bound shared tool caches (uv) and prune non-live codex profiles
+
 ### 2026-10-20
 
+- **PR #12771**: docs: align Judge/Doctor CI-wait recipes and mark unreadable required checks unknown
+- **Issue #11272** (closed): audit-agents phase 5: read-only audit CLI and rule catalogue
+- **Issue #10574** (closed): forge wait-checks / judge+doctor prompts: required-contexts via REST, Pending-CI --timeout, doctor step 10 (#10569 follow-ups)
+- **PR #12972**: fix: bound private-workspace Docker calls with the shared deadline runner
+- **PR #12971**: test: real-Docker coverage for private session recovery
+- **PR #12951**: refactor: move the clap CLI tree and handle_cli_command into the loom-daemon library
+- **PR #12774**: feat: bind private-clone admission and launch to the selected repository clone
+- **Issue #12967** (closed): Private-workspace recover: bound Docker calls with a deadline (reconciler thread can stall on a wedged engine)
+- **Issue #12965** (closed): Emit alert.transition as a span (dual-emit with the log), per 2am's span contract
+- **Issue #12937** (closed): loom-tools Phase 2a: move the CLI tree into the library (shared seam, no behavior change) — epic #12708
+- **Issue #12772** (closed): Recover configured private Codex containers through the existing session reconciler
+- **PR #12962**: Telemetry: story points on the step path (loom.dispatch.step, step loom.sweep close, running_by_points gauge)
+- **PR #12956**: test: pin version-policy guard on stale-base manifest-only PRs
+- **PR #12944**: feat: add process identity and start reason to daemon.start
+- **PR #12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
+- **PR #12777**: feat: recover stopped or missing private Codex sessions in reconcile
+- **PR #12613**: fix: disarm an armed floor roll when the fleet floor is rolled back
+- **PR #12599**: feat: keep operator release conditions binding in Champion's sticky-hold precheck
+- **PR #12354**: feat: report auto-update progress and degrade health when checks or convergence stall
+- **Issue #12964** (closed): CI experiment: kache vs rust-cache target/ caching on one ci.yml job
+- **Issue #12957** (closed): Telemetry: story points on the step path (loom.dispatch.step, step loom.sweep close, running_by_points gauge)
+- **Issue #12949** (closed): merge-pr version-policy guard counts main's version bumps on a stale-base PR (split from #12948)
+- **Issue #12942** (closed): Telemetry: emit a daemon start event and per-process identity (crash-loop / roll-restart counting)
+- **Issue #12776** (closed): Restore retained daemon binary after failed operator or fleet roll
+- **Issue #12610** (closed): auto-update: rolling the fleet floor back doesn't cancel a pause-and-roll already armed (or about to arm) toward the withdrawn version
+- **Issue #12594** (closed): Champion: an operator-named release condition on a held PR is lost when a new head makes Champion re-judge
+- **PR #12898**: refactor: reuse release_resolve::host helpers in daemon_update artifact
+- **PR #12955**: test(telemetry): guard a registered loom.kind against losing its last producer (#12947)
+- **PR #12684**: fix: write merge-driver .gitattributes into the install worktree
+- **Issue #12895** (closed): Consolidate duplicated target-triple and repo-slug helpers in daemon_update/artifact.rs onto release_resolve::host
+- **Issue #12947** (closed): guard: fail CI when a registered loom.kind loses its last producer (silent-blackout prevention, #11301 post-mortem)
+- **Issue #12683** (closed): install-loom.sh writes the merge-driver .gitattributes into the target's main checkout but leaves it out of the install PR
+- **PR #12946**: fix: grant group-check workflow reads and re-run on CI completion
+- **PR #12802**: build(deps): bump the npm-minor-patch group across 1 directory with 3 updates
+- **PR #12658**: fix: report a missing guard-destructive engine in check-guards-installed
+- **PR #12570**: fix: check out .loom in the merge-group template and audit group-check without checkout
+- **PR #12539**: fix: remove retired generated skills in source-backed resync
+- **PR #12321**: refactor: answer the gh pr merge guard from the shared command lexer
+- **PR #12154**: fix(resync): make forge label create/refresh opt-in via --sync-labels
+- **Issue #12568** (closed): merge_group workflow can't post loom/merge-authorization: write_scope refuses (no checkout in the template), so every queued PR times out
+- **Issue #12507** (closed): Source-backed resync leaves retired generated Codex skills discoverable
+- **Issue #12236** (closed): guard: shared command-analysis lexer + corpus harness, first move: merge-redirect check (slice 1 of #11113)
+- **Issue #10770** (closed): resync-installed.sh writes forge labels by default; make forge writes opt-in or list them in --dry-run
 - **PR #12931**: feat(fleet-dispatch): captain next endpoint and capacity-driven request backoff
 - **PR #12929**: build(deps): bump hono from 4.13.7 to 4.13.13 in /mcp-loom
 - **PR #12928**: feat: add fleet-config apply-floor for daemon-less hosts below the fleet floor
@@ -5631,51 +5696,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6633**: docs: genericize consumer-org reference in worktree-awk test comment
 - **Issue #6615** (closed): Queued dispatch_sweep requests (and their pre-spawn label flips) are silently lost when the daemon dies before spawning
 - **PR #6629**: fix(daemon): reclaim orphaned loom:building claims immediately at startup
-
-### 2026-08-20
-
-- **Issue #6601** (closed): champion: epic Phase-1 issues created twice — approval-time creation and the phase scanner both fired (epic 2am#372, product#79-81 then #84-86)
-- **PR #6617**: fix(champion): pre-creation existence check stops duplicate epic phase issues
-- **Issue #6605** (closed): test-live-state-sandbox.sh case 9a spuriously fails when ambient LOOM_WATCHDOG_LABEL is the real production watchdog label
-- **PR #6611**: fix(tests): give case 9a an explicit scratch watchdog arg in test-live-state-sandbox.sh
-- **Issue #6604** (closed): test-live-state-sandbox.sh spuriously fails when ambient LOOM_LAUNCHD_LABEL is the real production label
-- **PR #6606**: fix(tests): neutralize LOOM_LAUNCHD_LABEL/LOOM_WATCHDOG_LABEL in test-live-state-sandbox.sh
-- **Issue #6607** (closed): Auditor Capability Request: integration_basic nextest failures on hosts with a live daemon sharing -L loom tmux socket
-- **PR #6610**: fix(tests): warn (not exclude) integration_basic under nextest-daemon-guard contention
-- **Issue #6596** (closed): safehouse: merge-reconciliation (and sweep-exit merge check) cannot see private cross-owner repos — the daemon-owned GH_CONFIG_DIR is the primary installation, not the per-owner one (#5401/#6529 class, fourth path)
-- **PR #6608**: fix(safehouse): route sink's own gh calls through per-owner credential + gate public egress on repo visibility
-- **Issue #6592** (closed): dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued
-- **PR #6600**: fix(daemon): decouple DispatchSweep ack from the account-selection poll
-- **Issue #6595** (closed): sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse)
-- **PR #6603**: fix(sweep): flag stale-heartbeat peers under any PID, not just the caller's
-- **Issue #6593** (closed): Open-PR guard (#4123) refuses issue-keyed dispatch but offers no PrSet route — sweep.md's existing-PR taxonomy is unreachable on the daemon path
-- **PR #6598**: fix(daemon): name PrSet alternative in open-PR guard refusal; fix stale sweep.md claims
-- **Issue #6594** (closed): pr-worktree.sh leaves a stray pr-<N> worktree when its checkout collides with an existing builder worktree
-- **PR #6599**: fix(pr-worktree): detect branch-collision up front and clean up stray worktrees
-- **Issue #6591** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6590** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6588** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6584** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6587** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6586** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6585** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6582** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6581** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6580** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6579** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6577** (closed): check-defaults-version-bump.sh no-surface-change marker unreliable under CI's shallow merge-ref checkout
-- **PR #6578**: fix(ci): make no-surface-change marker detection reliable under CI's shallow checkout
-- **Issue #6574** (closed): defaults/roles/builder.md: troubleshooting link escapes the consumer repo (../../../ instead of ../)
-- **PR #6576**: docs(builder): use plain code-span for troubleshooting.md cross-reference
-- **Issue #6573** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6572** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6570** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6567** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6563** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #6552** (closed): Guard: resolve_stash_cwd() cd-tracking splits on whitespace, so #5176's cd-prefix threading silently fails for any repo path containing a space
-- **PR #6564**: fix(guard): mask embedded spaces in quoted cd args for resolve_stash_cwd()
-- **Issue #6537** (closed): random-file.sh: hand-rolled gitignore parser mis-anchors top-level dirs and drops negation lines
-- **PR #6557**: fix(scripts): replace hand-rolled gitignore parser in random-file.sh with git-native handling
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 

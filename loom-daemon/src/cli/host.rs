@@ -1,13 +1,13 @@
 //! `loom-daemon host disable|enable|status|check` — the durable host opt-out
-//! (Issue #10179). The marker logic lives in [`loom_daemon::host_optout`]; this
+//! (Issue #10179). The marker logic lives in [`crate::host_optout`]; this
 //! is the thin CLI over it (and the reason it is not in the frozen `main.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::host_optout::{self, State};
 use anyhow::Result;
 use clap::Subcommand;
-use loom_daemon::host_optout::{self, State};
 
 #[derive(Subcommand)]
 pub(crate) enum HostCommand {
@@ -98,7 +98,7 @@ fn disable(reason: &str) -> Result<()> {
         Err(e) => fail(&e),
     }
     let _ = std::fs::remove_file(&desired);
-    let _ = loom_daemon::operator_stop::discard(&desired);
+    let _ = crate::operator_stop::discard(&desired);
 
     // Stop the daemon and tear down its (and the watchdog's) supervisor jobs
     // through the existing stop path - one implementation of that teardown.
