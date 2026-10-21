@@ -16,7 +16,7 @@ use crate::cli::CheckpointAction;
 use super::sweep_experiment::SweepExperimentAction;
 
 /// `loom-daemon strip-ansi [--file PATH]` — backs `strip-ansi.sh`.
-pub(crate) fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
+pub fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
     use script_helpers::log_filter;
 
     if let Some(path) = file {
@@ -95,7 +95,7 @@ fn checkpoint_worktree(worktree: Option<&str>) -> PathBuf {
 }
 
 /// `loom-daemon checkpoint <write|read|clear|stages>` — backs `checkpoint.sh`.
-pub(crate) fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> {
+pub fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> {
     use script_helpers::checkpoints;
 
     match action {
