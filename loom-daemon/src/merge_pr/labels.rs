@@ -32,7 +32,7 @@
 //! decision, rather than a flag buried in a command line.
 //!
 //! That transition has to actually be available, and for one hold kind it was
-//! not: Champion's critical-file hold (criterion #3) re-applied `loom:operator`
+//! not: Champion's critical-file hold (the `critical-files` criterion) re-applied `loom:operator`
 //! on its next tick, so clearing the label bought the operator ~90 seconds
 //! before this guard refused again (#9016, merge train #8996). The fix is on
 //! Champion's side, not this guard's — `champion-critical-file-hold.md` now

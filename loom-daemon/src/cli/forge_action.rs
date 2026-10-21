@@ -530,7 +530,7 @@ pub(crate) enum ForgeAction {
 
     /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
     /// is `<file>`'s diff in PR `<pr>` nothing but a version-string change?
-    /// Champion criterion #3's version-only carve-out (#6147).
+    /// Champion's `critical-files` criterion's version-only carve-out (#6147).
     ///
     /// Exits 0 (`VERSION_ONLY=1`) ONLY when `<file>` is exactly one of the six
     /// version-bearing files (`package.json`, `mcp-loom/package.json`,

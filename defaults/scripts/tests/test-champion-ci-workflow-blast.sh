@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-champion-ci-workflow-blast.sh - Regression tests for criterion #2's
+# test-champion-ci-workflow-blast.sh - Regression tests for the merge-risk criterion's
 # vetted CI-workflow check (#12677): `ci_workflow_blast_eval` in
 # champion-pr-merge.md decides whether a workflow change stays red on the
 # blast-radius axis for being a workflow.
@@ -155,7 +155,7 @@ DOCTXT=$(cat "$CHAMPION_MD")
 # shellcheck disable=SC2016  # literal backticks
 assert_contains "$DOCTXT" 'CI workflows (unless `WF_BLAST=green`, #12677)' "blast-radius row names the exception"
 # shellcheck disable=SC2016  # literal backticks
-assert_contains "$DOCTXT" 'A CI-workflow change with `WF_BLAST=green` (#12677) is not red for being a workflow' "kept-set item 3 names the exception"
+assert_contains "$DOCTXT" 'A CI-workflow change with `WF_BLAST=green` (#12677) is not red for being a workflow' "kept set: the exception for WF_BLAST=green is named"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-critical-file-hold-tick.sh - runs the SHIPPED criterion #3 hold tick
+# test-critical-file-hold-tick.sh - runs the SHIPPED critical-files criterion hold tick
 # (#10875).
 #
 # test-champion-critical-file-check.sh mirrors the tick in local functions, and
@@ -166,7 +166,7 @@ reset() { # <head>
 }
 tick() { # [FAIL|PASS] — sets WRITES (";"-joined) and OUT
     : >"$T/writes"
-    OUT=$(cd "$T/w" && env -u LOOM_DAEMON_BIN PATH="$T/bin:$PATH" CRITERION3_RESULT="${1:-FAIL}" bash "$T/tick.sh" 2>&1)
+    OUT=$(cd "$T/w" && env -u LOOM_DAEMON_BIN PATH="$T/bin:$PATH" CRITICAL_FILES_RESULT="${1:-FAIL}" bash "$T/tick.sh" 2>&1)
     WRITES=$(paste -sd';' "$T/writes")
 }
 label() { grep -qxF loom:blocked "$T/labels" && echo present || echo absent; }

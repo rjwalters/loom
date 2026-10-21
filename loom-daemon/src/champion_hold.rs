@@ -1,6 +1,6 @@
 //! Champion's own pull-request holds (#11861): the merge-risk hold
-//! (`champion-pr-merge.md` criterion #2) and the critical-file hold
-//! (`champion-critical-file-hold.md`, criterion #3).
+//! (`champion-pr-merge.md`'s `merge-risk` criterion) and the critical-file hold
+//! (`champion-critical-file-hold.md`, the `critical-files` criterion).
 //!
 //! # The shape
 //!
