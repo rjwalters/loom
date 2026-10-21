@@ -9,7 +9,7 @@
 //! daemon subcommands' own writes (`park-record`, `operator-decision`), then
 //! the step's `CHAMPION-STEP … outcome=` word.
 
-use super::{Event, Evidence, Projection, Projector, StoreOp};
+use super::{projection, sanitize_detail, Event, Evidence, Projection, Projector, StoreOp};
 
 /// The merge gate's reason set.
 pub const MERGE_REASON_SET: &str = "champion_merge_v2";
@@ -188,15 +188,6 @@ fn marker_parts(marker: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
-fn projection(class: &'static str, reason: &str, set: &'static str) -> Projection {
-    Projection {
-        class,
-        reason: reason.to_string(),
-        reason_set: set,
-        ..Projection::default()
-    }
-}
-
 /// The merge-gate refusal a marker states: `(criterion_key, reason_key,
 /// reason)`.
 #[must_use]
@@ -233,15 +224,6 @@ fn body_hash(marker: &str) -> Option<String> {
         }
         _ => None,
     }
-}
-
-/// The session's raw `reason=` token for the record's `detail`: the token
-/// characters only, bounded.
-fn sanitize_detail(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .take(48)
-        .collect()
 }
 
 fn project(e: &Evidence) -> Option<Projection> {
