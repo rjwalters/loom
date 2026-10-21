@@ -8,7 +8,7 @@
 //! had no answer. The pass visits every managed checkout, so it emits one of
 //! these per checkout per pass.
 //!
-//! **OTLP-only** (`otlp: Logs`, `native: false`), and only when the exporter is
+//! **OTLP-only** (`otlp: Logs`), and only when the exporter is
 //! configured. `host` rides on the Resource as `host.name`/`host.id`. Every
 //! fact is read locally: the remote tip is the one the pass already learned
 //! (`checkout_ff::heard`), so the record costs no network call and writes
