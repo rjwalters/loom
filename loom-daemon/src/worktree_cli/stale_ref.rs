@@ -83,6 +83,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::wip::git_status_code as git_code;
+
 use super::branch_landed::{self, ForgeProbe, Verdict};
 
 /// Everything the decision needs, all of it already resolved by the caller.
@@ -210,18 +212,6 @@ fn rev_count(worktree: &Path, range: &str) -> u64 {
         .trim()
         .parse()
         .unwrap_or(0)
-}
-
-/// `git -C <dir> … >/dev/null 2>&1; echo $?`
-fn git_code(dir: &Path, args: &[&str]) -> i32 {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_or(127, |s| s.code().unwrap_or(127))
 }
 
 #[cfg(test)]
