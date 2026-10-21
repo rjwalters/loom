@@ -310,11 +310,13 @@ fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
     );
 }
 
-/// Journal a Champion park that [`apply`] landed (exit `0`, not a dry run,
-/// `--by champion`) for the role run's verdict record (#12027). Best-effort
-/// and a no-op outside a journaled run: it never changes output or exit.
+/// Journal a Champion or Curator park that [`apply`] landed (exit `0`, not a
+/// dry run, `--by champion` / `--by curator`) for the role run's verdict
+/// record (#12027, #12921). Best-effort and a no-op outside a journaled run:
+/// it never changes output or exit.
 pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
-    if code == exit::OK && !req.dry_run && req.by.as_deref() == Some("champion") {
+    if code == exit::OK && !req.dry_run && matches!(req.by.as_deref(), Some("champion" | "curator"))
+    {
         crate::observability::pick_journal::record_applied(
             req.number,
             is_pr,
