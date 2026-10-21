@@ -100,7 +100,7 @@ STUB_DIR="$(mktemp -d)"
 RECON_DIR="$(mktemp -d)"
 trap 'rm -rf "$FUNCS_FILE" "$STUB_DIR" "$RECON_DIR" 2>/dev/null || true' EXIT
 awk '
-  /^_reset_one_partial_issue\(\) \{/ { capture=1 }
+  /^_post_merge_bookkeeping\(\) \{/ { capture=1 }
   /^# Handle auto-merge mode/        { capture=0 }
   capture { print }
 ' "$MERGE_PR_SRC" > "$FUNCS_FILE"

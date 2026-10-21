@@ -278,6 +278,7 @@ pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
 pub mod poll_wait;
+pub mod post_merge_bookkeeping;
 pub mod post_merge_cleanup;
 pub mod pr_state;
 pub mod reconcile;
