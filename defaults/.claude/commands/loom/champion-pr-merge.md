@@ -984,13 +984,18 @@ four-axis judgment below.
 to a CI workflow is not red on blast radius *because it is a workflow* when
 `ci_workflow_blast_eval` returns `WF_BLAST=green`:
 
-- no changed or renamed workflow file is in the kept set, or has
-  publish, release, deploy or merge in its name (case-insensitive);
+- no changed or renamed workflow file is in the kept set;
+- every changed workflow file, read in full at the PR head SHA with whole-line
+  YAML comments dropped, matches none of `PRIVILEGED_CONTENT_PATTERNS` (#12988):
+  classification is by capability, never by file name, so `ci.yml` with a
+  `secrets.CLOUDFLARE_API_TOKEN` deploy step is red for any edit and an offline
+  `claude-bot-deploy-plan.yml` is not. The list is the one #12954's
+  `privilegedContentPatterns` classes use; both tests read it from this block;
 - every workflow file has a non-empty patch, and no added or removed workflow
-  line matches, case-insensitively, the words `permissions`, `secrets`,
-  `publish`, `release`, `deploy` or `merge` (the last four ignore YAML
-  comments), or `id-token`,
-  `pull_request_target`, `workflow_run`, `github.token`, `GITHUB_TOKEN`;
+  line matches, case-insensitively, the words `permissions` or `secrets`, or
+  `id-token`, `pull_request_target`, `workflow_run`, `github.token`,
+  `GITHUB_TOKEN`; and no *added* `run:` or `uses:` line (YAML comments ignored)
+  names publish, release, deploy or merge, which is a new release step;
 - the PR carries `loom:pr` (criterion #1 has already checked that the approval
   is for this head) and CI is green right now, with at least one passing
   check and none pending, failing or cancelled.
@@ -1001,11 +1006,24 @@ keeps the "CI workflows" entry red, and the rationale names `WF_BLAST_REASON`;
 is red.
 
 ```bash
+# PRIVILEGED_CONTENT_PATTERNS (#12988): the capability list (jq/Oniguruma
+# regexes, one per element) a workflow's full head contents must not match.
+# Same list as #12954's privilegedContentPatterns; operators copy it into a
+# class, and test-champion-ci-workflow-blast.sh and
+# test-champion-standing-authorization.sh both extract it from here.
+PRIVILEGED_CONTENT_PATTERNS=(
+  'secrets\.(?!GITHUB_TOKEN\b)' 'secrets:\s*inherit' '^\s*environment:'
+  ':\s*write\b' 'write-all' 'id-token' 'pull_request_target' 'workflow_run'
+  '^\s*release:' 'types:.*released' 'wrangler\s+deploy' 'npm\s+publish'
+  'gh\s+release'
+)
+
 # ci_workflow_blast_eval: sets WF_BLAST (none|green|red) and WF_BLAST_REASON.
-# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, read_ci_checks. Always reads the
+# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, PRIVILEGED_CONTENT_PATTERNS,
+# standing_auth_content_clear, read_ci_checks. Always reads the
 # PR's files afresh and checks the list is complete (count == changed_files).
 ci_workflow_blast_eval() {
-  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON NOCOMMENT_JSON SCAN_JSON rx rc
+  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON CONTENT_FILES STEP_HIT rx rc
   WF_BLAST=red
   WF_BLAST_REASON=""
   [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { WF_BLAST_REASON="kept set not loaded"; return 0; }
@@ -1023,12 +1041,6 @@ ci_workflow_blast_eval() {
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     lf=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
-    case "${lf##*/}" in
-      *publish* | *release* | *deploy* | *merge*)
-        WF_BLAST_REASON="$f is a publish/release/deploy/merge workflow"
-        return 0
-        ;;
-    esac
     for pattern in "${KEPT_SET_PATTERNS[@]}"; do
       # Lowercased: Loom-Champion.yml is as much a kept-set path as champion.yml.
       # shellcheck disable=SC2053
@@ -1044,23 +1056,35 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))]
     | if all(.[]; ((.patch // "") | length) > 0) then [.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]] else error("no patch") end' 2>/dev/null) \
     || { WF_BLAST_REASON="a workflow file has no readable patch"; return 0; }
-  # The publish/release/deploy/merge words skip YAML comments (#12934): a
-  # whole-line comment is dropped; a trailing ` #...` is cut only on a line with
-  # no quote at all, so `echo "#release"` and any line not parsed safely stay
-  # scanned whole. Every other regex scans the raw lines.
-  NOCOMMENT_JSON=$(printf '%s' "$LINES_JSON" | jq -c '
-    [.[] | select(test("^\\s*#") | not)
-         | if test("[\"\u0027]") then . elif test("\\s#") then sub("\\s#.*$"; "") else . end]' 2>/dev/null) \
-    || { WF_BLAST_REASON="workflow lines unparseable"; return 0; }
+  # Capability, not name (#12988): read each surviving workflow at its new path
+  # (a removed file has no contents; its lines are judged below) and hold on
+  # any privileged line. standing_auth_content_clear fails closed.
+  CONTENT_FILES=$(printf '%s' "$DIFF_JSON" | jq -c '
+    [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) and ((.status // "") != "removed"))]' 2>/dev/null) \
+    || { WF_BLAST_REASON="workflow files unparseable"; return 0; }
+  if [ "$CONTENT_FILES" != "[]" ]; then
+    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" \
+      || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
+  fi
   for rx in '\bpermissions\b' '\bsecrets\b' 'id-token' 'pull_request_target' 'workflow_run' \
-    'github\.token' 'github_token' '\b(publish|release|deploy|merge)\b'; do
-    SCAN_JSON=$LINES_JSON
-    case "$rx" in *publish*) SCAN_JSON=$NOCOMMENT_JSON ;; esac
-    printf '%s' "$SCAN_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
+    'github\.token' 'github_token'; do
+    printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
     rc=$?
     # rc 1 = no such line; 0 = a hit; anything else = an error. Only 1 passes.
     [ "$rc" -eq 1 ] || { WF_BLAST_REASON="a workflow line matches '$rx'"; return 0; }
   done
+  # A step that introduces a release/deploy/publish/merge action (#12934,
+  # #12988): added run:/uses: lines only. A whole-line comment is dropped; a
+  # trailing ` #...` is cut only on a line with no quote at all, so
+  # `echo "#release"` and any line not parsed safely stay scanned whole.
+  STEP_HIT=$(printf '%s' "$DIFF_JSON" | jq -r '
+    [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))
+         | .patch | split("\n")[] | select(test("^\\+")) | .[1:]
+         | select(test("^\\s*#") | not)
+         | if test("[\"\u0027]") then . elif test("\\s#") then sub("\\s#.*$"; "") else . end
+         | select(test("^\\s*(-\\s+)?(run|uses)\\s*:.*\\b(publish|release|deploy|merge)\\b"; "i"))]
+    | length' 2>/dev/null) || { WF_BLAST_REASON="workflow lines unparseable"; return 0; }
+  [ "$STEP_HIT" = "0" ] || { WF_BLAST_REASON="an added workflow step names publish/release/deploy/merge"; return 0; }
   echo "$LABELS" | grep -q "loom:pr" || { WF_BLAST_REASON="no loom:pr approval"; return 0; }
   read_ci_checks "$PR_NUMBER"
   # Green = at least one passing check and nothing pending, failing or
