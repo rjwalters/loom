@@ -182,8 +182,7 @@ pub struct PassSummaryRecord {
     /// Derived, never random: `derived_hex(["loom.pass", mechanism, host,
     /// repo, started_at])`. Every `pass.verdict` of the pass carries it.
     pub pass_id: String,
-    /// The pass: its `forge_call_stats` caller and its spans' `github.caller`
-    /// (`stale_blocked_release`).
+    /// The pass: its `forge_call_stats` caller (`stale_blocked_release`).
     pub mechanism: String,
     /// `owner/repo`, or [`REPO_UNRESOLVED`].
     pub repo: String,
