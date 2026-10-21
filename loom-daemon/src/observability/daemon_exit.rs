@@ -157,6 +157,10 @@ pub fn emit_to(sink: &dyn QueueSink, host_id: &str, record: DaemonExitRecord) {
 /// Enqueue the `daemon.exit` record on the global ops sink (a no-op when OTLP
 /// export is off). Called by [`super::shutdown::exit`] before its final drain.
 pub fn emit(cause: ExitCause, code: i32) {
+    // #12942: leave the cause for the next start's `start_reason`. Not in unit
+    // tests, which would overwrite a real daemon's state file under `~/.loom`.
+    #[cfg(not(test))]
+    super::daemon_lifecycle::record_exit(cause.requested_by());
     super::ops::emit_record(TelemetryRecord::DaemonExit(current_record(cause, code)));
 }
 

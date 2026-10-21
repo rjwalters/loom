@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::script_helpers;
+use crate::script_helpers;
 
 #[path = "curation_complete.rs"]
 mod curation_complete;

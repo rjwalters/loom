@@ -1,5 +1,5 @@
 //! `loom-daemon merge-pr tree-checks` (#10026): the repo-configured pre-merge
-//! merge-tree gate. Logic and contract: [`loom_daemon::merge_pr::tree_checks`].
+//! merge-tree gate. Logic and contract: [`crate::merge_pr::tree_checks`].
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
@@ -12,10 +12,10 @@
 //! that cannot run is not a pass. Callers only invoke this when the config
 //! declares checks, so an older binary never affects repos that do not opt in.
 
-use anyhow::Result;
-use loom_daemon::merge_pr::tree_checks::{
+use crate::merge_pr::tree_checks::{
     bypass_comment, evaluate, failure_comment, refusal, Outcome, BYPASSED, CLEAN,
 };
+use anyhow::Result;
 
 #[derive(clap::Args)]
 pub(crate) struct TreeChecksArgs {
@@ -56,14 +56,14 @@ pub(crate) struct TreeChecksArgs {
 /// (`forge_comment::post_comment`, #10089): `gh api --input <file>` under the
 /// `gh` facade, booked as `comment.post` / `comment.create`.
 fn post_comment(repo: &str, pr: &str, body: &str) {
-    if let Err(e) = loom_daemon::forge_comment::post_comment("gh", None, repo, pr, true, body) {
+    if let Err(e) = crate::forge_comment::post_comment("gh", None, repo, pr, true, body) {
         eprintln!("Warning: could not post the tree-check comment on PR #{pr}: {e}");
     }
 }
 
 impl TreeChecksArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = loom_daemon::repo_root::find_repo_root_from_cwd()
+        let root = crate::repo_root::find_repo_root_from_cwd()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let cfg_path = self

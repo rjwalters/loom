@@ -102,7 +102,11 @@ pub enum ProvisionOutcome {
     /// The function ran and succeeded; the payload is `PROVISIONED_DAEMON_BIN`
     /// (possibly empty, which the caller passes straight to the verifier — an
     /// empty destination is itself a verification failure).
-    Provisioned(String),
+    ///
+    /// The second field is the identity of the install the script's own
+    /// `install-binary publish` made, reported by that subprocess (see
+    /// [`txn::IDENTITY_SINK_ENV`]), or why there is none to restore to.
+    Provisioned(String, Result<txn::InstallIdentity, String>),
     /// The function ran and FAILED. A soft warn here (the pre-#4053 behaviour)
     /// left the exit code at 0, which is exactly the "reports success while
     /// shipping nothing" defect.
@@ -124,7 +128,10 @@ pub fn provision_machine_daemon(
     repo_root: &Path,
 ) -> ProvisionOutcome {
     let sink = super::scratch_file("loom-daemon-provisioned-bin");
-    let status = provision_command(script, new_bin, repo_root, &sink).status();
+    let identity_sink = super::scratch_file("loom-daemon-install-identity");
+    let status = provision_command(script, new_bin, repo_root, &sink)
+        .env(txn::IDENTITY_SINK_ENV, &identity_sink)
+        .status();
 
     let code = status.ok().and_then(|s| s.code()).unwrap_or(98);
     if code == 98 {
@@ -133,7 +140,9 @@ pub fn provision_machine_daemon(
     if code != 0 {
         return ProvisionOutcome::Failed;
     }
-    ProvisionOutcome::Provisioned(std::fs::read_to_string(&sink).unwrap_or_default())
+    let dest = std::fs::read_to_string(&sink).unwrap_or_default();
+    let identity = txn::read_reported_identity(&identity_sink, Path::new(&dest));
+    ProvisionOutcome::Provisioned(dest, identity)
 }
 
 /// The `bash -c` that sources `script` and calls `provision_machine_daemon`,
@@ -210,6 +219,12 @@ exit "$rc"
 ///
 /// `true` on success, `false` on any failure (the reason is printed).
 pub fn install_to(new_bin: &Path, dest: &Path) -> bool {
+    install_to_published(new_bin, dest).is_some()
+}
+
+/// [`install_to`], returning the transaction this call made so the caller can
+/// bind a later restore to it (#12776). `None` on failure.
+pub fn install_to_published(new_bin: &Path, dest: &Path) -> Option<Published> {
     let done = stage(new_bin, dest)
         .map_err(InstallError::Stage)
         .and_then(|staged| publish(&staged, dest));
@@ -218,11 +233,11 @@ pub fn install_to(new_bin: &Path, dest: &Path) -> bool {
             if let Some(line) = done.retained_line() {
                 out::say(&line);
             }
-            true
+            Some(done)
         }
         Err(e) => {
             out::err(&e.to_string());
-            false
+            None
         }
     }
 }
@@ -276,6 +291,9 @@ pub fn publish(staged: &Path, dest: &Path) -> Result<Published, InstallError> {
         guard.disarm();
         return Err(InstallError::NotStaged(staged.to_path_buf()));
     }
+    // Held to the end: every writer of `dest`, `<dest>.previous` and the
+    // record (this, and `txn::restore`) is excluded for the whole of it.
+    let _lock = DestLock::acquire(dest).map_err(InstallError::Lock)?;
     let dir = staging_dir(dest);
     let mut record = txn::begin(staged, dest)?;
     let staged_id = file_id(staged);
@@ -292,7 +310,8 @@ pub fn publish(staged: &Path, dest: &Path) -> Result<Published, InstallError> {
         // A concurrent install replaced `dest` between the rename and this
         // check. This one did publish, so it is not a failure, but it is not
         // the install that finished: its record stays at `published`.
-        // (Serializing installs against each other is #9734's.)
+        // (Writers that hold the [`DestLock`] cannot cause this; it is the
+        // defense against one that does not.)
         out::warn(&format!(
             "{} was replaced by another install while this one was publishing.",
             dest.display()
@@ -301,6 +320,46 @@ pub fn publish(staged: &Path, dest: &Path) -> Result<Published, InstallError> {
     }
     txn::advance(dest, &mut record, txn::Phase::Committed);
     Ok(Published { record })
+}
+
+/// Exclusive advisory lock (`flock` on `.<dest-name>.install.lock` beside
+/// `dest`) that serializes every writer of `dest`, `<dest>.previous` and
+/// `<dest>.install-state.json`: [`publish`] and [`txn::restore`] (#12776).
+///
+/// Separate opens contend even within one process, and the kernel releases it
+/// when the holder exits, so a killed holder cannot leave it stuck. The lock
+/// file is never deleted (deleting it would let two holders lock different
+/// inodes); a leftover one is harmless.
+pub(super) struct DestLock(#[allow(dead_code)] std::fs::File);
+
+impl DestLock {
+    pub(super) fn acquire(dest: &Path) -> std::io::Result<Self> {
+        let base = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "loom-daemon".to_string());
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(staging_dir(dest).join(format!(".{base}.install.lock")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            loop {
+                // SAFETY: `file` owns a valid open descriptor for this call.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self(file))
+    }
 }
 
 /// Is `staged` a file [`stage`] would have made for `dest`: in `dest`'s own

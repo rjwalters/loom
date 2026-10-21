@@ -4,16 +4,16 @@
 //! Brand-new logic, native per the shell-language policy.
 //! `resync-installed.sh` hands off to it when no `defaults/` source tree
 //! resolves; it is also run by hand. Logic and the exit-code contract live in
-//! [`loom_daemon::init::payload::standalone`].
+//! [`crate::init::payload::standalone`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 
-use loom_daemon::init::payload::standalone;
-use loom_daemon::release_fetch::source;
-use loom_daemon::release_provenance::{self, Provenance};
+use crate::init::payload::standalone;
+use crate::release_fetch::source;
+use crate::release_provenance::{self, Provenance};
 
 #[derive(clap::Args)]
 pub(crate) struct ResyncPayloadArgs {

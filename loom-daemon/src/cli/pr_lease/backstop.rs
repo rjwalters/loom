@@ -1,12 +1,12 @@
 //! The PR-lease half of the Judge no-verdict backstop (#11855): `release`
 //! records a Judge pass that ended without a verdict, and `claim` refuses a
 //! Judge a PR those records hold. The rules live in
-//! [`loom_daemon::judge_backstop`].
+//! [`crate::judge_backstop`].
 
+use crate::forge_call_stats::ops;
+use crate::gh_invocation::AccessIntent;
+use crate::judge_backstop::{self as backstop, CiRead, CiState};
 use chrono::{DateTime, Utc};
-use loom_daemon::forge_call_stats::ops;
-use loom_daemon::gh_invocation::AccessIntent;
-use loom_daemon::judge_backstop::{self as backstop, CiRead, CiState};
 
 use super::{Ctx, Gh, Role, Row};
 
