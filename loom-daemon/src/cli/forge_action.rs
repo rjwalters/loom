@@ -781,10 +781,13 @@ pub(crate) enum ForgeAction {
         /// How recent a same-verdict marker must be to dedupe against.
         #[arg(long, default_value_t = crate::verdict_gate::DEFAULT_WINDOW_SECS)]
         window_secs: i64,
-        /// RFC 3339 time the Judge began this review (#12614). With it, an
-        /// approval is refused when a trusted human comment on the PR or a
-        /// linked issue is newer, or a linked issue body no longer matches
-        /// `--issue-body-sha`. Absent: unchanged behaviour, with a warning.
+        /// RFC 3339 time the Judge began this review (#12614). An approval is
+        /// refused when a trusted human comment on the PR or a linked issue,
+        /// or a human edit of a linked issue body, is newer than the start,
+        /// or a body no longer matches `--issue-body-sha`. The start is the
+        /// dispatch epoch in `$LOOM_SWEEP_ID` (or the PR's judge lease); this
+        /// value can only move it earlier (#12714). With no start at all the
+        /// approval is refused.
         #[arg(long)]
         review_started: Option<String>,
         /// `N=HASH` (repeatable): issue N's body as the Judge reviewed it,
