@@ -6,11 +6,11 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 
-use loom_daemon::activity::transcript_archive::{
+use crate::activity::transcript_archive::{
     archive, default_archive_dir, ArchiveOptions, ArchiveStats, DEFAULT_ZSTD_LEVEL, LOCAL_SINK,
 };
-use loom_daemon::activity::ActivityDb;
-use loom_daemon::transcript_tokens::claude_projects_dir;
+use crate::activity::ActivityDb;
+use crate::transcript_tokens::claude_projects_dir;
 
 /// `loom-daemon archive-transcripts` — reached through
 /// [`super::telemetry::TelemetryCommand`], which is flattened, so this is a

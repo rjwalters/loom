@@ -1251,6 +1251,116 @@ esac
     );
 }
 
+// ---- #12817: items the captain offered ----------------------------------
+
+fn offer(repo: &str, item: u32, role: StepRole) -> Offer {
+    Offer {
+        repo: repo.to_string(),
+        item,
+        role,
+    }
+}
+
+fn run_offered(
+    workspaces: Vec<StepWorkspace>,
+    free_slots: usize,
+    spawner: &mut FakeSpawner,
+    offers: &[Offer],
+) -> StepTick {
+    run_with_offers(workspaces, limits(free_slots), &seed(), &PoolKnobs::default(), spawner, offers)
+}
+
+/// An offer in the gated pool spawns first, holds its slot and is not a draw.
+#[test]
+fn an_offer_in_the_pool_spawns_first_and_holds_its_slot() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        1,
+        &mut spawner,
+        &[offer("ACME/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(spawner.asked.len(), 1);
+    assert_eq!((spawner.asked[0].1, spawner.asked[0].2), (3, StepRole::Builder));
+    assert_eq!(tick.report.dispatched, 1);
+    // No draw was spent on it, and no slot is left for one.
+    assert_eq!(tick.draws, 0);
+    assert_eq!(tick.stop, TickStop::NoSlots);
+    assert_eq!(spawner.terms, vec![None]);
+}
+
+/// The rest of the slots draw as before, never drawing the offered item twice.
+#[test]
+fn the_slots_an_offer_leaves_still_draw() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        3,
+        &mut spawner,
+        &[offer("acme/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(tick.report.dispatched, 3);
+    assert_eq!(tick.draws, 2);
+    let threes = spawner.asked.iter().filter(|a| a.1 == 3).count();
+    assert_eq!(threes, 1);
+}
+
+/// An offer for an item the gates left out never reaches the spawner: the
+/// captain's queue is not authority to skip a gate.
+#[test]
+fn an_offer_cannot_skip_a_gate() {
+    let mut spawner = FakeSpawner::default();
+    // 7 is claimed (`loom:building`), 8 blocked, 9 operator-held; 999 is
+    // unknown; item 3 is a Builder item, not a Judge one; the repo differs.
+    let offers = [
+        offer("acme/one", 7, StepRole::Builder),
+        offer("acme/one", 8, StepRole::Builder),
+        offer("acme/one", 9, StepRole::Builder),
+        offer("acme/one", 999, StepRole::Builder),
+        offer("acme/one", 3, StepRole::Judge),
+        offer("acme/other", 3, StepRole::Builder),
+    ];
+    run_offered(vec![workspace(0, "acme/one", &forge())], 0, &mut spawner, &offers);
+    assert!(spawner.asked.is_empty());
+    let mut spawner = FakeSpawner::default();
+    run_offered(vec![workspace(0, "acme/one", &forge())], 10, &mut spawner, &offers);
+    let asked: BTreeSet<(u32, StepRole)> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+    assert!(!asked.contains(&(7, StepRole::Builder)));
+    assert!(!asked.contains(&(8, StepRole::Builder)));
+    assert!(!asked.contains(&(9, StepRole::Builder)));
+    assert!(!asked.contains(&(999, StepRole::Builder)));
+}
+
+/// A held workspace offers nothing.
+#[test]
+fn an_offer_in_a_held_workspace_is_not_spawned() {
+    let mut ws = workspace(0, "acme/one", &forge());
+    ws.halted = true;
+    let mut spawner = FakeSpawner::default();
+    run_offered(vec![ws], 5, &mut spawner, &[offer("acme/one", 3, StepRole::Builder)]);
+    assert!(spawner.asked.is_empty());
+}
+
+/// A refused offer is counted by reason like a draw's, and spends no pass.
+#[test]
+fn a_refused_offer_is_counted_and_spends_no_pass() {
+    let mut spawner = FakeSpawner {
+        refuse: vec![(3, "captain_not_eligible")],
+        ..FakeSpawner::default()
+    };
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        1,
+        &mut spawner,
+        &[offer("acme/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(tick.passes.get("captain_not_eligible"), Some(&1));
+    assert_eq!(tick.passes.values().sum::<usize>(), 1);
+    // The slot it did not fill is drawn for, and that draw spawned.
+    assert_eq!(spawner.asked.len(), 2);
+    assert_eq!(tick.report.dispatched, 1);
+}
+
 /// #12957: the tick's queue rows and spawn requests carry each item's story
 /// points from the labels the listing already returned (no forge call); a PR
 /// step carries its closing issue's, an unsized item none.

@@ -9,14 +9,14 @@
 //! (rather than declared in `main.rs`) because `main.rs` is frozen by the
 //! file-size ratchet — the same reason `cli::script_ports` exists.
 //!
-//! All logic lives in [`loom_daemon::script_helpers::fleet_experiment`]; this
+//! All logic lives in [`crate::script_helpers::fleet_experiment`]; this
 //! file is argument parsing and rendering only.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use loom_daemon::script_helpers::fleet_experiment as fx;
-use loom_daemon::script_helpers::fleet_experiment::lifecycle;
+use crate::script_helpers::fleet_experiment as fx;
+use crate::script_helpers::fleet_experiment::lifecycle;
 
 /// Default stratification: pair repos of similar recent throughput and similar
 /// kind, so an arm difference is not confounded by one arm drawing all the busy
@@ -132,7 +132,7 @@ fn run_plan(
         split_list(stratify_raw)
     };
 
-    let registry = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default()
         .context("reading the workspace registry")?;
     let roots: Vec<PathBuf> = registry.workspaces.iter().map(|w| w.root.clone()).collect();
     if roots.is_empty() {
@@ -156,7 +156,7 @@ fn run_plan(
     }
 
     if let Some(path) = out {
-        loom_daemon::script_helpers::write_json_file(path, &serde_json::to_value(&plan)?)
+        crate::script_helpers::write_json_file(path, &serde_json::to_value(&plan)?)
             .with_context(|| format!("writing {}", path.display()))?;
         eprintln!(
             "[sweep-experiment plan] wrote {} — start it with:\n  loom-daemon sweep-experiment \

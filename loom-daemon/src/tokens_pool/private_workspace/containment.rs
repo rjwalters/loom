@@ -56,8 +56,10 @@ pub(super) const DRIFTED: &str = "exclusive writer and stale-context refusal: th
 const UNMANAGED: &str = "protected remote operations and Loom lifecycle controls: this private clone ships no Loom hook provisioner, so no managed pre_tool_use bridge is registered for the session; container isolation alone does not prevent an authenticated force-push or a Loom lifecycle mutation";
 const UNTRUSTED: &str = "protected remote operations and Loom lifecycle controls: the account profile has not established Codex hook trust since Loom's managed registration was installed, and an untrusted hook fails OPEN on the pinned CLI; accept the hook-trust prompt once for this profile with CODEX_HOME at the session's mount point (Codex keys trust by that hooks.json path, so trust accepted on the host does not count), then stop and start the session (a private-clone session never uses the trust waiver; #10102 applies to host-mode sessions only)";
 const NOT_IN_CONTAINER: &str = "container identity: this process is not running inside the bound private session container, or the clone's identity record does not match the bound job; refusing to claim containment";
-const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: /workspace/repo is not an owned, independent Git root (missing, symlinked, or carrying object alternates)";
+const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: the selected clone is not an owned, independent Git root (missing, symlinked, or carrying object alternates)";
 const MALFORMED: &str = "container identity: the bound container, control identity or base revision is malformed, absent, or predates loom-private-control-v1";
+/// A proof is valid for the one clone it was measured against (#10796).
+pub(super) const WRONG_CLONE: &str = "host, sibling and peer repository isolation: the containment proof or lease is bound to a different repository clone than the one this execution acts on; refusing to reuse another clone's evidence";
 
 /// Evidence that one launch runs inside a verified private clone whose
 /// control boundary is intact. Deliberately neither `Clone` nor constructible
@@ -69,13 +71,42 @@ pub struct ContainmentProof {
     container_id: String,
     control: String,
     base_revision: String,
+    /// Canonical identity key (`host/owner/name`) of the clone this proof was
+    /// measured against, and where that clone lives in the container (#10796).
+    repository: String,
+    clone: String,
+}
+
+/// The clone paths a private session can run in: the legacy primary, or one
+/// directory of [`WORK_ROOT`] named by a safe slug. Anything else is refused.
+pub(super) fn valid_clone(clone: &str) -> bool {
+    clone == REPO
+        || clone
+            .strip_prefix(WORK_ROOT)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|slug| safe_segment(slug) && !slug.contains(".."))
+}
+
+/// The canonical key two spellings of one repository share, falling back to
+/// the literal text for a legacy shape [`identify`] does not parse.
+pub(super) fn repository_key(repository: &str) -> String {
+    identify(repository).map_or_else(|_| repository.to_owned(), |id| id.key)
 }
 
 impl ContainmentProof {
-    fn new(account: &str, container_id: &str, control: &str, base_revision: &str) -> Result<Self> {
+    fn new(
+        account: &str,
+        container_id: &str,
+        control: &str,
+        base_revision: &str,
+        repository: &str,
+        clone: &str,
+    ) -> Result<Self> {
         if !hex(container_id, 64)
             || !hex(control, 64)
             || !(hex(base_revision, 40) || hex(base_revision, 64))
+            || repository.is_empty()
+            || !valid_clone(clone)
         {
             bail!("{MALFORMED}");
         }
@@ -85,7 +116,20 @@ impl ContainmentProof {
             container_id: container_id.to_owned(),
             control: control.to_owned(),
             base_revision: base_revision.to_owned(),
+            repository: repository_key(repository),
+            clone: clone.to_owned(),
         })
+    }
+
+    /// Fail closed unless this proof was measured against `repository`.
+    ///
+    /// # Errors
+    /// [`WRONG_CLONE`] when it was measured against another repository.
+    pub fn require_repository(&self, repository: &str) -> Result<()> {
+        if self.repository != repository_key(repository) {
+            bail!("{WRONG_CLONE}");
+        }
+        Ok(())
     }
 
     /// Synthetic proof for admission unit tests only. Compiled out of every
@@ -93,7 +137,15 @@ impl ContainmentProof {
     /// configuration key — can reach it.
     #[cfg(test)]
     pub(crate) fn fixture(account: &str) -> Self {
-        Self::new(account, &"a".repeat(64), &"c".repeat(64), &"b".repeat(40)).unwrap()
+        Self::new(
+            account,
+            &"a".repeat(64),
+            &"c".repeat(64),
+            &"b".repeat(40),
+            "https://example.invalid/owner/repo",
+            REPO,
+        )
+        .unwrap()
     }
 
     /// The single runtime this proof is bound to.
@@ -126,6 +178,8 @@ impl ContainmentProof {
             control: short(&self.control),
             protocol: PROTOCOL.into(),
             base_revision: self.base_revision.clone(),
+            repository: self.repository.clone(),
+            clone: self.clone.clone(),
         }
     }
 }
@@ -202,9 +256,27 @@ pub(super) fn host_proof(
     config: &Config,
     report: &bundle::Report,
     job: &lease::Job,
+    target: &Target,
 ) -> Result<ContainmentProof> {
+    // The durable job must name exactly the clone this selection prepared; a
+    // lease left by another clone's job never certifies this one.
+    let expected = if target.slug.is_some() {
+        target.repository.as_str()
+    } else {
+        ""
+    };
+    if job.repository != expected {
+        bail!("{WRONG_CLONE}");
+    }
     enforcing(report, &config.profile)?;
-    ContainmentProof::new(&config.account, &job.container_id, &job.control, &job.base_revision)
+    ContainmentProof::new(
+        &config.account,
+        &job.container_id,
+        &job.control,
+        &job.base_revision,
+        &target.repository,
+        &target.path,
+    )
 }
 
 /// Resolve the model a candidate runtime would launch with, so account
@@ -248,6 +320,9 @@ pub fn admit_new(
         Ok(proof) => proof,
         Err(error) => return Err(rejection.with_containment_failure(&error.to_string())),
     };
+    if let Err(error) = require_workspace_repository(root, &proof) {
+        return Err(rejection.with_containment_failure(&error.to_string()));
+    }
     let admitted = admit_with(root, role, explicit, &proof)?;
     if let Err(error) = selection.record_admission(&admitted) {
         return Err(RuntimeRejection {
@@ -269,6 +344,13 @@ pub fn admit_new(
             .unwrap_or_default()
     );
     Ok((admitted, selection, proof))
+}
+
+/// A proof certifies the clone of the repository this workspace is the host
+/// checkout of, nothing else (#10796).
+fn require_workspace_repository(root: &Path, proof: &ContainmentProof) -> Result<()> {
+    let logical = dispatch::logical_repository(root).context(WRONG_CLONE)?;
+    proof.require_repository(&logical)
 }
 
 /// Admission against an existing proof. A thin, single-purpose wrapper so no
@@ -351,6 +433,9 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
         // naming a different model gets its own selection (#12748).
         if let Some((_, proof, held_model)) = &self.held {
             if *held_model == model {
+                if let Err(error) = require_workspace_repository(&self.root, proof) {
+                    return Err(rejection.with_containment_failure(&error.to_string()));
+                }
                 return admit_with(&self.root, role, explicit, proof);
             }
             self.held = None;
@@ -385,13 +470,41 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
 /// lease; a worker cannot write it. The boundary is then re-observed from the
 /// image-owned bundle and the read-only profile controls, and must still hash
 /// to that same identity.
-pub(super) fn in_container(account: &str, bound: &str, revision: &str) -> Result<ContainmentProof> {
+pub(super) fn in_container(
+    account: &str,
+    bound: &str,
+    revision: &str,
+    repository: &str,
+    clone: &str,
+) -> Result<ContainmentProof> {
     let profile = Path::new(PROFILE);
     let report = bundle::observe(Path::new(bundle::CONTROL_ROOT), profile);
     bundle::rebind(&report, profile, bound)?;
     enforcing(&report, profile)?;
-    let id = in_bound_container(revision)?;
-    ContainmentProof::new(account, &id, bound, revision)
+    let id = in_bound_container(revision, repository, clone)?;
+    ContainmentProof::new(account, &id, bound, revision, repository, clone)
+}
+
+/// Where the identity record of `clone` lives, and that the clone really is
+/// the one `repository` names: the primary's record is `/workspace/identity.json`;
+/// an additional clone's is `/workspace/work/.identity/<slug>.json` and its
+/// directory name must be the slug derived from the repository itself.
+pub(super) fn identity_record(repository: &str, clone: &str) -> Result<PathBuf> {
+    if !valid_clone(clone) {
+        bail!("{NOT_IN_CONTAINER}");
+    }
+    let Some(slug) = clone
+        .strip_prefix(WORK_ROOT)
+        .and_then(|r| r.strip_prefix('/'))
+    else {
+        return Ok(Path::new(ROOT).join("identity.json"));
+    };
+    if identify(repository).ok().map(|id| id.slug).as_deref() != Some(slug) {
+        bail!("{WRONG_CLONE}");
+    }
+    Ok(Path::new(WORK_ROOT)
+        .join(".identity")
+        .join(format!("{slug}.json")))
 }
 
 /// Prove this process really is inside the container the host bound, and that
@@ -403,14 +516,15 @@ pub(super) fn in_container(account: &str, bound: &str, revision: &str) -> Result
 /// short ID, a read-only root filesystem (one of the settings
 /// `docker::validate_settings` requires of the session), and an owned
 /// `/workspace/repo` with no object alternates.
-fn in_bound_container(revision: &str) -> Result<String> {
+fn in_bound_container(revision: &str, repository: &str, clone: &str) -> Result<String> {
     let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(Path::new(ROOT).join("identity.json"))?)?;
+        serde_json::from_slice(&std::fs::read(identity_record(repository, clone)?)?)?;
     let id = record["container_id"].as_str().unwrap_or_default();
     if record["protocol"] != PROTOCOL
         || !hex(id, 64)
         || record["revision"] != revision
-        || std::env::var("LOOM_PRIVATE_REPOSITORY").ok().as_deref() != record["repository"].as_str()
+        || record["repository"].as_str() != Some(repository)
+        || std::env::var("LOOM_PRIVATE_REPOSITORY").ok().as_deref() != Some(repository)
     {
         bail!("{NOT_IN_CONTAINER}");
     }
@@ -418,7 +532,7 @@ fn in_bound_container(revision: &str) -> Result<String> {
     if hostname.trim() != &id[..12] || !read_only_root()? {
         bail!("{NOT_IN_CONTAINER}");
     }
-    let repo = Path::new(REPO);
+    let repo = Path::new(clone);
     if repo.canonicalize()? != repo
         || !std::fs::symlink_metadata(repo.join(".git"))?.is_dir()
         || repo.join(".git/objects/info/alternates").exists()

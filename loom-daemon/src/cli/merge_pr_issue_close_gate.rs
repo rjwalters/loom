@@ -36,7 +36,7 @@
 use anyhow::Result;
 use std::io::Read;
 
-use loom_daemon::merge_pr::issue_close_gate::decide;
+use crate::merge_pr::issue_close_gate::decide;
 
 #[derive(clap::Args)]
 pub(crate) struct IssueCloseGateArgs {
@@ -64,7 +64,7 @@ impl IssueCloseGateArgs {
         let decision = decide(&close_targets, &self.issue, self.state.as_deref());
         println!("LOOM-ISSUE-CLEANUP {}", decision.token());
 
-        use loom_daemon::merge_pr::issue_close_gate::Decision;
+        use crate::merge_pr::issue_close_gate::Decision;
         std::process::exit(match decision {
             Decision::CloseTarget | Decision::StateClosed => 0,
             Decision::NeedState => 3,

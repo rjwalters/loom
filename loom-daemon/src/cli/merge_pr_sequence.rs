@@ -24,8 +24,8 @@
 //! `follower_head` pin is to detect that the tree the caller is about to act
 //! on is the tree the plan judged.
 
+use crate::merge_pr::sequence::{self, verdict_line, NONE};
 use anyhow::Result;
-use loom_daemon::merge_pr::sequence::{self, verdict_line, NONE};
 
 #[derive(clap::Args)]
 pub(crate) struct SequenceEvalArgs {
@@ -50,7 +50,7 @@ impl SequenceEvalArgs {
         // The `{owner}/{repo}` template lets `gh` resolve the repo from cwd,
         // matching the reconciliation scanner's convention.
         let nwo = self.repo.as_deref().unwrap_or("{owner}/{repo}");
-        let bin = loom_daemon::gh_invocation::gh_bin();
+        let bin = crate::gh_invocation::gh_bin();
 
         let Some(bodies) = sequence::fetch_trusted_bodies(&bin, &root, nwo, self.pr) else {
             eprintln!(
@@ -101,7 +101,7 @@ impl SequencePlanArgs {
         }
         let root = std::env::current_dir()?;
         let gh = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into());
-        let report = loom_daemon::claim_reconciliation::merge_sequence::plan_report(
+        let report = crate::claim_reconciliation::merge_sequence::plan_report(
             std::path::Path::new(&gh),
             &root,
         )?;

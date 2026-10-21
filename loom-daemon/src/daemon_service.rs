@@ -48,9 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use crate::cli;
-use crate::{handle_cli_command, Cli, Commands, FleetAction};
 use clap::Parser;
+use loom_daemon::cli;
+use loom_daemon::cli::root::{handle_cli_command, Cli, Commands, FleetAction};
 
 use cli::dispatch::handle_dispatch_command;
 use cli::dispatch_backoff::handle_dispatch_backoff_command;
@@ -2100,26 +2100,13 @@ fn check_tmux_installed() -> Result<()> {
         .ok_or_else(|| anyhow!("tmux not installed. Install with: brew install tmux"))
 }
 
-/// Resolve the daemon's loom directory: the parent of `LOOM_SOCKET_PATH` when
-/// that env var is set (test isolation), else `$HOME/.loom`. Pure — no side
-/// effects (no directory creation), so it's safe to call from `setup_logging()`
-/// (which runs before `main()`'s own `loom_dir`/`socket_path` resolution block)
-/// as well as from `main()` and `resolve_socket_path()` without duplicating the
-/// branching logic three times over.
-pub(crate) fn resolve_loom_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        let socket_path = PathBuf::from(path);
-        let loom_dir = socket_path
-            .parent()
-            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
-            .to_path_buf();
-        return Ok(loom_dir);
-    }
-    let loom_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom");
-    Ok(loom_dir)
-}
+// Resolve the daemon's loom directory: the parent of `LOOM_SOCKET_PATH` when
+// that env var is set (test isolation), else `$HOME/.loom`. Pure — no side
+// effects (no directory creation), so it's safe to call from `setup_logging()`
+// (which runs before `main()`'s own `loom_dir`/`socket_path` resolution block)
+// as well as from `main()` and `resolve_socket_path()` without duplicating the
+// branching logic three times over.
+pub(crate) use loom_daemon::cli::common::resolve_loom_dir;
 
 /// Resolve the daemon log file path: `LOOM_DAEMON_LOG` (full override) when
 /// set, else `<loom dir>/daemon.log` derived from [`resolve_loom_dir`]. This
