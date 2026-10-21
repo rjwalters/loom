@@ -15,6 +15,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #12865**: docs: assess checkpoint writes against worktree-isolation guard
+- **PR #13023**: chore: remove orphaned heredoc-body-safety test lib
+- **PR #12852**: refactor: share one loopback HTTP sink across telemetry exporter tests
+- **Issue #11274** (closed): audit-agents phase 7: findings, coverage, reconciliation, and qualification
+- **Issue #13020** (closed): Remove orphaned heredoc-body-safety.sh test lib (no sourcers since watchdog port)
+- **Issue #12655** (closed): Consolidate three duplicated mock HTTP sink test helpers in observability tests
+- **Issue #12810** (closed): Crew poll the captain for assignments on a fleet-gitops cadence; captain follows GitHub via /v1/changes (Phase 2 slice)
 - **PR #13016**: refactor: dedupe RepoVisibility string mapping into as_str()
 - **PR #12980**: feat: export pick.decision as a bounded summary and archive the full record
 - **Issue #12817** (closed): Captain next assignment and worker poll loop on a fleet-gitops cadence (Phase 2 slice 3)
