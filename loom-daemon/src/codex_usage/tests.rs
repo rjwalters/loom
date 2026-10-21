@@ -310,7 +310,7 @@ fn read_rollout_refuses_an_unauthorized_path_even_when_handed_one_directly() {
         home.join(SESSIONS_DIR).join("auth.json"),
     ] {
         assert!(path.is_file(), "fixture must exist: {}", path.display());
-        assert_eq!(read_rollout(&home, &path), None, "{}", path.display());
+        assert_eq!(read_rollout(&home, &path, u64::MAX), None, "{}", path.display());
     }
 }
 

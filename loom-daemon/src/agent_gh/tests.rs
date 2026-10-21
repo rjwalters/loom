@@ -153,3 +153,19 @@ fn a_signalled_gateway_attempt_reports_128_plus_the_signal() {
     assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(15)), 143);
     assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(3 << 8)), 3);
 }
+
+#[test]
+fn a_shed_for_an_owner_no_reader_serves_does_not_say_retry_later() {
+    let uncovered = |o: &str| o == "third-party";
+    let msg = super::shed_message(Some("third-party"), &uncovered);
+    assert!(msg.contains("no reader App on this host serves owner third-party"), "{msg}");
+    assert!(msg.contains("Retrying will not help"), "{msg}");
+    assert!(!msg.contains("Retry later"), "{msg}");
+    assert!(msg.ends_with(crate::gh_invocation::SHED_MARKER), "{msg}");
+    // A covered owner (out of budget, withdrawn) or no certain owner: retry.
+    for owner in [Some("acme"), None] {
+        let msg = super::shed_message(owner, &uncovered);
+        assert!(msg.contains("Retry later"), "{msg}");
+        assert!(msg.ends_with(crate::gh_invocation::SHED_MARKER), "{msg}");
+    }
+}

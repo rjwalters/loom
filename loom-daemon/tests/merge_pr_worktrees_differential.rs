@@ -345,3 +345,8 @@ awk -v want="refs/heads/feature/issue-42" '
     // The port cannot express that shape at all: one answer, or none.
     assert_eq!(worktrees::find_by_branch(CORPUS[1], "feature/issue-42"), Some("/repo/wt-a"));
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

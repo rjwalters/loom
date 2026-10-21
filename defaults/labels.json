@@ -579,7 +579,7 @@
       "hard_exclusion": false,
       "champion_path": false,
       "human_gated": false,
-      "merge_hold": false,
+      "merge_hold": true,
       "operator_hold": false,
       "contradicts_approval": 2,
       "stale_after_minutes": null,
@@ -720,7 +720,9 @@
         "# (defaults/docs/merge-pr-exit-code-exceptions.md) and by its",
         "# partial-increment reset (#9264) when the issue body carries a",
         "# `loom:remainder-hold` marker. Removed by a human. Champion's merge-risk and",
-        "# critical-file PR holds are loom:blocked, not this label (#11861)."
+        "# critical-file PR holds are loom:blocked, not this label (#11861).",
+        "# Requires a stated reason class: defaults/docs/label-state-machine.md",
+        "# § \"Routing to a human\"."
       ]
     },
     {

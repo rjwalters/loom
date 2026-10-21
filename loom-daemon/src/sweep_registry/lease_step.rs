@@ -64,16 +64,18 @@ pub(crate) fn lease_record_body(
 
 impl SweepRegistry {
     /// Write a lease record (Issue #6179) for `issue`, naming `step` when the
-    /// claimant is a step (#11898). Best-effort and bounded, as before: a `gh`
-    /// failure only logs, and never fails the dispatch or undoes the claim.
+    /// claimant is a step (#11898). Bounded, and a `gh` failure only logs and
+    /// never fails the dispatch or undoes the claim; the result says whether
+    /// the comment was posted, for a caller (the Builder step, #12133) that
+    /// must refuse without it. Other callers ignore it.
     pub(crate) fn write_lease_comment_for(
         &self,
         issue: u32,
         sweep_id: &str,
         step: Option<StepRole>,
-    ) {
+    ) -> bool {
         if self.config.skip_label_flip {
-            return;
+            return true;
         }
         let gh = self.resolved_gh();
         let host = self.published_host_id();
@@ -90,7 +92,7 @@ impl SweepRegistry {
         // Bounded so a wedged `gh` never blocks the dispatch path (#3973).
         let timeout = reaper::reap_gh_timeout();
         match self.run_counted(comment) {
-            Ok(Some(output)) if output.status.success() => {}
+            Ok(Some(output)) if output.status.success() => true,
             Ok(Some(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 self.report_forge_failure(&stderr, "sweep_dispatch (lease comment)");
@@ -99,12 +101,19 @@ impl SweepRegistry {
                     output.status.code(),
                     stderr.trim()
                 );
+                false
             }
-            Ok(None) => log::warn!(
-                "lease comment for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => log::warn!("lease comment for #{issue} failed: {e}"),
+            Ok(None) => {
+                log::warn!(
+                    "lease comment for #{issue} exceeded {}s, killed (#3973)",
+                    timeout.as_secs()
+                );
+                false
+            }
+            Err(e) => {
+                log::warn!("lease comment for #{issue} failed: {e}");
+                false
+            }
         }
     }
 }

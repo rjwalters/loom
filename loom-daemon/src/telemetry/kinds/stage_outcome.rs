@@ -12,8 +12,6 @@
 //!
 //! **OTLP only.** **Provenance is required.**
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -153,21 +151,6 @@ impl FactIdMissingReason {
             FactIdMissingReason::NoForgeInstant => "no_forge_instant",
         }
     }
-}
-
-/// Exits emitted without a `loom.fact_id` this process (#11401), reported by
-/// `host.export`. Cumulative per process lifetime.
-static FACT_ID_MISSING_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Count one emitted exit that carries no `loom.fact_id`.
-pub fn note_fact_id_missing() {
-    FACT_ID_MISSING_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Exits emitted without a `loom.fact_id` since this process started.
-#[must_use]
-pub fn fact_id_missing_total() -> u64 {
-    FACT_ID_MISSING_TOTAL.load(Ordering::Relaxed)
 }
 
 /// One stage an item left.

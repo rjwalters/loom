@@ -183,8 +183,6 @@ A test file takes its subject's status.
 | `defaults/scripts/tests/test-sweep-experiment.sh` | Its test | live |
 | `defaults/docs/model-cost-experiment.md` | Experiment design (#3725, #9122) | live (observe recording) |
 | `docs/model-selection-retune.md` | Cheap-first retune (#3718) | inert-unless-configured |
-| `defaults/scripts/experiments/README.md` | Cites `sweep.modelExperiment` as flag precedent | dead |
-| `defaults/scripts/experiments/judge-fanout-experiment.sh` | Same | dead |
 | `docs/research/dynamic-workflows-evaluation.md` | Same | dead |
 | `loom-daemon/tests/native_tools.rs` | Fixture config `autonomous.modelExperiment`, a key path nothing reads | dead |
 
@@ -199,7 +197,6 @@ A test file takes its subject's status.
 | `loom-daemon/src/forge_pr_congestion.rs` | `points_from_labels`, a **separate** parser that accepts `points:4` | live |
 | `loom-daemon/src/work_finder/ready_queue_tests.rs` | Ready-queue `story_points` for the disposition exporter | live |
 | `loom-daemon/src/sweep_registry/guards/issue_snapshot_tests.rs` | `points:3` label fixture | live |
-| `loom-daemon/src/observability/captain_gauges/facts_tests.rs` | `points:3` label fixture | live |
 | `loom-daemon/src/label_registry/tests.rs` | `points:1` used as a `replaced_by` fixture | live |
 | `.github/labels.yml` | 6 `points:*` labels marked "(paused)" | live |
 | `defaults/.github/labels.yml` | Same (consumer copy) | live |

@@ -54,7 +54,10 @@ pub fn find_repo_root() -> Option<PathBuf> {
     None
 }
 
-fn logical_cwd() -> Option<PathBuf> {
+/// bash's `$PWD` when it names the directory we are actually in, else the
+/// resolved physical path: the operator's logical path is what every message
+/// and state file should name. Shared with `daemon_update::paths`.
+pub(crate) fn logical_cwd() -> Option<PathBuf> {
     let physical = std::env::current_dir().ok()?;
     if let Some(pwd) = std::env::var_os("PWD") {
         let logical = PathBuf::from(pwd);

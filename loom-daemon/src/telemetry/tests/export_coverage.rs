@@ -38,9 +38,8 @@ fn pre_10196_record_decodes_with_empty_coverage() {
 fn exported_kinds_follow_the_registry_routing() {
     let https = exported_kinds_for(&["https".to_string()]);
     let otlp = exported_kinds_for(&["otlp".to_string()]);
-    // native-only kinds never appear under otlp-only and vice versa.
-    assert!(https.iter().any(|k| k == "queue.snapshot"));
-    assert!(!otlp.iter().any(|k| k == "queue.snapshot"));
+    // OTLP-only kinds never appear under https-only and vice versa.
+    assert!(https.iter().any(|k| k == "sweep.outcome"));
     assert!(otlp.iter().any(|k| k == "session.output"));
     assert!(!https.iter().any(|k| k == "session.output"));
     assert!(exported_kinds_for(&[]).is_empty());
@@ -73,7 +72,7 @@ fn coverage_excludes_misconfigured_exporters_in_a_mixed_configuration() {
     let (exporters, kinds) = export_coverage(&statuses, now);
     assert_eq!(exporters, vec!["https".to_string()]);
     assert_eq!(kinds, exported_kinds_for(&["https".to_string()]));
-    assert!(kinds.iter().any(|k| k == "queue.snapshot"));
+    assert!(kinds.iter().any(|k| k == "sweep.outcome"));
     // OTLP-only kinds must not be advertised by a sink that never ran.
     assert!(!kinds.iter().any(|k| k == "session.output"));
 }

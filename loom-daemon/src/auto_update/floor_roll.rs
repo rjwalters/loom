@@ -310,6 +310,42 @@ pub fn floor_verdict(
     }
 }
 
+/// Whether an armed floor roll should be disarmed because the floor moved
+/// after it was armed (#12610). `None` keeps the roll.
+///
+/// Only a floor that is *known* can disarm: an unknown or unreadable floor is a
+/// transient failure, not a withdrawal. The roll is disarmed when
+///
+/// - the floor is now **lower** than the one it was armed under
+///   (`floor_at_arm`): a rollback withdraws the target even when the new, lower
+///   floor would still demand a roll, since the target was chosen for the old
+///   one; or
+/// - the running version now **meets** the floor, so nothing demands a roll
+///   (unless a workspace's `repo_ahead` demand drives it, which a floor change
+///   does not withdraw).
+#[must_use]
+pub fn disarm_reason(
+    floor_at_arm: Option<&str>,
+    fresh: &FloorKnowledge,
+    running: &str,
+    repo_ahead_driving: bool,
+) -> Option<String> {
+    let FloorKnowledge::Set(floor) = fresh else {
+        return None;
+    };
+    let (now, run) = (parse_triple(floor)?, parse_triple(running)?);
+    if let Some(armed) = floor_at_arm.and_then(|f| parse_triple(f).map(|t| (f, t))) {
+        if now < armed.1 {
+            return Some(format!(
+                "the fleet floor was lowered from {} to {floor} after this roll was armed",
+                armed.0
+            ));
+        }
+    }
+    (run >= now && !repo_ahead_driving)
+        .then(|| format!("the fleet floor {floor} is met by the running version {running}"))
+}
+
 /// The loop's floor bookkeeping: the basis set at the start of each tick, the
 /// last verdict, and the record of the last unsatisfiable-floor alert.
 ///
@@ -327,6 +363,11 @@ pub struct FloorState {
     /// #11029: consecutive ticks a host below its floor could not resolve a
     /// release to roll to. Reset by any other reading and by a changed basis.
     unresolved_streak: u32,
+    /// #12652: an alerted stall was dropped during this tick, by
+    /// [`Self::set_basis`] or [`Self::observe`]. Read through
+    /// [`Self::was_alerted`] so the loom-ui incident is resolved; cleared at
+    /// the start of the next tick's [`Self::set_basis`].
+    alert_dropped: bool,
 }
 
 /// #11029: consecutive below-floor ticks with no resolvable target before the
@@ -350,6 +391,7 @@ impl FloorState {
     /// #10885: a basis under which a fleet host cannot be compared with its
     /// floor is logged at WARN here, once per change, not once per tick.
     pub fn set_basis(&mut self, knowledge: FloorKnowledge, running: &str) {
+        self.alert_dropped = false;
         if self.knowledge == knowledge && self.running == running {
             return;
         }
@@ -357,10 +399,11 @@ impl FloorState {
         self.running = running.to_string();
         self.unresolved_streak = 0;
         let floor = self.floor().map(str::to_string);
-        self.alert = self
-            .alert
-            .take()
+        let before = self.alert.take();
+        self.alert = before
+            .clone()
             .filter(|a| Some(&a.report.floor) == floor.as_ref() && a.report.running == running);
+        self.alert_dropped |= before.is_some() && self.alert.is_none();
         self.verdict = match &self.alert {
             Some(a) => FloorVerdict::Unsatisfiable(a.report.clone()),
             // Classified from the basis alone until [`Self::observe`] sees
@@ -468,7 +511,7 @@ impl FloorState {
         }
         if self.stall().is_none() {
             // A stall that returns later is a new start.
-            self.alert = None;
+            self.alert_dropped |= self.alert.take().is_some();
         }
         match &self.verdict {
             FloorVerdict::Below { target, .. } => Some(target.clone()),
@@ -656,6 +699,31 @@ mod tests {
 
     fn set(floor: &str) -> FloorKnowledge {
         FloorKnowledge::Set(floor.to_string())
+    }
+
+    #[test]
+    fn a_lowered_floor_disarms_even_when_it_still_demands_a_roll() {
+        let why = disarm_reason(Some("0.19.900"), &set("0.19.890"), "0.19.880", false);
+        assert!(why.is_some_and(|w| w.contains("lowered from 0.19.900 to 0.19.890")));
+    }
+
+    #[test]
+    fn a_floor_the_running_version_meets_disarms() {
+        assert!(disarm_reason(None, &set("0.19.880"), "0.19.880", false).is_some());
+        // A workspace's repo_ahead demand is not withdrawn by a floor change.
+        assert_eq!(disarm_reason(None, &set("0.19.880"), "0.19.880", true), None);
+    }
+
+    #[test]
+    fn a_standing_or_unreadable_floor_keeps_the_roll() {
+        assert_eq!(disarm_reason(Some("0.19.900"), &set("0.19.900"), "0.19.880", false), None);
+        assert_eq!(disarm_reason(Some("0.19.900"), &set("0.19.910"), "0.19.880", false), None);
+        let unknown = FloorKnowledge::Unknown("unreachable".to_string());
+        assert_eq!(disarm_reason(Some("0.19.900"), &unknown, "0.19.880", false), None);
+        assert_eq!(
+            disarm_reason(Some("0.19.900"), &FloorKnowledge::NoStore, "0.19.880", false),
+            None
+        );
     }
 
     #[test]

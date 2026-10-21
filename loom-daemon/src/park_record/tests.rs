@@ -51,7 +51,7 @@ fn render_park_with_no_blockers_declares_the_gap_rather_than_faking_a_reference(
     let park = render_park(&[], Some("human"), None, Some("reason pending"));
     assert!(park.contains("Blocked by: (unstated)"), "got {park}");
     assert!(blockers(&park).is_empty());
-    assert!(has_record(&park), "an unstated park is still a record");
+    assert!(!parse(&park).is_empty(), "an unstated park is still a record");
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn an_attribute_value_with_spaces_cannot_truncate_the_next_attribute() {
 #[test]
 fn prose_that_merely_mentions_a_blocker_is_not_a_record() {
     let body = "Blocked by #8322 - filed it to track the ratchet decision.";
-    assert!(!has_record(body));
+    assert!(parse(body).is_empty());
     assert!(blockers(body).is_empty());
     // …but the legacy prose parser still sees it, which is exactly the state
     // #8925 is about: readable as a dependency, not attributable as a park.
@@ -181,14 +181,14 @@ fn prose_that_merely_mentions_a_blocker_is_not_a_record() {
 
 #[test]
 fn a_truncated_marker_is_not_a_record() {
-    assert!(!has_record("<!-- loom:park Blocked by: #8322"));
+    assert!(parse("<!-- loom:park Blocked by: #8322").is_empty());
 }
 
 #[test]
 fn a_lease_record_is_not_a_park_record() {
     // The sibling marker family must not cross-parse (`lease-record.md`).
     let lease = "<!-- loom:lease host=host-34209a6e sweep=sweep-issue-8925-1790435534 -->";
-    assert!(!has_record(lease));
+    assert!(parse(lease).is_empty());
 }
 
 #[test]
@@ -290,50 +290,181 @@ fn mask_qualified_removes_only_qualified_refs_inside_markers() {
     assert!(m.contains("Blocked by: , #3"), "{m}");
 }
 
-// --- #10556: re-park rewrite and the qualified-ref skip --------------------
-
+/// #10837: a marker quoted in a fenced block or an inline code span renders as
+/// visible text, so it is not a record.
 #[test]
-fn drop_blockers_removes_only_the_resolved_records() {
-    let body = format!("Intro text.\n\n{}\n{}\n\nTrailer.\n", render(&rec(1)), render(&rec(3)));
-    let out = drop_blockers(&body, &[1]);
-    assert_eq!(blockers(&out), n(&[3]));
-    assert_eq!(out, format!("Intro text.\n\n{}\n\nTrailer.\n", render(&rec(3))));
-    // Nothing resolved: byte-for-byte unchanged.
-    assert_eq!(drop_blockers(&body, &[99]), body);
+fn a_marker_quoted_in_code_is_not_a_record() {
+    let quoted = "<!-- loom:park Blocked by: #1689 by=guide reason=\"x\" -->";
+    for body in [
+        format!("Report:\n\n```\n{quoted}\n```\n"),
+        format!("~~~text\n{quoted}\n~~~\n"),
+        format!("````md\n```\n{quoted}\n```\n````\n"),
+        format!("Unclosed:\n```\n{quoted}\n"),
+        format!("Inline: `{quoted}` and ``{quoted}``.\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+    }
+    // Outside the code, the same body still declares its own records.
+    let body = format!("```\n{quoted}\n```\n\n{}\n", render(&rec(7)));
+    assert_eq!(blockers(&body), n(&[7]));
 }
 
+/// The code mask must not hide a real record: a backtick in its reason, a
+/// code span beside it, or non-ASCII text before it on the line.
 #[test]
-fn drop_blockers_rerenders_a_mixed_hand_written_marker() {
-    let body = "x\n<!-- loom:park Blocked by: #1, #2 by=guide -->\ny\n";
-    let out = drop_blockers(body, &[1]);
-    assert_eq!(blockers(&out), n(&[2]));
-    assert!(out.starts_with("x\n<!-- loom:park Blocked by: #2 by=guide -->"));
-    assert!(out.ends_with("\ny\n"));
+fn a_real_record_beside_code_still_parses() {
+    let body = "ünïcode `span` <!-- loom:park Blocked by: #5 reason=\"the ` flag\" --> `tail`\n";
+    assert_eq!(blockers(body), n(&[5]));
+    assert_eq!(parse(body)[0].reason.as_deref(), Some("the ` flag"));
+    // An inline triple backtick is code, not a fence opener.
+    let body = "Use ```x``` here.\n<!-- loom:park Blocked by: #6 -->\n";
+    assert_eq!(blockers(body), n(&[6]));
 }
 
+/// #10837 review: Markdown code boundaries. A 4-space-indented triple backtick
+/// is indented code, not a fence opener, so the real record after it parses.
 #[test]
-fn drop_blockers_keeps_an_inline_marker_line() {
-    let body = format!("See {} here.\n", render(&rec(1)));
-    assert_eq!(drop_blockers(&body, &[1]), "See  here.\n");
+fn indented_backticks_do_not_open_a_fence() {
+    let body = "Evidence:\n\n    ```\n\n<!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+    let body = "Evidence:\n\n\t```\n\n<!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+    // Up to 3 spaces still opens a fence.
+    let body = "   ```\n<!-- loom:park Blocked by: #7 -->\n```\n";
+    assert!(parse(body).is_empty());
 }
 
+/// A backslash-escaped backtick is literal text, so it cannot open a code span
+/// that hides a genuine record after it.
 #[test]
-fn qualified_refs_are_detected_outside_the_reason_only() {
-    assert!(has_qualified_ref("<!-- loom:park Blocked by: example-org/ui-repo#303 -->"));
-    assert!(!has_qualified_ref(&render(&rec(5))));
-    assert!(!has_qualified_ref(
-        "<!-- loom:park Blocked by: #5 reason=\"after other/repo#9 lands\" -->"
-    ));
-    // Outside any marker: prose, not a park.
-    assert!(!has_qualified_ref("Depends on other/repo#9"));
+fn escaped_backtick_does_not_open_a_code_span() {
+    let body = r#"\` <!-- loom:park Blocked by: #5 reason="the ` flag" -->"#;
+    assert_eq!(blockers(body), n(&[5]));
+    // An unescaped span still hides a quoted marker.
+    let body = "`<!-- loom:park Blocked by: #5 -->`\n";
+    assert!(parse(body).is_empty());
 }
 
+/// #10837 review: backslashes pair off. An odd run escapes the backtick (no
+/// span, so the real record parses); an even run leaves it active (a span
+/// that quotes the marker).
 #[test]
-fn drop_blockers_never_drops_a_qualified_record_by_its_number() {
-    // A local `#1` resolving must not take `o/r#1` — another repo's artifact —
-    // with it (#10443 x #10556).
-    let body = "x\n<!-- loom:park Blocked by: #1, o/r#1 by=guide -->\ny\n";
-    let out = drop_blockers(body, &[1]);
-    assert_eq!(blockers(&out), vec![q("o/r", 1)]);
-    assert!(has_qualified_ref(&out), "{out}");
+fn backslash_parity_decides_whether_a_backtick_is_escaped() {
+    let q = "<!-- loom:park Blocked by: #7 -->";
+    // Two or four backslashes: the backtick is a live span opener, so the
+    // marker is code.
+    for body in [format!("\\\\`{q}`\n"), format!("\\\\\\\\`{q}`\n")] {
+        assert!(parse(&body).is_empty(), "{body}");
+    }
+    // One or three backslashes: escaped, so the marker is a real record.
+    for body in [format!("\\`{q}`\n"), format!("\\\\\\`{q}`\n")] {
+        assert_eq!(blockers(&body), n(&[7]), "{body}");
+    }
+}
+
+/// #10837 review: a heading is not an open paragraph, so a 4-space-indented
+/// marker directly under it is indented code; a real record after is a control.
+#[test]
+fn indented_marker_after_a_heading_is_code() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("## Evidence\n    {q}\n"),
+        format!("# Evidence #\n\t{q}\n"),
+        format!("---\n    {q}\n"),
+        format!("Title\n===\n    {q}\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        let after = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+        assert_eq!(blockers(&after), n(&[7]), "{after}");
+    }
+    // Plain paragraph text (or a `#tag` without a space) stays a paragraph, so
+    // an indented line is a continuation and the marker is a real record.
+    let body = format!("Evidence\n    {q}\n");
+    assert_eq!(blockers(&body), n(&[1689]));
+    let body = format!("#Evidence\n    {q}\n");
+    assert_eq!(blockers(&body), n(&[1689]));
+}
+
+/// #10837 review: a short (`--`) setext underline closes the paragraph like a
+/// long one, so an indented marker after it is code; a real record after a
+/// blank line is the control. An underline-looking line with inner spaces, or
+/// with no paragraph above it, does not change how the next line reads.
+#[test]
+fn indented_marker_after_a_short_setext_underline_is_code() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("Evidence\n--\n    {q}\n"),
+        format!("Evidence\n-\n\t{q}\n"),
+        format!("Evidence\n----  \n    {q}\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        let after = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+        assert_eq!(blockers(&after), n(&[7]), "{after}");
+    }
+    // `- -` is not an underline (inner space), so the paragraph stays open and
+    // the indented marker is a continuation: a real record.
+    let body = format!("Evidence\n- -\n    {q}\n");
+    assert_eq!(blockers(&body), n(&[1689]));
+}
+
+/// #10837 review: a fence opened directly inside a list item (bulleted,
+/// numbered, nested) quotes its content, even across blank lines; a genuine
+/// record after the list is still read.
+#[test]
+fn fences_inside_list_items_quote_their_markers() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("- ```\n\n  {q}\n\n  ```\n"),
+        format!("* ```\n  {q}\n  ```\n"),
+        format!("1. ```\n\n   {q}\n\n   ```\n"),
+        format!("1) ~~~text\n   {q}\n   ~~~\n"),
+        format!("- outer\n  - ```\n\n    {q}\n\n    ```\n"),
+        format!("- item\n\n  ```\n\n  {q}\n\n  ```\n"),
+        // Unclosed: runs to the end of the item (the end of the body here).
+        format!("- ```\n  {q}\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        // A genuine record after the list is the control.
+        let after = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+        if !body.ends_with(&format!("{q}\n")) {
+            assert_eq!(blockers(&after), n(&[7]), "{after}");
+        }
+    }
+    // A line dedented past the item ends its fence, so the record is real.
+    let body = "- ```\n  code\n<!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+    // A marker on a list item's own line is still a record.
+    let body = "- <!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+}
+
+/// Indented code, blockquotes (plain, indented, fenced, lazy), and multiline
+/// inline code spans never declare a record; a real record after each does.
+#[test]
+fn markers_in_indented_quoted_or_multiline_code_are_not_records() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("Evidence:\n\n    {q}\n"),
+        format!("Evidence:\n\n\t{q}\n"),
+        format!("> {q}\n"),
+        format!("  > {q}\n"),
+        format!("> > {q}\n"),
+        format!("> ```\n> {q}\n> ```\n"),
+        format!("Span `start\n{q}\nend` done\n"),
+        format!("Span ``start\n{q}\nend`` done\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+    }
+    // A real record right after a quote or code still parses.
+    for body in [
+        "> quoted\n\n<!-- loom:park Blocked by: #7 -->\n",
+        "> quoted\n<!-- loom:park Blocked by: #7 -->\n",
+        "    code\n\n<!-- loom:park Blocked by: #7 -->\n",
+        "Span `start\nend` done\n<!-- loom:park Blocked by: #7 -->\n",
+    ] {
+        assert_eq!(blockers(body), n(&[7]), "{body}");
+    }
+    // 4-space indent inside a paragraph is a continuation, not code.
+    let body = "para\n    <!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
 }

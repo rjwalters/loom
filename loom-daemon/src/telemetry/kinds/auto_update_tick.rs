@@ -242,6 +242,14 @@ pub struct AutoUpdateTickRecord {
     /// Raises the record to ERROR when floor-driven, else WARN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_held: Option<RollHeld>,
+    /// #12420: the host's update state at the end of the tick (`H0`–`H5`,
+    /// `H7`, `unknown`). Absent from a record written before the projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_state: Option<String>,
+    /// #12420: who would choose the roll target (`floor`, `repo-ahead`,
+    /// `autoUpdate`, `none`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_source: Option<String>,
     /// Consecutive retryable failures for the tracked target.
     pub consecutive_failures: u32,
     /// Wall time the tick took, milliseconds.

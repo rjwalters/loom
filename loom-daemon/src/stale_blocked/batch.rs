@@ -416,7 +416,6 @@ fn read_text(
     p.held = super::hold::latest_reasoned(&p.body).map(|r| super::Held {
         by: r.by,
         reason: r.reason.unwrap_or_default().trim().to_string(),
-        at: r.at,
     });
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
@@ -741,6 +740,8 @@ impl StaleBlockedForge for GhStaleBlockedForge {
     }
 
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>> {
+        // #12310: the blocked-issue listing is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         crate::forge_listing::list_issues_cached_all_as(
             CALLER,
             &self.gh_bin,
@@ -806,11 +807,20 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         )
         .forge_op(ops::ISSUE_CLOSED_BY_PULL_REQUESTS)
         .identity_scope(None, Some(&self.slug))
+        // Reader-only (#12394, #12584): a GraphQL argv does not spell its
+        // repo for the facade, so the reader route names it.
+        .reader_repo(&self.slug)
         .program(&self.gh_bin)
         .current_dir(&self.root)
         .args(["api", "graphql", "-f", field.as_str()]);
         let out = match inv.execute() {
             Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(GhCompletion::DeadlineReached) => {
+                return Err(anyhow!("gh api graphql not sent: the tick deadline passed"));
+            }
+            Ok(GhCompletion::Shed { .. }) => {
+                return Err(anyhow!("gh api graphql was shed: no reader can serve it"));
+            }
             Ok(_) => {
                 // It may still have been charged.
                 self.meter.graphql(None, None);

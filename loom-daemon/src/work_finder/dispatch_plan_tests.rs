@@ -1,14 +1,12 @@
 //! Coverage for `dispatch_plan::annotate` (Issue #9288) over hand-built
 //! tick reports. End-to-end coverage against a real tick (plan order equals
-//! the `dispatch()` call order) lives in `repo_cap_tests.rs`, beside the
-//! fakes it needs.
+//! the `dispatch()` call order) lives in the work finder's tick tests.
 
 use std::path::PathBuf;
 
-use super::super::repo_cap::RepoCapSnapshot;
 use super::super::{ready_queue, PriorityCandidate, TickReport};
 use super::*;
-use crate::types::{PlanGate, PlanShard, PlanState, QueueDisposition as Qd, RepoCapView};
+use crate::types::{PlanGate, PlanShard, PlanState, QueueDisposition as Qd};
 
 fn key(ws: usize, prio: u32, number: u32) -> PriorityCandidate {
     PriorityCandidate {
@@ -60,134 +58,6 @@ fn plan(report: &TickReport, inputs: &PlanInputs) -> (Vec<ReadyQueueRow>, Dispat
 
 fn by_issue(rows: &[ReadyQueueRow], issue: u32) -> &ReadyQueueRow {
     rows.iter().find(|r| r.issue == issue).unwrap()
-}
-
-/// `plan_state` per disposition: `running` for dispatched/in-flight; `next`
-/// for at most `max_admissions_per_tick` capacity/ramp-deferred rows in plan
-/// order, skipping a repo-capped one; `queued` for the other deferred rows;
-/// `blocked` otherwise — and `position` follows `plan_order`, not `rank`.
-#[test]
-fn plan_state_and_position_follow_the_shaped_order() {
-    let report = TickReport {
-        queue: vec![
-            qrow(0, 1, Qd::DeferredCapacity),
-            qrow(0, 2, Qd::Parked),
-            qrow(1, 3, Qd::Dispatched),
-            qrow(1, 4, Qd::DeferredRepoCap),
-            qrow(1, 5, Qd::DeferredRampCap),
-            qrow(1, 6, Qd::InFlight),
-            qrow(1, 7, Qd::DeferredCapacity),
-            qrow(1, 8, Qd::OpenPr),
-        ],
-        // Affinity floated workspace 1 ahead of workspace 0.
-        plan_order: vec![(1, 3), (1, 4), (1, 5), (1, 8), (1, 7), (0, 1)],
-        max_admissions_per_tick: Some(2),
-        occupancy: Some(3),
-        ..TickReport::default()
-    };
-    let (rows, ctx) = plan(&report, &inputs());
-
-    let expect = [
-        (1, Some(6), PlanState::Queued, Some(PlanGate::Capacity)),
-        (2, None, PlanState::Blocked, None),
-        (3, Some(1), PlanState::Running, None),
-        (4, Some(2), PlanState::Queued, Some(PlanGate::RepoCap)),
-        (5, Some(3), PlanState::Next, Some(PlanGate::Ramp)),
-        (6, None, PlanState::Running, None),
-        (7, Some(5), PlanState::Next, Some(PlanGate::Capacity)),
-        (8, None, PlanState::Blocked, None),
-    ];
-    for (issue, position, state, gate) in expect {
-        let p = &by_issue(&rows, issue).plan;
-        assert_eq!((p.position, p.plan_state, p.gate), (position, state, gate), "#{issue}");
-    }
-    // `rank` is untouched: still the bare comparator rank over every row.
-    assert_eq!(by_issue(&rows, 1).rank, 1);
-    assert_eq!(by_issue(&rows, 3).rank, 3);
-    assert_eq!(ctx.slots.free, Some(1));
-    assert_eq!(ctx.slots.max_admissions_per_tick, Some(2));
-    assert_eq!(ctx.tick_interval_secs, Some(60));
-    assert_eq!(ctx.scope, vec!["loom:issue", "loom:blocked"]);
-    assert_eq!(ctx.ordering, ready_queue::ordering_names());
-    assert!(ctx.complete);
-    // Every row names the comparator keys that placed it.
-    assert!(rows.iter().all(|r| r.plan.keys.len() == ctx.ordering.len()));
-}
-
-/// Saturation held ⇒ nothing is `next` (the brake holds every admission),
-/// while the slots are still reported.
-#[test]
-fn saturation_held_leaves_next_empty() {
-    let report = TickReport {
-        queue: vec![
-            qrow(0, 1, Qd::DeferredSaturation),
-            qrow(0, 2, Qd::DeferredSaturation),
-        ],
-        plan_order: vec![(0, 1), (0, 2)],
-        saturation_held: true,
-        max_admissions_per_tick: Some(4),
-        occupancy: Some(1),
-        ..TickReport::default()
-    };
-    let (rows, ctx) = plan(&report, &inputs());
-    assert!(rows.iter().all(|r| r.plan.plan_state == PlanState::Queued));
-    assert!(rows
-        .iter()
-        .all(|r| r.plan.gate == Some(PlanGate::Saturation)));
-    assert!(ctx.slots.saturation_held);
-    assert_eq!(ctx.slots.free, Some(3));
-}
-
-/// Deferred rows take their position from the shaped plan order (no slice
-/// rows trail it since #11682); the cap inputs are reported per row; and
-/// `owning_shard` still comes from the inputs — the fleet-merge primary rule
-/// reads it even though dispatch no longer shards.
-#[test]
-fn deferred_rows_follow_the_plan_with_shaping_inputs() {
-    let report = TickReport {
-        queue: vec![
-            qrow(0, 1, Qd::DeferredRepoCap),
-            qrow(0, 2, Qd::DeferredRepoCap),
-            qrow(1, 3, Qd::Dispatched),
-            qrow(1, 4, Qd::DeferredCapacity),
-        ],
-        plan_order: vec![(1, 3), (1, 4), (0, 1), (0, 2)],
-        repo_cap: Some(RepoCapSnapshot {
-            cap: Some(2),
-            occupancy: vec![0, 1],
-            occupancy_end: Vec::new(),
-        }),
-        max_admissions_per_tick: Some(1),
-        ..TickReport::default()
-    };
-    let inputs = PlanInputs {
-        shard: PlanShard {
-            configured: true,
-            host_shard: Some(1),
-            shard_count: Some(2),
-        },
-        owning_shard: vec![Some(0), Some(1)],
-        ..inputs()
-    };
-    let (rows, ctx) = plan(&report, &inputs);
-    let (one, two) = (&by_issue(&rows, 1).plan, &by_issue(&rows, 2).plan);
-    assert_eq!((one.position, one.plan_state), (Some(3), PlanState::Queued));
-    assert_eq!(two.position, Some(4));
-    assert_eq!(one.gate, Some(PlanGate::RepoCap));
-    assert_eq!((one.hot, one.owning_shard), (Some(false), Some(0)));
-    assert_eq!(
-        one.repo_cap,
-        Some(RepoCapView {
-            cap: Some(2),
-            occupancy: 0
-        })
-    );
-    let four = &by_issue(&rows, 4).plan;
-    assert_eq!((four.position, four.plan_state), (Some(2), PlanState::Next));
-    assert_eq!((four.hot, four.owning_shard), (Some(true), Some(1)));
-    assert_eq!(ctx.shard.host_shard, Some(1));
-    // No occupancy reading ⇒ no free-slot figure, never a guessed one.
-    assert_eq!(ctx.slots.free, None);
 }
 
 /// `in_slice` is retired (#11682): no row carries it, sharded or not.
@@ -242,15 +112,6 @@ fn mismatched_rows_are_left_unannotated() {
         .all(|r| r.plan == crate::types::RowPlan::default()));
 }
 
-#[test]
-fn gates_map_only_deferrals() {
-    assert_eq!(gate_of(Qd::DeferredRepoCap), Some(PlanGate::RepoCap));
-    assert_eq!(gate_of(Qd::DeferredSaturation), Some(PlanGate::Saturation));
-    for d in Qd::ALL {
-        assert_eq!(gate_of(d).is_some(), d.state() == "ready", "{d:?}");
-    }
-}
-
 /// Each of the five time-boxed hold dispositions (Issue #9311) carries its
 /// recorded expiry straight through to `plan.held_until`.
 #[test]
@@ -278,27 +139,45 @@ fn held_until_carries_each_time_boxed_holds_expiry() {
     }
 }
 
-/// Every other disposition — capacity/ramp gates, running, quarantined-style
-/// pre-filters with no recorded expiry, and a not-yet-held candidate — leaves
-/// `held_until` as `None` (Issue #9311): additive, never inferred.
+/// `plan_state` per disposition (#12406: no ramp, saturation or repo-cap
+/// gates): `running` for dispatched/in-flight; `next` for the first
+/// `max_concurrent` capacity-deferred rows in plan order; `queued` for the
+/// other deferred rows; `blocked` otherwise — and `position` follows
+/// `plan_order`, not `rank`.
 #[test]
-fn held_until_is_none_for_every_other_disposition() {
+fn plan_state_and_position_follow_the_draw_order() {
     let report = TickReport {
         queue: vec![
             qrow(0, 1, Qd::DeferredCapacity),
-            qrow(0, 2, Qd::DeferredRampCap),
-            qrow(0, 3, Qd::DeferredRepoCap),
-            qrow(0, 4, Qd::Dispatched),
-            qrow(0, 5, Qd::InFlight),
-            qrow(0, 6, Qd::Quarantined),
-            qrow(0, 7, Qd::PeerClaim),
-            qrow(0, 8, Qd::Parked),
+            qrow(0, 2, Qd::Parked),
+            qrow(1, 3, Qd::Dispatched),
+            qrow(1, 4, Qd::DeferredBuildBackoff),
+            qrow(1, 6, Qd::InFlight),
+            qrow(1, 7, Qd::DeferredCapacity),
+            qrow(1, 8, Qd::OpenPr),
         ],
-        plan_order: vec![(0, 4), (0, 1), (0, 2), (0, 3)],
-        max_admissions_per_tick: Some(1),
-        occupancy: Some(0),
+        plan_order: vec![(1, 3), (1, 4), (1, 8), (1, 7), (0, 1)],
+        occupancy: Some(3),
         ..TickReport::default()
     };
-    let (rows, _ctx) = plan(&report, &inputs());
-    assert!(rows.iter().all(|r| r.plan.held_until.is_none()));
+    let inputs = PlanInputs {
+        max_concurrent: 1,
+        ..inputs()
+    };
+    let (rows, ctx) = plan(&report, &inputs);
+    let expect = [
+        (1, Some(5), PlanState::Queued, Some(PlanGate::Capacity)),
+        (2, None, PlanState::Blocked, None),
+        (3, Some(1), PlanState::Running, None),
+        (4, Some(2), PlanState::Queued, Some(PlanGate::BuildBackoff)),
+        (6, None, PlanState::Running, None),
+        (7, Some(4), PlanState::Next, Some(PlanGate::Capacity)),
+        (8, None, PlanState::Blocked, None),
+    ];
+    for (issue, position, state, gate) in expect {
+        let p = &by_issue(&rows, issue).plan;
+        assert_eq!((p.position, p.plan_state, p.gate), (position, state, gate), "#{issue}");
+    }
+    assert_eq!(ctx.slots.max_concurrent, 1);
+    assert_eq!(ctx.slots.free, Some(0));
 }

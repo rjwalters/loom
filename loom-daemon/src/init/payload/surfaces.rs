@@ -195,17 +195,18 @@ pub(crate) fn export_pathspecs() -> Vec<&'static str> {
     specs
 }
 
+/// Is `root` one of the payload trees (the installer's `.loom` files and
+/// Loom's slash commands), as opposed to an extra surface?
+pub(crate) fn is_payload_tree(root: &str) -> bool {
+    PAYLOAD_TREES.iter().any(|tree| within(root, tree))
+}
+
 /// `path` is `root` or lies under it.
 fn within(path: &str, root: &str) -> bool {
     path == root
         || path
             .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// Is `path` one of the extra surfaces (as opposed to the installer's)?
-pub(super) fn is_extra(path: &str) -> bool {
-    EXTRA_SURFACES.iter().any(|s| within(path, s.path))
 }
 
 /// May a resync record `path` in `installed_files`? That list is deletion
@@ -259,6 +260,10 @@ pub(crate) enum SkipReason {
     /// or END, END before BEGIN, a lone or near-miss marker. Not guessed at;
     /// the run is reported failed so someone fixes the markers.
     MalformedMarkers(String),
+    /// A directory above it is a symlink the resync cannot write through:
+    /// it points outside the repo, dangles, loops, or resolves onto another
+    /// root (#11426). The reason names the link and where it points.
+    BehindSymlink(String),
 }
 
 /// Run every extra step over `stage`, which already holds the workspace's
@@ -406,6 +411,17 @@ pub(crate) fn log_skipped_once(repo: &Path, skipped: &[Skipped]) {
                  is until the BEGIN/END markers are fixed by hand",
                 repo.display(),
                 skip.path
+            ),
+            SkipReason::BehindSymlink(why) => log::warn!(
+                "resync: {}: {} is NOT resynced: {why}. Loom's files there stay at their \
+                 current release{}",
+                repo.display(),
+                skip.path,
+                if is_payload_tree(&skip.path) {
+                    ", and the install stamp is held at it until the link is fixed"
+                } else {
+                    ""
+                }
             ),
         }
     }

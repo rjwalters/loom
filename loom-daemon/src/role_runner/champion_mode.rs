@@ -24,7 +24,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Mutex, OnceLock};
 
-use super::RoleSpec;
+use super::{resolve_roles, RoleRunnerConfig, RoleSpec};
 
 /// The one role `championMode` applied to.
 pub const CHAMPION_ROLE: &str = "champion";
@@ -104,6 +104,14 @@ pub fn is_step_role(role: &str) -> bool {
 fn warned() -> &'static Mutex<BTreeSet<(String, String)>> {
     static WARNED: OnceLock<Mutex<BTreeSet<(String, String)>>> = OnceLock::new();
     WARNED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// The roles `config` runs as interval loops: [`resolve_roles`] without the
+/// [`STEP_ROLES`], which run as work-finder steps. What status and health
+/// report as ticking (#12049).
+#[must_use]
+pub fn resolve_interval_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
+    without_step_roles(resolve_roles(config), None)
 }
 
 /// `specs` without the [`STEP_ROLES`]. `key` names the config list they came

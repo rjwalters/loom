@@ -4,9 +4,9 @@
 use anyhow::Result;
 use std::path::Path;
 
-use loom_daemon::launchd_reload;
-use loom_daemon::restart_verify::{self, RelaunchOutcome, Supervisor};
-use loom_daemon::types::{Request, Response};
+use crate::launchd_reload;
+use crate::restart_verify::{self, RelaunchOutcome, Supervisor};
+use crate::types::{Request, Response};
 
 use super::common::{query_daemon, resolve_socket_path};
 
@@ -17,7 +17,7 @@ use super::common::{query_daemon, resolve_socket_path};
 /// only land by moving the WHOLE bundle to this already-under-threshold
 /// module instead of leaving a few new fields behind as dispatch debt).
 #[derive(clap::Args)]
-pub(crate) struct RestartArgs {
+pub struct RestartArgs {
     /// Finish all in-flight sweeps before restarting, instead of restarting
     /// immediately (#4090). New dispatch is paused for the duration.
     #[arg(long)]
@@ -119,7 +119,7 @@ pub(crate) struct VerifyOnlyArgs {
 /// proved not to be enough on a busy systemd host: a **pre-restart stale-unit
 /// warning**, and a **post-restart relaunch verification with supervisor
 /// self-heal** ([`verify_relaunch`]).
-pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
+pub async fn handle_restart_command(args: RestartArgs) -> Result<()> {
     let RestartArgs {
         drain,
         timeout,
@@ -175,7 +175,7 @@ pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
     // Best-effort: returns `None` (no output) on every non-launchd /
     // nothing-to-compare / no-drift outcome, and never blocks or fails the
     // restart itself.
-    if let Some(warning) = loom_daemon::launchd_env_drift::check_launchd_env_drift() {
+    if let Some(warning) = crate::launchd_env_drift::check_launchd_env_drift() {
         eprintln!();
         eprintln!("{warning}");
         eprintln!();
@@ -255,8 +255,10 @@ pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
         Err(e) => {
             eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
             eprintln!();
-            eprintln!("Is the daemon running? Start it with:");
-            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            if !super::common::eprint_socket_missing_hint(&socket_path) {
+                eprintln!("Is the daemon running? Start it with:");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
             std::process::exit(1);
         }
     }
@@ -264,7 +266,7 @@ pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
 
 /// Handle `restart --reload-supervisor` (Issue #6682) — a local
 /// `launchctl bootout` + bounded-retry `launchctl bootstrap`, never a request
-/// to the running daemon (see [`loom_daemon::launchd_reload`]).
+/// to the running daemon (see [`crate::launchd_reload`]).
 ///
 /// Refuses the drain-mode flags outright: they only make sense against the
 /// socket-based restart request this variant deliberately bypasses.
@@ -522,8 +524,10 @@ async fn handle_drain_reply(
         Err(e) => {
             eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
             eprintln!();
-            eprintln!("Is the daemon running? Start it with:");
-            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            if !super::common::eprint_socket_missing_hint(socket_path) {
+                eprintln!("Is the daemon running? Start it with:");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
             std::process::exit(1);
         }
     }

@@ -67,100 +67,6 @@ fn persistent_context_is_stable_across_reopen_and_distinct_per_execution_repo() 
     assert_eq!(TraceStore::load(&store.path(a.path(), "issue-18-attempt-1")).unwrap(), first);
 }
 
-/// 2AMLogic/2am `infra/ops/internal/storyid/testdata/vectors.json`, copied
-/// verbatim: the cross-language D32 v1 conformance vectors (#9068, #9223).
-const D32_VECTORS: &str = include_str!("../../../tests/fixtures/story_vectors_d32_v1.json");
-
-#[test]
-fn story_ids_match_every_d32_v1_reference_vector() {
-    let fixture: serde_json::Value = serde_json::from_str(D32_VECTORS).unwrap();
-    let number = |v: &serde_json::Value| u32::try_from(v["number"].as_u64().unwrap()).unwrap();
-    let vectors = fixture["vectors"].as_array().unwrap();
-    assert_eq!(vectors.len(), 3);
-    for v in vectors {
-        let repo_id = v["repo_id"].as_u64().unwrap();
-        assert_eq!(story_input(repo_id, number(v)), v["input"].as_str().unwrap());
-        let story = story_context(repo_id, number(v)).unwrap();
-        assert_eq!(story.trace_id.as_str(), v["trace_id"].as_str().unwrap(), "{}", v["story"]);
-        assert_eq!(story.span_id.as_str(), v["root_span"].as_str().unwrap(), "{}", v["story"]);
-        // Sampled, W3C random flag unset.
-        assert_eq!(story.flags, 1);
-    }
-    let spans = fixture["span_vectors"].as_array().unwrap();
-    assert_eq!(spans.len(), 11);
-    for v in spans {
-        let span = story_span_id(
-            v["repo_id"].as_u64().unwrap(),
-            number(v),
-            v["kind"].as_str().unwrap(),
-            v["source_event_id"].as_str().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(span.as_str(), v["span_id"].as_str().unwrap(), "{}", v["story"]);
-    }
-    let kinds: Vec<&str> = fixture["span_kinds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|k| k.as_str().unwrap())
-        .collect();
-    assert_eq!(kinds, STORY_SPAN_KINDS);
-    // Every kind is pinned by at least one cross-language span vector, so a
-    // kind cannot join the allowlist with an unchecked derivation.
-    for kind in STORY_SPAN_KINDS {
-        assert!(spans.iter().any(|v| v["kind"] == kind), "no span vector for {kind}");
-    }
-    assert_eq!(fixture["source_event_id_pattern"], "^[A-Za-z0-9._-]{1,256}$");
-}
-
-#[test]
-fn story_context_is_keyed_on_repo_id_not_name() {
-    // rjwalters/loom#9027 (repo_id 1073994527), pinned from D32's table.
-    let story = story_context(1_073_994_527, 9027).unwrap();
-    assert_eq!(story.trace_id.as_str(), "4e99cc89953fb6bd604a06896b83dc81");
-    assert_eq!(story.span_id.as_str(), "9bf80a36c4f1c38f");
-    assert!(story.sampled());
-    assert_ne!(story_context(1_073_994_527, 9028).unwrap().trace_id, story.trace_id);
-    assert_ne!(story_context(1_073_994_528, 9027).unwrap().trace_id, story.trace_id);
-    // The pre-#9068 name-derived key (NUL-joined `loom.story.trace`) is gone.
-    assert_ne!(
-        story.trace_id,
-        TraceId::derived(&["loom.story.trace", "rjwalters/loom", "9027"])
-    );
-}
-
-#[test]
-fn story_span_id_refuses_what_d32_refuses() {
-    let ok = |kind: &str, event: &str| story_span_id(1, 1, kind, event);
-    assert!(ok("story.merge", "a.B_c-9").is_ok());
-    assert!(ok("story.merge", &"x".repeat(256)).is_ok());
-    for kind in STORY_SPAN_KINDS {
-        assert!(ok(kind, "1").is_ok(), "{kind:?}");
-    }
-    for kind in [
-        "loom.story",
-        "ci.run",
-        "story.Merge",
-        "story.merge ",
-        "",
-        "story.Rework",
-        "story.rework ",
-        "story.operator-hold",
-        "story.operator_hold ",
-        // The #1533-adjacent names that were proposed and not adopted, by
-        // exact spelling only (2am's storyid_test pins the same refusals).
-        "story.remediation",
-        "story.re_review",
-        "story.ci.",
-    ] {
-        assert_eq!(ok(kind, "1"), Err(StoryIdError::UnknownKind), "{kind:?}");
-    }
-    let too_long = "x".repeat(257);
-    for event in ["", "a:b", "a b", "é", "a/b", too_long.as_str()] {
-        assert_eq!(ok("story.merge", event), Err(StoryIdError::InvalidEventId), "{event:?}");
-    }
-}
-
 #[test]
 fn derived_ci_ids_are_unchanged_by_the_shared_derivation() {
     use crate::ci_telemetry::records::{job_context, run_context};
@@ -174,31 +80,18 @@ fn derived_ci_ids_are_unchanged_by_the_shared_derivation() {
 }
 
 #[test]
-fn story_executions_share_the_story_trace_with_distinct_roots() {
+fn every_execution_is_its_own_root_trace() {
     let dir = tempfile::tempdir().unwrap();
     let store = TraceStore::new(dir.path());
-    let story = story_context(1_073_994_527, 9038).unwrap();
-    let first = store
-        .load_or_create_story(dir.path(), "sweep-1", Some(&story))
-        .unwrap();
-    let retry = store
-        .load_or_create_story(dir.path(), "sweep-2", Some(&story))
-        .unwrap();
-    for saved in [&first, &retry] {
-        assert_eq!(saved.context.trace_id, story.trace_id);
-        assert_ne!(saved.context.span_id, story.span_id);
-        assert_eq!(saved.story.as_ref(), Some(&story));
-    }
-    assert_ne!(first.context.span_id, retry.context.span_id);
+    let first = store.load_or_create(dir.path(), "sweep-1").unwrap();
+    let retry = store.load_or_create(dir.path(), "sweep-2").unwrap();
+    assert_ne!(first.context.trace_id, retry.context.trace_id);
     // Reopening keeps the persisted context rather than re-deriving it.
     assert_eq!(store.load_or_create(dir.path(), "sweep-1").unwrap(), first);
-    let plain = store.load_or_create(dir.path(), "tick").unwrap();
-    assert_ne!(plain.context.trace_id, story.trace_id);
-    assert_eq!(plain.story, None);
 }
 
 #[test]
-fn context_persisted_before_stories_still_loads() {
+fn context_persisted_with_a_retired_story_field_still_loads() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy.json");
     let context = TraceContext::root(true);
@@ -206,11 +99,12 @@ fn context_persisted_before_stories_still_loads() {
         "identity": "legacy",
         "context": context,
         "started_at": Utc::now(),
+        // An execution in flight across the upgrade still carries the field.
+        "story": TraceContext::root(true),
     });
     std::fs::write(&path, legacy.to_string()).unwrap();
     let saved = TraceStore::load(&path).unwrap();
     assert_eq!(saved.context, context);
-    assert_eq!(saved.story, None);
     assert!(!serde_json::to_string(&saved).unwrap().contains("story"));
 }
 
@@ -412,7 +306,7 @@ fn execution_root_is_derived_from_repo_and_sweep_id() {
     let dir = tempfile::tempdir().unwrap();
     let store = TraceStore::new(dir.path());
     let saved = store.load_or_create(dir.path(), "sweep-issue-7-1").unwrap();
-    assert_eq!(saved.context, TraceStore::root_context(dir.path(), "sweep-issue-7-1", None));
+    assert_eq!(saved.context, TraceStore::root_context(dir.path(), "sweep-issue-7-1"));
     store.complete(dir.path(), "sweep-issue-7-1").unwrap();
     assert_eq!(
         store
@@ -455,24 +349,4 @@ fn repo_attribute_body() {
     check("TwoAM-Fixture/Loom-UI", "TwoAM-Fixture/Loom-UI", "0", "TwoAM-Fixture/Loom-UI");
     check("twoam-fixture/loom-ui", "TwoAM-Fixture/Loom-UI", "0", "twoam-fixture/loom-ui");
     check("oldco-fixture/app", "NewCo-Fixture/App", "1", "oldco-fixture/app");
-}
-
-#[test]
-fn story_execution_span_is_derived_from_the_story_and_sweep_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let story = story_context(1_073_994_527, 42).unwrap();
-    let store = TraceStore::new(dir.path());
-    let saved = store
-        .load_or_create_story(dir.path(), "sweep-issue-42-1", Some(&story))
-        .unwrap();
-    assert_eq!(saved.context.trace_id, story.trace_id);
-    assert_eq!(
-        saved.context,
-        TraceStore::root_context(dir.path(), "sweep-issue-42-1", Some(&story))
-    );
-    assert_ne!(
-        saved.context,
-        TraceStore::root_context(dir.path(), "sweep-issue-42-2", Some(&story)),
-        "a retry is a distinct sibling in the same story"
-    );
 }

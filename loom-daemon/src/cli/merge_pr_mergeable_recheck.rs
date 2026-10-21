@@ -1,6 +1,6 @@
 //! `loom-daemon merge-pr mergeable-recheck` (#6104, slice of #8191).
 //!
-//! The process boundary around [`loom_daemon::merge_pr::mergeable_recheck::decide`].
+//! The process boundary around [`crate::merge_pr::mergeable_recheck::decide`].
 //! The shell keeps the I/O — the backoff loop, the uncached PR re-reads, the
 //! `git fetch` / `git merge-tree` corroboration — because the retained suite
 //! drives exactly that loop through its own stubs, and this split keeps its
@@ -23,8 +23,8 @@
 //! This mirrors the fail-closed choice every `merge-pr` guard in this family
 //! makes — see `cli::merge_pr_labels` for the canonical statement.
 
+use crate::merge_pr::mergeable_recheck::{decide, Evidence, TreeOutcome};
 use anyhow::Result;
-use loom_daemon::merge_pr::mergeable_recheck::{decide, Evidence, TreeOutcome};
 
 #[derive(clap::Args)]
 pub(crate) struct MergeableRecheckArgs {

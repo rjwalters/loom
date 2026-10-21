@@ -9,7 +9,6 @@
 use std::cell::{Cell, RefCell};
 
 use super::cwd_route::{CwdAnswer, DeriveEnv};
-use super::reader_route::ShedPolicy;
 use super::{GhCompletion, GhInvocation};
 use crate::forge_identity::{ReadClass, RouteDecision};
 use crate::proc_exec::ExecError;
@@ -20,7 +19,6 @@ pub(crate) struct TestRouting {
     pub(crate) decision: RouteDecision,
     pub(crate) env: DeriveEnv,
     pub(crate) checkout: CwdAnswer,
-    pub(crate) shed: bool,
 }
 
 /// One routed execution, as the seam saw it.
@@ -90,7 +88,6 @@ pub(super) fn run(inv: &GhInvocation) -> Option<Result<GhCompletion, ExecError>>
     let result = inv.execute_routed_v2(
         &move |_: &crate::forge_identity::RouteRequest<'_>| decision.clone(),
         &|_: &str, _: &str, _: crate::forge_identity::Failure, _: &str| {},
-        ShedPolicy { shed: routing.shed },
     );
     SEEN.with(|s| {
         s.borrow_mut().push(Seen {

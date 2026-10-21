@@ -356,6 +356,34 @@ fn zero_rows_with_a_required_context_times_out_never_none() {
     assert_eq!(lookups, 2, "the required lookup runs once per wait (two sources)");
 }
 
+/// #12552: zero rows never TIMEOUT-name the authorization context, and a
+/// required set of only that context is "no required set" (settles NONE).
+#[test]
+fn zero_rows_timeout_never_names_the_authorization_context() {
+    use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT as AUTHZ;
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend", AUTHZ]);
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Backend".into()]
+        }
+    );
+}
+
+#[test]
+fn zero_rows_with_only_the_authorization_context_required_settles_none() {
+    use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT as AUTHZ;
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&[AUTHZ]);
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(o, Outcome::NoChecks { sha: SHA.into() });
+}
+
 #[test]
 fn unreadable_payload_is_error() {
     let f = Forge::new();
@@ -684,6 +712,81 @@ fn a_required_lookup_that_keeps_failing_is_error_never_green() {
             pending: vec![verdict::REQUIRED_UNKNOWN.into()]
         }
     );
+}
+
+impl Forge {
+    /// Both required-context sources refused for want of a permission: the
+    /// rulesets read is empty, the GraphQL read and the REST branch summary
+    /// 403 "Resource not accessible by integration" (#11837).
+    fn required_denied(&self, status: u16, headers: &str, body: &str) {
+        self.required(&[]);
+        let raw = format!("HTTP/2.0 {status} Forbidden\r\n{headers}\r\n{body}");
+        let msg = crate::forge_denial::body_message(body).unwrap_or_default();
+        for k in ["graphql", &key("repos/o/r/branches/main")] {
+            std::fs::write(self.dir.path().join(format!("{k}.out")), "").ok();
+            let _ = std::fs::remove_file(self.dir.path().join(format!("{k}.out")));
+            std::fs::write(self.dir.path().join(format!("{k}.raw")), &raw).unwrap();
+            std::fs::write(
+                self.dir.path().join(format!("{k}.err")),
+                format!("gh: {msg} (HTTP {status})\n"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_permission_refused_lookup_decides_over_every_observed_check() {
+    let f = Forge::new();
+    f.required_denied(403, "", NOT_ACCESSIBLE);
+    f.runs(SHA, &[run("labeler", "completed", Some("success"))]);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert_eq!(o, Outcome::Green { sha: SHA.into() });
+    assert_eq!(f.polls(), 1, "a permission refusal is not retried");
+    assert!(notes.iter().any(|n| n.contains("Administration: Read")), "{notes:?}");
+}
+
+#[test]
+fn a_permission_refused_lookup_still_waits_for_a_pending_check() {
+    let f = Forge::new();
+    f.required_denied(403, "", NOT_ACCESSIBLE);
+    f.runs(
+        SHA,
+        &[
+            run("labeler", "completed", Some("success")),
+            run("lint", "in_progress", None),
+        ],
+    );
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["lint".into()]
+        }
+    );
+}
+
+#[test]
+fn a_permission_refused_lookup_still_reports_a_red_check() {
+    let f = Forge::new();
+    f.required_denied(403, "", NOT_ACCESSIBLE);
+    f.runs(SHA, &[run("lint", "completed", Some("failure"))]);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+}
+
+#[test]
+fn a_rate_limited_lookup_is_still_never_green() {
+    let f = Forge::new();
+    f.required_denied(
+        403,
+        "Retry-After: 60\r\n",
+        r#"{"message":"You have exceeded a secondary rate limit"}"#,
+    );
+    f.runs(SHA, &[run("labeler", "completed", Some("success"))]);
+    let (o, _) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert!(!matches!(o, Outcome::Green { .. }), "{o:?}");
 }
 
 /// `--required-only` waits through a failed lookup (no longer an immediate
@@ -1056,4 +1159,88 @@ fn required_only_alone_emits_no_settle_red_note() {
             .any(|n| n == "wait-checks: --settle-red: already failing: lint"),
         "{notes:?}"
     );
+}
+
+/// #12526: Champion posts `loom/merge-authorization` only after the Judge
+/// approves, so the Judge's own CI verdict must not wait on it.
+mod authorization_context {
+    use super::verdict::{decide, decide_settled, Decision, Rollup};
+    use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT as AUTHZ;
+
+    fn rollup(failing: &[&str], pending: &[&str], seen: &[&str]) -> Rollup {
+        let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        Rollup {
+            total: seen.len() as u64,
+            failing: v(failing),
+            pending: v(pending),
+            seen: seen.iter().map(|s| (*s).to_string()).collect(),
+            failed_detail: Vec::new(),
+        }
+    }
+
+    fn req() -> Vec<String> {
+        vec!["CI".to_string(), AUTHZ.to_string()]
+    }
+
+    #[test]
+    fn absent_authorization_does_not_hold_green() {
+        let r = rollup(&[], &[], &["CI"]);
+        for required_only in [false, true] {
+            assert_eq!(decide(&r, Some(&req()), required_only), Decision::Green);
+        }
+    }
+
+    #[test]
+    fn pending_authorization_does_not_hold_green() {
+        let r = rollup(&[], &[AUTHZ], &["CI", AUTHZ]);
+        for required_only in [false, true] {
+            assert_eq!(decide(&r, Some(&req()), required_only), Decision::Green);
+        }
+    }
+
+    #[test]
+    fn failed_authorization_is_red_in_both_modes() {
+        let r = rollup(&[AUTHZ], &[], &["CI", AUTHZ]);
+        for required_only in [false, true] {
+            assert_eq!(
+                decide(&r, Some(&req()), required_only),
+                Decision::Red(vec![AUTHZ.to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn absent_authorization_with_pending_or_red_ci_still_gates() {
+        let pending = rollup(&[], &["CI"], &["CI"]);
+        let red = rollup(&["CI"], &[], &["CI"]);
+        for required_only in [false, true] {
+            assert_eq!(
+                decide(&pending, Some(&req()), required_only),
+                Decision::Pending(vec!["CI".to_string()])
+            );
+            assert_eq!(
+                decide(&red, Some(&req()), required_only),
+                Decision::Red(vec!["CI".to_string()])
+            );
+        }
+    }
+
+    /// #12552: `decide_settled` must not let the authorization context hold
+    /// a finished red back, nor name it in a pending list.
+    #[test]
+    fn settled_ignores_pending_authorization() {
+        let red = rollup(&["CI"], &[AUTHZ], &["CI", AUTHZ]);
+        let absent = rollup(&["CI"], &[], &["CI"]);
+        for required_only in [false, true] {
+            assert_eq!(
+                decide_settled(&red, Some(&req()), required_only),
+                decide_settled(&absent, Some(&req()), required_only)
+            );
+        }
+        let running = rollup(&["CI"], &["Lint", AUTHZ], &["CI", "Lint", AUTHZ]);
+        assert_eq!(
+            decide_settled(&running, Some(&req()), false),
+            Decision::Pending(vec!["Lint".to_string()])
+        );
+    }
 }

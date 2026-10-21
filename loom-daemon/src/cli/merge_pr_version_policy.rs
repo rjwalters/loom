@@ -40,7 +40,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::version_policy::{evaluate, invalid_ref_message, Inputs, Verdict};
+use crate::merge_pr::version_policy::{evaluate, invalid_ref_message, Inputs, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct VersionPolicyArgs {

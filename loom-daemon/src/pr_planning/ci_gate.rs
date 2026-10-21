@@ -40,36 +40,16 @@ pub(super) const CI_SCREENED_ROWS: usize = 3;
 pub(super) const CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Whether `sha` (a PR head) has CI pending young enough to hold it from
-/// Judge, read through `get(path)` with `path` relative to `repos/{o}/{r}/`:
+/// Judge, read through `get(kind, path)` with `path` relative to `repos/{o}/{r}/`:
 /// every check-run page up to [`backstop::MAX_CHECK_RUN_PAGES`], then the
 /// legacy commit statuses. Stops at the first read that is pending, so the
 /// usual cost is one call; an unreadable read counts as not pending.
 pub fn ci_pending(
     sha: &str,
     now: DateTime<Utc>,
-    mut get: impl FnMut(&str) -> Option<Value>,
+    mut get: impl FnMut(backstop::CiRead, &str) -> Option<Value>,
 ) -> bool {
-    let base = format!("commits/{sha}/check-runs?per_page={}", backstop::CI_PAGE);
-    let mut read = 0;
-    for page in 1..=backstop::MAX_CHECK_RUN_PAGES {
-        let path = if page == 1 {
-            base.clone()
-        } else {
-            format!("{base}&page={page}")
-        };
-        let Some(v) = get(&path) else {
-            break;
-        };
-        if backstop::pending_exempts(&backstop::pending_check_runs(&v), now) {
-            return true;
-        }
-        read += backstop::check_runs_listed(&v);
-        if !backstop::more_check_runs(&v, read) {
-            break;
-        }
-    }
-    let status = format!("commits/{sha}/status?per_page={}", backstop::CI_PAGE);
-    get(&status).is_some_and(|v| backstop::pending_exempts(&backstop::pending_statuses(&v), now))
+    backstop::ci_state(sha, now, &mut get) == backstop::CiState::Young
 }
 
 type Cache = Mutex<HashMap<(PathBuf, String), (bool, Instant)>>;

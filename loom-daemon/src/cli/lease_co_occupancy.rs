@@ -64,10 +64,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
+use crate::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use loom_daemon::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
-use loom_daemon::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 
 /// The first-line prefix of a `loom:lease-yield` standdown record (#6287).
 const YIELD_MARKER_PREFIX: &str = "<!-- loom:lease-yield host=";
@@ -165,7 +165,7 @@ pub(crate) fn read_rows(
     timeout: Duration,
     policy: &TrustPolicy,
 ) -> Option<Vec<LeaseRow>> {
-    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // Counted as `lease.co_occupancy_comments` (#10089). The facade supplies
     // the cross-owner `GH_CONFIG_DIR` from `repo` (#5401) and the `LOOM_REPO`
     // -> `GH_REPO` override, nulls stdin, and bounds the call by `timeout`.
@@ -175,7 +175,7 @@ pub(crate) fn read_rows(
         GhTarget::None,
         timeout,
     )
-    .forge_op(loom_daemon::forge_call_stats::ops::COMMENT_LIST)
+    .forge_op(crate::forge_call_stats::ops::COMMENT_LIST)
     .program(gh_bin)
     .arg("api")
     .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))

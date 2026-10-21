@@ -7,13 +7,13 @@
 //! [`DrawInput`]s. The forge half ([`gather`]) reads them, each read
 //! bounded:
 //!
-//! - **the items**: [`super::listing::list_all_open`] (mirror, else the
-//!   shared ETag walk);
-//! - **the PRs' head and author**: the open-PR listing
-//!   (`forge_pull_listing`, ETag-cached, a Gate read; its last good copy
-//!   stands in on a failure, #12074), so the Builder branch links as it
-//!   does in the open-PR guard. When it cannot be read, a PR row links by its
-//!   body alone;
+//! - **the items, and the PRs' head and author**: the tick's one discovery
+//!   snapshot ([`crate::discovery`], #12306); the gather lists nothing itself.
+//!   The Direct backend lists per repo ([`super::listing::list_all_open`]
+//!   and the ETag-cached open-PR listing), the Mirror backend reads one
+//!   worklist for every repo. The last good copy of either stands in on a
+//!   failure (#12074), so the Builder branch links as it does in the open-PR
+//!   guard. When the PRs cannot be read, a PR row links by its body alone;
 //! - **hold markers** on `loom:blocked` PRs: their trusted comments, cached
 //!   per `(repo, PR, updated_at)`, at most [`MAX_MARKER_READS`] per tick;
 //! - **landed** `loom:issue` items: the landed pre-filter's batched,
@@ -45,6 +45,7 @@ use chrono::{DateTime, Utc};
 
 use super::item_draw::DrawInput;
 use super::stage_entry::{GhEventsReader, StageEntry, StageEntryProvider};
+use crate::discovery::{Target, TickSnapshot};
 use crate::forge_listing::RestIssue;
 use crate::forge_pull_listing::RestPull;
 use crate::step_role::StepRole;
@@ -87,6 +88,8 @@ pub struct Gathered {
     pub inputs: Vec<DrawInput>,
     /// The Champion re-evaluation ladder's due times, from the bodies.
     pub ladder: Vec<(u32, StepRole, DateTime<Utc>)>,
+    /// The same ladder records' rung and raw `next`, by item number (#12918).
+    pub reevals: HashMap<u32, super::reeval_ladder::Reeval>,
     /// Creation times by number.
     pub created_at: HashMap<u32, String>,
     /// The open-PR listing answered. When it did not, a PR linked only by
@@ -116,15 +119,15 @@ fn last_good() -> &'static Mutex<LastGood> {
 /// The listing, or on its failure the last good one while it is fresh.
 fn listing_or_last_good(
     slug: &str,
-    listing: anyhow::Result<super::listing::OpenItems>,
+    listing: anyhow::Result<Vec<RestIssue>>,
 ) -> anyhow::Result<(Vec<RestIssue>, bool)> {
     let mut cache = last_good()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match listing {
-        Ok(items) => {
-            cache.insert(slug.to_string(), (Instant::now(), items.rows.clone()));
-            Ok((items.rows, false))
+        Ok(rows) => {
+            cache.insert(slug.to_string(), (Instant::now(), rows.clone()));
+            Ok((rows, false))
         }
         Err(e) => match cache.get(slug) {
             Some((at, rows)) if at.elapsed() < LAST_GOOD_TTL => {
@@ -205,6 +208,7 @@ pub fn pull_from_row(row: &RestIssue, markers: PullMarkers) -> PullInput {
         same_repo: false,
         author_untrusted: false,
         queued: false,
+        draft: row.draft,
         markers,
     }
 }
@@ -305,8 +309,10 @@ pub fn draw_inputs(
 
 /// The Champion re-evaluation ladder's due times in the rows' bodies: a
 /// curated issue's for a promote step, a PR's for a merge step (#11900).
+/// Read at `now`: a marker written under the pre-#12513 ladder is due `now`
+/// ([`super::reeval_ladder::Reeval::due_at`]).
 #[must_use]
-pub fn ladder_due(rows: &[RestIssue]) -> Vec<(u32, StepRole, DateTime<Utc>)> {
+pub fn ladder_due(rows: &[RestIssue], now: DateTime<Utc>) -> Vec<(u32, StepRole, DateTime<Utc>)> {
     rows.iter()
         .filter_map(|r| {
             let role = if r.is_pull_request {
@@ -314,8 +320,33 @@ pub fn ladder_due(rows: &[RestIssue]) -> Vec<(u32, StepRole, DateTime<Utc>)> {
             } else {
                 StepRole::ChampionPromote
             };
-            let due = super::reeval_ladder::due(r.body.as_deref()?, role)?;
+            let due = super::reeval_ladder::due(r.body.as_deref()?, role, now)?;
             Some((r.number, role, due))
+        })
+        .collect()
+}
+
+/// The ladder record each row's body carries, by number (#12918): the one
+/// [`ladder_due`] reads (a PR's `champion_merge`, an issue's
+/// `champion_promote`), with its rung and its raw `next`. Read at `now` for
+/// the choice between several records, as [`ladder_due`] does.
+#[must_use]
+pub fn ladder_state(
+    rows: &[RestIssue],
+    now: DateTime<Utc>,
+) -> HashMap<u32, super::reeval_ladder::Reeval> {
+    rows.iter()
+        .filter_map(|r| {
+            let role = if r.is_pull_request {
+                StepRole::ChampionMerge
+            } else {
+                StepRole::ChampionPromote
+            };
+            let record = super::reeval_ladder::parse(r.body.as_deref()?)
+                .into_iter()
+                .filter(|e| e.step == role)
+                .max_by_key(|e| e.due_at(now))?;
+            Some((r.number, record))
         })
         .collect()
 }
@@ -357,6 +388,52 @@ pub fn hold_ci_pending(
     held
 }
 
+/// Turn every [`Step::ChampionHoldReevaluate`] whose PR is still at the head
+/// its hold recorded into a [`PassReason::HeldAtHead`] pass (#12900), and
+/// return how many it held. Such a run re-reads the same head and ends
+/// `held`, a no-op that occupies the repo's `champion_merge` slot.
+/// `hold_heads` maps a PR to [`PullMarkers::hold_head`] (already `None` once a
+/// release comment followed); `released` names the PRs carrying
+/// `loom:auto-merge-ok`. Fails open: a PR with no recorded or current head is
+/// drawn. A recorded SHA may be abbreviated, so heads match on prefix.
+///
+/// A change in the repo's standing authorizations is a release signal too
+/// (#12933): `hold_auths` maps a PR to the digest its hold recorded
+/// ([`PullMarkers::hold_auth`]) and `current_auth` is the repo's digest now.
+/// A hold whose digest differs, or that recorded none, is drawn once; its
+/// re-hold records the current digest. `current_auth` of `None` (no digest
+/// available) keeps the head-only rule. Pure.
+pub fn hold_at_recorded_head(
+    items: &mut [Item],
+    heads: &HashMap<u32, String>,
+    hold_heads: &HashMap<u32, String>,
+    hold_auths: &HashMap<u32, String>,
+    current_auth: Option<&str>,
+    released: &HashSet<u32>,
+) -> usize {
+    let mut held = 0usize;
+    for item in items.iter_mut() {
+        if item.step() != Some(Step::ChampionHoldReevaluate) {
+            continue;
+        }
+        let Some(pr) = item.target() else { continue };
+        if released.contains(&pr) {
+            continue;
+        }
+        let (Some(head), Some(recorded)) = (heads.get(&pr), hold_heads.get(&pr)) else {
+            continue;
+        };
+        if current_auth.is_some_and(|cur| hold_auths.get(&pr).map(String::as_str) != Some(cur)) {
+            continue;
+        }
+        if !recorded.is_empty() && (head.starts_with(recorded) || recorded.starts_with(head)) {
+            item.verdict = Verdict::Pass(PassReason::HeldAtHead);
+            held += 1;
+        }
+    }
+    held
+}
+
 // ---------------------------------------------------------------------------
 // The forge half
 // ---------------------------------------------------------------------------
@@ -373,20 +450,28 @@ fn marker_cache() -> &'static Mutex<MarkerCache> {
 fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, PullMarkers> {
     let mut out = HashMap::new();
     let mut reads = 0usize;
-    let mut cache = marker_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = || {
+        marker_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    // #12310: the hold-marker comment reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     for row in rows
         .iter()
         .filter(|r| r.is_pull_request && crate::work_finder::is_blocked_hold(&r.labels))
     {
         let key = (slug.to_string(), row.number);
-        if let Some((at, markers)) = cache.get(&key) {
-            if *at == row.updated_at {
-                out.insert(row.number, markers.clone());
-                continue;
-            }
+        // The lock is held only for the lookup and the insert, never across
+        // the comment read: several repos are gathered at once (#12256).
+        let cached = cache()
+            .get(&key)
+            .filter(|(at, _)| *at == row.updated_at)
+            .map(|(_, m)| m.clone());
+        if let Some(markers) = cached {
+            out.insert(row.number, markers);
+            continue;
         }
         if reads >= MAX_MARKER_READS {
             continue;
@@ -401,7 +486,7 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
             continue;
         };
         let markers = PullMarkers::from_trusted(&TrustedComments::filtered(&policy, trusted));
-        cache.insert(key, (row.updated_at.clone(), markers.clone()));
+        cache().insert(key, (row.updated_at.clone(), markers.clone()));
         out.insert(row.number, markers);
     }
     out
@@ -418,11 +503,40 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
 pub fn gather(
     root: &Path,
     registry: &Arc<Mutex<SweepRegistry>>,
+    snapshot: &TickSnapshot,
     main_red: impl FnOnce(Vec<crate::work_finder::WorkItem>) -> bool,
     held_capabilities: &BTreeSet<String>,
     provider: &mut StageEntryProvider,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<Gathered>> {
+    Ok(list(root, registry, snapshot, main_red, held_capabilities)?
+        .map(|l| finish(l, root, provider, now)))
+}
+
+/// One workspace's forge half of [`gather`] (#12256): the listings, the
+/// facts and the classification, everything but the stage-entry lookups.
+/// It touches no state shared across repos but the process caches (each
+/// behind its own lock), so the driver runs it for several repos at once.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    pub slug: String,
+    rows: Vec<RestIssue>,
+    items: Vec<Item>,
+    pulls_complete: bool,
+    stale_listing: bool,
+}
+
+/// [`gather`]'s forge half (module docs, [`Listed`]).
+///
+/// # Errors
+/// The listing's: the set is all-or-nothing.
+pub fn list(
+    root: &Path,
+    registry: &Arc<Mutex<SweepRegistry>>,
+    snapshot: &TickSnapshot,
+    main_red: impl FnOnce(Vec<crate::work_finder::WorkItem>) -> bool,
+    held_capabilities: &BTreeSet<String>,
+) -> anyhow::Result<Option<Listed>> {
     let target = registry
         .lock()
         .ok()
@@ -430,18 +544,28 @@ pub fn gather(
     let Some((gh_bin, root_dir, slug)) = target else {
         return Ok(None);
     };
+    // The tick's one snapshot is the only place the items come from (#12306).
+    // #12310: the open-PR listing is discovery.
+    let repo_snapshot = {
+        let _discovery = crate::gh_invocation::purpose::discovery();
+        snapshot.repo(&Target {
+            slug: slug.clone(),
+            gh_bin: gh_bin.clone(),
+            root_dir: root_dir.clone(),
+        })
+    };
     let (rows, stale_listing) = listing_or_last_good(
         &slug,
-        super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug)),
+        repo_snapshot
+            .as_ref()
+            .map(|r| r.rows.clone())
+            .map_err(|e| anyhow::anyhow!("{e:#}")),
     )?;
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
-    let pull_listing = crate::forge_pull_listing::list_open_pulls_cached_as(
-        super::listing::CALLER,
-        &gh_bin,
-        Some(&root_dir),
-        Some(&slug),
-        PULL_PAGES,
-    );
+    let pull_listing = repo_snapshot
+        .ok()
+        .and_then(|r| r.pulls.clone())
+        .ok_or_else(|| anyhow::anyhow!("open-PR listing unavailable"));
     let (pulls, pulls_complete) = pulls_or_last_good(&slug, pull_listing);
     let full: HashMap<u32, RestPull> = pulls.into_iter().map(|p| (p.number, p)).collect();
     let markers = pull_markers(&slug, root, &rows);
@@ -455,6 +579,14 @@ pub fn gather(
                 None => pull_from_row(r, m),
             }
         })
+        .collect();
+    let hold_heads: HashMap<u32, String> = pulls
+        .iter()
+        .filter_map(|p| p.markers.hold_head.clone().map(|h| (p.number, h)))
+        .collect();
+    let hold_auths: HashMap<u32, String> = pulls
+        .iter()
+        .filter_map(|p| p.markers.hold_auth.clone().map(|a| (p.number, a)))
         .collect();
     let linked_by_pr: Vec<u32> = pulls
         .iter()
@@ -523,6 +655,48 @@ pub fn gather(
     if held > 0 {
         log::debug!("work_finder: {slug}: {held} Judge step(s) held while CI runs at the head");
     }
+    let released: HashSet<u32> = rows
+        .iter()
+        .filter(|r| r.is_pull_request && has(&r.labels, "loom:auto-merge-ok"))
+        .map(|r| r.number)
+        .collect();
+    let at_head = hold_at_recorded_head(
+        &mut items,
+        &heads,
+        &hold_heads,
+        &hold_auths,
+        Some(crate::champion_hold::standing_auth_digest(root).as_str()),
+        &released,
+    );
+    if at_head > 0 {
+        log::debug!("work_finder: {slug}: {at_head} held PR(s) unchanged since their hold");
+    }
+    Ok(Some(Listed {
+        slug,
+        rows,
+        items,
+        pulls_complete,
+        stale_listing,
+    }))
+}
+
+/// [`gather`]'s serial half: the stage-entry lookups (one provider, one
+/// per-tick events budget, spent in the driver's walk order so it is
+/// deterministic) and the draw inputs. Its events reads are bounded by the
+/// provider's budget.
+pub fn finish(
+    listed: Listed,
+    root: &Path,
+    provider: &mut StageEntryProvider,
+    now: DateTime<Utc>,
+) -> Gathered {
+    let Listed {
+        slug,
+        rows,
+        items,
+        pulls_complete,
+        stale_listing,
+    } = listed;
     let mut events = GhEventsReader;
     let draw = draw_inputs(items, &rows, |row, label| {
         provider.entry(&mut events, root, &slug, row, label, now)
@@ -530,8 +704,9 @@ pub fn gather(
     if !stale_listing {
         provider.retain_present(&slug, &rows);
     }
-    Ok(Some(Gathered {
-        ladder: ladder_due(&rows),
+    Gathered {
+        ladder: ladder_due(&rows, now),
+        reevals: ladder_state(&rows, now),
         created_at: rows
             .iter()
             .filter_map(|r| r.created_at.clone().map(|c| (r.number, c)))
@@ -540,7 +715,7 @@ pub fn gather(
         inputs: draw,
         pulls_complete,
         stale_listing,
-    }))
+    }
 }
 
 #[cfg(test)]

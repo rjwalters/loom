@@ -13,9 +13,11 @@ issue(s) execute the migration.
 repo-relative. Re-run the commands in section 2 before relying on a number.
 
 **Measured vs inferred.** Section 2 numbers are measured (`git ls-files`,
-`git grep`, `wc -l`). The compile-time projection in section 4 is **inferred**
-from line counts and the #12089 baseline; no prototype crate was built or
-timed for this doc. The prototype is step 0 of the migration (section 5).
+`git grep`, `wc -l`). The `safehouse` row was re-counted by step 0 (#12157) on
+`df8089253`; the other rows are still the original counts. The compile-time
+projection in section 4 was inferred from line counts. Step 0 (#12157) replaced
+the `safehouse` part of it with a measurement, and found the extraction does
+not compile without a base crate roughly the size of the whole daemon.
 
 **Contents**
 
@@ -96,7 +98,7 @@ itself); fan-in is files outside the subsystem that name it.
 
 | Subsystem | Files | Lines | Test lines | Fan-out | Fan-in |
 |---|---|---|---|---|---|
-| `safehouse` | 8 | 6,541 | 5,281 | 12 | 13 |
+| `safehouse` | 11 | 11,283 | 5,736 | 21 | 13 |
 | `ipc` | 19 | 11,045 | 6,885 | 33 | 47 |
 | `merge_pr` | 126 | 35,645 | 16,290 | 22 | 32 |
 | `tokens_pool` | 90 | 44,301 | 11,063 | 23 | 111 |
@@ -161,19 +163,71 @@ way: each new crate adds its own link/metadata cost, and extracted crates that
 depend on each other serialise. Treat the 30% row as an upper bound and the 9%
 row as the first realistic target.
 
-This estimate is the weakest number in the doc. Step 0 replaces it with a
-`cargo build --timings` measurement on a real prototype.
+This estimate was the weakest number in the doc. Step 0 (#12157) measured the
+parts it could; the result is below.
+
+### Step 0 measurement (#12157, `df8089253`, `loom-worker-1`)
+
+**Result: no-go for extracting `safehouse` ahead of a base crate. The
+projection's premise (a leaf subsystem can leave the unit) does not hold.**
+
+*Baseline, cold target dir, 16-core shared host at load about 4:*
+
+```bash
+cargo test -p loom-daemon --lib --no-run --timings -j2
+```
+
+| Figure | Value |
+|---|---|
+| `lib (test)` unit (`loom-daemon`) | 180.85 s |
+| Whole build, wall clock (289 units, `-j2`) | 4 m 22 s |
+| Peak RSS | 12.5 GB |
+| `cargo nextest list -p loom-daemon --lib --profile ci --message-format json` test count | 17,220 (164 under `safehouse::`) |
+
+*Why there is no "after" figure.* `safehouse` is not a leaf. The design's fan-out
+of 12 was low: the §2 command gives 21 distinct `crate::` roots, 20 of them in
+non-test code (`activity`, `cmd_out`, `config_resolver`, `event_bus`,
+`filing_lock`, `gh_invocation`, `launch_record`, `loom_ui_alerts`,
+`observability`, `peer_claims`, `rate_limit_breaker`, `script_helpers`,
+`step_role`, `sweep_registry`, `transcript_tokens`, `types`, `usage_source`,
+`workspace_pool`, `workspace_registry`, `worktree_ops`). Those roots are 254k
+lines, led by `sweep_registry` (84k), `observability` (76k) and `worktree_ops`
+(21k). Following `crate::` references transitively at top-level-module
+granularity, the non-test closure is 239 modules and 973,680 of 1,041,110 lines
+(94%). Module granularity over-counts (a file may use one item of a module), so
+read 94% as an upper bound on what must move, not a plan. It is still far above
+anything a "small base crate" (step 1) can absorb. A prototype that compiles
+would have to move or stub most of the daemon, so a before/after of the
+`loom-daemon` lib-test unit would measure a different refactor, not this one.
+No prototype branch was built; the per-crate fixed cost (metadata, link) was
+not measured for the same reason.
+
+*Upper bound on the saving.* Even with a free extraction, 11,283 of about 1.04M
+lines is 1.1%. Applying the linear assumption to the measured 180.85 s gives at
+most about 2 s, below the run-to-run noise at this load and below the fixed
+cost one more crate adds. The design's "6.5k lines, 0.6%" row was already small;
+re-counted it is 1.1% and still not worth a crate.
+
+*What this means for the path.* The leaf-first ordering by fan-out is still the
+right order, but fan-out is not small for any candidate, and `safehouse` was the
+cheapest by the §2 table. Step 1 (shared base crate) is where the cost is, and
+the closure above says the base crate would be most of `loom-daemon`. Do not
+start step 1 on this design. A revised design should first pick a seam that
+cuts the dependency graph (for example `types` plus `event_bus` plus
+`peer_claims`, 14k lines, which many subsystems share) and measure that, or
+treat crate extraction as not viable and look at reducing monomorphised test
+code instead (37.8% of LLVM IR lines are in `tests` modules, section 1).
 
 ## 5. Incremental migration
 
 One crate or module per PR. Every PR runs the same two checks.
 
-**Step 0: prototype and measure (scratch branch, not merged).** Extract
-`safehouse` into a `loom-safehouse` workspace member on a scratch branch. Record
-`cargo build --timings --profile test` for the `loom-daemon` lib-test unit
-before and after. Replace the section 4 projection with the measured delta and
-record the per-crate fixed cost. If the saving per extracted line is far below
-linear, stop and revisit before step 1.
+**Step 0: prototype and measure (done in #12157; result: no-go).** The plan was
+to extract `safehouse` into a `loom-safehouse` workspace member and time the
+`loom-daemon` lib-test unit before and after. The dependency closure showed the
+extraction cannot compile without moving about 94% of the crate (section 4), so
+only the baseline was timed. Steps 1..N below are on hold until the design is
+revised around a seam that cuts the graph.
 
 **Step 1: shared base crate.** Move the types that the leaf subsystems import
 from `crate::` (config, error and path types) into `loom-core` (name TBD) so

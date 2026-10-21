@@ -1,8 +1,7 @@
 //! Start the daemon's **fleet-captain singleton tasks that own their loop**.
 //!
 //! A singleton job ([`crate::fleet_captain`], #8848) watches one shared thing
-//! and must run on exactly one fleet host. Most of them ride an existing loop
-//! (the collector's captain gauges); the ones here have
+//! and must run on exactly one fleet host. Some ride an existing loop; the ones here have
 //! a loop of their own, and share one call site because they share one
 //! contract: each re-evaluates its captain gate on every tick, so a
 //! `fleet.captain` edit takes effect without a restart, and each is inert on a
@@ -12,8 +11,6 @@
 //! over-threshold entry of the file-size ratchet.
 
 use std::path::PathBuf;
-
-use crate::event_bus::EventBus;
 
 /// Join handles for whatever started. Held by the caller for the process's
 /// lifetime; dropping them does not stop the tasks (tokio detaches on drop).
@@ -28,9 +25,9 @@ pub struct SingletonHandles {
 }
 
 /// Spawn every loop-owning singleton task against `workspace_root`'s config.
-pub fn spawn(workspace_root: PathBuf, bus: &EventBus) -> SingletonHandles {
+pub fn spawn(workspace_root: PathBuf) -> SingletonHandles {
     SingletonHandles {
-        ci_telemetry: crate::ci_telemetry::spawn_task_on(workspace_root.clone(), bus),
+        ci_telemetry: crate::ci_telemetry::spawn_task(workspace_root.clone()),
         intake_reconcile: crate::intake_reconcile::singleton::spawn_task(workspace_root),
     }
 }

@@ -75,6 +75,48 @@ kind = "rust"
 path = "loom-daemon/src/merge_pr/checks_failure/required.rs"
 
 [[operation]]
+id = "ci.commit-status"
+group = "ci-readiness"
+summary = "Read the legacy combined commit status for a head SHA."
+profile = "required-ci-landing"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "sha"]
+outputs = ["state", "context", "target_url", "total_count"]
+required_fields = ["state", "context"]
+actor = "daemon"
+permissions = ["statuses:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::ci-commit-status"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "high"
+high_risk_cases = ["queued-hidden-ci"]
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/commits/{sha}/status",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "a status posted by an external integration is invisible to the check-runs read; an unread status page can hide the only failure, so the read pages to completion",
+]
+notes = "Split out of `ci.check-runs-for-sha` so the pending-CI page loop shared by the PR gate and the release backstop (#12016) is attributable per route."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/judge_backstop.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/pr_planning/listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/pr_lease/backstop.rs"
+
+[[operation]]
 id = "ci.workflow-runs-for-sha"
 group = "ci-readiness"
 summary = "List workflow runs for a head SHA, including queued ones with no check runs."

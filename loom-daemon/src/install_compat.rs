@@ -42,15 +42,15 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.0";
 /// It must be at least every hard `# requires-daemon: <sub> >= <version>`
 /// floor in the shipped shell (`defaults/`); the CI harness and the unit test
 /// `no_shipped_hard_floor_is_above_requires_daemon` both enforce that.
-/// 0.19.1080 is the highest such floor today (`push-lease`, #9487). This is
-/// one patch above it: releases through 0.19.1080 shipped without
-/// `push-lease`, so the oldest daemon these files work with is the release
-/// that lands it (#10771).
+/// It is also at least the release that introduced every daemon subcommand
+/// those files call: 0.19.1088 is the first release with `host-id` (#11530),
+/// called by the host-export scripts (#10023); 0.19.1081 added `push-lease`
+/// (#9487, #10771).
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.19.1081";
+pub const REQUIRES_DAEMON: &str = "0.19.1088";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
@@ -346,6 +346,52 @@ fn git(repo_root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> 
         .args(args)
         .output()
         .map_err(|e| anyhow::anyhow!("could not run git: {e}"))
+}
+
+/// The schema version of [`capabilities_json`]. Bump when a key is removed or
+/// changes meaning; adding a key does not.
+pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
+
+/// The identity of the installed-file payload this binary was built against:
+/// the contract claims plus the daemon-invoked file list, in one string.
+///
+/// Two binaries built from the same payload report the same string whatever
+/// their own versions are, so the shell side compares it for equality and
+/// never orders it. A mismatch means the two disagree about what an installed
+/// tree must look like, and nothing here picks a winner.
+#[must_use]
+pub fn payload_identity() -> String {
+    format!(
+        "supports_installed={SUPPORTS_INSTALLED};requires_daemon={REQUIRES_DAEMON};invoked_files={}",
+        DAEMON_INVOKED_INSTALLED_FILES.join(",")
+    )
+}
+
+/// This binary's side of the contract as one JSON object. The single source
+/// for `loom-daemon install-compat show --json` and `loom-tools capabilities
+/// --json`, so the two cannot drift: the wrappers never carry capability
+/// rules of their own.
+///
+/// `installed` and `classification` are `null` unless an installed side was
+/// read (`install-compat show --repo`).
+#[must_use]
+pub fn capabilities_json(
+    daemon: &DaemonCompat,
+    installed: Option<&InstallMeta>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": CAPABILITIES_SCHEMA_VERSION,
+        "running": daemon.running.to_string(),
+        "supports_installed": SUPPORTS_INSTALLED,
+        "requires_daemon": REQUIRES_DAEMON,
+        "payload_identity": payload_identity(),
+        "invoked_files": DAEMON_INVOKED_INSTALLED_FILES,
+        "installed": installed.map(|m| serde_json::json!({
+            "loom_version": m.loom_version,
+            "requires_daemon": m.requires_daemon,
+        })),
+        "classification": installed.map(|m| format!("{:?}", classify(m, daemon))),
+    })
 }
 
 #[cfg(test)]

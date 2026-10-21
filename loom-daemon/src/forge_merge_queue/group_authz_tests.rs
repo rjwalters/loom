@@ -62,6 +62,14 @@ impl FakeQueue {
         }
         q
     }
+    /// The PR head, or an error once the entry has left the queue.
+    fn head(&self, pr: u32) -> Result<String, String> {
+        let e = self.entries.borrow();
+        e.iter()
+            .find(|m| m.pr == pr)
+            .map(|m| m.head.clone())
+            .ok_or_else(|| format!("PR #{pr} not queued"))
+    }
     fn groups(&self) -> Vec<MergeGroup> {
         let e = self.entries.borrow();
         (0..e.len())
@@ -105,7 +113,7 @@ impl FakeQueue {
     fn run_authz(&self, store: &dyn GrantStore, pr: u32) -> GroupConclusion {
         let g = self.group_of(pr);
         let others = Ok(vec![(CI.to_string(), self.state(&g.commit, CI))]);
-        let c = group_check(store, &g, others, &|p| self.facts_for(p));
+        let c = group_check(store, &g, others, &|p| self.facts_for(p).map(MemberFacts::Open));
         let (st, _) = status_for(&c);
         let st = match st {
             StatusState::Success => CheckState::Success,
@@ -201,7 +209,7 @@ fn revoke(q: &FakeQueue, s: &MemoryGrantStore, pr: u32) -> GroupRevocation {
             Ok(q.groups())
         }
     };
-    revoke_refail_dequeue(MergeMode::Queue, true, q, s, q, &groups, pr)
+    revoke_refail_dequeue(MergeMode::Queue, true, q, s, q, &groups, &|| q.head(pr), pr)
 }
 
 fn hold(q: &FakeQueue, pr: u32) {
@@ -229,7 +237,9 @@ fn authz_never_concludes_before_other_required_checks() {
         assert!(matches!(q.run_authz(&s, A), GroupConclusion::Pending(_)), "{st:?}");
     }
     let g = q.group_of(A);
-    let c = group_check(&s, &g, Err("checks api 502".into()), &|p| q.facts_for(p));
+    let c = group_check(&s, &g, Err("checks api 502".into()), &|p| {
+        q.facts_for(p).map(MemberFacts::Open)
+    });
     assert!(matches!(c, GroupConclusion::Pending(_)), "unreadable others never pass");
 }
 
@@ -244,7 +254,7 @@ fn facts_outage_while_others_pending_stays_pending() {
     let g = q.group_of(B);
     let others = || Ok(vec![(CI.to_string(), CheckState::Pending)]);
     let reads = Cell::new(0u32);
-    let down = |_: u32| -> Result<AuthzFacts, String> {
+    let down = |_: u32| -> Result<MemberFacts, String> {
         reads.set(reads.get() + 1);
         Err("pulls api 503".into())
     };
@@ -441,7 +451,8 @@ fn refail_works_in_a_dormant_build() {
     q.ci(A, CheckState::Success);
     q.run_authz(&s, A);
     let groups = || Ok(q.groups());
-    let r = revoke_refail_dequeue(MergeMode::Queue, false, &q, &s, &q, &groups, A);
+    let r =
+        revoke_refail_dequeue(MergeMode::Queue, false, &q, &s, &q, &groups, &|| Ok(HA.into()), A);
     assert_eq!(r.revocation.dequeue, Err(QueueError::ExecutionDormant));
     assert!(r.passed_checks_withdrawn());
     assert!(q.try_merge().is_empty());
@@ -519,4 +530,98 @@ fn group_discovery_outage_is_reported() {
     let r = revoke(&q, &s, A);
     assert!(!r.passed_checks_withdrawn());
     assert!(r.safe_to_transition(), "the grant is revoked; future evaluations deny");
+}
+
+#[test]
+fn revoke_fails_the_pr_head_status_too() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA)], &s);
+    q.post_status(HA, StatusState::Success, "authorized")
+        .unwrap();
+    let r = revoke(&q, &s, A);
+    assert_eq!(r.head_failed, Ok(()));
+    assert_eq!(
+        q.statuses
+            .borrow()
+            .get(&(HA.to_string(), REQUIRED_CHECK_CONTEXT.to_string())),
+        Some(&CheckState::Failure),
+        "the head success is replaced"
+    );
+}
+
+#[test]
+fn head_failure_is_reported_not_swallowed() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA)], &s);
+    // Status writes down: the group re-fail and the head write both fail.
+    q.status_down.set(true);
+    let r = revoke(&q, &s, A);
+    assert!(r.head_failed.is_err());
+    assert!(format!("{r}").contains("PR head status failure NOT confirmed"), "{r}");
+    // Head unreadable: reported too, and the rest still ran.
+    q.status_down.set(false);
+    let groups = || Ok(q.groups());
+    let r = revoke_refail_dequeue(
+        MergeMode::Queue,
+        true,
+        &q,
+        &s,
+        &q,
+        &groups,
+        &|| Err("pulls 502".into()),
+        A,
+    );
+    assert_eq!(r.head_failed, Err("pulls 502".to_string()));
+    assert!(r.passed_checks_withdrawn());
+}
+
+fn all_green() -> Result<Vec<(String, CheckState)>, String> {
+    Ok(vec![(CI.to_string(), CheckState::Success)])
+}
+
+/// A merged predecessor at the group's head is satisfied (#12585).
+#[test]
+fn merged_predecessor_at_group_head_is_authorized() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA), (B, HB)], &s);
+    let g = q.group_of(B);
+    let facts = |p: u32| match p {
+        A => Ok(MemberFacts::Merged { head: HA.into() }),
+        _ => q.facts_for(p).map(MemberFacts::Open),
+    };
+    assert_eq!(group_check(&s, &g, all_green(), &facts), GroupConclusion::Success);
+}
+
+/// Merged at another head than the group was built from: fail closed.
+#[test]
+fn merged_predecessor_at_other_head_still_fails() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA), (B, HB)], &s);
+    let g = q.group_of(B);
+    let facts = |p: u32| match p {
+        A => Ok(MemberFacts::Merged { head: HC.into() }),
+        _ => q.facts_for(p).map(MemberFacts::Open),
+    };
+    let c = group_check(&s, &g, all_green(), &facts);
+    assert!(
+        matches!(&c, GroupConclusion::Failure(w) if w.iter().all(|(pr, _)| *pr == A)),
+        "{c:?}"
+    );
+}
+
+/// A facts-read outage on an open member is still an outage, not a merge.
+#[test]
+fn open_member_outage_is_still_store_unavailable() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA), (B, HB)], &s);
+    let g = q.group_of(B);
+    let facts = |p: u32| match p {
+        A => Err("pulls api 503".to_string()),
+        _ => q.facts_for(p).map(MemberFacts::Open),
+    };
+    let c = group_check(&s, &g, all_green(), &facts);
+    assert!(
+        matches!(&c, GroupConclusion::Failure(w) if matches!(w[0].1, DenyReason::StoreUnavailable(_))),
+        "{c:?}"
+    );
 }

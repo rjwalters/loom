@@ -266,6 +266,8 @@ fn validate(row: &SinkLine, source: Source, now: i64) -> Option<AgentCall> {
             .unwrap_or(row.p.as_str())
             .to_string(),
         route: route(row.at.rt.as_deref(), row.at.tk.as_deref()),
+        // An agent `gh` front row does not carry a purpose (#12310).
+        purpose: crate::gh_invocation::purpose::UNKNOWN,
         outcome: match row.o {
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,

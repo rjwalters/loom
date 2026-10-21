@@ -9,11 +9,11 @@
 
 use std::path::PathBuf;
 
+use crate::forge_bucket_book::{self, BucketKey, Reading};
+use crate::forge_call_stats::buckets::{self, CallsAggregate, GroupBy};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Args;
-use loom_daemon::forge_bucket_book::{self, BucketKey, Reading};
-use loom_daemon::forge_call_stats::buckets::{self, CallsAggregate, GroupBy};
 
 /// `loom-daemon forge calls` arguments.
 #[derive(Args, Debug)]
@@ -57,7 +57,7 @@ pub(crate) fn handle(args: CallsArgs) -> Result<()> {
     let by = GroupBy::parse(&args.by).map_err(|e| anyhow!(e))?;
     let Some(dir) = args
         .sink_dir
-        .or_else(loom_daemon::forge_call_stats::host_sink_dir)
+        .or_else(crate::forge_call_stats::host_sink_dir)
     else {
         println!("forge calls: the call-stats sink is disabled (LOOM_FORGE_CALL_STATS_DIR=off)");
         return Ok(());

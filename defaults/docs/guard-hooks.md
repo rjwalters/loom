@@ -628,6 +628,8 @@ Whether the vendored copy is **installed** is a separate, per-repo choice, and b
 
 The committed case is deliberate, not drift: a git-tracked vendored guard is repo-shared state, so contributors and CI runners **without** Repo Skills installed still get full generic-guard coverage. Resync must therefore never delete it on the strength of one host's local, typically-gitignored `.claude/skills/repo/` install (#4403) — and because that state is the expected steady state rather than an anomaly, it is reported as a `note` (suppressed under `--quiet`) instead of a `WARN` that would reprint on every resync forever (#4566).
 
+**Direction (#8570, design only):** the operator ruled that the generic guard becomes a standalone shared `loom-guard` component installable by either `/repo` or `/loom`, with exactly one active generic engine per invocation and Loom-specific workflow/path hooks (`guard-loom-workflow.sh`, `guard-worktree-paths.sh`) staying Loom-owned. Nothing described above changes until that component is published and separately authorized for install. The boundary, install matrix, compatibility contract and measured divergences are in [`docs/design/loom-guard-extraction.md`](https://github.com/rjwalters/loom/blob/main/docs/design/loom-guard-extraction.md); `tests/hooks/compare-guard-engines.sh` runs one corpus through both engines and exits 3 (incomplete evidence, not a pass) when the canonical engine is missing; `tests/hooks/test-guard-install-matrix.sh` exercises the install/update/uninstall/rollback cells against stub Repo Skills trees and asserts exactly one active engine.
+
 If a repo genuinely wants to rely on Repo Skills provisioning instead, it drops the vendored copy **deliberately and repo-wide** with `git rm .loom/hooks/guard-destructive-generic.sh`; after that commit the branch above stops firing entirely and hosts without Repo Skills fall back to no generic guard, so make that trade consciously.
 
 ### SQL DDL/DML Guard Opt-Out (`guards.sqlDdl` / `LOOM_GUARD_SQL`)
@@ -1333,6 +1335,20 @@ nothing and `NAME` becomes empty) or prints the canonical path of that same
 directory. Everything else still fails closed — a third assignment, the
 reverse order, `${NAME}` inside the `realpath` call, a canonicalization of a
 *different* variable, or any prefix/suffix around the admitted form.
+
+**`/tmp` scratch loops (#12285)**: `wt_write_tmp_cwd_loop_var_safe()` allows
+`cd /tmp/probe && for name in a b; do echo x > "$name.gds"; done`, i.e. a write
+target `$var`/`${var}` plus a literal suffix, when ALL hold: the tracked cwd is a
+literal `/tmp/<dir>` outside every managed worktree and the main checkout, set by
+an earlier `cd /tmp/<literal>` in the same command; the suffix has no `/`, `..`
+or expansion; every binding of `var` is a literal `for var in <words>` or
+`var=<word>` (non-absolute, `/`-free, `..`-free) and the first one precedes the
+write; and the command has no `ln` command word. Anything else (a variable
+directory component, `read`/`+=`/`eval` rebinding, no assignment, a `$`/`..` in the
+`cd` target, a write before the `cd`) still denies. **Residual gap**: a symlink
+that already exists in `/tmp/<dir>` from an *earlier* command is not seen — the
+guard is lexical and never resolves paths. No new toggle; it narrows an existing
+`worktreeIsolation` deny.
 
 **`$(cd "$NAME" && pwd -P)` is deliberately NOT admitted**, even though it
 looks like an equally safe canonicalization of the same shape: `cd ""` is a

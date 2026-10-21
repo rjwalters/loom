@@ -6,7 +6,7 @@
 //!
 //! Invoked ONLY once a poll's fetch attempt has already failed (the shell
 //! establishes `fetch_rc != 0` before calling this — see the module docs on
-//! [`loom_daemon::merge_pr::check_runs_streak`] for why a successful fetch
+//! [`crate::merge_pr::check_runs_streak`] for why a successful fetch
 //! never reaches here). Always exits 0 with exactly one line:
 //!
 //! ```text
@@ -25,8 +25,8 @@
 //! caller's own `LOOM_AUTO_MERGE_TIMEOUT`), never misclassify a transient
 //! blip as the persistent condition that skips waiting altogether.
 
+use crate::merge_pr::check_runs_streak::{decide, render, Inputs};
 use anyhow::Result;
-use loom_daemon::merge_pr::check_runs_streak::{decide, render, Inputs};
 
 #[derive(clap::Args)]
 pub(crate) struct CheckRunsStreakArgs {

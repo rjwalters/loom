@@ -1362,6 +1362,18 @@ impl VerdictKind {
             Self::ChangesRequested => "changes-requested",
         }
     }
+
+    /// Every `verdict=` spelling a reader accepts for this verdict: the
+    /// canonical [`Self::marker_token`] first, then tolerated aliases
+    /// (a hand-posted or in-session marker may say `approve` /
+    /// `request-changes`). Writers stay canonical; only readers are lenient.
+    #[must_use]
+    pub fn marker_tokens(self) -> &'static [&'static str] {
+        match self {
+            Self::Approved => &["approved", "approve"],
+            Self::ChangesRequested => &["changes-requested", "request-changes"],
+        }
+    }
 }
 
 /// Labels that park a PR out of automated flow — an operator hold, or
@@ -1594,10 +1606,13 @@ impl VerdictReconcileStats {
 /// for a superseded verdict vouch for (or wrongly invalidate) the live one.
 #[must_use]
 pub fn extract_latest_verdict_sha(bodies: &[String], kind: VerdictKind) -> Option<String> {
-    let pattern = format!(
-        r"<!-- loom:verdict-sha sha=([0-9a-f]{{7,40}}) verdict={} -->",
-        regex::escape(kind.marker_token())
-    );
+    let tokens = kind
+        .marker_tokens()
+        .iter()
+        .map(|t| regex::escape(t))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(r"<!-- loom:verdict-sha sha=([0-9a-f]{{7,40}}) verdict=(?:{tokens}) -->");
     let re = regex::Regex::new(&pattern).ok()?;
     bodies
         .iter()
@@ -1894,24 +1909,8 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
 /// be redundant. Each tick's `gh` calls block, so it runs on a blocking
 /// thread (`tokio::task::spawn_blocking`), mirroring
 /// [`crate::token_ranking_refresh::spawn_multi_token_ranking_refresh_task`].
-///
-/// **Claim-reconcile wake (#8766, renamed in #8995).** A `loom:building` claim
-/// whose sweep is gone is what *holds* the dispatch queue's head, and this loop
-/// is what releases it — but releasing it does not by itself move the head, so
-/// this is not the head-mover: the work finder still has to tick before the
-/// freed issue is dispatched, which is why the flag names this pass rather than
-/// that effect. `event_bus` lets a `forge.event` prompt of a claim-relevant
-/// shape (a comment on a claimed issue, a PR reaching terminal state) run the
-/// *next ordinary pass now*
-/// instead of at the multi-minute cadence above — and nothing else. The pass
-/// body is untouched: it re-lists `loom:building` issues and re-decides from
-/// the same host-scoped evidence and the same lease gate it always did, so an
-/// early tick can only change *when* that happens. Disabled unless
-/// `forgeEvents.events.claimReconcileWake` is on for `fallback_root`;
-/// otherwise the ticker holds no bus subscription at all.
 pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
-    event_bus: std::sync::Arc<crate::event_bus::EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     // Safehouse-aware cadence (#4431): with live peer-claims carrying the
     // fast in-flight signal (re-advertised each reaper tick), a
@@ -1922,15 +1921,7 @@ pub fn spawn_periodic_reconciliation_task(
         interval.as_secs()
     );
     tokio::spawn(async move {
-        // An `Interval` a claim-relevant `forge.event` prompt may also tick
-        // early (#8766). Disarmed unless
-        // `forgeEvents.events.claimReconcileWake` is on; otherwise it is
-        // exactly `tokio::time::interval(interval)`.
-        let mut ticker = crate::forge_events::wake::EarlyTicker::for_claim_reconcile(
-            interval,
-            &event_bus,
-            &fallback_root,
-        );
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the immediate first fire: the startup pass already ran
         // moments ago in `main.rs`, so re-running instantly is redundant.
@@ -1985,6 +1976,10 @@ mod verdict_stale_comment;
 /// leaving a single dispatch call in the match arm here.
 mod verdict_invalidation;
 
+/// Return a PR held only by a machine CI gate to review once its exact head is
+/// green (#10178) — a sibling file per the file-size ratchet.
+pub(crate) mod ci_gate_recovery;
+
 /// The `Keep(Unverifiable)` arm of [`forge::reconcile_pr_verdicts`]: anchor an
 /// unmarked rejection (#6319), re-queue an unmarked approval (#9258) — a
 /// sibling file per the file-size ratchet.
@@ -1995,6 +1990,11 @@ pub mod merge_sequence;
 /// file per the file-size ratchet, run on the same tick right after
 /// [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
+
+/// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
+/// scratch-worktree git mechanics — sibling files per the file-size ratchet.
+pub mod orphan_stack;
+pub(crate) mod orphan_stack_git;
 
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file per the
@@ -2127,7 +2127,10 @@ pub mod forge {
         }
         let n = issue.to_string();
         let out = gh_call::output(
-            gh_call::read_own_write("claim.issue_labels", gh_bin, root)
+            // #12555: on a reader, like every daemon read. A reader lagging
+            // the reclaim edit reads as "partially applied", which costs one
+            // idempotent retry of the edit (`verify_reclaim_labels`).
+            gh_call::read("claim.issue_labels", gh_bin, root)
                 .args(["issue", "view", &n, "--json", "labels"])
                 .args(gh_call::loom_repo_flag()),
         )?;
@@ -2774,11 +2777,10 @@ pub mod forge {
     /// of the three state labels (`loom:review-requested`,
     /// `loom:changes-requested`, `loom:pr`) **and** it is not a draft (#8250:
     /// a draft PR is not ready for Judge, so the backfill is skipped even
-    /// when it has no state label). The safety-net check is best-effort: a
-    /// failure to read the PR's current labels/draft status defaults to
-    /// treating it as unlabeled and non-draft (adds `loom:review-requested`)
-    /// rather than leaving a PR that might genuinely have no state label
-    /// undiscoverable.
+    /// when it has no state label). The safety-net check fails CLOSED (#12571):
+    /// a failed or shed read of the PR's labels/draft status skips the
+    /// backfill, since guessing "unlabeled, non-draft" could add the label
+    /// next to `loom:pr`/`loom:changes-requested` or on a draft.
     fn reclaim_pr(gh_bin: &Path, root: &Path, pr_number: u32, claim_label: &str) -> Result<()> {
         let n = pr_number.to_string();
         let out = gh_call::output(
@@ -2795,8 +2797,9 @@ pub mod forge {
 
         const STATE_LABELS: [&str; 3] =
             ["loom:review-requested", "loom:changes-requested", "loom:pr"];
-        let pr_info =
-            super::pr_label_info::pr_label_names(gh_bin, root, pr_number).unwrap_or_default();
+        let Some(pr_info) = super::pr_label_info::labels_or_skip(gh_bin, root, pr_number) else {
+            return Ok(());
+        };
         let has_state_label = pr_info
             .labels
             .iter()
@@ -3163,3 +3166,7 @@ mod rest_only_tests;
 // #9258: an unmarked approval is re-queued, never anchored.
 #[cfg(test)]
 mod unanchored_verdict_tests;
+
+// #12230: a slow startup pass beside work-finder ticks dispatches once.
+#[cfg(test)]
+mod startup_cutoff_race_tests;

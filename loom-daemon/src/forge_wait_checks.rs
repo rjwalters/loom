@@ -307,6 +307,10 @@ struct State {
     /// Failed lookups so far, and the latest reason.
     lookup_failures: u32,
     lookup_error: String,
+    /// The lookup was refused for want of a permission (#11837): `required`
+    /// is then the empty set (default mode over every observed check), but
+    /// the set is still unknown, so an empty rollup never settles `NONE`.
+    required_unreadable: bool,
     zero_polls: u64,
     /// Why the legacy commit-status read was refused for want of a
     /// permission, once it has been (#10633). From then on the wait reads
@@ -331,6 +335,7 @@ pub fn wait<C: Clock>(
         required: None,
         lookup_failures: 0,
         lookup_error: String::new(),
+        required_unreadable: false,
         zero_polls: 0,
         statuses_denied: None,
         early_red: Vec::new(),
@@ -429,8 +434,12 @@ fn poll(
     if rollup.total == 0 {
         st.zero_polls += 1;
         let required = resolve_required(reads, st)?;
+        // The authorization context never holds a wait (#12526): a set of
+        // only that context is no required set at all.
+        let required = required.map(|r| verdict::without_authorization(&r));
         let req_state = match &required {
             None => Required::LookupFailed,
+            Some(_) if st.required_unreadable => Required::LookupFailed,
             Some(r) if r.is_empty() => Required::None,
             Some(_) => Required::Present,
         };
@@ -472,7 +481,7 @@ fn poll(
     // waits only on observed pending checks, so a failed lookup (#11837)
     // cannot hide a finished red.
     let needs_required =
-        opts.required_only || (rollup.pending.is_empty() && rollup.failing.is_empty());
+        opts.required_only || (rollup.blocking_pending().is_empty() && rollup.failing.is_empty());
     let required = if needs_required {
         resolve_required(reads, st)?
     } else {
@@ -519,7 +528,7 @@ fn poll(
             sha,
             names,
             sleep: None,
-            idle: rollup.pending.is_empty(),
+            idle: rollup.blocking_pending().is_empty(),
         },
     })
 }
@@ -547,6 +556,22 @@ fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<St
             st.lookup_failures = 0;
             st.required = Some(contexts);
         }
+        // A permission refusal never clears by retrying (#11837): decide as
+        // for a branch that requires nothing — green only when every observed
+        // check is terminal-success, at least as strict as a required-only
+        // verdict. Rate limits and other failures stay fail-closed below.
+        Err(why) if permission_refused(&why) => {
+            note(
+                st,
+                format!(
+                    "wait-checks: required-context lookup for {base} refused for want of a \
+                     permission ({why}); deciding over every observed check. Grant the GitHub \
+                     App 'Administration: Read' to restore the required-only verdict (#11837)."
+                ),
+            );
+            st.required_unreadable = true;
+            st.required = Some(Vec::new());
+        }
         Err(why) => {
             st.lookup_failures += 1;
             note(st, format!("wait-checks: required-context lookup for {base} failed: {why}"));
@@ -554,6 +579,23 @@ fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<St
         }
     }
     Ok(st.required.clone())
+}
+
+/// Whether a failed required-context lookup was refused for want of a
+/// permission on **every** source it tried (#11837): the classic GraphQL read
+/// *and* the REST branch fallback (#11855). Anything else — a rate limit, a
+/// ruleset failure, a withheld summary — is not, and keeps failing closed.
+fn permission_refused(why: &str) -> bool {
+    use crate::forge_denial::{classify, Denial};
+    let Some(rest) = why.strip_prefix("classic branch-protection lookup failed: ") else {
+        return false;
+    };
+    let Some((graphql, rest_branch)) = rest.split_once("; REST branch fallback: ") else {
+        return false;
+    };
+    [graphql, rest_branch]
+        .iter()
+        .all(|part| classify(Some(403), part, None) == Some(Denial::Permission))
 }
 
 /// Drop the check-runs of a superseded twin workflow run on `sha` (#11097,

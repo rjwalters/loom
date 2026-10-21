@@ -1,262 +1,31 @@
-//! Forge-side `loom:blocked` rows for `queue.snapshot` (Issue #8957).
+//! Where a workspace's issue listing comes from: the tick's published
+//! snapshot (mirror mode, #12307), or a listing of its own.
 //!
-//! The work finder lists only `loom:issue` items, so an issue that carries
-//! `loom:blocked` **without** `loom:issue` never reaches the ready queue and
-//! the dashboard had no row for it. This module adds those issues to the
-//! snapshot from the daemon side:
-//!
-//! - **Cost.** One ETag-cached REST listing per managed repo
-//!   ([`crate::forge_listing::list_issues_cached`]; an unchanged listing is a
-//!   free `304`), made only when a snapshot is actually emitted, so at most
-//!   once per repo per `host.health` interval.
-//! - **Anti-leak.** Rows go through the same slug and `derive_visibility`
-//!   resolution as ready rows and carry their own `visibility`. The reason is
-//!   the fixed [`QueueDisposition::reason`] text. `detail` is at most the
-//!   allowlisted hold labels in [`HOLD_LABELS`]; comment text (where a
-//!   blocking reason is usually written) is never read, let alone exported.
-//! - **Order.** The rows are not in dispatch order, so their `rank` is `0`.
-//! - **One lister per fleet (W12 part 2).** With
-//!   `fleet.captainGauges.queueBlocked`, the fleet captain lists and publishes
-//!   each repo's blocked issues (number, creation time, label names), and a
-//!   dispatcher builds its rows from those facts instead of listing, for the
-//!   repos the captain's fresh heartbeat covers. Anything else (no captain,
-//!   stale, uncovered) is this host's own listing, as before. The rows are
-//!   the same either way: both go through [`blocked_rows`]. See
-//!   [`super::captain_gauges::facts`].
+//! This module used to build the forge-side `loom:blocked` rows of the native
+//! `queue.snapshot` record (Issue #8957); that record was removed with the
+//! `/ingest` exporter (#12813). What remains is the snapshot-or-list choice
+//! `stage_occupancy` makes per workspace.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::forge_listing::RestIssue;
-use crate::telemetry::queue_snapshot::{QueueRepoRef, QueueSnapshotRow, MAX_ROWS};
-use crate::telemetry::QueueSnapshotRecord;
-use crate::types::QueueDisposition;
-use crate::workspace_pool::WorkspacePool;
 
-/// The label this module lists.
-pub const BLOCKED_LABEL: &str = "loom:blocked";
-
-/// Co-labels that explain a hold and may be exported as `detail`. Label
-/// names only, never free text.
-/// Derived (#10013): the registry's `blocked_colabel` labels plus the retired
-/// names that fold into one (#11795: `loom:operator`'s old names), presented
-/// in the fixed order below (the `detail` text is order-sensitive); a label
-/// outside that list sorts last, in registry order. The retired
-/// `loom:needs-capability` folds into `loom:blocked` itself, so it no longer
-/// explains a blocked row.
-pub static HOLD_LABELS: crate::label_registry::LabelSet =
-    crate::label_registry::LabelSet::new(|| {
-        const PRESENTATION_ORDER: [&str; 3] = [
-            "loom:operator",
-            "loom:operator-only",
-            "loom:operator-mechanical",
-        ];
-        let mut v = crate::label_registry::embedded_set_with_retired("blocked_colabel");
-        v.sort_by_key(|n| {
-            PRESENTATION_ORDER
-                .iter()
-                .position(|p| p == n)
-                .unwrap_or(usize::MAX)
-        });
-        v
-    });
-
-/// `rank` for rows outside the dispatch order.
-pub const UNRANKED: usize = 0;
-
-/// Whether a listed item gets a blocked row: an issue (REST listings include
-/// PRs) carrying `loom:blocked` and not `loom:issue` (the work finder already
-/// lists those). Pure.
-#[must_use]
-pub fn is_blocked_row(item: &RestIssue) -> bool {
-    !item.is_pull_request
-        && item.labels.iter().any(|l| l == BLOCKED_LABEL)
-        && !item.labels.iter().any(|l| l == "loom:issue")
+/// Where one workspace's blocked listing comes from.
+pub(super) enum Rows {
+    /// The tick's snapshot (mirror mode, #12307); nothing is listed.
+    Snapshot(Vec<RestIssue>),
+    /// Mirror mode, and the snapshot has not read the repo: no rows, like a
+    /// failed listing.
+    Skip,
+    /// Not mirror mode: list it.
+    List,
 }
 
-/// The snapshot rows for one repo's open `loom:blocked` listing
-/// ([`is_blocked_row`]). Pure.
-#[must_use]
-pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnapshotRow> {
-    listing
-        .iter()
-        .filter(|item| is_blocked_row(item))
-        .map(|item| {
-            let disposition = QueueDisposition::LabelledBlocked;
-            let holds: Vec<&str> = HOLD_LABELS
-                .iter()
-                .copied()
-                .filter(|hold| item.labels.iter().any(|l| l == hold))
-                .collect();
-            QueueSnapshotRow {
-                rank: UNRANKED,
-                repo: repo.repo.clone(),
-                visibility: repo.visibility,
-                issue: item.number,
-                workspace_weight: crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT,
-                // Deprecated by #9244: always false on the wire.
-                urgent: false,
-                level: crate::priority_pick::Level::of(&item.labels),
-                created_at: item.created_at.clone(),
-                disposition,
-                state: disposition.state().to_string(),
-                reason: disposition.reason().to_string(),
-                halt_cause: None,
-                detail: (!holds.is_empty()).then(|| holds.join(", ")),
-                // Outside the dispatch order: `blocked`, no position (#9288).
-                plan: crate::types::RowPlan {
-                    plan_state: crate::types::PlanState::Blocked,
-                    ..Default::default()
-                },
-            }
-        })
-        .collect()
-}
-
-/// Append `rows` to `record` after its ranked rows. Each counts in
-/// `counts.blocked`; rows already present (same repo and issue) are skipped,
-/// and rows past [`MAX_ROWS`] are counted in `rows_truncated`.
-pub fn append(record: &mut QueueSnapshotRecord, rows: Vec<QueueSnapshotRow>) {
-    let mut seen: BTreeSet<(String, u32)> = record
-        .rows
-        .iter()
-        .map(|r| (r.repo.clone(), r.issue))
-        .collect();
-    for row in rows {
-        if !seen.insert((row.repo.clone(), row.issue)) {
-            continue;
-        }
-        record.counts.blocked += 1;
-        if record.rows.len() >= MAX_ROWS {
-            record.rows_truncated += 1;
-        } else {
-            record.rows.push(row);
-        }
+pub(super) fn snapshot_rows(root: &Path) -> Rows {
+    use crate::discovery::published::{lookup, Lookup};
+    match lookup(root) {
+        Lookup::Repo(repo) => Rows::Snapshot(repo.rows.clone()),
+        Lookup::Absent => Rows::Skip,
+        Lookup::NotMirror => Rows::List,
     }
 }
-
-/// List `loom:blocked` for every managed repo and return the rows. A repo
-/// whose slug cannot be resolved, or whose listing fails, contributes nothing
-/// (logged at debug; the ready rows are unaffected).
-pub(super) async fn collect(
-    workspace_pool: &WorkspacePool,
-    slug_cache: &mut HashMap<String, String>,
-) -> Vec<QueueSnapshotRow> {
-    let mut rows = Vec::new();
-    let mut listed: BTreeSet<String> = BTreeSet::new();
-    for root in super::collector::provisioned_roots(workspace_pool) {
-        let root_str = root.to_string_lossy().to_string();
-        let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, &root_str).await
-        else {
-            continue;
-        };
-        if !listed.insert(slug.clone()) {
-            continue;
-        }
-        // W12 part 2: the fleet captain listed this repo and its facts are
-        // fresh, so no listing here. Stale, uncovered or unconfigured: list.
-        let from_captain = super::captain_gauges::captain_blocked(&slug, chrono::Utc::now())
-            .map(|facts| super::captain_gauges::facts::as_listing(&facts));
-        let listing = match from_captain {
-            Some(listing) => listing,
-            None => match list_open(root, BLOCKED_LABEL, "queue_blocked").await {
-                Some(listing) => listing,
-                None => continue,
-            },
-        };
-        let repo = QueueRepoRef {
-            visibility: super::collector::resolve_visibility(&slug).await,
-            repo: slug,
-        };
-        rows.extend(blocked_rows(&repo, &listing));
-    }
-    rows
-}
-
-/// One ETag-cached listing of open items carrying `label` in the repo at
-/// `root` (its `origin` remote, or `LOOM_REPO` when set), off the async
-/// runtime. `None` on failure.
-pub(super) async fn list_open(
-    root: PathBuf,
-    label: &'static str,
-    caller: &'static str,
-) -> Option<Vec<RestIssue>> {
-    list_open_in(root, None, label, caller).await
-}
-
-/// [`list_open`] of an explicit `repo`, which wins over both `origin` and
-/// `LOOM_REPO`; `root` then only picks the credential. The captain passes the
-/// slug it publishes its facts under, so the repo it lists is the repo it
-/// names (W12 part 2).
-pub(super) async fn list_open_in(
-    root: PathBuf,
-    repo: Option<String>,
-    label: &'static str,
-    caller: &'static str,
-) -> Option<Vec<RestIssue>> {
-    list_open_classed(root, repo, label, caller, false).await
-}
-
-/// [`list_open`] as an Observability read (#12193): shed, not retried on the
-/// writer, when no reader can serve it. `None` then, like any failure.
-pub(super) async fn list_open_observability(
-    root: PathBuf,
-    label: &'static str,
-    caller: &'static str,
-) -> Option<Vec<RestIssue>> {
-    list_open_classed(root, None, label, caller, true).await
-}
-
-async fn list_open_classed(
-    root: PathBuf,
-    repo: Option<String>,
-    label: &'static str,
-    caller: &'static str,
-    observability: bool,
-) -> Option<Vec<RestIssue>> {
-    let shown = root.display().to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-        list_open_with(&gh, &root, repo.as_deref(), label, caller, observability)
-    })
-    .await;
-    match result {
-        Ok(Ok(listing)) => Some(listing),
-        Ok(Err(error)) => {
-            log::debug!("observability: listing {label} in {shown} failed: {error}");
-            None
-        }
-        Err(join_error) => {
-            log::debug!("observability: listing {label} in {shown} panicked: {join_error}");
-            None
-        }
-    }
-}
-
-/// [`list_open`]'s blocking body, with the `gh` binary passed in.
-fn list_open_with(
-    gh: &Path,
-    root: &Path,
-    repo: Option<&str>,
-    label: &str,
-    caller: &'static str,
-    observability: bool,
-) -> anyhow::Result<Vec<RestIssue>> {
-    if observability {
-        crate::forge_listing::list_issues_cached_observability_as(
-            caller,
-            gh,
-            Some(root),
-            repo,
-            label,
-            "open",
-        )
-    } else {
-        crate::forge_listing::list_issues_cached_as(caller, gh, Some(root), repo, label, "open")
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-#[path = "queue_blocked_tests.rs"]
-mod tests;

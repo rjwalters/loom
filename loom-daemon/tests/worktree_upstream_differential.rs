@@ -56,6 +56,8 @@
 //! same runs.
 
 use std::collections::BTreeMap;
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -567,14 +569,7 @@ fn normalize(text: &str, root: &Path) -> String {
 }
 
 fn tmproot(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-upstream-diff-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmproot");
-    fs::canonicalize(&base).expect("canonicalize tmproot")
+    common::unique_tmpdir("loom-upstream-diff", tag)
 }
 
 struct Comparison {
@@ -918,3 +913,8 @@ fn a_backslash_in_the_path_is_re_escaped_by_the_shell_and_not_by_the_port() {
          be confined to the printed hint"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -436,3 +436,8 @@ fn the_live_script_no_longer_carries_either_body() {
         "merge-pr.sh does not invoke the verb that replaced the inline bodies"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

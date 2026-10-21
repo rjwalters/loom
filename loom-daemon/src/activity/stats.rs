@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use activity::stats::{AgentEffectiveness, CostPerIssue, DailyVelocity};
+//! use activity::stats::{AgentEffectiveness, CostPerIssue};
 //!
 //! let db = ActivityDb::new("activity.db".into())?;
 //!
@@ -31,7 +31,7 @@
 //! let cost = db.get_cost_per_issue(Some(42))?;
 //! ```
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -93,25 +93,6 @@ pub struct CostPerIssue {
     pub started: Option<DateTime<Utc>>,
     /// Timestamp when work was completed
     pub completed: Option<DateTime<Utc>>,
-}
-
-/// Daily velocity metrics for tracking productivity trends.
-///
-/// Aggregates activity by day to show development velocity,
-/// including prompt counts, issues touched, and PRs created.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct DailyVelocity {
-    /// Date of the activity
-    pub date: NaiveDate,
-    /// Number of prompts on this day
-    pub prompts: i64,
-    /// Number of unique issues touched
-    pub issues_touched: i64,
-    /// Number of PRs created
-    pub prs_created: i64,
-    /// Total cost for the day in USD
-    pub daily_cost: f64,
 }
 
 /// Weekly velocity summary for trend analysis.
@@ -646,21 +627,6 @@ pub trait StatsQueries {
     /// Vector of `CostPerIssue` records ordered by total cost descending.
     fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>>;
 
-    /// Get daily velocity metrics for a date range.
-    ///
-    /// # Arguments
-    /// * `start_date` - Optional start date filter (inclusive)
-    /// * `end_date` - Optional end date filter (inclusive)
-    ///
-    /// # Returns
-    /// Vector of `DailyVelocity` records ordered by date ascending.
-    #[allow(dead_code)]
-    fn get_daily_velocity(
-        &self,
-        start_date: Option<NaiveDate>,
-        end_date: Option<NaiveDate>,
-    ) -> rusqlite::Result<Vec<DailyVelocity>>;
-
     /// Get weekly velocity summary for trend analysis.
     ///
     /// # Returns
@@ -804,72 +770,6 @@ fn map_cost_per_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostPerIssue>
     })
 }
 
-#[allow(dead_code)]
-pub fn query_daily_velocity(
-    conn: &Connection,
-    start_date: Option<NaiveDate>,
-    end_date: Option<NaiveDate>,
-) -> rusqlite::Result<Vec<DailyVelocity>> {
-    // Ensure views exist
-    create_stats_views(conn)?;
-
-    let (sql, params): (&str, Vec<String>) = match (start_date, end_date) {
-        (Some(start), Some(end)) => (
-            r"SELECT date, prompts, issues_touched, prs_created, daily_cost
-              FROM daily_velocity
-              WHERE date >= ?1 AND date <= ?2
-              ORDER BY date ASC",
-            vec![start.to_string(), end.to_string()],
-        ),
-        (Some(start), None) => (
-            r"SELECT date, prompts, issues_touched, prs_created, daily_cost
-              FROM daily_velocity
-              WHERE date >= ?1
-              ORDER BY date ASC",
-            vec![start.to_string()],
-        ),
-        (None, Some(end)) => (
-            r"SELECT date, prompts, issues_touched, prs_created, daily_cost
-              FROM daily_velocity
-              WHERE date <= ?1
-              ORDER BY date ASC",
-            vec![end.to_string()],
-        ),
-        (None, None) => (
-            r"SELECT date, prompts, issues_touched, prs_created, daily_cost
-              FROM daily_velocity
-              ORDER BY date ASC
-              LIMIT 90",
-            vec![],
-        ),
-    };
-
-    let mut stmt = conn.prepare(sql)?;
-
-    let rows = match params.len() {
-        0 => stmt.query_map([], map_daily_velocity)?,
-        1 => stmt.query_map([&params[0]], map_daily_velocity)?,
-        2 => stmt.query_map([&params[0], &params[1]], map_daily_velocity)?,
-        _ => unreachable!(),
-    };
-
-    rows.collect()
-}
-
-fn map_daily_velocity(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyVelocity> {
-    let date_str: String = row.get(0)?;
-    let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-    Ok(DailyVelocity {
-        date,
-        prompts: row.get(1)?,
-        issues_touched: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-        prs_created: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-        daily_cost: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-    })
-}
-
 pub fn query_weekly_velocity(conn: &Connection) -> rusqlite::Result<Vec<WeeklyVelocity>> {
     // Ensure views exist
     create_stats_views(conn)?;
@@ -978,7 +878,6 @@ mod tests {
         // Verify views exist by querying them
         let _: Vec<AgentEffectiveness> = query_agent_effectiveness(&conn, None)?;
         let _: Vec<CostPerIssue> = query_cost_per_issue(&conn, None)?;
-        let _: Vec<DailyVelocity> = query_daily_velocity(&conn, None, None)?;
 
         Ok(())
     }
@@ -1095,9 +994,6 @@ mod tests {
 
         let cost_per_issue = query_cost_per_issue(&conn, None)?;
         assert!(cost_per_issue.is_empty());
-
-        let daily_velocity = query_daily_velocity(&conn, None, None)?;
-        assert!(daily_velocity.is_empty());
 
         let summary = query_stats_summary(&conn)?;
         assert_eq!(summary.total_prompts, 0);

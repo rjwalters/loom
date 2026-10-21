@@ -80,14 +80,17 @@ impl SweepRegistry {
     pub(crate) fn fetch_label_applied_at(&self, issue: u32, label: &str) -> Option<DateTime<Utc>> {
         // Counted as `guard.claim_timeline` (#10089); the facade applies the
         // cross-owner GH_CONFIG_DIR (#5401) and `LOOM_REPO` as GH_REPO (#8263 —
-        // `gh api` has no `--repo` flag).
+        // `gh api` has no `--repo` flag). A reader or the gateway answers,
+        // never the writer (#12555, #12394). The claim this guards against is
+        // a PEER's re-claim, which the writer reads no fresher than a reader,
+        // and the gateway's ETag cache revalidates every hit upstream.
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = format!(
             r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
         );
         let jq = jq.as_str();
         let output = self
-            .gh_read_own_write("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
             .ok()
             .flatten()?;
         if !output.status.success() {
@@ -164,6 +167,12 @@ pub(crate) const LEASELESS_CLAIM_HOST: &str = "unknown-host";
 /// `LeaseOrderDispatchError`, and the standdown annotation).
 pub(crate) const LEASELESS_CLAIM_SWEEP_PREFIX: &str = "leaseless-loom-building-label-";
 
+/// The `earliest_host` / `earliest_sweep_id` reported when an issue-sweep
+/// claim stands down because the lease order could not be verified (#12571):
+/// no peer won, so these name the absence of one.
+pub(crate) const UNVERIFIED_LEASE_HOST: &str = "unverified";
+pub(crate) const UNVERIFIED_LEASE_SWEEP: &str = "lease-order-unverified";
+
 /// Whether `in_window` — the lease comments
 /// [`lease_episode::in_episode`](super::lease_episode::in_episode) admitted
 /// into the current claim episode — contains NOTHING but this dispatcher's own
@@ -192,12 +201,11 @@ pub(crate) fn is_sole_claimant(in_window: &[&LeaseComment], host: &str, sweep_id
 /// (Issue #9453 Phase 3.1). Pure, so the two properties it encodes can be
 /// pinned without a `gh` fixture:
 ///
-/// - **Foreign**: strictly OLDER than `episode_start`. This dispatcher captures
-///   `episode_start` immediately *before* its own label flip, so the event its
-///   own flip creates is always newer — without this leg every uncontested
-///   dispatch would yield to itself. (When the label was already present, the
-///   flip is a no-op that creates no event at all, so the newest event remains
-///   the foreign claimant's.)
+/// - **Potentially foreign**: strictly OLDER than `episode_start`. Forge
+///   timestamps truncate to whole seconds, so even an own flip can match.
+///   Dispatch only waives that candidate using the actor/window/lease proof in
+///   [`SweepRegistry::leaseless_yield_is_own_phantom`], never a time-only slack.
+///   An already-present label creates no new event when flipped.
 /// - **Live**: no older than [`LEASELESS_CLAIM_LABEL_GRACE_SECS`]. An older
 ///   label is the shape a finished or abandoned claim leaves behind, and
 ///   yielding to it forever would wedge redispatch — the same anti-wedge
@@ -256,10 +264,14 @@ impl SweepRegistry {
     /// The newest `labeled loom:building` event's `(actor login, created_at)`.
     /// `None` on any read failure or unparseable output (callers fail closed).
     pub(crate) fn fetch_claim_event(&self, issue: u32) -> Option<(String, DateTime<Utc>)> {
+        // On a reader like `fetch_label_applied_at` (#12555). Freshness guard:
+        // the caller acts only on an event it attributes to its own flip
+        // (`claim_event_is_own_flip`); a read lagging that flip shows an older
+        // event and fails closed (no revert).
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building")] | max_by(.created_at) | select(. != null) | "\(.actor.login // "")\t\(.created_at)""#;
         let output = self
-            .gh_read_own_write("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
             .ok()
             .flatten()?;
         if !output.status.success() {
@@ -268,14 +280,14 @@ impl SweepRegistry {
         parse_claim_event(&output.stdout)
     }
 
-    /// Whether a leaseless yield's `loom:building` label is *provably* this
-    /// dispatcher's own phantom (Issue #10345), so it may be reverted.
+    /// Whether a candidate leaseless yield refers to this dispatcher's own
+    /// flip (#10345), so dispatch can proceed without yielding to itself (#10337).
     ///
     /// Requires: the newest label event is attributable to this dispatcher's
     /// flip ([`claim_event_is_own_flip`]), AND a fresh lease-comment read shows
-    /// no lease record other than this sweep's own. FAIL-CLOSED: every
-    /// unverifiable read returns `false` (keep the label, as before #10345) so
-    /// a real hand-claim's mutex (#5270/#9453) is never destroyed on a guess.
+    /// this sweep's own lease and no foreign record. FAIL-CLOSED: an empty or
+    /// unverifiable read returns `false`; retain the yield and label so a real
+    /// hand-claim's mutex (#5270/#9453) is never overridden on a guess.
     pub(crate) fn leaseless_yield_is_own_phantom(
         &self,
         issue: u32,
@@ -294,9 +306,10 @@ impl SweepRegistry {
         let Some(comments) = self.read_lease_comments(issue) else {
             return false;
         };
-        comments
-            .iter()
-            .all(|c| c.host == host && c.sweep_id == sweep_id)
+        !comments.is_empty()
+            && comments
+                .iter()
+                .all(|c| c.host == host && c.sweep_id == sweep_id)
     }
 }
 
@@ -326,7 +339,7 @@ impl LeaseOrderDecision {
     /// yield variant never has to be re-plumbed through the dispatch path.
     pub(crate) fn yield_identity(self) -> Option<(String, String)> {
         match self {
-            Self::Proceed => None,
+            Self::Proceed | Self::Unverified => None,
             Self::Yield {
                 earliest_host,
                 earliest_sweep_id,

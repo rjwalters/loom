@@ -323,6 +323,30 @@ mod role_tick {
 
     #[test]
     #[serial_test::serial]
+    fn a_roll_stopped_tick_exports_roll_interrupted_not_pre_launch() {
+        use super::super::super::role_invocation_classified;
+        use crate::observability::lifecycle::{note_role_failure, RoleFailure};
+        let dir = traced_root();
+        for noted in [false, true] {
+            let (_, trace, class) = role_invocation_classified(dir.path(), "judge", || {
+                launch(true);
+                if noted {
+                    note_role_failure(RoleFailure::new("exit-1", Some(1), "exited"));
+                }
+                RoleTickOutcome::Failure("exited with signal 15".into())
+            });
+            assert!(trace.unwrap().failure.is_none());
+            assert_eq!(class.as_ref().map(RoleFailure::class), Some("roll-interrupted"));
+        }
+        let (_, _, class) = role_invocation_classified(dir.path(), "judge", || {
+            launch(false);
+            RoleTickOutcome::Failure("exit 1".into())
+        });
+        assert!(class.is_none(), "an unstopped failure keeps its class on the span");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn an_unstopped_failure_still_closes_as_failure() {
         let dir = traced_root();
         let (_, trace) = role_invocation(dir.path(), "judge", || {

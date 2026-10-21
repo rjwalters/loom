@@ -180,8 +180,11 @@ pub fn parse_probe(body: &str, now: i64) -> Vec<(Resource, Reading)> {
 /// no probe.
 ///
 /// #12204: a directory is probed at most once per reset window — after
-/// that, response headers keep its reading current — instead of on every
-/// 300 s pass.
+/// that, response headers keep its reading current *while the directory sees
+/// traffic* — instead of on every 300 s pass. A quiet directory with no header
+/// traffic is not re-probed: its reading ages past `MAX_AGE_SECS` (600 s) and
+/// reads unknown until the window resets. Routing treats unknown as headroom,
+/// and a refusal still withdraws the bucket, so the gap is safe.
 pub fn probe_all(workspace_root: &Path) {
     let probes = probe_all_with(workspace_root, None, SystemTime::now());
     log::debug!("forge_bucket_book: {probes} rate_limit probe(s) (free) — W1");

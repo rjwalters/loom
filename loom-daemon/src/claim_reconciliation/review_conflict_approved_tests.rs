@@ -102,13 +102,54 @@ fn operator_held_pr_without_approval_stays_held() {
 }
 
 #[test]
-fn held_approved_pr_is_never_cleared() {
+fn mergeable_held_or_sequenced_approved_pr_loses_the_label_only() {
+    for extra in ["loom:operator", "loom:operator-only", "loom:sequenced"] {
+        assert_eq!(
+            decide_review_conflict(&pr(Mergeable::Mergeable, &[APPROVED, extra, MERGE_CONFLICT])),
+            ConflictAction::LabelClear,
+            "{extra}"
+        );
+        // No label to remove: nothing to do.
+        let keep = if extra == "loom:sequenced" {
+            ConflictKeepReason::NoChange
+        } else {
+            ConflictKeepReason::Held
+        };
+        assert_eq!(
+            decide_review_conflict(&pr(Mergeable::Mergeable, &[APPROVED, extra])),
+            ConflictAction::Keep(keep),
+            "{extra}"
+        );
+        // No information: leave the label.
+        assert_eq!(
+            decide_review_conflict(&pr(Mergeable::Unknown, &[APPROVED, extra, MERGE_CONFLICT])),
+            ConflictAction::Keep(ConflictKeepReason::Unknown),
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn mergeable_blocked_or_frozen_approved_pr_is_never_cleared() {
+    for hold in ["loom:blocked", "loom:frozen"] {
+        for extra in ["loom:operator", "loom:sequenced"] {
+            assert_eq!(
+                decide_review_conflict(&pr(
+                    Mergeable::Mergeable,
+                    &[APPROVED, hold, extra, MERGE_CONFLICT]
+                )),
+                ConflictAction::Keep(ConflictKeepReason::Held),
+                "{hold} {extra}"
+            );
+        }
+    }
+}
+
+#[test]
+fn flag_path_labels_still_go_through_clear_if_ours() {
     assert_eq!(
-        decide_review_conflict(&pr(
-            Mergeable::Mergeable,
-            &[APPROVED, "loom:operator", MERGE_CONFLICT]
-        )),
-        ConflictAction::Keep(ConflictKeepReason::Held)
+        decide_review_conflict(&pr(Mergeable::Mergeable, &[CHANGES_REQUESTED, MERGE_CONFLICT])),
+        ConflictAction::ClearIfOurs
     );
 }
 
@@ -298,5 +339,30 @@ fn end_to_end_already_flagged_approved_pr_is_not_reflagged() {
         "[]",
     );
     assert_eq!((stats.flagged, stats.labeled), (0, 0));
+    assert!(!calls.contains("pr edit"), "{calls}");
+}
+
+#[test]
+#[serial]
+fn end_to_end_mergeable_held_and_sequenced_prs_lose_only_the_conflict_label() {
+    for extra in ["loom:operator", "loom:sequenced"] {
+        let (stats, calls) =
+            run(&open(12041, "MERGEABLE", &["loom:pr", extra, "loom:merge-conflict"]), "[]");
+        assert_eq!((stats.label_cleared, stats.cleared, stats.flagged), (1, 0, 0), "{extra}");
+        assert!(calls.contains("pr edit 12041 --remove-label loom:merge-conflict"), "{calls}");
+        assert!(!calls.contains("--add-label"), "{extra}: {calls}");
+        assert!(!calls.contains("pr comment"), "{extra}: {calls}");
+        assert!(!calls.contains("/comments"), "{extra}: {calls}");
+    }
+}
+
+#[test]
+#[serial]
+fn end_to_end_unknown_mergeable_held_pr_keeps_the_label() {
+    let (stats, calls) = run(
+        &open(12041, "UNKNOWN", &["loom:pr", "loom:operator", "loom:merge-conflict"]),
+        "[]",
+    );
+    assert_eq!(stats.label_cleared, 0);
     assert!(!calls.contains("pr edit"), "{calls}");
 }

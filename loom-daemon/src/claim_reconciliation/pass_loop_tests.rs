@@ -216,7 +216,9 @@ fn conflict_and_sequence_passes_share_one_open_pr_listing() {
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     let listings = gh_calls
         .lines()
-        .filter(|l| l.contains("api --include") && l.contains("pulls?state=open"))
+        // #12310: discovery listings carry a `-H loom.forge.purpose:` pair between
+        // `api` and `--include`, so match the endpoint, not the argument order.
+        .filter(|l| l.contains("--include") && l.contains("pulls?state=open"))
         .count();
     assert_eq!(listings, 5, "2 claim + 2 verdict + 1 shared conflict/sequence: {gh_calls}");
     assert!(!gh_calls.contains("pr list"), "no GraphQL pr list: {gh_calls}");

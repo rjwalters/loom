@@ -100,6 +100,7 @@ use crate::fleet_store::{self as store, StoreLocation};
 // the otlp-only consumers do not leave them dead in a non-otlp build (#11197).
 pub mod applied;
 pub mod checkout_ff;
+pub mod config_restart;
 mod floor_knowledge;
 pub mod git_spawn_log;
 pub mod identity;
@@ -326,14 +327,12 @@ pub fn config_pass(
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
         let mut detail = describe_drift(&drift);
-        let keys = crate::config_journal::restart_keys(target, mode == Mode::Write && drifted);
         if mode == Mode::Write && drifted {
             let lost = render::lost_top_level_keys(target);
             if lost.is_empty() {
                 match render::write(target, &stamp) {
-                    Ok((w, backup)) => {
+                    Ok((w, _backup)) => {
                         wrote = w;
-                        crate::config_journal::record_rendered(w, target, backup, &commit, &keys);
                     }
                     Err(e) => {
                         error = Some(format!("writing {}: {e:#}", target.path.display()));
@@ -400,6 +399,11 @@ pub struct RosterPass {
     /// Missing clones this pass cloned or tried to (#11218).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clones: Vec<roster_clone::CloneAttempt>,
+    /// The registry changes this pass applied, and each desired repo it could
+    /// not register because it is not cloned (#12322). Published as
+    /// `roster.change` records; never serialized into the status file.
+    #[serde(skip)]
+    pub changes: Vec<roster_clone::RosterEvent>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
     /// Why the roster was not consulted at all this pass — set when the
@@ -599,6 +603,31 @@ fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+/// What [`refresh_floor`] needs to reach the store: set once by [`start`].
+fn fresh_floor_inputs() -> &'static OnceLock<(PathBuf, StoreLocation, PathBuf)> {
+    static INPUTS: OnceLock<(PathBuf, StoreLocation, PathBuf)> = OnceLock::new();
+    &INPUTS
+}
+
+/// Re-read the floor from the store now (#12610), not from the last timer
+/// pass, and publish it like a pass would. A roll about to stop agents calls
+/// this so a floor rolled back since the roll was armed is seen before work is
+/// stopped. A store that cannot be reached keeps the last good floor
+/// ([`resolve_floor`]); a host with no fleet store just answers
+/// [`floor_knowledge`]. Blocking (it shells out to `gh`).
+#[must_use]
+pub fn refresh_floor() -> FloorKnowledge {
+    if let Some((workspace, location, cache)) = fresh_floor_inputs().get() {
+        let transport = crate::fleet_store::gh::GhTransport::new(workspace, &location.repo);
+        let read = fetch::load(&transport, cache, location, Policy::AllowStale, Utc::now())
+            .map(|loaded| floor::read(&loaded.snapshot))
+            .map_err(|e| format!("{e:#}"));
+        let pass = resolve_floor(read, last_good_floor().as_deref());
+        floor_knowledge::record_floor(&pass);
+    }
+    floor_knowledge()
+}
+
 #[cfg(test)]
 fn set_floor(floor: Option<String>) {
     if let Ok(mut guard) = floor_cell().lock() {
@@ -615,6 +644,10 @@ fn set_floor(floor: Option<String>) {
 pub fn loom_min_version() -> Option<String> {
     floor_cell().lock().ok().and_then(|g| g.clone().flatten())
 }
+
+/// #12424: restart-required config changes since this process booted, beside
+/// the floor. See [`config_restart`].
+pub use config_restart::config_restart_demand;
 
 /// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
 /// daemon version a registered workspace NEEDS and this host does not run.
@@ -810,7 +843,6 @@ fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
     fetch::write_atomic(path, &body)?;
-    crate::config_journal::record_sync(status); // J3 shadow, after the legacy write
     Ok(())
 }
 
@@ -868,7 +900,6 @@ pub fn clear_status() {
                 "fleet_sync: no fleet store configured — removed the stale snapshot {}",
                 path.display()
             );
-            crate::config_journal::record_sync_cleared();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::debug!("fleet_sync: could not remove {}: {e:#}", path.display()),
@@ -1031,8 +1062,6 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // #10885: a floor that differs from the previous pass's wakes the
     // self-update loop, so it acts now and not at its next interval.
     floor_knowledge::record_floor(&floor);
-    // J3 shadow (#11349): config as resolved after this pass (deduplicated).
-    crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -1155,6 +1184,7 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
         log::debug!("fleet_sync: {summary}");
     }
     roster_clone::announce(status, bus);
+    roster_clone::emit_changes(status);
     loom_ui::report(status); // #11295
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
@@ -1306,6 +1336,11 @@ pub async fn start(
         auto_apply,
         clones: roster_clone::resolve_config(&effective, &|k| std::env::var(k).ok()),
     };
+    let _ = fresh_floor_inputs().set((
+        inputs.workspace.clone(),
+        inputs.location.clone(),
+        inputs.cache.clone(),
+    ));
     log::info!(
         "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={auto_apply}",
         inputs.location.repo,
@@ -1316,6 +1351,8 @@ pub async fn start(
     workspace_resync::mark_boot();
     let mut inputs = inputs;
     let state = startup_pass(&inputs, bus.as_deref()).await;
+    // #12424: snapshot the rendered tiers for the since-boot comparison.
+    config_restart::record_boot(&inputs.workspace);
     inputs.host = identity::adopted().unwrap_or(inputs.host); // #11740
                                                               // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
@@ -1423,6 +1460,8 @@ fn spawn_timer(
                     status.workspaces = workspace_resync::latest();
                     publish(&status);
                     report(&status, bus.as_deref());
+                    // #12424: refresh the since-boot restart-required demand.
+                    config_restart::check(mode, Utc::now());
                     // #10718: last, so the floor is current and a hold this
                     // pass just placed is already in the drain flag. Not
                     // awaited: see `workspace_resync::host`.
