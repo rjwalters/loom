@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-21
 
+- **PR #13035**: refactor: remove the native /ingest exporter and queue.snapshot
+- **Issue #12813** (closed): Daemon: remove the /ingest exporter, ingest key and native-only queue.snapshot
 - **PR #12865**: docs: assess checkpoint writes against worktree-isolation guard
 - **PR #13023**: chore: remove orphaned heredoc-body-safety test lib
 - **PR #12852**: refactor: share one loopback HTTP sink across telemetry exporter tests
