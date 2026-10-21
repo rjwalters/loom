@@ -248,7 +248,7 @@ fn cli_parses_and_defaults_to_sixty_days() {
         panic!("did not parse");
     };
     match cli.command {
-        Some(crate::Commands::ScriptPorts(
+        Some(crate::cli::Commands::ScriptPorts(
             crate::cli::script_ports::ScriptPortCommand::WorkDocs(WorkDocsCommand::Archive(a)),
         )) => {
             assert_eq!(a.older_than_days, 60);

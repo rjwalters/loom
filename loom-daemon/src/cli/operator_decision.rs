@@ -1,12 +1,12 @@
 //! `loom-daemon operator-decision` (#9344): clap shim over
-//! [`loom_daemon::operator_decision`], which documents the contract and the
+//! [`crate::operator_decision`], which documents the contract and the
 //! exit codes. Lives here, not in `main.rs`, for the frozen-`main.rs` reason
 //! `PremiseCheckArgs` gives.
 
-use anyhow::Result;
-use loom_daemon::operator_decision::cli::{
+use crate::operator_decision::cli::{
     self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, GhForge, Target,
 };
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand, Debug)]
@@ -100,7 +100,7 @@ impl OperatorDecisionCommand {
                         };
                         let code = apply(&mut forge, &text, &req, &mut out, &mut err);
                         // #12027: best-effort, never the exit code.
-                        loom_daemon::operator_decision::cli::journal_applied(&req, code);
+                        crate::operator_decision::cli::journal_applied(&req, code);
                         code
                     }
                     Err(e) => {

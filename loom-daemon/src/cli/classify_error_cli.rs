@@ -18,11 +18,11 @@
 //!   mode, so a caller can invoke it bare without stealing a terminal.
 //!
 //! The provider default chain (`--provider` > `$LOOM_RUNTIME` > `claude`) and
-//! the category precedence live in [`loom_daemon::classify_error`]; this file
+//! the category precedence live in [`crate::classify_error`]; this file
 //! is argv plumbing only.
 
+use crate::classify_error;
 use anyhow::Result;
-use loom_daemon::classify_error;
 use std::io::Read as _;
 use std::path::PathBuf;
 

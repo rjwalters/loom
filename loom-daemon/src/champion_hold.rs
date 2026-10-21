@@ -123,8 +123,10 @@ fn only_the_blocked_park<L: AsRef<str>>(labels: &[L]) -> bool {
 }
 
 /// Whether a trusted comment is an operator release of a hold: it *starts*
-/// with one of the instructions `champion-pr-merge.md` ("Sticky holds") names.
-/// Phrasing that merely mentions them does not match.
+/// with one of the instructions `champion-pr-merge.md` ("Sticky holds") names,
+/// or with the `loom:release-condition-met` marker that closes an operator
+/// release condition (#12594) — a held-at-head PR must be redrawn so Champion
+/// re-reads the condition. Phrasing that merely mentions them does not match.
 fn is_operator_release(comment: &str) -> bool {
     let c = comment.trim_start().to_ascii_lowercase();
     [
@@ -133,6 +135,7 @@ fn is_operator_release(comment: &str) -> bool {
         "override:",
         "merge anyway",
         "ok to merge",
+        "<!-- loom:release-condition-met -->",
     ]
     .iter()
     .any(|p| c.starts_with(p))
@@ -147,6 +150,15 @@ fn is_operator_release(comment: &str) -> bool {
 /// hold should be re-read at the same head, so the caller draws it again.
 #[must_use]
 pub fn unreleased_hold_head<C: AsRef<str>>(trusted: &[C]) -> Option<String> {
+    unreleased_hold(trusted).map(|(head, _)| head)
+}
+
+/// [`unreleased_hold_head`] plus the standing-authorization digest the same
+/// record carries (`auth=<digest>`, #12933): `Some((head, None))` is a legacy
+/// hold. Only trusted bodies are read, so an untrusted quote of the marker
+/// supplies neither.
+#[must_use]
+pub fn unreleased_hold<C: AsRef<str>>(trusted: &[C]) -> Option<(String, Option<String>)> {
     let at = trusted
         .iter()
         .rposition(|c| crate::merge_pr::hold_state::recorded_head(c.as_ref()).is_some())?;
@@ -157,7 +169,45 @@ pub fn unreleased_hold_head<C: AsRef<str>>(trusted: &[C]) -> Option<String> {
     if released {
         return None;
     }
-    crate::merge_pr::hold_state::recorded_head(trusted[at].as_ref())
+    let body = trusted[at].as_ref();
+    let head = crate::merge_pr::hold_state::recorded_head(body)?;
+    Some((head, crate::merge_pr::hold_state::recorded_auth(body)))
+}
+
+/// A short digest of the effective `champion.standingAuthorizations` for the
+/// repo at `root` (#12933): the first 16 hex of the sha256 of its canonical
+/// JSON (object keys sorted; array order kept). Absent, null and non-array
+/// values digest as `[]`, the empty set the prompts also treat them as.
+/// Champion records it in the hold marker (`auth=<digest>`); a later change to
+/// the set differs from it and releases the hold for one redraw.
+#[must_use]
+pub fn standing_auth_digest(root: &std::path::Path) -> String {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    let set = crate::config_resolver::get_path(&effective, "champion.standingAuthorizations");
+    digest_of(set)
+}
+
+fn digest_of(set: Option<&serde_json::Value>) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => {
+                let sorted: std::collections::BTreeMap<_, _> =
+                    m.iter().map(|(k, v)| (k.clone(), canonical(v))).collect();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.iter().map(canonical).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    let canon = match set {
+        Some(v @ serde_json::Value::Array(_)) => canonical(v),
+        _ => serde_json::Value::Array(Vec::new()),
+    };
+    let sum = Sha256::digest(canon.to_string().as_bytes());
+    hex::encode(sum)[..16].to_string()
 }
 
 /// The label shape of a Champion-held PR that Champion sent to Doctor
@@ -494,14 +544,60 @@ mod tests {
             "  Cleared: fine",
             "merge anyway, it is urgent",
             "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->\n**Approved**",
+            // #12594: closing an operator release condition must redraw the PR.
+            "<!-- loom:release-condition-met -->\npredecessor merged, healthy on every host",
         ] {
             assert_eq!(unreleased_hold_head(&[hold.as_str(), release]), None, "{release}");
         }
+        // The condition itself, or a notice quoting the -met marker, is not a release.
+        assert_eq!(
+            unreleased_hold_head(&[
+                hold.as_str(),
+                "<!-- loom:release-condition -->\nrelease after #12000 merges",
+                "Not merging: it closes when a comment opens with `<!-- loom:release-condition-met -->`",
+            ]),
+            Some("abc1234".into())
+        );
         // A release that predates a fresh hold record does not carry over.
         let fresh = hold_note("def5678");
         assert_eq!(
             unreleased_hold_head(&[hold.as_str(), "clear the hold", fresh.as_str()]),
             Some("def5678".into())
         );
+    }
+
+    #[test]
+    fn a_hold_records_its_standing_authorization_digest() {
+        let with = format!(
+            "{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc1234 auth=0123456789abcdef -->"
+        );
+        assert_eq!(
+            unreleased_hold(&[with.as_str()]),
+            Some(("abc1234".into(), Some("0123456789abcdef".into())))
+        );
+        // Legacy marker: head only.
+        let legacy = hold_note("abc1234");
+        assert_eq!(unreleased_hold(&[legacy.as_str()]), Some(("abc1234".into(), None)));
+        assert_eq!(unreleased_hold_head(&[with.as_str()]), Some("abc1234".into()));
+        // The newest record's digest wins, not an older one's.
+        assert_eq!(
+            unreleased_hold(&[with.as_str(), legacy.as_str()]),
+            Some(("abc1234".into(), None))
+        );
+        // A release after the hold drops the digest with the head.
+        assert_eq!(unreleased_hold(&[with.as_str(), "clear the hold"]), None);
+    }
+
+    #[test]
+    fn the_digest_ignores_key_order_and_treats_absent_as_empty() {
+        use serde_json::json;
+        let a = json!([{"id": "x", "classes": ["a"]}]);
+        let b = json!([{"classes": ["a"], "id": "x"}]);
+        assert_eq!(digest_of(Some(&a)), digest_of(Some(&b)));
+        assert_ne!(digest_of(Some(&a)), digest_of(Some(&json!([{"id": "y"}]))));
+        let empty = digest_of(Some(&json!([])));
+        assert_eq!(digest_of(None), empty);
+        assert_eq!(digest_of(Some(&json!(null))), empty);
+        assert_eq!(empty.len(), 16);
     }
 }

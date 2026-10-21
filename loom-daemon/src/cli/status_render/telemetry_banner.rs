@@ -22,8 +22,8 @@
 //! pressure applies to actual findings, never to a deliberate off (the
 //! anomaly-only rule, #4830).
 
+use crate::types::{ObservabilityExportState as State, ObservabilityExportStatus};
 use chrono::{DateTime, Utc};
-use loom_daemon::types::{ObservabilityExportState as State, ObservabilityExportStatus};
 
 /// Render the banner, or `None` when there is nothing to complain about.
 ///
@@ -45,7 +45,7 @@ pub fn render(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) ->
                 s.host_id.as_deref().unwrap_or("unknown-host"),
                 s.last_success_age_secs(now).map_or_else(
                     || "never".to_string(),
-                    |age| format!("{} ago", loom_daemon::health::format_window(age)),
+                    |age| format!("{} ago", crate::health::format_window(age)),
                 ),
                 s.last_failure_detail
                     .as_deref()
@@ -59,7 +59,7 @@ pub fn render(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) ->
                  acked{}",
                 s.endpoint.as_deref().unwrap_or("(no endpoint)"),
                 s.uptime_secs(now)
-                    .map_or_else(|| "?".to_string(), |u| loom_daemon::health::format_window(u)),
+                    .map_or_else(|| "?".to_string(), |u| crate::health::format_window(u)),
                 s.host_id.as_deref().unwrap_or("unknown-host"),
                 s.last_failure_detail
                     .as_deref()
@@ -105,8 +105,8 @@ fn block(headline: &str, s: &ObservabilityExportStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::render;
+    use crate::types::ObservabilityExportStatus;
     use chrono::{DateTime, Utc};
-    use loom_daemon::types::ObservabilityExportStatus;
 
     fn now() -> DateTime<Utc> {
         "2026-10-02T06:00:00Z".parse().unwrap()
@@ -114,7 +114,7 @@ mod tests {
 
     fn status(mutate: impl FnOnce(&mut ObservabilityExportStatus)) -> ObservabilityExportStatus {
         let mut s = ObservabilityExportStatus {
-            state: loom_daemon::types::ObservabilityExportState::Starting,
+            state: crate::types::ObservabilityExportState::Starting,
             host_id: Some("joseph-air".to_string()),
             ingest_host_id: None,
             endpoint: Some("http://127.0.0.1:14318".to_string()),
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn a_failing_exporter_gets_the_banner_with_endpoint_streak_and_fix() {
         let s = status(|e| {
-            e.state = loom_daemon::types::ObservabilityExportState::Failing;
+            e.state = crate::types::ObservabilityExportState::Failing;
             e.consecutive_failures = 12;
             e.last_failure_detail = Some("connection refused".to_string());
         });
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn never_exported_gets_the_banner() {
         let s = status(|e| {
-            e.state = loom_daemon::types::ObservabilityExportState::NeverExported;
+            e.state = crate::types::ObservabilityExportState::NeverExported;
         });
         let banner = render(Some(&s), now()).expect("never-exported must render");
         assert!(banner.contains("TELEMETRY HAS NEVER REACHED"), "{banner}");
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn healthy_disabled_starting_render_nothing() {
         let mut healthy = status(|e| {
-            e.state = loom_daemon::types::ObservabilityExportState::Healthy;
+            e.state = crate::types::ObservabilityExportState::Healthy;
             e.last_success_at = Some(now() - chrono::Duration::seconds(12));
         });
         healthy.refresh_endpoint_scope();
@@ -205,14 +205,14 @@ mod tests {
     #[test]
     fn a_loopback_endpoint_gets_the_first_hop_caveat() {
         let s = status(|e| {
-            e.state = loom_daemon::types::ObservabilityExportState::Failing;
+            e.state = crate::types::ObservabilityExportState::Failing;
             e.consecutive_failures = 3;
         });
         // The endpoint above is loopback, so the caveat must be present…
         assert!(render(Some(&s), now()).unwrap().contains("FIRST hop"),);
         // …and a remote endpoint must not carry it.
         let mut remote = status(|e| {
-            e.state = loom_daemon::types::ObservabilityExportState::Failing;
+            e.state = crate::types::ObservabilityExportState::Failing;
             e.endpoint = Some("https://telemetry.example.com/ingest".to_string());
         });
         remote.refresh_endpoint_scope();

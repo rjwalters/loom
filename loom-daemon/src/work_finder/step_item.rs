@@ -300,6 +300,10 @@ pub struct PullMarkers {
     /// no parseable record, or a release signal followed it (fail open).
     #[serde(default)]
     pub hold_head: Option<String>,
+    /// The standing-authorization digest that hold recorded beside its head
+    /// (#12933); `None` for a legacy hold, which is redrawn once.
+    #[serde(default)]
+    pub hold_auth: Option<String>,
 }
 
 /// One repository's lanes this tick.
@@ -1021,10 +1025,12 @@ impl PullMarkers {
     #[must_use]
     pub fn from_trusted(trusted: &TrustedComments) -> Self {
         let bodies = trusted.bodies();
+        let (hold_head, hold_auth) = crate::champion_hold::unreleased_hold(bodies).unzip();
         Self {
             champion_hold: crate::champion_hold::standing_hold(bodies).is_some(),
             doctor_cycle_capped: crate::champion_hold::doctor_cycle_capped(bodies),
-            hold_head: crate::champion_hold::unreleased_hold_head(bodies),
+            hold_head,
+            hold_auth: hold_auth.flatten(),
         }
     }
 }

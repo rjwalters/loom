@@ -42,11 +42,11 @@ impl LiveArgs {
             return Ok(());
         }
         ensure!(
-            loom_daemon::observability::endpoint_policy::valid_otlp_endpoint(&self.endpoint),
+            crate::observability::endpoint_policy::valid_otlp_endpoint(&self.endpoint),
             "invalid Collector endpoint"
         );
         ensure!(
-            loom_daemon::observability::endpoint_policy::reserved_placeholder_host(&self.endpoint)
+            crate::observability::endpoint_policy::reserved_placeholder_host(&self.endpoint)
                 .is_none(),
             "placeholder Collector endpoint refused"
         );
@@ -103,7 +103,7 @@ impl LiveArgs {
             .arg(&self.endpoint)
             .arg("--key-file")
             .arg(key_file);
-        let exported = loom_daemon::proc_exec::run_bounded(export, Duration::from_secs(60))
+        let exported = crate::proc_exec::run_bounded(export, Duration::from_secs(60))
             .is_ok_and(|result| result.succeeded());
         let passed = reports.iter().all(|r| r["verified"] == true);
         let report = serde_json::json!({"schema":1,"synthetic":false,"task":"isolated read-only curator smoke","full_issue_lifecycle":false,"forge_contact":false,"checkpoint_issue_is_local_fixture":true,"profile":"zai-flash","model":"glm-5.3-flash","effort":"low","attempts":reports,"token_cap":null,"billing":"not-measured","envelopes":envelopes.len(),"collector_acknowledged":exported,"backend_verification":"not_performed","unproven":["backend indexing and UI","full issue acceptance","cost efficiency","provider internal HTTP spans"]});
@@ -123,8 +123,8 @@ impl LiveArgs {
         guards: &std::path::Path,
         runtime: &str,
         key: &str,
-    ) -> Result<(serde_json::Value, Vec<loom_daemon::telemetry::TelemetryEnvelope>)> {
-        use loom_daemon::{
+    ) -> Result<(serde_json::Value, Vec<crate::telemetry::TelemetryEnvelope>)> {
+        use crate::{
             observability::{lifecycle, queue::DurableQueue},
             proc_exec::{run_bounded, run_bounded_observed, Completion, ExecError},
             telemetry::trace::SpanName,
@@ -132,8 +132,7 @@ impl LiveArgs {
         let root = &workspace.root;
         // Keyed on the canary's start instant (trace-identity policy: no random
         // trace keys); `loom.sweep_id` carries it, so the ID is recomputable.
-        let execution =
-            format!("canary-{}", loom_daemon::telemetry::trace::instant(chrono::Utc::now()));
+        let execution = format!("canary-{}", crate::telemetry::trace::instant(chrono::Utc::now()));
         let span = lifecycle::begin(
             root,
             &execution,
@@ -237,7 +236,7 @@ impl LiveArgs {
         );
         let records = queue.peek_batch(1000);
         let ids: Vec<_> = records.iter().filter_map(|e| match &e.record {
-            loom_daemon::telemetry::TelemetryRecord::Span(s) => Some(serde_json::json!({"trace_id":s.context.trace_id.as_str(),"span_id":s.context.span_id.as_str(),"parent_span_id":s.parent_span_id.as_ref().map(|v|v.as_str()),"name":s.name.as_str(),"status":s.status})), _ => None
+            crate::telemetry::TelemetryRecord::Span(s) => Some(serde_json::json!({"trace_id":s.context.trace_id.as_str(),"span_id":s.context.span_id.as_str(),"parent_span_id":s.parent_span_id.as_ref().map(|v|v.as_str()),"name":s.name.as_str(),"status":s.status})), _ => None
         }).collect();
         Ok((
             serde_json::json!({"runtime":runtime,"trace_id":trace_id,"execution_id":execution,"child_result":child_result,"verified":verified,"verification_error":verification_error,"checkpoint_written":checkpoint,"wall_milliseconds":started.elapsed().as_millis(),"expected_spans":ids}),

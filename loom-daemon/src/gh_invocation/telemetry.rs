@@ -18,8 +18,7 @@
 //! Besides process truth (`github.outcome`, `github.exit_code`), the span
 //! carries what GitHub billed — HTTP status, `304`, request count, billed
 //! resource and credential identity ([`super::billing`], #10343). Since
-//! #10752 it also carries `github.caller` (the daemon pass inside whose
-//! [`super::caller_scope`] it ran), `github.repo` (the repo the ledger booked
+//! #10752 it also carries `github.repo` (the repo the ledger booked
 //! it under) and, on a write, `github.number` (the issue/PR it targets).
 //!
 //! `github.invocation` is `<pid>.<seq>` — the process id and a process-local
@@ -81,9 +80,8 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.account",
     "github.cred_owner",
     "github.role",
-    // #10752: the daemon pass the call served ([`super::caller_scope`]), the
-    // repo the ledger booked it under, and the number(s) a write targets.
-    "github.caller",
+    // #10752: the repo the ledger booked the call under, and the number(s) a
+    // write targets.
     "github.repo",
     "github.number",
     // #11407: the endpoint as a template, its method and the gh command
@@ -473,11 +471,7 @@ impl InvocationSpan {
         if let Some(command) = super::route::front_command() {
             attributes.insert("github.command".into(), command.to_string());
         }
-        // #10752: which pass drove the call, and what a write touched, so a
-        // label change joins to the mechanism that made it.
-        if let Some(caller) = super::caller_scope::current() {
-            attributes.insert("github.caller".into(), caller.to_string());
-        }
+        // #10752: the repo the call was booked under, and what a write touched.
         if let Some(repo) = &billing.repo {
             attributes.insert("github.repo".into(), repo.clone());
         }
@@ -515,10 +509,6 @@ impl InvocationSpan {
         billing: &super::billing::Billing,
     ) {
         let ended_at = Utc::now();
-        super::caller_scope::note(
-            inv.intent == super::AccessIntent::Write,
-            billing.status == Some(304),
-        );
         let span = self.record(inv, launcher, outcome, exit_code, ended_at, billing);
         if outcome != Outcome::Ok {
             record_failure(&FailureRecord::from_span(&span, inv, outcome, exit_code));

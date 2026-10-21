@@ -26,7 +26,7 @@
 //! the status wire; all are workspace-scoped, so omitting them can only leave
 //! the "unheld workspaces" clause slightly optimistic, never misname the host.
 
-use loom_daemon::types::DaemonStatusReport;
+use crate::types::DaemonStatusReport;
 
 /// The line to print below the dispatch cap, or `None` to print nothing (the
 /// pre-flight advisory case with no other hold — #4386: the warning at the top
