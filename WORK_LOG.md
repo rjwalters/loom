@@ -13,8 +13,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-21
+
+- **PR #12968**: docs: document uv cache prune knob in worker disk-full runbook
+- **Issue #12460** (closed): Bound shared tool caches (uv) and prune non-live codex profiles
+
 ### 2026-10-20
 
+- **PR #12771**: docs: align Judge/Doctor CI-wait recipes and mark unreadable required checks unknown
+- **Issue #11272** (closed): audit-agents phase 5: read-only audit CLI and rule catalogue
+- **Issue #10574** (closed): forge wait-checks / judge+doctor prompts: required-contexts via REST, Pending-CI --timeout, doctor step 10 (#10569 follow-ups)
 - **PR #12972**: fix: bound private-workspace Docker calls with the shared deadline runner
 - **PR #12971**: test: real-Docker coverage for private session recovery
 - **PR #12951**: refactor: move the clap CLI tree and handle_cli_command into the loom-daemon library
