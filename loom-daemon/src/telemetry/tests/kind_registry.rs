@@ -157,18 +157,6 @@ fn wire_tags_and_variant_names_are_unique() {
 }
 
 #[test]
-fn every_kind_reaches_at_least_one_backend() {
-    for meta in TELEMETRY_KINDS {
-        assert!(
-            meta.native_ingest || meta.otlp != TelemetryKindOtlp::NotExported,
-            "kind `{}` declares `native: false` and `otlp: NotExported`, so nothing would \
-             ever carry it anywhere",
-            meta.kind
-        );
-    }
-}
-
-#[test]
 fn the_registry_row_agrees_with_the_record_it_describes() {
     for record in every_record() {
         let meta = TELEMETRY_KINDS
@@ -185,7 +173,6 @@ fn the_registry_row_agrees_with_the_record_it_describes() {
         );
         assert_eq!(meta.schema_version, record.schema_version());
         assert_eq!(meta.otlp, record.otlp_class());
-        assert_eq!(meta.native_ingest, record.accepted_by_native_ingest());
         assert_eq!(
             TelemetryEnvelope::new("host-abc", record.clone()).schema_version,
             meta.schema_version,
@@ -201,20 +188,20 @@ fn the_registry_row_agrees_with_the_record_it_describes() {
 #[test]
 fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
     let kind = |tag: &str| TELEMETRY_KINDS.iter().find(|k| k.kind == tag);
-    // (tag, exports over OTLP, accepted by the native HTTPS backend)
-    for (tag, otlp, native) in [
-        ("sweep.outcome", true, true),
-        ("sweep.started", true, true),
-        ("sweep.phase", true, true),
-        ("sweep.completed", true, true),
-        ("sweep.identity", true, true),
-        ("pick.decision", true, false),
-        ("fleet.state", true, false),
-        ("host.health", true, true),
-        ("host.export", true, false),
-        ("operator.presence", true, false),
-        ("pr.resolved", true, false),
-        ("eta.stage_outcome", true, false),
+    // (tag, exports over OTLP)
+    for (tag, otlp) in [
+        ("sweep.outcome", true),
+        ("sweep.started", true),
+        ("sweep.phase", true),
+        ("sweep.completed", true),
+        ("sweep.identity", true),
+        ("pick.decision", true),
+        ("fleet.state", true),
+        ("host.health", true),
+        ("host.export", true),
+        ("operator.presence", true),
+        ("pr.resolved", true),
+        ("eta.stage_outcome", true),
     ] {
         let meta = kind(tag).unwrap_or_else(|| panic!("contract kind `{tag}` is not registered"));
         assert_eq!(
@@ -222,7 +209,6 @@ fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
             otlp,
             "`{tag}`: OTLP export changed"
         );
-        assert_eq!(meta.native_ingest, native, "`{tag}`: native ingest changed");
     }
     for tag in [
         "eta.estimate",

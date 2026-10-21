@@ -272,7 +272,7 @@ impl<'de> Visitor<'de> for RepoVisibilityVisitor {
 /// shared file and had to be edited in lockstep by hand.
 macro_rules! define_telemetry_record {
     ($( $(#[$attr:meta])* $variant:ident = $kind:literal => $payload:ty,
-        gate: $gate:expr, otlp: $class:ident, native: $native:literal; )+) => {
+        gate: $gate:expr, otlp: $class:ident; )+) => {
         /// Every telemetry record kind, internally tagged on a `kind` discriminant. The
         /// tag values match the frozen SSE `sweep.*` topic vocabulary where they overlap
         /// (`sweep.started`/`sweep.phase`/`sweep.completed`) plus the epic's added
@@ -322,16 +322,6 @@ macro_rules! define_telemetry_record {
             pub fn otlp_class(&self) -> TelemetryKindOtlp {
                 match self {
                     $( Self::$variant(_) => TelemetryKindOtlp::$class, )+
-                }
-            }
-
-            /// Whether the removed native HTTPS `/ingest` backend accepted this
-            /// kind (#12813: no exporter reads it any more).
-            /// `false` for OTLP-only kinds (`trace.span`, `metric.points`).
-            #[must_use]
-            pub fn accepted_by_native_ingest(&self) -> bool {
-                match self {
-                    $( Self::$variant(_) => $native, )+
                 }
             }
         }
