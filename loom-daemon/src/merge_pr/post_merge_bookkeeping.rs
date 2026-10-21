@@ -50,6 +50,7 @@
 //! nothing.
 
 use std::io::Write as _;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use regex::bytes::Regex;
@@ -61,6 +62,8 @@ use super::partial_comment::{
 };
 use super::partial_reset::{self, hold_from_json, IssueView, PreMerge, Step};
 use super::refs::partial_increment_refs;
+use crate::claim_reconciliation::gh_call;
+use crate::gh_invocation::{AccessIntent, GhInvocation};
 
 /// Last stdout line of a finished run.
 pub const DONE: &str = "LOOM-POST-MERGE-BOOKKEEPING DONE";
@@ -387,26 +390,34 @@ pub struct SystemHost {
     pub forge_helpers: String,
 }
 
-fn gh_stdout(args: &[&str]) -> Option<String> {
-    let o = Command::new(crate::gh_invocation::gh_bin())
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    o.status
-        .success()
-        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+/// Run `gh <args…>` through the facade (#10089), booked under `op`.
+///
+/// The working directory is not a checkout of `repo`, so a read names it
+/// (`reader_repo`) or the facade cannot route it to a reader and sheds it.
+fn gh_inv(op: &'static str, intent: AccessIntent, repo: &str, args: &[&str]) -> GhInvocation {
+    let gh = crate::gh_invocation::gh_bin();
+    let inv = gh_call::inv(op, intent, Path::new(&gh), Path::new(".")).args(args);
+    if intent == AccessIntent::Read {
+        inv.reader_repo(repo)
+    } else {
+        inv
+    }
+}
+
+fn gh_stdout(op: &'static str, repo: &str, args: &[&str]) -> Option<String> {
+    gh_call::ok_stdout(gh_inv(op, AccessIntent::Read, repo, args))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 impl Host for SystemHost {
     fn read_issue(&self, repo: &str, issue: &str) -> String {
         let path = format!("repos/{repo}/issues/{issue}");
-        let o = Command::new(crate::gh_invocation::gh_bin())
-            .args(["api", &path])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
+        let o = gh_call::output(gh_inv(
+            "post_merge.issue_read",
+            AccessIntent::Read,
+            repo,
+            &["api", &path],
+        ));
         // `$(gh api … 2>/dev/null || echo '{}')`: on failure the (possibly
         // error-body) stdout is followed by `{}`.
         let mut s = match &o {
@@ -421,7 +432,7 @@ impl Host for SystemHost {
 
     fn commit_messages(&self, repo: &str, pr: &str) -> String {
         let path = format!("repos/{repo}/pulls/{pr}/commits");
-        let Some(raw) = gh_stdout(&["api", &path, "--paginate"]) else {
+        let Some(raw) = gh_stdout("post_merge.commits", repo, &["api", &path, "--paginate"]) else {
             return String::new();
         };
         // `--paginate` concatenates one JSON array per page.
@@ -439,7 +450,7 @@ impl Host for SystemHost {
 
     fn issue_kind(&self, repo: &str, issue: &str) -> String {
         let path = format!("repos/{repo}/issues/{issue}");
-        let Some(raw) = gh_stdout(&["api", &path]) else {
+        let Some(raw) = gh_stdout("post_merge.issue_kind", repo, &["api", &path]) else {
             return String::new();
         };
         match serde_json::from_str::<Value>(&raw) {
@@ -469,8 +480,11 @@ impl Host for SystemHost {
     }
 
     fn close_issue(&self, repo: &str, issue: &str, comment: &str) -> bool {
-        Command::new(crate::gh_invocation::gh_bin())
-            .args([
+        gh_call::output(gh_inv(
+            "post_merge.issue_close",
+            AccessIntent::Write,
+            repo,
+            &[
                 "issue",
                 "close",
                 issue,
@@ -480,12 +494,9 @@ impl Host for SystemHost {
                 "completed",
                 "--comment",
                 comment,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+            ],
+        ))
+        .is_ok_and(|o| o.status.success())
     }
 
     fn timestamp(&self) -> String {
