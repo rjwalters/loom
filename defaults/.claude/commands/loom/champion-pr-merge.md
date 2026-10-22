@@ -695,23 +695,64 @@ standing_auth_content_clear() {
   [ "$sha1" = "$sha2" ]
 }
 
+# standing_auth_class_hits <patterns> <excludes> <class-id> (#13042)
+#   Sets CLASS_HITS (JSON array): the critical-file hits in CRIT_DIFF this
+#   criticalFilesOnly class covers. A hit is covered only when its filename AND
+#   previous_filename each match a filePatterns glob and none matches an
+#   excludeFilePatterns glob; any other hit is left uncovered for another class
+#   (fail closed) and the reason is appended to STANDING_AUTH_WHY.
+standing_auth_class_hits() {
+  local patterns="$1" excludes="$2" cid="$3" hit name pattern ok why
+  CLASS_HITS="[]"
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    ok=1; why=""
+    while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      local m=0
+      while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        # shellcheck disable=SC2053
+        if [[ "$name" == $pattern ]]; then m=1; break; fi
+      done <<<"$patterns"
+      if [ "$m" -eq 0 ]; then ok=0; why="$name is outside filePatterns"; break; fi
+      while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        # shellcheck disable=SC2053
+        if [[ "$name" == $pattern ]]; then ok=0; why="$name matches excludeFilePatterns '$pattern'"; break 2; fi
+      done <<<"$excludes"
+    done < <(printf '%s' "$hit" | jq -r '.filename, (.previous_filename // empty)')
+    if [ "$ok" -eq 1 ]; then
+      CLASS_HITS=$(printf '%s\n%s' "$CLASS_HITS" "$hit" | jq -s -c '.[0] + [.[1]]') || { CLASS_HITS="[]"; return 0; }
+    else
+      STANDING_AUTH_WHY+="class '$cid' does not cover $(printf '%s' "$hit" | jq -r '.filename'): $why"$'\n'
+    fi
+  done < <(printf '%s' "$CRIT_DIFF" | jq -c '.[]')
+}
+
 # standing_auth_eval <any|critical>
 #   any      criterion #2: a class satisfies the four-axis judgment. A class
 #            with "criticalFilesOnly" set (#12648) is never eligible here.
 #   critical criterion #3: only a class with "coversCriticalFiles": true or
 #            "criticalFilesOnly": true, and no kept-set path, may waive the
 #            critical-file FAIL. A criticalFilesOnly class matches only the
-#            critical-file hits (CRITICAL_PATTERNS, from criterion #3).
-# Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID, and STANDING_AUTH_SCOPE ("all"
-# or "critical") / STANDING_AUTH_COVERED (the files the class matched). Every
+#            critical-file hits (CRITICAL_PATTERNS, from criterion #3), and
+#            (#13042) each class is checked over ITS OWN hits: the criterion
+#            passes when every hit is covered by at least one such class.
+# Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID (comma-joined when several
+# classes compose), and STANDING_AUTH_SCOPE ("all" or "critical") /
+# STANDING_AUTH_COVERED (the files the classes matched), and STANDING_AUTH_WHY
+# (one line per class/hit that failed a check, for the hold comment). Every
 # check fails closed. Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval),
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is criterion #3's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
   local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
+  local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
+  STANDING_AUTH_WHY=""
   STANDING_AUTH_SCOPE=""
   STANDING_AUTH_COVERED=""
   DIFF_JSON=""
@@ -782,9 +823,15 @@ standing_auth_eval() {
     # The files the class's patterns must cover: every changed file, or for a
     # criticalFilesOnly class the critical-file hits alone (none -> skip).
     CLASS_FILES="$MATCH_FILES"
+    CLASS_DIFF="$DIFF_JSON"
     if [ "$ONLY_CRIT" -eq 1 ]; then
       [ -n "$CRIT_DIFF" ] || continue
-      CLASS_FILES="$CRIT_MATCH_FILES"
+      # #13042: this class answers only for the hits it covers; the rest are
+      # left to the other criticalFilesOnly classes.
+      standing_auth_class_hits "$PATTERNS" "$EXCLUDES" "$CLASS_ID"
+      printf '%s' "$CLASS_HITS" | jq -e 'length > 0' >/dev/null 2>&1 || continue
+      CLASS_DIFF="$CLASS_HITS"
+      CLASS_FILES=$(printf '%s' "$CLASS_HITS" | jq -r '.[] | .filename, (.previous_filename // empty)') || continue
     fi
 
     # Fail safe: a malformed entry (no id, no patterns, or no conditions)
@@ -849,7 +896,7 @@ standing_auth_eval() {
           fi
         done
       done <<<"$MATCH_FILES"
-      [ "$ALL_MATCH" -eq 0 ] && continue
+      [ "$ALL_MATCH" -eq 0 ] && { STANDING_AUTH_WHY+="class '$CLASS_ID': a changed file is in the kept set (no class can waive it)"$'\n'; continue; }
     fi
 
     # forbiddenDiffPatterns (#12528): a regex (jq test(), one engine on every
@@ -861,9 +908,8 @@ standing_auth_eval() {
     if [ -n "$FORBIDDEN" ]; then
       local LINES_JSON DIFF_HIT=0 rx rc
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
-      CLASS_DIFF="$DIFF_JSON"
-      [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
-      printf '%s' "$CLASS_DIFF" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
+      [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
+      printf '%s' "$CLASS_DIFF" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || { STANDING_AUTH_WHY+="class '$CLASS_ID': a covered file has no patch (fails closed)"$'\n'; continue; }
       LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
       while IFS= read -r rx; do
         [ -z "$rx" ] && continue
@@ -877,7 +923,7 @@ standing_auth_eval() {
         # "none" passes.
         [ "$rc" -eq 1 ] || DIFF_HIT=1
       done <<<"$FORBIDDEN"
-      [ "$DIFF_HIT" -eq 1 ] && continue
+      [ "$DIFF_HIT" -eq 1 ] && { STANDING_AUTH_WHY+="class '$CLASS_ID': forbiddenDiffPatterns hit (or invalid regex) in a covered file"$'\n'; continue; }
     fi
 
     # privilegedContentPatterns (#12954): capability, read from each covered
@@ -885,9 +931,8 @@ standing_auth_eval() {
     # changed lines. Any privileged line, or any unreadable file, disqualifies.
     if [ -n "$PRIVILEGED" ]; then
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
-      CLASS_DIFF="$DIFF_JSON"
-      [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
-      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" || continue
+      [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
+      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
     fi
 
     # File list matches this class and every condition is recognized --
@@ -951,17 +996,39 @@ standing_auth_eval() {
     done <<<"$CONDITIONS"
 
     if [ "$CONDITIONS_HOLD" -eq 1 ]; then
+      if [ "$ONLY_CRIT" -eq 1 ]; then
+        # #13042: record what this class covered and keep going; the criterion
+        # passes once the classes together cover every hit.
+        UNION_HITS=$(printf '%s\n%s' "$UNION_HITS" "$CLASS_HITS" | jq -s -c '.[0] + .[1] | unique_by(.filename)') || continue
+        USED_IDS="${USED_IDS:+$USED_IDS,}$CLASS_ID"
+        continue
+      fi
       STANDING_AUTH_RESULT="ELIGIBLE"
       STANDING_AUTH_ID="$CLASS_ID"
       STANDING_AUTH_SCOPE="all"
       STANDING_AUTH_COVERED="$AUTH_FILES"
-      if [ "$ONLY_CRIT" -eq 1 ]; then
-        STANDING_AUTH_SCOPE="critical"
-        STANDING_AUTH_COVERED=$(printf '%s' "$CRIT_DIFF" | jq -r '.[].filename')
-      fi
       return 0
     fi
+    STANDING_AUTH_WHY+="class '$CLASS_ID': a condition does not hold now"$'\n'
   done
+
+  # criticalFilesOnly composition (#13042): every critical-file hit must be in
+  # the union of the hits the passing classes covered; one uncovered hit fails.
+  if [ -n "$USED_IDS" ]; then
+    CRIT_NAMES=$(printf '%s' "$CRIT_DIFF" | jq -r '.[].filename')
+    UNCOVERED=$(jq -n -r --argjson u "$UNION_HITS" --argjson c "$CRIT_DIFF" '($u | map(.filename)) as $got | [$c[].filename | select(. as $f | $got | index($f) | not)] | join(", ")') || UNCOVERED="unknown"
+    if [ -z "$UNCOVERED" ]; then
+      STANDING_AUTH_RESULT="ELIGIBLE"
+      STANDING_AUTH_ID="$USED_IDS"
+      STANDING_AUTH_SCOPE="critical"
+      STANDING_AUTH_COVERED="$CRIT_NAMES"
+    else
+      STANDING_AUTH_WHY+="critical-file hits not covered by any class: $UNCOVERED"$'\n'
+    fi
+  elif [ "$mode" = "critical" ] && [ -n "$CRIT_DIFF" ] && [ -z "$STANDING_AUTH_WHY" ]; then
+    STANDING_AUTH_WHY="no criticalFilesOnly or coversCriticalFiles class is configured for these critical-file hits"$'\n'
+  fi
+  return 0
 }
 
 standing_auth_eval any
@@ -1659,6 +1726,8 @@ standing_auth_eval critical "$FILES"
 if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ] && [ "$STANDING_AUTH_SCOPE" = "critical" ]; then
   # criticalFilesOnly class (#12648): only this criterion is waived, for the
   # critical files named. Criterion #2 judged the whole PR on the four axes.
+  # #13042: STANDING_AUTH_ID names every class used (comma-joined); each hit
+  # was covered by at least one of them.
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12648): criterion #3 satisfied by a criticalFilesOnly class — critical files: $STANDING_AUTH_COVERED"
   exit 0
 elif [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
@@ -1666,6 +1735,10 @@ elif [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
   # Name STANDING_AUTH_ID in the rationale. $CRITERION3_RESULT is "PASS".
   exit 0
 fi
+
+# Not waived (#13042): print what the evaluator actually found, per class and
+# hit, so the hold comment quotes it. Never claim "no class covers" without it.
+[ -z "$STANDING_AUTH_WHY" ] || printf 'Standing authorization not applied:\n%s' "$STANDING_AUTH_WHY"
 
 # Check each file against patterns. This loop MUST actually run over the full
 # $FILES list above — do not skip straight to "PASS" or "no critical-file
@@ -1711,6 +1784,8 @@ exactly a version-string line change.
 **Standing-authorization class (#12528)**: the check-loop runs `standing_auth_eval critical` (defined under criterion #2) before it can emit FAIL. A `champion.standingAuthorizations` class with `"coversCriticalFiles": true` whose `filePatterns` cover **every** changed file, with no changed file in `excludeFilePatterns`, no added/removed line matching `forbiddenDiffPatterns`, no kept-set path, and every `conditions` entry (`judgeApproval`, `greenCi`) holding now, passes this criterion and names the class id. Any one file outside the class, an excluded file, a forbidden diff line, an unreadable diff or a kept-set path restores today's FAIL and the durable hold below. A class without the flag, or no class at all, changes nothing. The check is mechanical, never a judgment call.
 
 **Critical-files-only class (#12648)**: a class with `"criticalFilesOnly": true` is matched against the **critical-file hits** only: the changed files this criterion's `CRITICAL_PATTERNS` flag, and the `previous_filename` of each on a rename. If every hit matches the class's `filePatterns`, no hit matches `excludeFilePatterns`, no added/removed line of a hit's patch matches `forbiddenDiffPatterns` (a hit with no patch fails closed), no changed file at all is a kept-set path, and every condition holds now, this criterion passes and the PASS line names the class (`#12648`) and the critical files. The other changed files are not matched against the class; criterion #2 judged them, and the whole PR, on the four axes, because such a class is never eligible there. A rename into a covered path from outside the class or from a kept-set path, a forbidden line in the workflow patch, or an excluded workflow restores the FAIL and the durable hold. An open hold episode closes through the ordinary PASS row.
+
+**Per-hit composition (#13042)**: each `criticalFilesOnly` class is checked over **its own** hits only (a hit whose name and `previous_filename` match its `filePatterns` and no `excludeFilePatterns`), with its own forbidden-line, privileged-content and condition checks. Criterion #3 passes when every critical-file hit is covered by at least one passing class, so a workflow + `package.json` PR passes under `workflow-critical-only` plus `package-scripts` and the PASS line names both ids (comma-joined). A class that fails on a hit leaves only that hit uncovered; a hit no class covers, a kept-set path anywhere, or an unreadable read still fails. The hold-state `auth=` digest is the existing `config get champion.standingAuthorizations --digest` of the whole class list, which changes whenever any class used changes. On a FAIL the block prints `STANDING_AUTH_WHY`, one line per class and hit with the failed check (pattern, exclude, forbidden or privileged line, condition, kept set) or "no criticalFilesOnly or coversCriticalFiles class is configured"; the hold comment quotes it, and Champion must never write "no class covers" without that output.
 
 **Rationale**: Changes to these files require careful human review due to high impact.
 

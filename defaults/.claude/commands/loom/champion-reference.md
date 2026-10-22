@@ -587,6 +587,7 @@ changed file. It waives criterion #3 only and is never eligible for criterion
 | `ci.yml` plus `defaults/scripts/install-loom.sh` | kept set: #3 **FAIL**, hold |
 | `src/ci.yml` renamed to `.github/workflows/ci.yml` | the previous name is outside the class: #3 **FAIL**, hold |
 | `docs/guide.md` alone | no critical-file hit: the class does not apply, #3 passes on its own |
+| `ci.yml` plus `package.json` scripts, classes `workflow-critical-only` and `package-scripts` (#13042) | each hit is covered by its own class: #3 **PASS** naming both; a forbidden line in either hunk, or a third critical file neither covers, **FAIL**s |
 
 **Dependabot bumps merge by default (#12948)**: operator direction 2026-10-20,
 "merge Dependabot and then fix things that break". Two more conditions express

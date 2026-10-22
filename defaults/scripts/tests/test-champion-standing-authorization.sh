@@ -700,6 +700,79 @@ out="$(run_eval any "$ALL_CFG" "$DOC" "" green "loom:pr")"
 assert_eq "ELIGIBLE:all" "$out" "criterion #2 still accepts an ordinary class"
 
 echo
+echo "--- #13042: criticalFilesOnly classes compose per critical-file hit ---"
+
+PKG="package.json"
+WF_PKG="$(printf '%s\n%s' "$WF" "$PKG")"
+COMPOSE='{"champion":{"standingAuthorizations":[{"id":"workflow-critical-only","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval","greenCi"],"criticalFilesOnly":true,"forbiddenDiffPatterns":["^\\s*permissions:"]},{"id":"package-scripts","filePatterns":["package.json"],"conditions":["judgeApproval","greenCi"],"criticalFilesOnly":true,"forbiddenDiffPatterns":["\"postinstall\""]}]}}'
+two() { # two <workflow-patch-line> <package-patch-line>
+    jq -n -c --arg w "$1" --arg p "$2" --arg wf "$WF" --arg pkg "$PKG" \
+        '[{filename:$wf, patch:("@@ -1 +1,2 @@\n name: ci\n" + $w)}, {filename:$pkg, patch:("@@ -1 +1,2 @@\n {\n" + $p)}]'
+}
+TWO_OK="$(two '+# c' '+  "test": "vitest"')"
+
+out="$(SHOW_SCOPE=1 run_eval critical "$COMPOSE" "$WF_PKG" "$TWO_OK" green "loom:pr")"
+assert_eq "ELIGIBLE:workflow-critical-only,package-scripts:critical:$WF,$PKG" "$out" \
+    "workflow + package.json: each hit passes its own class, criterion #3 passes naming both classes"
+
+out="$(run_eval critical "$COMPOSE" "$WF_PKG" "$(two '+permissions: write-all' '+  "test": "vitest"')" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a forbidden line in the workflow hunk fails the composition"
+
+out="$(run_eval critical "$COMPOSE" "$WF_PKG" "$(two '+# c' '+  "postinstall": "x"')" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a forbidden line in the package.json hunk fails the composition"
+
+THREE="$(printf '%s\nCargo.toml' "$WF_PKG")"
+out="$(run_eval critical "$COMPOSE" "$THREE" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a third critical file covered by neither class fails"
+
+out="$(run_eval critical "$COMPOSE" "$(printf '%s\ndefaults/scripts/install-loom.sh' "$WF_PKG")" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a kept-set path anywhere in the PR fails the composition"
+
+out="$(run_eval critical "$COMPOSE" "$WF_PKG" "$TWO_OK" red "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "red CI: conditions are checked per class, composition does not pass"
+
+# A hit selected by two classes where one fails is still covered by the other.
+OVERLAP='{"champion":{"standingAuthorizations":[{"id":"strict","filePatterns":["*"],"conditions":["judgeApproval"],"criticalFilesOnly":true,"forbiddenDiffPatterns":["vitest"]},{"id":"workflow-critical-only","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval"],"criticalFilesOnly":true},{"id":"package-scripts","filePatterns":["package.json"],"conditions":["judgeApproval"],"criticalFilesOnly":true}]}}'
+out="$(run_eval critical "$OVERLAP" "$WF_PKG" "$TWO_OK" green "loom:pr")"
+assert_eq "ELIGIBLE:workflow-critical-only,package-scripts" "$out" "a class failing on a hit another class covers does not disqualify the others"
+
+# One class's forbidden line in a hit it does not select is not its business.
+out="$(run_eval critical "$COMPOSE" "$WF_PKG" "$(two '+# postinstall' '+  "test": "vitest"')" green "loom:pr")"
+assert_eq "ELIGIBLE:workflow-critical-only,package-scripts" "$out" "package-scripts' forbidden pattern in the workflow hunk is not its to judge"
+
+# A rename out of a class's patterns leaves the hit uncovered.
+RENAME_PKG="$(jq -n -c --arg wf "$WF" '[{filename:$wf, patch:"@@\n+# c"}, {filename:"package.json", previous_filename:"old/package.json", status:"renamed", patch:"@@\n+x"}]')"
+out="$(run_eval critical "$COMPOSE" "$WF_PKG" "$RENAME_PKG" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a rename from outside the class's patterns leaves that hit uncovered"
+
+# The hold comment can quote why: STANDING_AUTH_WHY names the class and the failed check.
+why="$(
+    run_eval critical "$COMPOSE" "$WF_PKG" "$(two '+permissions: write-all' '+x')" green "loom:pr" >/dev/null
+    CONFIG_FILE="$CFG_DIR/config.json" PR_NUMBER=1 LABELS="loom:pr" STUB_API="$(two '+permissions: write-all' '+x')"
+    gh() { stub_gh "$@"; }
+    read_ci_checks() { NO_CHECKS=false; CHECKS='[{"name":"t","bucket":"pass"}]'; }
+    # shellcheck disable=SC1090
+    source "$EVAL_SRC"; source "$CRIT_SRC"
+    standing_auth_eval critical "$WF_PKG"
+    printf '%s' "$STANDING_AUTH_WHY"
+)"
+case "$why" in *"class 'workflow-critical-only': forbiddenDiffPatterns hit"*"not covered by any class: .github/workflows/ci.yml"*) r=NAMED ;; *) r="got: $why" ;; esac
+assert_eq "NAMED" "$r" "STANDING_AUTH_WHY names the class, the failed check and the uncovered hit"
+
+NOCLASS='{"champion":{"standingAuthorizations":[{"id":"docs","filePatterns":["docs/*"],"conditions":["judgeApproval"]}]}}'
+why="$(
+    printf '%s' "$NOCLASS" >"$CFG_DIR/config.json"
+    CONFIG_FILE="$CFG_DIR/config.json" PR_NUMBER=1 LABELS="loom:pr" STUB_API="$TWO_OK"
+    gh() { stub_gh "$@"; }
+    read_ci_checks() { NO_CHECKS=false; CHECKS='[{"name":"t","bucket":"pass"}]'; }
+    source "$EVAL_SRC"; source "$CRIT_SRC"
+    standing_auth_eval critical "$WF_PKG"
+    printf '%s' "$STANDING_AUTH_WHY"
+)"
+case "$why" in *"no criticalFilesOnly or coversCriticalFiles class is configured"*) r=NAMED ;; *) r="got: $why" ;; esac
+assert_eq "NAMED" "$r" "no applicable class configured is stated as such"
+
+echo
 echo "--- #12528: criterion #3's shipped block, executed end to end ---"
 
 # Extract the REAL criterion #3 verification block (FILES fetch ... final PASS
