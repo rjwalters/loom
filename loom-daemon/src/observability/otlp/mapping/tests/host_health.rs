@@ -185,3 +185,15 @@ fn datapoint_keys_are_declared_and_the_collector_keeps_them() {
         assert!(datapoint_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
     }
 }
+
+#[test]
+fn is_captain_is_a_three_valued_int_gauge() {
+    for (flag, expected) in [(Some(true), Some(1)), (Some(false), Some(0)), (None, None)] {
+        let m = metrics_of(with(|r| r.is_captain = flag));
+        let pts = points(&m, "loom.host.is_captain");
+        match expected {
+            Some(v) => assert_eq!(pts, vec![(v, BTreeMap::new())], "{flag:?}"),
+            None => assert!(pts.is_empty(), "undeclared captain must emit no point"),
+        }
+    }
+}
