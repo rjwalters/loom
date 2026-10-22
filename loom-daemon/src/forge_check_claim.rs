@@ -58,7 +58,11 @@
 //! shipped but the issue stayed open (PR #12512 / issue #12509). Never
 //! overridable by `--force-claim`; an unreadable answer exits
 //! [`EX_PROBE_FAILED`]. A PR with a closing keyword is not a blocker: GitHub
-//! closed the issue, so an open one was reopened on purpose.
+//! closed the issue, so an open one was reopened on purpose. Re-promotion
+//! exception (#13053): a PR that merged **before** the issue's newest
+//! `loom:issue` labeling does not block — a Curator revision plus Champion
+//! re-promotion states that scope remains, and `worktree.sh` already claims on
+//! a fresh branch. An unreadable events answer exits [`EX_PROBE_FAILED`].
 //!
 //! `TRIAGE` (#12713) is read off the same snapshot: the issue still carries
 //! `loom:triage`, so Curator has not yet decided it (the landed-route
