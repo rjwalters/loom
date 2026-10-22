@@ -27,7 +27,7 @@
 //! fetch failure is an error.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -436,19 +436,8 @@ fn prune_blobs(blob_dir: &Path, manifest: &Manifest) {
 /// Write `body` to `path` atomically (temp file in the same directory, then
 /// rename), creating the parent directory.
 pub fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    let parent: PathBuf = path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    std::fs::create_dir_all(&parent)
-        .with_context(|| format!("could not create {}", parent.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(&parent)
-        .with_context(|| format!("could not create a temp file in {}", parent.display()))?;
-    tmp.write_all(body)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)
-        .map_err(|e| anyhow!("could not replace {}: {}", path.display(), e.error))?;
-    Ok(())
+    crate::fs_util::write_atomic(path, body, crate::fs_util::AtomicOpts::default())
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 fn error_detail(body: &str) -> String {
