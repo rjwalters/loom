@@ -1369,33 +1369,25 @@ fn build_dispatch_digest_envelope_groups_by_repo_and_sorts() {
     })
     .collect();
 
-    let env = build_dispatch_digest_envelope(&batch, 1);
+    let env = build_dispatch_digest_envelope(&batch);
 
     assert_eq!(env.kind, "digest");
-    assert_eq!(env.task_id.as_deref(), Some("dispatch_digest_1"));
+    assert_eq!(env.task_id, None);
     assert_eq!(
         env.body,
         "dispatched 7: loom×6 (#4028 #4106 #4144 #4157 #4162 #4164), vibesql×1 (#6173)"
     );
 }
 
-/// Each flushed batch gets a distinct `task_id` (a new root), not one
-/// perpetual thread every dispatch wave piles onto.
+/// A digest carries no `task_id`, so digests from different hosts or process
+/// lifetimes can never share one and get mis-threaded (#13077).
 #[test]
-fn build_dispatch_digest_envelope_task_id_is_unique_per_batch() {
-    let batch = vec![
-        PendingDispatch {
-            repo: Some("/repos/loom".to_owned()),
-            issue: 1,
-        },
-        PendingDispatch {
-            repo: Some("/repos/loom".to_owned()),
-            issue: 2,
-        },
-    ];
-    let first = build_dispatch_digest_envelope(&batch, 1);
-    let second = build_dispatch_digest_envelope(&batch, 2);
-    assert_ne!(first.task_id, second.task_id);
+fn build_dispatch_digest_envelope_has_no_task_id() {
+    let batch = vec![PendingDispatch {
+        repo: Some("/repos/loom".to_owned()),
+        issue: 1,
+    }];
+    assert_eq!(build_dispatch_digest_envelope(&batch).task_id, None);
 }
 
 /// A dispatch with no `repo` stamped (synthetic/test event) still narrates
@@ -1413,7 +1405,7 @@ fn build_dispatch_digest_envelope_falls_back_for_missing_repo() {
             issue: 11,
         },
     ];
-    let env = build_dispatch_digest_envelope(&batch, 1);
+    let env = build_dispatch_digest_envelope(&batch);
     assert_eq!(env.body, "dispatched 2: unscoped×2 (#10 #11)");
 }
 

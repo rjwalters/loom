@@ -1447,11 +1447,12 @@ struct PendingDispatch {
 /// `dispatched 7: loom×6 (#4028 #4106 #4144 #4157 #4162 #4164), vibesql×1
 /// (#6173)`. Groups sort by descending count (ties broken alphabetically) so
 /// the busiest repo leads; issue numbers within a group sort ascending.
-/// `seq` gives each digest a distinct `task_id` so consecutive digests are
-/// separate thread roots rather than one perpetual accumulating thread — this
-/// module's contract is "one root per burst", not "one root ever" ([`Envelope::task_id`]
-/// must be `[A-Za-z0-9_]`, which a plain counter satisfies trivially).
-fn build_dispatch_digest_envelope(batch: &[PendingDispatch], seq: u64) -> Envelope {
+/// The digest carries **no** `task_id`: it is a plain top-level line, so each
+/// burst is its own root. A per-process counter id (`dispatch_digest_<seq>`)
+/// collided across hosts and daemon restarts, and safehoused's first-seen-wins
+/// thread roots then threaded a later digest as a reply under an unrelated
+/// one (#13077).
+fn build_dispatch_digest_envelope(batch: &[PendingDispatch]) -> Envelope {
     let mut groups: std::collections::BTreeMap<String, Vec<u32>> =
         std::collections::BTreeMap::new();
     for dispatch in batch {
@@ -1478,7 +1479,7 @@ fn build_dispatch_digest_envelope(batch: &[PendingDispatch], seq: u64) -> Envelo
     Envelope {
         to: "*".to_owned(),
         kind: "digest".to_owned(),
-        task_id: Some(format!("dispatch_digest_{seq}")),
+        task_id: None,
         body: format!("dispatched {}: {}", batch.len(), parts.join(", ")),
         meta: None,
     }
@@ -3275,7 +3276,6 @@ async fn run_sink(
     // guard on the flush branch below is what actually gates it, and the
     // guard starts `false` (buffer starts empty).
     let mut pending_dispatches: Vec<PendingDispatch> = Vec::new();
-    let mut digest_seq: u64 = 0;
     let digest_sleep = tokio::time::sleep_until(
         tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600),
     );
@@ -3464,8 +3464,7 @@ async fn run_sink(
                     narrated_repo = repo;
                     outbox.push(envelope);
                 } else {
-                    digest_seq = digest_seq.wrapping_add(1);
-                    outbox.push(build_dispatch_digest_envelope(&batch, digest_seq));
+                    outbox.push(build_dispatch_digest_envelope(&batch));
                     // A digest spans (potentially) several repos and always
                     // routes via `AttentionClass::Signal`, which ignores the
                     // `repo` argument entirely (see `RoomRouter::resolve`) —

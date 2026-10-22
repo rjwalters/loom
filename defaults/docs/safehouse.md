@@ -706,9 +706,10 @@ override) measured from the *first* buffered dispatch, then flushes:
   are made for a digest (would be N calls for one line).
 - **`digest` is a new envelope kind** (`KNOWN_TYPES`/`EnvelopeKind`'s sixth
   member, #4217), routed to the signal room via `AttentionClass::Signal` —
-  never the per-repo firehose, since one digest can span several repos. Each
-  flushed digest gets a fresh `task_id` (`dispatch_digest_<seq>`) so
-  consecutive digests are separate thread roots, not one perpetual thread.
+  never the per-repo firehose, since one digest can span several repos. A
+  digest carries no `task_id` (#13077): it is a plain top-level line, so
+  consecutive digests are separate roots, and a per-process counter id can't
+  collide across hosts or restarts and mis-thread under another digest.
 - Buffering, grouping, and the window itself add no new failure mode: a
   digest send is rejected/dropped exactly like any other envelope
   (degradation contract unchanged), and the buffer lives only in `run_sink`'s
