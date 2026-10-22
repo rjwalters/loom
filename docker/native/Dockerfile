@@ -88,9 +88,9 @@ ARG KIMI_NODE_FLOOR=22.19.0
 # two layers install identical Node builds on purpose, so a future bump is one
 # decision applied twice rather than two independent drifting pins.
 ARG TARGETARCH
-ARG NODE_VERSION=24.19.0
-ARG NODE_SHA256_AMD64=14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647
-ARG NODE_SHA256_ARM64=01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc
+ARG NODE_VERSION=24.22.1
+ARG NODE_SHA256_AMD64=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+ARG NODE_SHA256_ARM64=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e
 
 USER root
 
