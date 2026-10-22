@@ -249,7 +249,6 @@ mcp-loom/
 │   │   ├── daemon.ts      # Socket-based daemon communication
 │   │   └── formatting.ts  # Log/output formatting
 │   └── tools/
-│       ├── logs.ts        # Log tools (empty - use bash)
 │       ├── ui.ts          # UI/Engine tools
 │       ├── ui.test.ts
 │       ├── terminals.ts   # Terminal management tools
