@@ -348,3 +348,6 @@ test-ci-wait-prompt-consistency.sh
 # #12939: tools-first slice resolution on a clean install (loom-tools before
 # loom-daemon, transitional fallback). Hermetic.
 test-tools-first-clean-install.sh
+# #13056: worktree.sh reports and resets stale local feature branches on reuse.
+# Hermetic (throwaway git repos, no network).
+test-worktree-stale-local-branch-reuse.sh
