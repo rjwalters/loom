@@ -1594,6 +1594,9 @@ jobs:
       - name: worktree remote/local branch tracking + divergence (#4823, #8280, ported in #8195 slice 14)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-remote-branch-tracking.sh
+      - name: worktree stale local branch report/reset (#13056)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-worktree-stale-local-branch-reuse.sh
       # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
       # --sparse/--full family is now `loom-daemon worktree-sparse`, including
       # the re-configure arm this suite's Tests 3/4 drive (its registration
