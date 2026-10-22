@@ -716,6 +716,25 @@ override) measured from the *first* buffered dispatch, then flushes:
   worth of not-yet-flushed dispatches, which simply narrate on the next
   restart's own first dispatch instead.
 
+### One status per issue: reactions on the thread root (#13069)
+
+The first `task` message the sink sends for an issue (its dispatch or first
+phase line) is that issue's **thread root**; later phase lines stay threaded
+replies. The sink puts a single status reaction on the root via safehoused's
+`react` op — ⏳ when the root is created, then (taking the old one back with
+`redact`) ✅ done, ❌ failed, ⚠️ no progress, or 🚧 blocked/crashed — so a
+reader sees one current status per issue instead of scanning for it.
+
+- The `completion` envelope is **never** a root and is never reacted to,
+  edited or redacted (the egress delay buffer cancels a public publish if it
+  is touched, and the feed dedups on `event_id`).
+- Roots are tracked in memory (bounded); a restart simply stops updating
+  roots from before it.
+- Mixed fleets: a safehoused without `react`/`redact` (see `ops` in
+  `status`/`hello`) rejects the op; the sink warns once, stops reacting for
+  the run, and narration is exactly as before. Older loom daemons keep
+  posting separate lines, which is harmless.
+
 ### Completion envelopes → the public fleet feed (#4426)
 
 safehoused's egress subsystem mirrors well-formed **`completion`** envelopes out

@@ -1966,8 +1966,9 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
 
     let socket = dir.path().join("safehoused.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    // 3 requests: create_room, the routed task send, the routed handoff send.
-    let server = tokio::spawn(stub_server(listener, false, 3));
+    // 6 requests: create_room, the routed task send, the ⏳ react on its root
+    // (#13069), the routed handoff send, then the blocker's redact + 🚧 react.
+    let server = tokio::spawn(stub_server(listener, false, 6));
 
     let bus = Arc::new(EventBus::new());
     let subscription = bus.subscribe(Vec::<String>::new());
@@ -2014,7 +2015,7 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
     drop(bus);
     let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
 
-    assert_eq!(received.len(), 3);
+    assert_eq!(received.len(), 6);
     // 1. The firehose room is created lazily, on this repo's first narration.
     assert_eq!(received[0]["op"], json!("create_room"));
     assert_eq!(received[0]["name"], json!(alias));
@@ -2022,9 +2023,16 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
     assert_eq!(received[1]["op"], json!("send"));
     assert_eq!(received[1]["type"], json!("task"));
     assert_eq!(received[1]["room"], json!(alias));
+    // The root of the issue's thread gets the ⏳ status reaction (#13069).
+    assert_eq!(received[2]["op"], json!("react"));
+    assert_eq!(received[2]["room"], json!(alias));
     // 3. `handoff` (a human must act) → the signal room, same repo.
-    assert_eq!(received[2]["type"], json!("handoff"));
-    assert_eq!(received[2]["room"], json!("!signal:example.org"));
+    assert_eq!(received[3]["type"], json!("handoff"));
+    assert_eq!(received[3]["room"], json!("!signal:example.org"));
+    // The blocker moves the root's status in place: ⏳ taken back, 🚧 put on.
+    assert_eq!(received[4]["op"], json!("redact"));
+    assert_eq!(received[5]["op"], json!("react"));
+    assert_eq!(received[5]["key"], json!("🚧"));
 }
 
 /// The migration default: with **no** `rooms` map the wire shape is exactly
@@ -2037,7 +2045,8 @@ async fn run_sink_without_a_rooms_map_keeps_the_single_room_wire_shape() {
     let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
     let socket = dir.path().join("safehoused.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let server = tokio::spawn(stub_server(listener, false, 1));
+    // The send, then the ⏳ react on its thread root (#13069).
+    let server = tokio::spawn(stub_server(listener, false, 2));
 
     let bus = Arc::new(EventBus::new());
     let subscription = bus.subscribe(Vec::<String>::new());
@@ -2075,7 +2084,7 @@ async fn run_sink_without_a_rooms_map_keeps_the_single_room_wire_shape() {
     drop(bus);
     let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
 
-    assert_eq!(received.len(), 1, "no create_room op, no extra sends");
+    assert_eq!(received.len(), 2, "no create_room op, no extra sends (send + ⏳ react)");
     assert_eq!(received[0]["op"], json!("send"));
     assert_eq!(received[0]["type"], json!("task"));
     assert_eq!(received[0]["room"], json!("loom-fleet"));

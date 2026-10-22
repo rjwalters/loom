@@ -64,6 +64,7 @@ use crate::types::{Event, SweepKind};
 mod completion_runtime;
 mod forge_gate;
 mod reconcile_tick;
+mod status_reaction;
 #[cfg(test)]
 use reconcile_tick::ReconcileWatermarks;
 use reconcile_tick::{reconcile_merges_since, ReconcileState};
@@ -2943,6 +2944,18 @@ impl SafehouseClient {
         env: &Envelope,
         room: Option<&str>,
     ) -> std::result::Result<(), SendError> {
+        self.send_to_with_event_id(env, room).await.map(|_| ())
+    }
+
+    /// [`send_to`](Self::send_to) that also returns the Matrix `event_id`
+    /// safehoused reports for the accepted message (`None` when an older
+    /// daemon's reply omits it). The status-reaction tracker (#13069) uses it
+    /// to remember an issue's thread root.
+    pub async fn send_to_with_event_id(
+        &mut self,
+        env: &Envelope,
+        room: Option<&str>,
+    ) -> std::result::Result<Option<String>, SendError> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         // A malformed envelope is a transport-class caller bug (the connection
@@ -2951,6 +2964,51 @@ impl SafehouseClient {
         let req = build_send_request(env, id, room).map_err(SendError::Transport)?;
         self.write_line(&req).await.map_err(SendError::Transport)?;
         let reply = self.read_reply().await.map_err(SendError::Transport)?;
+        Self::check_reply(&reply, id)?;
+        Ok(reply
+            .get("event_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
+    /// Put an `m.annotation` reaction (`key`, an emoji) on `event_id` in `room`
+    /// via the socket `react` op, returning the reaction's own event id.
+    pub async fn react(
+        &mut self,
+        room: &str,
+        event_id: &str,
+        key: &str,
+    ) -> std::result::Result<Option<String>, SendError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let req = json!({"id": id, "op": "react", "room": room, "event_id": event_id, "key": key});
+        self.write_line(&req).await.map_err(SendError::Transport)?;
+        let reply = self.read_reply().await.map_err(SendError::Transport)?;
+        Self::check_reply(&reply, id)?;
+        Ok(reply
+            .get("event_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
+    /// Take back one of this daemon's own reactions via the socket `redact` op.
+    pub async fn redact(
+        &mut self,
+        room: &str,
+        event_id: &str,
+    ) -> std::result::Result<(), SendError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let req = json!({"id": id, "op": "redact", "room": room, "event_id": event_id});
+        self.write_line(&req).await.map_err(SendError::Transport)?;
+        let reply = self.read_reply().await.map_err(SendError::Transport)?;
+        Self::check_reply(&reply, id)
+    }
+
+    /// Shared reply gate: `ok:false` is a [`SendError::Rejected`]; a reply `id`
+    /// that does not echo the request is a stream desync (Transport), so the
+    /// sink reconnects.
+    fn check_reply(reply: &Value, id: u64) -> std::result::Result<(), SendError> {
         if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             let reason = reply
                 .get("error")
@@ -2959,9 +3017,6 @@ impl SafehouseClient {
                 .to_owned();
             return Err(SendError::Rejected { reason });
         }
-        // Replies echo the request id (handle_conn stamps it). A mismatch means
-        // the stream desynced — treat it as a transport error so the sink
-        // reconnects.
         if let Some(reply_id) = reply.get("id").and_then(Value::as_u64) {
             if reply_id != id {
                 return Err(SendError::Transport(anyhow::anyhow!(
@@ -3275,6 +3330,8 @@ async fn run_sink(
     // guard on the flush branch below is what actually gates it, and the
     // guard starts `false` (buffer starts empty).
     let mut pending_dispatches: Vec<PendingDispatch> = Vec::new();
+    // Per-issue thread roots + status reactions (#13069).
+    let mut status = status_reaction::StatusTracker::default();
     let mut digest_seq: u64 = 0;
     let digest_sleep = tokio::time::sleep_until(
         tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600),
@@ -3288,6 +3345,7 @@ async fn run_sink(
         // (no cross-task race between the two trigger paths).
         let mut outbox: Vec<Envelope> = Vec::new();
         let mut narrated_repo: Option<String> = None;
+        let mut status_update: Option<(String, &'static str)> = None;
 
         tokio::select! {
             biased;
@@ -3414,6 +3472,7 @@ async fn run_sink(
                     }
                 }
 
+                status_update = status_reaction::status_for_event(&event);
                 narrated_repo = event_repo(&event).map(ToOwned::to_owned);
             }
 
@@ -3587,9 +3646,37 @@ async fn run_sink(
                         }
                     },
                 };
-                if let Err(err) = connected.send_to(envelope, room.as_deref()).await {
-                    send_failure = Some(err);
-                    break;
+                match connected
+                    .send_to_with_event_id(envelope, room.as_deref())
+                    .await
+                {
+                    Ok(event_id) => {
+                        if let Err(err) = status_reaction::note_sent(
+                            connected,
+                            &mut status,
+                            envelope,
+                            room.as_deref(),
+                            event_id,
+                        )
+                        .await
+                        {
+                            send_failure = Some(err);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        send_failure = Some(err);
+                        break;
+                    }
+                }
+            }
+            if send_failure.is_none() {
+                if let Some((task_id, key)) = &status_update {
+                    if let Err(err) =
+                        status_reaction::apply_status(connected, &mut status, task_id, key).await
+                    {
+                        send_failure = Some(err);
+                    }
                 }
             }
         }
