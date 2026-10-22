@@ -93,6 +93,14 @@ const ROOMS_BY_REPO_ENV: &str = "LOOM_SAFEHOUSE_ROOMS_BY_REPO";
 /// [`SafehouseConfig::claims_room`].
 const ROOM_CLAIMS_ENV: &str = "LOOM_SAFEHOUSE_ROOM_CLAIMS";
 
+/// The optional alerts room (#13070): when set, `handoff`-type envelopes
+/// (fleet-degraded edges and their `Cleared`, BLOCKED, crashed) go here instead
+/// of the main/signal room. Dispatch, phase, ack and completion lines stay put.
+/// Deliberately separate from [`ROOM_SIGNAL_ENV`], which turns on attention
+/// routing and would move completions (the public-feed egress is pinned to the
+/// main room).
+const ROOM_ALERTS_ENV: &str = "LOOM_SAFEHOUSE_ROOM_ALERTS";
+
 /// Alias prefix for a lazily-created per-repo firehose room (#4225): the
 /// `vibesql` workspace's firehose is `fleet-vibesql`. Deliberately **not** the
 /// signal room's own name (`loom-fleet`) — the prefix reads as "the fleet's view
@@ -239,6 +247,11 @@ pub struct RoomMap {
     /// ensure every host's safehoused bot is joined to it (the same
     /// cross-host-provisioning requirement documented for `signal`).
     pub claims: Option<String>,
+    /// Optional alerts room (#13070), opt-in. When set, `handoff` envelopes —
+    /// and only those — resolve here; everything else routes exactly as it
+    /// would without it. Like `claims`, an alerts-only map does **not**
+    /// activate attention-class narration routing.
+    pub alerts: Option<String>,
 }
 
 impl RoomMap {
@@ -246,7 +259,10 @@ impl RoomMap {
     /// callers normalize it to `None` (single-room mode).
     #[must_use]
     fn is_empty(&self) -> bool {
-        self.signal.is_none() && self.by_repo.is_empty() && self.claims.is_none()
+        self.signal.is_none()
+            && self.by_repo.is_empty()
+            && self.claims.is_none()
+            && self.alerts.is_none()
     }
 
     /// Whether this map carries a **narration** routing target (`signal` and/or
@@ -420,6 +436,11 @@ fn rooms_from_value(block: Option<&Value>) -> Option<RoomMap> {
             map.claims = Some(claims.trim().to_owned());
         }
     }
+    if let Some(alerts) = rooms.get("alerts").and_then(Value::as_str) {
+        if !alerts.trim().is_empty() {
+            map.alerts = Some(alerts.trim().to_owned());
+        }
+    }
     (!map.is_empty()).then_some(map)
 }
 
@@ -451,6 +472,7 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
 ///
 /// - `LOOM_SAFEHOUSE_ROOM_SIGNAL` overrides `rooms.signal` alone.
 /// - `LOOM_SAFEHOUSE_ROOM_CLAIMS` (#4713) overrides `rooms.claims` alone.
+/// - `LOOM_SAFEHOUSE_ROOM_ALERTS` (#13070) overrides `rooms.alerts` alone.
 /// - `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,repo=room…`) replaces the
 ///   **whole** `byRepo` map rather than merging into it, so an operator can
 ///   override a stale committed map from the environment without editing config
@@ -464,8 +486,9 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
 fn apply_room_env_overrides(rooms: Option<RoomMap>) -> Option<RoomMap> {
     let signal = env_nonempty(ROOM_SIGNAL_ENV);
     let claims = env_nonempty(ROOM_CLAIMS_ENV);
+    let alerts = env_nonempty(ROOM_ALERTS_ENV);
     let by_repo = env_nonempty(ROOMS_BY_REPO_ENV).map(|raw| parse_by_repo_env(&raw));
-    if signal.is_none() && claims.is_none() && by_repo.is_none() {
+    if signal.is_none() && claims.is_none() && alerts.is_none() && by_repo.is_none() {
         return rooms;
     }
     let mut map = rooms.unwrap_or_default();
@@ -474,6 +497,9 @@ fn apply_room_env_overrides(rooms: Option<RoomMap>) -> Option<RoomMap> {
     }
     if let Some(claims) = claims {
         map.claims = Some(claims);
+    }
+    if let Some(alerts) = alerts {
+        map.alerts = Some(alerts);
     }
     if let Some(by_repo) = by_repo {
         map.by_repo = by_repo;
@@ -1275,6 +1301,13 @@ impl RoomRouter {
         // same: `rooms.claims` redirects the peer-claim coordination connection
         // only, and must not switch narration into attention-class routing —
         // per-repo lazy firehose creation included — as a side effect.
+        // The alerts room (#13070) is checked first and independently of
+        // narration routing: handoffs only, and it works in single-room mode.
+        if kind == EnvelopeKind::Handoff.as_str() {
+            if let Some(alerts) = self.map.as_ref().and_then(|map| map.alerts.clone()) {
+                return RoomDecision::Send(Some(alerts));
+            }
+        }
         let Some(map) = self.map.as_ref().filter(|map| map.routes_narration()) else {
             return RoomDecision::Send(self.single.clone());
         };
