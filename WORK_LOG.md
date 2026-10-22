@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-22
 
+- **Issue #13047** (closed): Dedupe multi-line pass()/fail() helpers in 31 test suites via lib/assert.sh
+- **Issue #13045** (closed): Remove stale references to the retired shell-budget gate (#12106 leftovers)
 - **PR #13048**: refactor: source lib/assert.sh in 31 test suites with multi-line pass()/fail()
 - **PR #13047**: Dedupe multi-line pass()/fail() helpers in 31 test suites via lib/assert.sh
 - **PR #13046**: docs: remove stale references to the retired shell-budget gate
