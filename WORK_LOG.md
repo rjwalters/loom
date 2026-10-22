@@ -15,6 +15,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-22
 
+- **PR #13066**: fix(security): refresh certificate validation and image runtimes
+- **PR #13064**: chore(harness): track latest CLIs — opencode 1.19.3→1.19.4
+- **PR #13061**: fix: clear check-claim MERGED_PR leg when issue was re-promoted after merge
+- **PR #13059**: fix: name MERGED_PR and TRIAGE as Builder refusal tokens
+- **Issue #13057** (closed): Dispatch keeps re-offering an issue whose claim guard deterministically hard-aborts
+- **Issue #13053** (closed): check-claim "work shipped" leg traps an issue the Champion re-promoted with remaining scope in a redispatch loop
+- **Issue #13024** (closed): [ci-daily] Supply Chain
+- **Issue #13006** (closed): Emit the daemon's captain status as a native OTLP carrier (is_captain) for the dashboard's SigNoz Live board
 - **PR #13010**: feat: emit loom.host.is_captain gauge over OTLP
 - **Issue #13047** (closed): Dedupe multi-line pass()/fail() helpers in 31 test suites via lib/assert.sh
 - **Issue #13045** (closed): Remove stale references to the retired shell-budget gate (#12106 leftovers)
