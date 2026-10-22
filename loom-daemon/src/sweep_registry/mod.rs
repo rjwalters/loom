@@ -156,6 +156,7 @@ pub mod step_cap_notice;
 mod step_issue;
 pub mod step_lease_owner;
 pub mod step_ledger;
+pub mod step_outcome_notice;
 mod step_reap;
 pub mod step_spawn;
 #[cfg(test)]
@@ -674,6 +675,8 @@ pub struct SweepRegistry {
     step_ledger_persisted: String,
     /// Per item, when the last Builder repeat-cap notice's window ends (#12500).
     step_cap_notices: HashMap<u32, DateTime<Utc>>,
+    /// Sweep ids whose Builder `noop` / `failed` reason comment was posted (#13054).
+    step_outcome_notices: std::collections::HashSet<String>,
     /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -1098,6 +1101,7 @@ impl SweepRegistry {
             step_ledger: Default::default(),
             step_ledger_persisted: String::new(),
             step_cap_notices: HashMap::new(),
+            step_outcome_notices: std::collections::HashSet::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
