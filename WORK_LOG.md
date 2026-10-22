@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-22
 
+- **PR #13060**: feat: post a daemon-side reason comment when a Builder step ends noop or failed
+- **Issue #13054** (closed): Already-satisfied or verification-only issues loop: a no-op Builder result returns them to loom:issue and they are re-offered indefinitely
 - **PR #13066**: fix(security): refresh certificate validation and image runtimes
 - **PR #13064**: chore(harness): track latest CLIs — opencode 1.19.3→1.19.4
 - **PR #13061**: fix: clear check-claim MERGED_PR leg when issue was re-promoted after merge
