@@ -640,6 +640,11 @@ otherwise thread into the *same* Matrix room thread. Every narrated event's
   folded to `_` — so `kicad-tools` becomes `kicad_tools`.
 - **Body prefix**: `<repo>#<issue>` (e.g. `vibesql#6173`), used verbatim since
   the body is free text with no charset restriction.
+- **Child-published events**: a sweep child's `sweep.issue.{N}.phase` /
+  `.blocker` payload should carry `repo` (its `LOOM_WORKSPACE`). When it does
+  not, the daemon's `PublishEvent` handler stamps the one managed workspace
+  that has a live sweep for `N`; with zero or two such workspaces it leaves the
+  event alone rather than guess.
 - **Fallback**: an event with no `repo` known (a synthetic/test event, or one
   from an era before this field existed) narrates with the pre-#4201
   unqualified form — bare `<issue>` for `task_id`, bare `#<issue>` for the body
@@ -1148,9 +1153,13 @@ coordination shrinks that window:
   lock, **before** the label flip — the daemon publishes a claim advertisement
   over the room: issue number, [repo slug](#), host identity, PID, and a
   wall-clock timestamp, carried as a **`task`** envelope (the `type` enum is
-  closed and owned by the safehouse repo, so a claim rides `task` with the bare
-  issue number as `task_id` — **no fifth type is invented**) whose `body` is the
-  structured JSON payload (marked `loom_claim`).
+  closed and owned by the safehouse repo, so a claim rides `task` — **no fifth
+  type is invented**) whose `body` is the structured JSON payload (marked
+  `loom_claim`). A claim ad carries **no `task_id`**: safehoused threads by
+  `task_id`, and the bare issue number it once carried piled every heartbeat
+  and filing lock (sentinel issue `0`) into one thread and threaded issue #N of
+  different repos together. Receivers read only the `body`, so older and newer
+  peers interoperate either way.
 - **Consume.** A **dedicated inbound read task** — separate from the narration
   sink — drains the socket continuously via `select!`, so an **idle** daemon that
   emits no narration still observes peer claims promptly (the narration
@@ -1380,8 +1389,12 @@ quiet because my receive path is broken" from `received`/`quiet_for` alone —
 an idle peer transmits nothing, same as an unreachable one.
 
 The fix: a `ClaimKind::Heartbeat` ad, published by
-`SweepRegistry::publish_peer_heartbeat` on **every** reaper tick regardless of
-live-sweep count — unlike `Advertise`, which stays entirely dispatch-gated.
+`SweepRegistry::publish_peer_heartbeat` once per reaper interval per host
+regardless of live-sweep count — unlike `Advertise`, which stays entirely
+dispatch-gated. Every managed workspace has its own reaper, so the shared
+`PeerClaimView` gates the send (`take_heartbeat_slot_at`) and only the first
+reaper past the interval publishes; receivers keep one host-agnostic "last
+heartbeat" timestamp, so a per-workspace heartbeat added traffic and no signal.
 `evaluate_coordination`'s receive-quiet anchor now takes whichever of
 `last_received_at`/`last_heartbeat_received_at` is more recent, so a fleet of
 genuinely idle-but-alive peers keeps this host's verdict healthy. A
