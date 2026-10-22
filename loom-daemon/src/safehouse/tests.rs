@@ -347,6 +347,7 @@ fn routing_config() -> SafehouseConfig {
                 .into_iter()
                 .collect(),
             claims: None,
+            alerts: None,
         }),
         ..SafehouseConfig::default()
     }
@@ -412,6 +413,7 @@ fn signal_room_falls_back_to_the_legacy_room_key() {
                 .into_iter()
                 .collect(),
             claims: None,
+            alerts: None,
         }),
         ..SafehouseConfig::default()
     };
@@ -440,6 +442,7 @@ fn claims_room_falls_back_to_signal_room_when_absent() {
     let cfg_with_claims = SafehouseConfig {
         rooms: Some(RoomMap {
             claims: Some("!claims:example.org".to_owned()),
+            alerts: None,
             ..cfg.rooms.clone().unwrap()
         }),
         ..cfg
@@ -477,6 +480,7 @@ fn claims_only_map_does_not_activate_attention_class_narration_routing() {
                 signal: None,
                 by_repo: std::collections::BTreeMap::new(),
                 claims: Some("!claims:example.org".to_owned()),
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         };
@@ -594,6 +598,7 @@ fn firehose_without_a_repo_degrades_to_signal_rather_than_inventing_a_room() {
                 .into_iter()
                 .collect(),
             claims: None,
+            alerts: None,
         }),
         ..SafehouseConfig::default()
     };
@@ -1980,6 +1985,7 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
                 signal: Some("!signal:example.org".to_owned()),
                 by_repo: std::collections::BTreeMap::new(),
                 claims: None,
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         },
@@ -4759,6 +4765,7 @@ async fn coordination_advertises_claim_ads_into_the_signal_room() {
                     .into_iter()
                     .collect(),
                 claims: None,
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         },
@@ -4834,6 +4841,7 @@ async fn coordination_advertises_claim_ads_into_a_dedicated_claims_room_when_con
                     .into_iter()
                     .collect(),
                 claims: Some("!claims:example.org".to_owned()),
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         },
@@ -4910,4 +4918,78 @@ async fn coordination_reconnects_when_socket_absent_and_exits_on_sender_drop() {
         SafehouseState::Unreachable { socket: s } => assert_eq!(s, socket),
         other => panic!("expected Unreachable, got {other:?}"),
     }
+}
+
+// ---- optional alerts room (#13070) ----
+
+fn alerts_config(rooms: Option<RoomMap>) -> SafehouseConfig {
+    SafehouseConfig {
+        enabled: true,
+        room: Some("!main:example.org".to_owned()),
+        rooms,
+        ..SafehouseConfig::default()
+    }
+}
+
+/// With `rooms.alerts` set (single-room mode otherwise), only `handoff` moves;
+/// every other kind stays in the main room.
+#[test]
+fn alerts_room_takes_only_handoffs() {
+    let cfg = alerts_config(Some(RoomMap {
+        alerts: Some("!alerts:example.org".to_owned()),
+        ..RoomMap::default()
+    }));
+    assert!(!cfg.routes_by_attention(), "alerts must not enable attention routing");
+    let router = RoomRouter::new(&cfg);
+    assert_eq!(
+        router.resolve("handoff", Some("/home/x/loom")),
+        RoomDecision::Send(Some("!alerts:example.org".to_owned()))
+    );
+    for kind in ["task", "chat", "ack", "completion", "digest"] {
+        assert_eq!(
+            router.resolve(kind, Some("/home/x/loom")),
+            RoomDecision::Send(Some("!main:example.org".to_owned())),
+            "{kind} must stay in the main room"
+        );
+    }
+}
+
+/// Alerts coexist with attention routing: handoff -> alerts, completion -> signal.
+#[test]
+fn alerts_room_composes_with_signal_routing() {
+    let mut cfg = routing_config();
+    cfg.rooms.as_mut().unwrap().alerts = Some("!alerts:example.org".to_owned());
+    let router = RoomRouter::new(&cfg);
+    assert_eq!(
+        router.resolve("handoff", None),
+        RoomDecision::Send(Some("!alerts:example.org".to_owned()))
+    );
+    assert_eq!(
+        router.resolve("completion", None),
+        RoomDecision::Send(Some("!signal:example.org".to_owned()))
+    );
+}
+
+/// Unset ⇒ handoffs resolve exactly as before.
+#[test]
+fn alerts_room_unset_leaves_handoff_routing_unchanged() {
+    let cfg = alerts_config(None);
+    assert_eq!(
+        RoomRouter::new(&cfg).resolve("handoff", None),
+        RoomDecision::Send(Some("!main:example.org".to_owned()))
+    );
+    let routed = routing_config();
+    assert_eq!(
+        RoomRouter::new(&routed).resolve("handoff", None),
+        RoomDecision::Send(Some("!signal:example.org".to_owned()))
+    );
+}
+
+#[test]
+fn alerts_room_parses_from_config_block() {
+    let block = json!({"rooms": {"alerts": " !a:example.org "}});
+    let cfg = config_from_value(Some(&block));
+    assert_eq!(cfg.rooms.and_then(|r| r.alerts).as_deref(), Some("!a:example.org"));
+    let blank = json!({"rooms": {"alerts": "  "}});
+    assert!(config_from_value(Some(&blank)).rooms.is_none());
 }

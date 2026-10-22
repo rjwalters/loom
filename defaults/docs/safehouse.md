@@ -101,6 +101,7 @@ Env overrides (each wins over config for that key):
 | `LOOM_SAFEHOUSE_ROOM_SIGNAL` | `rooms.signal` (#4225) |
 | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` | `rooms.byRepo`, as `repo=room[,repo=room…]` (#4225) |
 | `LOOM_SAFEHOUSE_ROOM_CLAIMS` | `rooms.claims` — dedicated peer-claim coordination room (#4713) |
+| `LOOM_SAFEHOUSE_ROOM_ALERTS` | `rooms.alerts` — optional alerts room: `handoff` envelopes (fleet-degraded and `Cleared`, BLOCKED, crashed) land only here; dispatch, phase, ack and completion stay in the main room. Unset ⇒ unchanged. Not `ROOM_SIGNAL`, which moves completions too (#13070) |
 
 **`room` resolution order is env > `.loom-local/local.json` > the committed
 `.loom/config.json`** (`config_resolver.rs`/`config-resolver.sh`), so the
