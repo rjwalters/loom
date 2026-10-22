@@ -762,6 +762,7 @@ assert_eq "NAMED" "$r" "STANDING_AUTH_WHY names the class, the failed check and 
 NOCLASS='{"champion":{"standingAuthorizations":[{"id":"docs","filePatterns":["docs/*"],"conditions":["judgeApproval"]}]}}'
 why="$(
     printf '%s' "$NOCLASS" >"$CFG_DIR/config.json"
+    # shellcheck disable=SC2034  # consumed by the sourced $EVAL_SRC / standing_auth_eval
     CONFIG_FILE="$CFG_DIR/config.json" PR_NUMBER=1 LABELS="loom:pr" STUB_API="$TWO_OK"
     gh() { stub_gh "$@"; }
     read_ci_checks() { NO_CHECKS=false; CHECKS='[{"name":"t","bucket":"pass"}]'; }
