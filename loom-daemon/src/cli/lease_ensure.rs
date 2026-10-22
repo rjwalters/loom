@@ -20,11 +20,9 @@
 //! ## Why this lives in `loom-daemon` rather than in `worktree.sh`
 //!
 //! `defaults/scripts/worktree.sh` — the one call site every builder runs
-//! immediately after claiming — is a shell-budget `contract` file, i.e. part of
-//! the **portable** pool epic #7810 exists to retire. `check_against_rev`
-//! refuses portable growth *unconditionally*: unlike floor growth, it has no
-//! `Shell-Budget-Growth:` override (see `shell_budget.rs`, "Portable growth is
-//! NOT overridable, deliberately"). So the ADR-0018 shape is not merely
+//! immediately after claiming — is a `contract` file, i.e. part of
+//! the **portable** pool epic #7810 exists to retire, and new portable shell
+//! is not admitted. So the ADR-0018 shape is not merely
 //! preferred here, it is the only admissible one — the behavior goes into this
 //! subcommand and `worktree.sh` keeps a two-line reach into it.
 //!
