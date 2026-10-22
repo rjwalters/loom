@@ -3709,8 +3709,20 @@ pub use claim_sink::PeerClaimSink;
 
 /// Build the `task`-typed advertisement envelope for a claim ad (Gap 2 of
 /// #4028): the envelope `type` enum is closed and owned by the safehouse repo, so
-/// a claim rides a `task` envelope with the bare issue number as `task_id` and
-/// the structured payload in `body`.
+/// a claim rides a `task` envelope with the structured payload in `body`.
+///
+/// **No `task_id`.** safehoused threads every send that carries a `task_id`
+/// under the first root it saw for that id. Claim ads used to carry the bare
+/// issue number, which threaded the machine traffic into a handful of
+/// unrelated threads: every heartbeat and filing lock (sentinel issue `0`)
+/// piled into one ever-growing thread `0`, issue #N in two repos shared a
+/// thread, and a claims-room root could capture a narration line that used
+/// the same bare id. A claim ad is not a conversation, so it is sent as a
+/// plain top-level message. Receivers are unaffected: [`PeerClaimSink`] reads
+/// only the envelope `body` (falling back to a top-level `body`) and parses it
+/// with [`ClaimAd::from_body_str`]; it never reads `task_id`, `type` or the
+/// room, so a peer on an older version folds these ads exactly as before, and
+/// this host still folds an older peer's ads that do carry a `task_id`.
 ///
 /// **Routing exception (#4225).** By the attention-class table this `task`
 /// envelope would belong in the per-repo firehose — claim ads *are* per-repo
@@ -3723,7 +3735,7 @@ pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
     Envelope {
         to: "*".to_owned(),
         kind: "task".to_owned(),
-        task_id: Some(ad.issue.to_string()),
+        task_id: None,
         body: ad.to_body_json(),
         meta: None,
     }

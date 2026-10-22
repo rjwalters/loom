@@ -21,8 +21,17 @@
 //!
 //! # Cost/cadence, and why it is acceptable here
 //!
-//! Published on **every** reaper tick (default 30s), regardless of
-//! live-sweep count — unlike [`SweepRegistry::readvertise_peer_claims`],
+//! Published **once per reaper interval per host** (default 30s), regardless
+//! of live-sweep count. Every managed workspace has its own reaper, so the
+//! call runs once per workspace per tick; the shared [`PeerClaimView`] gates
+//! it ([`PeerClaimView::take_heartbeat_slot_at`]) so only the first reaper
+//! past the interval sends. Before that gate a host managing ten
+//! workspaces sent ten identical heartbeats every 30s, and peers cannot use
+//! the extra nine: they keep one "last heartbeat from anyone" timestamp and
+//! read only the sender's host from the ad (to drop their own echo). The
+//! heartbeat's `repo` field is now whichever workspace's reaper won the slot;
+//! no receiver reads it. Before this gate it was published on every reaper
+//! tick, regardless of live-sweep count — unlike [`SweepRegistry::readvertise_peer_claims`],
 //! which only republishes claims for `Running`/`Pending` entries. This is a
 //! standing, permanent addition to fleet-wide traffic on the shared
 //! safehouse channel, not an edge-triggered one like
@@ -53,6 +62,20 @@ impl SweepRegistry {
         let Some(tx) = &self.peer_claim_publisher else {
             return;
         };
+        // One heartbeat per host per interval, not per workspace: every
+        // registry in this process shares the same view, so the first reaper
+        // past the interval takes the slot and the rest skip. Without a view
+        // (tests, a registry built outside the pool) there is no fan-out to
+        // collapse, so it sends every call as before.
+        if let Some(view) = &self.peer_claims {
+            let min_interval = heartbeat_min_interval(super::reaper::resolve_reaper_interval());
+            let mut view = view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !view.take_heartbeat_slot_at(Instant::now(), min_interval) {
+                return;
+            }
+        }
         let repo = peer_claims::repo_slug(&self.config.workspace_root);
         let host = host_identity();
         let pid = std::process::id();
@@ -68,6 +91,15 @@ impl SweepRegistry {
             );
         }
     }
+}
+
+/// The shortest gap this host allows between two of its own heartbeats: four
+/// fifths of the reaper interval (24s at the 30s default). Below a full
+/// interval so ordinary tick jitter never makes the one reaper that sent last
+/// time skip and leave a two-interval gap; well above zero so N reapers
+/// ticking at N different phases still collapse to one send per interval.
+fn heartbeat_min_interval(reaper_interval: Duration) -> Duration {
+    reaper_interval.saturating_sub(reaper_interval / 5)
 }
 
 #[cfg(test)]
@@ -131,5 +163,60 @@ mod tests {
             eval.reason.contains("nothing to judge"),
             "a heartbeat alone must never make this host read as having advertised: {eval:?}"
         );
+    }
+
+    /// One heartbeat per host, not one per managed workspace: two registries
+    /// (two workspaces, two reapers) sharing this process's view and
+    /// publisher send exactly one heartbeat between them per interval.
+    #[test]
+    fn registries_sharing_a_view_send_one_heartbeat_per_interval() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let view = std::sync::Arc::new(std::sync::Mutex::new(peer_claims::PeerClaimView::new(
+            "me".into(),
+            peer_claims::DEFAULT_PEER_CLAIM_TTL,
+        )));
+        let mut a = test_registry();
+        let mut b = test_registry();
+        for reg in [&mut a, &mut b] {
+            reg.set_peer_claim_publisher(tx.clone());
+            reg.set_peer_claims(view.clone());
+        }
+
+        a.publish_peer_heartbeat();
+        b.publish_peer_heartbeat();
+        a.publish_peer_heartbeat();
+
+        let first = rx.try_recv().expect("the first reaper to tick sends");
+        assert_eq!(first.kind, peer_claims::ClaimKind::Heartbeat);
+        assert!(
+            rx.try_recv().is_err(),
+            "the other workspace's reaper (and a re-tick) inside the interval must not send"
+        );
+    }
+
+    /// The slot reopens once the interval has passed, so the gate never
+    /// silences a host — it only collapses the per-workspace fan-out.
+    #[test]
+    fn heartbeat_slot_reopens_after_the_interval() {
+        let mut view =
+            peer_claims::PeerClaimView::new("me".into(), peer_claims::DEFAULT_PEER_CLAIM_TTL);
+        let min = heartbeat_min_interval(Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert!(view.take_heartbeat_slot_at(t0, min), "first heartbeat always sends");
+        assert!(!view.take_heartbeat_slot_at(t0 + Duration::from_secs(5), min));
+        assert!(!view.take_heartbeat_slot_at(t0 + min - Duration::from_millis(1), min));
+        // A full reaper interval later, the same reaper sends again.
+        assert!(view.take_heartbeat_slot_at(t0 + Duration::from_secs(30), min));
+        assert!(!view.take_heartbeat_slot_at(t0 + Duration::from_secs(31), min));
+    }
+
+    /// The gate sits below one reaper interval, so ordinary tick jitter never
+    /// makes the reaper that sent last skip its next tick.
+    #[test]
+    fn heartbeat_min_interval_is_under_one_reaper_interval() {
+        let interval = Duration::from_secs(DEFAULT_REAPER_INTERVAL_SECS);
+        let min = heartbeat_min_interval(interval);
+        assert!(min < interval && min > interval / 2, "{min:?} vs {interval:?}");
+        assert_eq!(heartbeat_min_interval(Duration::ZERO), Duration::ZERO);
     }
 }

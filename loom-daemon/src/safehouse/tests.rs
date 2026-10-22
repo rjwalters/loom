@@ -1584,9 +1584,13 @@ fn maps_the_narrated_events() {
     };
     let env = event_to_envelope(&idle_exit).unwrap();
     assert_eq!(env.kind, "handoff");
-    assert_eq!(env.task_id.as_deref(), Some("daemon-idle-exit"));
+    // Daemon-wide news: no thread key, and nothing safehoused would refuse.
+    assert_eq!(env.task_id, None);
     assert!(env.body.contains("host idle-shutdown"));
-    assert_eq!(env.meta.unwrap()["trigger"], "token_starvation");
+    assert_eq!(env.meta, None);
+    // The old `daemon-idle-exit` id (and a `meta` on a `handoff`) failed this
+    // validation, so the line never sent and the sink reconnected instead.
+    build_send_request(&env, 1, Some("fleet")).expect("idle-exit envelope must be sendable");
 }
 
 #[test]
@@ -4536,18 +4540,19 @@ async fn reconnects_after_mid_run_disconnect() {
 #[test]
 fn claim_ad_serializes_to_a_valid_task_envelope() {
     // Envelope-validity AC: the advertisement must serialize to a `type`
-    // within KNOWN_TYPES and a `task_id` matching [A-Za-z0-9_], asserted
-    // against build_send_request so a rejected-by-safehoused envelope fails
-    // at test time, not runtime.
+    // within KNOWN_TYPES, asserted against build_send_request so a
+    // rejected-by-safehoused envelope fails at test time, not runtime.
     let ad = ClaimAd::advertise(4028, "loom".into(), "maple".into(), 7, "ts".into());
     let env = claim_ad_to_envelope(&ad);
     assert_eq!(env.kind, "task");
     assert!(KNOWN_TYPES.contains(&env.kind.as_str()));
-    assert_eq!(env.task_id.as_deref(), Some("4028"));
+    // A claim ad carries no thread key: safehoused threads by `task_id`, and a
+    // bare issue number threaded unrelated ads together.
+    assert_eq!(env.task_id, None);
 
     let req = build_send_request(&env, 1, Some("fleet")).unwrap();
     assert_eq!(req["type"], json!("task"));
-    assert_eq!(req["task_id"], json!("4028"));
+    assert!(req.get("task_id").is_none(), "no task_id key on the wire: {req}");
     // The body round-trips back to the same claim on the receive side.
     let body = req["body"].as_str().unwrap();
     assert_eq!(ClaimAd::from_body_str(body), Some(ad));
