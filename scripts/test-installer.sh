@@ -533,14 +533,14 @@ if [[ ! -d "$LIB_DIR" ]]; then
   fail ".loom/scripts/lib/ directory missing (regression of #3220)"
   LIB_MISSING=1
 else
-  for lib_file in loom-tools.sh forge-helpers.sh pipe-pane-cmd.sh; do
+  for lib_file in loom-tools.sh repo-root.sh forge-helpers.sh pipe-pane-cmd.sh; do
     if [[ ! -f "$LIB_DIR/$lib_file" ]]; then
       fail ".loom/scripts/lib/$lib_file missing (regression of #3220)"
       LIB_MISSING=1
     fi
   done
   if [[ $LIB_MISSING -eq 0 ]]; then
-    pass ".loom/scripts/lib/ contains all required helpers (loom-tools.sh, forge-helpers.sh, pipe-pane-cmd.sh)"
+    pass ".loom/scripts/lib/ contains all required helpers (loom-tools.sh, repo-root.sh, forge-helpers.sh, pipe-pane-cmd.sh)"
   fi
 fi
 

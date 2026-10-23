@@ -682,6 +682,7 @@ verify_install() {
     ".loom/config.json"
     ".loom/scripts/worktree.sh"
     ".loom/scripts/lib/loom-tools.sh"
+    ".loom/scripts/lib/repo-root.sh"
     ".loom/install-metadata.json"
     ".loom/config/skill-routes.json"
   )
