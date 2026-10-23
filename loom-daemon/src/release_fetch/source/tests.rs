@@ -46,6 +46,7 @@ fn inputs<'a>(anchor: &'a AnchorSetting, record: Option<&'a Path>, sha: &'a str)
     GateInputs {
         slug: SLUG,
         tag: "v1.0.0",
+        binary: "loom-daemon",
         target: TARGET,
         asset_sha256: sha,
         anchor,
@@ -466,6 +467,7 @@ exit 1
     ) -> (FetchOutcome, serde_json::Value) {
         let inputs = FetchInputs {
             repo_root: &self.root,
+            binary: "loom-daemon",
             target: TARGET,
             repo_slug: SLUG,
             tag,
