@@ -125,6 +125,7 @@ mod merge_pr_retries_used;
 mod merge_pr_revalidate_head;
 mod merge_pr_sequence;
 mod merge_pr_stacked_children;
+mod merge_pr_stacked_reconcile;
 mod merge_pr_tree_checks;
 mod merge_pr_usage;
 mod merge_pr_version_policy;

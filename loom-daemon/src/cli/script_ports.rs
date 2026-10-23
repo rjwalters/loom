@@ -1149,6 +1149,12 @@ pub(crate) enum MergePrCommand {
     /// terminator, or `LOOM-NEED close-targets` (exit 3, nothing done) — see
     /// `cli::merge_pr_post_merge_bookkeeping`.
     PostMergeBookkeeping(super::merge_pr_post_merge_bookkeeping::PostMergeBookkeepingArgs),
+
+    /// The whole post-merge stacked-child reconcile pass (#8191 slice 3): plan,
+    /// per-child route, deferral comment or `reconcile-stack.sh`. Snapshot on
+    /// stdin; `LEVEL<TAB>message` records ended by `LOOM-STACKED-RECONCILE DONE`
+    /// — see `cli::merge_pr_stacked_reconcile`.
+    StackedReconcile(super::merge_pr_stacked_reconcile::StackedReconcileArgs),
 }
 
 impl MergePrCommand {
@@ -1204,6 +1210,7 @@ impl MergePrCommand {
             MergePrCommand::CleanupPaths(args) => args.run(),
             MergePrCommand::PostMergeCleanup(args) => args.run(),
             MergePrCommand::PostMergeBookkeeping(args) => args.run(),
+            MergePrCommand::StackedReconcile(args) => args.run(),
         }
     }
 }
