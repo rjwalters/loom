@@ -22,6 +22,9 @@ fn row(ws_idx: usize, number: u32) -> StateRow {
         reeval_next: None,
         iw: Some(10),
         weight: Some(100),
+        issue: None,
+        doctor_rejections: None,
+        doctor_escalated: None,
     }
 }
 
@@ -186,10 +189,43 @@ fn build_record_carries_the_gate_and_omits_what_is_absent() {
     r.gate_until = Some(at(300));
     r.iw = None;
     r.weight = None;
-    let record = build_record(&resolved("o/r", r), StateTransition::Changed, "host-a", at(0));
+    let record = build_record(&resolved("o/r", r), StateTransition::Changed, "host-a", at(0), None);
     assert_eq!(record.repo, "o/r");
     assert_eq!(record.gate_until, Some(at(300)));
     assert_eq!(record.iw, None);
     let value = serde_json::to_value(&record).unwrap();
     assert!(value.get("weight").is_none());
+}
+
+#[test]
+fn claimed_since_is_the_first_observation_and_resets_when_unclaimed() {
+    let claimed = |n| {
+        let mut r = row(0, n);
+        r.in_pool = false;
+        r.exclusion = Some("claimed".into());
+        resolved("o/r", r)
+    };
+    let free = |n| resolved("o/r", row(0, n));
+    let seen = observed(&["o/r"]);
+    let refresh = Duration::seconds(REFRESH);
+    let mut t = StateTracker::default();
+    t.diff(&[free(1)], &seen, at(0), refresh);
+    assert_eq!(t.claimed_since("o/r", 1), None, "unclaimed is absent, not now");
+    t.diff(&[claimed(1)], &seen, at(60), refresh);
+    t.diff(&[claimed(1)], &seen, at(120), refresh);
+    assert_eq!(t.claimed_since("o/r", 1), Some(at(60)));
+    t.diff(&[free(1)], &seen, at(180), refresh);
+    assert_eq!(t.claimed_since("o/r", 1), None);
+    t.diff(&[claimed(1)], &seen, at(240), refresh);
+    assert_eq!(t.claimed_since("o/r", 1), Some(at(240)), "a re-claim restarts the bound");
+}
+
+#[test]
+fn doctor_state_is_scoped_to_its_pr() {
+    let cp =
+        br#"{"phase":"doctor-done","doctor_escalation":{"pr":7,"rejections":2,"escalated":true}}"#;
+    assert_eq!(doctor_state_from(cp, 7), Some((2, true)));
+    assert_eq!(doctor_state_from(cp, 8), None, "another PR's history never applies");
+    assert_eq!(doctor_state_from(br#"{"phase":"x"}"#, 7), None);
+    assert_eq!(doctor_state_from(b"not json", 7), None);
 }

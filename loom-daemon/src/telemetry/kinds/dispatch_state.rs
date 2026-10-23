@@ -131,6 +131,21 @@ pub struct DispatchStateRecord {
     /// its repo's terms, as the draw's first pick sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u64>,
+    /// When this daemon first observed the item `claimed` (a role session is
+    /// treating it), kept while it stays claimed. A **lower bound** on the
+    /// claim start, never the exact start: a restart or a claim taken between
+    /// ticks is first observed late. Absent when not claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_since: Option<DateTime<Utc>>,
+    /// Qualifying Judge rejections of the Doctor PR's GLM attempts, from the
+    /// sweep checkpoint's `doctor_escalation` state for this PR. Doctor PR
+    /// rows only; absent (unknown, not `0`) when no state was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor_rejections: Option<u32>,
+    /// The GLM-to-Claude escalation latch, same source and omission contract
+    /// as `doctor_rejections`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor_escalated: Option<bool>,
     pub transition: StateTransition,
     /// The emission instant.
     pub sampled_at: DateTime<Utc>,
@@ -161,6 +176,9 @@ mod tests {
             reeval_next: Some(at),
             iw: None,
             weight: None,
+            claimed_since: None,
+            doctor_rejections: None,
+            doctor_escalated: None,
             transition: StateTransition::Changed,
             sampled_at: at,
             visibility: RepoVisibility::Public,
