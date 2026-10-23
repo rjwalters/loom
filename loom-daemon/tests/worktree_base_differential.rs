@@ -14,6 +14,7 @@
 #[allow(dead_code)]
 mod common;
 
+use common::git;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -36,13 +37,6 @@ fn hermetic(cmd: &mut Command) -> &mut Command {
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@t")
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = hermetic(Command::new("git").arg("-C").arg(dir).args(args))
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// A repo with a bare origin: `main`, a pushed `feature/issue-1`, a local-only
