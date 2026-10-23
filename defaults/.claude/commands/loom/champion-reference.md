@@ -145,6 +145,14 @@ if it were. In the incident behind #6883 the fix was wrong, its regression test
 fabricated the source payload the fix assumed, and the bug survived the close
 undetected until a human asked why the item still had not appeared.
 
+**Per-repo switch (#12703)**: optional config key `champion.outOfBandAcGate`
+(boolean; absent = `true`, today's behaviour), resolved through the daemon's
+config tiers (`loom-daemon config get champion.outOfBandAcGate --json`), so
+fleet-gitops can set it for one repo. Only an explicit `false` turns the gate
+off: Step 4 then skips the classifier and never adds `loom:operator` for an
+out-of-band criterion. Absent, unreadable or non-boolean values keep it on.
+First use case: 2AMLogic/loom-ui, whose live site is where testing happens.
+
 **Handling**: `champion-pr-merge.md` → Step 4 → "Out-of-Band Acceptance-Criteria
 Gate" runs `./.loom/scripts/classify-ac-verification.sh --issue <N> --pr <PR>
 --head-sha <head>` for every linked issue before confirming or forcing its close:
@@ -498,13 +506,15 @@ per-repo class instead of a hardcoded, always-safe one.
   `loom:auto-merge-ok`'s semantics or its critical-file caveat.
 - **Fail-safe on malformed config.** A class entry missing `id`,
   `filePatterns`, or `conditions`, or naming a condition outside the closed
-  vocabulary (today: `judgeApproval`, `greenCi`), is skipped — that entry
+  vocabulary (today: `judgeApproval`, `greenCi`, `authorIsDependabot`, `noMajorBump`), is skipped — that entry
   never authorizes anything, and a malformed entry never disables sibling
   entries in the array. No config, or an empty array, is a full no-op.
 - **Criteria #1/#3/#4/#5/#6 still run independently.** A standing
   authorization only ever waives criterion #2's four-axis judgment for a
-  matching PR — nothing else. A PR that matches a class but fails, say, the
-  critical-file check (#3) or CI (#6) still does not merge.
+  matching PR — nothing else, **except** criterion #3 for a class that
+  opts in with `"coversCriticalFiles": true` (#12528, below). A PR that
+  matches a class but fails, say, the critical-file check (#3) on a class
+  without that flag, or CI (#6), still does not merge.
 
 **Decision**:
 - Full changed-file list matches an authorized class's patterns and every
@@ -520,6 +530,97 @@ that does not cleanly match an authorized class. It gives an operator a way
 to retire a whole class of recurring, already-decided merge-risk judgments
 without weakening review for anything outside that class, addressing the
 monotonically-growing held-PR backlog documented in #6848.
+
+**Covering critical files (#12528)**: a class may add
+`"coversCriticalFiles": true`, `"excludeFilePatterns": [...]` (globs) and
+`"forbiddenDiffPatterns": [...]` (jq `test()` regexes over every added/removed line). Criterion
+#3 then runs the class check before it emits FAIL. Worked examples, class
+`ci-steps` = `filePatterns: [".github/workflows/*.yml"]`, `coversCriticalFiles: true`,
+`privilegedContentPatterns` (below), no name excludes,
+`forbiddenDiffPatterns: ["^\\s*permissions:", "id-token", "secrets\\.", "pull_request_target"]`,
+`conditions: ["judgeApproval", "greenCi"]`:
+
+| PR | Result |
+|---|---|
+| `.github/workflows/ci.yml`, one added `run:` step, Judge-approved, CI green | #3 **PASS**, rationale names `ci-steps`; no hold |
+| `ci.yml` plus `Cargo.toml` | `Cargo.toml` is outside the class: **FAIL**, today's hold |
+| `.github/workflows/publish.yml` holding `npm publish` or a non-`GITHUB_TOKEN` secret | privileged content: **FAIL**, hold |
+| `.github/workflows/claude-bot-deploy-plan.yml`, credential-free and read-only, a `runs-on` edit | no privileged content: #3 **PASS**, whatever the name |
+| `ci.yml` with an existing `secrets.CLOUDFLARE_API_TOKEN` step, a `runs-on` edit | privileged content at the head SHA: **FAIL**, hold |
+| `ci.yml`, but its contents cannot be read at the head SHA | unreadable content: **FAIL**, hold |
+| `ci.yml` adding a `permissions:` block | forbidden diff line: **FAIL**, hold |
+| `ci.yml`, but the files API returns no patch for it | unreadable diff: **FAIL**, hold |
+| `ci.yml`, CI red or pending | `greenCi` does not hold: **FAIL**, hold |
+| same class without `coversCriticalFiles` | #3 unchanged: **FAIL**, hold |
+| `defaults/hooks/guard-x.sh` under a class that lists it with the flag | kept set: **FAIL**, hold |
+
+**Classify by capability, not by filename (#12954)**: `"privilegedContentPatterns": [...]`
+(jq `test()` regexes, matched line by line against each covered file's full
+contents at the PR head SHA) holds any file that carries a privilege and
+covers any file that does not, whatever it is called. `forbiddenDiffPatterns`
+still catches a PR that adds a privilege. Example list for `ci-steps`:
+`["secrets\\.(?!GITHUB_TOKEN\\b)", "secrets:\\s*inherit", "^\\s*environment:", ":\\s*write\\b", "write-all", "id-token", "pull_request_target", "workflow_run", "^\\s*release:", "types:.*released", "wrangler\\s+deploy", "npm\\s+publish", "gh\\s+release"]`.
+Unreadable or empty content, an oversized or removed file, an invalid regex or
+a head SHA that moved fails closed. Whole-line YAML comments are not scanned
+(a comment grants nothing; the 2026-10-20 fixtures say "no id-token: write"
+in comments); trailing comments and every other line are. The fixture set in
+`defaults/scripts/tests/fixtures/champion-workflows/` (`cases.tsv`) pins the
+expected outcomes so an attended mirror can run the same cases.
+
+The kept set (irreversible migrations, the merge gate itself, credential/token
+selection, guard hooks, installers/updaters that rewrite installed files on
+roll) is never satisfiable by a class. Revertability is red only for a one-way
+effect that happens on merge or roll, not for one an operator later triggers
+by hand. Absent `coversCriticalFiles`, nothing changes.
+
+**Critical files only (#12648)**: `"criticalFilesOnly": true` narrows a class
+to the critical-file hits. Its `filePatterns`, `excludeFilePatterns` and
+`forbiddenDiffPatterns` are applied to the files criterion #3 flags (and each
+one's `previous_filename`) and nothing else; the kept set still covers every
+changed file. It waives criterion #3 only and is never eligible for criterion
+#2. Class `ci-only` = `ci-steps` above with `criticalFilesOnly: true`:
+
+| PR | Result |
+|---|---|
+| `.github/workflows/ci.yml` plus `docs/guide.md`, Judge-approved, CI green | #3 **PASS** under `ci-only`, naming `ci.yml`; criterion #2 still judges the whole PR on the four axes and may hold it |
+| same PR, `ci.yml` adds a `permissions:` block | forbidden line in a critical file: #3 **FAIL**, hold |
+| `ci.yml` plus `defaults/scripts/install-loom.sh` | kept set: #3 **FAIL**, hold |
+| `src/ci.yml` renamed to `.github/workflows/ci.yml` | the previous name is outside the class: #3 **FAIL**, hold |
+| `docs/guide.md` alone | no critical-file hit: the class does not apply, #3 passes on its own |
+
+**Dependabot bumps merge by default (#12948)**: operator direction 2026-10-20,
+"merge Dependabot and then fix things that break". Two more conditions express
+it, so no new config block is needed:
+
+- `authorIsDependabot`: the PR object's `user.login` is `dependabot[bot]` and
+  `user.type` is `Bot`, read live from the forge. A comment, title or label
+  claim never counts; a failed or empty read fails closed.
+- `noMajorBump`: opt-out for semver majors. Reads the version move from the
+  title Dependabot writes (`Bump X from A to B`); a changed first component
+  (second for `0.x`), or a title that does not parse (group bumps), holds.
+
+Fleet-default class (set in the fleet tier, not in this repo's committed file;
+omit `noMajorBump` to merge majors, which is the default):
+
+```json
+{
+  "id": "dependabot-bumps",
+  "description": "Dependabot manifest/lockfile bumps, given Judge approval and green CI",
+  "filePatterns": ["package.json", "*/package.json", "package-lock.json", "*/package-lock.json",
+                   "pnpm-lock.yaml", "yarn.lock", "Cargo.toml", "*/Cargo.toml", "Cargo.lock",
+                   "go.mod", "go.sum", "requirements*.txt", "uv.lock", "poetry.lock"],
+  "conditions": ["authorIsDependabot", "judgeApproval", "greenCi"],
+  "coversCriticalFiles": true
+}
+```
+
+It sets no `forbiddenDiffPatterns`: that list is per class and optional, so
+version lines are not refused unless a class asks. A human PR with the same
+manifest diff fails `authorIsDependabot` (held); a Dependabot PR that also
+touches any file outside `filePatterns` is held; the kept set still applies.
+Fix forward: a red `main` after such a merge is Auditor or Builder work, not a
+reason to pre-hold. After a Dependabot merge, `champion-pr-merge.md` Step 3.5
+comments `@dependabot rebase` once on open Dependabot PRs that now conflict.
 
 **Action** (single authoritative policy — implemented in
 `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment →

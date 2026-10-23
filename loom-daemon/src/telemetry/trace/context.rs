@@ -69,7 +69,7 @@ pub struct TraceContext {
 
 impl TraceContext {
     /// A sampled root context for the `kind` of work (`loom.<kind>.trace` /
-    /// `loom.<kind>.root`, the [`super::story_context`] convention) keyed by
+    /// `loom.<kind>.root`) keyed by
     /// its natural key: the same key always yields the same IDs.
     #[must_use]
     pub fn derived(kind: &str, key: &[&str]) -> Self {

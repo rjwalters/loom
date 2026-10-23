@@ -322,6 +322,9 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
                     // `heartbeat_broadcast`'s module doc for the cost/cadence
                     // tradeoff.
                     r.publish_peer_heartbeat();
+                    // Fleet dispatch (#12450): the captain's heartbeat rides
+                    // this same 30 s cadence; a no-op with the flag off.
+                    r.fleet_dispatch_heartbeat();
                     // Peer-coordination health (Issue #6157): evaluate on
                     // this same cadence, right after re-advertising, so
                     // the DEGRADED grace window is measured in reaper-tick

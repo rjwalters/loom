@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::forge_mirror::discovery::Outcome;
+use crate::forge_mirror::Outcome;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 
 /// Distinct series held between drains; past it a new series is dropped

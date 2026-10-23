@@ -47,7 +47,6 @@ fn eta_stage_outcome_is_registered_as_an_otlp_log_kind() {
         .expect("eta.stage_outcome has a registry row");
     assert_eq!(meta.variant, "StageOutcome");
     assert_eq!(meta.otlp, TelemetryKindOtlp::Logs);
-    assert!(!meta.native_ingest, "OTLP-only");
     assert_eq!(meta.schema_version, NEW_KIND_SCHEMA_VERSION);
 }
 

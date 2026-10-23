@@ -31,16 +31,7 @@ CMDS="$REPO_ROOT/defaults/.claude/commands/loom"
 SKILLS="$REPO_ROOT/defaults/.agents/skills"
 DOC="$REPO_ROOT/defaults/docs/targeted-role-invocation.md"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 for f in "$CMDS/judge.md" "$CMDS/curator.md" "$CMDS/builder.md" "$DOC" \
     "$SKILLS/loom-judge/SKILL.md" "$SKILLS/loom-curator/SKILL.md" "$SKILLS/loom-builder/SKILL.md"; do
@@ -103,12 +94,12 @@ check_curator() {
 check_builder() {
     local B="$1" where="$2"
     expect "$where builder: check-claim guard"         "$B" "loom-daemon forge check-claim <number>"
-    for tok in TARGET_IS_PR CLOSED FROZEN OPERATOR OPEN_PR; do
+    for tok in TARGET_IS_PR CLOSED FROZEN OPERATOR OPEN_PR MERGED_PR TRIAGE; do
         expect "$where builder: $tok refuses"          "$B" "\`$tok\`"
     done
     expect "$where builder: invoker's own claim allowed" "$B" "refuse unless your invoker holds this claim (\`LOOM_SWEEP_CLAIM_OWNED\`"
     expect "$where builder: the sweep brief is an ownership signal" "$B" "your brief says \`This /loom:sweep pre-flighted #<number>\`"
-    expect "$where builder: operator override is claim-only" "$B" "that overrides these three, never the five above"
+    expect "$where builder: operator override is claim-only" "$B" "that overrides these three, never the seven above"
     expect "$where builder: other exits are not an all-clear" "$B" "Any other exit: stop"
     expect "$where builder: outcome line"              "$B" "LOOM_STEP_OUTCOME role=builder"
     before "$where builder: guard precedes the claim"  "$B" "forge check-claim <number>" "--add-label \"loom:building\""
@@ -143,7 +134,7 @@ done
 expect "doc: forge post-state is authoritative"        "$D" "The forge post-state is authoritative."
 expect "doc: outcome line format"                      "$D" "LOOM_STEP_OUTCOME role=<judge|curator|builder> target=<N> class=<verdict|noop|refused|failed> reason=<token>"
 expect "doc: names where the loom:operator skip goes"  "$D" "The \`loom:operator\` skip (#11861)"
-expect "doc: OPERATOR is a never-overridable token" "$D" "\`OPERATOR\`, \`OPEN_PR\`) refuse whoever claimed"
+expect "doc: OPERATOR is a never-overridable token" "$D" "\`OPERATOR\`, \`OPEN_PR\`, \`MERGED_PR\`, \`TRIAGE\`) refuse whoever claimed"
 
 # #11861 (C13 review): an explicit user instruction overrides only the claim
 # race, never a category refusal or the loom:operator no-op.
@@ -153,7 +144,7 @@ for f in "$CMDS/judge.md" "$SKILLS/loom-judge/SKILL.md"; do
 done
 for f in "$CMDS/builder.md" "$SKILLS/loom-builder/SKILL.md"; do
     expect "user exception, builder ($(basename "$(dirname "$f")")): claim tokens only" "$(cat "$f")" \
-        "overrides only its three claim tokens, never the five refusals"
+        "overrides only its three claim tokens, never the seven refusals"
     nexpect="skip the label checks"
     if grep -qF "$nexpect" "$f"; then fail "user exception, builder: still says '$nexpect'"; else pass "user exception, builder: no blanket label-check skip"; fi
 done

@@ -21,7 +21,7 @@ use std::io::Read;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::revalidate_head::{revalidate, Revalidation};
+use crate::merge_pr::revalidate_head::{revalidate, Revalidation};
 
 #[derive(clap::Args)]
 pub(crate) struct RevalidateHeadArgs {

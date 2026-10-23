@@ -32,6 +32,8 @@ fn record() -> AutoUpdateTickRecord {
         floor_stall: None,
         floor_not_rolling: None,
         roll_held: None,
+        host_state: Some("H4".to_string()),
+        target_source: Some("floor".to_string()),
         consecutive_failures: 0,
         duration_ms: 4200,
         loom: Provenance {

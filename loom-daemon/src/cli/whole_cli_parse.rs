@@ -1,4 +1,4 @@
-//! Test-only: parse the whole top-level `crate::Cli` the way the binary does
+//! Test-only: parse the whole top-level `crate::cli::Cli` the way the binary does
 //! (#10616).
 //!
 //! In a **debug** build, clap's derive gives every
@@ -36,13 +36,13 @@ pub(crate) fn on_stack<T: Send + 'static>(
         .expect("sized parse thread panicked")
 }
 
-/// `crate::Cli::try_parse_from(args)` on an 8 MiB thread, so the test sees
+/// `crate::cli::Cli::try_parse_from(args)` on an 8 MiB thread, so the test sees
 /// the same `Command` tree the binary builds without depending on the test
 /// harness's stack size (`RUST_MIN_STACK`).
-pub(crate) fn try_parse_cli(args: &[&str]) -> Result<crate::Cli, clap::Error> {
+pub(crate) fn try_parse_cli(args: &[&str]) -> Result<crate::cli::Cli, clap::Error> {
     let argv: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
     on_stack("whole-cli-parse-8MiB", MAIN_THREAD_STACK, move || {
-        <crate::Cli as clap::Parser>::try_parse_from(argv)
+        <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
     })
 }
 
@@ -57,7 +57,7 @@ mod tests {
     fn parses_forge(args: &[&str]) -> bool {
         matches!(
             try_parse_cli(args).map(|cli| cli.command),
-            Ok(Some(crate::Commands::Forge { .. }))
+            Ok(Some(crate::cli::Commands::Forge { .. }))
         )
     }
 
@@ -79,8 +79,8 @@ mod tests {
     fn whole_cli_parse_fits_in_half_the_main_thread_stack() {
         let parsed =
             on_stack("cli-parse-headroom-guard-issue-10616", MAIN_THREAD_STACK / 2, || {
-                <crate::Cli as clap::Parser>::try_parse_from(DEEP_ARGV)
-                    .map(|cli| matches!(cli.command, Some(crate::Commands::Forge { .. })))
+                <crate::cli::Cli as clap::Parser>::try_parse_from(DEEP_ARGV)
+                    .map(|cli| matches!(cli.command, Some(crate::cli::Commands::Forge { .. })))
             });
         assert!(matches!(parsed, Ok(true)), "deep parse failed: {:?}", parsed.err());
     }

@@ -1,5 +1,5 @@
 //! `loom-daemon target-dir-gc` handler (Issue #8459) — CLI front-end for
-//! [`loom_daemon::target_dir_gc`]. Purely file-based; does not require a
+//! [`crate::target_dir_gc`]. Purely file-based; does not require a
 //! running daemon (mirrors `Clean`/`Cleanup`/`RecoverOrphans`).
 
 use std::path::Path;
@@ -8,7 +8,8 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
 
-use loom_daemon::target_dir_gc::{self, GcReport};
+use crate::fs_util::human_size;
+use crate::target_dir_gc::{self, GcReport};
 
 pub(crate) fn handle_target_dir_gc_command(
     target_dir: &str,
@@ -47,7 +48,7 @@ fn print_human(report: &GcReport) {
 
     if report.dry_run {
         println!("Would remove:   {} candidate(s)", report.plan.remove.len());
-        println!("Would reclaim:  {}", human_bytes(report.bytes_reclaimable()));
+        println!("Would reclaim:  {}", human_size(report.bytes_reclaimable()));
         println!("Would keep:     {} candidate(s)", report.plan.keep.len());
         println!();
         println!("{}", report.plan.summary());
@@ -55,7 +56,7 @@ fn print_human(report: &GcReport) {
         println!("Re-run without --dry-run to actually remove these entries.");
     } else {
         println!("Removed:        {} candidate(s)", report.removed.len());
-        println!("Reclaimed:      {}", human_bytes(report.bytes_reclaimed()));
+        println!("Reclaimed:      {}", human_size(report.bytes_reclaimed()));
         println!("Kept:           {} candidate(s)", report.plan.keep.len());
         let failed = report
             .plan
@@ -82,17 +83,4 @@ fn print_json(report: &GcReport) {
         "reason": report.reason(),
     });
     println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
-}
-
-fn human_bytes(bytes: u64) -> String {
-    let b = bytes as f64;
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1}G", b / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1}M", b / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1}K", b / 1024.0)
-    } else {
-        format!("{bytes}B")
-    }
 }

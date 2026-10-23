@@ -17,7 +17,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::remove_gate::{decide, render, Context};
+use crate::merge_pr::remove_gate::{decide, render, Context};
 
 #[derive(clap::Args)]
 pub(crate) struct RemoveGateArgs {

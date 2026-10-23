@@ -370,10 +370,7 @@ pub fn suite_envelopes(
             status: outcome_status(outcome),
             attributes: super::records::span_attributes(vec![
                 ("loom.repo", Some(target.repo.to_string())),
-                (
-                    "loom.repo.visibility",
-                    Some(super::records::visibility_str(target.visibility).to_string()),
-                ),
+                ("loom.repo.visibility", Some(target.visibility.as_str().to_string())),
                 ("loom.ci.run_id", Some(target.run_id.to_string())),
                 ("loom.ci.job_id", Some(target.job_id.to_string())),
                 ("loom.ci.workflow", Some(target.workflow.to_string())),
@@ -396,22 +393,16 @@ pub fn suite_envelopes(
 }
 
 /// The first file under `dir` (recursively, depth-first in sorted order) whose
-/// contents are valid UTF-8 and at most [`MAX_ARTIFACT_BYTES`] long.
+/// contents are valid UTF-8 and at most `max_bytes` long.
 ///
 /// `gh run download --name X --dir D` extracts X's files directly into `D`,
 /// but a `gh` that creates `D/X/` instead is not worth a version probe, so the
 /// walk is recursive. A file over the cap is skipped rather than truncated:
 /// half a JSON document does not parse anyway, and truncating would turn a
 /// deliberate flood into a confusing parse error instead of a named skip.
-pub fn read_artifact_text(dir: &Path) -> Option<String> {
-    read_artifact_text_capped(dir, MAX_ARTIFACT_BYTES as u64, "suite-timings")
-}
-
-/// [`read_artifact_text`] with the cap and the log label supplied by the
-/// caller, so the JUnit path (#9456) — whose documents are an order of
-/// magnitude larger, see `nextest::MAX_JUNIT_BYTES` — shares one
-/// implementation of the walk, the cap check and the skip log rather than
-/// cloning it.
+/// The caller supplies the cap and the log `label`, so the suite-timings and
+/// JUnit (#9456, see `nextest::MAX_JUNIT_BYTES`) paths share one
+/// implementation of the walk, the cap check and the skip log.
 pub fn read_artifact_text_capped(dir: &Path, max_bytes: u64, label: &str) -> Option<String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
     entries.sort_by_key(std::fs::DirEntry::file_name);

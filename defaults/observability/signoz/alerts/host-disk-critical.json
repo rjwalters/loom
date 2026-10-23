@@ -28,7 +28,7 @@
   },
   "annotations": {
     "summary": "Loom host worktree disk critical",
-    "description": "Host {{$labels.host}}: every worktree_root_free_gb reading in the last 10 min is below 5 GB (0 included) or below 3% of the volume, OR the slope of free GB over the last hour projects the volume full in under 1 h. The daemon halts dispatch with reason disk_full; if this host is the ETA authority every Ready ETA goes stale_inputs. Free space now or move fleet.etaAuthority. Keyed on the direct OTLP gauges loom.host.worktree_root_free_gb and loom.host.worktree_volume.{free,total}_bytes, host label host.name with a host.id fallback. A host that reports no free-space gauge is unknown, never 0 GB. Free space: `loom-daemon clean`/`loom-clean --force`, see troubleshooting.md 'Worker disk full'. Issue #10973."
+    "description": "Host {{$labels.host}}: every worktree_root_free_gb reading in the last 10 min is below 5 GB (0 included) or below 3% of the volume, OR the slope of free GB over the last hour projects the volume full in under 1 h. Dispatch keeps admitting up to maxConcurrent (#12406): lower it or free space. If this host is the ETA authority every Ready ETA goes stale_inputs. Free space now or move fleet.etaAuthority. Keyed on the direct OTLP gauges loom.host.worktree_root_free_gb and loom.host.worktree_volume.{free,total}_bytes, host label host.name with a host.id fallback. A host that reports no free-space gauge is unknown, never 0 GB. Free space: `loom-daemon clean`/`loom-clean --force`, see troubleshooting.md 'Worker disk full'. Issue #10973."
   },
   "disabled": false
 }

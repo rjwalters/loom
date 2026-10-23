@@ -2,12 +2,10 @@
 //! [`read_work_finder_config`], and the retired-CPU-knob deprecation notice.
 //!
 //! Split out of `work_finder.rs` (Issue #9034) for the same file-size-ratchet
-//! reason as [`super::repo_cap`] / [`super::configured_max`]: `work_finder.rs`
+//! reason as [`super::configured_max`]: `work_finder.rs`
 //! is frozen at its current size (`.loom/docs/file-size-policy.md`).
 
 use std::path::Path;
-
-use super::repo_cap;
 
 /// The subset of `.loom/config.json → autonomous.workFinder` this module
 /// consumes. Each field is `Option` so an absent key falls through to the
@@ -23,16 +21,6 @@ pub struct WorkFinderConfig {
     /// `autonomous.workFinder.maxConcurrent` — the operator concurrency ceiling
     /// (a zero/invalid value is dropped to `None`).
     pub max_concurrent: Option<usize>,
-    /// `autonomous.workFinder.maxAdmissionsPerTick` — the per-tick ramp
-    /// admission cap (#4234; a zero/invalid value is dropped to `None`). See
-    /// [`super::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for the full rationale.
-    pub max_admissions_per_tick: Option<usize>,
-    /// `autonomous.workFinder.maxConcurrentPerRepo` — how many of the shared
-    /// `maxConcurrent` budget's slots ONE repo may hold (#9090; a zero/invalid
-    /// value is dropped to `None`). Unlike every other knob here, `None` means
-    /// **uncapped** rather than "use a built-in default": a non-`None` default
-    /// would silently throttle every fleet on upgrade. See [`repo_cap`].
-    pub max_concurrent_per_repo: Option<usize>,
     /// `autonomous.workFinder.extraSkipLabels` — additional label names
     /// (Issue #6685) beyond the hardcoded [`super::PARK_LABELS`] this workspace
     /// wants the work-finder to treat as a skip/park signal (e.g. a
@@ -110,12 +98,6 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
-        max_admissions_per_tick: wf
-            .and_then(|w| w.get("maxAdmissionsPerTick"))
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&n| n > 0)
-            .and_then(|n| usize::try_from(n).ok()),
-        max_concurrent_per_repo: repo_cap::parse_config(wf),
         extra_skip_labels: wf.and_then(|w| w.get("extraSkipLabels")).and_then(|v| {
             v.as_array().map(|arr| {
                 arr.iter()
@@ -158,15 +140,6 @@ fn apply_hyperparams(effective: &serde_json::Value, config: &mut WorkFinderConfi
         .and_then(|n| usize::try_from(n).ok())
     {
         config.max_concurrent = Some(max);
-    }
-    if let Some(max) = dispatch
-        .get("maxAdmissionsPerTick")
-        .filter(|v| !v.is_null())
-        .and_then(serde_json::Value::as_u64)
-        .filter(|&n| n > 0)
-        .and_then(|n| usize::try_from(n).ok())
-    {
-        config.max_admissions_per_tick = Some(max);
     }
 }
 

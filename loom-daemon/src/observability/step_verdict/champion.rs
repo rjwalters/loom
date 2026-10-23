@@ -1,6 +1,7 @@
 //! Champion's projections (#12027): its merge-gate decisions
-//! (`champion_merge_v1`) and its promotion verdicts
-//! (`champion_promotion_v1`), each a closed, versioned reason set. A new
+//! (`champion_merge_v2`), its promotion verdicts (`champion_promotion_v1`)
+//! and its PR triage (`champion_triage_v1`, #12499), each a closed, versioned
+//! reason set. A new
 //! reason is a new version, never a silent addition.
 //!
 //! Evidence, strongest first: the write the gh front journaled (`merged`,
@@ -8,16 +9,27 @@
 //! daemon subcommands' own writes (`park-record`, `operator-decision`), then
 //! the step's `CHAMPION-STEP … outcome=` word.
 
-use super::{Event, Evidence, Projection, Projector, StoreOp};
+use super::{projection, sanitize_detail, Event, Evidence, Projection, Projector, StoreOp};
 
 /// The merge gate's reason set.
-pub const MERGE_REASON_SET: &str = "champion_merge_v1";
+pub const MERGE_REASON_SET: &str = "champion_merge_v2";
 
 /// The promotion verdict's reason set.
 pub const PROMOTION_REASON_SET: &str = "champion_promotion_v1";
 
+/// The PR triage's reason set (#12499): a `--pr` step on an unlabelled PR.
+pub const TRIAGE_REASON_SET: &str = "champion_triage_v1";
+
+/// Every reason of [`TRIAGE_REASON_SET`]: the PR went to review (`verdict`),
+/// or was blocked or sent to the operator (`refused`).
+pub const TRIAGE_REASONS: [&str; 3] = ["review_requested", "blocked", "operator"];
+
 /// Every reason of [`MERGE_REASON_SET`].
-pub const MERGE_REASONS: [&str; 14] = [
+///
+/// v2 (#12715) adds the stop gates a non-merging step names with `reason=`
+/// ([`STOP_REASONS`], plus `merge_rc<N>`, see [`stop_reason`]) and
+/// `unspecified` for a stop that named none.
+pub const MERGE_REASONS: [&str; 21] = [
     "merged",
     "ci_failing",
     "conflict",
@@ -32,6 +44,25 @@ pub const MERGE_REASONS: [&str; 14] = [
     "not_eligible",
     "failed",
     "unclassified",
+    "facts_unread",
+    "janitor_rc3",
+    "verdict_rc11",
+    "mergeable_unknown",
+    "pin_missing",
+    "unspecified",
+    "skipped",
+];
+
+/// The `reason=` tokens a `requeued` or `skipped` step may name, besides
+/// `merge_rc<N>`: the gate it stopped at. `ci_pending` is one of them only
+/// when the step says so, never by default.
+pub const STOP_REASONS: [&str; 6] = [
+    "facts_unread",
+    "janitor_rc3",
+    "verdict_rc11",
+    "ci_pending",
+    "mergeable_unknown",
+    "pin_missing",
 ];
 
 /// Every reason of [`PROMOTION_REASON_SET`].
@@ -75,6 +106,7 @@ pub(super) const PROJECTOR: Projector = Projector {
     step_name,
     project,
     outcome_word,
+    reason_word,
 };
 
 fn step_name(is_pr: bool) -> &'static str {
@@ -101,6 +133,46 @@ fn outcome_word(text: &str, is_pr: bool, item: u32) -> Option<String> {
     })
 }
 
+/// The `reason=` word of the last `CHAMPION-STEP` line for this mode and
+/// item, verbatim.
+fn reason_word(text: &str, is_pr: bool, item: u32) -> Option<String> {
+    step_field(text, is_pr, item, "reason")
+}
+
+/// `key=` of the last `CHAMPION-STEP` line for this mode and item.
+fn step_field(text: &str, is_pr: bool, item: u32, key: &str) -> Option<String> {
+    let mode = if is_pr { "pr" } else { "issue" };
+    text.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix(STEP_LINE)?;
+        let field = |key: &str| {
+            rest.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        };
+        (field("mode")? == mode && field("item")?.parse::<u32>().ok()? == item)
+            .then(|| field(key).map(str::to_string))
+            .flatten()
+    })
+}
+
+/// The merge-gate reason a stop names (`requeued` / `skipped`): a
+/// [`STOP_REASONS`] token or `merge_rc<N>` (`N` one or two digits, the
+/// `merge-pr.sh` exit code) verbatim, else `unspecified` (a missing or unknown
+/// token), never the old constant `ci_pending`.
+#[must_use]
+pub fn stop_reason(raw: Option<&str>) -> String {
+    match raw {
+        Some(w) if STOP_REASONS.contains(&w) => w.to_string(),
+        Some(w)
+            if w.strip_prefix("merge_rc").is_some_and(|n| {
+                (1..=2).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit())
+            }) =>
+        {
+            w.to_string()
+        }
+        _ => "unspecified".to_string(),
+    }
+}
+
 /// A marker's inner tokens: `<!-- champion:reject:ci-status:a,b -->` →
 /// `["champion", "reject", "ci-status", "a,b"]`. The fourth part is kept
 /// verbatim (further `:` and spaces: check names have them); the kind and the
@@ -114,15 +186,6 @@ fn marker_parts(marker: &str) -> Option<Vec<&str>> {
         *part = part.split_whitespace().next().unwrap_or_default();
     }
     Some(parts)
-}
-
-fn projection(class: &'static str, reason: &str, set: &'static str) -> Projection {
-    Projection {
-        class,
-        reason: reason.to_string(),
-        reason_set: set,
-        ..Projection::default()
-    }
 }
 
 /// The merge-gate refusal a marker states: `(criterion_key, reason_key,
@@ -206,7 +269,11 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             });
         }
     }
+    let triage = TRIAGE_REASON_SET;
     let p = match e.outcome.as_deref() {
+        Some("triaged") => projection("verdict", "review_requested", triage),
+        Some("triage-blocked") => projection("refused", "blocked", triage),
+        Some("triage-operator") => projection("refused", "operator", triage),
         Some("merged") => Projection {
             store: StoreOp::Clear,
             ..projection("verdict", "merged", set)
@@ -215,7 +282,10 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             store: StoreOp::Lookup,
             ..projection("refused", "unknown", set)
         },
-        Some("requeued") => projection("noop", "ci_pending", set),
+        Some("requeued" | "skipped") => Projection {
+            detail: e.reason.as_deref().map(sanitize_detail),
+            ..projection("noop", &stop_reason(e.reason.as_deref()), set)
+        },
         Some("held") => projection("noop", "held", set),
         Some("head-moved") => Projection {
             store: StoreOp::Clear,

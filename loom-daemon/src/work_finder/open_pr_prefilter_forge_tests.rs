@@ -467,14 +467,22 @@ fn a_failed_read_reuses_the_last_good_listing_for_a_few_minutes() {
     let (expired, _) = tick_one(fx.dispatcher(), &[8981, 8983], 5);
     assert_eq!((expired.dispatched, expired.pr_open_prefiltered), (0, 0));
     assert_eq!((expired.errors, expired.error_kind()), (2, Some("forge_listing")));
-    // (The sweep dispatched for #8982 above may still be talking to `gh`.)
-    let held = fx.calls()[before..].to_vec();
-    assert!(
-        !held
-            .iter()
-            .any(|c| c.contains("8981") || c.contains("8983")),
-        "no per-issue read for a held candidate: {held:?}"
-    );
+    // (The sweep dispatched for #8982 above may still be talking to `gh`: only
+    // a per-issue read (`/issues/<n>` or the guard GraphQL) naming a held
+    // candidate counts, not any call line that merely contains its digits.)
+    let reads_issue = |c: &str, n: u32| {
+        let names = |hay: &str, needle: &str| {
+            hay.match_indices(needle)
+                .any(|(i, m)| !hay[i + m.len()..].starts_with(|ch: char| ch.is_ascii_digit()))
+        };
+        names(c, &format!("/issues/{n}")) || (is_guard_graphql(c) && names(c, &n.to_string()))
+    };
+    let held: Vec<String> = fx.calls()[before..]
+        .iter()
+        .filter(|c| reads_issue(c, 8981) || reads_issue(c, 8983))
+        .cloned()
+        .collect();
+    assert!(held.is_empty(), "no per-issue read for a held candidate: {held:?}");
 }
 
 /// What links and what does not is the guard's own classifier: a fork PR from

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::super::{
-    hold_action, plan_group, plan_repo_with, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
+    hold_action, plan_group_with, plan_repo_with, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
 };
 use super::*;
 use crate::priority_pick::{IMPORTANT_LABEL, VERY_IMPORTANT_LABEL};
@@ -129,7 +129,13 @@ fn a_follower_waits_for_its_nearest_direct_overlap() {
         (3, &["b"]),
         (4, &["z", "b2", "a"]),
     ]);
-    let g = plan_group("seq-t", &order, &by, &f);
+    let g = plan_group_with(
+        "seq-t",
+        &order,
+        &by,
+        &f,
+        &crate::claim_reconciliation::merge_sequence::conflict::assume_conflict,
+    );
     assert_eq!(edges(&g), vec![(2, 1), (3, 2), (4, 2)]);
 }
 

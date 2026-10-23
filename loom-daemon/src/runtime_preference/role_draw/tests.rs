@@ -58,7 +58,15 @@ fn candidate_keys_parse_per_the_documented_grammar() {
     assert_eq!((c.runtime.as_str(), c.model_profile, c.model), ("claude", None, None));
     let c = Candidate::parse(" claude/opus ").unwrap();
     assert_eq!((c.key.as_str(), c.model.as_deref()), ("claude/opus", Some("opus")));
-    assert_eq!(c.tap(), Tap::runtime("claude"));
+    // The tap carries the pick's model, so containment selects an account
+    // for the model the launch will use (#12748).
+    assert_eq!(
+        c.tap(),
+        Tap {
+            model: Some("opus".into()),
+            ..Tap::runtime("claude")
+        }
+    );
     // A native runtime's `/` segment is its model profile.
     let c = Candidate::parse("opencode/zai-flash").unwrap();
     assert_eq!(c.tap(), Tap::with_profile("opencode", "zai-flash"));

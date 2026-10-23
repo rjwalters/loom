@@ -49,7 +49,7 @@ pub(super) enum Refusal {
     Other(String),
 }
 
-pub(super) fn tracking(branch: &str) -> String {
+pub(crate) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
@@ -160,7 +160,7 @@ pub(super) fn remote_head(root: &Path, branch: &str, timeout: Duration) -> Resul
 
 /// The commit the clone's `origin/<branch>` is at; `None` when it has never
 /// been fetched. Local.
-pub(super) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
+pub(crate) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
     let spec = format!("{}^{{commit}}", tracking(branch));
     ok(root, &["rev-parse", "--verify", "--quiet", &spec], timeout)
         .ok()

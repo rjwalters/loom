@@ -349,8 +349,8 @@ LIMIT 1 BY attributes_string['loom.fact_id'];
 --   merge_wait                   merge_wait    PR: loom:pr, the only review label, no hold label
 --   merge_hold                   merge_hold    PR: loom:pr, the only review label, and a hold
 --                                              label (the registry's merge_hold set:
---                                              loom:operator, loom:operator-decision,
---                                              loom:operator-only)
+--                                              loom:blocked, loom:operator,
+--                                              loom:operator-decision, loom:operator-only)
 --
 -- A PR stage is compared on the row's `pr`; a row without one is `no_pr`. A
 -- stage outside this table is `unmapped`. Neither is a disagreement.
@@ -421,7 +421,9 @@ forge AS (                      -- per instant and item: the stage the forge nam
                    i.target = 'issue' AND has(i.labels, 'loom:building'), 'building',
                    i.target = 'issue' AND has(i.labels, 'loom:issue'), 'ready_wait',
                    i.target = 'pr' AND review_labels = 1 AND has(i.labels, 'loom:pr')
-                       AND hasAny(i.labels, ['loom:operator', 'loom:operator-blocked',
+                       AND hasAny(i.labels, ['loom:blocked', 'loom:needs-capability',
+                                             'loom:operator',
+                                             'loom:operator-blocked',
                                              'loom:operator-decision',
                                              'loom:operator-mechanical',
                                              'loom:operator-only']), 'merge_hold',

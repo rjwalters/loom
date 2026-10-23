@@ -280,3 +280,42 @@ fn a_second_pass_inside_the_window_makes_no_probe() {
     let later = SystemTime::now() + std::time::Duration::from_secs(1801);
     assert_eq!(probe_all_with(ws.path(), Some(&gh), later), 1);
 }
+
+/// #12446: a `writers[]` owner's directory derives that owner's App, not the
+/// default writer's, so a matching sidecar is no mismatch and a missing one
+/// still books the right account.
+#[test]
+fn a_per_owner_writer_dir_derives_the_owners_app() {
+    let owner = "acme12446a";
+    let ws = workspace(owner, Some("1244600"));
+    std::fs::write(
+        ws.path().join(".loom/config.json"),
+        format!(
+            r#"{{"forge": {{"githubApp": {{"appId": "1244600", "privateKeyPath": "/k.pem"}},
+                "identities": {{"writers": [
+                    {{"appId": "1244601", "privateKeyPath": "/k2.pem", "owners": ["acme12446b"]}},
+                    {{"appId": "1244602", "privateKeyPath": "/k3.pem", "owners": ["{owner}"]}}]}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let by_owner = ws.path().join(".loom/gh-config-by-owner/acme12446b");
+    let primary = ws.path().join(".loom/gh-config");
+
+    // No sidecar: derived from the roster entry listing the owner.
+    std::fs::create_dir_all(&by_owner).unwrap();
+    let id = dir_identity(&by_owner, &classify_dir(&by_owner)).unwrap();
+    assert_eq!((id.account.as_str(), id.source), ("app-1244601", IdentitySource::Derived));
+
+    // Matching sidecar: the same account, and no mismatch is reported.
+    writer_dir(&by_owner, "1244601", "5", "acme12446b");
+    let id = dir_identity(&by_owner, &classify_dir(&by_owner)).unwrap();
+    assert_eq!((id.account.as_str(), id.source), ("app-1244601", IdentitySource::Sidecar));
+
+    // The primary directory follows the workspace owner's writer entry.
+    std::fs::create_dir_all(&primary).unwrap();
+    let id = dir_identity(&primary, &classify_dir(&primary)).unwrap();
+    assert_eq!(id.account, "app-1244602");
+
+    let accounts = crate::forge_bucket_book::writer_accounts(ws.path());
+    assert_eq!(accounts, ["app-1244600", "app-1244601", "app-1244602"]);
+}

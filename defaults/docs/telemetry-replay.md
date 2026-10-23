@@ -180,8 +180,9 @@ sweep_id, checkpoint entered_at)` or `(repo, issue, stage, next_stage,
 "entry", entered_at)`. A forge-instant key is unchanged and always wins.
 With none of these the record has no `loom.fact_id` and carries
 `loom.fact_id_missing_reason` (`forge_read_failed` / `no_forge_instant`)
-instead, never neither, and `host.export` counts it
-(`loom.host_export.fact_id_missing_total`). A fallback id and a peer host's
+instead, never neither. (`host.export`'s `fact_id_missing_total` count was
+retired in #12741; it never had a producer, so its absence is not a measured
+zero.) A fallback id and a peer host's
 forge-instant id for the same move differ; so does a `pr.resolved` from a
 build before #11126 (no `closed_at`, no fact id). Readers dedupe records
 without a fact id by `(repo, issue, next_stage)` for `eta.stage_outcome`
@@ -392,7 +393,7 @@ the past (the default ends 10 minutes ago).
 | `review_wait` | `review_wait` | PR: `loom:review-requested`, the only review label |
 | `doctor` | `doctor` | PR: `loom:changes-requested`, the only review label; or no review label and `loom:treating` |
 | `merge_wait` | `merge_wait` | PR: `loom:pr`, the only review label, no hold label |
-| `merge_hold` | `merge_hold` | PR: `loom:pr`, the only review label, and a hold label (the label registry's `merge_hold` set: `loom:operator`, `loom:operator-decision`, `loom:operator-only`) |
+| `merge_hold` | `merge_hold` | PR: `loom:pr`, the only review label, and a hold label (the label registry's `merge_hold` set: `loom:blocked`, `loom:operator`, `loom:operator-decision`, `loom:operator-only`; since #11907 a Champion-held `loom:pr` + `loom:blocked` PR is `merge_hold`, and `merge_hold` is no longer human-only) |
 
 A PR stage is compared on the row's `pr`; a row without one is `no_pr`. A
 stage outside the table is `unmapped`. `no_pr`, `no_forge_record` and

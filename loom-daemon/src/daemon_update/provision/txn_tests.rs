@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::super::{install_to, publish, stage};
+use super::super::{install_to, install_to_published, publish, stage};
 use super::{
-    begin, previous_path, read_record, record_path, InstallError, InstallRecord, Phase, RecordRead,
-    SCHEMA_VERSION, UNKNOWN_VERSION,
+    begin, previous_path, read_record, record_path, restore, snapshot, InstallError, InstallRecord,
+    Phase, RecordRead, RestoreOutcome, SCHEMA_VERSION, UNKNOWN_VERSION,
 };
 
 fn tmpdir() -> tempfile::TempDir {
@@ -71,7 +71,7 @@ impl Fixture {
         let mut names: Vec<String> = std::fs::read_dir(self.dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with('.'))
+            .filter(|n| n.starts_with('.') && !n.ends_with(".install.lock"))
             .collect();
         names.sort();
         names
@@ -638,4 +638,284 @@ fn the_sidecar_paths_sit_beside_the_destination() {
         record_path(dest),
         Path::new("/home/u/.local/bin/loom-daemon.install-state.json")
     );
+}
+
+// ---- restore (#12776) -------------------------------------------------------
+
+/// `v1` live, then `v2` installed over it: the state an exit-7 run is in.
+fn installed_v2_over_v1() -> (Fixture, super::InstallIdentity) {
+    let fx = Fixture::new(Some(&stub_body("1")));
+    let cand = fx.candidate("v2", &stub_body("2"));
+    // The identity comes from the publish itself, as in production.
+    let id = install_to_published(&cand, &fx.dest)
+        .unwrap()
+        .identity()
+        .unwrap();
+    (fx, id)
+}
+
+fn refused(o: RestoreOutcome) -> String {
+    match o {
+        RestoreOutcome::Refused(why) => why,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn restore_puts_the_previous_bytes_back_and_keeps_the_recovery_copy() {
+    let (fx, id) = installed_v2_over_v1();
+    let record_before = std::fs::read(record_path(&fx.dest)).unwrap();
+    assert!(matches!(restore(&fx.dest, &id), RestoreOutcome::Restored));
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("1"));
+    assert_eq!(fx.previous(), stub_body("1"), "the recovery copy survives");
+    assert_eq!(std::fs::read(record_path(&fx.dest)).unwrap(), record_before, "record untouched");
+    #[cfg(unix)]
+    assert_eq!(mode(&fx.dest), 0o755);
+    assert_eq!(fx.hidden(), Vec::<String>::new());
+}
+
+#[test]
+fn a_second_restore_is_refused() {
+    let (fx, id) = installed_v2_over_v1();
+    assert!(matches!(restore(&fx.dest, &id), RestoreOutcome::Restored));
+    let why = refused(restore(&fx.dest, &id));
+    assert!(why.contains("not the candidate"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("1"));
+}
+
+#[test]
+fn a_first_ever_install_has_nothing_to_restore() {
+    let fx = Fixture::new(None);
+    let cand = fx.candidate("v1", &stub_body("1"));
+    assert!(install_to(&cand, &fx.dest));
+    let why = snapshot(&fx.dest).unwrap_err();
+    assert!(why.contains("first-ever"), "{why}");
+    // A fabricated identity cannot get past the record either.
+    let forged = super::InstallIdentity {
+        started_at: fx.record().started_at,
+        target_sha256: sha(&stub_body("1")),
+        previous_sha256: sha(&stub_body("0")),
+    };
+    let why = refused(restore(&fx.dest, &forged));
+    assert!(why.contains("first-ever"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("1"));
+}
+
+#[test]
+fn a_missing_or_corrupt_previous_binary_is_refused_and_nothing_is_written() {
+    let (fx, id) = installed_v2_over_v1();
+    std::fs::write(previous_path(&fx.dest), b"corrupt").unwrap();
+    let why = refused(restore(&fx.dest, &id));
+    assert!(why.contains("does not match"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("2"));
+
+    std::fs::remove_file(previous_path(&fx.dest)).unwrap();
+    let why = refused(restore(&fx.dest, &id));
+    assert!(why.contains("could not be read"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("2"));
+}
+
+#[test]
+fn a_destination_another_install_replaced_is_never_overwritten() {
+    let (fx, id) = installed_v2_over_v1();
+    write_exec(&fx.dest, &stub_body("3"));
+    let why = refused(restore(&fx.dest, &id));
+    assert!(why.contains("not the candidate"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("3"));
+    assert_eq!(fx.previous(), stub_body("1"));
+}
+
+#[test]
+fn a_record_from_another_install_is_refused_even_when_the_hashes_match() {
+    // The same candidate installed again: same target and previous hashes,
+    // different `started_at`. That install is not this run's.
+    let (fx, id) = installed_v2_over_v1();
+    let again = fx.candidate("v2-again", &stub_body("2"));
+    assert!(install_to(&again, &fx.dest));
+    let now = snapshot(&fx.dest).unwrap();
+    assert_eq!(now.target_sha256, id.target_sha256);
+    assert_eq!(now.previous_sha256, id.previous_sha256);
+    assert_ne!(now.started_at, id.started_at);
+    let why = refused(restore(&fx.dest, &id));
+    assert!(why.contains("not the install this run made"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("2"));
+}
+
+/// B publishes after A's publish returned and before A restores. A's identity
+/// came from A's own transaction, so it cannot adopt B's record (the review
+/// concern on #12779: a re-read after the lock was released would).
+#[test]
+fn a_publisher_that_lands_between_publish_and_restore_is_never_undone() {
+    // (label, B's candidate, what B's own restore puts back). An identical
+    // candidate keeps the existing `.previous` (v1), per `publish`.
+    for (label, b_body, b_restores) in [
+        ("different candidate", stub_body("3"), stub_body("2")),
+        ("identical target", stub_body("2"), stub_body("1")),
+    ] {
+        let (fx, a) = installed_v2_over_v1();
+        let b_cand = fx.candidate("b", &b_body);
+        let b = install_to_published(&b_cand, &fx.dest)
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert_ne!(a.started_at, b.started_at, "{label}");
+        let (dest_before, prev_before) = (
+            std::fs::read(&fx.dest).unwrap(),
+            std::fs::read(previous_path(&fx.dest)).unwrap(),
+        );
+        let record_before = std::fs::read(record_path(&fx.dest)).unwrap();
+
+        let why = refused(restore(&fx.dest, &a));
+        assert!(why.contains("not the install this run made"), "{label}: {why}");
+        assert_eq!(std::fs::read(&fx.dest).unwrap(), dest_before, "{label}: B's dest intact");
+        assert_eq!(std::fs::read(previous_path(&fx.dest)).unwrap(), prev_before, "{label}");
+        assert_eq!(std::fs::read(record_path(&fx.dest)).unwrap(), record_before, "{label}");
+        // B's own identity still restores what B's publish retained.
+        assert!(matches!(restore(&fx.dest, &b), RestoreOutcome::Restored), "{label}");
+        assert_eq!(std::fs::read(&fx.dest).unwrap(), b_restores, "{label}");
+    }
+}
+
+/// The machine-script path: the identity crosses the `install-binary publish`
+/// subprocess boundary through the sink file, per destination.
+#[test]
+fn the_identity_sink_carries_the_publishers_own_identity() {
+    let (fx, a) = installed_v2_over_v1();
+    let sink = fx.dir.path().join("identity-sink");
+    let write = |dest: &Path, id: Result<super::InstallIdentity, String>| {
+        let line = super::SinkLine {
+            dest: dest.display().to_string(),
+            why_not: id.clone().err().unwrap_or_default(),
+            identity: id.ok(),
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sink)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            format!("{}\n", serde_json::to_string(&line).unwrap()).as_bytes(),
+        )
+        .unwrap();
+    };
+    write(&fx.dest, Ok(a.clone()));
+    write(Path::new("/elsewhere/loom-daemon"), Err("other".into()));
+    assert_eq!(super::read_reported_identity(&sink, &fx.dest).unwrap(), a);
+    assert!(super::read_reported_identity(&sink, Path::new("/nowhere")).is_err());
+    assert!(super::read_reported_identity(&fx.dir.path().join("absent"), &fx.dest).is_err());
+    write(&fx.dest, Err("first-ever".into()));
+    assert_eq!(super::read_reported_identity(&sink, &fx.dest).unwrap_err(), "first-ever");
+}
+
+#[test]
+fn an_unusable_or_unfinished_record_is_refused() {
+    let (fx, id) = installed_v2_over_v1();
+    std::fs::write(record_path(&fx.dest), b"{not json").unwrap();
+    assert!(refused(restore(&fx.dest, &id)).contains("unreadable"));
+    assert!(snapshot(&fx.dest).is_err());
+    std::fs::remove_file(record_path(&fx.dest)).unwrap();
+    assert!(refused(restore(&fx.dest, &id)).contains("no install record"));
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("2"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restore_that_cannot_write_fails_with_dest_and_previous_intact() {
+    if running_as_root() {
+        return;
+    }
+    let (fx, id) = installed_v2_over_v1();
+    set_mode(fx.dir.path(), 0o555);
+    let out = restore(&fx.dest, &id);
+    set_mode(fx.dir.path(), 0o755);
+    assert!(matches!(out, RestoreOutcome::Failed(_)), "{out:?}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("2"));
+    assert_eq!(fx.previous(), stub_body("1"));
+    assert_eq!(fx.hidden(), Vec::<String>::new());
+}
+
+/// Run `f` on a thread and report whether it finished within `wait`.
+fn finishes_within<T: Send + 'static>(
+    wait: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (bool, std::thread::JoinHandle<T>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        let v = f();
+        let _ = tx.send(());
+        v
+    });
+    (rx.recv_timeout(wait).is_ok(), h)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restorer_waits_for_a_publisher_then_refuses_instead_of_overwriting_it() {
+    let (fx, id) = installed_v2_over_v1();
+    let lock = super::super::DestLock::acquire(&fx.dest).unwrap();
+    let dest = fx.dest.clone();
+    let (done, handle) =
+        finishes_within(std::time::Duration::from_millis(300), move || restore(&dest, &id));
+    assert!(!done, "the restore must wait for the lock holder");
+    // The competing publisher lands another install in the check/rename gap.
+    write_exec(&fx.dest, &stub_body("3"));
+    drop(lock);
+    let why = refused(handle.join().unwrap());
+    assert!(why.contains("not the candidate"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("3"), "the other install survives");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_publisher_waits_for_a_restorer_and_the_record_stays_coherent() {
+    let (fx, id) = installed_v2_over_v1();
+    let lock = super::super::DestLock::acquire(&fx.dest).unwrap();
+    let cand = fx.candidate("v3", &stub_body("3"));
+    let staged = stage(&cand, &fx.dest).unwrap();
+    let dest = fx.dest.clone();
+    let (done, handle) = finishes_within(std::time::Duration::from_millis(300), {
+        let staged = staged.clone();
+        move || publish(&staged, &dest).map(|p| p.record.phase)
+    });
+    assert!(!done, "the publish must wait for the lock holder");
+    assert!(staged.exists());
+    drop(lock);
+    assert_eq!(handle.join().unwrap().unwrap(), Phase::Committed);
+    // The publish retained v2, so the old identity no longer restores v1 over it.
+    assert_eq!(fx.previous(), stub_body("2"));
+    let why = refused(restore(&fx.dest, &id));
+    assert!(why.contains("not the install this run made"), "{why}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("3"));
+}
+
+#[cfg(unix)]
+#[test]
+fn two_restorers_at_once_restore_exactly_once() {
+    let (fx, id) = installed_v2_over_v1();
+    let outcomes: Vec<_> = (0..2)
+        .map(|_| {
+            let (dest, id) = (fx.dest.clone(), id.clone());
+            std::thread::spawn(move || restore(&dest, &id))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    let restored = outcomes
+        .iter()
+        .filter(|o| matches!(o, RestoreOutcome::Restored))
+        .count();
+    assert_eq!(restored, 1, "{outcomes:?}");
+    assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("1"));
+    assert_eq!(fx.previous(), stub_body("1"));
+}
+
+#[test]
+fn a_lock_file_left_by_a_killed_holder_does_not_block() {
+    let (fx, id) = installed_v2_over_v1();
+    // The lock file persists after every install; a killed holder's flock is
+    // released by the kernel, so a leftover file is just a file.
+    assert!(fx.dir.path().join(".loom-daemon.install.lock").exists());
+    assert!(matches!(restore(&fx.dest, &id), RestoreOutcome::Restored));
 }

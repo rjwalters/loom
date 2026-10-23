@@ -120,6 +120,14 @@
 //! If you add a test that touches the tmux server, or any other machine-global
 //! resource, put it in the group — do not rely on `#[serial]`.
 
+// The `status --json` builder (`cli::status_render`) is one large
+// `serde_json::json!` invocation; each field this repo has added over time
+// pushes the macro's token-tree munching recursion a little deeper. #6470
+// added two more fields (`role_runner_env_override` /
+// `role_runner_host_env_override`) and tripped the default (128) limit —
+// bump it here rather than trimming the JSON shape to fit an arbitrary
+// compiler default.
+#![recursion_limit = "512"]
 // These modules were originally private to the binary crate. Exposing them as
 // a library (to allow unit tests to run without the binary's tokio runtime)
 // triggers public-API clippy lints that don't apply to internal-use code.
@@ -133,10 +141,11 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
-pub mod admission_brake;
 pub mod agent_gh;
 pub mod agent_session;
 pub mod agent_skills;
+/// Alert transitions as `alert.transition` OTLP log records (#11295, #12806).
+pub mod alerts;
 pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
@@ -154,11 +163,11 @@ pub mod ci_telemetry;
 pub mod claim_liveness;
 pub mod claim_reconciliation;
 pub mod classify_error;
+pub mod cli;
 pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
 pub mod comment_trust;
-pub mod config_journal;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;
@@ -180,14 +189,13 @@ pub mod dep_recheck;
 /// Fleet discovery (#12306): one snapshot of what work exists per step tick,
 /// from the mirror's worklist or per-repo listings.
 pub mod discovery;
-pub mod disk_admission;
-pub mod disk_footprint;
-pub mod disk_full_halt;
 pub mod disk_headroom;
 pub mod dispatch_tap;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
 pub mod eager_reclaim;
+#[cfg(test)]
+pub(crate) mod env_test_support;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
@@ -197,12 +205,11 @@ pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
-pub mod fleet_outputs;
+pub mod fleet_dispatch;
 pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
-pub mod foreign_load;
 pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;
@@ -213,10 +220,10 @@ pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_comment;
 pub mod forge_contract;
+pub mod forge_create_issue;
 pub mod forge_denial;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
-pub mod forge_events;
 pub mod forge_gateway;
 pub mod forge_host;
 pub mod forge_identity;
@@ -237,11 +244,11 @@ pub mod forge_rerun;
 pub mod forge_tree_unchanged;
 pub mod forge_version_only_diff;
 pub mod forge_wait_checks;
+pub mod fs_util;
 /// Generated content a quarantine must never stash: name-based artifacts and
 /// content-verified cargo build trees (#5690, #11075).
 pub mod generated_artifact;
 pub mod gh_invocation;
-pub mod gh_repo_env;
 pub mod gh_state_probe;
 pub mod git_ff_identical;
 pub mod git_parser;
@@ -254,10 +261,12 @@ pub mod health;
 pub mod health_monitor;
 pub mod hooks_home;
 pub mod host_affinity;
-pub mod host_breaker;
 pub mod host_identity;
+pub mod host_loss;
 pub mod host_optout;
 pub mod host_pressure;
+pub mod host_shape;
+pub mod host_status;
 pub mod hyperparams;
 pub mod idle_exit;
 pub mod inflight;
@@ -271,7 +280,6 @@ pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
 // #11855: bound Judge re-runs on a PR whose passes end without a verdict.
-pub mod journal;
 pub mod judge_backstop;
 pub mod key_ref;
 pub mod kimi_usage;
@@ -286,7 +294,6 @@ pub mod live_claim;
 /// run on any spawn of the real `gh` (#10138).
 #[cfg(test)]
 mod live_gh_guard;
-pub mod loom_ui_alerts;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;
@@ -298,6 +305,9 @@ pub mod opencode_usage;
 pub mod operator_decision;
 pub mod operator_stop;
 pub mod orphan_process_reaper;
+/// Replacement PRs for a stacked child orphaned in a merge-mode repository
+/// (#12767): the git half and the decisions, driven by Doctor.
+pub mod orphan_replace;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;
@@ -308,19 +318,19 @@ pub mod pipeline_snapshot;
 pub mod points_marker;
 pub mod pr_latency;
 // #11931: a terminated role run's PR leases are released on its behalf.
+pub mod agent_scopes;
 pub mod pr_lease_reap;
 pub mod pr_planning;
 pub mod preflight;
 pub mod premise_check;
-pub mod presence;
 pub mod primary_checkout_reaper;
 pub mod priority_pick;
 pub mod private_control_gate;
 pub mod proc_exec;
+pub mod promotion_author;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
-pub mod ram_headroom;
 pub mod ram_peaks;
 pub mod ram_scope_limit;
 pub mod rate_limit_breaker;
@@ -376,6 +386,10 @@ pub mod session_reconcile;
 pub mod session_status;
 pub mod short_hash;
 pub mod signoz_read;
+/// `stack-parent`: the open PR a Builder's conflicting work stacks on (#12759).
+pub mod stack_parent;
+/// `stacking.onConflict` accessor: the conflict-stacking switch and depth cap (#12758).
+pub mod stacking_config;
 pub mod stale_blocked;
 pub(crate) mod stale_token_retry;
 pub mod startup_adoption;
@@ -445,6 +459,7 @@ pub mod tmpfs_visibility;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;
+pub mod tools_mode;
 pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;

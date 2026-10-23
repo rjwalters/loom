@@ -25,7 +25,7 @@ A comment or review is trusted when its author is:
 | One of **this** fleet's GitHub Apps, matched exactly | The fleet's Apps appear as `NONE`/`CONTRIBUTOR`, so without this rule Loom could not read its own markers. The roster is [`forge_identity::FleetLogins`](github-authentication.md): the writer, every reader, `legacyLogins`, and the `loom-fleet-dispatch(-<digits>)` default family. The author must be *spelled* as an App (`x[bot]` from REST, `app/x` from GraphQL, or a `Bot` type): a user may register the bare slug, never `x[bot]`. |
 | This daemon's own identity | Compared with the same account kind: the user `x` is never the App `x[bot]`. |
 | A login in `forge.trustedCommenters` | An explicit allowlist, same account-kind rule (list `helper[bot]` to allow an App). |
-| A login on the **fleet admin roster**, `fleet/admins.json` in the fleet store | `{"admins": ["turian", "rjwalters"]}`, read through the fleet store reader (`fleet.repo`, `fleet.ref`), never from the repo being judged. User accounts only (App-spelled entries are ignored). Applies in every fleet repo (#10303). |
+| A login on the **fleet admin roster**, `fleet/admins.json` in the fleet store | `{"admins": ["rjwalters", "example-admin"]}`, read through the fleet store reader (`fleet.repo`, `fleet.ref`), never from the repo being judged. User accounts only (App-spelled entries are ignored). Applies in every fleet repo (#10303). |
 
 **Another Loom installation's markers are not ours.** A foreign fleet emits
 perfectly well-formed Loom markers; its Apps are not in this roster, so they
@@ -216,11 +216,7 @@ Anything unverifiable is a refusal. Reads are never gated.
   resolves `origin` (never gh's preference) or takes its caller's explicit
   `--repo`. The structural test
   `write_scope::tests::daemon_write_paths_are_scoped` fails when a new daemon
-  file writes to the forge without being reviewed into its list. One
-  autonomous write sits outside the rule above, scoped narrower by that test:
-  the declared captain's gauge heartbeat (#10395) goes to the configured
-  fleet store (`fleet.repo`, never gh's resolution) under its writer App, and
-  only to the dedicated `fleet.captainGauges.ref` branch, never the reviewed one.
+  file writes to the forge without being reviewed into its list.
 - **Shell:** `loom-daemon forge may-write [--repo OWNER/REPO]` prints the
   repository to name on the write (exit 0) or the reason (exit 1).
   `loom_write_repo` in `lib/forge-helpers.sh` wraps it. Every script that

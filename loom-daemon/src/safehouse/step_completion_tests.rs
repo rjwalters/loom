@@ -133,6 +133,10 @@ fn only_a_merge_steps_verdict_is_looked_up() {
     assert!(step_narrates_completion(ChampionMerge, "verdict", "closed"));
     assert!(step_narrates_completion(ChampionMerge, "verdict", "unclassified"));
     assert!(!step_narrates_completion(ChampionMerge, "verdict", "rejected"));
+    // A PR triage's verdicts (#12499) label a PR, never merge one.
+    for reason in ["triaged", "triage_blocked", "triage_operator"] {
+        assert!(!step_narrates_completion(ChampionMerge, "verdict", reason), "{reason}");
+    }
     for (class, reason) in [
         ("noop", "held"),
         ("noop", "ci_pending"),

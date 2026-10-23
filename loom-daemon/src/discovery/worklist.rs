@@ -5,6 +5,7 @@
 //!
 //! ```json
 //! { "repos": { "owner/name": {
+//!     "status": "ok" | "unknown" | "backfilling" | "error",
 //!     "watermark": { "last_event_at": "…", "last_reconciled_at": "…",
 //!                    "latest_seq": 42, "known": true, … },
 //!     "items": [ {
@@ -31,7 +32,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::snapshot::{Checks, ItemExtras, RepoSnapshot, Source, WatermarkView};
+use super::chain::Tier;
+use super::snapshot::{Checks, ItemExtras, RepoSnapshot, RepoStatus, Source, WatermarkView};
 use crate::forge_mirror::client::{MirrorItem, Watermark};
 use crate::forge_pull_listing::RestPull;
 
@@ -43,6 +45,9 @@ struct Response {
 
 #[derive(Debug, Default, Deserialize)]
 struct WireRepo {
+    /// `ok` | `unknown` | `backfilling` | `error`; absent reads as `ok`.
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     watermark: Watermark,
     #[serde(default)]
@@ -87,6 +92,9 @@ struct WireItem {
 #[derive(Debug, Default)]
 pub struct Worklist {
     pub repos: BTreeMap<String, Arc<RepoSnapshot>>,
+    /// Lowercase slug → the watermark as sent, so the tick can ask
+    /// [`Watermark::freshness`] whether the mirror vouches for the repo.
+    pub marks: BTreeMap<String, Watermark>,
 }
 
 fn time(raw: Option<&str>) -> Option<DateTime<Utc>> {
@@ -101,6 +109,7 @@ fn count(n: Option<u64>) -> Option<u32> {
 
 impl WireRepo {
     fn into_snapshot(self, slug: &str) -> RepoSnapshot {
+        let status = RepoStatus::parse(self.status.as_deref());
         let watermark = WatermarkView {
             last_event_at: time(self.watermark.last_event_at.as_deref()),
             last_reconciled_at: time(self.watermark.last_reconciled_at.as_deref()),
@@ -155,6 +164,8 @@ impl WireRepo {
         RepoSnapshot {
             slug: slug.to_string(),
             source: Source::Worklist,
+            tier: Tier::Mirror,
+            status,
             rows,
             pulls: Some(pulls),
             extras,
@@ -172,15 +183,12 @@ pub fn decode(
     body: serde_json::Value,
 ) -> Result<Worklist, crate::forge_mirror::client::MirrorError> {
     let response: Response = crate::forge_mirror::client::decode(body)?;
-    Ok(Worklist {
-        repos: response
-            .repos
-            .into_iter()
-            .map(|(slug, repo)| {
-                let slug = slug.to_ascii_lowercase();
-                let snap = Arc::new(repo.into_snapshot(&slug));
-                (slug, snap)
-            })
-            .collect(),
-    })
+    let mut list = Worklist::default();
+    for (slug, repo) in response.repos {
+        let slug = slug.to_ascii_lowercase();
+        list.marks.insert(slug.clone(), repo.watermark.clone());
+        let snap = Arc::new(repo.into_snapshot(&slug));
+        list.repos.insert(slug, snap);
+    }
+    Ok(list)
 }

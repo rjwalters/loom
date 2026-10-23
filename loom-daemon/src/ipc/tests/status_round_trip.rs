@@ -27,8 +27,6 @@ fn test_daemon_status_request_response_round_trip() {
         stale_sweeps: vec![],
         token_pool_size: 4,
         token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
-        disk_headroom: 10,
-        ram_headroom: 10,
         logical_cpus: 8,
         loadavg_1m: Some(1.25),
         cpu_idle_fraction: Some(0.90),
@@ -110,7 +108,16 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_floor_not_rolling: Some(
             crate::auto_update::not_rolling::FloorNotRolling::Unsupervised,
         ),
+        host_update: Some(crate::auto_update::update_observation::HostUpdateObservation {
+            state: crate::auto_update::update_observation::HostState::Staged,
+            running_version: "0.19.23".into(),
+            on_disk_version: Some("0.19.24".into()),
+            floor: Some("0.19.20".into()),
+            target_version: Some("0.19.24".into()),
+            target_source: crate::auto_update::update_observation::ObservedTargetSource::Floor,
+        }),
         auto_update_config_enabled: Some(false),
+        auto_update_freshness: None,
         task_liveness: Vec::new(),
         session_containers: Some(crate::session_status::SessionContainersReport {
             observation: "available".into(),
@@ -124,8 +131,6 @@ fn test_daemon_status_request_response_round_trip() {
             }],
             ..crate::session_status::SessionContainersReport::default()
         }),
-        host_breaker: None,
-        admission_brake: None,
         rate_limit_breaker: None,
         forge_calls: None,
         safehouse: Some(crate::types::SafehouseStatus {
@@ -168,17 +173,11 @@ fn test_daemon_status_request_response_round_trip() {
         daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
         work_finder_interval_secs: Some(60),
         startup_jitter_delay_secs: Some(437),
-        observability_host_id_mismatch: Some(crate::types::ObservabilityHostIdMismatch {
-            daemon_host_id: "robb-studio".to_string(),
-            ingest_host_id: "robb-pro".to_string(),
-            first_seen_at: chrono::Utc::now(),
-        }),
         observability_export: Some(crate::types::ObservabilityExportStatus {
-            state: crate::types::ObservabilityExportState::HostIdMismatch,
+            state: crate::types::ObservabilityExportState::Healthy,
             host_id: Some("robb-studio".to_string()),
-            ingest_host_id: Some("robb-pro".to_string()),
-            endpoint: Some("https://dashboard.example/ingest".to_string()),
-            exporter: Some("https".to_string()),
+            endpoint: Some("https://otlp.example/v1/logs".to_string()),
+            exporter: Some("otlp".to_string()),
             started_at: Some(chrono::Utc::now()),
             last_success_at: Some(chrono::Utc::now()),
             records_exported: 128,
@@ -187,10 +186,10 @@ fn test_daemon_status_request_response_round_trip() {
         // Per-exporter cells (#8756) — the round trip must preserve each
         // sink's independent entry.
         observability_exports: [(
-            "https".to_string(),
+            "otlp".to_string(),
             crate::types::ObservabilityExportStatus {
                 state: crate::types::ObservabilityExportState::Healthy,
-                exporter: Some("https".to_string()),
+                exporter: Some("otlp".to_string()),
                 // #9015: a healthy cell whose one verified hop is a LOCAL
                 // collector — the scope facts have to survive the wire, or the
                 // reading client is back to inferring them.
@@ -206,30 +205,6 @@ fn test_daemon_status_request_response_round_trip() {
             detail: Some("robb-studio per 2am#3649".to_string()),
             since: None,
             kinds: Vec::new(),
-        }),
-        forge_events: Some(crate::types::ForgeEventsStatus {
-            state: crate::types::ForgeEventsState::Backoff,
-            endpoint: Some("https://events.internal".to_string()),
-            host_id: Some("robb-studio".to_string()),
-            cursor: 4096,
-            pages_observed: 12,
-            events_observed: 340,
-            consecutive_failures: 5,
-            poll_interval_secs: 300,
-            last_error: Some("auth_failed".to_string()),
-            // #8995: the wake counters are collected in the daemon process and
-            // rendered by the CLI in another, so they only exist as an operator
-            // surface if they survive this hop.
-            wakes: vec![crate::types::ForgeEventsWakeStatus {
-                consumer: "claim-reconcile wake".to_string(),
-                config_key: "claimReconcileWake".to_string(),
-                cadence_secs: 600,
-                min_spacing_secs: 30,
-                prompts: 9,
-                early_ticks: 2,
-                throttled: 7,
-            }],
-            ..Default::default()
         }),
         peer_claims: None,
         deep_clean: Vec::new(),
@@ -264,9 +239,11 @@ fn test_daemon_status_request_response_round_trip() {
             assert!(sessions.degraded);
             assert_eq!(sessions.accounts[0].state, "stopped");
             assert_eq!(r.token_pool_dir, Some(std::path::PathBuf::from("/repo/a/.loom/tokens")));
-            assert_eq!(r.disk_headroom, 10);
             assert_eq!(r.logical_cpus, 8);
             assert!(r.auto_update_enabled);
+            let host = r.host_update.as_ref().expect("host update survives"); // #12420
+            assert_eq!(host.state.as_str(), "H3");
+            assert_eq!(host.target_source.as_str(), "floor");
             assert_eq!(
                 r.auto_update_mode.as_deref(),
                 Some("fleet floor only (autoUpdate.enabled=false)")
@@ -298,14 +275,6 @@ fn test_daemon_status_request_response_round_trip() {
             assert!(!r.per_repo[0].health_gate_not_evaluated);
             assert_eq!(r.main_health_gate_enabled, Some(true));
             assert!(r.main_health_gate_verdict_at.is_some());
-            // #4830: the host-identity mismatch survives the wire so a
-            // `health` client in another process can render the note.
-            let mismatch = r
-                .observability_host_id_mismatch
-                .as_ref()
-                .expect("mismatch round-trips");
-            assert_eq!(mismatch.daemon_host_id, "robb-studio");
-            assert_eq!(mismatch.ingest_host_id, "robb-pro");
             // #5083: the positive export record survives the wire too —
             // this is what lets a `status`/`health` client in another
             // process state that telemetry IS (or is not) landing rather
@@ -314,9 +283,8 @@ fn test_daemon_status_request_response_round_trip() {
                 .observability_export
                 .as_ref()
                 .expect("export status round-trips");
-            assert_eq!(export.state, crate::types::ObservabilityExportState::HostIdMismatch);
+            assert_eq!(export.state, crate::types::ObservabilityExportState::Healthy);
             assert_eq!(export.host_id.as_deref(), Some("robb-studio"));
-            assert_eq!(export.ingest_host_id.as_deref(), Some("robb-pro"));
             assert_eq!(export.records_exported, 128);
             // #9015: how far the state reaches travels with it — always
             // first-hop today, plus whether that hop is a local collector.
@@ -324,36 +292,13 @@ fn test_daemon_status_request_response_round_trip() {
             assert!(!export.endpoint_loopback, "a remote endpoint is not a local hop");
             let local_cell = r
                 .observability_exports
-                .get("https")
+                .get("otlp")
                 .expect("per-exporter cell round-trips");
             assert_eq!(local_cell.scope, crate::types::ObservabilityExportScope::FirstHop);
             assert!(
                 local_cell.endpoint_loopback,
                 "the per-exporter cell keeps its own local-collector flag"
             );
-            // ADR-0021 (#8765): the feed-consumer record survives the wire
-            // too, including the error CLASS underneath a backoff promotion
-            // — `backoff` answers "how often is it retrying", never "why".
-            let feed = r
-                .forge_events
-                .as_ref()
-                .expect("forge_events status round-trips");
-            assert_eq!(feed.state, crate::types::ForgeEventsState::Backoff);
-            assert_eq!(feed.host_id.as_deref(), Some("robb-studio"));
-            assert_eq!(feed.cursor, 4096);
-            assert_eq!(feed.events_observed, 340);
-            assert_eq!(feed.last_error.as_deref(), Some("auth_failed"));
-            assert_eq!(feed.poll_interval_secs, 300);
-            // #8995 item 3: one entry per ARMED consumer, keyed by the flag an
-            // operator greps their config for, with the counters intact — a
-            // truncated `wakes` would render as "armed and idle", which is a
-            // different answer from the truth.
-            let wake = feed.wakes.first().expect("an armed consumer round-trips");
-            assert_eq!(wake.config_key, "claimReconcileWake");
-            assert_eq!(wake.consumer, "claim-reconcile wake");
-            assert_eq!((wake.prompts, wake.early_ticks, wake.throttled), (9, 2, 7));
-            // Derived from the two cadence fields, so it must carry them too.
-            assert_eq!(wake.max_multiplier(), 20);
             assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
             assert!(r.per_repo[0].health_gate_verdict_at.is_some());
             assert_eq!(

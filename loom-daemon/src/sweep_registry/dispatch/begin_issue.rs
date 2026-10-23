@@ -217,8 +217,6 @@ impl SweepRegistry {
                 );
             }
             SweepKind::PrSet(prs) => {
-                // #11191: disk admission, as for an issue before step 3.
-                crate::disk_admission::admit_dispatch(&sr.config.workspace_root, kind)?;
                 return Ok(BeginIssueDispatch::Done(sr.dispatch_prset_inner(
                     prs,
                     kind,
@@ -686,17 +684,6 @@ impl SweepRegistry {
             .into());
         }
 
-        // 2.98 Disk admission (#11191): the repo's measured disk charge must fit
-        //      the free space left after the halt floor and the growth the
-        //      in-flight sweeps are still expected to write. Last of the guards,
-        //      so a candidate another guard refuses never leaves a pending
-        //      reservation behind; before any claim, label or spawn. Every
-        //      dispatch route converges here — the work finder, the watchdogs'
-        //      re-dispatch (#3910) and PR-set conversion (#7649, the PrSet arm
-        //      above), the reaper's resume (#4256), IPC/CLI and the epic
-        //      supervisor — so none of them bypasses the work finder's rule.
-        crate::disk_admission::admit_dispatch(&sr.config.workspace_root, kind)?;
-
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         if let Some(selection) = &selection {
@@ -743,10 +730,6 @@ impl SweepRegistry {
         // round trips below have already spent wall-clock time.
         let episode_start = Utc::now();
         let mut lease_order_yield: Option<(String, String)> = None;
-        // #10345: set when the yield is the leaseless-label variant, with the
-        // local window of this dispatcher's own flip, so step 4d can tell a
-        // phantom (own flip misread) from a genuine hand-claim.
-        let mut leaseless_flip_window: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
         // #11304: set once the flip below succeeds, so the post-claim state
         // re-check (4e) only runs for a claim this dispatch actually took.
         let mut claim_flipped = false;
@@ -820,23 +803,46 @@ impl SweepRegistry {
                     //     from a lane that published no lease record — which
                     //     `yield_identity` reports through this same channel.
                     let decision = acc.unlocked(|r| {
-                        r.resolve_lease_order(issue_number, &sweep_id, episode_start)
+                        #[cfg(test)]
+                        if r.config.blind_lease_order {
+                            return r.resolve_lease_order(issue_number, &sweep_id, episode_start);
+                        }
+                        r.resolve_lease_order_fail_closed(issue_number, &sweep_id, episode_start)
                     });
                     // #11852: a crash resume re-claims the issue's own
                     // `loom:building`, kept while its PR is open — not a
                     // foreign leaseless claim. Lease-comment order still counts.
-                    let decision = match decision {
-                        LeaseOrderDecision::YieldToLeaselessClaim { .. }
-                            if resume_bypass_pr.is_some() =>
-                        {
-                            LeaseOrderDecision::Proceed
-                        }
-                        other => other,
-                    };
-                    if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. }) {
-                        leaseless_flip_window = Some((episode_start, Utc::now()));
+                    let mut decision = decision;
+                    if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. })
+                        && resume_bypass_pr.is_some()
+                    {
+                        decision = LeaseOrderDecision::Proceed;
                     }
-                    lease_order_yield = decision.yield_identity();
+                    // #10337: forge timestamps truncate our own flip to whole seconds.
+                    // Reuse #10345's actor/window/lease proof BEFORE yielding, so the
+                    // sole owner keeps building. A peer lease verdict is never waived.
+                    if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. })
+                        && acc.unlocked(|r| {
+                            r.leaseless_yield_is_own_phantom(
+                                issue_number,
+                                &sweep_id,
+                                episode_start,
+                                Utc::now(),
+                            )
+                        })
+                    {
+                        decision = LeaseOrderDecision::Proceed;
+                    }
+                    // #12571: an unverified order is "not ours" — stand down
+                    // and retry later rather than build blind.
+                    lease_order_yield = if decision == LeaseOrderDecision::Unverified {
+                        Some((
+                            guards::claim_label::UNVERIFIED_LEASE_HOST.to_string(),
+                            guards::claim_label::UNVERIFIED_LEASE_SWEEP.to_string(),
+                        ))
+                    } else {
+                        decision.yield_identity()
+                    };
                 }
                 Err(e) => {
                     log::warn!(
@@ -894,34 +900,17 @@ impl SweepRegistry {
                     sr.inflight_idempotency.remove(key);
                 }
             }
-            // #10345: a leaseless yield whose `loom:building` event is provably
-            // this dispatcher's own flip (fleet actor, inside the flip window,
-            // no foreign lease) is a phantom: revert it in the same step so the
-            // issue is not stranded. Anything unverifiable keeps the label.
-            if let Some((flip_start, flip_end)) = leaseless_flip_window {
-                if acc.unlocked(|r| {
-                    r.leaseless_yield_is_own_phantom(issue_number, &sweep_id, flip_start, flip_end)
-                }) {
-                    log::warn!(
-                        "sweep_registry: leaseless yield for issue #{issue_number} \
-                         sweep_id={sweep_id} is this dispatcher's own phantom `loom:building` \
-                         (#10345) - reverting the label before standing down."
+            // No peer won an unverified order, so there is nothing to annotate.
+            if earliest_host != guards::claim_label::UNVERIFIED_LEASE_HOST {
+                acc.unlocked(|r| {
+                    r.post_lease_yield_comment(
+                        issue_number,
+                        &sweep_id,
+                        &earliest_host,
+                        &earliest_sweep_id,
                     );
-                    if let Err(e) = acc.unlocked(|r| r.restore_label_to_ready(issue_number)) {
-                        log::warn!(
-                            "sweep_registry: phantom-claim revert for #{issue_number} failed: {e}"
-                        );
-                    }
-                }
+                });
             }
-            acc.unlocked(|r| {
-                r.post_lease_yield_comment(
-                    issue_number,
-                    &sweep_id,
-                    &earliest_host,
-                    &earliest_sweep_id,
-                );
-            });
             return Err(LeaseOrderDispatchError {
                 issue: issue_number,
                 sweep_id: sweep_id.clone(),

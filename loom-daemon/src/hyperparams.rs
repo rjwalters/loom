@@ -42,7 +42,7 @@
 //!    run is reproducible from the exact vector it ran under.
 //!
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
-//! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}` (plus
+//! `dispatch.{tickIntervalSecs,maxConcurrent}` (plus
 //! the item draw's `dispatch.{itemWeight*,itemAge*,backlogExponent,busyExponent}`,
 //! #11896, #12185),
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
@@ -68,8 +68,7 @@ use crate::config_resolver;
 use crate::step_dispatch::item_draw;
 use crate::work_finder::{
     build_backoff::{BuildBackoffConfig, DEFAULT_HIGH, DEFAULT_LOW},
-    DEFAULT_MAX_ADMISSIONS_PER_TICK, DEFAULT_WORK_FINDER_INTERVAL_SECS,
-    DEFAULT_WORK_FINDER_MAX_CONCURRENT,
+    DEFAULT_WORK_FINDER_INTERVAL_SECS, DEFAULT_WORK_FINDER_MAX_CONCURRENT,
 };
 
 /// Env var carrying a **hyperparameter vector** as a JSON object — the
@@ -112,15 +111,9 @@ pub struct DispatchParams {
     /// Operator ceiling on concurrent sweeps this host admits. Source:
     /// `work_finder::DEFAULT_WORK_FINDER_MAX_CONCURRENT` (3). Legacy:
     /// `autonomous.workFinder.maxConcurrent`; env:
-    /// `LOOM_WORK_FINDER_MAX_CONCURRENT`. The dynamic cap is additionally
-    /// bounded by disk/RAM headroom, so this is an upper bound, not a target.
-    /// Range `[1, 256]`.
+    /// `LOOM_WORK_FINDER_MAX_CONCURRENT`. This is the cap, and nothing else
+    /// limits it (#12406). Range `[1, 256]`.
     pub max_concurrent: usize,
-    /// How many *new* sweeps one tick may admit (the #4234 ramp cap).
-    /// Source: `work_finder::DEFAULT_MAX_ADMISSIONS_PER_TICK` (3). Legacy:
-    /// `autonomous.workFinder.maxAdmissionsPerTick`; env:
-    /// `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK`. Range `[1, 64]`.
-    pub max_admissions_per_tick: usize,
     /// The step engine's item-draw priority factor for a red-main fix
     /// (`dispatch.itemWeightRedMain`, #11896). Default 50. Range
     /// `[1, 1000000]`. No legacy home, no single-knob env.
@@ -230,7 +223,6 @@ impl Default for Hyperparameters {
             dispatch: DispatchParams {
                 tick_interval_secs: DEFAULT_WORK_FINDER_INTERVAL_SECS,
                 max_concurrent: DEFAULT_WORK_FINDER_MAX_CONCURRENT,
-                max_admissions_per_tick: DEFAULT_MAX_ADMISSIONS_PER_TICK,
                 item_weight_red_main: item_draw::DEFAULT_WEIGHT_RED_MAIN,
                 item_weight_very_important: item_draw::DEFAULT_WEIGHT_VERY_IMPORTANT,
                 item_weight_important: item_draw::DEFAULT_WEIGHT_IMPORTANT,
@@ -383,7 +375,6 @@ impl std::fmt::Display for Violation {
 /// Range checks for the integer fields, as `(min, max)` inclusive.
 const TICK_INTERVAL_SECS_RANGE: (u64, u64) = (5, 3600);
 const MAX_CONCURRENT_RANGE: (u64, u64) = (1, 256);
-const MAX_ADMISSIONS_PER_TICK_RANGE: (u64, u64) = (1, 64);
 const LEASE_TTL_MINUTES_MAX: f64 = 1440.0;
 const IDLE_EXIT_MINUTES_RANGE: (u64, u64) = (1, 10080);
 const BUILD_BACKOFF_HIGH_RANGE: (u64, u64) = (1, 100_000);
@@ -476,7 +467,6 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
             key.as_str(),
             "tickIntervalSecs"
                 | "maxConcurrent"
-                | "maxAdmissionsPerTick"
                 | "itemWeightRedMain"
                 | "itemWeightVeryImportant"
                 | "itemWeightImportant"
@@ -487,6 +477,8 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
                 // Retired with the softmax (#11742) and the workspace draw
                 // (#12185). Still accepted, and ignored, so a host config
                 // that set them keeps starting (`--validate` warns).
+                // Retired with the per-tick ramp cap (#12406), the same way.
+                | "maxAdmissionsPerTick"
                 | "drawTemperature"
                 | "weightBonusRedMainFix"
                 | "weightBonusVeryImportant"
@@ -497,13 +489,6 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
     }
     check_u64(group, "dispatch", "tickIntervalSecs", TICK_INTERVAL_SECS_RANGE, violations);
     check_u64(group, "dispatch", "maxConcurrent", MAX_CONCURRENT_RANGE, violations);
-    check_u64(
-        group,
-        "dispatch",
-        "maxAdmissionsPerTick",
-        MAX_ADMISSIONS_PER_TICK_RANGE,
-        violations,
-    );
     for (key, range) in item_draw::HYPERPARAM_KEYS {
         check_u64(group, "dispatch", key, range, violations);
     }
@@ -542,8 +527,10 @@ pub fn retired_dispatch_keys(layer: &Value) -> Vec<&'static str> {
 
 /// `hyperparameters.dispatch` keys still accepted and ignored. `drawTemperature`
 /// went with the softmax (#11742); the `weightBonus*` points went with the
-/// workspace draw (#12185), whose job the item weights' priority factors do.
-const RETIRED_DISPATCH_KEYS: [&str; 4] = [
+/// workspace draw (#12185), whose job the item weights' priority factors do;
+/// `maxAdmissionsPerTick` went with the per-tick ramp cap (#12406).
+const RETIRED_DISPATCH_KEYS: [&str; 5] = [
+    "maxAdmissionsPerTick",
     "drawTemperature",
     "weightBonusRedMainFix",
     "weightBonusVeryImportant",
@@ -848,15 +835,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 "maxConcurrent",
                 wf_legacy.max_concurrent.map(|n| n as u64),
                 DEFAULT_WORK_FINDER_MAX_CONCURRENT as u64,
-                &mut sources,
-            ) as usize,
-            max_admissions_per_tick: pick_u64(
-                vector.as_ref(),
-                &block,
-                "dispatch",
-                "maxAdmissionsPerTick",
-                wf_legacy.max_admissions_per_tick.map(|n| n as u64),
-                DEFAULT_MAX_ADMISSIONS_PER_TICK as u64,
                 &mut sources,
             ) as usize,
             item_weight_red_main: pick_item(0, item_draw::DEFAULT_WEIGHT_RED_MAIN),
@@ -1167,11 +1145,6 @@ impl HyperparamsArgs {
             "dispatch.maxConcurrent         = {:>6}  [{}]",
             resolved.params.dispatch.max_concurrent,
             resolved.sources["dispatch.maxConcurrent"].as_str()
-        );
-        println!(
-            "dispatch.maxAdmissionsPerTick  = {:>6}  [{}]",
-            resolved.params.dispatch.max_admissions_per_tick,
-            resolved.sources["dispatch.maxAdmissionsPerTick"].as_str()
         );
         let d = &resolved.params.dispatch;
         for (key, value) in [

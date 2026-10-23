@@ -225,11 +225,7 @@ pub struct IdleHold {
 /// cannot coexist with idle slots.
 #[must_use]
 pub fn waiting_ready(report: &TickReport) -> usize {
-    report.deferred_capacity
-        + report.deferred_ramp_cap
-        + report.deferred_saturation
-        + report.deferred_build_backoff
-        + report.deferred_repo_cap
+    report.deferred_capacity + report.deferred_build_backoff
 }
 
 /// The tick's idle-slot points, and the hold to keep for the next tick.

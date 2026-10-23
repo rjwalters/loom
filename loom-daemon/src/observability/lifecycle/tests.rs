@@ -202,11 +202,8 @@ fn role_invocation_ids_derive_from_role_and_start_instant() {
     assert_eq!(judge, role_execution_id("judge", at), "recomputable");
     let curator = role_execution_id("curator", at);
     let ws = std::path::Path::new("/nonexistent/loom");
-    let (a, b) = (
-        TraceStore::root_context(ws, &judge, None),
-        TraceStore::root_context(ws, &curator, None),
-    );
-    assert_eq!(a, TraceStore::root_context(ws, &judge, None));
+    let (a, b) = (TraceStore::root_context(ws, &judge), TraceStore::root_context(ws, &curator));
+    assert_eq!(a, TraceStore::root_context(ws, &judge));
     assert_ne!(a.trace_id, b.trace_id);
     assert_ne!(a.span_id, b.span_id);
 }
@@ -291,6 +288,154 @@ fn host_and_admission_attributes_survive_the_span_allowlist() {
             "host attribute {key} was dropped or mangled by the allowlist"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #12113: role-span host attributes read the `host_status` latest record
+// ---------------------------------------------------------------------------
+
+use crate::host_status::TEST_SLOT as HOST_STATUS_SLOT;
+
+fn host_record(raw: &[(&str, f64)]) -> crate::telemetry::kinds::host_status::HostStatusRecord {
+    crate::telemetry::kinds::host_status::HostStatusRecord {
+        captured_at: Utc::now(),
+        interval_secs: 5,
+        raw: raw.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        filtered: Default::default(),
+        volumes: Vec::new(),
+    }
+}
+
+/// The four keys `host_status` supplies.
+const HOST_STATUS_KEYS: [&str; 4] = [
+    "loom.host.mem_available_bytes",
+    "loom.host.swap_used_bytes",
+    "loom.host.pressure",
+    "loom.host.load_per_core",
+];
+
+#[test]
+fn host_attributes_read_the_latest_host_status_record() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 123_456.0),
+        ("swap_used_bytes", 789.0),
+        ("mem_pressure_grade", 1.0),
+        ("cpu_load_per_core", 0.5),
+    ]));
+    let attrs = host_attributes();
+    crate::host_status::clear_latest();
+    assert_eq!(
+        attrs
+            .get("loom.host.mem_available_bytes")
+            .map(String::as_str),
+        Some("123456")
+    );
+    assert_eq!(attrs.get("loom.host.swap_used_bytes").map(String::as_str), Some("789"));
+    assert_eq!(attrs.get("loom.host.pressure").map(String::as_str), Some("some"));
+    assert_eq!(attrs.get("loom.host.load_per_core").map(String::as_str), Some("0.500"));
+}
+
+#[test]
+fn host_attributes_omit_signals_the_record_lacks() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // No record yet (first span before the first tick): all four are absent.
+    crate::host_status::clear_latest();
+    let none = host_attributes();
+    for key in HOST_STATUS_KEYS {
+        assert!(!none.contains_key(key), "{key} must be absent, not zero, with no record");
+    }
+    // A record with only some signals, and an unknown pressure grade.
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 42.0),
+        ("mem_pressure_grade", 7.0),
+    ]));
+    let partial = host_attributes();
+    crate::host_status::clear_latest();
+    assert_eq!(
+        partial
+            .get("loom.host.mem_available_bytes")
+            .map(String::as_str),
+        Some("42")
+    );
+    for key in [
+        "loom.host.swap_used_bytes",
+        "loom.host.pressure",
+        "loom.host.load_per_core",
+    ] {
+        assert!(!partial.contains_key(key), "{key} must be absent, not zero");
+    }
+}
+
+#[test]
+fn host_attributes_key_set_is_pinned() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 1.0),
+        ("swap_used_bytes", 1.0),
+        ("mem_pressure_grade", 0.0),
+        ("cpu_load_per_core", 1.0),
+    ]));
+    let attrs = host_attributes();
+    crate::host_status::clear_latest();
+    let allowed = [
+        "loom.host.mem_total_bytes",
+        "loom.host.mem_available_bytes",
+        "loom.host.mem_compressed_bytes",
+        "loom.host.swap_total_bytes",
+        "loom.host.swap_used_bytes",
+        "loom.host.swap_in_bytes_total",
+        "loom.host.swap_out_bytes_total",
+        "loom.host.oom_kill_total",
+        "loom.host.pressure",
+        "loom.host.load_per_core",
+        "loom.host.logical_cpus",
+        "loom.host.loadavg_1m",
+    ];
+    for key in attrs.keys() {
+        assert!(allowed.contains(&key.as_str()), "unexpected host attribute {key}");
+    }
+    for key in HOST_STATUS_KEYS {
+        assert!(attrs.contains_key(key), "{key} missing");
+    }
+}
+
+#[test]
+fn host_attributes_carry_the_cpu_count() {
+    let attrs = host_attributes();
+    let cpus: u64 = attrs["loom.host.logical_cpus"].parse().unwrap();
+    assert!(cpus >= 1);
+    // The load average is absent when unmeasurable, never zero-filled.
+    if let Some(load) = attrs.get("loom.host.loadavg_1m") {
+        assert!(load.parse::<f64>().unwrap() >= 0.0);
+    }
+}
+
+#[test]
+fn spawn_budget_attributes_require_integers_of_at_least_one() {
+    let ok = spawn_budget_from(Some("6"), Some(" 3 "));
+    assert_eq!(ok["loom.host.cpu_budget_cores"], "6");
+    assert_eq!(ok["loom.host.sweeps_in_flight"], "3");
+    for bad in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("abc"),
+        Some("-2"),
+        Some("1.5"),
+    ] {
+        let attrs = spawn_budget_from(bad, bad);
+        assert!(attrs.is_empty(), "{bad:?} must leave both keys absent");
+    }
+    let half = spawn_budget_from(Some("4"), None);
+    assert!(half.contains_key("loom.host.cpu_budget_cores"));
+    assert!(!half.contains_key("loom.host.sweeps_in_flight"));
 }
 
 // ---------------------------------------------------------------------------
@@ -953,10 +1098,10 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
     }
 }
 
-/// #11982: the sweep root names its issue and base SHA even when `repo_id` did
-/// not resolve (no story), and gains the issue branch's head SHA at close.
+/// #11982: the sweep root names its issue and base SHA even when the repo's
+/// GitHub identity did not resolve, and gains the issue branch's head SHA at close.
 #[test]
-fn sweep_root_carries_issue_and_commit_facts_without_a_story() {
+fn sweep_root_carries_issue_and_commit_facts_without_a_resolved_identity() {
     let (dir, base, head) = git_facts::tests::repo_with_branch();
     let root_dir = dir.path();
     std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
@@ -967,9 +1112,9 @@ fn sweep_root_carries_issue_and_commit_facts_without_a_story() {
     .unwrap();
     let mut command = Command::new("true");
     TraceStore::new(root_dir)
-        .load_or_create_story(root_dir, "sweep-11982", None)
+        .load_or_create(root_dir, "sweep-11982")
         .unwrap();
-    prepare_execution(&mut command, root_dir, "sweep-11982", None, Some(42));
+    prepare_execution(&mut command, root_dir, "sweep-11982", Some(42));
     let journal = Journal::for_context(&TraceStore::new(root_dir).path(root_dir, "sweep-11982"));
     let open = journal.active().unwrap();
     let attrs = &open[0].record.attributes;
@@ -1067,4 +1212,120 @@ fn only_a_steps_sweep_id_marks_a_step_journal() {
         .unwrap();
     assert_eq!(step_sweep_id(&journal.active().unwrap()), None);
     assert!(!running_step(dir.path(), &journal));
+}
+
+// ---------------------------------------------------------------------------
+// #12884: the open-time load sample survives the close on the drained span
+// ---------------------------------------------------------------------------
+
+fn publish_load(load_per_core: f64) {
+    crate::host_status::publish(&host_record(&[("cpu_load_per_core", load_per_core)]));
+}
+
+/// Asserts a drained, export-bounded span carries `open` under the start key
+/// and `close` under the plain (close-time) key, and that the raw load average
+/// keeps a start copy whenever the host measures one.
+fn assert_start_and_close_load(
+    span: &crate::telemetry::trace::SpanRecord,
+    open: &str,
+    close: &str,
+) {
+    let exported = span.clone().bounded();
+    let attrs = &exported.attributes;
+    let name = span.name;
+    assert_eq!(
+        attrs
+            .get("loom.host.start.load_per_core")
+            .map(String::as_str),
+        Some(open),
+        "{name:?}: start key must keep the open-time sample"
+    );
+    assert_eq!(
+        attrs.get("loom.host.load_per_core").map(String::as_str),
+        Some(close),
+        "{name:?}: plain key is the close-time sample"
+    );
+    assert_eq!(
+        attrs.contains_key("loom.host.start.loadavg_1m"),
+        attrs.contains_key("loom.host.loadavg_1m"),
+        "{name:?}: the load average keeps a start copy exactly when it is measured"
+    );
+}
+
+#[test]
+fn drained_sweep_and_phase_spans_keep_the_open_load_beside_the_close_load() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let store = TraceStore::new(root_dir);
+    let saved = store.load_or_create(root_dir, "sweep-12884").unwrap();
+    let journal = Journal::for_context(&store.path(root_dir, "sweep-12884"));
+    publish_load(0.5);
+    prepare_execution(&mut Command::new("true"), root_dir, "sweep-12884", None);
+    checkpoint_begin_observation(&journal, &saved.context, None, 12884, "builder", None, None)
+        .unwrap();
+    publish_load(3.25);
+    finish_execution(root_dir, "sweep-12884", "success", TraceAttributes::new()).unwrap();
+    crate::host_status::clear_latest();
+    let spans = drained_spans(&journal);
+    for name in [SpanName::Sweep, SpanName::Phase, SpanName::RoleAttempt] {
+        let span = spans.iter().find(|s| s.name == name).unwrap();
+        assert_start_and_close_load(span, "0.500", "3.250");
+    }
+}
+
+#[test]
+fn a_checkpoint_completion_keeps_the_begin_load_and_a_synthetic_one_its_only_sample() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    publish_load(0.5);
+    checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
+    publish_load(3.25);
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        1,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    // No begin for issue 2: the synthetic phase opens and closes on one sample.
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        2,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    crate::host_status::clear_latest();
+    let spans = drained_spans(&journal);
+    assert_eq!(spans.len(), 4);
+    for span in &spans {
+        let close = "3.250";
+        let open = if span.attributes["loom.issue"] == "1" {
+            "0.500"
+        } else {
+            close
+        };
+        assert_start_and_close_load(span, open, close);
+    }
 }
