@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-23
 
+- **PR #13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
+- **Issue #13030** (closed): Name Champion's criteria and kept-set entries by meaning, not number (criterion #3 → critical-files)
 - **PR #12990**: refactor: share git/ANSI helpers across worktree_cli verb modules
 - **PR #13000**: feat: add Champion ratification hard hold for specs that ratify on merge
 - **PR #13058**: fix: refuse post-verdict approvals when the caller holds no live Judge lease
