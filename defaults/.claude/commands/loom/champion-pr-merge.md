@@ -519,7 +519,9 @@ behavior is byte-for-byte unchanged from before #6850.
   matched against every **added or removed line** (leading `+`/`-` stripped)
   of every changed file, read fresh from the paginated files API (e.g.
   `^\s*permissions:`, `id-token`, `secrets\.`, `pull_request_target`). One
-  matching line disqualifies the PR from the class. **Fail closed**: an
+  matching line disqualifies the PR from the class. Whole-line `#` comments are
+  ignored and the literal `secrets.GITHUB_TOKEN` is stripped before matching
+  (#12995); any other `secrets.*` still matches. **Fail closed**: an
   unreadable diff, a changed file the API returns no patch for (binary, or
   too large to inline), or an invalid regex also disqualifies it.
 - `privilegedContentPatterns` (#12954, optional) — regexes (jq `test()`, the
@@ -558,7 +560,7 @@ behavior is byte-for-byte unchanged from before #6850.
   `*install-loom.sh`, `*resync-installed.sh`,
   `*auto_update*`, `*daemon_update*`, `*install_binary*`, `*land-resync*`;
   worktree/branch deletion: `*worktree*`, `*cleanup-branches*`; the label
-  schema and its migrations: `*labels.yml`, `*labels.json`,
+  schema and its migrations: `.github/labels.yml`, `defaults/labels.json` (anchored paths, #12995),
   `*labels_migrate*`). The floor is a **denylist and errs broad**: the
   patterns are substrings rather than exact paths, so a new file in one of
   these areas is kept without a list edit, and a path matched by accident only
@@ -642,7 +644,10 @@ KEPT_SET_PATTERNS=(
   "*daemon_update*" "*daemon-update*" "*install_binary*" "*land-resync*"
   # Worktree and branch deletion, label schema and its migrations, migrations.
   "*worktree*" "*loom-clean*" "*cleanup-branches*"
-  "*labels.yml" "*labels.json" "*labels_migrate*"
+  # Anchored to the label-sync paths (#12995): a `labels.json` data file
+  # elsewhere (e.g. a Worker fixture) is not the label schema.
+  ".github/labels.yml" "*/.github/labels.yml" "defaults/labels.json"
+  "*/defaults/labels.json" "*labels_migrate*"
   "*migrations/*" "*_migration.py"
 )
 
@@ -864,7 +869,10 @@ standing_auth_eval() {
       CLASS_DIFF="$DIFF_JSON"
       [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
       printf '%s' "$CLASS_DIFF" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
-      LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
+      # Whole-line comments are dropped and the literal secrets.GITHUB_TOKEN is
+      # stripped (#12995), so any other secrets.* still matches.
+      LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]
+        | select(test("^\\s*#") | not) | gsub("secrets\\.GITHUB_TOKEN\\b"; "")]') || continue
       while IFS= read -r rx; do
         [ -z "$rx" ] && continue
         # Validate the regex on its own: `any` over zero lines never compiles it.
