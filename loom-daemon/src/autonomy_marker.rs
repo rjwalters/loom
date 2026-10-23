@@ -189,40 +189,15 @@ pub fn render_marker(fields: &MarkerFields) -> String {
 /// temp file + atomic rename, so a concurrent watchdog read never sees a torn
 /// file. Returns a human-readable reason on any I/O failure (never fatal).
 fn write_marker_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(format!("could not create {}: {e}", parent.display()));
-        }
-    }
-    let tmp = path.with_extension(format!("autonomy.tmp.{}", uuid::Uuid::new_v4()));
-
-    let write_result = {
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .and_then(|mut f| f.write_all(contents.as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, contents.as_bytes())
-        }
-    };
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not write temp marker {}: {e}", tmp.display()));
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not rename marker into place {}: {e}", path.display()));
-    }
-    Ok(())
+    crate::fs_util::write_atomic(
+        path,
+        contents.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("could not write marker {}: {e}", path.display()))
 }
 
 /// Core, side-effect-scoped healing decision: given the resolved supervisor, the
