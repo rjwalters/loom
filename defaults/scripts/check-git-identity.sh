@@ -37,7 +37,7 @@
 #
 #   4. MISSING IDENTITY: no explicit author identity at any scope or in the
 #      environment, so git would invent `user@hostname` (#13088: a fleet PR
-#      was authored as `Ubuntu <ubuntu@ip-172-31-76-7.ec2.internal>`). Probed
+#      was authored as `Ubuntu <user@hostname>`). Probed
 #      mechanically with `git -c user.useConfigOnly=true var GIT_AUTHOR_IDENT`,
 #      which fails unless name and email are both explicit; `GIT_AUTHOR_*` env
 #      identities count as explicit. Reported as exit 4 with remediation.

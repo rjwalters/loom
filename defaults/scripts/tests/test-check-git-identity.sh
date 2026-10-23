@@ -284,7 +284,7 @@ git config --file "$FULL_GLOBAL" user.name "Dev"
 git config --file "$FULL_GLOBAL" user.email "dev@example.org"
 run_check_noenv "$REPO" "$FULL_GLOBAL"
 if [[ "$RC" -eq 0 ]]; then pass "global name+email -> exit 0"; else fail "global: expected 0, got rc=$RC; out=$OUT"; fi
-OUT=$(cd "$REPO" && GIT_AUTHOR_NAME=Dev GIT_AUTHOR_EMAIL=dev@corp.io GIT_CONFIG_GLOBAL="$EMPTY_GLOBAL" GIT_CONFIG_NOSYSTEM=1 "$SCRIPT" 2>&1); RC=$?
+OUT=$(cd "$REPO" && GIT_AUTHOR_NAME=Dev GIT_AUTHOR_EMAIL=dev@example.org GIT_CONFIG_GLOBAL="$EMPTY_GLOBAL" GIT_CONFIG_NOSYSTEM=1 "$SCRIPT" 2>&1); RC=$?
 if [[ "$RC" -eq 0 ]]; then pass "env identity -> exit 0"; else fail "env: expected 0, got rc=$RC; out=$OUT"; fi
 rm -rf "$REPO"
 
