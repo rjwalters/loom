@@ -84,7 +84,6 @@ use crate::observability::ops::liveness::{self, Fault};
 use crate::task_liveness::AUTO_UPDATE;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -214,14 +213,14 @@ pub fn store(path: &Path, state: &PersistedState) -> std::io::Result<()> {
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".auto_update_state.")
-        .suffix(".tmp")
-        .tempfile_in(dir)?;
-    tmp.write_all(&body)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
+    crate::fs_util::write_atomic(
+        path,
+        &body,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )?;
     // #10880 item 5: make the rename itself durable. Best-effort.
     report_dir_sync(dir, sync_dir(dir));
     Ok(())
