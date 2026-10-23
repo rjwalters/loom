@@ -1207,6 +1207,12 @@ pub struct PeerClaimView {
     /// into `counters.received` — a heartbeat proves a peer is alive, not
     /// that a dispatch claim arrived.
     last_heartbeat_received_at: Option<Instant>,
+    /// Local [`Instant`] at which THIS host last sent its own heartbeat —
+    /// the per-process gate [`Self::take_heartbeat_slot_at`] keeps so a
+    /// daemon managing many workspaces (one reaper each, all sharing this
+    /// view) sends one heartbeat per interval rather than one per workspace.
+    /// Send-side only: never read by [`Self::evaluate_coordination`].
+    last_heartbeat_sent_at: Option<Instant>,
     /// Whether [`Self::evaluate_coordination`] currently judges coordination
     /// DEGRADED (Issue #6157).
     coordination_degraded: bool,
@@ -1368,6 +1374,7 @@ impl PeerClaimView {
             coordination_clock_base: None,
             last_received_at: None,
             last_heartbeat_received_at: None,
+            last_heartbeat_sent_at: None,
             coordination_degraded: false,
             coordination_degraded_since: None,
             consecutive_receives_while_degraded: 0,
@@ -1610,6 +1617,36 @@ impl PeerClaimView {
             return false; // never treat our own heartbeat as a peer's
         }
         self.last_heartbeat_received_at = Some(now);
+        true
+    }
+
+    /// Claim this host's heartbeat slot at `now`: `true` (and the slot is
+    /// taken) when no heartbeat was sent in the last `min_interval`, `false`
+    /// otherwise.
+    ///
+    /// Every managed workspace has its own reaper and every reaper ticks
+    /// [`crate::sweep_registry::SweepRegistry::publish_peer_heartbeat`], but
+    /// all of a process's registries share this one view — so gating here
+    /// turns "one heartbeat per workspace per tick" into one per host. That is
+    /// all a receiver needs: [`Self::observe_heartbeat_at`] keys on nothing
+    /// but the sender's host (to drop its own echo) and keeps a single
+    /// receive timestamp, so a peer cannot tell one heartbeat per interval
+    /// from ten.
+    ///
+    /// Callers pass an interval a little under the reaper tick. Each reaper
+    /// still ticks once per full interval, so the first tick past
+    /// `min_interval` always sends and, while the sending workspace stays
+    /// provisioned, the gap between heartbeats is at most one reaper
+    /// interval, as before. (If it is evicted another reaper takes over
+    /// within two intervals — far inside the receivers' 20-minute
+    /// receive-quiet grace, the only thing a heartbeat feeds.)
+    pub fn take_heartbeat_slot_at(&mut self, now: Instant, min_interval: Duration) -> bool {
+        if let Some(last) = self.last_heartbeat_sent_at {
+            if now.saturating_duration_since(last) < min_interval {
+                return false;
+            }
+        }
+        self.last_heartbeat_sent_at = Some(now);
         true
     }
 
