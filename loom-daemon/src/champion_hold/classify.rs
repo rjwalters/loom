@@ -118,6 +118,8 @@ impl PrClass {
             | PrClass::StrayOperator(HoldKind::MergeRisk) => "merge-risk",
             PrClass::ChampionHold(HoldKind::CriticalFile)
             | PrClass::StrayOperator(HoldKind::CriticalFile) => "critical-file",
+            PrClass::ChampionHold(HoldKind::Ratification)
+            | PrClass::StrayOperator(HoldKind::Ratification) => "ratification",
             PrClass::Clear | PrClass::ForeignPark => "-",
         };
         format!("{CLASSIFY_SENTINEL} state={} pr={pr} detail={detail}", self.state())

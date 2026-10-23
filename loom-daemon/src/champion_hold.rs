@@ -1,6 +1,7 @@
 //! Champion's own pull-request holds (#11861): the merge-risk hold
-//! (`champion-pr-merge.md`'s `merge-risk` criterion) and the critical-file hold
-//! (`champion-critical-file-hold.md`, the `critical-files` criterion).
+//! (`champion-pr-merge.md`'s `merge-risk` criterion), the critical-file hold
+//! (`champion-critical-file-hold.md`, the `critical-files` criterion) and the
+//! ratification hold (`champion-ratification-hold.md`, #12992, [`ratification`]).
 //!
 //! # The shape
 //!
@@ -32,6 +33,7 @@
 //! The marker strings are a wire format: they live in comments on open PRs.
 
 pub mod classify;
+pub mod ratification;
 
 /// The merge-risk hold notice's first line.
 pub const MERGE_RISK_HOLD_MARKER: &str = "<!-- champion:merge-risk-hold -->";
@@ -56,6 +58,8 @@ pub const HOLD_BY: &str = "champion";
 pub enum HoldKind {
     MergeRisk,
     CriticalFile,
+    /// The ratification hold (#12992): merging ratifies a spec/decision record.
+    Ratification,
 }
 
 impl HoldKind {
@@ -65,6 +69,7 @@ impl HoldKind {
         match self {
             HoldKind::MergeRisk => MERGE_RISK_HOLD_REASON,
             HoldKind::CriticalFile => CRITICAL_FILE_HOLD_REASON,
+            HoldKind::Ratification => ratification::HOLD_REASON,
         }
     }
 }
@@ -79,11 +84,23 @@ impl HoldKind {
 /// - Merge-risk: a hold notice (`startswith`) with no reversal block
 ///   (`contains`: it is embedded in the pre-merge comment) after it.
 ///
-/// A critical-file hold wins when both stand: it never auto-merges, so it is
-/// the stricter of the two.
+/// - Ratification (#12992): the latest of its three markers, as for the
+///   critical-file hold. It is read first and never waived by a standing
+///   authorization class.
+///
+/// A critical-file hold wins over merge-risk when both stand: it never
+/// auto-merges, so it is the stricter of the two. A ratification hold wins over
+/// both: only a person's release ends it.
 #[must_use]
 pub fn standing_hold<S: AsRef<str>>(comments: &[S]) -> Option<HoldKind> {
     let last = |pred: &dyn Fn(&str) -> bool| comments.iter().rposition(|c| pred(c.as_ref()));
+    let rt_hold = last(&|c| c.starts_with(ratification::HOLD_MARKER));
+    let rt_end = last(&|c| {
+        c.starts_with(ratification::CLEARED_MARKER) || c.starts_with(ratification::RELEASED_MARKER)
+    });
+    if rt_hold.is_some_and(|h| rt_end.is_none_or(|e| h > e)) {
+        return Some(HoldKind::Ratification);
+    }
     let cf_hold = last(&|c| c.starts_with(CRITICAL_FILE_HOLD_MARKER));
     let cf_end = last(&|c| {
         c.starts_with(CRITICAL_FILE_CLEARED_MARKER) || c.starts_with(CRITICAL_FILE_RELEASED_MARKER)
@@ -257,7 +274,9 @@ pub const DOCTOR_CYCLE_CAP_PHRASE: &str = "doctor cycle exhausted";
 pub fn doctor_cycle_capped<C: AsRef<str>>(trusted: &[C]) -> bool {
     let hold = trusted.iter().rposition(|c| {
         let c = c.as_ref();
-        c.starts_with(MERGE_RISK_HOLD_MARKER) || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+        c.starts_with(MERGE_RISK_HOLD_MARKER)
+            || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+            || c.starts_with(ratification::HOLD_MARKER)
     });
     trusted.iter().enumerate().any(|(i, c)| {
         let c = c.as_ref();
@@ -280,7 +299,9 @@ pub const CAPPED_HOLD_RECOMMENDATION_MARKER: &str = "<!-- champion:capped-hold-r
 pub fn capped_hold_routed<C: AsRef<str>>(trusted: &[C]) -> bool {
     let hold = trusted.iter().rposition(|c| {
         let c = c.as_ref();
-        c.starts_with(MERGE_RISK_HOLD_MARKER) || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+        c.starts_with(MERGE_RISK_HOLD_MARKER)
+            || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+            || c.starts_with(ratification::HOLD_MARKER)
     });
     trusted.iter().enumerate().any(|(i, c)| {
         hold.is_none_or(|h| i > h) && c.as_ref().starts_with(CAPPED_HOLD_RECOMMENDATION_MARKER)
@@ -343,9 +364,11 @@ pub fn judge_may_review<L: AsRef<str>, C: AsRef<str>>(labels: &[L], trusted: &[C
 pub fn body_declares_hold(body: &str) -> bool {
     crate::park_record::parse(body).iter().any(|r| {
         r.blocker.is_none()
-            && r.reason
-                .as_deref()
-                .is_some_and(|x| x == MERGE_RISK_HOLD_REASON || x == CRITICAL_FILE_HOLD_REASON)
+            && r.reason.as_deref().is_some_and(|x| {
+                x == MERGE_RISK_HOLD_REASON
+                    || x == CRITICAL_FILE_HOLD_REASON
+                    || x == ratification::HOLD_REASON
+            })
     })
 }
 
@@ -392,6 +415,31 @@ mod tests {
         let mr = format!("{MERGE_RISK_HOLD_MARKER}\nx");
         let cf = format!("{CRITICAL_FILE_HOLD_MARKER}\ny");
         assert_eq!(standing_hold(&[cf.as_str(), mr.as_str()]), Some(HoldKind::CriticalFile));
+    }
+
+    #[test]
+    fn a_ratification_hold_outranks_the_others_and_ends_only_on_its_markers() {
+        use ratification::{CLEARED_MARKER, HOLD_MARKER, RELEASED_MARKER};
+        let rt = format!("{HOLD_MARKER}\nmerging ratifies");
+        let cf = format!("{CRITICAL_FILE_HOLD_MARKER}\ny");
+        let mr = format!("{MERGE_RISK_HOLD_MARKER}\nx");
+        assert_eq!(
+            standing_hold(&[cf.as_str(), mr.as_str(), rt.as_str()]),
+            Some(HoldKind::Ratification)
+        );
+        let released = format!("{RELEASED_MARKER}\nreleased");
+        let cleared = format!("{CLEARED_MARKER}\ncleared");
+        assert_eq!(standing_hold(&[rt.as_str(), released.as_str()]), None);
+        assert_eq!(standing_hold(&[rt.as_str(), cleared.as_str()]), None);
+        // The hold is a Champion hold: the janitor leaves `loom:pr` beside it,
+        // and the capped-PR pass sees it as the hold it must not outlive.
+        assert!(is_champion_hold(&["loom:pr", "loom:blocked"], &[rt.as_str()]));
+        assert!(body_declares_hold(&crate::park_record::render_park(
+            &[],
+            Some(HOLD_BY),
+            Some("2026-10-21T00:00:00Z"),
+            Some(HoldKind::Ratification.reason()),
+        )));
     }
 
     #[test]
