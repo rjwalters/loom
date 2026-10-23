@@ -15,6 +15,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-23
 
+- **PR #12990**: refactor: share git/ANSI helpers across worktree_cli verb modules
+- **PR #13000**: feat: add Champion ratification hard hold for specs that ratify on merge
+- **PR #13058**: fix: refuse post-verdict approvals when the caller holds no live Judge lease
+- **PR #13002**: feat: hold criterion #3 only on suspect manifest lines
+- **PR #13018**: fix: classify champion blast-eval workflows by capability, not basename
+- **Issue #12985** (closed): Dedupe git/ANSI helpers copied across worktree_cli verb modules
+- **Issue #12992** (closed): Champion: hard-hold PRs whose merge ratifies a spec/decision record (operator-only; never waived)
+- **Issue #13055** (closed): post-verdict.sh accepts a Judge verdict after the Judge's lease reclaim was refused
+- **Issue #12999** (closed): Champion criterion #3: hold critical files on suspect edits (dependencies, sources, build/install hooks), not on any edit
+- **Issue #12988** (closed): Champion blast eval: classify workflows by capability, not basename (align #12677 with #12958)
 - **PR #12996**: fix: anchor labels kept-set globs and ignore comments/GITHUB_TOKEN in forbiddenDiffPatterns
 - **Issue #12995** (closed): Champion: fix pattern over-matches (labels.json kept-set, comment lines, GITHUB_TOKEN) in forbiddenDiffPatterns
 - **PR #13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
