@@ -13,8 +13,25 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-23
+
+- **PR #13083**: refactor(mcp-loom): remove empty log-tools stub module
+- **Issue #13079** (closed): Remove empty mcp-loom log-tools stub module (logs.ts)
+- **PR #13080**: fix(safehouse): send dispatch digests without a task_id
+- **Issue #13077** (closed): Narration: dispatch_digest_<seq> task ids collide across hosts and restarts
+- **PR #13084**: refactor(daemon): remove dead classify_input and stale dead_code allows
+- **Issue #13081** (closed): Remove dead InFlightAgent::classify_input and stale allow(dead_code) in activity db
+
 ### 2026-10-22
 
+- **PR #13082**: test: pin stage-entry sources at tick level for mirror vs direct snapshots
+- **Issue #12312** (closed): Direct backend: standalone Loom discovery (GitHub or Gitea, `gh` only, the default), forge-neutral, one snapshot per tick, ETag cache and gatherConcurrency; CI parity tests for both forges
+- **PR #13075**: feat: keep one in-place status reaction per issue thread root in the fleet room
+- **Issue #13069** (closed): Narration: one status line per issue in the fleet room (react/edit in place, never touch the completion)
+- **PR #13072**: feat: route handoff envelopes to optional alerts room
+- **Issue #13070** (closed): Narration: optional alerts room for handoff/fleet-degraded envelopes (LOOM_SAFEHOUSE_ROOM_ALERTS)
+- **PR #13076**: fix(safehouse): stop claim ads threading, one heartbeat per host, qualify child task ids
+- **PR #13073**: chore(deps): Bump ip-address from 10.7.2 to 10.7.4 in /mcp-loom
 - **PR #13060**: feat: post a daemon-side reason comment when a Builder step ends noop or failed
 - **Issue #13054** (closed): Already-satisfied or verification-only issues loop: a no-op Builder result returns them to loom:issue and they are re-offered indefinitely
 - **PR #13066**: fix(security): refresh certificate validation and image runtimes
