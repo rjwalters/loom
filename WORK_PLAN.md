@@ -10,22 +10,14 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
 - **#12262**: fix: track cd in subshells, brace groups and pushd in write-confinement guard
-- **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
-- **#12381**: ci: make the macOS flake-shell leg of CI Daily advisory
 - **#12522**: fix: shed reads on failed roster load, withdraw evidence-free 404s briefly
 - **#12969**: feat: age-bound Codex rollout history in live profiles
-- **#12990**: refactor: share git/ANSI helpers across worktree_cli verb modules
-- **#12996**: fix: anchor labels kept-set globs and ignore comments/GITHUB_TOKEN in forbiddenDiffPatterns
 - **#12997**: feat: let several criticalFilesOnly standing classes jointly cover a PR's critical files
-- **#13000**: feat: add Champion ratification hard hold for specs that ratify on merge
-- **#13002**: feat: hold criterion #3 only on suspect manifest lines
-- **#13014**: feat: publish loom-tools release assets and add a daemon-free tools-only installer
-- **#13015**: feat(merge-pr): port the post-merge issue bookkeeping to one Rust orchestrator (#8191 slice)
-- **#13018**: fix: classify champion blast-eval workflows by capability, not basename
-- **#13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
-- **#13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
 - **#13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
+- **#13063**: feat: report and reset stale local branches reused by worktree.sh
+- **#13090**: fix: refuse to commit under a hostname-fallback git identity
+- **#13097**: feat(champion): pass the kept-set hold for byte-matching resync PRs
 
 ## Very Important
 
@@ -46,15 +38,12 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#11787**: issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate)
 - **#12085**: Telemetry(doctor): structured parked-PR cause (park reason, doctor_cycles, queue gate, treating age) (ETA doctor, loom-ui#4063 #6)
 - **#12217**: github-events mirror reads stale for quiet repos (1555 stale vs 1049 hits/h), so the step gather falls back to REST
-- **#12312**: Direct backend: standalone Loom discovery (GitHub or Gitea, `gh` only, the default), forge-neutral, one snapshot per tick, ETag cache and gatherConcurrency; CI parity tests for both forges
 - **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue
 - **#12506**: merge sequencing: Phase 1 release skips some followers whose predecessor merged at the recorded head, and fail-closed holds emit no telemetry
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12653**: Emit merge_hold hold-cause + release-actor + merge-queue facts to SigNoz (unblocks merge_hold ETA prediction)
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
-- **#12988**: Champion blast eval: classify workflows by capability, not basename (align #12677 with #12958)
-- **#12992**: Champion: hard-hold PRs whose merge ratifies a spec/decision record (operator-only; never waived)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
 - **#13008**: Merge-risk holds are redrawn at their held head again: #12933 draws holds with no auth= digest, and only critical-file holds record one
 - **#13009**: Captain champion_merge slot stays held ~20 min after a successful /v1/release (holder outlives its release until lease expiry)
@@ -96,29 +85,27 @@ Issues currently being built (`loom:building`).
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
-- **#12940**: loom-tools Phase 2d: release loom-tools assets and a tools-only installer — epic #12708
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
-- **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache
-- **#12985**: Dedupe git/ANSI helpers copied across worktree_cli verb modules
-- **#12988**: Champion blast eval: classify workflows by capability, not basename (align #12677 with #12958)
-- **#12992**: Champion: hard-hold PRs whose merge ratifies a spec/decision record (operator-only; never waived)
 - **#12994**: Champion: let the union of eligible criticalFilesOnly classes cover a PR's critical files
-- **#12995**: Champion: fix pattern over-matches (labels.json kept-set, comment lines, GITHUB_TOKEN) in forbiddenDiffPatterns
-- **#12999**: Champion criterion #3: hold critical files on suspect edits (dependencies, sources, build/install hooks), not on any edit
-- **#13006**: Emit the daemon's captain status as a native OTLP carrier (is_captain) for the dashboard's SigNoz Live board
 - **#13007**: Carry the remaining queue-plan fields (urgent, operator_priority, tier, workspace_weight, shard, listing_failed, seen) over OTLP for the dashboard's SigNoz Live board
 - **#13008**: Merge-risk holds are redrawn at their held head again: #12933 draws holds with no auth= digest, and only critical-file holds record one
 - **#13009**: Captain champion_merge slot stays held ~20 min after a successful /v1/release (holder outlives its release until lease expiry)
 - **#13026**: Champion: make per-repo merge concurrency a runtime tunable, and take hold re-reads out of the merge lane
 - **#13029**: Telemetry: merge-lane waits, Champion re-read outcomes, fleet_dispatch call outcomes, held-PR gauge (gaps found 2026-10-20/21)
-- **#13030**: Name Champion's criteria and kept-set entries by meaning, not number (criterion #3 → critical-files)
-- **#13031**: Champion champion_merge merged two PRs touching .github/workflows/ci.yml with no critical-file hold or self-release record
 - **#13042**: Champion: let criticalFilesOnly standing authorizations compose per critical file
+- **#13056**: worktree.sh reuses a weeks-old local branch/worktree for an issue instead of starting from origin/main
+- **#13065**: Consolidate ~10 hand-rolled atomic-write helpers into fs_util::write_atomic
+- **#13085**: Consolidate 20 copy-pasted git() test helpers into loom-daemon/tests/common
+- **#13088**: Workers with no git identity commit as user@hostname; DCO repos then cycle Judge/Doctor before reaching the operator
+- **#13096**: Champion: let a Loom resync pass the kept-set hold when every kept-set file byte-matches the upstream tag
+- **#13099**: Epic revisit: a periodic role pass that expands starved epics (or escalates them) so the fleet doesn't run dry with open epics
+- **#13102**: Champion: opt-in additive-migrations exception to the migrations kept-set (CREATE IF NOT EXISTS / ADD COLUMN / INSERT OR IGNORE backfill)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
+- **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12466**: feat: reap idle worktrees of open issues and PRs
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
@@ -127,6 +114,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#13013**: fix: ignore heartbeat steps for ended assignments in the fleet captain
 - **#13028**: feat: make Champion merges per repo a runtime tunable
 - **#13034**: feat: export merge-lane waits and Champion run outcomes to OTLP
+- **#13103**: refactor: route five remaining atomic-write copies through fs_util::write_atomic
 
 ## Approved (Awaiting Merge)
 
@@ -134,27 +122,19 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#11803**: fix(daemon-stop): record operator stops instead of deleting intent; leave the watchdog armed
 - **#12262**: fix: track cd in subshells, brace groups and pushd in write-confinement guard
-- **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
-- **#12381**: ci: make the macOS flake-shell leg of CI Daily advisory
 - **#12442**: feat: restart the daemon onto the same binary for restart-required config
 - **#12522**: fix: shed reads on failed roster load, withdraw evidence-free 404s briefly
 - **#12969**: feat: age-bound Codex rollout history in live profiles
-- **#12990**: refactor: share git/ANSI helpers across worktree_cli verb modules
-- **#12996**: fix: anchor labels kept-set globs and ignore comments/GITHUB_TOKEN in forbiddenDiffPatterns
 - **#12997**: feat: let several criticalFilesOnly standing classes jointly cover a PR's critical files
-- **#13000**: feat: add Champion ratification hard hold for specs that ratify on merge
-- **#13002**: feat: hold criterion #3 only on suspect manifest lines
-- **#13010**: feat: emit loom.host.is_captain gauge over OTLP
 - **#13011**: fix: keep holds with no recorded auth digest at their head; export tick exclusions
 - **#13012**: feat: carry queue level, workspace_weight and seen over OTLP
-- **#13014**: feat: publish loom-tools release assets and add a daemon-free tools-only installer
-- **#13015**: feat(merge-pr): port the post-merge issue bookkeeping to one Rust orchestrator (#8191 slice)
-- **#13018**: fix: classify champion blast-eval workflows by capability, not basename
-- **#13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
-- **#13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
 - **#13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
+- **#13063**: feat: report and reset stale local branches reused by worktree.sh
+- **#13086**: refactor(tests): share one hermetic git helper across worktree differential tests
+- **#13090**: fix: refuse to commit under a hostname-fallback git identity
+- **#13097**: feat(champion): pass the kept-set hold for byte-matching resync PRs
 
 ## Proposed
 
@@ -210,7 +190,6 @@ Issues carrying `loom:curated`.
 - **#12248**: Retired hold labels: remove core registry/work_finder readers (1/3 of #11843) *(curated)*
 - **#12304**: Epic: fleet discovery from one mirror read per tick — zero forge reads for discovery; delete per-host listing paths *(curated)*
 - **#12311**: Discovery interface: mirror backend (one worklist read per tick, in-memory 304 cache), the config-chosen tier chain, and the step gather reading one snapshot *(curated)*
-- **#12312**: Direct backend: standalone Loom discovery (GitHub or Gitea, `gh` only, the default), forge-neutral, one snapshot per tick, ETag cache and gatherConcurrency; CI parity tests for both forges *(curated)*
 - **#12313**: `queue_blocked` reads the tick snapshot; delete its own listing and the captain queue-blocked facts on the mirror path *(curated)*
 - **#12314**: Quarantine reconciliation reads the discovery snapshot; delete its `loom:blocked` listing *(curated)*
 - **#12315**: Claim reconciliation's open-PR discovery listing reads the snapshot; its write-gating reads stay live *(curated)*
@@ -235,31 +214,30 @@ Issues carrying `loom:curated`.
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies *(curated)*
 - **#12809**: Remove the daemon's dashboard wake source (forge_events /v1/hosts/{host}/events client) *(curated)*
 - **#12863**: Review dated guard-confinement evidence and owner-specific cases from gf180-opamp #214 *(curated)*
-- **#12940**: loom-tools Phase 2d: release loom-tools assets and a tools-only installer — epic #12708 *(curated)*
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20) *(curated)*
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
-- **#12988**: Champion blast eval: classify workflows by capability, not basename (align #12677 with #12958) *(curated)*
-- **#12992**: Champion: hard-hold PRs whose merge ratifies a spec/decision record (operator-only; never waived) *(curated)*
 - **#12994**: Champion: let the union of eligible criticalFilesOnly classes cover a PR's critical files *(curated)*
-- **#12995**: Champion: fix pattern over-matches (labels.json kept-set, comment lines, GITHUB_TOKEN) in forbiddenDiffPatterns *(curated)*
-- **#12999**: Champion criterion #3: hold critical files on suspect edits (dependencies, sources, build/install hooks), not on any edit *(curated)*
-- **#13006**: Emit the daemon's captain status as a native OTLP carrier (is_captain) for the dashboard's SigNoz Live board *(curated)*
 - **#13007**: Carry the remaining queue-plan fields (urgent, operator_priority, tier, workspace_weight, shard, listing_failed, seen) over OTLP for the dashboard's SigNoz Live board *(curated)*
 - **#13008**: Merge-risk holds are redrawn at their held head again: #12933 draws holds with no auth= digest, and only critical-file holds record one *(curated)*
 - **#13009**: Captain champion_merge slot stays held ~20 min after a successful /v1/release (holder outlives its release until lease expiry) *(curated)*
-- **#13024**: [ci-daily] Supply Chain *(curated)*
 - **#13025**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)*
 - **#13026**: Champion: make per-repo merge concurrency a runtime tunable, and take hold re-reads out of the merge lane *(curated)*
 - **#13029**: Telemetry: merge-lane waits, Champion re-read outcomes, fleet_dispatch call outcomes, held-PR gauge (gaps found 2026-10-20/21) *(curated)*
-- **#13030**: Name Champion's criteria and kept-set entries by meaning, not number (criterion #3 → critical-files) *(curated)*
-- **#13031**: Champion champion_merge merged two PRs touching .github/workflows/ci.yml with no critical-file hold or self-release record *(curated)*
 - **#13042**: Champion: let criticalFilesOnly standing authorizations compose per critical file *(curated)*
+- **#13056**: worktree.sh reuses a weeks-old local branch/worktree for an issue instead of starting from origin/main *(curated)*
+- **#13065**: Consolidate ~10 hand-rolled atomic-write helpers into fs_util::write_atomic *(curated)*
+- **#13088**: Workers with no git identity commit as user@hostname; DCO repos then cycle Judge/Doctor before reaching the operator *(curated)*
+- **#13096**: Champion: let a Loom resync pass the kept-set hold when every kept-set file byte-matches the upstream tag *(curated)*
+- **#13099**: Epic revisit: a periodic role pass that expands starved epics (or escalates them) so the fleet doesn't run dry with open epics *(curated)*
+- **#13102**: Champion: opt-in additive-migrations exception to the migrations kept-set (CREATE IF NOT EXISTS / ADD COLUMN / INSERT OR IGNORE backfill) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
+- **#13071**: Peer claims: move machine coordination off rendered room messages (custom event type / state events) *(architect)*
 - **#12589**: Archive older WORK_PLAN and WORK_LOG content through shared Loom maintenance *(hermit)*
 - **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(hermit)*
 - **#13017**: Split run_daemon (~1960-line fn) in daemon_service.rs into startup-phase modules *(hermit)*
+- **#13100**: Quality-metrics capture writes input_id=0 so stats joins never match *(hermit)*
 
 ## Epics
 
@@ -278,14 +256,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 17 |
+| Operator merge-risk holds | 9 |
 | Very important | 1 |
-| Important | 23 |
+| Important | 20 |
 | Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 36 |
-| PRs awaiting review | 8 |
-| Approved PRs awaiting merge | 23 |
-| Curated | 94 |
-| Architect / Hermit proposals | 3 |
+| In Progress (`loom:building`) | 33 |
+| PRs awaiting review | 10 |
+| Approved PRs awaiting merge | 15 |
+| Curated | 90 |
+| Architect / Hermit proposals | 5 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
