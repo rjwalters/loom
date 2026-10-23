@@ -210,6 +210,7 @@ pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
+pub mod forge_additive_migrations;
 pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;

@@ -265,6 +265,8 @@ run_eval() {
         STUB_API="$api"
         rm -f "$CFG_DIR/shacount"
         gh() { stub_gh "$@"; }
+        # loom-daemon forge additive-migrations (#13102): STUB_ADDITIVE_RC=0 clears the PR; default = held.
+        loom-daemon() { [ "${STUB_ADDITIVE_RC:-1}" = "0" ]; }
         read_ci_checks() {
             NO_CHECKS=false
             if [ "$ci" = "green" ]; then CHECKS='[{"name":"t","bucket":"pass"}]'; else CHECKS='[{"name":"t","bucket":"fail"}]'; fi
@@ -778,6 +780,48 @@ assert_eq "FAIL" "$r" "the critical-files criterion block: a forbidden line in t
 out="$(run_block "$CFO_CLASS" "$(printf '.github/workflows/loom-judge.yml\n%s' "$DOC")" AUTO "loom:pr")"
 case "$out" in *"FAIL: Critical file modified: .github/workflows/loom-judge.yml"*) r=FAIL ;; *) r="got: $out" ;; esac
 assert_eq "FAIL" "$r" "the critical-files criterion block: a kept-set workflow restores the FAIL"
+
+echo
+echo "--- #13102: additiveMigrations class (lifts only the migrations kept-set entry, verb-gated) ---"
+
+AM_CLASS='{"champion":{"standingAuthorizations":[{"id":"d1-additive","filePatterns":["migrations/*.sql"],"conditions":["judgeApproval","greenCi"],"additiveMigrations":true}]}}'
+AM_OFF='{"champion":{"standingAuthorizations":[{"id":"d1-off","filePatterns":["migrations/*.sql"],"conditions":["judgeApproval","greenCi"],"criticalFilesOnly":true}]}}'
+MIG="migrations/0042_add_t.sql"
+
+out="$(STUB_ADDITIVE_RC=0 SHOW_SCOPE=1 run_eval critical "$AM_CLASS" "$MIG" AUTO green "loom:pr")"
+assert_eq "ELIGIBLE:d1-additive:critical:$MIG" "$out" "class on + verb exit 0: an additive migration is waived"
+
+out="$(STUB_ADDITIVE_RC=1 run_eval critical "$AM_CLASS" "$MIG" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "class on + verb non-zero (forbidden statement, edited file, older daemon): held as today"
+
+out="$(STUB_ADDITIVE_RC=0 run_eval critical "$AM_OFF" "$MIG" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "class off (criticalFilesOnly without additiveMigrations): held even when the verb would clear it"
+
+out="$(STUB_ADDITIVE_RC=0 run_eval critical "$AM_CLASS" "$(printf '%s\ndefaults/hooks/guard-x.sh' "$MIG")" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a migration mixed with another kept-set path still holds"
+
+out="$(STUB_ADDITIVE_RC=0 run_eval critical "$AM_CLASS" "db/0003_x_migration.py" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a *_migration.py path outside the class's filePatterns holds"
+
+AM_PY='{"champion":{"standingAuthorizations":[{"id":"d1-additive","filePatterns":["*"],"conditions":["judgeApproval"],"additiveMigrations":true}]}}'
+out="$(STUB_ADDITIVE_RC=0 run_eval critical "$AM_PY" "migrations/0001.sql" AUTO green "loom:review-requested")"
+assert_eq "NOT ELIGIBLE:" "$out" "conditions still apply: no loom:pr, no waiver"
+
+AM_STR="${AM_CLASS/\"additiveMigrations\":true/\"additiveMigrations\":\"true\"}"
+out="$(STUB_ADDITIVE_RC=0 run_eval critical "$AM_STR" "$MIG" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a non-boolean additiveMigrations is malformed and skipped"
+
+out="$(STUB_ADDITIVE_RC=0 run_eval any "$AM_CLASS" "$MIG" "" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "an additiveMigrations class is never eligible for the merge-risk criterion"
+
+AM_EXCL="${AM_CLASS/\"conditions\"/\"excludeFilePatterns\":[\"migrations/*_drop*\"],\"conditions\"}"
+out="$(STUB_ADDITIVE_RC=0 run_eval critical "$AM_EXCL" "migrations/0043_drop_x.sql" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "the class's own excludeFilePatterns still apply to migration files"
+
+out="$(STUB_ADDITIVE_RC=0 SHOW_SCOPE=1 run_eval critical "$AM_CLASS" "$MIG" AUTO green "loom:pr")"
+assert_doc_contains "$CHAMPION_MD" "additive-migrations waiver" "champion-pr-merge.md records the additive-migrations waiver in the criterion output"
+assert_doc_contains "$CHAMPION_MD" '`additiveMigrations` (#13102' "champion-pr-merge.md documents additiveMigrations"
+assert_doc_contains "$PROMPT_DIR/champion-critical-file-hold.md" '"additiveMigrations": true' "champion-critical-file-hold.md documents the additiveMigrations exception"
 
 echo
 echo "--- #12954: privilegedContentPatterns (capability from head contents, not filename) ---"

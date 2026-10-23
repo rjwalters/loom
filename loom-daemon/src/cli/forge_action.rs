@@ -556,6 +556,29 @@ pub(crate) enum ForgeAction {
         repo: Option<String>,
     },
 
+    /// `forge additive-migrations <pr> [--repo OWNER/REPO]` (#13102) — is every
+    /// migration file PR `<pr>` touches a newly added `.sql` file containing only
+    /// additive statements (`CREATE TABLE/INDEX IF NOT EXISTS`, `ALTER TABLE … ADD
+    /// COLUMN`, `INSERT OR IGNORE INTO … SELECT`)? Backs Champion's opt-in
+    /// `additiveMigrations` class key.
+    ///
+    /// Exits 0 (`ADDITIVE_MIGRATIONS=1`) ONLY when the whole file list and every
+    /// migration file were read and parsed and nothing else is touched in the
+    /// migration paths. Any other outcome — a forbidden statement, an edited,
+    /// removed or renamed migration, a non-`.sql` migration path, unparsable SQL,
+    /// a forge error — exits 1 with the reason on stderr. Callers treat any
+    /// non-zero exit as "hold".
+    #[command(name = "additive-migrations")]
+    AdditiveMigrations {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge suspect-critical-diff <pr> <file> [--repo OWNER/REPO]` (#12999) —
     /// does any changed line of `<file>` (a `Cargo.toml` or `package.json`) in
     /// PR `<pr>` touch a suspect surface? Champion's `critical-files` criterion's hunk-aware
@@ -1274,6 +1297,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             file,
             repo,
         }),
+        ForgeAction::AdditiveMigrations { pr_number, repo } => {
+            ForgeCmd::AdditiveMigrations(crate::forge_additive_migrations::Args {
+                pr: pr_number,
+                repo,
+            })
+        }
         ForgeAction::SuspectCriticalDiff {
             pr_number,
             file,
