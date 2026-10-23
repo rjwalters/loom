@@ -1116,7 +1116,7 @@ fn assert_loom_payload_tree_complete(defaults: &Path, loom_path: &Path) -> Resul
 /// (including those in subdirectories) present in `defaults/<dir_name>/` exists
 /// in the destination. This guards against silent omissions like the regression
 /// reported in issue #3220, where `scripts/lib/forge-helpers.sh` was missing
-/// from installs even though `lib/loom-tools.sh` was verified by name.
+/// from installs even though `lib/repo-root.sh` was verified by name.
 fn sync_managed_dir(
     defaults: &Path,
     loom_path: &Path,
