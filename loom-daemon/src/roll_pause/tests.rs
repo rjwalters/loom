@@ -359,3 +359,13 @@ fn a_stand_down_touches_only_its_own_request_and_safe_point() {
     stand_down(&dir, "rp-2");
     assert!(!is_requested(&dir) && read_safe_point(&dir).is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn write_atomic_keeps_the_file_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("nested").join("handle");
+    write_atomic(&p, b"session-id").unwrap();
+    assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+}

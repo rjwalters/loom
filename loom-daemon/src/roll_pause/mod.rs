@@ -187,7 +187,14 @@ pub struct SafePoint {
 /// # Errors
 /// Any I/O failure creating, writing, syncing or renaming the file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    crate::fs_util::write_atomic(path, bytes, crate::fs_util::AtomicOpts::default())
+    crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// Raise a pause request for an item (daemon side). A safe-point record

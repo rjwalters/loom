@@ -436,8 +436,15 @@ fn prune_blobs(blob_dir: &Path, manifest: &Manifest) {
 /// Write `body` to `path` atomically (temp file in the same directory, then
 /// rename), creating the parent directory.
 pub fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
-    crate::fs_util::write_atomic(path, body, crate::fs_util::AtomicOpts::default())
-        .with_context(|| format!("could not write {}", path.display()))
+    crate::fs_util::write_atomic(
+        path,
+        body,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            ..Default::default()
+        },
+    )
+    .with_context(|| format!("could not write {}", path.display()))
 }
 
 fn error_detail(body: &str) -> String {
