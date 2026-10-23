@@ -81,13 +81,20 @@ matching row wins:
 | either, label present (a human put it back) | hold stands, silently — except that a changed standing-authorization digest is recorded once (#12933) |
 | `held`, label absent, recorded head == current head | **respect the release**: acknowledge once, do **not** re-add the label |
 | `none` | fresh hold: notice + `loom:blocked` |
-| either, head moved but the PR's own change provably did not (#9416) | **respect, re-recorded at the new head** with the equivalence kind |
+| either, head moved but the PR's own change provably did not (#9416), or only the operator's `release-scope:` paths changed (#13114) | **respect, re-recorded at the new head** with the equivalence kind |
 | either, anything else (or no head recorded — a legacy hold) | re-arm: a new hold episode at the current head |
 
 The #9416 row: `loom-daemon forge verdict-equivalent <pr> <recorded> <head>`
 (Judge's staleness verb; never re-derive it here) proves from the repository
 that the change survived the move (`tree`, `clean-merge`,
-`rebase-patch-identical`). **FAIL CLOSED**: only a literal `EQUIVALENCE_KIND=`
+`rebase-patch-identical`). An unreadable forge compare is retried (2×) and, if it
+stays unreadable, re-arms with `equivalence=unread` in the notice and in the
+`hold.transition` trigger. **Requested-change carry (#13114)**: a trusted human
+(never a bot or Champion) comment posted after the hold may carry one
+`release-scope: <path> [<path>...]` line; the tick passes those paths as
+`--allowed-paths`, and the verb answers `EQUIVALENCE_KIND=requested-change`
+**iff** the PR's per-file delta lies wholly inside them. Any other delta, or no
+line, re-arms; both kill switches disable it. **FAIL CLOSED**: only a literal `EQUIVALENCE_KIND=`
 line respects the release; anything else re-arms, naming why.
 CI is never exempted.
 
@@ -108,7 +115,7 @@ CF_TRUST=raw; T=$(loom-daemon forge trusted-comments --fetch "$PR_NUMBER" --gh-s
 HEAD_SHA=$(jq -r '.headRefOid' <<<"$CF_JSON")
 HOLD_LABEL_NOW=$(jq -r '[.labels[].name] | any(. == "loom:blocked")' <<<"$CF_JSON")
 cf_park() {
-  loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion critical-file hold" --by champion >/dev/null 2>&1 || true
+  LOOM_HOLD_EQUIVALENCE="${CF_EQUIV_CAUSE:-}" loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion critical-file hold" --by champion >/dev/null 2>&1 || true
   # #10937: an OPEN issue/PR the hold waits on, if the notice names one; inert (Guide skips a standing Champion hold)
   for N in ${CF_BLOCKER_NUMBERS:-}; do loom-daemon park-record apply --pr "$PR_NUMBER" --blocked-by "$N" \
     --reason "champion critical-file hold: human evidence gate" --by champion >/dev/null 2>&1 || true; done
@@ -126,15 +133,29 @@ esac
 STATE_HEAD=$(printf '%s' "$LAST_STATE" \
   | sed -n 's/.*champion:hold-state head=\([0-9a-f]*\).*/\1/p' | head -1)
 
-# Head moved; did the PR's change? Sets CF_EQUIV_KIND (empty => re-arm), CF_EQUIV_WHY.
+# The operator's `release-scope: <path> [<path>...]` line (#13114): the paths the
+# Doctor was asked to change. Only a TRUSTED, non-bot, non-Champion comment posted
+# AFTER the latest hold/release record counts; a marker is never evidence.
+CF_SCOPE=$(jq -r --arg h "$HOLD_MARKER" --arg r "$RELEASED_MARKER" '
+  .comments as $c
+  | ([range(0; $c | length) | select(($c[.].body | startswith($h)) or ($c[.].body | startswith($r)))] | last // -1) as $i
+  | [$c[($i + 1):][]
+     | select((.author.login | test("\\[bot\\]$") | not) and (.body | test("^<!-- champion:|Automated by [A-Za-z]+ role") | not))
+     | .body | split("\n")[] | capture("^release-scope:[ \\t]+(?<p>.+)$").p][-1] // ""
+  | split(" ")[] | select(test("^[A-Za-z0-9._/@+-]+$"))' <<<"$CF_JSON" 2>/dev/null | head -50 | paste -sd' ')
+
+# Head moved; did the PR's change? Sets CF_EQUIV_KIND (empty => re-arm), CF_EQUIV_WHY,
+# CF_EQUIV_CAUSE (`unread`: the forge compare never answered, #13114).
 # requires-daemon: forge optional   Without `forge verdict-equivalent` an equivalent head move re-arms (pre-#9416 behavior: one extra removal, never an unreviewed merge).
 cf_change_unmoved() {
-  CF_EQUIV_KIND="" CF_EQUIV_WHY="no head recorded (legacy hold)"
+  CF_EQUIV_KIND="" CF_EQUIV_WHY="no head recorded (legacy hold)" CF_EQUIV_CAUSE=""
   [ -n "$STATE_HEAD" ] || return 1
+  # shellcheck disable=SC2086  # CF_SCOPE is a space-joined, charset-checked path list
   CF_EQUIV_WHY=$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent \
-    "$PR_NUMBER" "$STATE_HEAD" "$HEAD_SHA" 2>&1)
+    "$PR_NUMBER" "$STATE_HEAD" "$HEAD_SHA" ${CF_SCOPE:+--allowed-paths $CF_SCOPE} 2>&1)
   CF_EQUIV_KIND=$(sed -n 's/^EQUIVALENCE_KIND=//p' <<<"$CF_EQUIV_WHY")
   CF_EQUIV_WHY=$(grep -v '^[A-Z_]*=' <<<"$CF_EQUIV_WHY" | tail -1)
+  case "$CF_EQUIV_WHY" in *equivalence=unread*) CF_EQUIV_CAUSE=unread ;; esac
   [ -n "$CF_EQUIV_KIND" ]
 }
 
@@ -229,6 +250,7 @@ ${CF_WF_NOTE}
       if [ -n "$CF_EQUIV_KIND" ]; then
         CF_EQUIV_LINE="<!-- champion:hold-equivalence kind=$CF_EQUIV_KIND from=$STATE_HEAD to=$HEAD_SHA -->"
         CF_EQUIV_NOTE=" — carried from \`$STATE_HEAD\` by equivalence \`$CF_EQUIV_KIND\`, re-derived from the repository (#9416)"
+        [ "$CF_EQUIV_KIND" = requested-change ] && CF_EQUIV_NOTE=" — carried from \`$STATE_HEAD\` by \`requested-change\` (#13114): the only paths whose diff moved are the ones your \`release-scope:\` line named (\`$CF_SCOPE\`). Judge's re-verdict confirms the change itself; CI is not exempted"
       else
         CF_EQUIV_LINE="<!-- champion:hold-equivalence kind=same-head -->"
         CF_EQUIV_NOTE=""

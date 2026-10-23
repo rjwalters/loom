@@ -1099,6 +1099,106 @@ If `$STANDING_AUTH_RESULT` is anything other than `ELIGIBLE` (including "no
 `champion.standingAuthorizations` configured"), fall through to the normal
 four-axis judgment below.
 
+### Resync waiver for the kept-set hold (#13096)
+
+A `chore(loom): resync installed Loom to vX` PR copies files Loom already reviewed and merged, so
+its kept-set files (`merge-pr.sh`, `verdict-staleness-guard.sh`, ...) carry no new gate logic.
+`resync_waiver_eval` lifts **only the kept-set hold** of the `merge-risk` criterion for such a PR
+when every changed kept-set file is byte-identical to the upstream tag. It is mechanical and fails
+closed. Everything else is unchanged: the other `merge-risk` axes, `critical-files`,
+`judge-approval`, `ci-green` and the ratification hold still run, a standing-authorization class
+still cannot waive the kept set, and `KEPT_SET_PATTERNS` stays hardcoded (no config key).
+
+It is eligible only when **all** hold, each read live in this pass:
+
+- the PR title is `chore(loom): resync installed Loom to v<X.Y.Z>`;
+- `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
+  `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
+- the files read is complete (count equals `changed_files`) and at least one changed file is a
+  kept-set path;
+- **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
+  `defaults/` counterpart through the surface map in `resync-installed.sh` (`.loom/hooks`,
+  `.loom/scripts`, `.loom/docs`, `.loom/runtimes`, `.loom/bin`, `.claude/commands/loom`,
+  `.claude/agents`; any other kept-set path, such as `.claude/settings.json`, `.githooks/*` or
+  `.loom/config.json`, has none and holds), and its head blob SHA equals that counterpart's blob SHA
+  at the tag;
+- the PR head did not move while it was read.
+
+A differing byte, a local-only file, a missing or unparsable tag, or any failed read gives
+`NOT ELIGIBLE` and the kept-set hold applies exactly as before. A non-resync PR never matches.
+
+```bash
+# resync_upstream_path <installed-path>: the defaults/ counterpart per resync-installed.sh's
+# surface map, empty when the path has none. Roles and skills are symlinks or generated
+# upstream, so their blobs never compare equal: no mapping, hold.
+resync_upstream_path() {
+  case "$1" in
+    .loom/hooks/*)            printf 'defaults/hooks/%s' "${1#.loom/hooks/}" ;;
+    .loom/scripts/*)          printf 'defaults/scripts/%s' "${1#.loom/scripts/}" ;;
+    .loom/docs/*)             printf 'defaults/docs/%s' "${1#.loom/docs/}" ;;
+    .loom/runtimes/*)         printf 'defaults/runtimes/%s' "${1#.loom/runtimes/}" ;;
+    .loom/bin/*)              printf 'defaults/.loom/bin/%s' "${1#.loom/bin/}" ;;
+    .claude/commands/loom/*)  printf 'defaults/.claude/commands/loom/%s' "${1#.claude/commands/loom/}" ;;
+    .claude/agents/*)         printf 'defaults/.claude/agents/%s' "${1#.claude/agents/}" ;;
+    *) return 0 ;;
+  esac
+}
+
+# resync_waiver_eval: sets RESYNC_WAIVER_RESULT (ELIGIBLE|NOT ELIGIBLE), RESYNC_WAIVER_TAG,
+# RESYNC_WAIVER_RECORD (one "path: sha" line per kept-set file) and RESYNC_WAIVER_REASON.
+# Reads PR_NUMBER and KEPT_SET_PATTERNS. Every step fails closed.
+resync_waiver_eval() {
+  local title ver tag sha1 sha2 meta_ver changed n file prev pattern is_kept up enc up_sha up_type head_sha status
+  RESYNC_WAIVER_RESULT="NOT ELIGIBLE"; RESYNC_WAIVER_TAG=""; RESYNC_WAIVER_RECORD=""; RESYNC_WAIVER_REASON=""
+  [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { RESYNC_WAIVER_REASON="kept set not loaded"; return 0; }
+  title=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.title' 2>/dev/null) || { RESYNC_WAIVER_REASON="PR unreadable"; return 0; }
+  if [[ "$title" =~ ^chore\(loom\):\ resync\ installed\ Loom\ to\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    ver="${BASH_REMATCH[1]}"; tag="v$ver"
+  else
+    RESYNC_WAIVER_REASON="not a resync PR"; return 0
+  fi
+  sha1=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || sha1=""
+  [ -n "$sha1" ] || { RESYNC_WAIVER_REASON="head unreadable"; return 0; }
+  meta_ver=$(gh api -H "Accept: application/vnd.github.raw" "repos/{owner}/{repo}/contents/.loom/install-metadata.json?ref=$sha1" 2>/dev/null | jq -r '.loom_version // empty' 2>/dev/null) || meta_ver=""
+  [ "$meta_ver" = "$ver" ] || { RESYNC_WAIVER_REASON="install-metadata names '${meta_ver:-none}', title names $ver"; return 0; }
+  [ "$(gh api "repos/rjwalters/loom/git/ref/tags/$tag" --jq '.ref' 2>/dev/null)" = "refs/tags/$tag" ] \
+    || { RESYNC_WAIVER_REASON="tag $tag not found upstream"; return 0; }
+  standing_auth_fetch_diff || { RESYNC_WAIVER_REASON="files unreadable"; return 0; }
+  n=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.changed_files' 2>/dev/null) || n=""
+  printf '%s' "$DIFF_JSON" | jq -e --argjson n "${n:-null}" 'length == $n and length > 0' >/dev/null 2>&1 \
+    || { RESYNC_WAIVER_REASON="files read incomplete"; return 0; }
+  while IFS=$'\t' read -r file prev head_sha status; do
+    [ -z "$file" ] && continue
+    is_kept=0
+    for pattern in "${KEPT_SET_PATTERNS[@]}"; do
+      # shellcheck disable=SC2053
+      if [[ "$file" == $pattern || "$prev" == $pattern ]]; then is_kept=1; break; fi
+    done
+    [ "$is_kept" -eq 1 ] || continue
+    case "$status" in added | modified) ;; *) RESYNC_WAIVER_REASON="$file is $status"; RESYNC_WAIVER_RECORD=""; return 0 ;; esac
+    up=$(resync_upstream_path "$file")
+    [ -n "$up" ] || { RESYNC_WAIVER_REASON="$file has no upstream counterpart"; RESYNC_WAIVER_RECORD=""; return 0; }
+    enc=$(jq -rn --arg p "$up" '$p | split("/") | map(@uri) | join("/")') || { RESYNC_WAIVER_RECORD=""; return 0; }
+    IFS=$'\t' read -r up_type up_sha < <(gh api "repos/rjwalters/loom/contents/${enc}?ref=$tag" --jq '[.type, .sha] | @tsv' 2>/dev/null)
+    if [ "$up_type" != "file" ] || [ -z "$up_sha" ] || [ "$up_sha" != "$head_sha" ]; then
+      RESYNC_WAIVER_REASON="$file differs from $tag:$up"; RESYNC_WAIVER_RECORD=""; return 0
+    fi
+    RESYNC_WAIVER_RECORD="${RESYNC_WAIVER_RECORD}${file}: ${head_sha}"$'\n'
+  done < <(printf '%s' "$DIFF_JSON" | jq -r '.[] | [.filename, (.previous_filename // .filename), (.sha // ""), (.status // "")] | @tsv')
+  [ -n "$RESYNC_WAIVER_RECORD" ] || { RESYNC_WAIVER_REASON="no kept-set file to waive"; return 0; }
+  sha2=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || sha2=""
+  [ "$sha1" = "$sha2" ] || { RESYNC_WAIVER_REASON="head moved while reading"; RESYNC_WAIVER_RECORD=""; return 0; }
+  RESYNC_WAIVER_RESULT="ELIGIBLE"; RESYNC_WAIVER_TAG="$tag"
+}
+```
+
+Run it once per pass, when `merge-risk` reads a kept-set path as red (`PR_NUMBER`,
+`KEPT_SET_PATTERNS` and `standing_auth_fetch_diff` come from "Standing operator authorization"
+above). On `ELIGIBLE`, the kept-set entries for these files are not red: judge the remaining axes
+as usual, and name the tag in the pre-merge comment (Step 2 renders `$RESYNC_BULLET` from
+`RESYNC_WAIVER_TAG` and `RESYNC_WAIVER_RECORD`). On `NOT ELIGIBLE`, hold under the kept set and cite
+`$RESYNC_WAIVER_REASON` in the hold bullet.
+
 **Vetted CI-workflow change (#12677, operator ruling 2026-10-17).** A change
 to a CI workflow is not red on blast radius *because it is a workflow* when
 `ci_workflow_blast_eval` returns `WF_BLAST=green`:
@@ -1234,8 +1334,10 @@ echo "WF_BLAST=$WF_BLAST${WF_BLAST_REASON:+ ($WF_BLAST_REASON)}"
 
 **Claim/label machinery is not red by itself (#11416).** Loom's own claim, lease, label-transition, dispatch and hand-back code is judged like any other code. Writing labels or claims *when it runs* is not a one-way action: `git revert` restores the old writer, and the state it wrote is re-derivable (janitors, lease reapers, `loom-recover-orphans` and the next tick repair a stranded claim or misrouted label). "Reverting cannot undo forge labels already changed" or "a defect could strand work fleet-wide" is **not** a red reason. Judge-approved + CI green + revert restores the behavior -> green on blast radius and revertability. "Mediates merging" in the table means the merge-gate entry of the kept set, nothing wider. **Kept set** — only these stay red, held for an operator (name the entry in the hold bullet):
 - **Irreversible migration, no rollback step**: a bulk relabel, or a rename/delete in `.github/labels.yml`, of live labels without a restore step; a lease/checkpoint/registry format the previous release cannot read.
-- **The merge gate itself** — code whose output decides *whether a PR merges*: the `judge-approval`, `merge-risk`, `critical-files`, `mergeable`, `recency` and `ci-green` criteria and the sticky-hold logic (this file, `champion-critical-file-hold.md`); `merge-pr.sh`'s verdict/label/ordering guards; any code that writes or invalidates a verdict label or marker (`post-verdict.sh`, `verdict-staleness-guard.sh`, the daemon's `reconcile_pr_verdicts`, `check-review-feedback.sh`) or decides whose markers and comments are trusted (`comment_trust.rs`, `forge trusted-comments`). The gate cannot vouch for a change to itself. Writing a verdict label (the Judge's `loom:pr` approval) is part of the gate, not a role hand-back; only routing that cannot make a PR mergeable (Builder/Doctor hand-backs, claims) is outside it.
+- **The merge gate itself** — code whose output decides *whether a PR merges*: the `judge-approval`, `merge-risk`, `critical-files`, `mergeable`, `recency` and `ci-green` criteria and the sticky-hold logic (this file, `champion-critical-file-hold.md`); `merge-pr.sh`'s verdict/label/ordering guards; any code that writes or invalidates a verdict label or marker (`post-verdict.sh`, `verdict-staleness-guard.sh`, the daemon's `reconcile_pr_verdicts`, `check-review-feedback.sh`) or decides whose markers and comments are trusted (`comment_trust.rs`, `forge trusted-comments`). The gate cannot vouch for a change to itself, except that a Loom resync PR whose every kept-set file byte-matches the upstream tag passes this entry ("Resync waiver", #13096). Writing a verdict label (the Judge's `loom:pr` approval) is part of the gate, not a role hand-back; only routing that cannot make a PR mergeable (Builder/Doctor hand-backs, claims) is outside it.
 - **The other red entries in the table above**, unchanged. A CI-workflow change with `WF_BLAST=green` (#12677) is not red for being a workflow; the rest of its diff is judged as usual. Critical files fail `critical-files` regardless, except where a `coversCriticalFiles` or `criticalFilesOnly` class applies (see `critical-files` below). A `criticalFilesOnly` class (#12648) does not change this judgment: the PR is judged on these axes as usual.
+
+**A resync PR can pass the kept-set hold, by byte equality only (#13096).** When `resync_waiver_eval` ("Resync waiver for the kept-set hold") returns `ELIGIBLE`, the merge-gate and installer entries are not red for the files it recorded; the other axes are judged as usual. Any difference, missing tag or failed read holds as before.
 
 **No standing authorization satisfies the kept set (#12528), except additive SQL migrations (#13102).** An opt-in `additiveMigrations` class lifts the `*migrations/*` kept-set entry for a PR that `loom-daemon forge additive-migrations` clears (only newly added `.sql` files of additive statements); that is the only kept-set carve-out, and it does not touch the "Irreversible migration, no rollback step" entry above, which concerns bulk relabels and persisted-format changes, not additive SQL. The irreversible-migration and merge-gate entries and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for the `critical-files` criterion by a class, with or without `coversCriticalFiles` or `criticalFilesOnly` (the additive-migrations carve-out above aside): the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
 
@@ -2663,6 +2765,14 @@ else
   CRITICAL_BULLET="No critical files modified"
 fi
 
+# Resync waiver bullet (#13096): only when resync_waiver_eval returned ELIGIBLE in this pass.
+RESYNC_BULLET=""
+if [ "${RESYNC_WAIVER_RESULT:-}" = "ELIGIBLE" ]; then
+  RESYNC_BULLET="- Kept-set hold waived (#13096): resync PR, every kept-set file byte-matches upstream tag \`$RESYNC_WAIVER_TAG\` (blob SHAs):
+$(printf '%s' "$RESYNC_WAIVER_RECORD" | sed 's/^/  - /')
+<!-- champion:resync-waiver tag=$RESYNC_WAIVER_TAG -->"
+fi
+
 # $HOLD_REVERSAL_BLOCK (the merge-risk criterion's sticky-hold precheck): empty when never
 # held, mandatory when this merge reverses a prior hold (#4742).
 ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$(cat <<EOF
@@ -2674,7 +2784,8 @@ This PR meets all safety criteria for automatic merging:
 - Merge-risk judgment passed: <ONE_LINE_RATIONALE — e.g. "diff is tests plus one self-contained module; no high-blast-radius surface; fully revertable">
 - Diff size: $TOTAL_LINES lines (+$ADDITIONS/-$DELETIONS) — informational, not a gate
 - $CRITICAL_BULLET
-- No merge conflicts
+${RESYNC_BULLET:+$RESYNC_BULLET
+}- No merge conflicts
 - Updated recently ($HOURS_AGO hours ago)
 - $CI_STATUS
 

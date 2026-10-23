@@ -61,6 +61,7 @@ test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
 test-champion-ratification-hold.sh
+test-champion-resync-waiver.sh
 test-champion-standing-authorization.sh
 test-champion-targeted-modes.sh
 test-champion-terminal-verdicts.sh
@@ -349,3 +350,5 @@ test-ci-wait-prompt-consistency.sh
 # #12939: tools-first slice resolution on a clean install (loom-tools before
 # loom-daemon, transitional fallback). Hermetic.
 test-tools-first-clean-install.sh
+# #12941: lib/loom-tools.sh is a compat alias for lib/repo-root.sh. Hermetic.
+test-repo-root-alias.sh

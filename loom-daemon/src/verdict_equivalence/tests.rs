@@ -888,3 +888,146 @@ fn detect_reports_clean_merge_for_a_merge_of_the_base() {
         &head,
     );
 }
+
+// ---------------------------------------------------------------------------
+// #13114: compare retry, `equivalence=unread`, requested-change carry
+// ---------------------------------------------------------------------------
+
+/// A compare response with two changed files.
+fn two_files(a_patch: &str, b_patch: &str) -> String {
+    format!(
+        r#"{{"status": "diverged", "files": [{{"filename": "src/a.rs", "status": "modified", "sha": "aaaa", "patch": "{a_patch}"}}, {{"filename": "docs/run.md", "status": "modified", "sha": "bbbb", "patch": "{b_patch}"}}]}}"#
+    )
+}
+
+fn scoped(gh: &Path, cwd: &Path, allowed: &[&str]) -> Assessment {
+    let allowed: Vec<String> = allowed.iter().map(|s| (*s).to_string()).collect();
+    assess_with_scope(true, true, gh, Some(cwd), 9416, REVIEWED, HEAD, &allowed)
+}
+
+/// A fake `gh` that fails the first `fail_first` calls to the reviewed-side
+/// compare, then answers.
+fn flaky_gh(dir: &Path, fail_first: u32, reviewed_body: &str, head_body: &str) -> PathBuf {
+    let count = dir.join("count");
+    std::fs::write(&count, "0").unwrap();
+    let bin = dir.join("flaky-gh.sh");
+    std::fs::write(
+        &bin,
+        format!(
+            r#"#!/usr/bin/env bash
+case "$*" in
+  *"--json baseRefName"*) printf '%s' '{{"baseRefName": "main"}}'; exit 0 ;;
+  *"compare/{REVIEWED}...{HEAD}"*) printf '%s' '{{"status": "diverged", "files": [{{"filename": "x"}}]}}'; exit 0 ;;
+  *"compare/main...{REVIEWED}"*)
+    n=$(cat "{count}"); echo $((n+1)) > "{count}"
+    if [ "$n" -lt {fail_first} ]; then exit 1; fi
+    printf '%s' '{reviewed_body}'; exit 0 ;;
+  *"compare/main...{HEAD}"*) printf '%s' '{head_body}'; exit 0 ;;
+esac
+exit 1
+"#,
+            count = count.display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    bin
+}
+
+#[test]
+fn an_unreadable_compare_is_retried_then_carries() {
+    let dir = tempdir().unwrap();
+    let body = one_file("@@ -1 +1 @@\\n-a\\n+b\\n");
+    let gh = flaky_gh(dir.path(), 2, &body, &body);
+    let a = scoped(&gh, dir.path(), &[]);
+    assert_eq!(a.equivalence, Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical));
+}
+
+#[test]
+fn a_compare_unreadable_after_the_retries_holds_as_unread() {
+    let dir = tempdir().unwrap();
+    let body = one_file("@@ -1 +1 @@\\n-a\\n+b\\n");
+    let gh = flaky_gh(dir.path(), 99, &body, &body);
+    let a = scoped(&gh, dir.path(), &["src/a.rs"]);
+    assert_eq!(a.equivalence, Equivalence::Indeterminate);
+    assert!(a.unavailable_note().unwrap().contains(UNREAD_TOKEN), "{a:?}");
+    // 1 attempt + COMPARE_RETRIES retries, bounded.
+    let n: u32 = std::fs::read_to_string(dir.path().join("count"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(n, 3);
+}
+
+#[test]
+fn a_delta_confined_to_the_named_paths_carries_as_requested_change() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let gh = fake_gh(
+        dir.path(),
+        &log,
+        &[
+            (
+                &format!("compare/{REVIEWED}...{HEAD}"),
+                r#"{"status": "diverged", "files": [{"filename": "x"}]}"#,
+            ),
+            BASE_MAIN,
+            (&format!("compare/main...{REVIEWED}"), &two_files("p1", "r1")),
+            (&format!("compare/main...{HEAD}"), &two_files("p1", "r2")),
+        ],
+    );
+    let a = scoped(&gh, dir.path(), &["docs/run.md"]);
+    assert_eq!(a.equivalence, Equivalence::Equivalent(EquivalenceKind::RequestedChange));
+    assert_eq!(EquivalenceKind::RequestedChange.token(), "requested-change");
+}
+
+#[test]
+fn a_delta_outside_the_named_paths_holds() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let gh = fake_gh(
+        dir.path(),
+        &log,
+        &[
+            (
+                &format!("compare/{REVIEWED}...{HEAD}"),
+                r#"{"status": "diverged", "files": [{"filename": "x"}]}"#,
+            ),
+            BASE_MAIN,
+            (&format!("compare/main...{REVIEWED}"), &two_files("p1", "r1")),
+            (&format!("compare/main...{HEAD}"), &two_files("p2", "r2")),
+        ],
+    );
+    // Both files changed, only one named: re-arm.
+    assert_eq!(scoped(&gh, dir.path(), &["docs/run.md"]).equivalence, Equivalence::Changed);
+    // No named paths at all: re-arm, as without the flag.
+    assert_eq!(scoped(&gh, dir.path(), &[]).equivalence, Equivalence::Changed);
+}
+
+#[test]
+fn the_kill_switches_disable_the_requested_change_carry() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let gh = fake_gh(
+        dir.path(),
+        &log,
+        &[
+            (
+                &format!("compare/{REVIEWED}...{HEAD}"),
+                r#"{"status": "diverged", "files": [{"filename": "x"}]}"#,
+            ),
+            BASE_MAIN,
+            (&format!("compare/main...{REVIEWED}"), &two_files("p1", "r1")),
+            (&format!("compare/main...{HEAD}"), &two_files("p1", "r2")),
+        ],
+    );
+    let allowed = vec!["docs/run.md".to_string()];
+    for (outer, inner) in [(false, true), (true, false)] {
+        let a =
+            assess_with_scope(outer, inner, &gh, Some(dir.path()), 9416, REVIEWED, HEAD, &allowed);
+        assert_eq!(a.equivalence, Equivalence::Indeterminate, "outer={outer} inner={inner}");
+    }
+}
