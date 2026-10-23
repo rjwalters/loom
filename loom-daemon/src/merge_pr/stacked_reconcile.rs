@@ -21,12 +21,14 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use super::partial_comment::now_timestamp;
 use super::post_merge_bookkeeping::Record;
 use super::reconcile::{
     child_route, defer_comment, plan, read_lease_state, route_with_lease, Plan, Route, Row,
 };
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 /// Last stdout line of a finished run.
 pub const DONE: &str = "LOOM-STACKED-RECONCILE DONE";
@@ -182,19 +184,24 @@ fn one_child(
     }
 }
 
+/// Deadline for each `gh` read.
+const PLAIN_GH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Plain uncached `gh`, exactly as the retired shell called it (not the
 /// gh-cached `$GH`, so a stale view cannot mask a live re-claim). `None` on any
 /// failure; `repo` is unused beyond documentation of the target.
 fn plain_gh(args: &[&str]) -> Option<String> {
-    let o = Command::new("gh")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    o.status
-        .success()
-        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    let outcome = GhInvocation::new(
+        Operation::new("merge_pr.stacked_reconcile"),
+        AccessIntent::Read,
+        GhTarget::None,
+        PLAIN_GH_TIMEOUT,
+    )
+    .args(args)
+    .run();
+    outcome
+        .ok_output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 /// The live forge and scripts.
