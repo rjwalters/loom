@@ -375,6 +375,20 @@ assert_eq "NOT ELIGIBLE:" "$out" "a line matching only the 2nd forbiddenDiffPatt
 out="$(run_eval critical "$CI_CLASS" "$WF" "$NOPATCH" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a changed file with no patch (unreadable diff) fails closed"
 
+# #12995: comment lines and secrets.GITHUB_TOKEN do not trip forbiddenDiffPatterns.
+COMMENTPERMPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+  # permissions: write-all, secrets.TOKEN"}]'
+GHTOKENPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+  run: echo ${{ secrets.GITHUB_TOKEN }}"}]'
+GHTOKENOTHERPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,3 @@\n name: ci\n+  a: ${{ secrets.GITHUB_TOKEN }}\n+  b: ${{ secrets.OTHER }}"}]'
+MIXEDPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,3 @@\n name: ci\n+  # note\n+permissions: write-all"}]'
+out="$(run_eval critical "$CI_CLASS" "$WF" "$COMMENTPERMPATCH" green "loom:pr")"
+assert_eq "ELIGIBLE:ci-steps" "$out" "a match only on a comment line does not disqualify"
+out="$(run_eval critical "$CI_CLASS" "$WF" "$GHTOKENPATCH" green "loom:pr")"
+assert_eq "ELIGIBLE:ci-steps" "$out" "secrets.GITHUB_TOKEN is exempt from forbiddenDiffPatterns"
+out="$(run_eval critical "$CI_CLASS" "$WF" "$GHTOKENOTHERPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "secrets.OTHER still matches beside a GITHUB_TOKEN line"
+out="$(run_eval critical "$CI_CLASS" "$WF" "$MIXEDPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a code line still matches beside a comment line"
+
 out="$(run_eval critical "$CI_CLASS" "$WF" "" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a failed files-API read fails closed"
 
@@ -563,6 +577,11 @@ kept_set_hit() {
         echo "NOT KEPT"
     )
 }
+
+# #12995: the labels globs are anchored to the label-sync paths.
+assert_eq "NOT KEPT" "$(kept_set_hit workers/data/labels.json)" "a labels.json data file elsewhere is not kept"
+assert_eq "NOT KEPT" "$(kept_set_hit docs/labels.yml)" "a labels.yml outside .github is not kept"
+assert_eq "KEPT" "$(kept_set_hit quickstarts/api/.github/labels.yml)" "a nested .github/labels.yml is kept"
 
 # In this source repo, the list must name files that exist, so it cannot rot
 # into a list of paths nobody ships. (An installed copy has no loom-daemon/.)
@@ -838,7 +857,11 @@ echo
 echo "--- #12954: privilegedContentPatterns (capability from head contents, not filename) ---"
 
 FIXTURE_DIR="$TEST_DIR/fixtures/champion-workflows"
-PRIV_RX='["secrets\\.(?!GITHUB_TOKEN\\b)","secrets:\\s*inherit","^\\s*environment:",":\\s*write\\b","write-all","id-token","pull_request_target","workflow_run","^\\s*release:","types:.*released","wrangler\\s+deploy","npm\\s+publish","gh\\s+release"]'
+# The list is the shipped PRIVILEGED_CONTENT_PATTERNS (#12988), so this test and
+# test-champion-ci-workflow-blast.sh cannot drift from each other or from the doc.
+PRIV_RX="$(awk '/^PRIVILEGED_CONTENT_PATTERNS=\(/{p=1} p{print} p&&/^\)/{exit}' "$CHAMPION_MD" >"$CFG_DIR/priv.sh"; \
+    (source "$CFG_DIR/priv.sh"; printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}") | jq -R . | jq -s -c .)"
+assert_contains "$PRIV_RX" "wrangler" "shared privileged-content list extracted from champion-pr-merge.md"
 cap_class() { # cap_class <privilegedContentPatterns-json|-> -> a ci class with no name excludes
     local extra=""
     [ "$1" = "-" ] || extra=",\"privilegedContentPatterns\":$1"

@@ -25,6 +25,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13018**: fix: classify champion blast-eval workflows by capability, not basename
 - **#13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
 - **#13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
+- **#13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
 
 ## Very Important
 
@@ -65,7 +66,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
-- **#8779**: peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
 - **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
 - **#12117**: Telemetry: inventory every kind; fix or delete role_tick.outcome, ci.job.log, session.output
@@ -123,12 +123,10 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
 - **#12960**: feat: let Champion self-release merge-risk holds above a confidence threshold
 - **#13013**: fix: ignore heartbeat steps for ended assignments in the fleet captain
 - **#13028**: feat: make Champion merges per repo a runtime tunable
 - **#13034**: feat: export merge-lane waits and Champion run outcomes to OTLP
-- **#13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
 
 ## Approved (Awaiting Merge)
 
@@ -156,6 +154,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13018**: fix: classify champion blast-eval workflows by capability, not basename
 - **#13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
 - **#13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
+- **#13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
 
 ## Proposed
 
@@ -198,6 +197,7 @@ Issues carrying `loom:curated`.
 - **#11703**: Config precedence: fleet-gitops values must override repo-committed .loom/config.json (general rule + enforcement) *(curated)*
 - **#11712**: Daemon: export OTLP only and remove inbound control channels other than config (2am#4300) *(curated)*
 - **#11787**: issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate) *(curated)*
+- **#11911**: Finish retiring daemon-spawned /loom:sweep and merge the two concurrency budgets *(curated)*
 - **#11928**: maintain_only dispatch aborts emit error-level telemetry for an intentional, configured refusal *(curated)*
 - **#12014**: ci: approved PRs touching workflow files need several CI rounds to land as main moves (no merge queue on a user-owned repo) *(curated)*
 - **#12029**: Telemetry: merge runs record PR number and observed result (merge-pr chokepoint) — Judge parts moved to #12362; held behind #12063 *(curated)*
@@ -278,14 +278,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 16 |
+| Operator merge-risk holds | 17 |
 | Very important | 1 |
 | Important | 23 |
-| Ready (`loom:issue`) | 9 |
+| Ready (`loom:issue`) | 8 |
 | In Progress (`loom:building`) | 36 |
-| PRs awaiting review | 10 |
-| Approved PRs awaiting merge | 22 |
-| Curated | 93 |
+| PRs awaiting review | 8 |
+| Approved PRs awaiting merge | 23 |
+| Curated | 94 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->

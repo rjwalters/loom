@@ -59,6 +59,12 @@ const UNCOUNTED: &[(&str, usize, &str)] = &[
          the choke-point ratchet owns its migration",
     ),
     (
+        "cli/champion_hold_cmd.rs",
+        1,
+        "`champion-hold ratification` CLI file-list read through the raw `script_helpers::run_gh` \
+         spawn: not a facade row; the choke-point ratchet owns its migration",
+    ),
+    (
         "comment_trust/records.rs",
         1,
         "trusted-comment CLI read through the raw `script_helpers::run_gh` spawn (optionally \

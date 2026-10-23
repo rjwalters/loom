@@ -17,7 +17,7 @@
 //! # Why this is Rust and not four more `case` statements in that script
 //!
 //! `scripts/check-guard-scan-contracts.sh` is `contract`-category shell. Epic
-//! #7810's `shell-budget` gate ratchets that pool DOWN, never up, and
+//! #7810 retires that pool, and
 //! `.loom/docs/shell-language-policy.md` is unconditional about the remedy:
 //! new executable logic is a `loom-daemon` subcommand, not more portable
 //! shell. This module is that subcommand's logic — the same move

@@ -87,6 +87,11 @@ impl SweepRegistry {
         if step == StepRole::Builder && run.outcome.class == OutcomeClass::Noop {
             self.note_builder_step_noop(item, &run.sweep_id, &run.outcome.reason);
         }
+        if step == StepRole::Builder
+            && matches!(run.outcome.class, OutcomeClass::Noop | OutcomeClass::Failed)
+        {
+            self.note_builder_outcome(run);
+        }
         if step == StepRole::Builder && rec.repeat_capped {
             if let Some(until) = self.step_ledger.cooling_until(item, step, now) {
                 self.note_builder_cap(item, until, now);
