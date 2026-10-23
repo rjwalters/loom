@@ -927,6 +927,39 @@ assert_doc_lacks "$CHAMPION_MD" \
     'label-check | size-check | critical-file |' \
     "the shared CRITERION_KEY slug comment no longer lists critical-file among the transient-failure criteria (#6879)"
 
+# ---------------------------------------------------------------------
+# (#13031) A criterion-#3 standing-authorization waiver leaves a truthful,
+# greppable record in the pre-merge comment; the no-waiver text is unchanged.
+# The shipped bullet-building block is extracted from the markdown and run,
+# not mirrored, so the test cannot drift from the prompt.
+# ---------------------------------------------------------------------
+echo
+echo "Criterion #3 waiver record (#13031):"
+BULLET_BLOCK=$(awk '/^if \[ -n "\$\{CRITERION3_WAIVER_ID:-\}" \]; then$/{f=1} f{print} f&&/^fi$/{exit}' "$CHAMPION_MD")
+render_bullet() {
+    # shellcheck disable=SC2034 # consumed by the eval'd BULLET_BLOCK
+    ( CRITERION3_WAIVER_ID="$1" CRITERION3_WAIVER_SCOPE="$2" CRITERION3_WAIVED_FILES="$3"
+      eval "$BULLET_BLOCK"; printf '%s' "$CRITICAL_BULLET" )
+}
+assert_contains "$BULLET_BLOCK" "CRITICAL_BULLET" "the shipped markdown carries the waiver bullet block"
+
+OUT=$(render_bullet "workflow-critical-only" "critical" ".github/workflows/ci.yml")
+assert_contains "$OUT" "workflow-critical-only" "waiver bullet names the class id"
+assert_contains "$OUT" "scope: critical" "waiver bullet names the scope"
+assert_contains "$OUT" ".github/workflows/ci.yml" "waiver bullet lists the waived files"
+assert_contains "$OUT" "<!-- champion:critical-file-waiver class=workflow-critical-only -->" "waiver bullet carries the machine-readable marker"
+assert_not_contains "$OUT" "No critical files modified" "waiver bullet never claims no critical files"
+
+OUT=$(render_bullet "all-class" "all" "a.yml b.yml")
+assert_contains "$OUT" "scope: all" "coversCriticalFiles (scope all) waiver names its scope"
+
+OUT=$(render_bullet "" "" "")
+assert_eq "No critical files modified" "$OUT" "no waiver keeps the unchanged text"
+assert_not_contains "$OUT" "champion:critical-file-waiver" "no waiver emits no marker"
+
+assert_doc_contains "$CHAMPION_MD" '- $CRITICAL_BULLET' "the pre-merge comment template renders the bullet from CRITERION3_WAIVER_*"
+assert_doc_lacks "$CHAMPION_MD" '- No critical files modified' "the pre-merge comment no longer hardcodes the no-critical-files bullet"
+
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]] || exit 1

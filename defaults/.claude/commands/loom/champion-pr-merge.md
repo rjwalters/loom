@@ -1655,13 +1655,19 @@ PR_NUMBER=<number>
 standing_auth_load_config             # resolved effective config (#12591)
 STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit criterion #2's ELIGIBLE
 STANDING_AUTH_ID=""
+# Waiver record (#13031): set only when a class waives this criterion; the
+# pre-merge comment renders its critical-file bullet from these, so a waiver is
+# never reported as "No critical files modified".
+CRITERION3_WAIVER_ID=""; CRITERION3_WAIVER_SCOPE=""; CRITERION3_WAIVED_FILES=""
 standing_auth_eval critical "$FILES"
 if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ] && [ "$STANDING_AUTH_SCOPE" = "critical" ]; then
+  CRITERION3_WAIVER_ID="$STANDING_AUTH_ID"; CRITERION3_WAIVER_SCOPE="critical"; CRITERION3_WAIVED_FILES="$STANDING_AUTH_COVERED"
   # criticalFilesOnly class (#12648): only this criterion is waived, for the
   # critical files named. Criterion #2 judged the whole PR on the four axes.
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12648): criterion #3 satisfied by a criticalFilesOnly class — critical files: $STANDING_AUTH_COVERED"
   exit 0
 elif [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
+  CRITERION3_WAIVER_ID="$STANDING_AUTH_ID"; CRITERION3_WAIVER_SCOPE="all"; CRITERION3_WAIVED_FILES="$AUTH_FILES"
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12528): criterion #3 satisfied by a coversCriticalFiles class — changed files: $AUTH_FILES"
   # Name STANDING_AUTH_ID in the rationale. $CRITERION3_RESULT is "PASS".
   exit 0
@@ -2449,6 +2455,17 @@ else
   CI_STATUS="All CI checks passing"
 fi
 
+# Critical-file bullet (#13031): from criterion #3's CRITERION3_WAIVER_* only.
+# A waiver names the class, scope and files and carries a greppable marker; no
+# waiver keeps the unchanged text. Never write "No critical files modified" when
+# CRITERION3_WAIVER_ID is set.
+if [ -n "${CRITERION3_WAIVER_ID:-}" ]; then
+  CRITICAL_BULLET="Critical-file check (#3) waived by standing authorization class \`$CRITERION3_WAIVER_ID\` (scope: $CRITERION3_WAIVER_SCOPE) — waived files: $CRITERION3_WAIVED_FILES
+<!-- champion:critical-file-waiver class=$CRITERION3_WAIVER_ID -->"
+else
+  CRITICAL_BULLET="No critical files modified"
+fi
+
 # $HOLD_REVERSAL_BLOCK (criterion #2's sticky-hold precheck): empty when never
 # held, mandatory when this merge reverses a prior hold (#4742).
 ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$(cat <<EOF
@@ -2459,7 +2476,7 @@ This PR meets all safety criteria for automatic merging:
 - Judge approved (\`loom:pr\` label)
 - Merge-risk judgment passed: <ONE_LINE_RATIONALE — e.g. "diff is tests plus one self-contained module; no high-blast-radius surface; fully revertable">
 - Diff size: $TOTAL_LINES lines (+$ADDITIONS/-$DELETIONS) — informational, not a gate
-- No critical files modified
+- $CRITICAL_BULLET
 - No merge conflicts
 - Updated recently ($HOURS_AGO hours ago)
 - $CI_STATUS
