@@ -1824,27 +1824,13 @@ pub struct DaemonStatusReport {
     /// as warming up. `None` when the gate is unarmed or for an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_jitter_delay_secs: Option<u64>,
-    /// An observability-exporter host-identity mismatch detected this process
-    /// (Issue #4830): the ingest key installed on this host is bound to a
-    /// *different* `host_id` than the one this daemon reports for itself, so
-    /// every record it pushes is filed under the wrong host.
-    ///
-    /// `None` in the overwhelmingly common case — the ids agree, the exporter
-    /// is disabled/keyless, or no batch has been acked yet this process — and
-    /// for a pre-#4830 wire payload. Published by
-    /// [`crate::observability::HostIdStatus`] and read here via
-    /// [`crate::observability::global_host_id_mismatch`]. `#[serde(default)]`
-    /// keeps older wire data / older clients compatible.
-    #[serde(default)]
-    pub observability_host_id_mismatch: Option<ObservabilityHostIdMismatch>,
     /// **Positive** confirmation of whether telemetry is actually reaching the
     /// backend, and under which `host_id` (Issue #5083).
     ///
-    /// [`Self::observability_host_id_mismatch`] above is anomaly-only by
-    /// design (#4830), which left "exporting fine", "observability disabled",
-    /// and "configured but silently never exported" all rendering as the same
-    /// thing: nothing at all. This field is the counterpart that always has an
-    /// answer — see [`ObservabilityExportStatus`].
+    /// Without it "exporting fine", "observability disabled", and
+    /// "configured but silently never exported" all render as the same thing:
+    /// nothing at all. This field always has an answer — see
+    /// [`ObservabilityExportStatus`].
     ///
     /// With the multi-exporter fan-out (#8756) this is the **first configured
     /// exporter's** cell — byte-identical to the pre-fan-out status for every
@@ -1980,7 +1966,7 @@ pub struct DeepCleanRepoStatus {
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
+    ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod ready_queue;

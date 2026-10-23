@@ -27,8 +27,8 @@
 //! # Where this runs, and why not the tick loop
 //!
 //! Driven from the collector's periodic sample
-//! (`observability::collector::sample_snapshots`, the same cadence as
-//! [`super::super::queue_snapshot::record`]),
+//! (`observability::collector::sample_snapshots`, the same cadence as the
+//! other queue samples),
 //! reading [`crate::work_finder::last_tick_summary`] — never from the
 //! work-finder tick itself, which must never block on a `gh repo view` probe
 //! (see `queue_snapshot`'s module doc for the identical rationale). A
@@ -90,7 +90,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::telemetry::RepoVisibility;
 use crate::types::{
@@ -463,7 +463,7 @@ fn allowed_park_label(disposition: QueueDisposition, detail: Option<&str>) -> Op
 /// The PR number in an `OpenPr` row's detail (`"open PR #<n>"`, the text
 /// `work_finder::tick_report::classify` formats) — structured extraction,
 /// never the free-form text itself. Mirrors
-/// `telemetry::queue_snapshot::exportable_detail`'s allowlist-by-disposition
+/// `telemetry::queue_repo::exportable_detail`'s allowlist-by-disposition
 /// rule.
 #[must_use]
 fn open_pr_number(disposition: QueueDisposition, detail: Option<&str>) -> Option<u32> {
@@ -582,13 +582,6 @@ pub fn refresh_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_REFRESH_SECS)
 }
 
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
-
 fn int(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -651,7 +644,7 @@ pub fn build_span(
     };
     let mut attributes: TraceAttributes = [
         ("loom.repo", emission.slug.clone()),
-        ("loom.repo.visibility", visibility_str(emission.visibility).to_string()),
+        ("loom.repo.visibility", emission.visibility.as_str().to_string()),
         ("loom.issue", issue),
         ("loom.queue.disposition", emission.disposition.as_str().to_string()),
         ("loom.queue.state", emission.disposition.state().to_string()),
@@ -748,7 +741,7 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
     let previous_sample = *LAST_SAMPLED_TICK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !super::super::queue_snapshot::is_new_tick(summary.at, previous_sample) {
+    if !super::super::repo_ref::is_new_tick(summary.at, previous_sample) {
         return;
     }
     let roots: HashSet<&str> = summary

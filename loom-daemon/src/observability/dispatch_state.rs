@@ -251,9 +251,9 @@ pub fn build_record(
 pub fn resolve_rows(
     rows: Vec<StateRow>,
     observed: &BTreeSet<usize>,
-    resolve: impl Fn(usize) -> Option<crate::telemetry::queue_snapshot::QueueRepoRef>,
+    resolve: impl Fn(usize) -> Option<crate::telemetry::queue_repo::QueueRepoRef>,
 ) -> (Vec<ResolvedRow>, HashSet<String>) {
-    let mut by_idx: HashMap<usize, Option<crate::telemetry::queue_snapshot::QueueRepoRef>> =
+    let mut by_idx: HashMap<usize, Option<crate::telemetry::queue_repo::QueueRepoRef>> =
         HashMap::new();
     let mut resolved = Vec::with_capacity(rows.len());
     for row in rows {

@@ -103,8 +103,11 @@ is `Part of #8191`; only the last closes it.
    `worktree-path`, `local-branch-cleanup`, `dirty-worktree-guard`,
    `primary-worktree-guard`, `primary-checkout-advice`,
    `worktree-remove-diagnosis`, `worktree-awk`.
-2. **Post-merge bookkeeping** (partial-increment reset, closed-issue building
-   strip, cleared-blocker notify, stacked-child reconcile).
+2. **Post-merge bookkeeping** — **PARTLY DONE** (see "Slice 2 status" below):
+   partial-increment reset, branch-derived issue close and closed-issue label
+   strip landed as `merge-pr post-merge-bookkeeping`. Still shell: the
+   cleared-blocker notify (already a one-line call to its own verb) and the
+   stacked-child reconcile/retarget.
 3. **Merge loop** (wait-for-checks, head sync + #8164 retry, merge retry,
    response classification). The one forge-merge call site.
 4. **Pre-merge guard sequence** (the ordered gates, `--dry-run` rendering,
@@ -166,3 +169,50 @@ bash *models* of the decision tree (Tests 4-6) now drive the real thing, which i
 a strictly stronger check. Four suites (`merge-ordering-guard`,
 `notify-cleared-blockers`, `verdict-label-guard`, `workflow-scope-preflight`)
 fail identically on `main` in this environment and are untouched.
+
+## Slice 2 status: issue bookkeeping (`merge-pr post-merge-bookkeeping`)
+
+What moved: `_reset_partial_increment_labels` / `_reset_one_partial_issue` /
+`_mp_post_partial_comment` / `_post_premature_close_comment`,
+`_close_branch_derived_issue` and `_strip_closed_issue_building_labels` /
+`_strip_one_closed_issue_building_label` (~300 shell lines) into
+`loom-daemon/src/merge_pr/post_merge_bookkeeping.rs`, with `partial_reset::plan`,
+`closed_building::plan`, `refs::partial_increment_refs` and the three
+`partial_comment` renderers called in-process in the order the shell called
+them. The shell keeps `_post_merge_bookkeeping`, a ~25-line wrapper, and three
+one-line aliases so the call sites and their order are unchanged.
+
+Design decisions a later slice should know about:
+
+- **One pass per call (`--step partial-reset|branch-close|strip`).** The order
+  is load-bearing (reset before strip so a reopened issue is not stripped;
+  branch close before strip so the strip sees the issue it closed), and a pass
+  never reads after its own writes, which keeps the `LOOM-NEED close-targets`
+  protocol replay-safe.
+- **The forge writes are still the shell's.** `SystemHost::helper` sources
+  `lib/forge-helpers.sh` into a child `bash` and runs the one
+  `forge_gh_{reopen_issue,swap_label,remove_label,comment}_rl_safe` function,
+  so the write-scope vet (#9548), the permission-window ladder (#6074) and the
+  GraphQL-exhaustion REST fallback (#4856) stay in exactly one place. Porting
+  that ladder is its own slice with its own differential; until then this
+  bridge is the seam. The reads (`gh api repos/<nwo>/issues/<n>`, the PR's
+  commits) are plain uncached `gh`, as before.
+- **A partial-increment reference the analysis cannot read is no longer a
+  failure mode.** The shell's `_partial_increment_refs ... || return 0` fail-safe
+  guarded a `$(...)` that could fail; the in-process call cannot.
+- **Fail direction unchanged: toward touching nothing.** A verb that did not run
+  (no `LOOM-POST-MERGE-BOOKKEEPING DONE` terminator) changes no issue. The
+  warning now names the manual commands generically (`<N>`) instead of the one
+  issue the retired per-issue loop was on, since the verb is what knows the
+  issue list.
+
+Suites: `partial-increment`, `closed-issue-cleanup`, `feature-branch-close` and
+`auto-reconcile` re-anchor their extraction on the wrapper; the verb-level
+fault-injection seams (a daemon lacking `partial-reset` / `partial-comment`, a
+shell-function override of the reopen wrapper, a fake daemon answering `SWAP
+loom:operator`) are replaced by faults injected through the `gh` stub, which
+reaches the same behaviour through the real wrapper. Source-text assertions are
+retired under the three-part test with named successors
+(`test-forge-helpers-rate-limit-fallback.sh` carries three more). The two
+`auto-reconcile` "no live lease" failures also fail on `origin/main` and are
+untouched.

@@ -187,3 +187,6 @@ scripts/experiments/judge-fanout-experiment.sh
 scripts/experiments/judge-fanout-results-template.md
 scripts/experiments/judge-fanout-workflow.js
 scripts/tests/test-judge-fanout-experiment.sh
+
+# #13020 (2026-10-21) — the orphaned heredoc-body-safety test lib is removed (PR #13023).
+scripts/tests/lib/heredoc-body-safety.sh

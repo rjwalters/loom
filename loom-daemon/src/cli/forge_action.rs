@@ -530,7 +530,7 @@ pub(crate) enum ForgeAction {
 
     /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
     /// is `<file>`'s diff in PR `<pr>` nothing but a version-string change?
-    /// Champion criterion #3's version-only carve-out (#6147).
+    /// Champion's `critical-files` criterion's version-only carve-out (#6147).
     ///
     /// Exits 0 (`VERSION_ONLY=1`) ONLY when `<file>` is exactly one of the six
     /// version-bearing files (`package.json`, `mcp-loom/package.json`,
@@ -543,6 +543,34 @@ pub(crate) enum ForgeAction {
     /// on stderr. Callers treat any non-zero exit as "not eligible".
     #[command(name = "version-only-diff")]
     VersionOnlyDiff {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// Repo-relative path of the changed file.
+        #[arg(value_name = "FILE")]
+        file: String,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
+    /// `forge suspect-critical-diff <pr> <file> [--repo OWNER/REPO]` (#12999) —
+    /// does any changed line of `<file>` (a `Cargo.toml` or `package.json`) in
+    /// PR `<pr>` touch a suspect surface? Champion's `critical-files` criterion's hunk-aware
+    /// carve-out for harmless manifest edits (e.g. new `[[bin]]` entries).
+    ///
+    /// Exits 0 (`SUSPECT=0`) ONLY when the file list and `patch` were read, every
+    /// hunk parsed, and no changed line is in a dependency, patch, replace or
+    /// features table, a `build`/`links`/`git`/`registry`/`path` source key, or
+    /// (package.json) a dependency/override key or install lifecycle script. A
+    /// suspect line exits 1 with `SUSPECT_LINE=` and `SUSPECT_SECTION=` on
+    /// stdout; every other outcome — forge error, no patch, unparseable hunk,
+    /// unreadable head file — exits 1 with the reason on stderr. Callers treat
+    /// any non-zero exit as "hold".
+    #[command(name = "suspect-critical-diff")]
+    SuspectCriticalDiff {
         /// Pull request number.
         #[arg(value_name = "PR")]
         pr_number: u32,
@@ -1242,6 +1270,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             file,
             repo,
         } => ForgeCmd::VersionOnlyDiff(crate::forge_version_only_diff::Args {
+            pr: pr_number,
+            file,
+            repo,
+        }),
+        ForgeAction::SuspectCriticalDiff {
+            pr_number,
+            file,
+            repo,
+        } => ForgeCmd::SuspectCriticalDiff(crate::forge_suspect_critical_diff::Args {
             pr: pr_number,
             file,
             repo,

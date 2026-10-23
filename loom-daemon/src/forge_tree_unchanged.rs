@@ -64,8 +64,7 @@
 //!   `forge disable-auto-merge` (#8900) already uses for the auto-merge disarm.
 //!
 //! There is deliberately **no** second copy of the comparison in shell. Adding
-//! one is what `.loom/docs/shell-language-policy.md` forbids and what the
-//! shell-budget ratchet refuses, and it is how the two paths came to disagree
+//! one is what `.loom/docs/shell-language-policy.md` forbids, and it is how the two paths came to disagree
 //! in the first place.
 //!
 //! # Fail closed, in both directions

@@ -1074,6 +1074,13 @@ pub(crate) enum MergePrCommand {
     /// <fact>` (exit 3, nothing done) when a forge fact must be fetched first
     /// — see `cli::merge_pr_post_merge_cleanup`.
     PostMergeCleanup(super::merge_pr_post_merge_cleanup::PostMergeCleanupArgs),
+
+    /// The post-merge issue bookkeeping (#8191, slice 2): the partial-increment
+    /// reset, the branch-derived issue close and the closed-issue label strip,
+    /// one `--step` per call. Prints `LEVEL<TAB>message` records ending in a
+    /// terminator, or `LOOM-NEED close-targets` (exit 3, nothing done) — see
+    /// `cli::merge_pr_post_merge_bookkeeping`.
+    PostMergeBookkeeping(super::merge_pr_post_merge_bookkeeping::PostMergeBookkeepingArgs),
 }
 
 impl MergePrCommand {
@@ -1119,6 +1126,7 @@ impl MergePrCommand {
             MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
             MergePrCommand::PostMergeCleanup(args) => args.run(),
+            MergePrCommand::PostMergeBookkeeping(args) => args.run(),
         }
     }
 }
