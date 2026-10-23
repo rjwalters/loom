@@ -783,7 +783,11 @@ echo
 echo "--- #12954: privilegedContentPatterns (capability from head contents, not filename) ---"
 
 FIXTURE_DIR="$TEST_DIR/fixtures/champion-workflows"
-PRIV_RX='["secrets\\.(?!GITHUB_TOKEN\\b)","secrets:\\s*inherit","^\\s*environment:",":\\s*write\\b","write-all","id-token","pull_request_target","workflow_run","^\\s*release:","types:.*released","wrangler\\s+deploy","npm\\s+publish","gh\\s+release"]'
+# The list is the shipped PRIVILEGED_CONTENT_PATTERNS (#12988), so this test and
+# test-champion-ci-workflow-blast.sh cannot drift from each other or from the doc.
+PRIV_RX="$(awk '/^PRIVILEGED_CONTENT_PATTERNS=\(/{p=1} p{print} p&&/^\)/{exit}' "$CHAMPION_MD" >"$CFG_DIR/priv.sh"; \
+    (source "$CFG_DIR/priv.sh"; printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}") | jq -R . | jq -s -c .)"
+assert_contains "$PRIV_RX" "wrangler" "shared privileged-content list extracted from champion-pr-merge.md"
 cap_class() { # cap_class <privilegedContentPatterns-json|-> -> a ci class with no name excludes
     local extra=""
     [ "$1" = "-" ] || extra=",\"privilegedContentPatterns\":$1"
