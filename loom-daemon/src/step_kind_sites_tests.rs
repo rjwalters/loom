@@ -235,6 +235,12 @@ const ISSUE_KIND_FIELDS: &[(&str, usize, &str)] = &[
     ),
     ("safehouse/envelopes.rs", 1, "event_to_envelope names Step"),
     (
+        "sweep_registry/published_repo.rs",
+        1,
+        "a #[cfg(test)] fixture seeding a live issue sweep; the lookup itself goes \
+         through live_issue_sweep_id, which already names the Builder step",
+    ),
+    (
         "safehouse.rs",
         1,
         "digest batching of issue dispatches; any other dispatch goes to \
