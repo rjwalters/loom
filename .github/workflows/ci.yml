@@ -1759,6 +1759,13 @@ jobs:
       - name: merge-pr closed-issue loom:building cleanup (#6199, #8191)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-closed-issue-cleanup.sh
+      # Moved out of shell-suite-tests by #8191's post-merge-bookkeeping slice:
+      # the feature-branch close bookkeeping now delegates to
+      # `loom-daemon merge-pr post-merge-bookkeeping`, so this suite's
+      # require-daemon-bin harness needs the binary this job downloads.
+      - name: merge-pr feature-branch close bookkeeping (#8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-merge-pr-feature-branch-close.sh
       # Moved out of shell-suite-tests by #8191's classify-response slice: the
       # head-SHA-mismatch classifier (#5579) this suite is ABOUT, and the
       # precedence keeping it out of the "Base branch was modified" retry arm,

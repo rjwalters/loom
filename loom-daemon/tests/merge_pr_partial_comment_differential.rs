@@ -408,8 +408,10 @@ fn neither_fixture_delegates_back_to_the_port() {
     }
 }
 
-/// `merge-pr.sh` must still be able to obtain both bodies. The wrapper that
-/// replaced the inline text is asserted by
+/// `merge-pr.sh` must still be able to obtain both bodies. The script reaches
+/// them through `merge-pr post-merge-bookkeeping` (#8191 slice 2), which calls
+/// `partial-comment` in-process. The wrapper that replaced the inline text is
+/// asserted by
 /// `defaults/scripts/tests/test-merge-pr-partial-increment.sh`; what is
 /// checked here is the half that lives on this side of the seam — that the
 /// live script no longer carries either body, so there is exactly one place
@@ -432,8 +434,8 @@ fn the_live_script_no_longer_carries_either_body() {
         );
     }
     assert!(
-        text.contains("merge-pr partial-comment"),
-        "merge-pr.sh does not invoke the verb that replaced the inline bodies"
+        text.contains("merge-pr post-merge-bookkeeping"),
+        "merge-pr.sh does not invoke the orchestrator that now renders the bodies in-process"
     );
 }
 
