@@ -394,7 +394,12 @@ pub struct SystemHost {
 ///
 /// The working directory is not a checkout of `repo`, so a read names it
 /// (`reader_repo`) or the facade cannot route it to a reader and sheds it.
-fn gh_inv(op: &'static str, intent: AccessIntent, repo: &str, args: &[&str]) -> GhInvocation {
+pub(crate) fn gh_inv(
+    op: &'static str,
+    intent: AccessIntent,
+    repo: &str,
+    args: &[&str],
+) -> GhInvocation {
     let gh = crate::gh_invocation::gh_bin();
     let inv = gh_call::inv(op, intent, Path::new(&gh), Path::new(".")).args(args);
     if intent == AccessIntent::Read {
@@ -404,7 +409,7 @@ fn gh_inv(op: &'static str, intent: AccessIntent, repo: &str, args: &[&str]) -> 
     }
 }
 
-fn gh_stdout(op: &'static str, repo: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn gh_stdout(op: &'static str, repo: &str, args: &[&str]) -> Option<String> {
     gh_call::ok_stdout(gh_inv(op, AccessIntent::Read, repo, args))
         .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
@@ -506,13 +511,18 @@ impl Host for SystemHost {
 
 /// Print a finished run in the wrapper's line protocol.
 pub fn print_records(records: &[Record]) {
+    print_records_with(records, DONE);
+}
+
+/// [`print_records`] with an explicit terminator (shared by sibling verbs).
+pub fn print_records_with(records: &[Record], done: &str) {
     let mut out = std::io::stdout().lock();
     for (level, text) in records {
         for line in text.split('\n') {
             let _ = writeln!(out, "{level}\t{line}");
         }
     }
-    let _ = writeln!(out, "{DONE}");
+    let _ = writeln!(out, "{done}");
     let _ = out.flush();
 }
 
