@@ -1191,10 +1191,10 @@ info "Branch: $PR_BRANCH"
 # read as "nothing to do".
 _post_merge_bookkeeping() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-  local step="$1" bin="${LOOM_DAEMON_BIN:-loom-daemon}" body out="" rc=0 attempt level text
+  local step="$1" bin="${LOOM_DAEMON_BIN:-loom-daemon}" body out="" rc=0 level text
   local args=(merge-pr post-merge-bookkeeping --step "$step" --repo "$REPO_NWO" --pr "$PR_NUMBER" --branch "${PR_BRANCH:-}" --conflicted "${PARTIAL_CONFLICT_ISSUES:-}" --open-before-merge "${PARTIAL_OPEN_BEFORE_MERGE:-}" --forge-helpers "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-helpers.sh")
   body="$(echo "$PR_JSON" | jq -r '.body // ""')"
-  for attempt in 1 2; do
+  for _ in 1 2; do
     rc=0; out="$(printf '%s' "$body" | "$bin" "${args[@]}")" || rc=$?
     [[ $rc -eq 3 && "$out" == "LOOM-NEED close-targets" ]] || break
     args+=(--close-targets "$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)")
@@ -2074,8 +2074,8 @@ _post_merge_cleanup() {
   [[ "${CLEANUP_PRIMARY_CHECKOUT:-true}" == "true" ]] || base+=(--no-cleanup-primary)
   [[ "${LOOM_PRESERVE_WORKTREE:-0}" != "1" ]] || base+=(--preserve-env)
   [[ -z "$WORKTREE_PATH_OVERRIDE" ]] || base+=(--worktree-path "$WORKTREE_PATH_OVERRIDE")
-  local facts=() out="" rc=0 attempt level text need
-  for attempt in 1 2 3 4; do
+  local facts=() out="" rc=0 level text need
+  for _ in 1 2 3 4; do
     rc=0; out="$("$bin" "${base[@]}" ${facts[@]+"${facts[@]}"})" || rc=$?
     [[ $rc -eq 3 && "$out" == "LOOM-NEED "* ]] || break
     need="${out#LOOM-NEED }"
