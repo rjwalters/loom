@@ -2543,17 +2543,21 @@ fn handle_request(
 
                             // Parse terminal output for quality metrics (test results, lint errors, build status)
                             // Issue #1054: Track test and quality outcomes
-                            match db.record_quality_from_output(0, &output_str) {
-                                Ok(Some(metrics_id)) => {
-                                    log::debug!(
-                                        "Recorded quality metrics (id: {metrics_id}) from terminal output"
-                                    );
-                                }
-                                Ok(None) => {
-                                    // No quality metrics found in output - this is normal
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to record quality metrics: {e}");
+                            // Skipped when no input correlates (#13100): a row with a
+                            // placeholder input_id would never match the stats joins.
+                            if let Some(input_id) = correlated_input_id {
+                                match db.record_quality_from_output(input_id, &output_str) {
+                                    Ok(Some(metrics_id)) => {
+                                        log::debug!(
+                                            "Recorded quality metrics (id: {metrics_id}) from terminal output"
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        // No quality metrics found in output - this is normal
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to record quality metrics: {e}");
+                                    }
                                 }
                             }
 
