@@ -1132,10 +1132,10 @@ info "Branch: $PR_BRANCH"
 # read as "nothing to do".
 _post_merge_bookkeeping() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-  local step="$1" bin="${LOOM_DAEMON_BIN:-loom-daemon}" body out="" rc=0 attempt level text
+  local step="$1" bin="${LOOM_DAEMON_BIN:-loom-daemon}" body out="" rc=0 level text
   local args=(merge-pr post-merge-bookkeeping --step "$step" --repo "$REPO_NWO" --pr "$PR_NUMBER" --branch "${PR_BRANCH:-}" --conflicted "${PARTIAL_CONFLICT_ISSUES:-}" --open-before-merge "${PARTIAL_OPEN_BEFORE_MERGE:-}" --forge-helpers "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-helpers.sh")
   body="$(echo "$PR_JSON" | jq -r '.body // ""')"
-  for attempt in 1 2; do
+  for _ in 1 2; do
     rc=0; out="$(printf '%s' "$body" | "$bin" "${args[@]}")" || rc=$?
     [[ $rc -eq 3 && "$out" == "LOOM-NEED close-targets" ]] || break
     args+=(--close-targets "$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)")
