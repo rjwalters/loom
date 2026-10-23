@@ -349,3 +349,5 @@ test-ci-wait-prompt-consistency.sh
 # #12939: tools-first slice resolution on a clean install (loom-tools before
 # loom-daemon, transitional fallback). Hermetic.
 test-tools-first-clean-install.sh
+# #12941: lib/loom-tools.sh is a compat alias for lib/repo-root.sh. Hermetic.
+test-repo-root-alias.sh
