@@ -406,6 +406,14 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
         ),
         (
+            "claim_reconciliation/orphan_stack.rs",
+            Via(
+                PASS,
+                "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
+                 comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
@@ -420,6 +428,13 @@ fn daemon_write_paths_are_scoped() {
                 "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
             ),
         ),
+        (
+            "fleet_sync/workspace_resync/w2.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync PR of a workspace repo the pass vetted with repo_writable (#12572)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         (
             "parent_link.rs",
@@ -431,6 +446,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("epic_supervisor.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         (
             "intake_reconcile/demote.rs",
@@ -452,6 +468,10 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "the lease record of a dispatched sweep or step (moved from guards.rs, #11898)"),
         ),
         (
+            "sweep_registry/step_spawn/builder_rollback.rs",
+            Via(DISPATCH, "yields the lease + restores the label of a refused dispatched Builder step (#12822)"),
+        ),
+        (
             "sweep_registry/dispatch/claim_release.rs",
             Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
         ),
@@ -471,6 +491,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "sweep_registry/step_cap_notice.rs",
             Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
+        ),
+        (
+            "sweep_registry/step_outcome_notice.rs",
+            Via(DISPATCH, "noop/failed reason comment on an item whose Builder step was dispatched (#13054)"),
         ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
@@ -589,10 +613,6 @@ fn daemon_write_paths_are_scoped() {
             OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
         ),
         (
-            "watchdog/peer_coord.rs",
-            NotAWrite("follow-up on the issue this watchdog filed"),
-        ),
-        (
             "forge_probe.rs",
             NotAWrite(
                 "the hosted-trial probe writes to the candidate instance's disposable \
@@ -605,6 +625,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("action names; writes go through dep_classify"),
         ),
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "stack_parent.rs",
+            NotAWrite("reads the forge and runs local git; only its test names git's `-X theirs`"),
+        ),
         (
             "gh_invocation/accounting.rs",
             NotAWrite("classifies an invocation's argv for call accounting, runs none"),
@@ -662,6 +686,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "fleet_dispatch/server.rs",
             NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
+        ),
+        (
+            "host_loss/imds.rs",
+            NotAWrite("IMDSv2 token `PUT` to the link-local metadata endpoint, not the forge"),
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

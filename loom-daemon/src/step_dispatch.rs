@@ -15,7 +15,7 @@
 //!
 //! - [`outcome_ledger`]: what a finished step's outcome class does next, per
 //!   `(item, step)`, and the cooldown query the draw reads (#11900).
-//! - [`reeval_ladder`]: the Champion re-evaluation ladder, 6 h → 7 d, kept
+//! - [`reeval_ladder`]: the Champion re-evaluation ladder, 1 h → 7 d, kept
 //!   in the item's body on the forge (#11900).
 //!
 //! - [`gather`]: one workspace's items, joined, classified and ready to
@@ -41,5 +41,6 @@ pub mod outcome_ledger;
 pub mod reeval_ladder;
 pub mod session_ledger;
 pub mod stage_entry;
+pub mod state_rows;
 pub mod step_end;
 pub mod tick;

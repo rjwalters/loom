@@ -17,8 +17,9 @@
 //! # Projections
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
-//! item to a closed, versioned `(class, reason)`. This change registers
-//! `champion` only ([`champion`]); other roles add theirs (#12029).
+//! item to a closed, versioned `(class, reason)`. Registered: `champion`
+//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921);
+//! other roles add theirs (#12029).
 //!
 //! # The ledger's view, record-only
 //!
@@ -59,6 +60,8 @@ use crate::telemetry::kinds::pass::{PassMode, PassVerdictRecord, StepFacts};
 use crate::telemetry::provenance::Provenance;
 
 pub mod champion;
+pub mod curator;
+pub mod doctor;
 pub mod refusals;
 
 use refusals::{Observed, RefusalStore};
@@ -95,6 +98,8 @@ pub struct Evidence {
     pub events: Vec<Event>,
     /// The step's outcome word, verbatim (step path only).
     pub outcome: Option<String>,
+    /// The step's `reason=` token, verbatim (step path only, #12715).
+    pub reason: Option<String>,
     /// A step end (always projected), not a role-runner tick.
     pub step_path: bool,
     /// The item's labels as the run's listings served them.
@@ -129,6 +134,8 @@ pub struct Projection {
     /// The verdict rests on a write that landed.
     pub wrote: bool,
     pub store: StoreOp,
+    /// The session's raw reason token, for the record's `detail` (#12715).
+    pub detail: Option<String>,
 }
 
 /// A role's projection (#12027 registers Champion; #12029 adds Judge).
@@ -139,6 +146,8 @@ pub struct Projector {
     pub project: fn(&Evidence) -> Option<Projection>,
     /// The step's outcome word from its log text.
     pub outcome_word: fn(text: &str, is_pr: bool, item: u32) -> Option<String>,
+    /// The step's `reason=` token from its log text (#12715).
+    pub reason_word: fn(text: &str, is_pr: bool, item: u32) -> Option<String>,
 }
 
 /// The projection registered for `role`, if any.
@@ -146,8 +155,45 @@ pub struct Projector {
 pub fn projector(role: &str) -> Option<Projector> {
     match role {
         "champion" => Some(champion::PROJECTOR),
+        "doctor" => Some(doctor::PROJECTOR),
+        "curator" => Some(curator::PROJECTOR),
         _ => None,
     }
+}
+
+/// `key=` of the last `LOOM_STEP_OUTCOME` line in `text` for `role` and
+/// `item`, verbatim (the ledger's own line, [`outcome_ledger::OUTCOME_LINE_PREFIX`]).
+fn outcome_field(text: &str, role: &str, item: u32, key: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        let rest = line
+            .trim()
+            .strip_prefix(outcome_ledger::OUTCOME_LINE_PREFIX)?;
+        let field = |key: &str| {
+            rest.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        };
+        (field("role")? == role && field("target")?.parse::<u32>().ok()? == item)
+            .then(|| field(key).map(str::to_string))
+            .flatten()
+    })
+}
+
+fn projection(class: &'static str, reason: &str, set: &'static str) -> Projection {
+    Projection {
+        class,
+        reason: reason.to_string(),
+        reason_set: set,
+        ..Projection::default()
+    }
+}
+
+/// The session's raw `reason=` token for a record's `detail`: the token
+/// characters only, bounded.
+fn sanitize_detail(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(48)
+        .collect()
 }
 
 /// The step whose end drains a journal.
@@ -288,7 +334,9 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     by: by.clone(),
                 },
             )),
-            JournalEntry::Queue { .. } | JournalEntry::Listing { .. } => None,
+            JournalEntry::Queue { .. }
+            | JournalEntry::Listing { .. }
+            | JournalEntry::Hold { .. } => None,
         })
         .collect()
 }
@@ -348,6 +396,7 @@ pub fn records_for(
                     .map(|(_, _, e)| e)
                     .collect(),
                 outcome: (projector.outcome_word)(text, is_pr, step.item),
+                reason: (projector.reason_word)(text, is_pr, step.item),
                 step_path: true,
                 pre_labels: labels.get(&step.item).cloned().unwrap_or_default(),
             };
@@ -357,7 +406,7 @@ pub fn records_for(
                 return Vec::new();
             };
             let pass_id = derived(&["loom.pass.step", &step.sweep_id]);
-            vec![record(
+            let mut rec = record(
                 ctx,
                 &projector,
                 &pass_id,
@@ -366,7 +415,9 @@ pub fn records_for(
                 Some(&ledger),
                 ctx.now,
                 store,
-            )]
+            );
+            rec.step.sweep_id = Some(step.sweep_id.clone());
+            vec![rec]
         }
         Source::Tick { started_at } => {
             let pass_id = derived(&[
@@ -454,7 +505,7 @@ fn record(
         p.reason_key.as_deref().unwrap_or_default(),
         &hour,
     ]);
-    let proposal_label = (!evidence.is_pr)
+    let proposal_label = (!evidence.is_pr && ctx.role == "champion")
         .then(|| {
             champion::PROPOSAL_LABELS
                 .into_iter()
@@ -471,7 +522,7 @@ fn record(
         artifact: if evidence.is_pr { "pr" } else { "issue" }.to_string(),
         verdict: p.class.to_string(),
         reason: Some(p.reason.clone()),
-        detail: None,
+        detail: p.detail.clone(),
         blockers: Vec::new(),
         labels_added: Vec::new(),
         labels_removed: Vec::new(),
@@ -481,6 +532,7 @@ fn record(
         budget: None,
         at: evaluated_at,
         step: StepFacts {
+            sweep_id: None,
             head_sha: p.head_sha,
             step: Some((projector.step_name)(evidence.is_pr).to_string()),
             class: Some(p.class.to_string()),

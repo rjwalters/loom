@@ -161,5 +161,21 @@ scripts/check-dependabot-labels.sh
 scripts/tests/test-check-dependabot-labels.sh
 scripts/tests/test-check-pipefail-early-exit.sh
 
+# #12121 (2026-10-16) — the operator presence hook is retired; operator
+# activity is inferred by consumers, not emitted.
+hooks/presence-beat.sh
+
 # #11983 (2026-10-16) — the stamp-only create-pr provenance test is removed.
 scripts/tests/test-create-pr-provenance.sh
+
+# #12709 (2026-10-18) — the unmeasured Judge fan-out experiment scaffold is
+# retired (PR #12743).
+scripts/experiments/README.md
+scripts/experiments/judge-fanout-corpus-runner.sh
+scripts/experiments/judge-fanout-experiment.sh
+scripts/experiments/judge-fanout-results-template.md
+scripts/experiments/judge-fanout-workflow.js
+scripts/tests/test-judge-fanout-experiment.sh
+
+# #13020 (2026-10-21) — the orphaned heredoc-body-safety test lib is removed (PR #13023).
+scripts/tests/lib/heredoc-body-safety.sh

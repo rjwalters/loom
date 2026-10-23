@@ -1,7 +1,7 @@
 # Champion: Critical-File Durable Hold (#6879, #9016)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Safety Criteria"
-→ "3. Critical File Exclusion Check". Read it once that check-loop has run,
+→ "`critical-files`: Critical File Exclusion Check". Read it once that check-loop has run,
 whatever the verdict: FAIL opens/maintains the hold, PASS alone closes an open
 episode. It owns one label (`loom:blocked` + a reason-only park record,
 #11861) and three markers on one PR; it never merges and never removes
@@ -11,17 +11,46 @@ Rationale: `.loom/docs/critical-file-hold.md`.
 ## The rules
 
 - A critical-file FAIL is a **one-way terminal state**, so it gets a durable
-  `loom:blocked` hold on criterion #2's pattern — **never** the "Transient
-  failures" template, nor criterion #2's sticky-hold machinery (#4742).
+  `loom:blocked` hold on the `merge-risk` criterion's pattern — **never** the "Transient
+  failures" template, nor the `merge-risk` criterion's sticky-hold machinery (#4742).
 - A FAIL skips Steps 2-3 for this PR **in every state, `released` included**:
   releasing hands the merge to the operator, never back to Champion.
-  `loom:auto-merge-ok` does not release it (criterion #2's override).
+  `loom:auto-merge-ok` does not release it (the `merge-risk` criterion's override).
 - **The operator's release is the label's ABSENCE** (#9016): a hand-removed
   `loom:blocked`, while this episode is open and the change has not moved, IS
   the release: Champion never removes it mid-episode (#11861 keeps it on
   through the Doctor round-trip).
 - The release is scoped to a **diff, not a commit id** (#9416): this verdict is a
   pure function of the file list, so the operator decided about that change.
+
+## A covering standing authorization means no hold (#12528)
+
+The FAIL above is "one-way terminal" only for a PR no operator pre-authorized.
+`champion-pr-merge.md`'s `critical-files` criterion runs `standing_auth_eval critical` first: a
+`champion.standingAuthorizations` class with `"coversCriticalFiles": true` that
+matches the whole diff (`filePatterns` exact subset; no `excludeFilePatterns`
+file; no `forbiddenDiffPatterns` line in any added/removed line; no kept-set
+path; `judgeApproval` and `greenCi` holding) passes `critical-files`, so this tick receives
+`$CRITICAL_FILES_RESULT="PASS"` and writes no hold. Any open episode closes through
+the ordinary PASS row (cleared notice + remove `loom:blocked`), naming the class
+id. One file outside the class, an excluded file, a forbidden line or an
+unreadable diff restores the FAIL and this whole machine. A `dependabot-bumps` class (`authorIsDependabot`, manifest and lockfile `filePatterns`; #12948) is the fleet-default example: Dependabot's own manifest bumps pass `critical-files`, a human PR with the same diff does not. The kept set (the
+merge gate, guard hooks, credential selection, installers/updaters,
+migrations) is never satisfiable by a class.
+
+A `"criticalFilesOnly": true` class (#12648) passes `critical-files` the same way, but is
+matched against the critical-file hits alone (the files `critical-files` flags, and each
+one's `previous_filename`): every hit must match its `filePatterns`, none its
+`excludeFilePatterns`, no forbidden line in the hits' patches, no kept-set path
+anywhere in the PR, conditions holding. Several such classes compose per hit
+(#13042): the criterion passes when each hit is covered by at least one passing
+class, each class checked over its own hits, and the PASS names every class used
+(the `auth=` digest stays the whole-list `--digest`). The hold comment quotes the
+evaluator's `STANDING_AUTH_WHY` (class, hit and failed check) instead of asserting
+that no class covers the PR. The other changed files are left to
+the `merge-risk` criterion, which this class never satisfies. A PASS under it closes an open
+episode through the same ordinary PASS row; if the `merge-risk` criterion then holds the PR,
+that is the `merge-risk` criterion's own hold, not this machine's.
 
 ## The state machine
 
@@ -35,7 +64,7 @@ The state is whichever of these three markers is the **latest** trusted comment
 | `<!-- champion:critical-file-hold-cleared -->`, or none | `none` — no open episode |
 
 Both `held` and `released` comments carry
-`<!-- champion:hold-state head=<sha> -->` as their second line — the marker #2
+`<!-- champion:hold-state head=<sha> -->` as their second line — the marker `merge-risk`
 records and `merge-pr.sh` reads back at merge time (#7419).
 
 On **PASS** the state alone decides: `held`/`released` closes the episode (cleared
@@ -45,7 +74,7 @@ matching row wins:
 | State | Action on FAIL |
 |---|---|
 | `released`, recorded head == current head | nothing at all: no label, no comment |
-| either, label present (a human put it back) | hold stands, silently |
+| either, label present (a human put it back) | hold stands, silently — except that a changed standing-authorization digest is recorded once (#12933) |
 | `held`, label absent, recorded head == current head | **respect the release**: acknowledge once, do **not** re-add the label |
 | `none` | fresh hold: notice + `loom:blocked` |
 | either, head moved but the PR's own change provably did not (#9416) | **respect, re-recorded at the new head** with the equivalence kind |
@@ -60,7 +89,7 @@ CI is never exempted.
 
 ## The tick
 
-With the check-loop's verdict in `$CRITERION3_RESULT`:
+With the check-loop's verdict in `$CRITICAL_FILES_RESULT`:
 
 ```bash
 PR_NUMBER=<number>
@@ -105,7 +134,7 @@ cf_change_unmoved() {
   [ -n "$CF_EQUIV_KIND" ]
 }
 
-if [ "$CRITERION3_RESULT" = "FAIL" ]; then
+if [ "$CRITICAL_FILES_RESULT" = "FAIL" ]; then
   CF_EQUIV_KIND=""
   if [ "$CF_STATE" = released ] && [ "$STATE_HEAD" = "$HEAD_SHA" ]; then
     CF_ACTION=none          # released at this head, already acknowledged
@@ -130,6 +159,18 @@ if [ "$CRITERION3_RESULT" = "FAIL" ]; then
     stands)
       # Idempotent; this and hold|rearm alone assert the hold.
       echo "Critical-file hold already posted for #$PR_NUMBER — hold stands, no comment"
+      # #12933: the daemon drew this hold because the standing-authorization
+      # digest moved (or a legacy record has none). No class covered it, so
+      # record the current digest ONCE at this head — the daemon reads the
+      # LAST trusted `champion:hold-state` record — or every later tick
+      # redraws it (the #12901 no-op loop). Not one of the three state
+      # markers, so LAST_STATE / STATE_HEAD are unchanged.
+      HOLD_AUTH=$(loom-daemon config get champion.standingAuthorizations --digest 2>/dev/null)
+      RECORDED_AUTH=$(jq -r '[.comments[].body | capture("<!-- champion:hold-state head=[0-9a-f]+(?: auth=(?<a>[0-9a-f]+))?")] | last | .a // ""' <<<"$CF_JSON")
+      if [ -n "$HOLD_AUTH" ] && [ "$RECORDED_AUTH" != "$HOLD_AUTH" ]; then
+        ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "<!-- champion:hold-state head=$HEAD_SHA auth=$HOLD_AUTH -->
+**Champion: critical-file hold re-read under changed standing authorizations (#12933)** — no class covers this PR's critical-file hits; the hold notice above still applies. The digest is recorded so this re-read happens once per policy change."
+      fi
       cf_park
       ;;
     hold|rearm)
@@ -139,18 +180,28 @@ if [ "$CRITERION3_RESULT" = "FAIL" ]; then
       else
         CF_REARM_NOTE=""
       fi
+      # #12999: name the suspect line the `critical-files` criterion matched, not just the file.
+      # Empty when the hold is a plain pattern hit (migrations, workflows, no patch).
+      CF_SUSPECT_NOTE=""
+      [ -n "${CRITERION3_SUSPECT_LINE:-}" ] &&
+        CF_SUSPECT_NOTE="
+- **Matched suspect line** (in \`[${CRITERION3_SUSPECT_SECTION:-?}]\`): \`${CRITERION3_SUSPECT_LINE}\`"
       CF_WF_NOTE=""   # #10539
       gh pr diff "$PR_NUMBER" --name-only 2>/dev/null | grep -q '^\.github/workflows/' &&
         CF_WF_NOTE="
 Merging workflow files needs the \`workflow\` token scope: \`gh auth refresh -h github.com -s workflow\`
 "
+      # Standing-authorization digest (#12933): a later change to
+      # `champion.standingAuthorizations` differs from it and re-reads this hold once.
+      HOLD_AUTH=$(loom-daemon config get champion.standingAuthorizations --digest 2>/dev/null)
+      HOLD_AUTH_FIELD=""; [ -n "$HOLD_AUTH" ] && HOLD_AUTH_FIELD=" auth=$HOLD_AUTH"
       ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$HOLD_MARKER
-<!-- champion:hold-state head=$HEAD_SHA -->
+<!-- champion:hold-state head=$HEAD_SHA${HOLD_AUTH_FIELD} -->
 **Champion: Holding for Human Merge — Critical File**
 
 ${CF_REARM_NOTE}This PR modifies a critical file and cannot be automatically merged:
 
-- **Critical File Exclusion Check**: <FILE_PATH> matches critical-file pattern \`<PATTERN>\`
+- **Critical File Exclusion Check**: <FILE_PATH> matches critical-file pattern \`<PATTERN>\`${CF_SUSPECT_NOTE}
 
 **Next steps** — to merge it yourself, two commands, in either order, no race:
 
@@ -196,7 +247,7 @@ elif [ "$CF_STATE" = held ] || [ "$CF_STATE" = released ]; then
   # PASS with an episode open — a push narrowed the diff. Post a one-time
   # reversal notice, then continue as an ordinary PASS. The label is shared
   # with the merge-risk hold: remove it only if no merge-risk hold stands
-  # (#11861), or criterion #2 would read Champion's removal as a human release.
+  # (#11861), or the merge-risk criterion would read Champion's removal as a human release.
   MR_STANDS=$(jq -r '[.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h
     | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)' <<<"$CF_JSON")
   [ "$MR_STANDS" = true ] || gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true

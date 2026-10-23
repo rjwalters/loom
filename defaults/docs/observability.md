@@ -14,12 +14,12 @@
 - [The pipeline, in one picture](#the-pipeline-in-one-picture)
 - [1. Enable telemetry on a daemon](#1-enable-telemetry-on-a-daemon)
 - [2. What gets sent: the wire schema](#2-what-gets-sent-the-wire-schema)
-- [3. Exporters: HTTPS (default) or OTLP (opt-in)](#3-exporters-https-default-or-otlp-opt-in)
+- [3. Exporters: OTLP](#3-exporters-otlp)
 - [3b. Confirming telemetry is actually flowing](#3b-confirming-telemetry-is-actually-flowing)
 - [3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)](#3b-2-every-daemon-must-export-otlp-otlp_export-issue-11353)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
-- [3e. Alerts on loom-ui's Alerts page (Issue #11295)](#3e-alerts-on-loom-uis-alerts-page-issue-11295)
+- [3e. Alerts as `alert.transition` telemetry (Issues #11295, #12806)](#3e-alerts-as-alerttransition-telemetry-issues-11295-12806)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -39,23 +39,19 @@ loom-daemon (per host)
   durable disk-backed queue (survives sink outage / sleep)
         │  drains via a jittered-retry loop
         ▼
-  exporter: HttpsExporter (default) or OtlpExporter (opt-in, #4858)
+  exporter: OtlpExporter (OTLP/HTTP, the only exporter since #12813)
         │
         ▼
-Cloudflare Worker backend (deploy-your-own, or an operator-run reference instance)
-  D1 (durable history) + Durable Object (live "what's running now")
-        │
-        ├── /api/*     authenticated, full detail   (Cloudflare Access)
-        └── /public/*  unauthenticated, redacted     (always reachable)
-        │
-        ▼
-Dashboard UI (served by the same Worker) — authenticated + public views
+OpenTelemetry backend you run (SigNoz, a Collector, Grafana, Honeycomb, …)
 ```
 
 Nothing here is mandatory: with no `observability` block (or `enabled:
 false`), the daemon does none of the above — no subscription, no queue file,
 no HTTP client, zero extra syscalls. Loom never phones home; every hop in
 this pipeline is infrastructure **you** deploy and point your own daemons at.
+The daemon never talks to a dashboard: the native JSON-over-HTTPS `/ingest`
+exporter was removed in #12813, and a dashboard reads what the daemon exports
+from the OTLP backend like any other consumer.
 
 ## 1. Enable telemetry on a daemon
 
@@ -66,7 +62,8 @@ Add the `observability` block to that host's `.loom/config.json` — **except**
 {
   "observability": {
     "enabled": true,
-    "endpoint": "https://<your-worker>.workers.dev/ingest",
+    "endpoint": "https://<your-otlp-collector>",
+    "exporter": "otlp",
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
@@ -87,8 +84,8 @@ Precedence is **env > config > default**, the same rule every other
 | `batchSize` | `LOOM_OBSERVABILITY_BATCH_SIZE` | 50 |
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
-| `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
-| `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3); an `otlp` entry may carry `headers_file` (§3) |
+| `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | unset ⇒ no exporter; `"otlp"` (§3). The retired `"https"` is skipped with a warning (#12813) |
+| `exporters` | — (config only) | unset ⇒ `exporter` (§3); an `otlp` entry may carry `headers_file` (§3) |
 | `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
 
 `claudeCodeTelemetry` is the one sub-block that configures **someone else's**
@@ -99,8 +96,8 @@ is [tracing](tracing.md) → "Worker-native sub-spans".
 
 **`endpoint` resolution order is env > `.loom-local/local.json` > the committed
 `.loom/config.json`** (`config_resolver.rs`/`config-resolver.sh`), so — like
-`ingestKeyFile` below — the committed file must never carry a live ingest
-endpoint; ship only a placeholder (e.g. `https://dashboard.example.com/ingest`)
+`ingestKeyFile` below — the committed file must never carry a live
+endpoint; ship only a placeholder (e.g. `https://collector.example.com`)
 there and deliver each operator's real endpoint through
 `LOOM_OBSERVABILITY_ENDPOINT` or the gitignored local-config tier (#6650) —
 **not** the private-defaults tier (`LOOM_CONFIG_DEFAULTS_FILE`, else
@@ -116,15 +113,17 @@ committed block must **also** carry `enabled: false` so the placeholder is
 inert; exporting hosts opt in with `LOOM_OBSERVABILITY_ENABLED=true` +
 `LOOM_OBSERVABILITY_ENDPOINT` (or both keys in `.loom-local/local.json`).
 
-The ingest key is **never inline in config** — `ingestKeyFile` is a path the
-daemon reads once at startup and holds only in memory, sent solely as an
-`Authorization: Bearer` header. A misconfigured block (missing *or*
+The bearer credential is **never inline in config** — `ingestKeyFile` (the
+name predates the OTLP-only pipeline; it is the OTLP sink's bearer token file)
+is a path the daemon reads once at startup and holds only in memory, sent
+solely as an `Authorization: Bearer` header. An `otlp` entry with its own
+`headers_file` needs no `ingestKeyFile` at all (§3). A misconfigured block (missing *or*
 placeholder endpoint, unreadable key file) degrades to off; it does not crash
 the daemon. Source of
 truth: `loom-daemon/src/observability/mod.rs`'s module doc (config
 resolution, FLAGS-OFF posture, read-only invariant) and its `collector.rs` /
 `queue.rs` / `exporter.rs` / `sender.rs` siblings (collector, durable queue,
-exporter trait + HTTPS implementation, retry-drain loop).
+exporter trait, retry-drain loop).
 
 **`ingestKeyFile` must never be committed to the shared `.loom/config.json`**
 — unlike every other `observability.*` key above, it is host-specific by
@@ -159,29 +158,33 @@ field-by-field reference, the `visibility` anti-leak contract, and the local
 exporter is configured**):
 [`.loom/docs/telemetry-schema.md`](telemetry-schema.md).
 
-## 3. Exporters: HTTPS (default) or OTLP (opt-in)
+## 3. Exporters: OTLP
 
-The default exporter is `HttpsExporter` — JSON-over-HTTPS `POST /ingest`,
-batched (`batchSize`), retried with jitter, backed by the durable disk queue
-so a sink outage or a sleeping host never silently drops data up to
-`queueCapacity`. The `Exporter` trait (`exporter.rs`) and the drain loop
-(`sender.rs`) are both deliberately generic, so a second sink is a drop-in
-addition rather than a rewrite: `OtlpExporter` (epic Phase 4, issue
-[#4858](https://github.com/rjwalters/loom/issues/4858)) translates the same
+OTLP is the only exporter (#12813 removed the native JSON-over-HTTPS `POST
+/ingest` one). `OtlpExporter` (epic Phase 4, issue
+[#4858](https://github.com/rjwalters/loom/issues/4858)) translates
 `TelemetryEnvelope` batches into OTLP logs (`/v1/logs`) and metrics
-(`/v1/metrics`) requests for operators with an existing OpenTelemetry stack
-(a self-hosted collector, Grafana, Honeycomb, …), reusing `sender.rs`'s
-durable queue and drain/retry loop.
+(`/v1/metrics`) requests, batched (`batchSize`), retried with jitter, and
+backed by the durable disk queue so a sink outage or a sleeping host never
+silently drops data up to `queueCapacity`. The `Exporter` trait
+(`exporter.rs`) and the drain loop (`sender.rs`) stay generic.
 
-Select it with `observability.exporter = "otlp"`
-(`LOOM_OBSERVABILITY_EXPORTER` env override; **env > config > default**,
-default `"https"`). Published artifacts include OTLP; local default Cargo builds
-still omit the optional feature. Export remains disabled until explicitly enabled.
+Select it with `observability.exporter = "otlp"` or an `observability.exporters`
+entry (`LOOM_OBSERVABILITY_EXPORTER` env override; **env > config**). **There is
+no default exporter**: an `enabled: true` config that names none reports
+`MISCONFIGURED — no exporter configured` in `loom-daemon status` instead of
+exporting anywhere. A config that still names `"https"` (the old default) logs
+one warning, skips the entry, and starts cleanly; its `endpoint` /
+`ingestKeyFile` keys are ignored unless an `otlp` entry uses them (the
+phase-2 shim, `retired_captain_config.rs`, still warns once about a dashboard
+`/ingest` endpoint). Published artifacts include OTLP; export remains disabled
+until explicitly enabled.
 See [execution traces](tracing.md) for persisted trace identity, correlated logs,
 completed-span export, and bounded shutdown.
 
 Every OTLP request, on all three signals (traces, logs, metrics), carries one
-resource per emitting host with exactly these attributes:
+resource per emitting host with these identity attributes, followed by the
+host-shape attributes in the next table:
 
 | Resource attribute | Value |
 |---|---|
@@ -192,6 +195,41 @@ resource per emitting host with exactly these attributes:
 | `service.version` | the reporting daemon's version (a `host.health` record's `daemon_version`, else the exporting build's) |
 | `loom.daemon.revision` | the exporting build's full git SHA (`unknown` for a tarball build) — the same value every span carries (#11197) |
 | `loom.fleet.config_sha` | the fleet-gitops commit whose rendered config tiers are **on disk on this host right now**: a 40-hex SHA, `unknown` (a fleet host where no applied commit is established yet, e.g. during a startup-pass timeout), or `none` (no fleet store, `fleet.repo` unset). Never empty, never omitted (#11197) |
+
+**Host shape (#12874).** The emitting host's static shape, so a sweep or phase
+span resolves to its host's size with no join against the
+`loom.host.logical_cpus` gauge:
+
+| Resource attribute | Value |
+|---|---|
+| `host.cpu.count` | logical CPU count (int) — the same source as the `loom.host.logical_cpus` gauge. Always present |
+| `loom.host.mem_total_bytes` | total physical memory in bytes (int; `/proc/meminfo` `MemTotal`, macOS `hw.memsize`). **Absent** when unmeasurable, never `0` |
+| `host.arch` | OTel semconv architecture: `amd64`, `arm64`, else Rust's raw `std::env::consts::ARCH`. Always present |
+| `host.type` | the EC2 instance type (e.g. `c7i.2xlarge`) on Linux once the IMDS probe succeeds; a Mac's `sysctl hw.model` (e.g. `Mac14,6`); absent elsewhere |
+| `cloud.provider`, `cloud.region` | `aws` and the instance's region, from the same IMDS probe; absent on a Mac or any non-EC2 host |
+
+CPU count, RAM, arch and Mac model are read once per process and cached. The
+instance type comes from a single AWS IMDSv2 probe (`PUT /latest/api/token`,
+then `meta-data/instance-type` and `meta-data/placement/region`) spawned at
+telemetry startup on Linux. It bypasses any `HTTP(S)_PROXY`, has a 1 s total
+budget, never retries and is never awaited — so startup is not delayed, and
+batches exported before it lands (or on a host where IMDS is unreachable)
+simply lack `host.type`/`cloud.*`. `eta.stage_outcome` records carry the
+*observing* host's shape, not the executing host's; join through the
+executing `host.id` on `sweep.*` records for that.
+
+**Host load on sweep/phase spans (#12884).** `loom.sweep` and every
+`loom.phase` span carry the `lifecycle::host_attributes()` sample, including
+`loom.host.logical_cpus` and `loom.host.loadavg_1m`, at open and again at
+close. A close overwrites a same-named key, so the plain
+`loom.host.loadavg_1m` / `loom.host.load_per_core` on an exported span are the
+**close-time** sample; the open-time sample is kept under
+`loom.host.start.loadavg_1m` / `loom.host.start.load_per_core`, which no close
+re-stamps. Phase spans opened inside a `spawn-claude.sh` child (the checkpoint
+sites) also carry `loom.host.cpu_budget_cores` and `loom.host.sweeps_in_flight`
+— the CPU quota and the in-flight sweep count it was divided by. Each key is
+absent when unknown, never zero-filled: `sweeps_in_flight` is absent when the
+budget was not shared across sweeps (`LOOM_SWEEP_SHARED_CPU_BUDGET=0`).
 
 `host.name` has one source, the same string as `host.id`: the daemon's host
 identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
@@ -228,29 +266,26 @@ process's exporter coming up.
 
 ### Multi-exporter fan-out (#8756)
 
-`observability.exporters` accepts a **list**, delivering the same envelopes to
-N sinks simultaneously — e.g. the native Cloudflare dashboard *and* an
-OTLP-fed collector:
+`observability.exporters` accepts a **list** of per-kind entries, each a bare
+kind string (`"otlp"`) using the shared `observability.endpoint`, or an object
+`{"kind": "otlp", "endpoint": …}` carrying its own endpoint override:
 
 ```json
 {
   "observability": {
     "enabled": true,
-    "endpoint": "https://dashboard.example.com/ingest",
-    "exporters": ["https", { "kind": "otlp", "endpoint": "http://collector.internal:4318" }]
+    "exporters": [{ "kind": "otlp", "endpoint": "http://collector.internal:4318" }]
   }
 }
 ```
 
-Each entry is either a bare kind string (`"https"`, `"otlp"`) — using the
-shared `observability.endpoint` — or an object `{"kind": …, "endpoint": …}`
-carrying its own endpoint override (required when the two sinks live at
-different URLs, as in the example above). Each configured exporter gets its
+Entries are deduplicated by kind, and `otlp` is the only kind since #12813, so
+the list holds at most one sink today; the per-kind machinery stays for a future
+second transport. Each configured exporter gets its
 **own** durable queue file (`observability-queue.<name>.jsonl` under
 `.loom/logs/`), its own sender task with an independent retry/backoff loop,
 and its own status entry — `loom-daemon status --json`'s
-`observability_exports` map keys `https` / `otlp` independently, so one
-sink's outage (and its queue backlog) never affects the other's delivery.
+`observability_exports` map is keyed by exporter name (`otlp`).
 
 Back-compat and upgrade rules:
 
@@ -263,7 +298,7 @@ Back-compat and upgrade rules:
   (renamed) into the **first** configured exporter's per-name file, exactly
   once — no records are stranded by the upgrade.
 - Entries dedupe by kind (first wins; queues and status are keyed by kind
-  name, so `"https"` can appear once). An unrecognized kind is logged and
+  name, so `"otlp"` can appear once). An unrecognized kind is logged and
   skipped, never a hard error.
 - A policy failure on one entry (bad endpoint, placeholder host, refused
   `headers_file`, or a missing/unreadable ingest key when this entry needs
@@ -341,8 +376,7 @@ like any other per-entry policy failure, and other exporters keep running:
   without it (which may use plain `http` to a collector on a private
   network, as in the fan-out example above) and applies only when
   `headers_file` is set.
-- **`headers_file` on a non-`otlp` entry**, or a value that is not a
-  non-empty string. The native HTTPS exporter does not take extra headers.
+- **A `headers_file` value that is not a non-empty string.**
 
 Header **values never leave the request**: they are not written to any log
 line, error, `loom-daemon status` field or exported record, and the type that
@@ -405,24 +439,13 @@ See [OTLP transport and artifact verification](otlp-transport.md) for response
 classification, per-signal counters, retry/drop policy and the real Collector
 canary. Mapping details remain in `observability/otlp/mapping.rs`.
 
-**The HTTPS exporter verifies its own identity** (issue #4830). Each `/ingest`
-success response echoes the `host_id` the presented key is bound to; the
-exporter compares that against the identity this daemon resolved for itself
-(`$LOOM_HOST_ID` > `$HOSTNAME` > `hostname`). On a disagreement — the wrong
-host's key file installed on a machine, which silently mislabeled a whole
-night of telemetry on 2026-07-31 — it logs a WARN **once per daemon lifetime**
-and `loom-daemon health` reports an `observability DEGRADED` section (exit
-`1`). Nothing else changes: the batch is still acked, and the key's binding
-stays authoritative on the backend. Fix by installing the right key or setting
-`$LOOM_HOST_ID` to match, then restarting the daemon.
-
-This check is specific to the native ingest protocol, which is what defines
-the echo. OTLP/HTTP has no equivalent — a success response carries only
-`partial_success`, and a generic OTLP sink has no notion of a per-host key
-binding to disagree with — so under `exporter = "otlp"` no mismatch is ever
-published and the `observability` health section stays silent. Choosing OTLP
-therefore trades this particular misconfiguration guardrail away; keep the
-default `"https"` sink if you want it.
+**Host-identity echo (retired, #12813).** Until #12813 the native `/ingest`
+exporter compared the `host_id` its success response echoed against this
+daemon's own and reported a mismatch (`host_id_mismatch`, an `observability
+DEGRADED` health section). OTLP/HTTP has no such echo, and the exporter that
+had it is gone, so no current daemon publishes that state or the
+`observability_host_id_mismatch` status field; an older daemon's
+`host_id_mismatch` state reads as `unrecognized` to a current client.
 
 ## 3b. Confirming telemetry is actually flowing
 
@@ -441,7 +464,7 @@ warning.
 how far that answer reaches (issue #9015):
 
 ```
-Observability: OK (first hop only) — last export 12s ago, 3481 record(s) as host_id=studio-host → https://…/ingest
+Observability: OK (first hop only) — last export 12s ago, 3481 record(s) as host_id=studio-host → https://…/v1/logs
 ```
 
 The same facts are machine-readable under `observability_export` in
@@ -455,11 +478,10 @@ loom-daemon status --json | jq -e '.observability_export.state == "healthy"'
 | `state` | Meaning | Rendered as |
 |---|---|---|
 | `disabled` | Exporter deliberately not running: `enabled=false`, or the block is absent. **Never** reported for `enabled: true` — see `misconfigured` below (#5337) | `Observability: disabled …` |
-| `misconfigured` | `enabled: true`, but a required piece of config could not be resolved (no endpoint, no `ingestKeyFile`, or that file is missing/unreadable/empty, or `otlp` without the Cargo feature) — a config error to fix, not a benign off-by-choice state (#5337) | `Observability: MISCONFIGURED …` |
+| `misconfigured` | `enabled: true`, but a required piece of config could not be resolved (no exporter, no endpoint, no `ingestKeyFile` where one is needed, or that file is missing/unreadable/empty) — a config error to fix, not a benign off-by-choice state (#5337) | `Observability: MISCONFIGURED …` |
 | `starting` | Running, nothing acked yet, still inside the grace window (3 × `flushIntervalSecs`, floored at 10 min) — a just-rolled daemon, not a fault | `Observability: starting …` |
 | `never_exported` | Running well past the grace window and **no batch has ever been acked** — the silent failure mode | `Observability: NEVER EXPORTED …` |
-| `healthy` | Batches are being acked **by the configured endpoint** and the ids agree. Says nothing about any hop past that endpoint — see "What `healthy` actually proves" below (#9015) | `Observability: OK (first hop only) …` |
-| `host_id_mismatch` | Batches are being acked, but under a different `host_id` than this daemon reports for itself (the #4830 condition, §3 above) | `Observability: HOST-ID MISMATCH …` |
+| `healthy` | Batches are being acked **by the configured endpoint**. Says nothing about any hop past that endpoint — see "What `healthy` actually proves" below (#9015) | `Observability: OK (first hop only) …` |
 | `failing` | The most recent flush attempt errored; the queue is retrying with backoff | `Observability: FAILING …` |
 
 `observability_export` also carries `host_id`, `endpoint`, `exporter`,
@@ -492,8 +514,7 @@ singular field above already distinguishes those states).
 
 The health section keeps its anomaly-only contract. It now recognizes three
 additional *non-green* conditions — `misconfigured`, `never_exported`, and
-`failing` — which are anomalies by the same rule that already admitted
-`host_id_mismatch`; `healthy`, `starting`, and `disabled` still render nothing
+`failing` — which are anomalies by the same anomaly-only rule; `healthy`, `starting`, and `disabled` still render nothing
 at all. When a section does render, its `detail` payload carries the full
 `observability_export` record, so a machine consumer of `loom-daemon health
 --json` gets the positive facts too.
@@ -600,6 +621,15 @@ tick and get 24h; activity-driven or failure-only kinds are `None` (never flagge
 kind with no row defaults to 24h. A host with no `otlp` exporter reports
 `no_exporter` with no `kinds`, and no error.
 
+Over OTLP (Issue #12905) each kind's `last_export_at` rides the `host.health` gauge
+`loom.host.kind_last_export_seconds{kind}` (unix seconds), so a consumer can refuse an
+`as_of` past a host's coverage. A kind with no export yet has no data point (absent,
+never zero), and a host with no `otlp_export` emits none. Caveats: the value is in
+memory, so after a restart it means "since process start"; and it is a delivery-coverage
+bound ("this host delivered kind K through T"), not proof the producer ran, because
+activity-driven kinds have no silence threshold. `host.health` and `host.export` give the
+host-level bound. `kind` is already on the collector's datapoint allowlist.
+
 ```json
 { "observability": {
     "otlp_required": false,
@@ -610,8 +640,7 @@ kind with no row defaults to 24h. A host with no `otlp` exporter reports
 
 `otlp_required: false` takes effect only with a non-empty `otlp_exempt_reason`;
 without one the daemon warns and treats the host as not exempt. The window
-defaults to 15 minutes. The `host.health` field is carried in the record body
-on the native HTTPS path. Over OTLP, where `host.health` becomes gauges, the
+defaults to 15 minutes. Over OTLP, where `host.health` becomes gauges, the
 state is the `loom.host.otlp_export` gauge (value 1) with a `state` label and,
 when exempt, a `reason` label; both labels are already on the collector's
 datapoint allowlist.
@@ -669,14 +698,6 @@ Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
 
-**Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
-(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
-gauges, and the intake-reconcile completed-pass heartbeat
-`.loom/state/intake-reconcile/last-pass.json`) against
-`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
-cross-host alert that watched the ETA singletons was removed with the ETA
-subsystem (#11098).
-
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
 and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
@@ -716,6 +737,20 @@ it reaching zero, #10888): `loom.merge.redate_prs{state}`
 merge-chain head that `main` keeps moving under. Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**Retried fleet dispatches (#12875).** When the fleet-dispatch captain
+grants an item and step again after an earlier assignment of the same repo,
+item and step ended, the worker's `loom.dispatch.step` span carries
+`loom.dispatch.attempt` (earlier assignments that ended),
+`loom.dispatch.prev_assignment_id` (the earlier step's `loom.assignment.id`)
+and `loom.dispatch.prev_end` (`released`, `expired`, or `host_lost` when the
+worker released it because its host was lost to a spot interruption, #12876). A first or renewed grant carries none. Each
+expired assignment also gets a captain `loom.fleet_dispatch.call` span with
+endpoint `expire`, result `expired`, reason `lease_expired`, naming the host,
+item, step and assignment id, so expiries are attributable per host and item.
+The captain keeps the lineage in memory, bounded to 4096 steps and 24 h; a
+captain restart resets `attempt`. Keys:
+[`telemetry-schema.md`](telemetry-schema.md).
+
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
 out earlier (`workspace_halted`, `parked`,
@@ -725,11 +760,11 @@ span on a disposition transition (including first sight), on a periodic
 refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
 once as a terminal `left_queue` record when it leaves a repo whose listing
 succeeded. Sampled from the collector's periodic pass (the same cadence as
-`queue.snapshot`), never the tick loop, so a disposition lasting less than one
+the other queue samples), never the tick loop, so a disposition lasting less than one
 collector interval can be missed; a 10-minute-or-longer lookback still always
-contains the current state of every queued issue. Cardinality is bounded: at
-most 256 rows become spans per sample (`loom.queue.disposition_rows_dropped{reason="truncated"}`
-counts the rest), and a row whose repo root never resolved to a forge slug is
+contains the current state of every queued issue. Every queued row becomes a
+span (no volume cap: a cap would make which items carry facts depend on
+iteration order), and a row whose repo root never resolved to a forge slug is
 dropped and counted as `reason="unresolved"` rather than exported with a local
 path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
 in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
@@ -751,7 +786,7 @@ vocabulary (`loom.queue.disposition`'s wire values):
 | Operator term | Disposition(s) |
 |---|---|
 | "build back-off" / "WIP limit" (PR debt high) | `deferred_build_backoff` (decisions reason `build_backoff`, tick result `build_backoff_held`, #9410) |
-| "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
+| "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
 | "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full). `deferred_ramp_cap`, `deferred_saturation` and `deferred_repo_cap` are retired (#12406; old payloads decode as `unknown`), as is `deferred_out_of_slice` (repo sharding, #11682) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
 | "waiting on overlapping work" (same files) | `deferred_file_overlap` (#9781): its `## Affected Files` share a path with same-repo work admitted earlier this tick or already in flight; the row's `detail` (and the `pick.decision` skip's `detail`) names the shared paths. A one-tick scheduling deferral, never a label or hold — see `daemon-reference.md` §"Same-repo file-overlap deferral" |
 | "repo locked by an open PR" | `open_pr` (the #4123 guard's `pr-open-skip`). Since #9674 the repo's `open_pr` rows carry the repo-level `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` / `lockout.duration_seconds` attributes, so rank which repo's lockout is starving the most ready work by grouping those spans on `loom.repo` |
@@ -849,10 +884,8 @@ same facts per call (#10343): `github.http.{status,not_modified,requests,source}
 (`unknown` when `gh` gave no HTTP evidence — never guessed),
 `github.billing` (`ok`|`not_modified`|`rate_limited`|`secondary_limited`|`error`|`not_sent`) and
 the bucket join keys `github.{resource,account,cred_owner,role}`. Since
-#10752 a span also carries `github.repo`, a write carries `github.number`, and
-a call made by a daemon pass inside its caller scope carries `github.caller`
-(for example `stale_blocked_release`, the retired `loom:blocked` release
-pass, #11301). Since #11407
+#10752 a span also carries `github.repo`, and a write carries `github.number`.
+Since #11407
 every span also names the endpoint: `github.route` (a template such as
 `/repos/{owner}/{repo}/pulls/{n}`, from the same finite table as gh-shim's
 `github.api.route`), `http.request.method`, and `github.command` (`pr view`
@@ -965,7 +998,8 @@ operational check on a fleet host (shadow recipe above), not a CI check.
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry
 (`crate::task_liveness`) once per finished iteration. The loops are the
-self-update loop (`auto_update`) and each role-runner
+self-update loop (`auto_update`), the CI telemetry poller (`ci_telemetry`, #12793;
+its per-cycle outcome metrics are in `telemetry-schema.md`) and each role-runner
 loop (`role_runner.<role>`). Every 60 s, on its own ticker independent of the
 collector pass, the daemon exports `loom.daemon.task_alive{task}`. The value
 is `1` while the loop has beaten within its staleness window. That window is
@@ -1020,8 +1054,10 @@ label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 test enforces this. The gateway also needs its `config.yaml` refreshed, as
 [execution traces](tracing.md) describes, before new label keys survive it.
 
-**The ready queue (Issue #8852, phase 2)** is exported to both sinks, split by
-cardinality:
+**The ready queue (Issue #8852, phase 2)** is exported to SigNoz (OTLP) only. The
+per-issue rows once travelled as a native `queue.snapshot` record; it was
+removed in #12813 with the `/ingest` exporter, and the dispatch-plan fields now
+ride the `loom.queue.*` span attributes:
 
 - **SigNoz (OTLP):** every work-finder tick emits `loom.queue.issues{state,reason}`
   gauges, one per queue disposition with zeros included, plus
@@ -1029,24 +1065,14 @@ cardinality:
   (#11139, a partial listing). These use the labels already on the
   allowlist, so no gateway change is needed. They never carry an issue number
   or a repo.
-- **Fleet dashboard (native HTTPS):** the per-issue rows travel as the
-  `queue.snapshot` record, sampled on the `host.health` interval whenever the
-  work finder has ticked since the last snapshot. Each row carries its forge
-  `owner/repo` and its own `visibility` tag. The OTLP exporter never receives
-  this record. Since #9288 each row also carries its dispatch-plan fields
-  (`position`, `plan_state`, `gate`, …) and the record carries a `plan` block.
-  That block holds the host's slots, tick interval, shard posture, `scope` and
-  key `ordering`. These are per-host plan data only: no gauge or label is
-  added on the OTLP side, and `loom:curated` / `loom:triage` stay unordered.
 
-Both are derived from the same rows as `loom-daemon queue`. See
-[`telemetry-schema.md` → `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+### Size-bounded `pick.decision` logs (#12974)
 
-**Phase 3** renders the record on the fleet dashboard: per-host backlog /
-running / ready / blocked counts with a freshness badge (`idle` = recent tick,
-empty queue; `stale` = no new tick for 15 minutes; `no queue data` = the host
-never sent one), and a fleet-wide work queue listing every issue
-with its host, phase, waiting time, blocking reason and issue / PR links.
+`pick.decision` is the largest log stream, so it is exported as a summary of at
+most 16 KB (flagged by `payload_ref`); the full record sits in the local payload
+archive (`~/.loom/pick-payloads/<day>/<tick_id>.json.zst`). Candidate- or
+draw-level questions (rank, draw replay) read the archive, not SigNoz. Fields,
+retention and readers: [`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md#exported-summary-and-payload-archive-12974).
 
 ### Which host and runtime ran a role tick? (#12342)
 
@@ -1159,13 +1185,14 @@ hash of it, and it is never logged or forwarded.
 | `service.name` | the harness — `claude-code` |
 | `service.instance.id`, `host.id`, `host.name` (whatever host attributes the daemon's own telemetry carries) | this daemon's host identity |
 | `loom.daemon.revision`, `loom.fleet.config_sha` | the relaying build's revision and the host's applied fleet-config SHA (#11197), with the daemon's value — sender-supplied copies are scrubbed with every other `loom.*` key |
+| `host.cpu.count`, `loom.host.mem_total_bytes`, `host.arch`, `host.type`, `cloud.provider`, `cloud.region` | this daemon's host shape (#12874), as on its own telemetry |
 | `loom.runtime`, `loom.session.kind` (`sweep`/`role`), `loom.session.launch` (`daemon`) | from the launch |
 | `loom.repo` | the workspace's forge `owner/name`; absent until resolved, never a directory name |
 | `loom.issue`, `loom.role`, `loom.sweep_id` | the issue, role and sweep (or role-tick execution) id the session was launched for, when it has one |
 | `loom.daemon.version`, `loom.relay.redaction` | the relaying build, and the redaction policy applied |
 
 Whatever the sender put under `service.name`, `service.namespace`,
-`service.instance.id`, `host.*` or `loom.*` — in any letter case — is
+`service.instance.id`, `host.*`, `cloud.*` or `loom.*` — in any letter case — is
 discarded, on the resource and on every scope, record, data point, span, span
 event, link and nested map, so a record-level attribute cannot shadow the
 bound one. Other resource attributes the CLI reports about itself
@@ -1255,23 +1282,26 @@ A session that outlives the daemon that launched it (a sweep adopted after a
 restart) keeps a stale address and exports nothing until it is relaunched —
 unless something else now holds that address, as above.
 
-## 3e. Alerts on loom-ui's Alerts page (Issue #11295)
+## 3e. Alerts as `alert.transition` telemetry (Issues #11295, #12806)
 
-loom-ui is the alert hub for every repo. With the native ingest export
-configured (section 1), the daemon also posts its alerts to
-`POST {loom-ui}/api/alerts/external` (2AMLogic/loom-ui
-`docs/alerts/external.md`) — same ingest key, same host id as `source`, URL
-derived from `observability.endpoint` by replacing its `/ingest` path. No
-ingest config means the output is off. `LOOM_LOOM_UI_ALERTS=0` turns it off
-on a host that exports telemetry; `LOOM_LOOM_UI_ALERTS_URL` overrides the URL.
-The host id must be in loom-ui's `ALERTS_EXTERNAL_HOSTS` (else 403, logged
-and dropped).
+Every daemon alert is an `alert.transition` OTLP log record, emitted through
+the daemon's own OTLP exporter like every other fact (record reference:
+[`telemetry-schema.md` → `alert.transition`](telemetry-schema.md#alerttransition)).
+loom-ui reads them from SigNoz for its Alerts page (2AMLogic/loom-ui
+`docs/alerts/external.md` § "As telemetry (shadow)" is the schema). The daemon
+never calls the dashboard: before #12806 it POSTed these alerts to loom-ui's
+`/api/alerts/external` with the host ingest key, with the URL derived from the
+`/ingest` exporter config; that path and its `LOOM_LOOM_UI_ALERTS` /
+`LOOM_LOOM_UI_ALERTS_URL` settings are gone. No OTLP exporter means the output
+is off. `alert.source` is this host's id (the Resource's `host.id`), the rule
+and key are below, and `alert.observed_at` is when the daemon observed the
+transition.
 
 | Rule | From | Open / resolved |
 |---|---|---|
 | `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `output-missing`; `star-backlog` retired by #11510, `capacity-limited` by #12406) | `fleet_alert` | condition started (and each reminder) / cleared |
 | `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
-| `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
+| `watchdog.peer-coord-degraded` (critical) | the watchdog (see note below) | coordination degraded / green |
 | `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |
 | `fleet.floor-unsatisfiable` | `auto_update` | the floor ERROR line / floor met |
 | `fleet.floor-malformed` | fleet-sync pass | `loom_min_version` malformed / a valid (or no) floor |
@@ -1285,22 +1315,37 @@ and dropped).
 | `llm-monitor.stale` | llm-monitor `ranking.json` | older than 30 minutes (or unreadable) on two reads 5 minutes apart / fresh (no file: nothing) |
 | `install.<invariant>` (key = workspace root) | `install_self_check`, when enabled | violation standing after the tick / gone, or the check off |
 
+**Peer-coordination visibility tradeoff (#12818).** The watchdog's peer-claim
+coordination check no longer files, comments on, reopens or closes any GitHub
+issue; it reports to the watchdog log (`DIVERGENCE` / `[OK]`) and to the
+`watchdog.peer-coord-degraded` alert above. GitHub notifications were removed
+ahead of verified SigNoz visibility of this signal, which #12167 tracks
+separately; that export is neither claimed nor required by this change. Legacy
+`.watchdog-peer-coord-escalated` / `-cooldown` files are never read or written.
+
 `tokens-zero-healthy` is not sent: loom-ui derives `provider-pool-exhausted`
-from the daemon's pool gauge itself. Delivery is a bounded FIFO drained by one
-task (open always before resolved): a 2xx is done, any other 4xx except 429 is
-dropped and logged, 429 / 5xx / network errors back off (5 s doubling to
-15 min, at most 20 tries). The watchdog posts synchronously (10 s bound) and
-keeps a `<sentinel>.loom-ui` record so an unanswered post retries next tick.
+from the daemon's pool gauge itself. Each transition is offered to the OTLP
+exporters' durable queue at once, in order (open always before resolved).
+While an alert holds, its `open` is re-sent every 6 hours (the schema asks for
+at least every 12, since loom-ui closes an incident unobserved for 24). The
+watchdog, a separate one-shot process that runs while the daemon is down,
+writes its record durably into its own OTLP queue
+(`.loom/logs/watchdog-alerts-ops-queue.N.jsonl` under the marker's
+`repo_root`, exported with that workspace's observability config), flushes it
+within 10 s, and keeps a `<sentinel>.alert` record of an exported `open`, so an
+unexported one retries next tick and a held one is re-sent every 6 hours.
 
 Level-triggered sources keep the incidents they hold open in
-`~/.loom/loom-ui-alerts/<scope>.json`, so a restarted daemon resolves one
+`~/.loom/loom-ui-alerts/<scope>.json` (the pre-#12806 directory name, kept so
+an upgraded daemon finds them), so a restarted daemon resolves one
 the previous process opened once it finds the condition gone, and keeps one
-open while its failure count (process memory) builds up again; a daemon
-that finds the output off removes those files. The single-key
-watches (safehouse, breaker, llm-monitor) send one `resolved` on their first
-healthy sample instead. Alerts raised before the output starts (credential
-preflight, the fleet-sync startup pass) wait in the outbox. llm-monitor's
-quota step-change alert is not in `ranking.json` yet, so it is not sent.
+open (and its heartbeat going) while its failure count (process memory)
+builds up again; a daemon that finds the output off removes those files. The
+single-key watches (safehouse, breaker, llm-monitor) send one `resolved` on
+their first healthy sample instead. Alerts raised before the output starts
+(credential preflight, the fleet-sync startup pass) are held (at most 256) and
+go out once the exporters are up. llm-monitor's quota step-change alert is not
+in `ranking.json` yet, so it is not sent.
 
 `fleet_alert` only runs when `autonomous.fleetAlert.enabled` is on (off by
 default here); the fleet defaults (fleet-gitops) are where to enable it.
@@ -1439,8 +1484,9 @@ Sections 1-5 above are all `loom-daemon` hosts pushing their own
 `sweep.*`/`tokens.snapshot`/`host.health` telemetry through the collector →
 queue → exporter pipeline. The same Cloudflare backend also accepts
 telemetry from emitters that are **not** a `loom-daemon` process at all —
-`POST /ingest`'s wire contract (a bare JSON array of `TelemetryEnvelope`s,
-bearer-authenticated) has no dependency on the sender being the daemon,
+the backend's ingest wire contract (a bare JSON array of `TelemetryEnvelope`s,
+bearer-authenticated; the daemon itself no longer sends to it, #12813) has no
+dependency on the sender being the daemon,
 provided the sender speaks the same envelope shape.
 
 The first such emitter (2am's elastic EDA batch runner, tracked in parent

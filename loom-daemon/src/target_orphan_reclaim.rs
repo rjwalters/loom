@@ -89,6 +89,8 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 
+use crate::fs_util::newest_mtime_and_size;
+
 /// The category every reclaim log line carries.
 pub const CATEGORY: &str = "cargo_target_orphan";
 
@@ -541,27 +543,6 @@ fn issue_numbers(name: &str) -> Vec<u32> {
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse().ok())
         .collect()
-}
-
-/// The newest mtime anywhere under `path`, and the total size, without
-/// following symlinks. An unreadable child is skipped.
-pub(crate) fn newest_mtime_and_size(path: &Path) -> std::io::Result<(DateTime<Utc>, u64)> {
-    let meta = std::fs::symlink_metadata(path)?;
-    let own: DateTime<Utc> = meta.modified().map_or_else(|_| Utc::now(), DateTime::from);
-    if !meta.is_dir() {
-        return Ok((own, meta.len()));
-    }
-    let mut newest = own;
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok((child, size)) = newest_mtime_and_size(&entry.path()) {
-                newest = newest.max(child);
-                total = total.saturating_add(size);
-            }
-        }
-    }
-    Ok((newest, total))
 }
 
 /// Run every gate on one name-matched path, cheapest first: the live-claim

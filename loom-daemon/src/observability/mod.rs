@@ -11,17 +11,13 @@
 //! - [`queue`] — a bounded, disk-backed offline queue those envelopes land in,
 //!   so a sink outage (or a sleeping/idle-shut-down host, #4467/#4697) never
 //!   silently loses data up to `queueCapacity`.
-//! - [`exporter`] + [`sender`] — the [`exporter::Exporter`] trait, its
-//!   [`exporter::HttpsExporter`] JSON-over-HTTPS push implementation, and the
+//! - [`exporter`] + [`sender`] — the [`exporter::Exporter`] trait and the
 //!   jittered-retry drain loop that pulls batches off the queue and pushes
-//!   them to the sink.
-//! - `otlp` (Epic #4702, Phase 4 — issue #4858, behind the `otlp` Cargo
-//!   feature) — a second [`exporter::Exporter`] implementation for operators
-//!   with an existing OpenTelemetry stack, selected via
-//!   `observability.exporter = "otlp"` or an `observability.exporters` entry
-//!   ([`resolve_exporters`], which since #8756 fans one envelope out to N
-//!   configured sinks at once). Off by
-//!   default; [`exporter::HttpsExporter`] stays the default sink.
+//!   them to the sink. The only implementation is the `otlp` exporter (Epic
+//!   #4702, Phase 4 — issue #4858): `observability.exporters` entries of kind
+//!   `otlp` ([`resolve_exporters`], which since #8756 fans one envelope out to
+//!   N configured sinks at once). The native JSON-over-HTTPS `/ingest`
+//!   exporter was removed in #12813.
 //! - [`backfill`] (Issue #5084) — the local `sweep-outcome-telemetry.jsonl`
 //!   journal ([`crate::sweep_outcomes`]) is written unconditionally at every
 //!   sweep's terminal transition, independent of whether [`collector`]'s
@@ -60,42 +56,23 @@
 //! (`config_resolver.rs`'s documented precedence): **env > config > default**,
 //! default `enabled = false`. [`spawn_task`] returns `None` — no
 //! subscription, no queue file, no HTTP client construction, zero syscalls —
-//! whenever the resolved config is disabled or under-configured (no endpoint,
-//! no readable ingest key file). This is the same "disabled means truly
-//! inert" contract [`crate::safehouse::spawn_sink`] and
+//! whenever the resolved config is disabled or under-configured (no OTLP
+//! exporter, no endpoint, no credential). This is the same "disabled means
+//! truly inert" contract [`crate::safehouse::spawn_sink`] and
 //! [`crate::idle_exit::spawn_task`]'s callers already rely on.
 //!
 //! # Read-only invariant
 //!
-//! This module only ever originates outbound HTTP POSTs
-//! ([`exporter::HttpsExporter::emit_batch`]); nothing here parses a response
-//! body for anything but a batch-accepted/rejected status **plus the
-//! self-diagnostic host-identity echo below**, and no daemon *behavior* is
-//! ever driven by data received over this channel.
+//! This module only ever originates outbound OTLP POSTs; no daemon *behavior*
+//! is ever driven by data received over this channel.
 //!
-//! The one thing read out of a response body (Issue #4830) is the `host_id`
-//! the backend echoes for the key it authenticated. It is compared against
-//! this daemon's own [`crate::sweep_registry::host_identity`] and, on a
-//! mismatch, published to [`HostIdStatus`] + logged once — it never selects an
-//! endpoint, never changes what is exported, and is never written into a
-//! record. A hostile/broken sink can therefore, at worst, make this daemon
-//! report a mismatch that is not real; it cannot steer the daemon.
+//! # Bearer credential handling
 //!
-//! That check is **specific to the native HTTPS ingest protocol**, which is
-//! what defines the echo: the `otlp` sink below has no equivalent (OTLP/HTTP
-//! success responses carry only `partial_success`), so under
-//! `observability.exporter = "otlp"` no [`HostIdStatus`] is registered and
-//! [`global_host_id_mismatch`] reads `None` — see the OTLP arm of
-//! [`spawn_task`] for the full rationale.
-//!
-//! # Ingest key handling
-//!
-//! The ingest key is read once at startup from `ingestKeyFile` (never
-//! accepted inline in config) and held only in memory as an
-//! [`exporter::HttpsExporter`] field, sent solely as an `Authorization:
-//! Bearer` HTTP header value. Every log line and [`exporter::ExportError`]
-//! variant in this module tree names the *file path*, never the key
-//! contents.
+//! An `otlp` entry without its own `headers_file` authenticates with a bearer
+//! token read once at startup from `ingestKeyFile` (never accepted inline in
+//! config) and held only in memory, sent solely as an `Authorization: Bearer`
+//! HTTP header value. Every log line and [`exporter::ExportError`] variant in
+//! this module tree names the *file path*, never the contents.
 //!
 //! `ingestKeyFile` defaults to `$HOME/.loom/observability/ingest.key`
 //! ([`resolve_ingest_key_file`]) when no tier sets it explicitly, so the
@@ -107,12 +84,14 @@ pub mod agent_relay;
 pub mod backfill;
 pub mod claude_code_telemetry;
 pub mod collector;
-pub mod cycle_guard;
 pub mod daemon_event;
 pub mod daemon_exit;
 pub mod daemon_lifecycle;
+pub mod dispatch_eligibility;
+pub mod dispatch_state;
 pub mod endpoint_policy;
 pub mod exporter;
+pub mod hold_transition;
 mod ingest_key;
 pub mod lifecycle;
 pub mod llm_billing;
@@ -124,20 +103,25 @@ pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
 pub mod pick_journal;
+pub mod pick_payload_archive;
 pub mod queue;
 pub mod queue_blocked;
-pub mod queue_snapshot;
 pub mod repo_ref;
 pub mod request_headers;
 pub mod retired_captain_config;
+pub mod run_state_request;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
 pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
+pub mod stage_entry_fact;
+pub mod stage_occupancy;
 pub mod standalone_ops;
 pub mod step_verdict;
+#[cfg(test)]
+pub(crate) mod test_sink;
 pub mod tracing;
 pub mod work_started;
 
@@ -149,17 +133,13 @@ use crate::event_bus::EventBus;
 use crate::workspace_pool::WorkspacePool;
 
 use endpoint_policy::reserved_placeholder_host;
-use exporter::HttpsExporter;
-use ingest_key::{
-    entry_needs_key, read_ingest_key, resolve_for_planned, PlannedKey, NOT_CONFIGURED_DETAIL,
-};
+#[cfg(test)]
+use ingest_key::read_ingest_key;
+use ingest_key::{entry_needs_key, resolve_for_planned, PlannedKey};
 use queue::DurableQueue;
 
 // The ingest-key resolution lives in `ingest_key`; the `pub use` keeps the
-// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working
-// for `loom_ui_alerts` and the attended live-output tailer, and the private
-// `read_ingest_key` re-import keeps `super::super::read_ingest_key` alive
-// for the latter.
+// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working.
 pub use ingest_key::resolve_ingest_key_file;
 
 /// `observability.enabled` env override.
@@ -254,17 +234,13 @@ pub struct ExporterEntry {
 }
 
 /// Which [`exporter::Exporter`] implementation [`spawn_task`] selects.
-/// Resolved by [`resolve_exporters`] — **env > config > default**
-/// ([`ExporterKind::Https`]), matching every other `observability.*` knob's
-/// precedence.
+/// Resolved by [`resolve_exporters`] — **env > config**, matching every other
+/// `observability.*` knob's precedence. OTLP is the only kind since the native
+/// JSON-over-HTTPS exporter was removed (#12813).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExporterKind {
-    /// Native JSON-over-HTTPS push ([`exporter::HttpsExporter`]) — the
-    /// default, for backward compatibility with every deployment predating
-    /// this issue.
-    Https,
     /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, compiled into every build
-    /// since #10700) — an escape hatch for an existing OpenTelemetry stack.
+    /// since #10700).
     Otlp,
 }
 
@@ -276,22 +252,24 @@ impl ExporterKind {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            ExporterKind::Https => "https",
             ExporterKind::Otlp => "otlp",
         }
     }
 
     /// Case-insensitive classification; `None` for an unrecognized value (the
-    /// caller logs and skips/degrades, never a hard error).
+    /// caller logs and skips, never a hard error).
     #[must_use]
     pub fn parse_lenient(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "https" => Some(ExporterKind::Https),
             "otlp" => Some(ExporterKind::Otlp),
             _ => None,
         }
     }
 }
+
+/// The retired native exporter's kind name (#12813). A config that still
+/// selects it is warned about and skipped by [`resolve_exporters`].
+pub const RETIRED_HTTPS_KIND: &str = "https";
 
 /// Read the `observability` block from `root`'s resolved config
 /// (`config_resolver::resolve_effective_config`), same pattern as
@@ -459,78 +437,6 @@ pub fn resolve_queue_capacity(config: &ObservabilityConfig) -> usize {
 }
 
 // ============================================================================
-// Host-identity mismatch status (Issue #4830)
-// ============================================================================
-
-/// Shared, thread-safe handle the exporter publishes a confirmed host-identity
-/// mismatch to, and [`crate::ipc::build_daemon_status`] reads back — mirroring
-/// [`crate::auto_update::AutoUpdateStatus`]'s process-global pattern rather than
-/// threading an `Arc` through the whole IPC server.
-///
-/// **Write-once per process.** The first mismatch observed wins and is never
-/// overwritten or cleared: the WARN is once-per-daemon-lifetime by AC, so the
-/// published record has to be too, or `first_seen_at` would silently become
-/// "last flush" and the two surfaces would disagree.
-#[derive(Debug, Default)]
-pub struct HostIdStatus {
-    inner: std::sync::Mutex<Option<crate::types::ObservabilityHostIdMismatch>>,
-}
-
-// Allow expect_used: a poisoned status mutex means another thread panicked while
-// holding it — unrecoverable, matching the crash-on-poison policy `auto_update`
-// and `ipc` already use for their status mutexes.
-#[allow(clippy::expect_used)]
-impl HostIdStatus {
-    /// Record the first observed mismatch. Returns `true` when this call is the
-    /// one that recorded it (i.e. the caller owes exactly one WARN), `false`
-    /// when a mismatch was already published this process.
-    pub fn record_mismatch(&self, daemon_host_id: &str, ingest_host_id: &str) -> bool {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("observability host-id status mutex poisoned");
-        if guard.is_some() {
-            return false;
-        }
-        *guard = Some(crate::types::ObservabilityHostIdMismatch {
-            daemon_host_id: daemon_host_id.to_string(),
-            ingest_host_id: ingest_host_id.to_string(),
-            first_seen_at: chrono::Utc::now(),
-        });
-        true
-    }
-
-    /// The published mismatch, or `None` when the ids have agreed on every
-    /// acked batch so far (the common case).
-    #[must_use]
-    pub fn snapshot(&self) -> Option<crate::types::ObservabilityHostIdMismatch> {
-        self.inner
-            .lock()
-            .expect("observability host-id status mutex poisoned")
-            .clone()
-    }
-}
-
-/// Process-global status handle, registered by [`spawn_task`] when — and only
-/// when — the exporter actually starts. Unset (observability disabled, keyless,
-/// or under-configured) reads as `None`, so a disabled exporter contributes
-/// nothing to `status`/`health`.
-static GLOBAL_HOST_ID_STATUS: std::sync::OnceLock<Arc<HostIdStatus>> = std::sync::OnceLock::new();
-
-/// Register the exporter's status handle as the process-global. Idempotent:
-/// only the first registration wins (there is exactly one exporter per process).
-pub fn register_global_host_id_status(status: Arc<HostIdStatus>) {
-    let _ = GLOBAL_HOST_ID_STATUS.set(status);
-}
-
-/// The process-global host-identity mismatch, or `None` when none has been
-/// observed (or the exporter never started).
-#[must_use]
-pub fn global_host_id_mismatch() -> Option<crate::types::ObservabilityHostIdMismatch> {
-    GLOBAL_HOST_ID_STATUS.get().and_then(|s| s.snapshot())
-}
-
-// ============================================================================
 // Export liveness status (Issue #5083)
 // ============================================================================
 
@@ -557,19 +463,13 @@ pub fn register_global_export_status(status: Arc<ExportStatus>) {
 /// block is absent — deliberately off), which is a materially different
 /// report from the `None` an older daemon binary puts on the wire. An
 /// `enabled: true` config that failed to resolve registers a `misconfigured()`
-/// cell instead (Issue #5337), so the two are never confused. Any confirmed
-/// #4830 host-identity mismatch is folded in here as `ingest_host_id`, so a
-/// single field carries the whole state machine and
-/// [`crate::types::ObservabilityExportStatus::classify`] needs no second input.
+/// cell instead (Issue #5337), so the two are never confused.
 #[must_use]
 pub fn global_export_status() -> crate::types::ObservabilityExportStatus {
     let Some(status) = GLOBAL_EXPORT_STATUS.get() else {
         return crate::types::ObservabilityExportStatus::disabled();
     };
     let mut snapshot = status.snapshot();
-    if let Some(mismatch) = global_host_id_mismatch() {
-        snapshot.ingest_host_id = Some(mismatch.ingest_host_id);
-    }
     snapshot.state = snapshot.classify(chrono::Utc::now());
     snapshot
 }
@@ -631,14 +531,9 @@ pub fn register_global_export_statuses(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(statuses);
 }
 
-/// Every configured exporter's status, keyed by exporter name ("https",
-/// "otlp"; Issue #8756), each with its `state` re-derived as of now. Empty
+/// Every configured exporter's status, keyed by exporter name ("otlp";
+/// Issue #8756), each with its `state` re-derived as of now. Empty
 /// when observability is off by choice or no exporter reached registration.
-///
-/// A confirmed #4830 host-identity mismatch is folded into the `https`
-/// entry's `ingest_host_id` only — the echo check is a native-ingest
-/// protocol property (see [`spawn_task`]'s OTLP arm), so it never annotates
-/// an OTLP entry.
 #[must_use]
 pub fn global_export_statuses(
 ) -> std::collections::BTreeMap<String, crate::types::ObservabilityExportStatus> {
@@ -648,15 +543,9 @@ pub fn global_export_statuses(
     let Some(map) = guard.as_ref() else {
         return std::collections::BTreeMap::new();
     };
-    let mismatch = global_host_id_mismatch();
     map.iter()
         .map(|(name, status)| {
             let mut snapshot = status.snapshot();
-            if name == ExporterKind::Https.name() {
-                if let Some(mismatch) = &mismatch {
-                    snapshot.ingest_host_id = Some(mismatch.ingest_host_id.clone());
-                }
-            }
             snapshot.state = snapshot.classify(chrono::Utc::now());
             (name.clone(), snapshot)
         })
@@ -720,8 +609,8 @@ pub fn global_export_queue_stats(
         .unwrap_or_default()
 }
 
-/// **env(singular) > config list > config singular > default (`[https]`)**
-/// (Issue #8756). Resolves the full exporter list [`spawn_task`] fans out to:
+/// **env(singular) > config list > config singular** (Issue #8756). Resolves
+/// the full exporter list [`spawn_task`] fans out to:
 ///
 /// - `$LOOM_OBSERVABILITY_EXPORTER` (the pre-fan-out singular knob) selects a
 ///   one-element list, overriding any configured list — same env-wins
@@ -729,14 +618,15 @@ pub fn global_export_queue_stats(
 /// - `observability.exporters` (mixed string/object entries) next.
 /// - The singular `observability.exporter` key after that — a one-element
 ///   list for back-compat.
-/// - Otherwise the `[https]` default.
 ///
 /// An unrecognized kind at any tier is logged and skipped, the same
 /// "malformed input never panics/blocks startup" posture as the rest of this
-/// module — never a hard error. Entries are deduped by kind (queues and
-/// status are keyed by [`ExporterKind::name`], so one kind appears once —
-/// first entry wins); a list whose every entry is unrecognized degrades to
-/// the `[https]` default, so the return value is never empty.
+/// module — never a hard error. The retired `"https"` kind (#12813) is named
+/// in its own warning. Entries are deduped by kind (queues and status are
+/// keyed by [`ExporterKind::name`], so one kind appears once — first entry
+/// wins). Unlike before #12813 there is **no default exporter**: a config that
+/// names none resolves to an empty list, which [`spawn_task`] reports as a
+/// `misconfigured` status instead of exporting anywhere.
 #[must_use]
 pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
     let raw: Vec<RawExporterEntry> = if let Some(env) = env_nonempty(EXPORTER_ENV) {
@@ -748,15 +638,15 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
     } else if let Some(list) = config.exporters.as_ref().filter(|list| !list.is_empty()) {
         list.clone()
     } else {
-        let singular = config
+        config
             .exporter
-            .clone()
-            .unwrap_or_else(|| "https".to_string());
-        vec![RawExporterEntry {
-            kind: singular,
-            endpoint: None,
-            headers_file: None,
-        }]
+            .iter()
+            .map(|singular| RawExporterEntry {
+                kind: singular.clone(),
+                endpoint: None,
+                headers_file: None,
+            })
+            .collect()
     };
     let mut resolved: Vec<ExporterEntry> = Vec::with_capacity(raw.len());
     for entry in raw {
@@ -776,6 +666,13 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
                     });
                 }
             }
+            None if entry.kind.trim().eq_ignore_ascii_case(RETIRED_HTTPS_KIND) => {
+                log::warn!(
+                    "observability: exporter {:?} was removed (#12813) — skipping that entry; \
+                     delete it from observability.exporter(s)",
+                    entry.kind
+                );
+            }
             None => {
                 log::warn!(
                     "observability: unrecognized exporter {:?} — skipping that entry",
@@ -783,13 +680,6 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
                 );
             }
         }
-    }
-    if resolved.is_empty() {
-        resolved.push(ExporterEntry {
-            kind: ExporterKind::Https,
-            endpoint: None,
-            headers_file: None,
-        });
     }
     resolved
 }
@@ -871,7 +761,7 @@ fn entry_endpoint(
                 .to_string(),
         ));
     };
-    if entry.kind == ExporterKind::Otlp && !endpoint_policy::valid_otlp_endpoint(&endpoint) {
+    if !endpoint_policy::valid_otlp_endpoint(&endpoint) {
         return Err((
             Some(endpoint),
             "invalid OTLP base URL: use HTTP(S) without credentials, query or fragment".into(),
@@ -893,11 +783,7 @@ fn entry_endpoint(
     }
     // `headers_file` (Issue #10961): refused here, before the ingest key or
     // the headers file itself is read. A no-op for an entry without one.
-    if let Err(detail) = request_headers::entry_policy(
-        entry.kind == ExporterKind::Otlp,
-        &endpoint,
-        entry.headers_file.as_deref(),
-    ) {
+    if let Err(detail) = request_headers::entry_policy(&endpoint, entry.headers_file.as_deref()) {
         return Err((Some(endpoint), detail));
     }
     Ok(endpoint)
@@ -927,7 +813,6 @@ pub fn planned_otlp_exporters(config: &ObservabilityConfig) -> Vec<(String, Opti
     let shared_endpoint = resolve_endpoint(config);
     resolve_exporters(config)
         .iter()
-        .filter(|entry| entry.kind == ExporterKind::Otlp)
         .filter_map(|entry| {
             let endpoint = entry_endpoint(entry, shared_endpoint.as_ref()).ok()?;
             Some((endpoint, entry.headers_file.clone()))
@@ -984,6 +869,24 @@ pub fn spawn_task(
         return None;
     }
     let entries = resolve_exporters(config);
+    if entries.is_empty() {
+        // No default exporter since #12813: the native exporter that used to
+        // fill this gap is gone, so enabling observability without naming an
+        // `otlp` entry exports nowhere. Say so in `status` rather than going
+        // silently quiet.
+        let detail = "no exporter configured: observability.exporters must name an \
+                      `otlp` entry (the native `https` exporter was removed in #12813)"
+            .to_string();
+        log::warn!("observability: enabled but {detail} — export off");
+        let mut statuses = std::collections::BTreeMap::new();
+        statuses.insert(
+            ExporterKind::Otlp.name().to_string(),
+            Arc::new(ExportStatus::misconfigured(None, detail)),
+        );
+        register_global_export_statuses(statuses.clone());
+        register_global_export_status(primary_status_for(&entries, &statuses));
+        return None;
+    }
     let sole = entries.len() == 1;
     let shared_endpoint = resolve_endpoint(config);
 
@@ -1087,8 +990,6 @@ pub fn spawn_task(
         std::collections::BTreeMap::new();
     // The OTLP-only subset, for the `ops` sink (Issue #8860).
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
-    // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
-    let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The OTLP sinks whose senders started, for the agent relay (#10964).
     let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
@@ -1102,36 +1003,16 @@ pub fn spawn_task(
             Arc::new(ExportStatus::started(&host_id, endpoint, name, flush_interval.as_secs()));
         export_status.attach_queue(queue.clone());
         let sender_handle = match entry.kind {
-            ExporterKind::Https => {
-                // Host-identity mismatch detection (Issue #4830) is created and
-                // registered *inside* this arm, not before the dispatch: it is a
-                // property of the native ingest protocol, not of exporting in
-                // general (see the OTLP arm below). Registering it only when the
-                // HTTPS sink actually starts keeps `global_host_id_mismatch()`
-                // reading `None` under any other sink, which is exactly the
-                // "the exporter never started" semantics `status`/`health`
-                // already handle.
-                let host_id_status = Arc::new(HostIdStatus::default());
-                register_global_host_id_status(host_id_status.clone());
-                // Unreachable in practice — an HTTPS entry needs the key,
-                // and every key-needing entry was refused above when the
-                // key did not resolve — but kept total rather than
-                // `unwrap`ped so a later edit to `entry_needs_key` cannot
-                // turn into a panic here.
-                let Some(key) = ingest_key.as_ref() else {
-                    reject(
-                        &mut statuses,
-                        name,
-                        Some(endpoint.clone()),
-                        NOT_CONFIGURED_DETAIL.to_string(),
-                    );
-                    continue;
-                };
-                match HttpsExporter::new(
+            ExporterKind::Otlp => {
+                // `headers_file` (#10961) is read here, at construction — a
+                // refused file lands in the `Err` arm below as this sink's own
+                // `misconfigured` detail (path and line only). The ingest key
+                // is `None` when no surviving entry needed one (#11555): the
+                // file's headers are then this entry's whole authentication.
+                match otlp::OtlpExporter::with_headers_file(
                     endpoint.clone(),
-                    key.clone(),
-                    host_id.clone(),
-                    host_id_status,
+                    ingest_key.clone(),
+                    entry.headers_file.as_deref(),
                 ) {
                     Ok(exporter) => sender::spawn_task(
                         queue.clone(),
@@ -1142,88 +1023,26 @@ pub fn spawn_task(
                     ),
                     Err(error) => {
                         log::warn!(
-                            "observability: failed to construct HTTPS exporter for {endpoint}: {error} — export off for this sink"
+                            "observability: failed to construct OTLP exporter for {endpoint}: {error} — export off for this sink"
                         );
                         statuses.insert(
                             name.to_string(),
                             Arc::new(ExportStatus::misconfigured(
                                 Some(endpoint.clone()),
-                                format!("failed to construct HTTPS exporter: {error}"),
+                                format!("failed to construct OTLP exporter: {error}"),
                             )),
                         );
                         continue;
                     }
                 }
             }
-            ExporterKind::Otlp => {
-                // No `HostIdStatus` wiring here, deliberately (Issue #4830 vs.
-                // #4858). The mismatch check is not a generic exporter concern
-                // that OTLP is missing out on — it is a *native-ingest
-                // protocol* feature: `HttpsExporter::check_host_identity`
-                // parses the Loom `/ingest` success body
-                // (`{"accepted":N,"host_id":"…"}`) and compares the backend's
-                // echoed `host_id` against this daemon's own, which is only
-                // meaningful because the Cloudflare backend binds each ingest
-                // key to exactly one host and reports that binding back.
-                //
-                // OTLP/HTTP has no such echo: a success response is an
-                // `ExportLogsServiceResponse`/`ExportMetricsServiceResponse`
-                // whose only payload is `partial_success`, and a generic OTLP
-                // sink (an OpenTelemetry Collector, Grafana, Honeycomb) has no
-                // concept of a per-host key binding to disagree with in the
-                // first place. Threading a `HostIdStatus` in here would hand the
-                // OTLP exporter a handle it could never write to — parity in the
-                // signature only, while `loom-daemon status`/`health` gained a
-                // field that is unconditionally `None` and indistinguishable
-                // from "checked, and they agree". Better to leave the surface
-                // honestly absent until an OTLP-side identity signal exists to
-                // check against.
-                {
-                    // `headers_file` (#10961) is read here, at construction —
-                    // a refused file lands in the `Err` arm below as this
-                    // sink's own `misconfigured` detail (path and line only).
-                    // The ingest key is `None` when no surviving entry
-                    // needed one (#11555): the file's headers are then this
-                    // entry's whole authentication.
-                    match otlp::OtlpExporter::with_headers_file(
-                        endpoint.clone(),
-                        ingest_key.clone(),
-                        entry.headers_file.as_deref(),
-                    ) {
-                        Ok(exporter) => sender::spawn_task(
-                            queue.clone(),
-                            exporter,
-                            batch_size,
-                            flush_interval,
-                            export_status.clone(),
-                        ),
-                        Err(error) => {
-                            log::warn!(
-                                "observability: failed to construct OTLP exporter for {endpoint}: {error} — export off for this sink"
-                            );
-                            statuses.insert(
-                                name.to_string(),
-                                Arc::new(ExportStatus::misconfigured(
-                                    Some(endpoint.clone()),
-                                    format!("failed to construct OTLP exporter: {error}"),
-                                )),
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
         };
         statuses.insert(name.to_string(), export_status);
-        if entry.kind == ExporterKind::Otlp {
-            relay_sinks.push(otlp::relay::Sink {
-                endpoint: endpoint.clone(),
-                headers_file: entry.headers_file.clone(),
-            });
-            otlp_queues.push(queue.clone());
-        } else {
-            native_queues.push(queue.clone());
-        }
+        relay_sinks.push(otlp::relay::Sink {
+            endpoint: endpoint.clone(),
+            headers_file: entry.headers_file.clone(),
+        });
+        otlp_queues.push(queue.clone());
         export_queues.insert(name.to_string(), queue.clone());
         queues.push(queue);
         sender_handles.push(sender_handle);
@@ -1273,6 +1092,19 @@ pub fn spawn_task(
     // start an exporter, least of all the managed HTTPS one.
     session_output::register_sink(otlp_queues.clone(), &host_id);
     ops_handles.extend(session_output::spawn_task(bus, workspace_root.clone()));
+    // `eta.dispatch_eligibility` (#12790): the dispatcher's schedulability
+    // decision per waiting ready item, OTLP-only, sampled by the collector
+    // below on the same cadence as `queue.snapshot`.
+    dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.dispatch_state` (#12918): each classified item's dispatch gate and
+    // its release time, OTLP-only, emitted by the step driver's tick.
+    dispatch_state::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.stage_occupancy` (#12866): the pre-ready stage occupancy gauge,
+    // OTLP-only, sampled by the collector on the same cadence.
+    stage_occupancy::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.stage_entry` (#12869): arrivals diffed from the step driver's
+    // per-tick discovery snapshot, OTLP-only.
+    stage_entry_fact::register_sink(otlp_queues.clone(), &host_id);
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
@@ -1282,11 +1114,6 @@ pub fn spawn_task(
         ops_handles.push(ops::liveness::spawn_task());
         // IPC request latency by kind (#10765), on its own ticker too.
         ops_handles.push(ops::ipc_latency::spawn_task());
-    }
-    // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
-    // HTTPS queues only, sampled by the collector below.
-    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
-        queue_snapshot::register_global_sink(sink);
     }
     // `daemon.start` (#11197): exactly one lifecycle record per process,
     // offered once the exporters are up — every disabled/under-configured
@@ -1299,6 +1126,12 @@ pub fn spawn_task(
     // `daemon_event`'s module doc for why it is a separate subscriber rather
     // than folded into `collector`.
     let daemon_event_handle = daemon_event::spawn_task(bus, fanout.clone(), host_id.clone());
+    // Host shape (#12874): a one-shot IMDSv2 probe for `host.type` /
+    // `cloud.*` on the resource. Spawned and never awaited — startup is not
+    // delayed, and batches exported before it lands just lack the keys.
+    // Linux only: fleet EC2 hosts are Linux; a Mac reads `hw.model` instead.
+    #[cfg(target_os = "linux")]
+    crate::host_shape::spawn_imds_probe();
     let collector_handle = collector::spawn_task(
         bus,
         fanout,
@@ -1333,7 +1166,7 @@ fn primary_status_for(
 ) -> Arc<ExportStatus> {
     let name = entries
         .first()
-        .map_or_else(|| ExporterKind::Https.name(), |entry| entry.kind.name());
+        .map_or_else(|| ExporterKind::Otlp.name(), |entry| entry.kind.name());
     statuses.get(name).cloned().unwrap_or_else(|| {
         Arc::new(ExportStatus::misconfigured(
             None,

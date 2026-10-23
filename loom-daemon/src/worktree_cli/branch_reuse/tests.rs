@@ -173,17 +173,115 @@ fn a_fresh_branch_at_the_default_tip_is_never_refused() {
 }
 
 #[test]
-fn divergence_is_detected_only_when_the_branch_lacks_base_history() {
+fn classify_separates_current_reset_and_keep() {
+    assert_eq!(classify(3, 0, None), Staleness::Current);
+    assert_eq!(classify(0, 0, None), Staleness::Current);
+    assert_eq!(classify(0, 5, None), Staleness::NoUniqueWork { behind: 5 });
+    assert_eq!(
+        classify(2, 5, Some(9)),
+        Staleness::Unique {
+            ahead: 2,
+            behind: 5,
+            merge_base_secs: Some(9)
+        }
+    );
+}
+
+#[test]
+fn age_is_whole_days_and_never_underflows() {
+    assert_eq!(age_days(86_400 * 10, 0), 10);
+    assert_eq!(age_days(86_399, 0), 0);
+    assert_eq!(age_days(5, 100), 0);
+}
+
+#[test]
+fn warning_names_ahead_behind_age_and_goes_loud_past_the_threshold() {
+    let o = opts(Path::new("/x"), false);
+    let old = now_secs() - 30 * 86_400;
+    let msg = divergence_warning(&o, 2, 40, Some(old));
+    assert!(msg.contains("has diverged from main"), "{msg}");
+    assert!(msg.contains("2 commit(s) ahead, 40 behind"), "{msg}");
+    assert!(msg.contains("30 day(s) old"), "{msg}");
+    assert!(msg.contains("WARNING"), "{msg}");
+    let fresh = divergence_warning(&o, 2, 1, Some(now_secs() - 86_400));
+    assert!(!fresh.contains("WARNING"), "{fresh}");
+}
+
+#[test]
+fn staleness_is_measured_against_real_history() {
     let behind = fixture("behind", true);
-    assert!(
-        !contains_base_history(&behind.repo, &opts(&behind.repo, false)),
-        "a branch cut before main advanced does not contain origin/main"
-    );
+    assert!(matches!(
+        staleness(&behind.repo, &opts(&behind.repo, false)),
+        Staleness::Unique {
+            ahead: 1,
+            behind: 1,
+            merge_base_secs: Some(_)
+        }
+    ));
     let current = fixture("current", false);
-    assert!(
-        contains_base_history(&current.repo, &opts(&current.repo, false)),
-        "a branch cut from the current tip does contain origin/main"
+    assert_eq!(staleness(&current.repo, &opts(&current.repo, false)), Staleness::Current);
+}
+
+/// A `--base origin/dev` fixture: `dev` is two commits past `main`, and
+/// `feature/issue-42` sits exactly at `main`'s tip -- 0 ahead of the base, 2
+/// behind. The tip equals `origin/main`, so the #8280 degenerate-tip guard
+/// reuses it; any other 0-ahead branch behind the default branch is refused as
+/// already landed before this step runs.
+fn stale_zero_ahead(tag: &str) -> (Fx, Options) {
+    let fx = fixture(tag, false);
+    git(&fx.repo, &["checkout", "-q", "-b", "dev", "main"]);
+    git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "dev1"]);
+    git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "dev2"]);
+    git(&fx.repo, &["push", "-q", "origin", "dev"]);
+    git(&fx.repo, &["branch", "-f", "feature/issue-42", "main"]);
+    git(&fx.repo, &["checkout", "-q", "main"]);
+    git(&fx.repo, &["fetch", "-q", "origin"]);
+    let mut o = opts(&fx.repo, false);
+    o.base_ref = "origin/dev".to_string();
+    o.base_display = "dev".to_string();
+    (fx, o)
+}
+
+#[test]
+fn a_stale_branch_with_no_work_of_its_own_is_reset_to_base() {
+    let (fx, o) = stale_zero_ahead("reset0");
+    assert_eq!(run_with(&o, &|_| ForgeProbe::unavailable()), 0);
+    assert_eq!(rev(&fx.repo, "feature/issue-42"), rev(&fx.repo, "origin/dev"));
+}
+
+#[test]
+fn a_stale_branch_with_unique_commits_is_kept() {
+    let fx = fixture("keep", true);
+    let tip = rev(&fx.repo, "feature/issue-42");
+    assert_eq!(run_with(&opts(&fx.repo, false), &|_| ForgeProbe::unavailable()), 0);
+    assert_eq!(rev(&fx.repo, "feature/issue-42"), tip, "unique work was discarded");
+}
+
+#[test]
+fn a_stale_branch_held_by_a_worktree_is_not_reset() {
+    let (fx, o) = stale_zero_ahead("held0");
+    let wt = fx.root.join("wt");
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "feature/issue-42",
+        ],
     );
+    let tip = rev(&fx.repo, "feature/issue-42");
+    assert_eq!(run_with(&o, &|_| ForgeProbe::unavailable()), 0);
+    assert_eq!(rev(&fx.repo, "feature/issue-42"), tip, "a checked-out branch moved");
+}
+
+#[test]
+fn a_fresh_branch_is_left_unchanged() {
+    let fx = fixture("fresh", false);
+    let tip = rev(&fx.repo, "feature/issue-42");
+    assert_eq!(run_with(&opts(&fx.repo, false), &|_| ForgeProbe::unavailable()), 0);
+    assert_eq!(rev(&fx.repo, "feature/issue-42"), tip);
 }
 
 #[test]

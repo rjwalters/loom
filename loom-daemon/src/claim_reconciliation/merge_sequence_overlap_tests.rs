@@ -5,10 +5,19 @@
 use std::cell::Cell;
 
 use super::super::{
-    plan_repo, plan_repo_with, release_comment_body, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
+    plan_repo_with, release_comment_body, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
 };
 use super::*;
 use crate::merge_pr::sequence::marker_text;
+
+/// Plan with no stalled PRs: the deterministic spelling of the live pass.
+fn plan_repo(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+) -> Vec<SequenceGroup> {
+    plan_repo_with(open_prs, files, markers, &BTreeSet::new())
+}
 
 fn sha(n: u32) -> String {
     format!("{n:040x}")

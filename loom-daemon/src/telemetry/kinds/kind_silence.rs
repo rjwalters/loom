@@ -36,10 +36,13 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("ci.duration", None),
     ("ci.job.log", None),
     ("metric.points", None),
-    ("queue.snapshot", None),
     ("auto_update.tick", None),
     ("fleet.state", None),
     ("pick.decision", None),
+    ("eta.dispatch_eligibility", None),
+    ("eta.dispatch_state", None),
+    ("eta.stage_occupancy", None),
+    ("eta.stage_entry", None),
     ("pr.resolved", None),
     ("eta.stage_outcome", None),
     ("pass.summary", None),
@@ -51,8 +54,16 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("issue.estimate", None),
     ("stage.work_started", None),
     ("write_scope.refused", None),
+    ("merge_queue.event", None),
+    ("merge.authorization.evaluated", None),
+    ("hold.transition", None),
+    ("merge.queue.observed", None),
+    ("merge.queue.regime", None),
     ("daemon.exit", None),
+    ("daemon.run_state_request", None),
     ("scope.memory", None),
+    // Only while an alert holds (heartbeat) or on a transition.
+    ("alert.transition", None),
 ];
 
 /// How long `kind` may stay silent; `None` when it is exempt.

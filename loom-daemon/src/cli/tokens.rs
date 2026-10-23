@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{ClaudeConfigAction, PinAction, TokensAction};
+use crate::cli::{ClaudeConfigAction, PinAction, TokensAction};
 
 mod select_cmd;
 
@@ -66,7 +66,7 @@ fn reject_workspace_inside_pool(resolved: &Path) -> Result<()> {
 
 /// `loom-daemon claude-config` handler (issue #4415).
 pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result<()> {
-    use loom_daemon::terminal::{
+    use crate::terminal::{
         claude_config_cleanup, claude_config_setup, claude_config_trust, claude_config_validate,
     };
 
@@ -178,8 +178,8 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
 /// only when the "not a recognized workspace" branch fired, so callers can
 /// surface *how* the directory was chosen (not just *which* directory).
 fn resolve_tokens_pool_dir_for_cli(workspace: &str) -> Result<(PathBuf, bool)> {
-    use loom_daemon::tokens_pool::paths;
-    use loom_daemon::workspace_registry::{resolve_client_workspace_default, WorkspaceRegistry};
+    use crate::tokens_pool::paths;
+    use crate::workspace_registry::{resolve_client_workspace_default, WorkspaceRegistry};
 
     let ws = resolve_tokens_workspace(workspace)?;
     // Whatever the resolution branch below decides, a legacy in-worktree pool
@@ -224,7 +224,7 @@ fn resolve_tokens_pool_dir_for_cli(workspace: &str) -> Result<(PathBuf, bool)> {
 ///   door. The invariant is "outside every worktree", not "named
 ///   `~/.loom/tokens`", so it is enforced on the resolved path.
 fn provisioning_destination_pool() -> PathBuf {
-    use loom_daemon::tokens_pool::paths::{is_inside_git_worktree, shared_tokens_dir};
+    use crate::tokens_pool::paths::{is_inside_git_worktree, shared_tokens_dir};
 
     let Some(dir) = shared_tokens_dir() else {
         eprintln!(
@@ -257,8 +257,8 @@ fn provisioning_destination_pool() -> PathBuf {
 /// is the empty-pool error in `tokens_pool::select`, which fires exactly when
 /// the refused pool was the only one present.
 fn warn_retired_in_worktree_pool(workspace: &Path) {
-    if let Some(pool) = loom_daemon::tokens_pool::paths::retired_in_worktree_pool(workspace) {
-        eprintln!("warning: {}", loom_daemon::tokens_pool::paths::in_worktree_pool_error(&pool));
+    if let Some(pool) = crate::tokens_pool::paths::retired_in_worktree_pool(workspace) {
+        eprintln!("warning: {}", crate::tokens_pool::paths::in_worktree_pool_error(&pool));
     }
 }
 
@@ -287,11 +287,11 @@ pub(crate) struct PoolTarget {
 /// pool once per such workspace. The single shared-pool entry appended at
 /// the end already covers it.
 pub(crate) fn enumerate_all_pools() -> Vec<PoolTarget> {
-    use loom_daemon::tokens_pool::paths::{
+    use crate::tokens_pool::paths::{
         has_token_files, is_inside_git_worktree as paths_is_inside_git_worktree,
         per_repo_tokens_dir, shared_tokens_dir,
     };
-    use loom_daemon::workspace_registry::WorkspaceRegistry;
+    use crate::workspace_registry::WorkspaceRegistry;
     use std::collections::HashSet;
 
     let registry = WorkspaceRegistry::load_default().unwrap_or_default();
@@ -335,12 +335,12 @@ pub(crate) fn enumerate_all_pools() -> Vec<PoolTarget> {
 fn run_probe_against_pool(
     tokens_dir: &Path,
     ranking: bool,
-    resolved_source: loom_daemon::tokens_pool::check::Source,
+    resolved_source: crate::tokens_pool::check::Source,
     prompt: &str,
     no_stagger: bool,
-) -> loom_daemon::tokens_pool::check::ProbeReport {
-    use loom_daemon::tokens_pool::bad_tokens;
-    use loom_daemon::tokens_pool::check::{self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL};
+) -> crate::tokens_pool::check::ProbeReport {
+    use crate::tokens_pool::bad_tokens;
+    use crate::tokens_pool::check::{self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL};
 
     // Routine `.bad_tokens` hygiene (#4643) — the second wired path. `tokens
     // check` is the low-frequency periodic probe (the daemon's ranking
@@ -371,11 +371,9 @@ fn run_probe_against_pool(
     };
     // Issue #10744: trace the run so the daemon's refresh loop (which set
     // `LOOM_TOKEN_RANKING_SUMMARY_FILE`) learns per-account probe outcomes.
-    let trace = loom_daemon::tokens_pool::round_summary::RoundTrace::default();
+    let trace = crate::tokens_pool::round_summary::RoundTrace::default();
     let report = check::run_check_traced(tokens_dir, &opts, &CurlTransport, &trace);
-    loom_daemon::tokens_pool::round_summary::write_summary_if_requested(
-        tokens_dir, &report, &trace,
-    );
+    crate::tokens_pool::round_summary::write_summary_if_requested(tokens_dir, &report, &trace);
     // Issue #8347: persist today's weekly-limit-point sample. Best-effort and
     // `--ranking`-gated — see `super::tokens_weekly_points` for why this is
     // the call site (it rides the daemon's existing ranking-refresh cadence).
@@ -412,7 +410,7 @@ pub(crate) struct UnblockOutcome {
 /// and `removed`/`kept`/`excluded` are all zero-value defaults —
 /// `bad_tokens::unblock_in_dir` is never called with an empty name list.
 fn unblock_against_pool(dir: &Path, names: &[String], all_reasons: bool) -> Result<UnblockOutcome> {
-    use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts};
+    use crate::tokens_pool::{allowlist, bad_tokens, failure_counts};
 
     let available = allowlist::list_accounts_in_dir(dir);
     let available_set: std::collections::HashSet<&str> =
@@ -548,7 +546,7 @@ fn source_label(source: &str) -> &str {
 /// Print the effective merged account set and where each came from. Mirrors
 /// `cli._print_effective_accounts` — secrets are never shown, only email, token
 /// filename, and source.
-fn print_effective_accounts(result: &loom_daemon::tokens_pool::bootstrap::BootstrapResult) {
+fn print_effective_accounts(result: &crate::tokens_pool::bootstrap::BootstrapResult) {
     let disp = |p: &Option<std::path::PathBuf>| -> String {
         p.as_ref()
             .map_or_else(|| "(none)".to_string(), |p| p.display().to_string())
@@ -582,7 +580,7 @@ fn print_effective_accounts(result: &loom_daemon::tokens_pool::bootstrap::Bootst
 
 /// Print the imported account set from `import-from-monitor`. Secrets are
 /// never shown. Mirrors `cli._print_monitor_import`.
-fn print_monitor_import(result: &loom_daemon::tokens_pool::monitor_db::MonitorImportResult) {
+fn print_monitor_import(result: &crate::tokens_pool::monitor_db::MonitorImportResult) {
     let disp = |p: &Option<std::path::PathBuf>| -> String {
         p.as_ref()
             .map_or_else(|| "(none)".to_string(), |p| p.display().to_string())
@@ -631,7 +629,7 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
-    use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts};
+    use crate::tokens_pool::{allowlist, bad_tokens, failure_counts};
 
     match action {
         TokensAction::Select {
@@ -665,7 +663,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             dry_run,
             json,
         } => {
-            use loom_daemon::tokens_pool::bootstrap::{self, BootstrapError, BootstrapOptions};
+            use crate::tokens_pool::bootstrap::{self, BootstrapError, BootstrapOptions};
 
             let repo_root = resolve_tokens_workspace(&workspace)?;
 
@@ -673,7 +671,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             // (issue #5345) — mirrors `workspace add/set-weight/remove`'s
             // gate in `cli::workspace_fleet`. `tokens select` (read-only, on
             // the spawn hot path) is deliberately never gated.
-            if let Some(delegate) = loom_daemon::config_resolver::daemon_delegated_to(&repo_root) {
+            if let Some(delegate) = crate::config_resolver::daemon_delegated_to(&repo_root) {
                 eprintln!(
                     "error: daemon admin is delegated to {delegate} — perform token bootstrap \
                      there."
@@ -743,7 +741,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             dry_run,
             json,
         } => {
-            use loom_daemon::tokens_pool::monitor_db::{
+            use crate::tokens_pool::monitor_db::{
                 import_from_monitor, ImportOptions, MonitorImportError,
             };
 
@@ -807,7 +805,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             no_stagger,
             all_pools,
         } => {
-            use loom_daemon::tokens_pool::check::{self, DEFAULT_PROBE_PROMPT};
+            use crate::tokens_pool::check::{self, DEFAULT_PROBE_PROMPT};
 
             let source_flag = match source {
                 Some(raw) => match check::Source::parse(&raw) {
@@ -952,7 +950,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             json,
             all_pools,
         } => {
-            use loom_daemon::tokens_pool::paths::shared_tokens_dir;
+            use crate::tokens_pool::paths::shared_tokens_dir;
 
             if all_pools {
                 let pools = enumerate_all_pools();
@@ -1034,7 +1032,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 }
             } else {
                 let ws = resolve_tokens_workspace(&workspace)?;
-                loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws)
+                crate::tokens_pool::paths::resolve_tokens_dir(&ws)
             };
 
             let outcome = unblock_against_pool(&dir, &names, all_reasons)?;
@@ -1081,7 +1079,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
 
 /// Handle `loom-daemon tokens pin <set|add|remove|status>`.
 fn handle_pin_action(action: PinAction, ws: &Path) -> Result<()> {
-    use loom_daemon::tokens_pool::{allowlist, failure_counts};
+    use crate::tokens_pool::{allowlist, failure_counts};
 
     match action {
         PinAction::Set { names } => match allowlist::write_allowlist(ws, &names) {

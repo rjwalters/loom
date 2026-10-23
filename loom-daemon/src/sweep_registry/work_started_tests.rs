@@ -3,11 +3,14 @@
 
 use super::*;
 use crate::observability::ops::capture::capture;
+use crate::step_role::StepRole;
+use crate::sweep_registry::step_spawn::StepSpawnRequest;
 use crate::sweep_registry::test_support::*;
 use crate::telemetry::kinds::fleet_state::FleetStage;
 use crate::telemetry::kinds::work_started::WorkStartedRecord;
 use crate::telemetry::{DispatchOrigin, TelemetryRecord};
 use serial_test::serial;
+use std::time::Duration;
 use tempfile::tempdir;
 
 const REPO: &str = "RJWalters/Loom";
@@ -189,4 +192,74 @@ fn nothing_is_built_without_an_exporter() {
         )
         .unwrap();
     std::env::remove_var("LOOM_REPO");
+}
+
+// ---- step spawns (#12904) -------------------------------------------------
+
+fn cancel_all(reg: &mut SweepRegistry) {
+    let ids: Vec<String> = reg.entries.keys().cloned().collect();
+    for id in ids {
+        let _ = reg.cancel(&id, Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[serial]
+fn a_spawned_builder_step_starts_sweep_builder_with_source_step() {
+    std::env::set_var("LOOM_REPO", REPO);
+    let dir = tempdir().unwrap();
+    let (mut reg, _rec) = fixture_registry(dir.path());
+    let request = StepSpawnRequest::new(1_290_401, StepRole::Builder);
+    let (outcome, captured) = capture(|| reg.spawn_step(&request));
+    std::env::remove_var("LOOM_REPO");
+    let sweep_id = outcome.unwrap().sweep_id;
+    let started = starts(captured.records);
+    assert_eq!(started.len(), 1, "{started:?}");
+    let r = &started[0];
+    assert_eq!(r.repo, "rjwalters/loom");
+    assert_eq!(r.issue, Some(1_290_401));
+    assert_eq!(r.stage, FleetStage::SweepBuilder);
+    assert_eq!(r.role, "builder");
+    assert_eq!(r.sweep_id, sweep_id);
+    assert_eq!(r.source, "step");
+    cancel_all(&mut reg);
+}
+
+#[test]
+#[serial]
+fn a_pr_acting_or_promote_step_emits_no_step_start() {
+    std::env::set_var("LOOM_REPO", REPO);
+    let dir = tempdir().unwrap();
+    let (mut reg, _rec) = fixture_registry(dir.path());
+    for (item, role) in [
+        (1_290_411, StepRole::Judge),
+        (1_290_412, StepRole::Doctor),
+        (1_290_413, StepRole::ChampionMerge),
+        (1_290_414, StepRole::ChampionPromote),
+    ] {
+        let (outcome, captured) = capture(|| reg.spawn_step(&StepSpawnRequest::new(item, role)));
+        outcome.unwrap();
+        assert!(starts(captured.records).is_empty(), "{role:?}");
+    }
+    std::env::remove_var("LOOM_REPO");
+    cancel_all(&mut reg);
+}
+
+#[test]
+#[serial]
+fn a_refused_step_emits_no_start() {
+    std::env::set_var("LOOM_REPO", REPO);
+    let dir = tempdir().unwrap();
+    let (mut reg, _rec) = fixture_registry(dir.path());
+    crate::sweep_registry::test_support::write_lock_owner(
+        &reg,
+        1_290_421,
+        "sweep-issue-1290421-1",
+        std::process::id(),
+    );
+    let (result, captured) =
+        capture(|| reg.spawn_step(&StepSpawnRequest::new(1_290_421, StepRole::Builder)));
+    std::env::remove_var("LOOM_REPO");
+    assert!(result.is_err());
+    assert!(starts(captured.records).is_empty());
 }

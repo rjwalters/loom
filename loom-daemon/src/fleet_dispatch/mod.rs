@@ -9,22 +9,30 @@
 //! - [`proto`]: the wire contract, shared by the server and the client.
 //! - [`client`]: the worker's HTTP client and its `loom.fleet_dispatch.call`
 //!   span (#12450).
+//! - [`backoff`]: when a worker asks the captain for work: capacity-driven,
+//!   with capped jittered backoff on empty answers, pure (#12817).
 //! - [`fallback`]: the worker's fail-open hysteresis, pure (#12450).
 //! - [`worker`]: the worker's claim, refuse, release and heartbeat, behind
 //!   the per-host `fleetDispatch.enabled` flag (#12450).
 //! - [`table`]: the soft assignment table and its policy, pure, on an
 //!   injected monotonic clock.
 //! - [`identity`]: remote address → tailnet node (LocalAPI `whois`).
+//! - [`request`]: the worker's capacity-driven request loop (#12817).
 //! - [`roster`]: tailnet node → fleet `host_id`, and each host's cap, from the
 //!   fleet store's `fleet.json`.
+//! - [`queue`]: the fleet queue, classified from the mirror's worklist, with
+//!   refresh and tombstones, pure (#12816).
 //! - [`server`]: `loom-daemon fleet-dispatch serve`.
 //! - [`telemetry`]: the `loom.fleet_dispatch.call` span and the captain's
 //!   counters.
 
+pub mod backoff;
 pub mod client;
 pub mod fallback;
 pub mod identity;
 pub mod proto;
+pub mod queue;
+pub mod request;
 pub mod roster;
 pub mod server;
 pub mod table;

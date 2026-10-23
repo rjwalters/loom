@@ -1,5 +1,5 @@
 //! `loom-daemon telemetry-join` — the thin CLI over
-//! [`loom_daemon::telemetry_join`] (Issue #11528). One command brings a host
+//! [`crate::telemetry_join`] (Issue #11528). One command brings a host
 //! into SigNoz and proves its records land under the right identity: fetch
 //! the per-host token from its declared store, write the exporter's 0600
 //! `headers_file`, send one probe `host.export` record, and read it back
@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 
-use loom_daemon::observability::endpoint_policy;
-use loom_daemon::signoz_read::{EndpointConfig, TelemetryReader};
-use loom_daemon::telemetry_join::{
+use crate::observability::endpoint_policy;
+use crate::signoz_read::{EndpointConfig, TelemetryReader};
+use crate::telemetry_join::{
     self, JoinDeps, JoinPlan, OtlpProbeSender, ReaderProbe, DEFAULT_HEADERS_PATH, PROBE_QUERY,
 };
 
@@ -34,7 +34,7 @@ pub(crate) struct JoinArgs {
     host: String,
 
     /// OTLP base endpoint the probe is sent to.
-    #[arg(long, value_name = "URL", default_value = loom_daemon::telemetry_join::DEFAULT_ENDPOINT)]
+    #[arg(long, value_name = "URL", default_value = crate::telemetry_join::DEFAULT_ENDPOINT)]
     endpoint: String,
 
     /// Credential source: `ssm://<parameter>` (AWS CLI, decrypted),
@@ -60,7 +60,7 @@ pub(crate) struct JoinArgs {
     probe_sql: Option<String>,
 
     /// How long the probe may take to appear in SigNoz, in seconds.
-    #[arg(long, value_name = "SECONDS", default_value_t = loom_daemon::telemetry_join::DEFAULT_TIMEOUT_SECS)]
+    #[arg(long, value_name = "SECONDS", default_value_t = crate::telemetry_join::DEFAULT_TIMEOUT_SECS)]
     timeout: u64,
 
     /// Where the 0600 headers file is written (default

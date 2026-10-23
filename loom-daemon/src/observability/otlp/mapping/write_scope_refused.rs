@@ -3,21 +3,11 @@
 //! the record's JSON; the scalars ride as `loom.write_scope.*` attributes, with
 //! `loom.repo` when the refused repository is known.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::session_output::LogParts;
-use super::{kv, kv_string, nanos};
+use super::{kv_bool, kv_string, nanos};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
     let TelemetryRecord::WriteScopeRefused(r) = record else {
@@ -36,6 +26,12 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
     ];
     if let Some(repo) = &r.repo {
         attributes.push(kv_string("loom.repo", repo));
+    }
+    if let Some(owner) = &r.repo_owner {
+        attributes.push(kv_string("loom.write_scope.repo_owner", owner));
+    }
+    if let Some(owner) = &r.credential_owner {
+        attributes.push(kv_string("loom.write_scope.credential_owner", owner));
     }
     Some(LogParts {
         event_name: "write_scope.refused",
@@ -63,7 +59,9 @@ mod tests {
     fn record(repo: Option<&str>) -> WriteScopeRefusedRecord {
         WriteScopeRefusedRecord {
             repo: repo.map(Into::into),
+            repo_owner: repo.map(|r| r.split('/').next().unwrap_or(r).to_owned()),
             credential: "gh-config:acme".into(),
+            credential_owner: Some("acme".into()),
             call_site: "claim reconciliation".into(),
             reason: RefusalClass::NotInInstallation,
             refused_at: Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap(),
@@ -104,6 +102,10 @@ mod tests {
             TelemetryEnvelope::new("host-1", TelemetryRecord::WriteScopeRefused(record(None)));
         let log = log_record_for(&envelope).unwrap();
         assert!(!log.attributes.iter().any(|kv| kv.key == "loom.repo"));
+        assert!(!log
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "loom.write_scope.repo_owner"));
     }
 
     #[test]

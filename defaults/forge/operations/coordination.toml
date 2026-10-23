@@ -241,6 +241,9 @@ kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
 [[operation.callers]]
 kind = "rust"
@@ -251,6 +254,9 @@ path = "loom-daemon/src/intake_reconcile/singleton.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/epic_supervisor.rs"
 
 [[operation]]
 id = "issue.edit-body"
@@ -435,7 +441,13 @@ kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/epic_supervisor.rs"
 
 [[operation]]
 id = "comment.list"

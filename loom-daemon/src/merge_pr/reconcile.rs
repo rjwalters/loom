@@ -365,6 +365,55 @@ pub fn child_route(issue: Option<&str>, labels: &[u8]) -> Decision {
     }
 }
 
+/// [`child_route`] refined by the child issue's live lease (#12759, AC7).
+///
+/// A Loom Builder's issue keeps `loom:building` until its PR merges, so the
+/// label alone defers every Loom-built child for good: nothing runs a later
+/// pass. `loom:building` is therefore only a *claim*; whether a Builder is
+/// actually working the branch is the lease. A `Defer` from the label logic is
+/// lifted to `Reconcile` only when the lease read succeeded and found no fresh
+/// lease. A held lease or a failed read still defers (unknown is never free).
+///
+/// A documented divergence from the retired shell, which had no lease read:
+/// `merge-pr.sh` itself is unchanged and still feeds the label bytes.
+pub fn route_with_lease(decision: Decision, lease: &LeaseState) -> Decision {
+    if decision.route != Route::Defer {
+        return decision;
+    }
+    match lease {
+        LeaseState::NoneFresh => Decision {
+            route: Route::Reconcile,
+            why: "the child issue is loom:building but holds no live lease, so no Builder \
+                  is working the branch",
+        },
+        LeaseState::Held | LeaseState::Unknown => decision,
+    }
+}
+
+/// What a live read of the child issue's lease showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    /// A fresh, non-yielded lease: a live worker holds the claim.
+    Held,
+    /// The read succeeded and found no fresh lease.
+    NoneFresh,
+    /// The read failed.
+    Unknown,
+}
+
+/// Read the lease of `issue` live (library side: the reader is crate-private).
+#[must_use]
+pub fn read_lease_state(root: &std::path::Path, issue: u32) -> LeaseState {
+    use crate::forge_check_claim::{read_freshest_live_lease, LeaseLeg};
+    let gh = std::path::PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into()));
+    let ttl = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+    match read_freshest_live_lease(&gh, root, issue, chrono::Utc::now(), ttl) {
+        LeaseLeg::Held { .. } => LeaseState::Held,
+        LeaseLeg::NoneFresh => LeaseState::NoneFresh,
+        LeaseLeg::ReadFailed => LeaseState::Unknown,
+    }
+}
+
 /// The deferral comment body, byte-frozen from the retired shell.
 ///
 /// Held byte-for-byte against the frozen fixture by

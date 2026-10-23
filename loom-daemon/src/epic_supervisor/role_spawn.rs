@@ -86,26 +86,7 @@ mod tests {
         "CLAUDE_CODE_ENABLE_TELEMETRY",
     ];
 
-    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-    impl EnvGuard {
-        fn clear() -> Self {
-            let previous = KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
-            for key in KEYS {
-                std::env::remove_var(key);
-            }
-            Self(previous)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
+    use crate::env_test_support::EnvGuard;
 
     fn shape() -> DispatchShape {
         DispatchShape {
@@ -138,7 +119,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn epic_role_command_carries_the_opt_in_telemetry_env() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(KEYS);
         let dir = root(true);
         let cmd = command(Path::new("/bin/true"), dir.path(), 42, &shape(), "sonnet");
         assert_eq!(env(&cmd, "CLAUDE_CODE_ENABLE_TELEMETRY"), Some(Some("1".into())));
@@ -170,7 +151,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn epic_role_command_carries_no_managed_env_when_off() {
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(KEYS);
         // Ambient values on the daemon must not leak through.
         std::env::set_var("CLAUDE_CODE_ENABLE_TELEMETRY", "1");
         let dir = root(false);
@@ -192,7 +173,7 @@ mod tests {
         use crate::workspace_hold::{
             set_for_test, HeldCopy, HoldKind, WorkspaceHeldDispatchError, WorkspaceHold,
         };
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(KEYS);
         let dispatcher = |dir: &Path| {
             let (registry, log) = crate::sweep_registry::test_support::fixture_registry(dir);
             let bin = dir.join(".loom/scripts/spawn-claude.sh");
@@ -249,7 +230,7 @@ mod tests {
                 Ok(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
             }
         }
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(KEYS);
         let supervisor = |dir: &Path| {
             let (registry, log) = crate::sweep_registry::test_support::fixture_registry(dir);
             let bin = dir.join(".loom/scripts/spawn-claude.sh");
@@ -308,7 +289,7 @@ mod tests {
                 Ok(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
             }
         }
-        let _guard = EnvGuard::clear();
+        let _guard = EnvGuard::clear(KEYS);
         let dispatcher = |dir: &Path| {
             let (registry, log) = crate::sweep_registry::test_support::fixture_registry(dir);
             let bin = dir.join(".loom/scripts/spawn-claude.sh");

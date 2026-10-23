@@ -72,37 +72,5 @@ pub fn resolve_repo(root: &Path) -> Option<String> {
     Some(crate::telemetry::repo_identity::resolve(&slug)?.full_name)
 }
 
-/// The OTLP signal an OTLP-only record kind belongs to, or `None` for a kind
-/// the native HTTPS backend also accepts. Spans and `metric.points` (#8860)
-/// never reach native ingest.
-///
-/// Both halves are read off the kind's own registry row in
-/// `telemetry/kinds.rs` (#8921) — `native: false` makes a kind OTLP-only, and
-/// its `otlp:` class names the signal — so adding a record kind never edits
-/// this function.
-pub(super) fn otlp_only_signal(record: &crate::telemetry::TelemetryRecord) -> Option<&'static str> {
-    if record.accepted_by_native_ingest() {
-        return None;
-    }
-    record.otlp_class().signal()
-}
-
-/// Existing native ingest accepts lifecycle records, never OTLP-only payloads
-/// ([`otlp_only_signal`]). Also strips the additive context fields for older
-/// native backend versions.
-pub(super) fn native_envelopes(
-    envelopes: &[crate::telemetry::TelemetryEnvelope],
-) -> Vec<crate::telemetry::TelemetryEnvelope> {
-    envelopes
-        .iter()
-        .filter(|e| otlp_only_signal(&e.record).is_none())
-        .cloned()
-        .map(|mut envelope| {
-            envelope.trace_context = None;
-            envelope
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests;

@@ -197,11 +197,9 @@ above stays required: synthetic completions, and pre-#9438 data, are still
 `loom.role_attempt` spans have distinct IDs for retries. Explicit checkpoint
 attempt numbers are retained. Unknown usage remains absent; measured zero stays
 zero. Each attempt's token usage is a set of per-model `loom.runtime.usage`
-children with `loom.usage.scope=attempt` (#9303): `loom-daemon usage-record`,
-run after each checkpoint write, reads the role subagent's transcript and
-journals them under the role's newest attempt, or, in an operator session with
-no inherited context, under a `loom.role_attempt` it creates in the issue's
-story trace (`loom.timing_source=transcript_window`). The whole execution's
+children with `loom.usage.scope=attempt` (#9303), written by the daemon for
+its own role-runner ticks. No CLI an attended or outside session can call
+emits usage telemetry (#12536): only daemon work is recorded. The whole execution's
 usage is the `scope=execution` set; see `telemetry-schema.md` for how to total
 the two without double counting. Outcome logs include existing grouped usage, failure classification, ordered
 Judge verdicts and Doctor counts. Grouped usage inherits the source journal's
@@ -319,11 +317,31 @@ unplanned crash stays `process_lost`. A resumed role run carries
 `loom.resumed_from` = that item id. Failure-rate queries and the role-failures
 watch should exclude `interrupted_by_roll`.
 
+A run a lost EC2 host ended (#12876) closes as
+`loom.result=interrupted_by_host_loss`, unset status, with
+`loom.host.loss_cause` = `spot_reclaim` (IMDS `spot/instance-action`) or
+`rebalance` (`events/recommendations/rebalance`). On an EC2 host (DMI vendor
+Amazon; any other host runs no watcher and makes no IMDS request) the daemon
+polls both endpoints about every 5 s while sweeps are in flight, and on the
+first notice of each kind: closes every in-flight sweep span that way, sends the
+captain a `release` with outcome `host_lost` for each assignment (the row ends
+at once, no hold is armed, instead of expiring at its TTL), and emits one
+`loom.host.interruption_notice` span (instant, own root). A non-spot EC2 host
+answers 404 on both and emits nothing. Its attributes: `loom.host.id`,
+`loom.host.instance_type`, `loom.host.loss_cause`,
+`loom.host.interruption.kind`, `loom.host.interruption.notice_time` (RFC 3339;
+for a spot reclaim, when the daemon first saw it), `loom.host.interruption.action_time`
+(spot reclaim only), `loom.host.in_flight_sweeps` (comma-separated sweep ids),
+`loom.host.interruption.sweeps_closed` and `loom.host.assignments_released`.
+Failure-rate queries should exclude `interrupted_by_host_loss` too. Moving the
+work to another host is #6704.
+
 A step's `loom.sweep` root (`loom.sweep_id=step-<role>-<item>-…`, #12253) is
 closed by the step's own end, when the reaper, a cancel or startup sees the
 session exit: `loom.result` is the same `success`/`failure` its
 `role_tick.outcome` reports, with `loom.role`, the step's model and effort,
-`loom.exit_code` when known, and on a failure a `loom.failure_class` of
+`loom.exit_code` when known, `loom.story_points` when the item is sized
+(#12957), and on a failure a `loom.failure_class` of
 `timeout-ceiling`, `cancelled`, `step-outcome-failed` (the session's
 `LOOM_STEP_OUTCOME class=failed`), `exit-<code>` or `exit-unobserved`. A step a
 roll stopped closes as `interrupted_by_roll`. Orphan recovery leaves a step's

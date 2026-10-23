@@ -13,13 +13,19 @@
 //! `detail`: `forge_closed`, `forge_closed_not_planned` or `journal_landed`;
 //! `unknown` for a row with none of these), so the split is measurable without
 //! the native `queue.snapshot`.
+//! A fifth, `loom.queue.host_shard` (#12827), is this host's shard index on
+//! the tick's dispatch plan, labelled `shard_count`. It is emitted only when
+//! sharding is configured and the index is known: an unsharded host, a tick
+//! without a plan, or an unknown index exports no point (absent stays absent,
+//! never a `0` that would read as "shard 0").
 //!
 //! Every disposition is emitted every tick, **zeros included**, so an empty
 //! queue reads as `0` and not as a missing series. A missing series then
 //! means only one thing: this host stopped ticking or stopped exporting. The
 //! labels are two small closed vocabularies. An issue number or a repo never
-//! becomes a label; the per-issue rows go to the native backend as
-//! `queue.snapshot` (`crate::telemetry::queue_snapshot`).
+//! becomes a label; per-issue rows ride the `pick.decision` and
+//! `eta.*` kinds instead (the native `queue.snapshot` record was removed in
+//! #12813).
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
@@ -61,7 +67,23 @@ pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
         int(summary.listing_incomplete.len()),
     ));
     points.extend(already_landed_points(summary));
+    points.extend(host_shard_point(summary));
     points
+}
+
+/// `loom.queue.host_shard{shard_count}` (#12827): the host's shard index
+/// from the tick's plan, only when sharding is configured and the index is
+/// known. `shard_count` is a label only when the plan names it.
+fn host_shard_point(summary: &WorkFinderTickSummary) -> Option<MetricPoint> {
+    let shard = summary.plan.as_ref()?.shard;
+    if !shard.configured {
+        return None;
+    }
+    let point = MetricPoint::int(MetricName::QueueHostShard, i64::from(shard.host_shard?));
+    Some(match shard.shard_count {
+        Some(count) => point.label("shard_count", count.to_string()),
+        None => point,
+    })
 }
 
 /// One `loom.queue.already_landed{reason}` point per evidence, zeros

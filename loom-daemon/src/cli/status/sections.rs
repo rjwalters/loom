@@ -8,16 +8,16 @@
 //! them. Without `--section` every helper here answers "everything", and the
 //! request is the unchanged `Request::DaemonStatus`.
 
+use crate::daemon_install_state::{self, ProtectionReport};
+use crate::errors::ErrorCode;
+use crate::self_update::{self, SelfUpdateStatus};
+use crate::status_section::{SectionSet, StatusSection};
+use crate::types::{DaemonStatusReport, Request, Response};
 use anyhow::anyhow;
-use loom_daemon::daemon_install_state::{self, ProtectionReport};
-use loom_daemon::errors::ErrorCode;
-use loom_daemon::self_update::{self, SelfUpdateStatus};
-use loom_daemon::status_section::{SectionSet, StatusSection};
-use loom_daemon::types::{DaemonStatusReport, Request, Response};
 
 /// Arguments of `loom-daemon status`.
 #[derive(Debug, Clone, clap::Args)]
-pub(crate) struct StatusArgs {
+pub struct StatusArgs {
     /// Emit machine-readable JSON instead of the human-readable table.
     #[arg(long)]
     pub json: bool,

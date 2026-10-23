@@ -1,5 +1,5 @@
 //! `loom-daemon inflight` — the agent-facing surface onto the in-flight
-//! verification registry ([`loom_daemon::inflight`], Issue #8268).
+//! verification registry ([`crate::inflight`], Issue #8268).
 //!
 //! No running daemon is required: state is a machine-wide directory, not
 //! in-daemon memory. That is load-bearing rather than incidental — the
@@ -14,7 +14,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use loom_daemon::inflight::{
+use crate::inflight::{
     self, fingerprint, normalize_tree, resolve_stale, store_dir, ClaimOutcome, Registration,
 };
 

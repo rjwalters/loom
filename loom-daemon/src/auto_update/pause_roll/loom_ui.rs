@@ -16,8 +16,8 @@
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use crate::loom_ui_alerts::ledger::Ledger;
-use crate::loom_ui_alerts::{Alert, Severity, State};
+use crate::alerts::ledger::Ledger;
+use crate::alerts::{Alert, Severity, State};
 
 /// Rule for a failed pause.
 pub const RULE_PAUSE_FAILED: &str = "version.pause-failed";

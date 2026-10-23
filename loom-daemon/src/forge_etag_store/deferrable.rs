@@ -29,7 +29,7 @@ use anyhow::Result;
 use super::{reader_failure, run_fetch_with, ConditionalRead, FetchResult, Target};
 use crate::forge_bucket_book::Resource;
 use crate::forge_identity::{served, Failure, IdentityRole, RouteDecision, RouteRequest};
-use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation, ShedWhy};
 
 /// A conditional read that was not sent: no reader can serve the repo until
 /// about `until` (out of budget, withdrawn, or unable to see it). The caller
@@ -53,6 +53,20 @@ impl std::fmt::Display for ReadShed {
 }
 
 impl std::error::Error for ReadShed {}
+
+/// A conditional read that was not sent because the work-finder tick stopped
+/// it (#12641). Not a [`ReadShed`]: no reader budget is involved. The caller
+/// skips its pass, as for a shed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TickDeadlineReached;
+
+impl std::fmt::Display for TickDeadlineReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deferred: tick deadline reached")
+    }
+}
+
+impl std::error::Error for TickDeadlineReached {}
 
 /// Readers one read may try before it stops asking the router.
 const MAX_READERS_TRIED: usize = 8;
@@ -85,6 +99,22 @@ pub(super) fn fetch(
             None,
         )
     };
+    if crate::gh_invocation::discovery_isolation::active() {
+        // #12312: the fleet `gh` tier. Its own config dir, no token variable,
+        // no reader router: a host with nothing logged in there fails closed.
+        return run_fetch_with(
+            site,
+            gh_bin,
+            cwd,
+            target,
+            url,
+            etag,
+            Some(&crate::gh_invocation::discovery_isolation::config_dir()),
+            true,
+            IdentityRole::Writer,
+            None,
+        );
+    }
     let Some(repo) = target.repo.as_deref() else {
         // An unresolved repo has no reader pool to be out of budget.
         return on_writer();
@@ -122,18 +152,21 @@ pub(super) fn fetch(
             // reader is left.
             RouteDecision::Reader { app_id, .. } => {
                 let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
-                return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
+                let why = ShedWhy::Router("every reader offered already failed this read");
+                return Err(shed(site, gh_bin, target, repo, until, Some(&app_id), why));
             }
-            RouteDecision::Exhausted { until, .. } => {
+            RouteDecision::Exhausted { until, cause } => {
                 let app = tried.last().map(String::as_str);
-                return Err(shed(site, gh_bin, target, repo, until, app));
+                let why = ShedWhy::Router(cause.as_str());
+                return Err(shed(site, gh_bin, target, repo, until, app, why));
             }
             // The pool went away after a reader (the gateway) was tried: a
             // withdrawal, not "no pool".
             RouteDecision::NoPool if !tried.is_empty() => {
                 let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                 let app = tried.last().map(String::as_str);
-                return Err(shed(site, gh_bin, target, repo, until, app));
+                let why = ShedWhy::Router("the reader pool went away");
+                return Err(shed(site, gh_bin, target, repo, until, app, why));
             }
             // No reader pool on this host: the writer is the only credential.
             RouteDecision::NoPool => return on_writer(),
@@ -191,7 +224,8 @@ pub(super) fn fetch(
                 // and the reader stays on the repo's other reads.
                 served::CoverageRefusal::Shed => {
                     let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
-                    return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
+                    let why = ShedWhy::Router("a covering reader answered 404 for one item");
+                    return Err(shed(site, gh_bin, target, repo, until, Some(&app_id), why));
                 }
                 served::CoverageRefusal::Withdraw => {}
                 // No evidence at all: a short withdrawal (#12511).
@@ -220,6 +254,7 @@ fn shed(
     repo: &str,
     until: SystemTime,
     app: Option<&str>,
+    why: ShedWhy,
 ) -> anyhow::Error {
     let owner = crate::credential_preflight::owner_of_nwo(repo).to_ascii_lowercase();
     GhInvocation::new(
@@ -231,7 +266,7 @@ fn shed(
     .forge_op(site.op)
     .identity_scope(target.host.as_deref(), target.repo.as_deref())
     .program(gh_bin)
-    .record_read_shed(site.class, &owner, Resource::Core, until, app);
+    .record_read_shed(site.class, &owner, Resource::Core, until, app, why);
     anyhow::Error::new(ReadShed { until })
 }
 

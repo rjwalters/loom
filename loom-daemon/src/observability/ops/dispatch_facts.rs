@@ -33,10 +33,11 @@
 use std::path::Path;
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::RepoVisibility;
 use crate::types::CapView;
 use crate::work_finder::halt_cause::since::RootHalt;
+use crate::work_finder::RepoDepth;
 use crate::work_finder::TickReport;
 
 /// Span attribute values are bounded to this many characters at export
@@ -219,11 +220,38 @@ pub fn tick_points(report: &TickReport, cap: Option<CapView>) -> Vec<MetricPoint
                 .label("kind", "configured"),
         );
     }
+    points.extend(depth_points(&report.depth));
     if report.pr_open_prefiltered > 0 {
         points.push(MetricPoint::int(
             MetricName::DispatchPrOpenPrefiltered,
             int(report.pr_open_prefiltered),
         ));
+    }
+    points
+}
+
+/// The step tick's dispatchable depth (#12734): `loom.dispatch.pool_items`
+/// by `repo` and `step`, `loom.dispatch.excluded_items` by `repo` and
+/// `reason`. Non-zero counts only, so absence means zero. Labels are the
+/// registered workspace slugs and the closed `Step` / `Exclusion` names. Pure.
+#[must_use]
+pub fn depth_points(depth: &[RepoDepth]) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
+    for d in depth {
+        for (step, &n) in d.pool.iter().filter(|(_, n)| **n > 0) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchPoolItems, int(n))
+                    .label("repo", d.repo.as_str())
+                    .label("step", *step),
+            );
+        }
+        for (reason, &n) in d.excluded.iter().filter(|(_, n)| **n > 0) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchExcludedItems, int(n))
+                    .label("repo", d.repo.as_str())
+                    .label("reason", *reason),
+            );
+        }
     }
     points
 }
@@ -479,6 +507,42 @@ mod tests {
         .unwrap();
         assert!(named.len() <= MAX_ATTRIBUTE_CHARS, "{}", named.len());
         assert!(named.split(',').all(|e| e.ends_with("=drain")), "{named}");
+    }
+
+    #[test]
+    fn depth_points_carry_pool_and_exclusions_within_closed_sets() {
+        use crate::step_dispatch::item_draw::Exclusion;
+        use crate::work_finder::step_item::{PassReason, Step};
+        let depth = RepoDepth {
+            repo: "o/a".into(),
+            pool: [(Step::Builder.as_str(), 2), (Step::Judge.as_str(), 0)].into(),
+            excluded: [
+                (Exclusion::Pass(PassReason::Blocked).as_str(), 5),
+                (Exclusion::MergeInFlight.as_str(), 1),
+            ]
+            .into(),
+        };
+        let held = RepoDepth {
+            repo: "o/b".into(),
+            ..RepoDepth::default()
+        };
+        let points = depth_points(&[depth, held]);
+        let pool = MetricPoint::int(MetricName::DispatchPoolItems, 2)
+            .label("repo", "o/a")
+            .label("step", "builder");
+        let blocked = MetricPoint::int(MetricName::DispatchExcludedItems, 5)
+            .label("repo", "o/a")
+            .label("reason", "blocked");
+        let merging = MetricPoint::int(MetricName::DispatchExcludedItems, 1)
+            .label("repo", "o/a")
+            .label("reason", "merge_in_flight");
+        assert_eq!(points, vec![pool, blocked, merging]);
+        for p in &points {
+            assert!(p
+                .labels
+                .keys()
+                .all(|k| crate::telemetry::ops::OPS_METRIC_LABEL_KEYS.contains(&k.as_str())));
+        }
     }
 
     #[test]

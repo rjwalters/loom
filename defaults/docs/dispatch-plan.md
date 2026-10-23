@@ -11,8 +11,8 @@ different questions:
 
 The host-local layer is documented with the rest of the queue surface in
 [`daemon-reference.md`](daemon-reference.md) ("Dispatch plan (#9288)") and
-field-by-field in [`telemetry-schema.md`](telemetry-schema.md) under
-`queue.snapshot`. This document is about the second layer: the fleet merge.
+as the `loom.queue.*` span attributes in
+[`telemetry-schema.md`](telemetry-schema.md). This document is about the second layer: the fleet merge.
 
 ## Why a merge rule at all
 
@@ -49,7 +49,7 @@ together.
   (`loom-daemon/src/work_finder/step_item.rs`): `curator`,
   `curator_keep_or_close`, `champion_promote`, `champion_reevaluate`,
   `builder`, `judge`, `doctor`, `champion_merge`,
-  `champion_hold_reevaluate`.
+  `champion_hold_reevaluate`, `champion_triage`.
 - **An absent `step` is `builder`.** Every plan published before step
   dispatch was a Builder plan, so an older host's row folds into the same
   item as a newer host's explicit `builder` row. A host that does not set
@@ -145,7 +145,7 @@ it:
   the `HostPlan` / `FleetPlan` types in
   `loom-daemon/src/types/fleet_plan.rs`.
 - `2AMLogic/loom-ui:web/src/workQueue.ts` — `mergeFleetQueue`, over the per-host
-  `queue.snapshot` records the fleet backend stores.
+  per-host queue records the fleet backend stores.
 
 They are pinned to the same JSON fixture, kept as two identical copies:
 

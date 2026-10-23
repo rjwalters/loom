@@ -1,0 +1,21 @@
+{
+  "_provenance": "Copied verbatim from 2AMLogic/loom-ui web/src/pages/kpis/landedSizeParams.ts at 9f4d5f2a87e4ae9dc78de0cae81424dc08fee5a9 (read-only observation, #12548). Re-copy when loom-ui's vendored parameters change; run-parity.mjs fails if they drift from landed-size.sql.",
+  "paramsVersion": "v1-2026-10-02",
+  "baselineStart": "2026-09-29T00:00:00Z",
+  "baselineEnd": "2026-10-02T00:00:00Z",
+  "meanLogHwLines": 5.77683,
+  "sdLogHwLines": 1.965216,
+  "meanLogHwFiles": 1.852509,
+  "sdLogHwFiles": 0.769972,
+  "meanLogNormTokens": 0.742732,
+  "sdLogNormTokens": 0.352462,
+  "cuts": [1, 2, 3, 5, 8, 13],
+  "modelTokenFactors": {
+    "<unattributed>": 30339879.008721,
+    "claude-opus-5": 20869614.457459,
+    "claude-opus-5-5": 5417277.931668,
+    "claude-sonnet-5": 18208672.096412,
+    "claude-sonnet-5-5": 2745672.19194,
+    "glm-5.3": 30857811.255173
+  }
+}

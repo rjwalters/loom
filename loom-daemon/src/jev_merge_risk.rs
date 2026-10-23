@@ -1,15 +1,15 @@
 //! `loom-daemon jev-merge-risk <pr>` — shadow-mode Jev (TypeSafe) pre-score
-//! for Champion's PR auto-merge criterion #2 (issue #8545).
+//! for Champion's PR auto-merge `merge-risk` criterion (issue #8545).
 //!
 //! # Scope — read-only shadow telemetry, never a decision
 //!
-//! This subcommand answers the same four risk axes Champion's criterion #2
+//! This subcommand answers the same four risk axes Champion's `merge-risk` criterion
 //! judges by hand — diff composition, blast radius, Judge review depth,
 //! revertability — as four `noul` (yes/no probability) questions posted to
 //! Jev's `POST /v1/systemone` endpoint. It prints one JSON object to stdout
 //! and does nothing else: it never comments on, labels, merges, or holds a
 //! PR. Champion (`champion-pr-merge.md`) is the only caller, and only *after*
-//! it has already reached its own criterion #2 verdict — this subcommand's
+//! it has already reached its own `merge-risk` criterion verdict — this subcommand's
 //! output is appended to a shadow log for later precision/recall analysis and
 //! must never influence the merge decision itself.
 //!
@@ -115,7 +115,7 @@ pub struct AxisScore {
     pub confidence: f64,
 }
 
-/// The four axes, named after `champion-pr-merge.md`'s criterion #2 axis
+/// The four axes, named after `champion-pr-merge.md`'s `merge-risk` criterion axis
 /// table. Each is asked as "is this axis RED?", so a higher probability means
 /// more merge risk.
 #[derive(Debug, Serialize)]
@@ -155,7 +155,7 @@ pub struct JevMergeRiskOutput {
 }
 
 // ---------------------------------------------------------------------------
-// The four axes, VERBATIM from champion-pr-merge.md's criterion #2 table
+// The four axes, VERBATIM from champion-pr-merge.md's `merge-risk` criterion table
 // ---------------------------------------------------------------------------
 //
 // `axis_table_matches_champion_prompt` (below) re-reads that table out of
@@ -167,7 +167,7 @@ const DIFF_COMPOSITION_GREEN: &str = "The bulk of the diff is tests, docs/markdo
 const DIFF_COMPOSITION_RED: &str = "Load-bearing hunks change the *existing* behavior of a shared runtime path, and you cannot enumerate them — or the diff is dense enough that you skimmed rather than read it.";
 
 const BLAST_RADIUS_GREEN: &str = "Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature.";
-const BLAST_RADIUS_RED: &str = "Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows, or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature.";
+const BLAST_RADIUS_RED: &str = "Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows (unless `WF_BLAST=green`, #12677), or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature.";
 
 const REVIEW_DEPTH_GREEN: &str = "The Judge's verdict cites specifics from the diff — named files/functions, concrete behavior, what was run or verified.";
 const REVIEW_DEPTH_RED: &str = "A short generic approval (\"LGTM\", \"looks good\") with no evidence the diff was read, or a review that explicitly defers verification of some part (\"did not check X\").";
@@ -712,7 +712,7 @@ mod tests {
     }
 
     /// The criteria are only "copied verbatim from `champion-pr-merge.md`'s
-    /// criterion #2 axis table" (#8545) for as long as nobody edits either
+    /// `merge-risk` criterion axis table" (#8545) for as long as nobody edits either
     /// side. Re-read the table and compare, so drift fails here rather than
     /// silently making the shadow score answer a different rubric than the
     /// Champion it is shadowing.
@@ -729,7 +729,7 @@ mod tests {
             let row = text
                 .lines()
                 .find(|l| l.starts_with(&needle))
-                .unwrap_or_else(|| panic!("no criterion #2 table row for '{}'", axis.axis));
+                .unwrap_or_else(|| panic!("no merge-risk axis table row for '{}'", axis.axis));
             let cells: Vec<&str> = row.trim().trim_matches('|').split(" | ").collect();
             assert_eq!(cells.len(), 3, "unexpected row shape for '{}'", axis.axis);
             assert_eq!(

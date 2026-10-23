@@ -105,6 +105,33 @@ pub fn workspace_root() -> Option<&'static Path> {
     WORKSPACE_ROOT.get().map(PathBuf::as_path)
 }
 
+/// The root a read made for the checkout at `given` routes against: the one
+/// whose roster and **published reader directories** [`route_read`] uses —
+/// the daemon's workspace root, else the agent front's reader root, else
+/// `given` (a CLI process with neither).
+///
+/// [`spawn_reader_refresh`] publishes reader tokens under the daemon's
+/// workspace root only. A managed checkout's own `.loom/gh-config-by-owner`
+/// holds at most a writer token, so routing against it found every reader
+/// "stale" and shed the read without asking one (#12630).
+#[must_use]
+pub fn reader_root(given: &Path) -> PathBuf {
+    reader_root_with(given, published_reader_root())
+}
+
+/// The root this process's reader tokens are published under: the daemon's
+/// workspace root, else the agent front's reader root ([`reader_root`]).
+#[must_use]
+pub fn published_reader_root() -> Option<&'static Path> {
+    workspace_root().or_else(front_root)
+}
+
+/// [`reader_root`] with the published root injected.
+#[must_use]
+pub fn reader_root_with(given: &Path, published: Option<&Path>) -> PathBuf {
+    published.unwrap_or(given).to_path_buf()
+}
+
 /// Exported to agent sessions (#12207): the daemon's workspace root, whose
 /// roster and published reader directories the agent `gh` front's served
 /// reads may use when no gateway profile answers for the owner. A
@@ -969,26 +996,6 @@ pub fn writer_bucket(owner: &str) -> Option<String> {
     (crate::forge_bucket_book::valid_owner(owner)
         && crate::forge_call_stats::sanitize(owner).as_deref() == Some(owner))
     .then(|| format!("{WRITER_BUCKET_PREFIX}{}", owner.to_ascii_lowercase()))
-}
-
-/// The writer bucket that serves `owner_repo` (#10334), mirroring how a
-/// writer `gh` call picks its credential (`GhInvocation::env_plan`): the
-/// owner's own writer when one is registered for it
-/// (`owner_writer_registered`, `credential_preflight::gh_config_dir_for_owner_slug`),
-/// else the primary writer, booked under the workspace's own owner
-/// (`primary_owner`). With the primary owner unknown, the repo's owner — the
-/// same owner a writer row without a credential owner is booked under.
-#[must_use]
-pub fn serving_writer_bucket(
-    owner_repo: &str,
-    owner_writer_registered: bool,
-    primary_owner: Option<&str>,
-) -> Option<String> {
-    let repo_owner = crate::credential_preflight::owner_of_nwo(owner_repo);
-    match primary_owner {
-        Some(primary) if !owner_writer_registered => writer_bucket(primary),
-        _ => writer_bucket(repo_owner),
-    }
 }
 
 /// The one reader-only read shape (#12394; was `reader_then_writer`, #9537/#9872).

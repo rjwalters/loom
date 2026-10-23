@@ -1024,9 +1024,6 @@ async fn sample_snapshots(
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
-    // The work finder's ranked ready queue (Issue #8852, phase 2) — native
-    // HTTPS only, and only when the work finder has ticked since last time.
-    super::queue_snapshot::record(workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;
@@ -1034,6 +1031,16 @@ async fn sample_snapshots(
     // without the ops sink, and without a new work-finder tick since the last
     // export pass.
     super::ops::disposition::record(slug_cache).await;
+    // Per-item dispatch eligibility facts (Issue #12790), OTLP-only: splits
+    // `ready_wait` dwell at the eligibility boundary and records the eligible
+    // work-ahead. Reads only the repo-ref cache the two passes above warmed, so
+    // it makes no forge call; a no-op without the OTLP sink or a fresh tick.
+    super::dispatch_eligibility::record();
+    // Per-stage occupancy gauge (Issue #12866), OTLP-only: the items still
+    // waiting in triage / approval / operator hold. Counts come from the
+    // mirror snapshot or ETag-cached all-pages label listings; a no-op
+    // without the OTLP sink.
+    super::stage_occupancy::record(workspace_pool, slug_cache).await;
     // Per-account Codex session-container state (Issue #10455): export the
     // gauge from the always-on watch's newest observations. No docker call
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot

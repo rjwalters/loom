@@ -1,7 +1,7 @@
 # Shellcheck configuration for Loom shell scripts
 # See: https://github.com/koalaman/shellcheck/wiki/Directive
 
-# Target bash for macOS compatibility (bash 3.2+)
+# Target bash: Loom requires bash >= 4 (macOS: `brew install bash`)
 shell=bash
 
 # SC1090: Can't follow non-constant source
