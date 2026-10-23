@@ -1,7 +1,7 @@
 -- Pass activity (Issue #10752): what the daemon's artifact passes did, from
--- their `pass.summary` / `pass.verdict` logs and the `invoke github` spans
--- their caller scope stamps with `github.caller`. Until #11301 one pass emitted
--- them: the `loom:blocked` release pass (#10556), mechanism
+-- their `pass.summary` / `pass.verdict` logs and the repo's `invoke github`
+-- spans (no longer stamped per pass: the `github.caller` key is gone). Until
+-- #11301 one pass emitted them: the `loom:blocked` release pass (#10556), mechanism
 -- `stale_blocked_release`. Nothing emits them now; these read stored history.
 -- Role verdicts (Guide, Champion) are planned to land in the same records with
 -- `loom.role` set.
@@ -18,7 +18,8 @@
 --    removes nothing, so those land in `planned_released` / `planned_reparked`),
 --    how many artifacts they skipped and why
 --    (`skip_reasons` sums the body's per-reason map), and the GitHub calls
---    the pass made by operation (`calls_by_op`, from its spans).
+--    made against the repo by operation (`calls_by_op`, from its spans; these
+--    count every caller, since spans no longer name the pass).
 WITH passes AS (
     SELECT attributes_string['loom.pass.mechanism'] AS mechanism,
            lower(attributes_string['loom.repo']) AS repo,
@@ -48,15 +49,13 @@ WITH passes AS (
     GROUP BY mechanism, repo
 ),
 calls AS (
-    SELECT attributes_string['github.caller'] AS mechanism,
-           lower(attributes_string['github.repo']) AS repo,
+    SELECT lower(attributes_string['github.repo']) AS repo,
            sumMap([attributes_string['github.operation']], [toUInt64(1)]) AS calls_by_op,
            countIf(attributes_string['github.access_intent'] = 'write') AS github_writes
     FROM signoz_traces.distributed_signoz_index_v3
     WHERE name = 'invoke github'
-      AND attributes_string['github.caller'] != ''
       AND timestamp >= now() - INTERVAL 1 DAY
-    GROUP BY mechanism, repo
+    GROUP BY repo
 )
 SELECT p.mechanism, p.repo, p.passes, p.refused, p.dry_run_passes,
        p.released, p.reparked, p.failed, p.planned_released, p.planned_reparked,
@@ -64,7 +63,7 @@ SELECT p.mechanism, p.repo, p.passes, p.refused, p.dry_run_passes,
        p.write_cap_hits, p.github_calls, c.github_writes, c.calls_by_op,
        p.latest_version
 FROM passes AS p
-LEFT JOIN calls AS c ON c.mechanism = p.mechanism AND c.repo = p.repo
+LEFT JOIN calls AS c ON c.repo = p.repo
 ORDER BY p.mechanism, p.repo;
 
 -- 2. Why is each artifact still held? The newest verdict per (repo, number)

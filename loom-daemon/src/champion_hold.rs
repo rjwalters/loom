@@ -1,6 +1,7 @@
 //! Champion's own pull-request holds (#11861): the merge-risk hold
-//! (`champion-pr-merge.md` criterion #2) and the critical-file hold
-//! (`champion-critical-file-hold.md`, criterion #3).
+//! (`champion-pr-merge.md`'s `merge-risk` criterion), the critical-file hold
+//! (`champion-critical-file-hold.md`, the `critical-files` criterion) and the
+//! ratification hold (`champion-ratification-hold.md`, #12992, [`ratification`]).
 //!
 //! # The shape
 //!
@@ -32,6 +33,7 @@
 //! The marker strings are a wire format: they live in comments on open PRs.
 
 pub mod classify;
+pub mod ratification;
 
 /// The merge-risk hold notice's first line.
 pub const MERGE_RISK_HOLD_MARKER: &str = "<!-- champion:merge-risk-hold -->";
@@ -56,6 +58,8 @@ pub const HOLD_BY: &str = "champion";
 pub enum HoldKind {
     MergeRisk,
     CriticalFile,
+    /// The ratification hold (#12992): merging ratifies a spec/decision record.
+    Ratification,
 }
 
 impl HoldKind {
@@ -65,6 +69,7 @@ impl HoldKind {
         match self {
             HoldKind::MergeRisk => MERGE_RISK_HOLD_REASON,
             HoldKind::CriticalFile => CRITICAL_FILE_HOLD_REASON,
+            HoldKind::Ratification => ratification::HOLD_REASON,
         }
     }
 }
@@ -79,11 +84,23 @@ impl HoldKind {
 /// - Merge-risk: a hold notice (`startswith`) with no reversal block
 ///   (`contains`: it is embedded in the pre-merge comment) after it.
 ///
-/// A critical-file hold wins when both stand: it never auto-merges, so it is
-/// the stricter of the two.
+/// - Ratification (#12992): the latest of its three markers, as for the
+///   critical-file hold. It is read first and never waived by a standing
+///   authorization class.
+///
+/// A critical-file hold wins over merge-risk when both stand: it never
+/// auto-merges, so it is the stricter of the two. A ratification hold wins over
+/// both: only a person's release ends it.
 #[must_use]
 pub fn standing_hold<S: AsRef<str>>(comments: &[S]) -> Option<HoldKind> {
     let last = |pred: &dyn Fn(&str) -> bool| comments.iter().rposition(|c| pred(c.as_ref()));
+    let rt_hold = last(&|c| c.starts_with(ratification::HOLD_MARKER));
+    let rt_end = last(&|c| {
+        c.starts_with(ratification::CLEARED_MARKER) || c.starts_with(ratification::RELEASED_MARKER)
+    });
+    if rt_hold.is_some_and(|h| rt_end.is_none_or(|e| h > e)) {
+        return Some(HoldKind::Ratification);
+    }
     let cf_hold = last(&|c| c.starts_with(CRITICAL_FILE_HOLD_MARKER));
     let cf_end = last(&|c| {
         c.starts_with(CRITICAL_FILE_CLEARED_MARKER) || c.starts_with(CRITICAL_FILE_RELEASED_MARKER)
@@ -120,6 +137,94 @@ fn only_the_blocked_park<L: AsRef<str>>(labels: &[L]) -> bool {
             crate::work_finder::PARK_LABELS.contains(&l)
                 && !crate::work_finder::BLOCKED_HOLD_NAMES.contains(&l)
         })
+}
+
+/// Whether a trusted comment is an operator release of a hold: it *starts*
+/// with one of the instructions `champion-pr-merge.md` ("Sticky holds") names,
+/// or with the `loom:release-condition-met` marker that closes an operator
+/// release condition (#12594) — a held-at-head PR must be redrawn so Champion
+/// re-reads the condition. Phrasing that merely mentions them does not match.
+fn is_operator_release(comment: &str) -> bool {
+    let c = comment.trim_start().to_ascii_lowercase();
+    [
+        "clear the hold",
+        "cleared:",
+        "override:",
+        "merge anyway",
+        "ok to merge",
+        "<!-- loom:release-condition-met -->",
+    ]
+    .iter()
+    .any(|p| c.starts_with(p))
+}
+
+/// The head SHA a Champion hold recorded (`champion:hold-state head=<sha>`),
+/// while nothing has released it (#12900). `trusted` is the PR's trusted
+/// comment bodies, oldest first. `None` when no comment records a head, or
+/// when a comment after the newest record is a release signal: a trusted
+/// operator release ([`is_operator_release`]) or a Judge verdict
+/// ([`crate::claim_reconciliation::VERDICT_MARKER_PREFIX`]). Either means the
+/// hold should be re-read at the same head, so the caller draws it again.
+#[must_use]
+pub fn unreleased_hold_head<C: AsRef<str>>(trusted: &[C]) -> Option<String> {
+    unreleased_hold(trusted).map(|(head, _)| head)
+}
+
+/// [`unreleased_hold_head`] plus the standing-authorization digest the same
+/// record carries (`auth=<digest>`, #12933): `Some((head, None))` is a legacy
+/// hold. Only trusted bodies are read, so an untrusted quote of the marker
+/// supplies neither.
+#[must_use]
+pub fn unreleased_hold<C: AsRef<str>>(trusted: &[C]) -> Option<(String, Option<String>)> {
+    let at = trusted
+        .iter()
+        .rposition(|c| crate::merge_pr::hold_state::recorded_head(c.as_ref()).is_some())?;
+    let released = trusted[at + 1..].iter().any(|c| {
+        let c = c.as_ref();
+        is_operator_release(c) || c.contains(crate::claim_reconciliation::VERDICT_MARKER_PREFIX)
+    });
+    if released {
+        return None;
+    }
+    let body = trusted[at].as_ref();
+    let head = crate::merge_pr::hold_state::recorded_head(body)?;
+    Some((head, crate::merge_pr::hold_state::recorded_auth(body)))
+}
+
+/// A short digest of the effective `champion.standingAuthorizations` for the
+/// repo at `root` (#12933): the first 16 hex of the sha256 of its canonical
+/// JSON (object keys sorted; array order kept). Absent, null and non-array
+/// values digest as `[]`, the empty set the prompts also treat them as.
+/// Champion records it in the hold marker (`auth=<digest>`); a later change to
+/// the set differs from it and releases the hold for one redraw.
+#[must_use]
+pub fn standing_auth_digest(root: &std::path::Path) -> String {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    let set = crate::config_resolver::get_path(&effective, "champion.standingAuthorizations");
+    digest_of(set)
+}
+
+fn digest_of(set: Option<&serde_json::Value>) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => {
+                let sorted: std::collections::BTreeMap<_, _> =
+                    m.iter().map(|(k, v)| (k.clone(), canonical(v))).collect();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.iter().map(canonical).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    let canon = match set {
+        Some(v @ serde_json::Value::Array(_)) => canonical(v),
+        _ => serde_json::Value::Array(Vec::new()),
+    };
+    let sum = Sha256::digest(canon.to_string().as_bytes());
+    hex::encode(sum)[..16].to_string()
 }
 
 /// The label shape of a Champion-held PR that Champion sent to Doctor
@@ -169,7 +274,9 @@ pub const DOCTOR_CYCLE_CAP_PHRASE: &str = "doctor cycle exhausted";
 pub fn doctor_cycle_capped<C: AsRef<str>>(trusted: &[C]) -> bool {
     let hold = trusted.iter().rposition(|c| {
         let c = c.as_ref();
-        c.starts_with(MERGE_RISK_HOLD_MARKER) || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+        c.starts_with(MERGE_RISK_HOLD_MARKER)
+            || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+            || c.starts_with(ratification::HOLD_MARKER)
     });
     trusted.iter().enumerate().any(|(i, c)| {
         let c = c.as_ref();
@@ -192,7 +299,9 @@ pub const CAPPED_HOLD_RECOMMENDATION_MARKER: &str = "<!-- champion:capped-hold-r
 pub fn capped_hold_routed<C: AsRef<str>>(trusted: &[C]) -> bool {
     let hold = trusted.iter().rposition(|c| {
         let c = c.as_ref();
-        c.starts_with(MERGE_RISK_HOLD_MARKER) || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+        c.starts_with(MERGE_RISK_HOLD_MARKER)
+            || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+            || c.starts_with(ratification::HOLD_MARKER)
     });
     trusted.iter().enumerate().any(|(i, c)| {
         hold.is_none_or(|h| i > h) && c.as_ref().starts_with(CAPPED_HOLD_RECOMMENDATION_MARKER)
@@ -255,9 +364,11 @@ pub fn judge_may_review<L: AsRef<str>, C: AsRef<str>>(labels: &[L], trusted: &[C
 pub fn body_declares_hold(body: &str) -> bool {
     crate::park_record::parse(body).iter().any(|r| {
         r.blocker.is_none()
-            && r.reason
-                .as_deref()
-                .is_some_and(|x| x == MERGE_RISK_HOLD_REASON || x == CRITICAL_FILE_HOLD_REASON)
+            && r.reason.as_deref().is_some_and(|x| {
+                x == MERGE_RISK_HOLD_REASON
+                    || x == CRITICAL_FILE_HOLD_REASON
+                    || x == ratification::HOLD_REASON
+            })
     })
 }
 
@@ -304,6 +415,31 @@ mod tests {
         let mr = format!("{MERGE_RISK_HOLD_MARKER}\nx");
         let cf = format!("{CRITICAL_FILE_HOLD_MARKER}\ny");
         assert_eq!(standing_hold(&[cf.as_str(), mr.as_str()]), Some(HoldKind::CriticalFile));
+    }
+
+    #[test]
+    fn a_ratification_hold_outranks_the_others_and_ends_only_on_its_markers() {
+        use ratification::{CLEARED_MARKER, HOLD_MARKER, RELEASED_MARKER};
+        let rt = format!("{HOLD_MARKER}\nmerging ratifies");
+        let cf = format!("{CRITICAL_FILE_HOLD_MARKER}\ny");
+        let mr = format!("{MERGE_RISK_HOLD_MARKER}\nx");
+        assert_eq!(
+            standing_hold(&[cf.as_str(), mr.as_str(), rt.as_str()]),
+            Some(HoldKind::Ratification)
+        );
+        let released = format!("{RELEASED_MARKER}\nreleased");
+        let cleared = format!("{CLEARED_MARKER}\ncleared");
+        assert_eq!(standing_hold(&[rt.as_str(), released.as_str()]), None);
+        assert_eq!(standing_hold(&[rt.as_str(), cleared.as_str()]), None);
+        // The hold is a Champion hold: the janitor leaves `loom:pr` beside it,
+        // and the capped-PR pass sees it as the hold it must not outlive.
+        assert!(is_champion_hold(&["loom:pr", "loom:blocked"], &[rt.as_str()]));
+        assert!(body_declares_hold(&crate::park_record::render_park(
+            &[],
+            Some(HOLD_BY),
+            Some("2026-10-21T00:00:00Z"),
+            Some(HoldKind::Ratification.reason()),
+        )));
     }
 
     #[test]
@@ -425,5 +561,91 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].blocker.is_none(), "reason-only: the release pass skips it");
         assert_eq!(records[0].reason.as_deref(), Some(MERGE_RISK_HOLD_REASON));
+    }
+
+    fn hold_note(head: &str) -> String {
+        format!("{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head={head} -->\nHolding")
+    }
+
+    #[test]
+    fn a_hold_records_its_head_until_something_releases_it() {
+        let hold = hold_note("abc1234");
+        assert_eq!(unreleased_hold_head(&[hold.as_str()]), Some("abc1234".into()));
+        let empty: [&str; 0] = [];
+        assert_eq!(unreleased_hold_head(&empty), None, "no record fails open");
+        assert_eq!(unreleased_hold_head(&["just prose"]), None);
+        // The latest record wins.
+        let later = hold_note("def5678");
+        assert_eq!(unreleased_hold_head(&[hold.as_str(), later.as_str()]), Some("def5678".into()));
+        // Unrelated chatter after the hold does not release it.
+        assert_eq!(
+            unreleased_hold_head(&[hold.as_str(), "do not clear the hold yet"]),
+            Some("abc1234".into())
+        );
+    }
+
+    #[test]
+    fn an_operator_clear_or_a_judge_verdict_after_the_hold_releases_it() {
+        let hold = hold_note("abc1234");
+        for release in [
+            "clear the hold \u{2014} QA signed off",
+            "  Cleared: fine",
+            "merge anyway, it is urgent",
+            "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->\n**Approved**",
+            // #12594: closing an operator release condition must redraw the PR.
+            "<!-- loom:release-condition-met -->\npredecessor merged, healthy on every host",
+        ] {
+            assert_eq!(unreleased_hold_head(&[hold.as_str(), release]), None, "{release}");
+        }
+        // The condition itself, or a notice quoting the -met marker, is not a release.
+        assert_eq!(
+            unreleased_hold_head(&[
+                hold.as_str(),
+                "<!-- loom:release-condition -->\nrelease after #12000 merges",
+                "Not merging: it closes when a comment opens with `<!-- loom:release-condition-met -->`",
+            ]),
+            Some("abc1234".into())
+        );
+        // A release that predates a fresh hold record does not carry over.
+        let fresh = hold_note("def5678");
+        assert_eq!(
+            unreleased_hold_head(&[hold.as_str(), "clear the hold", fresh.as_str()]),
+            Some("def5678".into())
+        );
+    }
+
+    #[test]
+    fn a_hold_records_its_standing_authorization_digest() {
+        let with = format!(
+            "{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc1234 auth=0123456789abcdef -->"
+        );
+        assert_eq!(
+            unreleased_hold(&[with.as_str()]),
+            Some(("abc1234".into(), Some("0123456789abcdef".into())))
+        );
+        // Legacy marker: head only.
+        let legacy = hold_note("abc1234");
+        assert_eq!(unreleased_hold(&[legacy.as_str()]), Some(("abc1234".into(), None)));
+        assert_eq!(unreleased_hold_head(&[with.as_str()]), Some("abc1234".into()));
+        // The newest record's digest wins, not an older one's.
+        assert_eq!(
+            unreleased_hold(&[with.as_str(), legacy.as_str()]),
+            Some(("abc1234".into(), None))
+        );
+        // A release after the hold drops the digest with the head.
+        assert_eq!(unreleased_hold(&[with.as_str(), "clear the hold"]), None);
+    }
+
+    #[test]
+    fn the_digest_ignores_key_order_and_treats_absent_as_empty() {
+        use serde_json::json;
+        let a = json!([{"id": "x", "classes": ["a"]}]);
+        let b = json!([{"classes": ["a"], "id": "x"}]);
+        assert_eq!(digest_of(Some(&a)), digest_of(Some(&b)));
+        assert_ne!(digest_of(Some(&a)), digest_of(Some(&json!([{"id": "y"}]))));
+        let empty = digest_of(Some(&json!([])));
+        assert_eq!(digest_of(None), empty);
+        assert_eq!(digest_of(Some(&json!(null))), empty);
+        assert_eq!(empty.len(), 16);
     }
 }

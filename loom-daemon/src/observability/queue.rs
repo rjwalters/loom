@@ -423,6 +423,22 @@ impl DurableQueue {
         self.persist(&mut state);
     }
 
+    /// Drop every queued envelope `keep` rejects, wherever it sits, and
+    /// persist. Returns how many were removed. For a single-writer caller
+    /// (the one-shot watchdog, #12831) that has no sender or snapshot in
+    /// flight: it shifts the head sequence like an ack would.
+    pub fn retain(&self, mut keep: impl FnMut(&TelemetryEnvelope) -> bool) -> usize {
+        let mut state = self.lock();
+        let before = state.items.len();
+        state.items.retain(|e| keep(e));
+        let removed = before - state.items.len();
+        if removed > 0 {
+            state.head_sequence += removed as u128;
+            self.persist(&mut state);
+        }
+        removed
+    }
+
     /// Remove the front `n` envelopes (clamped to the current length) after a
     /// successful export, persisting the drained state to disk.
     pub fn ack(&self, n: usize) {

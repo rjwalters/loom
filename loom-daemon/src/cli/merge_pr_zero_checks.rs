@@ -1,7 +1,7 @@
 //! `loom-daemon merge-pr zero-checks-settle` (#9091).
 //!
 //! One zero-row check-runs poll in `merge-pr.sh --auto`'s settle wait, decided.
-//! The rule itself is [`loom_daemon::merge_pr::zero_checks`]; this is the
+//! The rule itself is [`crate::merge_pr::zero_checks`]; this is the
 //! process boundary around it.
 //!
 //! # The line contract
@@ -35,11 +35,11 @@
 //! That degraded mode is the status quo ante this change narrows, so a fault
 //! here can only ever cost time, never a skipped gate.
 
-use anyhow::Result;
-use loom_daemon::merge_pr::stale_checks;
-use loom_daemon::merge_pr::zero_checks::{
+use crate::merge_pr::stale_checks;
+use crate::merge_pr::zero_checks::{
     decide, render, settle_interval, settle_polls, Inputs, Required,
 };
+use anyhow::Result;
 
 #[derive(clap::Args)]
 pub(crate) struct ZeroChecksSettleArgs {

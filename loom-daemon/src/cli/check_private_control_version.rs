@@ -1,7 +1,7 @@
 //! `loom-daemon check-private-control-version` (Issue #8858): fail when the
 //! private-control `POLICY` changes without a strictly greater
 //! `CONTROL_VERSION` relative to the merge base. Logic and tests live in
-//! [`loom_daemon::private_control_gate`].
+//! [`crate::private_control_gate`].
 //!
 //! Exit codes: `0` = ok, `1` = violation or unreadable/ambiguous declaration.
 
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::private_control_gate::{self, Verdict};
+use crate::private_control_gate::{self, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct CheckPrivateControlVersionArgs {

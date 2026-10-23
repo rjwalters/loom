@@ -60,7 +60,7 @@ impl GrantRecord {
     }
 }
 
-fn marker_re() -> &'static Regex {
+pub(super) fn marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         #[allow(clippy::unwrap_used)] // a literal pattern

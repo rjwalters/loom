@@ -466,6 +466,7 @@ fn parse_tap(entry: &Value, path: &str, index: usize) -> Result<Tap, String> {
             .map(|runtime| Tap {
                 runtime,
                 model_profile: None,
+                model: None,
             })
             .ok_or_else(|| format!("{path}[{index}] is an empty runtime name")),
         Value::Object(map) => {
@@ -495,6 +496,7 @@ fn parse_tap(entry: &Value, path: &str, index: usize) -> Result<Tap, String> {
             Ok(Tap {
                 runtime,
                 model_profile,
+                model: None,
             })
         }
         _ => Err(format!(
@@ -701,10 +703,14 @@ pub trait ContainmentPreparer {
     /// The original `rejection` (with the unmet obligation appended) whenever
     /// containment does not apply or cannot be proven. An implementation must
     /// never widen the rejection into an admission on any other basis.
+    ///
+    /// `drawn_model` is the model a role draw's pick for this candidate pins
+    /// (#12748), so account selection is for the model the launch will use.
     fn contain(
         &mut self,
         role: &str,
         explicit: Option<&str>,
+        drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection>;
     /// Release the containment prepared for a candidate the walk passed over,
@@ -720,6 +726,7 @@ impl ContainmentPreparer for NoContainment {
         &mut self,
         _role: &str,
         _explicit: Option<&str>,
+        _drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection> {
         Err(rejection)
@@ -736,6 +743,7 @@ fn admit_static(
     role: &str,
     explicit: Option<&str>,
     model_profile: Option<&str>,
+    drawn_model: Option<&str>,
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
     // `model_profile` is a preference tap's own profile (#11400), so the
@@ -749,7 +757,7 @@ fn admit_static(
         crate::runtime_admission::AdmissionContext::Host,
     ) {
         Err(rejection) if rejection.containment_eligible() => {
-            preparer.contain(role, explicit, rejection)
+            preparer.contain(role, explicit, drawn_model, rejection)
         }
         other => other,
     }
@@ -797,7 +805,7 @@ fn resolve_runtime_in(
         // never moves the launch to a different runtime (#8787).
         return Ok(Decision::Static {
             reason: StaticReason::OperatorPin(pin),
-            result: admit_static(root, role, explicit, None, preparer),
+            result: admit_static(root, role, explicit, None, None, preparer),
         });
     }
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -818,7 +826,7 @@ fn resolve_runtime_in(
         let Some(listed) = listed else {
             return Ok(Decision::Static {
                 reason: StaticReason::NoPreferenceConfigured,
-                result: admit_static(root, role, None, None, preparer),
+                result: admit_static(root, role, None, None, None, preparer),
             });
         };
         listed
@@ -847,6 +855,7 @@ fn resolve_runtime_in(
                 canonical,
                 Some(&tap.runtime),
                 tap.model_profile.as_deref(),
+                tap.model.as_deref(),
                 *preparer.borrow_mut(),
             )
             .map(|mut admitted| {

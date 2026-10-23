@@ -2,9 +2,8 @@
 //! projection of the tick that just ran.
 //!
 //! There is no second ranking function here. The tick records the shaped
-//! pass-2 order it iterated ([`TickReport::plan_order`], written by
-//! `repo_cap::shape_queue`) plus the shaping inputs and admission knobs it ran
-//! under; [`annotate`] reads those and fills each ready-queue row's plan
+//! pass-2 order it iterated ([`TickReport::plan_order`]) plus the
+//! admission knobs it ran under; [`annotate`] reads those and fills each ready-queue row's plan
 //! fields and the per-tick [`DispatchPlanContext`]. The comparator keys come
 //! from [`ready_queue::candidate_keys`], the same seam `candidate_cmp` is
 //! built from.
@@ -12,11 +11,9 @@
 //! # `plan_state`
 //!
 //! - `running` — `dispatched` / `in_flight`.
-//! - `next` — the first `max_admissions_per_tick` rows, in plan order, among
-//!   rows deferred by the concurrency or ramp cap: what the next tick admits
-//!   once slots free. Saturation-held and repo-capped rows are never `next`
-//!   (the saturation brake holds every admission; a repo-capped row needs
-//!   something besides a free slot).
+//! - `next` — the first `max_concurrent` rows, in plan order, among rows
+//!   deferred by the concurrency cap: what the next tick admits once slots
+//!   free.
 //! - `queued` — every other deferred row.
 //! - `blocked` — everything else.
 //!
@@ -35,13 +32,13 @@ use super::{ready_queue, TickReport};
 use crate::role_shard::ShardDecision;
 use crate::types::{
     DispatchPlanContext, PlanGate, PlanShard, PlanSlots, PlanState, QueueDisposition as Qd,
-    ReadyQueueRow, RepoCapView, PLAN_SCOPE,
+    ReadyQueueRow, PLAN_SCOPE,
 };
 
 /// What the tick loop knows that the [`TickReport`] does not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanInputs {
-    /// The dynamic concurrency cap the tick ran under.
+    /// The concurrency cap the tick ran under (`maxConcurrent`, #12406).
     pub max_concurrent: usize,
     /// The work finder's tick interval.
     pub tick_interval_secs: Option<u64>,
@@ -85,10 +82,7 @@ fn to_u32(n: usize) -> Option<u32> {
 pub fn gate_of(disposition: Qd) -> Option<PlanGate> {
     match disposition {
         Qd::DeferredCapacity => Some(PlanGate::Capacity),
-        Qd::DeferredRampCap => Some(PlanGate::Ramp),
-        Qd::DeferredSaturation => Some(PlanGate::Saturation),
         Qd::DeferredBuildBackoff => Some(PlanGate::BuildBackoff),
-        Qd::DeferredRepoCap => Some(PlanGate::RepoCap),
         Qd::DeferredFileOverlap => Some(PlanGate::FileOverlap),
         _ => None,
     }
@@ -130,8 +124,6 @@ pub fn annotate(
             max_concurrent: inputs.max_concurrent,
             occupancy,
             free: occupancy.map(|o| inputs.max_concurrent.saturating_sub(o)),
-            max_admissions_per_tick: report.max_admissions_per_tick,
-            saturation_held: report.saturation_held,
             any_halted: report.halted,
             overflow_free: report.overflow_free,
         },
@@ -167,45 +159,37 @@ fn annotate_rows(
             PlanState::Blocked => None,
             _ => in_plan.get(&(idx, tick_row.key.number)).copied(),
         };
-        let cap = report.repo_cap.as_ref();
-        let occupancy = cap.map(|c| c.occupancy.get(idx).copied().unwrap_or(0));
         let plan = &mut row.plan;
         plan.position = position;
         plan.plan_state = plan_state;
         plan.keys = ready_queue::plan_keys(&tick_row.key);
         plan.gate = gate;
-        plan.hot = occupancy.map(|o| o > 0);
         plan.owning_shard = inputs
             .owning_shard
             .get(idx)
             .copied()
             .flatten()
             .and_then(to_u32);
-        plan.repo_cap = cap.zip(occupancy).map(|(c, occupancy)| RepoCapView {
-            cap: c.cap,
-            occupancy,
-        });
         // Issue #9311: a time-boxed hold's absolute expiry, straight from the
         // tick row — never touched for any other disposition, so it stays
-        // `None` for capacity/ramp gates, in-flight, quarantined, peer-claimed
+        // `None` for capacity gates, in-flight, quarantined, peer-claimed
         // and every disposition that isn't one of the five recorded holds.
         plan.held_until = tick_row.held_until;
         plan.step = tick_row.step.map(crate::types::PlanStep::Known);
     }
-    promote_next(rows, report.max_admissions_per_tick.unwrap_or(usize::MAX));
+    promote_next(rows, inputs.max_concurrent);
 }
 
-/// Mark the first `ramp` capacity- or ramp-deferred rows, in plan order, as
-/// `next`.
-fn promote_next(rows: &mut [ReadyQueueRow], ramp: usize) {
+/// Mark the first `n` capacity-deferred rows, in plan order, as `next`.
+fn promote_next(rows: &mut [ReadyQueueRow], n: usize) {
     let mut eligible: Vec<(u32, usize)> = rows
         .iter()
         .enumerate()
-        .filter(|(_, r)| matches!(r.plan.gate, Some(PlanGate::Capacity | PlanGate::Ramp)))
+        .filter(|(_, r)| r.plan.gate == Some(PlanGate::Capacity))
         .filter_map(|(i, r)| r.plan.position.map(|p| (p, i)))
         .collect();
     eligible.sort_unstable();
-    for (_, i) in eligible.into_iter().take(ramp) {
+    for (_, i) in eligible.into_iter().take(n) {
         rows[i].plan.plan_state = PlanState::Next;
     }
 }

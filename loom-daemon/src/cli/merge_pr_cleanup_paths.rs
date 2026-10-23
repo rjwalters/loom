@@ -19,14 +19,14 @@
 //! of it and an empty *leading* field is unrecoverable. `<default-path>` — the
 //! only field with no absent case — therefore leads, which pushes both possible
 //! empties to the tail, where `read` does preserve them. See
-//! [`loom_daemon::merge_pr::cleanup_paths::render`] for the full reasoning and
+//! [`crate::merge_pr::cleanup_paths::render`] for the full reasoning and
 //! the bug this ordering fixes.
 //!
 //! # Exit code
 //!
 //! 0 with the line above; 2 when the answer cannot be framed unambiguously
 //! (a worktree root containing a tab or newline — see
-//! [`loom_daemon::merge_pr::cleanup_paths::render`]).
+//! [`crate::merge_pr::cleanup_paths::render`]).
 //!
 //! # Fail direction: OPEN
 //!
@@ -47,8 +47,8 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::cleanup_paths::{plan, render};
-use loom_daemon::worktree_root::worktree_root_readable;
+use crate::merge_pr::cleanup_paths::{plan, render};
+use crate::worktree_root::worktree_root_readable;
 use std::path::Path;
 
 #[derive(clap::Args)]

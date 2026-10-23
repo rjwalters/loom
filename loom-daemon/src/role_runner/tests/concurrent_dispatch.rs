@@ -116,6 +116,13 @@ impl RoleInvocationRunner for LatchRunner {
 }
 
 /// A gate that blocked runners wait on until `open`.
+///
+/// The wait's timeout is only a backstop against a hung test, never the
+/// thing a test relies on: every test opens its gates explicitly, and holds
+/// an [`OpenOnDrop`] so a failed assertion releases them too. It is long
+/// because a loaded host (the 6 x 8 stress loop) has taken over 50 s to get
+/// from spawn to `open`, and a timed-out wait lets a "still running" root
+/// finish early (`ac2_…` failed that way at a 30 s timeout).
 #[derive(Clone, Default)]
 struct Gate(Arc<(Mutex<bool>, Condvar)>);
 
@@ -124,7 +131,7 @@ impl Gate {
         let (lock, cvar) = &*self.0;
         let open = lock.lock().unwrap();
         let _open = cvar
-            .wait_timeout_while(open, Duration::from_secs(30), |o| !*o)
+            .wait_timeout_while(open, Duration::from_secs(600), |o| !*o)
             .unwrap();
     }
     fn open(&self) {
@@ -134,30 +141,80 @@ impl Gate {
     }
 }
 
-/// Blocks on `gate` when its root is in `blocked`, otherwise returns at once.
+/// Opens its gate when dropped, so a failed assertion (or a `join_one`
+/// timeout) cannot leave a run blocked on it until the backstop timeout.
+struct OpenOnDrop(Gate);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// Blocks on the gate paired with its root, if any; otherwise returns at once.
 struct GatedRunner {
     root: PathBuf,
-    blocked: Vec<PathBuf>,
-    gate: Gate,
+    gates: Arc<Vec<(PathBuf, Gate)>>,
 }
 
 impl RoleInvocationRunner for GatedRunner {
     fn invoke(&mut self, _role: &str, _prompt: &str) -> RoleTickOutcome {
-        if self.blocked.contains(&self.root) {
-            self.gate.wait();
+        if let Some((_, gate)) = self.gates.iter().find(|(r, _)| *r == self.root) {
+            gate.wait();
         }
         RoleTickOutcome::Success
     }
 }
 
+/// Every root in `blocked` waits on the one `gate`.
 fn gated_factory(blocked: Vec<PathBuf>, gate: Gate) -> RunnerFactory {
+    gated_factory_per_root(blocked.into_iter().map(|r| (r, gate.clone())).collect())
+}
+
+/// Each listed root waits on its own gate; the rest return at once.
+fn gated_factory_per_root(gates: Vec<(PathBuf, Gate)>) -> RunnerFactory {
+    let gates = Arc::new(gates);
     Arc::new(move |root| {
         Box::new(GatedRunner {
             root,
-            blocked: blocked.clone(),
-            gate: gate.clone(),
+            gates: Arc::clone(&gates),
         })
     })
+}
+
+/// Why the fairness tests gate their runs: a run's guard (its budget/ceiling
+/// slot) is released when its blocking task returns, which can happen while
+/// `dispatch_tick` is still walking the roots. An instant run admitted early
+/// in the walk could then free its slot and let a later root in the same
+/// tick be admitted too, so an exact `spawned` list flakes under load
+/// (#12325). Holding each tick's runs until `dispatch_tick` has returned
+/// keeps every slot taken for the whole walk; no timeout is involved.
+///
+/// A gate per tick: runs read the current one when they start, and the test
+/// swaps in a fresh gate only after the previous tick's runs are all joined.
+#[derive(Clone, Default)]
+struct TickGate(Arc<Mutex<Gate>>);
+
+impl TickGate {
+    fn current(&self) -> Gate {
+        self.0.lock().unwrap().clone()
+    }
+    fn next(&self) {
+        *self.0.lock().unwrap() = Gate::default();
+    }
+    fn factory(&self) -> RunnerFactory {
+        let tick = self.clone();
+        Arc::new(move |_| Box::new(TickGatedRunner(tick.current())))
+    }
+}
+
+struct TickGatedRunner(Gate);
+
+impl RoleInvocationRunner for TickGatedRunner {
+    fn invoke(&mut self, _role: &str, _prompt: &str) -> RoleTickOutcome {
+        self.0.wait();
+        RoleTickOutcome::Success
+    }
 }
 
 // -- AC1: concurrent across repositories -----------------------------------
@@ -251,6 +308,7 @@ fn ac2_a_root_still_in_flight_is_refused_and_the_others_are_admitted() {
         production_decide(spec("judge")),
     );
     let in_progress = new_in_progress_guard();
+    let _open = OpenOnDrop(gate.clone());
 
     let first = d.dispatch_tick(roots.clone(), &in_progress);
     // B and C finish; A stays blocked.
@@ -542,6 +600,7 @@ fn row(number: u32, is_pr: bool, labels: &[&str]) -> crate::forge_listing::RestI
         comments: 0,
         open_sub_issues: None,
         labels_at: None,
+        draft: false,
     }
 }
 
@@ -768,6 +827,7 @@ fn refusal_tick(config: &str, roots: usize) -> (TickReport, Vec<(log::Level, Str
     let mut d =
         dispatcher("judge", gated_factory(paths.clone(), gate.clone()), admit_only("judge"));
     let in_progress = new_in_progress_guard();
+    let _open = OpenOnDrop(gate.clone());
     let mut report = TickReport::default();
     let records = crate::test_log_capture::capture_logs(|| {
         report = d.dispatch_tick(paths.clone(), &in_progress);
@@ -828,27 +888,32 @@ fn ac8_a_role_budget_refusal_logs_one_line_per_tick() {
 // -- Fairness: round-robin cursor and empty-queue resume -----------------------
 
 /// Drive `ticks` ticks of `role` over `roots` fresh workspaces written with
-/// `config`, runs finishing instantly and joined between ticks (as the loop's
-/// `select!` would reap them). Returns how many runs each root got.
+/// `config`. Each tick's runs are held on that tick's gate until
+/// `dispatch_tick` returns (see [`TickGate`]), then finish at once and are
+/// joined before the next tick (as the loop's `select!` would reap them).
+/// Returns how many runs each root got.
 fn spawns_per_root(config: &str, roots: usize, ticks: usize) -> Vec<usize> {
     let rt = runtime();
     let _enter = rt.enter();
     let dirs: Vec<tempfile::TempDir> = (0..roots).map(|_| workspace(config)).collect();
     let paths: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
-    let factory: RunnerFactory = Arc::new(|_| {
-        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
-    });
-    let mut d = dispatcher("judge", factory, admit_only("judge"));
+    let tick_gate = TickGate::default();
+    let mut d = dispatcher("judge", tick_gate.factory(), admit_only("judge"));
     let in_progress = new_in_progress_guard();
     let mut counts = vec![0usize; roots];
     for _ in 0..ticks {
+        let gate = OpenOnDrop(tick_gate.current());
         let report = d.dispatch_tick(paths.clone(), &in_progress);
+        // The walk is done: release this tick's runs, then reap them all
+        // before a fresh gate is armed for the next tick.
+        drop(gate);
         for root in &report.spawned {
             counts[paths.iter().position(|p| p == root).unwrap()] += 1;
         }
         while d.in_flight_len() > 0 {
             let _ = join_one(&rt, &mut d);
         }
+        tick_gate.next();
     }
     counts
 }
@@ -891,24 +956,33 @@ fn fairness_cursor_survives_long_runs_and_registry_changes() {
     let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
     let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| workspace(cfg)).collect();
     let p: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
-    let gate = Gate::default();
-    let mut d =
-        dispatcher("judge", gated_factory(vec![p[0].clone()], gate.clone()), admit_only("judge"));
+    // Root 0's run is held across a whole second tick. Roots 1 and 2 are
+    // each held only until their own tick's walk is done (see `TickGate`):
+    // run instantly, either could free the budget slot mid-walk and let the
+    // next root in.
+    let gates: Vec<Gate> = (0..3).map(|_| Gate::default()).collect();
+    let _open: Vec<OpenOnDrop> = gates.iter().cloned().map(OpenOnDrop).collect();
+    let factory = gated_factory_per_root(p.iter().cloned().zip(gates.iter().cloned()).collect());
+    let mut d = dispatcher("judge", factory, admit_only("judge"));
     let in_progress = new_in_progress_guard();
 
     assert_eq!(d.dispatch_tick(p.clone(), &in_progress).spawned, vec![p[0].clone()]);
     let blocked = d.dispatch_tick(p.clone(), &in_progress);
     assert!(blocked.spawned.is_empty(), "the budget is held by root 0");
     assert_eq!(blocked.deferred, 4, "walk began at root 1 and wrapped");
-    gate.open();
+    gates[0].open();
     let _ = join_one(&rt, &mut d);
-    assert_eq!(d.dispatch_tick(p.clone(), &in_progress).spawned, vec![p[1].clone()]);
+    let third = d.dispatch_tick(p.clone(), &in_progress);
+    gates[1].open();
+    assert_eq!(third.spawned, vec![p[1].clone()]);
     let _ = join_one(&rt, &mut d);
 
     // Root 1 (the cursor) is removed: the walk goes on with the root that
     // followed it, not back to the head.
     let shrunk = vec![p[0].clone(), p[2].clone(), p[3].clone()];
-    assert_eq!(d.dispatch_tick(shrunk, &in_progress).spawned, vec![p[2].clone()]);
+    let fourth = d.dispatch_tick(shrunk, &in_progress);
+    gates[2].open();
+    assert_eq!(fourth.spawned, vec![p[2].clone()]);
     let _ = join_one(&rt, &mut d);
 }
 
@@ -928,12 +1002,6 @@ fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
     // the first-tick assertions are done. An instant probe could finish and
     // free the budget slot before the walk decides the full root, admitting
     // it too. Opened on drop so an assertion failure cannot hang the test.
-    struct OpenOnDrop(Gate);
-    impl Drop for OpenOnDrop {
-        fn drop(&mut self) {
-            self.0.open();
-        }
-    }
     let gate = Gate::default();
     let _open = OpenOnDrop(gate.clone());
     let probe: QueueProbe = {
@@ -991,21 +1059,29 @@ fn fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending() {
     let _enter = rt.enter();
     let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
     let (a, b) = (workspace(cfg), workspace(cfg));
-    // Hold `a`'s run so its slot is still taken while the walk decides `b`;
-    // an instant run could free the slot first and admit `b` too.
-    let gate = Gate::default();
-    let factory = gated_factory(vec![a.path().to_path_buf()], gate.clone());
+    // Hold each tick's run so its slot is still taken while the walk decides
+    // the other root; an instant run could free the slot first and admit the
+    // other root too. `a` is held through the first tick, `b` (first in the
+    // second tick's walk, `[b, a]`) through the second.
+    let (gate_a, gate_b) = (Gate::default(), Gate::default());
+    let _open = (OpenOnDrop(gate_a.clone()), OpenOnDrop(gate_b.clone()));
+    let factory = gated_factory_per_root(vec![
+        (a.path().to_path_buf(), gate_a.clone()),
+        (b.path().to_path_buf(), gate_b.clone()),
+    ]);
     let mut d = dispatcher("judge", factory, admit_only("judge"));
     let in_progress = new_in_progress_guard();
     let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
     let first = d.dispatch_tick(roots.clone(), &in_progress);
-    gate.open();
+    gate_a.open();
     assert_eq!(first.deferred, 1);
     let joined = join_one(&rt, &mut d);
     d.handle_joined(joined);
     assert!(!d.resume_due(), "a Success run spent an agent — no resume");
     assert!(d.resume_after_queue_empty(&in_progress).is_none());
-    assert_eq!(d.dispatch_tick(roots, &in_progress).spawned, vec![b.path().to_path_buf()]);
+    let second = d.dispatch_tick(roots, &in_progress);
+    gate_b.open();
+    assert_eq!(second.spawned, vec![b.path().to_path_buf()]);
     let _ = join_one(&rt, &mut d);
 }
 

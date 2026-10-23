@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use super::snapshot::{RepoSnapshot, RepoStatus};
 use super::worklist::{self, Worklist};
-use crate::forge_mirror::client::{self, Conditional, MirrorError};
+use crate::forge_mirror::client::{self, Conditional, Freshness, MirrorError};
 
 /// The worklist path.
 pub const PATH: &str = "/v1/mirror/worklist";
@@ -80,6 +80,9 @@ pub enum Miss {
     NotInWorklist,
     /// The worklist names the repo with a `status` that is not `ok`.
     Status(RepoStatus),
+    /// The mirror cannot vouch for the repo ([`Freshness::Unknown`]): its
+    /// `items` may be empty or partial, so they are not the truth.
+    Unvouched,
 }
 
 impl Miss {
@@ -88,7 +91,7 @@ impl Miss {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::NoWorklist(class) => class,
-            Self::NotInWorklist | Self::Status(_) => "repo_status",
+            Self::NotInWorklist | Self::Status(_) | Self::Unvouched => "repo_status",
         }
     }
 
@@ -97,23 +100,28 @@ impl Miss {
     pub fn status(&self) -> RepoStatus {
         match self {
             Self::NoWorklist(_) => RepoStatus::Error,
-            Self::NotInWorklist => RepoStatus::Unknown,
+            Self::NotInWorklist | Self::Unvouched => RepoStatus::Unknown,
             Self::Status(s) => *s,
         }
     }
 }
 
-fn request(etag: Option<&str>) -> Fetched {
+fn request_from(active: &crate::forge_mirror::Active, etag: Option<&str>) -> Fetched {
     let started = Instant::now();
-    let outcome = match crate::forge_mirror::active() {
-        None => Err(MirrorError::Transport("the mirror is not live".into())),
-        Some(active) => {
-            client::get_json_conditional_blocking(&active, PATH, etag, REQUEST_DEADLINE)
-        }
-    };
+    let outcome = client::get_json_conditional_blocking(active, PATH, etag, REQUEST_DEADLINE);
     Fetched {
         outcome,
         latency: started.elapsed(),
+    }
+}
+
+fn request(etag: Option<&str>) -> Fetched {
+    match crate::forge_mirror::active() {
+        None => Fetched {
+            outcome: Err(MirrorError::Transport("the mirror is not live".into())),
+            latency: Duration::ZERO,
+        },
+        Some(active) => request_from(&active, etag),
     }
 }
 
@@ -123,19 +131,39 @@ impl MirrorBackend {
         self.fetch_with(now, request)
     }
 
+    /// [`Self::fetch`] against a mirror the caller holds (its own URL and
+    /// key), not the process-global one. The cache and its ETag are this
+    /// backend's, so a caller keeps one backend per mirror.
+    pub fn fetch_from(
+        &mut self,
+        active: &crate::forge_mirror::Active,
+        now: DateTime<Utc>,
+    ) -> TickWorklist {
+        self.fetch_bounded(now, active.max_staleness, |etag| request_from(active, etag))
+    }
+
     /// [`Self::fetch`] with the request given.
     pub fn fetch_with(
         &mut self,
+        now: DateTime<Utc>,
+        send: impl FnOnce(Option<&str>) -> Fetched,
+    ) -> TickWorklist {
+        let max_staleness = crate::forge_mirror::active()
+            .map_or(Duration::from_secs(crate::forge_mirror::DEFAULT_MAX_STALENESS_SECS), |a| {
+                a.max_staleness
+            });
+        self.fetch_bounded(now, max_staleness, send)
+    }
+
+    fn fetch_bounded(
+        &mut self,
         _now: DateTime<Utc>,
+        max_staleness: Duration,
         send: impl FnOnce(Option<&str>) -> Fetched,
     ) -> TickWorklist {
         let etag = self.last.as_ref().and_then(|c| c.etag.clone());
         let Fetched { outcome, latency } = send(etag.as_deref());
         let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
-        let max_staleness = crate::forge_mirror::active()
-            .map_or(Duration::from_secs(crate::forge_mirror::DEFAULT_MAX_STALENESS_SECS), |a| {
-                a.max_staleness
-            });
         let mut tick = TickWorklist {
             worklist: None,
             failure: None,
@@ -181,21 +209,41 @@ impl MirrorBackend {
 impl TickWorklist {
     /// One repo's snapshot from the worklist.
     ///
+    /// A stale repo (known and reconciled, evidence older than the bound) is
+    /// still served; one the mirror cannot vouch for at all is not.
+    ///
     /// # Errors
     ///
-    /// [`Miss`]: the caller falls to the next tier for this repo alone.
-    pub fn repo(&self, slug: &str, _now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>, Miss> {
+    /// [`Miss`]: the caller falls to the next tier for this repo alone. The
+    /// worklist is absent or omits the repo, the repo's `status` is not `ok`,
+    /// or its watermark reads [`Freshness::Unknown`] (not known, moved or
+    /// deleted, never reconciled, or naming another repo): [`Miss::Unvouched`].
+    pub fn repo(&self, slug: &str, now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>, Miss> {
         let Some(list) = &self.worklist else {
             return Err(Miss::NoWorklist(self.failure.as_ref().map_or("transport", |f| f.class)));
         };
-        let repo = list
-            .repos
-            .get(&slug.to_ascii_lowercase())
-            .ok_or(Miss::NotInWorklist)?;
+        let slug = slug.to_ascii_lowercase();
+        let repo = list.repos.get(&slug).ok_or(Miss::NotInWorklist)?;
+        let unvouched = list
+            .marks
+            .get(&slug)
+            .is_none_or(|m| m.freshness(&slug, self.max_staleness, now) == Freshness::Unknown);
+        if unvouched {
+            return Err(Miss::Unvouched);
+        }
         match repo.status {
             RepoStatus::Ok => Ok(repo.clone()),
             other => Err(Miss::Status(other)),
         }
+    }
+
+    /// The repos the worklist carries (lowercase slugs); empty with no
+    /// worklist.
+    #[must_use]
+    pub fn slugs(&self) -> Vec<String> {
+        self.worklist
+            .as_ref()
+            .map_or_else(Vec::new, |w| w.repos.keys().cloned().collect())
     }
 
     /// `ok`, `not_modified` or `error`.

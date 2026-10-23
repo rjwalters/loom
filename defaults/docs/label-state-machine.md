@@ -34,6 +34,7 @@ leaves the issue uncurated. The rubric is in `.loom/docs/story-points.md`.
 - [The kind comes from the body (#11795)](#the-kind-comes-from-the-body-11795)
 - [Fact-based de-escalation of a Champion `proposal-escalated` hold (#7650, retired by #11861)](#fact-based-de-escalation-of-a-champion-proposal-escalated-hold-7650-retired-by-11861)
 - [PR verdict-label mutual exclusion: three independent layers (#8112)](#pr-verdict-label-mutual-exclusion-three-independent-layers-8112)
+- [CI-gate recovery (#10178)](#ci-gate-recovery-10178)
 - [Follow-up work](#follow-up-work)
 - [Label registry: the source of truth (#10013)](#label-registry-the-source-of-truth-10013)
 - [No-op hold (#10156)](#no-op-hold-10156)
@@ -98,6 +99,7 @@ structurally cannot.
 | A step needing a human's hands: hardware, a credential or access no fleet host holds | `loom:operator`, plus a comment naming the exact step |
 | A human action that waits on something named first | `loom:operator`, plus a literal `Blocked by #N` line in the body or comment |
 | Waiting on something automation will resolve: an issue, a PR, infrastructure | `loom:blocked` with a park record (`loom-daemon park-record apply`, [`park-record.md`](park-record.md)), or at least a literal `Blocked by #N` / `Depends on #N` / `Requires #N` line in the same comment (the phrasings `detect-dependency-cycle.sh` and `warn-operator-gated.sh` parse; a backtick-quoted reference does not count) |
+| Cross-repo or time-gated leftover (a sweep standing down, not a human ask) | File the child in the other repo and `loom-daemon park-record apply <N> --blocked-by OWNER/REPO#N --by <role> --remove-label loom:building`; the park releases when the child closes. For a time-gated wait, park on the tracking issue or PR whose closing is the signal; with none, file a same-repo tracking issue. If the fleet identity cannot see the other repo (404 on filing), use the capability row below, not `loom:operator`. A reason-only `--reason "wait until <date>: ..."` park is the last resort: **no date release exists today**, so it sits until a human or a fingerprint change moves it, and the reason must say so. Never `loom:operator` just to stop re-dispatch |
 | Waiting on a capability a fleet host may hold (host or admin access, a credential profile) | `loom:blocked` with a reason-only park record and a `<!-- loom:capability=<name> -->` marker naming it, plus a linked capability-request issue: the capability lane (below) proposes it on a host that holds it |
 
 **`loom:operator` needs a stated reason class.** Only these classes qualify:
@@ -212,16 +214,16 @@ the migration table in `priority-model.md`.
 
 | Role | Trigger | Label |
 |---|---|---|
-| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (criterion #2) | `loom:blocked` (#11861) — `champion-pr-merge.md`, "Hold behavior" |
-| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | `loom:blocked` (#11861) — `champion-critical-file-hold.md` |
-| Champion (issue close) | Holds a merged PR's linked **issue** open because one of its acceptance criteria needs out-of-band verification and no `loom:ac-verified` marker attests it | `loom:operator` (#6883) — `champion-pr-merge.md`, Step 4 |
+| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (the `merge-risk` criterion) | `loom:blocked` (#11861) — `champion-pr-merge.md`, "Hold behavior" |
+| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because the `critical-files` criterion matched a critical-file pattern | `loom:blocked` (#11861) — `champion-critical-file-hold.md` |
+| Champion (issue close) | Holds a merged PR's linked **issue** open because one of its acceptance criteria needs out-of-band verification and no `loom:ac-verified` marker attests it | `loom:operator` (#6883) — `champion-pr-merge.md`, Step 4; per-repo off switch `champion.outOfBandAcGate=false` (#12703, first use: 2AMLogic/loom-ui) |
 | Champion (promotion) | A proposal's only recurring finding is an open dependency | `loom:blocked` + one park record per blocker (#11860, #11861) — Step 4 `park-record apply --blocked-by` |
 | Curator / Builder / Doctor / Judge | Encounters work that needs a ruling or a human's hands | `loom:operator` (#11795) — "Routing to a human" above |
 | Human | Applies the label directly to any issue or PR | Always available |
 
 ## Champion's PR holds (#11861)
 
-A merge-risk hold (criterion #2) and a critical-file hold (criterion #3) are
+A merge-risk hold (the `merge-risk` criterion) and a critical-file hold (the `critical-files` criterion) are
 Champion's own, and Champion must keep re-evaluating and releasing them. Before
 #11861 they used `loom:operator`, which was not a park on a PR. Under the
 all-role rule they moved to `loom:blocked`:
@@ -269,16 +271,16 @@ gh pr edit <N> --remove-label "loom:blocked"
 ./.loom/scripts/merge-pr.sh <N>
 ```
 
-- **Critical-file hold** (criterion #3): the release is scoped to the **diff**,
+- **Critical-file hold** (the `critical-files` criterion): the release is scoped to the **diff**,
   not to a commit id (#9416). Champion acknowledges it once, behind a
   `champion:critical-file-release-respected` marker, and does not re-apply the
   label. A push that changes the diff re-arms the hold; a head move across which
   the PR's own change is *provably* unchanged (`loom-daemon forge
   verdict-equivalent`) does not. See `champion-critical-file-hold.md` and
   `critical-file-hold.md`.
-- **Merge-risk hold** (criterion #2): your removal (a human `unlabeled` event
+- **Merge-risk hold** (the `merge-risk` criterion): your removal (a human `unlabeled` event
   after the hold) **releases** it (#11416). Champion merges it on its next tick
-  unless it finds a concern the hold did not name (criteria #3-#6 still apply),
+  unless it finds a concern the hold did not name (the `critical-files`, `mergeable`, `recency` and `ci-green` criteria still apply),
   posting the reversal comment. A human removal of the pre-#11861
   `loom:operator` counts too, so a hold released before the migration stays
   released.
@@ -331,14 +333,32 @@ criterion that was never really out-of-band. There is no automated release,
 deliberately: the PR that would re-evaluate it is already merged, and "a human
 must observe something in the world" cannot be discharged by an engine re-read.
 
+### The author gate on promotion (#10827)
+
+Champion's content criteria say nothing about who wrote the issue. So before any
+**automatic** `loom:issue` write (Champion's Step 3b and the
+`check-promotion-landed.sh --apply` backstop) it asks
+`loom-daemon forge promotion-author --number N`, which judges the issue **author**
+with the same predicate as [`comment-trust.md`](comment-trust.md) (repo insider, a
+fleet App, this daemon, `forge.trustedCommenters`, the fleet admin roster), with
+no second trust table. Only `TRUSTED` promotes. An `UNTRUSTED` author, or an
+`UNKNOWN` one (the issue could not be read), leaves the issue at `loom:curated`
+with one comment (keyed on `<!-- loom:promotion-author-gate -->`, so retries do not
+repeat it). Unreadable evidence never counts as trust.
+
+Adoption is a trusted maintainer applying `loom:issue` by hand, or re-filing the
+issue; an automated Champion verdict alone is not adoption. Trusted authors see no
+change. This is admission control for external submissions, not protection against
+a compromised trusted agent, and it adds no signed decisions or keys.
+
 ## Current implementation
 
-- **Criterion #2 (merge-risk hold)** — `champion-pr-merge.md`: entry in
+- **The `merge-risk` criterion (merge-risk hold)** — `champion-pr-merge.md`: entry in
   "Hold behavior" (`park-record apply --pr`), exit in Step 2 (`gh pr edit
   --remove-label loom:blocked`, gated on `$HOLD_REVERSAL_BLOCK`), repair in
   the sticky precheck (`LABEL_REPAIR`).
-- **Criterion #3 (critical-file hold, #6879, #9016)** —
-  `champion-critical-file-hold.md`, run after criterion #3's check-loop: add on
+- **The `critical-files` criterion (critical-file hold, #6879, #9016)** —
+  `champion-critical-file-hold.md`, run after the `critical-files` criterion's check-loop: add on
   FAIL, remove with the `champion:critical-file-hold-cleared` notice once a push
   leaves every pattern, and respect a human's hand-removal at the held diff.
 - **Queues** — `pr-queue --role champion` keeps `loom:pr` + `loom:blocked`
@@ -458,6 +478,17 @@ said. Now the body is the only copy:
 No role acts on any of these (#11861): the kind tells the human what to do.
 A capability marker on a `loom:operator` item is inert; the capability lane
 reads `loom:blocked` only (below).
+
+### Tracker marker (`<!-- loom:tracker -->`, #10886)
+
+A body marker (not a label, not a hold) for a living tracker or governance hub
+that is meant to stay open with no finite deliverable. It must be a line by
+itself outside any code fence; a quoted or inline mention does not count.
+Champion's Priority 2 discovery skips it and `champion-issue-promo.md` treats it
+as `ALREADY_ROUTED`, so no rejection is counted and it never reaches the N=2
+escalation; Curator leaves it as found. Remove the marker to restore normal
+evaluation. It does not suppress a human-filed `loom:operator` decision.
+`loom:needs-capability` waits need no marker: the registry `hold` set covers them.
 
 ### Capability marker (`<!-- loom:capability=<name> -->`, #6885/#6892)
 
@@ -753,6 +784,21 @@ record that removal instead of re-asserting it over you. Procedure and scoping:
 ["Releasing a Champion hold and merging it yourself"](#releasing-a-champion-hold-and-merging-it-yourself-9016)
 above. Nothing about the guard changes for any other blocking label.
 
+## CI-gate recovery (#10178)
+
+A Judge CI-failing verdict leaves `loom:changes-requested` + `loom:ci-failure`.
+Head-move invalidation never fires when the head does not move, and refuses a
+`loom:blocked` PR. A daemon pass (`claim_reconciliation/ci_gate_recovery.rs`,
+behind `LOOM_VERDICT_STALENESS_RECONCILE`) therefore returns such a PR to
+`loom:review-requested` once `wait-checks` reports the **exact head** green, and
+only for a CI-only verdict (`<!-- loom:ci-gate-only -->`). It never touches
+`loom:operator*`, `loom:frozen`, a Champion hold, or a `loom:blocked` that is not
+a park record with no blocker and `reason="ci-gate"`.
+
+A CI-only gate must not add `loom:blocked`; if one is unavoidable, park with
+`loom-daemon park-record apply --issue <PR> --reason ci-gate --by judge` so the
+pass can tell it from a real hold.
+
 ## Follow-up work
 
 - Derive `loom:blocked-unnamed` from "blocked without a park record" instead
@@ -856,16 +902,21 @@ adopts and releases them as above. See
 
 When a PR merges with a non-closing `Part of #N` / `Contributes to #N` reference,
 `merge-pr.sh` returns issue N from `loom:building` to `loom:issue`. If what is left
-needs a human (an operator decision, a deployment-time check, a hardware step), the
+needs a human's hands or a ruling (an operator decision, a hardware step), the
 issue body declares it with an HTML comment marker, added **before** the PR merges:
 
 ```text
-<!-- loom:remainder-hold reason="deployment-time checks need the fleet on a release containing this merge" -->
+<!-- loom:remainder-hold reason="needs the operator to flash the board and read back the result" -->
 ```
 
 With the marker, the reset swaps `loom:building` -> `loom:operator` instead, logs the
 reason, and posts a "Partial Increment Merged (remainder held)" comment. To release,
 a human removes `loom:operator` and the marker, then re-applies `loom:issue`.
+
+A remainder that is only cross-repo or time-gated (for example a deployment-time check
+that waits on a fleet release) is agent work, not a human ask: do not use the marker.
+Park it instead, per the "Cross-repo or time-gated leftover" row in
+[Routing to a human](#routing-to-a-human-10001-11795).
 
 - The marker is honoured from any author: it can only keep an issue out of the
   ready queue. The `reason` is one line and is only quoted, never evaluated.

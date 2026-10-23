@@ -70,17 +70,16 @@ pub mod api;
 pub mod artifact_spans;
 pub mod billing;
 pub mod export;
-pub mod feed;
 pub mod journal;
 pub mod ledger;
 pub mod logs;
+pub mod metrics;
 pub mod nextest;
 pub mod owners;
 pub mod poll;
 pub mod records;
 pub mod rotation;
 pub mod state;
-pub mod story;
 pub mod suites;
 
 use std::path::{Path, PathBuf};
@@ -435,27 +434,9 @@ pub fn journal_path(root: &Path) -> PathBuf {
 
 /// Spawn the daemon-integrated periodic poller, or return `None` when
 /// `autonomous.ciTelemetry.enabled` resolves false (the default — zero side
-/// effects, no task, no file I/O). Never feed-driven: see [`spawn_task_on`].
+/// effects, no task, no file I/O).
 #[must_use]
 pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_task_with_bus(root, None)
-}
-
-/// [`spawn_task`] with the daemon's event bus: feed-driven (#9201, [`feed`])
-/// when `forgeEvents.events.ciTelemetryRuns` resolves true, otherwise the
-/// plain periodic loop, unchanged.
-#[must_use]
-pub fn spawn_task_on(
-    root: PathBuf,
-    bus: &crate::event_bus::EventBus,
-) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_task_with_bus(root, Some(bus))
-}
-
-fn spawn_task_with_bus(
-    root: PathBuf,
-    bus: Option<&crate::event_bus::EventBus>,
-) -> Option<tokio::task::JoinHandle<()>> {
     let resolved = resolve(&read_config(&root));
     if !resolved.enabled {
         log::debug!("ci_telemetry: disabled (set autonomous.ciTelemetry.enabled=true to opt in)");
@@ -478,9 +459,6 @@ fn spawn_task_with_bus(
             resolved.owners_source
         );
     }
-    if let Some(bus) = bus.filter(|_| feed::consumer_armed(&root)) {
-        return Some(feed::spawn(root, resolved, bus));
-    }
     let interval = Duration::from_secs(resolved.interval_secs);
     log::info!(
         "ci_telemetry: enabled (owners={}, interval={}s, excluded={:?})",
@@ -488,11 +466,14 @@ fn spawn_task_with_bus(
         interval.as_secs(),
         resolved.excluded_repos
     );
+    metrics::register_liveness(interval);
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // A deliberate non-captain skip below still counts as alive (#12793).
+            crate::task_liveness::beat(crate::task_liveness::CI_TELEMETRY, interval);
             // Fleet-captain gate (#8901): re-evaluated every tick, so a
             // `fleet.captain` edit or a host-identity change takes effect on
             // the very next cycle rather than requiring a daemon restart —
@@ -501,13 +482,15 @@ fn spawn_task_with_bus(
             if !gate_tick(&root, &host_id, chrono::Utc::now()) {
                 continue;
             }
-            let root = root.clone();
-            let resolved = resolved.clone();
+            let started = std::time::Instant::now();
+            let (cycle_root, cycle_resolved) = (root.clone(), resolved.clone());
             let outcome = tokio::task::spawn_blocking(move || {
                 let api = api::GhCliApi::from_env();
-                poll::run_cycle(&poll::CycleContext::new(&root, &resolved), &api)
+                poll::run_cycle(&poll::CycleContext::new(&cycle_root, &cycle_resolved), &api)
             })
             .await;
+            metrics::record_cycle(&root, outcome.as_ref().ok(), started.elapsed());
+            crate::task_liveness::beat(crate::task_liveness::CI_TELEMETRY, interval);
             match outcome {
                 Ok(Ok(report)) => log::info!("ci_telemetry: {}", report.summary()),
                 Ok(Err(error)) => log::warn!("ci_telemetry: cycle failed: {error}"),

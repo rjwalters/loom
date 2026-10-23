@@ -1379,6 +1379,40 @@ pub fn apply_gh_config_for_owner_slug(cmd: &mut Command, owner_repo: &str) {
     }
 }
 
+/// The per-owner `GH_CONFIG_DIR` a `gh` call run from `cwd` against
+/// `target` (`owner/repo`) carries when its site chose none: the one
+/// registered for `cwd` (#5401), else the one registered for `target`'s
+/// owner (#5431), else `None` (this process's own credential).
+///
+/// This is the single rule for "which writer does this call use". The `gh`
+/// facade applies it to every invocation
+/// (`GhInvocation::env_plan`), and the #9548 write-scope gate probes the
+/// credential it names (`write_scope::may_write_from`), so the gate always
+/// vets the credential the write will carry (#12606). Before #12606 the
+/// gate probed the process credential (the workspace-root owner's writer)
+/// while the write itself ran under the item owner's, so every cross-owner
+/// write through `GhForge` was refused as "not in this App installation".
+#[must_use]
+pub fn gh_config_dir_for_call(cwd: Option<&Path>, target: Option<&str>) -> Option<PathBuf> {
+    cwd.and_then(gh_config_dir_for_root)
+        .or_else(|| target.and_then(gh_config_dir_for_owner_slug))
+}
+
+/// The owner a registered per-owner `GH_CONFIG_DIR` belongs to (#5431's
+/// owner-keyed registry, reversed), for telemetry: names whose writer
+/// installation a credential is without exposing anything secret. `None` for
+/// a directory no owner registered (the process's own credential, or a
+/// root-only registration).
+#[must_use]
+pub fn owner_for_gh_config_dir(dir: &Path) -> Option<String> {
+    owner_slug_config_registry()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(_, d)| d.as_path() == dir)
+        .map(|(owner, _)| owner.clone())
+}
+
 /// One distinct non-root owner among the managed repos, with a representative
 /// `owner/repo` to mint from and every managed checkout root under that owner
 /// to register (#5401). Produced by [`plan_cross_owner_credentials`].
@@ -2083,6 +2117,35 @@ mod tests {
             "unregistered root must not set GH_CONFIG_DIR on the child"
         );
 
+        clear_owner_root_registry();
+    }
+
+    /// #12606: the one "which writer does this call carry" rule, shared by
+    /// the `gh` facade and the write-scope gate: the cwd's registration, else
+    /// the target owner's, else the process's own.
+    #[test]
+    #[serial_test::serial]
+    fn gh_config_dir_for_call_prefers_the_root_then_the_target_owner() {
+        clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout-b");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_cfg = dir.path().join("root-cfg");
+        let owner_cfg = dir.path().join("gh-config-by-owner/xowner-12606");
+        register_owner_gh_config_dir("xowner-12606", &owner_cfg);
+        assert_eq!(
+            gh_config_dir_for_call(Some(&root), Some("xowner-12606/r")),
+            Some(owner_cfg.clone())
+        );
+        assert_eq!(gh_config_dir_for_call(Some(&root), Some("other/r")), None);
+        assert_eq!(gh_config_dir_for_call(None, None), None);
+        register_root_gh_config_dir(&root, &root_cfg);
+        assert_eq!(
+            gh_config_dir_for_call(Some(&root), Some("xowner-12606/r")),
+            Some(root_cfg.clone())
+        );
+        assert_eq!(owner_for_gh_config_dir(&owner_cfg).as_deref(), Some("xowner-12606"));
+        assert_eq!(owner_for_gh_config_dir(&root_cfg), None);
         clear_owner_root_registry();
     }
 

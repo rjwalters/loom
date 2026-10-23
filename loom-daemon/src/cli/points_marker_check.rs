@@ -16,11 +16,11 @@
 //!
 //! # Message parity
 //!
-//! The BLOCKED text is [`loom_daemon::points_marker::PointsError`]'s
+//! The BLOCKED text is [`crate::points_marker::PointsError`]'s
 //! `Display`, the same text `loom-daemon curation-complete` refuses with
 //! (#11663), and the body is validated by the same hardened parser.
 
-use loom_daemon::points_marker::scan;
+use crate::points_marker::scan;
 use std::io::Read;
 
 use anyhow::Result;
@@ -41,7 +41,7 @@ pub(crate) struct CheckPointsMarkerArgs {
 
 impl CheckPointsMarkerArgs {
     /// Exit 0 = valid marker (a `ok: … is pointed N` line on stdout); exit 1 =
-    /// any [`loom_daemon::points_marker::PointsError`] (the BLOCKED guidance
+    /// any [`crate::points_marker::PointsError`] (the BLOCKED guidance
     /// on stderr).
     pub(crate) fn run(self) -> Result<()> {
         let mut raw_body = Vec::new();

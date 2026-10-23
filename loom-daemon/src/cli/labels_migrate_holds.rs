@@ -7,7 +7,7 @@
 //!
 //! 1. **Champion-held pull requests.** A PR whose trusted comments carry a
 //!    standing merge-risk or critical-file hold marker
-//!    ([`loom_daemon::champion_hold::standing_hold`]) gains a reason-only park
+//!    ([`crate::champion_hold::standing_hold`]) gains a reason-only park
 //!    record and `loom:blocked`, then loses `loom:operator` itself (the only
 //!    name Champion ever wrote; the retired sub-kinds are a human's or another
 //!    role's and are left for the retired-name migration). This holds at
@@ -20,7 +20,7 @@
 //! 2. **Dependency-only escalations.** A proposal (`loom:curated`,
 //!    `loom:architect`, `loom:hermit`, `loom:auditor`) Champion escalated for
 //!    a timing finding is handed to
-//!    [`loom_daemon::dep_classify::cli::migrate_escalation`]: blockers closed
+//!    [`crate::dep_classify::cli::migrate_escalation`]: blockers closed
 //!    → the hold comes off (Pass 0's un-escalation, one last time); blockers
 //!    still open → `loom:blocked` + one park record per blocker, which stays
 //!    until a human, Guide or Champion lifts it once they close (#11301).
@@ -28,7 +28,7 @@
 //!    parked as a human gate, before #12024, carries `loom:operator` and a
 //!    trusted hold notice (`<!-- loom:noop-hold-kind=hold (#10156) -->`) with
 //!    no release notice after it
-//!    ([`loom_daemon::sweep_registry::standing_noop_hold_fingerprint`]). It
+//!    ([`crate::sweep_registry::standing_noop_hold_fingerprint`]). It
 //!    gains the daemon's `no-op hold` park record and `loom:blocked`, then
 //!    loses `loom:operator`. A daemon then adopts the park from the forge and
 //!    releases it when the issue's fingerprint changes, exactly like a hold
@@ -56,11 +56,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use loom_daemon::champion_hold::{capped_hold_routed, standing_hold, HoldKind, HOLD_BY};
-use loom_daemon::dep_classify::cli::EscalationMigration;
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::sweep_registry::park_hold::{DAEMON_HOLD_BY, NOOP_HOLD_REASON};
-use loom_daemon::sweep_registry::standing_noop_hold_fingerprint;
+use crate::champion_hold::{capped_hold_routed, standing_hold, HoldKind, HOLD_BY};
+use crate::dep_classify::cli::EscalationMigration;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::sweep_registry::park_hold::{DAEMON_HOLD_BY, NOOP_HOLD_REASON};
+use crate::sweep_registry::standing_noop_hold_fingerprint;
 use serde::Serialize;
 
 use super::labels_migrate::{classify, enc, pace_write, ForgeError, Target, PER_PAGE};
@@ -232,7 +232,7 @@ fn stop_on_limit(r: &mut Report, e: &ForgeError) -> Result<(), Stop> {
 /// merged, by number.
 fn operator_held(forge: &dyn HoldsForge) -> Result<Vec<HoldItem>, ForgeError> {
     let mut all: BTreeMap<u64, HoldItem> = BTreeMap::new();
-    for name in loom_daemon::work_finder::OPERATOR_HOLD_NAMES.iter() {
+    for name in crate::work_finder::OPERATOR_HOLD_NAMES.iter() {
         let mut done = false;
         for page in 1..=MAX_PAGES {
             let batch = forge.open_page(name, page)?;
@@ -291,21 +291,19 @@ pub(crate) fn run(forge: &dyn HoldsForge, repo: &str, apply: bool) -> Report {
 
 fn one(forge: &dyn HoldsForge, item: &HoldItem, apply: bool, r: &mut Report) -> Result<(), Stop> {
     let has = |l: &str| item.labels.iter().any(|x| x == l);
-    if loom_daemon::work_finder::is_frozen(&item.labels) {
+    if crate::work_finder::is_frozen(&item.labels) {
         r.summary.untouched += 1;
         return Ok(());
     }
     if item.is_pr {
         return pr_hold(forge, item, apply, r);
     }
-    if has(loom_daemon::work_finder::OPERATOR_HOLD_LABEL) && noop_hold(forge, item, apply, r)? {
+    if has(crate::work_finder::OPERATOR_HOLD_LABEL) && noop_hold(forge, item, apply, r)? {
         return Ok(());
     }
     // An escalation is moved only off `loom:operator` itself; a retired name
     // stays for the retired-name migration (#11861 review).
-    if !ESCALATION_LABELS.iter().any(|l| has(l))
-        || !has(loom_daemon::work_finder::OPERATOR_HOLD_LABEL)
-    {
+    if !ESCALATION_LABELS.iter().any(|l| has(l)) || !has(crate::work_finder::OPERATOR_HOLD_LABEL) {
         r.summary.untouched += 1;
         return Ok(());
     }
@@ -333,7 +331,7 @@ fn one(forge: &dyn HoldsForge, item: &HoldItem, apply: bool, r: &mut Report) -> 
             r.summary.left += 1;
         }
         EscalationMigration::Failed(why) => {
-            if loom_daemon::rate_limit_breaker::indicates_rate_limit(&why) {
+            if crate::rate_limit_breaker::indicates_rate_limit(&why) {
                 return stop_on_limit(r, &ForgeError::RateLimited(why));
             }
             r.events.push(Event::Failed { item: n, why });
@@ -387,7 +385,7 @@ fn noop_hold(
         return Ok(true);
     }
     r.summary.writes += 1;
-    match forge.remove_label(n, loom_daemon::work_finder::OPERATOR_HOLD_LABEL) {
+    match forge.remove_label(n, crate::work_finder::OPERATOR_HOLD_LABEL) {
         Ok(()) => r.summary.writes += 1,
         Err(ForgeError::NotFound(_)) => {}
         Err(e) => {
@@ -444,6 +442,7 @@ fn pr_hold(
     }
     let hold = match kind {
         HoldKind::MergeRisk => "merge-risk",
+        HoldKind::Ratification => "ratification",
         HoldKind::CriticalFile => "critical-file",
     };
     // Only `loom:operator` itself, the one name Champion ever wrote for its
@@ -453,7 +452,7 @@ fn pr_hold(
     let removed: Vec<String> = item
         .labels
         .iter()
-        .filter(|l| l.as_str() == loom_daemon::work_finder::OPERATOR_HOLD_LABEL)
+        .filter(|l| l.as_str() == crate::work_finder::OPERATOR_HOLD_LABEL)
         .cloned()
         .collect();
     r.events.push(Event::Hold {
@@ -519,9 +518,9 @@ impl GhHoldsForge {
         if let Some(o) = r.ok_output() {
             return Ok(o.stdout.clone());
         }
-        if let loom_daemon::cmd_out::CmdOutcome::Unavailable(
-            loom_daemon::cmd_out::Unavailable::Shed { .. },
-        ) = r
+        if let crate::cmd_out::CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Shed {
+            ..
+        }) = r
         {
             return Err(ForgeError::RateLimited(r.failure_reason(&what)));
         }
@@ -562,7 +561,7 @@ impl HoldsForge for GhHoldsForge {
     fn trusted_comments(&self, number: u64) -> Result<Vec<String>, ForgeError> {
         let path = format!("repos/{}/issues/{number}/comments?per_page=100", self.repo);
         let out = self.gh(AccessIntent::Read, &["api", "--paginate", &path])?;
-        loom_daemon::comment_trust::TrustPolicy::for_root(&self.root)
+        crate::comment_trust::TrustPolicy::for_root(&self.root)
             .trusted_bodies(&out)
             .ok_or_else(|| ForgeError::Other("comment listing did not parse".to_string()))
     }
@@ -584,8 +583,7 @@ impl HoldsForge for GhHoldsForge {
 
     fn migrate_escalation(&self, number: u64, apply: bool) -> EscalationMigration {
         let n = i64::try_from(number).unwrap_or(0);
-        let plan =
-            loom_daemon::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, false);
+        let plan = crate::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, false);
         // Pace only an item that will write (the plan is a read).
         if !apply || !matches!(plan, EscalationMigration::Release | EscalationMigration::Park(_)) {
             return plan;
@@ -593,7 +591,7 @@ impl HoldsForge for GhHoldsForge {
         for _ in 0..ESCALATION_WRITES {
             pace_write();
         }
-        loom_daemon::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, true)
+        crate::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, true)
     }
 }
 
@@ -603,7 +601,7 @@ impl GhHoldsForge {
         // Two writes at most: the body record, then the label.
         pace_write();
         pace_write();
-        let req = loom_daemon::park_record::apply::ApplyRequest {
+        let req = crate::park_record::apply::ApplyRequest {
             number,
             repo: Some(self.repo.clone()),
             blocked_by: Vec::new(),
@@ -612,14 +610,13 @@ impl GhHoldsForge {
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             remove_labels: Vec::new(),
             dry_run: false,
+            is_pr: false,
         };
-        let mut forge = loom_daemon::operator_decision::cli::GhForge::new(
-            self.root.clone(),
-            Some(self.repo.clone()),
-        );
+        let mut forge =
+            crate::operator_decision::cli::GhForge::new(self.root.clone(), Some(self.repo.clone()));
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = loom_daemon::park_record::apply::apply(&mut forge, &req, &mut out, &mut err);
-        if code == loom_daemon::park_record::apply::exit::OK {
+        let code = crate::park_record::apply::apply(&mut forge, &req, &mut out, &mut err);
+        if code == crate::park_record::apply::exit::OK {
             return Ok(());
         }
         Err(classify(String::from_utf8_lossy(&err).trim().to_string()))

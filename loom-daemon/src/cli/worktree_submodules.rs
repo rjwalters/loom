@@ -24,7 +24,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::submodules;
+use crate::worktree_cli::submodules;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeSubmodulesArgs {

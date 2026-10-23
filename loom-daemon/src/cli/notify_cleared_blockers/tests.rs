@@ -7,9 +7,9 @@
 //! gathering's forge-call counts in `stale_blocked/notify_tests.rs`.
 
 use super::*;
-use loom_daemon::dep_recheck::extract;
-use loom_daemon::stale_blocked::cited_among;
-use loom_daemon::stale_blocked::notify::has_marker;
+use crate::dep_recheck::extract;
+use crate::stale_blocked::cited_among;
+use crate::stale_blocked::notify::has_marker;
 
 fn input_with_comment(body: &str) -> extract::Input {
     extract::Input {

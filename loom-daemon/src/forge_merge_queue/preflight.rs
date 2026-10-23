@@ -38,6 +38,7 @@ use super::github::{classify_failure, safe_detail, FailureClass};
 use crate::cmd_out::{decode_json, Query};
 use crate::forge_merge_config::BranchRule;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::telemetry::kinds::merge_queue_regime::QueueRegime;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -112,6 +113,43 @@ pub struct Capability {
     pub queue_rulesets: Vec<u64>,
     /// Required status-check contexts, sorted and de-duplicated.
     pub required_checks: Vec<String>,
+    /// The queue regime from the `merge_queue` rule's `parameters` (#12675).
+    pub regime: QueueRegime,
+}
+
+/// The regime one `merge_queue` rule's `parameters` declare. A missing key is
+/// `None`, never a default.
+fn regime_of(parameters: Option<&serde_json::Value>) -> QueueRegime {
+    let get = |k: &str| parameters.and_then(|p| p.get(k));
+    QueueRegime {
+        check_response_timeout_minutes: get("check_response_timeout_minutes")
+            .and_then(serde_json::Value::as_u64),
+        max_entries_to_build: get("max_entries_to_build").and_then(serde_json::Value::as_u64),
+        grouping_strategy: get("grouping_strategy")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        ambiguous: false,
+    }
+}
+
+/// The regime across every `merge_queue` rule: the shared one, or an
+/// `ambiguous` regime with no values when the rules differ.
+fn regime_across(rules: &[BranchRule]) -> QueueRegime {
+    let mut regimes = rules
+        .iter()
+        .filter(|r| r.kind == "merge_queue")
+        .map(|r| regime_of(r.parameters.as_ref()));
+    let Some(first) = regimes.next() else {
+        return QueueRegime::default();
+    };
+    if regimes.all(|r| r == first) {
+        first
+    } else {
+        QueueRegime {
+            ambiguous: true,
+            ..QueueRegime::default()
+        }
+    }
 }
 
 /// The slice of `GET repos/<nwo>` the preflight reads.
@@ -191,6 +229,7 @@ pub(crate) fn evaluate_capability(
         branch: branch.to_string(),
         queue_rulesets,
         required_checks,
+        regime: regime_across(rules),
     })
 }
 
@@ -258,4 +297,90 @@ pub fn github_preflight(
         &format!("the rules on '{branch}'"),
     )?;
     evaluate_capability(&branch, &repo, &rules)
+}
+
+#[cfg(test)]
+mod regime_tests {
+    #![allow(clippy::unwrap_used)]
+    use serde_json::json;
+
+    use super::*;
+
+    fn rule(kind: &str, id: u64, parameters: Option<serde_json::Value>) -> BranchRule {
+        BranchRule {
+            kind: kind.to_string(),
+            ruleset_id: Some(id),
+            parameters,
+        }
+    }
+
+    fn checks() -> BranchRule {
+        rule(
+            "required_status_checks",
+            1,
+            Some(json!({"required_status_checks": [{"context": "ci"}]})),
+        )
+    }
+
+    fn capability(rules: &[BranchRule]) -> Capability {
+        evaluate_capability("main", &RepoFacts::default(), rules).unwrap()
+    }
+
+    #[test]
+    fn a_merge_queue_rule_yields_the_three_fields() {
+        let c = capability(&[
+            rule(
+                "merge_queue",
+                1,
+                Some(json!({"check_response_timeout_minutes": 60, "max_entries_to_build": 5,
+                            "grouping_strategy": "ALLGREEN"})),
+            ),
+            checks(),
+        ]);
+        assert_eq!(
+            c.regime,
+            QueueRegime {
+                check_response_timeout_minutes: Some(60),
+                max_entries_to_build: Some(5),
+                grouping_strategy: Some("ALLGREEN".into()),
+                ambiguous: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_rule_without_parameters_is_unknown_not_defaulted() {
+        let c = capability(&[rule("merge_queue", 1, None), checks()]);
+        assert_eq!(c.regime, QueueRegime::default());
+        let c = capability(&[
+            rule("merge_queue", 1, Some(json!({"max_entries_to_build": 3}))),
+            checks(),
+        ]);
+        assert_eq!(c.regime.max_entries_to_build, Some(3));
+        assert_eq!(c.regime.grouping_strategy, None);
+        assert_eq!(c.regime.check_response_timeout_minutes, None);
+    }
+
+    #[test]
+    fn differing_merge_queue_rules_are_ambiguous_with_no_guess() {
+        let c = capability(&[
+            rule("merge_queue", 1, Some(json!({"max_entries_to_build": 3}))),
+            rule("merge_queue", 2, Some(json!({"max_entries_to_build": 5}))),
+            checks(),
+        ]);
+        assert!(c.regime.ambiguous);
+        assert_eq!(c.regime.max_entries_to_build, None);
+    }
+
+    #[test]
+    fn identical_merge_queue_rules_are_not_ambiguous() {
+        let p = json!({"max_entries_to_build": 3});
+        let c = capability(&[
+            rule("merge_queue", 1, Some(p.clone())),
+            rule("merge_queue", 2, Some(p)),
+            checks(),
+        ]);
+        assert!(!c.regime.ambiguous);
+        assert_eq!(c.regime.max_entries_to_build, Some(3));
+    }
 }

@@ -30,7 +30,6 @@ async fn a_tick_dispatches_only_into_the_normal_workspace() {
         false,
         &preflight_causes,
         false,
-        false,
     );
     assert_eq!(causes[0], Some(halt_cause::HaltCause::MaintainOnly));
     assert_ne!(causes[1], Some(halt_cause::HaltCause::MaintainOnly));

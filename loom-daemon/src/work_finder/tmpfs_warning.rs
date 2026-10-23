@@ -6,9 +6,9 @@
 //!
 //! [`check_and_warn`] returns only whether it fired — a fact for the caller
 //! to (optionally) log or count, never a value fed into
-//! [`crate::work_finder::resolve_dynamic_max_concurrent`] or either headroom
-//! axis ([`crate::disk_headroom::disk_headroom_limit`],
-//! [`crate::ram_headroom::ram_headroom_limit`]). There is no path from this
+//! `crate::work_finder::resolve_dynamic_max_concurrent` (removed, #12406) or either headroom
+//! axis (`crate::disk_headroom::disk_headroom_limit` (removed, #12406),
+//! the former RAM headroom term, removed in #12330). There is no path from this
 //! module back into the admission cap — `tests::warning_never_changes_the_admission_cap`
 //! pins that structurally: computing the cap before and after a firing
 //! warning yields the identical value. A host with a legitimately large tmpfs
@@ -261,22 +261,4 @@ mod tests {
     // ===================================================================
     // Dispatch/admission independence (#8572 AC: "warning only", test-asserted)
     // ===================================================================
-
-    #[test]
-    fn warning_never_changes_the_admission_cap() {
-        let disk = 5;
-        let ram = 3;
-        let configured_max = 10;
-        let before = crate::work_finder::resolve_dynamic_max_concurrent(disk, ram, configured_max);
-
-        // A firing warning (fraction far above threshold) has no return value
-        // or shared state that could feed into admission math.
-        assert!(should_warn(Some(0.95), 15.0, None, Utc::now(), 1800));
-
-        let after = crate::work_finder::resolve_dynamic_max_concurrent(disk, ram, configured_max);
-        assert_eq!(
-            before, after,
-            "the tmpfs warning must never influence the admission cap (#8572)"
-        );
-    }
 }

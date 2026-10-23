@@ -24,10 +24,10 @@ pub(crate) enum ScriptPortCommand {
     Preflight(super::preflight::PreflightArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
-    SessionExec(loom_daemon::session_exec::SessionExecCommand),
+    SessionExec(crate::session_exec::SessionExecCommand),
     /// Private workspace endpoint used inside a session container.
     #[command(subcommand)]
-    PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    PrivateWorkspace(crate::tokens_pool::private_workspace::WorkerCommand),
     /// Readiness of Loom's managed Codex hook, behind
     /// `provision-codex-hooks.sh verify` (#9390).
     #[command(subcommand)]
@@ -240,6 +240,10 @@ pub(crate) enum ScriptPortCommand {
     /// `serde_json` instead of spliced by hand. Exit 0 resolved, 1 refused.
     WorktreeBase(super::worktree_base::WorktreeBaseArgs),
 
+    /// Which open PR (if any) a Builder's committed work should be stacked on
+    /// (#12759): one `STACK-PARENT …` line, exit 0 for every decision.
+    StackParent(super::stack_parent::StackParentArgs),
+
     /// `worktree.sh`'s in-worktree predicate and both decisions it gated
     /// (#8195 slice 11): the `--check` verb, and the create path's
     /// auto-navigation out of a worktree. The retired
@@ -295,10 +299,6 @@ pub(crate) enum ScriptPortCommand {
     /// the predicate holds, 1 when it does not — an answer, not an error.
     #[command(subcommand)]
     RetryClassify(super::retry_classify::RetryClassifyCommand),
-    /// Provenance stamps (#9027, D33): commit trailers, the `commit-msg`
-    /// stamper and the PR-body `loom:provenance` marker.
-    #[command(subcommand)]
-    Provenance(super::provenance::ProvenanceCommand),
     /// Host-side autonomy-loss detector (#8086), backing
     /// `loom-daemon-watchdog.sh`. Run by a launchd/systemd timer on a
     /// `StartInterval` cadence, so it owns no long-lived process.
@@ -378,6 +378,14 @@ pub(crate) enum ScriptPortCommand {
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 
+    /// The git half of Doctor's orphan-stack replacement recipe (#12767): in a
+    /// merge-mode repository, replay a stacked child's own commits (the closed
+    /// parent's excluded) onto the default branch as a NEW branch, never
+    /// rewriting the original. Exit 0 done, 1 refused with nothing pushed,
+    /// 2 transient.
+    #[command(subcommand)]
+    OrphanReplace(super::orphan_replace::OrphanReplaceCommand),
+
     /// Build a PINNED `--force-with-lease=<branch>:<oid>` push argument, or
     /// refuse (#9487). Backs the lease capture in `reconcile-stack.sh` and
     /// `rebase-stacked-children.sh`. A bare `--force-with-lease` compares
@@ -425,6 +433,14 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     AffectedFiles(super::affected_files_check::AffectedFilesCommand),
 
+    /// Rotate `WORK_LOG.md` into dated monthly archives (#12633): `work-docs
+    /// archive` moves whole `### YYYY-MM-DD` sections older than the cutoff
+    /// (minimum 45 days, above Guide's 30-day lookback) byte-for-byte into
+    /// `work_log/WORK_LOG_YYYY-MM.md`; `work-docs check` verifies nothing was
+    /// lost or duplicated. Not a port: brand-new native verb.
+    #[command(subcommand)]
+    WorkDocs(super::work_docs_archive::WorkDocsCommand),
+
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
     /// host is the captain, 4 no `fleet.captain` declared at all — three
@@ -444,6 +460,13 @@ pub(crate) enum ScriptPortCommand {
     /// on the same no-op branch as an unavailable binary.
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
+
+    /// Shared command-lexer verdicts for the guard hooks (#12236): `gh-pr-merge`
+    /// exits 0 when a command line would execute it, 1 when not (a heredoc body
+    /// or quoted argument is data). Any other exit means unanswered; the hook
+    /// fails closed.
+    #[command(subcommand)]
+    CommandAnalysis(super::command_analysis::CommandAnalysisCommand),
 
     /// Per-stage runtime selection views (#11726): `roles draw --explain`
     /// prints each stage's effective weighted, per-attempt draw table on this
@@ -685,13 +708,13 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
             ScriptPortCommand::WorktreeBase(args) => args.run(),
+            ScriptPortCommand::StackParent(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::CodexHooks(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::WorktreeBranchReuse(args) => args.run(),
             ScriptPortCommand::WorktreeOpenPr(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
-            ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::Host(cmd) => cmd.run(),
@@ -704,13 +727,16 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::OrphanReplace(cmd) => cmd.run(),
             ScriptPortCommand::PushLease(cmd) => cmd.run(),
             ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
+            ScriptPortCommand::WorkDocs(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::CommandAnalysis(cmd) => cmd.run(),
             ScriptPortCommand::Roles(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
@@ -1107,6 +1133,22 @@ pub(crate) enum MergePrCommand {
     /// AWAIT|SYNC|FAIL` plus its narration, exit 0. The shell routes on the
     /// classifier's kind itself on any fault — see `cli::merge_pr_merge_route`.
     MergeRoute(super::merge_pr_merge_route::MergeRouteArgs),
+
+    /// The whole post-merge worktree/branch cleanup block (#8191, slice 1 of
+    /// the orchestrator port): target naming, the remove-vs-preserve decision,
+    /// the primary/sentinel/dirty-work guards, the removal, the ledger, the
+    /// local-branch delete and the cargo-target reclaim, sequenced in one
+    /// process. Prints `LEVEL<TAB>message` records to replay, or `LOOM-NEED
+    /// <fact>` (exit 3, nothing done) when a forge fact must be fetched first
+    /// — see `cli::merge_pr_post_merge_cleanup`.
+    PostMergeCleanup(super::merge_pr_post_merge_cleanup::PostMergeCleanupArgs),
+
+    /// The post-merge issue bookkeeping (#8191, slice 2): the partial-increment
+    /// reset, the branch-derived issue close and the closed-issue label strip,
+    /// one `--step` per call. Prints `LEVEL<TAB>message` records ending in a
+    /// terminator, or `LOOM-NEED close-targets` (exit 3, nothing done) — see
+    /// `cli::merge_pr_post_merge_bookkeeping`.
+    PostMergeBookkeeping(super::merge_pr_post_merge_bookkeeping::PostMergeBookkeepingArgs),
 }
 
 impl MergePrCommand {
@@ -1160,6 +1202,8 @@ impl MergePrCommand {
             MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
+            MergePrCommand::PostMergeCleanup(args) => args.run(),
+            MergePrCommand::PostMergeBookkeeping(args) => args.run(),
         }
     }
 }

@@ -92,6 +92,9 @@ struct WireItem {
 #[derive(Debug, Default)]
 pub struct Worklist {
     pub repos: BTreeMap<String, Arc<RepoSnapshot>>,
+    /// Lowercase slug → the watermark as sent, so the tick can ask
+    /// [`Watermark::freshness`] whether the mirror vouches for the repo.
+    pub marks: BTreeMap<String, Watermark>,
 }
 
 fn time(raw: Option<&str>) -> Option<DateTime<Utc>> {
@@ -180,15 +183,12 @@ pub fn decode(
     body: serde_json::Value,
 ) -> Result<Worklist, crate::forge_mirror::client::MirrorError> {
     let response: Response = crate::forge_mirror::client::decode(body)?;
-    Ok(Worklist {
-        repos: response
-            .repos
-            .into_iter()
-            .map(|(slug, repo)| {
-                let slug = slug.to_ascii_lowercase();
-                let snap = Arc::new(repo.into_snapshot(&slug));
-                (slug, snap)
-            })
-            .collect(),
-    })
+    let mut list = Worklist::default();
+    for (slug, repo) in response.repos {
+        let slug = slug.to_ascii_lowercase();
+        list.marks.insert(slug.clone(), repo.watermark.clone());
+        let snap = Arc::new(repo.into_snapshot(&slug));
+        list.repos.insert(slug, snap);
+    }
+    Ok(list)
 }

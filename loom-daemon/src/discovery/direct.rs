@@ -15,44 +15,60 @@ use crate::step_dispatch::gather::PULL_PAGES;
 use crate::step_dispatch::listing::{self, CALLER};
 
 /// One repo's snapshot, by listing it. `reads` counts the listing calls.
-/// `per_call_mirror`: the item listing may ask the mirror per call (today's
-/// behaviour, `forge.mirror.discovery = "per_call"`); the chain's gateway and
-/// `gh` tiers never do. `tier` is what the snapshot is recorded under.
+/// `tier` is what the snapshot is recorded under.
 ///
 /// # Errors
 ///
 /// The item listing's: the set is all-or-nothing. A failed open-PR listing is
 /// not an error; it leaves [`RepoSnapshot::pulls`] `None`.
-pub fn read_repo(
+pub fn read_repo(target: &Target, reads: &AtomicU64, tier: Tier) -> Result<RepoSnapshot> {
+    // Forge-neutral at the interface, forge-specific underneath (#12312): the
+    // snapshot is the same value whichever forge the root is on.
+    let forge = crate::forge_cmd::detect_forge(Some(&target.root_dir));
+    list_repo(forge, target, reads, tier)
+}
+
+/// [`read_repo`] for a fleet chain (#12312): its `gh` tier runs in the
+/// isolated `gh` environment ([`crate::gh_invocation::discovery_isolation`]); the gateway tier keeps
+/// the read router.
+///
+/// # Errors
+///
+/// As [`read_repo`].
+pub fn read_repo_fleet(target: &Target, reads: &AtomicU64, tier: Tier) -> Result<RepoSnapshot> {
+    let _isolated = (tier == Tier::Gh).then(crate::gh_invocation::discovery_isolation::scope);
+    read_repo(target, reads, tier)
+}
+
+/// One repo's snapshot on `forge`.
+///
+/// # Errors
+///
+/// As [`read_repo`].
+pub fn list_repo(
+    forge: crate::forge_cmd::ForgeType,
     target: &Target,
     reads: &AtomicU64,
-    per_call_mirror: bool,
     tier: Tier,
 ) -> Result<RepoSnapshot> {
     reads.fetch_add(1, Ordering::Relaxed);
-    let list = if per_call_mirror {
-        listing::list_all_open
-    } else {
-        listing::list_all_open_forge
-    };
-    let items = list(&target.gh_bin, Some(&target.root_dir), Some(&target.slug))?;
-    // A per-call mirror answer is the mirror tier's.
-    let tier = if items.source == listing::ListingSource::Mirror {
-        Tier::Mirror
-    } else {
-        tier
-    };
+    let rows = listing::list_all_open_on(
+        forge,
+        &target.gh_bin,
+        Some(&target.root_dir),
+        Some(&target.slug),
+    )?;
     // As the gather always did, the open-PR listing is read only once the
     // item listing answered.
     reads.fetch_add(1, Ordering::Relaxed);
-    let pulls = crate::forge_pull_listing::list_open_pulls_cached_as(
+    let pulls = crate::forge_pull_listing::list_open_pulls_on(
+        forge,
         CALLER,
         &target.gh_bin,
         Some(&target.root_dir),
         Some(&target.slug),
         PULL_PAGES,
     );
-    let rows = items.rows;
     Ok(RepoSnapshot {
         slug: target.slug.clone(),
         source: Source::Listing,
@@ -64,3 +80,8 @@ pub fn read_repo(
         watermark: None,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "direct_forge_tests.rs"]
+mod forge_tests;

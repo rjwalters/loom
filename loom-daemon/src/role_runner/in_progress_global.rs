@@ -12,7 +12,7 @@ use super::{active_run_count, InProgressGuard};
 /// out-of-band readers (`loom-daemon status` via [`crate::ipc`]) can sample the
 /// live role-agent count without threading the `Arc` through the IPC server —
 /// the same process-global read-back shape
-/// [`crate::admission_brake::register_global`] uses for the brake.
+/// `crate::admission_brake::register_global` (removed, #12406) uses for the brake.
 static GLOBAL_IN_PROGRESS: OnceLock<InProgressGuard> = OnceLock::new();
 
 /// Register the process-global [`InProgressGuard`] handle. Idempotent: only the
@@ -27,7 +27,7 @@ pub fn register_global_in_progress(set: InProgressGuard) {
 /// `0` when no guard has been registered (role runner never spawned, or a
 /// non-daemon process such as the `calibrate` CLI) — honestly "no role agents
 /// observed here", the same zero-behavior-change contract
-/// [`crate::admission_brake::global_is_holding`] has.
+/// `crate::admission_brake::global_is_holding` (removed, #12406) has.
 ///
 /// This is the count that [`crate::types::DaemonStatusReport::active_role_agents`]
 /// reports, so `loom-daemon status` shows total agent load — sweeps *and* role

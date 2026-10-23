@@ -530,7 +530,7 @@ fn a_deferred_publisher_is_bounded_even_when_max_age_is_zero() {
 #[test]
 fn a_deferred_publisher_backs_off_once_the_peer_is_provably_live() {
     let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
-    let ttl = (loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as u64;
+    let ttl = (crate::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as u64;
     let t = FakeTime::new();
     let end = deferred::retry_loop(
         &args(&dir),
@@ -654,7 +654,7 @@ fn a_dead_owners_lock_never_orphans_another_sessions_declined_publish() {
     let a_id = session_sweep_id(a.watch_pid).expect("A's session identity");
     let b_id = session_sweep_id(b.watch_pid).expect("B's session identity");
     let log = || {
-        let root = loom_daemon::repo_root::resolve_repo_root(&a.workspace).unwrap();
+        let root = crate::repo_root::resolve_repo_root(&a.workspace).unwrap();
         fs::read_to_string(deferred::log_path(&root, 8193)).unwrap_or_default()
     };
     assert!(
@@ -714,7 +714,7 @@ fn a_dead_owners_lock_never_orphans_another_sessions_declined_publish() {
 #[test]
 fn a_waiting_publisher_ends_with_its_own_session_while_the_owner_lives() {
     let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
-    let root = loom_daemon::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
+    let root = crate::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
     let owner = deferred::try_lock(&deferred::lock_path(&root, 8193))
         .expect("stand-in owner takes the issue lock");
     let mut session = session_process();
@@ -742,7 +742,7 @@ fn outcomes_are_recorded_in_the_per_issue_log() {
     let dir = checkout(PUBLISH_OK, RENEW_OK);
     deferred::record(&dir.path().to_string_lossy(), 8193, "first line");
     deferred::record(&dir.path().to_string_lossy(), 8193, "second line");
-    let root = loom_daemon::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
+    let root = crate::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
     let log = fs::read_to_string(deferred::log_path(&root, 8193)).unwrap();
     assert!(log.contains(" first line\n") && log.contains(" second line\n"), "{log}");
 }

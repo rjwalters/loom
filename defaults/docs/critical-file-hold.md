@@ -9,19 +9,19 @@ have to carry the incident narrative that explains it (issues #6879, #9016,
 
 ## Why a durable hold and not a transient retry (#6879)
 
-Criteria #1/#4/#5/#6 of `champion-pr-merge.md` → "Safety Criteria" are mechanical
+The `judge-approval`, `mergeable`, `recency` and `ci-green` criteria of `champion-pr-merge.md` → "Safety Criteria" are mechanical
 failures: they clear on their own, or on the next push, so they use the shared
 "Transient failures" template in that file's "PR Rejection Workflow". A
 critical-file FAIL is not like them. It is a **one-way terminal state** —
 nothing about a diff's critical-file-ness changes without a human decision or a
-later push that narrows the diff — so it gets a durable hold on criterion #2's
+later push that narrows the diff — so it gets a durable hold on the `merge-risk` criterion's
 pattern instead: `loom:blocked` with a reason-only park record (#11861; it was
 `loom:operator` before that label became a no-op for every role).
 
-It does **not** need criterion #2's sticky-hold judgment-call machinery (#4742).
-That machinery exists because #2 is a judgment call that a later re-read might
+It does **not** need the `merge-risk` criterion's sticky-hold judgment-call machinery (#4742).
+That machinery exists because `merge-risk` is a judgment call that a later re-read might
 answer differently, so a hold has to be pinned lest it "silently evaporate".
-Criterion #3's check-loop is a deterministic file-pattern match: the same diff
+The `critical-files` criterion's check-loop is a deterministic file-pattern match: the same diff
 always produces the same verdict, and nothing but the file list can change it.
 
 ## Why the operator's release is the label's ABSENCE (#9016)
@@ -35,7 +35,7 @@ The hold keeps `loom:pr` (Judge really did approve) and adds the hold label
 `merge-pr.sh` refuses any PR carrying both at once — the verdict-contradiction
 guard #8112, which has **no** override flag by design. So the operator's only
 route was to remove the label and merge; but the next Champion tick
-re-added it, because the criterion-#3 verdict is deterministic and nothing on the
+re-added it, because the `critical-files` criterion verdict is deterministic and nothing on the
 PR recorded that a human had already decided. On merge train #8996 (2026-09-26)
 the label came back 1m42s after the operator's release comment; the PR merged
 only by removing the label and running `merge-pr.sh` in the *same* shell command.
@@ -69,7 +69,7 @@ every tree-identical re-date push (#8248's freshness remedy, #8508, retired by
 the operator had already released on a byte-identical diff. #9348 paid that tax
 four times to land one PR on 2026-09-28.
 
-The criterion-#3 verdict is a pure function of the PR's **file list**, so the
+The `critical-files` criterion verdict is a pure function of the PR's **file list**, so the
 operator's decision is a decision about the *change*, not about a commit id. The
 release is therefore scoped to the change, and whether the change survived a head
 move is re-derived from the repository by `loom-daemon forge verdict-equivalent`
@@ -126,7 +126,7 @@ tick, and `verdict_equivalence/noop_chain_tests.rs` covers the proof.
 A respected release posts a `<!-- champion:critical-file-release-respected -->`
 comment carrying two further markers:
 
-- `<!-- champion:hold-state head=<sha> -->` — the same marker criterion #2
+- `<!-- champion:hold-state head=<sha> -->` — the same marker the `merge-risk` criterion
   records and `merge-pr.sh` reads back at merge time (#7419), so an operator
   merging some other head already gets a staleness warning for free. On an
   equivalent head move this line is **re-anchored** at the new head, which is

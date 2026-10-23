@@ -74,12 +74,9 @@ impl WaitClass {
 pub fn wait_class(disposition: QueueDisposition) -> Option<WaitClass> {
     use QueueDisposition as D;
     match disposition {
-        D::DeferredCapacity
-        | D::DeferredRampCap
-        | D::DeferredSaturation
-        | D::DeferredBuildBackoff
-        | D::DeferredRepoCap
-        | D::DeferredFileOverlap => Some(WaitClass::Ready),
+        D::DeferredCapacity | D::DeferredBuildBackoff | D::DeferredFileOverlap => {
+            Some(WaitClass::Ready)
+        }
         D::WorkspaceHalted
         | D::WorkspaceCommandsMissing
         | D::Quarantined

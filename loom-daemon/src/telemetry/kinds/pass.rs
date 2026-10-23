@@ -10,15 +10,14 @@
 //! - **`pass.summary`**, one per pass per workspace: the `mechanism`, repo,
 //!   host, deciding build, mode, outcome, counts by verdict and by skip reason,
 //!   whether the write cap was hit, the duration and the GitHub calls the pass
-//!   made (its [`crate::gh_invocation::caller_scope`]).
+//!   made.
 //! - **`pass.verdict`**, one per artifact: repo#n, the verdict and its reason,
 //!   the blockers with the state the pass read, and the labels it changed.
 //!   `role` is empty for a daemon pass. A role's verdicts (Guide's unblock
 //!   outcomes, Champion's promotion verdicts) fit the same record with `role`
 //!   set and their own `mechanism`, `verdict` and `reason` vocabulary.
 //!
-//! `mechanism` is the name the pass's GitHub calls carry as `github.caller`
-//! on their `invoke github` spans (and its `forge_call_stats` caller), so a
+//! `mechanism` is the pass's `forge_call_stats` caller, so a
 //! pass, its verdicts and its forge cost join on one string.
 //!
 //! **OTLP only**, like the other post-#8921 log kinds. The body is the
@@ -75,6 +74,8 @@ pub const PASS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pass.reason_set",
     "loom.pass.proposal_label",
     "loom.pass.body_hash",
+    // #12715: the step's raw reason token.
+    "loom.pass.reason_detail",
     "loom.pass.unevaluated_reason",
     "loom.pass.unevaluated_reasons",
     "loom.pass.budget.bucket",
@@ -181,8 +182,7 @@ pub struct PassSummaryRecord {
     /// Derived, never random: `derived_hex(["loom.pass", mechanism, host,
     /// repo, started_at])`. Every `pass.verdict` of the pass carries it.
     pub pass_id: String,
-    /// The pass: its `forge_call_stats` caller and its spans' `github.caller`
-    /// (`stale_blocked_release`).
+    /// The pass: its `forge_call_stats` caller (`stale_blocked_release`).
     pub mechanism: String,
     /// `owner/repo`, or [`REPO_UNRESOLVED`].
     pub repo: String,
@@ -291,6 +291,9 @@ pub struct PassVerdictRecord {
 /// empty. Only what was knowable at `evaluated_at` is ever filled.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepFacts {
+    /// The step's sweep id (#12715), so a verdict joins to its session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
     /// The head the role evaluated, when the run recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
@@ -302,7 +305,7 @@ pub struct StepFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
     /// The closed reason set the projection's `reason` comes from
-    /// (`champion_merge_v1`, `champion_promotion_v1`).
+    /// (`champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_set: Option<String>,
     /// The outcome ledger's own classification of the step

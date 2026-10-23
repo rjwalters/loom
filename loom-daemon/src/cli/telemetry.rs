@@ -1,15 +1,13 @@
 //! Token-cost telemetry subcommands: what a fleet's agents actually spent.
 //!
 //! Members include `usage` (what the Anthropic OAuth API reports for the
-//! current credential, live), `usage-record` (Issue #9303: one in-session
-//! role attempt's usage, journalled into its story trace), `ingest-transcripts` (Issue #8059: persist
+//! current credential, live), `ingest-transcripts` (Issue #8059: persist
 //! what the local transcripts record into `activity.db`), `usage-report`
 //! (Issue #8062: the role/model/repo/day cost breakdown over the rows
 //! ingestion writes), `opencode-usage` (Issue #8507: the same question asked
 //! of OpenCode's own session store), and `archive-transcripts` (Issue #8494:
 //! a verified `.tar.zst` backstop for the *raw* transcripts, which
-//! ingestion's derived data does not cover), and `live-output-attend` (Issue
-//! #10116: live `session.output` for an agent an attended session started).
+//! ingestion's derived data does not cover).
 //!
 //! They are gathered into one **flattened** enum, exactly as
 //! [`super::script_ports`] is and for the same second reason: `main.rs` is over
@@ -26,12 +24,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::script_helpers;
+use crate::script_helpers;
 
 #[path = "curation_complete.rs"]
 mod curation_complete;
-#[path = "live_output_attend.rs"]
-mod live_output_attend;
 #[path = "record_rework.rs"]
 mod record_rework;
 #[path = "telemetry_export.rs"]
@@ -40,23 +36,15 @@ mod telemetry_export;
 mod telemetry_fixture;
 #[path = "telemetry_join.rs"]
 mod telemetry_join;
-#[path = "telemetry_journal_cli.rs"]
-mod telemetry_journal_cli;
 #[path = "telemetry_live.rs"]
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
 mod telemetry_overhead;
-#[path = "usage_record.rs"]
-mod usage_record;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
     /// Journal one Curator completion before applying curated labels.
     CurationComplete(curation_complete::CurationCompleteArgs),
-    /// J2 telemetry journal shadow streams (#11348): `append` one record
-    /// after a legacy write, `verify` the concern against the legacy stores.
-    #[command(name = "telemetry")]
-    TelemetryJournal(telemetry_journal_cli::TelemetryJournalArgs),
     /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
@@ -109,15 +97,6 @@ pub(crate) enum TelemetryCommand {
     /// `--status` flag, unchanged) so `check-usage.sh`'s contract is never at
     /// risk of a parse ambiguity — see `usage_report_cli`'s module doc.
     UsageReport(super::usage_report_cli::UsageReportArgs),
-
-    /// Journal one role attempt's token usage (per model, with a USD
-    /// estimate) into the issue's story trace (Issue #9303).
-    ///
-    /// For in-session sweeps, which never reach the daemon's terminal
-    /// transition: run after each checkpoint write with the role subagent's
-    /// `--agent-id`. `usage-record`, not `usage record`, so `usage` stays a
-    /// leaf. Always exits 0 — a telemetry failure never fails a sweep.
-    UsageRecord(usage_record::UsageRecordArgs),
 
     /// Mark one in-sweep **rework event** so the sweep's `sweep.outcome`
     /// carries it (Issue #9444).
@@ -177,16 +156,6 @@ pub(crate) enum TelemetryCommand {
 
     // Issue #8824 — help text lives on `CiTelemetryArgs` itself.
     CiTelemetry(super::ci_telemetry_cli::CiTelemetryArgs),
-
-    /// Publish live `session.output` for an agent started from an attended
-    /// Claude Code session (Issue #10116).
-    ///
-    /// Run from inside a subagent's own tool call with the issue it works on:
-    /// it finds that agent's transcript, detaches a tailer that publishes
-    /// through the configured OTLP exporter, and returns at once. `lease
-    /// ensure` already runs it at every claim step. Always exits 0; a no-op
-    /// unless `observability.liveOutput` and an OTLP exporter are configured.
-    LiveOutputAttend(live_output_attend::LiveOutputAttendArgs),
 }
 
 impl TelemetryCommand {
@@ -199,7 +168,6 @@ impl TelemetryCommand {
     pub(crate) async fn run(self) -> Result<()> {
         match self {
             TelemetryCommand::CurationComplete(args) => args.run(),
-            TelemetryCommand::TelemetryJournal(args) => args.run(),
             TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
@@ -218,14 +186,12 @@ impl TelemetryCommand {
             TelemetryCommand::Usage(args) => args.run(),
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),
-            TelemetryCommand::UsageRecord(args) => args.run(),
             TelemetryCommand::RecordRework(args) => args.run(),
             TelemetryCommand::OpencodeUsage(args) => args.run(),
             TelemetryCommand::CodexUsage(args) => args.run(),
             TelemetryCommand::PiUsage(args) => args.run(),
             TelemetryCommand::ArchiveTranscripts(args) => args.run(),
             TelemetryCommand::CiTelemetry(args) => args.run(),
-            TelemetryCommand::LiveOutputAttend(args) => args.run().await,
         }
     }
 }

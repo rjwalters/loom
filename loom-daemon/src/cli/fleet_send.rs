@@ -53,8 +53,8 @@
 //! is unchanged and, as before, runs BEFORE the socket is opened, so an
 //! invalid argument is never even a connection.
 
+use crate::safehouse::{build_send_request, Envelope};
 use anyhow::Result;
-use loom_daemon::safehouse::{build_send_request, Envelope};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

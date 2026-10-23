@@ -3,7 +3,7 @@
 //! The multi-workspace tick folds several independent per-root and
 //! daemon-global hold signals into one `halted: &[bool]`, so a
 //! `workspace_halted` row could previously say only "repo dispatch held
-//! (red main, gate, token pool, drain or breaker)" — never which one. This
+//! (red main, gate, token pool or drain)" — never which one. This
 //! seam module owns the named-cause counterpart: a small closed vocabulary
 //! plus the per-root fold that computes it. It lives in its own file for the
 //! same file-size-ratchet reason `tick_report.rs` and `pool_preflight.rs`
@@ -50,8 +50,6 @@ pub enum HaltCause {
     PreflightAdvisory,
     /// A daemon-global scheduled drain is in progress (#4090).
     Drain,
-    /// The host-distress breaker is suppressing dispatch globally.
-    Breaker,
     /// This installation may not write to the root's repository (#9548):
     /// `gh` resolves it to an `upstream` rather than origin, it is not
     /// managed here, or the credential lacks WRITE.
@@ -70,10 +68,6 @@ pub enum HaltCause {
     /// its Loom install current and never dispatches into it. An operator's
     /// choice; it clears only when the mark is lifted.
     MaintainOnly,
-    /// The repo's measured disk charge does not fit this host's free space
-    /// after the halt floor and the in-flight sweeps' expected growth
-    /// (#11191). Host-local; clears as sweeps finish or space is reclaimed.
-    DiskReservation,
     /// The root's draw weight is 0 (#11742): it is never drawn, so its ready
     /// issues wait. An operator's choice; clears when the weight is raised.
     WeightZero,
@@ -81,19 +75,17 @@ pub enum HaltCause {
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 11] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
         Self::PreflightAdvisory,
         Self::Drain,
-        Self::Breaker,
         Self::WriteScope,
         Self::CiBilling,
         Self::InstallIncompatible,
         Self::DaemonTooOld,
         Self::MaintainOnly,
-        Self::DiskReservation,
         Self::WeightZero,
     ];
 
@@ -119,13 +111,11 @@ impl HaltCause {
             Self::TokenPool => "token_pool",
             Self::PreflightAdvisory => "preflight_advisory",
             Self::Drain => "drain",
-            Self::Breaker => "breaker",
             Self::WriteScope => "write_scope",
             Self::CiBilling => "ci_billing",
             Self::InstallIncompatible => "install_incompatible",
             Self::DaemonTooOld => "daemon_too_old",
             Self::MaintainOnly => "maintain_only",
-            Self::DiskReservation => "disk_reservation",
             Self::WeightZero => "weight_zero",
         }
     }
@@ -140,13 +130,11 @@ impl HaltCause {
             Self::TokenPool => "token pool exhausted",
             Self::PreflightAdvisory => "pre-flight advisory tripped",
             Self::Drain => "scheduled drain",
-            Self::Breaker => "host-distress breaker",
             Self::WriteScope => "no write access to this repo",
             Self::CiBilling => "CI billing failure",
             Self::InstallIncompatible => "installed Loom incompatible",
             Self::DaemonTooOld => "daemon too old for installed Loom",
             Self::MaintainOnly => "maintain-only workspace",
-            Self::DiskReservation => "disk reservation does not fit",
             Self::WeightZero => "draw weight 0",
         }
     }
@@ -177,7 +165,7 @@ pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
 
 /// The per-root cause fold — the named-cause counterpart of
 /// [`super::dispatch_held_per_root_with_preflight`] plus the daemon-global
-/// `draining` / breaker terms the production loop OR's on top (#9017).
+/// `draining` term the production loop OR's on top (#9017).
 ///
 /// `preflight_causes` is parallel to `roots`, as computed by
 /// [`crate::work_finder::pool_preflight::preflight_held_causes_per_root`];
@@ -197,8 +185,6 @@ pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
 /// 4. `preflight_advisory` — per-root, and already probe-driven, so it is the
 ///    least urgent of the per-root holds.
 /// 5. `drain` — daemon-global operator intent.
-/// 6. `breaker` — daemon-global automatic suppression; the least specific
-///    cause names the least specific holds.
 ///
 /// `None` means the root is not held. `cause.is_some()` is byte-for-byte the
 /// bool fold's `true`, which is how the production loop derives its `halted`
@@ -211,7 +197,6 @@ pub fn causes_per_root(
     suppress_dispatch_during_gate: bool,
     preflight_causes: &[Option<HaltCause>],
     draining: bool,
-    breaker_suppressed: bool,
 ) -> Vec<Option<HaltCause>> {
     roots
         .iter()
@@ -226,54 +211,9 @@ pub fn causes_per_root(
             if let Some(cause) = preflight_causes.get(i).copied().flatten() {
                 return Some(cause);
             }
-            if draining {
-                return Some(HaltCause::Drain);
-            }
-            breaker_suppressed.then_some(HaltCause::Breaker)
+            draining.then_some(HaltCause::Drain)
         })
         .collect()
-}
-
-/// The single-workspace loop's cause (#11649): the [`causes_per_root`]
-/// precedence over the holds that loop folds, given as `(main_red,
-/// gate_pending, other_hold, breaker)`. `other_hold` is the breaker OR the
-/// root's token-pool hold, so with the breaker off it names the pool. `None`
-/// exactly when no hold is in force — the loop's `halted` bool.
-#[must_use]
-pub fn single_root(
-    root: &std::path::Path,
-    (main_red, gate_pending, other_hold, breaker): (bool, bool, bool, bool),
-) -> Option<HaltCause> {
-    if main_red {
-        Some(main_red_or_billing(root))
-    } else if gate_pending {
-        Some(HaltCause::GatePending)
-    } else if !other_hold {
-        None
-    } else if breaker {
-        Some(HaltCause::Breaker)
-    } else {
-        Some(HaltCause::TokenPool)
-    }
-}
-
-/// Fold the disk budget's holds (#11191) into the per-root causes: a root no
-/// other hold names, whose disk charge does not fit at the top of the tick,
-/// is held as [`HaltCause::DiskReservation`]. Lowest precedence, so a root
-/// that is red or pool-held still names that cause. No budget: unchanged.
-#[must_use]
-pub fn with_disk_holds(
-    mut causes: Vec<Option<HaltCause>>,
-    disk: Option<&crate::disk_admission::DiskBudget>,
-) -> Vec<Option<HaltCause>> {
-    if let Some(budget) = disk {
-        for (cause, held) in causes.iter_mut().zip(budget.held()) {
-            if cause.is_none() && held {
-                *cause = Some(HaltCause::DiskReservation);
-            }
-        }
-    }
-    causes
 }
 
 /// A halted root's cause: `ci_billing` when its repo owner's Actions jobs are

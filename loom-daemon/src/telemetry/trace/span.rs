@@ -114,6 +114,21 @@ pub enum SpanName {
     /// (`created` / `reused` / `closed` / `closed_duplicate`) and the issue.
     #[serde(rename = "main_red.autofile")]
     MainRedAutofile,
+    /// One fleet-dispatch call (#12449, spec #12452 §12): on the captain, one
+    /// per request it answered; `loom.fleet_dispatch.side` says which end.
+    /// Its own root trace.
+    #[serde(rename = "loom.fleet_dispatch.call")]
+    FleetDispatchCall,
+    /// One worktree-reaper pass over one repo and worktree class (Issue
+    /// #12461): an instant span, its own root, with the pass's scanned /
+    /// removed / failed / preserved counts, preserved by fixed reason, and the
+    /// bytes reclaimed. Never a path or the gate's free-text wording.
+    #[serde(rename = "reaper.pass")]
+    ReaperPass,
+    /// One EC2 spot interruption or rebalance notice (#12876): an instant
+    /// span, its own root, naming the kind, the host and the sweeps it ended.
+    #[serde(rename = "loom.host.interruption_notice")]
+    HostInterruptionNotice,
 }
 
 impl SpanName {
@@ -146,6 +161,9 @@ impl SpanName {
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",
             Self::MainRedAutofile => "main_red.autofile",
+            Self::FleetDispatchCall => "loom.fleet_dispatch.call",
+            Self::ReaperPass => "reaper.pass",
+            Self::HostInterruptionNotice => "loom.host.interruption_notice",
         }
     }
 }
@@ -207,9 +225,6 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 "loom.repo"
                     | "loom.repo.visibility"
                     | "loom.sweep_id"
-                    | "loom.story_id"
-                    | "loom.story"
-                    | "loom.story.key_version"
                     | "loom.issue"
                     | "loom.pr_number"
                     | "loom.base_sha"
@@ -240,6 +255,12 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.host.oom_kill_total"
                     | "loom.host.pressure"
                     | "loom.host.load_per_core"
+                    | "loom.host.logical_cpus"
+                    | "loom.host.loadavg_1m"
+                    | "loom.host.start.loadavg_1m"
+                    | "loom.host.start.load_per_core"
+                    | "loom.host.cpu_budget_cores"
+                    | "loom.host.sweeps_in_flight"
                     | "loom.admission.reason"
                     | "loom.admission.load_per_core"
                     | "loom.admission.load_threshold"
@@ -257,6 +278,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::observability::llm_billing::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::roll_interruption::KEYS.contains(&key.as_str())
+                || crate::host_loss::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_runtime::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_draw::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))

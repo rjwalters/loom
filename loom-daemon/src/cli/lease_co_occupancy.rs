@@ -54,8 +54,8 @@
 //! ## Why this is Rust and not a `lib/*.sh` helper
 //!
 //! The kicad-tools fix shipped as a new `lib/worktree-foreign-lease-guard.sh`.
-//! Upstream, `worktree.sh` is a `contract` shell-budget file whose portable
-//! pool may not grow, and a new `.sh` cannot be admitted to the shell allowlist
+//! Upstream, `worktree.sh` is a `contract` file whose portable
+//! shell should not grow, and a new `.sh` cannot be admitted to the shell allowlist
 //! as `contract` (`.loom/docs/shell-language-policy.md`). So the logic lives
 //! here and `worktree.sh` keeps a one-line reach into it, the same shape as
 //! `worktree-lock check-issue` (#8553) directly above it.
@@ -64,10 +64,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
+use crate::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use loom_daemon::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
-use loom_daemon::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 
 /// The first-line prefix of a `loom:lease-yield` standdown record (#6287).
 const YIELD_MARKER_PREFIX: &str = "<!-- loom:lease-yield host=";
@@ -165,7 +165,7 @@ pub(crate) fn read_rows(
     timeout: Duration,
     policy: &TrustPolicy,
 ) -> Option<Vec<LeaseRow>> {
-    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // Counted as `lease.co_occupancy_comments` (#10089). The facade supplies
     // the cross-owner `GH_CONFIG_DIR` from `repo` (#5401) and the `LOOM_REPO`
     // -> `GH_REPO` override, nulls stdin, and bounds the call by `timeout`.
@@ -175,7 +175,7 @@ pub(crate) fn read_rows(
         GhTarget::None,
         timeout,
     )
-    .forge_op(loom_daemon::forge_call_stats::ops::COMMENT_LIST)
+    .forge_op(crate::forge_call_stats::ops::COMMENT_LIST)
     .program(gh_bin)
     .arg("api")
     .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))

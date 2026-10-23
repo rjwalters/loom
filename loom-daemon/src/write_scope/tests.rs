@@ -402,6 +402,18 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
+            "claim_reconciliation/ci_gate_recovery.rs",
+            Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
+        ),
+        (
+            "claim_reconciliation/orphan_stack.rs",
+            Via(
+                PASS,
+                "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
+                 comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
@@ -414,6 +426,13 @@ fn daemon_write_paths_are_scoped() {
             Via(
                 "fleet_sync/workspace_resync/host.rs",
                 "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
+            ),
+        ),
+        (
+            "fleet_sync/workspace_resync/w2.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync PR of a workspace repo the pass vetted with repo_writable (#12572)",
             ),
         ),
         ("worktree_ops/gh.rs", Gated),
@@ -448,6 +467,10 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "the lease record of a dispatched sweep or step (moved from guards.rs, #11898)"),
         ),
         (
+            "sweep_registry/step_spawn/builder_rollback.rs",
+            Via(DISPATCH, "yields the lease + restores the label of a refused dispatched Builder step (#12822)"),
+        ),
+        (
             "sweep_registry/dispatch/claim_release.rs",
             Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
         ),
@@ -463,6 +486,14 @@ fn daemon_write_paths_are_scoped() {
         (
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
+        ),
+        (
+            "sweep_registry/step_cap_notice.rs",
+            Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
+        ),
+        (
+            "sweep_registry/step_outcome_notice.rs",
+            Via(DISPATCH, "noop/failed reason comment on an item whose Builder step was dispatched (#13054)"),
         ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
@@ -488,6 +519,13 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("forge_rerun.rs", Gated),
         (
+            "forge_create_issue.rs",
+            Via(
+                "cli/forge_action.rs",
+                "the `forge create-issue` verb is vetted via may_write_from before create()",
+            ),
+        ),
+        (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
         ),
@@ -500,8 +538,7 @@ fn daemon_write_paths_are_scoped() {
             Via(
                 "cli/forge_action.rs",
                 "enqueue/dequeue mutations (#10255) run only from `forge merge-queue \
-                 enqueue|dequeue`, vetted via write_target before dispatch; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 enqueue|dequeue`, vetted via write_target before dispatch; opt-in via champion.mergeMode=queue",
             ),
         ),
         (
@@ -516,8 +553,8 @@ fn daemon_write_paths_are_scoped() {
                  path's `revoke_for_root` run only from claim_reconciliation/pass_loop.rs \
                  after gate_root_with, and forge_disable_auto_merge.rs's call follows its \
                  shell-vetted guard. Both are no-ops (no forge call) in direct mode; an \
-                 unresolved mode/repo reports `NOT confirmed` rather than writing; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 unresolved mode/repo reports `NOT confirmed` rather than writing; opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         (
@@ -529,9 +566,13 @@ fn daemon_write_paths_are_scoped() {
                  whose callers are exactly the gh_lifecycle.rs ones above: `forge \
                  merge-queue revoke` (vetted via write_target) and `revoke_for_root` (behind \
                  gate_root_with / the shell-vetted disable-auto-merge guard). It returns \
-                 before any forge call in direct mode, refuses a non-sha target, and only \
-                 ever writes `failure` (withdraws authority); dormant behind \
-                 QUEUE_EXECUTION_ENABLED=false",
+                 before any forge call in direct mode, refuses a non-sha target, and writes \
+                 `failure` (withdraws authority) on revoke. The one `success` write (#12496) \
+                 is the PR-head status `authorize_and_enqueue` posts from `forge merge-queue \
+                 handoff` (vetted via write_target), only after the dormant/direct execution \
+                 gate and `evaluate` allowed it, pinned to the grant's approved sha, and rolled \
+                 back to `failure` if the enqueue does not follow; opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         ("cli/forge_action.rs", Gated),
@@ -571,10 +612,6 @@ fn daemon_write_paths_are_scoped() {
             OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
         ),
         (
-            "watchdog/peer_coord.rs",
-            NotAWrite("follow-up on the issue this watchdog filed"),
-        ),
-        (
             "forge_probe.rs",
             NotAWrite(
                 "the hosted-trial probe writes to the candidate instance's disposable \
@@ -587,6 +624,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("action names; writes go through dep_classify"),
         ),
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "stack_parent.rs",
+            NotAWrite("reads the forge and runs local git; only its test names git's `-X theirs`"),
+        ),
         (
             "gh_invocation/accounting.rs",
             NotAWrite("classifies an invocation's argv for call accounting, runs none"),
@@ -615,7 +656,6 @@ fn daemon_write_paths_are_scoped() {
             "gh_invocation/own_writes.rs",
             NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
         ),
-        ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         (
             "agent_gh/read_route.rs",
             NotAWrite(
@@ -641,6 +681,14 @@ fn daemon_write_paths_are_scoped() {
         (
             "observability/otlp/relay/server.rs",
             NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
+        (
+            "fleet_dispatch/server.rs",
+            NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
+        ),
+        (
+            "host_loss/imds.rs",
+            NotAWrite("IMDSv2 token `PUT` to the link-local metadata endpoint, not the forge"),
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

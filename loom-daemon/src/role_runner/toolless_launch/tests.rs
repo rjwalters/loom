@@ -77,31 +77,7 @@ fn write_executable(path: &Path, body: &str) {
 /// `LOOM_MODEL_PROFILE` picks the profile whose `excludedRoles` admission checks (#11400).
 const GUARDED_ENV: [&str; 3] = ["LOOM_RUNTIME", "LOOM_RUNTIME_JUDGE", "LOOM_MODEL_PROFILE"];
 
-struct EnvGuard(Vec<(&'static str, Option<String>)>);
-
-impl EnvGuard {
-    fn new() -> Self {
-        let prior = GUARDED_ENV
-            .iter()
-            .map(|key| (*key, std::env::var(key).ok()))
-            .collect();
-        for key in GUARDED_ENV {
-            std::env::remove_var(key);
-        }
-        Self(prior)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.0.drain(..) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 /// A workspace whose `judge` role is pinned to the `opencode` native runtime
 /// (which `judge.json`'s only requirement, `loomControl`, admits), with a
@@ -172,7 +148,7 @@ fn judge_runner(root: &Path) -> ScriptRoleInvocationRunner {
 #[test]
 #[serial]
 fn an_exit_zero_opencode_tick_with_no_loom_tool_use_is_a_failed_tick() {
-    let _env = EnvGuard::new();
+    let _env = EnvGuard::clear(&GUARDED_ENV);
     let workspace = tempfile::tempdir().unwrap();
     opencode_judge_workspace(workspace.path(), TOOLLESS_STREAM);
 
@@ -195,7 +171,7 @@ fn an_exit_zero_opencode_tick_with_no_loom_tool_use_is_a_failed_tick() {
 #[test]
 #[serial]
 fn the_same_tick_that_did_use_a_loom_tool_is_still_a_success() {
-    let _env = EnvGuard::new();
+    let _env = EnvGuard::clear(&GUARDED_ENV);
     let workspace = tempfile::tempdir().unwrap();
     opencode_judge_workspace(workspace.path(), TOOL_USING_STREAM);
 

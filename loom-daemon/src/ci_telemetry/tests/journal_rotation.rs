@@ -138,7 +138,10 @@ fn export_resumes_from_a_mid_file_cursor_without_reoffering() {
     assert_eq!(export::backfill(dir.path(), &first), 7);
     let cursor = export::load_cursor(dir.path());
     assert_eq!(cursor.exported, 7);
-    assert!(cursor.byte_offset > 0 && cursor.byte_offset < len(&journal_path(dir.path())));
+    // The priority lane (#12792) offers run/job lines first, so mid-file
+    // progress is carried by whichever cursor moved.
+    let progress = cursor.fast_offset.unwrap_or(cursor.byte_offset);
+    assert!(progress > 0 && progress < len(&journal_path(dir.path())));
     assert_eq!(export::pending_count(dir.path()), total - 7);
 
     // The next pass starts at the cursor: only the rest, each exactly once.
@@ -246,7 +249,8 @@ fn rotation_waits_until_every_line_is_exported() {
         export::load_cursor(dir.path()),
         ExportCursor {
             byte_offset: 0,
-            exported: total as u64
+            exported: total as u64,
+            ..Default::default()
         }
     );
 }
@@ -492,6 +496,7 @@ fn a_large_journal_opens_replays_and_exports_by_streaming() {
         serde_json::to_string(&ExportCursor {
             byte_offset: tail_start,
             exported: 0,
+            ..Default::default()
         })
         .unwrap(),
     )

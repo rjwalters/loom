@@ -32,9 +32,10 @@ use std::path::PathBuf;
 use super::classify::is_slug;
 
 /// How the front may run one passthrough: the gateway profile, then a reader
-/// App (#12245), then the session's credential (the writer). A read with
-/// neither is booked on the writer as `direct_read`, so every read that
-/// reaches the writer is counted.
+/// App (#12245). A read with a pool but no reader that answers is shed
+/// (#12394: the writer is never used for reads); only where no pool exists
+/// is it exec'd on the session's credential, booked on the writer as
+/// `direct_read` so it is counted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontRoute {
     /// The owner's gateway profile, tried first.
@@ -43,6 +44,17 @@ pub struct FrontRoute {
     pub reader: Option<PathBuf>,
     /// The call was classified as a read.
     pub read: bool,
+    /// The read's repo is certain, so a gateway or reader could serve it
+    /// (#12394). Such a read no gateway or reader answered is shed — never
+    /// exec'd on the session's credential, the writer. Unset where no reader
+    /// can be named (no pool on the host, a TTY, another forge, an unknown
+    /// repo): those stay on the session's credential and are booked as
+    /// `direct_read`.
+    pub pooled: bool,
+    /// The read's owner, lowercased, when its repo is certain: the shed
+    /// message says whether retrying can help (a reader pool none of whose
+    /// readers serves the owner never will).
+    pub owner: Option<String>,
 }
 
 /// The flags one read shape accepts: those taking a value, and the boolean
@@ -402,6 +414,9 @@ pub fn plan(
         gateway: gateway(&owner),
         reader: reader(&repo),
         read: true,
+        // The repo is certain, so a reader could have served it.
+        pooled: true,
+        owner: Some(owner),
     }
 }
 
@@ -434,8 +449,8 @@ pub fn pool_reader(repo: &str, resource: crate::forge_bucket_book::Resource) -> 
 
 /// Whether a reader's failed answer is the reader's own refusal — coverage
 /// (403/404, not accessible by integration), a refused token (401) or a
-/// rate limit — so the read goes on to the writer, as
-/// [`crate::forge_identity::reader_then_writer`] does for served reads.
+/// rate limit — so it is not taken as the answer: the read goes on to the
+/// next in line and is finally shed, never run on the writer (#12394).
 /// `http_status` is the response's status when `gh` printed headers; the
 /// stderr's `HTTP <nnn>` otherwise.
 #[must_use]
