@@ -1,9 +1,9 @@
 //! `loom-daemon forge version-only-diff <pr> <file>` (#9611) — the fail-closed
-//! decision behind Champion criterion #3's version-only carve-out (#6147).
+//! decision behind Champion's `critical-files` criterion's version-only carve-out (#6147).
 //!
 //! # What the question is
 //!
-//! Criterion #3 hard-fails any PR touching a critical file. The six
+//! The `critical-files` criterion hard-fails any PR touching a critical file. The six
 //! version-bearing files ([`ALLOWLIST`]) are rewritten with nothing but a
 //! version-string change on every version bump, so the carve-out exempts one of
 //! them when, and only when, every changed line in its diff is that format's

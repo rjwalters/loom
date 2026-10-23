@@ -110,11 +110,11 @@ echo "--- the hold is never waivable ---"
 tick_src=$(cat "$T/tick.sh")
 check 0 "$(grep -c 'standing_auth\|standingAuthorization\|auto-merge-ok' <<<"$tick_src" || true)" "the tick never consults a standing authorization or the auto-merge-ok override"
 check 1 "$(grep -c 'standing_auth_eval' "$HOLD_MD" | awk '$1>=1{print 1}')" "the prompt states standing_auth_eval is not consulted"
-check 1 "$(grep -c '### 3a. Ratification Hold' "$MERGE_MD")" "champion-pr-merge.md wires the hold in as 3a"
+check 1 "$(grep -c '### `ratification`: Ratification Hold' "$MERGE_MD")" "champion-pr-merge.md wires the hold in as ratification"
 check 1 "$(grep -c 'champion-ratification-hold.md' "$MERGE_MD" | awk '$1>=1{print 1}')" "champion-pr-merge.md points at the hold prompt"
-# Criteria #2/#3 run standing_auth_eval before 3a; 3a sits after #3 and before #4.
-a=$(grep -n '^### 3. Critical File' "$MERGE_MD" | cut -d: -f1); b=$(grep -n '^### 3a. Ratification' "$MERGE_MD" | cut -d: -f1); c=$(grep -n '^### 4. Merge Conflict' "$MERGE_MD" | cut -d: -f1)
-check yes "$([[ -n "$a" && "$a" -lt "$b" && "$b" -lt "$c" ]] && echo yes || echo no)" "3a sits between criteria #3 and #4"
+# merge-risk/critical-files run standing_auth_eval before ratification; it sits after critical-files and before mergeable.
+a=$(grep -n '^### `critical-files`: Critical File' "$MERGE_MD" | cut -d: -f1); b=$(grep -n '^### `ratification`: Ratification' "$MERGE_MD" | cut -d: -f1); c=$(grep -n '^### `mergeable`: Merge Conflict' "$MERGE_MD" | cut -d: -f1)
+check yes "$([[ -n "$a" && "$a" -lt "$b" && "$b" -lt "$c" ]] && echo yes || echo no)" "ratification sits between critical-files and mergeable"
 
 echo
 echo "$((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed"
