@@ -2831,8 +2831,17 @@ attribute).
 | `gate_until` | when the gate lifts, where it has a per-item end (a `cooling_down` window). |
 | `reeval_rung` / `reeval_next` | the Champion re-evaluation ladder rung and `next` from the item's body marker (`champion_merge` on a PR, `champion_promote` on an issue); absent without a marker. |
 | `iw` / `weight` | when pooled: the item weight (priority × age term) and its weight in the host-wide draw (`iw` scaled by its repo's terms). |
+| `claimed_since` | when this daemon first observed the item `claimed` (a role session is treating it), kept while it stays claimed. A **lower bound** on the claim start (a restart or a claim between ticks is first observed late), never the exact start. Absent when not claimed. Body only. |
+| `doctor_rejections` / `doctor_escalated` | Doctor PR rows (`step: doctor`): qualifying Judge rejections of GLM Doctor attempts and the GLM-to-Claude escalation latch, read locally from the sweep checkpoint's `doctor_escalation` state for **this PR** (`issue-<N>.json`, else `pr-<P>-doctor.json`; another PR's state never applies). Absent (unknown, not `0`/`false`) when no state was read. Body only. |
 | `transition` | `changed` or `refresh`. |
 | `sampled_at` | the emission instant (record time). |
+
+The Doctor's park state is already a row: `exclusion: blocked` is parked and
+`claimed` is treating. Total completed cycles stay on `sweep.outcome`
+(`loom.doctor_cycles`, completion-time); these as-of facts are what a
+prediction made earlier can join without that later total. The park *cause*
+is not exported here (it is free text in the issue body, which this
+no-forge-call record does not read).
 
 ### `eta.stage_occupancy` — items still waiting in a pre-ready stage
 
