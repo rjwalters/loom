@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-critical-file-hold-tick.sh - runs the SHIPPED criterion #3 hold tick
+# test-critical-file-hold-tick.sh - runs the SHIPPED critical-files criterion hold tick
 # (#10875).
 #
 # test-champion-critical-file-check.sh mirrors the tick in local functions, and
@@ -166,7 +166,7 @@ reset() { # <head>
 }
 tick() { # [FAIL|PASS] — sets WRITES (";"-joined) and OUT
     : >"$T/writes"
-    OUT=$(cd "$T/w" && env -u LOOM_DAEMON_BIN PATH="$T/bin:$PATH" CRITERION3_RESULT="${1:-FAIL}" bash "$T/tick.sh" 2>&1)
+    OUT=$(cd "$T/w" && env -u LOOM_DAEMON_BIN PATH="$T/bin:$PATH" CRITICAL_FILES_RESULT="${1:-FAIL}" bash "$T/tick.sh" 2>&1)
     WRITES=$(paste -sd';' "$T/writes")
 }
 label() { grep -qxF loom:blocked "$T/labels" && echo present || echo absent; }
@@ -292,6 +292,17 @@ tick PASS; check "" "$WRITES" "trust filter down + PASS: no clear, no label writ
 check "present" "$(label)" "loom:blocked kept while the trusted read fails"
 rm -f "$T/trust_down"
 tick PASS; check "LABEL-:loom:blocked;COMMENT:cleared" "$WRITES" "trust filter back: the clear lands"
+
+echo "--- #12999: the hold notice names the matched suspect line ---"
+reset "$A"
+CRITERION3_SUSPECT_LINE='+serde = "1"' CRITERION3_SUSPECT_SECTION=dependencies tick
+check "COMMENT:hold;LABEL+:loom:blocked" "$WRITES" "a suspect-line FAIL holds as before"
+check "1" "$(jq -r '[.[].body | select(contains("**Matched suspect line** (in `[dependencies]`): `+serde = \"1\"`"))] | length' "$T/comments.json")" \
+    "the hold comment shows the matched line and its section"
+reset "$A"
+tick
+check "0" "$(jq -r '[.[].body | select(contains("Matched suspect line"))] | length' "$T/comments.json")" \
+    "a plain pattern hit (no suspect line) carries no matched-line bullet"
 
 echo
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed, $TESTS_FAILED failed"

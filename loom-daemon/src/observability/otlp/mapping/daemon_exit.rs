@@ -39,6 +39,15 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
         attributes
             .push(kv_int("loom.daemon_exit.uptime_s", i64::try_from(uptime).unwrap_or(i64::MAX)));
     }
+    for (key, value) in [
+        ("loom.daemon_exit.request_id", &r.request_id),
+        ("loom.daemon_exit.request_verb", &r.request_verb),
+        ("loom.daemon_exit.caused_by_request_id", &r.caused_by_request_id),
+    ] {
+        if let Some(value) = value {
+            attributes.push(kv_string(key, value));
+        }
+    }
     Some(LogParts {
         event_name: "daemon.exit",
         severity: if r.requested_by == RequestedBy::Unknown {
@@ -76,6 +85,9 @@ mod tests {
             in_flight_sweeps: vec!["sweep-1".into(), "sweep-2".into()],
             in_flight_fate: InFlightFate::DieWithCgroup,
             uptime_s: Some(3600),
+            request_id: Some("rsr-1".into()),
+            request_verb: Some("drain".into()),
+            caused_by_request_id: Some("rsr-1".into()),
             observed_at: Utc.with_ymd_and_hms(2026, 10, 12, 8, 42, 26).unwrap(),
             loom: Provenance {
                 version: "0.19.1".into(),
@@ -109,9 +121,16 @@ mod tests {
         let mut r = record();
         r.signal = None;
         r.uptime_s = None;
+        r.request_id = None;
+        r.request_verb = None;
+        r.caused_by_request_id = None;
         let keys = keys(r);
         assert!(!keys.iter().any(|k| k == "loom.daemon_exit.signal"));
         assert!(!keys.iter().any(|k| k == "loom.daemon_exit.uptime_s"));
+        assert!(!keys.iter().any(|k| k == "loom.daemon_exit.request_id"));
+        assert!(!keys
+            .iter()
+            .any(|k| k == "loom.daemon_exit.caused_by_request_id"));
     }
 
     #[test]

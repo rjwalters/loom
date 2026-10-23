@@ -147,7 +147,6 @@ fn every_page_of_a_multi_page_check_runs_read_is_folded_in() {
     assert_eq!(runs.len(), 250);
     let unique: std::collections::BTreeSet<&str> = runs.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(unique.len(), 250, "no page dropped or double-counted");
-    assert_eq!(runs[7].actions_job_id, Some(7), "projection still parsed");
 }
 
 #[test]

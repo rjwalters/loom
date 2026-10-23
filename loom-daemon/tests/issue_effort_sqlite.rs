@@ -611,3 +611,8 @@ fn sf1_coverage_row_reports_the_attributable_share_without_dividing_by_zero() {
         assert_eq!(rows[0], expected, "window [{since}, {until})");
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -336,3 +336,8 @@ fn frozen_shell_and_rust_agree_byte_for_byte() {
         "corpus exercised `recheck #N` with fewer than two distinct N values: {resolved_ns:?}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -27,7 +27,7 @@ pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for the fetch of one branch.
 pub(super) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Starting bound for each local read.
-pub(super) const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for the fast-forward itself. Long on purpose, and never shortened by
 /// the startup budget: a `merge` killed halfway leaves a half-written working
 /// tree and a stale `index.lock`, which is exactly the damage this step must
@@ -49,7 +49,7 @@ pub(super) enum Refusal {
     Other(String),
 }
 
-pub(super) fn tracking(branch: &str) -> String {
+pub(crate) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
@@ -120,7 +120,7 @@ pub(super) fn stdout(out: &Output) -> String {
 }
 
 /// [`run`], requiring exit 0. Returns trimmed stdout.
-pub(super) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(crate) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let out = run(root, &[], args, timeout)?;
     if out.status.success() {
         Ok(stdout(&out))
@@ -160,7 +160,7 @@ pub(super) fn remote_head(root: &Path, branch: &str, timeout: Duration) -> Resul
 
 /// The commit the clone's `origin/<branch>` is at; `None` when it has never
 /// been fetched. Local.
-pub(super) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
+pub(crate) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
     let spec = format!("{}^{{commit}}", tracking(branch));
     ok(root, &["rev-parse", "--verify", "--quiet", &spec], timeout)
         .ok()

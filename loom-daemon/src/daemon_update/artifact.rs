@@ -22,6 +22,7 @@ use std::process::{Command, Stdio};
 
 use super::out;
 use super::util;
+use crate::release_resolve::host;
 
 /// The verified download, as the shell's `ARTIFACT_*` globals held it.
 pub struct FetchedArtifact {
@@ -49,71 +50,6 @@ pub struct Resolution {
     pub reason: String,
 }
 
-/// `detect_target_triple` — this host's release target triple, or `""` for a
-/// platform the release matrix does not build for (e.g. x86_64 macOS).
-#[must_use]
-pub fn detect_target_triple() -> String {
-    let os = util::uname_s();
-    let arch = util::uname_m();
-    match os.as_str() {
-        "Darwin" => match arch.as_str() {
-            "arm64" | "aarch64" => "aarch64-apple-darwin",
-            _ => "",
-        },
-        "Linux" => match arch.as_str() {
-            "aarch64" | "arm64" => "aarch64-unknown-linux-gnu",
-            "x86_64" | "amd64" => "x86_64-unknown-linux-gnu",
-            _ => "",
-        },
-        _ => "",
-    }
-    .to_string()
-}
-
-/// `resolve_gh_repo_slug` — `owner/repo` parsed from the `origin` remote, or
-/// `""`.
-///
-/// The three URL forms the shell recognised, and only those: an unrecognised
-/// form returns `""` so the caller reports the actionable
-/// "set LOOM_DAEMON_UPDATE_GH_REPO to override" rather than guessing.
-#[must_use]
-pub fn resolve_gh_repo_slug(repo_root: &Path) -> String {
-    let url = util::git(repo_root, &["remote", "get-url", "origin"]).unwrap_or_default();
-    parse_gh_repo_slug(&url)
-}
-
-/// The pure half of [`resolve_gh_repo_slug`]: the URL grammar, with the git
-/// call factored out.
-///
-/// Extracted so its test drives THIS function rather than a copy of it. A test
-/// that re-implements the parser it is testing asserts only that two
-/// transcriptions agree, which is exactly the shape
-/// `defaults/docs/verification-recipes.md` §6 warns about ("if the test needs
-/// its own copy of the parser, say which implementation it models") — and the
-/// cheapest way to not need one is to make the real function callable.
-#[must_use]
-fn parse_gh_repo_slug(url: &str) -> String {
-    if url.is_empty() {
-        return String::new();
-    }
-    let stripped = if let Some(rest) = url.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else {
-        return String::new();
-    };
-    // `s/\.git$//` — anchored at end, exactly once.
-    stripped
-        .strip_suffix(".git")
-        .unwrap_or(stripped)
-        .to_string()
-}
-
 /// `fetch_resolve_latest` — read-only resolution, no downloads.
 ///
 /// `pinned_tag` (#10709) resolves exactly that release instead of the newest
@@ -129,12 +65,11 @@ pub fn fetch_resolve_latest(repo_root: &Path, pinned_tag: Option<&str>) -> Resol
         reason: String::new(),
     };
 
-    r.target =
-        util::env_non_empty("LOOM_DAEMON_UPDATE_TARGET").unwrap_or_else(detect_target_triple);
+    r.target = util::env_non_empty("LOOM_DAEMON_UPDATE_TARGET")
+        .unwrap_or_else(|| host::target_triple().unwrap_or("").to_string());
     if r.target.is_empty() {
-        // The shell's fallback here is `?`, not `unknown` — a different
-        // string from `detect_target_triple`'s own, and it is the one that
-        // reaches the operator.
+        // The shell's fallback here is `?`, not `unknown`, and it is the one
+        // that reaches the operator.
         let os = uname_or_question("-s");
         let arch = uname_or_question("-m");
         r.reason =
@@ -148,7 +83,7 @@ pub fn fetch_resolve_latest(repo_root: &Path, pinned_tag: Option<&str>) -> Resol
     }
 
     r.repo_slug = util::env_non_empty("LOOM_DAEMON_UPDATE_GH_REPO")
-        .unwrap_or_else(|| resolve_gh_repo_slug(repo_root));
+        .unwrap_or_else(|| host::repo_slug(repo_root).unwrap_or_default());
     if r.repo_slug.is_empty() {
         r.reason = "could not resolve owner/repo from git remote 'origin' (set LOOM_DAEMON_UPDATE_GH_REPO to override)".to_string();
         return r;
@@ -253,6 +188,9 @@ fn gh_release_view(slug: &str, tag: Option<&str>, fields: &str, jq: &str) -> Opt
     let timeout = std::time::Duration::from_secs(60);
     let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, timeout)
         .forge_op(crate::forge_call_stats::ops::RELEASE_RESOLVE_AND_FETCH)
+        // Reader-only (#12394, #12584): the reader route names the repo the
+        // `release view -R` argv reads, which the facade does not derive.
+        .reader_repo(slug)
         .args(release_view_args(slug, tag, fields, jq))
         .run();
     let ran = outcome.ok_output()?;
@@ -305,6 +243,7 @@ pub fn fetch_and_verify_artifact(
 
     let inputs = FetchInputs {
         repo_root,
+        binary: crate::release_fetch::fetch::DAEMON_BIN,
         target,
         repo_slug,
         tag,
@@ -354,25 +293,6 @@ pub fn fetch_and_verify_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slug_parsing_covers_exactly_the_three_recognised_url_forms() {
-        // Drives the REAL parser (`parse_gh_repo_slug`), not a transcription
-        // of it: the git call is the only half factored out, and it is not
-        // what this asserts.
-        let cases = [
-            ("git@github.com:rjwalters/loom.git", "rjwalters/loom"),
-            ("git@github.com:rjwalters/loom", "rjwalters/loom"),
-            ("https://github.com/rjwalters/loom.git", "rjwalters/loom"),
-            ("http://github.com/rjwalters/loom", "rjwalters/loom"),
-            ("ssh://git@github.com/rjwalters/loom.git", "rjwalters/loom"),
-            ("https://gitea.example/rjwalters/loom.git", ""),
-            ("", ""),
-        ];
-        for (url, expected) in cases {
-            assert_eq!(parse_gh_repo_slug(url), expected, "{url}");
-        }
-    }
 
     /// A forge with one release per tag (the first entry is the newest),
     /// answering `view` exactly as `gh release view [<tag>]` would.

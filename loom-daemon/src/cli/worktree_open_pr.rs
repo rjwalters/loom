@@ -7,7 +7,7 @@
 //! `lib/worktree-forge-pr-check.sh`'s `_worktree_open_pr_for_branch` into its
 //! `_WT_OPEN_PR_*` globals — always exactly one `STATUS` record, plus
 //! `NUMBER`/`CROSS_REPO`/`HEAD_REPO`/`HEAD_REF`/`URL` when (and only when)
-//! `STATUS` is `found`. See [`loom_daemon::worktree_cli::open_pr`] for the
+//! `STATUS` is `found`. See [`crate::worktree_cli::open_pr`] for the
 //! four-way status contract.
 //!
 //! # Exit code
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::open_pr;
+use crate::worktree_cli::open_pr;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeOpenPrArgs {

@@ -72,19 +72,18 @@ fn dispatch_result_matches_the_canonical_tick_result_in_precedence_order() {
     // (case, report, billing_blocked, dispatch_result, legacy outcome)
     let cases: Vec<(&str, TickReport, bool, &str, &str)> = vec![
         (
-            "dispatched wins over a hold, saturation and errors",
+            "dispatched wins over a hold and errors",
             report(&[(1, Qd::Dispatched), (2, Qd::DispatchError)], |r| {
-                (r.halted, r.halt_causes, r.saturation_held, r.errors) =
-                    (true, vec![MainRed], true, 1);
+                (r.halted, r.halt_causes, r.errors) = (true, vec![MainRed], 1);
             }),
             false,
             "dispatched",
             "dispatched",
         ),
         (
-            "an attributed whole hold wins over saturation",
+            "an attributed whole hold wins over errors",
             report(&halted_rows, |r| {
-                (r.halted, r.halt_causes, r.saturation_held) = (true, vec![MainRed], true);
+                (r.halted, r.halt_causes, r.errors) = (true, vec![MainRed], 1);
             }),
             false,
             "halted_main_red",
@@ -107,22 +106,13 @@ fn dispatch_result_matches_the_canonical_tick_result_in_precedence_order() {
             "halted",
         ),
         (
-            "a partial hold falls through to saturation",
-            report(&[(1, Qd::WorkspaceHalted), (2, Qd::DeferredSaturation)], |r| {
-                (r.halted, r.halt_partial, r.halt_causes, r.saturation_held) =
-                    (true, true, vec![Drain], true);
+            "a partial hold falls through to the capacity deferral",
+            report(&[(1, Qd::WorkspaceHalted), (2, Qd::DeferredCapacity)], |r| {
+                (r.halted, r.halt_partial, r.halt_causes, r.deferred_capacity) =
+                    (true, true, vec![Drain], 1);
             }),
             false,
-            "saturation_held",
-            "none_dispatched",
-        ),
-        (
-            "saturation wins over errors",
-            report(&[(1, Qd::DispatchError)], |r| {
-                (r.saturation_held, r.errors) = (true, 1);
-            }),
-            false,
-            "saturation_held",
+            "capacity_full",
             "none_dispatched",
         ),
         (
@@ -149,13 +139,6 @@ fn dispatch_result_matches_the_canonical_tick_result_in_precedence_order() {
             report(&[(1, Qd::DeferredCapacity), (2, Qd::Parked)], |r| {
                 (r.deferred_capacity, r.skipped_labeled) = (1, 1);
             }),
-            false,
-            "capacity_full",
-            "none_dispatched",
-        ),
-        (
-            "ramp-cap deferral",
-            report(&[(1, Qd::DeferredRampCap)], |r| r.deferred_ramp_cap = 1),
             false,
             "capacity_full",
             "none_dispatched",

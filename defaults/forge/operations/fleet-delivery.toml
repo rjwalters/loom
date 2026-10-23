@@ -353,9 +353,6 @@ kind = "rust"
 path = "loom-daemon/src/fleet/add_worker.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/gh_repo_env.rs"
-[[operation.callers]]
-kind = "rust"
 path = "loom-daemon/src/forge_wait_checks/reads.rs"
 
 [[operation]]
@@ -738,6 +735,17 @@ path = "loom-daemon/src/release_fetch/fetch.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/install_compat_harness.rs"
+# The optional merge-queue group-check template (#12323) downloads the
+# loom-daemon release asset (and its .sha256) before running
+# `forge merge-queue group-check`.
+[[operation.callers]]
+kind = "workflow"
+path = "defaults/optional/github-workflows/merge-group-check.yml"
+# The daemon-free tools-only installer (#12940) resolves the latest release
+# and downloads the loom-tools-<triple> asset (and its .sha256).
+[[operation.callers]]
+kind = "installer"
+path = "scripts/install/provision-tools.sh"
 
 [[operation]]
 id = "release.publish"

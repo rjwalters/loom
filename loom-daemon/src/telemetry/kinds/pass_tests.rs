@@ -111,7 +111,6 @@ fn both_kinds_are_otlp_only_logs() {
     for tag in ["pass.summary", "pass.verdict"] {
         let row = TELEMETRY_KINDS.iter().find(|k| k.kind == tag).unwrap();
         assert_eq!(row.otlp, TelemetryKindOtlp::Logs);
-        assert!(!row.native_ingest);
         assert_eq!(row.schema_version, NEW_KIND_SCHEMA_VERSION);
     }
 }

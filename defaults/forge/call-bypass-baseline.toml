@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 80 file(s), 250 direct call site(s) at baseline.
+# 80 file(s), 253 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -68,18 +68,6 @@ owner = "role-scripts"
 removal_issue = 9799
 
 [[bypass]]
-path = "defaults/scripts/experiments/judge-fanout-corpus-runner.sh"
-calls = 3
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
-path = "defaults/scripts/experiments/judge-fanout-experiment.sh"
-calls = 1
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
 path = "defaults/scripts/guide-docs-telemetry.sh"
 calls = 1
 owner = "role-scripts"
@@ -105,7 +93,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/rebase-stacked-children.sh"
-calls = 3
+calls = 7
 owner = "role-scripts"
 removal_issue = 9799
 
@@ -320,15 +308,15 @@ owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/merge_pr/retarget_children.rs"
-calls = 3
+path = "loom-daemon/src/merge_pr/post_merge_bookkeeping.rs"
+calls = 4
 owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/observability/session_output/attended_caller.rs"
-calls = 1
-owner = "daemon-other"
+path = "loom-daemon/src/merge_pr/retarget_children.rs"
+calls = 3
+owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]

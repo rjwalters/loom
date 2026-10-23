@@ -1388,3 +1388,8 @@ fn the_frozen_cases_are_the_ones_the_generator_builds() {
         );
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

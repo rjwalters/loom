@@ -1222,21 +1222,6 @@ pub struct DaemonStatusReport {
     /// daemon binaries compatible (an absent field parses as `None`).
     #[serde(default)]
     pub token_pool_dir: Option<PathBuf>,
-    /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
-    /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
-    pub disk_headroom: usize,
-    /// Dynamic-cap input (#5270): how many worktrees the host's
-    /// currently-available RAM can hold at `LOOM_PER_WORKTREE_RAM_GB` each.
-    /// Via [`crate::ram_headroom::ram_headroom_limit`] — the second machine-
-    /// headroom axis alongside [`Self::disk_headroom`], added when the token
-    /// axis was removed from admission entirely (operator direction: "we
-    /// should only ever limit parallelism based on the machine
-    /// disk/RAM/CPU"). `#[serde(default)]` keeps pre-#5270 wire data / older
-    /// clients compatible (an absent field parses as `0`, i.e. "unknown" —
-    /// callers should treat a `0` from a stale client cautiously, the same
-    /// caution any dynamic-cap input warrants).
-    #[serde(default)]
-    pub ram_headroom: usize,
     /// The host's logical CPU count (#3978), via
     /// [`crate::cpu_headroom::logical_cpu_count`]. **Observational only since
     /// #4512** — the CPU headroom *term* it used to feed was removed from the
@@ -1304,18 +1289,15 @@ pub struct DaemonStatusReport {
     /// compatible (an absent field parses as `None`).
     #[serde(default)]
     pub preflight_advisory_changed_at: Option<DateTime<Utc>>,
-    /// Dynamic-cap input 3: **the** per-machine admission knob
-    /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
-    /// Since #4512 this is the only *policy* term in the cap — the other two
-    /// meter exhaustible resources (accounts, bytes) — so it is what an operator
-    /// tunes for a host, empirically, from the observed idle fraction above.
+    /// **The** per-machine admission knob (`autonomous.workFinder.maxConcurrent`
+    /// / `LOOM_WORK_FINDER_MAX_CONCURRENT`). Since #12406 it is the cap and
+    /// nothing else limits it, so it is what an operator tunes for a host,
+    /// empirically, from the host's observed load, RAM and disk.
     pub configured_max: usize,
-    /// The effective dynamic concurrency cap —
-    /// `min(disk_headroom, ram_headroom, configured_max)`
-    /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`
-    /// from #3978 was removed in #4512, and the token axis was removed
-    /// entirely in #5270 — see [`Self::ram_headroom`]). This is the
-    /// total-occupancy ceiling the work finder recomputes every tick.
+    /// The effective concurrency cap: equal to [`Self::configured_max`] since
+    /// #12406, which removed every automatic term (CPU #4512, tokens #5270,
+    /// RAM #12330, disk #12406; an older payload's `ram_headroom` and
+    /// `disk_headroom` are ignored). Kept under its old name for consumers.
     pub dynamic_cap: usize,
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new
@@ -1573,12 +1555,23 @@ pub struct DaemonStatusReport {
     /// not below the floor or is rolling. Absent from an older daemon.
     #[serde(default)]
     pub auto_update_floor_not_rolling: Option<crate::auto_update::not_rolling::FloorNotRolling>,
+    /// #12420: the host's update state (H0–H5, H7 or `unknown`) with the
+    /// versions, floor and target it was read from. Read-only; present whether
+    /// or not the update loop runs. Absent from an older daemon.
+    #[serde(default)]
+    pub host_update: Option<crate::auto_update::update_observation::HostUpdateObservation>,
     /// #11042: what `autonomous.autoUpdate.enabled` resolved to. Since #10954
     /// `auto_update_enabled` means "the loop runs", which a fleet host's loop
     /// does for the floor alone; this is the setting beside it. `None` before
     /// the spawn decision and from an older daemon.
     #[serde(default)]
     pub auto_update_config_enabled: Option<bool>,
+    /// #9736: the loop's progress clocks (last successful check, unapplied
+    /// release age, next attempt, blocking reason, thresholds), stamped with the
+    /// daemon's own running version. `None` when the loop has not ticked and
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_freshness: Option<crate::auto_update::freshness::FreshnessReport>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
@@ -1590,32 +1583,11 @@ pub struct DaemonStatusReport {
     /// pre-#10600 daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_containers: Option<crate::session_status::SessionContainersReport>,
-    /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
-    /// has been registered this process (the work-finder loop is running and the
-    /// breaker is enabled); `None` when no breaker is active — which the status
-    /// renderer treats as "breaker inactive", the zero-behavior-change baseline.
-    /// `#[serde(default)]` keeps pre-#4235 wire data / older clients compatible
-    /// (an absent field parses as `None`). Boxed (`clippy::large_enum_variant`):
-    /// `HostBreakerStatus` is the field that tips `Response::DaemonStatus` past
-    /// the second-largest variant, and the indirection is the cheapest fix (one
-    /// heap alloc on an already-rare, human-latency status round-trip).
-    #[serde(default)]
-    pub host_breaker: Option<Box<HostBreakerStatus>>,
-    /// Saturation admission-brake state (Issue #4903). `Some` once a brake has
-    /// been registered this process (the daemon registers one at startup
-    /// alongside the host breaker); `None` when none is active — which the
-    /// status renderer treats as "brake inactive", the zero-behavior-change
-    /// baseline. Answers the question `capacity_bound: false` could not: a host
-    /// that is refusing new work because it is already saturated now says so
-    /// instead of reading as idle. `#[serde(default)]` keeps pre-#4903 wire data
-    /// / older clients compatible (an absent field parses as `None`).
-    #[serde(default)]
-    pub admission_brake: Option<AdmissionBrakeStatus>,
     /// GitHub rate-limit circuit-breaker state (Issue #4429). `Some` once the
     /// breaker is registered at startup; `None` on older daemons.
     /// `#[serde(default)]` keeps pre-#4429 wire data / older clients compatible.
-    /// Boxed for the same `clippy::large_enum_variant` reason as
-    /// [`Self::host_breaker`].
+    /// Boxed (`clippy::large_enum_variant`): one heap alloc on an
+    /// already-rare, human-latency status round-trip.
     #[serde(default)]
     pub rate_limit_breaker: Option<Box<RateLimitBreakerStatus>>,
     /// Per-caller forge call accounting (Issue #9251): 200/304/limited/error
@@ -1852,27 +1824,13 @@ pub struct DaemonStatusReport {
     /// as warming up. `None` when the gate is unarmed or for an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_jitter_delay_secs: Option<u64>,
-    /// An observability-exporter host-identity mismatch detected this process
-    /// (Issue #4830): the ingest key installed on this host is bound to a
-    /// *different* `host_id` than the one this daemon reports for itself, so
-    /// every record it pushes is filed under the wrong host.
-    ///
-    /// `None` in the overwhelmingly common case — the ids agree, the exporter
-    /// is disabled/keyless, or no batch has been acked yet this process — and
-    /// for a pre-#4830 wire payload. Published by
-    /// [`crate::observability::HostIdStatus`] and read here via
-    /// [`crate::observability::global_host_id_mismatch`]. `#[serde(default)]`
-    /// keeps older wire data / older clients compatible.
-    #[serde(default)]
-    pub observability_host_id_mismatch: Option<ObservabilityHostIdMismatch>,
     /// **Positive** confirmation of whether telemetry is actually reaching the
     /// backend, and under which `host_id` (Issue #5083).
     ///
-    /// [`Self::observability_host_id_mismatch`] above is anomaly-only by
-    /// design (#4830), which left "exporting fine", "observability disabled",
-    /// and "configured but silently never exported" all rendering as the same
-    /// thing: nothing at all. This field is the counterpart that always has an
-    /// answer — see [`ObservabilityExportStatus`].
+    /// Without it "exporting fine", "observability disabled", and
+    /// "configured but silently never exported" all render as the same thing:
+    /// nothing at all. This field always has an answer — see
+    /// [`ObservabilityExportStatus`].
     ///
     /// With the multi-exporter fan-out (#8756) this is the **first configured
     /// exporter's** cell — byte-identical to the pre-fan-out status for every
@@ -1901,16 +1859,6 @@ pub struct DaemonStatusReport {
     /// pre-#11353 daemon; never read as `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
-    /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
-    /// daemon is polling its operator-provisioned per-host event feed, under
-    /// which `host_id`, how far its cursor has advanced, and — when it is not
-    /// advancing — which class of failure is responsible.
-    ///
-    /// `None` **only** from a pre-ADR-0021 daemon binary that never computed
-    /// one. A daemon of this vintage with no `forgeEvents` block reports
-    /// `Some(ForgeEventsStatus::disabled())`, so silence is never the answer.
-    #[serde(default)]
-    pub forge_events: Option<ForgeEventsStatus>,
     /// The daemon-wide peer-claim view + transport counters (Issue #5921):
     /// which issues THIS host currently sees claimed, by which host and with
     /// what remaining TTL, plus how many claims have been advertised /
@@ -2009,33 +1957,29 @@ pub struct DeepCleanRepoStatus {
     /// What that firing pass reclaimed, e.g. `"target/ (34.1G)"` or
     /// `"nothing"`.
     pub last_reclaimed: Option<String>,
+    /// What `clean.keepBuildArtifacts` left in place on that pass, e.g.
+    /// `"node_modules/ (1.2G)"` (#12694). `None` when nothing was kept.
+    #[serde(default)]
+    pub last_kept: Option<String>,
 }
 
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
-};
-
-mod forge_events;
-pub use forge_events::{
-    ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus, PollGatingStatus,
-    PollGatingWorkspace,
+    ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};
 mod dispatch_plan;
 pub use dispatch_plan::{
-    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, PlanStep, RepoCapView,
-    RowPlan, PLAN_SCOPE,
+    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, PlanStep, RowPlan,
+    PLAN_SCOPE,
 };
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 pub(crate) mod work_finder_tick;
-pub use work_finder_tick::{
-    CapLimiter, CapView, CapacityWait, RepoLimitView, WorkFinderTickSummary,
-};
+pub use work_finder_tick::{CapView, CapacityWait, WorkFinderTickSummary};
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
 ///
@@ -2298,93 +2242,6 @@ pub struct PeerClaimEntryStatus {
     /// How long this entry has left before it expires from THIS daemon's
     /// view. `0` reads as "expired, not yet pruned" rather than absent.
     pub remaining_ttl_secs: u64,
-}
-
-/// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue
-/// #4235). Rendered from [`crate::host_breaker::BreakerSnapshot`]. The
-/// `daemon.host_breaker.state` event carries the same transition data on every
-/// phase change; this is the point-in-time status view.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HostBreakerStatus {
-    /// Whether the breaker is enabled (default ON — a safety backstop).
-    pub enabled: bool,
-    /// The current phase: `"closed"`, `"open"`, or `"cooldown"`.
-    pub phase: String,
-    /// Whether the breaker is currently suppressing new dispatch (Open or
-    /// CoolDown).
-    pub suppressed: bool,
-    /// Human-readable reason for the current non-Closed state; `None` while
-    /// Closed.
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// When the breaker last tripped to Open; `None` while Closed.
-    #[serde(default)]
-    pub tripped_at: Option<DateTime<Utc>>,
-    /// When the current cool-down completes and normal dispatch resumes; `None`
-    /// outside CoolDown.
-    #[serde(default)]
-    pub releases_at: Option<DateTime<Utc>>,
-    /// The most recent load-per-core sample observed; `None` when no
-    /// load-average source is available.
-    #[serde(default)]
-    pub last_load_per_core: Option<f64>,
-    /// The configured load-per-core trip threshold.
-    pub load_per_core_threshold: f64,
-    /// The configured number of consecutive over-threshold ticks needed to trip.
-    pub sustain_ticks: u32,
-    /// The configured cool-down window, in seconds.
-    pub cooldown_secs: u64,
-}
-
-/// Saturation admission-brake snapshot for `loom-daemon status` (Issue #4903).
-/// Rendered from [`crate::admission_brake::BrakeSnapshot`].
-///
-/// Distinct from [`HostBreakerStatus`] on purpose: the brake is the
-/// **point-in-time** guard that holds new admissions while the host is already
-/// saturated and releases the moment it recovers, whereas the breaker is the
-/// stateful trip that remembers sustained distress across a cool-down. A host
-/// holding admissions must *say so* — before this field, a worker at 12×
-/// overcommit reported `capacity_bound: false` and read as idle.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct AdmissionBrakeStatus {
-    /// Whether the brake is enabled (default ON — a safety backstop).
-    pub enabled: bool,
-    /// Whether **new** sweep admissions are currently held. In-flight sweeps are
-    /// never affected by this flag: the brake has no path to running work.
-    pub held: bool,
-    /// The most recent load-per-core sample observed; `None` when no
-    /// load-average source is available (which fails safe to *not* holding).
-    #[serde(default)]
-    pub load_per_core: Option<f64>,
-    /// The configured load-per-core hold threshold.
-    pub load_per_core_threshold: f64,
-    /// When the current hold streak began; `None` while not holding.
-    #[serde(default)]
-    pub held_since: Option<DateTime<Utc>>,
-    /// How many consecutive ticks the current streak has held; `0` when not
-    /// holding.
-    #[serde(default)]
-    pub held_ticks: u32,
-    /// When the current **starvation** streak began — held with **zero**
-    /// sweeps in flight, continuously, since this timestamp (Issue #5715).
-    /// `None` when not currently starving, including whenever sweeps are
-    /// genuinely in flight (healthy backpressure never starves, however long
-    /// it holds). `#[serde(default)]` keeps a pre-#5715 wire payload
-    /// compatible.
-    #[serde(default)]
-    pub starving_since: Option<DateTime<Utc>>,
-    /// How many consecutive ticks the current starvation streak has held;
-    /// `0` when not starving. `#[serde(default)]` keeps a pre-#5715 wire
-    /// payload compatible.
-    #[serde(default)]
-    pub starving_ticks: u32,
-    /// Cumulative starvation-escape-hatch grants this daemon process's
-    /// lifetime (Issue #5715) — `0` on a healthy host forever; any nonzero
-    /// count means the brake has had to force at least one admission through
-    /// despite the host still reading saturated. `#[serde(default)]` keeps a
-    /// pre-#5715 wire payload compatible.
-    #[serde(default)]
-    pub escape_hatch_grants: u32,
 }
 
 /// GitHub rate-limit circuit-breaker snapshot for `loom-daemon status` (Issue
@@ -3107,8 +2964,8 @@ pub struct CapacityReport {
     pub exhausted_accounts: usize,
     /// The health-adjusted token-axis limit: `healthy_accounts` when a ranking
     /// exists, else the raw token-pool size. The token axis no longer feeds the
-    /// dynamic concurrency cap (`min(disk headroom, ram headroom,
-    /// configured_max)`, removed in #5270) — this field is informational only,
+    /// concurrency cap (removed from it in #5270; the cap is the configured
+    /// `maxConcurrent` since #12406) — this field is informational only,
     /// reported here because it still drives spawn-time account *selection*
     /// (prefer healthier accounts) elsewhere in the daemon.
     pub token_axis_limit: usize,

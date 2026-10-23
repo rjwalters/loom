@@ -212,3 +212,8 @@ fn the_rust_predicate_agrees_with_the_shell_on_every_case() {
         "corpus lost its discriminating power: {yes} matches, {no} non-matches"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

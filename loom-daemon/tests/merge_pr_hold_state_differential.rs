@@ -317,3 +317,8 @@ fn a_recorded_head_equal_to_the_current_head_is_never_a_warning() {
         );
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

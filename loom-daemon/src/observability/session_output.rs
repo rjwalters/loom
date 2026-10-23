@@ -30,9 +30,8 @@
 //!   endpoint, never constructs an exporter, and never adds one to the
 //!   configured list — no OTLP exporter configured means
 //!   [`register_sink`] registers nothing and every emit is a no-op.
-//! - `session.output` is declared `native: false`, so even on a host whose
-//!   configured sink *is* the managed HTTPS backend, no session text is
-//!   offered to it.
+//! - `session.output` is an OTLP-only kind (`otlp: Logs`); the managed HTTPS
+//!   backend it never reached has since been removed (#12813).
 //!
 //! # Latency budget
 //!
@@ -45,7 +44,6 @@
 //! 5 s, leaving ~3 s for the gateway, the backend and a consumer's polling
 //! cache. See `defaults/docs/session-output.md`.
 
-pub mod attended;
 pub mod claude;
 pub mod latency;
 
@@ -252,20 +250,6 @@ enum Source {
     /// workspace's project directory ([`claude::discover`]), with identity
     /// filled in from each transcript on first sight.
     Discover,
-    /// An attended run (#10116): the one transcript the attending agent
-    /// writes, located once when the tailer started. Its identity is complete
-    /// at open time and is never re-derived from the transcript, whose `cwd`
-    /// is the operator session's directory and can name a different repo.
-    ///
-    /// The run owns only a segment of that transcript: from its claim line
-    /// (`from`, a byte offset) up to `until`, the end of the lines the tailer
-    /// has checked for the agent's next task. Nothing outside it is read.
-    Fixed {
-        stream_id: String,
-        path: PathBuf,
-        from: u64,
-        until: u64,
-    },
 }
 
 /// One tracked in-flight run.
@@ -424,20 +408,6 @@ impl Tracker {
             Run::new(identity, PathBuf::from(workspace_root), Source::Discover, status_stream, now);
         self.runs.insert(key.clone(), run);
         self.runs.get_mut(&key)
-    }
-
-    /// Track an already-built run under `(workspace_root, issue)` — the
-    /// attended tailer's way in, which opens exactly one run per process and
-    /// so needs neither the attempt counter nor the run ceiling.
-    fn insert(&mut self, workspace_root: &str, issue: u32, run: Run) -> &mut Run {
-        use std::collections::hash_map::Entry;
-        match self.runs.entry((workspace_root.to_string(), issue)) {
-            Entry::Occupied(mut slot) => {
-                slot.insert(run);
-                slot.into_mut()
-            }
-            Entry::Vacant(slot) => slot.insert(run),
-        }
     }
 
     fn close(&mut self, workspace_root: &str, issue: u32) -> Option<Run> {
@@ -614,12 +584,8 @@ async fn tick(
             // never read, and it never heartbeats as if it were live.
             continue;
         }
-        let projects_dir = match (&run.source, projects.as_deref()) {
-            (_, Some(dir)) => dir,
-            // A fixed source names its own transcript and needs no projects
-            // directory to discover it from.
-            (Source::Fixed { .. }, None) => Path::new(""),
-            (Source::Discover, None) => continue,
+        let Some(projects_dir) = projects.as_deref() else {
+            continue;
         };
         records.extend(advance_run(run, projects_dir, now));
         if now
@@ -652,10 +618,6 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
     let mut out = Vec::new();
     let streams = match &run.source {
         Source::Discover => claude::discover(projects_dir, &run.workspace_root, issue),
-        Source::Fixed {
-            stream_id, path, ..
-        } if path.is_file() => vec![(stream_id.clone(), path.clone())],
-        Source::Fixed { .. } => Vec::new(),
     };
     if !streams.is_empty() {
         // A source was located: coverage is `live` from here on, even across
@@ -690,22 +652,15 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
                     run.identity.session_kind = context.session_kind;
                 }
             }
-            let cursor = match &run.source {
-                Source::Fixed { from, .. } => claude::Cursor::starting_at(*from),
-                Source::Discover => claude::Cursor::default(),
-            };
+            let cursor = claude::Cursor::default();
             run.cursors.insert(stream_id.clone(), (path, cursor));
         }
         let identity = run.identity.clone();
-        let limit = match &run.source {
-            Source::Fixed { until, .. } => Some(*until),
-            Source::Discover => None,
-        };
         let Some((path, cursor)) = run.cursors.get_mut(&stream_id) else {
             continue;
         };
         let path = path.clone();
-        let pass = cursor.advance_within(&path, &stream_id, &identity, now, limit);
+        let pass = cursor.advance(&path, &stream_id, &identity, now);
         if let Some((reason, dropped)) = pass.gap {
             run.dropped_events = run.dropped_events.saturating_add(dropped);
             let record = run
@@ -735,6 +690,32 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
         }
     }
     out
+}
+
+/// Per-test scratch directory shared by the `session_output` test modules;
+/// removed on drop. `tag` is only a readable prefix, uniqueness comes from
+/// `tempfile`.
+#[cfg(test)]
+pub(crate) struct Scratch(tempfile::TempDir);
+
+#[cfg(test)]
+impl Scratch {
+    pub(crate) fn new(tag: &str) -> Self {
+        Scratch(
+            tempfile::Builder::new()
+                .prefix(&format!("loom-session-output-{tag}-"))
+                .tempdir()
+                .unwrap(),
+        )
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        self.0.path()
+    }
+
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
+        self.0.path().join(name)
+    }
 }
 
 #[cfg(test)]

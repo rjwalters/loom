@@ -102,6 +102,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::wip::{git_status_code, git_stdout_nl as git_stdout};
+
 use crate::worktree_ops::safety::{self, CwdProbe};
 
 /// What to reset, and what to call the rescue patch if one is needed.
@@ -254,42 +256,6 @@ fn has_live_process(worktree: &Path, ignore_pids: &[u32]) -> bool {
             false
         }
     }
-}
-
-/// `$(git -C "$wt" … 2>/dev/null)` — trimmed stdout on success, `None` when git
-/// exits non-zero or could not run, so the caller can apply the shell's own
-/// `|| default`.
-fn git_stdout(worktree: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    // Command substitution strips trailing newlines; nothing else.
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .trim_end_matches(['\n', '\r'])
-            .to_string(),
-    )
-}
-
-/// The exit code of `git -C "$wt" … >/dev/null 2>&1`. A git that cannot be
-/// spawned answers 127, which is what bash reports for the same failure — and
-/// is >1, so both call sites read it as an error rather than as data.
-fn git_status_code(worktree: &Path, args: &[&str]) -> i32 {
-    Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_or(127, |s| s.code().unwrap_or(127))
 }
 
 /// `date -u +%Y%m%dT%H%M%SZ`, the rescue patch's timestamp.

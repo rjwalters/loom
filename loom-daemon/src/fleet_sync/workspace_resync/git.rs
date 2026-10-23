@@ -312,6 +312,12 @@ pub(super) fn resync_message(host: &str, version: &str) -> String {
     )
 }
 
+/// The branch a resync proposes itself on when the default branch refuses a
+/// direct push (#12572). One per version, so a retry finds its own PR.
+pub(super) fn resync_branch(version: &str) -> String {
+    format!("chore/loom-resync-v{version}")
+}
+
 /// The daemon resync commits among the last [`HISTORY_DEPTH`] commits reachable
 /// from `commit`, newest first. Local: the history is already in the clone.
 pub(super) fn past_resyncs(root: &Path, commit: &str) -> Result<Vec<PastResync>> {
@@ -366,24 +372,104 @@ pub(super) fn metadata_at(root: &Path, commit: &str) -> Result<Option<String>> {
 /// payload can be diffed against the default branch without a checkout. The
 /// pathspecs are the resync's own surface table (#10895); `git archive` fails
 /// on one the tree lacks, so each is checked first.
+///
+/// A surface behind a symlinked directory (#11426, miniset's
+/// `.claude/commands -> ../.agents/commands`) is not reachable by its own
+/// path in git, so the link itself is exported, and with it the in-repo
+/// path it resolves to. The export then holds what a resync of a checkout
+/// would see: the resync follows the link to the real files, or reports a
+/// link that leaves the repo.
 pub(super) fn export_surfaces(root: &Path, commit: &str, dest: &Path) -> Result<()> {
-    let mut args = vec!["archive", "--format=tar", commit, "--"];
-    for surface in crate::init::payload::surfaces::export_pathspecs() {
-        let spec = format!("{commit}:{surface}");
-        if run(root, root, &["cat-file", "-e", &spec], QUICK)?
+    let exists = |path: &str| -> Result<bool> {
+        let spec = format!("{commit}:{path}");
+        Ok(run(root, root, &["cat-file", "-e", &spec], QUICK)?
             .status
-            .success()
-        {
-            args.push(surface);
+            .success())
+    };
+    let mut specs: Vec<String> = Vec::new();
+    // Link targets in the repo: git keeps no empty directory, so one whose
+    // surface has no files yet is created after the unpack, where the
+    // checkout would have it, and the link does not read as dangling.
+    let mut target_dirs: Vec<String> = Vec::new();
+    for surface in crate::init::payload::surfaces::export_pathspecs() {
+        if exists(surface)? {
+            specs.push(surface.to_string());
+            continue;
+        }
+        if let Some(LinkedSurface { link, target }) = linked_surface(root, commit, surface)? {
+            specs.push(link);
+            if let Some((dir, real)) = target {
+                if exists(&real)? {
+                    specs.push(real);
+                }
+                if exists(&dir)? {
+                    target_dirs.push(dir);
+                }
+            }
         }
     }
+    specs.sort();
+    specs.dedup();
+    let mut args = vec!["archive", "--format=tar", commit, "--"];
+    args.extend(specs.iter().map(String::as_str));
     let out = run(root, root, &args, HEAVY)?;
     if !out.status.success() {
         bail!("git archive {commit} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     tar::Archive::new(out.stdout.as_slice())
         .unpack(dest)
-        .with_context(|| format!("unpacking the default-branch tree into {}", dest.display()))
+        .with_context(|| format!("unpacking the default-branch tree into {}", dest.display()))?;
+    for dir in target_dirs {
+        std::fs::create_dir_all(dest.join(&dir))
+            .with_context(|| format!("creating {dir} in {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// A surface reached through a directory `commit` records as a symlink.
+struct LinkedSurface {
+    /// The symlinked directory.
+    link: String,
+    /// The in-repo directory it points to and the surface's path through
+    /// it; `None` when the link leaves the repo or is absolute.
+    target: Option<(String, String)>,
+}
+
+/// The shallowest directory above `surface` that `commit` records as a
+/// symlink, with the in-repo directory it points to and the path the surface
+/// resolves to through it (`None` when the link leaves the repo or is
+/// absolute). `None` overall when no directory above it is a symlink.
+fn linked_surface(root: &Path, commit: &str, surface: &str) -> Result<Option<LinkedSurface>> {
+    let mut ancestors: Vec<&Path> = Path::new(surface)
+        .ancestors()
+        .skip(1)
+        .filter(|a| !a.as_os_str().is_empty())
+        .collect();
+    ancestors.reverse();
+    for dir in ancestors {
+        let dir = dir.to_string_lossy();
+        let out = run(root, root, &["ls-tree", commit, "--", &dir], QUICK)?;
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let Some(line) = listing.lines().next() else {
+            return Ok(None);
+        };
+        if !line.starts_with("120000 ") {
+            continue;
+        }
+        let spec = format!("{commit}:{dir}");
+        let target = run(root, root, &["cat-file", "-p", &spec], QUICK)?;
+        let target = String::from_utf8_lossy(&target.stdout)
+            .trim_end()
+            .to_string();
+        let rest = surface.strip_prefix(dir.as_ref()).unwrap_or_default();
+        let target = crate::init::payload::linked_roots::resolve_relative(&dir, &target)
+            .map(|real| (real.clone(), format!("{real}{rest}")));
+        return Ok(Some(LinkedSurface {
+            link: dir.into_owned(),
+            target,
+        }));
+    }
+    Ok(None)
 }
 
 /// The subset of `paths` the workspace's ignore rules exclude. A file the

@@ -57,6 +57,12 @@ rustflags = [
     # Warn (not deny) on dead code so it surfaces locally without aborting
     # iterative builds. CI's `-D warnings` denies it — see the note above.
     "-W", "dead_code",
+
+    # #12079: tokio's `Handle::dump()` (SIGUSR1 task dump for a hung daemon
+    # tick) needs this cfg plus tokio's `taskdump` feature
+    # (loom-daemon/Cargo.toml). CI's per-triple RUSTFLAGS env is joined with
+    # this list, not a replacement, so it needs no repeat.
+    "--cfg", "tokio_unstable",
 ]
 
 [target.aarch64-apple-darwin]
@@ -74,7 +80,7 @@ runner = ".cargo/macos-test-runner.sh"
 LOOM_FORGE_CALL_STATS_DIR = { value = "", force = true }
 # #9720: `config_resolver::private_defaults_path()` returns None only under
 # `cfg(test)`, and the bin target compiles the lib without it, so bin-target
-# tests (fleet_captain_cmd, attend_hook) read the host's machine-tier
+# tests (fleet_captain_cmd) read the host's machine-tier
 # `~/.local/share/loom/config/defaults.json` and fail on a host whose file
 # names a captain. Empty disables that tier; a test that wants a defaults file
 # sets its own via set_var, which overrides this. `force = true` also applies

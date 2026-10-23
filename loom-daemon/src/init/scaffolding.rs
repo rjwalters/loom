@@ -28,35 +28,11 @@ pub const INTERNAL_SKIP_LIST_NAME: &str = ".loom-internal.list";
 /// Hooks are written with `${CLAUDE_PROJECT_DIR}/` prefix so that Claude Code
 /// expands them at hook-invocation time to the project root, ensuring the
 /// commands resolve regardless of the agent's current working directory.
-#[allow(dead_code)]
 pub const LOOM_HOOK_PREFIX: &str = "${CLAUDE_PROJECT_DIR}/.loom/hooks/";
 
 /// Legacy prefix for hooks installed before the `${CLAUDE_PROJECT_DIR}` migration.
 /// Used during merge/remove operations to detect and migrate stale entries.
-#[allow(dead_code)]
 pub const LEGACY_LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
-
-/// Substring marker identifying Loom's **machine-level** hook command form
-/// (Epic #3835 Phase 5, #4262). Where [`LOOM_HOOK_PREFIX`] and
-/// [`LEGACY_LOOM_HOOK_PREFIX`] are project-relative paths that start the
-/// command, the machine-level form is a `bash -c '...'` wrapper (provisioned
-/// into the *user-scope* `~/.claude/settings.json` by
-/// `scripts/install/provision-hooks.sh`, not written by this scaffolding
-/// module) that resolves and execs a hook script from the shared machine
-/// checkout, e.g.:
-///
-/// ```text
-/// bash -c 'R=$(...) || exit 0; ...; H="${LOOM_HOME:-$HOME/.local/share/loom}/defaults/hooks/guard-destructive.sh"; [ -x "$H" ] && exec "$H" || exit 0'
-/// ```
-///
-/// The interesting path segment (`/defaults/hooks/`) appears mid-string, not
-/// at the start, so recognition uses substring containment rather than
-/// `starts_with`. Project-level `.claude/settings.json` never contains this
-/// form today (it is user-scope only), but [`is_loom_hook_command`] still
-/// recognizes it so a future merge/removal pass over project-level settings
-/// (or a hand-copied entry) is not silently treated as a foreign hook.
-#[allow(dead_code)]
-pub const MACHINE_HOOK_MARKER: &str = "/defaults/hooks/";
 
 /// Normalize a hook command string for semantic-duplicate comparison.
 ///
@@ -72,7 +48,6 @@ pub const MACHINE_HOOK_MARKER: &str = "/defaults/hooks/";
 /// before comparing treats them as the same hook without discarding either
 /// side's original on-disk formatting -- this function is for comparison
 /// only, never for rewriting a stored `command` value.
-#[allow(dead_code)]
 fn normalize_hook_command(cmd: &str) -> String {
     cmd.chars()
         .filter(|c| *c != '"' && *c != '\'')
@@ -80,19 +55,6 @@ fn normalize_hook_command(cmd: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Returns true if a command string belongs to Loom (matches new or legacy prefix).
-///
-/// The command is normalized (see [`normalize_hook_command`]) before the
-/// prefix check so quoted-form entries (e.g. a path wrapped in `"..."` to
-/// survive spaces) are still recognized as Loom-owned.
-#[allow(dead_code)]
-fn is_loom_hook_command(cmd: &str) -> bool {
-    let normalized = normalize_hook_command(cmd);
-    normalized.starts_with(LOOM_HOOK_PREFIX)
-        || normalized.starts_with(LEGACY_LOOM_HOOK_PREFIX)
-        || normalized.contains(MACHINE_HOOK_MARKER)
 }
 
 /// Loom section markers for CLAUDE.md content preservation
@@ -815,108 +777,6 @@ fn merge_permissions(
     }
 
     result
-}
-
-/// Remove Loom-owned hooks from a settings.json value.
-///
-/// Loom hooks are identified by command paths starting with either the new
-/// `${CLAUDE_PROJECT_DIR}/.loom/hooks/` prefix or the legacy `.loom/hooks/`
-/// prefix (pre-3265 installs). Both are stripped so uninstall is clean for
-/// users on any prior version.
-///
-/// After removal, empty matcher entries and empty hook type arrays are cleaned up.
-#[allow(dead_code)]
-pub fn remove_loom_hooks(settings: &mut Value) {
-    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return;
-    };
-
-    // Process each hook type
-    let hook_types: Vec<String> = hooks.keys().cloned().collect();
-    for hook_type in &hook_types {
-        let Some(matchers) = hooks.get_mut(hook_type).and_then(|m| m.as_array_mut()) else {
-            continue;
-        };
-
-        // For each matcher entry, remove Loom hooks from the hooks array
-        for matcher_entry in matchers.iter_mut() {
-            if let Some(hook_arr) = matcher_entry
-                .get_mut("hooks")
-                .and_then(|h| h.as_array_mut())
-            {
-                hook_arr.retain(|hook| {
-                    let cmd = hook.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                    !is_loom_hook_command(cmd)
-                });
-            }
-        }
-
-        // Remove matcher entries with empty hooks arrays
-        matchers.retain(|entry| {
-            !entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .is_some_and(Vec::is_empty)
-        });
-    }
-
-    // Remove hook types with empty matcher arrays
-    hooks.retain(|_, v| !v.as_array().is_some_and(Vec::is_empty));
-
-    // If hooks object is now empty, remove it entirely
-    if hooks.is_empty() {
-        if let Some(obj) = settings.as_object_mut() {
-            obj.remove("hooks");
-        }
-    }
-}
-
-/// Remove Loom-specific permissions from a settings.json value.
-///
-/// Removes permissions that match Loom's default permission list exactly, plus
-/// the legacy Loom-shipped rules in [`LEGACY_LOOM_PERMISSIONS`].
-#[allow(dead_code)]
-pub fn remove_loom_permissions(settings: &mut Value, loom_defaults: &Value) {
-    let loom_perms = loom_defaults
-        .get("permissions")
-        .and_then(|p| p.get("allow"))
-        .and_then(|a| a.as_array());
-
-    let loom_perm_set: std::collections::HashSet<&str> = loom_perms
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str())
-        .chain(LEGACY_LOOM_PERMISSIONS.iter().copied())
-        .collect();
-
-    let Some(allow) = settings
-        .get_mut("permissions")
-        .and_then(|p| p.get_mut("allow"))
-        .and_then(|a| a.as_array_mut())
-    else {
-        return;
-    };
-
-    allow.retain(|v| !v.as_str().is_some_and(|s| loom_perm_set.contains(s)));
-
-    // Clean up empty permissions
-    if allow.is_empty() {
-        if let Some(perms) = settings
-            .get_mut("permissions")
-            .and_then(|p| p.as_object_mut())
-        {
-            perms.remove("allow");
-        }
-    }
-    if settings
-        .get("permissions")
-        .and_then(|p| p.as_object())
-        .is_some_and(serde_json::Map::is_empty)
-    {
-        if let Some(obj) = settings.as_object_mut() {
-            obj.remove("permissions");
-        }
-    }
 }
 
 /// Setup repository scaffolding files

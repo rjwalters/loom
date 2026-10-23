@@ -112,8 +112,12 @@ enum Done {
     Loop(String),
     /// The branch moved on both tries. Next tick.
     Moved,
-    /// A rule on the remote refused the push.
+    /// A rule on the remote refused the push, and the pull-request route did
+    /// not work either.
     Protected(String),
+    /// A rule refused the push to the default branch, so the resync is
+    /// waiting in a pull request (#12572): its number, URL and the rule.
+    PrOpen(Option<u64>, String, String),
 }
 
 /// Releases the claim when dropped, so a panic or an early return inside the
@@ -267,6 +271,15 @@ pub(super) fn attempt(
         }
         Ok(Done::Protected(rule)) => {
             let detail = format!("push refused by a branch rule: {rule}");
+            record_failure(env, report, FailureKind::Protected, &detail, memory, &mut scan.alerts);
+        }
+        Ok(Done::PrOpen(number, url, rule)) => {
+            // Still `Protected`: the repo is not current until the PR merges,
+            // so the alert stays raised and the 6 h backoff paces the next
+            // look. W0 clears both.
+            let pr = number.map_or(url.clone(), |n| format!("#{n} {url}"));
+            let detail =
+                format!("push refused by a branch rule: {rule}; resync pull request open: {pr}");
             record_failure(env, report, FailureKind::Protected, &detail, memory, &mut scan.alerts);
         }
         Err(e) => fail_attempt(env, &candidate.nwo, report, &e, memory, scan),
@@ -427,7 +440,85 @@ impl Step<'_, '_> {
         Ok(match git::push(worktree, root, &self.candidate.branch)? {
             git::Push::Accepted => Done::Pushed(new),
             git::Push::NonFastForward => Done::Moved,
-            git::Push::Protected(rule) => Done::Protected(rule),
+            git::Push::Protected(rule) => self.open_pull_request(&new, rule)?,
         })
     }
+
+    /// The default branch refuses a direct push (a merge queue, no bypass
+    /// actor): push the same commit to `chore/loom-resync-v<version>` (never
+    /// forced) and open a PR for it (#12572). Idempotent: an open PR from that
+    /// branch is the answer, and nothing new is made. `Protected` when this
+    /// route fails too.
+    fn open_pull_request(&self, new: &str, rule: String) -> Result<Done> {
+        let failed = |why: String| Done::Protected(format!("{rule}; pull-request route: {why}"));
+        let nwo = &self.candidate.nwo;
+        let version = self.env.running.to_string();
+        let branch = git::resync_branch(&version);
+        let owner = nwo.split('/').next().unwrap_or_default();
+        let open = format!("repos/{nwo}/pulls?head={owner}:{branch}&state=open&per_page=1");
+        let listed = match self.claimant.read.get(&open, None, None) {
+            Ok(reply) if reply.status == 200 => reply,
+            Ok(reply) => return Ok(failed(format!("listing PRs: HTTP {}", reply.status))),
+            Err(e) => return Ok(failed(format!("listing PRs: {e:#}"))),
+        };
+        let existing: serde_json::Value = serde_json::from_str(&listed.body).unwrap_or_default();
+        if let Some(pr) = existing.as_array().and_then(|a| a.first()) {
+            return Ok(Done::PrOpen(pr_number(pr), pr_url(pr), rule));
+        }
+        match git::push(self.worktree, self.root, &branch) {
+            // A branch left by an earlier try that opened no PR: the PR is
+            // what is missing, so open it.
+            Ok(git::Push::Accepted | git::Push::NonFastForward) => {}
+            Ok(git::Push::Protected(r)) => return Ok(failed(format!("pushing {branch}: {r}"))),
+            Err(e) => return Ok(failed(format!("pushing {branch}: {e:#}"))),
+        }
+        let message = git::resync_message(self.env.host, &version);
+        let (title, body) = message.split_once("\n\n").unwrap_or((&message, ""));
+        let created = self.claimant.write.write(
+            "POST",
+            &format!("repos/{nwo}/pulls"),
+            &serde_json::json!({
+                "title": title,
+                "head": branch,
+                "base": self.candidate.branch,
+                "body": format!(
+                    "{body}\nThe default branch refused a direct push ({rule}), so the \
+                     resync is proposed here.\n"
+                ),
+            }),
+        );
+        let pr: serde_json::Value = match created {
+            Ok(reply) if (200..300).contains(&reply.status) => {
+                serde_json::from_str(&reply.body).unwrap_or_default()
+            }
+            Ok(reply) => return Ok(failed(format!("opening the PR: HTTP {}", reply.status))),
+            Err(e) => return Ok(failed(format!("opening the PR: {e:#}"))),
+        };
+        let number = pr_number(&pr);
+        if let Some(n) = number {
+            // The label Judge and then Champion work from. A failure leaves a
+            // PR a person can label; it is not worth abandoning the route.
+            let labelled = self.claimant.write.write(
+                "POST",
+                &format!("repos/{nwo}/issues/{n}/labels"),
+                &serde_json::json!({"labels": ["loom:review-requested"]}),
+            );
+            if !labelled.is_ok_and(|r| (200..300).contains(&r.status)) {
+                log::warn!("workspace_resync: {nwo}: could not label resync PR #{n}");
+            }
+        }
+        log::info!("workspace_resync: {nwo}: opened resync PR for {new}: {}", pr_url(&pr));
+        Ok(Done::PrOpen(number, pr_url(&pr), rule))
+    }
+}
+
+fn pr_number(pr: &serde_json::Value) -> Option<u64> {
+    pr.get("number").and_then(serde_json::Value::as_u64)
+}
+
+fn pr_url(pr: &serde_json::Value) -> String {
+    pr.get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(no URL in the reply)")
+        .to_string()
 }

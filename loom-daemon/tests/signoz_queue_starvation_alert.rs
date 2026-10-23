@@ -707,3 +707,8 @@ fn go_duration_strings_parse() {
     assert_eq!(duration_ms("250ms"), 250);
     assert_eq!(duration_ms("1m30s"), 90_000);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

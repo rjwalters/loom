@@ -1343,3 +1343,8 @@ fn ttl_only_drop_parts_keeps_an_over_age_row_in_a_mixed_part() {
         "without the setting the same mixed part must expire the over-age row"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

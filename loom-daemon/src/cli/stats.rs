@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 
-use loom_daemon::activity::{self, ActivityDb, StatsQueries};
+use crate::activity::{self, ActivityDb, StatsQueries};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_stats_command(

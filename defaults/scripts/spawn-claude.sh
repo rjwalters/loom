@@ -415,9 +415,14 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
     # on its side.
     export LOOM_SWEEP_CPU_BUDGET_CORES="$_cpu_budget_cores"
     if [[ "$_cpu_shared" == "1" ]]; then
+        # #12884: the sweep count the budget was divided by, for the phase
+        # spans. Only a shared budget measured it; unshared, `1` is a
+        # placeholder, so the key is unset (no parent value leaks through).
+        export LOOM_SWEEP_CPU_INFLIGHT="$_cpu_inflight"
         log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) divided across ${_cpu_inflight} in-flight sweep(s) on this host — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issues #5111/#5979)"
     else
         log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) — host-wide sharing disabled (LOOM_SWEEP_SHARED_CPU_BUDGET=0, #5979) — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issue #5111)"
+        unset LOOM_SWEEP_CPU_INFLIGHT
     fi
 
     _systemd_user_lib="${_script_dir}/lib/systemd-user.sh"
@@ -438,15 +443,17 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
         # kernel's global OOM killer choosing a victim. The policy and the
         # systemd probe live in `loom-daemon ram-scope-limit` (exit 0 apply,
         # 3 rejected by systemd, anything else — incl. an older binary — no limit).
+        # Its stderr is one `ram-scope-limit: …` line naming the source that
+        # decided (env, config tier or default; issue #12246), so it is kept.
         # requires-daemon: ram-scope-limit optional   #11094 — any non-0/3 exit (incl. an older binary's unknown-subcommand error) means the scope runs with no MemoryMax, exactly the pre-#11094 behaviour.
         # shellcheck source=lib/locate-daemon-bin.sh
         source "${_script_dir}/lib/locate-daemon-bin.sh"
         _mem_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
         _mem_rc=0
-        _mem_max_mb="$([[ -n "$_mem_bin" ]] && "$_mem_bin" ram-scope-limit --workspace "$WORKSPACE" --probe 2>/dev/null)" || _mem_rc=$?
+        _mem_max_mb="$([[ -n "$_mem_bin" ]] && "$_mem_bin" ram-scope-limit --workspace "$WORKSPACE" --probe)" || _mem_rc=$?
         case "$_mem_rc:$_mem_max_mb" in
             0:[0-9]*) _cpu_quota_props+=(-p "MemoryMax=${_mem_max_mb}M")
-                log_info "spawn-claude: scope MemoryMax=${_mem_max_mb}M from observed per-repo peak (LOOM_SWEEP_MEMORY_MAX=0 disables; issue #11094)" ;;
+                log_info "spawn-claude: scope MemoryMax=${_mem_max_mb}M (autonomous.agentMemoryMax=off or LOOM_SWEEP_MEMORY_MAX=0 disables; issue #11094)" ;;
             3:[0-9]*) log_warn "spawn-claude: MemoryMax=${_mem_max_mb}M rejected by systemd (memory controller not delegated?); scope runs without a memory limit (issue #11094)" ;;
         esac
         if [[ "$_cpu_wallclock" != "0" ]]; then
@@ -631,9 +638,11 @@ fi
 # registry — the SAME "sweeps survive by design" property launchd already
 # gives bare-metal sweeps today (see daemon-reference.md), now extended to
 # systemd too, via the container boundary instead of process reparenting.
-# `loom-daemon restart --drain` remains the recommended path on both
-# supervisors — it waits for in-flight sweeps (containerized or not) to
-# finish before the daemon exits, so the orphan case above is a hard-stop
+# `loom-daemon restart --drain` (relaunch) and `restart --pause --then-exit`
+# (host maintenance, #11812) remain the recommended paths on both
+# supervisors — the first waits for in-flight sweeps (containerized or not)
+# to finish before the daemon exits, the second pauses them for the next
+# start's H5 to resume — so the orphan case above is a hard-stop
 # fallback, not the common path. Reconciling a still-running orphaned
 # container after a daemon restart (`SweepRegistry::reconstruct`'s
 # container-recognition extension) remains a real, named Phase 3 obligation

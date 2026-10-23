@@ -29,7 +29,10 @@
 //!
 //! Telemetry: the first completed tick publishes [`FIRST_TICK_TOPIC`] (a
 //! `daemon.event` record in SigNoz) with the seconds since the startup passes
-//! began and whether the cap fired.
+//! began, how much of that the gate itself held, the startup jitter, and
+//! whether the cap fired. On the OTLP path the record's scalars also ride as
+//! typed attributes ([`FIRST_TICK_LOG_ATTRIBUTE_KEYS`], #12230), so the
+//! duration is a number per `host.name`, not a field inside `loom.payload`.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -47,6 +50,16 @@ pub const WAIT_KEY: &str = "autonomous.startupReconcileWaitSecs";
 pub const DEFAULT_WAIT_SECS: u64 = 90;
 /// The `daemon.event` topic of the first completed tick.
 pub const FIRST_TICK_TOPIC: &str = "daemon.work_finder.first_tick";
+/// The typed OTLP log attributes the first-tick record carries besides
+/// `loom.topic` / `loom.payload` (#12230): each is the payload field of the
+/// same name. The collector's `transform/privacy` allowlist keeps every one
+/// (`defaults/observability/collector/config.yaml`, contract-tested).
+pub const FIRST_TICK_LOG_ATTRIBUTE_KEYS: &[&str] = &[
+    "loom.payload.secs_since_start",
+    "loom.payload.gate_wait_secs",
+    "loom.payload.jitter_delay_secs",
+    "loom.payload.startup_reconcile_cap_fired",
+];
 
 /// The cap: env > config > [`DEFAULT_WAIT_SECS`]. An unparsable value at a
 /// tier falls through to the next one.
@@ -105,15 +118,18 @@ pub async fn wait(rx: &mut watch::Receiver<StartupPasses>, cap: Duration) -> Out
 #[derive(Debug)]
 pub struct FirstTick {
     since: Instant,
+    gate_wait: Duration,
     outcome: Option<Outcome>,
 }
 
 impl FirstTick {
-    /// `since` is when the startup passes began (about daemon start).
+    /// `since` is when the startup passes began (about daemon start);
+    /// `gate_wait` is how long [`wait`] held the first tick.
     #[must_use]
-    pub fn new(since: Instant, outcome: Outcome) -> Self {
+    pub fn new(since: Instant, outcome: Outcome, gate_wait: Duration) -> Self {
         Self {
             since,
+            gate_wait,
             outcome: Some(outcome),
         }
     }
@@ -124,20 +140,41 @@ impl FirstTick {
         let Some(outcome) = self.outcome.take() else {
             return;
         };
-        let secs = self.since.elapsed().as_secs_f64();
+        let elapsed = self.since.elapsed();
+        let jitter = crate::startup_jitter::armed_delay_secs();
         log::info!(
-            "work_finder: first tick completed {secs:.1}s after daemon start (startup \
-             reconciliation cap fired: {}) (#12222)",
+            "work_finder: first tick completed {:.1}s after daemon start (startup jitter {}s, \
+             startup gate held {:.1}s, startup reconciliation cap fired: {}) (#12222)",
+            elapsed.as_secs_f64(),
+            jitter.unwrap_or(0),
+            self.gate_wait.as_secs_f64(),
             outcome.cap_fired()
         );
         let _ = bus.publish_generic(
             FIRST_TICK_TOPIC,
-            serde_json::json!({
-                "secs_since_start": (secs * 10.0).round() / 10.0,
-                "startup_reconcile_cap_fired": outcome.cap_fired(),
-            }),
+            first_tick_payload(elapsed, self.gate_wait, jitter, outcome),
         );
     }
+}
+
+/// The [`FIRST_TICK_TOPIC`] payload: seconds to one decimal; the jitter is
+/// omitted when the gate was never armed.
+fn first_tick_payload(
+    elapsed: Duration,
+    gate_wait: Duration,
+    jitter_secs: Option<u64>,
+    outcome: Outcome,
+) -> serde_json::Value {
+    let tenths = |d: Duration| (d.as_secs_f64() * 10.0).round() / 10.0;
+    let mut payload = serde_json::json!({
+        "secs_since_start": tenths(elapsed),
+        "gate_wait_secs": tenths(gate_wait),
+        "startup_reconcile_cap_fired": outcome.cap_fired(),
+    });
+    if let Some(jitter) = jitter_secs {
+        payload["jitter_delay_secs"] = serde_json::json!(jitter);
+    }
+    payload
 }
 
 #[cfg(test)]
@@ -205,6 +242,90 @@ mod tests {
         let (tx, mut rx) = watch::channel(StartupPasses::Running);
         drop(tx);
         assert_eq!(wait(&mut rx, Duration::from_secs(90)).await, Outcome::Ready);
+    }
+
+    struct CapturingSink(std::sync::Mutex<Vec<crate::telemetry::TelemetryEnvelope>>);
+
+    impl crate::observability::queue::QueueSink for CapturingSink {
+        fn offer(&self, envelope: crate::telemetry::TelemetryEnvelope) {
+            self.0.lock().unwrap().push(envelope);
+        }
+        fn offer_durable(
+            &self,
+            envelope: crate::telemetry::TelemetryEnvelope,
+        ) -> std::io::Result<()> {
+            self.offer(envelope);
+            Ok(())
+        }
+    }
+
+    /// #12230: the first completed tick reaches the export queue — through
+    /// the same `daemon.event` bus subscriber every other `daemon.*` event
+    /// uses — exactly once, stamped with the host and carrying its durations.
+    #[tokio::test]
+    async fn the_first_tick_is_recorded_once_for_export_with_host_and_durations() {
+        use crate::telemetry::TelemetryRecord;
+        let bus = crate::event_bus::EventBus::new();
+        let sink = std::sync::Arc::new(CapturingSink(std::sync::Mutex::new(Vec::new())));
+        let collector =
+            crate::observability::daemon_event::spawn_task(&bus, sink.clone(), "worker-7".into());
+        let since = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        let mut first = FirstTick::new(since, Outcome::CapExpired, Duration::from_secs(3));
+        first.completed(&bus);
+        first.completed(&bus);
+        bus.publish_generic("daemon.drain.started", serde_json::json!({}))
+            .unwrap();
+        // The drain event is the marker that the collector has consumed
+        // everything published before it.
+        let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let got = sink.0.lock().unwrap().clone();
+                if got.iter().any(|e| {
+                    matches!(&e.record, TelemetryRecord::DaemonEvent(r) if r.topic == "daemon.drain.started")
+                }) {
+                    return got;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the collector records the events");
+        collector.abort();
+        let first_ticks: Vec<_> = recorded
+            .iter()
+            .filter_map(|e| match &e.record {
+                TelemetryRecord::DaemonEvent(r) if r.topic == FIRST_TICK_TOPIC => {
+                    Some((e.host_id.clone(), r.payload.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first_ticks.len(), 1, "exactly one first-tick record: {recorded:?}");
+        let (host, payload) = &first_ticks[0];
+        assert_eq!(host, "worker-7");
+        assert!(payload["secs_since_start"].as_f64().unwrap() >= 5.0);
+        assert_eq!(payload["gate_wait_secs"], 3.0);
+        assert_eq!(payload["startup_reconcile_cap_fired"], true);
+    }
+
+    #[test]
+    fn the_payload_omits_an_unarmed_jitter() {
+        let p = first_tick_payload(
+            Duration::from_millis(94_249),
+            Duration::from_millis(1_960),
+            None,
+            Outcome::Ready,
+        );
+        assert_eq!(
+            p,
+            serde_json::json!({
+                "secs_since_start": 94.2,
+                "gate_wait_secs": 2.0,
+                "startup_reconcile_cap_fired": false,
+            })
+        );
+        let p = first_tick_payload(Duration::ZERO, Duration::ZERO, Some(42), Outcome::Ready);
+        assert_eq!(p["jitter_delay_secs"], 42);
     }
 
     #[test]

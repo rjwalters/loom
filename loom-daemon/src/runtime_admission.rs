@@ -130,6 +130,13 @@ pub struct ExecutionProvenance {
     pub control: String,
     pub protocol: String,
     pub base_revision: String,
+    /// Canonical `host/owner/name` of the clone this admission is bound to
+    /// (#10796). Empty in a record written before multi-repository seats.
+    #[serde(default)]
+    pub repository: String,
+    /// Where that clone lives inside the session container.
+    #[serde(default)]
+    pub clone: String,
 }
 
 impl ExecutionProvenance {
@@ -144,7 +151,7 @@ impl ExecutionProvenance {
             .join(",");
         format!(
             "mode={} satisfied={} native={} policy={} account={} container={} control={} \
-             protocol={} base={}",
+             protocol={} base={} repository={} clone={}",
             self.mode,
             self.satisfied.join(","),
             native,
@@ -153,7 +160,9 @@ impl ExecutionProvenance {
             self.container,
             self.control,
             self.protocol,
-            self.base_revision
+            self.base_revision,
+            self.repository,
+            self.clone
         )
     }
 }

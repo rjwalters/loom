@@ -773,11 +773,6 @@ fn gateway_forwards_exactly_the_ci_telemetry_vocabulary() {
     }
     assert_eq!(ci(keep("log")), owned(CI_LOG_ATTRIBUTE_KEYS));
     assert_eq!(ci(keep("span")), owned(CI_SPAN_ATTRIBUTE_KEYS));
-    // Issue #9168: a role tick's per-target story span introduces no new
-    // key; every one it carries must already pass the span allowlist.
-    for key in loom_daemon::role_tick_telemetry::story::STORY_SPAN_ATTRIBUTE_KEYS {
-        assert!(keep("span").contains(*key), "span keep_keys drops role-tick story key {key}");
-    }
 }
 
 /// Issue #9440: the gateway must forward the `tokens_status` pair, because the
@@ -814,3 +809,8 @@ fn gateway_forwards_the_tokens_status_pair() {
         "config.yaml must state why the #9440 status pair is allowlisted"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

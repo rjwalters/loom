@@ -389,9 +389,16 @@ loom_cmd_update() {
     target="$scripts_dir/cli/loom-daemon-update.sh"
     # Honor the daemon updater's read-only modes: `--check/--dry-run` mutate
     # nothing (no ff-sync, no provisioning, no bundle refresh).
-    if loom_has_flag "--check" "$@"; then ro="--check"
+    # `--help`/`-h` is read-only too (#12558): usage must never rebuild the
+    # bundle or ff-sync the checkout first. Help prints no banner and goes
+    # straight to the delegate, which owns the usage text.
+    local help=""
+    if loom_has_flag "--help" "$@" || loom_has_flag "-h" "$@"; then help=1
+    elif loom_has_flag "--check" "$@"; then ro="--check"
     elif loom_has_flag "--dry-run" "$@"; then ro="--dry-run"; fi
-    if [[ -n "$ro" ]]; then
+    if [[ -n "$help" ]]; then
+        :
+    elif [[ -n "$ro" ]]; then
         printf 'loom: (%s) checkout sync, user-scope provisioning and mcp-loom bundle refresh skipped in read-only mode.\n' "$ro"
     else
         # ff-sync FIRST so the provisioning libs executed are the fresh ones.
@@ -401,7 +408,7 @@ loom_cmd_update() {
     fi
     # The daemon half is optional: a daemonless operator laptop is a supported
     # setup, so a missing binary is a note, not a failure.
-    if ! command -v loom-daemon >/dev/null 2>&1 \
+    if [[ -z "$help" ]] && ! command -v loom-daemon >/dev/null 2>&1 \
         && [[ ! -x "$HOME/.local/bin/loom-daemon" ]] \
         && [[ ! -x "$checkout/loom-daemon/target/release/loom-daemon" ]]; then
         echo "loom: loom-daemon not installed; skipping daemon update."

@@ -1,5 +1,5 @@
-//! GitHub repository identity (`repo_id` + canonical `full_name`) for the D32
-//! v1 story key (#9068), resolved once per repo and cached per process.
+//! GitHub repository identity (`repo_id` + canonical `full_name`), resolved
+//! once per repo and cached per process (#9068).
 //!
 //! Mirrors [`super::visibility`]'s shape — a process-global map keyed on the
 //! lowercased `owner/repo`, one `gh api repos/{owner}/{repo}` probe (the same
@@ -8,9 +8,8 @@
 //!
 //! - A **failure is remembered** for [`NEGATIVE_TTL`]: every dispatch of an
 //!   issue in an unresolvable repo would otherwise pay a blocking `gh` call.
-//! - There is **no fallback**. An unresolvable repo has no story key, and the
-//!   caller makes the execution its own root. A name-derived key would mint a
-//!   second, wrong story trace that never joins the reconciler's.
+//! - There is **no fallback**. An unresolvable repo has no identity, and the
+//!   caller keeps the repo name as written.
 //!
 //! The failure is logged once per repo per process, not per dispatch.
 use std::collections::{HashMap, HashSet};
@@ -21,7 +20,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoIdentity {
     pub id: u64,
-    /// `Owner/Name` as GitHub spells it (the `loom.story` / `Loom-Story` text).
+    /// `Owner/Name` as GitHub spells it (the `loom.repo` text).
     pub full_name: String,
 }
 

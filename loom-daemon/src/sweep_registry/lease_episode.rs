@@ -102,6 +102,19 @@ pub(crate) fn renewal_cutoff(episode_start: DateTime<Utc>) -> DateTime<Utc> {
     episode_start - chrono::Duration::seconds(secs)
 }
 
+/// Age (seconds before `episode_start`) up to which a never-renewed lease is
+/// still inside its first renewal interval: the renewer's default 300s
+/// cadence (`sweep-lease-renew.sh` sleeps first) plus 60s of grace.
+pub(crate) const FIRST_RENEWAL_WINDOW_SECS: i64 = 360;
+
+/// Cutoff for a never-renewed record's `created_at`, derived from
+/// `created_cutoff` (`episode_start - LEASE_ORDER_LOOKBACK_SECS`) so all
+/// windows measure from the one `episode_start` clock reading.
+fn first_interval_cutoff(created_cutoff: DateTime<Utc>) -> DateTime<Utc> {
+    created_cutoff
+        - chrono::Duration::seconds(FIRST_RENEWAL_WINDOW_SECS - LEASE_ORDER_LOOKBACK_SECS)
+}
+
 /// Whether `c` belongs to the claim episode
 /// [`SweepRegistry::resolve_lease_order`](super::SweepRegistry::resolve_lease_order)
 /// is adjudicating.
@@ -126,6 +139,12 @@ pub(crate) fn renewal_cutoff(episode_start: DateTime<Utc>) -> DateTime<Utc> {
 /// embedded in the comment's prose, which `defaults/docs/lease-record.md`
 /// explicitly forbids treating as liveness, and never the advertising
 /// host's own clock as carried in the body text.
+///
+/// A record that was never renewed (`updated_at == created_at`) is also
+/// admitted while its age is within [`FIRST_RENEWAL_WINDOW_SECS`] (Issue
+/// #12825): the renewer sleeps first, so a live lease is unrenewed for its
+/// first ~300s and would otherwise be invisible from 90s to ~300s. Once it
+/// is older than that and still unrenewed, its renewer is presumed dead.
 ///
 /// A record that simply aged out — a finished sweep whose renewal loop
 /// stopped — fails leg 2 exactly as it failed leg 1, so the anti-wedge
@@ -174,7 +193,12 @@ pub(crate) fn in_claim_episode(
     let (Some(created), Some(updated)) = (c.created_at, c.updated_at) else {
         return false;
     };
-    updated > created && updated >= renewal_cutoff
+    if updated > created {
+        return updated >= renewal_cutoff;
+    }
+    // Never renewed (`updated_at == created_at`): admitted only while still
+    // inside its first renewal interval (Issue #12825).
+    updated == created && created >= first_interval_cutoff(created_cutoff)
 }
 
 /// Apply [`in_claim_episode`] across a whole read-back, supplying the one
@@ -327,6 +351,45 @@ mod tests {
         let now = Utc::now();
         let (created_cutoff, renewal_cutoff) = cutoffs(now);
         assert!(in_claim_episode(&lease(1, now, 10, 10), created_cutoff, renewal_cutoff, true));
+    }
+
+    /// Issue #12825: a live lease inside its first renewal interval
+    /// (older than the 90s lookback, not yet renewed) is a member, and
+    /// stops being one past the first-interval window.
+    #[test]
+    fn a_never_renewed_record_inside_the_first_renewal_interval_is_a_member() {
+        let now = Utc::now();
+        let (created_cutoff, renewal_cutoff) = cutoffs(now);
+        let young = lease(1, now, 200, 200);
+        assert!(young.created_at.unwrap() < created_cutoff);
+        assert!(in_claim_episode(&young, created_cutoff, renewal_cutoff, false));
+        // Boundary: just inside / just outside the window.
+        assert!(in_claim_episode(
+            &lease(2, now, FIRST_RENEWAL_WINDOW_SECS - 1, FIRST_RENEWAL_WINDOW_SECS - 1),
+            created_cutoff,
+            renewal_cutoff,
+            false
+        ));
+        assert!(!in_claim_episode(
+            &lease(3, now, FIRST_RENEWAL_WINDOW_SECS + 1, FIRST_RENEWAL_WINDOW_SECS + 1),
+            created_cutoff,
+            renewal_cutoff,
+            false
+        ));
+    }
+
+    /// Issue #12825: a finished local sweep's young un-renewed record is
+    /// still excluded.
+    #[test]
+    fn a_young_never_renewed_record_for_a_locally_finished_sweep_is_not_a_member() {
+        let now = Utc::now();
+        let (created_cutoff, renewal_cutoff) = cutoffs(now);
+        assert!(!in_claim_episode(
+            &lease(1, now, 200, 200),
+            created_cutoff,
+            renewal_cutoff,
+            true
+        ));
     }
 
     /// Missing forge timestamps are never invented into liveness: a record

@@ -202,3 +202,8 @@ fn deep_clean_safe_still_reclaims_when_nothing_is_running_from_target() {
         "the reclaim must still be reported; stdout:\n{stdout}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

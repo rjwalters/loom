@@ -152,3 +152,8 @@ fn the_worker_passes_on_the_daemons_read_routing() {
     let (gateway, _) = run(&ws);
     assert_eq!(gateway, "", "not a published base: removed");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

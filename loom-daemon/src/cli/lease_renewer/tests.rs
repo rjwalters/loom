@@ -361,22 +361,44 @@ fn stop_pid_refuses_an_identity_that_changes_mid_check_and_ignores_a_dead_pid() 
 
 #[test]
 fn stop_pid_never_signals_a_real_unrelated_process() {
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    // Own and reap the child even if an assertion fails, so a failure never
+    // leaks a `sleep` into the runner (nextest's LEAK).
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(Command::new("sleep").arg("30").spawn().unwrap());
+    let pid = child.0.id();
+    let is_sleep = |argv: &Option<Vec<String>>| {
+        argv.as_ref()
+            .is_some_and(|a| a.first().is_some_and(|p| argv_base(p) == "sleep"))
+    };
+    // `spawn` returning does not mean `/proc/<pid>/cmdline` shows `sleep`
+    // yet. On Linux std uses glibc posix_spawn (CLONE_VM|CLONE_VFORK): the
+    // parent resumes when the child's execve releases the vfork, which the
+    // kernel does in exec_mmap BEFORE it installs the new mm. Until then the
+    // child's cmdline reads the parent's (this test binary's) argv. Wait for
+    // exec so stop_pid is judged against the real, unrelated `sleep`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut argv = process_argv(pid);
+    while !is_sleep(&argv) {
+        assert!(std::time::Instant::now() < deadline, "argv never became sleep: {argv:?}");
+        assert!(child.0.try_wait().unwrap().is_none(), "sleep exited early");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        argv = process_argv(pid);
+    }
     let sent = RefCell::new(vec![]);
-    let r = stop_pid(
-        &child.id().to_string(),
-        std::process::id(),
-        &start_identity,
-        &process_argv,
-        &|p| sent.borrow_mut().push(p),
-    );
+    let r = stop_pid(&pid.to_string(), std::process::id(), &start_identity, &process_argv, &|p| {
+        sent.borrow_mut().push(p)
+    });
     assert!(matches!(r, StopOutcome::Refused(_)), "{r:?}");
     assert!(sent.borrow().is_empty());
-    assert!(process_argv(child.id())
-        .unwrap()
-        .contains(&"sleep".to_string()));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    // Still the same live `sleep`: nothing signalled it.
+    assert!(child.0.try_wait().unwrap().is_none(), "sleep was stopped");
+    assert!(is_sleep(&process_argv(pid)));
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

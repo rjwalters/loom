@@ -74,9 +74,11 @@ outside, so the only defense is your own discipline:
 - **Emit progress as you go.** Print a short line at each step. Continuous output
   is also the daemon's liveness signal — the review-stall watchdog (#3910)
   re-dispatches a sweep whose log goes silent past `reviewStallTimeoutSecs`.
-- **Bound the whole fix.** Make the smallest change that satisfies the feedback,
-  then hand back. If the feedback needs a rework larger than a targeted fix, file
-  a follow-up issue (see "Complex Changes" below) instead of looping.
+- **Bound the whole fix.** Limit *scope*, not completeness: no unrelated
+  refactors, and no rework beyond a targeted fix — file a follow-up issue (see
+  "Complex Changes" below) instead of looping. Within that scope the fix includes
+  every instance of a cited defect class in the PR's changed files (see "Fix the
+  Whole Class, Not Just the Cited Lines" below), then hand back.
 
 ## CRITICAL: PR Branch Isolation (Always Use a Worktree)
 
@@ -351,6 +353,7 @@ If a number is provided (e.g., `/doctor 123`):
    `lease pr claim` re-attaches (exit 0) — continue and add `loom:treating`
    yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`
 4. Proceed directly to fixing that PR
+5. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=doctor target=<pr> class=<verdict|noop|refused|failed> reason=<token>`. `verdict` / `fixed` when you pushed a fix; `noop` / `no_fix_needed` when the PR needed none. Without it the captain reads the step as `failed` and holds the PR fleet-wide (#12551)
 
 **How judge feedback reaches you.** When `/loom:sweep` dispatches a Doctor after a
 Judge rejection, the feedback lives in the PR itself — the Judge's review comments
@@ -530,6 +533,19 @@ gh pr list --state=open --json number,title,labels,mergeable \
   | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator" and .name != "loom:blocked" and .name != "loom:frozen")) | "#\(.number): \(.title)"'
 ```
 
+**Find orphaned stacked children (merge-mode repos, #12767):** a PR flagged by
+the orphan-stack pass has `loom:merge-conflict` plus a trusted
+`<!-- loom:orphan-stack flagged parent=<N> head=<sha> -->` comment, and no
+`loom:changes-requested`, so the queues below never list it. Claim it like any
+other PR (holds excluded, `loom:treating`), then follow
+[`orphan-stack-replacement.md`](../loom-orphan-stack-replacement/SKILL.md) — a replacement PR,
+never a rewrite of its branch.
+```bash
+gh pr list --state=open --label=loom:merge-conflict --json number,labels,comments \
+  | jq -r '.[] | select(.labels | all(.name != "loom:operator" and .name != "loom:blocked" and .name != "loom:frozen" and .name != "loom:treating")) | select(any(.comments[]?; .body | contains("<!-- loom:orphan-stack flagged"))) | "#\(.number)"'
+```
+(A candidate still needs its marker confirmed from a **trusted** author.)
+
 **Find all open PRs:**
 ```bash
 # Check primary queues first
@@ -660,7 +676,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
 4. **Read feedback**: Understand what the reviewer is asking for
 5. **Check out PR branch in a dedicated worktree** ("PR Branch Isolation" above; its "Occupied worktree" check first): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`. Then "Verify the pin" (below), before any edit.
 6. **CRITICAL: Assess ALL CI failures FIRST** (see "CI Assessment" section below):
-   - Run `forge wait-checks <number> --timeout 20` to identify ALL failing checks
+   - Run `loom-daemon forge wait-checks <number> --timeout 20` to identify ALL failing checks
    - Fetch logs for each failing check
    - Create a complete list of ALL issues before starting ANY fixes
 7. **Address ALL issues comprehensively**:
@@ -679,7 +695,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
      ./.loom/scripts/rebase-stacked-children.sh feature/issue-<N>
      ```
      It rebases open child PRs that went stale onto your new tip (safe children auto-rebase with a *pinned* force-with-lease; a child whose issue is still `loom:building` gets a deferred-reconciliation comment). No-op without stacked children, and **best-effort** — a failure (conflict, non-GitHub forge) never fails your own work; carry on to step 10. `--dry-run` previews.
-10. **Verify CI remotely**: after push, `forge wait-checks <number> --timeout 20` (GREEN/NONE = pass; else CI Assessment Step 5)
+10. **Verify CI remotely**: after push, `loom-daemon forge wait-checks <number> --timeout 20` (GREEN/NONE = pass). Not green and not RED (pending, head moved, unknown required contexts): do not wait; hand back to Judge in step 11 and report CI as pending (see "CRITICAL: Never End Your Turn on a Background CI Monitor", path 1). RED: CI Assessment. Only an invocation that explicitly requires the settled result uses the bounded foreground wait (path 2)
 11. **Signal completion and unclaim** (run the lease fence and the Verdict-Time CAS Recheck — see below — immediately before this write; abort/stand down instead if either finds your claim lost or the PR already moved; then `lease pr release`):
     - Remove `loom:changes-requested` and `loom:treating` labels
     - Add `loom:review-requested` label (green badge)
@@ -837,7 +853,10 @@ comment id, and renews yours while your session lives
 - **claim** exit **0** = held: add `loom:treating` (**2** = an older
   `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
   live lease wins (a lost race posts your yield record), **5** = unreadable,
-  any other code (**1** = `loom-daemon` failed to start) = unknown: never
+  **7** = another actor is working the PR (a live lease of another kind on it
+  or its closing issue, or a push by another login inside
+  `LOOM_DOCTOR_PUSH_WINDOW_MINUTES`, default 15; #12105), any other code
+  (**1** = `loom-daemon` failed to start) = unknown: never
   "label-only" — stand down **before** any worktree, snapshot or label action.
   Never touch a worktree a peer's lease holds, or its `loom:treating`.
 - **fence** before every push and the completion write (step 11):
@@ -986,7 +1005,7 @@ This is the same technique as the Pre-Push Head-SHA Recheck, applied to the
 write that actually matters, not just at claim time.
 
 **Pre-completion checklist** (verify before signaling completion):
-- [ ] All CI checks pass (verified via `forge wait-checks <number>`)
+- [ ] All CI checks pass (verified via `loom-daemon forge wait-checks <number>`)
 - [ ] I ran the stale `loom:treating` claim check before claiming (skipped the PR
       on a fresh claim; reclaimed only on a stale one)
 - [ ] I held the PR lease before adding `loom:treating`, fenced it before each
@@ -1078,6 +1097,7 @@ shellcheck scripts/*.sh # Shell scripts (if applicable)
 |---|---|
 | [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
 | [`ci-refusals-reference.md`](../loom-ci-refusals-reference/SKILL.md) | A CI read got 403/429, or a job needs a re-run. |
+| [`orphan-stack-replacement.md`](../loom-orphan-stack-replacement/SKILL.md) | A PR carries `loom:merge-conflict` and a trusted `<!-- loom:orphan-stack flagged … -->` comment in a merge-mode repo (stacked child whose parent closed unmerged). |
 
 ### Step 5: Verify Remote CI After Push
 
@@ -1085,8 +1105,12 @@ shellcheck scripts/*.sh # Shell scripts (if applicable)
 # Push fixes
 git push
 
-# Verify ALL checks pass (ETag'd, backed-off wait; see "CI has not settled" below)
-loom-daemon forge wait-checks <PR_NUMBER> --timeout 1200
+# Snapshot (ETag'd). Pending is NOT a reason to wait: hand back to Judge
+# (see "CI has not settled" below, path 1).
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
+
+# Only when the invocation explicitly requires the settled result (path 2):
+# loom-daemon forge wait-checks <PR_NUMBER> --timeout 1200
 
 # If any still failing, repeat assessment (but should be rare now)
 ```
@@ -1108,6 +1132,8 @@ This rule is about *when your own turn may end*, not about *whether someone else
 
 1. **You have made the fix and pushed it: hand back to Judge instead of waiting.** This is the correct default. Verifying the final CI verdict is **Judge's** gate — complete the `loom:changes-requested` → `loom:review-requested` transition, state in your PR comment that CI was still running at hand-off, and finish your turn. A later Judge pass re-evaluates once CI settles.
 2. **Single-PR / manual invocation where a settled result is expected before your turn ends: block-poll in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** in the foreground (bounded by `--timeout`). It returns control to you before you write your final message; nothing about it depends on a future turn.
+
+An unreadable required-context lookup leaves the result *unknown*, never green: treat it as unsettled (hand back to Judge, report CI as unknown).
 
 **Use `loom-daemon forge wait-checks`, not a `gh pr checks` loop.** It is ETag'd and settles the empty-rollup trap (#6169). Branch on the first **stdout** line (never the exit code; keep stderr separate, it carries the RED detail). For a snapshot use `--timeout 20` (`0` reads a no-checks repo as TIMEOUT). 
 
@@ -1148,6 +1174,22 @@ escalation ladder (#3481) is orchestrator-level and dispatch-time, not
 something you control from inside a Doctor session; this note is for a human
 choosing a Doctor model in manual mode — don't reach for a stronger model on a
 purely mechanical format fix (#4882).
+
+### Fix the Whole Class, Not Just the Cited Lines
+
+For each finding, name the underlying pattern (the same mistake in a value,
+field, call or schema entry), then search the **PR's changed files** (and code
+directly affected by them) for every instance — `grep`, or a structured query of
+a data file — and fix them all. A fix that stops at the cited lines turns one
+class-level defect into extra Judge/Doctor rounds.
+
+- **Class language means examples.** When the Judge writes "the same … occurs
+  in", "and other …" or "everywhere that …", the cited instances are examples,
+  not the full list.
+- **Bounded.** Only the PR's changed files and directly affected code; no
+  repository-wide cleanup, and the time budget above is unchanged.
+- **Report it.** The fix summary comment lists the extra instances fixed beyond
+  those the Judge cited (path and line), or says "no other instances found".
 
 ### Medium Complexity (Usually Handle)
 - Refactoring to improve clarity
@@ -1298,7 +1340,7 @@ git commit -m "Address review feedback
 # Pre-push head-SHA recheck — did another agent push while you worked?
 CURRENT_HEAD_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
 if [ -n "$CURRENT_HEAD_SHA" ] && [ "$CURRENT_HEAD_SHA" != "$CLAIM_HEAD_SHA" ]; then
-  # Re-verify the blocker (gh pr view 42 --comments / forge wait-checks 42) before
+  # Re-verify the blocker (gh pr view 42 --comments / loom-daemon forge wait-checks 42) before
   # continuing — stand down if a concurrent fix already landed.
   echo "Head moved: $CLAIM_HEAD_SHA -> $CURRENT_HEAD_SHA"
 fi

@@ -342,3 +342,8 @@ fn extraction_falls_back_to_the_string_map_and_preserves_true_absence() {
         "loom.doctor_cycles is absent from both maps and must stay NULL, never 0"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

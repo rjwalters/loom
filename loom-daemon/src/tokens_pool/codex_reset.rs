@@ -38,9 +38,8 @@
 //!    executable logic goes into `loom-daemon`, not into shell
 //!    (`.loom/docs/shell-language-policy.md`, ADR-0018). Both files it would
 //!    have to grow — `lib/classify-error.sh` and `spawn-codex.sh` — are
-//!    `contract` entries in the epic #7810 portable pool, so
-//!    `loom-daemon shell-budget --check` refuses the growth by design and
-//!    names this module's approach as the first-listed remedy.
+//!    `contract` entries in the epic #7810 portable pool, which is not meant
+//!    to grow.
 //! 2. **No version skew.** A `v=3` record is silently dropped by any daemon
 //!    older than the adapter that emitted it (the parser fails closed on an
 //!    unknown arity), which would lose the *whole* terminal signal — the
@@ -102,7 +101,7 @@ pub const CAPTURED_USAGE_LIMIT_REFUSAL: &str = "ERROR: You've hit your usage lim
      25, 2026 3:00 PM.";
 
 /// The refusal family this module reads a horizon out of — the same wording
-/// `classify-error.sh`'s `_classify_error_codex` maps to `TOKEN_EXHAUSTED`,
+/// `loom-daemon classify-error`'s codex table maps to `TOKEN_EXHAUSTED`,
 /// restricted to the *usage-limit* rows (the credit-limit and API-error rows
 /// carry no "try again at"). Matched case-insensitively.
 const USAGE_LIMIT_NEEDLES: &[&str] = &[

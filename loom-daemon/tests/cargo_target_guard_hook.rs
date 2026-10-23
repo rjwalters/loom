@@ -282,3 +282,8 @@ fn shared_deny_toggle_off_allows() {
     // The deny keeps its own toggle.
     f.assert_denied("CARGO_TARGET_DIR=/tmp/x cargo test", &[], "/tmp");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

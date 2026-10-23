@@ -20,6 +20,7 @@ pub(crate) fn row(number: u32, labels: &[&str], body: &str, pr: bool) -> RestIss
         comments: 0,
         open_sub_issues: None,
         labels_at: None,
+        draft: false,
     }
 }
 
@@ -102,11 +103,54 @@ fn draw_inputs_read_the_target_row_and_its_stage_label() {
 fn the_ladder_and_the_red_fix_marker_are_read_from_bodies() {
     let ladder = "<!-- loom:reeval step=champion_merge rung=1 next=2026-10-20T00:00:00Z -->";
     let rows = vec![row(70, &["loom:pr"], ladder, true)];
-    let due = ladder_due(&rows);
+    let next = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let now = next - chrono::Duration::minutes(30);
+    let due = ladder_due(&rows, now);
     assert_eq!(due.len(), 1);
-    assert_eq!((due[0].0, due[0].1), (70, StepRole::ChampionMerge));
+    assert_eq!((due[0].0, due[0].1, due[0].2), (70, StepRole::ChampionMerge, next));
+    // #12513: four days out is past rung 1's 1 h, a pre-#12513 marker: due now.
+    let early = next - chrono::Duration::days(4);
+    assert_eq!(ladder_due(&rows, early)[0].2, early);
     assert!(has_red_fix_marker(Some("text\n<!-- loom:main-red-fix -->\n")));
     assert!(!has_red_fix_marker(Some("quoting <!-- loom:main-red-fix --> inline")));
+}
+
+/// #12918: the rung and the raw `next` of the marker, for a PR's merge ladder
+/// and an issue's promote ladder; a row with no marker has no entry.
+#[test]
+fn ladder_state_reads_rung_and_next_for_both_artifacts() {
+    let pr_next = "2026-10-20T00:00:00Z";
+    let issue_next = "2026-10-20T06:00:00Z";
+    let rows = vec![
+        row(
+            70,
+            &["loom:pr"],
+            &format!("<!-- loom:reeval step=champion_merge rung=2 next={pr_next} -->"),
+            true,
+        ),
+        row(
+            71,
+            &["loom:curated"],
+            &format!("body\n<!-- loom:reeval step=champion_promote rung=3 next={issue_next} -->\n"),
+            false,
+        ),
+        row(72, &["loom:pr"], "", true),
+        // A promote marker on a PR is not that PR's ladder.
+        row(
+            73,
+            &["loom:pr"],
+            &format!("<!-- loom:reeval step=champion_promote rung=1 next={pr_next} -->"),
+            true,
+        ),
+    ];
+    let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+    let state = ladder_state(&rows, t(pr_next) - chrono::Duration::minutes(30));
+    assert_eq!((state[&70].rung, state[&70].next), (2, t(pr_next)));
+    assert_eq!((state[&71].rung, state[&71].next), (3, t(issue_next)));
+    assert!(!state.contains_key(&72));
+    assert!(!state.contains_key(&73));
 }
 
 // ------------------------------------------------- the Judge CI hold (#12042)
@@ -131,7 +175,7 @@ mod ci_hold {
     /// `pr_planning::ci_pending` (the #12003 rule) over a fixed forge.
     fn forge(page: Value) -> impl FnMut(&str) -> bool {
         move |sha: &str| {
-            crate::pr_planning::ci_pending(sha, now(), |path| {
+            crate::pr_planning::ci_pending(sha, now(), |_, path| {
                 Some(if path.contains("/status?") {
                     json!({"state": "success", "statuses": []})
                 } else {
@@ -227,4 +271,107 @@ fn a_failed_pull_listing_keeps_the_last_good_set_unvouched() {
     let (kept, ok) = pulls_or_last_good(&slug, Err(anyhow::anyhow!("shed")));
     assert_eq!(kept, vec![pull]);
     assert!(!ok, "a last good PR listing never vouches for a Builder step");
+}
+
+mod held_at_head {
+    use super::*;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// PR 5, held (`loom:pr` + `loom:blocked`, a standing hold), so it
+    /// classifies as a `ChampionHoldReevaluate` step.
+    fn held_pr() -> Vec<Item> {
+        let rows = vec![row(5, &["loom:pr", "loom:blocked"], "", true)];
+        let markers = PullMarkers {
+            champion_hold: true,
+            ..PullMarkers::default()
+        };
+        let pulls = vec![pull_from_row(&rows[0], markers)];
+        let inputs = build_inputs(
+            &rows,
+            pulls,
+            &IssueFacts::default(),
+            RepoInput::default(),
+            HostInput::default(),
+        );
+        let items = step_item::classify(&inputs);
+        assert_eq!(items[0].step(), Some(Step::ChampionHoldReevaluate), "{items:?}");
+        items
+    }
+
+    fn map(v: &str) -> HashMap<u32, String> {
+        HashMap::from([(5, v.to_string())])
+    }
+
+    fn run(
+        heads: &HashMap<u32, String>,
+        hold: &HashMap<u32, String>,
+        released: &[u32],
+    ) -> (usize, Verdict) {
+        let mut items = held_pr();
+        let n = hold_at_recorded_head(
+            &mut items,
+            heads,
+            hold,
+            &HashMap::new(),
+            None,
+            &released.iter().copied().collect(),
+        );
+        (n, items[0].verdict)
+    }
+
+    /// At its held head, with `recorded` the digest the hold wrote (`None`
+    /// for a legacy hold) and `current` the repo's digest now.
+    fn run_auth(recorded: Option<&str>, current: Option<&str>) -> usize {
+        let mut items = held_pr();
+        let auths: HashMap<u32, String> =
+            recorded.map(|a| (5, a.to_string())).into_iter().collect();
+        hold_at_recorded_head(&mut items, &map(HEAD), &map(HEAD), &auths, current, &HashSet::new())
+    }
+
+    #[test]
+    fn an_unchanged_digest_keeps_the_hold() {
+        assert_eq!(run_auth(Some("aa11"), Some("aa11")), 1);
+    }
+
+    #[test]
+    fn a_changed_digest_or_a_legacy_hold_is_drawn_once() {
+        assert_eq!(run_auth(Some("aa11"), Some("bb22")), 0);
+        assert_eq!(run_auth(None, Some("bb22")), 0);
+    }
+
+    #[test]
+    fn no_current_digest_keeps_the_head_only_rule() {
+        assert_eq!(run_auth(Some("aa11"), None), 1);
+        assert_eq!(run_auth(None, None), 1);
+    }
+
+    #[test]
+    fn a_pr_at_its_held_head_is_not_drawn() {
+        let (n, v) = run(&map(HEAD), &map(HEAD), &[]);
+        assert_eq!((n, v), (1, Verdict::Pass(PassReason::HeldAtHead)));
+        assert_eq!(PassReason::HeldAtHead.as_str(), "held_at_head");
+    }
+
+    #[test]
+    fn an_abbreviated_recorded_sha_still_matches() {
+        assert_eq!(run(&map(HEAD), &map(&HEAD[..7]), &[]).0, 1);
+    }
+
+    #[test]
+    fn a_push_makes_it_drawable() {
+        let (n, v) = run(&map("fedcba9876543210"), &map(HEAD), &[]);
+        assert_eq!((n, v), (0, Verdict::Step(Step::ChampionHoldReevaluate)));
+    }
+
+    #[test]
+    fn auto_merge_ok_makes_it_drawable() {
+        assert_eq!(run(&map(HEAD), &map(HEAD), &[5]).0, 0);
+    }
+
+    #[test]
+    fn it_fails_open_without_a_recorded_or_current_head() {
+        assert_eq!(run(&map(HEAD), &HashMap::new(), &[]).0, 0);
+        assert_eq!(run(&HashMap::new(), &map(HEAD), &[]).0, 0);
+    }
 }

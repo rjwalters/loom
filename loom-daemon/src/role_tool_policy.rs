@@ -23,10 +23,8 @@
 //!
 //! Implementing that inline in both scripts added +110 lines of **portable
 //! shell** in the `contract` category, which is exactly what epic #7810 is
-//! retiring — `loom-daemon shell-budget --check` refused PR #8314 for it, with
-//! no commit-trailer escape hatch (portable growth is deliberately not
-//! overridable). This module is the gate's own recommended fix: the logic
-//! lands once, natively, and both scripts shrink to a call-out.
+//! retiring — PR #8314 was rejected for it. This module is the
+//! recommended fix: the logic lands once, natively, and both scripts shrink to a call-out.
 //!
 //! # Byte-for-byte parity is the requirement
 //!

@@ -104,6 +104,30 @@ fn a_live_step_occupies_its_item_and_is_excluded_from_sweep_restarts() {
     assert_eq!(reg.review_stall_watchdog_once(Duration::ZERO), 0);
 }
 
+/// A poisoned registry lock still holds the real claims: the step driver's
+/// reads recover it rather than report an empty registry (#12049).
+#[test]
+fn a_poisoned_registry_lock_still_reports_its_claims() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    insert_step(&mut reg, 9_004, StepRole::Doctor, std::process::id());
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(reg));
+    let held = std::sync::Arc::clone(&registry);
+    let _ = std::thread::spawn(move || {
+        let _guard = held.lock().unwrap();
+        panic!("poison the registry lock");
+    })
+    .join();
+    assert!(registry.is_poisoned());
+
+    assert_eq!(crate::step_dispatch::driver::occupancy(&registry), 1);
+    let claims = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .draw_claims();
+    assert!(claims.items.contains(&9_004), "the recorded claim survives the poison");
+}
+
 /// M7: the step's own dispatch label, stamped up to a clock skew after the
 /// step's local start, is not another claimant's; a label well after it is.
 #[test]

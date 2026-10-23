@@ -11,7 +11,7 @@ Role records carry the queue the role agent **actually consumed** and what it
 below; the daemon's admission-gate listing is only the fallback when the agent's
 queue was not observed. `candidate_source` and `decisions_observed` say which.
 
-OTLP-only log record (`otlp: Logs`, `native: false`), envelope
+OTLP-only log record (`otlp: Logs`), envelope
 `schema_version: 12` (`NEW_KIND_SCHEMA_VERSION`). The log **body** is the
 record's JSON; the attributes are `loom.kind` (`pick.decision`, which the
 queries below filter on), `loom.role` and, on a role record, `loom.repo`
@@ -41,16 +41,66 @@ no journal is created, when no OTLP exporter runs.
 | `started_at` / `ended_at` | RFC 3339 | tick bounds. Present on **empty ticks too**, so cadence per host and gaps (stalls) are measurable |
 | `repo` | string, optional | role records only (#11858): the repo the tick ran for, forge slug or `repo_unresolved`; present with an empty queue too, so empty-queue repos are a `loom.repo` filter. Absent on work-finder records and older daemons; additive, so `schema_version` stays `2` |
 | `outcome` | string | role: the `role_tick.outcome` result (`success`, `skipped_queue_empty`, ...); work finder: `dispatched`, `halted`, `idle`, `none_dispatched` |
-| `dispatch_result` | string, optional | work finder only (#11840): the completed tick's canonical `loom.dispatch.result`, the same token the tick's `loom.dispatch.tick` span carries, classified once from the tick's own report by `observability::ops::dispatch::tick_result` (first match wins): `dispatched`; a whole hold as `halted_<cause>` (one `work_finder::halt_cause` token, e.g. `halted_main_red`, `halted_drain`), `halted_ci_billing` (also a cause-less hold while billing-blocked) or `halted` (several causes, or none named); `saturation_held`; `error`; `build_backoff_held`; `no_eligible_work`; `capacity_full`; `all_skipped`. A tick skipped whole by the GitHub rate-limit breaker (#12083) is an empty record (`outcome` `skipped`, no candidates, `decisions_observed` false) with `dispatch_result` `rate_limit_held`. A partial hold falls through to the rows below it. It repeats on every chunk. `outcome` is unchanged beside it. Absent on role ticks and older daemons: absence means *unavailable*, never idle or ready (free slots alone do not establish readiness). Additive, so `schema_version` stays `2` |
+| `dispatch_result` | string, optional | work finder only (#11840): the completed tick's canonical `loom.dispatch.result`, the same token the tick's `loom.dispatch.tick` span carries, classified once from the tick's own report by `observability::ops::dispatch::tick_result` (first match wins): `dispatched`; a whole hold as `halted_<cause>` (one `work_finder::halt_cause` token, e.g. `halted_main_red`, `halted_drain`), `halted_ci_billing` (also a cause-less hold while billing-blocked) or `halted` (several causes, or none named); `error`; `build_backoff_held`; `no_eligible_work`; `capacity_full`; `all_skipped`. A tick skipped whole by the GitHub rate-limit breaker (#12083) is an empty record (`outcome` `skipped`, no candidates, `decisions_observed` false) with `dispatch_result` `rate_limit_held`. A partial hold falls through to the rows below it. It repeats on every chunk. `outcome` is unchanged beside it. Absent on role ticks and older daemons: absence means *unavailable*, never idle or ready (free slots alone do not establish readiness). Additive, so `schema_version` stays `2` |
 | `candidates_total` | integer | candidates considered (the full count; `candidates[]` lists every one, across chunks) |
 | `candidates[]` | array | in the ranker's order, **every candidate, uncapped** (#11567): `rank` (1-based), `repo` (forge slug, or `repo_unresolved`; never a local path), `number`, `stage`, `sort_key` (`name`, `value`) |
 | `acted[]` | array | `repo`, `number`, `action`, uncapped. Work finder: `dispatched`. Roles: one entry per distinct observed write, from the closed set below; may name an item outside `candidates` |
-| `skipped[]` | array | one `{repo, number, reason}` per skipped candidate listed in `candidates`, plus optional fields set only on work-finder rows. `detail`: a `deferred_file_overlap` row's shared `## Affected Files` paths (`file overlap: a, b`, one line, truncated at 160 chars, #9781), or a `workspace_halted` row's halt cause, only when it is a closed-vocabulary `work_finder::halt_cause` token (`main_red`, `drain`, `weight_zero`, ...; #11811), or an `already_landed` row's evidence (`forge_closed`, `forge_closed_not_planned`, `journal_landed`; #11858); no other disposition's detail (e.g. dispatch-error text) is carried. `disposition` (#11811): the row's own un-collapsed `QueueDisposition` wire name (e.g. `deferred_ramp_cap` vs `deferred_repo_cap`, both `reason = cap`), so a reader can name which cap, back-off or hold skipped it. `held_until` (#11811): RFC 3339 instant the row's time-boxed hold clears, as in `queue.snapshot` (#9311): set for the recheck, dispatch / open-PR back-off, cooldown and retry windows the work finder tracks. All additive (absent otherwise and on older daemons), so `schema_version` stays `2` |
+| `skipped[]` | array | one `{repo, number, reason}` per skipped candidate listed in `candidates`, plus optional fields set only on work-finder rows. `detail`: a `deferred_file_overlap` row's shared `## Affected Files` paths (`file overlap: a, b`, one line, truncated at 160 chars, #9781), or a `workspace_halted` row's halt cause, only when it is a closed-vocabulary `work_finder::halt_cause` token (`main_red`, `drain`, `weight_zero`, ...; #11811), or an `already_landed` row's evidence (`forge_closed`, `forge_closed_not_planned`, `journal_landed`; #11858); no other disposition's detail (e.g. dispatch-error text) is carried. `disposition` (#11811): the row's own un-collapsed `QueueDisposition` wire name (e.g. `deferred_build_backoff` vs `recheck_interval`, both `reason = backoff`), so a reader can name which back-off or hold skipped it. `held_until` (#11811): RFC 3339 instant the row's time-boxed hold clears, as in `queue.snapshot` (#9311): set for the recheck, dispatch / open-PR back-off, cooldown and retry windows the work finder tracks. All additive (absent otherwise and on older daemons), so `schema_version` stays `2` |
 | `candidate_source` | string | `ready_queue` (work finder), `serving_queue` (the role's `pr-queue` result), `listing` (the issue/PR listings the role read, e.g. Curator), `gate_listing` (fallback: the daemon's gate listing), `none` (nothing observed) |
 | `decisions_observed` | boolean | `true` when the agent's writes were observed, so every candidate without an action is a real skip; `false` when only a ranking was seen, and an unexplained candidate is then in neither `acted` nor `skipped` |
-| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, optional `seed_scheme` / `seed_minute` / `seed_host` (#11683; absent when the seed was pinned: `seed` = first 8 bytes, big-endian, of `sha256(seed_scheme + ":" + seed_minute + ":" + seed_host)` for `seed_scheme` `"loom-draw/v1"`, `seed_minute` a decimal string of `floor(unix_utc_secs/60)`), and `draws[]` (every draw, in order; `seed`, `draws_total` and the three `seed_*` fields repeat on each chunk), each `{candidates[{repo, weight, base_weight, bonus}], total_weight, roll, picked, number}`. Since #11742 `weight` = `base_weight` (the repo's roster weight) + `bonus` (points for a verified red-main fix, very-important or important work), and the draw picked the repo with probability `weight / total_weight`. Records from before #11742 also carry a per-tick `temperature` and per-draw `pool` / `p_min`, with softmax weights on a 1,000,000 scale and no `base_weight` / `bonus`; readers must tolerate both, so `schema_version` stays `2`. Replaying the draws from `seed` and the logged weights reproduces the dispatch order; see [`priority-model.md`](priority-model.md) |
-| `item_draw` | object, optional | step engine only (#11896), absent elsewhere: the item draws of a tick, `actionable × priority × age`. Header (repeats on every chunk): `seed_scheme` (`loom-draw/v2`), `seed_minute`, `seed_host`, `tick_counter` (decimal strings), `draws_total`, and `excluded[]`, one `{repo, reason, skip_reason, count}` per workspace and weight-0 reason (`reason` is the classifier's pass reason, e.g. `claimed`, `blocked`, `no_stage`, or `pool_exhausted` (the step's role has no spawnable account) or `build_backoff`; `skip_reason` is its closed-set mapping, `PickSkipReason::from_exclusion`). `pools[]` (chunked in order): each drawn workspace's pool before its first draw, `{repo, index, number, issue, pr, step, weight, priority, age_permille, age_source}` in pool order. `draws[]` (chunked in order): `{repo, draw_index, seed, pool_size, total_weight, roll, picked_index, number, issue, pr, step, weight, actionable, priority, level, lane, age_permille, age_minutes, age_source}`. Draw `i` of a workspace is seeded `sha256("loom-draw/v2:" + seed_minute + ":" + seed_host + ":" + tick_counter + ":" + repo + ":" + draw_index)`, first 8 bytes big-endian; `weight` = `priority × (divisor_min + min(age_minutes, cap_min))`, so P = `weight / total_weight` and draws are without replacement. The roll is `PickRng(seed)` values with rejection of the low `2^64 mod total_weight` ones, then `% total_weight` (no modulo bias). Replay: per repo, start from `pools[]`; for each draw, `roll` selects the first row whose cumulative weight exceeds it over the pool minus earlier picks, and that row's position is `picked_index` (`step_dispatch::item_draw::replay_record`). The tick counter is per process, so a restart within a minute reuses that minute's seeds; replay is unaffected. `age_source` is `mirror`, `events`, `created` or `none`. Additive, so `schema_version` stays `2` |
+| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, optional `seed_scheme` / `seed_minute` / `seed_host` (#11683; absent when the seed was pinned: `seed` = first 8 bytes, big-endian, of `sha256(seed_scheme + ":" + seed_minute + ":" + seed_host)` for `seed_scheme` `"loom-draw/v1"`, `seed_minute` a decimal string of `floor(unix_utc_secs/60)`), and `draws[]` (every draw, in order; `seed`, `draws_total` and the three `seed_*` fields repeat on each chunk), each `{candidates[{repo, weight, base_weight, bonus}], total_weight, roll, picked, number}`. Since #11742 `weight` = `base_weight` (the repo's roster weight) + `bonus` (points for a verified red-main fix, very-important or important work), and the draw picked the repo with probability `weight / total_weight`. Records from before #11742 also carry a per-tick `temperature` and per-draw `pool` / `p_min`, with softmax weights on a 1,000,000 scale and no `base_weight` / `bonus`; readers must tolerate both, so `schema_version` stays `2`. Replaying the draws from `seed` and the logged weights reproduces the dispatch order; see [`priority-model.md`](priority-model.md). Absent on every step-engine tick, the only live dispatch path since #11909 (2026-10-14): live draws are in `item_draw.draws[]`. Records written before #12877 keep only the first 50 draws, so `len(draws) < draws_total` on a busy tick is that truncation |
+| `item_draw` | object, optional | step engine only (#11896, one pool since #12185), absent elsewhere and on a tick that drew nothing: the item draws of a tick from one pool of every actionable item across the host's repos. Header (repeats on every chunk): `seed_scheme` (`loom-draw/v3`), `seed_minute`, `seed_host`, `tick_counter` (decimal strings), `draws_total`, `backlog_exponent` (α) and `busy_exponent` (β) (decimal strings that parse back to the same float), `repos[]` (one `{repo, weight, in_flight, items, pool_weight}` per repo in the starting pool, in pool order: `weight` = `w_repo`, `in_flight` = `in_flight_repo`, `items` = `n_items`, `pool_weight` = `S_r`), `closures[]` (`{repo, after_draw, steps}`: a repo the per-repo cap took out of the pool mid-tick is absent from every draw with `draw_index >= after_draw`; with `steps` (absent when empty), only that repo's rows of those steps are, e.g. a repo whose Champion merge the tick spawned loses its other `champion_merge` and `champion_hold_reevaluate` rows, #12494), `weight_overflow[]` (the repos in the pool when Σw overflowed `u64` and the tick's draws stopped), and `excluded[]`, one `{repo, reason, skip_reason, count}` per workspace and weight-0 reason (`reason` is the classifier's pass reason, e.g. `claimed`, `blocked`, `no_stage`, `draft`, or `pool_exhausted` (the step's role has no spawnable account) or `build_backoff`; `skip_reason` is its closed-set mapping, `PickSkipReason::from_exclusion`; a `refused_<reason>` row counts draws a gate or the claim refused; a `merge_in_flight` row counts the repo's merge steps held out of the pool because a Champion merge, this host's or a peer's, was in flight there, and a `deferred_merge_in_flight` row those a merge this tick spawned took out, #12494). `pools[]` (chunked in order): the pool before the first draw, repos in workspace order, each repo's items in item order, `{repo, index, number, issue, pr, step, weight, priority, age_permille, age_source}`; `index` counts across the whole pool and `weight` is the item weight `iw` = `priority × (divisor_min + min(age_minutes, cap_min))`. `draws[]` (chunked in order): `{repo, draw_index, seed, pool_size, total_weight, roll, picked_index, number, issue, pr, step, weight, draw_weight, repo_weight, repo_items, repo_pool_weight, in_flight_repo, actionable, priority, level, lane, age_permille, age_minutes, age_source}`. Draw `i` of the tick is seeded `sha256("loom-draw/v3:" + seed_minute + ":" + seed_host + ":" + tick_counter + ":" + draw_index)`, first 8 bytes big-endian (`v2` also keyed the repo). A pooled item's draw weight is `w_repo × iw × S_r^(α−1) × (1 + in_flight_repo)^(−β)`, computed in floating point over the items still in the pool, scaled so the heaviest weighs `2^40` and rounded to an integer (a positive weight never becomes 0); `draw_weight` is the drawn item's, `repo_items` and `repo_pool_weight` are its repo's `n_items` and `S_r` at that draw, and P = `draw_weight / total_weight`. Draws are without replacement. The roll is `PickRng(seed)` values with rejection of the low `2^64 mod total_weight` ones, then `% total_weight` (no modulo bias). Replay: start from `pools[]` and `repos[]`; for each draw, drop the repos (or, for a closure with `steps`, those rows of the repo) `closures[]` closed by then, weigh the pool left with the formula above, check `seed`, `total_weight`, `roll` and `draw_weight`, and select the first row whose cumulative weight exceeds the roll; that row's position is `picked_index` (`step_dispatch::item_draw::replay_record`). The tick counter is per process, so a restart within a minute reuses that minute's seeds; replay is unaffected. `age_source` is `mirror`, `events`, `created` or `none`. Additive (a `loom-draw/v2` record has no `repos[]`, exponents or `closures[]` and does not replay under v3), so `schema_version` stays `2` |
 | `very_important_demoted` | array, optional | work finder only (#11509), absent when empty: one `{repo, number, holder}` per `loom:very-important` issue the per-workspace cap ranked as important this tick (`holder` keeps the slot; every one, uncapped). Additive, so `schema_version` is unchanged; see [`priority-model.md`](priority-model.md) |
+
+## Exported summary and payload archive (#12974)
+
+The **exported** log record is a bounded summary, at most 16 KB of JSON
+(`SUMMARY_MAX_BYTES`, pinned by `a_worst_case_summary_stays_under_the_ceiling`),
+so it survives a ~16 KB ingest cap (parent #12973). The **full record** (every
+candidate and draw, exactly the former chunk union) is written first to the
+payload archive and is no longer exported. Chunking (`chunk_index` /
+`chunk_count`, below) now applies only to records read back from older
+daemons; an exported summary is always `chunk_index` 0, `chunk_count` 1.
+
+A summary is recognised by `payload_ref`. It keeps `schema_version`, `role`,
+`host`, `tick_id`, `started_at` / `ended_at`, `outcome`, `dispatch_result`,
+`repo`, `candidate_source`, `decisions_observed`, `candidates_total`, up to 20
+`acted[]` entries, `workspace_draw` (`seed`, `draws_total`, the `seed_*` fields)
+and the `item_draw` header (the seed inputs, exponents and `draws_total`). It
+**never** carries `candidates[]`, `skipped[]`, `workspace_draw.draws[]` or
+`item_draw.pools[]` / `draws[]` / `repos[]` / `excluded[]` / `closures[]` /
+`weight_overflow[]`. If `lanes[]` or `very_important_demoted[]` would push it past
+the cap they are dropped too, then `acted[]`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `payload_ref` | string, summary only | the run id (= `tick_id`) the full record is archived under |
+| `skipped_counts` | object, summary only | `skipped[]` entries per closed-set skip reason, e.g. `{"in_flight": 12, "quota": 3}` |
+| `exclusion_counts` | object, summary only | the step engine's weight-0 items (`item_draw.excluded[].count`) per skip reason |
+
+**Archive.** `observability/pick_payload_archive.rs`: a `PickPayloadSink` trait
+with one implementation, `LocalDirSink`, which writes
+`~/.loom/pick-payloads/<yyyy-mm-dd>/<tick_id>.json.zst` (zstd-compressed JSON of
+the full `PickDecisionRecord`; the day is the tick's `ended_at` date;
+`LOOM_PICK_PAYLOAD_DIR` overrides the directory). Retention: payloads older than
+14 days and, past 512 MiB, the oldest files are deleted (checked at most hourly).
+An S3 sink is a separate child issue. The archive is best-effort: an unwritable
+directory is logged and counted (`pick_payload_archive::failure_count`), the
+summary still exports and the tick does not fail, so a `payload_ref` can name a
+payload that was never written.
+
+**Readers.** Anything needing candidate or draw detail (rank, the draw
+sequence, per-candidate verdicts) must fetch the payload by `payload_ref`:
+`pick_payload_archive::read_payload` returns the full `PickDecisionRecord`, and
+`step_dispatch::item_draw::replay_record` replays `item_draw` from it
+(`replay_from_the_archived_payload_gives_the_same_picks`). SigNoz alone no
+longer has the candidate list. The 2am `infra/ops/scripts/step-dispatch-watch.py`
+reads `item_draw` `draws_total` / `excluded[]` / `draws[]` from `logs_v2`; it
+keeps `draws_total` but loses `excluded[]` / `draws[]` (use `exclusion_counts`) and
+needs a follow-up in that repo.
+
+**Wire compatibility.** Additive only: `schema_version` stays `2`. The three
+new fields are omitted when unset, so a full record is byte-identical to before.
 
 ## What "ranking" means per source
 
@@ -147,10 +197,10 @@ it, only a hold label names a reason; other candidates are undecided.
 | `pr_open_skip` | the item already has an open PR | `open_pr`, `open_pr_backoff` |
 | `operator_hold` | held for a human | `parked`, `hard_exclusion`, `declined`; roles: a merge-hold / park label on the PR |
 | `quota` | token pool or quota would not admit it | roles: `skipped_no_token_pool`, `skipped_pool_exhausted` ticks |
-| `cap` | a concurrency, ramp, per-repo or saturation cap | `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_repo_cap` (`deferred_out_of_slice` mapped here until the dispatch slice was retired, #11682) |
+| `cap` | the concurrency cap is full | `deferred_capacity` (`deferred_ramp_cap`, `deferred_saturation` and `deferred_repo_cap` mapped here until #12406 removed them; `deferred_out_of_slice` until the dispatch slice was retired, #11682) |
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
-| `halted` | the repo's dispatch is halted (red main, gate, drain, breaker) | `workspace_halted` |
+| `halted` | the repo's dispatch is halted (red main, gate, drain, ...) | `workspace_halted` |
 | `host_constraint` | not for this host | `host_constraint`, `peer_claim` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
@@ -158,7 +208,7 @@ it, only a hold label names a reason; other candidates are undecided.
 | `not_selected` | the role ran, its writes were observed, and it did not act on this candidate | roles only, with `decisions_observed` |
 | `already_landed` | the item's work already landed: the issue is closed, or this host recorded a `landed` sweep for it in the last 30 minutes (#11429) | `already_landed` |
 | `already_closed` | the issue is closed as not planned (#11429) | `already_closed` |
-| `no_step` | the item's state calls for no step: an epic, an unpromoted proposal, a PR with no workflow label | step engine only (#11896): `item_draw.excluded[].skip_reason` for `epic`, `proposal`, `no_stage` |
+| `no_step` | the item's state calls for no step: an epic, an unpromoted proposal, an unlabelled draft PR | step engine only (#11896): `item_draw.excluded[].skip_reason` for `epic`, `proposal`, `no_stage`, `draft` |
 
 `QueueDisposition::Dispatched` is the one disposition with no reason: it is
 *acted*. The mapping is a total match in
@@ -169,9 +219,16 @@ there. The step engine's weight-0 exclusions map through the parallel total matc
 → `backoff`, `frozen` / `operator` / `hard_exclusion` → `operator_hold`,
 `claimed` / `queued` → `in_flight`, `shared_pr` → `pr_open_skip`, `sequenced`
 → `overlap_chain`, `blocked` → `blocked`, `capability_missing` →
-`host_constraint`, `epic` / `proposal` / `no_stage` → `no_step`.
+`host_constraint`, `epic` / `proposal` / `no_stage` / `draft` → `no_step`.
 
 ## Rank of an item in each role's latest candidate list
+
+> **Since #12974 this is not derivable from SigNoz.** The exported record is a
+> summary with no `candidates[]` (see "Exported summary and payload archive"),
+> so the `arrayFirstIndex` query below returns `0` for every item on a daemon
+> that exports summaries. Rank at an instant needs the archived payload:
+> fetch it by `payload_ref` and read the candidate's `rank`. The query is kept
+> for records written by older daemons.
 
 For a record with `candidate_source = serving_queue` this is the item's rank in
 the role's serving-queue order; for `listing`, in the order the role read it;
@@ -218,6 +275,10 @@ filter grouped by `role, host`, restricted to `chunk_index = 0` so the chunks of
 one tick are not counted as multiple ticks.
 
 ## Record volume
+
+> **Since #12974** the exported records are summaries of at most 16 KB, so the
+> several-hundred-KB figures below describe the archived payload (compressed
+> on local disk), not the log stream.
 
 > **Step dispatch (#11894, live since #11909).** Item roles have left the fixed role-runner cadences, so this table no longer holds for Curator, Judge and Doctor. Work-finder records carry `item_draw` (the step, the weight terms, `age_source`, and `weight_overflow`), and each work-finder row's `stage` names its step. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
 

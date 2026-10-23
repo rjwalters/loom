@@ -35,7 +35,7 @@ fn read_config_parses_headers_file_on_an_exporter_entry() {
             "enabled": true,
             "exporters": [
                 {"kind": "otlp", "endpoint": "https://otlp.internal", "headers_file": "/run/secrets/otlp-headers"},
-                {"kind": "https", "headersFile": "/run/secrets/alias"},
+                {"kind": "otlp", "headersFile": "/run/secrets/alias"},
                 {"kind": "other", "headers_file": 7},
                 {"kind": "plain", "endpoint": "https://plain.internal"}
             ]
@@ -49,7 +49,7 @@ fn read_config_parses_headers_file_on_an_exporter_entry() {
         config.exporters,
         Some(vec![
             with_headers("otlp", Some("https://otlp.internal"), "/run/secrets/otlp-headers"),
-            with_headers("https", None, "/run/secrets/alias"),
+            with_headers("otlp", None, "/run/secrets/alias"),
             // Present but not a string: kept as an unusable path so the
             // policy pass refuses the entry rather than dropping the key.
             with_headers("other", None, ""),
@@ -63,26 +63,24 @@ fn read_config_parses_headers_file_on_an_exporter_entry() {
 fn resolve_exporters_carries_the_headers_file_path_through() {
     clear_env();
     let config = ObservabilityConfig {
-        exporters: Some(vec![
-            raw("https", None),
-            with_headers("otlp", Some("https://otlp.internal"), "/run/secrets/otlp-headers"),
-        ]),
+        exporters: Some(vec![with_headers(
+            "otlp",
+            Some("https://otlp.internal"),
+            "/run/secrets/otlp-headers",
+        )]),
         ..Default::default()
     };
     assert_eq!(
         resolve_exporters(&config),
-        vec![
-            entry(ExporterKind::Https, None),
-            ExporterEntry {
-                headers_file: Some("/run/secrets/otlp-headers".to_string()),
-                ..entry(ExporterKind::Otlp, Some("https://otlp.internal"))
-            },
-        ]
+        vec![ExporterEntry {
+            headers_file: Some("/run/secrets/otlp-headers".to_string()),
+            ..entry(ExporterKind::Otlp, Some("https://otlp.internal"))
+        }]
     );
 }
 
 /// The policy pass, on every build: a `headers_file` entry is refused when
-/// it is not `otlp`, has no usable path, or would send the headers in
+/// it has no usable path, or would send the headers in
 /// cleartext off the host — and an entry without one is judged exactly as
 /// before (plain `http` to a non-loopback collector stays allowed).
 #[test]
@@ -90,14 +88,8 @@ fn entry_endpoint_applies_the_headers_file_policy_only_to_entries_that_have_one(
     let shared = "https://ingest.test-fixture.internal".to_string();
     let refused = |entry: &ExporterEntry| entry_endpoint(entry, Some(&shared)).unwrap_err().1;
 
-    let https_kind = ExporterEntry {
-        headers_file: Some("/run/secrets/otlp-headers".to_string()),
-        ..entry(ExporterKind::Https, None)
-    };
-    assert!(refused(&https_kind).contains("only supported on an otlp"));
-
     assert_eq!(
-        entry_endpoint(&entry(ExporterKind::Https, None), Some(&shared)),
+        entry_endpoint(&entry(ExporterKind::Otlp, None), Some(&shared)),
         Ok(shared.clone())
     );
 
@@ -135,10 +127,11 @@ fn planned_otlp_exporters_pairs_each_endpoint_with_its_headers_file() {
     let config = ObservabilityConfig {
         enabled: Some(true),
         endpoint: Some("https://ingest.test-fixture.internal".to_string()),
-        exporters: Some(vec![
-            raw("https", None),
-            with_headers("otlp", Some("https://otlp.test-fixture.internal"), "/run/secrets/h"),
-        ]),
+        exporters: Some(vec![with_headers(
+            "otlp",
+            Some("https://otlp.test-fixture.internal"),
+            "/run/secrets/h",
+        )]),
         ..Default::default()
     };
     assert_eq!(
@@ -149,35 +142,6 @@ fn planned_otlp_exporters_pairs_each_endpoint_with_its_headers_file() {
         )]
     );
     assert_eq!(planned_otlp_endpoints(&config), vec!["https://otlp.test-fixture.internal"]);
-}
-
-/// A `headers_file` on a non-otlp entry takes that sink out with its own
-/// `misconfigured` status, before any file is read. Runs on every build.
-#[tokio::test]
-#[serial]
-async fn spawn_task_refuses_a_headers_file_on_a_non_otlp_entry() {
-    clear_env();
-    let bus = EventBus::new();
-    let dir = tempdir().unwrap();
-    let config = ObservabilityConfig {
-        enabled: Some(true),
-        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-        // Never read: the entry is refused in the policy pass.
-        ingest_key_file: Some(dir.path().join("absent").to_string_lossy().into_owned()),
-        exporters: Some(vec![with_headers("https", None, "/nonexistent/otlp-headers")]),
-        ..Default::default()
-    };
-    let handles =
-        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
-    assert!(handles.is_none());
-    let statuses = global_export_statuses();
-    assert_eq!(statuses["https"].state, crate::types::ObservabilityExportState::Misconfigured);
-    assert!(statuses["https"]
-        .last_failure_detail
-        .as_deref()
-        .unwrap()
-        .contains("only supported on an otlp"));
-    assert_eq!(bus.receiver_count(), 0);
 }
 
 /// A refused headers file — loose permissions, then a malformed line — turns
@@ -312,65 +276,6 @@ async fn spawn_task_starts_a_headers_file_entry_with_no_ingest_key() {
             "started, not misconfigured"
         );
         assert!(!serde_json::to_string(status).unwrap().contains(SECRET));
-        for handle in handles {
-            handle.abort();
-        }
-    }
-}
-
-/// #11555: with no usable ingest key, only the entries that need one are
-/// `misconfigured` — the `headers_file` entry still starts, in the same
-/// `spawn_task` call.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn spawn_task_misconfigures_only_the_entries_that_need_the_missing_key() {
-    clear_env();
-    for (key_file, expected) in [
-        (None, "ingestKeyFile not configured"),
-        (Some("missing.key"), "could not read ingest key file"),
-    ] {
-        let bus = EventBus::new();
-        let dir = tempdir().unwrap();
-        let headers_path =
-            write_headers_file(dir.path(), &format!("X-Client-Secret: {SECRET}\n"), 0o600);
-        let config = ObservabilityConfig {
-            enabled: Some(true),
-            endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-            ingest_key_file: key_file
-                .map(|name| dir.path().join(name).to_string_lossy().into_owned()),
-            exporters: Some(vec![
-                raw("https", None),
-                with_headers("otlp", Some("https://otlp.test-fixture.internal"), &headers_path),
-            ]),
-            flush_interval_secs: Some(3600), // no network attempt during the test
-            ..Default::default()
-        };
-        let handles = spawn_task(
-            &config,
-            dir.path().to_path_buf(),
-            &bus,
-            Instant::now(),
-            test_workspace_pool(),
-        )
-        .expect("the headers_file entry must survive the missing key");
-        let statuses = global_export_statuses();
-        let https = &statuses["https"];
-        assert_eq!(https.state, crate::types::ObservabilityExportState::Misconfigured);
-        assert!(
-            https
-                .last_failure_detail
-                .as_deref()
-                .unwrap()
-                .contains(expected),
-            "detail was: {}",
-            https.last_failure_detail.as_deref().unwrap()
-        );
-        assert_eq!(
-            statuses["otlp"].state,
-            crate::types::ObservabilityExportState::Starting,
-            "the headers_file entry started anyway"
-        );
         for handle in handles {
             handle.abort();
         }

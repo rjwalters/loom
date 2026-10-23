@@ -276,25 +276,22 @@ fn a_download_runs_under_the_reader() {
 }
 
 #[test]
-fn a_download_outside_the_readers_installation_falls_back_and_withdraws_for_the_repo() {
+fn a_download_outside_the_readers_installation_is_the_readers_answer_not_a_writer_retry() {
     let stub = Stub::new(NOT_COVERED, OK);
     let (result, rows, withdrawn) = download(&stub, true);
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(stub.calls(), vec![true, false]);
-    assert_eq!(roles(&rows), vec!["reader", "writer-fallback"]);
-    assert_eq!(
-        *withdrawn.lock().unwrap(),
-        vec![(APP.to_string(), REPO.to_string(), Failure::Coverage)]
-    );
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(stub.calls(), vec![true], "writer stub NOT invoked");
+    assert_eq!(roles(&rows), vec!["reader"]);
+    assert!(withdrawn.lock().unwrap().is_empty());
 }
 
 #[test]
-fn a_rate_limited_reader_download_falls_back_and_withdraws_the_reader() {
+fn a_rate_limited_reader_download_withdraws_the_reader_and_never_runs_on_the_writer() {
     let stub = Stub::new(RATE_LIMITED, OK);
     let (result, rows, withdrawn) = download(&stub, true);
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(stub.calls(), vec![true, false]);
-    assert_eq!(roles(&rows), vec!["reader", "writer-fallback"]);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(stub.calls(), vec![true], "writer stub NOT invoked");
+    assert_eq!(roles(&rows), vec!["reader"]);
     assert_eq!(
         *withdrawn.lock().unwrap(),
         vec![(

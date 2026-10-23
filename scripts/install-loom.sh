@@ -1897,8 +1897,11 @@ success "Installation metadata recorded ($(echo "$INSTALLED_FILES_JSON" | grep -
 echo ""
 
 # Wire the install-metadata.json merge=ours driver (#4528) so this host's
-# resync commits stop conflicting with other hosts' on `git merge`.
-ensure_install_metadata_merge_driver "$TARGET_PATH"
+# resync commits stop conflicting with other hosts' on `git merge`. Write
+# .gitattributes into the install worktree (not the main checkout) so it lands
+# in the install PR instead of sitting untracked after the merge (#12683); the
+# merge.ours.driver git config is shared by all worktrees of the repo.
+ensure_install_metadata_merge_driver "$TARGET_PATH/$WORKTREE_PATH"
 success "Configured install-metadata.json merge=ours driver (.gitattributes + local git config)"
 echo ""
 
@@ -2000,6 +2003,7 @@ EXPECTED_FILES=(
   ".loom/roles"
   ".loom/scripts/worktree.sh"
   ".loom/scripts/lib/loom-tools.sh"
+  ".loom/scripts/lib/repo-root.sh"
   ".loom/scripts/lib/forge-helpers.sh"
   ".loom/scripts/lib/pipe-pane-cmd.sh"
   # NOTE (#4262): .loom/hooks/*.sh are intentionally NOT expected — hook scripts

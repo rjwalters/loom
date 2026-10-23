@@ -315,9 +315,11 @@ impl ParkForge for RegistryParkForge<'_> {
     fn view(&mut self, number: u64) -> Result<IssueState, String> {
         self.refuse_if_wedged()?;
         let path = self.issue_path(number)?;
-        // Writer identity: this read is the first half of a read-modify-write,
-        // so a lagging reader App must not supply a stale body.
-        let r = self.reg.gh_read_own_write(
+        // The first half of a read-modify-write. A reader or the gateway
+        // answers, never the writer (#12555, #12394): the body is someone
+        // else's edit as often as ours, which the writer reads no fresher,
+        // and the read is unconditional (no cached `If-None-Match`).
+        let r = self.reg.gh_read(
             VIEW_OP,
             [
                 "api",

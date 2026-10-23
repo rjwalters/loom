@@ -11,9 +11,8 @@
 //!    ([`crate::observability::ops::stage_events`], #11924: page 1 for the
 //!    `Link` header, then back from the last page; GitHub lists events
 //!    oldest first, so page 1 alone would give an earlier application). It
-//!    shares the stage-dwell sampler's page walk, not its in-process cache:
-//!    that one is the captain's, budgeted for a 5-minute sample and skipped
-//!    on dispatchers. Its reads are counted under their own caller,
+//!    uses the shared page walk ([`crate::observability::ops::stage_events`]).
+//!    Its reads are counted under their own caller,
 //!    [`EVENTS_CALLER`]. This provider keeps its own **persisted** cache,
 //!    keyed `(repo, number, label)`, and its own per-tick read budget
 //!    ([`DEFAULT_EVENTS_BUDGET`]), where **each page is one read**. One read
@@ -72,7 +71,7 @@ pub const NOT_FOUND_TTL_SECS: i64 = 6 * 3600;
 pub const REVALIDATE_SECS: i64 = 10 * 60;
 
 /// The `caller` this provider's events reads are counted under in
-/// `loom.forge.calls`, apart from stage-dwell's.
+/// `loom.forge.calls`.
 pub const EVENTS_CALLER: &str = "stage_entry.events";
 
 /// Most cached entries kept; past it the oldest reads are dropped first.
@@ -140,6 +139,8 @@ impl EventsSource for GhEventsReader {
         label: &str,
         max_pages: usize,
     ) -> LabelTimes {
+        // #12310: the labeled-events read is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         stage_events::read(EVENTS_CALLER, root, slug, number, label, max_pages)
     }
 }

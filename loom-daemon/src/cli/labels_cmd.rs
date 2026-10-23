@@ -8,9 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::label_registry::{generate, Registry, BOOL_PROPERTIES, KINDS};
 use anyhow::Result;
 use clap::Subcommand;
-use loom_daemon::label_registry::{generate, Registry, BOOL_PROPERTIES, KINDS};
 
 /// Query the label registry and keep `labels.yml` generated from it (#10013).
 #[derive(clap::Args)]
@@ -141,8 +141,8 @@ fn load(root: &Path) -> Result<Registry> {
 pub(crate) fn dispatch(args: LabelsArgs) -> Result<()> {
     // 2AMLogic/2am#4367: `undeclared` and `migrate` read the forge; run by a
     // host job with LOOM_GH_GATEWAY_DIR set, those reads use the daemon's
-    // published gateway profiles. A no-op without the variable.
-    loom_daemon::forge_gateway::enable_cli();
+    // published gateway profiles. Every subcommand enables that at startup
+    // now (`forge_gateway::enable_cli_reads`, #12389).
     let code = run(args.action)?;
     if code != 0 {
         std::process::exit(code);
@@ -160,9 +160,7 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
             let reg = Registry::embedded();
             let names: Vec<&str> = match (property, kind) {
                 (Some(p), None) => match reg.with_property(&p) {
-                    Some(_) if with_retired => {
-                        loom_daemon::label_registry::embedded_set_with_retired(&p)
-                    }
+                    Some(_) if with_retired => crate::label_registry::embedded_set_with_retired(&p),
                     Some(n) => n,
                     None => {
                         eprintln!("unknown property '{p}'; known: {}", BOOL_PROPERTIES.join(", "));
@@ -189,7 +187,7 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
                 eprintln!("unknown label '{name}'");
                 return Ok(1);
             };
-            for n in loom_daemon::label_registry::embedded_aliases(label.name.as_str()) {
+            for n in crate::label_registry::embedded_aliases(label.name.as_str()) {
                 println!("{n}");
             }
             Ok(0)
@@ -278,7 +276,7 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
     }
 }
 
-fn label_json(l: &loom_daemon::label_registry::Label) -> serde_json::Value {
+fn label_json(l: &crate::label_registry::Label) -> serde_json::Value {
     serde_json::json!({
         "name": l.name, "description": l.description, "color": l.color,
         "kind": l.kind, "applied_by": l.applied_by, "removed_by": l.removed_by,

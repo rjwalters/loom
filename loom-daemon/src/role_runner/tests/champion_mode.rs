@@ -143,3 +143,38 @@ fn champion_mode_non_item_is_the_admitted_interval_prompt() {
     let (prompt, _guard) = decision.expect("champion is enabled and listed");
     assert_eq!(prompt, "/loom:champion --non-item");
 }
+
+/// Status and health report the interval loops that run, not the step roles
+/// a config still names (#12049).
+#[test]
+fn reported_interval_roles_exclude_step_roles() {
+    use crate::role_runner::champion_mode::resolve_interval_roles;
+    let names = |cfg: &RoleRunnerConfig| -> Vec<&'static str> {
+        resolve_interval_roles(cfg).iter().map(|s| s.name).collect()
+    };
+
+    let cfg = RoleRunnerConfig {
+        roles: Some(vec![
+            "curator".to_string(),
+            "guide".to_string(),
+            "judge".to_string(),
+        ]),
+        ..Default::default()
+    };
+    assert_eq!(names(&cfg), vec!["guide"]);
+
+    let only_steps = RoleRunnerConfig {
+        roles: Some(
+            crate::role_runner::champion_mode::STEP_ROLES
+                .map(String::from)
+                .to_vec(),
+        ),
+        ..Default::default()
+    };
+    assert!(names(&only_steps).is_empty());
+
+    let default = names(&RoleRunnerConfig::default());
+    assert!(default
+        .iter()
+        .all(|n| !crate::role_runner::champion_mode::is_step_role(n)));
+}

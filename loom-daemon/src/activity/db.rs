@@ -90,7 +90,6 @@ impl ActivityDb {
 
     /// Get terminal activity history (inputs joined with outputs)
     /// Returns entries in reverse chronological order (most recent first)
-    #[allow(dead_code)]
     pub fn get_terminal_activity(
         &self,
         terminal_id: &str,
@@ -174,7 +173,6 @@ impl ActivityDb {
     // ========================================================================
 
     /// Parse and record quality metrics from terminal output.
-    #[allow(dead_code)]
     pub fn record_quality_from_output(&self, input_id: i64, output: &str) -> Result<Option<i64>> {
         quality::record_quality_from_output(&self.conn, input_id, output)
     }
@@ -347,12 +345,6 @@ impl ActivityDb {
         claims::get_claims_by_terminal(&self.conn, terminal_id)
     }
 
-    /// Get stale claims (those without heartbeat for longer than threshold).
-    #[allow(dead_code)]
-    pub fn get_stale_claims(&self, stale_threshold_secs: i64) -> Result<Vec<IssueClaim>> {
-        claims::get_stale_claims(&self.conn, stale_threshold_secs)
-    }
-
     /// Release all stale claims and return the count of claims released.
     pub fn release_stale_claims(&self, stale_threshold_secs: i64) -> Result<usize> {
         claims::release_stale_claims(&self.conn, stale_threshold_secs)
@@ -374,8 +366,7 @@ impl ActivityDb {
 
 // Implement StatsQueries trait for ActivityDb
 use super::stats::{
-    self, AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary,
-    WeeklyVelocity,
+    self, AgentEffectiveness, CostPerIssue, StatsQueries, StatsSummary, WeeklyVelocity,
 };
 use chrono::NaiveDate;
 
@@ -389,14 +380,6 @@ impl StatsQueries for ActivityDb {
 
     fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>> {
         stats::query_cost_per_issue(&self.conn, issue_number)
-    }
-
-    fn get_daily_velocity(
-        &self,
-        start_date: Option<NaiveDate>,
-        end_date: Option<NaiveDate>,
-    ) -> rusqlite::Result<Vec<DailyVelocity>> {
-        stats::query_daily_velocity(&self.conn, start_date, end_date)
     }
 
     fn get_weekly_velocity(&self) -> rusqlite::Result<Vec<WeeklyVelocity>> {

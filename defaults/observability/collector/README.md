@@ -110,7 +110,9 @@ Claude Code's own attribute names (`session.id`, `user.email`,
 `loom.*`-prefixed. The shared `transform/privacy` processor in `config.yaml`
 still applies unmodified to this path — it keeps only the resource keys
 (`service.name`, `service.version`, `service.instance.id`, `host.id`,
-`host.name`, `loom.fleet.config_sha`, `loom.daemon.revision`) and the
+`host.name`, `loom.fleet.config_sha`, `loom.daemon.revision`, and the host
+shape `host.cpu.count`, `loom.host.mem_total_bytes`, `host.arch`,
+`host.type`, `cloud.provider`, `cloud.region` — #12874) and the
 explicit `loom.*` log/span allowlist, plus the small non-namespaced
 `metric_statements` datapoint keys listed under "Privacy and remote
 deployment" below. Anything else Claude Code sends — including
@@ -261,6 +263,13 @@ counts/ids/allowlisted tool names — never transcript content, same as
 `epic.issue.*` event-bus payload, carried whole as one JSON string rather than
 re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
 
+Issue #12230 adds four allowlisted attributes and no new kind: the
+`daemon.work_finder.first_tick` record's scalars as typed copies,
+`loom.payload.secs_since_start`, `loom.payload.gate_wait_secs`,
+`loom.payload.jitter_delay_secs` and
+`loom.payload.startup_reconcile_cap_fired` (durations and a flag; the same
+values are already inside `loom.payload`).
+
 Issue #9445 adds one more allowlisted attribute and no new kind:
 `session.summary`'s `loom.session_kind` (`sweep` / `role` / `interactive`), a
 fixed three-value vocabulary that says whether a row's absent `loom.issue` is
@@ -365,6 +374,16 @@ and again when it exports it (#8857). The #8857 quota metrics
 (`loom.llm.tokens.*`, `loom.llm.requests`, `loom.pool.*`) carry only
 `provider`, `model` and `state`: per-provider aggregates, never an account
 name or credential.
+
+`host.health`'s fleet-state gauges (#12811, `HOST_HEALTH_DATAPOINT_KEYS` in
+`loom-daemon/src/observability/otlp/mapping/host_health.rs`, contract-tested
+against this list) add `sweep_ids`, `visibility` and `workspace`. `sweep_ids`
+is the one deliberate exception to "low cardinality": it is the host's
+in-flight sweep-id set on `loom.host.active_sweeps` (sorted, at most 32 ids),
+which the dashboard reconciles live sweeps against now that the daemon no longer sends to `/ingest` (#12813). It
+opens a new series only when the set changes, at most once per `host.health`
+sample (about every 5 minutes per host). `workspace` is a directory name, never
+a path.
 
 **The body policy, exactly** (rewritten for #8825; this used to read "does not
 accept raw shell output, prompts or model completions", which is no longer the

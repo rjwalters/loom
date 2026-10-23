@@ -91,24 +91,7 @@ impl WorkSource for GhWorkSource {
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
         }
-        // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
-        // off): while the feed is `healthy`, a repo with no event since its
-        // last poll returns its held *candidate* listing. Off, this is a bare
-        // call. The claim itself (`dispatch`) re-reads the forge and is never
-        // gated.
-        let repo = self.repo.clone();
-        let cwd = self.cwd.clone();
-        let listed =
-            crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
-                self.list_ready_issues_uncached()
-            });
-        // #11139: a fresh listing that fell short is never held, so a gated
-        // tick cannot serve partial rows as the whole queue. (A held listing
-        // leaves `complete` at its per-tick default, `true`.)
-        if !self.complete {
-            crate::forge_events::poll_gate::forget_held(cwd.as_deref());
-        }
-        listed
+        self.list_ready_issues_uncached()
     }
 
     fn listing_complete(&self) -> bool {
@@ -122,17 +105,10 @@ impl WorkSource for GhWorkSource {
     /// the cap unions with the ready listing); it never marks the ready queue incomplete, because
     /// the ready rows themselves were read whole.
     fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        // #12310: the work finder's listings are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
         let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
-        // 2am#4367 P5: a discovery listing, so the mirror may serve it.
-        if let Some(rows) = mirror_rows(cwd, repo, label, true) {
-            return Some(
-                rows.into_iter()
-                    .filter(|r| !r.is_pull_request)
-                    .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
-                    .collect(),
-            );
-        }
         match crate::forge_listing::list_issues_cached_paged_as(
             "work_finder",
             gh,
@@ -230,16 +206,10 @@ impl GhWorkSource {
     /// change) returns what it read and clears [`Self::complete`]; only page
     /// 1 failing is an error. Without `all_pages`, page 1 alone.
     fn list_label(&mut self, label: &str, all_pages: bool) -> Result<Vec<WorkItem>> {
+        // #12310: the work finder's listings are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
-        // 2am#4367 P5: the candidate listing from the state mirror when the
-        // repo's watermark is within its bound; else today's REST path. The
-        // claim itself (`dispatch`) re-reads the forge and never the mirror.
-        let listing = if let Some(rows) = mirror_rows(cwd, repo, label, all_pages) {
-            crate::forge_listing::PagedListing {
-                rows,
-                incomplete: None,
-            }
-        } else if all_pages {
+        let listing = if all_pages {
             crate::forge_listing::list_issues_cached_paged_as(
                 "work_finder",
                 gh,
@@ -293,32 +263,6 @@ impl GhWorkSource {
     }
 }
 
-/// A candidate listing from the GitHub state mirror (2am#4367 P5), or `None`
-/// (read the forge as today): no mirror live, the repo stale or unknown to
-/// it, or any error. Always a [`ReadKind::Discovery`] read.
-///
-/// [`ReadKind::Discovery`]: crate::forge_events::poll_gate::ReadKind::Discovery
-fn mirror_rows(
-    cwd: Option<&Path>,
-    repo: Option<&str>,
-    label: &str,
-    all_pages: bool,
-) -> Option<Vec<crate::forge_listing::RestIssue>> {
-    use crate::forge_mirror::discovery::{list_open, Caller, Pages};
-    if !crate::forge_mirror::is_active() {
-        return None;
-    }
-    let pages = if all_pages { Pages::All } else { Pages::First };
-    list_open(
-        crate::forge_events::poll_gate::ReadKind::Discovery,
-        Caller::WorkFinder,
-        cwd,
-        repo,
-        Some(label),
-        pages,
-    )
-}
-
 /// A concrete [`WorkDispatcher`] backed by the daemon [`SweepRegistry`].
 ///
 /// `dispatch()` calls the registry's own `dispatch()` — reusing its
@@ -330,8 +274,7 @@ pub struct RegistryDispatcher {
 }
 
 impl RegistryDispatcher {
-    /// Construct a dispatcher over the shared registry. Production goes
-    /// through [`dispatcher_pairs`].
+    /// Construct a dispatcher over the shared registry.
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
         Self { registry }
@@ -754,21 +697,6 @@ impl WorkDispatcher for RegistryDispatcher {
         }
         Ok(outcome.was_new)
     }
-}
-
-/// Build the per-tick `(source, dispatcher)` pair for every root (#3924).
-#[must_use]
-pub fn dispatcher_pairs(
-    pool: &crate::workspace_pool::WorkspacePool,
-    roots: &[PathBuf],
-) -> Vec<(GhWorkSource, RegistryDispatcher)> {
-    roots
-        .iter()
-        .map(|root| {
-            let registry = pool.get_or_provision(root);
-            (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
-        })
-        .collect()
 }
 
 #[cfg(test)]

@@ -405,6 +405,8 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     let outcome = match status {
         Some(304) => Outcome::NotModified,
         Some(200..=299) if exit_ok => Outcome::Ok,
+        // #12310: a gateway reserve refusal is a `429` that is not a limit.
+        _ if crate::gh_invocation::purpose::is_reserve_refusal(stderr) => Outcome::Error,
         _ if is_secondary_limit(response, stderr) => Outcome::SecondaryLimited,
         _ if crate::rate_limit_breaker::indicates_rate_limit(stderr) => Outcome::RateLimited,
         Some(429) => Outcome::RateLimited,
@@ -425,20 +427,6 @@ pub fn is_secondary_limit(response: Option<&HttpResponse>, stderr: &str) -> bool
     };
     crate::forge_denial::classify(response.map(|r| r.status), &text, response.map(|r| &r.ratelimit))
         == Some(crate::forge_denial::Denial::SecondaryRateLimit)
-}
-
-/// Record one `gh api --include` call by `caller` (see [`classify`]) with the
-/// #9777 call identity. Plain `gh` spawns are recorded by the `GhInvocation`
-/// facade (#10089); this is for a caller that carries an explicit identity.
-pub fn record_gh_api_with_identity(
-    caller: &'static str,
-    identity: &CallIdentity,
-    response: Option<&HttpResponse>,
-    exit_ok: bool,
-    stderr: &str,
-) {
-    let (pool, outcome) = classify(response, exit_ok, stderr);
-    record_with_identity(caller, identity, pool, outcome, response.map(|r| &r.ratelimit));
 }
 
 /// Record one forge call. Never blocks or fails the caller: a poisoned lock
@@ -1117,47 +1105,6 @@ fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option
         })
         .map(|(pool, r)| (*pool, r.reset_epoch.and_then(epoch)))
         .collect()
-}
-
-/// The newest header budget reading of each pool, per **reader rate-limit
-/// identity bucket** (#10232, #10334), keyed by the public bucket label
-/// ([`crate::forge_identity::reader_bucket`], or
-/// [`crate::forge_identity::writer_bucket`] — `writer@<owner>` — for an
-/// owner's writer and its fallback). Unlike [`status_report`]'s `budget` this
-/// never mixes identities: two readers of the same role, or two owners'
-/// writers, are separate buckets, and an unattributed call is not returned at
-/// all. Never a credential.
-#[must_use]
-pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetReading>> {
-    let window = sink_dir().map(|d| read_window(&d, now.timestamp()));
-    let process = process_state()
-        .lock()
-        .map(|s| s.latest_by_bucket.clone())
-        .unwrap_or_default();
-    let mut latest = process;
-    for (key, r) in window.iter().flat_map(|w| w.latest_by_bucket.iter()) {
-        if latest
-            .get(key)
-            .is_none_or(|l| l.observed_at < r.observed_at)
-        {
-            latest.insert(key.clone(), *r);
-        }
-    }
-    let mut out: BTreeMap<String, Vec<ForgeBudgetReading>> = BTreeMap::new();
-    for ((pool, bucket), r) in latest {
-        let Some(observed_at) = epoch(r.observed_at) else {
-            continue;
-        };
-        out.entry(bucket).or_default().push(ForgeBudgetReading {
-            pool: pool.as_str().to_string(),
-            remaining: r.remaining,
-            used: r.used,
-            reset_at: r.reset_epoch.and_then(epoch),
-            observed_at,
-            source: "headers".to_string(),
-        });
-    }
-    out
 }
 
 /// This host's budget-costing forge calls per pool over the last window on
