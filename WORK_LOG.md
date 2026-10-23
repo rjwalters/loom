@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-23
 
+- **PR #13067**: refactor: add fs_util::write_atomic and migrate five duplicate helpers
 - **Issue #13094** (closed): [ci-daily] Docker Image Smokes (unfiltered)
 - **PR #13092**: chore(harness): track latest CLIs — codex 0.163.0→0.164.0
 - **PR #13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
