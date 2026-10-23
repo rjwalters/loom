@@ -22,7 +22,7 @@
 //! arm of `worktree.sh <N>` runs on the always-taken path, where a hard daemon
 //! dependency is exactly what got slice 1's first delegation reverted (#8226),
 //! and where a full shell fallback would have to be kept alongside the port —
-//! growing a file whose portable-shell budget admits no growth. `--sparse` and
+//! growing a file whose portable shell should not grow. `--sparse` and
 //! `--full` are flags no role prompt, command or script in the tree passes, so
 //! this family can leave the shell entirely, today, without moving the
 //! ordinary `worktree.sh <N>` onto a built binary. See "No daemon" below for

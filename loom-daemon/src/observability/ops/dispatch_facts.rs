@@ -33,7 +33,7 @@
 use std::path::Path;
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::RepoVisibility;
 use crate::types::CapView;
 use crate::work_finder::halt_cause::since::RootHalt;

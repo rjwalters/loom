@@ -519,7 +519,9 @@ behavior is byte-for-byte unchanged from before #6850.
   matched against every **added or removed line** (leading `+`/`-` stripped)
   of every changed file, read fresh from the paginated files API (e.g.
   `^\s*permissions:`, `id-token`, `secrets\.`, `pull_request_target`). One
-  matching line disqualifies the PR from the class. **Fail closed**: an
+  matching line disqualifies the PR from the class. Whole-line `#` comments are
+  ignored and the literal `secrets.GITHUB_TOKEN` is stripped before matching
+  (#12995); any other `secrets.*` still matches. **Fail closed**: an
   unreadable diff, a changed file the API returns no patch for (binary, or
   too large to inline), or an invalid regex also disqualifies it.
 - `privilegedContentPatterns` (#12954, optional) — regexes (jq `test()`, the
@@ -558,7 +560,7 @@ behavior is byte-for-byte unchanged from before #6850.
   `*install-loom.sh`, `*resync-installed.sh`,
   `*auto_update*`, `*daemon_update*`, `*install_binary*`, `*land-resync*`;
   worktree/branch deletion: `*worktree*`, `*cleanup-branches*`; the label
-  schema and its migrations: `*labels.yml`, `*labels.json`,
+  schema and its migrations: `.github/labels.yml`, `defaults/labels.json` (anchored paths, #12995),
   `*labels_migrate*`). The floor is a **denylist and errs broad**: the
   patterns are substrings rather than exact paths, so a new file in one of
   these areas is kept without a list edit, and a path matched by accident only
@@ -642,7 +644,10 @@ KEPT_SET_PATTERNS=(
   "*daemon_update*" "*daemon-update*" "*install_binary*" "*land-resync*"
   # Worktree and branch deletion, label schema and its migrations, migrations.
   "*worktree*" "*loom-clean*" "*cleanup-branches*"
-  "*labels.yml" "*labels.json" "*labels_migrate*"
+  # Anchored to the label-sync paths (#12995): a `labels.json` data file
+  # elsewhere (e.g. a Worker fixture) is not the label schema.
+  ".github/labels.yml" "*/.github/labels.yml" "defaults/labels.json"
+  "*/defaults/labels.json" "*labels_migrate*"
   "*migrations/*" "*_migration.py"
 )
 
@@ -864,7 +869,10 @@ standing_auth_eval() {
       CLASS_DIFF="$DIFF_JSON"
       [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
       printf '%s' "$CLASS_DIFF" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
-      LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
+      # Whole-line comments are dropped and the literal secrets.GITHUB_TOKEN is
+      # stripped (#12995), so any other secrets.* still matches.
+      LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]
+        | select(test("^\\s*#") | not) | gsub("secrets\\.GITHUB_TOKEN\\b"; "")]') || continue
       while IFS= read -r rx; do
         [ -z "$rx" ] && continue
         # Validate the regex on its own: `any` over zero lines never compiles it.
@@ -984,13 +992,18 @@ four-axis judgment below.
 to a CI workflow is not red on blast radius *because it is a workflow* when
 `ci_workflow_blast_eval` returns `WF_BLAST=green`:
 
-- no changed or renamed workflow file is in the kept set, or has
-  publish, release, deploy or merge in its name (case-insensitive);
+- no changed or renamed workflow file is in the kept set;
+- every changed workflow file, read in full at the PR head SHA with whole-line
+  YAML comments dropped, matches none of `PRIVILEGED_CONTENT_PATTERNS` (#12988):
+  classification is by capability, never by file name, so `ci.yml` with a
+  `secrets.CLOUDFLARE_API_TOKEN` deploy step is red for any edit and an offline
+  `claude-bot-deploy-plan.yml` is not. The list is the one #12954's
+  `privilegedContentPatterns` classes use; both tests read it from this block;
 - every workflow file has a non-empty patch, and no added or removed workflow
-  line matches, case-insensitively, the words `permissions`, `secrets`,
-  `publish`, `release`, `deploy` or `merge` (the last four ignore YAML
-  comments), or `id-token`,
-  `pull_request_target`, `workflow_run`, `github.token`, `GITHUB_TOKEN`;
+  line matches, case-insensitively, the words `permissions` or `secrets`, or
+  `id-token`, `pull_request_target`, `workflow_run`, `github.token`,
+  `GITHUB_TOKEN`; and no *added* `run:` or `uses:` line (YAML comments ignored)
+  names publish, release, deploy or merge, which is a new release step;
 - the PR carries `loom:pr` (the `judge-approval` criterion has already checked that the approval
   is for this head) and CI is green right now, with at least one passing
   check and none pending, failing or cancelled.
@@ -1001,11 +1014,24 @@ keeps the "CI workflows" entry red, and the rationale names `WF_BLAST_REASON`;
 is red.
 
 ```bash
+# PRIVILEGED_CONTENT_PATTERNS (#12988): the capability list (jq/Oniguruma
+# regexes, one per element) a workflow's full head contents must not match.
+# Same list as #12954's privilegedContentPatterns; operators copy it into a
+# class, and test-champion-ci-workflow-blast.sh and
+# test-champion-standing-authorization.sh both extract it from here.
+PRIVILEGED_CONTENT_PATTERNS=(
+  'secrets\.(?!GITHUB_TOKEN\b)' 'secrets:\s*inherit' '^\s*environment:'
+  ':\s*write\b' 'write-all' 'id-token' 'pull_request_target' 'workflow_run'
+  '^\s*release:' 'types:.*released' 'wrangler\s+deploy' 'npm\s+publish'
+  'gh\s+release'
+)
+
 # ci_workflow_blast_eval: sets WF_BLAST (none|green|red) and WF_BLAST_REASON.
-# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, read_ci_checks. Always reads the
+# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, PRIVILEGED_CONTENT_PATTERNS,
+# standing_auth_content_clear, read_ci_checks. Always reads the
 # PR's files afresh and checks the list is complete (count == changed_files).
 ci_workflow_blast_eval() {
-  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON NOCOMMENT_JSON SCAN_JSON rx rc
+  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON CONTENT_FILES STEP_HIT rx rc
   WF_BLAST=red
   WF_BLAST_REASON=""
   [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { WF_BLAST_REASON="kept set not loaded"; return 0; }
@@ -1023,12 +1049,6 @@ ci_workflow_blast_eval() {
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     lf=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
-    case "${lf##*/}" in
-      *publish* | *release* | *deploy* | *merge*)
-        WF_BLAST_REASON="$f is a publish/release/deploy/merge workflow"
-        return 0
-        ;;
-    esac
     for pattern in "${KEPT_SET_PATTERNS[@]}"; do
       # Lowercased: Loom-Champion.yml is as much a kept-set path as champion.yml.
       # shellcheck disable=SC2053
@@ -1044,23 +1064,35 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))]
     | if all(.[]; ((.patch // "") | length) > 0) then [.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]] else error("no patch") end' 2>/dev/null) \
     || { WF_BLAST_REASON="a workflow file has no readable patch"; return 0; }
-  # The publish/release/deploy/merge words skip YAML comments (#12934): a
-  # whole-line comment is dropped; a trailing ` #...` is cut only on a line with
-  # no quote at all, so `echo "#release"` and any line not parsed safely stay
-  # scanned whole. Every other regex scans the raw lines.
-  NOCOMMENT_JSON=$(printf '%s' "$LINES_JSON" | jq -c '
-    [.[] | select(test("^\\s*#") | not)
-         | if test("[\"\u0027]") then . elif test("\\s#") then sub("\\s#.*$"; "") else . end]' 2>/dev/null) \
-    || { WF_BLAST_REASON="workflow lines unparseable"; return 0; }
+  # Capability, not name (#12988): read each surviving workflow at its new path
+  # (a removed file has no contents; its lines are judged below) and hold on
+  # any privileged line. standing_auth_content_clear fails closed.
+  CONTENT_FILES=$(printf '%s' "$DIFF_JSON" | jq -c '
+    [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) and ((.status // "") != "removed"))]' 2>/dev/null) \
+    || { WF_BLAST_REASON="workflow files unparseable"; return 0; }
+  if [ "$CONTENT_FILES" != "[]" ]; then
+    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" \
+      || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
+  fi
   for rx in '\bpermissions\b' '\bsecrets\b' 'id-token' 'pull_request_target' 'workflow_run' \
-    'github\.token' 'github_token' '\b(publish|release|deploy|merge)\b'; do
-    SCAN_JSON=$LINES_JSON
-    case "$rx" in *publish*) SCAN_JSON=$NOCOMMENT_JSON ;; esac
-    printf '%s' "$SCAN_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
+    'github\.token' 'github_token'; do
+    printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
     rc=$?
     # rc 1 = no such line; 0 = a hit; anything else = an error. Only 1 passes.
     [ "$rc" -eq 1 ] || { WF_BLAST_REASON="a workflow line matches '$rx'"; return 0; }
   done
+  # A step that introduces a release/deploy/publish/merge action (#12934,
+  # #12988): added run:/uses: lines only. A whole-line comment is dropped; a
+  # trailing ` #...` is cut only on a line with no quote at all, so
+  # `echo "#release"` and any line not parsed safely stay scanned whole.
+  STEP_HIT=$(printf '%s' "$DIFF_JSON" | jq -r '
+    [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))
+         | .patch | split("\n")[] | select(test("^\\+")) | .[1:]
+         | select(test("^\\s*#") | not)
+         | if test("[\"\u0027]") then . elif test("\\s#") then sub("\\s#.*$"; "") else . end
+         | select(test("^\\s*(-\\s+)?(run|uses)\\s*:.*\\b(publish|release|deploy|merge)\\b"; "i"))]
+    | length' 2>/dev/null) || { WF_BLAST_REASON="workflow lines unparseable"; return 0; }
+  [ "$STEP_HIT" = "0" ] || { WF_BLAST_REASON="an added workflow step names publish/release/deploy/merge"; return 0; }
   echo "$LABELS" | grep -q "loom:pr" || { WF_BLAST_REASON="no loom:pr approval"; return 0; }
   read_ci_checks "$PR_NUMBER"
   # Green = at least one passing check and nothing pending, failing or
@@ -1578,7 +1610,7 @@ its critical-file caveat, or its role as sticky-hold release path (a).
 **Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read** — an existing key in `.loom/config.json` is inert and can be deleted. A repo that used a low value to keep Champion conservative should rely instead on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running the auto-merge pass.
 
 ### `critical-files`: Critical File Exclusion Check
-- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below)
+- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below), a `Cargo.toml` / `package.json` edit with no suspect line (see "Suspect-line carve-out" below), or a workflow change with `WF_BLAST=green`
 
 **Critical file patterns** (do NOT auto-merge if PR modifies any of these):
 - `Cargo.toml` - root dependency changes
@@ -1641,6 +1673,34 @@ version_only_diff() {
   loom-daemon forge version-only-diff "$number" "$file" >/dev/null || return 1
 }
 
+# Suspect-line carve-out (#12999): a Cargo.toml / package.json hit passes when no
+# changed line touches a suspect surface (dependency/patch/replace/features
+# tables, build/links/git/registry/path source keys, package.json dependency
+# keys and install lifecycle scripts) -- e.g. new [[bin]] entries (#12976). The
+# decision is `loom-daemon forge suspect-critical-diff`: exit 0 AND a literal
+# `SUSPECT=0` line is the ONLY pass. A suspect line exits 1 and prints
+# SUSPECT_LINE= / SUSPECT_SECTION= (kept for the FAIL line and the hold
+# comment); anything else -- patch missing/empty, unparseable hunk, forge error,
+# 2 (a daemon predating the verb), 126/127 (no binary) -- is a hold with no line.
+CRITERION3_SUSPECT_LINE=""; CRITERION3_SUSPECT_SECTION=""
+suspect_critical_diff() {
+  local file="$1" number="$2" out rc
+  case "${file##*/}" in Cargo.toml|package.json) ;; *) return 1 ;; esac
+  out=$(loom-daemon forge suspect-critical-diff "$number" "$file" 2>/dev/null); rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -qx 'SUSPECT=0'; then return 0; fi
+  CRITERION3_SUSPECT_LINE=$(printf '%s\n' "$out" | sed -n 's/^SUSPECT_LINE=//p' | head -1)
+  CRITERION3_SUSPECT_SECTION=$(printf '%s\n' "$out" | sed -n 's/^SUSPECT_SECTION=//p' | head -1)
+  return 1
+}
+
+# A .github/workflows/* hit passes only when the merge-risk criterion's ci_workflow_blast_eval
+# returned WF_BLAST=green (#12677). Not defined, red, or none-with-a-hit: hold.
+wf_blast_green() {
+  type ci_workflow_blast_eval >/dev/null 2>&1 || return 1
+  [ -n "${WF_BLAST:-}" ] || ci_workflow_blast_eval
+  [ "${WF_BLAST:-}" = green ]
+}
+
 # Standing-authorization class check (#12528), BEFORE any FAIL is emitted: a
 # class with "coversCriticalFiles": true that matches the whole PR (exact
 # subset, no excludeFilePatterns / forbiddenDiffPatterns / kept-set hit,
@@ -1655,13 +1715,19 @@ PR_NUMBER=<number>
 standing_auth_load_config             # resolved effective config (#12591)
 STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit the merge-risk criterion's ELIGIBLE
 STANDING_AUTH_ID=""
+# Waiver record (#13031): set only when a class waives this criterion; the
+# pre-merge comment renders its critical-file bullet from these, so a waiver is
+# never reported as "No critical files modified".
+CRITERION3_WAIVER_ID=""; CRITERION3_WAIVER_SCOPE=""; CRITERION3_WAIVED_FILES=""
 standing_auth_eval critical "$FILES"
 if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ] && [ "$STANDING_AUTH_SCOPE" = "critical" ]; then
+  CRITERION3_WAIVER_ID="$STANDING_AUTH_ID"; CRITERION3_WAIVER_SCOPE="critical"; CRITERION3_WAIVED_FILES="$STANDING_AUTH_COVERED"
   # criticalFilesOnly class (#12648): only this criterion is waived, for the
   # critical files named. The merge-risk criterion judged the whole PR on the four axes.
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12648): critical files covered by a criticalFilesOnly class — critical files: $STANDING_AUTH_COVERED"
   exit 0
 elif [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
+  CRITERION3_WAIVER_ID="$STANDING_AUTH_ID"; CRITERION3_WAIVER_SCOPE="all"; CRITERION3_WAIVED_FILES="$AUTH_FILES"
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12528): critical files covered by a coversCriticalFiles class — changed files: $AUTH_FILES"
   # Name STANDING_AUTH_ID in the rationale. $CRITICAL_FILES_RESULT is "PASS".
   exit 0
@@ -1681,8 +1747,12 @@ while IFS= read -r file; do
     if [[ "$file" == *"$pattern"* ]]; then
       if version_only_diff "$file" <number>; then
         echo "PASS (version-only carve-out): $file"
+      elif suspect_critical_diff "$file" <number>; then
+        echo "PASS (no suspect line, #12999): $file"
+      elif [[ "$file" == *".github/workflows/"* ]] && wf_blast_green; then
+        echo "PASS (WF_BLAST=green, #12677): $file"
       else
-        echo "FAIL: Critical file modified: $file"
+        echo "FAIL: Critical file modified: $file${CRITERION3_SUSPECT_LINE:+ -- suspect line [$CRITERION3_SUSPECT_SECTION]: $CRITERION3_SUSPECT_LINE}"
         exit 1
       fi
       continue 2
@@ -1708,6 +1778,8 @@ generalize this pattern to any other critical file or any other kind of
 "trivial-looking" diff — it is scoped to exactly these 6 filenames and
 exactly a version-string line change.
 
+**Suspect-line carve-out (#12999, operator ruling 2026-10-21)**: a critical-file hit is not a blanket veto on every edit to it. For a `Cargo.toml`-family or `package.json`-family hit that `version_only_diff` did not clear, the check-loop calls `suspect_critical_diff`, which wraps `loom-daemon forge suspect-critical-diff <pr> <file>`. Only a clean exit 0 with `SUSPECT=0` passes. It holds when a changed line is in a dependency, dev/build/target dependency, `[patch.*]`, `[replace]` or `[features]` table, is a `build =` / `links =` / `git =` / `registry =` / `path =` source key (a target table's own `path =` under `[[bin]]`, `[[bench]]`, `[[test]]`, `[[example]]` or `[lib]` is not one), or, in `package.json`, sits under `dependencies` / `devDependencies` / `optionalDependencies` / `peerDependencies` / `overrides` / `resolutions` or is a `preinstall` / `install` / `postinstall` / `prepare` script. A suspect hit emits the FAIL line with the matched line and its section, and passes that line on to the hold comment as `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION`. Every other outcome is a hold: no patch, an unparseable hunk, an unreadable head file for a hunk whose section the patch does not show, a forge error, exit 2 from an older daemon, 126/127 for no binary. A `.github/workflows/*` hit passes only on `WF_BLAST=green` (the `merge-risk` criterion's `ci_workflow_blast_eval`); red, none, or an unreadable read holds. `migrations/` and `_migration.py` hits still hold on any change. The carve-out never widens `CRITICAL_PATTERNS` and never judges anything but these two manifest families; `Cargo.lock` and `package-lock.json` keep today's version-only treatment.
+
 **Standing-authorization class (#12528)**: the check-loop runs `standing_auth_eval critical` (defined under the `merge-risk` criterion) before it can emit FAIL. A `champion.standingAuthorizations` class with `"coversCriticalFiles": true` whose `filePatterns` cover **every** changed file, with no changed file in `excludeFilePatterns`, no added/removed line matching `forbiddenDiffPatterns`, no kept-set path, and every `conditions` entry (`judgeApproval`, `greenCi`) holding now, passes this criterion and names the class id. Any one file outside the class, an excluded file, a forbidden diff line, an unreadable diff or a kept-set path restores today's FAIL and the durable hold below. A class without the flag, or no class at all, changes nothing. The check is mechanical, never a judgment call.
 
 **Critical-files-only class (#12648)**: a class with `"criticalFilesOnly": true` is matched against the **critical-file hits** only: the changed files this criterion's `CRITICAL_PATTERNS` flag, and the `previous_filename` of each on a rename. If every hit matches the class's `filePatterns`, no hit matches `excludeFilePatterns`, no added/removed line of a hit's patch matches `forbiddenDiffPatterns` (a hit with no patch fails closed), no changed file at all is a kept-set path, and every condition holds now, this criterion passes and the PASS line names the class (`#12648`) and the critical files. The other changed files are not matched against the class; the `merge-risk` criterion judged them, and the whole PR, on the four axes, because such a class is never eligible there. A rename into a covered path from outside the class or from a kept-set path, a forbidden line in the workflow patch, or an excluded workflow restores the FAIL and the durable hold. An open hold episode closes through the ordinary PASS row.
@@ -1722,7 +1794,7 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 
 **Durable hold on FAIL, not a transient retry (#6879, #9016)**: a critical-file FAIL is a **one-way terminal state** — nothing about a diff's critical-file-ness changes without a human decision or a later push that narrows the diff — so it gets its own durable hold, never the shared "Transient failures" template in "PR Rejection Workflow" (`critical-file` is not one of that section's `CRITERION_KEY` values).
 
-Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITICAL_FILES_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise). That file owns the whole state machine: the `loom:blocked` label and its reason-only park record (#11861, was `loom:operator`), the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:blocked` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
+Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITICAL_FILES_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise), plus `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION` when the FAIL named a suspect line. That file owns the whole state machine: the `loom:blocked` label and its reason-only park record (#11861, was `loom:operator`), the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:blocked` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
 
 A FAIL skips Steps 2-3 for this PR this pass in **every** one of those states, including a released one — releasing the hold hands the merge to the operator, never back to Champion — and `loom:auto-merge-ok` does not release it (that override is scoped to the `merge-risk` criterion).
 
@@ -2449,6 +2521,17 @@ else
   CI_STATUS="All CI checks passing"
 fi
 
+# Critical-file bullet (#13031): from the `critical-files` criterion's CRITERION3_WAIVER_* only.
+# A waiver names the class, scope and files and carries a greppable marker; no
+# waiver keeps the unchanged text. Never write "No critical files modified" when
+# CRITERION3_WAIVER_ID is set.
+if [ -n "${CRITERION3_WAIVER_ID:-}" ]; then
+  CRITICAL_BULLET="Critical-file check (#3) waived by standing authorization class \`$CRITERION3_WAIVER_ID\` (scope: $CRITERION3_WAIVER_SCOPE) — waived files: $CRITERION3_WAIVED_FILES
+<!-- champion:critical-file-waiver class=$CRITERION3_WAIVER_ID -->"
+else
+  CRITICAL_BULLET="No critical files modified"
+fi
+
 # $HOLD_REVERSAL_BLOCK (the merge-risk criterion's sticky-hold precheck): empty when never
 # held, mandatory when this merge reverses a prior hold (#4742).
 ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$(cat <<EOF
@@ -2459,7 +2542,7 @@ This PR meets all safety criteria for automatic merging:
 - Judge approved (\`loom:pr\` label)
 - Merge-risk judgment passed: <ONE_LINE_RATIONALE — e.g. "diff is tests plus one self-contained module; no high-blast-radius surface; fully revertable">
 - Diff size: $TOTAL_LINES lines (+$ADDITIONS/-$DELETIONS) — informational, not a gate
-- No critical files modified
+- $CRITICAL_BULLET
 - No merge conflicts
 - Updated recently ($HOURS_AGO hours ago)
 - $CI_STATUS

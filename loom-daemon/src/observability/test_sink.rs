@@ -44,7 +44,6 @@ struct Script {
 pub(crate) struct HttpSink {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<SinkRequest>>>,
-    script: Arc<Mutex<Script>>,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -124,7 +123,6 @@ impl HttpSink {
         HttpSink {
             addr,
             requests,
-            script,
             shutdown,
             handle: Some(handle),
         }
@@ -136,36 +134,6 @@ impl HttpSink {
 
     pub(crate) fn requests(&self) -> Vec<SinkRequest> {
         self.requests.lock().unwrap().clone()
-    }
-
-    pub(crate) fn set_status(&self, status: u16) {
-        self.script.lock().unwrap().fallback.0 = status;
-    }
-
-    pub(crate) fn set_body(&self, body: &str) {
-        self.script.lock().unwrap().fallback.1 = body.to_string();
-    }
-
-    /// Simulate the sink going offline: join the accept thread and drop the
-    /// listener, so a *new* POST hits connection-refused.
-    pub(crate) fn kill(mut self) -> (SocketAddr, Arc<Mutex<Vec<SinkRequest>>>) {
-        self.stop();
-        // `requests` is cloned (both point at the same underlying data — it is
-        // an `Arc`) rather than moved, because `Self` implements `Drop` and
-        // cannot be partially moved out of.
-        (self.addr, self.requests.clone())
-    }
-
-    /// Revive a killed sink on the **same** address (rebinding a plain TCP
-    /// listening socket with no established connections is safe immediately
-    /// after close — no TIME_WAIT is incurred on a never-accepted listener).
-    pub(crate) fn revive(addr: SocketAddr, requests: Arc<Mutex<Vec<SinkRequest>>>) -> Self {
-        let script = Script {
-            queue: VecDeque::new(),
-            fallback: (200, String::new()),
-            content_type: "application/json".to_string(),
-        };
-        Self::serve(TcpListener::bind(addr).unwrap(), requests, script, |_| {})
     }
 
     fn stop(&mut self) {

@@ -1732,7 +1732,6 @@ pub fn build_daemon_status_for(
         // Observability host-identity mismatch (#4830) — same process-global
         // snapshot pattern again, registered only when the exporter actually
         // starts, so a disabled/keyless exporter always reads `None`.
-        observability_host_id_mismatch: crate::observability::global_host_id_mismatch(),
         // Positive export-liveness signal (#5083) — the counterpart to the
         // anomaly-only field above. Always `Some` from a daemon of this
         // vintage: an exporter that never started reports `disabled`, which is
@@ -3368,7 +3367,16 @@ fn handle_request(
             // topics and malformed payloads fall through to `Event::Generic`
             // unchanged (publish is fire-and-forget advisory).
             let topic_ack = topic.clone();
-            let event = Event::from_published(topic, payload);
+            let mut event = Event::from_published(topic, payload);
+            // A child that left `repo` out of its payload would narrate under
+            // a bare issue number, threading issue #N of every managed repo
+            // together. Stamp the one workspace running that issue, when
+            // there is exactly one; see `sweep_registry::published_repo`.
+            let mut registries = workspace_pool.provisioned_registries();
+            if !registries.iter().any(|r| Arc::ptr_eq(r, sweep_registry)) {
+                registries.push(sweep_registry.clone());
+            }
+            crate::sweep_registry::published_repo::backfill_published_repo(&mut event, &registries);
             match event_bus.publish(event) {
                 Ok(receivers) => Response::EventPublished {
                     topic: topic_ack,

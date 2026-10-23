@@ -3,7 +3,7 @@
 use chrono::{Duration, TimeZone, Utc};
 
 use super::*;
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 
 fn at(secs: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()

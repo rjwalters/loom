@@ -34,8 +34,7 @@
 #
 # That gate lives in the `vendored-private-refs` job in
 # .github/workflows/ci.yml, NOT in this script: this script is
-# `contract`-category portable shell, and `loom-daemon shell-budget --check`
-# refuses any net growth of that pool with no override (epic #7810). Same
+# `contract`-category portable shell, which epic #7810 is retiring. Same
 # concern, same CI job, different file — see that job's comment. Like the
 # checks here, it reports file:line and never the matched value.
 #
@@ -79,8 +78,7 @@ ALLOWED_HOST_SUFFIXES=(
   # `defaults/docs/runtime-model-trials.md` cites, the latter the platform API
   # endpoint its example model profile names. Same category as anthropic.com /
   # openai.com on these two lines — a vendor Loom drives, not an
-  # operator-owned deployment. Folded onto the existing lines rather than
-  # given their own so this stays a zero-line change to the shell budget.
+  # operator-owned deployment. Folded onto the existing lines.
   # `chatgpt.com` is OpenAI's public product host, cited verbatim in the
   # Codex usage-limit refusal captured for #8539 (token-pool.md and the
   # matching assert_classify row) — same category, folded onto this line.

@@ -124,8 +124,8 @@ fn anchor_with(n: u32) -> FleetStateRecord {
     r
 }
 
-/// OTLP-only log kind on the shared post-#8921 gate. It is not native: it is a
-/// replay record, not a dashboard state key.
+/// OTLP-only log kind on the shared post-#8921 gate: a replay record, not a
+/// dashboard state key.
 #[test]
 fn fleet_state_is_registered_as_an_otlp_only_log_kind() {
     let meta = TELEMETRY_KINDS
@@ -135,12 +135,10 @@ fn fleet_state_is_registered_as_an_otlp_only_log_kind() {
     assert_eq!(meta.variant, "FleetState");
     assert_eq!(meta.schema_version, NEW_KIND_SCHEMA_VERSION);
     assert_eq!(meta.otlp, TelemetryKindOtlp::Logs);
-    assert!(!meta.native_ingest);
 
     let record = TelemetryRecord::FleetState(record());
     assert_eq!(record.kind(), "fleet.state");
     assert_eq!(record.otlp_class(), TelemetryKindOtlp::Logs);
-    assert!(!record.accepted_by_native_ingest());
     assert_eq!(TelemetryEnvelope::new("host", record).schema_version, NEW_KIND_SCHEMA_VERSION);
 }
 

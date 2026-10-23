@@ -132,25 +132,6 @@ async fn refused_trace_group_counts_unmappable_envelopes_once() {
 }
 
 #[tokio::test]
-async fn native_exporter_drops_trace_records_without_sending_or_counting_as_exported() {
-    use crate::observability::exporter::HttpsExporter;
-    use crate::observability::HostIdStatus;
-    let sink = MockSink::start();
-    let exporter = HttpsExporter::new(
-        sink.base_url(),
-        "key".into(),
-        "host".into(),
-        Arc::new(HostIdStatus::default()),
-    )
-    .unwrap();
-    let outcome = exporter.emit_batch_outcome(&[envelope(true)]).await;
-    assert_eq!(outcome.acknowledged, 1);
-    assert_eq!(outcome.exported, 0);
-    assert_eq!(outcome.signals["spans"].dropped, 1);
-    assert!(sink.requests().is_empty());
-}
-
-#[tokio::test]
 #[serial_test::serial]
 async fn shutdown_does_not_repost_partial_logs_while_metrics_are_in_flight() {
     use crate::observability::{queue::DurableQueue, sender, shutdown, ExportStatus};
