@@ -1199,12 +1199,32 @@ mod authorization_context {
     }
 
     #[test]
-    fn failed_authorization_is_red_in_both_modes() {
+    fn failed_authorization_alone_is_green_in_both_modes() {
         let r = rollup(&[AUTHZ], &[], &["CI", AUTHZ]);
+        for required_only in [false, true] {
+            assert_eq!(decide(&r, Some(&req()), required_only), Decision::Green);
+            assert_eq!(decide_settled(&r, Some(&req()), required_only), Decision::Green);
+        }
+    }
+
+    #[test]
+    fn failed_authorization_is_not_named_beside_a_red_ci() {
+        let r = rollup(&["CI", AUTHZ], &[], &["CI", AUTHZ]);
         for required_only in [false, true] {
             assert_eq!(
                 decide(&r, Some(&req()), required_only),
-                Decision::Red(vec![AUTHZ.to_string()])
+                Decision::Red(vec!["CI".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn failed_authorization_with_pending_ci_stays_pending() {
+        let r = rollup(&[AUTHZ], &["CI"], &["CI", AUTHZ]);
+        for required_only in [false, true] {
+            assert_eq!(
+                decide(&r, Some(&req()), required_only),
+                Decision::Pending(vec!["CI".to_string()])
             );
         }
     }
