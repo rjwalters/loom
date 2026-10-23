@@ -97,6 +97,9 @@ pub struct ApplyRequest {
     /// Labels to drop once parked (e.g. `loom:building`).
     pub remove_labels: Vec<String>,
     pub dry_run: bool,
+    /// The target is a PR (not an issue). Only a PR park is a merge hold, so
+    /// only it journals a `hold.transition` (#12665).
+    pub is_pr: bool,
 }
 
 /// Why a request is refused before any forge call, or `None` when it may run.
@@ -261,7 +264,10 @@ pub fn apply(
         }
     }
     if !add.is_empty() {
-        if let Err(e) = forge.add_labels(n, &add) {
+        let added = forge.add_labels(n, &add);
+        // #12665: the hold transition, only when the label was not already on.
+        journal_hold_add(req, added.is_ok());
+        if let Err(e) = added {
             let _ = writeln!(err, "park-record apply: labeling #{n} failed: {e}");
             return exit::FORGE;
         }
@@ -277,5 +283,91 @@ pub fn apply(
     exit::OK
 }
 
+/// The `hold.transition` reason code for a Champion park's `--reason`.
+fn hold_reason_code(reason: Option<&str>) -> &'static str {
+    use crate::telemetry::kinds::hold_transition::reason;
+    match reason {
+        Some(r) if r.contains("merge-risk") => reason::MERGE_RISK_HOLD,
+        Some(r) if r.contains("critical-file") => reason::CRITICAL_FILE_HOLD,
+        _ => reason::CHAMPION_PARK,
+    }
+}
+
+/// Journal the `loom:blocked` write on a Champion park of a PR as a hold
+/// `add` (#12665). `confirmed` is `false` for a write that failed. Best-effort
+/// and a no-op outside a journaled run or for any other role.
+fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
+    if req.dry_run || !req.is_pr || req.by.as_deref() != Some("champion") {
+        return;
+    }
+    crate::observability::pick_journal::record_hold(
+        req.number,
+        crate::telemetry::kinds::hold_transition::transition::ADD,
+        hold_reason_code(req.reason.as_deref()),
+        "champion_role",
+        confirmed,
+        None,
+    );
+}
+
+/// Journal a Champion or Curator park that [`apply`] landed (exit `0`, not a
+/// dry run, `--by champion` / `--by curator`) for the role run's verdict
+/// record (#12027, #12921). Best-effort and a no-op outside a journaled run:
+/// it never changes output or exit.
+pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
+    if code == exit::OK && !req.dry_run && matches!(req.by.as_deref(), Some("champion" | "curator"))
+    {
+        crate::observability::pick_journal::record_applied(
+            req.number,
+            is_pr,
+            "blocked",
+            "park_record",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod journal_tests {
+    use super::*;
+    use crate::observability::pick_journal::{parse, set_test_journal, JournalEntry};
+
+    fn journaled(req: &ApplyRequest, is_pr: bool, code: i32) -> Vec<JournalEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        set_test_journal(Some(path.clone()));
+        journal_applied(req, is_pr, code);
+        set_test_journal(None);
+        parse(&std::fs::read_to_string(&path).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_landed_champion_park_journals_one_blocked_write() {
+        let req = ApplyRequest {
+            number: 42,
+            by: Some("champion".to_string()),
+            ..ApplyRequest::default()
+        };
+        let entries = journaled(&req, false, exit::OK);
+        assert!(matches!(
+            entries.as_slice(),
+            [JournalEntry::Applied { number: 42, is_pr: false, action, by, .. }]
+                if action == "blocked" && by == "park_record"
+        ));
+        assert!(journaled(&req, false, exit::FORGE).is_empty(), "a failed apply");
+        assert!(journaled(&req, false, exit::REFUSED).is_empty(), "a refused apply");
+        let dry = ApplyRequest {
+            dry_run: true,
+            ..req.clone()
+        };
+        assert!(journaled(&dry, false, exit::OK).is_empty(), "a dry run wrote nothing");
+        let other = ApplyRequest {
+            by: Some("doctor".to_string()),
+            ..req
+        };
+        assert!(journaled(&other, false, exit::OK).is_empty(), "not Champion's park");
+    }
+}

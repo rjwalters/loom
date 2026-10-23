@@ -8,6 +8,19 @@ use std::path::Path;
 
 use crate::claim_reconciliation::gh_call;
 
+/// Off-switch for the open-PR hold (#11852): an issue keeps `loom:building`
+/// while its PR is open, on every release path and in claim reconciliation.
+/// On by default; `0`/`false`/`no`/`off` turns it off, restoring the old
+/// release (`loom:issue` re-added beside an open PR).
+pub const OPEN_PR_VETO_ENV: &str = "LOOM_RELEASE_OPEN_PR_VETO";
+
+/// Whether the open-PR hold is on ([`OPEN_PR_VETO_ENV`], default on).
+pub(crate) fn open_pr_veto_enabled() -> bool {
+    std::env::var(OPEN_PR_VETO_ENV).map_or(true, |v| {
+        !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    })
+}
+
 /// Telemetry name of the label read (an `issue.view-state` op).
 pub(crate) const LABELS_OP: &str = "release_veto.issue_labels";
 
@@ -25,6 +38,9 @@ pub(crate) fn veto(gh_bin: &Path, root: &Path, issue: u32, removing: &[&str]) ->
 /// `loom:building` vetoes too, since this path never removes it.
 pub(crate) fn quarantine_veto(gh_bin: &Path, root: &Path, issue: u32) -> Option<String> {
     let labels = labels(gh_bin, root, issue)?;
+    if crate::work_finder::is_frozen(&labels) {
+        return Some(crate::work_finder::FROZEN_LABEL.to_string());
+    }
     let building = crate::work_finder::BUILDING_LABEL;
     if labels.iter().any(|l| l == building) {
         return Some(building.to_string());

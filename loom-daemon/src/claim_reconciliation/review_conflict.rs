@@ -31,13 +31,26 @@
 //!   A Judge's own DIRTY fallback (or any later real verdict) is never undone
 //!   by this pass; Doctor owns those.
 //!
+//! - **Flag an approved PR (#12041).** A Judge-approved `loom:pr` PR that goes
+//!   `CONFLICTING` is flagged the same way (its approval is set aside: the tree
+//!   no longer merges), so Doctor sees it without waiting for Champion to
+//!   attempt the merge. `loom:review-requested` **and** `loom:pr` are both
+//!   removed when present. Clearing returns it to `loom:review-requested`,
+//!   never to `loom:pr` — the rebase invalidated the approval.
+//! - **Label only.** A `CONFLICTING` `loom:pr` PR carrying `loom:operator` (or
+//!   its retired names) or `loom:sequenced` gets `loom:merge-conflict` and
+//!   nothing else: no comment, no state swap. When such a PR turns
+//!   `MERGEABLE`, that label alone is removed again.
+//!
 //! # What it never does
 //!
 //! - `mergeable=UNKNOWN` (GitHub computes mergeability lazily and reports
 //!   `UNKNOWN` while recomputing) is **no information**: no label changes in
 //!   either direction; the next tick re-reads it. Same rule as
 //!   `champion-held-pr-staleness.md` (#8552).
-//! - A PR carrying [`VERDICT_HOLD_LABELS`] is never touched.
+//! - A PR carrying [`VERDICT_HOLD_LABELS`] is never touched — except the
+//!   operator-hold label-only case above. `loom:blocked` and `loom:frozen`
+//!   are never touched, not even label-only.
 //! - A PR with an agent mid-flight on it (`loom:reviewing` / `loom:treating`)
 //!   is left to that agent — Judge's own DIRTY path handles a conflict it
 //!   discovers mid-review, and relabeling under it would race its verdict write.
@@ -64,6 +77,7 @@ pub const BASE_CONFLICT_MARKER: &str = "<!-- loom:base-conflict flagged -->";
 pub const BASE_CONFLICT_CLEARED_MARKER: &str = "<!-- loom:base-conflict cleared -->";
 
 const REVIEW_REQUESTED: &str = "loom:review-requested";
+const APPROVED: &str = "loom:pr";
 const CHANGES_REQUESTED: &str = "loom:changes-requested";
 const MERGE_CONFLICT: &str = "loom:merge-conflict";
 
@@ -154,6 +168,12 @@ pub enum ConflictAction {
     Flag {
         head_sha: String,
     },
+    /// A conflicting `loom:pr` PR that is operator-held or sequenced: add
+    /// `loom:merge-conflict` only (#12041) — no comment, no state change.
+    LabelOnly,
+    /// A mergeable held/sequenced `loom:pr` PR still carrying the label-only
+    /// `loom:merge-conflict`: remove that label and change nothing else.
+    LabelClear,
     /// Mergeable again and carrying `loom:merge-conflict`: return it to review
     /// **if** [`flag_is_latest`] confirms this pass flagged it.
     ClearIfOurs,
@@ -163,7 +183,16 @@ pub enum ConflictAction {
 /// Pure decision function — no I/O.
 #[must_use]
 pub fn decide_review_conflict(pr: &ConflictPr) -> ConflictAction {
-    if VERDICT_HOLD_LABELS.iter().any(|l| pr.has(l)) {
+    // An operator-held `loom:pr` PR is read (label-only, #12041); any other
+    // hold — `loom:blocked`, `loom:frozen` — is never touched.
+    let operator_only = pr.has(APPROVED)
+        && VERDICT_HOLD_LABELS.iter().any(|l| pr.has(l))
+        && pr
+            .labels
+            .iter()
+            .filter(|l| VERDICT_HOLD_LABELS.contains(&l.as_str()))
+            .all(|l| crate::work_finder::OPERATOR_HOLD_NAMES.contains(&l.as_str()));
+    if !operator_only && VERDICT_HOLD_LABELS.iter().any(|l| pr.has(l)) {
         return ConflictAction::Keep(ConflictKeepReason::Held);
     }
     if IN_FLIGHT_LABELS.iter().any(|l| pr.has(l)) {
@@ -177,6 +206,35 @@ pub fn decide_review_conflict(pr: &ConflictPr) -> ConflictAction {
             },
             _ => ConflictAction::Keep(ConflictKeepReason::NoHeadSha),
         },
+        Mergeable::Conflicting
+            if pr.has(APPROVED)
+                && (operator_only || pr.has(super::merge_sequence::SEQUENCE_LABEL)) =>
+        {
+            if pr.has(MERGE_CONFLICT) {
+                ConflictAction::Keep(ConflictKeepReason::NoChange)
+            } else {
+                ConflictAction::LabelOnly
+            }
+        }
+        Mergeable::Conflicting if pr.has(APPROVED) => match pr.head_sha.as_deref() {
+            Some(sha) if !sha.is_empty() => ConflictAction::Flag {
+                head_sha: sha.to_string(),
+            },
+            _ => ConflictAction::Keep(ConflictKeepReason::NoHeadSha),
+        },
+        // The label-only path writes no flag comment, so `ClearIfOurs` could
+        // never recognise its label: drop it directly. `loom:pr` +
+        // `loom:merge-conflict` only arises from that path (the Flag path
+        // removes `loom:pr`).
+        Mergeable::Mergeable
+            if pr.has(APPROVED)
+                && pr.has(MERGE_CONFLICT)
+                && (operator_only || pr.has(super::merge_sequence::SEQUENCE_LABEL)) =>
+        {
+            ConflictAction::LabelClear
+        }
+        // A held PR is never cleared otherwise.
+        Mergeable::Mergeable if operator_only => ConflictAction::Keep(ConflictKeepReason::Held),
         Mergeable::Mergeable if pr.has(MERGE_CONFLICT) && !pr.has(REVIEW_REQUESTED) => {
             ConflictAction::ClearIfOurs
         }
@@ -206,15 +264,39 @@ pub fn flag_is_latest(bodies: &[String]) -> bool {
 /// stale-verdict pass treats the new label as a fresh verdict on `head_sha`.
 #[must_use]
 pub fn flag_comment_body(head_sha: &str) -> String {
+    flag_comment_body_removing(head_sha, &[REVIEW_REQUESTED])
+}
+
+/// [`flag_comment_body`] naming the label(s) the flag removes. When that
+/// includes `loom:pr`, the approval is said to be set aside (#12041).
+#[must_use]
+pub fn flag_comment_body_removing(head_sha: &str, removed: &[&str]) -> String {
+    let removed_list = removed
+        .iter()
+        .map(|l| format!("`{l}`"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let (heading, why) = if removed.contains(&APPROVED) {
+        (
+            "moved out of the merge queue",
+            "the base branch moved, this tree no longer merges cleanly, and the rebase that must \
+             follow will move the head — so the earlier approval is set aside rather than merged \
+             on",
+        )
+    } else {
+        (
+            "moved out of the review queue",
+            "the base branch moved and this tree no longer merges cleanly. Reviewing it now would \
+             review a tree that cannot land, and the rebase that must follow would invalidate \
+             that review anyway",
+        )
+    };
     format!(
         "{BASE_CONFLICT_MARKER}\n\
          {VERDICT_MARKER_PREFIX}{head_sha} verdict=changes-requested -->\n\
-         **Merge conflict with the base branch — moved out of the review queue**\n\n\
-         GitHub reports this PR as `mergeable=CONFLICTING` at head `{head_sha}`: the base \
-         branch moved and this tree no longer merges cleanly. Reviewing it now would review a \
-         tree that cannot land, and the rebase that must follow would invalidate that review \
-         anyway.\n\n\
-         - Removed: `{REVIEW_REQUESTED}`\n\
+         **Merge conflict with the base branch — {heading}**\n\n\
+         GitHub reports this PR as `mergeable=CONFLICTING` at head `{head_sha}`: {why}.\n\n\
+         - Removed: {removed_list}\n\
          - Added: `{CHANGES_REQUESTED}` + `{MERGE_CONFLICT}` (routes to Doctor)\n\n\
          This implies no judgment about the code. Rebase onto the base branch and resolve the \
          conflicts; a head move re-queues it for review automatically, and if the conflict \
@@ -254,8 +336,8 @@ fn gh_pr_retrying(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> 
     crate::stale_token_retry::run(op, root, || gh_pr(gh_bin, root, args))
 }
 
-/// The PRs this pass decides on: those carrying `loom:review-requested` or
-/// `loom:merge-conflict`, keyed by number (a PR carrying both appears once).
+/// The PRs this pass decides on: those carrying `loom:review-requested`,
+/// `loom:pr` (#12041) or `loom:merge-conflict`, keyed by number (a PR carrying both appears once).
 ///
 /// The REST listing has no `mergeable` (#10349), so `mergeable` is asked per
 /// candidate — but only for one whose decision it can change: a held or
@@ -271,7 +353,9 @@ pub fn conflict_candidates(
     mut mergeable: impl FnMut(u32) -> (Mergeable, Option<String>),
 ) -> BTreeMap<u32, ConflictPr> {
     rows.iter()
-        .filter(|r| r.has_label(REVIEW_REQUESTED) || r.has_label(MERGE_CONFLICT))
+        .filter(|r| {
+            r.has_label(REVIEW_REQUESTED) || r.has_label(APPROVED) || r.has_label(MERGE_CONFLICT)
+        })
         .map(|r| {
             let mut pr = ConflictPr {
                 number: r.number,
@@ -297,25 +381,22 @@ pub fn conflict_candidates(
 
 /// Comment first, then relabel — a failed comment aborts before any label is
 /// touched, so the transition never happens without its audit trail.
-fn flag(gh_bin: &Path, root: &Path, number: u32, head_sha: &str) -> Result<()> {
+fn flag(gh_bin: &Path, root: &Path, number: u32, head_sha: &str, removed: &[&str]) -> Result<()> {
     let n = number.to_string();
-    let body = flag_comment_body(head_sha);
+    let body = flag_comment_body_removing(head_sha, removed);
     // Each write is its own retry (#9247): one refresh, one re-run, each.
     gh_pr_retrying(gh_bin, root, &["comment", &n, "--body", &body])?;
-    gh_pr_retrying(
-        gh_bin,
-        root,
-        &[
-            "edit",
-            &n,
-            "--remove-label",
-            REVIEW_REQUESTED,
-            "--add-label",
-            CHANGES_REQUESTED,
-            "--add-label",
-            MERGE_CONFLICT,
-        ],
-    )?;
+    let mut args = vec!["edit", n.as_str()];
+    for label in removed {
+        args.extend(["--remove-label", label]);
+    }
+    args.extend([
+        "--add-label",
+        CHANGES_REQUESTED,
+        "--add-label",
+        MERGE_CONFLICT,
+    ]);
+    gh_pr_retrying(gh_bin, root, &args)?;
     Ok(())
 }
 
@@ -356,6 +437,12 @@ fn clear(gh_bin: &Path, root: &Path, number: u32) -> Result<()> {
 pub struct ReviewConflictStats {
     pub checked: usize,
     pub flagged: usize,
+    /// Conflicting operator-held / sequenced `loom:pr` PRs that got
+    /// `loom:merge-conflict` only (#12041).
+    pub labeled: usize,
+    /// Mergeable held/sequenced `loom:pr` PRs whose label-only
+    /// `loom:merge-conflict` was removed.
+    pub label_cleared: usize,
     pub cleared: usize,
     /// Base conflicts NOT flagged because the PR is sequenced behind an open
     /// predecessor (#9686): the repair would be redundant until it lands.
@@ -455,19 +542,81 @@ pub(super) fn reconcile_review_conflicts_sharing(
                     }
                 }
                 attempted_write = true;
-                match flag(gh_bin, root, pr.number, &head_sha) {
+                let removed: Vec<&str> = [REVIEW_REQUESTED, APPROVED]
+                    .into_iter()
+                    .filter(|l| pr.has(l))
+                    .collect();
+                match flag(gh_bin, root, pr.number, &head_sha, &removed) {
                     Ok(()) => {
                         stats.flagged += 1;
                         log::warn!(
                             "claim_reconciliation: PR #{} in {} is CONFLICTING with its base at \
-                             {head_sha} — moved from loom:review-requested to \
-                             loom:changes-requested + loom:merge-conflict (#8922)",
+                             {head_sha} — moved from {} to loom:changes-requested + \
+                             loom:merge-conflict (#8922, #12041)",
+                            pr.number,
+                            root.display(),
+                            removed.join(" + ")
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "claim_reconciliation: failed to flag base conflict on PR #{} in {}: {e}",
+                        pr.number,
+                        root.display()
+                    ),
+                }
+            }
+            ConflictAction::LabelOnly => {
+                attempted_write = true;
+                match gh_pr_retrying(
+                    gh_bin,
+                    root,
+                    &[
+                        "edit",
+                        &pr.number.to_string(),
+                        "--add-label",
+                        MERGE_CONFLICT,
+                    ],
+                ) {
+                    Ok(_) => {
+                        stats.labeled += 1;
+                        log::info!(
+                            "claim_reconciliation: PR #{} in {} is CONFLICTING and held/sequenced \
+                             — labelled loom:merge-conflict only (#12041)",
                             pr.number,
                             root.display()
                         );
                     }
                     Err(e) => log::warn!(
-                        "claim_reconciliation: failed to flag base conflict on PR #{} in {}: {e}",
+                        "claim_reconciliation: failed to label base conflict on PR #{} in {}: {e}",
+                        pr.number,
+                        root.display()
+                    ),
+                }
+            }
+            ConflictAction::LabelClear => {
+                attempted_write = true;
+                match gh_pr_retrying(
+                    gh_bin,
+                    root,
+                    &[
+                        "edit",
+                        &pr.number.to_string(),
+                        "--remove-label",
+                        MERGE_CONFLICT,
+                    ],
+                ) {
+                    Ok(_) => {
+                        stats.label_cleared += 1;
+                        log::info!(
+                            "claim_reconciliation: PR #{} in {} is MERGEABLE again and \
+                             held/sequenced — removed loom:merge-conflict only",
+                            pr.number,
+                            root.display()
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "claim_reconciliation: failed to remove base conflict label on PR #{} in \
+                         {}: {e}",
                         pr.number,
                         root.display()
                     ),
@@ -518,6 +667,10 @@ pub(super) fn reconcile_review_conflicts_sharing(
 #[cfg(test)]
 #[path = "review_conflict_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_conflict_approved_tests.rs"]
+mod approved_tests;
 
 #[cfg(test)]
 #[path = "review_conflict_stale_token_tests.rs"]

@@ -511,3 +511,8 @@ fn replayed_work_finder_stall_on_a_live_host_pages_within_one_interval() {
         ["host-e1d4c843", "loom-worker-1", "loom-worker-4"]
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

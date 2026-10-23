@@ -59,7 +59,6 @@
 //! same checkout. That is documented rather than defended against: a rare
 //! over-count is preferable to the alternative of reporting nothing.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -111,6 +110,9 @@ pub struct RoleTickTelemetry {
     /// Which credential pool gated a pre-spawn pool skip (Issue #8408) — see
     /// [`RoleTickOutcome::gated_pool`]. `None` for every other result.
     pub gated_pool: Option<String>,
+    /// The closed-vocabulary class of a failed tick (#12028); `None` for
+    /// every other result.
+    pub failure_class: Option<String>,
     /// Tier of the ordered-preference list this tick launched on (Issue
     /// #8599), when a list chose its tap. `None` on the static path.
     pub preference_tier: Option<u32>,
@@ -120,6 +122,17 @@ pub struct RoleTickTelemetry {
     /// The role draw's decision record when `runtimes.roleDraw` chose the
     /// tap (#11726).
     pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
+    /// The checkout the session's prompts came from, read at launch (#11989).
+    pub prompt: Option<prompt_tree::PromptTree>,
+    /// The step's sweep id when a step-engine step, not a role tick, ran
+    /// (#11906); the record then carries `source = "step"`.
+    pub step_sweep_id: Option<String>,
+    /// The host limit that deferred this repo's tick (#12084); `Some` exactly
+    /// when `result` is [`RoleTickResult::SkippedDeferred`].
+    pub deferred_by: Option<String>,
+    /// `<index>/<count>` of the shard that owns this repo (#12084), when the
+    /// host is sharded.
+    pub shard_owner: Option<String>,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -139,6 +152,9 @@ pub struct ResolvedLaunch {
     /// The ordered-preference stamp of the runtime it launched on, when a
     /// preference list chose it (#8599).
     pub preference: Option<crate::runtime_preference::PreferenceStamp>,
+    /// The checkout the session's prompts are read from, as it stood
+    /// immediately before the spawn (#11989).
+    pub prompt: Option<prompt_tree::PromptTree>,
 }
 
 impl ResolvedLaunch {
@@ -150,7 +166,18 @@ impl ResolvedLaunch {
             model: model.to_string(),
             effort: effort.to_string(),
             preference: None,
+            prompt: None,
         }
+    }
+
+    /// Record the prompt tree of `root` (#11989): a role session's
+    /// `/loom:<role>` prompt is read from that checkout's working tree. The
+    /// remote facts come from the tip the daemon last heard (#12509), never
+    /// from a remote question.
+    #[must_use]
+    pub fn with_prompt_tree(mut self, root: &Path) -> Self {
+        self.prompt = prompt_tree::remote::read_with_heard(root);
+        self
     }
 
     /// Attach the ordered-preference stamp carried by the admitted runtime
@@ -267,7 +294,7 @@ pub fn emit_for_tick(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
 ) {
-    emit_for_tick_correlated(root, role, started_at, outcome, resolved, None);
+    emit_for_tick_correlated(root, role, started_at, outcome, resolved, None, None);
 }
 
 pub fn emit_for_tick_correlated(
@@ -277,6 +304,75 @@ pub fn emit_for_tick_correlated(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+) {
+    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None);
+}
+
+/// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
+/// record marked `source = "step"` with the step's sweep id, so it is never
+/// counted as a role-runner tick. `failure` is the class the step's end
+/// derived (#12480); `None` on a failure falls back to `unclassified:step`.
+pub fn emit_for_step(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved: Option<ResolvedLaunch>,
+    failure: Option<crate::observability::lifecycle::RoleFailure>,
+    sweep_id: &str,
+) {
+    emit_tick(
+        root,
+        role,
+        started_at,
+        outcome,
+        resolved,
+        None,
+        failure,
+        Some(sweep_id.to_string()),
+    );
+}
+
+/// The `loom.failure_class` of a failed tick (#12028), `None` for any other
+/// result. A launched tick reuses the class its `role_attempt` span closed
+/// with (`trace.failure`, no second classifier); a tick refused before launch
+/// uses the class its site noted; a failure with neither falls back to an
+/// explicit `unclassified:*` label, never an absent attribute.
+fn failure_class_of(
+    outcome: &RoleTickOutcome,
+    trace: Option<&crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+    is_step: bool,
+) -> Option<String> {
+    use crate::observability::lifecycle::{UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP};
+    if !matches!(outcome, RoleTickOutcome::Failure(_)) {
+        return None;
+    }
+    let class = trace
+        .and_then(|t| t.failure.as_ref())
+        .or(unlaunched.as_ref())
+        .map(|f| f.class().to_string());
+    Some(class.unwrap_or_else(|| {
+        if is_step {
+            UNCLASSIFIED_STEP
+        } else {
+            UNCLASSIFIED_PRE_LAUNCH
+        }
+        .to_string()
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tick(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved: Option<ResolvedLaunch>,
+    trace: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+    step_sweep_id: Option<String>,
 ) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
     crate::observability::pick_decision::emit_role_tick(
@@ -284,7 +380,7 @@ pub fn emit_for_tick_correlated(
         role,
         started_at,
         outcome,
-        trace.as_ref().map(|t| t.execution.clone()),
+        trace.as_ref(),
     );
     let (result, detail) = classify(outcome);
     let (model, effort) = match &resolved {
@@ -294,6 +390,9 @@ pub fn emit_for_tick_correlated(
     // #8599: a tick that never resolved a launch has no tier to report, and a
     // launch the preference list did not decide has none either — absent, not
     // a fabricated `0`, which would read as "chose the top tap".
+    let prompt = resolved
+        .as_ref()
+        .and_then(|resolved| resolved.prompt.clone());
     let preference = resolved.and_then(|resolved| resolved.preference);
     let role_draw = preference
         .as_ref()
@@ -309,11 +408,21 @@ pub fn emit_for_tick_correlated(
             effort,
             detail,
             gated_pool: outcome.gated_pool().map(str::to_string),
+            failure_class: failure_class_of(
+                outcome,
+                trace.as_ref(),
+                unlaunched,
+                step_sweep_id.is_some(),
+            ),
             preference_tier: preference
                 .as_ref()
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
             preference_tap: preference.map(|stamp| stamp.tap),
             role_draw,
+            prompt,
+            step_sweep_id,
+            deferred_by: None,
+            shard_owner: None,
         },
         trace,
     );
@@ -438,15 +547,8 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
     }
 }
 
-/// Fold one transcript record's `tool_use` blocks into `actions`, and the
-/// issues/PRs they wrote to into `targets` (#9168); `session` carries the
-/// transcript's shell state (`cd`, `GH_REPO`) between commands (#9180).
-fn tally_record_actions(
-    obj: &Value,
-    actions: &mut RoleTickActions,
-    session: &mut targets::Session,
-    targets: &mut BTreeSet<targets::Target>,
-) {
+/// Fold one transcript record's `tool_use` blocks into `actions`.
+fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
     let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(obj);
     let Some(content) = container.get("content").and_then(Value::as_array) else {
         return;
@@ -463,7 +565,6 @@ fn tally_record_actions(
             continue;
         };
         tally_command(command, actions);
-        targets::collect(command, session, targets);
     }
 }
 
@@ -478,20 +579,10 @@ fn tally_record_actions(
 /// token numbers here cannot drift from `sweep.outcome`'s.
 #[must_use]
 pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
-    scan_transcripts_with_targets(transcripts).map(|(scan, _)| scan)
-}
-
-/// [`scan_transcripts`], also returning every issue/PR the commands wrote
-/// to ([`targets`], #9168) — collected in the same pass, never a second read.
-#[must_use]
-pub fn scan_transcripts_with_targets(
-    transcripts: &[PathBuf],
-) -> Option<(TranscriptScan, BTreeSet<targets::Target>)> {
     use std::collections::BTreeMap;
 
     let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
     let mut actions = RoleTickActions::default();
-    let mut targets = BTreeSet::new();
     let mut read_any = false;
     // One fold across every transcript: deduped on `message.id` per scan, not
     // per file (#8186, #9303, #9315).
@@ -508,7 +599,6 @@ pub fn scan_transcripts_with_targets(
             continue;
         };
         read_any = true;
-        let mut session = targets::Session::default();
         for raw in text.lines() {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -517,7 +607,7 @@ pub fn scan_transcripts_with_targets(
             let Ok(obj) = serde_json::from_str::<Value>(raw) else {
                 continue;
             };
-            tally_record_actions(&obj, &mut actions, &mut session, &mut targets);
+            tally_record_actions(&obj, &mut actions);
             if let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) {
                 fold.add(rec);
             }
@@ -531,13 +621,10 @@ pub fn scan_transcripts_with_targets(
     // fields exist to preserve.
     // `actions` is `Some` on this path by construction: reaching here means at
     // least one transcript was read, so a zero count is an *observation*.
-    read_any.then_some((
-        TranscriptScan {
-            tokens_by_model: totals.into_values().collect(),
-            actions: Some(actions),
-        },
-        targets,
-    ))
+    read_any.then_some(TranscriptScan {
+        tokens_by_model: totals.into_values().collect(),
+        actions: Some(actions),
+    })
 }
 
 /// The distinct model ids in a token breakdown, sorted and deduped — the same
@@ -613,9 +700,14 @@ pub fn build_record(
         effort: tick.effort.clone().filter(|e| !e.is_empty()),
         detail: tick.detail.clone().filter(|d| !d.is_empty()),
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
+        failure_class: tick
+            .failure_class
+            .clone()
+            .filter(|c| !c.is_empty() && matches!(tick.result, RoleTickResult::Failure)),
         preference_tier: tick.preference_tier,
         preference_tap: tick.preference_tap.clone().filter(|t| !t.is_empty()),
         role_draw: tick.role_draw.clone(),
+        prompt: tick.prompt.clone(),
         // Populated by `emit` via `apply_runtime_attribution` (Issue #8507):
         // that resolution needs a filesystem read this function deliberately
         // stays free of (see the doc comment above).
@@ -625,6 +717,13 @@ pub fn build_record(
         tokens_by_model,
         models_used,
         actions,
+        source: tick
+            .step_sweep_id
+            .as_ref()
+            .map(|_| crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string()),
+        sweep_id: tick.step_sweep_id.clone(),
+        deferred_by: tick.deferred_by.clone().filter(|d| !d.is_empty()),
+        shard_owner: tick.shard_owner.clone().filter(|s| !s.is_empty()),
     }
 }
 
@@ -735,14 +834,9 @@ fn emit_correlated(
                 &role_log,
                 Some((tick.started_at, tick.ended_at)),
             )
-            .map(|tokens_by_model| {
-                (
-                    TranscriptScan {
-                        tokens_by_model,
-                        actions: None,
-                    },
-                    BTreeSet::new(),
-                )
+            .map(|tokens_by_model| TranscriptScan {
+                tokens_by_model,
+                actions: None,
             });
         }
         let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
@@ -753,19 +847,18 @@ fn emit_correlated(
             tick.started_at,
             tick.ended_at,
         );
-        scan_transcripts_with_targets(&transcripts)
+        scan_transcripts(&transcripts)
     });
-    let (scan, targets) = scan.flatten().unzip();
+    let scan = scan.flatten();
     // The launch record's runtime, else the resolved-runtime marker (#8594);
     // absent (unknown, never guessed) for a Claude tick with neither.
-    let story_runtime = usage_runtime.clone().flatten();
-    // #10749: how the tick was billed — read once, stamped on the usage spans
-    // and the story copies. A launch record's own class wins; otherwise a
+    let usage_runtime_name = usage_runtime.clone().flatten();
+    // #10749: how the tick was billed — read once, stamped on the usage spans. A launch record's own class wins; otherwise a
     // Claude/Codex tick is classified by runtime (and a metered backstop tap).
     let llm_billing = tick.result.spawned().then(|| {
         tick_llm_billing(
             runtime_attribution.as_ref(),
-            story_runtime.as_deref(),
+            usage_runtime_name.as_deref(),
             tick.preference_tap.as_deref(),
             &role_log,
         )
@@ -783,13 +876,7 @@ fn emit_correlated(
         TelemetryRecord::RoleTickOutcome(record),
     );
     envelope.trace_context = trace.as_ref().map(|t| t.context.clone());
-    // #11348: shadow into the J2 `role_tick` stream only after this succeeds.
-    if let Err(e) = crate::telemetry::journal_shadow::after_legacy(
-        &tick.root,
-        crate::telemetry::journal_shadow::TelemetryStream::RoleTick,
-        || crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope),
-        |()| crate::telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
-    ) {
+    if let Err(e) = crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope) {
         log::warn!(
             "role_tick_telemetry: failed to append {} tick record for {} at {}: {e} — \
              best-effort, never fatal to the tick (#8056)",
@@ -798,15 +885,17 @@ fn emit_correlated(
             path.display()
         );
     }
-    // #9168: join the story of every issue/PR this tick wrote to — after the
-    // durable record, so a slow forge lookup can never cost the tick record.
+    // #11858: the record also goes to SigNoz, joined to the tick's trace, so
+    // a tick that never spawned (pool exhausted, runtime rejected, queue
+    // empty) is visible there. The journal above stays the local copy.
+    export(&envelope);
     if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
         usage::journal_execution(
             &tick.root,
             trace,
             &tick.role,
             tick.ended_at,
-            story_runtime.as_deref(),
+            usage::span_runtime(usage_runtime_name.as_deref(), source),
             llm_billing.as_ref(),
             rows,
         );
@@ -825,19 +914,30 @@ fn emit_correlated(
             tick.ended_at,
         );
     }
-    if let (Some(trace), Some(targets)) = (trace, targets) {
-        let facts = story::TickFacts {
-            trace,
-            role: tick.role.clone(),
-            ended_at: tick.ended_at,
-            result: result_label(tick.result),
-            runtime: story_runtime,
-            model: tick.model.clone(),
-            tokens_by_model,
-            llm_billing,
-        };
-        story::emit(&tick.root, &facts, &targets);
+}
+
+/// Offer a `role_tick.outcome` envelope to the OTLP exporters (#11858). A
+/// no-op with no OTLP exporter; the record's mapping exports no free-form
+/// `detail`.
+fn export(envelope: &TelemetryEnvelope) {
+    if crate::observability::ops::records_exported() {
+        crate::observability::ops::emit_record_in(
+            exportable(envelope.record.clone()),
+            envelope.trace_context.clone(),
+        );
     }
+}
+
+/// The exported copy of a record: a repo that is not a forge `owner/repo`
+/// (the local journal's path fallback) reads `repo_unresolved`, so no local
+/// path reaches the wire (#9442).
+fn exportable(mut record: TelemetryRecord) -> TelemetryRecord {
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut record {
+        if !crate::agent_gh::classify::is_slug(&r.repo) {
+            r.repo = crate::observability::pick_decision::REPO_UNRESOLVED.to_string();
+        }
+    }
+    record
 }
 
 /// Whether the role log's last preference marker records a metered-backstop
@@ -895,19 +995,8 @@ pub fn result_label(result: RoleTickResult) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// [`RoleTickResult::spawned`] read back off a [`result_label`] string, for
-/// the emit sites that carry the label rather than the enum (the story copies,
-/// #9168). `None` for a label no [`RoleTickResult`] round-trips from — an
-/// unparseable label is "undetermined", never a guessed `false` (#9420).
-#[must_use]
-pub fn label_spawned(label: &str) -> Option<bool> {
-    serde_json::from_value::<RoleTickResult>(serde_json::Value::String(label.to_owned()))
-        .ok()
-        .map(RoleTickResult::spawned)
-}
-
-pub mod story;
-pub mod targets;
+pub mod deferred;
+pub mod prompt_tree;
 pub mod usage;
 
 #[cfg(test)]

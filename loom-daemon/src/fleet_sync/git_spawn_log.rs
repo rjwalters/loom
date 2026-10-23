@@ -275,10 +275,27 @@ fn sample_group(pgid: u32, peak: &AtomicU64) {
     }
 }
 
+/// True while `/proc/<pid>` still runs the daemon's own binary: a forked child
+/// that has not yet called `exec`. Its `VmHWM` is the daemon's RSS at fork time,
+/// not git's, so sampling it attributes the daemon's footprint to a cheap git
+/// command (the multi-GB `rev-parse` peaks in #11583).
+#[cfg(target_os = "linux")]
+fn is_pre_exec(pid: &str) -> bool {
+    static SELF_EXE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let me = SELF_EXE.get_or_init(|| std::fs::read_link("/proc/self/exe").ok());
+    match (me, std::fs::read_link(format!("/proc/{pid}/exe"))) {
+        (Some(me), Ok(exe)) => *me == exe,
+        _ => false,
+    }
+}
+
 /// Raise `peak` to `/proc/<pid>/status` `VmHWM` (KiB); a gone or zombie pid
-/// has no such line and is skipped.
+/// has no such line and is skipped, as is a child still pre-`exec`.
 #[cfg(target_os = "linux")]
 fn read_vmhwm(pid: &str, peak: &AtomicU64) {
+    if is_pre_exec(pid) {
+        return;
+    }
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
         return;
     };
@@ -321,6 +338,24 @@ mod tests {
         assert_eq!(memory_config_for("fetch"), MEMORY_BOUND_CONFIG);
         assert_eq!(memory_config_for("clone"), MEMORY_BOUND_CONFIG);
         assert!(memory_config_for("rev-parse").is_empty());
+    }
+
+    /// A pid running the daemon's own binary (a pre-`exec` fork) must not
+    /// contribute its inherited `VmHWM`; a different binary still does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_exec_child_does_not_contribute_inherited_hwm() {
+        let peak = AtomicU64::new(0);
+        read_vmhwm("self", &peak);
+        assert_eq!(peak.load(Ordering::Relaxed), 0, "own-exe pid was sampled");
+
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        let pid = child.id().to_string();
+        std::thread::sleep(Duration::from_millis(100));
+        read_vmhwm(&pid, &peak);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(peak.load(Ordering::Relaxed) > 0, "post-exec child skipped");
     }
 
     #[test]

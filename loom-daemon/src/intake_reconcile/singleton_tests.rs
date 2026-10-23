@@ -186,6 +186,7 @@ struct Fake {
     listing: Vec<IntakeRow>,
     listing_fails: bool,
     listing_shed: bool,
+    listing_deadline: bool,
     /// Issue number → what the re-read answers (absent = read failure).
     current: std::collections::BTreeMap<u32, Option<Vec<String>>>,
     write_denied: bool,
@@ -194,6 +195,10 @@ struct Fake {
     /// `loom:triage`).
     post_answers: std::collections::BTreeMap<u32, Vec<String>>,
     remove_fails: bool,
+    /// Issue number → its `labeled` events (absent = events read failure).
+    events: std::collections::BTreeMap<u32, Vec<LabelEvent>>,
+    /// Labels whose removal fails.
+    remove_label_fails: bool,
     calls: Vec<String>,
 }
 
@@ -205,23 +210,33 @@ impl IntakeForge for Fake {
                 until: std::time::SystemTime::now(),
             }));
         }
+        if self.listing_deadline {
+            return Err(anyhow::Error::new(store::TickDeadlineReached));
+        }
         if self.listing_fails {
             return Err(anyhow!("listing changed mid-walk"));
         }
         Ok(self.listing.clone())
     }
 
+    fn may_write(&mut self, _: &Repo) -> bool {
+        self.calls.push("scope".into());
+        !self.write_denied
+    }
+
+    fn remove_triage(&mut self, _: &Repo, number: u32) -> bool {
+        self.calls.push(format!("delete {number}"));
+        !self.remove_fails
+    }
+}
+
+impl DemoteForge<Repo> for Fake {
     fn current_labels(&mut self, _: &Repo, number: u32) -> Result<Option<Vec<String>>> {
         self.calls.push(format!("reread {number}"));
         self.current
             .get(&number)
             .cloned()
             .ok_or_else(|| anyhow!("HTTP 502"))
-    }
-
-    fn may_write(&mut self, _: &Repo) -> bool {
-        self.calls.push("scope".into());
-        !self.write_denied
     }
 
     fn add_triage(&mut self, _: &Repo, number: u32) -> Option<Vec<String>> {
@@ -234,9 +249,22 @@ impl IntakeForge for Fake {
         })
     }
 
-    fn remove_triage(&mut self, _: &Repo, number: u32) -> bool {
-        self.calls.push(format!("delete {number}"));
-        !self.remove_fails
+    fn label_events(&mut self, _: &Repo, number: u32) -> Result<Vec<LabelEvent>> {
+        self.calls.push(format!("events {number}"));
+        self.events
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| anyhow!("HTTP 502"))
+    }
+
+    fn remove_label(&mut self, _: &Repo, number: u32, label: &str) -> bool {
+        self.calls.push(format!("unlabel {number} {label}"));
+        !self.remove_label_fails
+    }
+
+    fn comment(&mut self, _: &Repo, number: u32, _: &str) -> bool {
+        self.calls.push(format!("comment {number}"));
+        true
     }
 }
 
@@ -245,6 +273,7 @@ fn row(number: u32, labels: &[&str]) -> IntakeRow {
         number,
         created_at: Some("2026-09-01T00:00:00Z".parse().unwrap()),
         labels: labels.iter().map(|s| (*s).to_string()).collect(),
+        author: None,
     }
 }
 
@@ -375,108 +404,6 @@ fn the_pass_covers_every_repo_and_stops_while_the_breaker_is_open() {
     assert!(forge.calls.is_empty());
 }
 
-// ===== the completed-pass heartbeat (#10924) =====
-
-fn t(mins: i64) -> DateTime<Utc> {
-    now() + chrono::Duration::minutes(mins)
-}
-
-/// A pass that walks every repo and reads every listing stamps the success
-/// heartbeat even when it labels nothing: a quiet fleet is not a dead one.
-#[test]
-fn a_completed_quiet_pass_stamps_the_success_heartbeat() {
-    let repos = [repo("acme/a"), repo("acme/b")];
-    let mut forge = Fake {
-        listing: vec![row(1, &["loom:triage"])], // nothing to label
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert!(pass.completed_scan(repos.len()));
-    let hb = next_heartbeat(None, "cap", t(0), &pass, repos.len());
-    assert_eq!(hb.success_at(), Some(t(0)));
-    assert_eq!((hb.repos, hb.labelled), (2, 0));
-}
-
-/// The write-scope gate refusing a repo does not undo a completed scan:
-/// listing outcomes are the scan, labels retry next pass by design.
-#[test]
-fn a_denied_write_does_not_undo_a_completed_scan() {
-    let repos = [repo("acme/a")];
-    let mut forge = Fake {
-        listing: vec![row(1, &[])], // something to label
-        write_denied: true,
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert!(pass.completed_scan(repos.len()));
-    assert_eq!(next_heartbeat(None, "cap", t(0), &pass, repos.len()).success_at(), Some(t(0)));
-}
-
-/// A shed, failed or early-stopped pass cannot refresh the success stamp:
-/// the previous completed pass's timestamp is kept.
-#[test]
-fn shed_failed_and_stopped_early_passes_keep_the_previous_stamp() {
-    let repos = [repo("acme/a"), repo("acme/b")];
-    let stamped = next_heartbeat(
-        None,
-        "cap",
-        t(0),
-        &PassReport {
-            repos: 2,
-            ..PassReport::default()
-        },
-        2,
-    );
-    // Shed: every reader out of budget.
-    let mut forge = Fake {
-        listing_shed: true,
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert!((pass.listing_failed, pass.shed) == (2, 2));
-    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
-    // Failed listing.
-    let mut forge = Fake {
-        listing_fails: true,
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert_eq!(pass.listing_failed, 2);
-    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
-    // Stopped early by the breaker after the first repo.
-    let mut forge = Fake::default();
-    let seen = std::cell::Cell::new(0);
-    let tripped = || seen.replace(seen.get() + 1) >= 1;
-    let pass = run_pass(&mut forge, &repos, now(), 50, &tripped);
-    assert!(pass.stopped_early && pass.repos == 1);
-    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
-    // And with no previous stamp at all: never completed.
-    assert_eq!(next_heartbeat(None, "cap", t(5), &pass, 2).success_at(), None);
-}
-
-/// The heartbeat file: round trip, and a record of another schema proves
-/// nothing (a foreign file is not a success stamp).
-#[test]
-fn the_heartbeat_file_round_trips_and_rejects_other_schemas() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(read_heartbeat(dir.path()).is_none());
-    let hb = next_heartbeat(
-        None,
-        "cap",
-        t(0),
-        &PassReport {
-            repos: 1,
-            ..PassReport::default()
-        },
-        1,
-    );
-    write_heartbeat(dir.path(), &hb);
-    assert_eq!(read_heartbeat(dir.path()), Some(hb));
-    let foreign = br#"{"schema": "intake-reconcile/pass/v0", "host": "cap"}"#;
-    std::fs::write(heartbeat_path(dir.path()), foreign).unwrap();
-    assert!(read_heartbeat(dir.path()).is_none());
-}
-
 // ===== the live forge, against a stub =====
 
 #[test]
@@ -500,17 +427,29 @@ impl IntakeForge for Scoped {
     fn list_open(&mut self, repo: &Repo) -> Result<Vec<IntakeRow>> {
         self.0.list_open(repo)
     }
-    fn current_labels(&mut self, repo: &Repo, number: u32) -> Result<Option<Vec<String>>> {
-        self.0.current_labels(repo, number)
-    }
     fn may_write(&mut self, _: &Repo) -> bool {
         true
+    }
+    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
+        self.0.remove_triage(repo, number)
+    }
+}
+
+impl DemoteForge<Repo> for Scoped {
+    fn current_labels(&mut self, repo: &Repo, number: u32) -> Result<Option<Vec<String>>> {
+        self.0.current_labels(repo, number)
     }
     fn add_triage(&mut self, repo: &Repo, number: u32) -> Option<Vec<String>> {
         self.0.add_triage(repo, number)
     }
-    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
-        self.0.remove_triage(repo, number)
+    fn label_events(&mut self, repo: &Repo, number: u32) -> Result<Vec<LabelEvent>> {
+        self.0.label_events(repo, number)
+    }
+    fn remove_label(&mut self, repo: &Repo, number: u32, label: &str) -> bool {
+        self.0.remove_label(repo, number, label)
+    }
+    fn comment(&mut self, repo: &Repo, number: u32, body: &str) -> bool {
+        self.0.comment(repo, number, body)
     }
 }
 
@@ -518,6 +457,7 @@ impl IntakeForge for Scoped {
 /// pull request, #4 was labelled after the listing and is left alone, only
 /// #1 gets the label, and the next listing of the unchanged repo is one `304`.
 #[test]
+#[serial_test::serial]
 fn the_live_pass_re_reads_each_issue_and_an_idle_repo_is_a_304() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().display();
@@ -587,6 +527,48 @@ esac
     std::fs::remove_file(dir.path().join("calls.log")).unwrap();
     assert_eq!(forge.current_labels(&repo, 1).unwrap(), labels(&[]));
     assert_eq!(calls(), "reread 1\n");
+}
+
+/// #12118 / #12316: the intake listing, not a telemetry sampler, journals
+/// `issue.estimate` for a freshly curated issue, once.
+#[test]
+#[serial_test::serial]
+fn the_live_listing_journals_issue_estimate_for_a_fresh_curated_issue() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let updated = Utc::now().to_rfc3339();
+    let listing = serde_json::json!([{
+        "number": 7, "state": "open", "created_at": updated, "updated_at": updated,
+        "labels": [{"name": "loom:curated"}],
+        "body": "<!-- loom:estimate lines=7 files=1 doctor_risk=0.3 -->",
+        "user": {"login": "owner"}, "author_association": "OWNER"
+    }]);
+    std::fs::write(dir.path().join("listing.json"), listing.to_string()).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+d={d}
+printf 'HTTP/2.0 200 OK\r\nEtag: W/"l1"\r\n\r\n'
+cat "$d/listing.json"
+"#
+    );
+    let gh = dir.path().join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repo = Repo {
+        slug: "acme/widgets".into(),
+        host: None,
+        root: dir.path().to_path_buf(),
+    };
+    let mut forge = GhIntakeForge::new(gh);
+    forge.list_open(&repo).unwrap();
+    let journal = || {
+        std::fs::read_dir(dir.path().join(".loom/logs/issue-estimates"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    assert_eq!(journal(), 1);
+    forge.list_open(&repo).unwrap();
+    assert_eq!(journal(), 1, "re-observing the same marker journals nothing");
 }
 
 /// The write's own answer is the compare step: when it shows another
@@ -684,6 +666,22 @@ fn a_shed_listing_skips_the_repo_and_is_counted() {
     assert_eq!((pass.repos, pass.shed, pass.labelled), (0, 2, 0));
     assert_eq!(forge.calls, ["list acme/a", "list acme/b"]);
     assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before + 2);
+}
+
+/// A tick-deadline stop is a failed listing, but not a budget shed.
+#[test]
+fn a_tick_deadline_listing_is_failed_but_not_counted_as_shed() {
+    let before = crate::forge_call_stats::counters::get(LISTING_SHED);
+    let mut forge = Fake {
+        listing: vec![row(1, &[])],
+        listing_deadline: true,
+        ..Fake::default()
+    };
+    let report = run_repo(&mut forge, &repo("acme/a"), now(), 50);
+    assert!(report.listing_failed);
+    assert!(!report.listing_shed);
+    assert_eq!(forge.calls, ["list acme/a"]);
+    assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before);
 }
 
 /// End to end with every reader withdrawn for budget: the captain's walk
@@ -786,4 +784,140 @@ fn the_inline_pass_asks_the_resolved_mode_before_its_cadence() {
     }
     assert!(!super::super::inline_pass_due(false, || false, || true), "disabled");
     set(None);
+}
+
+// ===== demotion of issues opened past intake (#11820) =====
+
+fn fresh(number: u32, labels: &[&str]) -> IntakeRow {
+    IntakeRow {
+        number,
+        created_at: Some("2026-10-03T10:00:00Z".parse().unwrap()),
+        labels: labels.iter().map(|s| (*s).to_string()).collect(),
+        author: Some("alice".into()),
+    }
+}
+
+fn labeled(label: &str, actor: &str, at: &str) -> LabelEvent {
+    LabelEvent {
+        label: label.into(),
+        actor: Some(actor.into()),
+        created_at: Some(at.parse().unwrap()),
+    }
+}
+
+/// Through `run_repo`: an issue opened with `loom:issue` and one with
+/// `loom:curated` are demoted; a later promotion is untouched; the ordinary
+/// unlabelled issue is labelled as before, with no raced/reverted count.
+#[test]
+fn run_repo_demotes_issues_opened_past_intake_and_leaves_promotions() {
+    let mut forge = Fake {
+        listing: vec![
+            fresh(1, &["loom:issue"]),
+            fresh(2, &["loom:curated"]),
+            fresh(3, &["loom:issue"]),
+            row(4, &[]),
+        ],
+        ..Fake::default()
+    };
+    forge
+        .events
+        .insert(1, vec![labeled("loom:issue", "alice", "2026-10-03T10:00:00Z")]);
+    forge
+        .events
+        .insert(2, vec![labeled("loom:curated", "alice", "2026-10-03T10:00:05Z")]);
+    forge
+        .events
+        .insert(3, vec![labeled("loom:issue", "rjwalters", "2026-10-03T11:00:00Z")]);
+    forge.current.insert(1, labels(&["loom:issue"]));
+    forge.current.insert(2, labels(&["loom:curated"]));
+    forge.current.insert(4, labels(&[]));
+    let report = run_repo(&mut forge, &repo("acme/demote-a"), now(), 50);
+    assert_eq!(
+        (report.demoted, report.labelled, report.raced, report.reverted),
+        (2, 1, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(
+        forge.calls,
+        [
+            "list acme/demote-a",
+            "scope",
+            "events 1",
+            "reread 1",
+            "post 1",
+            "unlabel 1 loom:issue",
+            "comment 1",
+            "events 2",
+            "reread 2",
+            "post 2",
+            "unlabel 2 loom:curated",
+            "comment 2",
+            "events 3",
+            "reread 4",
+            "post 4",
+        ]
+    );
+    // The pass folds it in.
+    let pass = run_pass(&mut Fake::default(), &[], now(), 50, &|| false);
+    assert_eq!(pass.demoted, 0);
+}
+
+/// Events reads share the cap: with cap 2 and two candidates, the unlabelled
+/// step gets nothing this pass (oldest candidates first).
+#[test]
+fn demotion_events_reads_count_against_the_cap() {
+    let mut forge = Fake {
+        listing: vec![
+            fresh(1, &["loom:issue"]),
+            fresh(2, &["loom:issue"]),
+            fresh(3, &["loom:issue"]),
+            row(4, &[]),
+        ],
+        ..Fake::default()
+    };
+    for n in [1, 2, 3] {
+        forge
+            .events
+            .insert(n, vec![labeled("loom:issue", "bob", "2026-10-03T10:00:00Z")]);
+    }
+    let report = run_repo(&mut forge, &repo("acme/demote-cap"), now(), 2);
+    assert_eq!((report.demoted, report.labelled), (0, 0));
+    assert_eq!(forge.calls, ["list acme/demote-cap", "scope", "events 1", "events 2"]);
+    // Both are remembered promotions; the next pass reads #3, then labels #4.
+    forge.calls.clear();
+    forge.current.insert(4, labels(&[]));
+    let report = run_repo(&mut forge, &repo("acme/demote-cap"), now(), 2);
+    assert_eq!(report.labelled, 1);
+    assert_eq!(
+        forge.calls,
+        [
+            "list acme/demote-cap",
+            "scope",
+            "events 3",
+            "reread 4",
+            "post 4"
+        ]
+    );
+}
+
+/// A failed events read stops the repo's pass with nothing written; a
+/// write-scope refusal writes nothing either.
+#[test]
+fn demotion_fails_closed() {
+    let mut shed = Fake {
+        listing: vec![fresh(1, &["loom:issue"]), row(4, &[])],
+        ..Fake::default()
+    };
+    let report = run_repo(&mut shed, &repo("acme/demote-shed"), now(), 50);
+    assert_eq!((report.demoted, report.labelled), (0, 0));
+    assert_eq!(shed.calls, ["list acme/demote-shed", "scope", "events 1"]);
+
+    let mut denied = Fake {
+        listing: vec![fresh(1, &["loom:issue"])],
+        write_denied: true,
+        ..Fake::default()
+    };
+    let report = run_repo(&mut denied, &repo("acme/demote-denied"), now(), 50);
+    assert!(report.denied);
+    assert_eq!(denied.calls, ["list acme/demote-denied", "scope"]);
 }

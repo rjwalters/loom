@@ -1,10 +1,7 @@
 //! Shared repo-root -> forge-slug resolution for the periodic collector
 //! samples that name repositories (Issue #8852's `queue_snapshot` and #9222's
 //! `ops::disposition`), plus a synchronous, read-only cache of the result
-//! (Issue #9222). `ops::stage_dwell` resolves its own roots directly through
-//! `collector::resolve_repo_slug_cached` / `resolve_visibility` (it also needs
-//! the root `PathBuf`, not just its display string) and is unaffected by this
-//! module.
+//! (Issue #9222).
 //!
 //! [`resolve_repo_refs`] is the one place that turns a set of workspace-root
 //! strings into their [`QueueRepoRef`]s (forge slug + visibility), so its two
@@ -27,7 +24,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use chrono::{DateTime, Utc};
+
+use crate::telemetry::queue_repo::QueueRepoRef;
+
+/// Whether a work-finder tick completed at `tick_at` still needs a sample,
+/// given the last sampled tick's timestamp. A stalled work finder then shows
+/// downstream as silence, not as a re-stamped copy of an old tick.
+#[must_use]
+pub fn is_new_tick(tick_at: DateTime<Utc>, last_emitted: Option<DateTime<Utc>>) -> bool {
+    last_emitted.is_none_or(|last| tick_at > last)
+}
 
 /// Resolve every root in `roots` to its [`QueueRepoRef`], skipping roots that
 /// are not absolute paths (the single-workspace loop's `workspace #N`
@@ -88,6 +95,14 @@ pub(super) fn cached_repo_ref(root: &str) -> Option<QueueRepoRef> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(root)
         .cloned()
+}
+
+/// The `owner/repo` the collector last resolved for workspace `root` from the
+/// forge, never from the clone's own `origin` (#12509): what `origin` is
+/// compared with to find a clone pointing somewhere else. Cache only.
+#[must_use]
+pub fn registered_repo(root: &std::path::Path) -> Option<String> {
+    cached_repo_ref(&root.display().to_string()).map(|r| r.repo)
 }
 
 #[cfg(test)]

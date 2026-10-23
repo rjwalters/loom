@@ -10,7 +10,7 @@
 //!   Prints exactly one category line — the shell library's uppercase enum —
 //!   and exits `0`. `2` is a usage error (missing `--exit-code`, unreadable
 //!   tail file); stdout stays empty on `2` so the shell library's delegation
-//!   reads it as "could not ask" and falls back to its in-file tables.
+//!   reads it as "could not ask" and gives its degraded answer.
 //! * **Predicate mode** (`--transient <CATEGORY>`): mirrors
 //!   `classification_is_transient` — exit `0` when a retry loop should retry
 //!   that category, `1` when it is terminal. The deny-list answer travels in
@@ -18,11 +18,11 @@
 //!   mode, so a caller can invoke it bare without stealing a terminal.
 //!
 //! The provider default chain (`--provider` > `$LOOM_RUNTIME` > `claude`) and
-//! the category precedence live in [`loom_daemon::classify_error`]; this file
+//! the category precedence live in [`crate::classify_error`]; this file
 //! is argv plumbing only.
 
+use crate::classify_error;
 use anyhow::Result;
-use loom_daemon::classify_error;
 use std::io::Read as _;
 use std::path::PathBuf;
 

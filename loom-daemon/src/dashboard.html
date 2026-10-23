@@ -397,14 +397,11 @@ function renderQueue(report) {
 function renderCapacity(report) {
   var body = document.getElementById("capacity-body");
   body.innerHTML = "";
-  // Since #5270 the dynamic cap is min(disk headroom, ram headroom,
-  // configured max) — the token axis / per-token-concurrency factor was
-  // removed from admission entirely (#5743) and is no longer shown here as a
-  // cap term; `report.capacity.token_axis_limit` remains available elsewhere
-  // on the report as an informational account-health figure only.
+  // The cap is the configured max and nothing else (#12406: the disk, RAM,
+  // token and CPU terms are all gone). `report.capacity.token_axis_limit`
+  // remains available elsewhere on the report as an informational
+  // account-health figure only.
   var terms = [
-    ["disk headroom", report.disk_headroom],
-    ["ram headroom", report.ram_headroom],
     ["configured max", report.configured_max],
   ];
   var minVal = terms.reduce(function (acc, t) {
@@ -584,8 +581,8 @@ function renderPipeline(rows) {
       el("th", { text: "merged 24h" }),
       // Issue #8091: the operator-attention bucket, reusing this same row —
       // "held" is open PRs labeled loom:operator (a first-class, re-evaluable
-      // hold, not a fault), "op-only" is open issues labeled
-      // loom:operator-only (the hard park).
+      // hold, not a fault), "op-only" is open issues held by loom:operator
+      // (the issue park; the retired loom:operator-only counts, #11795).
       el("th", { text: "held" }), el("th", { text: "op-only" }),
     ])]),
   ]);

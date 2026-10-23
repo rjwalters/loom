@@ -67,6 +67,13 @@ use std::sync::{Mutex, OnceLock};
 /// It is also the top of the lease chain ([`lease_host_identity`]).
 pub const HOST_ID_ENV: &str = "LOOM_HOST_ID";
 
+/// Lease-only host identity pin, ahead of [`HOST_ID_ENV`] in the lease chain
+/// ([`lease_host_identity`]) and absent from [`host_identity`]. A step child
+/// carries the daemon's lease host here so a containered session's lease owner
+/// matches the daemon's without touching the child's telemetry `host.id`
+/// (Issue #11906, #11530).
+pub const LEASE_HOST_ID_ENV: &str = "LOOM_LEASE_HOST_ID";
+
 /// Overrides the persisted id's path (default `~/.loom/host-id`). Used by
 /// tests and by an operator who keeps `~/.loom` somewhere unusual.
 pub const HOST_ID_FILE_ENV: &str = "LOOM_HOST_ID_FILE";
@@ -549,7 +556,7 @@ pub(crate) fn adopt_at(path: &Path, expected: &str, name: &str) -> std::io::Resu
     Ok(true)
 }
 
-/// The **lease** host identity: `LOOM_HOST_ID` > `$HOSTNAME` > the
+/// The **lease** host identity: `LOOM_LEASE_HOST_ID` > `LOOM_HOST_ID` > `$HOSTNAME` > the
 /// `hostname` binary > [`UNKNOWN_HOST`] — the pre-#11530 chain, unchanged.
 ///
 /// Used only where an id is published into, or compared against, a
@@ -564,6 +571,13 @@ pub fn lease_host_identity() -> String {
     let warn_once = |message: String| {
         FALLBACK_WARNED.get_or_init(|| log::warn!("{message}"));
     };
+    if let Some(id) = std::env::var(LEASE_HOST_ID_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_blank)
+    {
+        return id;
+    }
     if let Some(id) = env_host_id() {
         return id;
     }

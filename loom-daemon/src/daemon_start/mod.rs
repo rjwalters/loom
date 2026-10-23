@@ -47,6 +47,7 @@
 //! | [`launch`] | the launchd / systemd / nohup start paths |
 //! | [`platform`] | the label/domain/unit resolvers the lifecycle scripts share |
 //! | [`supervision_dropin`] | none: the daemon's startup systemd drop-in (#11111) |
+//! | [`systemd_autonomy`] | none: the unit no longer carries autonomy env (#11951) |
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,6 +64,7 @@ pub mod paths;
 pub mod platform;
 pub mod render;
 pub mod supervision_dropin;
+pub mod systemd_autonomy;
 pub mod unescape;
 pub mod watchdog_job;
 
@@ -317,7 +319,7 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         false,
     );
 
-    persist_invocation_flags(&ctx);
+    let prior_flags = persist_invocation_flags(&ctx);
 
     out::say(&format!("Daemon binary: {}", ctx.daemon_bin_str()));
     out::say(&format!("Socket:        {}", ctx.socket_path.display()));
@@ -386,6 +388,10 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         }
     };
 
+    // #11951: on systemd the unit carries no autonomy env, so the guard reads
+    // what will decide each loop after the re-render (drop-in, then config).
+    let systemd_layer = is_linux_systemd
+        .then(|| systemd_autonomy::Layer::read(&platform::systemd_unit_path(), &ctx.repo_root));
     let downgrade = autonomy::warn_autonomy_downgrade(&autonomy::DowngradeCheck {
         from_config: ctx.args.from_config,
         work_finder: (
@@ -400,9 +406,12 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         want_health_gate: ctx.args.want_health_gate,
         prior: &prior,
         intent_marker: &ctx.intent_marker,
+        config_work_finder: config_work_finder(&ctx.repo_root),
+        systemd: systemd_layer.as_ref(),
     });
     if downgrade {
         autonomy::print_downgrade_refusal();
+        restore_invocation_flags(&ctx, prior_flags);
         std::process::exit(1);
     }
     // The drift warning runs FIRST so a refused start still reports both
@@ -527,6 +536,8 @@ fn run_inspection_mode_and_exit(ctx: &Ctx) -> ! {
         }
     };
 
+    let systemd_layer = (!ctx.args.print_plist)
+        .then(|| systemd_autonomy::Layer::read(&platform::systemd_unit_path(), &ctx.repo_root));
     // Warn-only by construction on this path, so an operator sees the warning
     // whether they are inspecting or actually starting.
     let _ = autonomy::warn_autonomy_downgrade(&autonomy::DowngradeCheck {
@@ -543,6 +554,8 @@ fn run_inspection_mode_and_exit(ctx: &Ctx) -> ! {
         want_health_gate: ctx.args.want_health_gate,
         prior: &prior,
         intent_marker: &ctx.intent_marker,
+        config_work_finder: config_work_finder(&ctx.repo_root),
+        systemd: systemd_layer.as_ref(),
     });
     guards::warn_scratch_workdir_drift(&ctx.repo_root);
     let _ = guards::guard_session_context_start(
@@ -639,13 +652,36 @@ fn run_inspection_mode_and_exit(ctx: &Ctx) -> ! {
 /// reflects the most recent invocation — `loom-daemon-update.sh` replays it
 /// after a rebuild so the FLAGS-OFF/opt-in contract never widens across an
 /// update.
-fn persist_invocation_flags(ctx: &Ctx) {
+///
+/// Returns what the file held before (`None`: it did not exist), so a start
+/// REFUSED as an autonomy downgrade can put it back: the watchdog replays this
+/// file on recovery, and a refused bare start that left it empty would turn
+/// the next recovery into the very downgrade it refused (#11934).
+fn persist_invocation_flags(ctx: &Ctx) -> Option<String> {
     let flags_file = ctx.state_home.join(".daemon.flags");
+    let before = std::fs::read_to_string(&flags_file).ok();
     let body = args::persisted_flags(&ctx.args.original)
         .into_iter()
         .map(|f| format!("{f}\n"))
         .collect::<String>();
     let _ = std::fs::write(&flags_file, body);
+    before
+}
+
+/// Undo [`persist_invocation_flags`] for a refused start (#11934).
+fn restore_invocation_flags(ctx: &Ctx, before: Option<String>) {
+    let flags_file = ctx.state_home.join(".daemon.flags");
+    let _ = match before {
+        Some(body) => std::fs::write(&flags_file, body),
+        None => std::fs::remove_file(&flags_file),
+    };
+}
+
+/// The resolved config's `autonomous.workFinder.enabled` for `repo_root`
+/// (#11934) — the same read the daemon makes at startup, so the downgrade
+/// check sees exactly the value the started daemon would have obeyed.
+fn config_work_finder(repo_root: &Path) -> Option<bool> {
+    crate::work_finder::read_work_finder_config(repo_root).enabled
 }
 
 /// `DAEMON_SLEEP_INHIBIT_WRAP` — the `systemd-inhibit` prefix, or empty.

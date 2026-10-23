@@ -74,6 +74,7 @@ fn sample() -> PauseManifest {
             timeout_remaining_secs: None,
             holds_issue_creation_mutex: false,
             stopped_at: None,
+            step: None,
         }],
         events: vec![],
     }

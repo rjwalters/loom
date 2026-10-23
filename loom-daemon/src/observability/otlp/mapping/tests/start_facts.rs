@@ -16,6 +16,7 @@ fn facts() -> SweepStartFacts {
         trigger: Some("operator_redispatch".to_string()),
         previous_sweep_id: Some("sweep-issue-4858-prior".to_string()),
         dispatch_origin: Some("operator".to_string()),
+        role_draw: None,
     }
 }
 

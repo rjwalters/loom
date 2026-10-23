@@ -39,19 +39,6 @@ CHAMPION_MD="$PROMPT_DIR/champion-issue-promo.md"
 # shellcheck source=lib/assert.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-assert_not_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$haystack" != *"$needle"* ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Unexpected substring: '$needle'"
-    fi
-}
-
 assert_doc_contains() {
     local file="$1" needle="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -204,6 +191,17 @@ chmod +x "$STUB_DIR/gh"
 cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub loom-daemon: LOOM_TEST_STUB_DIR not set}"
+# $STUB_DIR/hold-labels: the registry's answer to `labels list --property hold
+# --with-retired` (#11795); absent, the query fails like an older binary.
+if [[ "$*" == "labels list --property hold --with-retired" && -f "$STUB_DIR_FROM_ENV/hold-labels" ]]; then
+  exec cat "$STUB_DIR_FROM_ENV/hold-labels"
+fi
+# $STUB_DIR/author-gate holds the promotion-author answer (#10827); absent: TRUSTED.
+if [[ "$1" == "forge" && "$2" == "promotion-author" ]]; then
+  if [[ -f "$STUB_DIR_FROM_ENV/author-gate-fail" ]]; then exit 1; fi
+  if [[ -f "$STUB_DIR_FROM_ENV/author-gate" ]]; then cat "$STUB_DIR_FROM_ENV/author-gate"; else echo TRUSTED; fi
+  exit 0
+fi
 if [[ "$1" == "forge" && "$2" == "trusted-comments" && ! -f "$STUB_DIR_FROM_ENV/trust-verb-missing" ]]; then
   exec jq -c '[.[] | select(
       ((.author_association // "") | ascii_upcase | IN("OWNER","MEMBER","COLLABORATOR"))
@@ -216,6 +214,8 @@ chmod +x "$STUB_DIR/loom-daemon"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# A real daemon from the caller (CI exports LOOM_DAEMON_BIN) supplies (h3)'s registry answer.
+LOOM_TEST_REAL_DAEMON="${LOOM_TEST_REAL_DAEMON:-${LOOM_DAEMON_BIN:-}}"
 unset LOOM_DAEMON_BIN
 
 labels_json() {
@@ -281,7 +281,7 @@ reset_state() {
     rm -f "$STUB_DIR"/issue-fail-* "$STUB_DIR"/verify-fail-* "$STUB_DIR"/timeline-fail-*
     rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR"/edit-fail-*
     rm -f "$STUB_DIR"/comment-writes.log "$STUB_DIR"/edit-writes.log
-    rm -f "$STUB_DIR"/comments-fail-* "$STUB_DIR"/trust-verb-missing
+    rm -f "$STUB_DIR"/comments-fail-* "$STUB_DIR"/trust-verb-missing "$STUB_DIR"/author-gate "$STUB_DIR"/author-gate-fail
 }
 
 run_sut() {
@@ -353,6 +353,26 @@ assert_contains "$EDITS" "loom:issue" "(e) the completing edit adds loom:issue"
 assert_not_contains "$EDITS" "tier:" "(e) the completing edit adds no retired tier label (#11512)"
 assert_contains "$COMMENTS_POSTED" "6464" "(e) a reconciliation comment is posted on the issue"
 
+# (e2) Author gate (#10827): an untrusted or unverifiable author is never
+#     completed by the backstop - no label edit, no comment. Fail closed.
+for mode in untrusted unknown failed; do
+  reset_state
+  issue_json "OPEN" "$(labels_json "loom:curated")" \
+    "[$(approved_comment "2026-08-18T00:00:00Z" "**Goal Alignment**: fine")]" \
+    > "$STUB_DIR/issue-6465.json"
+  stage_verify 6465 "$(labels_json "loom:issue")"
+  case "$mode" in
+    untrusted) echo "UNTRUSTED drive-by" > "$STUB_DIR/author-gate" ;;
+    unknown) echo "UNKNOWN the issue could not be read" > "$STUB_DIR/author-gate" ;;
+    failed) : > "$STUB_DIR/author-gate-fail" ;;
+  esac
+  run_sut --issue 6465 --apply
+  assert_eq "0" "$RC" "(e2/$mode) held by the author gate -> exit 0"
+  assert_eq "ALREADY_ESCALATED" "$(get_field "$OUT" DECISION)" "(e2/$mode) DECISION=ALREADY_ESCALATED"
+  assert_not_contains "$EDITS" "loom:issue" "(e2/$mode) no loom:issue is applied"
+  assert_eq "" "$COMMENTS_POSTED" "(e2/$mode) no comment is posted"
+done
+
 # (f) A current verdict names no tier at all -> still COMPLETED, never an
 #     escalation (before #11512 an unrecoverable tier escalated to an operator).
 reset_state
@@ -363,20 +383,56 @@ stage_verify 302 "$(labels_json "loom:issue" "loom:curated")"
 run_sut --issue 302 --apply
 assert_eq "12" "$RC" "(f) a verdict with no tier completes -> exit 12"
 assert_eq "COMPLETED" "$(get_field "$OUT" DECISION)" "(f) DECISION=COMPLETED"
-assert_not_contains "$EDITS" "loom:operator-only" "(f) no operator escalation"
+assert_not_contains "$EDITS" "loom:operator" "(f) no operator escalation"
 
-# (h2) #6942: an issue already carrying loom:operator-only (a pre-#11512 run
+# (h2) #6942: an issue already carrying loom:operator (a pre-#11512 run
 #     escalated it, or an operator holds it) gets no label edit and no comment
 #     -- DECISION=ALREADY_ESCALATED, exit 0, distinguishable from ESCALATED (13).
 reset_state
-issue_json "OPEN" "$(labels_json "loom:curated" "loom:operator-only" "loom:operator-mechanical")" \
+issue_json "OPEN" "$(labels_json "loom:curated" "loom:operator")" \
   "[$(approved_comment "2026-08-18T00:00:00Z" "no tier info here")]" \
   > "$STUB_DIR/issue-302.json"
 run_sut --issue 302 --apply
-assert_eq "0" "$RC" "(h2) already loom:operator-only -> exit 0, not 13"
+assert_eq "0" "$RC" "(h2) already loom:operator -> exit 0, not 13"
 assert_eq "ALREADY_ESCALATED" "$(get_field "$OUT" DECISION)" "(h2) DECISION=ALREADY_ESCALATED, distinguishable from fresh ESCALATED"
 assert_eq "" "$EDITS" "(h2) no label edit is issued"
 assert_eq "" "$COMMENTS_POSTED" "(h2) no comment is posted"
+
+# (h3) #11795 transition: an issue carrying ONLY a retired hold name (not yet
+#     moved by `labels migrate`) is still held -- never promoted over, through
+#     the registry (--with-retired) and through the older-daemon fallback.
+REAL_DAEMON="${LOOM_TEST_REAL_DAEMON:-}"
+for retired in loom:operator-only loom:operator-blocked; do
+  for source in fallback registry; do
+    reset_state
+    rm -f "$STUB_DIR/hold-labels"
+    if [[ "$source" == "registry" ]]; then
+      if [[ -n "$REAL_DAEMON" && -x "$REAL_DAEMON" ]]; then
+        "$REAL_DAEMON" labels list --property hold --with-retired > "$STUB_DIR/hold-labels"
+      else
+        printf '%s\n' loom:blocked loom:operator loom:frozen loom:operator-only loom:operator-decision \
+          loom:operator-mechanical loom:operator-blocked loom:needs-capability > "$STUB_DIR/hold-labels"
+      fi
+    fi
+    issue_json "OPEN" "$(labels_json "loom:curated" "$retired")" \
+      "[$(approved_comment "2026-08-18T00:00:00Z" "no tier info here")]" \
+      > "$STUB_DIR/issue-302.json"
+    run_sut --issue 302 --apply
+    assert_eq "ALREADY_ESCALATED" "$(get_field "$OUT" DECISION)" "(h3) only $retired ($source) -> still held, ALREADY_ESCALATED"
+    assert_eq "" "$EDITS" "(h3) only $retired ($source) -> no loom:issue added"
+  done
+done
+rm -f "$STUB_DIR/hold-labels"
+
+# (h4) any hold, not only the operator's: an issue under loom:frozen is never
+#     promoted over either.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:curated" "loom:frozen")" \
+  "[$(approved_comment "2026-08-18T00:00:00Z" "no tier info here")]" \
+  > "$STUB_DIR/issue-302.json"
+run_sut --issue 302 --apply
+assert_eq "ALREADY_ESCALATED" "$(get_field "$OUT" DECISION)" "(h4) loom:frozen -> held, ALREADY_ESCALATED"
+assert_eq "" "$EDITS" "(h4) loom:frozen -> no label edit"
 
 # (i) --apply, but the completing edit's OWN read-back still shows loom:issue
 #     missing (the exact #6464 failure mode recurring on the reconciliation

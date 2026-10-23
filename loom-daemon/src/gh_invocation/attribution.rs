@@ -20,7 +20,7 @@ pub struct CredAttr {
     pub account: String,
     /// The owner the App installation covers (lowercased), when known.
     pub owner: Option<String>,
-    /// `reader`, `writer`, `env` or `ambient`.
+    /// `reader`, `writer`, `gateway`, `env` or `ambient`.
     pub kind: &'static str,
     /// The App installation the credential's sidecar names (#10571).
     pub installation: Option<String>,
@@ -68,6 +68,7 @@ pub fn cred_of(inv: &GhInvocation) -> CredAttr {
 /// - `…/.loom/gh-config-by-owner/<owner>/<digits>` ⇒ `app-<digits>`, reader;
 /// - `…/.loom/gh-config-by-owner/<owner>` ⇒ the writer App, that owner;
 /// - `…/.loom/gh-config` ⇒ the writer App, the workspace's own owner;
+/// - `…/.loom/gh-config-gateway/<owner>` ⇒ `gateway`, that owner (2am#4367 P4);
 /// - anything else, or none ⇒ `ambient`.
 ///
 /// A writer directory's App and owner are the ones its `identity.json`
@@ -86,6 +87,16 @@ pub fn cred_of_with(dir: Option<&Path>, env_token: bool) -> CredAttr {
     let Some(dir) = dir else {
         return CredAttr::ambient();
     };
+    // 2am#4367 P4: a gateway read profile spends no host-held App's bucket;
+    // the gateway's own App does, and the gateway reports it.
+    if let Some(owner) = crate::forge_gateway::owner_of_profile_dir(dir) {
+        return CredAttr {
+            account: crate::forge_gateway::GATEWAY_APP_ID.to_string(),
+            owner: Some(owner),
+            kind: crate::forge_gateway::CRED_KIND,
+            installation: None,
+        };
+    }
     let class = forge_bucket_book::classify_dir(dir);
     let kind = match class {
         DirClass::Reader { .. } => "reader",

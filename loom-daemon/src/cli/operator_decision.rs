@@ -1,12 +1,12 @@
 //! `loom-daemon operator-decision` (#9344): clap shim over
-//! [`loom_daemon::operator_decision`], which documents the contract and the
+//! [`crate::operator_decision`], which documents the contract and the
 //! exit codes. Lives here, not in `main.rs`, for the frozen-`main.rs` reason
 //! `PremiseCheckArgs` gives.
 
-use anyhow::Result;
-use loom_daemon::operator_decision::cli::{
+use crate::operator_decision::cli::{
     self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, GhForge, Target,
 };
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand, Debug)]
@@ -19,7 +19,7 @@ pub(crate) enum OperatorDecisionCommand {
         input: PathBuf,
     },
     /// Write a validated decision onto an issue (or file a new one) and label
-    /// it loom:operator-decision. Refuses, touching nothing, on any contract
+    /// it loom:operator (#11795). Refuses, touching nothing, on any contract
     /// failure.
     Apply {
         /// Existing issue to rewrite and relabel (relabel mode).
@@ -38,8 +38,8 @@ pub(crate) enum OperatorDecisionCommand {
         #[arg(long, value_name = "FILE|-")]
         input: PathBuf,
 
-        /// Extra label to add with loom:operator-decision (repeatable), e.g.
-        /// loom:operator-only.
+        /// Extra label to add with loom:operator (repeatable), e.g.
+        /// loom:important. A retired name is added as its replacement.
         #[arg(long = "also-label", value_name = "LABEL")]
         also_label: Vec<String>,
 
@@ -98,7 +98,10 @@ impl OperatorDecisionCommand {
                             remove_labels: remove_label,
                             dry_run,
                         };
-                        apply(&mut forge, &text, &req, &mut out, &mut err)
+                        let code = apply(&mut forge, &text, &req, &mut out, &mut err);
+                        // #12027: best-effort, never the exit code.
+                        crate::operator_decision::cli::journal_applied(&req, code);
+                        code
                     }
                     Err(e) => {
                         eprintln!("ERROR: {e}");

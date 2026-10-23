@@ -645,6 +645,7 @@ mod tests {
     #[test]
     #[serial(loom_socket_path_env)]
     fn test_run_pass_script_missing_when_marker_present() {
+        let _restore_ambient_marker = RestoreAmbientAutonomyMarker::clear();
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);
@@ -657,6 +658,7 @@ mod tests {
     #[test]
     #[serial(loom_socket_path_env)]
     fn test_run_pass_healed_on_successful_script() {
+        let _restore_ambient_marker = RestoreAmbientAutonomyMarker::clear();
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);
@@ -673,6 +675,7 @@ mod tests {
     #[test]
     #[serial(loom_socket_path_env)]
     fn test_run_pass_failed_on_nonzero_exit() {
+        let _restore_ambient_marker = RestoreAmbientAutonomyMarker::clear();
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);
@@ -692,6 +695,7 @@ mod tests {
     #[test]
     #[serial(loom_socket_path_env)]
     fn test_run_pass_failed_on_timeout() {
+        let _restore_ambient_marker = RestoreAmbientAutonomyMarker::clear();
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);
@@ -742,6 +746,7 @@ mod tests {
     #[tokio::test]
     #[serial(loom_socket_path_env)]
     async fn test_loop_runs_a_pass_promptly() {
+        let _restore_ambient_marker = RestoreAmbientAutonomyMarker::clear();
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);

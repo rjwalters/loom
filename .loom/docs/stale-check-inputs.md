@@ -1,1 +1,0 @@
-../../defaults/docs/stale-check-inputs.md

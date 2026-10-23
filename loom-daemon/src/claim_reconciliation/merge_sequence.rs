@@ -130,6 +130,10 @@ pub mod overlap;
 #[path = "merge_sequence_ready.rs"]
 pub mod ready;
 
+// Live CI and mergeability: "landable now" feeds `ready` (#12010).
+#[path = "merge_sequence_landable.rs"]
+pub mod landable;
+
 // Tree-identical re-dates keep a hold; operator releases stick (#10398).
 #[path = "merge_sequence_sticky.rs"]
 pub mod sticky;
@@ -297,29 +301,12 @@ pub fn plan_id(members: &[(u32, &str)]) -> String {
     format!("seq-{}", &digest[..8])
 }
 
-/// Connected components of the shared-file overlap graph over `eligible`.
-///
-/// `files` maps PR number → its changed paths. PRs without an entry (a
-/// failed files read) are singletons — a failed read must not widen a group
-/// by pretending to know the files.
-#[must_use]
-pub fn overlap_components(
-    eligible: &[&SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-) -> Vec<Vec<u32>> {
-    overlap_components_with(eligible, files, &conflict::assume_conflict)
-}
-
 /// Order one component's members: constraint edges first (trusted markers
 /// among members, stacked bases), then oldest-first with a stable number
 /// tiebreak. `None` on a constraint cycle — the caller skips the component
 /// whole rather than applying a partial order.
-#[must_use]
-pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> Option<Vec<u32>> {
-    order_component_with(members, constraints, &BTreeSet::new())
-}
-
-/// [`order_component`] with the placeable-set ranking: among members that
+///
+/// Ranking over the placeable set: among members that
 /// are placeable right now (no unplaced constraint predecessor), ready
 /// members go first (#10371, [`ready::tier`]); within a tier a `stalled`
 /// member goes last and a higher priority level goes first (#10060,
@@ -381,19 +368,9 @@ pub fn order_component_with(
 /// Followers with no pinnable head SHA yield no edge: an unpinned hold
 /// cannot be re-checked safely. Edges carry [`EdgeReason::SharedFiles`]
 /// except where the follower's base branch IS the predecessor's head branch
-/// ([`EdgeReason::StackedBase`]).
-#[must_use]
-pub fn plan_group(
-    plan: &str,
-    order: &[u32],
-    by_number: &BTreeMap<u32, SequencePr>,
-    files: &BTreeMap<u32, BTreeSet<String>>,
-) -> SequenceGroup {
-    plan_group_with(plan, order, by_number, files, &conflict::assume_conflict)
-}
-
-/// [`plan_group`] where a shared file yields an edge only when `conflicts`
-/// says the pair really conflicts (#10350); stacking is unconditional.
+/// ([`EdgeReason::StackedBase`]). A shared file yields an edge only when
+/// `conflicts` says the pair really conflicts (#10350); stacking is
+/// unconditional.
 #[must_use]
 pub fn plan_group_with(
     plan: &str,
@@ -453,16 +430,7 @@ pub fn plan_group_with(
 /// come from `markers` (trusted, by follower) and from base-branch stacking
 /// among members. Components of size 1 are not groups. Stalled no-verdict
 /// PRs are judged against the wall clock and [`stall_hours`].
-#[must_use]
-pub fn plan_repo(
-    open_prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    markers: &BTreeMap<u32, SequenceMarker>,
-) -> Vec<SequenceGroup> {
-    plan_repo_checked(open_prs, files, markers, &conflict::assume_conflict)
-}
-
-/// [`plan_repo`] with the real-conflict predicate (#10350) — the live pass.
+/// With the real-conflict predicate (#10350) — the live pass.
 #[must_use]
 pub fn plan_repo_checked(
     open_prs: &[SequencePr],
@@ -474,7 +442,7 @@ pub fn plan_repo_checked(
     plan_repo_conflicts(open_prs, files, markers, &stalled, conflicts)
 }
 
-/// [`plan_repo`] with an explicit stalled set (deterministic for tests).
+/// [`plan_repo_checked`] with an explicit stalled set (deterministic for tests).
 #[must_use]
 pub fn plan_repo_with(
     open_prs: &[SequencePr],
@@ -691,7 +659,11 @@ pub fn apply_comment_body(marker: &SequenceMarker, reason: EdgeReason) -> String
 
 /// The release comment (predecessor landed / dissolved / expired).
 #[must_use]
-pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> String {
+pub fn release_comment_body(
+    marker: &SequenceMarker,
+    action: HoldAction,
+    head: Option<&SequencePr>,
+) -> String {
     let why = match action {
         HoldAction::Release => {
             format!("#{} merged at the recorded head — this PR may land now", marker.after)
@@ -713,7 +685,7 @@ pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> Stri
             marker.after
         ),
         HoldAction::ReleaseNoOverlap => overlap::release_reason(marker),
-        HoldAction::ReleaseNotReady => ready::release_reason(marker),
+        HoldAction::ReleaseNotReady => ready::release_reason(marker, head),
         _ => "released".to_string(),
     };
     format!(
@@ -965,6 +937,9 @@ pub struct PlanReport {
     /// Existing holds Phase 1 would release as no-overlap (#10077):
     /// `(follower, predecessor)`.
     pub would_release_no_overlap: Vec<(u32, u32)>,
+    /// Existing holds and why each is still kept (#12595):
+    /// `(follower, predecessor, reason)`. Read-only; nothing is written.
+    pub held_because: Vec<(u32, u32, String)>,
 }
 
 /// Compute the plan report without writing anything.
@@ -980,6 +955,7 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     if open.len() <= TRIGGER_OPEN_PRS {
         return Ok(report);
     }
+    let open = landable::tag_live(gh_bin, root, &open, true);
     let eligible: Vec<&SequencePr> = open
         .iter()
         .filter(|p| p.eligible_for_ordering() && p.pinnable())
@@ -1002,6 +978,16 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
     report.groups = plan_repo_checked(&open, &files, &markers, &conflicts);
     let bin = gh_bin.to_string_lossy().to_string();
+    let open_ready = ready::demote_unlandable(&open, &markers);
+    for (n, marker) in &markers {
+        let Some(follower) = open.iter().find(|p| p.number == *n) else {
+            continue;
+        };
+        let pred = predecessor(&bin, root, &open, marker.after);
+        let head = open_ready.iter().find(|p| p.number == marker.after);
+        let why = ready::hold_reason(marker, pred.as_ref(), follower, head);
+        report.held_because.push((*n, marker.after, why));
+    }
     for g in &mut report.groups {
         g.edges.retain(|e| {
             // #10634: the order key, not the plan id — the live pass keeps a
@@ -1104,7 +1090,7 @@ pub(super) fn reconcile_merge_sequences_with(
 ) -> MergeSequenceStats {
     // #10634: one host per workspace plans and posts — the role-runner shard
     // (#6374/#6704) that already makes one host of a sharded fleet own a
-    // workspace's other forge-writing passes (`stale_blocked`). Unsharded
+    // workspace's role ticks. Unsharded
     // hosts own everything, so a lone daemon is unaffected. Releasing an
     // existing hold is not gated (see `reconcile_merge_sequences_gated`).
     let owned = cfg!(test) || crate::role_shard::decide(root).admits_role_tick();
@@ -1148,6 +1134,8 @@ pub(super) fn reconcile_merge_sequences_gated(
     if open.len() <= TRIGGER_OPEN_PRS {
         return stats;
     }
+    // #12010: a ready PR that is red or conflicting now is not ready.
+    let open = landable::tag_live(gh_bin, root, &open, owned);
     let max_age = max_age_hours();
     let (now, stall_bound) = (Utc::now(), stall_hours());
     let mut stalls = stall::StallLedger::default();
@@ -1255,8 +1243,8 @@ pub(super) fn reconcile_merge_sequences_gated(
             | HoldAction::ReleaseStalled
             | HoldAction::ReleaseNoOverlap
             | HoldAction::ReleaseNotReady => {
-                release_hold(gh_bin, root, pr.number, &release_comment_body(&marker, action))
-                    .map(|_| action)
+                let body = release_comment_body(&marker, action, ready_head);
+                release_hold(gh_bin, root, pr.number, &body).map(|_| action)
             }
             HoldAction::VoidAndReplan => {
                 release_hold(gh_bin, root, pr.number, REPLAN_NOTE_BODY).map(|_| action)

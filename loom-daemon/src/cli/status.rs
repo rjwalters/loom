@@ -12,10 +12,10 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use loom_daemon::daemon_install_state::{self, InstallStateReport};
-use loom_daemon::self_update;
-use loom_daemon::status_section::StatusSection;
-use loom_daemon::types::{DaemonStatusReport, Request, Response};
+use crate::daemon_install_state::{self, InstallStateReport};
+use crate::self_update;
+use crate::status_section::StatusSection;
+use crate::types::{DaemonStatusReport, Request, Response};
 
 use super::common::resolve_socket_path;
 use super::status_render::{
@@ -63,7 +63,7 @@ pub(crate) struct StatusTimeoutInfo {
 ///
 /// `None` load-per-core (no reading available — an unsupported platform, or a
 /// transient read failure) leaves `base` unchanged: mirrors
-/// [`loom_daemon::cpu_headroom`]'s fail-open convention that absent evidence
+/// [`crate::cpu_headroom`]'s fail-open convention that absent evidence
 /// is never treated as "the host is loaded".
 #[must_use]
 pub(crate) fn scale_timeout_for_load(base: Duration, load_per_core: Option<f64>) -> Duration {
@@ -91,7 +91,7 @@ pub(crate) fn scale_timeout_for_load(base: Duration, load_per_core: Option<f64>)
 ///    (shared with `dispatch`, via
 ///    [`super::common::apply_ipc_timeout_env_floor`]) as a raise-only floor
 ///    over that, then
-///    [`loom_daemon::status_budget::apply_client_probe_floor`] over the
+///    [`crate::status_budget::apply_client_probe_floor`] over the
 ///    registered root count as a second raise-only floor (Issue #8224).
 ///
 /// The load reading is always taken and returned alongside the timeout —
@@ -103,13 +103,13 @@ pub(crate) fn scale_timeout_for_load(base: Duration, load_per_core: Option<f64>)
 ///
 /// [`MAX_SCALED_STATUS_TIMEOUT`] bounds *load* scaling, which is a speculative
 /// multiplier over a cost nobody has measured. The root-count term is not
-/// speculative: [`loom_daemon::ipc::build_daemon_status`] walks every
+/// speculative: [`crate::ipc::build_daemon_status`] walks every
 /// registered workspace root on every round-trip, so the thing this timeout
 /// waits on is known to be `O(roots)` (#8163 measured `13.1s`/`14.3s` builds
 /// on a "several dozen" root host). Capping that term at the load ceiling
 /// would reintroduce exactly the false timeout it exists to prevent, so the
 /// root-scaled floor is applied *after* the clamp and carries its own,
-/// higher, bound — [`loom_daemon::status_budget::MAX_ROOT_SCALED_PROBE_TIMEOUT`].
+/// higher, bound — [`crate::status_budget::MAX_ROOT_SCALED_PROBE_TIMEOUT`].
 ///
 /// Unlike `cli::health`, `status` has no retry/escalation concept: there is
 /// one attempt, so the floor is applied to it unconditionally rather than
@@ -121,20 +121,20 @@ pub(crate) fn scale_timeout_for_load(base: Duration, load_per_core: Option<f64>)
 /// [`LOOM_DAEMON_IPC_TIMEOUT_MS`]: super::common::DAEMON_IPC_TIMEOUT_ENV
 #[must_use]
 pub(crate) fn resolve_status_timeout(explicit_secs: Option<u64>) -> StatusTimeoutInfo {
-    let logical_cpus = loom_daemon::cpu_headroom::logical_cpu_count();
-    let loadavg_1m = loom_daemon::cpu_headroom::read_loadavg_1m();
-    let load_per_core = loom_daemon::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
+    let logical_cpus = crate::cpu_headroom::logical_cpu_count();
+    let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
+    let load_per_core = crate::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
     // Read from the LOCAL workspace registry (a cheap JSON read), never from
     // the daemon: the client cannot learn the root count from a round-trip it
     // is still trying to budget for. Same rationale as #8163's health client.
-    let root_count = loom_daemon::status_budget::registered_root_count();
+    let root_count = crate::status_budget::registered_root_count();
 
     let timeout = match explicit_secs {
         Some(secs) => Duration::from_secs(secs.max(1)),
         None => {
             let scaled = scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, load_per_core);
             let env_floored = super::common::apply_ipc_timeout_env_floor(scaled);
-            loom_daemon::status_budget::apply_client_probe_floor(env_floored, root_count)
+            crate::status_budget::apply_client_probe_floor(env_floored, root_count)
         }
     };
 
@@ -333,7 +333,7 @@ fn classify_roundtrip_error(e: anyhow::Error) -> StatusAttemptError {
 }
 
 /// Collect per-token usage via an in-process call to
-/// [`loom_daemon::tokens_pool::check::run_check`] — the same native probe
+/// [`crate::tokens_pool::check::run_check`] — the same native probe
 /// `loom-daemon tokens check --json` (`TokensAction::Check`) runs, called
 /// directly rather than shelled out to (issue #4080, epic #4081 Phase 2).
 /// `loom-daemon status` runs client-side with no supervision requirement, and
@@ -353,7 +353,7 @@ fn classify_roundtrip_error(e: anyhow::Error) -> StatusAttemptError {
 /// report predates #4292 keeps the pre-existing cwd-based behavior for that
 /// one legacy case (an old daemon binary talking to a newer CLI).
 fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
-    use loom_daemon::tokens_pool::check::{
+    use crate::tokens_pool::check::{
         self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
     };
 
@@ -361,7 +361,7 @@ fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
         Some(dir) => dir.to_path_buf(),
         None => {
             let ws = resolve_tokens_workspace(".").ok()?;
-            loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws)
+            crate::tokens_pool::paths::resolve_tokens_dir(&ws)
         }
     };
 
@@ -395,7 +395,7 @@ fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
 ///
 /// `--section` (#10787, [`sections`]) scopes the daemon's build and this
 /// function's client-side collectors to the selected sections.
-pub(crate) async fn handle_status_command(args: sections::StatusArgs) -> Result<()> {
+pub async fn handle_status_command(args: sections::StatusArgs) -> Result<()> {
     let (json, pipeline, selected) = (args.json, args.pipeline, args.selection());
     let socket_path = resolve_socket_path()?;
     let timeout_info = resolve_status_timeout(args.timeout_secs);
@@ -444,8 +444,8 @@ pub(crate) async fn handle_status_command(args: sections::StatusArgs) -> Result<
     // the "Managed repos" dispatch table above it.
     let pipeline_snapshots = if pipeline && selected.has(StatusSection::Pipeline) {
         let roots: Vec<PathBuf> = report.per_repo.iter().map(|r| r.root.clone()).collect();
-        let source = Arc::new(loom_daemon::pipeline_snapshot::GhPipelineSource::new());
-        Some(loom_daemon::pipeline_snapshot::collect_pipeline_snapshots(source, roots).await)
+        let source = Arc::new(crate::pipeline_snapshot::GhPipelineSource::new());
+        Some(crate::pipeline_snapshot::collect_pipeline_snapshots(source, roots).await)
     } else {
         None
     };
@@ -467,11 +467,11 @@ pub(crate) async fn handle_status_command(args: sections::StatusArgs) -> Result<
     // socket, so walking the roots the daemon itself reported measures exactly
     // the right filesystem. A root the daemon already flagged missing (#4326)
     // is skipped rather than walked into.
-    let worktree_disk: Vec<loom_daemon::worktree_disk_status::WorktreeDiskSummary> = report
+    let worktree_disk: Vec<crate::worktree_disk_status::WorktreeDiskSummary> = report
         .per_repo
         .iter()
         .filter(|r| selected.has(StatusSection::Worktrees) && !r.root_missing)
-        .map(|r| loom_daemon::worktree_disk_status::collect_worktree_disk_summary(&r.root))
+        .map(|r| crate::worktree_disk_status::collect_worktree_disk_summary(&r.root))
         .collect();
 
     if json {
@@ -571,12 +571,12 @@ fn cli_pid_alive(pid: u32) -> bool {
 ///
 /// Best-effort throughout: any read/resolve failure yields an empty list
 /// rather than erroring the already-failing `status` command further.
-fn read_degraded_in_flight_sweeps() -> Vec<loom_daemon::sweep_journal::JournalEntry> {
-    let Ok(path) = loom_daemon::sweep_journal::default_journal_path() else {
+fn read_degraded_in_flight_sweeps() -> Vec<crate::sweep_journal::JournalEntry> {
+    let Ok(path) = crate::sweep_journal::default_journal_path() else {
         return Vec::new();
     };
-    let mut journal = loom_daemon::sweep_journal::load(&path);
-    loom_daemon::sweep_journal::prune_dead(&mut journal, cli_pid_alive);
+    let mut journal = crate::sweep_journal::load(&path);
+    crate::sweep_journal::prune_dead(&mut journal, cli_pid_alive);
     journal.entries
 }
 
@@ -722,6 +722,10 @@ fn print_status_unreachable_human(
         watchdog_utc_stamp(now)
     );
     eprintln!();
+
+    if super::common::eprint_socket_missing_hint(socket_path) {
+        return;
+    }
 
     match install_state {
         None => {
@@ -952,27 +956,27 @@ fn print_status_unreachable_human(
 /// host's own status in-process, fan out to every registered fleet worker
 /// concurrently, merge, render, and exit non-zero unless every roster host is
 /// `UP`. Thin clap→module wiring: the merge/render/exit-code logic lives in
-/// [`loom_daemon::fleet::status`]; only the local-host collection (which needs
+/// [`crate::fleet::status`]; only the local-host collection (which needs
 /// this binary's own socket/install-state machinery) lives here.
 ///
 /// `timeout_secs` (issue #5575) bounds BOTH the SSH connect timeout
-/// ([`loom_daemon::fleet::status::SshStatusSource::connect_timeout_secs`])
+/// ([`crate::fleet::status::SshStatusSource::connect_timeout_secs`])
 /// and the outer per-host [`tokio::time::timeout`] wrapping the whole
 /// collection — the CLI's `--timeout-secs` flag defaults to
-/// [`loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS`], so omitting it
+/// [`crate::fleet::status::DEFAULT_TIMEOUT_SECS`], so omitting it
 /// preserves the pre-#5575 8s behavior exactly.
-pub(crate) async fn handle_fleet_status_command(json: bool, timeout_secs: u64) -> Result<()> {
-    use loom_daemon::fleet::status::{
+pub async fn handle_fleet_status_command(json: bool, timeout_secs: u64) -> Result<()> {
+    use crate::fleet::status::{
         all_tailnet_hosts_unreachable, collect_fleet_report, update_last_seen_up_at,
         SshStatusSource,
     };
-    use loom_daemon::fleet::FleetRegistry;
+    use crate::fleet::FleetRegistry;
 
     // `collect_fleet_report` consumes its registry argument (it owns each
     // `WorkerRecord` into the concurrent per-host collection).
     let registry = FleetRegistry::load_default()?;
     let local = collect_local_fleet_report().await;
-    let source: Arc<dyn loom_daemon::fleet::status::HostStatusSource> = Arc::new(SshStatusSource {
+    let source: Arc<dyn crate::fleet::status::HostStatusSource> = Arc::new(SshStatusSource {
         connect_timeout_secs: timeout_secs,
     });
     let timeout = Duration::from_secs(timeout_secs);
@@ -990,7 +994,7 @@ pub(crate) async fn handle_fleet_status_command(json: bool, timeout_secs: u64) -
     // #4697: persist "last observed Up" so a LATER poll that finds this host
     // Unreachable can measure elapsed silence against its configured
     // idle-shutdown window (the expected-power-off heuristic in
-    // `loom_daemon::fleet::status`).
+    // `crate::fleet::status`).
     //
     // Deliberately RE-LOADS the registry rather than mutating the copy fanned
     // out above: the SSH collection can take up to `timeout_secs`, and
@@ -1028,18 +1032,18 @@ pub(crate) async fn handle_fleet_status_command(json: bool, timeout_secs: u64) -
 /// roll the `loom-daemon` binary across fleet hosts with a measured
 /// process-vs-build-time verdict. Thin clap→module wiring — the SSH
 /// orchestration, measured verdict, and per-host fanout all live in
-/// [`loom_daemon::fleet::roll`]; this needs the async runtime for the same
+/// [`crate::fleet::roll`]; this needs the async runtime for the same
 /// reason `fleet status` does (a per-host [`tokio::time::timeout`] fanout in
 /// `--all` mode).
-pub(crate) async fn handle_fleet_roll_command(
+pub async fn handle_fleet_roll_command(
     host: Option<String>,
     all: bool,
     timeout_secs: u64,
     json: bool,
 ) -> Result<()> {
-    use loom_daemon::fleet::add_worker::SshRunner;
-    use loom_daemon::fleet::roll::{self, RollReport};
-    use loom_daemon::fleet::CommandRunner;
+    use crate::fleet::add_worker::SshRunner;
+    use crate::fleet::roll::{self, RollReport};
+    use crate::fleet::CommandRunner;
 
     if !all && host.is_none() {
         eprintln!(
@@ -1069,15 +1073,15 @@ pub(crate) async fn handle_fleet_roll_command(
     std::process::exit(report.exit_code());
 }
 
-/// Collect the local host's own [`loom_daemon::fleet::status::HostReport`] —
+/// Collect the local host's own [`crate::fleet::status::HostReport`] —
 /// in-process, over the daemon's Unix socket (never `ssh localhost`, per
 /// #4342's implementation guidance). Reuses the exact same
 /// [`build_status_json_value`] payload shape `loom-daemon status --json`
 /// emits, so the local row's fields line up with every remote host's
 /// self-reported `status --json` (#4069's unreachable-daemon classification is
 /// reused for the down case too).
-async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport {
-    use loom_daemon::fleet::status::HostReport;
+async fn collect_local_fleet_report() -> crate::fleet::status::HostReport {
+    use crate::fleet::status::HostReport;
 
     let socket_path = match resolve_socket_path() {
         Ok(path) => path,
@@ -1131,17 +1135,17 @@ async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport 
 
 /// #4952: cheap, local-only self-check for "is the tailnet client on THIS
 /// host actually the thing that's down" — run only when
-/// [`all_tailnet_hosts_unreachable`](loom_daemon::fleet::status::all_tailnet_hosts_unreachable)
+/// [`all_tailnet_hosts_unreachable`](crate::fleet::status::all_tailnet_hosts_unreachable)
 /// flags every tailnet-addressed remote roster host as `Unreachable`, since
 /// that pattern is otherwise indistinguishable from a genuine multi-host
-/// outage. Never an SSH round-trip (that is [`HostStatusSource`](loom_daemon::fleet::status::HostStatusSource)'s job) —
+/// outage. Never an SSH round-trip (that is [`HostStatusSource`](crate::fleet::status::HostStatusSource)'s job) —
 /// this shells out to the LOCAL `tailscale` CLI exactly once.
 ///
 /// Returns `None` when the check is a no-op — AC 4: a missing `tailscale`
 /// CLI must not become a new hard dependency, so an absent binary
 /// (`ErrorKind::NotFound`) silently skips the check rather than erroring the
 /// whole report (current, pre-#4952 behavior unchanged).
-fn check_local_tailnet_state() -> Option<loom_daemon::fleet::status::LocalTailnetState> {
+fn check_local_tailnet_state() -> Option<crate::fleet::status::LocalTailnetState> {
     check_local_tailnet_state_with_path_override(None)
 }
 
@@ -1159,8 +1163,8 @@ fn check_local_tailnet_state() -> Option<loom_daemon::fleet::status::LocalTailne
 /// `resolve_tool_path_in`/`probe_gh_availability_with_search_path` do.
 fn check_local_tailnet_state_with_path_override(
     path_override: Option<&std::ffi::OsStr>,
-) -> Option<loom_daemon::fleet::status::LocalTailnetState> {
-    use loom_daemon::fleet::status::LocalTailnetState;
+) -> Option<crate::fleet::status::LocalTailnetState> {
+    use crate::fleet::status::LocalTailnetState;
 
     let mut command = std::process::Command::new("tailscale");
     command
@@ -1192,8 +1196,8 @@ fn check_local_tailnet_state_with_path_override(
 #[must_use]
 fn classify_tailscale_status_output(
     stdout: &[u8],
-) -> Option<loom_daemon::fleet::status::LocalTailnetState> {
-    use loom_daemon::fleet::status::LocalTailnetState;
+) -> Option<crate::fleet::status::LocalTailnetState> {
+    use crate::fleet::status::LocalTailnetState;
 
     let text = String::from_utf8_lossy(stdout);
     match serde_json::from_str::<serde_json::Value>(&text) {
@@ -1217,7 +1221,7 @@ mod local_tailnet_tests {
     //! parent process's — so this needs no `#[serial]` guard and cannot race
     //! any other test in this binary.
     use super::{check_local_tailnet_state_with_path_override, classify_tailscale_status_output};
-    use loom_daemon::fleet::status::LocalTailnetState;
+    use crate::fleet::status::LocalTailnetState;
 
     #[test]
     fn classifies_running_backend_state_as_up() {
@@ -1384,7 +1388,7 @@ mod reported_started_at_tests {
 
 #[cfg(test)]
 pub(crate) mod sample_report;
-pub(crate) mod sections;
+pub mod sections;
 
 #[cfg(test)]
 pub(crate) mod status_client_tests {
@@ -1396,7 +1400,7 @@ pub(crate) mod status_client_tests {
     //! reconnect retry absorbs a transient first-connection drop.
     use super::sample_report::sample_report;
     use super::{query_daemon_status, resolve_status_timeout};
-    use loom_daemon::types::Response;
+    use crate::types::Response;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -1619,7 +1623,7 @@ mod degraded_journal_tests {
     //! sweeps read from the persisted sweep journal, for when the IPC
     //! round-trip itself is what is slow/unresponsive.
     use super::{cli_pid_alive, read_degraded_in_flight_sweeps};
-    use loom_daemon::sweep_journal::{self, JournalEntry, SweepJournal};
+    use crate::sweep_journal::{self, JournalEntry, SweepJournal};
     use serial_test::serial;
 
     #[test]

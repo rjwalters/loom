@@ -2,6 +2,7 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 pub mod cargo_debuginfo;
+mod claim_owned;
 pub mod containment;
 // `pub(crate)` rather than private since #8436: `runtime_preference::
 // availability` mirrors `credential::resolve`'s ladder to decide whether a
@@ -565,10 +566,6 @@ fn run_preflight(
         };
         let launch = serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)}).to_string();
         writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| LaunchError::config(e.to_string()))?;
-        // J1 shadow (#11346): attribution only, after the legacy line is written.
-        if let Some(log_path) = options.log.as_deref() {
-            crate::journal::execution::launch_recorded(root, log_path, &launch);
-        }
         if let Some((prepared, _)) = &prepared {
             writeln!(log, "{}", prepared.dispatch_marker())
                 .and_then(|()| log.flush())
@@ -672,6 +669,19 @@ fn run_preflight(
     let path = crate::agent_gh::session_path(current.as_deref());
     if let Some(path) = path {
         command.env("PATH", path);
+    }
+    // 2am#4367 P4: no gh update check, and the gateway profiles the front's
+    // classified reads use — exported only while the daemon has them live.
+    // 2am#4501: and the hooks of this release, which the wired user-scope
+    // hook command prefers over the machine checkout.
+    for (key, value) in crate::forge_gateway::agent_env()
+        .into_iter()
+        .chain(crate::hooks_home::agent_env())
+    {
+        match value {
+            Some(v) => command.env(key, v),
+            None => command.env_remove(key),
+        };
     }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's

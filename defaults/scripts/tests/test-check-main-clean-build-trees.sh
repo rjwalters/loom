@@ -17,12 +17,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# #9548: the subject vets its write target (`forge may-write`) first; that
-# decision is not what this suite tests (test-write-scope.sh does).
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$SCRIPT_DIR/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# #9548: every case here runs with LOOM_QUARANTINE_COMMENT=0, so the subject
+# never reaches its one vetted write (the breadcrumb comment) and needs no
+# registered fixture; test-check-main-clean.sh covers that write.
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/check-main-clean.sh"
 # --quarantine asks `loom-daemon stashes build-trees` which cargo build trees to
@@ -32,25 +29,7 @@ SCRIPT="$HELPERS_DIR/check-main-clean.sh"
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
 loom_test_require_daemon_bin --self-only "$HELPERS_DIR" "stashes"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # A throwaway git repo with one commit and a tracked source file.
 make_repo_with_source() {
@@ -143,7 +122,7 @@ if grep -q '^target-x/' <<<"$STASH_FILES"; then
 else
     fail "partial-output daemon: partial output still drove an exclusion; stash holds: $STASH_FILES"
 fi
-rm -rf "${REPO:?}" "${STUB_DIR:?}" "${WS_STUB_DIR:?}"
+rm -rf "${REPO:?}" "${STUB_DIR:?}"
 
 # -------- Summary --------
 echo ""

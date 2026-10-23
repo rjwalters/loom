@@ -16,7 +16,8 @@
 # This file tests:
 #   1. is_rate_limit_error() fires on all five documented signatures and
 #      stays silent on unrelated failures (auth, network, 404).
-#   2. forge_gh_comment_rl_safe / forge_gh_reopen_issue_rl_safe /
+#   2. forge_gh_comment_rl_safe is daemon-only (#9865: success, failure with
+#      stderr passthrough, absent binary); forge_gh_reopen_issue_rl_safe /
 #      forge_gh_swap_label_rl_safe: succeed via the primary `gh` mutation
 #      when it works, fall back to the correct REST endpoint/method only on
 #      a rate-limit rejection, and propagate (not swallow) any OTHER
@@ -47,29 +48,9 @@ HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 
 # Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+# shellcheck source=lib/assert.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-assert_eq() {
-    local expected="$1"
-    local actual="$2"
-    local msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$expected" == "$actual" ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
 
 # shellcheck source=../lib/forge-helpers.sh
 source "$HELPERS_DIR/lib/forge-helpers.sh"
@@ -141,13 +122,26 @@ source "$SCRIPT_DIR/lib/write-scope-fixture.sh"
 write_scope_register "$STUB_DIR/checkout" owner/repo
 cd "$STUB_DIR/checkout"
 
-# #9774: forge_gh_comment_rl_safe tries the daemon chokepoint before the gh
-# ladder. This suite's subject is the ladder, so pin the SELF daemon to a
-# mock that refuses — the gh stub stays the path under test, deterministically.
+# #9774/#9865: forge_gh_comment_rl_safe posts only through the daemon
+# chokepoint. Pin the SELF daemon to a mock whose behavior is driven by
+# $DAEMON_MODE_FILE ("ok" posts, "fail" refuses with a stderr message).
+DAEMON_MODE_FILE="$STUB_DIR/daemon-mode.txt"
+DAEMON_ARGV_LOG="$STUB_DIR/daemon-argv.log"
+export DAEMON_MODE_FILE DAEMON_ARGV_LOG
 cat > "$STUB_DIR/loom-daemon" <<'MOCK'
 #!/usr/bin/env bash
-echo "mock loom-daemon: forge comment not under test here" >&2
-exit 127
+printf '%s\n' "$*" >> "$DAEMON_ARGV_LOG"
+# A daemon predating `forge create-issue` (#12504): create-issue.sh must fall
+# back to the shell ladder these tests exercise.
+if [[ "${1:-} ${2:-}" == "forge create-issue" ]]; then
+  echo "error: unrecognized subcommand 'create-issue'" >&2
+  exit 2
+fi
+if [[ "$(cat "$DAEMON_MODE_FILE" 2>/dev/null || echo ok)" == "fail" ]]; then
+  echo "mock loom-daemon: forge refused the comment" >&2
+  exit 3
+fi
+exit 0
 MOCK
 chmod +x "$STUB_DIR/loom-daemon"
 export LOOM_DAEMON_SELF_BIN="$STUB_DIR/loom-daemon"
@@ -236,41 +230,56 @@ _run_stubbed() {
     PATH="$STUB_DIR:$PATH" "$@"
 }
 
-# --- forge_gh_comment_rl_safe ---
-rc=0
-_run_stubbed ok forge_gh_comment_rl_safe "owner/repo" "42" "hello" >/dev/null 2>&1 || rc=$?
-assert_eq "0" "$rc" "forge_gh_comment_rl_safe: primary gh issue comment succeeds -> no REST call"
-TESTS_RUN=$((TESTS_RUN + 1))
-if ! grep -q "^api " "$ARGV_LOG"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_gh_comment_rl_safe (ok mode) never calls gh api"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_gh_comment_rl_safe (ok mode) unexpectedly called gh api"
-fi
+# --- forge_gh_comment_rl_safe (#9865: daemon-only, no gh ladder) ---
+_run_daemon() {
+    echo "$1" > "$DAEMON_MODE_FILE"; shift
+    : > "$DAEMON_ARGV_LOG"; : > "$ARGV_LOG"
+    "$@"
+}
 
 rc=0
-_run_stubbed ratelimited forge_gh_comment_rl_safe "owner/repo" "42" "hello" >/dev/null 2>&1 || rc=$?
-assert_eq "0" "$rc" "forge_gh_comment_rl_safe: rate-limited primary call recovers via REST fallback"
-TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q "^api repos/owner/repo/issues/42/comments" "$ARGV_LOG"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_gh_comment_rl_safe REST fallback hits the correct comments endpoint"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_gh_comment_rl_safe REST fallback endpoint wrong or missing"
-fi
+_run_daemon ok forge_gh_comment_rl_safe "owner/repo" "42" "hello" >/dev/null 2>&1 || rc=$?
+assert_eq "0" "$rc" "forge_gh_comment_rl_safe: daemon success -> 0"
+assert_eq "forge comment 42 --repo owner/repo --body hello" "$(cat "$DAEMON_ARGV_LOG")" "forge_gh_comment_rl_safe: issue comment daemon argv"
 
 rc=0
-_run_stubbed other-error forge_gh_comment_rl_safe "owner/repo" "42" "hello" >/dev/null 2>&1 || rc=$?
-assert_eq "1" "$rc" "forge_gh_comment_rl_safe: non-rate-limit failure propagates (not swallowed)"
+_run_daemon ok forge_gh_comment_rl_safe "owner/repo" "42" "hello" 1 >/dev/null 2>&1 || rc=$?
+assert_eq "forge comment 42 --repo owner/repo --body hello --pr" "$(cat "$DAEMON_ARGV_LOG")" "forge_gh_comment_rl_safe: PR comment passes --pr"
+
+rc=0
+err="$(_run_daemon fail forge_gh_comment_rl_safe "owner/repo" "42" "hello" 2>&1 >/dev/null)" || rc=$?
+assert_eq "1" "$rc" "forge_gh_comment_rl_safe: daemon failure -> 1"
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! grep -q "UNEXPECTED_REST_CALL" "$ARGV_LOG"; then
+if [[ "$err" == *"forge refused the comment"* ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_gh_comment_rl_safe never retries over REST on a non-rate-limit failure"
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_comment_rl_safe passes the daemon's stderr through"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_gh_comment_rl_safe incorrectly retried over REST on a non-rate-limit failure"
+    echo -e "  ${RED}FAIL${NC}: forge_gh_comment_rl_safe swallowed the daemon's stderr ('$err')"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -s "$ARGV_LOG" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_comment_rl_safe never falls back to gh on daemon failure"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_comment_rl_safe fell back to gh: $(cat "$ARGV_LOG")"
+fi
+
+# Daemon absent: LOOM_DAEMON_SELF_BIN empty makes the resolver run; point the
+# checkout at no binary by stubbing the resolver.
+rc=0
+err="$( ( loom_resolve_self_daemon_bin() { return 1; }
+          LOOM_DAEMON_SELF_BIN="" ; unset LOOM_DAEMON_SELF_BIN
+          forge_gh_comment_rl_safe "owner/repo" "42" "hello" ) 2>&1 >/dev/null)" || rc=$?
+assert_eq "1" "$rc" "forge_gh_comment_rl_safe: no daemon binary -> 1"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$err" == *"comment posting requires loom-daemon >= 0.19.598 (#9865)"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_comment_rl_safe no-binary failure names the minimum version"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_comment_rl_safe no-binary message wrong ('$err')"
 fi
 
 # --- forge_gh_reopen_issue_rl_safe ---
@@ -542,32 +551,42 @@ rm -rf "$STUB_DIR"
 echo ""
 echo "Testing merge-pr.sh source wiring (#4856)..."
 
-TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q 'forge_gh_reopen_issue_rl_safe "\$REPO_NWO" "\$issue_num"' "$MERGE_PR_SRC"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh's premature-auto-close reopen uses forge_gh_reopen_issue_rl_safe"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing forge_gh_reopen_issue_rl_safe at the reopen call site"
-fi
-
-TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q 'forge_gh_swap_label_rl_safe "\$REPO_NWO" "\$issue_num" "loom:building" "\${text:-loom:issue}"' "$MERGE_PR_SRC"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh's partial-increment label reset uses forge_gh_swap_label_rl_safe"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing forge_gh_swap_label_rl_safe at the label-swap call site"
-fi
+# #8191 slice 2: the reopen, the label swap and the partial-increment comments
+# are no longer call sites in merge-pr.sh. `merge-pr post-merge-bookkeeping`
+# (loom-daemon/src/merge_pr/post_merge_bookkeeping.rs) makes them, through a
+# child bash that sources THIS library, so they still reach the #4856 wrappers.
+# The three source greps cannot pass against merge-pr.sh any more; each is
+# retired under the three-part test (defaults/docs/verification-recipes.md §6).
+YELLOW='\033[0;33m'
+retired() { # <what> <property> <structural> <successor>
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${YELLOW}RETIRED${NC}: $1"
+    echo "      property:   $2"
+    echo "      structural: $3"
+    echo "      successor:  $4"
+}
+_moved="the call moved into the Rust orchestrator, which reaches the wrapper through a child bash; merge-pr.sh no longer contains the call text"
+retired "merge-pr.sh's premature-auto-close reopen uses forge_gh_reopen_issue_rl_safe" \
+    "the #4569 revert reopens through the rate-limit-safe wrapper, never a raw gh issue reopen" \
+    "$_moved" \
+    "post_merge_bookkeeping::tests::partial_reset_reverts_a_premature_close_before_swapping asserts the orchestrator calls forge_gh_reopen_issue_rl_safe, and test-merge-pr-partial-increment.sh drives the real wrapper against the stub gh"
+retired "merge-pr.sh's partial-increment label reset uses forge_gh_swap_label_rl_safe" \
+    "the loom:building -> loom:issue swap goes through the rate-limit-safe wrapper" \
+    "$_moved" \
+    "post_merge_bookkeeping::tests::partial_reset_swaps_and_comments asserts the exact wrapper call, and test-merge-pr-partial-increment.sh T1/T2 assert the recorded gh call"
 
 comment_call_count="$(grep -c 'forge_gh_comment_rl_safe "\$REPO_NWO"' "$MERGE_PR_SRC" || true)"
-assert_eq "3" "$comment_call_count" "merge-pr.sh routes all 3 comment call sites (PR override, shared partial-increment helper, stacked-child PR) through forge_gh_comment_rl_safe"
+assert_eq "1" "$comment_call_count" "merge-pr.sh's remaining comment call site (PR override) goes through forge_gh_comment_rl_safe"
 
-# The two partial-increment comments (partial-merged, premature-close) share
-# one helper that owns the single wrapper call above; both kinds must still
-# reach it, so the #4856 rate-limit-safe coverage of each is preserved.
-partial_helper_calls="$(grep -c '^ *_mp_post_partial_comment \(partial-merged\|premature-close\) ' "$MERGE_PR_SRC" || true)"
-assert_eq "2" "$partial_helper_calls" "both partial-increment comment kinds route through _mp_post_partial_comment"
+retired "merge-pr.sh's stacked-child deferred-reconciliation comment uses forge_gh_comment_rl_safe" \
+    "the stacked-child PR comment is posted through the #4856 rate-limit-safe wrapper, never a raw gh pr comment" \
+    "$_moved (_reconcile_one_stacked_child was ported to merge_pr/stacked_reconcile.rs, #8191)" \
+    "stacked_reconcile::tests assert the orchestrator's comment path, and the raw-gh-comment assertion below still pins that nothing posts around the wrapper"
+
+retired "both partial-increment comment kinds route through _mp_post_partial_comment" \
+    "the two partial-increment audit comments are posted through the one #4856 comment wrapper" \
+    "$_moved" \
+    "post_merge_bookkeeping::tests::partial_reset_reverts_a_premature_close_before_swapping asserts both bodies reach forge_gh_comment_rl_safe, and the raw-gh-comment assertion below still pins that nothing posts around the wrapper"
 
 # ...and nothing posts a comment by invoking gh directly. The two assertions
 # above pin the shape of the call sites that DO exist; this one pins that no

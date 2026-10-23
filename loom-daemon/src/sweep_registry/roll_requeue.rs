@@ -158,9 +158,17 @@ impl SweepRegistry {
     /// # Errors
     /// When the label restore fails, or the comment could not be posted. The
     /// caller leaves the item `planned` so the next start finishes it.
+    ///
+    /// A `loom:frozen` issue gets neither (#11743): the restore's own label
+    /// read finds it, writes nothing, and the comment is skipped. That read
+    /// fails open like every release path (a failed read restores and
+    /// comments as before), and a frozen skip is `Ok`, so the item is not
+    /// retried at the next start.
     pub(crate) fn requeue_for_roll(&self, issue: u32, notice: &RollRequeueNotice) -> Result<()> {
-        self.restore_label_to_ready(issue)?;
-        if self.config.skip_label_flip {
+        let released = self.restore_label_to_ready_checked(issue)?;
+        // #11852: an issue held at `loom:building` by its open PR is not
+        // requeued either, so it gets no requeue comment.
+        if self.config.skip_label_flip || released != restore_to_ready::ClaimRelease::Released {
             return Ok(());
         }
         let body = notice.comment_body();
@@ -248,6 +256,11 @@ pub(crate) fn refresh_lease_once(
         .arg(sweep_id)
         .current_dir(workspace_root)
         .stdin(Stdio::null());
+    // Vet and perform the lease write under the root owner's credential, not the
+    // daemon's process-global one (#5401): on a cross-owner root the latter is
+    // refused by the write-scope probe. The recovery variant covers a roll that
+    // runs soon after a daemon start, before the root is registered (#6722).
+    crate::credential_preflight::apply_gh_config_for_root_with_recovery(&mut cmd, workspace_root);
     match reaper::output_with_timeout(cmd, timeout) {
         Ok(Some(out)) if out.status.success() => Ok(()),
         Ok(Some(out)) => Err(format!(
@@ -265,6 +278,44 @@ pub(crate) fn refresh_lease_once(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A stub `renew-once` helper that records the `GH_CONFIG_DIR` it ran under;
+    /// returns that recorded value (`""` when the child inherited none).
+    fn gh_config_dir_seen_by_refresh(root: &Path) -> String {
+        let script = root.join(dispatch::LEASE_RENEW_SCRIPT_REL);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        let out = root.join("seen");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s' \"${{GH_CONFIG_DIR-}}\" > \"{}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        refresh_lease_once(root, "h", 7, "sweep-7", Duration::from_secs(10)).unwrap();
+        std::fs::read_to_string(out).unwrap()
+    }
+
+    /// The `renew-once` child runs under the root owner's `GH_CONFIG_DIR` for a
+    /// registered cross-owner root, and inherits the process one otherwise.
+    #[test]
+    #[serial_test::serial]
+    fn lease_refresh_child_carries_the_root_owners_gh_config_dir() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let cross = dir.path().join("cross");
+        let same = dir.path().join("same");
+        let owner_dir = dir.path().join("gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(&cross, &owner_dir);
+
+        assert_eq!(gh_config_dir_seen_by_refresh(&cross), owner_dir.display().to_string());
+        let inherited = std::env::var("GH_CONFIG_DIR").unwrap_or_default();
+        assert_eq!(gh_config_dir_seen_by_refresh(&same), inherited);
+
+        crate::credential_preflight::clear_owner_root_registry();
+    }
 
     fn notice(reason: &str) -> RollRequeueNotice {
         RollRequeueNotice {
@@ -329,5 +380,40 @@ mod tests {
         assert_eq!(calls.matches("issue comment 7").count(), 1, "exactly one comment: {calls}");
         assert!(calls.contains("loom:issue"), "the label was restored: {calls}");
         assert!(calls.contains("pause-budget-missed"), "{calls}");
+    }
+
+    /// #11743: a `loom:frozen` issue is requeued with zero writes — no label
+    /// edit and no comment — and the requeue still reports success.
+    #[test]
+    #[serial_test::serial]
+    fn a_frozen_issue_is_requeued_without_any_write() {
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = dir.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in api\\ repos/*/issues/7\\ --jq*) \
+                 echo '{{\"state\":\"open\",\"labels\":[\"loom:building\",\"loom:frozen\"]}}' ;; \
+                 esac\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+        registry
+            .requeue_for_roll(7, &notice("pause-budget-missed"))
+            .unwrap();
+        std::env::remove_var("LOOM_REPO");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("/issues/7 --jq"), "the restore read the labels: {calls}");
+        assert!(!calls.contains("issue edit"), "{calls}");
+        assert!(!calls.contains("issue comment"), "{calls}");
     }
 }

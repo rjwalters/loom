@@ -78,8 +78,8 @@ issue, the body/comment reports:
 - **Fork-behind** — how many commits this repo has that the fork hasn't
   synced (context only; not actionable from this side).
 
-The issue is labeled `loom:operator-only` when that label exists on the repo
-(see `.github/labels.yml`: "Requires human action outside automation") —
+The issue is labeled `loom:operator` when that label exists on the repo
+(see `.github/labels.yml`: a human must act or decide) —
 deciding *what* to harvest and *how* (cherry-pick vs. invite a fork PR) is a
 human/triage call, and the label keeps this recurring report out of the
 autonomous work-finder's queue.

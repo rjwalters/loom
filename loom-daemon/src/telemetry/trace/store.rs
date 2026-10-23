@@ -32,11 +32,6 @@ pub struct ExecutionContext {
     pub identity: String,
     pub context: TraceContext,
     pub started_at: DateTime<Utc>,
-    /// The issue story this execution belongs to (#9037): `context` shares
-    /// its trace id and the root span is parented to it. Absent for
-    /// executions outside an issue, and in files persisted before #9038.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub story: Option<TraceContext>,
 }
 
 #[derive(Debug)]
@@ -63,25 +58,15 @@ impl TraceStore {
         hex::encode(hash.finalize())
     }
 
-    /// An execution's root context. Inside an issue story it is the story's
-    /// child keyed by the execution (sweep) id; outside one it is its own
-    /// trace keyed by repo + execution id. Either way `sweep-issue-42-…` in
-    /// `owner/repo` always maps to the same IDs, on any host.
+    /// An execution's root context: its own trace keyed by repo + execution
+    /// id, so `sweep-issue-42-…` in `owner/repo` always maps to the same IDs,
+    /// on any host.
     #[must_use]
-    pub fn root_context(
-        workspace: &Path,
-        execution: &str,
-        story: Option<&TraceContext>,
-    ) -> TraceContext {
-        match story {
-            Some(story) => story.derived_child(&["loom.sweep", execution]),
-            None => {
-                TraceContext::derived("execution", &[&Self::fallback_repo(workspace), execution])
-            }
-        }
+    pub fn root_context(workspace: &Path, execution: &str) -> TraceContext {
+        TraceContext::derived("execution", &[&Self::fallback_repo(workspace), execution])
     }
 
-    /// The repo key for an execution outside a story: [`Self::repo_name`],
+    /// The repo key of an execution's root context: [`Self::repo_name`],
     /// lowercased so hosts whose origins differ only in case derive the same
     /// IDs. An ID-derivation input only; the span's `loom.repo` is
     /// [`Self::repo_attribute`], whose ASCII lowercase is exactly this key.
@@ -156,18 +141,8 @@ impl TraceStore {
         }
     }
 
+    /// An already-persisted execution keeps its saved context.
     pub fn load_or_create(&self, workspace: &Path, execution: &str) -> Result<ExecutionContext> {
-        self.load_or_create_story(workspace, execution, None)
-    }
-
-    /// As [`Self::load_or_create`], but a new execution joins `story`'s trace
-    /// as its child. An already-persisted execution keeps its saved context.
-    pub fn load_or_create_story(
-        &self,
-        workspace: &Path,
-        execution: &str,
-        story: Option<&TraceContext>,
-    ) -> Result<ExecutionContext> {
         let _lock = self.lock()?;
         let path = self.path(workspace, execution);
         if path.exists() {
@@ -185,9 +160,8 @@ impl TraceStore {
         anyhow::ensure!(count < MAX_ACTIVE_CONTEXTS, "active trace context limit reached");
         let context = ExecutionContext {
             identity: Self::identity(workspace, execution),
-            context: Self::root_context(workspace, execution, story),
+            context: Self::root_context(workspace, execution),
             started_at: Utc::now(),
-            story: story.cloned(),
         };
         let mut tmp = tempfile::NamedTempFile::new_in(&self.directory)?;
         serde_json::to_writer(&mut tmp, &context)?;

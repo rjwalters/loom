@@ -37,7 +37,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::link;
+use crate::worktree_cli::link;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeLinkArgs {

@@ -1,0 +1,71 @@
+name: Merge-queue group check
+
+# Posts the `loom/merge-authorization` commit status on a merge-group commit
+# (Phase C of #9978; #12323). Install it only in a repo whose default branch has
+# a merge queue and `champion.mergeMode: queue`. See defaults/optional/README.md.
+
+on:
+  merge_group:
+    types: [checks_requested]
+  # Re-run when CI finishes: `checks_requested` fires while merge-group CI is still
+  # running, so the first run posts `pending` and nothing else would re-evaluate it.
+  # Replace "CI" with the name of the workflow that runs your required checks.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ['gh-readonly-queue/**']
+
+# `group-check` reads the merge queue and PRs (pull-requests), the CI check-runs on
+# the group commit (checks), and posts the status (statuses).
+permissions:
+  statuses: write
+  pull-requests: read
+  checks: read
+  contents: read
+
+# One run per group head; never cancel a distinct commit's run.
+concurrency:
+  group: merge-group-check-${{ github.event.merge_group.head_sha || github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  group-check:
+    name: Merge authorization
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # `group-check` refuses to post a status unless it runs inside a checkout
+      # that has `.loom/` and whose origin is this repository (write_scope, #9548).
+      # Sparse + depth 1 keeps it cheap; the default ref is the merge-group commit.
+      - name: Check out .loom
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .loom
+          fetch-depth: 1
+          ref: ${{ github.event.merge_group.head_sha || github.event.workflow_run.head_sha }}
+
+      - name: Install loom-daemon
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Pin to the release your fleet runs; it must include `forge merge-queue group-check`.
+          LOOM_VERSION: latest
+        run: |
+          set -euo pipefail
+          asset=loom-daemon-x86_64-unknown-linux-gnu
+          if [ "$LOOM_VERSION" = latest ]; then
+            gh release download --repo rjwalters/loom --pattern "$asset*" --dir "$RUNNER_TEMP"
+          else
+            gh release download "$LOOM_VERSION" --repo rjwalters/loom --pattern "$asset*" --dir "$RUNNER_TEMP"
+          fi
+          (cd "$RUNNER_TEMP" && sha256sum -c "$asset.sha256")
+          install -m 0755 "$RUNNER_TEMP/$asset" "$RUNNER_TEMP/loom-daemon"
+
+      - name: Check merge-group authorization
+        env:
+          # The workflow token carries `statuses: write`, `pull-requests: read` and
+          # `checks: read` (above), which cover the queue, PR and check-run reads.
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          "$RUNNER_TEMP/loom-daemon" forge merge-queue group-check \
+            --commit "${{ github.event.merge_group.head_sha || github.event.workflow_run.head_sha }}" --repo "$GH_REPO"

@@ -78,7 +78,7 @@ pub mod exit {
     /// check and post the record first.
     pub const RECORD_REQUIRED: i32 = 10;
     /// A consistent record routing the issue to a human:
-    /// `loom:operator-only` + `loom:operator-decision`, no enrichment pass.
+    /// `loom:operator` with a decision block (#11795), no enrichment pass.
     pub const ROUTE_OPERATOR: i32 = 11;
     /// A record exists but fails a structural rule. Same action as
     /// [`RECORD_REQUIRED`] — an inconsistent record is not a record.

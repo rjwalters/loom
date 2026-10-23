@@ -3,7 +3,7 @@ name: Fork Drift Monitor
 # Daily check comparing each tracked fork's `main` against this repo's `main`
 # (ahead/behind commit counts), reported from upstream's perspective. On
 # detecting fork-ahead commits (harvestable work not yet landed here), opens
-# (or updates) a single deduplicated `loom:operator-only` issue per fork
+# (or updates) a single deduplicated `loom:operator` issue per fork
 # pointing at the harvest procedure in docs/guides/fork-drift.md.
 #
 # This repo IS the upstream -- gpeyton/loom (tracked in #4165) diverged by
@@ -133,8 +133,8 @@ jobs:
               echo "Updated existing fork-drift issue #$existing_number for ${fork}"
             else
               label_args=()
-              if gh label list --limit 200 --json name --jq '.[].name' | grep -Fxq 'loom:operator-only'; then
-                label_args=(--label "loom:operator-only")
+              if gh label list --limit 200 --json name --jq '.[].name' | grep -Fxq 'loom:operator'; then
+                label_args=(--label "loom:operator")
               fi
               gh issue create --title "$title" "${label_args[@]}" --body "$body"
             fi

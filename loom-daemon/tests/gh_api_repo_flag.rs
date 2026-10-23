@@ -23,13 +23,13 @@
 //! lint script is not admissible. A `#[test]` in `loom-daemon/tests/` is
 //! already wired into CI (`cargo nextest run --workspace`, the `backend-tests`
 //! job) and needs no new workflow step. The precedent it follows is
-//! `defaults_symlink_containment.rs` / `shell_budget_ratchet.rs`: static
+//! `defaults_symlink_containment.rs`: static
 //! assertions over the repo tree, no daemon needed.
 //!
 //! # The fix a finding wants
 //!
-//! Call `crate::gh_repo_env::apply_loom_repo_override(&mut cmd)` — the single
-//! documented place the override is applied, as `GH_REPO`. Do NOT touch the
+//! Build the call through `crate::gh_invocation::GhInvocation` — the single
+//! place the `LOOM_REPO` override is applied, as `GH_REPO`. Do NOT touch the
 //! `gh issue` / `gh pr` / `gh repo` call sites: `--repo` is correct there, and
 //! the scan below is built to leave them alone.
 
@@ -191,7 +191,7 @@ fn no_gh_api_builder_appends_a_repo_flag() {
         "`gh api` has NO --repo flag — it exits `unknown flag: --repo` before \
          issuing any request, silently disabling these fail-open probes on every \
          host that exports LOOM_REPO (#8263).\n\
-         Call `crate::gh_repo_env::apply_loom_repo_override(&mut cmd)` instead, \
+         Build the call through `crate::gh_invocation::GhInvocation` instead, \
          which applies the override as the GH_REPO env var.\n\n{}",
         findings
             .iter()
@@ -310,3 +310,8 @@ fn the_scan_ignores_comments_and_doc_comments() {
 "#;
     assert!(scan(prose).is_empty(), "{:?}", scan(prose));
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

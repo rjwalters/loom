@@ -25,9 +25,9 @@
 //! page is already its own conditional request and row.
 
 use crate::forge_call_stats;
+use crate::gh_invocation::test_support::stub;
 use crate::types::ForgeCallCounts;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// `(file, "--paginate" literals in it, why they are not walkable)`.
 /// Adding an entry is a decision to leave pages uncounted even with the
@@ -35,16 +35,16 @@ use std::path::{Path, PathBuf};
 /// walkable argv.
 const UNCOUNTED: &[(&str, usize, &str)] = &[
     (
+        "agent_gh/read_route.rs",
+        1,
+        "not a call site: the agent front's classifier names `--paginate` as a flag a `gh api` \
+         read may carry (2am#4367 P4); the agent's own call is booked by the front's ledger",
+    ),
+    (
         "premise_check/cli.rs",
         1,
         "GraphQL cursor pagination issued through the raw `script_helpers::run_gh` spawn: the \
          walk follows REST `Link` headers only, and the call is not a facade row at all",
-    ),
-    (
-        "merge_pr/redate.rs",
-        1,
-        "`gh_api_with` is a raw `Command` spawn (it pipes a request body on stdin) outside the \
-         facade: no ledger row, so no page count; the choke-point ratchet owns its migration",
     ),
     (
         "cli/pr_latency_cmd.rs",
@@ -57,6 +57,12 @@ const UNCOUNTED: &[(&str, usize, &str)] = &[
         1,
         "`forge verdict` CLI through the raw `script_helpers::run_gh` spawn: not a facade row; \
          the choke-point ratchet owns its migration",
+    ),
+    (
+        "cli/champion_hold_cmd.rs",
+        1,
+        "`champion-hold ratification` CLI file-list read through the raw `script_helpers::run_gh` \
+         spawn: not a facade row; the choke-point ratchet owns its migration",
     ),
     (
         "comment_trust/records.rs",
@@ -318,13 +324,6 @@ fn the_allowlist_is_exact_and_cannot_go_stale() {
 
 // ---- a migrated site end to end: one row per page with the switch on,
 // ---- one row with it off ----
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
 
 fn rows_after(switch: Option<&str>, body: impl FnOnce()) -> Vec<ForgeCallCounts> {
     let sink = tempfile::tempdir().unwrap();

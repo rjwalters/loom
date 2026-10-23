@@ -34,6 +34,46 @@ impl DispatchModel<'_> {
         self.resolve_for_runtime(config, kind, admitted.map(|a| a.runtime.as_str()))
     }
 
+    /// The model a step launches with when its admission may carry a role
+    /// draw's pick (#12748). A literal or explicit request pin keeps its
+    /// precedence; otherwise a drawn model is the launch model, reconciled
+    /// against the admitted runtime exactly as a non-Builder step's is, and a
+    /// provable runtime conflict is refused rather than silently replaced. With
+    /// no drawn model this is [`Self::resolve_for_runtime`] unchanged.
+    ///
+    /// # Errors
+    /// The conflict description when the drawn model cannot run on `runtime`.
+    pub(crate) fn resolve_drawn(
+        self,
+        config: &SweepRegistryConfig,
+        kind: &SweepKind,
+        runtime: &str,
+        drawn: Option<&str>,
+    ) -> std::result::Result<Option<String>, String> {
+        let pinned = match self {
+            Self::Resolved(Some(_)) => true,
+            Self::Request(Some(model)) => !model.trim().is_empty(),
+            _ => false,
+        };
+        let drawn = drawn.map(str::trim).filter(|m| !m.is_empty());
+        let (false, Some(drawn)) = (pinned, drawn) else {
+            return Ok(self.resolve_for_runtime(config, kind, Some(runtime)));
+        };
+        let (model, _) =
+            crate::role_runner::model_resolution::reconcile_unpinned_model_with_runtime(
+                runtime,
+                drawn.to_string(),
+                "role-draw".to_string(),
+            );
+        if let Some(why) = model_runtime_mismatch(runtime, &model) {
+            return Err(why);
+        }
+        log::info!(
+            "sweep dispatch: attempting {kind:?} runtime={runtime} model={model} (source=role-draw)"
+        );
+        Ok((!model.is_empty()).then_some(model))
+    }
+
     /// [`Self::resolve`] keyed on the admitted runtime's NAME — the only part
     /// of the admission it actually reads. Private-clone containment (#8787)
     /// needs the model BEFORE its own admission completes, because account
@@ -61,9 +101,20 @@ impl DispatchModel<'_> {
         // actually launched.
         let policy = admitted
             .map_or_else(|| DefaultModelPolicy::resolve(root), DefaultModelPolicy::for_runtime);
-        let resolved = match (self, kind) {
-            (Self::Request(None) | Self::Autonomous, SweepKind::Issue(issue)) => {
-                resolve_autonomous_model_for_runtime(root, *issue, policy)
+        // Only Builder work keeps the per-issue experiment arm (design #11894
+        // §4.4): an issue sweep, or a Builder step (#11898). Other steps take
+        // their role's resolvers at spawn (#11906), so here the default.
+        let experiment_issue = match kind {
+            SweepKind::Issue(n)
+            | SweepKind::Step {
+                item: n,
+                role: crate::step_role::StepRole::Builder,
+            } => Some(*n),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
+        };
+        let resolved = match (self, experiment_issue) {
+            (Self::Request(None) | Self::Autonomous, Some(issue)) => {
+                resolve_autonomous_model_for_runtime(root, issue, policy)
             }
             _ => {
                 let explicit = match self {

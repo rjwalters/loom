@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, TimeZone, Utc};
 
 use super::dispatch::{decision_counts, tick_points, tick_result, tick_span};
-use super::host::{parse_macos_swapusage, parse_meminfo, HostResources};
+use super::host::{
+    parse_macos_swapusage, parse_meminfo, parse_vm_stat_available_pages, HostResources,
+};
 use super::OpsSink;
 use crate::observability::queue::QueueSink;
 use crate::telemetry::ops::{
@@ -243,6 +245,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
         MetricName::QueueListingIncompleteRepos,
+        MetricName::QueueHostShard,
         MetricName::LlmTokensInput,
         MetricName::LlmTokensOutput,
         MetricName::LlmTokensCacheRead,
@@ -260,9 +263,15 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::DispatchSlotTurnaroundSamples,
         MetricName::DispatchIdleSlots,
         MetricName::DispatchIdleSlotSeconds,
-        MetricName::ForgeStageDwell,
-        MetricName::ForgeStageDwellSamples,
-        MetricName::ForgeStageItems,
+        MetricName::DispatchBusySlots,
+        MetricName::DispatchRoleMaxConcurrent,
+        MetricName::DispatchRoleIdleSlots,
+        MetricName::DispatchRunningOldestAgeSec,
+        MetricName::DispatchRunningByAge,
+        MetricName::DispatchRunningByPoints,
+        MetricName::StepActionable,
+        MetricName::ForgeHoldItems,
+        MetricName::ForgeHoldAgeSeconds,
         MetricName::QueueDispositionRowsDropped,
         MetricName::MergeRedatePrs,
         MetricName::MergeRedatesMax,
@@ -282,35 +291,35 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::CodexSessionState,
         MetricName::CodexSessionRecord,
         MetricName::CodexSessionMountDrift,
-        MetricName::CaptainGaugeAgeSeconds,
-        MetricName::CaptainGaugeFallback,
         MetricName::AgentScopePeakMemoryBytes,
+        MetricName::AgentScopeOomKills,
+        MetricName::ForgeMirrorReads,
+        MetricName::ForgeMirrorChanges,
+        MetricName::ForgeMirrorWakeLatency,
+        MetricName::StageEntryLookups,
+        MetricName::FeedCompletions,
+        MetricName::FeedReconcilePasses,
+        MetricName::CiQueueDepth,
+        MetricName::FleetDispatchRefusals,
+        MetricName::FleetDispatchExpired,
+        MetricName::FleetDispatchClaimLostAfterGrant,
+        MetricName::FleetDispatchRows,
+        MetricName::FleetDispatchFreeSlotsReported,
+        MetricName::FleetDispatchLiveReported,
+        MetricName::FleetDispatchOldestLiveAgeSec,
         MetricName::EgressRequests,
         MetricName::EgressTokens,
         MetricName::EgressLatency,
         MetricName::EgressTtft,
+        MetricName::CiTelemetryCycles,
+        MetricName::CiTelemetryCycleItems,
+        MetricName::CiTelemetryCycleDuration,
+        MetricName::CiTelemetryJournalBytes,
+        MetricName::CiTelemetryExportCursorOffset,
+        MetricName::CiTelemetryExportLag,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
-}
-
-#[test]
-fn native_https_path_drops_metric_points() {
-    let envelopes = vec![
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::MetricPoints(MetricPointsRecord {
-                captured_at: at(0),
-                interval_start: None,
-                points: vec![MetricPoint::int(MetricName::DispatchCandidates, 1)],
-            }),
-        ),
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::Span(tick_span(&TickReport::default(), 1, at(0), at(1))),
-        ),
-    ];
-    assert!(crate::observability::tracing::native_envelopes(&envelopes).is_empty());
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -355,23 +364,22 @@ fn tick_result_precedence() {
     };
     assert_eq!(super::dispatch::tick_result_with(&held, true), "halted_ci_billing");
     assert_eq!(super::dispatch::tick_result_with(&held, false), "halted");
-    // The hold outranks saturation, as before.
+    // The hold outranks an error.
     assert_eq!(
         with(|r| {
             r.halted = true;
             r.halt_causes = vec![HaltCause::Drain];
-            r.saturation_held = true;
+            r.errors = 1;
         }),
         "halted_drain"
     );
-    assert_eq!(with(|r| r.saturation_held = true), "saturation_held");
     assert_eq!(with(|r| r.errors = 1), "error");
-    assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");
+    assert_eq!(with(|r| r.deferred_capacity = 2), "capacity_full");
     assert_eq!(with(|r| r.skipped_backoff = 3), "all_skipped");
 }
 
 /// #11649: a held tick's result names the hold its workspaces recorded — a
-/// disk-held tick is not a red `main` — and several causes read `halted`.
+/// drain-held tick is not a red `main` — and several causes read `halted`.
 #[test]
 fn halted_tick_result_names_the_recorded_cause() {
     use super::dispatch::{halted_result, tick_result_with};
@@ -384,13 +392,13 @@ fn halted_tick_result_names_the_recorded_cause() {
         };
         tick_result_with(&report, billing)
     };
-    assert_eq!(held(vec![HaltCause::DiskReservation], false), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::Drain], false), "halted_drain");
     assert_eq!(held(vec![HaltCause::TokenPool], false), "halted_token_pool");
     assert_eq!(held(vec![HaltCause::CiBilling], false), "halted_ci_billing");
     // A global billing block does not relabel another root's named cause.
-    assert_eq!(held(vec![HaltCause::DiskReservation], true), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::Drain], true), "halted_drain");
     assert_eq!(held(vec![HaltCause::MainRed], true), "halted_main_red");
-    assert_eq!(held(vec![HaltCause::MainRed, HaltCause::DiskReservation], false), "halted");
+    assert_eq!(held(vec![HaltCause::MainRed, HaltCause::Drain], false), "halted");
     // Every single cause maps to `halted_` + its wire token.
     for cause in HaltCause::ALL {
         assert_eq!(halted_result(&[cause], false), format!("halted_{}", cause.as_str()));
@@ -403,14 +411,42 @@ fn tick_span_lists_halt_causes_only_when_held() {
     let held = TickReport {
         seen: 2,
         halted: true,
-        halt_causes: vec![HaltCause::Drain, HaltCause::DiskReservation],
+        halt_causes: vec![HaltCause::Drain, HaltCause::TokenPool],
         ..TickReport::default()
     };
     let span = tick_span(&held, 3, at(0), at(1));
     assert_eq!(span.attributes["loom.dispatch.result"], "halted");
-    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,disk_reservation");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,token_pool");
     let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
     assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
+}
+
+/// #11857: a partial hold keeps its causes and held count on the span but
+/// does not name the result; `loom.dispatch.held_roots` is always present.
+#[test]
+fn partial_hold_keeps_its_causes_but_not_the_result() {
+    let partial = TickReport {
+        seen: 2,
+        halted: true,
+        halt_causes: vec![HaltCause::MaintainOnly],
+        held_roots: 1,
+        halt_partial: true,
+        ..TickReport::default()
+    };
+    let span = tick_span(&partial, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "all_skipped");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "1");
+    let full = TickReport {
+        halt_partial: false,
+        held_roots: 2,
+        ..partial
+    };
+    let span = tick_span(&full, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "halted_maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "2");
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert_eq!(idle.attributes["loom.dispatch.held_roots"], "0");
 }
 
 /// #10624: the build back-off result keys on an actual deferral, ranks after
@@ -652,7 +688,9 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     summary.listing_failed = vec!["/r2".into()];
     summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
     let points = super::queue::queue_points(&summary);
-    assert_eq!(points.len(), Qd::ALL.len() + 2);
+    // + listing_failed, listing_incomplete and the four already_landed
+    // evidence points (#11858).
+    assert_eq!(points.len(), Qd::ALL.len() + 2 + 4);
     let value = |reason: &str| {
         points
             .iter()
@@ -689,9 +727,134 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     }
 }
 
+/// #11858: `already_landed` rows split by the landed guard's evidence, with
+/// a row naming none read as `unknown` and free text never a label.
+#[test]
+fn queue_points_split_already_landed_by_evidence() {
+    use crate::types::QueueDisposition as Qd;
+    let mut summary = queue_summary(&[Qd::AlreadyLanded; 4]);
+    let details = [
+        Some("forge_closed"),
+        Some("journal_landed"),
+        Some("journal_landed"),
+        Some("free text"),
+    ];
+    for (row, detail) in summary.queue.iter_mut().zip(details) {
+        row.detail = detail.map(str::to_string);
+    }
+    let points = super::queue::queue_points(&summary);
+    let landed = |reason: &str| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == MetricName::QueueAlreadyLanded
+                    && p.labels.get("reason").map(String::as_str) == Some(reason)
+            })
+            .map(|p| p.value)
+    };
+    assert_eq!(landed("forge_closed"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("journal_landed"), Some(MetricValue::Int(2)));
+    assert_eq!(landed("forge_closed_not_planned"), Some(MetricValue::Int(0)));
+    assert_eq!(landed("unknown"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("free text"), None);
+}
+
+/// #12827: `loom.queue.host_shard{shard_count}` only for a sharded plan
+/// whose host index is known; absent stays absent.
+#[test]
+fn queue_points_emit_host_shard_only_for_a_sharded_plan() {
+    use crate::types::{DispatchPlanContext, PlanShard, WorkFinderTickSummary};
+    let host_shard = |summary: &WorkFinderTickSummary| -> Vec<MetricPoint> {
+        super::queue::queue_points(summary)
+            .into_iter()
+            .filter(|p| p.name == MetricName::QueueHostShard)
+            .collect()
+    };
+    let with_shard = |shard: PlanShard| {
+        let mut summary = queue_summary(&[]);
+        summary.plan = Some(DispatchPlanContext {
+            shard,
+            ..Default::default()
+        });
+        summary
+    };
+
+    let sharded = with_shard(PlanShard {
+        configured: true,
+        host_shard: Some(2),
+        shard_count: Some(3),
+    });
+    let points = host_shard(&sharded);
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].value, MetricValue::Int(2));
+    assert_eq!(points[0].labels.get("shard_count").map(String::as_str), Some("3"));
+    assert_eq!(points[0].labels.len(), 1);
+    assert!(points[0]
+        .labels
+        .keys()
+        .all(|k| OPS_METRIC_LABEL_KEYS.contains(&k.as_str())));
+
+    // Unsharded, sharded with no known index, and no plan at all: nothing.
+    assert!(host_shard(&with_shard(PlanShard::default())).is_empty());
+    assert!(host_shard(&with_shard(PlanShard {
+        configured: true,
+        host_shard: None,
+        shard_count: Some(3),
+    }))
+    .is_empty());
+    assert!(host_shard(&with_shard(PlanShard {
+        configured: false,
+        host_shard: Some(0),
+        shard_count: Some(1),
+    }))
+    .is_empty());
+    assert!(host_shard(&queue_summary(&[])).is_empty());
+}
+
 #[test]
 fn an_empty_queue_reads_as_zeros_not_as_missing() {
     let points = super::queue::queue_points(&queue_summary(&[]));
     assert!(!points.is_empty());
     assert!(points.iter().all(|p| p.value == MetricValue::Int(0)));
+}
+
+/// #11973: a tick that counted errors names their kind from the fixed set;
+/// several kinds read `mixed`; a clean tick omits the key.
+#[test]
+fn tick_span_names_the_error_kind_only_when_it_counted_errors() {
+    use crate::work_finder::DispatchErrorKind as K;
+    let mut listing = TickReport::default();
+    listing.note_listing_failure(0, &anyhow::anyhow!("gh: HTTP 502 Bad Gateway"));
+    let span = tick_span(&listing, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "error");
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "forge_listing");
+    assert_eq!(listing.listing_failed, vec![0]);
+
+    let mut limited = TickReport::default();
+    limited.note_listing_failure(1, &anyhow::anyhow!("API rate limit exceeded (HTTP 403)"));
+    limited.note_listing_failure(2, &anyhow::anyhow!("API rate limit exceeded (HTTP 403)"));
+    let span = tick_span(&limited, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.errors"], "2");
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "rate_limited");
+
+    let mut mixed = limited.clone();
+    mixed.note_error(K::DispatchSpawn);
+    let span = tick_span(&mixed, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "mixed");
+
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert!(!idle.attributes.contains_key("loom.dispatch.error_kind"));
+    assert!(OPS_SPAN_ATTRIBUTE_KEYS.contains(&"loom.dispatch.error_kind"));
+}
+
+#[test]
+fn parse_vm_stat_sums_free_and_inactive() {
+    let out = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                Pages free:                              10000.\n\
+                Pages active:                            50000.\n\
+                Pages inactive:                           5000.\n\
+                Pages speculative:                         100.\n";
+    assert_eq!(parse_vm_stat_available_pages(out), Some(15_000));
+    assert_eq!(parse_vm_stat_available_pages("Pages free: 10000.\n"), None);
+    assert_eq!(parse_vm_stat_available_pages(""), None);
 }

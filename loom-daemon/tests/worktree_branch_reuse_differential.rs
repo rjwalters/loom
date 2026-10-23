@@ -230,6 +230,20 @@ fn json_doc(o: &Output) -> Option<String> {
 
 const BRANCH: &str = "feature/issue-42";
 
+/// #13056 replaced the retired shell's generic divergence warning with one that
+/// names ahead/behind/age. Everything else is still compared byte for byte, so
+/// fold the new parenthetical and trailing period back to the retired text.
+fn legacy_divergence(msg: &str) -> String {
+    let Some(open) = msg.find(" has diverged from ") else {
+        return msg.to_string();
+    };
+    let (Some(lp), Some(rp)) = (msg[open..].find(" ("), msg[open..].find(") - reusing")) else {
+        return msg.to_string();
+    };
+    let tail = msg[open + rp + 1..].trim_end_matches('.');
+    format!("{} (does not contain all of its history){}", &msg[..open + lp], tail)
+}
+
 #[test]
 fn port_agrees_with_the_retired_shell_on_every_case() {
     for forge in [Forge::MergedAtTip, Forge::None, Forge::Off] {
@@ -240,7 +254,8 @@ fn port_agrees_with_the_retired_shell_on_every_case() {
                 let (s, p) = (shell(&a, BRANCH, json), port(&b, BRANCH, json));
                 let ctx = format!("forge={forge:?} advance_main={advance_main} json={json}");
                 assert_eq!(s.status.code(), p.status.code(), "exit for {ctx}");
-                assert_eq!(msgs(&s), msgs(&p), "messages for {ctx}");
+                let legacy: Vec<String> = msgs(&p).iter().map(|m| legacy_divergence(m)).collect();
+                assert_eq!(msgs(&s), legacy, "messages for {ctx}");
                 if json && s.status.code() != Some(0) {
                     // Compared as VALUES: the shell spaced its hand-built
                     // document (`"a": b`), serde emits it compact.
@@ -400,3 +415,8 @@ fn the_port_names_a_worktree_holding_the_landed_branch() {
     assert!(wt.join(".loom-managed").is_file());
     assert_eq!(rev(&fx.repo, BRANCH), tip);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

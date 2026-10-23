@@ -173,10 +173,18 @@ pub fn parse_probe(body: &str, now: i64) -> Vec<(Resource, Reading)> {
         .collect()
 }
 
-/// Probe every [`probe_targets`] directory under `workspace_root`, book the
+/// Probe every [`probe_targets`] directory under `workspace_root` whose
+/// bucket the book does not already hold for the current window, book the
 /// readings, and snapshot the book into the forge-call sink. Called after
 /// every reader-refresh pass; a host with no published App credential makes
 /// no probe.
+///
+/// #12204: a directory is probed at most once per reset window — after
+/// that, response headers keep its reading current *while the directory sees
+/// traffic* — instead of on every 300 s pass. A quiet directory with no header
+/// traffic is not re-probed: its reading ages past `MAX_AGE_SECS` (600 s) and
+/// reads unknown until the window resets. Routing treats unknown as headroom,
+/// and a refusal still withdraws the bucket, so the gap is safe.
 pub fn probe_all(workspace_root: &Path) {
     let probes = probe_all_with(workspace_root, None, SystemTime::now());
     log::debug!("forge_bucket_book: {probes} rate_limit probe(s) (free) — W1");
@@ -185,12 +193,20 @@ pub fn probe_all(workspace_root: &Path) {
 /// [`probe_all`] with an injectable `gh` and clock; returns the number of
 /// probes made.
 pub fn probe_all_with(workspace_root: &Path, program: Option<&Path>, now: SystemTime) -> usize {
-    let targets = probe_targets(workspace_root, now);
-    for target in &targets {
-        run_probe(target, program);
+    let at = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let mut probes = 0;
+    for target in probe_targets(workspace_root, now) {
+        let key = BucketKey::new(&target.account, &target.owner, Resource::Core);
+        if super::window_open(&key, at) {
+            continue;
+        }
+        run_probe(&target, program);
+        probes += 1;
     }
     persist_to_sink();
-    targets.len()
+    probes
 }
 
 /// Run one probe and book its readings. `false` when it produced none.

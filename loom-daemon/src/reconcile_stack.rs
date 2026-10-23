@@ -221,7 +221,10 @@ fn short(dir: &Path, rev: &str) -> String {
 /// rebase uses, and the local branch of the same name is never consulted. A
 /// failure at either step is a refusal — reusing stale local state on a failed
 /// fetch is the silent-data-loss path, not a graceful degradation.
-fn fetch_and_pin_target(
+///
+/// Also the destination of the orphaned-stacked-child pass
+/// (`claim_reconciliation::orphan_stack`, #12760).
+pub(crate) fn fetch_and_pin_target(
     repo_dir: &Path,
     remote: &str,
     branch: &str,

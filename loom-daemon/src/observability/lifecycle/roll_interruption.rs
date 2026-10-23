@@ -148,7 +148,9 @@ pub(crate) fn noted(pid: u32) -> Option<Interruption> {
     stopped_registry().lock().ok()?.get(&pid).cloned()
 }
 
-fn take_stopped(pid: u32) -> Option<Interruption> {
+/// Take what [`note_stopped`] recorded for `pid`, consuming it. A step's end
+/// reads it for the step's leader (#12253), as [`stopped`] does for a tick.
+pub(crate) fn take_stopped(pid: u32) -> Option<Interruption> {
     if pid == 0 {
         return None;
     }

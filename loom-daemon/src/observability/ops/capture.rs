@@ -24,6 +24,24 @@ pub struct Captured {
 
 thread_local! {
     static CAPTURE: RefCell<Option<Captured>> = const { RefCell::new(None) };
+    static SINKLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as a process with **no** global ops sink would, on this thread
+/// only (#11904). The sink is a process-global `OnceLock` that any test
+/// starting an OTLP exporter registers for the rest of the test binary, so a
+/// test pinning sinkless behaviour (the `worker` launcher's journal fallback)
+/// otherwise passes or fails on test order. A [`capture`] still wins.
+pub fn without_global_sink<T>(f: impl FnOnce() -> T) -> T {
+    let previous = SINKLESS.with(|flag| flag.replace(true));
+    let value = f();
+    SINKLESS.with(|flag| flag.set(previous));
+    value
+}
+
+/// Whether [`without_global_sink`] is active on this thread.
+pub(super) fn sinkless() -> bool {
+    SINKLESS.with(std::cell::Cell::get)
 }
 
 /// Run `f`, recording every ops signal emitted on this thread meanwhile.

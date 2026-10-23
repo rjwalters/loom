@@ -64,14 +64,9 @@ fn absent_config_resolves_to_documented_defaults() {
     assert_eq!(resolve_batch_size(&config), DEFAULT_BATCH_SIZE);
     assert_eq!(resolve_flush_interval_secs(&config), DEFAULT_FLUSH_INTERVAL_SECS);
     assert_eq!(resolve_queue_capacity(&config), DEFAULT_QUEUE_CAPACITY);
-    assert_eq!(
-        resolve_exporters(&config),
-        vec![ExporterEntry {
-            kind: ExporterKind::Https,
-            endpoint: None,
-            headers_file: None
-        }],
-        "https is the default exporter"
+    assert!(
+        resolve_exporters(&config).is_empty(),
+        "no exporter is the default since the native exporter was removed (#12813)"
     );
 }
 
@@ -81,31 +76,48 @@ fn absent_config_resolves_to_documented_defaults() {
 // ------------------------------------------------------------------
 
 // ------------------------------------------------------------------
-// resolve_exporter — env > config > default("https"); unknown ⇒ https.
+// resolve_exporter — env > config; unknown ⇒ skipped, no default (#12813).
 // ------------------------------------------------------------------
 
 #[test]
 #[serial]
-fn resolve_exporter_unknown_value_falls_back_to_https() {
+fn resolve_exporter_unknown_value_is_skipped() {
     clear_env();
     let config = ObservabilityConfig {
         exporter: Some("datadog".to_string()),
         ..Default::default()
     };
-    assert_eq!(
-        resolve_exporters(&config),
-        vec![ExporterEntry {
-            kind: ExporterKind::Https,
-            endpoint: None,
-            headers_file: None
-        }],
-        "a sole unknown singular value still degrades to the https default"
+    assert!(
+        resolve_exporters(&config).is_empty(),
+        "a sole unknown singular value resolves to no exporter"
     );
+}
+
+/// #12813: the removed native kind is skipped (with its own warning), whether
+/// it comes from the singular key, the list or the env knob, and never
+/// resolves to an exporter again.
+#[test]
+#[serial]
+fn the_retired_https_kind_is_skipped_everywhere_it_can_be_named() {
+    clear_env();
+    let singular = ObservabilityConfig {
+        exporter: Some("https".to_string()),
+        ..Default::default()
+    };
+    assert!(resolve_exporters(&singular).is_empty());
+    let list = ObservabilityConfig {
+        exporters: Some(vec![raw("HTTPS", None), raw("otlp", None)]),
+        ..Default::default()
+    };
+    assert_eq!(resolve_exporters(&list), vec![entry(ExporterKind::Otlp, None)]);
+    std::env::set_var(EXPORTER_ENV, "https");
+    assert!(resolve_exporters(&ObservabilityConfig::default()).is_empty());
+    clear_env();
 }
 
 // ------------------------------------------------------------------
 // resolve_exporters — the `observability.exporters` list (#8756):
-// env(singular) > config list > config singular > default [https].
+// env(singular) > config list > config singular; no default (#12813).
 // Entries dedupe by kind (one queue/status per kind this slice) and an
 // unknown kind is logged + skipped, never a hard error.
 // ------------------------------------------------------------------
@@ -132,12 +144,9 @@ fn entry(kind: ExporterKind, endpoint: Option<&str>) -> ExporterEntry {
 
 #[test]
 #[serial]
-fn resolve_exporters_defaults_to_a_https_singleton() {
+fn resolve_exporters_has_no_default_exporter() {
     clear_env();
-    assert_eq!(
-        resolve_exporters(&ObservabilityConfig::default()),
-        vec![entry(ExporterKind::Https, None)]
-    );
+    assert!(resolve_exporters(&ObservabilityConfig::default()).is_empty());
 }
 
 #[test]
@@ -145,18 +154,15 @@ fn resolve_exporters_defaults_to_a_https_singleton() {
 fn resolve_exporters_parses_mixed_string_and_object_entries() {
     clear_env();
     let config = ObservabilityConfig {
-        exporters: Some(vec![
-            raw("https", None),
-            raw("otlp", Some("http://collector.internal:4318")),
-        ]),
+        exporters: Some(vec![raw("otlp", Some("http://collector.internal:4318"))]),
         ..Default::default()
     };
     assert_eq!(
         resolve_exporters(&config),
-        vec![
-            entry(ExporterKind::Https, None),
-            entry(ExporterKind::Otlp, Some("http://collector.internal:4318")),
-        ]
+        vec![entry(
+            ExporterKind::Otlp,
+            Some("http://collector.internal:4318")
+        )]
     );
 }
 
@@ -165,7 +171,10 @@ fn resolve_exporters_parses_mixed_string_and_object_entries() {
 fn resolve_exporters_env_singular_still_overrides_the_whole_list() {
     clear_env();
     let config = ObservabilityConfig {
-        exporters: Some(vec![raw("https", None), raw("otlp", None)]),
+        exporters: Some(vec![
+            raw("bogus", None),
+            raw("otlp", Some("http://a.internal:4318")),
+        ]),
         ..Default::default()
     };
     std::env::set_var(EXPORTER_ENV, "otlp");
@@ -190,7 +199,7 @@ fn resolve_exporters_singular_config_key_is_a_one_element_list() {
 
 #[test]
 #[serial]
-fn resolve_exporters_skips_unknown_kinds_and_falls_back_when_all_invalid() {
+fn resolve_exporters_skips_unknown_kinds_and_resolves_empty_when_all_invalid() {
     clear_env();
     let config = ObservabilityConfig {
         exporters: Some(vec![raw("bogus", None), raw("otlp", None)]),
@@ -205,10 +214,9 @@ fn resolve_exporters_skips_unknown_kinds_and_falls_back_when_all_invalid() {
         exporters: Some(vec![raw("bogus", None)]),
         ..Default::default()
     };
-    assert_eq!(
-        resolve_exporters(&all_invalid),
-        vec![entry(ExporterKind::Https, None)],
-        "every entry invalid degrades to the https default"
+    assert!(
+        resolve_exporters(&all_invalid).is_empty(),
+        "every entry invalid resolves to no exporter"
     );
 }
 
@@ -218,18 +226,14 @@ fn resolve_exporters_dedupes_by_kind_first_wins() {
     clear_env();
     let config = ObservabilityConfig {
         exporters: Some(vec![
-            raw("https", None),
             raw("otlp", None),
-            raw("https", Some("https://other.example.com/ingest")),
+            raw("otlp", Some("https://other.example.com")),
         ]),
         ..Default::default()
     };
     assert_eq!(
         resolve_exporters(&config),
-        vec![
-            entry(ExporterKind::Https, None),
-            entry(ExporterKind::Otlp, None)
-        ],
+        vec![entry(ExporterKind::Otlp, None)],
         "queue/status are keyed by kind name, so a repeated kind collapses to its first entry"
     );
 }
@@ -352,7 +356,7 @@ fn queue_path_for_sole_exporter_keeps_the_legacy_filename() {
     clear_env();
     let root = Path::new("/ws");
     assert_eq!(
-        queue_path_for(root, "https", true),
+        queue_path_for(root, "otlp", true),
         PathBuf::from("/ws/.loom/logs/observability-queue.jsonl")
     );
 }
@@ -363,8 +367,8 @@ fn queue_path_for_multiple_exporters_is_per_name() {
     clear_env();
     let root = Path::new("/ws");
     assert_eq!(
-        queue_path_for(root, "https", false),
-        PathBuf::from("/ws/.loom/logs/observability-queue.https.jsonl")
+        queue_path_for(root, "sink-a", false),
+        PathBuf::from("/ws/.loom/logs/observability-queue.sink-a.jsonl")
     );
     assert_eq!(
         queue_path_for(root, "otlp", false),
@@ -378,11 +382,11 @@ fn queue_path_env_override_gains_the_name_suffix_for_multiple_exporters() {
     clear_env();
     std::env::set_var(queue::QUEUE_PATH_ENV, "/tmp/queues/override.jsonl");
     assert_eq!(
-        queue_path_for(Path::new("/ws"), "https", false),
-        PathBuf::from("/tmp/queues/override.https.jsonl")
+        queue_path_for(Path::new("/ws"), "otlp", false),
+        PathBuf::from("/tmp/queues/override.otlp.jsonl")
     );
     assert_eq!(
-        queue_path_for(Path::new("/ws"), "https", true),
+        queue_path_for(Path::new("/ws"), "otlp", true),
         PathBuf::from("/tmp/queues/override.jsonl"),
         "sole exporter keeps the override verbatim (pre-#8756 behavior)"
     );
@@ -397,7 +401,7 @@ fn adopt_legacy_queue_file_renames_a_backlog_into_the_first_per_name_file() {
     let logs = dir.path().join(".loom/logs");
     std::fs::create_dir_all(&logs).unwrap();
     let legacy = logs.join("observability-queue.jsonl");
-    let per_name = logs.join("observability-queue.https.jsonl");
+    let per_name = logs.join("observability-queue.otlp.jsonl");
     std::fs::write(&legacy, "{}\n").unwrap();
     adopt_legacy_queue_file(dir.path(), &per_name);
     assert!(per_name.exists(), "backlog moved into the per-name queue file");
@@ -582,6 +586,7 @@ async fn spawn_task_enabled_without_endpoint_returns_none() {
     let dir = tempdir().unwrap();
     let config = ObservabilityConfig {
         enabled: Some(true),
+        exporter: Some("otlp".to_string()),
         ..Default::default()
     };
     let handles =
@@ -604,7 +609,8 @@ async fn spawn_task_placeholder_endpoint_returns_none() {
     std::fs::write(&key_path, "s3cr3t\n").unwrap();
     let config = ObservabilityConfig {
         enabled: Some(true),
-        endpoint: Some("https://dashboard.example.com/ingest".to_string()),
+        endpoint: Some("https://collector.example.com".to_string()),
+        exporter: Some("otlp".to_string()),
         ingest_key_file: Some(key_path.to_string_lossy().to_string()),
         ..Default::default()
     };
@@ -626,6 +632,7 @@ async fn spawn_task_enabled_without_ingest_key_file_returns_none() {
     let config = ObservabilityConfig {
         enabled: Some(true),
         endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
+        exporter: Some("otlp".to_string()),
         ..Default::default()
     };
     let handles =
@@ -642,6 +649,7 @@ async fn spawn_task_enabled_with_unreadable_ingest_key_file_returns_none() {
     let config = ObservabilityConfig {
         enabled: Some(true),
         endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
+        exporter: Some("otlp".to_string()),
         ingest_key_file: Some(
             dir.path()
                 .join("does-not-exist.key")
@@ -653,34 +661,6 @@ async fn spawn_task_enabled_with_unreadable_ingest_key_file_returns_none() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     assert!(handles.is_none());
-}
-
-#[tokio::test]
-#[serial]
-async fn spawn_task_fully_configured_spawns_three_tasks() {
-    clear_env();
-    let bus = EventBus::new();
-    let dir = tempdir().unwrap();
-    let key_path = dir.path().join("ingest.key");
-    std::fs::write(&key_path, "s3cr3t\n").unwrap();
-    let config = ObservabilityConfig {
-        enabled: Some(true),
-        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
-        flush_interval_secs: Some(3600), // avoid a real network attempt during the test
-        ..Default::default()
-    };
-    let handles =
-        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
-    let handles = handles.expect("fully configured ⇒ spawn_task must return Some");
-    // Issue #8760: `daemon_event::spawn_task` adds a third handle alongside
-    // `collector`'s and the sender's. The HTTPS-only sink starts no OTLP ops
-    // tasks, and the ETA subscriber / fleet refresh / nightly folds tasks are
-    // gone with the ETA subsystem (#11098).
-    assert_eq!(handles.len(), 3, "collector + daemon_event collector + sender");
-    for handle in handles {
-        handle.abort();
-    }
 }
 
 /// Issue #11197: `spawn_task` enqueues exactly one `daemon.start` record per
@@ -698,6 +678,7 @@ async fn spawn_task_offers_exactly_one_daemon_start_record() {
     let config = ObservabilityConfig {
         enabled: Some(true),
         endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
+        exporter: Some("otlp".to_string()),
         ingest_key_file: Some(key_path.to_string_lossy().to_string()),
         flush_interval_secs: Some(3600), // avoid a real network attempt during the test
         ..Default::default()
@@ -747,51 +728,6 @@ async fn spawn_task_disabled_emits_no_daemon_start() {
 
 #[tokio::test]
 #[serial]
-async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
-    clear_env();
-    let bus = EventBus::new();
-    let dir = tempdir().unwrap();
-    let key_path = dir.path().join("ingest.key");
-    std::fs::write(&key_path, "s3cr3t\n").unwrap();
-    let config = ObservabilityConfig {
-        enabled: Some(true),
-        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
-        exporters: Some(vec![
-            raw("https", None),
-            raw("otlp", Some("http://collector.test-fixture.internal:4318")),
-        ]),
-        flush_interval_secs: Some(3600),
-        ..Default::default()
-    };
-    let handles =
-        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
-            .expect("fully configured ⇒ spawn_task must return Some");
-    // Issue #8760: `daemon_event::spawn_task` adds one more handle alongside
-    // `collector`'s and one sender per exporter.
-    // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
-    // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
-    // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
-    // (The ETA tasks were removed with the ETA subsystem, #11098.)
-    // Issue #11161: the `fleet.state` pass after each work-finder tick.
-    assert_eq!(
-        handles.len(),
-        8,
-        "collector + daemon_event + turnaround + two senders + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
-    );
-    let statuses = global_export_statuses();
-    assert_eq!(
-        statuses.keys().collect::<Vec<_>>(),
-        vec!["https", "otlp"],
-        "each exporter surfaces its own status entry"
-    );
-    for handle in handles {
-        handle.abort();
-    }
-}
-
-#[tokio::test]
-#[serial]
 async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
     clear_env();
     for endpoint in [
@@ -825,14 +761,11 @@ async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
     }
 }
 
-/// The OTLP counterpart of
-/// `spawn_task_fully_configured_spawns_three_tasks`: `exporter=otlp`
-/// spawns the same collector+daemon_event+sender
-/// trio, just wired to `otlp::OtlpExporter` instead of `HttpsExporter`, plus
-/// the three OTLP ops-sink tasks.
+/// `exporter=otlp` spawns the collector+daemon_event+sender trio, wired to
+/// `otlp::OtlpExporter`, plus the three OTLP ops-sink tasks.
 #[tokio::test]
 #[serial]
-async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {
+async fn spawn_task_fully_configured_spawns_trio_plus_ops_tasks() {
     clear_env();
     let bus = EventBus::new();
     let dir = tempdir().unwrap();
@@ -852,11 +785,11 @@ async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {
     // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
-    // Issue #11161: the `fleet.state` pass after each work-finder tick.
+    // (The `fleet.state` tick pass was removed with its producer, #11301.)
     assert_eq!(
         handles.len(),
-        7,
-        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
+        6,
+        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
     );
     for handle in handles {
         handle.abort();
@@ -864,3 +797,43 @@ async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {
 }
 
 mod headers_file;
+
+/// #12813: the native exporter that used to be the default is gone, so an
+/// enabled config that names no exporter (or only the retired `https` one)
+/// exports nowhere and says so in `status` instead of going quiet.
+#[tokio::test]
+#[serial]
+async fn spawn_task_enabled_without_an_exporter_is_misconfigured_not_silent() {
+    clear_env();
+    for exporter in [None, Some("https".to_string())] {
+        let bus = EventBus::new();
+        let dir = tempdir().unwrap();
+        let config = ObservabilityConfig {
+            enabled: Some(true),
+            endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
+            exporter,
+            ..Default::default()
+        };
+        assert!(spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool()
+        )
+        .is_none());
+        let status = global_export_statuses();
+        let otlp = status
+            .get("otlp")
+            .expect("a misconfigured cell is registered");
+        assert_eq!(otlp.state, crate::types::ObservabilityExportState::Misconfigured);
+        assert!(
+            otlp.last_failure_detail
+                .as_deref()
+                .unwrap()
+                .contains("no exporter configured"),
+            "{otlp:?}"
+        );
+        assert!(!dir.path().join(".loom").exists(), "no queue file for a sink that never ran");
+    }
+}

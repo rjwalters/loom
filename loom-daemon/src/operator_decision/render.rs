@@ -88,6 +88,15 @@ pub fn extract_block(body: &str) -> Option<String> {
     None
 }
 
+/// Whether `body` carries a decision (#11795): a ```` ```decision ```` fence
+/// line or the managed section's start marker. This, not a sub-label, is
+/// what makes a `loom:operator` hold a decision. Presence only: a malformed
+/// block is still a decision, under repair (`loom:decision-malformed`).
+#[must_use]
+pub fn has_decision_block(body: &str) -> bool {
+    body.contains(SECTION_START) || body.lines().any(|l| l.trim_end() == FENCE_OPEN)
+}
+
 /// The first decision block in `body`, parsed. `None` when there is no
 /// block or it is not decision JSON.
 #[must_use]

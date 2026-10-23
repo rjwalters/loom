@@ -9,9 +9,15 @@
 /// hold must not mistake for a change in what the sweep depends on: a claim
 /// (`loom:building`), its release (`loom:issue`), and the Curator / Doctor
 /// working markers.
+///
+/// `loom:curated` is churn too (#12024): Champion's promotion and a Builder
+/// step's release move an issue between `loom:curated` and `loom:issue`, and
+/// that cycle is exactly the loop the hold must count through, not a change
+/// that restarts it.
 const DAEMON_CHURN_LABELS: &[&str] = &[
     "loom:building",
     "loom:issue",
+    "loom:curated",
     "loom:curating",
     "loom:treating",
 ];
@@ -22,23 +28,34 @@ const DAEMON_CHURN_LABELS: &[&str] = &[
 /// silently partial: never counted, never a release.
 pub(super) const MAX_DEPENDENCY_READS: usize = 50;
 
-/// Which park a held issue gets.
+/// What the no-op loop looks like, which decides the notice's wording and the
+/// telemetry class. Since #12024 both kinds park on `loom:blocked` alone: the
+/// daemon re-evaluates its own holds, and `loom:operator` is only ever
+/// removed by a human (#11861), so it is never this hold's label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParkKind {
-    /// Remaining work is blocked on other issues: `loom:blocked`.
+    /// Remaining work is blocked on other issues.
     Blocked,
-    /// Remaining work is a human gate (or we cannot tell):
-    /// `loom:operator-only` + `loom:operator-decision`.
+    /// Remaining work looks like a human decision (or we cannot tell).
+    /// Before #12024 this kind wrote `loom:operator` (#11795).
     HumanGate,
 }
 
+/// The one label every no-op park adds and its release removes (#12024).
+const NOOP_PARK_LABELS: &[&str] = &[crate::work_finder::BLOCKED_HOLD_LABEL];
+
 impl ParkKind {
-    /// Labels the park adds.
+    /// Labels the park adds: `loom:blocked`, for either kind (#12024).
     pub(super) fn labels(self) -> &'static [&'static str] {
-        match self {
-            Self::Blocked => &["loom:blocked"],
-            Self::HumanGate => &["loom:operator-only", "loom:operator-decision"],
-        }
+        NOOP_PARK_LABELS
+    }
+
+    /// Labels a release of this park removes: exactly [`Self::labels`].
+    /// A hold an older daemon applied as `loom:operator` is never lifted by
+    /// the daemon (only a human removes that label, #11861); it is moved to
+    /// `loom:blocked` by `loom-daemon labels migrate --holds` (#12024).
+    pub(super) fn lift_labels(self) -> &'static [&'static str] {
+        self.labels()
     }
 
     /// Stable tag for the persisted-holds file.
@@ -65,6 +82,47 @@ impl ParkKind {
             Self::HumanGate => "noop-loop:human-gate",
         }
     }
+}
+
+/// The short, stable digest of a fingerprint (#12024): the first 16 hex
+/// characters of its SHA-256. It is what the streak, the persisted holds, the
+/// hold notice and the fleet-wide `NoopStreak` ad compare, so every host
+/// (and every daemon version from #12024 on) derives the same value.
+#[must_use]
+pub(crate) fn digest(fingerprint: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let full = hex::encode(Sha256::digest(fingerprint.as_bytes()));
+    full[..16].to_string()
+}
+
+/// The digest of a full fingerprint written by an older daemon (a
+/// pre-#12024 hold notice or holds file), after dropping the labels this
+/// version counts as churn from its `labels=[…]` segment. Without this a
+/// legacy hold would never match a fresh read once `loom:curated` became
+/// churn, and would be released on its first reconciliation.
+#[must_use]
+pub(crate) fn legacy_digest(full: &str) -> String {
+    let normalized = full
+        .strip_prefix("labels=[")
+        .and_then(|rest| rest.split_once("];"))
+        .map_or_else(
+            || full.to_string(),
+            |(labels, tail)| {
+                let kept: Vec<&str> = labels
+                    .split(',')
+                    .filter(|l| !l.is_empty() && !DAEMON_CHURN_LABELS.contains(l))
+                    .collect();
+                format!("labels=[{}];{tail}", kept.join(","))
+            },
+        );
+    digest(&normalized)
+}
+
+/// Whether `s` is already a [`digest`] (a pre-#12024 persisted hold stored
+/// the full fingerprint).
+#[must_use]
+pub(crate) fn is_digest(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The forge facts a no-op's fingerprint is built from.
@@ -149,10 +207,11 @@ const DEPENDENCY_WORDS: &[&str] = &[
     "upstream",
 ];
 
-/// Choose the park. A reason naming a human gate wins; a reason naming
+/// Classify the loop. A reason naming a human gate wins; a reason naming
 /// dependencies (or an open dependency in the snapshot, when the reason says
-/// nothing either way) selects `loom:blocked`; everything else — including an
-/// absent reason — is the safer, more visible operator pair.
+/// nothing either way) is [`ParkKind::Blocked`]; everything else, including an
+/// absent reason, is [`ParkKind::HumanGate`]. Both park on `loom:blocked`
+/// (#12024); the kind only words the notice and names the telemetry class.
 pub(crate) fn choose_park(reason: Option<&str>, snapshot: Option<&IssueSnapshot>) -> ParkKind {
     let lower = reason.unwrap_or_default().to_ascii_lowercase();
     if HUMAN_WORDS.iter().any(|w| lower.contains(w)) {
@@ -246,12 +305,38 @@ mod tests {
     }
 
     #[test]
-    fn park_labels_never_touch_the_claim_or_the_priority() {
+    fn park_labels_never_touch_the_claim_the_priority_or_the_operator_hold() {
         for kind in [ParkKind::Blocked, ParkKind::HumanGate] {
-            for l in kind.labels() {
+            assert_eq!(kind.labels(), &["loom:blocked"], "#12024: one park label");
+            for l in kind.labels().iter().chain(kind.lift_labels()) {
                 assert_ne!(*l, "loom:building");
                 assert_ne!(*l, "loom:important");
+                assert!(
+                    !crate::work_finder::OPERATOR_HOLD_NAMES.contains(l),
+                    "the no-op hold never writes or removes an operator hold: {l}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn the_digest_is_short_stable_and_recognisable() {
+        let d = digest(&base().fingerprint());
+        assert!(is_digest(&d), "{d}");
+        assert_eq!(d, digest(&base().fingerprint()));
+        assert_ne!(d, digest("something else"));
+        assert!(!is_digest(&base().fingerprint()));
+    }
+
+    #[test]
+    fn a_legacy_fingerprint_digests_like_a_fresh_read_of_the_same_state() {
+        let mut s = base();
+        s.labels = vec!["loom:curated".into(), "loom:important".into()];
+        let full = s.fingerprint();
+        assert!(full.starts_with("labels=[loom:important];"), "curated is churn: {full}");
+        // What an older daemon recorded for the same state.
+        let recorded = full.replace("labels=[", "labels=[loom:curated,");
+        assert_ne!(digest(&recorded), digest(&full));
+        assert_eq!(legacy_digest(&recorded), digest(&full));
     }
 }

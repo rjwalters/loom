@@ -1,6 +1,6 @@
 //! `doctor-attempt` / `doctor-rejection` / `doctor-route` (#11359): durable
 //! GLM-Doctor rejection state kept in the sweep checkpoint's
-//! `doctor_escalation` key. Decision logic is `loom_daemon::doctor_escalation`.
+//! `doctor_escalation` key. Decision logic is `crate::doctor_escalation`.
 //!
 //! The state lives in the issue checkpoint when one exists. Mode C can run a
 //! Doctor with no checkpoint yet (the first `doctor-done` is written after the
@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use loom_daemon::doctor_escalation::{self as de, Rejection, Route, State};
+use crate::doctor_escalation::{self as de, Rejection, Route, State};
 use serde_json::{json, Value};
 
 use super::{invalid, io_error, number, persist, Result};
@@ -179,7 +179,7 @@ pub(super) fn run(
         de::record_doctor(&mut state, pr, head, glm, rebase);
         format!("recorded glm={glm} kind={}", if rebase { "rebase" } else { "fix" })
     } else {
-        let k = de::parse_k(&loom_daemon::config_resolver::resolve_effective_config(root))
+        let k = de::parse_k(&crate::config_resolver::resolve_effective_config(root))
             .map_err(|m| (78, m))?;
         match de::record_rejection(&mut state, pr, head, k) {
             Rejection::Counted { count, escalated } => {

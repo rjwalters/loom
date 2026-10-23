@@ -28,7 +28,10 @@ sit on top of.
   rendered issue/PR, and a **sentinel** that distinguishes a declaration from
   prose that merely *mentions* a blocker elsewhere in the body. Same pattern,
   same reason, as the lease record (`<!-- loom:lease host=… sweep=… -->`,
-  `lease-record.md`) and the verdict-SHA / `loom:ac-verified` markers.
+  `lease-record.md`) and the verdict-SHA / `loom:ac-verified` markers. A
+  marker quoted inside a fenced code block or an inline code span renders as
+  visible text, so it is **not** a record: the parser ignores it and a re-park
+  never edits it (#10837, where quoted evidence released an unrecorded hold).
 - `Blocked by: #N` — **deliberately the existing vocabulary**, not a new one.
   `guide.md`'s `parse_dependencies`, `dep_recheck::extract`'s
   `DEPENDENCY_PHRASES`, `warn-operator-gated.sh` and
@@ -139,6 +142,41 @@ These writers differ from `apply` in two documented ways:
   the body. Readers key on `loom:blocked` first, so a leftover record on an
   unblocked issue declares nothing.
 
+### Champion's PR holds (#11861)
+
+Champion's merge-risk and critical-file holds write a reason-only record on
+the PR (`reason="champion merge-risk hold"` / `"champion critical-file hold"`,
+`by=champion`, `loom_daemon::champion_hold`), keep `loom:pr`, and add
+`loom:blocked`. Only Champion or a human releases it. A dependency-only promotion finding writes one record per
+open blocker (`park-record apply --blocked-by --by champion`, #11860; or
+`classify-dependency-block.sh --check-defer --apply`). Nothing lifts it
+automatically when the blockers close: the daemon's release pass was retired
+(#11301), so a role or a human clears it.
+
+**A hold is a human evidence gate, not a dependency wait (#10937).** When the
+hold's concern names an open issue/PR ("pending real-PDK verification in
+#N"), Champion writes one more record beside the reason-only one so
+`check-stale-blocked` and the pipeline view show what the PR waits on:
+
+```bash
+loom-daemon park-record apply --pr "$PR_NUMBER" --blocked-by "$N" --by champion \
+  --reason "champion merge-risk hold: human evidence gate"
+```
+
+The reason-only record stays (`body_declares_hold` reads it); `apply` refuses a
+closed blocker (#9102), so a hold that names none, or only closed ones, is
+unchanged. The extra record is inert: `check_and_unblock_prs` skips a PR whose
+`loom-daemon champion-hold classify` says `state=champion-hold` before it reads
+a `Blocked by`, so closing #N never lifts the hold. Worked example, PR 8314
+holds with `Blocked by: #8301` recorded, #8301 closes:
+
+```
+check_and_unblock_prs → PR 8314: state=champion-hold → skipped (no unblock, no comment)
+```
+
+Release stays Champion's (a release signal, `champion-pr-merge.md` "Sticky
+holds") or a human's; nothing auto-releases.
+
 ## Who reads one
 
 - `loom-daemon check-stale-blocked` (`defaults/scripts/check-stale-blocked.sh`,
@@ -160,12 +198,12 @@ These writers differ from `apply` in two documented ways:
   `rateLimit.cost`, `rest_requests`, `rest_not_modified`, `budget_before`,
   `projected`, `floor`, `budget_refused`, `budget_stopped`). It first reads
   the repository's `archived` flag (#10562, one REST + ETag read shared with
-  `release-stale-blocked` and the role runner): an archived repository is
+  the role runner): an archived repository is
   read-only, so nothing is listed, `--json` reports `archived: true` and the
   human report is one line. A probe that fails is NOT EVALUATED, never
   archived and never clear (`archived: null`). Champion's merge-risk hold
   digest issue (exact title, or body starting with its marker) is exempt from
-  this pass, the notifier and the release pass: it is `loom:blocked` only to
+  this pass and the notifier: it is `loom:blocked` only to
   stay out of curation and has no blocker to cite (#9397).
   **Do not loop it over many repositories by hand.** The budget floor reads
   the hourly buckets, which a secondary rate limit never shows in, and a
@@ -219,6 +257,13 @@ check_and_unblock_prs() {
     local title=$(printf '%s\n' "$pr_row" | jq -r '.title')
 
     [ "$(has_permanent_block "$number")" = "true" ] && continue  # #8742, guide.md
+
+    # A standing Champion hold is a human evidence gate, not a dependency wait
+    # (#10937): closing a `Blocked by` number it records never releases it.
+    # Unreadable (exit 3) fails safe; foreign-park/clear/exit 2 go on.
+    local hc hrc
+    hc=$(loom-daemon champion-hold classify --pr "$number" 2>/dev/null); hrc=$?
+    case "$hrc $hc" in "0 "*" state=champion-hold "*|"3 "*) continue ;; esac
 
     local deps=$(parse_dependencies "$body")
 
@@ -286,7 +331,7 @@ pr_has_superseding_block() {
   fi
 
   local pr_hold=$(printf '%s\n' "$pr_json" | jq -r \
-    '[.labels[].name] | any(. == "loom:operator" or . == "loom:operator-only")')
+    '[.labels[].name] | any(. == "loom:operator" or . == "loom:frozen")')
   if [ "$pr_hold" = "true" ]; then
     echo "true"
     return
@@ -354,6 +399,15 @@ job (issues) and `check-stale-blocked`'s advisory report (both issues and
 PRs) — this document defines the wire format both sit on top of, nothing more.
 
 See also: [`label-state-machine.md`](label-state-machine.md) for where
-`loom:blocked` sits relative to `loom:operator`/`loom:operator-only`, and
+`loom:blocked` sits relative to `loom:operator`/`loom:frozen`, and
 [`lease-record.md`](lease-record.md) for the sibling HTML-comment-marker
 convention this format's shape was co-designed with.
+
+## `park-record released` (#12665)
+
+`loom-daemon park-record released --pr N [--entered-at TS] [--failed]` writes
+nothing to the forge. Champion calls it after removing a merge-risk hold's
+`loom:blocked`, to journal the release as a `hold.transition` `remove`
+([`telemetry-schema.md`](telemetry-schema.md#holdtransition--a-hold-label-applied-to-or-removed-from-a-pr)).
+A Champion `park-record apply` journals the matching `add` itself, only when
+the label was not already on the PR.

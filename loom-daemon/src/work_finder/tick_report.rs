@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 
 use super::halt_cause::HaltCause;
 use super::ready_queue;
+#[path = "tick_error_kind.rs"]
+pub mod error_kind;
 use crate::sweep_registry::{
     AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
     DispatchBackoffError, LandedEvidence, LeaseOrderDispatchError, LiveClaimDispatchError,
@@ -16,6 +18,21 @@ use crate::sweep_registry::{
     WorkspaceCommandsMissingDispatchError,
 };
 use crate::types::QueueDisposition as Qd;
+use error_kind::DispatchErrorKind;
+
+/// One workspace's draw pool and exclusions as the step tick weighed them
+/// (#12734), after the claims and the Builder hold were applied: what the
+/// work finder can draw from the repo now. Exported as
+/// `loom.dispatch.pool_items` and `loom.dispatch.excluded_items`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoDepth {
+    /// The forge slug.
+    pub repo: String,
+    /// Drawable items by `Step::as_str`; empty for a held workspace.
+    pub pool: std::collections::BTreeMap<&'static str, usize>,
+    /// Excluded items by `Exclusion::as_str`.
+    pub excluded: std::collections::BTreeMap<&'static str, usize>,
+}
 
 /// Per-tick outcome counts, for observability and test assertions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,29 +53,12 @@ pub struct TickReport {
     pub skipped_in_flight: usize,
     /// Issues deferred to a future tick because the concurrency cap was reached.
     pub deferred_capacity: usize,
-    /// Issues deferred to a future tick because the **per-tick admission cap**
-    /// (#4234, `max_admissions_per_tick`) was reached, independent of
-    /// `deferred_capacity` — this fires even when `max_concurrent` computes
-    /// large enough to admit them (e.g. a token-axis jump), because the ramp
-    /// cap deliberately smooths *how fast* new sweeps are admitted rather than
-    /// how many may run concurrently. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`](super::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV).
-    pub deferred_ramp_cap: usize,
-    /// Issues deferred to a future tick because the **saturation admission
-    /// brake** (#4903, [`crate::admission_brake`]) held new admissions: the host
-    /// is already at/over the configured load-per-core hold threshold, so adding
-    /// work would only slow the sweeps already running.
-    ///
-    /// Deliberately its own counter, not folded into
-    /// [`deferred_capacity`](Self::deferred_capacity): the concurrency cap was
-    /// *not* reached — the host was. Conflating them would report a token/disk
-    /// shortage on a machine whose only problem is that it is already full, and
-    /// send an operator to raise a knob that is not binding.
-    pub deferred_saturation: usize,
     /// Issues deferred to a future tick because the **build back-off**
     /// (#9410, [`build_backoff`](super::build_backoff)) was engaged: review +
     /// merge debt is high, so no new unstarred issue build is admitted. Its
-    /// own counter for the same reason as [`deferred_saturation`](Self::deferred_saturation):
-    /// no cap was reached, a WIP policy held.
+    /// own counter, not folded into
+    /// [`deferred_capacity`](Self::deferred_capacity): no cap was reached, a
+    /// WIP policy held.
     pub deferred_build_backoff: usize,
     /// Issues skipped because they are quarantined for repeated insta-crashing
     /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
@@ -93,6 +93,23 @@ pub struct TickReport {
     /// an operator tells them apart by the admission span, which only an
     /// in-dispatch refusal has.
     pub pr_open_prefiltered: usize,
+    /// The step gather's cost and coverage this tick (#12074): how long it
+    /// took, how many repos it read and how many the tick deadline cut.
+    /// `None` when no step gather ran.
+    pub gather: Option<crate::step_dispatch::gather_budget::GatherStats>,
+    /// Where the step tick's wall time went, by phase (#12256). `None` when
+    /// no step tick ran.
+    pub phases: Option<crate::step_dispatch::gather_budget::TickPhases>,
+    /// The step tick's draws and passes by reason (#12410). `None` when no
+    /// step tick ran.
+    pub passes: Option<crate::step_dispatch::gather_budget::TickPasses>,
+    /// What this tick's discovery snapshot cost and covered (#12306). `None`
+    /// when no step tick ran.
+    pub discovery: Option<crate::discovery::SnapshotStats>,
+    /// Why the step tick stopped spawning before its slots were filled
+    /// (#12298): `rate_limit_breaker` when the breaker tripped mid-tick.
+    /// `None` when it never stopped.
+    pub spawn_hold: Option<String>,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)
@@ -179,6 +196,10 @@ pub struct TickReport {
     pub skipped_host_constraint: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
+    /// The distinct reasons behind [`Self::errors`] (#11973), sorted. Fed
+    /// only through [`Self::note_error`]; exported as
+    /// `loom.dispatch.error_kind`.
+    pub error_kinds: Vec<DispatchErrorKind>,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
     /// of #4028). Unlike the other counters — which are per-tick tallies — this
     /// is a **monotonic total** read from the dispatcher(s) at tick end, so an
@@ -197,46 +218,32 @@ pub struct TickReport {
     /// the gate loop reports — including when a repo's forge query fails.
     ///
     /// Despite the history above, any hold sets it — a drain, an exhausted
-    /// token pool, a disk reservation (#9017, #11191); [`Self::halt_causes`]
+    /// token pool (#9017); [`Self::halt_causes`]
     /// says which.
     pub halted: bool,
     /// The distinct causes of this tick's holds (#11649), in
     /// [`HaltCause::ALL`] order. Empty when the tick was not held, or when the
     /// caller attributed no cause (a legacy, cause-less tick). The
-    /// `loom.dispatch.tick` result is derived from it, so a disk-held tick no
-    /// longer reads `halted_main_red`.
+    /// `loom.dispatch.tick` result is derived from it, so a drain-held tick
+    /// does not read `halted_main_red`.
     pub halt_causes: Vec<HaltCause>,
-    /// True when the saturation admission brake (#4903) was engaged for this
-    /// tick. Reported separately from
-    /// [`deferred_saturation`](Self::deferred_saturation) so "the host was
-    /// holding" is visible even when the backlog was empty and nothing was
-    /// deferred — otherwise a saturated host with no queued work is
-    /// indistinguishable from a healthy idle one, which is the exact reporting
-    /// gap #4903 was filed on.
-    pub saturation_held: bool,
+    /// How many workspaces a hold gated this tick (#11857), exported as
+    /// `loom.dispatch.held_roots` so the held share of a host stays visible
+    /// once a partial hold no longer names the tick's result.
+    pub held_roots: usize,
+    /// True when [`Self::halted`] is set but the hold did not cover the tick's
+    /// work (#11857): some workspace with ready candidates was not held, so
+    /// the tick's outcome is the per-candidate one, not `halted_<cause>`. See
+    /// [`Self::note_halts`] for the rule.
+    pub halt_partial: bool,
     /// True when the build back-off (#9410) held at least one repo this tick
     /// (#10624: the hold is per repo), even when nothing was deferred. The tick
     /// result keys on [`deferred_build_backoff`](Self::deferred_build_backoff)
     /// instead, so a repo that stays held cannot mask other outcomes.
     pub build_backoff_held: bool,
-    /// Candidates deferred THIS TICK because their own repo was already at
-    /// `autonomous.workFinder.maxConcurrentPerRepo` (Issue #9090,
-    /// [`repo_cap`](super::repo_cap)). Always `0` when the knob is absent (the
-    /// opt-in default) — see [`RepoCap`](super::RepoCap).
-    ///
-    /// Deliberately its own counter, not folded into
-    /// [`deferred_capacity`](Self::deferred_capacity): the *machine* cap was not
-    /// reached, one repo's share of it was, so an operator reading
-    /// `deferred_capacity` is never sent to raise a ceiling that is not binding.
-    /// Purely observational (mirrors
-    /// [`deferred_saturation`](Self::deferred_saturation)'s shape): these
-    /// candidates are NOT lost — they stay ready and are re-evaluated next tick,
-    /// and within THIS tick their deferral is handed straight to the next
-    /// candidate, which is another repo's work.
-    pub deferred_repo_cap: usize,
     /// The subset of [`dispatched`](Self::dispatched) admitted through the
     /// overflow slot (#9244, inert since #11508): an operator-starred issue that
-    /// only the global and/or per-repo cap refused, dispatched as this host's
+    /// only the global cap refused, dispatched as this host's
     /// single over-limit sweep. At most one per tick, and none while an
     /// earlier overflow sweep is still live. See
     /// [`operator_priority::OverflowSlot`](super::operator_priority::OverflowSlot).
@@ -275,18 +282,12 @@ pub struct TickReport {
     /// single-workspace tick). Feeds `loom.dispatch.idle_slots`.
     pub occupancy: Option<usize>,
     /// The shaped candidate order pass 2 iterated, as `(workspace_idx,
-    /// issue)` (Issue #9288): the global sort after `repo_cap::shape_queue`'s
-    /// affinity partition. Recorded before pass 2 runs, so it is
+    /// issue)` (Issue #9288): the global draw order. Recorded before pass 2
+    /// runs, so it is
     /// the order `dispatch()` was offered candidates in, including those a
     /// gate then deferred. The published plan's `position` is read from here
     /// and never re-derived. Empty for the single-workspace tick.
     pub plan_order: Vec<(usize, u32)>,
-    /// The per-repo cap and top-of-tick per-workspace occupancy (#9090) the
-    /// tick shaped with. `None` for the single-workspace tick.
-    pub repo_cap: Option<super::repo_cap::RepoCapSnapshot>,
-    /// The per-tick admission ramp cap (#4234) the tick ran under, or `None`
-    /// when the caller did not record it.
-    pub max_admissions_per_tick: Option<usize>,
     /// Whether the host's single overflow slot (#9244, inert since #11508)
     /// was still unused when the tick finished, or `None` when the
     /// tick did not record it (Issue #9288).
@@ -298,9 +299,35 @@ pub struct TickReport {
     /// The `loom:very-important` issues the flood cap ranked as important
     /// this tick (#11509), in listing order; exported in `pick.decision`.
     pub vi_demotions: Vec<super::vi_cap::ViDemotion>,
+    /// The step tick's item draws (#11909), exported on `pick.decision`.
+    pub item_draw: Option<crate::telemetry::kinds::pick_decision::PickItemDraw>,
+    /// Each step-tick workspace's pool and exclusions (#12734). Empty when
+    /// no step tick ran.
+    pub depth: Vec<RepoDepth>,
 }
 
 impl TickReport {
+    /// Count one error of `kind` (#11973).
+    pub fn note_error(&mut self, kind: DispatchErrorKind) {
+        self.errors += 1;
+        if let Err(at) = self.error_kinds.binary_search(&kind) {
+            self.error_kinds.insert(at, kind);
+        }
+    }
+
+    /// Count workspace `idx`'s failed ready-issue listing (#8852, #11973).
+    pub fn note_listing_failure(&mut self, idx: usize, err: &anyhow::Error) {
+        self.note_error(DispatchErrorKind::of_listing(err));
+        self.listing_failed.push(idx);
+    }
+
+    /// The tick's `loom.dispatch.error_kind` value (#11973), or `None` when
+    /// it counted no error. See [`error_kind::attribute_value`].
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&'static str> {
+        error_kind::attribute_value(self.errors, &self.error_kinds)
+    }
+
     /// Record whether workspace `idx`'s listing came back whole (#11139).
     pub fn note_listing(&mut self, idx: usize, complete: bool) {
         if !complete {
@@ -328,8 +355,20 @@ impl TickReport {
     /// first `n` workspaces is held, and [`Self::halt_causes`] as the distinct
     /// causes `causes` (parallel to `halted`, optional) names at held indices.
     /// A cause at a not-held index is ignored, as `record_halted` does.
+    ///
+    /// #11857: also [`Self::held_roots`] (the held count) and
+    /// [`Self::halt_partial`]. The hold explains the tick only when it covered
+    /// the tick's work: every workspace that listed ready candidates (a row in
+    /// [`Self::queue`]) was held (or weight 0) or, when none listed any, every
+    /// workspace was held. Otherwise one held repo (say a maintain-only one)
+    /// would name every idle tick on the host and hide why the healthy repos
+    /// dispatched nothing. Keying on candidates rather than on every workspace keeps the
+    /// hold visible when the held repo is the only one with work — a healthy
+    /// but empty repo does not turn a held backlog into `all_skipped`.
     pub fn note_halts(&mut self, halted: &[bool], causes: Option<&[Option<HaltCause>]>, n: usize) {
+        let is_held = |i: usize| i < n && halted.get(i).copied().unwrap_or(false);
         self.halted = halted.iter().take(n).any(|&h| h);
+        self.held_roots = halted.iter().take(n).filter(|&&h| h).count();
         let held: Vec<HaltCause> = halted
             .iter()
             .take(n)
@@ -341,22 +380,29 @@ impl TickReport {
             .into_iter()
             .filter(|cause| held.contains(cause))
             .collect();
+        // A weight-0 root's rows (#11742) read `WorkspaceHalted` though no
+        // hold flag is set: it is configured off, so it counts as held here.
+        let covered = if self.queue.is_empty() {
+            self.held_roots == n
+        } else {
+            self.queue.iter().all(|row| {
+                is_held(row.key.workspace_idx) || row.disposition == Some(Qd::WorkspaceHalted)
+            })
+        };
+        self.halt_partial = self.halted && !covered;
     }
 
-    /// An empty report for a multi-workspace tick run under these admission
-    /// knobs.
+    /// The hold covered this tick's work (#11857): [`Self::halted`] without
+    /// [`Self::halt_partial`]. Gate tick-level reactions on this, not on
+    /// `halted`, or one held repo silences them for its healthy neighbours.
     #[must_use]
-    pub fn for_tick(saturation_held: bool, max_admissions_per_tick: usize) -> Self {
-        TickReport {
-            saturation_held,
-            max_admissions_per_tick: Some(max_admissions_per_tick),
-            ..TickReport::default()
-        }
+    pub fn halted_fully(&self) -> bool {
+        self.halted && !self.halt_partial
     }
 
     /// This report with no occupancy reading and none of the admission
     /// context a multi-workspace tick records for its dispatch plan (#9288:
-    /// ramp cap, slice mask, per-repo cap snapshot, overflow slot), for comparing an idle
+    /// the overflow slot), for comparing an idle
     /// tick against [`TickReport::default`] in tests. The shaped order itself
     /// (`plan_order`) is kept: an idle tick has none.
     #[cfg(test)]
@@ -364,8 +410,6 @@ impl TickReport {
     pub fn without_occupancy(self) -> Self {
         TickReport {
             occupancy: None,
-            max_admissions_per_tick: None,
-            repo_cap: None,
             overflow_free: None,
             workspace_draw: None,
             ..self
@@ -547,7 +591,7 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
         // Empty/unusable token pool (#4689, typed by #6614): a real failure,
         // still on `errors`, named because the remedy is the pool. The registry
         // has armed this issue's backoff and the cross-issue pool hold.
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::TokenSelection);
         report.refused_token_selection += 1;
         log::warn!(
             "work_finder: dispatch for issue #{issue} died at token selection — the token pool \
@@ -556,18 +600,18 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
         Outcome::new(Qd::DispatchError, why, "error", "token_selection_failed")
     } else if e.downcast_ref::<CollisionDispatchError>().is_some() {
         // Cross-host collision enforcement (#5789): a peer already claimed it.
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::ClaimCollision);
         report.refused_claim_collision += 1;
         log::info!("work_finder: skipping issue #{issue} — {e}");
         Outcome::new(Qd::DispatchError, why, "refused", "claim_collision")
     } else if e.downcast_ref::<ClaimLockDispatchError>().is_some() {
         // The local claim lock is already held (#8907).
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::ClaimLock);
         report.refused_claim_lock += 1;
         log::warn!("work_finder: dispatch for issue #{issue} failed: {e}");
         Outcome::new(Qd::DispatchError, why, "refused", "claim_lock_held")
     } else {
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::of_dispatch(e));
         log::warn!("work_finder: dispatch for issue #{issue} failed: {e}");
         Outcome::new(Qd::DispatchError, why, "error", "error")
     }

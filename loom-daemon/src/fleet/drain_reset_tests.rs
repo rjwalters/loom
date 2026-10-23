@@ -121,3 +121,18 @@ fn a_failed_label_edit_is_an_error_and_posts_no_comment() {
     assert!(err.contains("gh issue edit #9 in o/r failed"), "{err}");
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
 }
+
+/// #11743: a frozen claim is left exactly as it is — one read, no label edit,
+/// no comment — and reported as not reset, so the drain still completes.
+#[test]
+#[serial_test::serial]
+fn a_frozen_claim_is_read_and_never_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let labels = r#"{"labels":[{"name":"loom:building"},{"name":"loom:frozen"}]}"#;
+    let (gh, log) = stub(tmp.path(), labels, 0);
+    let got = reset_claim_with(gh.as_os_str(), child_path(), "o/r", 9, "worker-1");
+    assert!(matches!(got, Ok(false)), "{got:?}");
+    let argv = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(argv.lines().count(), 1, "the label read only: {argv}");
+    assert!(argv.contains("|issue view 9 --repo o/r --json labels"), "{argv}");
+}

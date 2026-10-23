@@ -40,9 +40,7 @@ _check_partial_increment_close_conflict() {
   # where $partial_refs is EMPTY — a trailer the author backticked, which
   # parses as no declaration at all. Pure text analysis, no forge calls, so
   # the common (non-partial-increment) path still costs zero extra requests.
-  # (The statements below share one line deliberately — #8831 pays for the
-  # daemon round trip inside the shell-budget ratchet's portable pool, and
-  # this keeps that cost at net zero. The unquoted $(...) is intentional: it
+  # (The statements below share one line deliberately (#8831). The unquoted $(...) is intentional: it
   # expands to a single `--dry-run` token or nothing, never anything word
   # splitting could mis-tokenize — hence the SC2046 disable directly below.
   # That directive covers only the ONE statement that follows it, which is why

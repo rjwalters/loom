@@ -4,18 +4,11 @@
 
 use super::*;
 use crate::forge_bucket_book::{self, BucketKey, Resource};
+use crate::gh_invocation::test_support::stub;
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation, ParentContext};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
 
 fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
     GhInvocation::new(
@@ -489,12 +482,17 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
             "installation",
             "op",
             "outcome",
+            "purpose",
             "resource",
             "role",
+            "route",
             "target_owner"
         ]
     );
     assert_eq!(ok_point.labels["target_owner"], "acme");
+    // 2am#4367 P4: a read sent to GitHub directly (no gateway) is the
+    // writer-read share the gateway canary measures.
+    assert_eq!(ok_point.labels["route"], "direct_read");
     assert_eq!(ok_point.labels["agent"], "-", "the daemon's own row (#10607)");
     assert_eq!(ok_point.labels["resource"], "graphql");
     assert_eq!(ok_point.labels["role"], "writer");

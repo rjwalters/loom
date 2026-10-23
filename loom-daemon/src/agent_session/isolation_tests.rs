@@ -80,9 +80,17 @@ fn a_session_gets_the_host_sink_beside_its_private_tmpdir() {
             "CLAUDE_CONFIG_DIR",
             "TMPDIR",
             "LOOM_FORGE_CALL_STATS_DIR",
-            "LOOM_GH_BOOKED"
+            "LOOM_GH_BOOKED",
+            // 2am#4367 P4: no gh update check; the gateway dir (blank: off).
+            "GH_NO_UPDATE_NOTIFIER",
+            "LOOM_GH_GATEWAY_DIR",
+            // #12207: the reader root the front's served reads fall back to.
+            "LOOM_GH_READER_ROOT",
+            // 2am#4501: this release's hooks (blank in tests: none).
+            "LOOM_HOOKS_HOME"
         ]
     );
+    assert_eq!(all[7].1, "", "no hooks home means a blank, never an inherited value");
     assert_eq!(all[1].1, "/repo/.loom/claude-config/b-1/tmp");
     assert_eq!(all[2].1, "/var/host-tmp/loom-forge-call-stats");
     assert!(

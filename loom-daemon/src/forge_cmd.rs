@@ -225,21 +225,8 @@ pub(crate) fn parse_host(url: &str) -> Option<String> {
     None
 }
 
-/// Get the `origin` remote URL from `cwd`, or `None`.
-pub(crate) fn get_remote_url(cwd: &Path) -> Option<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .stdin(Stdio::null());
-    let outcome = run_command(cmd, FORGE_CMD_TIMEOUT);
-    let out = outcome.ok_output()?;
-    let url = std::str::from_utf8(&out.stdout).ok()?.trim().to_string();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url)
-    }
-}
+mod remote_url;
+pub(crate) use remote_url::get_remote_url;
 
 /// Determine forge type from a hostname, consulting the configured Gitea URL.
 fn detect_from_host(host: &str, forge_config: &Value) -> ForgeType {
@@ -820,6 +807,8 @@ pub enum ForgeCmd {
     },
     /// `forge version-only-diff` (#9611): see [`crate::forge_version_only_diff`].
     VersionOnlyDiff(crate::forge_version_only_diff::Args),
+    /// `forge suspect-critical-diff` (#12999): see [`crate::forge_suspect_critical_diff`].
+    SuspectCriticalDiff(crate::forge_suspect_critical_diff::Args),
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
     /// to `forge_merge_pr`. See
@@ -893,6 +882,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             crate::verdict_equivalence::handle(pr, &reviewed, &head)
         }
         ForgeCmd::VersionOnlyDiff(args) => crate::forge_version_only_diff::handle(&args),
+        ForgeCmd::SuspectCriticalDiff(args) => crate::forge_suspect_critical_diff::handle(&args),
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }

@@ -51,6 +51,8 @@
 //! `LOOM_DAEMON_SELF_BIN` seam matters: every run here is pinned to the binary
 //! built from *this* tree, never to whatever the host has installed.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -117,25 +119,11 @@ impl Fixture {
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-wt-return-diff-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmpdir");
-    fs::canonicalize(&base).expect("canonicalize tmpdir")
+    common::unique_tmpdir("loom-wt-return-diff", tag)
 }
 
 fn hermetic(cmd: &mut Command) -> &mut Command {
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-        .env("LC_ALL", "C")
-        .env("TERM", "dumb")
+    common::hermetic_git(cmd)
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -546,3 +534,8 @@ fn an_unresolvable_daemon_is_neither_answer() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

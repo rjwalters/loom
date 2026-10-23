@@ -54,7 +54,8 @@ fn guarded_paths(rel: &str, text: &str) -> usize {
 #[test]
 fn all_paths_call_the_guard_before_the_force_push() {
     for (rel, expected) in [
-        ("defaults/.claude/commands/loom/judge.md", 3),
+        // 2: the BEHIND path no longer updates the branch at all (#12063 D6).
+        ("defaults/.claude/commands/loom/judge.md", 2),
         // 2, not 3: the unlabeled-queue block no longer pushes itself; it defers to
         // "PR Has Merge Conflicts" (#10771), so it has no gate-then-push path of its own.
         ("defaults/.claude/commands/loom/doctor.md", 2),
@@ -78,7 +79,7 @@ fn judge_no_longer_carries_its_own_empty_diff_predicate() {
 #[test]
 fn every_prompt_call_site_warns_when_the_guard_gives_no_answer() {
     for (rel, expected) in [
-        ("defaults/.claude/commands/loom/judge.md", 3),
+        ("defaults/.claude/commands/loom/judge.md", 2),
         ("defaults/.claude/commands/loom/doctor.md", 2),
     ] {
         let text = shipped(rel);

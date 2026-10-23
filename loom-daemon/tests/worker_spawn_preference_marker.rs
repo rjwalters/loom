@@ -92,3 +92,8 @@ fn an_unconfigured_launch_records_no_preference_line() {
     assert!(text.contains("# LOOM_RUNTIME_RESOLVED runtime=opencode"), "{text}");
     assert!(!text.contains("LOOM_RUNTIME_PREFERENCE"), "{text}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

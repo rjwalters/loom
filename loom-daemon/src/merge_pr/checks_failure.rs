@@ -34,8 +34,8 @@
 //! rollup already fetched (`forge_get_check_runs`), and `required` from
 //! `forge_get_required_status_check_contexts` — the two-source (rulesets +
 //! classic branch protection) lookup that also backs GitHub AND Gitea, unlike
-//! the GitHub-only `loom-daemon merge-pr stale-checks` lookup this deliberately
-//! does not reuse. A failure of THAT lookup is refused by the shell before
+//! the GitHub-only `stale_checks::fetch::required_contexts` lookup (which
+//! backs `required-checks`) this deliberately does not reuse. A failure of THAT lookup is refused by the shell before
 //! this classification ever runs (fails closed, mirroring the #6104 UNSTABLE
 //! fallback) — [`classify`] only runs once a `required` answer already exists.
 

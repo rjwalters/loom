@@ -30,7 +30,7 @@
 //! contain spaces and shell metacharacters.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Which tree a verb operates on.
 ///
@@ -109,11 +109,11 @@ pub struct Out {
     pub json: bool,
 }
 
-const RED: &str = "\x1b[0;31m";
-const GREEN: &str = "\x1b[0;32m";
-const YELLOW: &str = "\x1b[1;33m";
-const BLUE: &str = "\x1b[0;34m";
-const NC: &str = "\x1b[0m";
+pub(super) const RED: &str = "\x1b[0;31m";
+pub(super) const GREEN: &str = "\x1b[0;32m";
+pub(super) const YELLOW: &str = "\x1b[1;33m";
+pub(super) const BLUE: &str = "\x1b[0;34m";
+pub(super) const NC: &str = "\x1b[0m";
 
 impl Out {
     #[must_use]
@@ -328,6 +328,35 @@ pub fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `$(git -C "$dir" … 2>/dev/null)` — stdout with only trailing CR/LF removed
+/// (command substitution strips nothing else), `None` when git exits non-zero
+/// or could not run. Unlike [`git_stdout`], leading/trailing spaces survive.
+pub(super) fn git_stdout_nl(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = git(dir, args)?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim_end_matches(['\n', '\r'])
+            .to_string(),
+    )
+}
+
+/// `git -C "$dir" … >/dev/null 2>&1; echo $?` — a git that cannot be spawned
+/// answers 127, matching bash's own report for that failure; it is >1, so
+/// callers read it as an error rather than as data.
+pub(super) fn git_status_code(dir: &Path, args: &[&str]) -> i32 {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_or(127, |s| s.code().unwrap_or(127))
 }
 
 /// Is `dir` a git working tree? Mirrors the shell's

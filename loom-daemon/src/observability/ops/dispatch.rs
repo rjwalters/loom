@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use chrono::{DateTime, Utc};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{Admission, TickReport};
@@ -30,7 +30,7 @@ use crate::work_finder::{Admission, TickReport};
 /// `claim_collision`, `claim_lock_held`), so their parents are reported net of
 /// them: every candidate lands in exactly one reason.
 #[must_use]
-pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
+pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 23] {
     let classified_errors =
         report.refused_token_selection + report.refused_claim_collision + report.refused_claim_lock;
     [
@@ -56,10 +56,7 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
         ("recheck_interval", report.skipped_recheck_interval),
         ("host_constraint", report.skipped_host_constraint),
         ("capacity", report.deferred_capacity),
-        ("ramp_cap", report.deferred_ramp_cap),
-        ("saturation", report.deferred_saturation),
         ("build_backoff", report.deferred_build_backoff),
-        ("repo_cap", report.deferred_repo_cap),
         ("error", report.errors.saturating_sub(classified_errors)),
         // Typed dispatch refusals (Issue #8907) — one contiguous block.
         ("lease_order_lost", report.refused_lease_order),
@@ -74,15 +71,19 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | value | when |
 /// |---|---|
 /// | `dispatched` | at least one sweep started |
-/// | `halted_<cause>` | every held workspace names one cause, e.g. `halted_main_red`, `halted_disk_reservation` (#11649; see [`halted_result`]) |
+/// | `halted_<cause>` | the hold covered the tick's work (#11857: every workspace with candidates was held, or every workspace when none had any; see [`TickReport::note_halts`]) and every held workspace names one cause, e.g. `halted_main_red`, `halted_drain` (#11649; see [`halted_result`]) |
 /// | `halted_ci_billing` | the `ci_billing` cause, or a cause-less hold while an owner's Actions jobs are billing-blocked (#10113) |
 /// | `halted` | held, but by several causes or by none named (`loom.dispatch.halt_causes` lists them) |
-/// | `saturation_held` | the saturation admission brake was engaged |
 /// | `error` | a dispatch or listing failed and nothing started |
 /// | `build_backoff_held` | the build back-off (#9410) deferred at least one candidate |
 /// | `no_eligible_work` | no ready candidates at all |
-/// | `capacity_full` | candidates deferred by the concurrency or ramp cap |
+/// | `capacity_full` | candidates deferred by the concurrency cap |
 /// | `all_skipped` | every candidate was skipped for a per-issue reason |
+///
+/// A partial hold (#11857: [`TickReport::halt_partial`]) falls through to the
+/// rows below it: one held repo no longer masks why the others dispatched
+/// nothing. Its causes stay on `loom.dispatch.halt_causes` and its size on
+/// `loom.dispatch.held_roots`.
 #[must_use]
 pub fn tick_result(report: &TickReport) -> &'static str {
     tick_result_with(report, crate::ci_telemetry::billing::any_blocked())
@@ -93,10 +94,8 @@ pub fn tick_result(report: &TickReport) -> &'static str {
 pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static str {
     if report.dispatched > 0 {
         "dispatched"
-    } else if report.halted {
+    } else if report.halted && !report.halt_partial {
         halted_result(&report.halt_causes, billing_blocked)
-    } else if report.saturation_held {
-        "saturation_held"
     } else if report.errors > 0 {
         "error"
     } else if report.deferred_build_backoff > 0 {
@@ -107,7 +106,7 @@ pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static 
         "build_backoff_held"
     } else if report.seen == 0 {
         "no_eligible_work"
-    } else if report.deferred_capacity + report.deferred_ramp_cap > 0 {
+    } else if report.deferred_capacity > 0 {
         "capacity_full"
     } else {
         "all_skipped"
@@ -133,13 +132,11 @@ pub fn halted_result(causes: &[HaltCause], billing_blocked: bool) -> &'static st
             HaltCause::TokenPool => "halted_token_pool",
             HaltCause::PreflightAdvisory => "halted_preflight_advisory",
             HaltCause::Drain => "halted_drain",
-            HaltCause::Breaker => "halted_breaker",
             HaltCause::WriteScope => "halted_write_scope",
             HaltCause::CiBilling => "halted_ci_billing",
             HaltCause::InstallIncompatible => "halted_install_incompatible",
             HaltCause::DaemonTooOld => "halted_daemon_too_old",
             HaltCause::MaintainOnly => "halted_maintain_only",
-            HaltCause::DiskReservation => "halted_disk_reservation",
             HaltCause::WeightZero => "halted_weight_zero",
         },
         _ => "halted",
@@ -166,6 +163,17 @@ pub fn tick_points(report: &TickReport, max_concurrent: usize) -> Vec<MetricPoin
     points
 }
 
+/// The context of the tick span that starts at `started_at` (#12256): known
+/// before the tick runs, so the tick's forge calls can be parented to it
+/// ([`crate::gh_invocation::telemetry::enter_parent`]). Pure.
+#[must_use]
+pub fn tick_context(started_at: DateTime<Utc>) -> TraceContext {
+    TraceContext::derived(
+        SpanName::DispatchTick.as_str(),
+        &[&crate::telemetry::trace::instant(started_at)],
+    )
+}
+
 /// The tick's span: its own sampled root trace covering `started_at..ended_at`,
 /// its ID derived from the tick's start instant.
 #[must_use]
@@ -182,6 +190,7 @@ pub fn tick_span(
         ("loom.dispatch.dispatched", report.dispatched.to_string()),
         ("loom.dispatch.errors", report.errors.to_string()),
         ("loom.dispatch.max_concurrent", max_concurrent.to_string()),
+        ("loom.dispatch.held_roots", report.held_roots.to_string()), // #11857
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
@@ -193,12 +202,14 @@ pub fn tick_span(
         let causes: Vec<&str> = report.halt_causes.iter().map(|c| c.as_str()).collect();
         attributes.insert("loom.dispatch.halt_causes".to_string(), causes.join(","));
     }
+    if let Some(kind) = report.error_kind() {
+        // #11973: why `loom.dispatch.errors` is non-zero, from a fixed set
+        // (`work_finder::tick_report::error_kind`); absent on a clean tick.
+        attributes.insert("loom.dispatch.error_kind".to_string(), kind.to_string());
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
-        context: TraceContext::derived(
-            SpanName::DispatchTick.as_str(),
-            &[&crate::telemetry::trace::instant(started_at)],
-        ),
+        context: tick_context(started_at),
         parent_span_id: None,
         name: SpanName::DispatchTick,
         started_at,
@@ -263,7 +274,7 @@ pub fn admission_spans(
                 attributes.insert("loom.repo".to_string(), repo_ref.repo.clone());
                 attributes.insert(
                     "loom.repo.visibility".to_string(),
-                    visibility_str(repo_ref.visibility).to_string(),
+                    repo_ref.visibility.as_str().to_string(),
                 );
                 // Issue #9674: stamp the repo's lockout weight on the very
                 // admission spans the open-PR guard produced.
@@ -317,17 +328,6 @@ pub fn admission_spans(
         .collect()
 }
 
-/// UCUM-free wire text for a repo visibility tag (mirrors the private
-/// `visibility_str` helpers in `otlp::mapping` and `ci_telemetry::records` —
-/// each ops-adjacent module keeps its own copy rather than sharing one across
-/// unrelated call graphs).
-fn visibility_str(visibility: crate::telemetry::RepoVisibility) -> &'static str {
-    match visibility {
-        crate::telemetry::RepoVisibility::Public => "public",
-        crate::telemetry::RepoVisibility::Private => "private",
-    }
-}
-
 /// The workspace roots referenced by `admissions` and by `report`'s ready-
 /// queue rows, resolved through the synchronous
 /// [`super::super::repo_ref::cached_repo_ref`] cache the collector populates
@@ -353,7 +353,9 @@ fn resolved_repo_refs(
         let Some(root) = roots.get(idx) else {
             continue;
         };
+        // #11858: before the collector's first pass, the checkout's origin.
         if let Some(repo_ref) = super::super::repo_ref::cached_repo_ref(&root.display().to_string())
+            .or_else(|| super::dispatch_facts::fallback_repo_ref(root))
         {
             resolved.insert(idx, repo_ref);
         }
@@ -428,7 +430,13 @@ pub fn record_tick(
         &failed,
         completed_at,
     );
-    let tick = tick_span(report, max_concurrent, started_at, completed_at);
+    let mut tick = tick_span(report, max_concurrent, started_at, completed_at);
+    // #11858: the cap, pre-filtered skips and held repos.
+    let cap = super::dispatch_facts::published_cap().filter(|c| c.configured == max_concurrent);
+    let held = super::dispatch_facts::current_halted_repos();
+    tick.attributes
+        .extend(super::dispatch_facts::tick_attributes(report, cap, held));
+    sink.emit_metrics_since(super::dispatch_facts::tick_points(report, cap), Some(started_at));
     for span in admission_spans(report, &tick, &repo_refs, &lockouts) {
         sink.emit_span(span);
     }
