@@ -1726,6 +1726,13 @@ pub mod forge {
                 reg.config().workspace_root.clone()
             };
             let gh_bin = PathBuf::from(crate::gh_invocation::gh_bin());
+            // Forge-write scope (#9548): never label or comment in a repo this
+            // checkout may not write to.
+            if !crate::write_scope::gate_root_with(&root, &gh_bin, "epic revisit") {
+                return Err(anyhow!(
+                    "epic revisit escalation for #{epic} skipped: repo not writable"
+                ));
+            }
             let n = epic.to_string();
             let label = gh_call::output(
                 gh_call::write("epic_revisit.add_label", &gh_bin, &root)
