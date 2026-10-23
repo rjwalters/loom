@@ -81,6 +81,29 @@ An audit of 16 merged PRs whose heads moved after approval found six moved
 heads: four clean fleet merges of `main`, two rebases, all six with
 byte-identical patches.
 
+### Unreadable compares and the requested-change carry (#13114)
+
+Two further cases cost operators a second release for the same concern:
+
+- **An unreadable forge compare.** `patch_identity` retries a compare that gives
+  no parsable answer twice (fixed short backoff, no loop) before answering
+  "could not tell". A compare that stays unreadable still re-arms (fail closed),
+  but its reason line carries `equivalence=unread`, and the re-arm's
+  `hold.transition` record uses the trigger `champion_role_equivalence_unread`,
+  so an outage is countable apart from a real change.
+- **A Doctor push that makes only the requested change.** A trusted human
+  comment (the #9548 rule; never a bot or Champion) posted after the hold may
+  carry one `release-scope: <path> [<path>...]` line naming the paths the Doctor
+  was asked to change. The tick passes them as `forge verdict-equivalent
+  --allowed-paths`; the verb answers `EQUIVALENCE_KIND=requested-change` only
+  when the per-file delta between the two three-dot compares is non-empty and
+  lies wholly inside that set. The release comment records the kind and the
+  paths so the Judge's re-verdict can confirm the change. Any other delta, no
+  line, or either kill switch (`LOOM_VERDICT_EQUIVALENCE`,
+  `LOOM_VERDICT_TREE_CARVEOUT`) re-arms as before. Judge verdicts never carry on
+  this kind (`verdict-staleness-guard.sh` passes no paths), and CI is not
+  exempted.
+
 Three properties are not negotiable, and the prompt restates each one:
 
 1. **Evidence, never shape.** No commit message, author, or ref-update shape is
