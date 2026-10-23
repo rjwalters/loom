@@ -175,6 +175,12 @@ if [ "$CRITERION3_RESULT" = "FAIL" ]; then
       else
         CF_REARM_NOTE=""
       fi
+      # #12999: name the suspect line criterion #3 matched, not just the file.
+      # Empty when the hold is a plain pattern hit (migrations, workflows, no patch).
+      CF_SUSPECT_NOTE=""
+      [ -n "${CRITERION3_SUSPECT_LINE:-}" ] &&
+        CF_SUSPECT_NOTE="
+- **Matched suspect line** (in \`[${CRITERION3_SUSPECT_SECTION:-?}]\`): \`${CRITERION3_SUSPECT_LINE}\`"
       CF_WF_NOTE=""   # #10539
       gh pr diff "$PR_NUMBER" --name-only 2>/dev/null | grep -q '^\.github/workflows/' &&
         CF_WF_NOTE="
@@ -190,7 +196,7 @@ Merging workflow files needs the \`workflow\` token scope: \`gh auth refresh -h 
 
 ${CF_REARM_NOTE}This PR modifies a critical file and cannot be automatically merged:
 
-- **Critical File Exclusion Check**: <FILE_PATH> matches critical-file pattern \`<PATTERN>\`
+- **Critical File Exclusion Check**: <FILE_PATH> matches critical-file pattern \`<PATTERN>\`${CF_SUSPECT_NOTE}
 
 **Next steps** — to merge it yourself, two commands, in either order, no race:
 

@@ -293,6 +293,17 @@ check "present" "$(label)" "loom:blocked kept while the trusted read fails"
 rm -f "$T/trust_down"
 tick PASS; check "LABEL-:loom:blocked;COMMENT:cleared" "$WRITES" "trust filter back: the clear lands"
 
+echo "--- #12999: the hold notice names the matched suspect line ---"
+reset "$A"
+CRITERION3_SUSPECT_LINE='+serde = "1"' CRITERION3_SUSPECT_SECTION=dependencies tick
+check "COMMENT:hold;LABEL+:loom:blocked" "$WRITES" "a suspect-line FAIL holds as before"
+check "1" "$(jq -r '[.[].body | select(contains("**Matched suspect line** (in `[dependencies]`): `+serde = \"1\"`"))] | length' "$T/comments.json")" \
+    "the hold comment shows the matched line and its section"
+reset "$A"
+tick
+check "0" "$(jq -r '[.[].body | select(contains("Matched suspect line"))] | length' "$T/comments.json")" \
+    "a plain pattern hit (no suspect line) carries no matched-line bullet"
+
 echo
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]]
