@@ -526,6 +526,14 @@ pub(crate) enum ForgeAction {
         /// The PR's current head (7-40 lowercase hex).
         #[arg(value_name = "HEAD")]
         head: String,
+
+        /// Paths an operator's release named as the requested change (#13114).
+        /// When the PR's patch differs ONLY in these paths the answer is
+        /// `EQUIVALENCE_KIND=requested-change`; any other delta, or an empty
+        /// list, answers as without the flag. Only Champion's critical-file
+        /// hold passes it; a Judge verdict never carries on this kind.
+        #[arg(long = "allowed-paths", value_name = "PATH", num_args = 1..)]
+        allowed_paths: Vec<String>,
     },
 
     /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
@@ -1260,10 +1268,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             pr_number,
             reviewed,
             head,
+            allowed_paths,
         } => ForgeCmd::VerdictEquivalent {
             pr: pr_number,
             reviewed,
             head,
+            allowed_paths,
         },
         ForgeAction::VersionOnlyDiff {
             pr_number,
