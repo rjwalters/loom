@@ -243,6 +243,7 @@ pub fn fetch_and_verify_artifact(
 
     let inputs = FetchInputs {
         repo_root,
+        binary: crate::release_fetch::fetch::DAEMON_BIN,
         target,
         repo_slug,
         tag,
