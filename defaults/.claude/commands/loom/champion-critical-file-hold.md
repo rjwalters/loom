@@ -46,7 +46,12 @@ A `"criticalFilesOnly": true` class (#12648) passes `critical-files` the same wa
 matched against the critical-file hits alone (the files `critical-files` flags, and each
 one's `previous_filename`): every hit must match its `filePatterns`, none its
 `excludeFilePatterns`, no forbidden line in the hits' patches, no kept-set path
-anywhere in the PR, conditions holding. The other changed files are left to
+anywhere in the PR, conditions holding. Several such classes compose per hit
+(#13042): the criterion passes when each hit is covered by at least one passing
+class, each class checked over its own hits, and the PASS names every class used
+(the `auth=` digest stays the whole-list `--digest`). The hold comment quotes the
+evaluator's `STANDING_AUTH_WHY` (class, hit and failed check) instead of asserting
+that no class covers the PR. The other changed files are left to
 the `merge-risk` criterion, which this class never satisfies. A PASS under it closes an open
 episode through the same ordinary PASS row; if the `merge-risk` criterion then holds the PR,
 that is the `merge-risk` criterion's own hold, not this machine's.
