@@ -239,7 +239,7 @@ Full convention and rationale: `.loom/docs/untrusted-external-content.md`. A mar
 
 ## Safety Criteria
 
-For each `loom:pr` PR, verify ALL 6 safety criteria. If ANY criterion fails, do NOT merge.
+For each `loom:pr` PR, verify ALL 6 safety criteria, plus the ratification hold (3a). If ANY criterion fails, do NOT merge.
 
 ### 0. PR facts: one read for every criterion (#12242)
 
@@ -1797,6 +1797,11 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITERION3_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise), plus `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION` when the FAIL named a suspect line. That file owns the whole state machine: the `loom:blocked` label and its reason-only park record (#11861, was `loom:operator`), the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:blocked` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
 
 A FAIL skips Steps 2-3 for this PR this pass in **every** one of those states, including a released one — releasing the hold hands the merge to the operator, never back to Champion — and `loom:auto-merge-ok` does not release it (that override is scoped to criterion #2).
+
+### 3a. Ratification Hold (#12992)
+- [ ] No spec/decision file in the PR declares that merging it ratifies it
+
+Run [`champion-ratification-hold.md`](champion-ratification-hold.md)'s tick on every PR that reaches this point, whatever criteria #2 and #3 returned. It asks `loom-daemon champion-hold ratification --pr <N>` (a mechanical detector over the PR's head contents, never merge-risk judgment) and owns a **hard hold**: `loom:blocked` + a reason-only park record + its own markers, notice "merging ratifies; the operator approves". It is **never waived**: `standing_auth_eval` is not consulted for it, no `champion.standingAuthorizations` class clears it, `loom:auto-merge-ok` and criterion #2's release phrases do not release it, and a hand-removed `loom:blocked` is put back. Only a trusted non-bot comment opening `clear the hold —` releases it. When the tick sets `SKIP_REMAINING=true` (`hold`, `stands`, `defer`) skip Steps 2-3 for this PR this pass.
 
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
