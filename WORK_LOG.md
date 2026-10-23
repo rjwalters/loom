@@ -15,6 +15,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-23
 
+- **PR #12996**: fix: anchor labels kept-set globs and ignore comments/GITHUB_TOKEN in forbiddenDiffPatterns
+- **Issue #12995** (closed): Champion: fix pattern over-matches (labels.json kept-set, comment lines, GITHUB_TOKEN) in forbiddenDiffPatterns
+- **PR #13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
+- **Issue #13031** (closed): Champion champion_merge merged two PRs touching .github/workflows/ci.yml with no critical-file hold or self-release record
 - **PR #13083**: refactor(mcp-loom): remove empty log-tools stub module
 - **Issue #13079** (closed): Remove empty mcp-loom log-tools stub module (logs.ts)
 - **PR #13080**: fix(safehouse): send dispatch digests without a task_id
