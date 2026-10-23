@@ -1,10 +1,10 @@
 //! `loom-daemon forge suspect-critical-diff <pr> <file>` (#12999) — the
-//! fail-closed, hunk-aware decision behind Champion criterion #3's second
+//! fail-closed, hunk-aware decision behind Champion's `critical-files` criterion's second
 //! carve-out, beside `forge version-only-diff` (#9611).
 //!
 //! # What the question is
 //!
-//! Criterion #3 holds any PR whose file list matches `CRITICAL_PATTERNS`. For
+//! The `critical-files` criterion holds any PR whose file list matches `CRITICAL_PATTERNS`. For
 //! `Cargo.toml` / `package.json` that held harmless edits too (#12976 added two
 //! `[[bin]]` entries to `loom-daemon/Cargo.toml`). The operator ruled
 //! (2026-10-21) to hold only on *suspect* hunks. This verb answers, for one

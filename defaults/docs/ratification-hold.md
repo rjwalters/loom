@@ -46,7 +46,7 @@ Same shape (`loom:blocked` + reason-only park record + marker comments, so the
 janitor's `loom:pr` + `loom:blocked` exception and `merge-pr.sh`'s #8112 guard
 need no change), two deliberate differences:
 
-1. **Never waivable.** `standing_auth_eval` runs inside criteria #2 and #3 only;
+1. **Never waivable.** `standing_auth_eval` runs inside `merge-risk` and `critical-files` only;
    this hold is evaluated outside it, so no `champion.standingAuthorizations`
    class (any flag combination) applies. The #12950 self-release path skips it
    because it keys on the merge-risk hold's marker, not this one.
@@ -54,7 +54,7 @@ need no change), two deliberate differences:
    treats a hand-removed `loom:blocked` as the release (#9016). Here the
    operator must *act*, so a removed label is re-asserted by the next tick, and
    only a trusted non-bot, non-Champion comment opening with `clear the hold —`
-   (the #12599 trusted-person rule; narrower than criterion #2's phrases:
+   (the #12599 trusted-person rule; narrower than `merge-risk`'s phrases:
    `merge anyway` / `ok to merge` do not release a ratification) ends it.
 
 A release is scoped to a head. A later push that still declares ratification

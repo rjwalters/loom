@@ -15,7 +15,7 @@
 //! - It is a pure function of the PR's **head contents** ([`scan`]), so a
 //!   re-evaluation is deterministic.
 //! - No `champion.standingAuthorizations` class is ever consulted for it
-//!   (`standing_auth_eval` runs only inside criteria #2/#3), and the #12950
+//!   (`standing_auth_eval` runs only inside `merge-risk`/`critical-files`), and the #12950
 //!   self-release path skips it: the hold's own marker ([`HOLD_MARKER`]) is
 //!   what [`super::standing_hold`] reads, and [`super::HoldKind::Ratification`]
 //!   outranks the other holds there.
@@ -224,7 +224,7 @@ impl Comment {
 /// Whether `body` opens with a release instruction: `clear|lift|override [the|
 /// this] hold` as the leading clause (first sentence of the first line, minus
 /// an `@mention` / `please` courtesy prefix), and that clause is not a
-/// question. Narrower than criterion #2's `RELEASE_DEFS`: "merge anyway" and
+/// question. Narrower than `merge-risk`'s `RELEASE_DEFS`: "merge anyway" and
 /// "ok to merge" do not release a ratification, only an explicit hold clear.
 #[must_use]
 pub fn is_release_instruction(body: &str) -> bool {

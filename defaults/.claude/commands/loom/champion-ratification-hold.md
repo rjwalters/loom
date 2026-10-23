@@ -1,8 +1,8 @@
 # Champion: Ratification Hold (#12992)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Safety Criteria"
-→ "3a. Ratification Hold". Read it on **every** PR that reaches the criteria,
-whatever criteria #2 and #3 said. It owns `loom:blocked` + a reason-only park
+→ "`ratification`: Ratification Hold". Read it on **every** PR that reaches the criteria,
+whatever `merge-risk` and `critical-files` said. It owns `loom:blocked` + a reason-only park
 record and three markers on one PR; it never merges and never removes
 `loom:pr`.
 
@@ -26,7 +26,7 @@ Rationale: `.loom/docs/ratification-hold.md`.
 - **Never waived.** `standing_auth_eval` is not consulted: no
   `champion.standingAuthorizations` class, with or without `coversCriticalFiles`
   or `criticalFilesOnly`, passes this step. The #12950 self-release path skips
-  it, `loom:auto-merge-ok` does not release it, and criterion #2's
+  it, `loom:auto-merge-ok` does not release it, and `merge-risk`'s
   "Sticky holds" release phrases (`merge anyway`, `ok to merge`) do not.
 - **The release is a person's comment, never the label's absence.** A trusted,
   non-`[bot]`, non-Champion comment opening with `clear the hold —` releases it
