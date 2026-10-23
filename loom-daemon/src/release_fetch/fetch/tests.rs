@@ -171,6 +171,7 @@ fn successful_fetch_verifies_and_reports_the_artifact() {
 
     let inputs = FetchInputs {
         repo_root: &dir,
+        binary: "loom-daemon",
         target: "x86_64-unknown-linux-gnu",
         repo_slug: "test-owner/test-repo",
         tag: "v0.16.0",
@@ -205,6 +206,61 @@ fn successful_fetch_verifies_and_reports_the_artifact() {
     }
 }
 
+/// #12940: `binary` names the asset. A `loom-tools` fetch downloads and
+/// verifies `loom-tools-<triple>`, and never reads the daemon asset beside it.
+#[test]
+#[serial]
+fn tools_binary_fetch_uses_the_loom_tools_asset_name() {
+    let dir = tempdir();
+    let assets = write_checksummed_assets(&dir, "loom-tools-x86_64-unknown-linux-gnu");
+    // A daemon asset with a WRONG checksum sits beside it: if the fetch read it
+    // the outcome would be a mismatch.
+    std::fs::write(assets.join("loom-daemon-x86_64-unknown-linux-gnu"), b"daemon").unwrap();
+    std::fs::write(assets.join("loom-daemon-x86_64-unknown-linux-gnu.sha256"), "0  x\n").unwrap();
+
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    let mut inputs = linux_inputs(&dir);
+    inputs.binary = TOOLS_BIN;
+
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        outcome = Some(fetch_and_verify(&inputs));
+    });
+    match outcome.unwrap() {
+        FetchOutcome::Verified { artifact, .. } => {
+            assert_eq!(
+                artifact.bin_path.file_name().unwrap(),
+                "loom-tools-x86_64-unknown-linux-gnu"
+            );
+            let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+        }
+        _ => panic!("expected a Verified loom-tools fetch"),
+    }
+}
+
+/// #12940: a published tag that carries only the daemon asset must fail closed
+/// for `loom-tools`: no fallback to the daemon binary, no soft success.
+#[test]
+#[serial]
+fn tools_binary_fetch_fails_closed_when_the_tag_lacks_the_tools_asset() {
+    let dir = tempdir();
+    let assets = write_checksummed_assets(&dir, "loom-daemon-x86_64-unknown-linux-gnu");
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    let mut inputs = linux_inputs(&dir);
+    inputs.binary = TOOLS_BIN;
+
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        outcome = Some(fetch_and_verify(&inputs));
+    });
+    assert!(
+        matches!(outcome.unwrap(), FetchOutcome::DownloadFailed(_)),
+        "a tag without the tools asset must be a download failure"
+    );
+}
+
 /// AC2: a checksum mismatch aborts the WHOLE update -- never a soft
 /// fallback -- and the scratch directory is NOT left behind (trapped, not
 /// leaked, even inside this process's own lifetime).
@@ -228,6 +284,7 @@ fn checksum_mismatch_fails_closed_and_removes_its_scratch_dir() {
 
     let inputs = FetchInputs {
         repo_root: &dir,
+        binary: "loom-daemon",
         target: "x86_64-unknown-linux-gnu",
         repo_slug: "test-owner/test-repo",
         tag: "v0.16.0",
@@ -294,6 +351,7 @@ fn missing_release_asset_is_a_download_failure_not_a_verification_failure() {
 
     let inputs = FetchInputs {
         repo_root: &dir,
+        binary: "loom-daemon",
         target: "x86_64-unknown-linux-gnu",
         repo_slug: "test-owner/test-repo",
         tag: "v0.16.0",
@@ -340,6 +398,7 @@ pub(super) fn write_checksummed_assets(dir: &Path, bin_name: &str) -> PathBuf {
 pub(super) fn linux_inputs<'a>(dir: &'a Path) -> FetchInputs<'a> {
     FetchInputs {
         repo_root: dir,
+        binary: "loom-daemon",
         target: "x86_64-unknown-linux-gnu",
         repo_slug: "test-owner/test-repo",
         tag: "v0.16.0",

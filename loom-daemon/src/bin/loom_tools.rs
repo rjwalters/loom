@@ -1,7 +1,9 @@
 //! `loom-tools`: the tools-only entry point (#12938, epic #12708; design
 //! `docs/design/loom-tools-cli-boundary.md` §6.2 step 4, §7.3, §10).
 //!
-//! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939). The handlers are the
+//! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939), plus the
+//! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940): the
+//! tools-only installer (`scripts/install/provision-tools.sh`) has no daemon to call. The handlers are the
 //! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config`
 //! call), so there is no second copy. This crate links `loom_daemon` and not
 //! `daemon_service`, which is private to the `loom-daemon` bin.
@@ -18,7 +20,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
     config_get_dispatch, handle_checkpoint_command, handle_strip_ansi_command, CheckpointAction,
-    ConfigArgs,
+    ConfigArgs, InstallBinaryCommand, ReleaseFetchArgs, ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::tools_mode::{self, Route};
@@ -26,7 +28,7 @@ use loom_daemon::tools_mode::{self, Route};
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -49,6 +51,17 @@ enum ToolsCommands {
     },
     /// Read the resolved effective config (`config get mode`).
     Config(ConfigArgs),
+    /// Download, verify and print a release binary (`--bin loom-tools` for
+    /// this one): the same checksum/signature/glibc verification as
+    /// `loom-daemon release-fetch`.
+    ReleaseFetch(ReleaseFetchArgs),
+    /// Stage a binary beside its destination and publish it over it, keeping
+    /// the previous one as `<dest>.previous` (same as `loom-daemon install-binary`).
+    #[command(subcommand)]
+    InstallBinary(InstallBinaryCommand),
+    /// Resync a workspace's installed Loom from the payload embedded in this
+    /// binary (same as `loom-daemon resync-payload`).
+    ResyncPayload(ResyncPayloadArgs),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -109,6 +122,9 @@ fn run() -> Result<()> {
             handle_checkpoint_command(action)
         }
         ToolsCommands::Config(args) => config_get_dispatch(args),
+        ToolsCommands::ReleaseFetch(args) => args.run(),
+        ToolsCommands::InstallBinary(cmd) => cmd.run(),
+        ToolsCommands::ResyncPayload(args) => args.run(),
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }

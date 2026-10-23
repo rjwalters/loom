@@ -58,9 +58,18 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// not paid for in minutes of `DOWNLOAD_TIMEOUT`.
 const PUBLISHED_ASSET_ATTEMPTS: u32 = 2;
 
+/// The release binary the daemon installer fetches (the default).
+pub const DAEMON_BIN: &str = "loom-daemon";
+/// The agent-tools binary published beside the daemon under the same tag
+/// (#12940, epic #12708).
+pub const TOOLS_BIN: &str = "loom-tools";
+
 /// Inputs to one fetch-and-verify.
 pub struct FetchInputs<'a> {
     pub repo_root: &'a Path,
+    /// Which release binary to fetch: [`DAEMON_BIN`] or [`TOOLS_BIN`]
+    /// (`<binary>-<target>` names the asset, #12940).
+    pub binary: &'a str,
     pub target: &'a str,
     pub repo_slug: &'a str,
     pub tag: &'a str,
@@ -453,7 +462,7 @@ pub(super) fn verify_core(
         }
     };
 
-    let bin_name = format!("loom-daemon-{}", inputs.target);
+    let bin_name = format!("{}-{}", inputs.binary, inputs.target);
     let sha_name = format!("{bin_name}.sha256");
     let sig_name = format!("{bin_name}.sig");
     let cert_name = format!("{bin_name}.pem");
@@ -587,6 +596,7 @@ pub(super) fn verify_core(
     let gate_inputs = source::GateInputs {
         slug: inputs.repo_slug,
         tag: inputs.tag,
+        binary: inputs.binary,
         target: inputs.target,
         asset_sha256: &asset_sha,
         anchor: &policy.approved_source_anchor,
