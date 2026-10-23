@@ -1037,7 +1037,7 @@ resync_upstream_path() {
 # RESYNC_WAIVER_RECORD (one "path: sha" line per kept-set file) and RESYNC_WAIVER_REASON.
 # Reads PR_NUMBER and KEPT_SET_PATTERNS. Every step fails closed.
 resync_waiver_eval() {
-  local title ver tag sha1 sha2 meta_ver changed n file pattern is_kept up enc up_sha up_type head_sha status
+  local title ver tag sha1 sha2 meta_ver changed n file prev pattern is_kept up enc up_sha up_type head_sha status
   RESYNC_WAIVER_RESULT="NOT ELIGIBLE"; RESYNC_WAIVER_TAG=""; RESYNC_WAIVER_RECORD=""; RESYNC_WAIVER_REASON=""
   [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { RESYNC_WAIVER_REASON="kept set not loaded"; return 0; }
   title=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.title' 2>/dev/null) || { RESYNC_WAIVER_REASON="PR unreadable"; return 0; }
@@ -1056,12 +1056,12 @@ resync_waiver_eval() {
   n=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.changed_files' 2>/dev/null) || n=""
   printf '%s' "$DIFF_JSON" | jq -e --argjson n "${n:-null}" 'length == $n and length > 0' >/dev/null 2>&1 \
     || { RESYNC_WAIVER_REASON="files read incomplete"; return 0; }
-  while IFS=$'\t' read -r file head_sha status; do
+  while IFS=$'\t' read -r file prev head_sha status; do
     [ -z "$file" ] && continue
     is_kept=0
     for pattern in "${KEPT_SET_PATTERNS[@]}"; do
       # shellcheck disable=SC2053
-      if [[ "$file" == $pattern ]]; then is_kept=1; break; fi
+      if [[ "$file" == $pattern || "$prev" == $pattern ]]; then is_kept=1; break; fi
     done
     [ "$is_kept" -eq 1 ] || continue
     case "$status" in added | modified) ;; *) RESYNC_WAIVER_REASON="$file is $status"; RESYNC_WAIVER_RECORD=""; return 0 ;; esac
@@ -1073,7 +1073,7 @@ resync_waiver_eval() {
       RESYNC_WAIVER_REASON="$file differs from $tag:$up"; RESYNC_WAIVER_RECORD=""; return 0
     fi
     RESYNC_WAIVER_RECORD="${RESYNC_WAIVER_RECORD}${file}: ${head_sha}"$'\n'
-  done < <(printf '%s' "$DIFF_JSON" | jq -r '.[] | [.filename, (.sha // ""), (.status // "")] | @tsv')
+  done < <(printf '%s' "$DIFF_JSON" | jq -r '.[] | [.filename, (.previous_filename // .filename), (.sha // ""), (.status // "")] | @tsv')
   [ -n "$RESYNC_WAIVER_RECORD" ] || { RESYNC_WAIVER_REASON="no kept-set file to waive"; return 0; }
   sha2=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || sha2=""
   [ "$sha1" = "$sha2" ] || { RESYNC_WAIVER_REASON="head moved while reading"; RESYNC_WAIVER_RECORD=""; return 0; }
