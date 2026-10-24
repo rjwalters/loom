@@ -2389,6 +2389,43 @@ async fn test_handle_request_publish_event_routes_to_subscribers() {
 }
 
 #[tokio::test]
+async fn test_handle_request_publish_event_backfills_repo_from_dispatching_workspace() {
+    // A child that omits `repo` would narrate under a bare `task_id` and
+    // thread with issue #N of every other repo. The daemon dispatched it into
+    // exactly one workspace, so it stamps that workspace's root.
+    let (tm, db, sr, bus) = setup_test_context();
+    let root = sr
+        .lock()
+        .unwrap()
+        .config()
+        .workspace_root
+        .display()
+        .to_string();
+    sr.lock().unwrap().seed_live_issue_sweep_for_test(321);
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    handle_request(
+        Request::PublishEvent {
+            topic: "sweep.issue.321.phase".to_string(),
+            payload: serde_json::json!({"phase": "builder"}),
+        },
+        &tm,
+        &db,
+        &sr,
+        &bus,
+        &test_pool(),
+    );
+
+    match sub.recv().await.unwrap() {
+        Event::SweepPhase { issue, repo, .. } => {
+            assert_eq!(issue, 321);
+            assert_eq!(repo.as_deref(), Some(root.as_str()));
+        }
+        other => panic!("Expected SweepPhase event, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_handle_request_publish_event_upgrades_blocker_topic() {
     // Issue #4466: `sweep.issue.{N}.blocker` upgrades to `Event::SweepBlocker`
     // with the full documented payload (incl. the optional `repo`).

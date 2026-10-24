@@ -323,25 +323,6 @@ fn every_metric_name_serializes_to_its_as_str() {
     }
 }
 
-#[test]
-fn native_https_path_drops_metric_points() {
-    let envelopes = vec![
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::MetricPoints(MetricPointsRecord {
-                captured_at: at(0),
-                interval_start: None,
-                points: vec![MetricPoint::int(MetricName::DispatchCandidates, 1)],
-            }),
-        ),
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::Span(tick_span(&TickReport::default(), 1, at(0), at(1))),
-        ),
-    ];
-    assert!(crate::observability::tracing::native_envelopes(&envelopes).is_empty());
-}
-
 // ---------------------------------------------------------------- dispatch
 
 #[test]

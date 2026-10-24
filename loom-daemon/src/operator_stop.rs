@@ -154,36 +154,15 @@ pub fn discard(marker: &Path) -> bool {
 /// Owner-only (`0o600`) temp-file + rename, so a concurrent watchdog read never
 /// sees a torn file.
 fn write_private_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-    }
-    let mut tmp_name = path.as_os_str().to_os_string();
-    tmp_name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
-    let tmp = PathBuf::from(tmp_name);
-    let written = {
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .and_then(|mut f| f.write_all(contents.as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, contents.as_bytes())
-        }
-    };
-    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not write {}: {e}", path.display()));
-    }
-    Ok(())
+    crate::fs_util::write_atomic(
+        path,
+        contents.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 #[cfg(test)]

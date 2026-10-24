@@ -13,14 +13,13 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { handleLogTool, logTools } from "./tools/logs.js";
 import { handleSweepTool, sweepTools } from "./tools/sweeps.js";
 import { handleStatusTool, statusTools } from "./tools/status.js";
 import { handleTerminalTool, terminalTools } from "./tools/terminals.js";
 import { handleUITool, uiTools } from "./tools/ui.js";
 
 // Combine all tools from all modules
-const allTools = [...logTools, ...uiTools, ...terminalTools, ...sweepTools, ...statusTools];
+const allTools = [...uiTools, ...terminalTools, ...sweepTools, ...statusTools];
 
 // Create the unified MCP server
 const server = new Server(
@@ -46,7 +45,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     // Determine which module handles this tool
-    const logToolNames = logTools.map((t) => t.name);
     const uiToolNames = uiTools.map((t) => t.name);
     const terminalToolNames = terminalTools.map((t) => t.name);
     const sweepToolNames = sweepTools.map((t) => t.name);
@@ -54,9 +52,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     let content: { type: "text"; text: string }[];
 
-    if (logToolNames.includes(name)) {
-      content = await handleLogTool(name, args as Record<string, unknown>);
-    } else if (uiToolNames.includes(name)) {
+    if (uiToolNames.includes(name)) {
       content = await handleUITool(name, args as Record<string, unknown>);
     } else if (terminalToolNames.includes(name)) {
       content = await handleTerminalTool(name, args as Record<string, unknown>);
@@ -95,7 +91,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Loom MCP server running on stdio (unified: logs + ui + terminals + sweeps + status)");
+  console.error("Loom MCP server running on stdio (unified: ui + terminals + sweeps + status)");
 }
 
 main().catch((error) => {

@@ -36,7 +36,6 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("ci.duration", None),
     ("ci.job.log", None),
     ("metric.points", None),
-    ("queue.snapshot", None),
     ("auto_update.tick", None),
     ("fleet.state", None),
     ("pick.decision", None),

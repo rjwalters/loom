@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use chrono::{Duration, TimeZone, Utc};
 
 use super::*;
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::RepoVisibility;
 use crate::types::{QueueDisposition as Qd, ReadyQueueRow, WorkFinderTickSummary};
 

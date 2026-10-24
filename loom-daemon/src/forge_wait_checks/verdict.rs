@@ -68,6 +68,14 @@ impl Rollup {
     pub fn blocking_pending(&self) -> Vec<String> {
         without_authorization(&self.pending)
     }
+
+    /// [`Rollup::failing`] without [`REQUIRED_CHECK_CONTEXT`]: its `failure`
+    /// is an output of approval (a revocation), so reading it as an input
+    /// deadlocks a PR whose every other check is green.
+    #[must_use]
+    pub fn blocking_failing(&self) -> Vec<String> {
+        without_authorization(&self.failing)
+    }
 }
 
 /// `names` minus [`REQUIRED_CHECK_CONTEXT`] (#12552).
@@ -183,13 +191,16 @@ pub const REQUIRED_UNKNOWN: &str = "(required-contexts-unknown)";
 /// **The authorization context never holds the wait** (#12526): Champion posts
 /// [`REQUIRED_CHECK_CONTEXT`] only AFTER the Judge's approval, so a Judge
 /// waiting on it for a green verdict deadlocks until timeout. Its absence or
-/// `pending` state is ignored; a posted `failure` (a revocation) still counts
-/// as failing in both modes.
+/// `pending` state is ignored, and so is a posted `failure` (a revocation): the
+/// status is an output of approval, so counting it red would block the very
+/// approval that re-grants it. The merge queue's own required-check ruleset
+/// still enforces the grant at merge time.
 #[must_use]
 pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> Decision {
+    let failing = r.blocking_failing();
     let Some(req) = required else {
-        if !required_only && !r.failing.is_empty() {
-            return Decision::Red(r.failing.clone());
+        if !required_only && !failing.is_empty() {
+            return Decision::Red(failing);
         }
         let mut waiting = if required_only {
             Vec::new()
@@ -212,14 +223,14 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
             .cloned()
             .collect();
         waiting.extend(missing);
-        return match checks_failure::classify(&r.failing, req, !waiting.is_empty()) {
+        return match checks_failure::classify(&failing, req, !waiting.is_empty()) {
             RequiredVerdict::RequiredFailed(names) => Decision::Red(names),
             RequiredVerdict::StillPending => Decision::Pending(waiting),
             RequiredVerdict::InformationalOnly => Decision::Green,
         };
     }
-    if !r.failing.is_empty() {
-        return Decision::Red(r.failing.clone());
+    if !failing.is_empty() {
+        return Decision::Red(failing);
     }
     if !pending.is_empty() {
         return Decision::Pending(pending);

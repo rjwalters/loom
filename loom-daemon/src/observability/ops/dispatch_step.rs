@@ -189,10 +189,7 @@ pub fn record(root: &Path, step: &StepDispatch<'_>) {
     }
     let repo = super::super::repo_ref::cached_repo_ref(&root.display().to_string())
         .or_else(|| super::dispatch_facts::fallback_repo_ref(root));
-    let visibility = repo.as_ref().map(|r| match r.visibility {
-        crate::telemetry::RepoVisibility::Public => "public",
-        crate::telemetry::RepoVisibility::Private => "private",
-    });
+    let visibility = repo.as_ref().map(|r| r.visibility.as_str());
     let repo = repo.as_ref().map(|r| r.repo.as_str()).zip(visibility);
     super::emit_span(span(step, repo, Utc::now()));
 }
