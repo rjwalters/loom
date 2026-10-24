@@ -9211,6 +9211,7 @@ stops a host running sweeps at all).
       "enabled": true,
       "intervalSecs": 900,
       "gracePeriodSecs": 600,
+      "idleOpenSecs": 86400,
       "diskWarnFreeGb": 20
     }
   }
@@ -9222,8 +9223,42 @@ stops a host running sweeps at all).
 | `LOOM_WORKTREE_REAPER` | `autonomous.worktreeReaper.enabled` | env > config > default | `true` (on) |
 | `LOOM_WORKTREE_REAPER_INTERVAL_SECS` | `autonomous.worktreeReaper.intervalSecs` | env > config > default | `900` (15 min) |
 | — | `autonomous.worktreeReaper.gracePeriodSecs` | config > default | `600` (10 min) |
+| `LOOM_WORKTREE_REAPER_IDLE_OPEN_SECS` | `autonomous.worktreeReaper.idleOpenSecs` | env > config > default | `86400` (24 h; `0` disables) |
 | `LOOM_WORKTREE_REAPER_DISK_WARN_GB` | `autonomous.worktreeReaper.diskWarnFreeGb` | env > config > default | `20` |
 | `LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES` | — | env > default | `30` (see below) |
+
+#### Idle worktrees of open items (#12458)
+
+Under step dispatch an open issue/PR keeps its worktree until it closes, so a
+busy host accumulates hundreds of them (~400 against 15–20 live sessions).
+`idleOpenSecs` makes the `issue-<N>` / `pr-<N>` worktree of an **open** item
+reapable once **all** hold: no live session or step holds it (the usual
+claim-lock / `.loom-in-use` / process / in-flight gates), nothing was written in
+it for the idle period (the `worktree_activity` gate), it has no tracked changes
+and no untracked user files, and its branch is fully on a remote (or has no
+commits beyond base). The decision lives in `clean::classify_worktree` /
+`classify_pr_worktree` — there is no second removal path — and the item's next
+step recreates the worktree through `worktree.sh`. `0` disables it.
+
+**Nothing is removed until the remote holds a backup** (operator direction,
+2026-10-20). Every one of the gates above is an inference and `git worktree
+remove --force` is one-way, so an open item's worktree yields
+`RemoveWithBackup`, never a bare `Remove`: the reaper first commits the
+worktree's **whole** state — tracked changes, deletions, staged and
+intent-to-add entries, every untracked file `.gitignore` does not exclude —
+into a detached snapshot built in a temporary index (parent: the worktree's
+`HEAD`; the branch, index and `refs/stash` are untouched), pushes it to
+`origin` as `refs/loom/backup/<issue-N | pr-N>/<branch | detached>/<UTC stamp>`,
+and reads the ref back with `ls-remote` to confirm it holds that exact sha.
+Ignored files, content-verified Cargo build trees (#11075) and Loom's own
+markers are never pushed. The `refs/loom/` namespace triggers no CI, PR
+automation or merge queue (those key on `refs/heads/*`), and a clone's
+default refspec never fetches it. A push that is rejected, offline, unauthenticated
+or times out keeps the worktree (preserve category `backup_failed`). The ref
+is written to the daemon log (`warn`), the removal ledger
+(`.loom/logs/worktree-removals.log`, next to the removal it precedes) and the
+`reaper.pass` span (`loom.reaper.backed_up`, `loom.reaper.backup_refs`).
+Restore: `git fetch origin <ref> && git checkout FETCH_HEAD`.
 
 #### Activity gate on the artifact-reclaim pass (#8116)
 
