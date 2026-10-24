@@ -142,6 +142,10 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.repos.error",
     "loom.discovery.items",
     "loom.discovery.forge_reads",
+    // #12317: the per-item reads the snapshot cannot answer.
+    "loom.discovery.live_reads.landed",
+    "loom.discovery.live_reads.markers",
+    "loom.discovery.live_reads.ci",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
