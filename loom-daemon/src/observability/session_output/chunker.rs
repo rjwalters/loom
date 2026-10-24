@@ -51,6 +51,7 @@
 //! the same key and the `put` is a no-op. The chunker does not de-duplicate.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -151,8 +152,11 @@ struct OpenChunk {
 
 #[derive(Debug)]
 struct Sealed {
+    /// Monotonic per chunker, so a put that ran with the lock released can be
+    /// committed by identity even if the queue shifted underneath it.
+    id: u64,
     pointer: ChunkPointer,
-    chunk: Chunk,
+    chunk: Arc<Chunk>,
 }
 
 /// Batches records into chunks. Pure and clock-injected: every method takes
@@ -165,6 +169,7 @@ pub struct Chunker {
     queue_cap: usize,
     open: Vec<OpenChunk>,
     queue: VecDeque<Sealed>,
+    next_id: u64,
     /// Records lost to overflow and not yet reported on a chunk.
     unreported_dropped: u64,
 }
@@ -206,6 +211,7 @@ impl Chunker {
             queue_cap: queue_cap.max(1),
             open: Vec::new(),
             queue: VecDeque::new(),
+            next_id: 0,
             unreported_dropped: 0,
         }
     }
@@ -298,24 +304,43 @@ impl Chunker {
         self.queue.len()
     }
 
+    /// The queued chunks, oldest first, tagged for [`commit_stored`](Self::commit_stored).
+    ///
+    /// Together these let a caller run the store's I/O without holding
+    /// whatever lock guards this chunker: snapshot, put, then commit.
+    #[must_use]
+    pub fn queued_snapshot(&self) -> Vec<(u64, Arc<Chunk>)> {
+        self.queue
+            .iter()
+            .map(|sealed| (sealed.id, Arc::clone(&sealed.chunk)))
+            .collect()
+    }
+
+    /// Drop the chunks whose ids were stored and return their pointers, in
+    /// queue order. Ids no longer queued (evicted by overflow meanwhile,
+    /// already declared as dropped) are ignored.
+    pub fn commit_stored(&mut self, ids: &[u64]) -> Vec<ChunkPointer> {
+        let mut stored = Vec::new();
+        self.queue.retain(|sealed| {
+            if ids.contains(&sealed.id) {
+                stored.push(sealed.pointer.clone());
+                false
+            } else {
+                true
+            }
+        });
+        stored
+    }
+
     /// Try to put every queued chunk, oldest first. Stops at the first
     /// failure, leaving that chunk and everything behind it queued for the
     /// next pass. Returns the pointers of the chunks that were stored.
+    ///
+    /// Holds `&mut self` across the puts; a caller that shares the chunker
+    /// behind a lock should use the snapshot/commit split instead.
     pub fn pump(&mut self, store: &dyn ChunkStore) -> Vec<ChunkPointer> {
-        let mut stored = Vec::new();
-        while let Some(front) = self.queue.front() {
-            if let Err(error) = store.put(&front.chunk) {
-                log::warn!(
-                    "session.output: chunk put failed ({} queued, will retry): {error}",
-                    self.queue.len()
-                );
-                break;
-            }
-            if let Some(done) = self.queue.pop_front() {
-                stored.push(done.pointer);
-            }
-        }
-        stored
+        let stored = put_in_order(store, &self.queued_snapshot());
+        self.commit_stored(&stored)
     }
 
     fn seal(&mut self, position: usize, now: DateTime<Utc>) {
@@ -371,7 +396,13 @@ impl Chunker {
             sha256,
             bytes,
         };
-        self.queue.push_back(Sealed { pointer, chunk });
+        let id = self.next_id;
+        self.next_id += 1;
+        self.queue.push_back(Sealed {
+            id,
+            pointer,
+            chunk: Arc::new(chunk),
+        });
         while self.queue.len() > self.queue_cap {
             if let Some(lost) = self.queue.pop_front() {
                 // Oldest first: the live view cares about the newest text.
@@ -381,6 +412,23 @@ impl Chunker {
             }
         }
     }
+}
+
+/// Put `snapshot` oldest first, stopping at the first failure. Returns the ids
+/// that were stored.
+pub fn put_in_order(store: &dyn ChunkStore, snapshot: &[(u64, Arc<Chunk>)]) -> Vec<u64> {
+    let mut stored = Vec::new();
+    for (id, chunk) in snapshot {
+        if let Err(error) = store.put(chunk) {
+            log::warn!(
+                "session.output: chunk put failed ({} queued, will retry): {error}",
+                snapshot.len()
+            );
+            break;
+        }
+        stored.push(*id);
+    }
+    stored
 }
 
 impl ChunkPointer {

@@ -384,3 +384,37 @@ fn a_stream_whose_owner_changes_mid_run_starts_a_new_chunk() {
     assert_eq!(pointers.len(), 2);
     assert_ne!(pointers[0].repo, pointers[1].repo);
 }
+
+#[test]
+fn commit_stored_removes_only_the_stored_ids_even_if_the_queue_shifted() {
+    let mut chunker = Chunker::with_limits("host-a", 1, DEFAULT_MAX_AGE, 2);
+    chunker.offer(&output("o/r", "s1", 0, "a"), t0());
+    let snapshot = chunker.queued_snapshot();
+    assert_eq!(snapshot.len(), 1);
+    let stored_id = snapshot[0].0;
+    // While the lock would be released for the put, two more chunks seal and
+    // overflow evicts the snapshotted one (cap 2).
+    chunker.offer(&output("o/r", "s1", 1, "b"), t0());
+    chunker.offer(&output("o/r", "s1", 2, "c"), t0());
+    assert_eq!(chunker.queued(), 2);
+    assert!(chunker.commit_stored(&[stored_id]).is_empty());
+    assert_eq!(chunker.queued(), 2, "newer chunks must survive the commit");
+}
+
+#[test]
+fn a_failed_put_keeps_it_and_everything_behind_it_queued_in_order() {
+    let mut chunker = Chunker::with_limits("host-a", 1, DEFAULT_MAX_AGE, 10);
+    let store = FakeStore::default();
+    chunker.offer(&output("o/r", "s1", 0, "a"), t0());
+    chunker.offer(&output("o/r", "s1", 1, "b"), t0());
+    assert_eq!(chunker.pump(&store).len(), 2);
+    store.fail(true);
+    chunker.offer(&output("o/r", "s1", 2, "c"), t0());
+    chunker.offer(&output("o/r", "s1", 3, "d"), t0());
+    assert!(chunker.pump(&store).is_empty());
+    assert_eq!(chunker.queued(), 2);
+    store.fail(false);
+    let pointers = chunker.pump(&store);
+    assert_eq!(pointers[0].first_sequence, 2);
+    assert_eq!(pointers[1].first_sequence, 3);
+}
