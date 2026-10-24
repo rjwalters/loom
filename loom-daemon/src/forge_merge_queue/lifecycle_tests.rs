@@ -344,6 +344,95 @@ fn a_moved_head_after_the_grant_is_still_revoked_withdrawing_the_status() {
     );
 }
 
+/// A forge whose enqueue loses a race to a concurrent enqueue of the same head.
+struct Racing<'a>(&'a Gh);
+
+impl QueueApi for Racing<'_> {
+    fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+        self.0.status(pr)
+    }
+    fn enqueue(&self, pr: u32, n: &str, expected: &str) -> Result<EnqueueAck, QueueError> {
+        self.0.enqueue(pr, n, expected)?;
+        Ok(EnqueueAck::AlreadyQueued)
+    }
+    fn dequeue(&self, pr: u32, n: &str) -> Result<DequeueAck, QueueError> {
+        self.0.dequeue(pr, n)
+    }
+}
+
+#[test]
+fn direct_enqueue_of_a_queued_same_head_pr_ignores_the_group_commit() {
+    let gh = Gh::new();
+    gh.entry_reports_group_commit.set(true);
+    *gh.queued.borrow_mut() = Some(SHA1.into());
+    assert!(matches!(enqueue(&gh, PR, SHA1), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+}
+
+#[test]
+fn direct_enqueue_of_a_queued_moved_head_pr_is_queued_at_other_head() {
+    let gh = Gh::new();
+    gh.entry_reports_group_commit.set(true);
+    *gh.queued.borrow_mut() = Some(SHA1.into());
+    *gh.head.borrow_mut() = SHA2.into();
+    match enqueue(&gh, PR, SHA1) {
+        Err(QueueError::QueuedAtOtherHead { queued, .. }) => assert_eq!(queued, SHA2),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_enqueue_race_branch_ignores_the_group_commit() {
+    let gh = Gh::new();
+    gh.entry_reports_group_commit.set(true);
+    gh.head_status
+        .borrow_mut()
+        .insert(SHA1.into(), StatusState::Success);
+    assert!(matches!(
+        enqueue(&Racing(&gh), PR, SHA1),
+        Ok(EnqueueOutcome::AlreadyQueued { .. })
+    ));
+}
+
+#[test]
+fn the_enqueue_race_branch_still_flags_a_moved_head_and_a_vanished_entry() {
+    let gh = Gh::new();
+    gh.head_status
+        .borrow_mut()
+        .insert(SHA1.into(), StatusState::Success);
+    struct Moves<'a>(&'a Gh);
+    impl QueueApi for Moves<'_> {
+        fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+            self.0.status(pr)
+        }
+        fn enqueue(&self, pr: u32, n: &str, e: &str) -> Result<EnqueueAck, QueueError> {
+            self.0.enqueue(pr, n, e)?;
+            *self.0.head.borrow_mut() = SHA2.into();
+            Ok(EnqueueAck::AlreadyQueued)
+        }
+        fn dequeue(&self, pr: u32, n: &str) -> Result<DequeueAck, QueueError> {
+            self.0.dequeue(pr, n)
+        }
+    }
+    assert!(matches!(
+        enqueue(&Moves(&gh), PR, SHA1),
+        Err(QueueError::QueuedAtOtherHead { .. })
+    ));
+    struct Vanishes<'a>(&'a Gh);
+    impl QueueApi for Vanishes<'_> {
+        fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+            self.0.status(pr)
+        }
+        fn enqueue(&self, _: u32, _: &str, _: &str) -> Result<EnqueueAck, QueueError> {
+            Ok(EnqueueAck::AlreadyQueued)
+        }
+        fn dequeue(&self, pr: u32, n: &str) -> Result<DequeueAck, QueueError> {
+            self.0.dequeue(pr, n)
+        }
+    }
+    let gh2 = Gh::new();
+    assert!(matches!(enqueue(&Vanishes(&gh2), PR, SHA1), Err(QueueError::Forge { .. })));
+}
+
 #[test]
 fn handoff_is_idempotent_for_a_queued_head() {
     let (gh, ev) = (Gh::new(), MemoryEventSink::default());
