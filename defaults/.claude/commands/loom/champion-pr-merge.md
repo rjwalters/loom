@@ -510,6 +510,23 @@ behavior is byte-for-byte unchanged from before #6850.
   version-only carve-out) counts as a hit here too, so it must match as well.
   Use it for the common mixed PR: one workflow file plus docs or scripts, held
   only by the workflow file.
+- `additiveMigrations` (#13102, optional, default `false`) — a literal `true`
+  makes the class a `criticalFilesOnly` class (same matching, same
+  `merge-risk` ineligibility) that also lifts the `*migrations/*` kept-set
+  entry, **for additive SQL migrations only**. The entry is lifted for a PR
+  only when `loom-daemon forge additive-migrations <pr>` exits 0: every
+  migration-path file of the PR is a newly added `.sql` file whose statements
+  are all `CREATE TABLE IF NOT EXISTS`, `CREATE [UNIQUE] INDEX IF NOT EXISTS`,
+  `ALTER TABLE … ADD COLUMN` or `INSERT OR IGNORE INTO … SELECT …` (comments
+  ignored). An edited, removed or renamed migration, any other statement, a
+  non-`.sql` migration path (`*_migration.py`), unparsable SQL, a forge error
+  or an older daemon without the verb (non-zero exit) leaves the kept-set hold
+  as today. Every other kept-set pattern still applies to every changed file,
+  and the migration files must also satisfy the class's `filePatterns`,
+  `excludeFilePatterns` and `forbiddenDiffPatterns`. Not a boolean `true`/`false`:
+  malformed, the entry is skipped in both criteria. Opt-in only; no class
+  enables it by default. The waiver is recorded in the pre-merge comment's
+  critical-file bullet (scope `critical, additive-migrations waiver`).
 - `excludeFilePatterns` (#12528, optional) — globs, matched like
   `filePatterns`. A PR with **any** changed file matching one is disqualified
   from the class (e.g. `.github/workflows/*publish*`, `*release*`,
@@ -544,7 +561,7 @@ behavior is byte-for-byte unchanged from before #6850.
   scanned — a comment grants nothing, and the 2026-10-20 fixtures carry
   comments such as "no id-token: write" — while trailing comments and every
   other line are.
-- **Kept set — never satisfiable by a class (#12528).** In the `critical-files` criterion mode
+- **Kept set — never satisfiable by a class (#12528), except additive migrations (#13102).** In the `critical-files` criterion mode
   the matcher also disqualifies any PR touching a path of the kept set,
   whatever the class says and with or without `coversCriticalFiles`: kept-set
   entries of the `merge-risk` criterion (irreversible migrations; the merge gate
@@ -747,7 +764,9 @@ standing_auth_class_hits() {
 # Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID (comma-joined when several
 # classes compose), and STANDING_AUTH_SCOPE ("all" or "critical") /
 # STANDING_AUTH_COVERED (the files the classes matched), and STANDING_AUTH_WHY
-# (one line per class/hit that failed a check, for the hold comment). Every
+# (one line per class/hit that failed a check, for the hold comment), and
+# STANDING_AUTH_ADDITIVE=1 when a passing additiveMigrations class (#13102)
+# lifted the migrations kept-set entry for this PR. Every
 # check fails closed. Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval),
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is the critical-files criterion's own $FILES and CRITICAL_PATTERNS its pattern list.
@@ -755,6 +774,8 @@ standing_auth_eval() {
   local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
+  local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0
+  STANDING_AUTH_ADDITIVE=0
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
   STANDING_AUTH_WHY=""
@@ -817,6 +838,17 @@ standing_auth_eval() {
     case "$CFO" in
       null | false) ;;
       true) [ "$mode" = "critical" ] || continue; ONLY_CRIT=1 ;;
+      *) continue ;;
+    esac
+
+    # additiveMigrations (#13102): `null`/`false` is today's class. `true` makes
+    # the class criticalFilesOnly-shaped (critical mode only) and lets it lift
+    # the migrations kept-set entry when the additive-migrations verb clears the
+    # PR. Any other value is malformed: skipped in both modes.
+    ADD_MIG=0
+    case "$(jq -c ".champion.standingAuthorizations[$i].additiveMigrations" "$CONFIG_FILE")" in
+      null | false) ;;
+      true) [ "$mode" = "critical" ] || continue; ADD_MIG=1; ONLY_CRIT=1 ;;
       *) continue ;;
     esac
 
@@ -891,11 +923,22 @@ standing_auth_eval() {
     done <<<"$CLASS_FILES"
     [ "$ALL_MATCH" -eq 0 ] && continue
     if [ "$mode" = "critical" ]; then
+      ADD_MIG_LIFTED=0
       while IFS= read -r file; do
         [ -z "$file" ] && continue
         for pattern in "${KEPT_SET_PATTERNS[@]}"; do
           # shellcheck disable=SC2053
           if [[ "$file" == $pattern ]]; then
+            # additiveMigrations (#13102): the two migrations entries, and only
+            # those, are lifted when the verb clears every migration file of the
+            # PR. Run once; any non-zero exit (forbidden statement, edited file,
+            # forge error, older daemon) keeps the hold.
+            if [ "$ADD_MIG" -eq 1 ] && { [ "$pattern" = "*migrations/*" ] || [ "$pattern" = "*_migration.py" ]; }; then
+              if [ -z "$ADD_MIG_STATE" ]; then
+                if loom-daemon forge additive-migrations "$PR_NUMBER" >/dev/null 2>&1; then ADD_MIG_STATE=ok; else ADD_MIG_STATE=held; fi
+              fi
+              if [ "$ADD_MIG_STATE" = ok ]; then ADD_MIG_LIFTED=1; continue; fi
+            fi
             ALL_MATCH=0
             break 2
           fi
@@ -1008,6 +1051,7 @@ standing_auth_eval() {
         # #13042: record what this class covered and keep going; the criterion
         # passes once the classes together cover every hit.
         UNION_HITS=$(printf '%s\n%s' "$UNION_HITS" "$CLASS_HITS" | jq -s -c '.[0] + .[1] | unique_by(.filename)') || continue
+        [ "$ADD_MIG_LIFTED" -eq 1 ] && STANDING_AUTH_ADDITIVE=1
         USED_IDS="${USED_IDS:+$USED_IDS,}$CLASS_ID"
         continue
       fi
@@ -1295,7 +1339,7 @@ echo "WF_BLAST=$WF_BLAST${WF_BLAST_REASON:+ ($WF_BLAST_REASON)}"
 
 **A resync PR can pass the kept-set hold, by byte equality only (#13096).** When `resync_waiver_eval` ("Resync waiver for the kept-set hold") returns `ELIGIBLE`, the merge-gate and installer entries are not red for the files it recorded; the other axes are judged as usual. Any difference, missing tag or failed read holds as before.
 
-**No standing authorization satisfies the kept set (#12528).** The irreversible-migration and merge-gate entries and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for the `critical-files` criterion by a class, with or without `coversCriticalFiles` or `criticalFilesOnly`: the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
+**No standing authorization satisfies the kept set (#12528), except additive SQL migrations (#13102).** An opt-in `additiveMigrations` class lifts the `*migrations/*` kept-set entry for a PR that `loom-daemon forge additive-migrations` clears (only newly added `.sql` files of additive statements); that is the only kept-set carve-out, and it does not touch the "Irreversible migration, no rollback step" entry above, which concerns bulk relabels and persisted-format changes, not additive SQL. The irreversible-migration and merge-gate entries and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for the `critical-files` criterion by a class, with or without `coversCriticalFiles` or `criticalFilesOnly` (the additive-migrations carve-out above aside): the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
 
 **Decision rule**:
 - Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to the `critical-files` criterion — the axes are not judged for this PR (see "Docs-only fast path" above).
@@ -1884,6 +1928,7 @@ PR_NUMBER=<number>
 standing_auth_load_config             # resolved effective config (#12591)
 STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit the merge-risk criterion's ELIGIBLE
 STANDING_AUTH_ID=""
+STANDING_AUTH_ADDITIVE=0
 # Waiver record (#13031): set only when a class waives this criterion; the
 # pre-merge comment renders its critical-file bullet from these, so a waiver is
 # never reported as "No critical files modified".
@@ -1893,6 +1938,12 @@ if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ] && [ "$STANDING_AUTH_SCOPE" = "criti
   CRITERION3_WAIVER_ID="$STANDING_AUTH_ID"; CRITERION3_WAIVER_SCOPE="critical"; CRITERION3_WAIVED_FILES="$STANDING_AUTH_COVERED"
   # criticalFilesOnly class (#12648): only this criterion is waived, for the
   # critical files named. The merge-risk criterion judged the whole PR on the four axes.
+  if [ "$STANDING_AUTH_ADDITIVE" -eq 1 ]; then
+    # additiveMigrations class (#13102): migrations kept-set entry lifted by the verb.
+    CRITERION3_WAIVER_SCOPE="critical, additive-migrations waiver"
+    echo "PASS (standing authorization '$STANDING_AUTH_ID', #13102): additive-migrations waiver — migration files verified additive by loom-daemon forge additive-migrations; critical files: $STANDING_AUTH_COVERED"
+    exit 0
+  fi
   # #13042: STANDING_AUTH_ID names every class used (comma-joined); each hit
   # was covered by at least one of them.
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12648): critical files covered by a criticalFilesOnly class — critical files: $STANDING_AUTH_COVERED"
@@ -1953,7 +2004,7 @@ generalize this pattern to any other critical file or any other kind of
 "trivial-looking" diff — it is scoped to exactly these 6 filenames and
 exactly a version-string line change.
 
-**Suspect-line carve-out (#12999, operator ruling 2026-10-21)**: a critical-file hit is not a blanket veto on every edit to it. For a `Cargo.toml`-family or `package.json`-family hit that `version_only_diff` did not clear, the check-loop calls `suspect_critical_diff`, which wraps `loom-daemon forge suspect-critical-diff <pr> <file>`. Only a clean exit 0 with `SUSPECT=0` passes. It holds when a changed line is in a dependency, dev/build/target dependency, `[patch.*]`, `[replace]` or `[features]` table, is a `build =` / `links =` / `git =` / `registry =` / `path =` source key (a target table's own `path =` under `[[bin]]`, `[[bench]]`, `[[test]]`, `[[example]]` or `[lib]` is not one), or, in `package.json`, sits under `dependencies` / `devDependencies` / `optionalDependencies` / `peerDependencies` / `overrides` / `resolutions` or is a `preinstall` / `install` / `postinstall` / `prepare` script. A suspect hit emits the FAIL line with the matched line and its section, and passes that line on to the hold comment as `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION`. Every other outcome is a hold: no patch, an unparseable hunk, an unreadable head file for a hunk whose section the patch does not show, a forge error, exit 2 from an older daemon, 126/127 for no binary. A `.github/workflows/*` hit passes only on `WF_BLAST=green` (the `merge-risk` criterion's `ci_workflow_blast_eval`); red, none, or an unreadable read holds. `migrations/` and `_migration.py` hits still hold on any change. The carve-out never widens `CRITICAL_PATTERNS` and never judges anything but these two manifest families; `Cargo.lock` and `package-lock.json` keep today's version-only treatment.
+**Suspect-line carve-out (#12999, operator ruling 2026-10-21)**: a critical-file hit is not a blanket veto on every edit to it. For a `Cargo.toml`-family or `package.json`-family hit that `version_only_diff` did not clear, the check-loop calls `suspect_critical_diff`, which wraps `loom-daemon forge suspect-critical-diff <pr> <file>`. Only a clean exit 0 with `SUSPECT=0` passes. It holds when a changed line is in a dependency, dev/build/target dependency, `[patch.*]`, `[replace]` or `[features]` table, is a `build =` / `links =` / `git =` / `registry =` / `path =` source key (a target table's own `path =` under `[[bin]]`, `[[bench]]`, `[[test]]`, `[[example]]` or `[lib]` is not one), or, in `package.json`, sits under `dependencies` / `devDependencies` / `optionalDependencies` / `peerDependencies` / `overrides` / `resolutions` or is a `preinstall` / `install` / `postinstall` / `prepare` script. A suspect hit emits the FAIL line with the matched line and its section, and passes that line on to the hold comment as `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION`. Every other outcome is a hold: no patch, an unparseable hunk, an unreadable head file for a hunk whose section the patch does not show, a forge error, exit 2 from an older daemon, 126/127 for no binary. A `.github/workflows/*` hit passes only on `WF_BLAST=green` (the `merge-risk` criterion's `ci_workflow_blast_eval`); red, none, or an unreadable read holds. `migrations/` and `_migration.py` hits still hold on any change, unless an `additiveMigrations` class (#13102) applies. The carve-out never widens `CRITICAL_PATTERNS` and never judges anything but these two manifest families; `Cargo.lock` and `package-lock.json` keep today's version-only treatment.
 
 **Standing-authorization class (#12528)**: the check-loop runs `standing_auth_eval critical` (defined under the `merge-risk` criterion) before it can emit FAIL. A `champion.standingAuthorizations` class with `"coversCriticalFiles": true` whose `filePatterns` cover **every** changed file, with no changed file in `excludeFilePatterns`, no added/removed line matching `forbiddenDiffPatterns`, no kept-set path, and every `conditions` entry (`judgeApproval`, `greenCi`) holding now, passes this criterion and names the class id. Any one file outside the class, an excluded file, a forbidden diff line, an unreadable diff or a kept-set path restores today's FAIL and the durable hold below. A class without the flag, or no class at all, changes nothing. The check is mechanical, never a judgment call.
 

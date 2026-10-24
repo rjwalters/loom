@@ -36,7 +36,11 @@ the ordinary PASS row (cleared notice + remove `loom:blocked`), naming the class
 id. One file outside the class, an excluded file, a forbidden line or an
 unreadable diff restores the FAIL and this whole machine. A `dependabot-bumps` class (`authorIsDependabot`, manifest and lockfile `filePatterns`; #12948) is the fleet-default example: Dependabot's own manifest bumps pass `critical-files`, a human PR with the same diff does not. The kept set (the
 merge gate, guard hooks, credential selection, installers/updaters,
-migrations) is never satisfiable by a class.
+migrations) is never satisfiable by a class, with one exception (#13102): an opt-in
+`"additiveMigrations": true` class lifts the `*migrations/*` entry for a PR that
+`loom-daemon forge additive-migrations <pr>` clears (only newly added `.sql` files holding
+`CREATE TABLE/INDEX IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN` or `INSERT OR IGNORE INTO … SELECT`);
+any other statement, an edited or deleted migration, or a failed read keeps the hold.
 
 A `"criticalFilesOnly": true` class (#12648) passes `critical-files` the same way, but is
 matched against the critical-file hits alone (the files `critical-files` flags, and each

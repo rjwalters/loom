@@ -808,6 +808,8 @@ pub enum ForgeCmd {
     },
     /// `forge version-only-diff` (#9611): see [`crate::forge_version_only_diff`].
     VersionOnlyDiff(crate::forge_version_only_diff::Args),
+    /// `forge additive-migrations` (#13102): see [`crate::forge_additive_migrations`].
+    AdditiveMigrations(crate::forge_additive_migrations::Args),
     /// `forge suspect-critical-diff` (#12999): see [`crate::forge_suspect_critical_diff`].
     SuspectCriticalDiff(crate::forge_suspect_critical_diff::Args),
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
@@ -886,6 +888,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             allowed_paths,
         } => crate::verdict_equivalence::handle(pr, &reviewed, &head, &allowed_paths),
         ForgeCmd::VersionOnlyDiff(args) => crate::forge_version_only_diff::handle(&args),
+        ForgeCmd::AdditiveMigrations(args) => crate::forge_additive_migrations::handle(&args),
         ForgeCmd::SuspectCriticalDiff(args) => crate::forge_suspect_critical_diff::handle(&args),
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
