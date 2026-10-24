@@ -813,6 +813,7 @@ fn an_expired_assignment_is_reported_and_the_next_grant_names_it() {
             item: 7,
             step: "builder".into(),
             assignment_id: id.clone(),
+            merge_slot_holder: None,
         }]
     );
     assert!(t.take_expired().is_empty(), "drained once");
@@ -962,4 +963,65 @@ fn the_gauge_snapshot_separates_rows_from_what_hosts_report() {
     let g_after = t.host_gauges(at(2000), HEARTBEAT_FRESH);
     assert!(g.hosts.contains_key(B));
     assert!(!g_after.hosts.contains_key(B));
+}
+
+#[test]
+fn a_heartbeat_built_before_a_release_does_not_resurrect_the_merge_slot() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 8));
+    t.heartbeat(at(100), B, &hb(B, vec![], 8));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 10, "champion_merge"));
+    assert!(t.release_outcome(at(110), A, &id, "noop"));
+    // The heartbeat was built while the step still ran.
+    t.heartbeat(at(111), A, &hb(A, vec![live("acme/w", 10, "champion_merge", Some(&id))], 8));
+    assert!(t.row("acme/w", 10).is_none());
+    assert_eq!(t.merge_holder("acme/w"), None);
+    granted_id(&t.claim(at(112), B, "acme/w", 11, "champion_merge"));
+}
+
+#[test]
+fn a_heartbeat_naming_an_expired_assignment_does_not_resurrect_it() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 8));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 10, "champion_merge"));
+    let late = at(100 + 3600);
+    t.expire(late);
+    t.heartbeat(late, A, &hb(A, vec![live("acme/w", 10, "champion_merge", Some(&id))], 8));
+    assert!(t.row("acme/w", 10).is_none());
+}
+
+#[test]
+fn a_heartbeat_naming_an_id_this_captain_never_saw_is_still_adopted() {
+    let mut t = open_table();
+    t.heartbeat(
+        at(100),
+        A,
+        &hb(A, vec![live("acme/w", 10, "champion_merge", Some("a-old-1"))], 8),
+    );
+    assert_eq!(t.merge_holder("acme/w"), Some("a-old-1"));
+}
+
+#[test]
+fn ended_ids_are_forgotten_after_their_age_and_bounded() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 8));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 10, "judge"));
+    assert!(t.release_outcome(at(101), A, &id, "noop"));
+    let later = at(101).plus(ENDED_ID_MAX_AGE).plus(Duration::from_secs(1));
+    t.expire(later);
+    t.heartbeat(later, A, &hb(A, vec![live("acme/w", 10, "judge", Some(&id))], 8));
+    assert!(t.row("acme/w", 10).is_some(), "an old id is adopted again");
+    for n in 0..(LINEAGE_MAX + 5) {
+        let key = ("r".to_string(), n as u64);
+        let row = Row {
+            host: Some(A.into()),
+            step: "judge".into(),
+            assignment_id: format!("x-{n}"),
+            state: RowState::Live,
+            granted: true,
+            deadline: later,
+        };
+        t.note_ended(&key, &row, PrevEnd::Released, later);
+    }
+    assert!(t.ended_ids.len() <= LINEAGE_MAX);
 }

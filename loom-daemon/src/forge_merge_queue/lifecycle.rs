@@ -174,8 +174,11 @@ pub fn reconcile_pr(ctx: &Ctx<'_>, pr: u32) -> Reconciled {
             }
         }
         PrState::Open => match status.entry {
-            Some(entry) => {
-                let head = entry.head_oid.unwrap_or_else(|| status.head_oid.clone());
+            Some(_) => {
+                // The grant vouches for the PR head. `entry.head_oid` is the
+                // queue's `headCommit`, which on GitHub can be the merge-group
+                // commit, so it must not stand in for the head (#13124).
+                let head = status.head_oid.clone();
                 match merge_group_check(&store, pr, &head, read_facts(ctx.forge, pr)) {
                     CheckConclusion::Success => Reconciled::StillQueued { head },
                     CheckConclusion::Failure(why) => {
@@ -191,6 +194,9 @@ pub fn reconcile_pr(ctx: &Ctx<'_>, pr: u32) -> Reconciled {
                                  nor the dequeue was confirmed: {rev:?}",
                                 join(&why)
                             ));
+                        }
+                        if let GrantRecord::Live { sha, .. } = &rec {
+                            withdraw_head_status(ctx.statuses, pr, sha);
                         }
                         ctx.removed_event(pr, &rec, format!("revoked-{}", why_token(&why)), None);
                         Reconciled::Continue(Some(format!(

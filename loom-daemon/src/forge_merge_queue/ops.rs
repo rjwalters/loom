@@ -313,22 +313,17 @@ pub fn enqueue(
         });
     }
     if let Some(entry) = &st.entry {
-        return match entry.head_oid.as_deref() {
-            Some(queued) if !queued.eq_ignore_ascii_case(&approved) => {
-                Err(QueueError::QueuedAtOtherHead {
-                    pr,
-                    approved,
-                    queued: queued.to_string(),
-                })
-            }
-            _ if !st.head_oid.eq_ignore_ascii_case(&approved) => Err(QueueError::HeadMismatch {
+        // The PR head, not `entry.head_oid` (possibly the merge-group commit).
+        return if st.head_oid.eq_ignore_ascii_case(&approved) {
+            Ok(EnqueueOutcome::AlreadyQueued {
+                position: entry.position,
+            })
+        } else {
+            Err(QueueError::QueuedAtOtherHead {
                 pr,
                 approved,
-                actual: Some(st.head_oid.clone()),
-            }),
-            _ => Ok(EnqueueOutcome::AlreadyQueued {
-                position: entry.position,
-            }),
+                queued: st.head_oid.clone(),
+            })
         };
     }
     if !st.head_oid.eq_ignore_ascii_case(&approved) {
@@ -344,14 +339,13 @@ pub fn enqueue(
             // A concurrent enqueue won the race; confirm it is OUR head.
             let again = api.status(pr)?;
             match again.entry {
-                Some(QueueEntry {
-                    head_oid: Some(ref q),
-                    ..
-                }) if !q.eq_ignore_ascii_case(&approved) => Err(QueueError::QueuedAtOtherHead {
-                    pr,
-                    approved,
-                    queued: q.clone(),
-                }),
+                Some(_) if !again.head_oid.eq_ignore_ascii_case(&approved) => {
+                    Err(QueueError::QueuedAtOtherHead {
+                        pr,
+                        approved,
+                        queued: again.head_oid.clone(),
+                    })
+                }
                 Some(entry) => Ok(EnqueueOutcome::AlreadyQueued {
                     position: entry.position,
                 }),

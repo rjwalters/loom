@@ -518,6 +518,10 @@ fn daemon_write_paths_are_scoped() {
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
+        (
+            "script_helpers/validate_phase_curator.rs",
+            Via(DISPATCH, "curator recovery split out of validate_phase.rs; runs inside a dispatched sweep"),
+        ),
         ("forge_rerun.rs", Gated),
         (
             "forge_create_issue.rs",
