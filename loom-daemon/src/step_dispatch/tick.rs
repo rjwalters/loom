@@ -695,6 +695,7 @@ pub fn run_with_offers(
             resumed: false,
             draw: None,
             story_points: c.item.story_points,
+            hold_auth: c.item.hold_auth.clone(),
         };
         match spawner.spawn(idx, &request) {
             SpawnResult::Spawned => {
@@ -857,6 +858,7 @@ pub fn run_with_offers(
                             in_flight_repo: terms.repo.in_flight,
                         }),
                         story_points: picked.item.story_points,
+                        hold_auth: picked.item.hold_auth.clone(),
                     },
                     key,
                 });

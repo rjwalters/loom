@@ -361,6 +361,7 @@ impl SweepRegistry {
                 step: role,
                 item,
                 log: log_path,
+                hold_auth_before: self.step_hold_auth(sweep_id),
             };
             let spawned = std::thread::Builder::new()
                 .name("step-capture".to_string())

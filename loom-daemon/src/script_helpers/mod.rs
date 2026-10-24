@@ -41,6 +41,7 @@ pub mod sweep_experiment_arms;
 pub mod transcript_usage;
 pub mod usage;
 pub mod validate_phase;
+mod validate_phase_curator;
 
 use crate::cmd_out::{decode_json, run_command, CmdOutcome, Query, DEFAULT_TIMEOUT};
 
