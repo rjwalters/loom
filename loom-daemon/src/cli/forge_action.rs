@@ -853,6 +853,11 @@ pub(crate) enum ForgeAction {
         /// sha256 of the body without trailing newlines (#12614).
         #[arg(long = "issue-body-sha")]
         issue_body_sha: Vec<String>,
+        /// Comment id (repeatable) the Judge re-read and confirmed is
+        /// spec-neutral: excluded from the stale-read comment check (#13134).
+        /// Never excuses a body edit, a body-hash mismatch or another comment.
+        #[arg(long = "acknowledged-comment")]
+        acknowledged_comment: Vec<u64>,
     },
 
     /// `forge verdict-labels <pr> --repo R --verdict V` (#10581) — apply the
@@ -1133,6 +1138,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             window_secs,
             review_started,
             issue_body_sha,
+            acknowledged_comment,
         } => {
             return super::forge_verdict_cmd::verdict_gate(
                 pr,
@@ -1143,6 +1149,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 window_secs,
                 review_started.as_deref(),
                 &issue_body_sha,
+                &acknowledged_comment,
             );
         }
         ForgeAction::VerdictLock { action, pr, repo } => {
@@ -1534,6 +1541,7 @@ mod write_target_tests {
             window_secs: 600,
             review_started: None,
             issue_body_sha: Vec::new(),
+            acknowledged_comment: Vec::new(),
         };
         assert_eq!(write_target(&gate), None);
     }

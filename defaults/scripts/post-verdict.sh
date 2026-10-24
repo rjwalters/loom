@@ -99,7 +99,7 @@
 #   post-verdict.sh <pr-number> <approved|changes-requested> <sha> \
 #       (--body TEXT | --body-file PATH) [--reviews-reconciled TEXT] \
 #       [--overrules-prior TEXT] [--review-started RFC3339] \
-#       [--issue-body-sha N=HASH]...
+#       [--issue-body-sha N=HASH]... [--acknowledged-comment ID]...
 #
 #   PATH may be "-" to read the body from stdin.
 #
@@ -127,6 +127,13 @@
 #       current spec and either end without a verdict (a fresh dispatch approves)
 #       or post changes-requested. With no start resolvable at all (no epoch, no
 #       lease, no flag) the approval is refused.
+#
+#   --acknowledged-comment ID   Approvals only (#13134), repeatable: a PR or
+#       issue comment id the Judge re-read and confirmed spec-neutral (the
+#       refusal names the id). Excluded from the stale-read comment check
+#       only: it never excuses a body edit, an --issue-body-sha mismatch or an
+#       unlisted comment. Use it only after confirming the body hash is
+#       unchanged.
 #
 #   --issue-body-sha N=HASH   (repeatable) Issue N's body as you reviewed it:
 #       `printf %s "$(gh api repos/OWNER/REPO/issues/N --jq .body)" | sha256sum | cut -d' ' -f1`.
@@ -200,7 +207,7 @@ esac
 BODY=""
 BODY_FILE=""
 HAVE_BODY=false
-RECONCILED="" OVERRULE="" REVIEW_STARTED="" ISSUE_HASHES=()
+RECONCILED="" OVERRULE="" REVIEW_STARTED="" ISSUE_HASHES=() ACKED=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -217,6 +224,7 @@ while [[ $# -gt 0 ]]; do
     --overrules-prior) OVERRULE="${2:-}"; shift 2 ;;
     --review-started) REVIEW_STARTED="${2:-}"; shift 2 ;;
     --issue-body-sha) ISSUE_HASHES+=("${2:-}"); shift 2 ;;
+    --acknowledged-comment) ACKED+=("${2:-}"); shift 2 ;;
     *)
       echo "post-verdict.sh: unknown argument: $1" >&2
       exit 2
@@ -566,7 +574,7 @@ fi
 # the build that merges #10684; no version floor is declared for them, because the
 # capability probe above checks them on the resolved binary. Roll loom-daemon
 # before (or with) these scripts: until then, verdicts take the legacy path.
-VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" ${REVIEW_STARTED:+--review-started "$REVIEW_STARTED"} ${ISSUE_HASHES[@]+"${ISSUE_HASHES[@]/#/--issue-body-sha=}"} 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
+VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" ${REVIEW_STARTED:+--review-started "$REVIEW_STARTED"} ${ISSUE_HASHES[@]+"${ISSUE_HASHES[@]/#/--issue-body-sha=}"} ${ACKED[@]+"${ACKED[@]/#/--acknowledged-comment=}"} 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
 case "$VG_RC:$VG_OUT" in
   "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;
   "10:LOOM-VERDICT-GATE DEDUPE"*) NONCE=""; echo "post-verdict.sh: not posting a duplicate verdict on PR #$PR (applying its labels only): $VG_OUT" >&2 ;;
