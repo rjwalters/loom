@@ -4,6 +4,7 @@
 
 use super::tests::fake_gh;
 use super::*;
+use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
@@ -55,6 +56,7 @@ fn pin_repo_rejects_a_malformed_repo_and_none_is_a_no_op() {
 }
 
 #[test]
+#[serial]
 fn pinned_repo_reaches_gh_as_repo_flag_and_gh_repo_env() {
     let dir = tempdir().unwrap();
     let log = dir.path().join("log");
