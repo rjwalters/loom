@@ -108,6 +108,7 @@ mod merge_pr_loom_pr_guard;
 mod merge_pr_loom_pr_override_comment;
 mod merge_pr_merge_route;
 mod merge_pr_mergeable_recheck;
+mod merge_pr_mergeable_recheck_run;
 mod merge_pr_partial_comment;
 mod merge_pr_partial_conflict;
 mod merge_pr_partial_reset;
