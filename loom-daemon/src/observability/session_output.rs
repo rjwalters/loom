@@ -252,11 +252,23 @@ impl ChunkTap {
     /// Seal what is due and put whatever is queued. Blocking: runs the
     /// store's I/O.
     fn pump_due(&self, now: DateTime<Utc>) -> Vec<chunker::ChunkPointer> {
-        let Ok(mut chunker) = self.chunker.lock() else {
-            return Vec::new();
+        // The lock is held only to seal and snapshot, and again to commit; the
+        // store's I/O runs unlocked so `offer` never waits on a put.
+        let snapshot = {
+            let Ok(mut chunker) = self.chunker.lock() else {
+                return Vec::new();
+            };
+            chunker.flush_due(now);
+            chunker.queued_snapshot()
         };
-        chunker.flush_due(now);
-        chunker.pump(self.store.as_ref())
+        let stored = chunker::put_in_order(self.store.as_ref(), &snapshot);
+        if stored.is_empty() {
+            return Vec::new();
+        }
+        match self.chunker.lock() {
+            Ok(mut chunker) => chunker.commit_stored(&stored),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
