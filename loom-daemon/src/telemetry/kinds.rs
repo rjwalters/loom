@@ -576,13 +576,13 @@ macro_rules! telemetry_kind_table {
             /// another PR's merge in the same repo (#13029). OTLP-only. See
             /// [`merge_lane_wait`].
             MergeLaneWait = "merge.lane_wait" => $crate::telemetry::kinds::merge_lane_wait::MergeLaneWaitRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// What one Champion merge / hold-reevaluate run decided, with the
             /// standing-authorization digests it read (#13029). OTLP-only. See
             /// [`champion_run`].
             ChampionRun = "champion.run" => $crate::telemetry::kinds::champion_run::ChampionRunRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// The merge queue (order, membership, completeness) as the existing
             /// `mergeQueue.entries` read saw it (#12667). OTLP-only. See
