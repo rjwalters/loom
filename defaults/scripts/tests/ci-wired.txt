@@ -352,3 +352,5 @@ test-ci-wait-prompt-consistency.sh
 test-tools-first-clean-install.sh
 # #12941: lib/loom-tools.sh is a compat alias for lib/repo-root.sh. Hermetic.
 test-repo-root-alias.sh
+# #11787: create-issue.sh refuses a direct loom:curated write (exits 2 before forge_detect). Hermetic.
+test-create-issue-curated.sh

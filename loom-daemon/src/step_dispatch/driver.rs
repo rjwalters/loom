@@ -440,6 +440,9 @@ impl StepDriver {
                     },
                     halted: true,
                     created_at: Default::default(),
+                    merge_slots: 0,
+                    merge_concurrency: 0,
+                    merges_in_flight: 0,
                 });
                 continue;
             }
@@ -535,12 +538,14 @@ impl StepDriver {
             if journal_state {
                 reevals.insert(idx, gathered.reevals.clone());
             }
-            let (mut cooldowns, pool_exhausted_roles, claims) = {
+            let (mut cooldowns, pool_exhausted_roles, mut claims) = {
                 let reg = registry
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
             };
+            // #13026: read each tick, so a change needs no roll.
+            claims.merge_concurrency = crate::config_resolver::champion_merge_concurrency(root);
             exhausted_roles.extend(pool_exhausted_roles.iter().cloned());
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
@@ -563,6 +568,8 @@ impl StepDriver {
             // items leave the pool.
             let in_flight = claims.items.len();
             let held = shape_pool(&mut weighing, &claims, listing);
+            // #13029: the merge lane's per-PR waits, from what the shape just did.
+            crate::observability::lane_wait::observe(&repo, &weighing, &claims);
             if held > 0 {
                 log::warn!(
                     "work_finder: {repo}: {held} Builder step(s) held this tick: the {} cannot \
@@ -584,6 +591,9 @@ impl StepDriver {
                 weighing,
                 halted: false,
                 created_at: gathered.created_at,
+                merge_slots: claims.merge_slots_free(),
+                merge_concurrency: claims.merge_limit(),
+                merges_in_flight: claims.merges_in_flight.len(),
             });
         }
         let filter_ms = millis(filter_started.elapsed());
@@ -697,6 +707,8 @@ impl StepDriver {
             draws: result.draws,
             draws_unspawned: result.draws_unspawned,
             merge_deferred: result.merge_deferred,
+            merge_concurrency: result.merge_concurrency,
+            merges_in_flight: result.merges_in_flight,
             by_reason: result.passes.clone(),
             budget: result.budget,
             stop: Some(result.stop.as_str()),
