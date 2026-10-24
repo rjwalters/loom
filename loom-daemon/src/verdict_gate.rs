@@ -434,14 +434,55 @@ fn comment_time(c: &Value) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// Comments the stale-read check must not count (#13134): the Judge's own
+/// notes and ones it was told to acknowledge. Neither excuses a body edit or
+/// an `--issue-body-sha` mismatch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StaleIgnore<'a> {
+    /// `$LOOM_SWEEP_ID`: a body carrying `sweep=<id>` is this dispatch's own
+    /// note, even if it was stamped without a `<!-- loom:` marker.
+    pub sweep: Option<&'a str>,
+    /// Comment ids the Judge re-read and confirmed spec-neutral.
+    pub acknowledged: &'a [u64],
+}
+
+impl StaleIgnore<'_> {
+    fn is_own_sweep_note(&self, body: &str) -> bool {
+        let Some(id) = self.sweep.map(str::trim).filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let needle = format!("sweep={id}");
+        body.match_indices(&needle).any(|(i, _)| {
+            body[i + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        })
+    }
+}
+
 /// The newest-first-found trusted *human* comment created after `started`:
 /// not an App/bot author, and carrying no Loom marker (verdict, lease,
 /// standdown, claim-activity … traffic is the fleet's own, even when it is
 /// posted through a human token). Returned as a description naming it.
-fn human_comment_after(comments: &[Value], started: DateTime<Utc>) -> Option<String> {
+fn human_comment_after(
+    comments: &[Value],
+    started: DateTime<Utc>,
+    ignore: &StaleIgnore<'_>,
+) -> Option<String> {
     comments
         .iter()
         .filter(|c| !crate::comment_trust::Author::from_json(c).app)
+        .filter(|c| {
+            !c.get("id")
+                .and_then(Value::as_u64)
+                .is_some_and(|i| ignore.acknowledged.contains(&i))
+        })
+        .filter(|c| {
+            !c.get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|b| ignore.is_own_sweep_note(b))
+        })
         .filter(|c| {
             !c.get("body")
                 .and_then(Value::as_str)
@@ -475,16 +516,20 @@ pub fn stale_read(
     started: DateTime<Utc>,
     pr_comments: &[Value],
     issues: Option<&[IssueSnapshot]>,
+    ignore: &StaleIgnore<'_>,
 ) -> Option<String> {
     let remedy = "re-review against the current spec (read the comment or edit first). The \
-                  start is the dispatch time, so a retry in this same dispatch is refused \
-                  again: if the PR still meets the spec, end without a verdict and let a fresh \
-                  dispatch approve it; if it no longer does, post changes-requested (never \
-                  refused). Only a manual run with no dispatch epoch and no lease may retry \
-                  with a fresh --review-started";
+                  start is the dispatch time, so a fresh --review-started does not help. If \
+                  you re-read the named comment and confirmed it is spec-neutral and the issue \
+                  body hash is unchanged, retry with --acknowledged-comment <id> for that \
+                  comment id (it never excuses a body edit, a hash mismatch or another \
+                  comment); otherwise, if the PR still meets the spec, end without a verdict \
+                  and let a fresh dispatch approve it; if it no longer does, post \
+                  changes-requested (never refused). Only a manual run with no dispatch epoch \
+                  and no lease may retry with a fresh --review-started";
     let at = started.to_rfc3339();
     let mut why: Vec<String> = Vec::new();
-    if let Some(d) = human_comment_after(pr_comments, started) {
+    if let Some(d) = human_comment_after(pr_comments, started, ignore) {
         why.push(format!(
             "a human comment landed on the PR after this review started ({at}): {d}"
         ));
@@ -527,7 +572,7 @@ pub fn stale_read(
                 e.at.to_rfc3339()
             ));
         }
-        if let Some(d) = human_comment_after(comments, started) {
+        if let Some(d) = human_comment_after(comments, started, ignore) {
             why.push(format!(
                 "a human comment landed on issue #{n} after this review started ({at}): {d}"
             ));
@@ -556,6 +601,10 @@ pub struct GateInput<'a> {
     pub review_started: Option<DateTime<Utc>>,
     /// The linked issues as re-read; see [`stale_read`].
     pub issues: Option<&'a [IssueSnapshot]>,
+    /// This dispatch's `$LOOM_SWEEP_ID`; its own notes never count (#13134).
+    pub own_sweep: Option<&'a str>,
+    /// `--acknowledged-comment` ids excluded from the comment check (#13134).
+    pub acknowledged: &'a [u64],
 }
 
 /// The pre-post decision. Pure; see the module docs for the rules.
@@ -594,7 +643,15 @@ pub fn decide(input: &GateInput<'_>) -> Decision {
                     .into(),
             );
         };
-        if let Some(why) = stale_read(started, comments, input.issues) {
+        if let Some(why) = stale_read(
+            started,
+            comments,
+            input.issues,
+            &StaleIgnore {
+                sweep: input.own_sweep,
+                acknowledged: input.acknowledged,
+            },
+        ) {
             return Decision::Refuse(why);
         }
     }
