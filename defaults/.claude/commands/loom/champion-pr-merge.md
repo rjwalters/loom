@@ -666,6 +666,9 @@ KEPT_SET_PATTERNS=(
   ".github/labels.yml" "*/.github/labels.yml" "defaults/labels.json"
   "*/defaults/labels.json" "*labels_migrate*"
   "*migrations/*" "*_migration.py"
+  # Destructive cleanup of open work, quarantine, and account binding (#12950):
+  # the floor under the `merge-risk` criterion's self-release as well as under `critical-files`.
+  "*deep_clean*" "*reaper*" "*quarantine*" "*account*"
 )
 
 # standing_auth_fetch_diff: read the PR's files ONCE, every page slurped into a
@@ -1344,13 +1347,110 @@ echo "WF_BLAST=$WF_BLAST${WF_BLAST_REASON:+ ($WF_BLAST_REASON)}"
 **Decision rule**:
 - Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to the `critical-files` criterion — the axes are not judged for this PR (see "Docs-only fast path" above).
 - Standing operator authorization matched (`STANDING_AUTH_RESULT=ELIGIBLE`) **and** no prior hold is still in force -> **PASS**, continue to the `critical-files` criterion — the axes are not judged for this PR (see "Standing operator authorization (#6850)" above). Name `STANDING_AUTH_ID` in the rationale.
-- All four axes green **and** no prior hold is still in force -> **PASS**, continue to the `critical-files` criterion.
+- All four axes green **and** no prior hold is still in force -> **PASS**, continue to the `critical-files` criterion; export it with `loom-daemon park-record decision --pr "$PR_NUMBER" --outcome pass --confidence 1 >/dev/null 2>&1 || true` (#12950).
 - All four axes green **but** the sticky-hold precheck found a hold still in force -> **HOLD the merge** (silently; the axes do not get a vote here — see "Sticky holds" below). The PR is **not** dropped from this pass: continue to the **Held-PR Health Pass** (#6720).
+- Any axis red or unsure, **and** "Self-release" (#12950) clears -> **PASS**, continue to the `critical-files` criterion; Step 2 carries the self-release block (and the reversal block when `PRIOR_HOLD=true`).
 - Any axis red -> **HOLD the merge** (see hold behavior below), then continue to the **Held-PR Health Pass** (#6720) — except a human-released same concern, (e) in "Sticky holds" (#11416).
 - **Unsure on any axis -> HOLD.** Conservative bias: a held PR costs one human merge; a bad auto-merge costs a revert on `main`.
 - Merging a PR that ever carried a hold marker -> **PASS + mandatory reversal comment** (Step 2 must state what changed; see "Sticky holds").
 
 **Size is not a proxy for any axis.** An 886-line PR that is 700 lines of new tests plus one self-contained module is green on all four; a 12-line change to `merge-pr.sh`'s ordering guard is red on blast radius *and* revertability. Never hold a PR because it is large, and never merge a PR because it is small.
+
+#### Self-release (#12950)
+
+Operator direction (2026-10-20): Champion makes the call itself when the answer is clear. When the four-axis read is **red or unsure** (a fresh PR, or a held one: `PRIOR_HOLD=true` with no `RELEASE_REASON`), Champion may clear the hold on its own confidence that a human would release it. This relaxes **the `merge-risk` criterion only**: `critical-files`, `loom:auto-merge-ok` and every other criterion are untouched.
+
+**Order is fixed; each step can only stop the release.**
+
+1. **Kept-set check, deterministic, no judgment.** If any changed file, or any `previous_filename` on a rename, matches `KEPT_SET_PATTERNS` (hardcoded above, so no config can narrow it), or the file list cannot be read, **stop: hold as today.** No confidence is formed, so a high-confidence misjudgment cannot reach a kept-set path. Unmatched but uncertain also holds (the confidence step below).
+2. **State the confidence** (0-1) that a human would release this PR, from the evidence only: revertability (does `git revert -m 1` undo it), blast radius, Judge review depth (named files, what was run), and cited operator rulings on the same kind of PR (PR or comment links, e.g. a `clear the hold —` comment). A ruling that cannot be linked is not evidence. Name the single axis that was red.
+3. **Compare with the threshold.** `champion.mergeRisk.selfReleaseConfidence`, a number in (0, 1], absent = 0.9, read below. At or above it: self-release. Below it, or when the key is `1.0`: hold exactly as today.
+
+```bash
+PR_NUMBER=<number>
+
+# Threshold: resolved through the daemon's config tiers (fleet / repo-class /
+# .loom/config.json), like champion.outOfBandAcGate. Absent, unreadable, a
+# missing verb or any value that is not a number in (0, 1] means 0.9.
+self_release_threshold() {
+  local out v
+  command -v loom-daemon >/dev/null 2>&1 || { echo 0.9; return; }
+  out=$(loom-daemon config get champion.mergeRisk.selfReleaseConfidence --json 2>/dev/null) || { echo 0.9; return; }
+  v=$(printf '%s' "$out" | jq -r 'if .found == true and (.value | type) == "number" and .value > 0 and .value <= 1 then .value else 0.9 end' 2>/dev/null) || v=0.9
+  [ -n "$v" ] && echo "$v" || echo 0.9
+}
+
+# Exit 0 only when self-release is on (threshold < 1.0; 1.0 disables it) and
+# the stated confidence $1 is a number in [threshold, 1].
+self_release_clears() {
+  local t
+  t=$(self_release_threshold)
+  awk -v t="$t" -v c="$1" 'BEGIN { exit !(t < 1 && c ~ /^[0-9]*\.?[0-9]+$/ && c + 0 >= t + 0 && c + 0 <= 1) }'
+}
+
+# Exit 0 (= HOLD) on any kept-set hit, an unreadable list or an empty one.
+kept_set_hit() {
+  local list file pattern
+  list=$(gh api "repos/{owner}/{repo}/pulls/$1/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' 2>/dev/null) || return 0
+  [ -n "$list" ] || return 0
+  [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || return 0
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    for pattern in "${KEPT_SET_PATTERNS[@]}"; do
+      # shellcheck disable=SC2053
+      [[ "$file" == $pattern ]] && return 0
+    done
+  done <<<"$list"
+  return 1
+}
+
+# Only when the axes are red/unsure and no durable release signal fired:
+if kept_set_hit "$PR_NUMBER"; then
+  loom-daemon park-record decision --pr "$PR_NUMBER" --outcome hold >/dev/null 2>&1 || true
+  : # hold as today
+elif [ "$OPEN_CONDITION" = true ]; then
+  : # an operator-named release condition (#12594) is the hold; Champion never self-releases it
+else
+  SELF_CONF=<0-1, stated from the evidence above>
+  if self_release_clears "$SELF_CONF"; then
+    SELF_RELEASE=true
+    SELF_AXIS="<the axis that was red>"
+    SELF_EVIDENCE="<revertability; blast radius; Judge review depth; cited rulings as links>"
+    # Held PR: un-stick it for this pass; the reversal block names the release.
+    if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
+      RELEASE_REASON="Champion self-release (confidence $SELF_CONF >= $(self_release_threshold))"
+      MERGE_BLOCKED_BY_HOLD=false
+      HOLD_REVERSAL_BLOCK="<!-- champion:merge-risk-hold-cleared -->
+**Reversing a prior merge-risk hold** (held $HOLD_AT):
+
+- **What released it**: $RELEASE_REASON
+- **Axis that flipped**: $SELF_AXIS: <the concrete, falsifiable reason it is now clear>
+- **Original hold concern**: <QUOTE_THE_AXIS_AND_CONCERN_FROM_THE_HOLD_COMMENT>
+"
+    fi
+    SELF_RELEASE_BLOCK="<!-- champion:merge-risk-self-release -->
+**Champion self-release** (head $(jq -r '.headRefOid' <<<"$PR_JSON")):
+
+- **Axis**: $SELF_AXIS
+- **Confidence**: $SELF_CONF (threshold $(self_release_threshold))
+- **Evidence**: $SELF_EVIDENCE
+"
+    loom-daemon park-record decision --pr "$PR_NUMBER" --outcome self-release --confidence "$SELF_CONF" >/dev/null 2>&1 || true
+    # PASS the `merge-risk` criterion and continue to `critical-files`. Step 2 posts the block(s) below.
+  else
+    loom-daemon park-record decision --pr "$PR_NUMBER" --outcome hold --confidence "$SELF_CONF" >/dev/null 2>&1 || true
+    : # below threshold or disabled: hold as today
+  fi
+fi
+```
+
+**Properties that must hold.**
+
+- **A high confidence never overrides the kept set**, because step 1 runs first and ends the attempt. A kept-set PR is never self-released at any confidence, including `1.0`.
+- **`champion.mergeRisk.selfReleaseConfidence=1.0` never self-releases.** `self_release_clears` returns false for any threshold of 1.0.
+- **Nothing is carried over.** The confidence is formed on this pass against this head SHA; a self-release comment on an earlier head is never read as a release (the sticky precheck does not look for it), so a push after a self-release gets a fresh decision. The comment is an audit record of a decision made in the same pass as the merge, in the same comment as the reversal block, so it creates no new trusted-marker input (`comment-trust.md`).
+- **Not the shadow score.** The confidence is not the #8545 pre-score, which never changes a verdict ([`champion-merge-risk-shadow.md`](champion-merge-risk-shadow.md)).
+- **Telemetry on every decision.** The `park-record decision` calls above (and the `pass` call in the all-green row of the decision rule: `--outcome pass --confidence 1`) export the outcome and confidence as `hold.transition` records (`loom.hold.confidence_pct`), so calibration can be checked against later reverts and operator overrides. Best-effort: a failed call changes nothing. The 7-day revert comparison is tracked in #12952.
 
 **Optional shadow pre-score (#8545).** Only with `TYPESAFE_API_KEY` set, and only *after* your verdict above is final, log a score per [`champion-merge-risk-shadow.md`](champion-merge-risk-shadow.md) — telemetry about this rubric, never an input to it. Unset: skip; nothing changes.
 
@@ -1380,6 +1480,8 @@ HOLD_MARKER="<!-- champion:merge-risk-hold -->"
 # Reset per PR, FIRST (#6720): it routes the Held-PR Health Pass, so a `true`
 # leaked from the previous PR would mis-route this one.
 MERGE_BLOCKED_BY_HOLD=false
+SELF_RELEASE=false   # #12950: set only by "Self-release" below, never by this precheck
+SELF_RELEASE_BLOCK=""
 
 # "0. PR facts" — this pass's live read, NOT "$GH_READ": it gates the merge.
 # Comments are TRUSTED authors only (#9548, `.loom/docs/comment-trust.md`): an
@@ -1576,7 +1678,10 @@ else
   OPEN_CONDITION=false              # closed, or overridden by the label: the rows below apply as usual
 fi
 
-if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
+if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ] && [ "$SELF_RELEASE" != true ]; then
+  # Not final yet (#12950): this is the first pass through the block, so
+  # SELF_RELEASE is false. "Self-release" below judges a held PR's axes too and,
+  # only if it clears, sets RELEASE_REASON and resets MERGE_BLOCKED_BY_HOLD.
   MERGE_BLOCKED_BY_HOLD=true
   if [ "$OPEN_CONDITION" = true ]; then
     # Name the condition once per condition comment (idempotent: the marker
@@ -1616,7 +1721,8 @@ fi
 | Precheck result | What the `merge-risk` criterion does |
 |---|---|
 | `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
-| `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates the `mergeable`, `recency` and `ci-green` criteria. |
+| `PRIOR_HOLD=true`, no `RELEASE_REASON`, "Self-release" clears (#12950) | The `merge-risk` criterion **PASS**: no kept-set path is touched and the confidence is at or above the threshold. Continue to `critical-files`. Step 2's reversal block **and** self-release block are **mandatory**. |
+| `PRIOR_HOLD=true`, no `RELEASE_REASON`, "Self-release" does not clear | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates the `mergeable`, `recency` and `ci-green` criteria. |
 | `OPEN_CONDITION=true` (#12594), no `loom:auto-merge-ok` | **HOLD the merge** whatever (b)-(e) and the axes say — `PRIOR_HOLD=true`, `RELEASE_REASON=""`, `MERGE_BLOCKED_BY_HOLD=true`, even with no hold marker on the PR. The notice names the condition (once per condition comment). Closed only by a later trusted comment from a person (never an `x[bot]` author, never Champion) that opens with `<!-- loom:release-condition-met -->`, or that is a release instruction (`clear the hold — …`, `override: …`, `ok to merge — …`) citing the condition (the word "condition" in its body); then the rows below apply as usual. A clearing comment that does not cite it releases nothing: the condition is the hold. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | The `merge-risk` criterion **PASS** by override — the axes are not re-scored. Continue to `critical-files`. Step 2's reversal block is **mandatory**. |
 | `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to `critical-files`, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
@@ -1627,7 +1733,7 @@ itself, not by a counter: after a new commit lands, later ticks keep seeing
 written against a diff that no longer exists. What can never happen is a merge of
 the *same* diff on a *different* read.
 
-**Champion cannot release its own hold.** Every release test excludes comments
+**Champion cannot release its own hold by re-reading it.** The one exception is "Self-release" (#12950), which is not a stored signal: it is a fresh decision each pass behind the deterministic kept-set check, and no earlier self-release comment is ever read back as one. Every release test (a)-(e) excludes comments
 containing `champion:` or `*Automated by Champion role*`. A hold is released by a
 human/Judge signal or by the code moving — never by Champion talking to itself.
 That exclusion is also what keeps Champion's own rejection/janitor comments from
@@ -2775,6 +2881,8 @@ fi
 
 # $HOLD_REVERSAL_BLOCK (the merge-risk criterion's sticky-hold precheck): empty when never
 # held, mandatory when this merge reverses a prior hold (#4742).
+# $SELF_RELEASE_BLOCK (the `merge-risk` criterion's "Self-release", #12950): empty unless
+# Champion cleared the merge-risk judgment on its own confidence.
 ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$(cat <<EOF
 **Champion Auto-Merge**
 
@@ -2790,6 +2898,7 @@ ${RESYNC_BULLET:+$RESYNC_BULLET
 - $CI_STATUS
 
 $HOLD_REVERSAL_BLOCK
+${SELF_RELEASE_BLOCK:-}
 **Proceeding with merge...** If this was merged in error, you can revert with:
 \`git revert -m 1 <merge-sha>\`
 
