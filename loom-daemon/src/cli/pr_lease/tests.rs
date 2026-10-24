@@ -774,6 +774,43 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     assert!(patched.contains(&a.released_marker()), "{patched}");
 }
 
+/// #13132: a release missing the claim's identity names the claimant and
+/// exits nonzero, leaving the lease untouched; the right identity releases.
+#[test]
+fn a_release_under_the_wrong_identity_names_the_claimant_and_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let claimant = who(Role::Doctor, "sweep-pid-1");
+    fs::write(dir.path().join("rows"), live_row(100, &claimant)).unwrap();
+    let wrong = who(Role::Doctor, "pr-lease-unknown");
+    assert_eq!(ctx(dir.path(), wrong).release(None, None, None), EXIT_MISMATCH);
+    assert!(patched(dir.path()).is_empty(), "the lease is untouched");
+    assert_eq!(ctx(dir.path(), claimant).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).contains("issues/comments/100"));
+}
+
+#[test]
+fn a_release_with_no_matching_same_host_lease_of_the_role_still_exits_zero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = who(Role::Doctor, "sweep-b");
+    // nothing at all
+    assert_eq!(ctx(dir.path(), me.clone()).release(None, None, None), EXIT_HELD);
+    // another host's lease, another role's lease, an expired lease
+    let mut other_host = who(Role::Doctor, "sweep-a");
+    other_host.host = "elsewhere".into();
+    let rows = live_row(100, &other_host)
+        + &live_row(101, &who(Role::Judge, "sweep-j"))
+        + &row_at(
+            102,
+            Utc::now() - chrono::Duration::days(1),
+            &who(Role::Doctor, "old").lease_marker(),
+        );
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), me).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty());
+}
+
 #[test]
 fn claim_refuses_without_writing_when_write_scope_denies_the_repo() {
     let dir = TempDir::new().unwrap();
