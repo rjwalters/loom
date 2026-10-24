@@ -130,7 +130,6 @@ impl StatusSection {
             S::Observability => (
                 "observability",
                 &[
-                    "observability_host_id_mismatch",
                     "observability_export",
                     "observability_exports",
                     "otlp_export",

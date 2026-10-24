@@ -1336,6 +1336,103 @@ esac
     );
 }
 
+/// An events source that records every read (#12312).
+#[derive(Default)]
+struct RecordingEvents {
+    reads: Vec<u32>,
+}
+
+impl crate::step_dispatch::stage_entry::EventsSource for RecordingEvents {
+    fn label_times(
+        &mut self,
+        _root: &std::path::Path,
+        _slug: &str,
+        number: u32,
+        _label: &str,
+        _max_pages: usize,
+    ) -> crate::observability::ops::stage_events::LabelTimes {
+        self.reads.push(number);
+        crate::observability::ops::stage_events::LabelTimes {
+            times: Some(Default::default()),
+            pages: 1,
+        }
+    }
+}
+
+/// The stage-entry sources a tick's lookups reach (#12312): a mirror
+/// snapshot (every labelled row carries `labels_at`) answers every stepped
+/// item from the mirror and makes no events read; the same rows without
+/// `labels_at` (the direct shape) read events; a mixed snapshot reads events
+/// only for the rows lacking `labels_at`.
+#[test]
+fn only_the_direct_backend_reaches_the_events_and_created_sources() {
+    use crate::step_dispatch::stage_entry::{Source, StageEntryProvider};
+
+    fn lookups(rows: &[RestIssue]) -> (Vec<u32>, Vec<Source>) {
+        let pulls = rows
+            .iter()
+            .filter(|r| r.is_pull_request)
+            .map(|r| pull_from_row(r, PullMarkers::default()))
+            .collect();
+        let inputs = build_inputs(
+            rows,
+            pulls,
+            &IssueFacts::default(),
+            RepoInput::default(),
+            HostInput::default(),
+        );
+        let items = step_item::classify(&inputs);
+        let mut events = RecordingEvents::default();
+        let mut provider = StageEntryProvider::load(None, 100);
+        let mut sources = Vec::new();
+        let drawn = draw_inputs(items, rows, |r, label| {
+            let e = provider.entry(
+                &mut events,
+                std::path::Path::new("/nonexistent"),
+                "acme/widgets",
+                r,
+                label,
+                now(),
+            );
+            sources.extend(e.map(|e| e.source));
+            e
+        });
+        assert!(drawn.iter().any(|d| d.stage_entry.is_some()));
+        (events.reads, sources)
+    }
+
+    fn mirrored(mut r: RestIssue) -> RestIssue {
+        r.labels_at = Some(
+            r.labels
+                .iter()
+                .map(|l| (l.clone(), "2026-10-05T00:00:00Z".to_string()))
+                .collect(),
+        );
+        r
+    }
+
+    let direct = forge();
+    let mirror: Vec<RestIssue> = direct.iter().cloned().map(mirrored).collect();
+
+    let (reads, sources) = lookups(&mirror);
+    assert!(reads.is_empty(), "a mirror snapshot reads no events: {reads:?}");
+    assert!(!sources.is_empty() && sources.iter().all(|s| *s == Source::Mirror));
+
+    let (reads, sources) = lookups(&direct);
+    assert!(!reads.is_empty(), "the direct shape reads events");
+    assert!(sources.iter().all(|s| *s != Source::Mirror));
+
+    // Mixed: only rows without `labels_at` are read.
+    let mixed: Vec<RestIssue> = direct
+        .iter()
+        .cloned()
+        .map(|r| if r.number % 2 == 0 { mirrored(r) } else { r })
+        .collect();
+    let (reads, _) = lookups(&mixed);
+    assert!(!reads.is_empty());
+    assert!(reads.iter().all(|n| n % 2 == 1), "even rows are mirrored: {reads:?}");
+}
+
 // ---- #12817: items the captain offered ----------------------------------
 
 fn offer(repo: &str, item: u32, role: StepRole) -> Offer {

@@ -33,7 +33,7 @@
 use std::path::Path;
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::RepoVisibility;
 use crate::types::CapView;
 use crate::work_finder::halt_cause::since::RootHalt;
@@ -111,6 +111,9 @@ pub fn tick_attributes(
     }
     if let Some(p) = &report.passes {
         out.extend(pass_attributes(p));
+    }
+    if let Some(excluded) = excluded_attribute(&report.depth) {
+        out.push(("loom.dispatch.excluded".into(), excluded));
     }
     if let Some(d) = &report.discovery {
         out.extend(discovery_attributes(d));
@@ -209,6 +212,30 @@ pub fn pass_attributes(
         out.push(("loom.dispatch.stop".into(), stop.to_string()));
     }
     out
+}
+
+/// The tick span's `loom.dispatch.excluded` (#13008): the tick's exclusions
+/// by reason, summed over repos, as comma-joined `reason=count` pairs in
+/// reason order (the `loom.dispatch.passes` rendering). `None` when nothing
+/// was excluded. Pure.
+#[must_use]
+pub fn excluded_attribute(depth: &[RepoDepth]) -> Option<String> {
+    let mut by_reason: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for d in depth {
+        for (reason, &n) in d.excluded.iter().filter(|(_, n)| **n > 0) {
+            *by_reason.entry(reason).or_default() += n;
+        }
+    }
+    if by_reason.is_empty() {
+        return None;
+    }
+    Some(
+        by_reason
+            .iter()
+            .map(|(reason, n)| format!("{reason}={n}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 /// The tick's extra metric points: the `loom.dispatch.cap_term{kind="configured"}`
@@ -420,6 +447,33 @@ mod tests {
             .any(|(k, v)| k == "loom.dispatch.draws" && v == "0"));
         assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.passes"));
         assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.stop"));
+    }
+
+    #[test]
+    fn tick_exclusions_are_one_attribute_the_export_keeps() {
+        let depth = |repo: &str, excluded: &[(&'static str, usize)]| RepoDepth {
+            repo: repo.to_string(),
+            excluded: excluded.iter().copied().collect(),
+            ..RepoDepth::default()
+        };
+        let report = TickReport {
+            depth: vec![
+                depth("o/a", &[("held_at_head", 2), ("cooling_down", 1)]),
+                depth("o/b", &[("held_at_head", 3), ("blocked", 0)]),
+            ],
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&report, None, None);
+        let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("loom.dispatch.excluded"), Some("cooling_down=1,held_at_head=5"));
+        for (key, _) in &attrs {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
+                "{key} is not on the export allowlist"
+            );
+        }
+        let quiet = tick_attributes(&TickReport::default(), None, None);
+        assert!(!quiet.iter().any(|(k, _)| k == "loom.dispatch.excluded"));
     }
 
     #[test]

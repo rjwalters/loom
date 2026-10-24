@@ -116,7 +116,6 @@ mod tests {
         let mut s = ObservabilityExportStatus {
             state: crate::types::ObservabilityExportState::Starting,
             host_id: Some("joseph-air".to_string()),
-            ingest_host_id: None,
             endpoint: Some("http://127.0.0.1:14318".to_string()),
             exporter: Some("otlp".to_string()),
             started_at: Some(now() - chrono::Duration::hours(4)),

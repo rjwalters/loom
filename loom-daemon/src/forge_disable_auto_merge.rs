@@ -44,7 +44,7 @@
 //!   mutation inline. The first draft of #8900 did mirror it in `gh api
 //!   graphql`, and that duplication was rejected in review (PR #8990): it is
 //!   exactly the new portable shell `.loom/docs/shell-language-policy.md`
-//!   forbids and the shell-budget ratchet refuses. The consequence to keep in
+//!   forbids. The consequence to keep in
 //!   mind when changing this module: the guard's disarm is only as available as
 //!   `loom-daemon` is on that host. The guard reports `AUTO_MERGE_DISARMED=0`
 //!   and names the failure in its `REASON=` when the binary cannot be resolved,
@@ -315,8 +315,7 @@ fn post_audit_comment(gh_bin: &Path, pr: u32, outcome: &Disarm, hold: Option<&st
 /// armed. This is what `verdict-staleness-guard.sh --clear` uses: the guard
 /// delegates the whole disarm (mutation *and* audit trail) to this verb rather
 /// than mirroring the mutation and two comment bodies in portable shell, which
-/// is both the language policy (`.loom/docs/shell-language-policy.md`) and what
-/// the shell-budget ratchet requires.
+/// is the language policy (`.loom/docs/shell-language-policy.md`).
 pub fn handle_disable_auto_merge(pr: u32, audit_comment: bool, hold: Option<&str>) -> Result<()> {
     if crate::forge_cmd::detect_forge(None) == crate::forge_cmd::ForgeType::Gitea {
         eprintln!(
