@@ -20,14 +20,7 @@ use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::{kv_int, kv_string, nanos};
 use crate::telemetry::kinds::dispatch_state::Artifact;
-use crate::telemetry::{RepoVisibility, TelemetryRecord};
-
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
+use crate::telemetry::TelemetryRecord;
 
 fn rfc3339(at: chrono::DateTime<chrono::Utc>) -> String {
     at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -43,7 +36,7 @@ pub(super) fn log_parts(
     };
     let mut attributes = vec![
         kv_string("loom.repo", r.repo.clone()),
-        kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+        kv_string("loom.repo.visibility", r.visibility.as_str()),
         match r.artifact {
             Artifact::Issue => kv_int("loom.issue", i64::from(r.number)),
             Artifact::Pr => kv_int("loom.pr_number", i64::from(r.number)),
@@ -106,6 +99,9 @@ mod tests {
             reeval_next: Some(now),
             iw: None,
             weight: None,
+            claimed_since: None,
+            doctor_rejections: None,
+            doctor_escalated: None,
             transition: StateTransition::Changed,
             sampled_at: now,
             visibility: RepoVisibility::Private,

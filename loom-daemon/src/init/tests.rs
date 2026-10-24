@@ -1040,8 +1040,8 @@ fn test_hooks_preserved_on_reinstall() {
 
 #[test]
 fn test_scripts_lib_subdirectory_copied_on_fresh_install() {
-    // Verifies that scripts/lib/ subdirectory (containing loom-tools.sh
-    // and pipe-pane-cmd.sh) is correctly copied during initialization.
+    // Verifies that scripts/lib/ subdirectory (containing loom-tools.sh,
+    // repo-root.sh and pipe-pane-cmd.sh) is correctly copied during initialization.
     // This is the specific scenario reported in issue #2392.
     let temp_dir = TempDir::new().unwrap();
     let workspace = temp_dir.path();
@@ -1062,6 +1062,11 @@ fn test_scripts_lib_subdirectory_copied_on_fresh_install() {
     fs::write(
         defaults.join("scripts").join("lib").join("loom-tools.sh"),
         "#!/bin/bash\n# shared helper library",
+    )
+    .unwrap();
+    fs::write(
+        defaults.join("scripts").join("lib").join("repo-root.sh"),
+        "#!/bin/bash\n# repo-root helper",
     )
     .unwrap();
     fs::write(
@@ -1106,6 +1111,13 @@ fn test_scripts_lib_subdirectory_copied_on_fresh_install() {
             .added
             .contains(&".loom/scripts/lib/loom-tools.sh".to_string()),
         "Report should include lib/loom-tools.sh, got: {:?}",
+        report.added
+    );
+    assert!(
+        report
+            .added
+            .contains(&".loom/scripts/lib/repo-root.sh".to_string()),
+        "Report should include lib/repo-root.sh, got: {:?}",
         report.added
     );
     assert!(

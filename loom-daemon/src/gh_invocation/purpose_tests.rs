@@ -34,7 +34,6 @@ fn every_discovery_site_sets_the_tag() {
         "pr_planning/listing.rs",
         "work_finder/landed_prefilter.rs",
         "work_finder/forge.rs",
-        "observability/queue_blocked.rs",
         "quarantine_reconciliation/listing.rs",
         "claim_reconciliation/open_pr_listing.rs",
         "intake_reconcile.rs",

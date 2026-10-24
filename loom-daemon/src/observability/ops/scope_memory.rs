@@ -26,16 +26,7 @@ pub fn record(
     at: DateTime<Utc>,
 ) -> ScopeMemoryRecord {
     let (repo, repo_visibility) = match repo {
-        Some((slug, vis)) => (
-            Some(slug),
-            Some(
-                match vis {
-                    RepoVisibility::Public => "public",
-                    RepoVisibility::Private => "private",
-                }
-                .to_string(),
-            ),
-        ),
+        Some((slug, vis)) => (Some(slug), Some(vis.as_str().to_string())),
         None => (None, None),
     };
     ScopeMemoryRecord {

@@ -5,7 +5,7 @@
 //!
 //! The check first landed as a `check_mcp_guard_wiring()` function inside
 //! `scripts/check-guard-scan-contracts.sh`, which is `contract`-category shell.
-//! Epic #7810's `shell-budget` gate ratchets that pool DOWN, never up, and
+//! Epic #7810 retires that pool, and
 //! `.loom/docs/shell-language-policy.md` is unconditional: new executable logic
 //! is a `loom-daemon` subcommand. This is that move — the same one
 //! [`super::points_marker_check`] made for #9056, and the one this issue's own
@@ -13,7 +13,7 @@
 //!
 //! # Where it runs
 //!
-//! The `Daemon Checks` CI job, alongside `shell-budget` and the `.gitignore`
+//! The `Daemon Checks` CI job, alongside the `.gitignore`
 //! convergence gate — the job that already downloads the shared debug binary.
 //! It deliberately does **not** live in `Structural Checks`: that job is
 //! toolchain-free by design (no cargo, no daemon binary), which is exactly why

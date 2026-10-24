@@ -33,6 +33,7 @@
 //! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.close`     | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.revisit`   | Epic supervisor | `{epic, drawable, held, parked, action, shape, epic_held}` |
 //! | `daemon.capacity.advisory` | Work finder | `{pressured, queued, healthy_accounts, exhausted_accounts, total_accounts, estimated_drain_minutes?, message}` |
 //! | `daemon.drain.started`   | Drain supervisor | `{in_flight, timeout_secs, force_after_timeout, deadline}` |
 //! | `daemon.drain.completed` | Drain supervisor | `{in_flight}` (always 0) |

@@ -100,36 +100,132 @@ struct CompareFile {
 /// One file's full identity, as compared between the two sides.
 type FileIdentity = (String, String, String, String, String);
 
+/// Extra reads of an unreadable compare before giving up (#13114): a transient
+/// forge failure (rate limit, truncated response) must not by itself re-arm a
+/// released hold. Bounded, no loop beyond this.
+const COMPARE_RETRIES: u32 = 2;
+
+/// Fixed pause between compare attempts.
+#[cfg(not(test))]
+const COMPARE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const COMPARE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Why one side's diff could not be produced.
+enum SideError {
+    /// The compare could not be read or parsed even after the retries — the
+    /// forge gave no answer ([`Outcome::Unread`]).
+    Unread,
+    /// The compare was read but is not byte evidence (truncated file list, a
+    /// patch-less entry).
+    Inconclusive,
+}
+
+/// One compare read, retried when it yields no parsable body.
+fn read_compare(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    base_ref: &str,
+    head: &str,
+) -> Result<Compare, SideError> {
+    for attempt in 0..=COMPARE_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(COMPARE_BACKOFF);
+        }
+        let Some(body) = super::gh_api(
+            "verdict.patch_compare",
+            gh_bin,
+            cwd,
+            &format!("repos/{{owner}}/{{repo}}/compare/{base_ref}...{head}"),
+        ) else {
+            continue;
+        };
+        if let Ok(parsed) = serde_json::from_slice::<Compare>(&body) {
+            return Ok(parsed);
+        }
+    }
+    Err(SideError::Unread)
+}
+
 /// Fetch and canonicalize one side's merge-base-relative diff.
 fn side(
     gh_bin: &Path,
     cwd: Option<&Path>,
     base_ref: &str,
     head: &str,
-) -> Option<Vec<FileIdentity>> {
-    let body = super::gh_api(
-        "verdict.patch_compare",
-        gh_bin,
-        cwd,
-        &format!("repos/{{owner}}/{{repo}}/compare/{base_ref}...{head}"),
-    )?;
-    let parsed: Compare = serde_json::from_slice(&body).ok()?;
+) -> Result<Vec<FileIdentity>, SideError> {
+    let parsed = read_compare(gh_bin, cwd, base_ref, head)?;
     if parsed.files.len() >= FILES_PAGE_CAP {
-        return None;
+        return Err(SideError::Inconclusive);
     }
     let mut rows: Vec<FileIdentity> = Vec::with_capacity(parsed.files.len());
     for f in parsed.files {
         // No patch text => no byte evidence. Refusing here is what keeps a
         // binary change (whose diff the endpoint renders as nothing at all)
         // from reading as "identical" against a different binary change.
-        let patch = f.patch?;
-        let sha = f.sha?;
+        let (Some(patch), Some(sha)) = (f.patch, f.sha) else {
+            return Err(SideError::Inconclusive);
+        };
         rows.push((f.filename, f.previous_filename.unwrap_or_default(), f.status, sha, patch));
     }
     // The endpoint's ordering is not a documented guarantee; sort so the
     // comparison is about content, not about response order.
     rows.sort();
-    Some(rows)
+    Ok(rows)
+}
+
+/// What the two sides said.
+pub enum Outcome {
+    /// Both sides read; the patches are byte-identical.
+    Proven,
+    /// Both sides read; the patches differ. Carries every path whose identity
+    /// differs (a file on one side only, or on both with different content,
+    /// including a rename's old name).
+    Differs(Vec<String>),
+    /// The compare stayed unreadable after the retries (`equivalence=unread`).
+    Unread,
+    /// Read, but not usable as byte evidence.
+    Inconclusive,
+}
+
+/// Compare the PR's own patch before and after the head move.
+pub fn outcome(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    reviewed: &str,
+    head: &str,
+    base_ref: &str,
+) -> Outcome {
+    if !super::is_sha(reviewed) || !super::is_sha(head) || !super::is_safe_ref(base_ref) {
+        return Outcome::Inconclusive;
+    }
+    let before = side(gh_bin, cwd, base_ref, reviewed);
+    let after = side(gh_bin, cwd, base_ref, head);
+    let (before, after) = match (before, after) {
+        (Ok(b), Ok(a)) => (b, a),
+        (Err(SideError::Unread), _) | (_, Err(SideError::Unread)) => return Outcome::Unread,
+        _ => return Outcome::Inconclusive,
+    };
+    // Two empty diffs prove nothing: each head merely equals its own merge
+    // base, and those merge bases can differ. See the module doc.
+    if before.is_empty() && after.is_empty() {
+        return Outcome::Inconclusive;
+    }
+    if before == after {
+        return Outcome::Proven;
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for row in before
+        .iter()
+        .filter(|r| !after.contains(r))
+        .chain(after.iter().filter(|r| !before.contains(r)))
+    {
+        paths.insert(row.0.clone());
+        if !row.1.is_empty() {
+            paths.insert(row.1.clone());
+        }
+    }
+    Outcome::Differs(paths.into_iter().collect())
 }
 
 /// Is the PR's own patch byte-identical before and after the head move?
@@ -140,22 +236,9 @@ pub fn evidence(
     head: &str,
     base_ref: &str,
 ) -> Evidence {
-    if !super::is_sha(reviewed) || !super::is_sha(head) || !super::is_safe_ref(base_ref) {
-        return Evidence::Indeterminate;
-    }
-    let (Some(before), Some(after)) =
-        (side(gh_bin, cwd, base_ref, reviewed), side(gh_bin, cwd, base_ref, head))
-    else {
-        return Evidence::Indeterminate;
-    };
-    // Two empty diffs prove nothing: each head merely equals its own merge
-    // base, and those merge bases can differ. See the module doc.
-    if before.is_empty() && after.is_empty() {
-        return Evidence::Indeterminate;
-    }
-    if before == after {
-        Evidence::Proven
-    } else {
-        Evidence::Refuted
+    match outcome(gh_bin, cwd, reviewed, head, base_ref) {
+        Outcome::Proven => Evidence::Proven,
+        Outcome::Differs(_) => Evidence::Refuted,
+        Outcome::Unread | Outcome::Inconclusive => Evidence::Indeterminate,
     }
 }

@@ -7,9 +7,8 @@
 //!
 //! # Why this is Rust and not shell
 //!
-//! `worktree.sh` and `spawn-claude.sh` are both in the shell budget's
-//! `contract` (portable) pool, whose growth the ratchet refuses with no
-//! `Shell-Budget-Growth:` override (epic #7810, `.loom/docs/shell-language-policy.md`).
+//! `worktree.sh` and `spawn-claude.sh` are both `contract` (portable) shell,
+//! which should not grow (epic #7810, `.loom/docs/shell-language-policy.md`).
 //! A first cut of this issue put the whole decision in
 //! `defaults/scripts/lib/cargo-target-dir.sh` and added 138 portable lines; the
 //! gate refused it, correctly. The two scripts now call

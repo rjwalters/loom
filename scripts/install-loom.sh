@@ -2003,6 +2003,7 @@ EXPECTED_FILES=(
   ".loom/roles"
   ".loom/scripts/worktree.sh"
   ".loom/scripts/lib/loom-tools.sh"
+  ".loom/scripts/lib/repo-root.sh"
   ".loom/scripts/lib/forge-helpers.sh"
   ".loom/scripts/lib/pipe-pane-cmd.sh"
   # NOTE (#4262): .loom/hooks/*.sh are intentionally NOT expected — hook scripts

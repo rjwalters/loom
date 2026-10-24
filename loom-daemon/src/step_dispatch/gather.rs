@@ -400,9 +400,12 @@ pub fn hold_ci_pending(
 /// A change in the repo's standing authorizations is a release signal too
 /// (#12933): `hold_auths` maps a PR to the digest its hold recorded
 /// ([`PullMarkers::hold_auth`]) and `current_auth` is the repo's digest now.
-/// A hold whose digest differs, or that recorded none, is drawn once; its
-/// re-hold records the current digest. `current_auth` of `None` (no digest
-/// available) keeps the head-only rule. Pure.
+/// A hold whose recorded digest differs is drawn once; its re-hold records
+/// the current digest. A hold that recorded none (every merge-risk hold, and
+/// a legacy critical-file one) keeps the head-only rule (#13008): nothing
+/// re-records a digest on the merge-risk path, so drawing it would redraw it
+/// on every tick. `current_auth` of `None` (no digest available) keeps the
+/// head-only rule too. Pure.
 pub fn hold_at_recorded_head(
     items: &mut [Item],
     heads: &HashMap<u32, String>,
@@ -423,7 +426,12 @@ pub fn hold_at_recorded_head(
         let (Some(head), Some(recorded)) = (heads.get(&pr), hold_heads.get(&pr)) else {
             continue;
         };
-        if current_auth.is_some_and(|cur| hold_auths.get(&pr).map(String::as_str) != Some(cur)) {
+        let moved = current_auth.is_some_and(|cur| {
+            hold_auths
+                .get(&pr)
+                .is_some_and(|recorded| recorded.as_str() != cur)
+        });
+        if moved {
             continue;
         }
         if !recorded.is_empty() && (head.starts_with(recorded) || recorded.starts_with(head)) {

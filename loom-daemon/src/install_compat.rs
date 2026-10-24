@@ -348,5 +348,51 @@ fn git(repo_root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> 
         .map_err(|e| anyhow::anyhow!("could not run git: {e}"))
 }
 
+/// The schema version of [`capabilities_json`]. Bump when a key is removed or
+/// changes meaning; adding a key does not.
+pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
+
+/// The identity of the installed-file payload this binary was built against:
+/// the contract claims plus the daemon-invoked file list, in one string.
+///
+/// Two binaries built from the same payload report the same string whatever
+/// their own versions are, so the shell side compares it for equality and
+/// never orders it. A mismatch means the two disagree about what an installed
+/// tree must look like, and nothing here picks a winner.
+#[must_use]
+pub fn payload_identity() -> String {
+    format!(
+        "supports_installed={SUPPORTS_INSTALLED};requires_daemon={REQUIRES_DAEMON};invoked_files={}",
+        DAEMON_INVOKED_INSTALLED_FILES.join(",")
+    )
+}
+
+/// This binary's side of the contract as one JSON object. The single source
+/// for `loom-daemon install-compat show --json` and `loom-tools capabilities
+/// --json`, so the two cannot drift: the wrappers never carry capability
+/// rules of their own.
+///
+/// `installed` and `classification` are `null` unless an installed side was
+/// read (`install-compat show --repo`).
+#[must_use]
+pub fn capabilities_json(
+    daemon: &DaemonCompat,
+    installed: Option<&InstallMeta>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": CAPABILITIES_SCHEMA_VERSION,
+        "running": daemon.running.to_string(),
+        "supports_installed": SUPPORTS_INSTALLED,
+        "requires_daemon": REQUIRES_DAEMON,
+        "payload_identity": payload_identity(),
+        "invoked_files": DAEMON_INVOKED_INSTALLED_FILES,
+        "installed": installed.map(|m| serde_json::json!({
+            "loom_version": m.loom_version,
+            "requires_daemon": m.requires_daemon,
+        })),
+        "classification": installed.map(|m| format!("{:?}", classify(m, daemon))),
+    })
+}
+
 #[cfg(test)]
 mod tests;

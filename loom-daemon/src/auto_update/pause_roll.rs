@@ -566,10 +566,6 @@ impl Run<'_> {
         });
     }
 
-    /// Undo a pause that has stopped nothing: withdraw every pause request,
-    /// hand the sweeps back to the reaper, delete the manifest. Only this
-    /// run's: a superseded run that gets here late leaves its replacement's
-    /// manifest, requests and holds alone ([`RunLedger::undo`]).
     /// Why the floor no longer asks for this roll, when it does not (#12610).
     /// Only a floor-driven roll can be withdrawn this way.
     fn floor_withdrawn(&self) -> Option<String> {
@@ -615,6 +611,10 @@ impl Run<'_> {
         H4Outcome::StoodDown { promoted: false }
     }
 
+    /// Undo a pause that has stopped nothing: withdraw every pause request,
+    /// hand the sweeps back to the reaper, delete the manifest. Only this
+    /// run's: a superseded run that gets here late leaves its replacement's
+    /// manifest, requests and holds alone ([`RunLedger::undo`]).
     fn stand_down(&mut self, promoted: bool) -> H4Outcome {
         self.ledger.undo(self.host.as_ref());
         log::warn!(

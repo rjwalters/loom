@@ -446,6 +446,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("epic_supervisor.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         (
             "intake_reconcile/demote.rs",
@@ -490,6 +491,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "sweep_registry/step_cap_notice.rs",
             Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
+        ),
+        (
+            "sweep_registry/step_outcome_notice.rs",
+            Via(DISPATCH, "noop/failed reason comment on an item whose Builder step was dispatched (#13054)"),
         ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),

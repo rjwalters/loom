@@ -34,7 +34,7 @@
 //! # Why this is Rust and not more lines in that script
 //!
 //! `check-dependabot-labels.sh` is `contract`-category shell. Epic #7810's
-//! `shell-budget` gate ratchets that pool down, never up, and
+//! retires that pool, and
 //! `.loom/docs/shell-language-policy.md` sends new executable logic to a
 //! `loom-daemon` subcommand — the same move [`crate::guard_wiring`] made for
 //! #9108.

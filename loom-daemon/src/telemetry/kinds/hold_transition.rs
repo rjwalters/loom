@@ -62,7 +62,7 @@ pub mod reason {
     pub const HOLD_RELEASED: &str = "hold-released";
     /// Champion cleared its own merge-risk hold on confidence (#12950).
     pub const MERGE_RISK_SELF_RELEASE: &str = "merge-risk-self-release";
-    /// Criterion #2 passed with no hold involved (#12950).
+    /// The `merge-risk` criterion passed with no hold involved (#12950).
     pub const MERGE_RISK_PASS: &str = "merge-risk-pass";
 }
 

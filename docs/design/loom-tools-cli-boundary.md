@@ -280,6 +280,28 @@ retired Python `loom-tools` package (ADR-0013) and now only provides
 inherits an ambiguous name. Epic Phase 2 resolves it; the rename is a
 compatibility edit across `agent-spawn.sh` and `agent-wait.sh`, which source it.
 
+#### 4.3.1 Tools-first order and `capabilities --json` (#12939)
+
+For `strip-ansi` and `checkpoint` the locator resolves, in order: a
+`LOOM_DAEMON_BIN` pin (explicit, still names the daemon; `LOOM_TOOLS_BIN`
+overrides it), then `loom-tools` (`LOOM_TOOLS_BIN`, `PATH`, the machine
+install, a repo build), then `loom-daemon` as a logged **transitional**
+fallback. The fallback is off under `LOOM_MODE=session` and when
+`LOOM_TOOLS_DAEMON_FALLBACK=0`; with nothing resolvable the stub exits
+non-zero. Other commands resolve the daemon only.
+
+`loom-tools capabilities --json [--repo PATH]` prints the same object as
+`loom-daemon install-compat show --json` (one Rust builder,
+`install_compat::capabilities_json`), plus `"binary": "loom-tools"`. Keys:
+`schema_version` (1), `running`, `supports_installed`, `requires_daemon`,
+`payload_identity`, `invoked_files`, `installed`, `classification`. Removing
+or renaming a key bumps `schema_version`.
+
+`payload_identity` is compared for equality only. `resync-installed.sh`
+refuses when tools and daemon report different identities, or when the tools
+binary's `requires_daemon` is older than the payload being installed. Newer
+tools than the payload (rollback) proceeds; an unreadable identity fails open.
+
 ### 4.4 Handlers that reach daemon workspace-registry state
 
 Listed in 3.6. They are **C** and stay in `loom-daemon` unless a verb is
@@ -649,7 +671,17 @@ seam):
   `forge-helpers.sh`, `merge-pr.sh`).
 - Whether `ForgeAction` and `quarantine`/`noop-cooldown` depend on binary-root
   types beyond the files named in 3.6.
-- Release size and build-time effect of a second bin: not measured, no claim made.
+- Release size of the second bin, measured (#12940) from `cargo build --release
+  --bins -j2 --features otlp` at `6aa459a5c` on `x86_64-unknown-linux-gnu`
+  (the release job's profile, unstripped, as uploaded): `loom-daemon`
+  83,862,304 bytes (80.0 MiB; 30,536,847 gzipped), `loom-tools` 15,618,712
+  bytes (14.9 MiB; 8,706,809 gzipped). Both carry the same embedded install
+  payload (about 4.5 MB of that, `build.rs`), so a tools-only machine downloads
+  roughly 19% of the daemon's bytes. Not measured: the two Darwin/aarch64
+  triples (no runner here; the first release run records them in its job
+  summary), and the wall-clock effect of the second bin (the one cold
+  `cargo build` covering both took 6m24s on a shared host, which is not a
+  comparison against a daemon-only build).
 - Gitea: the Rust facade declines (`EX_FORGE_DECLINED`); the Phase 3 decision
   (port or retain a bounded shell adapter) is open and must be made before the
   forge write family moves. Counted: 23 library files mention `ForgeType::Gitea`

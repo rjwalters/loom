@@ -69,7 +69,7 @@ pub(crate) struct DecisionArgs {
     #[arg(long, value_name = "N")]
     pub pr: u64,
 
-    /// What criterion #2 decided.
+    /// What the `merge-risk` criterion decided.
     #[arg(long, value_enum)]
     pub outcome: DecisionOutcome,
 

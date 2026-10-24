@@ -335,9 +335,14 @@ mod held_at_head {
     }
 
     #[test]
-    fn a_changed_digest_or_a_legacy_hold_is_drawn_once() {
+    fn a_changed_digest_is_drawn_once() {
         assert_eq!(run_auth(Some("aa11"), Some("bb22")), 0);
-        assert_eq!(run_auth(None, Some("bb22")), 0);
+    }
+
+    #[test]
+    fn a_hold_with_no_recorded_digest_stays_held_at_its_head() {
+        // A merge-risk hold never records `auth=` (#13008).
+        assert_eq!(run_auth(None, Some("bb22")), 1);
     }
 
     #[test]

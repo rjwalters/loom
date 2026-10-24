@@ -173,41 +173,15 @@ pub fn claim_at(path: &Path, pid: u32) -> ClaimOutcome {
 /// umask, and unlike the autonomy marker (which records paths and is written
 /// under `umask 077`) a pid file carries nothing sensitive.
 fn write_pid_atomic(path: &Path, pid: u32) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(format!("could not create {}: {e}", parent.display()));
-        }
-    }
-    let tmp = path.with_extension(format!("pid.tmp.{}", uuid::Uuid::new_v4()));
-    let contents = format!("{pid}\n");
-
-    let write_result = {
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(&tmp)
-                .and_then(|mut f| f.write_all(contents.as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, contents.as_bytes())
-        }
-    };
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not write temp pid file {}: {e}", tmp.display()));
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not rename pid file into place {}: {e}", path.display()));
-    }
-    Ok(())
+    crate::fs_util::write_atomic(
+        path,
+        format!("{pid}\n").as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: false,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("could not write pid file {}: {e}", path.display()))
 }
 
 /// Parse a pid file into its recorded pid — `None` when the file is missing,

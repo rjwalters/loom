@@ -54,6 +54,13 @@ pub(crate) enum ChampionHoldCommand {
         #[arg(long, value_name = "SHA")]
         head: String,
     },
+
+    /// Decide the ratification hold's tick for a PR (#12992): reads the head
+    /// contents of every spec/decision file the PR changes and the trusted
+    /// comments, and prints `LOOM-CHAMPION-RATIFICATION verdict=<clear|hold|
+    /// unreadable> action=<none|hold|stands|release|clear|defer> pr=<N>
+    /// head=<sha> files=<a,b|->`. Exit 3 with no stdout when a read failed.
+    Ratification(TargetArgs),
 }
 
 #[derive(clap::Args)]
@@ -148,6 +155,10 @@ impl ChampionHoldCommand {
                 println!("{}", class.line(t.pr));
                 Ok(())
             }
+            ChampionHoldCommand::Ratification(t) => {
+                println!("{}", ratification_line(&t, &root));
+                Ok(())
+            }
             ChampionHoldCommand::MergeFailedMarker { target, head } => {
                 let trusted = target
                     .trusted_bodies(&root)
@@ -167,4 +178,88 @@ impl ChampionHoldCommand {
             }
         }
     }
+}
+
+/// The ratification verb's stdout line; exits 3 on any failed read.
+fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
+    use crate::champion_hold::ratification::{decide, scan, ChangedFile, Comment, Config, Verdict};
+    let repo = t.repo();
+    let fail = |what: &str| -> ! { unreadable("ratification", t.pr, what) };
+    let pull = TargetArgs::read_json(&format!("repos/{repo}/pulls/{}", t.pr), root)
+        .unwrap_or_else(|| fail("head"));
+    let head = pull
+        .pointer("/head/sha")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| fail("head"))
+        .to_string();
+    let listing = crate::script_helpers::run_gh(
+        &[
+            "api",
+            &format!("repos/{repo}/pulls/{}/files", t.pr),
+            "--paginate",
+            "--jq",
+            ".[]",
+        ],
+        root,
+        false,
+    );
+    let listing = listing.ok_output().unwrap_or_else(|| fail("file list"));
+    let cfg = Config::from_effective(&crate::config_resolver::resolve_effective_config(root));
+    let mut files = Vec::new();
+    for line in String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+    {
+        let v: Value = serde_json::from_str(line).unwrap_or_else(|_| fail("file list"));
+        let name = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        let mut f = ChangedFile {
+            filename: name("filename").unwrap_or_else(|| fail("file list")),
+            previous_filename: name("previous_filename"),
+            status: name("status").unwrap_or_default(),
+            head_content: None,
+        };
+        // Contents are read only for files the path rules select.
+        if f.status != "removed" && ratification_candidate(&f, &cfg) {
+            let path = format!("repos/{repo}/contents/{}?ref={head}", f.filename);
+            let out = crate::script_helpers::run_gh(
+                &["api", "-H", "Accept: application/vnd.github.raw", &path],
+                root,
+                false,
+            );
+            f.head_content = out
+                .ok_output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        }
+        files.push(f);
+    }
+    let comments: Vec<Comment> =
+        crate::comment_trust::records::fetch_trusted_comments(repo, &t.pr.to_string(), root, false)
+            .unwrap_or_else(|| fail("trusted comments"))
+            .iter()
+            .filter_map(Comment::from_record)
+            .collect();
+    let verdict = scan(&files, &cfg);
+    let action = decide(&verdict, &comments, &head);
+    let (name, hit) = match &verdict {
+        Verdict::Clear => ("clear", Vec::new()),
+        Verdict::Hold(h) => ("hold", h.clone()),
+        Verdict::Unreadable(u) => ("unreadable", u.clone()),
+    };
+    let listed = if hit.is_empty() {
+        "-".to_string()
+    } else {
+        hit.join(",")
+    };
+    format!(
+        "LOOM-CHAMPION-RATIFICATION verdict={name} action={} pr={} head={head} files={listed}",
+        action.as_str(),
+        t.pr
+    )
+}
+
+fn ratification_candidate(
+    f: &crate::champion_hold::ratification::ChangedFile,
+    cfg: &crate::champion_hold::ratification::Config,
+) -> bool {
+    crate::champion_hold::ratification::is_candidate(f, cfg)
 }

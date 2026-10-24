@@ -173,17 +173,11 @@ fn test_daemon_status_request_response_round_trip() {
         daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
         work_finder_interval_secs: Some(60),
         startup_jitter_delay_secs: Some(437),
-        observability_host_id_mismatch: Some(crate::types::ObservabilityHostIdMismatch {
-            daemon_host_id: "robb-studio".to_string(),
-            ingest_host_id: "robb-pro".to_string(),
-            first_seen_at: chrono::Utc::now(),
-        }),
         observability_export: Some(crate::types::ObservabilityExportStatus {
-            state: crate::types::ObservabilityExportState::HostIdMismatch,
+            state: crate::types::ObservabilityExportState::Healthy,
             host_id: Some("robb-studio".to_string()),
-            ingest_host_id: Some("robb-pro".to_string()),
-            endpoint: Some("https://dashboard.example/ingest".to_string()),
-            exporter: Some("https".to_string()),
+            endpoint: Some("https://otlp.example/v1/logs".to_string()),
+            exporter: Some("otlp".to_string()),
             started_at: Some(chrono::Utc::now()),
             last_success_at: Some(chrono::Utc::now()),
             records_exported: 128,
@@ -192,10 +186,10 @@ fn test_daemon_status_request_response_round_trip() {
         // Per-exporter cells (#8756) — the round trip must preserve each
         // sink's independent entry.
         observability_exports: [(
-            "https".to_string(),
+            "otlp".to_string(),
             crate::types::ObservabilityExportStatus {
                 state: crate::types::ObservabilityExportState::Healthy,
-                exporter: Some("https".to_string()),
+                exporter: Some("otlp".to_string()),
                 // #9015: a healthy cell whose one verified hop is a LOCAL
                 // collector — the scope facts have to survive the wire, or the
                 // reading client is back to inferring them.
@@ -281,14 +275,6 @@ fn test_daemon_status_request_response_round_trip() {
             assert!(!r.per_repo[0].health_gate_not_evaluated);
             assert_eq!(r.main_health_gate_enabled, Some(true));
             assert!(r.main_health_gate_verdict_at.is_some());
-            // #4830: the host-identity mismatch survives the wire so a
-            // `health` client in another process can render the note.
-            let mismatch = r
-                .observability_host_id_mismatch
-                .as_ref()
-                .expect("mismatch round-trips");
-            assert_eq!(mismatch.daemon_host_id, "robb-studio");
-            assert_eq!(mismatch.ingest_host_id, "robb-pro");
             // #5083: the positive export record survives the wire too —
             // this is what lets a `status`/`health` client in another
             // process state that telemetry IS (or is not) landing rather
@@ -297,9 +283,8 @@ fn test_daemon_status_request_response_round_trip() {
                 .observability_export
                 .as_ref()
                 .expect("export status round-trips");
-            assert_eq!(export.state, crate::types::ObservabilityExportState::HostIdMismatch);
+            assert_eq!(export.state, crate::types::ObservabilityExportState::Healthy);
             assert_eq!(export.host_id.as_deref(), Some("robb-studio"));
-            assert_eq!(export.ingest_host_id.as_deref(), Some("robb-pro"));
             assert_eq!(export.records_exported, 128);
             // #9015: how far the state reaches travels with it — always
             // first-hop today, plus whether that hop is a local collector.
@@ -307,7 +292,7 @@ fn test_daemon_status_request_response_round_trip() {
             assert!(!export.endpoint_loopback, "a remote endpoint is not a local hop");
             let local_cell = r
                 .observability_exports
-                .get("https")
+                .get("otlp")
                 .expect("per-exporter cell round-trips");
             assert_eq!(local_cell.scope, crate::types::ObservabilityExportScope::FirstHop);
             assert!(
