@@ -41,5 +41,6 @@ pub mod outcome_ledger;
 pub mod reeval_ladder;
 pub mod session_ledger;
 pub mod stage_entry;
+pub mod state_rows;
 pub mod step_end;
 pub mod tick;

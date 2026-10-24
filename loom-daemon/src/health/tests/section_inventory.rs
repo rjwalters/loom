@@ -33,8 +33,15 @@ fn report_always_has_every_unconditional_section() {
 
 #[test]
 fn the_observability_section_is_appended_last_and_only_when_present() {
-    let with_mismatch = assess(&mismatched_inputs(60));
-    let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
+    let mut inputs = healthy_inputs();
+    inputs.status.as_mut().unwrap().observability_export =
+        Some(crate::types::ObservabilityExportStatus {
+            state: crate::types::ObservabilityExportState::Misconfigured,
+            last_failure_detail: Some("no exporter configured".to_string()),
+            ..Default::default()
+        });
+    let with_note = assess(&inputs);
+    let keys: Vec<&str> = with_note.sections.iter().map(|s| s.key).collect();
     assert_eq!(keys.last(), Some(&"observability"));
     // 13 always-present sections (#6157 added `peer_coordination`; #6201
     // added `role_liveness`; #7529 added `stale_sweeps`; #7584 added

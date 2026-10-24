@@ -10,6 +10,7 @@ mod ci;
 mod daemon_event;
 mod daemon_exit;
 mod dispatch_eligibility;
+mod dispatch_state;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -45,7 +46,7 @@ mod write_scope_refused;
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
 pub(super) use host_resource::resource_for_host;
-use metadata::{role_tick_result_str, severity_for_role_tick, visibility_str};
+use metadata::{role_tick_result_str, severity_for_role_tick};
 
 use std::collections::BTreeMap;
 
@@ -62,7 +63,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 
 use crate::telemetry::{
-    AnomalyFlag, RepoVisibility, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
+    AnomalyFlag, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
 };
 
 // ============================================================================
@@ -202,7 +203,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
@@ -225,7 +226,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SweepIdentity(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
@@ -251,7 +252,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             format!("sweep phase {}: {} issue #{}", r.phase, r.repo, r.issue),
             vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.phase", r.phase.clone()),
@@ -262,7 +263,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // unresolved case is stamped explicitly instead of a path ever
             // being written.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
@@ -289,7 +290,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #9442: `loom.repo` only when the slug resolved;
             // `loom.repo_unresolved=true` replaces it, never a host path.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
@@ -345,7 +346,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // tick is an event with a result and a detail string, not a gauge.
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.role", r.role.clone()),
                 kv_string("loom.result", role_tick_result_str(r.result)),
                 kv_int("loom.duration_sec", r.duration_sec),
@@ -419,7 +420,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the parse never copies message text or tool output, so
             // nothing here needs a free-text bound beyond `bounded`'s.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.session_id", r.session_id.clone()),
                 kv_string("loom.runtime", r.runtime.clone()),
                 kv_int("loom.tokens.input", r.tokens_input),
@@ -497,7 +498,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // rollup, mapped as a log record like `session.summary` — an
             // event with counts and a dollar figure, not a gauge.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.session_id", r.session_id.clone()),
             ];
             // Absent, never a directory name — see the `session.summary` arm
@@ -613,6 +614,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
+        | TelemetryRecord::DispatchState(_)
         | TelemetryRecord::StageOccupancy(_)
         | TelemetryRecord::StageEntry(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
@@ -638,6 +640,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
+                .or_else(|| dispatch_state::log_parts(r))
                 .or_else(|| stage_occupancy::log_parts(r))
                 .or_else(|| stage_entry::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;

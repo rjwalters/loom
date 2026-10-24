@@ -183,6 +183,46 @@ fn a_cooling_item_step_is_excluded_and_counted() {
     assert_eq!(Exclusion::CoolingDown.as_str(), "cooling_down");
 }
 
+/// #12918: every weight-0 item is kept by identity with its exclusion, one per
+/// [`Exclusion`] `weigh` produces; only a cooling item carries a `gate_until`.
+#[test]
+fn excluded_items_keep_identity_and_exclusion_per_variant() {
+    let fresh = "2026-10-01T00:00:00Z";
+    let pass = DrawInput {
+        item: item(Some(1), None, Verdict::Pass(PassReason::Frozen), Lane::Normal),
+        ..step_input(1, Step::Builder, &[], fresh)
+    };
+    let pooled_out = step_input(2, Step::Curator, &[], fresh);
+    let backoff = step_input(3, Step::Builder, &[], fresh);
+    let cooling = step_input(4, Step::ChampionReevaluate, &[], fresh);
+    let pooled = step_input(5, Step::Judge, &[], fresh);
+    let until = now() + chrono::Duration::hours(3);
+    let mut c = ctx();
+    c.pool_exhausted_roles
+        .insert(Step::Curator.role().to_string());
+    c.build_backoff_engaged = true;
+    c.cooldowns.insert(4, StepRole::ChampionPromote, until);
+    let w = weigh(&[pass, pooled_out, backoff, cooling, pooled], &c, &ItemWeights::default());
+    let got: Vec<_> = w
+        .excluded_items
+        .iter()
+        .map(|e| (e.item.issue, e.exclusion.as_str(), e.gate_until))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Some(1), "frozen", None),
+            (Some(2), "pool_exhausted", None),
+            (Some(3), "build_backoff", None),
+            (Some(4), "cooling_down", Some(until)),
+        ]
+    );
+    // The identity list and the counts agree.
+    let by_variant: usize = w.excluded.values().sum();
+    assert_eq!(by_variant, w.excluded_items.len());
+    assert_eq!(w.pool.len(), 1);
+}
+
 #[test]
 fn the_vi_cap_demotes_across_stages_before_weighting() {
     // Two very-important items at different stages: the older live one
@@ -699,4 +739,41 @@ fn the_layer_overlays_in_range_values_only() {
     assert_eq!(w.age_divisor_days, 7);
     assert_eq!(w.age_cap_days, DEFAULT_AGE_CAP_DAYS);
     assert_eq!(ItemWeights::from_layer(&Value::Null), ItemWeights::default());
+}
+
+/// #12974: the full record is archived and the draw sequence replays from the
+/// payload read back, the way an operator replays an exported summary's
+/// `payload_ref`.
+#[test]
+fn replay_from_the_archived_payload_gives_the_same_picks() {
+    use crate::observability::pick_payload_archive::{archive_record, read_ref, LocalDirSink};
+    use crate::telemetry::kinds::pick_decision::{PickDecisionRecord, PickTick};
+    let k = key(42);
+    let mut draw = draw_over(three_repos(), k.clone());
+    let draws: Vec<DrawRecord> = draw.by_ref().take(25).collect();
+    let tick = PickTick {
+        role: "work_finder".into(),
+        host: "host-a".into(),
+        tick_id: "work_finder-9".into(),
+        started_at: now(),
+        ended_at: now(),
+        outcome: "dispatched".into(),
+    };
+    let full = PickDecisionRecord::build(tick, Vec::new())
+        .with_item_draw(Some(wire_record(&draw, &draws, &k)));
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = LocalDirSink {
+        dir: tmp.path().to_path_buf(),
+        max_age_days: 14,
+        max_bytes: u64::MAX,
+    };
+    let payload_ref = archive_record(&sink, &full);
+    // The exported summary has no draws to replay; the payload does.
+    let summary = full.summarize(&payload_ref);
+    assert_eq!(summary.item_draw.as_ref().unwrap().draws_total, 25);
+    assert!(summary.item_draw.as_ref().unwrap().draws.is_empty());
+    let archived = read_ref(&sink, &payload_ref, full.ended_at).unwrap();
+    let replayed = replay_record(archived.item_draw.as_ref().unwrap()).unwrap();
+    let expected: Vec<Option<u32>> = draws.iter().map(|d| d.picked.item.issue).collect();
+    assert_eq!(replayed.iter().map(|p| p.issue).collect::<Vec<_>>(), expected);
 }

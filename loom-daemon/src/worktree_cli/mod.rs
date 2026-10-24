@@ -113,8 +113,7 @@
 //! because that file is frozen — and, more pointedly, because the logic's hard
 //! part is a [`branch_landed`] question, which now has exactly one
 //! implementation. Its first attempt (PR #8351) added the decision as inline
-//! bash to a `contract`-category library and the shell budget ratchet refused
-//! it; #8354 is that refusal honoured rather than argued with. It answers
+//! bash to a `contract`-category library and it was rejected; #8354 is that refusal honoured rather than argued with. It answers
 //! *which* reference the already-registered-worktree fast path may judge
 //! staleness — and therefore `git reset --hard` — against, when a live
 //! `origin/<branch>` carries the branch's real commits and the local branch

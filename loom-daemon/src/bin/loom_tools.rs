@@ -1,7 +1,9 @@
 //! `loom-tools`: the tools-only entry point (#12938, epic #12708; design
 //! `docs/design/loom-tools-cli-boundary.md` §6.2 step 4, §7.3, §10).
 //!
-//! Only `strip-ansi`, `checkpoint` and `config get`. The handlers are the
+//! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939), plus the
+//! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940): the
+//! tools-only installer (`scripts/install/provision-tools.sh`) has no daemon to call. The handlers are the
 //! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config`
 //! call), so there is no second copy. This crate links `loom_daemon` and not
 //! `daemon_service`, which is private to the `loom-daemon` bin.
@@ -18,14 +20,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
     config_get_dispatch, handle_checkpoint_command, handle_strip_ansi_command, CheckpointAction,
-    ConfigArgs,
+    ConfigArgs, InstallBinaryCommand, ReleaseFetchArgs, ResyncPayloadArgs,
 };
+use loom_daemon::install_compat;
 use loom_daemon::tools_mode::{self, Route};
 
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -48,6 +51,45 @@ enum ToolsCommands {
     },
     /// Read the resolved effective config (`config get mode`).
     Config(ConfigArgs),
+    /// Download, verify and print a release binary (`--bin loom-tools` for
+    /// this one): the same checksum/signature/glibc verification as
+    /// `loom-daemon release-fetch`.
+    ReleaseFetch(ReleaseFetchArgs),
+    /// Stage a binary beside its destination and publish it over it, keeping
+    /// the previous one as `<dest>.previous` (same as `loom-daemon install-binary`).
+    #[command(subcommand)]
+    InstallBinary(InstallBinaryCommand),
+    /// Resync a workspace's installed Loom from the payload embedded in this
+    /// binary (same as `loom-daemon resync-payload`).
+    ResyncPayload(ResyncPayloadArgs),
+    /// Print this binary's side of the install-compat contract as JSON: the
+    /// same object `loom-daemon install-compat show --json` prints, so the
+    /// shell wrappers carry no capability rules of their own.
+    Capabilities {
+        /// Accepted for symmetry with `install-compat show --json`; the
+        /// output is always JSON.
+        #[arg(long)]
+        json: bool,
+        /// A repo clone whose default-branch `.loom/install-metadata.json` to
+        /// classify against this binary.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<std::path::PathBuf>,
+    },
+}
+
+/// `capabilities`: one JSON object on stdout. Read-only, no forge call.
+fn capabilities(repo: Option<&std::path::Path>) -> Result<()> {
+    let daemon = install_compat::DaemonCompat::this_binary(None).ok_or_else(|| {
+        anyhow::anyhow!("this binary's version or SUPPORTS_INSTALLED is not MAJOR.MINOR.PATCH")
+    })?;
+    let installed = match repo {
+        Some(repo) => install_compat::read_default_branch(repo)?,
+        None => None,
+    };
+    let mut obj = install_compat::capabilities_json(&daemon, installed.as_ref());
+    obj["binary"] = "loom-tools".into();
+    println!("{obj}");
+    Ok(())
 }
 
 /// Resolve `mode`, then (fleet route only) adopt the exported read routing.
@@ -80,6 +122,10 @@ fn run() -> Result<()> {
             handle_checkpoint_command(action)
         }
         ToolsCommands::Config(args) => config_get_dispatch(args),
+        ToolsCommands::ReleaseFetch(args) => args.run(),
+        ToolsCommands::InstallBinary(cmd) => cmd.run(),
+        ToolsCommands::ResyncPayload(args) => args.run(),
+        ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }
 

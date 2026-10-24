@@ -117,6 +117,42 @@ fn the_ladder_and_the_red_fix_marker_are_read_from_bodies() {
     assert!(!has_red_fix_marker(Some("quoting <!-- loom:main-red-fix --> inline")));
 }
 
+/// #12918: the rung and the raw `next` of the marker, for a PR's merge ladder
+/// and an issue's promote ladder; a row with no marker has no entry.
+#[test]
+fn ladder_state_reads_rung_and_next_for_both_artifacts() {
+    let pr_next = "2026-10-20T00:00:00Z";
+    let issue_next = "2026-10-20T06:00:00Z";
+    let rows = vec![
+        row(
+            70,
+            &["loom:pr"],
+            &format!("<!-- loom:reeval step=champion_merge rung=2 next={pr_next} -->"),
+            true,
+        ),
+        row(
+            71,
+            &["loom:curated"],
+            &format!("body\n<!-- loom:reeval step=champion_promote rung=3 next={issue_next} -->\n"),
+            false,
+        ),
+        row(72, &["loom:pr"], "", true),
+        // A promote marker on a PR is not that PR's ladder.
+        row(
+            73,
+            &["loom:pr"],
+            &format!("<!-- loom:reeval step=champion_promote rung=1 next={pr_next} -->"),
+            true,
+        ),
+    ];
+    let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+    let state = ladder_state(&rows, t(pr_next) - chrono::Duration::minutes(30));
+    assert_eq!((state[&70].rung, state[&70].next), (2, t(pr_next)));
+    assert_eq!((state[&71].rung, state[&71].next), (3, t(issue_next)));
+    assert!(!state.contains_key(&72));
+    assert!(!state.contains_key(&73));
+}
+
 // ------------------------------------------------- the Judge CI hold (#12042)
 
 mod ci_hold {
@@ -299,9 +335,14 @@ mod held_at_head {
     }
 
     #[test]
-    fn a_changed_digest_or_a_legacy_hold_is_drawn_once() {
+    fn a_changed_digest_is_drawn_once() {
         assert_eq!(run_auth(Some("aa11"), Some("bb22")), 0);
-        assert_eq!(run_auth(None, Some("bb22")), 0);
+    }
+
+    #[test]
+    fn a_hold_with_no_recorded_digest_stays_held_at_its_head() {
+        // A merge-risk hold never records `auth=` (#13008).
+        assert_eq!(run_auth(None, Some("bb22")), 1);
     }
 
     #[test]
