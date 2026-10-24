@@ -45,12 +45,13 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.0";
 /// It is also at least the release that introduced every daemon subcommand
 /// those files call: 0.19.1088 is the first release with `host-id` (#11530),
 /// called by the host-export scripts (#10023); 0.19.1081 added `push-lease`
-/// (#9487, #10771).
+/// (#9487, #10771). 0.19.1146 is the first release whose `curation-complete`
+/// applies `loom:curated` (#11676), called by `create-issue.sh` (#11787).
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.19.1088";
+pub const REQUIRES_DAEMON: &str = "0.19.1146";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
