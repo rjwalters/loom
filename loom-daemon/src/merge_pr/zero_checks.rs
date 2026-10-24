@@ -52,8 +52,7 @@
 //! zero-row polls. Each invocation of this subcommand is a fresh process, so
 //! the resolved state is handed **back** to the caller on every decision line
 //! and passed **in** on the next poll — which is what makes the lookup happen
-//! exactly once per `--auto` wait, with the shell holding nothing but an opaque
-//! token. See `cli::merge_pr_zero_checks` for the line format.
+//! exactly once per wait, with the caller holding nothing but an opaque token.
 
 use std::fmt;
 
