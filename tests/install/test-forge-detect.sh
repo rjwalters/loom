@@ -13,31 +13,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
 # Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m'
 
-assert_eq() {
-  local desc="$1"
-  local expected="$2"
-  local actual="$3"
-  TOTAL=$((TOTAL + 1))
-  if [[ "$expected" == "$actual" ]]; then
-    echo -e "${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo -e "${RED}FAIL${NC}: $desc"
-    echo "  expected: '$expected'"
-    echo "  actual:   '$actual'"
-    FAIL=$((FAIL + 1))
-  fi
-}
+source "$SCRIPT_DIR/lib/assert.sh"
 
 # Source forge-detect (we'll test its helper functions directly)
 source "$REPO_ROOT/scripts/install/forge-detect.sh"
