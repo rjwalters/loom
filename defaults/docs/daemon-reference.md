@@ -4194,6 +4194,14 @@ forge's own compare endpoint, never from a comment or marker — whether the
 reviewed change is still the change in front of it. Three kinds, tried in this
 order:
 
+`loom-daemon forge verdict-equivalent` takes `--repo OWNER/REPO` (#13146): every
+forge read it makes (the compares and `gh pr view`) then targets that repository
+instead of the one `gh` resolves from the process cwd, so a caller outside the
+checkout gets the same answer. Without it behavior is unchanged (`LOOM_REPO` is
+still honored). An indeterminate answer's `Why:` line names the underlying
+failure (`gh` exit status and first stderr line, `unsafe base ref name`, or
+`unparseable response`) rather than only "could not read".
+
 | Kind | Carried when | Computed by |
 |------|--------------|-------------|
 | `tree` (#9124, #9576) | the two heads' trees are byte-identical | `forge_tree_unchanged::tree_unchanged` — `compare/{marker}...{head}` reporting `files: []` **together with** `status` `identical`/`ahead` |

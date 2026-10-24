@@ -805,6 +805,7 @@ pub enum ForgeCmd {
         reviewed: String,
         head: String,
         allowed_paths: Vec<String>,
+        repo: Option<String>,
     },
     /// `forge version-only-diff` (#9611): see [`crate::forge_version_only_diff`].
     VersionOnlyDiff(crate::forge_version_only_diff::Args),
@@ -886,7 +887,14 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             reviewed,
             head,
             allowed_paths,
-        } => crate::verdict_equivalence::handle(pr, &reviewed, &head, &allowed_paths),
+            repo,
+        } => crate::verdict_equivalence::handle(
+            pr,
+            &reviewed,
+            &head,
+            &allowed_paths,
+            repo.as_deref(),
+        ),
         ForgeCmd::VersionOnlyDiff(args) => crate::forge_version_only_diff::handle(&args),
         ForgeCmd::AdditiveMigrations(args) => crate::forge_additive_migrations::handle(&args),
         ForgeCmd::SuspectCriticalDiff(args) => crate::forge_suspect_critical_diff::handle(&args),
