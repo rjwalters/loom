@@ -1730,10 +1730,18 @@ async fn run_sink_gh(
         .args(args);
     let why = match inv.run_async().await {
         CmdOutcome::Ran(output) => return Some(output),
-        CmdOutcome::Unavailable(Unavailable::TimedOut { .. }) => {
-            format!("timed out after {}s", timeout.as_secs())
+        CmdOutcome::Unavailable(u) => {
+            // Every failure is counted (#13156); the log below stays one-shot.
+            crate::observability::ops::safehouse_forge_lookup::record_failed(
+                call,
+                &crate::peer_claims::repo_slug(workspace_root),
+                &u,
+            );
+            match u {
+                Unavailable::TimedOut { .. } => format!("timed out after {}s", timeout.as_secs()),
+                u => format!("could not run gh: {u}"),
+            }
         }
-        CmdOutcome::Unavailable(u) => format!("could not run gh: {u}"),
     };
     log_gh_failure_once(call, workspace_root, &why);
     None
