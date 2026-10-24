@@ -366,6 +366,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.reaper.preserved.uncommitted",
     "loom.reaper.preserved.private_workspace",
     "loom.reaper.preserved.other",
+    // #12458: open-item worktrees pushed to a remote backup ref before
+    // removal (count, and the refs as the restore handle), and the preserve
+    // category for a backup that failed.
+    "loom.reaper.backed_up",
+    "loom.reaper.backup_refs",
+    "loom.reaper.preserved.backup_failed",
 ];
 
 /// Longest label value kept, in bytes.

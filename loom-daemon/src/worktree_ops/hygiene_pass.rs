@@ -344,6 +344,7 @@ impl<'a> Pass<'a> {
             decision,
             WorktreeDecision::Remove
                 | WorktreeDecision::RemoveWithQuarantine
+                | WorktreeDecision::RemoveWithBackup
                 | WorktreeDecision::ConfirmClosedIssue
         );
         if dry_run || !removes {
