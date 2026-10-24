@@ -609,6 +609,22 @@ if [[ -z "$REPO_ROOT" || ! -d "$REPO_ROOT/.loom" ]]; then
     exit 1
 fi
 
+# ---------- loom-tools / loom-daemon payload identity (#12939) ----------
+#
+# With both binaries present they must agree on the payload; two that disagree
+# are a refusal, never a pick by PATH order or mtime. Older tools than the
+# payload being installed refuse the same way. Fails open when an identity
+# cannot be read (a binary with no `capabilities` verb).
+if [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
+    _pi_src=""
+    [[ -f "$REPO_ROOT/loom-daemon/src/install_compat.rs" ]] && _pi_src="$REPO_ROOT"
+    if loom_payload_identity_conflict "$REPO_ROOT" "$_pi_src"; then
+        exit 1
+    fi
+fi
+
 # ---------- refuse to run from a linked worktree (#4563) ----------
 #
 # The resolution above is the whole point of the refusal: from an issue/PR
@@ -774,7 +790,7 @@ fi
 
 # ---------- resolve the defaults/ source tree ----------
 #
-# Mirrors the resolution order lib/loom-tools.sh's find_loom_tools() used before
+# Mirrors the resolution order lib/repo-root.sh's find_loom_tools() used before
 # epic #4081 Phase 4 (#4557) retired it with the Python package:
 #   1. Loom source repo (dogfood): $REPO_ROOT/defaults/
 #   2. Recorded loom-source-path (target repo install)

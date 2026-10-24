@@ -96,18 +96,7 @@ impl ShowArgs {
             .as_ref()
             .map(|m| format!("{:?}", classify(m, &daemon)));
         if self.json {
-            let obj = serde_json::json!({
-                "running": daemon.running.to_string(),
-                "supports_installed": SUPPORTS_INSTALLED,
-                "requires_daemon": REQUIRES_DAEMON,
-                "invoked_files": DAEMON_INVOKED_INSTALLED_FILES,
-                "installed": installed.as_ref().map(|m| serde_json::json!({
-                    "loom_version": m.loom_version,
-                    "requires_daemon": m.requires_daemon,
-                })),
-                "classification": classification,
-            });
-            println!("{obj}");
+            println!("{}", install_compat::capabilities_json(&daemon, installed.as_ref()));
             return Ok(());
         }
         println!("running            {}", daemon.running);

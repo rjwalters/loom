@@ -404,8 +404,8 @@ fn already_queued(
         return None;
     }
     let entry = status.entry?;
-    let queued_head = entry.head_oid.unwrap_or(status.head_oid);
-    if !queued_head.eq_ignore_ascii_case(approved_sha) {
+    // The PR head, not `entry.head_oid` (possibly the merge-group commit).
+    if !status.head_oid.eq_ignore_ascii_case(approved_sha) {
         return None;
     }
     let grant = store.get(pr).ok()??;

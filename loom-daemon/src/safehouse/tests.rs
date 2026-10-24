@@ -347,6 +347,7 @@ fn routing_config() -> SafehouseConfig {
                 .into_iter()
                 .collect(),
             claims: None,
+            alerts: None,
         }),
         ..SafehouseConfig::default()
     }
@@ -412,6 +413,7 @@ fn signal_room_falls_back_to_the_legacy_room_key() {
                 .into_iter()
                 .collect(),
             claims: None,
+            alerts: None,
         }),
         ..SafehouseConfig::default()
     };
@@ -440,6 +442,7 @@ fn claims_room_falls_back_to_signal_room_when_absent() {
     let cfg_with_claims = SafehouseConfig {
         rooms: Some(RoomMap {
             claims: Some("!claims:example.org".to_owned()),
+            alerts: None,
             ..cfg.rooms.clone().unwrap()
         }),
         ..cfg
@@ -477,6 +480,7 @@ fn claims_only_map_does_not_activate_attention_class_narration_routing() {
                 signal: None,
                 by_repo: std::collections::BTreeMap::new(),
                 claims: Some("!claims:example.org".to_owned()),
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         };
@@ -594,6 +598,7 @@ fn firehose_without_a_repo_degrades_to_signal_rather_than_inventing_a_room() {
                 .into_iter()
                 .collect(),
             claims: None,
+            alerts: None,
         }),
         ..SafehouseConfig::default()
     };
@@ -1369,33 +1374,25 @@ fn build_dispatch_digest_envelope_groups_by_repo_and_sorts() {
     })
     .collect();
 
-    let env = build_dispatch_digest_envelope(&batch, 1);
+    let env = build_dispatch_digest_envelope(&batch);
 
     assert_eq!(env.kind, "digest");
-    assert_eq!(env.task_id.as_deref(), Some("dispatch_digest_1"));
+    assert_eq!(env.task_id, None);
     assert_eq!(
         env.body,
         "dispatched 7: loom×6 (#4028 #4106 #4144 #4157 #4162 #4164), vibesql×1 (#6173)"
     );
 }
 
-/// Each flushed batch gets a distinct `task_id` (a new root), not one
-/// perpetual thread every dispatch wave piles onto.
+/// A digest carries no `task_id`, so digests from different hosts or process
+/// lifetimes can never share one and get mis-threaded (#13077).
 #[test]
-fn build_dispatch_digest_envelope_task_id_is_unique_per_batch() {
-    let batch = vec![
-        PendingDispatch {
-            repo: Some("/repos/loom".to_owned()),
-            issue: 1,
-        },
-        PendingDispatch {
-            repo: Some("/repos/loom".to_owned()),
-            issue: 2,
-        },
-    ];
-    let first = build_dispatch_digest_envelope(&batch, 1);
-    let second = build_dispatch_digest_envelope(&batch, 2);
-    assert_ne!(first.task_id, second.task_id);
+fn build_dispatch_digest_envelope_has_no_task_id() {
+    let batch = vec![PendingDispatch {
+        repo: Some("/repos/loom".to_owned()),
+        issue: 1,
+    }];
+    assert_eq!(build_dispatch_digest_envelope(&batch).task_id, None);
 }
 
 /// A dispatch with no `repo` stamped (synthetic/test event) still narrates
@@ -1413,7 +1410,7 @@ fn build_dispatch_digest_envelope_falls_back_for_missing_repo() {
             issue: 11,
         },
     ];
-    let env = build_dispatch_digest_envelope(&batch, 1);
+    let env = build_dispatch_digest_envelope(&batch);
     assert_eq!(env.body, "dispatched 2: unscoped×2 (#10 #11)");
 }
 
@@ -1584,9 +1581,13 @@ fn maps_the_narrated_events() {
     };
     let env = event_to_envelope(&idle_exit).unwrap();
     assert_eq!(env.kind, "handoff");
-    assert_eq!(env.task_id.as_deref(), Some("daemon-idle-exit"));
+    // Daemon-wide news: no thread key, and nothing safehoused would refuse.
+    assert_eq!(env.task_id, None);
     assert!(env.body.contains("host idle-shutdown"));
-    assert_eq!(env.meta.unwrap()["trigger"], "token_starvation");
+    assert_eq!(env.meta, None);
+    // The old `daemon-idle-exit` id (and a `meta` on a `handoff`) failed this
+    // validation, so the line never sent and the sink reconnected instead.
+    build_send_request(&env, 1, Some("fleet")).expect("idle-exit envelope must be sendable");
 }
 
 #[test]
@@ -1966,8 +1967,9 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
 
     let socket = dir.path().join("safehoused.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    // 3 requests: create_room, the routed task send, the routed handoff send.
-    let server = tokio::spawn(stub_server(listener, false, 3));
+    // 6 requests: create_room, the routed task send, the ⏳ react on its root
+    // (#13069), the routed handoff send, then the blocker's redact + 🚧 react.
+    let server = tokio::spawn(stub_server(listener, false, 6));
 
     let bus = Arc::new(EventBus::new());
     let subscription = bus.subscribe(Vec::<String>::new());
@@ -1980,6 +1982,7 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
                 signal: Some("!signal:example.org".to_owned()),
                 by_repo: std::collections::BTreeMap::new(),
                 claims: None,
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         },
@@ -2014,7 +2017,7 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
     drop(bus);
     let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
 
-    assert_eq!(received.len(), 3);
+    assert_eq!(received.len(), 6);
     // 1. The firehose room is created lazily, on this repo's first narration.
     assert_eq!(received[0]["op"], json!("create_room"));
     assert_eq!(received[0]["name"], json!(alias));
@@ -2022,9 +2025,16 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
     assert_eq!(received[1]["op"], json!("send"));
     assert_eq!(received[1]["type"], json!("task"));
     assert_eq!(received[1]["room"], json!(alias));
+    // The root of the issue's thread gets the ⏳ status reaction (#13069).
+    assert_eq!(received[2]["op"], json!("react"));
+    assert_eq!(received[2]["room"], json!(alias));
     // 3. `handoff` (a human must act) → the signal room, same repo.
-    assert_eq!(received[2]["type"], json!("handoff"));
-    assert_eq!(received[2]["room"], json!("!signal:example.org"));
+    assert_eq!(received[3]["type"], json!("handoff"));
+    assert_eq!(received[3]["room"], json!("!signal:example.org"));
+    // The blocker moves the root's status in place: ⏳ taken back, 🚧 put on.
+    assert_eq!(received[4]["op"], json!("redact"));
+    assert_eq!(received[5]["op"], json!("react"));
+    assert_eq!(received[5]["key"], json!("🚧"));
 }
 
 /// The migration default: with **no** `rooms` map the wire shape is exactly
@@ -2037,7 +2047,8 @@ async fn run_sink_without_a_rooms_map_keeps_the_single_room_wire_shape() {
     let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
     let socket = dir.path().join("safehoused.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let server = tokio::spawn(stub_server(listener, false, 1));
+    // The send, then the ⏳ react on its thread root (#13069).
+    let server = tokio::spawn(stub_server(listener, false, 2));
 
     let bus = Arc::new(EventBus::new());
     let subscription = bus.subscribe(Vec::<String>::new());
@@ -2075,7 +2086,7 @@ async fn run_sink_without_a_rooms_map_keeps_the_single_room_wire_shape() {
     drop(bus);
     let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
 
-    assert_eq!(received.len(), 1, "no create_room op, no extra sends");
+    assert_eq!(received.len(), 2, "no create_room op, no extra sends (send + ⏳ react)");
     assert_eq!(received[0]["op"], json!("send"));
     assert_eq!(received[0]["type"], json!("task"));
     assert_eq!(received[0]["room"], json!("loom-fleet"));
@@ -4536,18 +4547,19 @@ async fn reconnects_after_mid_run_disconnect() {
 #[test]
 fn claim_ad_serializes_to_a_valid_task_envelope() {
     // Envelope-validity AC: the advertisement must serialize to a `type`
-    // within KNOWN_TYPES and a `task_id` matching [A-Za-z0-9_], asserted
-    // against build_send_request so a rejected-by-safehoused envelope fails
-    // at test time, not runtime.
+    // within KNOWN_TYPES, asserted against build_send_request so a
+    // rejected-by-safehoused envelope fails at test time, not runtime.
     let ad = ClaimAd::advertise(4028, "loom".into(), "maple".into(), 7, "ts".into());
     let env = claim_ad_to_envelope(&ad);
     assert_eq!(env.kind, "task");
     assert!(KNOWN_TYPES.contains(&env.kind.as_str()));
-    assert_eq!(env.task_id.as_deref(), Some("4028"));
+    // A claim ad carries no thread key: safehoused threads by `task_id`, and a
+    // bare issue number threaded unrelated ads together.
+    assert_eq!(env.task_id, None);
 
     let req = build_send_request(&env, 1, Some("fleet")).unwrap();
     assert_eq!(req["type"], json!("task"));
-    assert_eq!(req["task_id"], json!("4028"));
+    assert!(req.get("task_id").is_none(), "no task_id key on the wire: {req}");
     // The body round-trips back to the same claim on the receive side.
     let body = req["body"].as_str().unwrap();
     assert_eq!(ClaimAd::from_body_str(body), Some(ad));
@@ -4759,6 +4771,7 @@ async fn coordination_advertises_claim_ads_into_the_signal_room() {
                     .into_iter()
                     .collect(),
                 claims: None,
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         },
@@ -4834,6 +4847,7 @@ async fn coordination_advertises_claim_ads_into_a_dedicated_claims_room_when_con
                     .into_iter()
                     .collect(),
                 claims: Some("!claims:example.org".to_owned()),
+                alerts: None,
             }),
             ..SafehouseConfig::default()
         },
@@ -4910,4 +4924,78 @@ async fn coordination_reconnects_when_socket_absent_and_exits_on_sender_drop() {
         SafehouseState::Unreachable { socket: s } => assert_eq!(s, socket),
         other => panic!("expected Unreachable, got {other:?}"),
     }
+}
+
+// ---- optional alerts room (#13070) ----
+
+fn alerts_config(rooms: Option<RoomMap>) -> SafehouseConfig {
+    SafehouseConfig {
+        enabled: true,
+        room: Some("!main:example.org".to_owned()),
+        rooms,
+        ..SafehouseConfig::default()
+    }
+}
+
+/// With `rooms.alerts` set (single-room mode otherwise), only `handoff` moves;
+/// every other kind stays in the main room.
+#[test]
+fn alerts_room_takes_only_handoffs() {
+    let cfg = alerts_config(Some(RoomMap {
+        alerts: Some("!alerts:example.org".to_owned()),
+        ..RoomMap::default()
+    }));
+    assert!(!cfg.routes_by_attention(), "alerts must not enable attention routing");
+    let router = RoomRouter::new(&cfg);
+    assert_eq!(
+        router.resolve("handoff", Some("/home/x/loom")),
+        RoomDecision::Send(Some("!alerts:example.org".to_owned()))
+    );
+    for kind in ["task", "chat", "ack", "completion", "digest"] {
+        assert_eq!(
+            router.resolve(kind, Some("/home/x/loom")),
+            RoomDecision::Send(Some("!main:example.org".to_owned())),
+            "{kind} must stay in the main room"
+        );
+    }
+}
+
+/// Alerts coexist with attention routing: handoff -> alerts, completion -> signal.
+#[test]
+fn alerts_room_composes_with_signal_routing() {
+    let mut cfg = routing_config();
+    cfg.rooms.as_mut().unwrap().alerts = Some("!alerts:example.org".to_owned());
+    let router = RoomRouter::new(&cfg);
+    assert_eq!(
+        router.resolve("handoff", None),
+        RoomDecision::Send(Some("!alerts:example.org".to_owned()))
+    );
+    assert_eq!(
+        router.resolve("completion", None),
+        RoomDecision::Send(Some("!signal:example.org".to_owned()))
+    );
+}
+
+/// Unset ⇒ handoffs resolve exactly as before.
+#[test]
+fn alerts_room_unset_leaves_handoff_routing_unchanged() {
+    let cfg = alerts_config(None);
+    assert_eq!(
+        RoomRouter::new(&cfg).resolve("handoff", None),
+        RoomDecision::Send(Some("!main:example.org".to_owned()))
+    );
+    let routed = routing_config();
+    assert_eq!(
+        RoomRouter::new(&routed).resolve("handoff", None),
+        RoomDecision::Send(Some("!signal:example.org".to_owned()))
+    );
+}
+
+#[test]
+fn alerts_room_parses_from_config_block() {
+    let block = json!({"rooms": {"alerts": " !a:example.org "}});
+    let cfg = config_from_value(Some(&block));
+    assert_eq!(cfg.rooms.and_then(|r| r.alerts).as_deref(), Some("!a:example.org"));
+    let blank = json!({"rooms": {"alerts": "  "}});
+    assert!(config_from_value(Some(&blank)).rooms.is_none());
 }

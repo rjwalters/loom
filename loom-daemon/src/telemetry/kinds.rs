@@ -28,7 +28,7 @@
 //!    lines in the over-threshold `telemetry/mod.rs`.
 //! 2. Append one row to [`telemetry_kind_table!`]. That row generates the enum
 //!    variant, the serde tag, the envelope's `schema_version`, the OTLP
-//!    routing class, the native-ingest scope, and the [`TELEMETRY_KINDS`]
+//!    routing class, and the [`TELEMETRY_KINDS`]
 //!    metadata entry.
 //! 3. Leave `gate:` as [`NEW_KIND_SCHEMA_VERSION`] — **do not invent a
 //!    number**. Every kind added after #8921 shares that one gate, so no two
@@ -52,7 +52,6 @@
 //! | payload | The record struct carried by the variant. |
 //! | `gate:` | The envelope `schema_version` this kind's envelopes carry. |
 //! | `otlp:` | Which OTLP signal shape this kind exports as ([`TelemetryKindOtlp`]). |
-//! | `native:` | Whether the native HTTPS `/ingest` backend accepts it. |
 
 use std::fmt;
 
@@ -141,8 +140,6 @@ pub struct TelemetryKindMeta {
     pub schema_version: u32,
     /// How this kind exports over OTLP.
     pub otlp: TelemetryKindOtlp,
-    /// Whether the native HTTPS `/ingest` backend accepts this kind.
-    pub native_ingest: bool,
 }
 
 // ============================================================================
@@ -179,12 +176,16 @@ pub mod stage_entry;
 /// still waiting in a pre-ready stage (count, oldest age, age buckets).
 pub mod stage_occupancy;
 
+/// `champion.run` (#13029) — what a Champion merge / hold-reevaluate run decided.
+pub mod champion_run;
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `hold.transition` (#12665) — a hold label applied to or removed from a PR.
 pub mod hold_transition;
 /// `merge.authorization.evaluated` (#12666) — one merge-group authorization evaluation.
 pub mod merge_authorization;
+/// `merge.lane_wait` (#13029) — a Champion merge step held behind another PR's merge.
+pub mod merge_lane_wait;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
 pub mod merge_queue_event;
 /// `merge.queue.observed` (#12667) — the merge queue as one existing read saw it.
@@ -227,6 +228,9 @@ pub mod pass;
 
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
+
+/// `pick.decision` bounded summary (#12974) — the exported form; the full record is archived.
+pub mod pick_summary;
 
 /// `pr.resolved` (#10519) — a PR's merge or close instant, from `fleet.state`.
 pub mod pr_resolved;
@@ -277,19 +281,16 @@ pub fn export_coverage(
 }
 
 /// The sorted wire `kind` tags the given exporters (by
-/// `ExporterKind::name`: `"https"`, `"otlp"`) carry, derived from the registry
-/// rows (Issue #10196). `https` carries `native_ingest` kinds; `otlp` carries
-/// every kind whose class is not [`TelemetryKindOtlp::NotExported`]. Unknown
-/// exporter names contribute nothing.
+/// `ExporterKind::name`: `"otlp"`, or the retired `"https"`) carry, derived from the registry
+/// rows (Issue #10196). `otlp` carries every kind whose class is not
+/// [`TelemetryKindOtlp::NotExported`]. Unknown exporter names (including the
+/// retired `"https"`) contribute nothing.
 #[must_use]
 pub fn exported_kinds_for(exporters: &[String]) -> Vec<String> {
-    let https = exporters.iter().any(|e| e == "https");
     let otlp = exporters.iter().any(|e| e == "otlp");
     let mut kinds: Vec<String> = TELEMETRY_KINDS
         .iter()
-        .filter(|k| {
-            (https && k.native_ingest) || (otlp && k.otlp != TelemetryKindOtlp::NotExported)
-        })
+        .filter(|k| otlp && k.otlp != TelemetryKindOtlp::NotExported)
         .map(|k| k.kind.to_string())
         .collect();
     kinds.sort();
@@ -314,7 +315,7 @@ pub fn exported_kinds_for(exporters: &[String]) -> Vec<String> {
 /// ```ignore
 /// macro_rules! count_kinds {
 ///     ($( $(#[$attr:meta])* $variant:ident = $kind:literal => $payload:ty,
-///         gate: $gate:expr, otlp: $class:ident, native: $native:literal; )+) => {
+///         gate: $gate:expr, otlp: $class:ident; )+) => {
 ///         const KIND_COUNT: usize = [$( $kind ),+].len();
 ///     };
 /// }
@@ -326,47 +327,47 @@ macro_rules! telemetry_kind_table {
         $callback! {
             /// A sweep began (mirrors the dispatch moment of the frozen SSE topics).
             SweepStarted = "sweep.started" => $crate::telemetry::SweepStartedRecord,
-                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs, native: true;
+                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs;
 
             /// Late-resolved launch identity; enriches an existing active sweep only.
             SweepIdentity = "sweep.identity" => $crate::telemetry::SweepIdentityRecord,
-                gate: 4, otlp: Logs, native: true;
+                gate: 4, otlp: Logs;
 
             /// A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
             SweepPhase = "sweep.phase" => $crate::telemetry::SweepPhaseRecord,
-                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs, native: true;
+                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs;
 
             /// A sweep reached a terminal state (mirrors the exited/crashed/completed
             /// frozen topics; the richer per-phase/config detail lives in the paired
             /// [`SweepOutcomeRecord`]).
             SweepCompleted = "sweep.completed" => $crate::telemetry::SweepCompletedRecord,
-                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs, native: true;
+                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs;
 
             /// The full post-hoc outcome of a sweep: model/config/effort, per-phase
             /// durations, terminal result, and PR number.
             SweepOutcome = "sweep.outcome" => $crate::telemetry::SweepOutcomeRecord,
-                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs, native: true;
+                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs;
 
             /// A snapshot of the multi-account token pool's per-account usage state.
             TokensSnapshot = "tokens.snapshot" => $crate::telemetry::TokenSnapshotRecord,
-                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Gauges, native: true;
+                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Gauges;
 
             /// Host health: CPU/disk headroom, daemon version, uptime.
             HostHealth = "host.health" => $crate::telemetry::HostHealthRecord,
-                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Gauges, native: true;
+                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Gauges;
 
             /// One role-runner tick's outcome (Issue #8056) — the per-`(root, role)`
             /// counterpart of [`SweepOutcome`](Self::SweepOutcome). The seventh
             /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
             RoleTickOutcome = "role_tick.outcome" => $crate::telemetry::RoleTickOutcomeRecord,
-                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs, native: true;
+                gate: $crate::telemetry::CURRENT_SCHEMA_VERSION, otlp: Logs;
 
             /// One transcript's session shape (Issue #8757, G3 of #8714) — ids,
             /// attribution, models, token totals, and turn/tool counts, emitted by
             /// the transcript-ingest pass. Carries **no** prompt, tool-output, key
             /// or email content by construction (see [`SessionSummaryRecord`]).
             SessionSummary = "session.summary" => $crate::telemetry::SessionSummaryRecord,
-                gate: 5, otlp: Logs, native: true;
+                gate: 5, otlp: Logs;
 
             /// A derived per-session anomaly/quality rollup (Issue #8760, G3 part 2
             /// of #8714) — retry-loop detection, the longest paired tool call, a USD
@@ -377,51 +378,46 @@ macro_rules! telemetry_kind_table {
             /// as `session.summary`: no prompt, tool-output, key or email content,
             /// ever).
             SessionAnalysis = "session.analysis" => $crate::telemetry::SessionAnalysisRecord,
-                gate: 6, otlp: Logs, native: true;
+                gate: 6, otlp: Logs;
 
             /// One of the four named event-bus topics that carried no telemetry
             /// record kind of their own (Issue #8760, G4 of #8714): `daemon.drain.*`,
             /// `daemon.capacity.advisory`, `daemon.preflight.advisory`, and
             /// `epic.issue.*`. See [`DaemonEventRecord`].
             DaemonEvent = "daemon.event" => $crate::telemetry::DaemonEventRecord,
-                gate: 7, otlp: Logs, native: true;
+                gate: 7, otlp: Logs;
 
             /// One distributed-tracing span (Issue #8631). OTLP-only — the native
             /// HTTPS `/ingest` backend never receives spans.
             Span = "trace.span" => $crate::telemetry::trace::SpanRecord,
-                gate: 3, otlp: Spans, native: false;
+                gate: 3, otlp: Spans;
 
             /// One completed GitHub Actions workflow run (Issue #8824). See
             /// [`ci`] for the CI record family and its attribute allowlist.
             CiRun = "ci.run" => $crate::telemetry::CiRunRecord,
-                gate: 8, otlp: Logs, native: true;
+                gate: 8, otlp: Logs;
 
             /// One completed job of a GitHub Actions run (Issue #8824).
             CiJob = "ci.job" => $crate::telemetry::CiJobRecord,
-                gate: 8, otlp: Logs, native: true;
+                gate: 8, otlp: Logs;
 
             /// One CI run/job duration sample — the carrier for the
             /// `loom.ci.{run,job}.duration_ms` histograms (Issue #8824).
             CiDuration = "ci.duration" => $crate::telemetry::CiDurationRecord,
-                gate: 8, otlp: Histograms, native: true;
+                gate: 8, otlp: Histograms;
 
             /// One ≤ 8 KiB chunk of a completed job's log text (Issue #8825). The
             /// only kind carrying free text the daemon did not author — see
             /// [`CiJobLogRecord`] for why the gateway, not the source, scrubs it,
             /// and why it pins its own gate instead of sharing the CI family's `8`.
             CiJobLog = "ci.job.log" => $crate::telemetry::CiJobLogRecord,
-                gate: 9, otlp: Logs, native: true;
+                gate: 9, otlp: Logs;
 
             /// A batch of generic operational metric points (Issue #8860) — the shared
             /// carrier any daemon loop emits through `observability::ops`. OTLP-only;
             /// see [`ops`] for the fixed name vocabulary and label policy.
             MetricPoints = "metric.points" => $crate::telemetry::MetricPointsRecord,
-                gate: 10, otlp: OpsPoints, native: false;
-
-            /// The work finder's ranked ready queue as of its last tick (Issue #8852,
-            /// phase 2). Native-HTTPS only; see [`queue_snapshot`].
-            QueueSnapshot = "queue.snapshot" => $crate::telemetry::QueueSnapshotRecord,
-                gate: 11, otlp: NotExported, native: true;
+                gate: 10, otlp: OpsPoints;
 
             /// One live agent-output event during an in-flight run (Issue
             /// #9764) — readable, producer-redacted, issue-scoped. The second
@@ -433,13 +429,13 @@ macro_rules! telemetry_kind_table {
             /// the native HTTPS ingest backend never receives session text.
             /// See [`session_output`].
             SessionOutput = "session.output" => $crate::telemetry::kinds::session_output::SessionOutputRecord,
-                gate: 13, otlp: Logs, native: false;
+                gate: 13, otlp: Logs;
 
             /// One self-update loop decision (Issue #10414): decision, installed
             /// and target versions, defer reason, drain state. OTLP-only. See
             /// [`auto_update_tick`].
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One host's in-flight items (stage, entered-at, PR, host, slot)
             /// and per-repo open-PR census (Issue #10196). OTLP-only: the
@@ -447,51 +443,51 @@ macro_rules! telemetry_kind_table {
             /// with deltas in between only when something changed. See
             /// [`fleet_state`].
             FleetState = "fleet.state" => $crate::telemetry::kinds::fleet_state::FleetStateRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One role tick's (or work-finder tick's) pick decision (Issue #10212):
             /// the ranked candidates it considered, what it acted on, and a
             /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
             PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// A PR that left the review listings, with its forge merge or
             /// close instant (Issue #10519; produced by `fleet.state` since
             /// #11126). OTLP-only. See [`pr_resolved`].
             PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One stage an item left, with its entry and exit instants (Issue
             /// #10929; produced by `fleet.state` since #11126). The wire tag
             /// keeps its `eta.` prefix. OTLP-only. See [`stage_outcome`].
             StageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::stage_outcome::StageOutcomeRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One pass over a workspace's artifacts (Issue #10752): mechanism,
             /// mode, outcome, counts by verdict and skip reason, write cap,
             /// duration and GitHub calls. OTLP-only. See [`pass`].
             PassSummary = "pass.summary" => $crate::telemetry::kinds::pass::PassSummaryRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One artifact's verdict in a pass (Issue #10752): repo#n, verdict,
             /// reason, blockers with their states, labels changed. OTLP-only.
             /// See [`pass`].
             PassVerdict = "pass.verdict" => $crate::telemetry::kinds::pass::PassVerdictRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One workspace's token-ranking refresh round (Issue #10744):
             /// accounts probed, per-account outcome and credential kind, and
             /// how many probes used a metered API key. OTLP-only. See
             /// [`token_ranking_refresh`].
             TokenRankingRefresh = "token_ranking.refresh" => $crate::telemetry::kinds::token_ranking_refresh::TokenRankingRefreshRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// This host's export view (Issue #11124, R2 of #10196): active
             /// exporters, queue depth, the durable by-reason loss counts
             /// (`dropped_total`/`dropped_by_reason`, #11527) per exporter and
             /// the last successful flush. OTLP-only. See [`host_export`].
             HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// An operator session's presence beat (Issue #11563): who is at the
             /// keyboard (`last_input_at`), when the session last did anything,
@@ -501,93 +497,105 @@ macro_rules! telemetry_kind_table {
             /// #11525 settled the transport — the same path as every other fact.
             /// See [`operator_presence`].
             OperatorPresence = "operator.presence" => $crate::telemetry::kinds::operator_presence::OperatorPresenceRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
             /// A managed checkout's history was moved by something other than
             /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
             CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
             /// The roster pass changed this host's workspace registry, or could
             /// not register a desired repo because it is not cloned (Issue
             /// #12322). Emitted whatever the repo's queue holds. OTLP-only. See
             /// [`roster_change`].
             RosterChange = "roster.change" => $crate::telemetry::kinds::roster_change::RosterChangeRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One curation completion's blind difficulty estimate (#11608).
             IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// A role agent began working an item in a stage (#11641): the
             /// work-start that splits a stay into queue wait and work time.
             WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One daemon-pass write the #9548 credential-scope gate refused
             /// (Issue #12168): repo, credential identity, call site and a
             /// closed reason class. OTLP-only. See [`write_scope_refused`].
             WriteScopeRefused = "write_scope.refused" => $crate::telemetry::kinds::write_scope_refused::WriteScopeRefusedRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// Why the daemon process ended (#11839): signal / exit code, who asked,
             /// whether a relaunch is expected, and the in-flight sweeps. OTLP-only.
             /// See [`daemon_exit`].
             DaemonExit = "daemon.exit" => $crate::telemetry::kinds::daemon_exit::DaemonExitRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One run-state IPC request (pause, drain, abort-drain, stop,
             /// restart) and its caller, on receipt (#12546). OTLP-only. See
             /// [`run_state_request`].
             RunStateRequest = "daemon.run_state_request" => $crate::telemetry::kinds::run_state_request::RunStateRequestRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One agent scope's applied memory limit, its source, the peak
             /// and the OOM kills, when the scope ends (#12241). OTLP-only.
             /// See [`scope_memory`].
             ScopeMemory = "scope.memory" => $crate::telemetry::kinds::scope_memory::ScopeMemoryRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// A fixed-interval sample of this host's CPU, memory, disk and
             /// network, raw and EWMA-filtered (#12112, slice a of #11809). OTLP
             /// gauges only. See [`host_status`].
             HostStatus = "host.status" => $crate::telemetry::kinds::host_status::HostStatusRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges;
 
             /// One managed checkout, measured against the remote tip the
             /// fast-forward pass already learned (#12509). OTLP-only. See
             /// [`checkout_freshness`].
             CheckoutFreshness = "checkout.freshness" => $crate::telemetry::kinds::checkout_freshness::CheckoutFreshnessRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One merge-queue record (`enqueued` / `merged` / `removed`) the
             /// sink appended, with its classified reason and enqueue-to-event
             /// latency (#12653). OTLP-only. See [`merge_queue_event`].
             MergeQueueEvent = "merge_queue.event" => $crate::telemetry::kinds::merge_queue_event::MergeQueueEventRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One merge-group authorization evaluation with a closed reason
             /// token (#12666). OTLP-only. See [`merge_authorization`].
             MergeAuthorization = "merge.authorization.evaluated" => $crate::telemetry::kinds::merge_authorization::MergeAuthorizationRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// A hold label applied to or removed from a PR, with its
             /// structured reason and attempted-vs-confirmed state (#12665).
             /// OTLP-only. See [`hold_transition`].
             HoldTransition = "hold.transition" => $crate::telemetry::kinds::hold_transition::HoldTransitionRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
+            /// A Champion merge step entering or leaving the wait behind
+            /// another PR's merge in the same repo (#13029). OTLP-only. See
+            /// [`merge_lane_wait`].
+            MergeLaneWait = "merge.lane_wait" => $crate::telemetry::kinds::merge_lane_wait::MergeLaneWaitRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
+            /// What one Champion merge / hold-reevaluate run decided, with the
+            /// standing-authorization digests it read (#13029). OTLP-only. See
+            /// [`champion_run`].
+            ChampionRun = "champion.run" => $crate::telemetry::kinds::champion_run::ChampionRunRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// The merge queue (order, membership, completeness) as the existing
             /// `mergeQueue.entries` read saw it (#12667). OTLP-only. See
             /// [`merge_queue_observed`].
             MergeQueueObserved = "merge.queue.observed" => $crate::telemetry::kinds::merge_queue_observed::MergeQueueObservedRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// The merge-queue regime (`check_response_timeout_minutes`,
             /// `max_entries_to_build`, `grouping_strategy`) read from the
             /// daemon tick's rules read, emitted on change only (#12675).
             /// OTLP-only. See [`merge_queue_regime`].
             MergeQueueRegime = "merge.queue.regime" => $crate::telemetry::kinds::merge_queue_regime::MergeQueueRegimeRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One ready item's dispatch-eligibility decision as of one
             /// work-finder tick (Issue #12790): schedulable vs blocked, the
@@ -596,7 +604,7 @@ macro_rules! telemetry_kind_table {
             /// `ready_wait` signal the dwell facts could not see. OTLP-only.
             /// See [`dispatch_eligibility`].
             DispatchEligibility = "eta.dispatch_eligibility" => $crate::telemetry::kinds::dispatch_eligibility::DispatchEligibilityRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One classified open item's dispatch gate as of one step
             /// dispatch tick (Issue #12918): in the draw pool or the
@@ -605,7 +613,7 @@ macro_rules! telemetry_kind_table {
             /// re-evaluation ladder's rung and `next`. One row per item, no
             /// cap. OTLP-only. See [`dispatch_state`].
             DispatchState = "eta.dispatch_state" => $crate::telemetry::kinds::dispatch_state::DispatchStateRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One alert opening (or re-asserting) or resolving on this host
             /// (#12806), in loom-ui's `alert.transition` schema: body and
@@ -613,7 +621,7 @@ macro_rules! telemetry_kind_table {
             /// attributes. Replaces the POST to loom-ui's
             /// `/api/alerts/external`. OTLP-only. See [`alert_transition`].
             AlertTransition = "alert.transition" => $crate::telemetry::kinds::alert_transition::AlertTransitionRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// A per-stage occupancy gauge (Issue #12866): how many items sit in
             /// `triage_wait` / `approval_wait` / `operator_hold` right now, the
@@ -621,14 +629,14 @@ macro_rules! telemetry_kind_table {
             /// rollup — the still-waiting population `eta.stage_outcome` (exit
             /// only) cannot see. OTLP-only. See [`stage_occupancy`].
             StageOccupancy = "eta.stage_occupancy" => $crate::telemetry::kinds::stage_occupancy::StageOccupancyRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One item's observed arrival in a pipeline stage (Issue #12869),
             /// diffed from the step driver's per-tick discovery snapshot:
             /// the arrival (inflow) fact `eta.stage_outcome`'s reconstructed
             /// `entered_at` could not give. OTLP-only. See [`stage_entry`].
             StageEntry = "eta.stage_entry" => $crate::telemetry::kinds::stage_entry::StageEntryRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —
@@ -641,7 +649,7 @@ macro_rules! telemetry_kind_table {
 
 macro_rules! declare_kind_metadata {
     ($( $(#[$attr:meta])* $variant:ident = $kind:literal => $payload:ty,
-        gate: $gate:expr, otlp: $class:ident, native: $native:literal; )+) => {
+        gate: $gate:expr, otlp: $class:ident; )+) => {
         /// Every registered record kind, in declaration order — the runtime
         /// reflection of [`telemetry_kind_table!`]. Generated from the same
         /// rows as the enum, so a kind cannot be in one and not the other.
@@ -652,7 +660,6 @@ macro_rules! declare_kind_metadata {
                     kind: $kind,
                     schema_version: $gate,
                     otlp: TelemetryKindOtlp::$class,
-                    native_ingest: $native,
                 },
             )+
         ];

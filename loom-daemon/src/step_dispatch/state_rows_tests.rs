@@ -31,6 +31,7 @@ fn input(issue: Option<u32>, pr: Option<u32>, verdict: Verdict) -> DrawInput {
             lane: Lane::Normal,
             send_back: false,
             story_points: None,
+            hold_auth: None,
         },
         labels: Vec::new(),
         created_at: Some(t("2026-10-01T00:00:00Z")),

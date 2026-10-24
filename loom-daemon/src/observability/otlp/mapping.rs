@@ -4,6 +4,7 @@
 
 mod alert_transition;
 mod auto_update;
+mod champion_run;
 mod checkout_external_change;
 mod checkout_freshness;
 mod ci;
@@ -21,6 +22,7 @@ mod host_resource;
 mod host_status;
 mod issue_estimate;
 mod merge_authorization;
+mod merge_lane_wait;
 mod merge_queue_event;
 mod merge_queue_observed;
 mod merge_queue_regime;
@@ -46,7 +48,7 @@ mod write_scope_refused;
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
 pub(super) use host_resource::resource_for_host;
-use metadata::{role_tick_result_str, severity_for_role_tick, visibility_str};
+use metadata::{role_tick_result_str, severity_for_role_tick};
 
 use std::collections::BTreeMap;
 
@@ -63,7 +65,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 
 use crate::telemetry::{
-    AnomalyFlag, RepoVisibility, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
+    AnomalyFlag, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
 };
 
 // ============================================================================
@@ -203,7 +205,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
@@ -226,7 +228,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SweepIdentity(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
@@ -252,7 +254,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             format!("sweep phase {}: {} issue #{}", r.phase, r.repo, r.issue),
             vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.phase", r.phase.clone()),
@@ -263,7 +265,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // unresolved case is stamped explicitly instead of a path ever
             // being written.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
@@ -290,7 +292,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #9442: `loom.repo` only when the slug resolved;
             // `loom.repo_unresolved=true` replaces it, never a host path.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
@@ -346,7 +348,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // tick is an event with a result and a detail string, not a gauge.
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.role", r.role.clone()),
                 kv_string("loom.result", role_tick_result_str(r.result)),
                 kv_int("loom.duration_sec", r.duration_sec),
@@ -441,7 +443,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the parse never copies message text or tool output, so
             // nothing here needs a free-text bound beyond `bounded`'s.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.session_id", r.session_id.clone()),
                 kv_string("loom.runtime", r.runtime.clone()),
                 kv_int("loom.tokens.input", r.tokens_input),
@@ -519,7 +521,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // rollup, mapped as a log record like `session.summary` — an
             // event with counts and a dollar figure, not a gauge.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.session_id", r.session_id.clone()),
             ];
             // Absent, never a directory name — see the `session.summary` arm
@@ -676,6 +678,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::MergeQueueEvent(_)
         | TelemetryRecord::MergeAuthorization(_)
         | TelemetryRecord::HoldTransition(_)
+        | TelemetryRecord::MergeLaneWait(_)
+        | TelemetryRecord::ChampionRun(_)
         | TelemetryRecord::MergeQueueObserved(_)
         | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
@@ -702,6 +706,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| merge_queue_event::log_parts(r))
                 .or_else(|| merge_authorization::log_parts(r))
                 .or_else(|| hold_transition::log_parts(r))
+                .or_else(|| merge_lane_wait::log_parts(r))
+                .or_else(|| champion_run::log_parts(r))
                 .or_else(|| merge_queue_observed::log_parts(r))
                 .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;

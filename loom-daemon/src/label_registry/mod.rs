@@ -9,8 +9,8 @@
 //! `SKIP_LABELS`, `HARD_EXCLUSION_LABELS`, `CHAMPION_PATH_LABELS`) are
 //! [`LabelSet`]s derived from registry properties via [`embedded_set`].
 //!
-//! Slice 2b: `OPERATOR_GATE_LABELS`, pr_latency `hold_labels`, merge_pr
-//! `BLOCKING` and queue_blocked `HOLD_LABELS` are derived too; `tests.rs`
+//! Slice 2b: `OPERATOR_GATE_LABELS`, pr_latency `hold_labels` and merge_pr
+//! `BLOCKING` are derived too; `tests.rs`
 //! pins each to its literal.
 //!
 //! The `propagate` rule table (#10012) is gone (#11510): its only consumer,

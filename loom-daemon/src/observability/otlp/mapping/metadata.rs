@@ -2,20 +2,12 @@
 //! token-price estimates, or provider billing guesses enter this mapping.
 use super::{
     any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
-    RepoVisibility,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::{
     PhaseDuration, PhaseTapUsageRow, RoleTickResult, SweepOutcomeRecord, SweepStartFacts,
 };
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
-
-pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
 
 /// The wire string for a role-tick result (Issue #8056) — the serde
 /// `rename_all = "snake_case"` spelling, restated here so the OTLP attribute

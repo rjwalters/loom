@@ -157,6 +157,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_account_ms",
     // #12410: the tick's draws and passes by reason (`ops::dispatch_facts`).
     "loom.dispatch.passes",
+    // #13008: the tick's exclusions by reason, `held_at_head` among them.
+    "loom.dispatch.excluded",
     "loom.dispatch.draws",
     "loom.dispatch.draws_unspawned",
     // #12494: merge steps held back before the draw by a repo's merge in
@@ -337,6 +339,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.hold_set_by_outcome",
     "loom.fleet_dispatch.hold_set_by_assignment_id",
     "loom.fleet_dispatch.holder_assignment_id",
+    "loom.fleet_dispatch.merge_slot_holder",
     "loom.dispatch.held_by",
     "loom.dispatch.retry_after_s",
     "loom.dispatch.hold_until",
@@ -364,6 +367,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.reaper.preserved.uncommitted",
     "loom.reaper.preserved.private_workspace",
     "loom.reaper.preserved.other",
+    // #12458: open-item worktrees pushed to a remote backup ref before
+    // removal (count, and the refs as the restore handle), and the preserve
+    // category for a backup that failed.
+    "loom.reaper.backed_up",
+    "loom.reaper.backup_refs",
+    "loom.reaper.preserved.backup_failed",
 ];
 
 /// Longest label value kept, in bytes.

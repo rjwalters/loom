@@ -70,6 +70,7 @@ fn step(role: StepRole, item: u32, outcome: Option<&str>) -> Source {
         step: role,
         item,
         log_text: Some(text),
+        hold_auth_before: None,
     })
 }
 
@@ -440,6 +441,7 @@ fn the_staged_step_reads_only_its_own_log_section() {
         step: StepRole::ChampionMerge,
         item: 9,
         log,
+        hold_auth_before: None,
     };
     stage_step(staged.clone());
     assert_eq!(take_staged_step(), Some(staged.clone()));
@@ -493,11 +495,17 @@ fn the_exporter_leaves_the_registrys_step_cooldowns_unchanged() {
                 step: StepRole::ChampionMerge,
                 item: 11277,
                 log: dir.path().join("missing.log"),
+                hold_auth_before: None,
             }),
             Some(&j),
         );
     });
-    assert_eq!(captured.records.len(), 1);
+    // The verdict and, for a Champion merge step, its run fact (#13029).
+    assert_eq!(captured.records.len(), 2);
+    assert!(captured
+        .records
+        .iter()
+        .any(|r| matches!(r, crate::telemetry::TelemetryRecord::ChampionRun(_))));
     assert_eq!(reg.step_cooldowns(now), before);
 }
 
@@ -746,6 +754,7 @@ fn role_step(role: StepRole, item: u32, line: Option<(&str, &str)>) -> Source {
         step: role,
         item,
         log_text: Some(text),
+        hold_auth_before: None,
     })
 }
 

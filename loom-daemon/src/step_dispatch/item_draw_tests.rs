@@ -21,6 +21,7 @@ fn item(issue: Option<u32>, pr: Option<u32>, verdict: Verdict, lane: Lane) -> It
         lane,
         send_back: false,
         story_points: None,
+        hold_auth: None,
     }
 }
 
@@ -739,4 +740,41 @@ fn the_layer_overlays_in_range_values_only() {
     assert_eq!(w.age_divisor_days, 7);
     assert_eq!(w.age_cap_days, DEFAULT_AGE_CAP_DAYS);
     assert_eq!(ItemWeights::from_layer(&Value::Null), ItemWeights::default());
+}
+
+/// #12974: the full record is archived and the draw sequence replays from the
+/// payload read back, the way an operator replays an exported summary's
+/// `payload_ref`.
+#[test]
+fn replay_from_the_archived_payload_gives_the_same_picks() {
+    use crate::observability::pick_payload_archive::{archive_record, read_ref, LocalDirSink};
+    use crate::telemetry::kinds::pick_decision::{PickDecisionRecord, PickTick};
+    let k = key(42);
+    let mut draw = draw_over(three_repos(), k.clone());
+    let draws: Vec<DrawRecord> = draw.by_ref().take(25).collect();
+    let tick = PickTick {
+        role: "work_finder".into(),
+        host: "host-a".into(),
+        tick_id: "work_finder-9".into(),
+        started_at: now(),
+        ended_at: now(),
+        outcome: "dispatched".into(),
+    };
+    let full = PickDecisionRecord::build(tick, Vec::new())
+        .with_item_draw(Some(wire_record(&draw, &draws, &k)));
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = LocalDirSink {
+        dir: tmp.path().to_path_buf(),
+        max_age_days: 14,
+        max_bytes: u64::MAX,
+    };
+    let payload_ref = archive_record(&sink, &full);
+    // The exported summary has no draws to replay; the payload does.
+    let summary = full.summarize(&payload_ref);
+    assert_eq!(summary.item_draw.as_ref().unwrap().draws_total, 25);
+    assert!(summary.item_draw.as_ref().unwrap().draws.is_empty());
+    let archived = read_ref(&sink, &payload_ref, full.ended_at).unwrap();
+    let replayed = replay_record(archived.item_draw.as_ref().unwrap()).unwrap();
+    let expected: Vec<Option<u32>> = draws.iter().map(|d| d.picked.item.issue).collect();
+    assert_eq!(replayed.iter().map(|p| p.issue).collect::<Vec<_>>(), expected);
 }

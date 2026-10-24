@@ -6,7 +6,7 @@
 //!
 //! Driven from the collector's periodic sample
 //! (`observability::collector::sample_snapshots`, the same cadence as
-//! [`super::queue_snapshot::record`] and [`super::ops::disposition::record`]),
+//! [`super::ops::disposition::record`]),
 //! reading [`crate::work_finder::last_tick_summary`] — never from the
 //! work-finder tick itself, which must never block on a forge probe. The
 //! dispatcher already computed each row's [`QueueDisposition`]; this fact only
@@ -140,7 +140,7 @@ fn u32_from(n: usize) -> u32 {
 #[must_use]
 pub fn build_rows(
     summary: &WorkFinderTickSummary,
-    resolve: impl Fn(&str) -> Option<crate::telemetry::queue_snapshot::QueueRepoRef>,
+    resolve: impl Fn(&str) -> Option<crate::telemetry::queue_repo::QueueRepoRef>,
 ) -> Vec<EligRow> {
     // The denominator: (rank, root, is-eligible-for-counting) for every queue
     // row, resolved or not. A non-`blocked` row (running or ready) competes for
@@ -349,7 +349,7 @@ pub(super) fn record() {
     let previous_sample = *LAST_SAMPLED_TICK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !super::queue_snapshot::is_new_tick(summary.at, previous_sample) {
+    if !super::repo_ref::is_new_tick(summary.at, previous_sample) {
         return;
     }
     let rows = build_rows(&summary, |root| cached_repo_ref(root));

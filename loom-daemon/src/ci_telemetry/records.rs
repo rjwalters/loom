@@ -774,7 +774,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         status: span_status(run.conclusion.as_deref()),
         attributes: span_attributes(vec![
             ("loom.repo", Some(repo.full_name.clone())),
-            ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
+            ("loom.repo.visibility", Some(repo.visibility().as_str().to_string())),
             ("loom.ci.run_id", Some(run.id.to_string())),
             ("loom.ci.workflow", Some(workflow)),
             ("loom.ci.event", Some(run.event.clone())),
@@ -794,13 +794,6 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         envelope(host_id, TelemetryRecord::CiDuration(duration_record), None),
         envelope(host_id, TelemetryRecord::Span(span), Some(ctx)),
     ]
-}
-
-pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
 }
 
 /// The envelopes of one completed job's unit: `ci.job`, `ci.duration`
@@ -892,7 +885,7 @@ pub fn job_envelopes_with_reason(
         status: span_status(job.conclusion.as_deref()),
         attributes: span_attributes(vec![
             ("loom.repo", Some(repo.full_name.clone())),
-            ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
+            ("loom.repo.visibility", Some(repo.visibility().as_str().to_string())),
             ("loom.ci.run_id", Some(run.id.to_string())),
             ("loom.ci.job_id", Some(job.id.to_string())),
             ("loom.ci.workflow", Some(workflow)),
@@ -965,7 +958,7 @@ fn step_envelopes(
                 status: span_status(step.conclusion.as_deref()),
                 attributes: span_attributes(vec![
                     ("loom.repo", Some(repo.full_name.clone())),
-                    ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
+                    ("loom.repo.visibility", Some(repo.visibility().as_str().to_string())),
                     ("loom.ci.run_id", Some(run.id.to_string())),
                     ("loom.ci.job_id", Some(job.id.to_string())),
                     ("loom.ci.workflow", Some(run.workflow())),
