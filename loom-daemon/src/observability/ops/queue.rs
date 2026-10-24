@@ -8,13 +8,24 @@
 //! failed, which means the counts are incomplete rather than low. A third,
 //! `loom.queue.listing_incomplete_repos` (#11139), counts the repos whose
 //! listing came back partial: their rows are counted, but not all of them.
+//! A fourth, `loom.queue.already_landed` (#11858), splits the
+//! `already_landed` rows by the evidence the landed guard found (the row's
+//! `detail`: `forge_closed`, `forge_closed_not_planned` or `journal_landed`;
+//! `unknown` for a row with none of these), so the split is measurable without
+//! the native `queue.snapshot`.
+//! A fifth, `loom.queue.host_shard` (#12827), is this host's shard index on
+//! the tick's dispatch plan, labelled `shard_count`. It is emitted only when
+//! sharding is configured and the index is known: an unsharded host, a tick
+//! without a plan, or an unknown index exports no point (absent stays absent,
+//! never a `0` that would read as "shard 0").
 //!
 //! Every disposition is emitted every tick, **zeros included**, so an empty
 //! queue reads as `0` and not as a missing series. A missing series then
 //! means only one thing: this host stopped ticking or stopped exporting. The
 //! labels are two small closed vocabularies. An issue number or a repo never
-//! becomes a label; the per-issue rows go to the native backend as
-//! `queue.snapshot` (`crate::telemetry::queue_snapshot`).
+//! becomes a label; per-issue rows ride the `pick.decision` and
+//! `eta.*` kinds instead (the native `queue.snapshot` record was removed in
+//! #12813).
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
@@ -23,9 +34,18 @@ fn int(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// The `already_landed` evidence tokens `loom.queue.already_landed` names
+/// (the landed guard's row details, #11429), plus [`UNKNOWN_EVIDENCE`].
+pub const LANDED_EVIDENCE: [&str; 3] =
+    ["forge_closed", "forge_closed_not_planned", "journal_landed"];
+
+/// The evidence label for an `already_landed` row whose detail names none.
+pub const UNKNOWN_EVIDENCE: &str = "unknown";
+
 /// The tick's queue gauges: one `loom.queue.issues{state,reason}` point per
-/// entry of [`QueueDisposition::ALL`], plus `loom.queue.listing_failed_repos`
-/// and `loom.queue.listing_incomplete_repos`.
+/// entry of [`QueueDisposition::ALL`], plus `loom.queue.listing_failed_repos`,
+/// `loom.queue.listing_incomplete_repos` and one
+/// `loom.queue.already_landed{reason}` point per evidence (#11858).
 #[must_use]
 pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
     let mut points: Vec<MetricPoint> = QueueDisposition::ALL
@@ -46,7 +66,48 @@ pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
         MetricName::QueueListingIncompleteRepos,
         int(summary.listing_incomplete.len()),
     ));
+    points.extend(already_landed_points(summary));
+    points.extend(host_shard_point(summary));
     points
+}
+
+/// `loom.queue.host_shard{shard_count}` (#12827): the host's shard index
+/// from the tick's plan, only when sharding is configured and the index is
+/// known. `shard_count` is a label only when the plan names it.
+fn host_shard_point(summary: &WorkFinderTickSummary) -> Option<MetricPoint> {
+    let shard = summary.plan.as_ref()?.shard;
+    if !shard.configured {
+        return None;
+    }
+    let point = MetricPoint::int(MetricName::QueueHostShard, i64::from(shard.host_shard?));
+    Some(match shard.shard_count {
+        Some(count) => point.label("shard_count", count.to_string()),
+        None => point,
+    })
+}
+
+/// One `loom.queue.already_landed{reason}` point per evidence, zeros
+/// included (#11858).
+fn already_landed_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
+    let evidence = |detail: Option<&str>| {
+        detail
+            .and_then(|d| LANDED_EVIDENCE.iter().find(|e| **e == d))
+            .copied()
+            .unwrap_or(UNKNOWN_EVIDENCE)
+    };
+    LANDED_EVIDENCE
+        .iter()
+        .chain(std::iter::once(&UNKNOWN_EVIDENCE))
+        .map(|reason| {
+            let count = summary
+                .queue
+                .iter()
+                .filter(|r| r.disposition == QueueDisposition::AlreadyLanded)
+                .filter(|r| evidence(r.detail.as_deref()) == *reason)
+                .count();
+            MetricPoint::int(MetricName::QueueAlreadyLanded, int(count)).label("reason", *reason)
+        })
+        .collect()
 }
 
 /// Export one tick's queue gauges. Returns immediately when no ops sink is

@@ -16,17 +16,18 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::work_finder::step_item::Step;
+
 /// Where a row stands in the plan.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanState {
     /// A sweep is running for it (dispatched this tick, or already in flight).
     Running,
-    /// Among the first `max_admissions_per_tick` capacity-deferred rows in
-    /// plan order: what the next tick admits once slots free.
+    /// Among the first `max_concurrent` capacity-deferred rows in plan
+    /// order: what the next tick admits once slots free.
     Next,
-    /// Deferred for a capacity-style reason, behind the `next` rows
-    /// (including repo-capped rows).
+    /// Deferred for a capacity-style reason, behind the `next` rows.
     Queued,
     /// Held by something specific to the issue, its repo, or its history.
     Blocked,
@@ -42,21 +43,74 @@ pub enum PlanState {
 pub enum PlanGate {
     /// The shared concurrency cap was full.
     Capacity,
-    /// The per-tick admission ramp cap was reached.
-    Ramp,
-    /// The saturation admission brake held new admissions.
-    Saturation,
     /// The build back-off (#9410) held new issue builds on review/merge debt.
     BuildBackoff,
-    /// Its own repo was at `maxConcurrentPerRepo`.
-    RepoCap,
     /// Its affected files overlap same-repo work admitted or in flight (#9781).
     FileOverlap,
     /// A gate this client does not know (forward compatibility). This
-    /// includes `out_of_slice`, retired with the dispatch slice (#11682) and
-    /// never emitted since: a historical record carrying it parses here.
+    /// includes `out_of_slice`, retired with the dispatch slice (#11682), and
+    /// `ramp`, `saturation` and `repo_cap`, retired with those caps
+    /// (#12406): a historical record carrying one parses here.
     #[serde(other)]
     Unknown,
+}
+
+/// The step a plan row advances its item by (Issue #11910): which role
+/// session the row is for, under step dispatch (#11894 §12).
+///
+/// The serialised names are [`Step`]'s own (`builder`, `judge`,
+/// `champion_merge`, …), so a plan row and the classifier speak one
+/// vocabulary. A name this build does not know — a newer daemon's step — is
+/// kept verbatim in [`PlanStep::Unknown`] rather than failing the parse or
+/// collapsing into another step: two different unknown steps stay two fold
+/// keys in the fleet merge.
+///
+/// A row with **no** `step` field means `builder` (see [`RowPlan::step`]):
+/// every plan published before step dispatch was a Builder plan, so older
+/// plans and older readers keep working (an additive wire change).
+///
+/// A `step` that is not a string at all (a number, an object, …) is kept as
+/// an unknown step named by its JSON text rather than rejecting the row, the
+/// same tolerance [`PlanState`] gives a value it does not know (#11909).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(untagged)]
+pub enum PlanStep {
+    Known(Step),
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for PlanStep {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        if let Ok(step) = serde_json::from_value::<Step>(value.clone()) {
+            return Ok(PlanStep::Known(step));
+        }
+        Ok(PlanStep::Unknown(match value {
+            serde_json::Value::String(name) => name,
+            other => other.to_string(),
+        }))
+    }
+}
+
+impl Default for PlanStep {
+    /// The step an older plan's row was always for.
+    fn default() -> Self {
+        PlanStep::Known(Step::Builder)
+    }
+}
+
+impl PlanStep {
+    /// The wire name — the fold key's third part in the fleet merge.
+    #[must_use]
+    pub fn name(&self) -> String {
+        match self {
+            PlanStep::Known(step) => serde_json::to_value(step)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            PlanStep::Unknown(name) => name.clone(),
+        }
+    }
 }
 
 /// One comparator key that placed a row, in comparator order.
@@ -64,17 +118,6 @@ pub enum PlanGate {
 pub struct PlanKey {
     pub name: String,
     pub value: serde_json::Value,
-}
-
-/// A workspace's per-repo cap and its top-of-tick occupancy.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RepoCapView {
-    /// `maxConcurrentPerRepo`, or `None` when uncapped.
-    #[serde(default)]
-    pub cap: Option<usize>,
-    /// Live sweeps in the workspace at the top of the tick.
-    #[serde(default)]
-    pub occupancy: usize,
 }
 
 /// The per-row plan fields, flattened into `ReadyQueueRow` and
@@ -92,24 +135,32 @@ pub struct RowPlan {
     pub keys: Vec<PlanKey>,
     #[serde(default)]
     pub gate: Option<PlanGate>,
-    /// Whether the workspace had a live sweep at the top of the tick (the
-    /// track-affinity input).
-    #[serde(default)]
-    pub hot: Option<bool>,
     /// The shard that owns the workspace, when sharding is configured.
     #[serde(default)]
     pub owning_shard: Option<u32>,
-    #[serde(default)]
-    pub repo_cap: Option<RepoCapView>,
     /// When a time-boxed hold clears (Issue #9311): the recheck interval,
     /// dispatch backoff (including the open-PR-guard-armed subset), no-op
     /// cooldown, decline cooldown, or PR-less-retry window. `None` for a
-    /// `position`-bearing row (capacity/ramp/repo-cap deferrals
+    /// `position`-bearing row (capacity deferrals
     /// name a gate, not a clock) and for every other `blocked` disposition
     /// this field does not (yet) trace — additive, never a substitute for
     /// `gate` or `plan_state`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_until: Option<DateTime<Utc>>,
+    /// The step this row advances its item by (Issue #11910). Absent on the
+    /// wire means `builder` — read it through [`RowPlan::step`], never
+    /// directly. Not serialised when `None`, so a plan built without step
+    /// dispatch is byte-for-byte what older readers already parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<PlanStep>,
+}
+
+impl RowPlan {
+    /// The row's step, with an absent field read as `builder`.
+    #[must_use]
+    pub fn step(&self) -> PlanStep {
+        self.step.clone().unwrap_or_default()
+    }
 }
 
 /// Admission capacity as of the tick.
@@ -123,10 +174,6 @@ pub struct PlanSlots {
     /// `max_concurrent - occupancy`, saturating.
     #[serde(default)]
     pub free: Option<usize>,
-    #[serde(default)]
-    pub max_admissions_per_tick: Option<usize>,
-    #[serde(default)]
-    pub saturation_held: bool,
     #[serde(default)]
     pub any_halted: bool,
     /// Whether the host's single overflow slot (#9244) is unused. Inert
@@ -187,6 +234,20 @@ mod tests {
         assert_eq!(ctx, DispatchPlanContext::default());
     }
 
+    /// A non-string `step` is an unknown step, never a rejected row (#11909).
+    #[test]
+    fn a_non_string_step_parses_as_unknown() {
+        let row: RowPlan = serde_json::from_value(serde_json::json!({ "step": 7 })).unwrap();
+        assert_eq!(row.step(), PlanStep::Unknown("7".to_string()));
+        let row: RowPlan =
+            serde_json::from_value(serde_json::json!({ "step": { "x": 1 } })).unwrap();
+        assert_eq!(row.step(), PlanStep::Unknown("{\"x\":1}".to_string()));
+        let row: RowPlan = serde_json::from_value(serde_json::json!({ "step": "judge" })).unwrap();
+        assert_eq!(row.step(), PlanStep::Known(Step::Judge));
+        let row: RowPlan = serde_json::from_value(serde_json::json!({ "step": "scout" })).unwrap();
+        assert_eq!(row.step(), PlanStep::Unknown("scout".to_string()));
+    }
+
     #[test]
     fn unknown_enum_values_parse_as_unknown() {
         let row: RowPlan = serde_json::from_value(serde_json::json!({
@@ -217,7 +278,7 @@ mod tests {
     #[test]
     fn wire_names_are_snake_case() {
         assert_eq!(serde_json::to_value(PlanState::Next).unwrap(), "next");
-        assert_eq!(serde_json::to_value(PlanGate::RepoCap).unwrap(), "repo_cap");
+        assert_eq!(serde_json::to_value(PlanGate::FileOverlap).unwrap(), "file_overlap");
     }
 
     /// `held_until` (Issue #9311) round-trips as RFC-3339 when present, and
@@ -244,5 +305,35 @@ mod tests {
         );
         let round_tripped: RowPlan = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped.held_until, None);
+    }
+
+    /// Issue #11910: a row with no `step` (an older plan) reads as
+    /// `builder`, and is still serialised without one.
+    #[test]
+    fn a_row_without_a_step_reads_as_builder() {
+        let row: RowPlan =
+            serde_json::from_value(serde_json::json!({ "position": 1, "plan_state": "next" }))
+                .unwrap();
+        assert_eq!(row.step, None);
+        assert_eq!(row.step(), PlanStep::Known(Step::Builder));
+        assert_eq!(row.step().name(), "builder");
+        let value = serde_json::to_value(&row).unwrap();
+        assert!(value.get("step").is_none(), "absent, not null: {value}");
+    }
+
+    /// The `step` field uses the classifier's own names, and a step this
+    /// build does not know is kept verbatim rather than failing the row.
+    #[test]
+    fn step_uses_the_classifier_names_and_keeps_unknown_ones() {
+        let row: RowPlan =
+            serde_json::from_value(serde_json::json!({ "step": "champion_merge" })).unwrap();
+        assert_eq!(row.step(), PlanStep::Known(Step::ChampionMerge));
+        assert_eq!(serde_json::to_value(&row).unwrap()["step"], "champion_merge");
+
+        let newer: RowPlan =
+            serde_json::from_value(serde_json::json!({ "step": "auditor_sweep" })).unwrap();
+        assert_eq!(newer.step(), PlanStep::Unknown("auditor_sweep".into()));
+        assert_eq!(newer.step().name(), "auditor_sweep");
+        assert_eq!(serde_json::to_value(&newer).unwrap()["step"], "auditor_sweep");
     }
 }

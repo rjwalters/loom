@@ -249,9 +249,27 @@ pub fn plan(
     })
 }
 
-/// Book the passthrough of `args` (see the module docs). Never fails, never
-/// panics into the caller.
-pub fn book(args: &[OsString], cwd: Option<&Path>, route: &super::read_route::FrontRoute) {
+/// Book the passthrough of `args` (see the module docs), run under `profile`
+/// — a gateway profile or a reader App's directory — or, when `None`, the
+/// session's own credential. `read` is the front's classification. Never
+/// fails, never panics into the caller.
+pub fn book(args: &[OsString], cwd: Option<&Path>, profile: Option<&Path>, read: bool) {
+    book_as(args, cwd, profile, read, Outcome::Ok);
+}
+
+/// Book a read the front shed instead of exec'ing it on the writer (#12394):
+/// the same row as [`book`], `o=shed`.
+pub fn book_shed(args: &[OsString], cwd: Option<&Path>) {
+    book_as(args, cwd, None, true, Outcome::Shed);
+}
+
+fn book_as(
+    args: &[OsString],
+    cwd: Option<&Path>,
+    profile: Option<&Path>,
+    read: bool,
+    outcome: Outcome,
+) {
     let _ = std::panic::catch_unwind(|| {
         if std::env::var_os(crate::gh_invocation::BOOKED_ENV).is_some_and(|v| v == "1") {
             return;
@@ -262,14 +280,15 @@ pub fn book(args: &[OsString], cwd: Option<&Path>, route: &super::read_route::Fr
             host: var("GH_HOST"),
             gh_repo: var("GH_REPO"),
         };
-        // A gateway-routed read runs under its profile with every env token
-        // removed (2am#4367 P4); anything else under the session's own.
-        let dir = route.gateway.clone().or_else(|| {
+        // A gateway- or reader-routed read runs under that directory with
+        // every env token removed (2am#4367 P4, #12245); anything else under
+        // the session's own.
+        let dir = profile.map(Path::to_path_buf).or_else(|| {
             std::env::var_os("GH_CONFIG_DIR")
                 .filter(|d| !d.is_empty())
                 .map(std::path::PathBuf::from)
         });
-        let env_token = route.gateway.is_none()
+        let env_token = profile.is_none()
             && ["GH_TOKEN", "GITHUB_TOKEN"]
                 .iter()
                 .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
@@ -277,12 +296,12 @@ pub fn book(args: &[OsString], cwd: Option<&Path>, route: &super::read_route::Fr
         let remote = || cwd.and_then(|dir| bounded_remote("git", dir, REMOTE_BUDGET));
         if let Some(mut row) = plan(args, &session, &cred, remote) {
             row.attribution.rt =
-                Some(crate::forge_gateway::route_label(cred.kind, route.read).to_string());
+                Some(crate::forge_gateway::route_label(cred.kind, read).to_string());
             forge_call_stats::record_attributed(
                 row.caller,
                 &row.identity,
                 row.pool,
-                Outcome::Ok,
+                outcome,
                 None,
                 &row.attribution,
             );

@@ -251,6 +251,10 @@ pub struct PauseResumeStatus {
     pub pause_to_resume_secs: Option<u64>,
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
+    /// When the current H5 `step` began, so `status` can show how long this
+    /// phase has been running (#12147).
+    #[serde(default)]
+    pub step_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub finished_at: Option<DateTime<Utc>>,
     /// A short note on the last transition.
@@ -447,6 +451,9 @@ impl Run<'_> {
     }
 
     fn step(&mut self, step: &str) {
+        if self.status.step != step || self.status.step_started_at.is_none() {
+            self.status.step_started_at = Some(Utc::now());
+        }
         self.status.step = step.to_string();
         self.status.phase = Some(self.manifest.phase.as_str().to_string());
         self.status.holding = self.held;
@@ -1217,3 +1224,7 @@ pub(crate) mod test_support;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "pause_resume/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pause_resume/step_tests.rs"]
+mod step_tests;

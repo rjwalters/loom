@@ -29,17 +29,36 @@ pub const FACT_UNESCALATE_MARKER_PREFIX: &str = "<!-- champion:proposal-unescala
 /// the findings source for `--check-defer`.
 pub const REJECT_NEEDLE: &str = "Champion Review: NEEDS REVISION";
 
-/// The label that parks a proposal for an operator.
-pub const OPERATOR_ONLY_LABEL: &str = "loom:operator-only";
+/// The label that parks a proposal for an operator (#11795). Before the fold
+/// it was `loom:operator-only` plus a sub-kind (`loom:operator-blocked` for a
+/// dependency-timing escalation, `loom:operator-decision` for a fact-checkable
+/// one); an unmigrated item may still carry those, which [`held_label`] and
+/// [`other_hold_names`] read.
+pub const OPERATOR_LABEL: &str = crate::work_finder::OPERATOR_HOLD_LABEL;
 
-/// The #5671 sub-kind label. Must never outlive the base label it accompanies,
-/// but a pre-#5679 escalation never carried one — so its absence is normal.
-pub const OPERATOR_BLOCKED_LABEL: &str = "loom:operator-blocked";
+/// The operator hold `labels` carry: [`OPERATOR_LABEL`] when present, else the
+/// first retired name for it present (an unmigrated escalation), else
+/// [`OPERATOR_LABEL`] (absent, so the deciders answer `not-operator-only`).
+#[must_use]
+pub fn held_label(labels: &[String]) -> &'static str {
+    crate::work_finder::OPERATOR_HOLD_NAMES
+        .iter()
+        .copied()
+        .find(|n| labels.iter().any(|l| l == n))
+        .unwrap_or(OPERATOR_LABEL)
+}
 
-/// The #7650 sub-kind label a **fact**-checkable escalation carries instead of
-/// [`OPERATOR_BLOCKED_LABEL`]. `champion-issue-promo.md` selects it whenever a
-/// recurring finding is not a pure dependency citation.
-pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";
+/// The hold's other names `labels` carry beside `held` (retired names and
+/// sub-kinds), which an un-escalation removes best-effort. Present ones only:
+/// removing a label a repo never had can fail.
+#[must_use]
+pub fn other_hold_names(labels: &[String], held: &str) -> Vec<&'static str> {
+    crate::work_finder::OPERATOR_HOLD_NAMES
+        .iter()
+        .copied()
+        .filter(|n| *n != held && labels.iter().any(|l| l == n))
+        .collect()
+}
 
 /// Prefix of the marker stamped into the issue **body** by a fact
 /// un-escalation's `## Revision` section. Its presence is what stops a retry

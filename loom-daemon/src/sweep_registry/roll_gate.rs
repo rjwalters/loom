@@ -53,7 +53,8 @@ pub(crate) struct RollGate {
     mid_spawn: Arc<AtomicUsize>,
 }
 
-/// Held by a dispatch from its spawn until its registry entry is recorded.
+/// Held by a dispatch from its gate admission (same lock hold as `admit`,
+/// #9573) until its registry entry is recorded or the attempt is abandoned.
 #[derive(Debug)]
 pub(crate) struct MidSpawn(Arc<AtomicUsize>);
 

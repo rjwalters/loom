@@ -42,6 +42,45 @@ pub mod glibc;
 pub mod signature;
 pub mod source;
 
+/// RAII temp dir for the release_fetch tests (#9896): removed on drop, so it
+/// is cleaned even when a test panics. Derefs to `PathBuf`.
+#[cfg(test)]
+pub(crate) struct TestDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    pub(crate) fn new(label: &str) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("loom-daemon-{label}-test-"))
+            .tempdir()
+            .unwrap()
+            .keep();
+        Self(dir)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestDir {
+    type Target = std::path::PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub use evidence::{fetch_and_verify_with_evidence, SignatureEvidence};
 pub use fetch::{
     fetch_and_verify, fetch_and_verify_with_policy, FetchInputs, FetchOutcome, SignaturePolicy,

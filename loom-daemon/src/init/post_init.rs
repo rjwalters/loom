@@ -223,6 +223,8 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/retry-state/",
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
+    // Private-clone job records (tokens_pool/private_workspace/export.rs).
+    ".loom/private-jobs/",
     ".loom/sweep-run/",
     // Loom-owned per-run cargo target dirs (#8370): `worker_spawn` exports one
     // as CARGO_TARGET_DIR for every role run, and `role_runner` / the orphan
@@ -1014,6 +1016,7 @@ mod tests {
             // The original exact-path rule must keep covering the live pool —
             // adding the globs must not have replaced it.
             (".loom/tokens/x.token", ".loom/tokens/"),
+            (".loom/private-jobs/issue-7.json", ".loom/private-jobs/"),
         ] {
             let matched = check_ignore(path)
                 .unwrap_or_else(|| panic!("{path} is NOT ignored by the generated .gitignore"));
@@ -1028,6 +1031,10 @@ mod tests {
         // `.loom/accounts.json` is the deliberately committable per-repo profile
         // allowlist (#5014) — if a future widening starts ignoring it, this
         // fails here instead of silently un-tracking a shared config.
+        assert!(
+            check_ignore(".loom/private-jobs.json").is_none(),
+            ".loom/private-jobs.json must not be swallowed by the directory-scoped pattern"
+        );
         assert!(
             check_ignore(".loom/accounts.json").is_none(),
             ".loom/accounts.json must stay trackable (#5014)"

@@ -439,3 +439,40 @@ fn reader_rejects_malformed_metadata() {
     let repo = repo_with_origin_main(Some("{not json"));
     assert!(read_default_branch(repo.path()).is_err());
 }
+
+/// Pins the `capabilities --json` / `install-compat show --json` schema
+/// (#12939). The shell side reads `payload_identity` and `schema_version`;
+/// removing or renaming a key is a `CAPABILITIES_SCHEMA_VERSION` bump.
+#[test]
+fn capabilities_json_schema_is_pinned() {
+    let d = daemon();
+    let obj = capabilities_json(&d, None);
+    let mut keys: Vec<&str> = obj
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "classification",
+            "installed",
+            "invoked_files",
+            "payload_identity",
+            "requires_daemon",
+            "running",
+            "schema_version",
+            "supports_installed",
+        ]
+    );
+    assert_eq!(obj["schema_version"], CAPABILITIES_SCHEMA_VERSION);
+    assert_eq!(obj["payload_identity"], payload_identity());
+    assert!(obj["installed"].is_null() && obj["classification"].is_null());
+
+    let m = meta(Some("0.19.700"), Some(REQUIRES_DAEMON));
+    let with = capabilities_json(&d, Some(&m));
+    assert_eq!(with["installed"]["loom_version"], "0.19.700");
+    assert!(with["classification"].is_string());
+}

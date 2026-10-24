@@ -66,6 +66,17 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
         .or_else(|| selection.as_ref().and_then(|s| s.lease()))
         .context("private dispatch has no owned account lease")?;
     let job = lease::read(&dir)?.context("private dispatch lost its durable job identity")?;
+    // The clone this job was prepared in, from the durable job the lease owns:
+    // an empty repository is the legacy primary, anything else must still be a
+    // registered clone of this account or the launch is refused.
+    let target = config
+        .target((!job.repository.is_empty()).then_some(job.repository.as_str()))
+        .context(containment::WRONG_CLONE)?;
+    if let Some(selection) = &selection {
+        if selection.target() != Some(&target) {
+            bail!("{}", containment::WRONG_CLONE);
+        }
+    }
     let state =
         docker::inspect(&config.container)?.context("private session disappeared before launch")?;
     docker::validate(&config, &state)?;
@@ -77,8 +88,8 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     // still hash to the identity bound at admission (issue #8839).
     docker::recheck_control(&config, &job.container_id, &job.control)?;
     args.container = job.container_id.clone();
-    args.workdir = REPO.into();
-    args.env = child_env(&args.env, &config, &job)?;
+    args.workdir = target.path.clone();
+    args.env = child_env(&args.env, &config, &job, &target)?;
     // Resolve hooks on the worker, using its private installed bridge. Never
     // bless hook trust or enable a capability that the manifest rejects.
     args.command.splice(
@@ -131,11 +142,21 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     result
 }
 
-fn child_env(input: &[String], config: &Config, job: &lease::Job) -> Result<Vec<String>> {
+fn child_env(
+    input: &[String],
+    config: &Config,
+    job: &lease::Job,
+    target: &Target,
+) -> Result<Vec<String>> {
+    let clone = &target.path;
     let mut env = vec![
-        format!("LOOM_WORKSPACE={REPO}"),
-        format!("LOOM_PROJECT_ROOT={REPO}"),
-        format!("LOOM_WORKTREE_ROOT={REPO}/.loom/worktrees"),
+        format!("LOOM_WORKSPACE={clone}"),
+        format!("LOOM_PROJECT_ROOT={clone}"),
+        format!("LOOM_WORKTREE_ROOT={clone}/.loom/worktrees"),
+        // The selected clone, set on this exec itself: credentials and the
+        // worker's containment proof are scoped to exactly this repository.
+        format!("LOOM_PRIVATE_REPOSITORY={}", target.repository),
+        format!("LOOM_PRIVATE_CLONE={clone}"),
         "LOOM_RUNTIME=codex".into(),
         "LOOM_PRIVATE_WORKSPACE=1".into(),
         "CARGO_INCREMENTAL=0".into(),
@@ -197,6 +218,7 @@ mod tests {
             docker_desktop: false,
             repository: "https://example.invalid/repo".into(),
             base: "main".into(),
+            repositories: vec![],
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
@@ -210,6 +232,7 @@ mod tests {
             base_revision: String::new(),
             host_pid: 1,
             control: "b".repeat(64),
+            repository: String::new(),
         };
         let env = child_env(
             &[
@@ -222,9 +245,11 @@ mod tests {
             ],
             &config,
             &job,
+            &config.primary(),
         )
         .unwrap();
         assert!(env.contains(&"LOOM_WORKSPACE=/workspace/repo".into()));
+        assert!(env.contains(&"LOOM_PRIVATE_CLONE=/workspace/repo".into()));
         assert!(env.contains(&"LOOM_ROLE=guide".into()));
         assert!(env.contains(&"LOOM_WORK_ORIGIN=autonomous".into()));
         // The bound control identity and base revision the worker re-checks
@@ -234,5 +259,51 @@ mod tests {
         assert!(!env
             .iter()
             .any(|v| v.contains("/host/") || v.starts_with("LOOM_RUN_JOB")));
+    }
+
+    /// The launch environment names the SELECTED clone and its repository, so
+    /// a job on an additional clone never runs in, or is credentialed for, the
+    /// account's primary (#10796).
+    #[test]
+    fn child_env_names_the_selected_additional_clone() {
+        let mut config = Config {
+            schema_version: 1,
+            account: "test".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://example.invalid/o/primary".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: "/host/profile".into(),
+            gh_config: None,
+        };
+        let id = identify("https://example.invalid/o/second").unwrap();
+        config.repositories.push(Registered {
+            repository: id.url.clone(),
+            base: "main".into(),
+            slug: id.slug.clone(),
+        });
+        let target = config
+            .target(Some("https://example.invalid/o/second"))
+            .unwrap();
+        let job = lease::Job {
+            owner: "o".into(),
+            kind: JobKind::Role,
+            issue: None,
+            branch: None,
+            container_id: "a".repeat(64),
+            base_revision: "b".repeat(40),
+            host_pid: 1,
+            control: "c".repeat(64),
+            repository: id.url.clone(),
+        };
+        let env = child_env(&[], &config, &job, &target).unwrap();
+        let clone = format!("{WORK_ROOT}/{}", id.slug);
+        assert!(env.contains(&format!("LOOM_WORKSPACE={clone}")));
+        assert!(env.contains(&format!("LOOM_PRIVATE_CLONE={clone}")));
+        assert!(env.contains(&format!("LOOM_PRIVATE_REPOSITORY={}", id.url)));
+        assert!(!env.iter().any(|v| v.contains("/workspace/repo")), "{env:?}");
     }
 }

@@ -11,7 +11,7 @@
 -- post-reset value, never a negative delta), which stays correct for either
 -- shape.
 --
--- STATUS: queries 1-3 are executed verbatim against the pinned ClickHouse by
+-- STATUS: queries 1-5 are executed verbatim (6-7, #12942, are not replayed yet) against the pinned ClickHouse by
 -- loom-daemon/tests/signoz_host_export_queries.rs (CI runs it with --ignored).
 
 -- 1. Hosts with drops in the last 2 h, worst first. Each host's latest sample
@@ -234,3 +234,104 @@ SELECT s.host AS host, s.exporter AS exporter, s.versions AS versions,
        r.reason AS reason, r.reason_delta AS reason_delta
 FROM summary AS s INNER JOIN reason_rows AS r ON s.host = r.host AND s.exporter = r.exporter
 ORDER BY delta DESC, host, exporter, reason_delta DESC;
+
+-- 5. Last known state per roster host: running, stopped or silent (Issue
+--    #10023). One row per roster host, from the `daemon.start` (loom.kind
+--    `daemon.event`, loom.topic `daemon.start`), `daemon.exit` and `host.export`
+--    logs the daemon already emits; nothing new is exported. The roster and the
+--    thresholds are query 3's (900 s `always`, 86400 s `when_awake`); paste the
+--    same rows between this query's own markers.
+--      stopped  the latest `daemon.exit` is newer than the latest `daemon.start`
+--               and no `host.export` followed it: a deliberate, clean stop.
+--      running  a `host.export` inside the host's threshold (and not stopped).
+--               Two `daemon.start` with no `daemon.exit` between them are a
+--               crash or kill followed by a restart, and read as running.
+--      silent   no `host.export` inside the threshold and no later
+--               `daemon.exit`: crashed, killed, asleep, or export failing. A
+--               daemon cannot emit on SIGKILL or power loss, so the absence of
+--               a `daemon.exit` is itself the signal. Query 3's `state`
+--               (`exporter_silent` vs `host_silent`) separates "export failing"
+--               from "host down" for the same host.
+--    A zero timestamp column means the record was not seen in the 48 h lookback.
+WITH roster AS (
+    SELECT host, telemetry
+    FROM values('host String, telemetry String',
+        /* loom:lifecycle-roster:begin */
+        ('example-always', 'always'), ('example-when-awake', 'when_awake')
+        /* loom:lifecycle-roster:end */
+    )
+),
+seen AS (
+    SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
+           maxIf(timestamp, attributes_string['loom.kind'] = 'daemon.event'
+                            AND attributes_string['loom.topic'] = 'daemon.start') AS last_start_ns,
+           maxIf(timestamp, attributes_string['loom.kind'] = 'daemon.exit') AS last_exit_ns,
+           maxIf(timestamp, attributes_string['loom.kind'] = 'host.export') AS last_export_ns
+    FROM signoz_logs.distributed_logs_v2
+    WHERE timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 48 HOUR)
+    GROUP BY host
+),
+judged AS (
+    SELECT r.host AS host,
+           r.telemetry AS telemetry,
+           if(r.telemetry = 'always', 900, 86400) AS threshold_seconds,
+           toInt64(ifNull(s.last_start_ns, 0)) AS ls_ns,
+           toInt64(ifNull(s.last_exit_ns, 0)) AS lx_ns,
+           toInt64(ifNull(s.last_export_ns, 0)) AS le_ns,
+           toInt64(toUnixTimestamp64Nano(now64(9))) AS now_ns
+    FROM roster AS r
+    LEFT JOIN seen AS s ON r.host = s.host
+)
+SELECT host,
+       telemetry,
+       multiIf(lx_ns > ls_ns AND lx_ns >= le_ns, 'stopped',
+               le_ns > 0 AND intDiv(now_ns - le_ns, 1000000000) <= threshold_seconds, 'running',
+               'silent') AS state,
+       if(ls_ns = 0, NULL, fromUnixTimestamp64Nano(ls_ns)) AS last_start,
+       if(lx_ns = 0, NULL, fromUnixTimestamp64Nano(lx_ns)) AS last_exit,
+       if(le_ns = 0, NULL, fromUnixTimestamp64Nano(le_ns)) AS last_export
+FROM judged
+ORDER BY host;
+
+-- 6. Every daemon start per host over a window, with its version and reason
+--    (Issue #12942). One row per `daemon.start` record (loom.kind
+--    `daemon.event`, loom.topic `daemon.start`); the fields come from the
+--    record's typed `loom.payload.<field>` attributes (the whole `loom.payload`
+--    string is over the exporter's 256-byte bound). `start_reason` is `roll` (auto-update),
+--    `restart` (IPC restart or operator drain), `cold` (first start on the
+--    host) or `unknown`. A crash, SIGKILL or power loss records no exit cause,
+--    so the start that follows reads `unknown`: an `unknown` start with no
+--    `daemon.exit` before it is the crash signal. `previous_version` is empty
+--    when the host had no earlier state. Change the 24 HOUR window as needed.
+SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
+       fromUnixTimestamp64Nano(toInt64(timestamp)) AS started_at,
+       attributes_string['loom.payload.version'] AS version,
+       attributes_string['loom.payload.previous_version'] AS previous_version,
+       attributes_string['loom.payload.start_reason'] AS start_reason,
+       attributes_string['loom.payload.instance'] AS instance
+FROM signoz_logs.distributed_logs_v2
+WHERE attributes_string['loom.kind'] = 'daemon.event'
+  AND attributes_string['loom.topic'] = 'daemon.start'
+  AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 24 HOUR)
+ORDER BY host, started_at DESC;
+
+-- 7. Daemon starts per host per hour, crash loops flagged (Issue #12942). A
+--    host is `crash_loop` in an hour with more than `max_starts_per_hour`
+--    starts (edit the constant; 3 by default). `unknown_starts` counts the
+--    starts whose predecessor left no exit cause, the crash-shaped ones, so a
+--    burst of deliberate rolls (`roll_starts`, `restart_starts`) is told apart
+--    from a loop.
+WITH 3 AS max_starts_per_hour
+SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
+       toStartOfHour(fromUnixTimestamp64Nano(toInt64(timestamp))) AS hour,
+       count() AS starts,
+       countIf(attributes_string['loom.payload.start_reason'] = 'roll') AS roll_starts,
+       countIf(attributes_string['loom.payload.start_reason'] = 'restart') AS restart_starts,
+       countIf(attributes_string['loom.payload.start_reason'] = 'unknown') AS unknown_starts,
+       starts > max_starts_per_hour AS crash_loop
+FROM signoz_logs.distributed_logs_v2
+WHERE attributes_string['loom.kind'] = 'daemon.event'
+  AND attributes_string['loom.topic'] = 'daemon.start'
+  AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 24 HOUR)
+GROUP BY host, hour
+ORDER BY hour DESC, starts DESC, host;

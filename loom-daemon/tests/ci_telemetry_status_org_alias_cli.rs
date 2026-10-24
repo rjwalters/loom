@@ -62,3 +62,8 @@ fn the_comma_joined_owner_logins_from_status_json_are_echoed_as_the_org_alias() 
     assert!(value.get("owners").is_some(), "{value}");
     assert!(value.get("owners_source").is_some(), "{value}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

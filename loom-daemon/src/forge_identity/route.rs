@@ -67,12 +67,13 @@ pub const MAX_LATCH: Duration = Duration::from_secs(3660);
 /// A latch with no known home reset releases this long after it engaged.
 pub const DEFAULT_LATCH: Duration = Duration::from_secs(3600);
 
-/// How a read may be treated when its readers run dry. W4-B records it on
-/// the request only; W4-C acts on it (shedding is opt-in per site, and
-/// [`ReadClass::Gate`] — the default — keeps today's writer fallback).
+/// What a read decides. Since #12394 the class no longer changes where a read
+/// goes when its readers run dry — every class is shed, never sent to the
+/// writer ("the writer is never used for reads"); it records how much the
+/// caller leans on the answer (telemetry, and the router's headroom reserve).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadClass {
-    /// Gates a decision (dispatch, claim, merge, reap): never shed.
+    /// Gates a decision (dispatch, claim, merge, reap).
     #[default]
     Gate,
     /// Housekeeping that may be deferred.
@@ -167,9 +168,13 @@ pub enum RouteDecision {
 /// because the readers' **budget** is spent and the writer's must be kept
 /// for decision-gating reads. A reader that cannot see the repo, holds a
 /// stale or refused token, or is withdrawn App-wide says nothing about
-/// budget — shedding on those would stop a repo's housekeeping for as long
-/// as the condition lasts (a coverage miss is an hour; an unpublished token
-/// directory is forever), so those reads go to the writer like a Gate read.
+/// budget. A withdrawal (App-wide, a refused credential, a gateway outage)
+/// ends on its own, so it is [`ExhaustCause::Withdrawn`] and a Hygiene read
+/// waits it out; a stale or unpublished token directory, or no reader
+/// covering the repo, may never clear, so it is
+/// [`ExhaustCause::Unavailable`] and a Hygiene read goes to the writer like a
+/// Gate read. An Observability read is shed on every cause
+/// ([`ReadClass::sheds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExhaustCause {
     /// Every reader that could serve the repo is out of budget: a live
@@ -177,8 +182,12 @@ pub enum ExhaustCause {
     /// above the headroom reserve. At least one such reader exists and no
     /// reader is excluded for any other reason.
     Budget,
-    /// Some reader is excluded for a reason other than budget (stale or
-    /// unpublished token, refused credential, App-wide withdrawal), or no
+    /// Every reader that could serve the repo is withdrawn or out of budget,
+    /// and at least one withdrawal is not a rate limit (App-wide, a refused
+    /// credential, the gateway's outage withdrawal). Every exclusion ends on
+    /// its own.
+    Withdrawn,
+    /// Some reader holds a stale or unpublished token directory, or no
     /// reader covers the repo at all.
     Unavailable,
 }
@@ -188,6 +197,7 @@ impl ExhaustCause {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Budget => "budget",
+            Self::Withdrawn => "withdrawn",
             Self::Unavailable => "unavailable",
         }
     }
@@ -653,6 +663,54 @@ pub fn eligible_readers<'a>(roster: &'a Roster, owner: &str) -> Vec<&'a Identity
         .collect()
 }
 
+/// Whether `roster` has a reader pool but no reader that serves `owner`
+/// (W4-B `owners`): such a read is shed, not sent to the writer, and no
+/// retry will change that until a reader for the owner is configured.
+/// Legacy routing has no owners filter, so it never holds there.
+#[must_use]
+pub fn owner_uncovered_in(roster: &Roster, owner: &str, mode: RoutingMode) -> bool {
+    mode != RoutingMode::Legacy
+        && !owner.is_empty()
+        && !roster.readers.is_empty()
+        && eligible_readers(roster, owner).is_empty()
+}
+
+/// [`owner_uncovered_in`] for the daemon's workspace or the agent front's
+/// reader root; `false` with neither (no pool at all).
+#[must_use]
+pub fn owner_uncovered(owner: &str) -> bool {
+    let Some(ws) = super::workspace_root().or_else(super::front_root) else {
+        return false;
+    };
+    owner_uncovered_in(&super::cached(ws), owner, RoutingMode::current())
+}
+
+/// How often an uncovered owner is logged at `error` (per owner).
+const UNCOVERED_LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// Log (at most every [`UNCOVERED_LOG_EVERY`] per owner) that a read for
+/// `owner` found a reader pool with no reader serving it.
+fn log_owner_uncovered(owner: &str, now: SystemTime) {
+    static LAST: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+    let Ok(mut m) = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
+        return;
+    };
+    let key = owner.to_ascii_lowercase();
+    let due = m.get(&key).is_none_or(|&at| {
+        now.duration_since(at)
+            .is_ok_and(|d| d >= UNCOVERED_LOG_EVERY)
+    });
+    if due {
+        m.insert(key, now);
+        log::error!(
+            "forge_identity: no reader serves owner {owner} (every reader's `owners` excludes \
+             it); its reads are shed, never sent to the writer, until a reader for it is \
+             configured (logged at most every {}s per owner)",
+            UNCOVERED_LOG_EVERY.as_secs()
+        );
+    }
+}
+
 /// What [`route_read_in`] needs beyond the roster.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteEnv<'a> {
@@ -660,18 +718,39 @@ pub struct RouteEnv<'a> {
     pub cfg: &'a RoutingConfig,
 }
 
-/// Route one read for the daemon's workspace (see the module docs).
+/// Route one read for the daemon's workspace (see the module docs), or in
+/// the agent `gh` front for the reader root the daemon exported to it
+/// ([`super::front_root`], #12207).
 #[must_use]
 pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     if !is_github(req.host) {
         return RouteDecision::NoPool;
     }
-    let Some(ws) = super::workspace_root() else {
-        return RouteDecision::NoPool;
+    let (ws, front) = match (super::workspace_root(), super::front_root()) {
+        (Some(ws), _) => (ws, false),
+        (None, Some(ws)) => (ws, true),
+        (None, None) => return RouteDecision::NoPool,
     };
     let mode = RoutingMode::current();
     let cfg = cached_routing(ws);
-    route_read_in(ws, &super::cached(ws), req, &RouteEnv { mode, cfg: &cfg }, now)
+    let decision = route_read_in(ws, &super::cached(ws), req, &RouteEnv { mode, cfg: &cfg }, now);
+    if front {
+        trusted_in_front(decision, &crate::forge_gateway::trusted_profile)
+    } else {
+        decision
+    }
+}
+
+/// The front found its reader root in its environment, not by publishing it:
+/// a reader directory it would hand to `gh` must be private to this user,
+/// as the daemon writes it (0700, `hosts.yml` 0600), or the read goes to the
+/// writer ([`RouteDecision::NoPool`]).
+#[must_use]
+pub fn trusted_in_front(decision: RouteDecision, trusted: &dyn Fn(&Path) -> bool) -> RouteDecision {
+    match decision {
+        RouteDecision::Reader { ref dir, .. } if !trusted(dir) => RouteDecision::NoPool,
+        other => other,
+    }
 }
 
 fn is_github(host: Option<&str>) -> bool {
@@ -702,6 +781,17 @@ pub fn route_read_in(
         eligible_readers(roster, owner)
     };
     let n = readers.len();
+    if n == 0 && !roster.readers.is_empty() {
+        // A host WITH a reader pool, none of whose readers serves this owner
+        // (W4-B `owners`): not "no pool". `NoPool` sends the read to the
+        // writer, which never serves reads (#12394), so this is an exhaustion
+        // the read chains shed, booked with an error so the gap is seen.
+        log_owner_uncovered(owner, now);
+        return RouteDecision::Exhausted {
+            until: now + forge_read_pool::DEFAULT_WITHDRAWAL,
+            cause: ExhaustCause::Unavailable,
+        };
+    }
     let Some(home) = forge_read_pool::assignment_index(req.owner_repo, n) else {
         return RouteDecision::NoPool;
     };
@@ -857,8 +947,9 @@ pub fn route_read_in(
     // - a reader withdrawn from this repo (coverage) is not part of the
     //   repo's pool at all and counts as neither;
     // - a live rate-limit withdrawal is budget;
-    // - an App-wide withdrawal, a refused credential or a stale/unpublished
-    //   token directory is not;
+    // - an App-wide withdrawal or a refused credential is a (time-bounded)
+    //   withdrawal;
+    // - a stale/unpublished token directory is neither;
     // - a deferrable read (not [`ReadClass::Gate`]) also needs headroom: on
     //   the first reader that could serve it (its placement, or the first
     //   one past readers that cannot) below `shedPct`, the headroom
@@ -871,11 +962,11 @@ pub fn route_read_in(
         bucket_key(&r.app_id, owner, req.resource)
             .and_then(|k| forge_bucket_book::projected_used_pct(&k, now_epoch))
     };
-    let (mut budget, mut other, mut first_seen) = (0_usize, 0_usize, false);
+    let (mut budget, mut withdrawn, mut other, mut first_seen) = (0_usize, 0_usize, 0_usize, false);
     for off in 0..n {
         let r = readers[(start + off) % n];
         if forge_read_pool::is_withdrawn_at(&r.app_id, now) {
-            other += 1;
+            withdrawn += 1;
             continue;
         }
         if super::repo_withdrawn_at(&r.app_id, req.owner_repo, now) {
@@ -886,7 +977,7 @@ pub fn route_read_in(
                 budget += 1;
                 first_seen = true;
             } else {
-                other += 1;
+                withdrawn += 1;
             }
             continue;
         }
@@ -917,10 +1008,12 @@ pub fn route_read_in(
             },
         );
     }
-    let cause = if budget > 0 && other == 0 {
-        ExhaustCause::Budget
-    } else {
+    let cause = if other > 0 || budget + withdrawn == 0 {
         ExhaustCause::Unavailable
+    } else if withdrawn > 0 {
+        ExhaustCause::Withdrawn
+    } else {
+        ExhaustCause::Budget
     };
     RouteDecision::Exhausted {
         until: exhausted_until(&readers, req, owner, legacy, now),
@@ -962,6 +1055,79 @@ fn exhausted_until(
         })
         .min()
         .unwrap_or(refresh)
+}
+
+/// What this daemon's router sees for each reader that could serve a
+/// `resource` read of `owner_repo` at `now`, for a shed's log line (#12630):
+/// a withdrawal (its scope, end and kind), a stale or unpublished token
+/// directory, or "usable", each with the bucket book's reading (remaining,
+/// limit, reset and source: header, probe or refusal). `None` when there is
+/// no reader root or no reader for the owner.
+#[must_use]
+pub fn describe_readers(owner_repo: &str, resource: Resource, now: SystemTime) -> Option<String> {
+    let ws = super::workspace_root().or_else(super::front_root)?;
+    describe_readers_in(ws, &super::cached(ws), owner_repo, resource, now)
+}
+
+/// [`describe_readers`] against an explicit workspace and roster.
+#[must_use]
+pub fn describe_readers_in(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> Option<String> {
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    let readers = eligible_readers(roster, owner);
+    if owner.is_empty() || readers.is_empty() {
+        return None;
+    }
+    let at = |t: SystemTime| {
+        chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let parts: Vec<String> = readers
+        .iter()
+        .map(|r| {
+            let state = if let Some(t) = forge_read_pool::withdrawn_until(&r.app_id, now) {
+                format!("withdrawn app-wide until {}", at(t))
+            } else if let Some(t) = super::repo_withdrawn_until(&r.app_id, owner_repo, now) {
+                format!("withdrawn from {owner_repo} (coverage) until {}", at(t))
+            } else if let Some(t) =
+                forge_read_pool::scoped_withdrawal_until(&r.app_id, owner, resource, now)
+            {
+                let kind =
+                    if forge_read_pool::is_budget_withdrawn_at(&r.app_id, owner, resource, now) {
+                        "rate limit"
+                    } else {
+                        "credential"
+                    };
+                format!("withdrawn from {} {} until {} ({kind})", owner, resource.as_str(), at(t))
+            } else if !super::dir_is_fresh(&super::reader_dir(workspace_root, owner, r), now) {
+                "token directory stale or unpublished".to_string()
+            } else {
+                "usable".to_string()
+            };
+            let book = bucket_key(&r.app_id, owner, resource)
+                .and_then(|k| forge_bucket_book::reading(&k, epoch(now)))
+                .map_or_else(
+                    || "no book reading".to_string(),
+                    |b| {
+                        let n =
+                            |v: Option<u64>| v.map_or_else(|| "?".to_string(), |v| v.to_string());
+                        format!(
+                            "book {}/{} reset {} from {}",
+                            n(b.remaining),
+                            n(b.limit),
+                            system_time(b.reset_epoch).map_or_else(|| "?".to_string(), at),
+                            b.source.as_str()
+                        )
+                    },
+                );
+            format!("app {}: {state}, {book}", r.app_id)
+        })
+        .collect();
+    Some(parts.join("; "))
 }
 
 /// The bucket a reader's reads of `owner`'s `resource` spend; `None` for an

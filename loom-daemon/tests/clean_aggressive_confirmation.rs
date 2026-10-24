@@ -14,6 +14,9 @@
 //! today's already-correct `--branches-only` behavior — rather than silently
 //! destroying worktrees.
 
+#[allow(dead_code)]
+mod common;
+
 use std::process::{Command, Stdio};
 
 /// Initialize a minimal git repo (with an initial commit so `HEAD` resolves)
@@ -68,7 +71,9 @@ fn aggressive_worktrees_only_with_closed_stdin_removes_nothing() {
         "precondition: scratch worktree must exist before cleanup"
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    common::deny_real_gh(&mut cmd);
+    let output = cmd
         .args([
             "clean",
             "--aggressive",
@@ -125,7 +130,9 @@ fn aggressive_dry_run_with_closed_stdin_does_not_abort() {
     let dir = tempfile::tempdir().unwrap();
     init_repo(dir.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    common::deny_real_gh(&mut cmd);
+    let output = cmd
         .args([
             "clean",
             "--aggressive",
@@ -149,3 +156,8 @@ fn aggressive_dry_run_with_closed_stdin_does_not_abort() {
          stdout: {stdout}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

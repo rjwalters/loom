@@ -2,9 +2,36 @@
 
 ## Status
 
-Proposed. Design note for the cross-host slice of #10512 (direction 3 of
-#9243). No code ships with this ADR; it fixes the shape so the implementation
-slices can be filed and reviewed independently.
+**Superseded (pending rollout), 2026-10-13**, by the GitHub state mirror:
+daemon discovery reads from an operator-run mirror and wakes from its change
+stream (`forge.mirror`; 2AMLogic/2am#4367 P5, which also names the read
+gateway's shared cache, P2 and P4, as the other half of the fix). This ADR's
+publisher was never built. It is superseded once `forge.mirror` is rolled out
+across the fleet; until then its problem stands and this design stays on
+record.
+
+**The mechanism that replaces it.** No host publishes for the others. A
+mirror service, outside this repo, holds every repo's issues and PRs from
+GitHub App webhooks and a slow reconcile, and stamps each answer with a
+freshness watermark. Each daemon's discovery listings (`work_finder`'s
+candidates and `stage_dwell`'s stage listings; `star_liveness` was removed by
+#11104) read the mirror when the repo's watermark is within
+`forge.mirror.maxStalenessSecs` (capped at ADR-0021's 15 minutes) and fall back
+to their own conditional reads otherwise, which is decision 3 below with the
+mirror in place of the captain's snapshot. Decision 4 holds unchanged: claim,
+label-transition and merge reads never read the mirror. Wakes come from the
+mirror's change stream (loom#10892), so the polling floor stays where ADR-0021
+puts it. See [`forge-events.md` §8](../../defaults/docs/forge-events.md).
+
+Why not the captain snapshot: the captain would still be one GitHub reader per
+repo paying a `200` for every change, with its staleness bounded by its own
+poll interval. The mirror is fed by the change itself, its staleness is
+stated on every answer, and it needs no new peer-written data contract
+between hosts.
+
+Originally: Proposed. Design note for the cross-host slice of #10512
+(direction 3 of #9243). No code ships with this ADR; it fixes the shape so the
+implementation slices can be filed and reviewed independently.
 
 ## Context
 

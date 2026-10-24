@@ -101,9 +101,12 @@ pub fn dir_identity(dir: &Path, class: &DirClass) -> Option<CredIdentity> {
                 installation,
             });
         }
-        DirClass::OwnerWriter { root, owner } => (super::writer_account(root), Some(owner.clone())),
+        DirClass::OwnerWriter { root, owner } => {
+            (super::writer_account_for_owner(root, Some(owner)), Some(owner.clone()))
+        }
         DirClass::PrimaryWriter { root } => {
-            (super::writer_account(root), super::primary_owner(root))
+            let owner = super::primary_owner(root);
+            (super::writer_account_for_owner(root, owner.as_deref()), owner)
         }
         DirClass::Other => return None,
     };

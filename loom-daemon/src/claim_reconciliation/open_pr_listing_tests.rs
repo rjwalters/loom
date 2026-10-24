@@ -54,23 +54,7 @@ fn write_script(path: &Path, body: &str) {
     }
 }
 
-/// Restore an env var on drop.
-struct EnvGuard(&'static str, Option<String>);
-impl EnvGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self(key, prev)
-    }
-}
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.1 {
-            Some(v) => std::env::set_var(self.0, v),
-            None => std::env::remove_var(self.0),
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 fn run_pass(root: &Path, gh: &Path) {
     let stats = run_reconciliation_pass_over_roots(&[root.to_path_buf()], gh, false, || false);
@@ -387,4 +371,35 @@ fn an_ordinary_mergeable_failure_does_not_trip_the_breaker() {
     assert_eq!((a, b), ((Mergeable::Unknown, None), (Mergeable::Unknown, None)));
     assert!(!handle.is_suppressed());
     assert_eq!(read_count(&reads), 2);
+}
+
+/// #12307: with the mirror's worklist as the chain the open-PR listing is the
+/// tick's snapshot: no `gh` call, and a repo the snapshot has not read is an
+/// error (a failed listing), never an empty list of PRs.
+#[test]
+#[serial]
+fn mirror_mode_reads_the_snapshot_and_lists_nothing() {
+    use crate::discovery::published::test_support::{repo, set, MirrorRoot};
+    let fixture = MirrorRoot::new("acme/widgets");
+    let (root, gh) = (fixture.path(), &fixture.gh);
+
+    set(Vec::new());
+    assert!(list_open_prs(gh, root).is_err(), "an unread repo is not an empty one");
+
+    let mut snapshot = repo("acme/widgets");
+    snapshot.pulls = Some(
+        crate::forge_pull_listing::parse_rest_pulls(&listing(&[row(7, &["loom:pr"])])).unwrap(),
+    );
+    set(vec![snapshot]);
+    let got = list_open_prs(gh, root).unwrap();
+    assert_eq!(got.iter().map(|p| p.number).collect::<Vec<_>>(), [7]);
+    assert_eq!(list_with_label(gh, root, "loom:pr").unwrap().len(), 1);
+
+    let mut unread = repo("acme/widgets");
+    unread.pulls = None;
+    set(vec![unread]);
+    assert!(list_open_prs(gh, root).is_err(), "no open-PR facts is a failed listing");
+
+    assert_eq!(fixture.gh_calls(), "", "mirror mode made a listing call");
+    set(Vec::new());
 }

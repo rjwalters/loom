@@ -55,36 +55,7 @@ fi
 JUDGE_MD="$PROMPT_DIR/judge.md"
 JUDGE_REF_MD="$PROMPT_DIR/judge-reference.md"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
-
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    if [[ "$expected" == "$actual" ]]; then
-        pass "$msg"
-    else
-        fail "$msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
-
-assert_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then
-        pass "$msg"
-    else
-        fail "$msg (missing '$needle' in: ${haystack//$'\n'/ | })"
-    fi
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 for f in "$JUDGE_MD" "$JUDGE_REF_MD"; do
     [[ -f "$f" ]] || { echo "FATAL: subject not found: $f" >&2; exit 1; }
@@ -114,7 +85,7 @@ fi
 pass "tdd_merge_base_run() extracted from the shipped judge-reference.md and parses as bash"
 
 # shellcheck disable=SC1090
-source <(printf '%s\n' "$FN_SRC")
+eval "$FN_SRC"
 
 # =====================================================================
 # Fixture: a two-commit repo. BASE has the bug; HEAD has the fix plus

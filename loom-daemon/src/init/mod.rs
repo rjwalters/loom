@@ -61,10 +61,8 @@ pub use post_init::update_gitignore;
 pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
 
 // Import the rest for internal use
-use git::{
-    link_dogfood_symlinks, resolve_defaults_path, validate_git_repository,
-    validate_loom_source_repo,
-};
+pub(crate) use git::link_dogfood_symlinks;
+use git::{resolve_defaults_path, validate_git_repository, validate_loom_source_repo};
 
 /// Report of files affected during initialization
 ///
@@ -1118,7 +1116,7 @@ fn assert_loom_payload_tree_complete(defaults: &Path, loom_path: &Path) -> Resul
 /// (including those in subdirectories) present in `defaults/<dir_name>/` exists
 /// in the destination. This guards against silent omissions like the regression
 /// reported in issue #3220, where `scripts/lib/forge-helpers.sh` was missing
-/// from installs even though `lib/loom-tools.sh` was verified by name.
+/// from installs even though `lib/repo-root.sh` was verified by name.
 fn sync_managed_dir(
     defaults: &Path,
     loom_path: &Path,

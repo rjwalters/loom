@@ -89,6 +89,37 @@ pub fn static_pool(args: &[OsString]) -> Pool {
 /// The endpoint is the first `gh api` argument that is not a flag or a flag's
 /// value. Flags taking a value are skipped with it.
 fn api_pool(rest: &[String]) -> Pool {
+    let Some(path) = api_path(rest) else {
+        return Pool::Other;
+    };
+    if path == "graphql" {
+        Pool::Graphql
+    } else if path == "rate_limit" {
+        Pool::Other
+    } else if path.starts_with("search/") {
+        Pool::Search
+    } else {
+        Pool::Core
+    }
+}
+
+/// The REST path of a `gh api` argv (`args[0] == "api"`), leading `/`
+/// dropped; `None` for any other command.
+#[must_use]
+pub(crate) fn api_endpoint(args: &[OsString]) -> Option<String> {
+    let words: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if words.first().map(String::as_str) != Some("api") {
+        return None;
+    }
+    api_path(&words[1..]).map(str::to_string)
+}
+
+/// The first `gh api` argument (after `api`) that is not a flag or a flag's
+/// value, leading `/` dropped.
+fn api_path(rest: &[String]) -> Option<&str> {
     const VALUED: &[&str] = &[
         "-H",
         "--header",
@@ -119,18 +150,9 @@ fn api_pool(rest: &[String]) -> Pool {
             i += 1;
             continue;
         }
-        let path = a.trim_start_matches('/');
-        return if path == "graphql" {
-            Pool::Graphql
-        } else if path == "rate_limit" {
-            Pool::Other
-        } else if path.starts_with("search/") {
-            Pool::Search
-        } else {
-            Pool::Core
-        };
+        return Some(a.trim_start_matches('/'));
     }
-    Pool::Other
+    None
 }
 
 /// Whether the invocation asked `gh api` to print the response headers.
@@ -224,6 +246,33 @@ fn is_rate_limit_probe(args: &[OsString]) -> bool {
     args.first().is_some_and(|a| a == "api") && static_pool(args) == Pool::Other
 }
 
+/// Whether a read was sent on the writer credential without saying so
+/// (#12394): a read the router never moved onto a reader, that no caller
+/// pinned with `GhInvocation::writer_identity` and that no caller gave a
+/// credential of its own. "The writer is never used for reads": this is
+/// the runtime half of the structural guard (`tests/writer_read_guard.rs`).
+#[must_use]
+pub(super) fn is_unmarked_read_on_writer(inv: &GhInvocation) -> bool {
+    inv.intent == super::AccessIntent::Read
+        && super::reader_route::role_of(inv) == crate::forge_identity::IdentityRole::Writer
+        && !inv.writer_only
+        && inv.config_dir.is_none()
+        && !inv.strip_token_env
+}
+
+/// An error-level event for [`is_unmarked_read_on_writer`], so the
+/// operation that spent writer budget on a read is named in the log.
+fn flag_read_on_writer(inv: &GhInvocation) {
+    if is_unmarked_read_on_writer(inv) {
+        log::error!(
+            "gh_invocation: read on the writer credential: {} — the writer is never used for \
+             reads (#12394); route it to a reader, shed it, or pin it with writer_identity() \
+             and list it in tests/writer_read_guard.rs [read-on-writer]",
+            inv.operation.as_str()
+        );
+    }
+}
+
 /// Record one completed invocation (see the module docs for what is skipped)
 /// and return its [`Billing`] facts for the `invoke github` span (#10343).
 /// `captured` is `(stdout, stderr)` for a captured run, `None` for passthrough.
@@ -245,6 +294,7 @@ pub(super) fn record(
             super::reader_route::role_of(inv).as_str(),
         );
     }
+    flag_read_on_writer(inv);
     let caller = inv.operation.as_str();
     let (identity, ro) =
         resolve_with(inv, std::env::var("GH_HOST").ok(), std::env::var("LOOM_REPO").ok());
@@ -340,7 +390,19 @@ pub(super) fn record(
         }
     }
 
-    record_metric(caller, &identity, &cred, (&resource, route), classified, pg);
+    let reserve = super::purpose::is_reserve_refusal(stderr);
+    if reserve && inv.purpose() == super::ForgePurpose::Discovery {
+        super::purpose::end_discovery();
+    }
+    record_metric(
+        caller,
+        &identity,
+        &cred,
+        (&resource, route),
+        classified,
+        pg,
+        (inv.purpose(), reserve),
+    );
     Billing::sent(
         response.as_ref().map(|r| r.status),
         stderr,
@@ -351,6 +413,7 @@ pub(super) fn record(
         identity.role.as_deref().unwrap_or("unknown"),
     )
     .with_repo(identity.repo.as_deref())
+    .with_fallback_reason(reserve.then_some(super::purpose::FALLBACK_RESERVE))
 }
 
 /// Record a shed read (W4-C): no request was sent, so the row charges
@@ -397,7 +460,15 @@ pub(super) fn record_shed(
         kind: "shed",
         installation: None,
     };
-    record_metric(caller, &identity, &cred, (resource.as_str(), "none"), Outcome::Shed, None);
+    record_metric(
+        caller,
+        &identity,
+        &cred,
+        (resource.as_str(), "none"),
+        Outcome::Shed,
+        None,
+        (inv.purpose(), false),
+    );
 }
 
 /// Add the row to `loom.forge.calls` (a no-op without an ops sink).
@@ -408,6 +479,7 @@ fn record_metric(
     (resource, route): (&str, &'static str),
     outcome: Outcome,
     pg: Option<u32>,
+    (purpose, reserve): (super::ForgePurpose, bool),
 ) {
     use crate::observability::ops::forge_calls::{self, CallLabels, CallOutcome};
     let unknown = || forge_call_stats::UNKNOWN_OPERATION.to_string();
@@ -430,7 +502,9 @@ fn record_metric(
         target_owner,
         resource: resource.to_string(),
         route,
+        purpose: purpose.as_str(),
         outcome: match outcome {
+            _ if reserve => CallOutcome::ReserveRefused,
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,
             Outcome::RateLimited => CallOutcome::RateLimited,

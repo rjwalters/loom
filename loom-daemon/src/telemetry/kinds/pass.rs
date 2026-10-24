@@ -10,15 +10,14 @@
 //! - **`pass.summary`**, one per pass per workspace: the `mechanism`, repo,
 //!   host, deciding build, mode, outcome, counts by verdict and by skip reason,
 //!   whether the write cap was hit, the duration and the GitHub calls the pass
-//!   made (its [`crate::gh_invocation::caller_scope`]).
+//!   made.
 //! - **`pass.verdict`**, one per artifact: repo#n, the verdict and its reason,
 //!   the blockers with the state the pass read, and the labels it changed.
 //!   `role` is empty for a daemon pass. A role's verdicts (Guide's unblock
 //!   outcomes, Champion's promotion verdicts) fit the same record with `role`
 //!   set and their own `mechanism`, `verdict` and `reason` vocabulary.
 //!
-//! `mechanism` is the name the pass's GitHub calls carry as `github.caller`
-//! on their `invoke github` spans (and its `forge_call_stats` caller), so a
+//! `mechanism` is the pass's `forge_call_stats` caller, so a
 //! pass, its verdicts and its forge cost join on one string.
 //!
 //! **OTLP only**, like the other post-#8921 log kinds. The body is the
@@ -63,6 +62,31 @@ pub const PASS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pass.labels_added",
     "loom.pass.labels_removed",
     "loom.pass.applied",
+    // #12027: a role step's verdict ([`StepFacts`]).
+    "loom.pass.head_sha",
+    "loom.pass.step",
+    "loom.pass.class",
+    "loom.pass.ledger_class",
+    "loom.pass.ledger_reason",
+    "loom.pass.fact_id",
+    "loom.pass.first_refused_at",
+    "loom.pass.criterion",
+    "loom.pass.reason_set",
+    "loom.pass.proposal_label",
+    "loom.pass.body_hash",
+    // #12715: the step's raw reason token.
+    "loom.pass.reason_detail",
+    "loom.pass.unevaluated_reason",
+    "loom.pass.unevaluated_reasons",
+    "loom.pass.budget.bucket",
+    "loom.pass.budget.remaining",
+    "loom.pass.budget.floor",
+    "loom.pass.budget.core_start",
+    "loom.pass.budget.core_end",
+    "loom.pass.budget.graphql_start",
+    "loom.pass.budget.graphql_end",
+    "loom.pass.budget.core_floor",
+    "loom.pass.budget.graphql_floor",
 ];
 
 /// `repo` value when no forge slug is known. Never a local path (#9442).
@@ -126,14 +150,39 @@ pub struct GithubSpend {
     pub not_modified: u64,
 }
 
+/// The budget readings of one pass (#12036). Start is the probe the pass
+/// already makes; end is the latest reading the forge sent back with an
+/// answer the pass already received, never a fresh probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_end: Option<u64>,
+    pub core_floor: u64,
+    pub graphql_floor: u64,
+}
+
+/// The budget reading that stopped one artifact (#12036).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassBudgetReading {
+    /// `core` or `graphql`.
+    pub bucket: String,
+    pub remaining: u64,
+    pub floor: u64,
+}
+
 /// One pass over one workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassSummaryRecord {
     /// Derived, never random: `derived_hex(["loom.pass", mechanism, host,
     /// repo, started_at])`. Every `pass.verdict` of the pass carries it.
     pub pass_id: String,
-    /// The pass: its `forge_call_stats` caller and its spans' `github.caller`
-    /// (`stale_blocked_release`).
+    /// The pass: its `forge_call_stats` caller (`stale_blocked_release`).
     pub mechanism: String,
     /// `owner/repo`, or [`REPO_UNRESOLVED`].
     pub repo: String,
@@ -155,6 +204,13 @@ pub struct PassSummaryRecord {
     pub verdicts: BTreeMap<String, u64>,
     /// Skipped artifacts per reason.
     pub skipped: BTreeMap<String, u64>,
+    /// Unevaluated artifacts per `unevaluated_reason`, every reason present
+    /// (zeros included) (#12036).
+    #[serde(default)]
+    pub unevaluated_reasons: BTreeMap<String, u64>,
+    /// The budget readings the pass took; a reading it never took is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<PassBudget>,
     /// The per-pass write cap left work for the next pass.
     pub write_cap_hit: bool,
     pub github: GithubSpend,
@@ -204,6 +260,13 @@ pub struct PassVerdictRecord {
     /// failed), sanitized and truncated. Body only, never an attribute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why an artifact went unevaluated (`budget_floor_core`,
+    /// `budget_floor_graphql`, `read_failed`, `other`) (#12036).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unevaluated_reason: Option<String>,
+    /// The budget reading behind a floor stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<PassBudgetReading>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<BlockerState>,
     /// Labels the verdict adds (planned, under dry-run).
@@ -217,6 +280,69 @@ pub struct PassVerdictRecord {
     pub applied: bool,
     /// When it was decided; the record's time.
     pub at: DateTime<Utc>,
+    /// A role step's facts (#12027); all absent for a daemon pass, so a
+    /// `stale_blocked_release` record serializes exactly as before.
+    #[serde(flatten, default)]
+    pub step: StepFacts,
+}
+
+/// What a role step's verdict adds to [`PassVerdictRecord`] (#12027,
+/// `observability::step_verdict`). Every field is optional and skipped when
+/// empty. Only what was knowable at `evaluated_at` is ever filled.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepFacts {
+    /// The step's sweep id (#12715), so a verdict joins to its session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
+    /// The head the role evaluated, when the run recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// `champion_pr`, `champion_issue`, …: the role plus its mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// `verdict | noop | refused | failed`, the projection's class (the
+    /// record's `verdict` carries the same value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// The closed reason set the projection's `reason` comes from
+    /// (`champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_set: Option<String>,
+    /// The outcome ledger's own classification of the step
+    /// (`step_dispatch::outcome_ledger::classify`), computed record-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_reason: Option<String>,
+    /// The item's labels as the run read them, before it acted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_labels: Vec<String>,
+    /// When the decision was knowable (the step's end, or the journal
+    /// entry's time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluated_at: Option<DateTime<Utc>>,
+    /// When this refusal identity was first seen on this head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_refused_at: Option<DateTime<Utc>>,
+    /// The raw marker tokens (`champion:reject:<criterion_key>:<reason_key>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_key: Option<String>,
+    /// The proposal label the issue carried (`loom:curated`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_label: Option<String>,
+    /// The `proposal-verdict:body-<hash>` the verdict named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
+    /// Derived, never random, so a duplicate from another host dedups on
+    /// read: `derived_hex(["loom.pass.verdict", mechanism, repo, number,
+    /// head_sha, criterion_key, reason_key, evaluated_at hour], 32)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_id: Option<String>,
+    /// The deciding build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loom: Option<Provenance>,
 }
 
 #[cfg(test)]

@@ -36,25 +36,29 @@ fn a_pending_signal_starts_no_further_docker_call() {
 fn the_signal_is_forwarded_to_the_running_child() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("got");
-    // Like `docker run`/`pull` on SIGINT: clean up and exit nonzero.
+    let ready = dir.path().join("ready");
+    // Like `docker run`/`pull` on SIGINT: clean up and exit nonzero. The child
+    // says when its trap is installed, so the signal never races the startup
+    // of a shell on a loaded host.
     let script = format!(
-        "trap 'echo int > \"{}\"; kill $! 2>/dev/null; exit 130' INT; sleep 30 & wait",
-        marker.display()
+        "trap 'echo int > \"{}\"; kill $! 2>/dev/null; exit 130' INT; \
+         sleep 30 & touch \"{}\"; wait",
+        marker.display(),
+        ready.display()
     );
     let started = Instant::now();
-    let error = run_bounded_with(
-        "sh",
-        &["-c", &script],
-        DOCKER_CALL_TIMEOUT,
-        &sigint_after(Duration::from_millis(300)),
-    )
+    let error = run_bounded_with("sh", &["-c", &script], DOCKER_CALL_TIMEOUT, &|| {
+        ready.exists().then_some(libc::SIGINT)
+    })
     .unwrap_err();
     assert_eq!(
         error.downcast_ref::<Interrupted>(),
         Some(&Interrupted(libc::SIGINT)),
         "{error:#}"
     );
-    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    // The signal ended the call: well short of the child's `sleep 30` and of
+    // the call's own timeout. A bound this loose holds on a starved host.
+    assert!(started.elapsed() < DOCKER_CALL_TIMEOUT, "{:?}", started.elapsed());
     assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "int", "the child got SIGINT");
 }
 

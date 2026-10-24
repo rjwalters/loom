@@ -17,10 +17,10 @@
 //! OPEN. Anything else (missing or older daemon, non-zero exit, off-protocol
 //! output) falls back to the retired shell predicate (`PR_MERGED == true` ->
 //! exit 0, `PR_STATE == closed` -> refuse), the same pattern as
-//! `revalidate-head`. Proceeding instead would not be safe: later gates (e.g.
-//! `redate-checks` under `--auto --redate-stale-checks`) can write to a
-//! terminal PR's branch before the forge refuses the merge, and the
-//! already-merged exit 0 that re-runs rely on would be lost.
+//! `revalidate-head`. Proceeding instead would not be safe: later steps (e.g.
+//! `--auto`'s base sync) can write to a terminal PR's branch before the forge
+//! refuses the merge, and the already-merged exit 0 that re-runs rely on would
+//! be lost.
 
 /// Where the PR is in its lifecycle, for the purposes of this gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

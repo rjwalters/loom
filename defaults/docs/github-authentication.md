@@ -243,9 +243,15 @@ exploration) starves the daemon.
   naming the account: its pool is shared with every PAT, OAuth token and `gh`
   login of that user. The report never carries a token value.
 - Reads by pool: `loom-daemon status --json | jq .forge_calls.identity_roles`
-  counts calls per identity role: `reader` (a reader App's pool), `writer`,
-  `writer-fallback` (a read a reader failed on, re-run on the writer) and
-  `unknown` (a call recorded outside the `gh` facade, or by an older binary).
+  counts calls per identity role: `reader` (a reader App's pool), `writer`
+  and `unknown` (a call recorded outside the `gh` facade, or by an older
+  binary). **The writer is never used for reads** (#12394): a read no reader
+  can serve is shed, not re-run on the writer, so `writer` rows should be
+  writes plus the few read-backs a write needs (listed in
+  `loom-daemon/tests/writer_read_guard.rs`); a read on the writer outside
+  that list logs an error. Older rows may still show `writer-fallback`.
+  Rule and exceptions: `daemon-reference.md` → "The writer is never used for
+  reads".
 - Calls by billed bucket (W1): `loom-daemon forge calls --by bucket` (or
   `--by caller|role|repo`, `--since 90m|3h`) rolls up this host's forge-call
   sink per `(account, cred_owner, resource, reset)`. Each row shows what this
@@ -476,6 +482,21 @@ Every host is configured the same way. There is no per-host pinning:
     reader for that one repo for an hour;
   - only a **mint or key** failure withdraws the reader App-wide.
 
+- **Per-owner writers (#12446).** When the fleet manages repos under more than
+  one account (a user and an org) a single private App cannot write to both. Add
+  `forge.identities.writers: [{"appId": "...", "privateKeyPath": "...", "owners": ["acme"]}]`;
+  writes for a listed owner mint as that App, every other owner keeps
+  `forge.githubApp`. Absent key = unchanged behaviour. Check with
+  `loom-daemon forge identities` and `loom-daemon forge token --repo acme/x`
+  (the per-owner check: the owner is the `--repo` argument's, there is no
+  `--owner` flag). It needs **config-mode provisioning** (`forge.githubApp` in
+  config, no `LOOM_GITHUB_APP_ID` / `LOOM_GITHUB_APP_KEY_PATH` in the
+  environment): the env override still beats everything in
+  `github-app-token.sh`, so with it set credential delivery, agent writes and
+  `merge-pr.sh` use that one App for every owner, while `forge token` (lease
+  posting) ignores the env and follows `writers[]`. `forge identities` warns
+  when both are present.
+
   Each withdrawal is exported as a `forge.reader.withdrawn` span
   ([`telemetry-schema.md`](telemetry-schema.md)), and `loom-daemon status`
   lists the live scoped ones under `reader withdrawals (scoped)`. Reads fall
@@ -551,7 +572,20 @@ silently, so it would send the key to GitHub instead.
   grant), so no key file sits on the host. It is always read with an
   explicit `--region`: `region`, else `AWS_REGION`, else
   `AWS_DEFAULT_REGION`. With none of these set, `ssm://` refs are refused
-  (logged once) and that owner keeps today's routing. `file:<path>` must be an
+  (logged once) and that owner keeps today's routing. The read runs as the
+  host's instance role: `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, the static key
+  variables, the web-identity and container-credential variables
+  (`AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_CONTAINER_CREDENTIALS_*`)
+  are removed from the `aws` child, and `AWS_CONFIG_FILE` /
+  `AWS_SHARED_CREDENTIALS_FILE` are set to `/dev/null`, so neither a daemon
+  environment that names another identity (a build-cache profile, say) nor a
+  `default` profile in `~/.aws` can read as it. A host whose grant is a
+  named profile sets `awsProfile`, passed as `--profile=<name>`; the profile
+  must live in the daemon user's default `~/.aws/config` /
+  `~/.aws/credentials` (the environment's file overrides are removed). A
+  name must start with a letter or digit; an invalid `awsProfile` refuses
+  every `ssm://` ref of the block (logged) rather than reading with the
+  default credential chain. A failed read logs the exit code and the CLI's first stderr line. `file:<path>` must be an
   owner-only file outside every checkout. An owner with no ref keeps
   today's routing.
 
@@ -612,6 +646,11 @@ to unset it.
 the writer), `direct` (writes and unclassified calls) or `none` (shed).
 The writer's read share is `route = direct_read` on the writer's `account`
 over all reads. A rise means a classifier gap, not an outage.
+
+Discovery listings can also skip GitHub, and the gateway, entirely: with a
+state mirror configured (`forge.mirror`), the work finder
+reads fresh listings from it and fall back to the paths above. See
+[`forge-events.md`](forge-events.md#the-state-mirror-forgemirror-discovery-reads-and-the-change-stream).
 
 ### The cached-permission window: `403 … not accessible by integration` (#6074)
 
@@ -787,9 +826,8 @@ shells to join.
 **Read the middle column precisely.** The breaker and the ETag cache bound the
 daemon's *own* polling loops; they do **not** govern the `gh` calls a spawned
 Claude session makes while it works an issue. What bounds those is admission
-control — `autonomous.workFinder.maxConcurrent` and the token / disk terms
-folded into the same `min(...)` ceiling (the fourth cpu/load term was deleted in
-#4512 — see [`daemon-reference.md`](daemon-reference.md)) — which caps how many
+control — `autonomous.workFinder.maxConcurrent`, the only admission cap since
+#12406 (see [`daemon-reference.md`](daemon-reference.md)) — which caps how many
 sessions exist at once on a host. A hand-rolled loop has no equivalent: N
 shells started by hand are N unbounded `gh` consumers, and nothing
 coordinates them across the other projects sharing the same machine and the
@@ -861,8 +899,8 @@ stopped it, and why it was hard to diagnose:
   never registers one, so a secondary-limit refusal neither stops the rest of
   that invocation nor reaches the next one, and a loop of them keeps bursting.
   The classifier does match secondary-limit phrasing, which is why the
-  daemon's own every-workspace pass (`release-stale-blocked`) is gated on the
-  breaker and a shell loop is not.
+  daemon's own every-workspace passes are gated on the breaker and a shell
+  loop is not.
 
 If you do have to visit several repositories from a shell, pace the
 invocations, and stop the whole loop at the first rate-limit refusal instead

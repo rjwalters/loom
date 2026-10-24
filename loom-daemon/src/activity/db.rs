@@ -15,9 +15,8 @@ use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 use super::models::{
-    ActivityEntry, AgentInput, AgentOutput, BudgetConfig, BudgetPeriod, BudgetStatus, ClaimResult,
-    ClaimType, CostByIssue, CostByPr, CostByRole, CostSummary, InputContext, InputType, IssueClaim,
-    PromptChanges, PromptForgeEvent, RunwayProjection,
+    ActivityEntry, AgentInput, AgentOutput, ClaimResult, ClaimType, CostByIssue, InputContext,
+    InputType, IssueClaim, PromptChanges, PromptForgeEvent,
 };
 use super::schema::init_schema;
 use super::{claims, cost_analytics, prompts, quality, usage_report, weekly_point_history};
@@ -91,7 +90,6 @@ impl ActivityDb {
 
     /// Get terminal activity history (inputs joined with outputs)
     /// Returns entries in reverse chronological order (most recent first)
-    #[allow(dead_code)]
     pub fn get_terminal_activity(
         &self,
         terminal_id: &str,
@@ -175,7 +173,6 @@ impl ActivityDb {
     // ========================================================================
 
     /// Parse and record quality metrics from terminal output.
-    #[allow(dead_code)]
     pub fn record_quality_from_output(&self, input_id: i64, output: &str) -> Result<Option<i64>> {
         quality::record_quality_from_output(&self.conn, input_id, output)
     }
@@ -238,66 +235,9 @@ impl ActivityDb {
     // Delegated to cost_analytics module
     // ========================================================================
 
-    /// Save or update a budget configuration.
-    #[allow(dead_code)]
-    pub fn save_budget_config(&self, config: &BudgetConfig) -> Result<i64> {
-        cost_analytics::save_budget_config(&self.conn, config)
-    }
-
-    /// Get the active budget configuration for a period.
-    #[allow(dead_code)]
-    pub fn get_budget_config(&self, period: BudgetPeriod) -> Result<Option<BudgetConfig>> {
-        cost_analytics::get_budget_config(&self.conn, period)
-    }
-
-    /// Get all active budget configurations.
-    #[allow(dead_code)]
-    pub fn get_all_budget_configs(&self) -> Result<Vec<BudgetConfig>> {
-        cost_analytics::get_all_budget_configs(&self.conn)
-    }
-
-    /// Get cost summary for a date range.
-    #[allow(dead_code)]
-    pub fn get_cost_summary(
-        &self,
-        start_date: DateTime<Utc>,
-        end_date: DateTime<Utc>,
-    ) -> Result<CostSummary> {
-        cost_analytics::get_cost_summary(&self.conn, start_date, end_date)
-    }
-
-    /// Get cost breakdown by agent role.
-    #[allow(dead_code)]
-    pub fn get_cost_by_role(&self) -> Result<Vec<CostByRole>> {
-        cost_analytics::get_cost_by_role(&self.conn)
-    }
-
     /// Get cost breakdown by GitHub issue.
-    #[allow(dead_code)]
     pub fn get_cost_by_issue(&self, issue_number: Option<i32>) -> Result<Vec<CostByIssue>> {
         cost_analytics::get_cost_by_issue(&self.conn, issue_number)
-    }
-
-    /// Get cost breakdown by pull request.
-    #[allow(dead_code)]
-    pub fn get_cost_by_pr(&self, pr_number: Option<i32>) -> Result<Vec<CostByPr>> {
-        cost_analytics::get_cost_by_pr(&self.conn, pr_number)
-    }
-
-    /// Get budget status for a specific period.
-    #[allow(dead_code)]
-    pub fn get_budget_status(&self, period: BudgetPeriod) -> Result<Option<BudgetStatus>> {
-        cost_analytics::get_budget_status(&self.conn, period)
-    }
-
-    /// Project runway based on recent burn rate.
-    #[allow(dead_code)]
-    pub fn project_runway(
-        &self,
-        period: BudgetPeriod,
-        lookback_days: i32,
-    ) -> Result<Option<RunwayProjection>> {
-        cost_analytics::project_runway(&self.conn, period, lookback_days)
     }
 
     /// Token/cost usage report (Issue #8062): every `resource_usage` row at
@@ -405,12 +345,6 @@ impl ActivityDb {
         claims::get_claims_by_terminal(&self.conn, terminal_id)
     }
 
-    /// Get stale claims (those without heartbeat for longer than threshold).
-    #[allow(dead_code)]
-    pub fn get_stale_claims(&self, stale_threshold_secs: i64) -> Result<Vec<IssueClaim>> {
-        claims::get_stale_claims(&self.conn, stale_threshold_secs)
-    }
-
     /// Release all stale claims and return the count of claims released.
     pub fn release_stale_claims(&self, stale_threshold_secs: i64) -> Result<usize> {
         claims::release_stale_claims(&self.conn, stale_threshold_secs)
@@ -432,8 +366,7 @@ impl ActivityDb {
 
 // Implement StatsQueries trait for ActivityDb
 use super::stats::{
-    self, AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary,
-    WeeklyVelocity,
+    self, AgentEffectiveness, CostPerIssue, StatsQueries, StatsSummary, WeeklyVelocity,
 };
 use chrono::NaiveDate;
 
@@ -447,14 +380,6 @@ impl StatsQueries for ActivityDb {
 
     fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>> {
         stats::query_cost_per_issue(&self.conn, issue_number)
-    }
-
-    fn get_daily_velocity(
-        &self,
-        start_date: Option<NaiveDate>,
-        end_date: Option<NaiveDate>,
-    ) -> rusqlite::Result<Vec<DailyVelocity>> {
-        stats::query_daily_velocity(&self.conn, start_date, end_date)
     }
 
     fn get_weekly_velocity(&self) -> rusqlite::Result<Vec<WeeklyVelocity>> {

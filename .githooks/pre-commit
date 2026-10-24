@@ -16,16 +16,6 @@ require_tool() {
   exit 1
 }
 
-# Format staged TypeScript/JSON files with Biome
-STAGED_TS=$(git diff --cached --name-only --diff-filter=d -- 'src/**/*.ts' 'src/**/*.tsx' 'src/**/*.js' 'src/**/*.jsx' 'e2e/**/*.ts' 'e2e/**/*.tsx' 'defaults/**/*.json')
-if [ -n "$STAGED_TS" ]; then
-  if require_tool pnpm "format staged TypeScript/JSON files"; then
-    echo "$STAGED_TS" | xargs pnpm biome check --write \
-      || { echo "pre-commit: pnpm biome check failed; fix the errors above and re-commit" >&2; exit 1; }
-    echo "$STAGED_TS" | xargs git add
-  fi
-fi
-
 # Format staged Rust files with rustfmt
 STAGED_RS=$(git diff --cached --name-only --diff-filter=d -- '*.rs')
 if [ -n "$STAGED_RS" ]; then

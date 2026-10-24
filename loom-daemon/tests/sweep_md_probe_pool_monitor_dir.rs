@@ -265,3 +265,8 @@ fn override_shell_text_is_never_evaluated() {
     assert_eq!(count, "0");
     assert!(!root.join("pwned").exists(), "override text must not be eval'd");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

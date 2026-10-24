@@ -163,6 +163,7 @@ fn retired(name: &str, to: Option<&str>, owned: bool) -> RetiredLabel {
         replaced_by: to.map(str::to_string),
         owned,
         retired_in: "#11103".into(),
+        also_remove: Vec::new(),
     }
 }
 
@@ -316,7 +317,7 @@ fn an_unowned_label_is_add_only_in_every_mode() {
 
 #[test]
 fn priority_high_is_owned_so_it_is_relabelled_then_deleted() {
-    let reg = loom_daemon::label_registry::Registry::embedded();
+    let reg = crate::label_registry::Registry::embedded();
     let entry = reg
         .retired
         .iter()
@@ -490,7 +491,7 @@ fn gh_helpers_encode_and_classify() {
 #[test]
 fn the_embedded_registry_carries_the_retired_map() {
     // The embedded map is what a consumer repo (no labels.json) migrates by.
-    let reg = loom_daemon::label_registry::Registry::embedded();
+    let reg = crate::label_registry::Registry::embedded();
     assert!(reg.retired.iter().any(|r| r.name == STAR && r.owned));
     assert!(reg
         .retired
@@ -557,4 +558,79 @@ fn keep_labels_relabels_open_items_and_never_deletes() {
     assert!(f.writes().is_empty());
     assert!(!text(&r).contains("DELETE"), "{}", text(&r));
     assert!(r.summary.remaining >= 1);
+}
+
+// --- also_remove (#11860): a retired label that rode on another one ---
+
+const REVISE: &str = "loom:needs-revision";
+const TRIAGE: &str = "loom:triage";
+const CURATED: &str = "loom:curated";
+
+fn revise_entry() -> RetiredLabel {
+    RetiredLabel {
+        also_remove: vec![CURATED.into()],
+        ..retired(REVISE, Some(TRIAGE), true)
+    }
+}
+
+#[test]
+fn also_remove_is_stripped_after_the_add_and_before_the_old_label() {
+    let f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(5, &[CURATED, REVISE, "bug"]);
+    let r = run(&f, "o/r", &[revise_entry()], true);
+    assert_eq!(
+        f.writes(),
+        vec![
+            format!("add #5 {TRIAGE}"),
+            format!("remove #5 {CURATED}"),
+            format!("remove #5 {REVISE}"),
+            format!("delete {REVISE}"),
+        ]
+    );
+    assert_eq!(f.labels_of(5), BTreeSet::from(["bug".to_string(), TRIAGE.to_string()]));
+    assert!(text(&r).contains("RELABEL #5 loom:needs-revision -> loom:triage, -loom:curated\n"));
+    assert_eq!(r.exit, 0);
+}
+
+#[test]
+fn also_remove_is_skipped_on_an_item_that_lacks_it() {
+    let f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(6, &["loom:architect", REVISE]);
+    let r = run(&f, "o/r", &[revise_entry()], true);
+    assert!(!f.writes().iter().any(|w| w.contains(CURATED)), "{:?}", f.writes());
+    assert_eq!(
+        f.labels_of(6),
+        BTreeSet::from(["loom:architect".to_string(), TRIAGE.to_string()])
+    );
+    assert!(text(&r).contains("RELABEL #6 loom:needs-revision -> loom:triage\n"));
+}
+
+#[test]
+fn also_remove_in_a_dry_run_writes_nothing_and_counts_as_remaining() {
+    let f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(5, &[CURATED, REVISE]);
+    let r = run(&f, "o/r", &[revise_entry()], false);
+    assert!(f.writes().is_empty(), "{:?}", f.writes());
+    // add + strip + remove + delete
+    assert_eq!(r.summary.remaining, 4);
+    assert!(text(&r).contains("-loom:curated"));
+}
+
+#[test]
+fn a_failed_also_remove_leaves_the_old_label_for_the_rerun() {
+    let mut f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(5, &[CURATED, REVISE]);
+    f.remove_fails.insert((5, CURATED.into()));
+    let r = run(&f, "o/r", &[revise_entry()], true);
+    assert!(f.labels_of(5).contains(REVISE), "the old label is the rerun's marker");
+    assert!(!f.writes().iter().any(|w| w.starts_with("delete")), "{:?}", f.writes());
+    assert_eq!(r.exit, 3);
+}
+
+#[test]
+fn the_registry_retires_needs_revision_onto_triage_without_curated() {
+    let reg = crate::label_registry::Registry::embedded();
+    assert!(reg.get(REVISE).is_none(), "loom:needs-revision is no longer declared");
+    let r = reg
+        .get_retired(REVISE)
+        .expect("loom:needs-revision is retired");
+    assert_eq!(r.replaced_by.as_deref(), Some(TRIAGE));
+    assert_eq!(r.also_remove, vec![CURATED.to_string()]);
+    assert!(r.owned);
 }

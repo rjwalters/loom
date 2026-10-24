@@ -262,7 +262,9 @@ fn telemetry_replay_check_vocabulary_matches_the_stage_enum_registry_and_webhook
         assert_eq!(serde_json::from_value::<FleetStage>(wire.into()).unwrap(), stage);
     }
     let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut holds: Vec<String> = crate::label_registry::embedded_set("merge_hold")
+    // #11795: with the retired names that fold into a merge hold, so a replay
+    // over history (and unmigrated PRs) still reads them as held.
+    let mut holds: Vec<String> = crate::label_registry::embedded_set_with_retired("merge_hold")
         .iter()
         .map(|l| format!("'{l}'"))
         .collect();

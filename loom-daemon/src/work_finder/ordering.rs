@@ -35,9 +35,9 @@ pub struct PriorityCandidate {
     /// in that repo can merge, so its fix goes first. It is not an input to
     /// [`Self::level`], and on a green `main` it is `false`, so the marker
     /// grants nothing. Its only gate effect is unchanged: it lets the fix
-    /// past the three gates that `main` being red would otherwise deadlock
-    /// (#11508): the build back-off, the file-overlap gate and the
-    /// repo-sharding slice.
+    /// past the two gates that `main` being red would otherwise deadlock
+    /// (#11508): the build back-off and the file-overlap gate (the
+    /// repo-sharding slice it also bypassed left dispatch in #11682).
     pub main_red_fix: bool,
 }
 

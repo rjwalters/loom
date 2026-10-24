@@ -72,17 +72,18 @@ pub const MAX_DIFF_LINES_ENV: &str = "LOOM_CONSOLIDATE_MAX_DIFF_LINES";
 const DEFAULT_MAX_DIFF_LINES: u64 = 800;
 
 /// Absolute exclusions (ADR-0023 E3): any of these labels on a component
-/// rejects the group before any mutation. `loom:operator-only` /
-/// `loom:operator-decision` are the original operator ruling, preserved
-/// verbatim; the rest are ordinary holds this contract must not widen.
-pub const INELIGIBLE_LABELS: [&str; 6] = [
-    "loom:blocked",
-    "loom:operator",
-    "loom:operator-only",
-    "loom:operator-decision",
-    "loom:changes-requested",
-    "loom:ci-failure",
-];
+/// rejects the group before any mutation. The operator hold under any of its
+/// names is the original operator ruling (it named `loom:operator-only` /
+/// `loom:operator-decision`, folded into `loom:operator` by #11795); the rest
+/// are ordinary holds this contract must not widen. Derived: `loom:blocked`
+/// and `loom:operator` with their retired names, then the two review holds.
+pub static INELIGIBLE_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| {
+        let mut v = crate::work_finder::BLOCKED_HOLD_NAMES.to_vec();
+        v.extend(crate::work_finder::OPERATOR_HOLD_NAMES.iter().copied());
+        v.extend(["loom:changes-requested", "loom:ci-failure"]);
+        v
+    });
 
 /// In-flight claims (ADR-0023 E5): an agent owns the PR right now.
 pub const IN_FLIGHT_LABELS: [&str; 3] = ["loom:reviewing", "loom:treating", "loom:building"];
@@ -253,7 +254,7 @@ pub fn check_eligibility(
                 detail: "no head SHA".to_string(),
             });
         }
-        for label in INELIGIBLE_LABELS {
+        for label in INELIGIBLE_LABELS.iter() {
             if c.has(label) {
                 failures.push(EligibilityFailure::Held {
                     number: c.number,
@@ -696,31 +697,6 @@ pub fn default_branch(gh_bin: &Path, root: &Path) -> Result<String> {
     )?;
     let r: Ref = serde_json::from_slice(&stdout).context("parse gh repo view JSON")?;
     Ok(r.default_branch_ref.name)
-}
-
-/// The live default-branch tip: fetched (not a local ref guess), so
-/// construction starts from what the candidate will actually target.
-pub fn live_base_sha(gh_bin: &Path, root: &Path, default_branch: &str) -> Result<String> {
-    #[derive(Debug, Deserialize)]
-    struct Ref {
-        #[serde(rename = "object")]
-        object: Obj,
-    }
-    #[derive(Debug, Deserialize)]
-    struct Obj {
-        sha: String,
-    }
-    let stdout = gh(
-        "consolidate.base_sha",
-        gh_bin,
-        root,
-        &[
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/commits/{default_branch}"),
-        ],
-    )?;
-    let r: Ref = serde_json::from_slice(&stdout).context("parse commits API JSON")?;
-    Ok(r.object.sha)
 }
 
 /// An open candidate PR for this head branch, if one exists — the adopt-first

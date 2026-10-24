@@ -819,7 +819,7 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
     entries
         .filter(|(id, info)| {
             matches!(info.state, SweepState::Running | SweepState::Pending)
-                && matches!(info.kind, SweepKind::Issue(_))
+                // The kind is matched exhaustively below (#11898).
                 // The complement of the other two watchdogs' eligibility
                 // gate: ONLY sweeps this daemon instance did not itself
                 // spawn are candidates here, so nothing is ever
@@ -828,8 +828,12 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
                 && !is_own_child(id)
         })
         .filter_map(|(id, info)| {
-            let SweepKind::Issue(issue) = info.kind else {
-                return None;
+            let issue = match info.kind {
+                SweepKind::Issue(issue) => issue,
+                // A step's liveness is its claim (`stale_after_minutes`, the
+                // lease); a dead one is restored by the reaper (#11898). This
+                // backstop's remedy is an issue-sweep recovery, so not here.
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => return None,
             };
             if !is_pid_alive(info.pid) {
                 // Already dead: the ordinary reaper's dead-pid path
@@ -963,8 +967,11 @@ impl SweepRegistry {
             .iter()
             .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                // A step holds its item's slot like a sweep holds its issue's
+                // (#11898): both draw from the same `maxConcurrent`.
+                let issue = match info.kind {
+                    SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                    SweepKind::PrSet(_) => return None,
                 };
                 let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
                 Some((id.clone(), issue, info.log_path.clone(), elapsed))
@@ -995,8 +1002,9 @@ impl SweepRegistry {
             .iter()
             .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                let issue = match info.kind {
+                    SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                    SweepKind::PrSet(_) => return None,
                 };
                 if self.watchdog_progressed.contains(id)
                     || self.sweep_made_progress(issue, &info.log_path)
@@ -1032,13 +1040,15 @@ impl SweepRegistry {
             .iter()
             .filter(|(id, info)| {
                 matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && matches!(info.kind, SweepKind::Issue(_))
                     // Only sweeps we spawned (own the Child handle) are cancelable.
                     && self.children.contains_key(*id)
             })
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                let issue = match info.kind {
+                    SweepKind::Issue(issue) => issue,
+                    // The restart re-dispatches `/loom:sweep N`; a hung step is
+                    // left to its claim's staleness and the reaper (#11898).
+                    SweepKind::Step { .. } | SweepKind::PrSet(_) => return None,
                 };
                 let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
                 Some((id.clone(), issue, info.log_path.clone(), elapsed))
@@ -1495,7 +1505,8 @@ impl SweepRegistry {
     /// issued after the reaper restored `loom:issue` (Issue #3895).
     pub(crate) fn issue_has_active_sweep(&self, issue: u32) -> bool {
         self.entries.values().any(|i| {
-            matches!(i.kind, SweepKind::Issue(n) if n == issue)
+            // A live issue step on it is as good as a sweep (#11898).
+            i.kind.issue_number() == Some(issue)
                 && matches!(i.state, SweepState::Running | SweepState::Pending)
         })
     }
@@ -1556,14 +1567,11 @@ impl SweepRegistry {
         let candidates: Vec<(SweepId, u32)> = self
             .entries
             .iter()
-            .filter(|(_, info)| {
-                info.state.is_terminal()
-                    && matches!(info.kind, SweepKind::Issue(_))
-                    && info.pr_number.is_none()
-            })
+            .filter(|(_, info)| info.state.is_terminal() && info.pr_number.is_none())
             .filter_map(|(id, info)| match info.kind {
                 SweepKind::Issue(issue) => Some((id.clone(), issue)),
-                SweepKind::PrSet(_) => None,
+                // A step's recovery is its claim restore, not a re-dispatch.
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
 
@@ -1906,13 +1914,14 @@ impl SweepRegistry {
             .iter()
             .filter(|(id, info)| {
                 matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && matches!(info.kind, SweepKind::Issue(_))
                     // Only sweeps we spawned (own the Child handle) are cancelable.
                     && self.children.contains_key(*id)
             })
             .filter_map(|(id, i)| match i.kind {
                 SweepKind::Issue(n) => Some((id.clone(), n, i.pid, i.log_path.clone())),
-                SweepKind::PrSet(_) => None,
+                // A review-stalled step is one Judge/Doctor session: its claim
+                // goes stale and the reaper restores it (#11898).
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
 

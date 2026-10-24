@@ -23,7 +23,7 @@
 //! | [`NeedsDecomp`] | [`DesignInPlace`] | **Architect-on-epic** — enrich the epic body in place with `### Phase` structure, **no PR** |
 //! | [`Designed`] | [`ExpandFirstPhase`] | **Champion** expand phase-1 children (under the #3707 mutex) |
 //! | [`PhaseJoin`] | [`AdvancePhase`] | **Champion** expand phase N+1 children (under the #3707 mutex, barrier-gated by [`epic_join_ready`]) |
-//! | [`Active`] | [`BuildChildren`] | `dispatch_sweep` per open `loom:issue` child |
+//! | [`Active`] | [`BuildChildren`] | nothing: the children flow as Builder steps (#11909) |
 //! | [`Done`] | [`CloseEpic`] | **Champion** close-epic |
 //!
 //! [`NeedsDecomp`]: EpicState::NeedsDecomp
@@ -136,6 +136,25 @@ pub struct EpicSnapshot {
     /// The issue numbers of the epic's currently-open, build-ready
     /// `loom:issue` children (the wave the `active` transition sweeps).
     pub open_issue_children: Vec<u32>,
+    /// The epic's own label names, so the revisit pass can see a
+    /// `loom:operator` / `loom:blocked` / `loom:frozen` hold.
+    pub labels: Vec<String>,
+    /// Per-child facts for the revisit pass. `None` when the source did not
+    /// fetch child labels; every open phase child then counts as drawable.
+    pub child_facts: Option<Vec<ChildFacts>>,
+}
+
+/// What the revisit pass needs to know about one `loom:epic-phase` child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildFacts {
+    /// The child issue number.
+    pub number: u32,
+    /// True if the child issue is still open.
+    pub open: bool,
+    /// The child carries `loom:operator` or `loom:frozen`.
+    pub held: bool,
+    /// The child carries `loom:blocked` (parked).
+    pub parked: bool,
 }
 
 impl EpicSnapshot {
@@ -152,7 +171,23 @@ impl EpicSnapshot {
             body: body.into(),
             phase_children,
             open_issue_children,
+            labels: Vec::new(),
+            child_facts: None,
         }
+    }
+
+    /// Attach the epic's own label names.
+    #[must_use]
+    pub fn with_labels(mut self, labels: Vec<String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// Attach per-child facts for the revisit pass.
+    #[must_use]
+    pub fn with_child_facts(mut self, facts: Vec<ChildFacts>) -> Self {
+        self.child_facts = Some(facts);
+        self
     }
 
     /// The Phase 1 derived state of this epic.
@@ -196,8 +231,9 @@ pub enum EpicTransition {
     /// serialized under the #3707 mutex **and** gated by the phase-join
     /// barrier ([`epic_join_ready`](crate::phase_join::epic_join_ready)).
     AdvancePhase,
-    /// `active`: dispatch one `/loom:sweep` per open `loom:issue` child. The
-    /// payload is the child issue numbers to build.
+    /// `active`: the open `loom:issue` children to build. Gated off since
+    /// #11909: the work finder draws each child as a Builder step, so the
+    /// supervisor dispatches nothing for it.
     BuildChildren(Vec<u32>),
     /// `done`: dispatch Champion to close the epic.
     CloseEpic,
@@ -301,6 +337,180 @@ pub fn plan_epic_transition(snapshot: &EpicSnapshot) -> EpicTransition {
             _ => EpicTransition::Noop,
         },
     }
+}
+
+// ============================================================================
+// Epic revisit: starvation classification
+// ============================================================================
+
+/// Labels that take an epic out of the revisit pass (it is already held).
+pub const EPIC_HOLD_LABELS: [&str; 3] = ["loom:operator", "loom:blocked", "loom:frozen"];
+
+/// Marker on the escalation comment; the revisit never posts it twice.
+pub const REVISIT_COMMENT_MARKER: &str = "<!-- loom:epic-revisit -->";
+
+/// Why an epic has no drawable work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallShape {
+    /// The next phase's children were never filed.
+    PhaseNotFiled,
+    /// Every child closed and the epic is not done.
+    AllChildrenClosed,
+    /// Open children exist but each is held or parked.
+    ChildrenHeld,
+    /// A single-phase epic with no children: likely a mislabelled issue.
+    ConcreteNoChildren,
+}
+
+impl StallShape {
+    /// Stable snake_case name used in the event payload.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PhaseNotFiled => "phase_not_filed",
+            Self::AllChildrenClosed => "all_children_closed",
+            Self::ChildrenHeld => "children_held",
+            Self::ConcreteNoChildren => "concrete_no_children",
+        }
+    }
+}
+
+/// What the revisit pass does about a starved epic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisitAction {
+    /// The existing Champion expand/join dispatch files the next phase.
+    Expand,
+    /// Add `loom:operator` with a one-line question.
+    Escalate,
+    /// Nothing to do.
+    None,
+}
+
+impl RevisitAction {
+    /// Stable snake_case name used in the event payload.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expand => "expand",
+            Self::Escalate => "escalate",
+            Self::None => "none",
+        }
+    }
+}
+
+/// A starved epic: zero drawable children and acceptance not met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Starvation {
+    /// Which stall shape the epic is in.
+    pub shape: StallShape,
+    /// Expand or escalate.
+    pub action: RevisitAction,
+}
+
+/// Open-child counts for one epic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChildDepth {
+    /// Open children a role can act on now.
+    pub drawable: usize,
+    /// Open children carrying `loom:operator` or `loom:frozen`.
+    pub held: usize,
+    /// Open children carrying `loom:blocked`.
+    pub parked: usize,
+}
+
+impl ChildDepth {
+    /// Total open children.
+    #[must_use]
+    pub fn open(&self) -> usize {
+        self.drawable + self.held + self.parked
+    }
+}
+
+/// True when the epic itself carries a hold label.
+#[must_use]
+pub fn epic_is_held(snapshot: &EpicSnapshot) -> bool {
+    snapshot
+        .labels
+        .iter()
+        .any(|l| EPIC_HOLD_LABELS.contains(&l.as_str()))
+}
+
+/// Count the epic's open children by drawability. Without per-child facts
+/// every open phase child is drawable.
+#[must_use]
+pub fn child_depth(snapshot: &EpicSnapshot) -> ChildDepth {
+    let mut depth = ChildDepth::default();
+    match &snapshot.child_facts {
+        Some(facts) => {
+            for c in facts.iter().filter(|c| c.open) {
+                if c.parked {
+                    depth.parked += 1;
+                } else if c.held {
+                    depth.held += 1;
+                } else {
+                    depth.drawable += 1;
+                }
+            }
+        }
+        None => depth.drawable = snapshot.phase_children.iter().filter(|c| c.open).count(),
+    }
+    depth
+}
+
+/// Classify an epic with no drawable work. Pure: `None` for a held epic, an
+/// epic with drawable children, or one the existing close dispatch finishes.
+#[must_use]
+pub fn classify_starvation(snapshot: &EpicSnapshot) -> Option<Starvation> {
+    if epic_is_held(snapshot) {
+        return None;
+    }
+    let depth = child_depth(snapshot);
+    if depth.drawable > 0 {
+        return None;
+    }
+    let (shape, action) = if depth.open() > 0 {
+        (StallShape::ChildrenHeld, RevisitAction::Escalate)
+    } else {
+        match plan_epic_transition(snapshot) {
+            EpicTransition::ExpandFirstPhase | EpicTransition::AdvancePhase => {
+                (StallShape::PhaseNotFiled, RevisitAction::Expand)
+            }
+            EpicTransition::DesignInPlace => {
+                if !snapshot.phase_children.is_empty() {
+                    // Children exist and all are closed, yet the body has too
+                    // little phase structure to ever reach `done`.
+                    (StallShape::AllChildrenClosed, RevisitAction::Escalate)
+                } else if count_phase_sections(&snapshot.body) == 1 {
+                    (StallShape::ConcreteNoChildren, RevisitAction::Escalate)
+                } else {
+                    // No phase structure yet: the Architect enrich is in charge.
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    };
+    Some(Starvation { shape, action })
+}
+
+/// The one-line question posted when an epic is escalated.
+#[must_use]
+pub fn escalation_comment(shape: StallShape) -> String {
+    let question = match shape {
+        StallShape::ChildrenHeld => {
+            "every open child is held or parked, so nothing can be drawn. Unblock one, or rescope the epic?"
+        }
+        StallShape::AllChildrenClosed => {
+            "every child is closed but the epic is not done. Close it as complete, or file the missing phase?"
+        }
+        StallShape::ConcreteNoChildren => {
+            "this epic has a single phase and no children. Is it a concrete issue that should lose `loom:epic`, or does it need decomposing?"
+        }
+        StallShape::PhaseNotFiled => "the next phase has not been filed. Should it be?",
+    };
+    format!(
+        "**Epic revisit**: the fleet has no drawable work under this epic: {question}\n\n{REVISIT_COMMENT_MARKER}"
+    )
 }
 
 // ============================================================================
@@ -416,6 +626,10 @@ pub trait EpicDispatcher {
 
     /// Dispatch a `/loom:sweep` for one open `loom:issue` child of `epic`.
     fn dispatch_sweep(&mut self, epic: u32, child: u32) -> Result<()>;
+
+    /// Add `loom:operator` to `epic` and post `comment` on it (revisit
+    /// escalation). Must be idempotent: the label lands before the comment.
+    fn escalate(&mut self, epic: u32, comment: &str) -> Result<()>;
 }
 
 // ============================================================================
@@ -437,12 +651,15 @@ pub struct TickReport {
     pub epics_seen: usize,
     /// Singleton role transitions actually dispatched.
     pub roles_dispatched: usize,
-    /// Individual `/loom:sweep` dispatches issued for `active` children.
+    /// Individual `/loom:sweep` dispatches issued for `active` children:
+    /// always 0 since #11909 (the children are Builder steps).
     pub sweeps_dispatched: usize,
     /// Transitions skipped because the same transition was already in flight.
     pub skipped_in_flight: usize,
     /// Epics with no enabled transition this tick.
     pub noop: usize,
+    /// Starved epics escalated to the operator this tick.
+    pub escalated: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Whether this tick was skipped wholesale because the reactive main-health
@@ -461,9 +678,6 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     mutex: IssueCreationMutex,
     /// Singleton transition currently in flight per epic number.
     in_flight: HashMap<u32, InFlight>,
-    /// Child issue numbers for which a sweep has already been dispatched this
-    /// process lifetime (globally unique across epics).
-    dispatched_children: HashSet<u32>,
     inflight_ttl: Duration,
     /// Optional event bus for publishing epic-action topics (#3873). When
     /// absent the supervisor runs silently (unit-test / no-observability path).
@@ -481,6 +695,9 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     /// The workspace this supervisor serves, so a W3/W4 hold on it (#10719)
     /// can stop its tick. `None` for a supervisor with no workspace identity.
     hold_root: Option<PathBuf>,
+    /// Epics already escalated by this supervisor, covering the lag before the
+    /// forge listing shows the `loom:operator` label.
+    escalated: HashSet<u32>,
 }
 
 impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
@@ -493,12 +710,12 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             dispatcher,
             mutex,
             in_flight: HashMap::new(),
-            dispatched_children: HashSet::new(),
             inflight_ttl: resolve_inflight_ttl(),
             bus: None,
             health_state: None,
             drain_flag: None,
             hold_root: None,
+            escalated: HashSet::new(),
         }
     }
 
@@ -592,8 +809,19 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             ..TickReport::default()
         };
         for epic in &epics {
-            let transition = plan_epic_transition(epic);
+            let mut transition = plan_epic_transition(epic);
+            let starvation = classify_starvation(epic);
+            let action = starvation.map_or(RevisitAction::None, |s| s.action);
+            if let (RevisitAction::Escalate, Some(s)) = (action, starvation) {
+                self.escalate(epic.number, s.shape, &mut report);
+                // An escalated epic is the operator's call, not the Architect's.
+                if transition == EpicTransition::DesignInPlace {
+                    transition = EpicTransition::Noop;
+                }
+            }
             self.fire(epic.number, transition, &mut report).await;
+            // After the fire, so an action event precedes its revisit record.
+            self.emit_revisit(epic, starvation);
         }
         Ok(report)
     }
@@ -616,8 +844,9 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             EpicTransition::Noop => {
                 report.noop += 1;
             }
-            EpicTransition::BuildChildren(children) => {
-                self.fire_build_children(epic, children, report);
+            // #11909: the children are Builder steps; nothing to dispatch.
+            EpicTransition::BuildChildren(_) => {
+                report.noop += 1;
             }
             EpicTransition::DesignInPlace => {
                 if self.singleton_in_flight(epic, kind) {
@@ -643,35 +872,6 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
                 self.fire_expand(epic, kind, ExpandKind::NextPhase, report)
                     .await;
             }
-        }
-    }
-
-    /// Dispatch `/loom:sweep` for each not-yet-dispatched open child, recording
-    /// each so repeated ticks over an unchanged `active` epic are no-ops.
-    fn fire_build_children(&mut self, epic: u32, children: Vec<u32>, report: &mut TickReport) {
-        let mut any_new = false;
-        for child in children {
-            if self.dispatched_children.contains(&child) {
-                continue;
-            }
-            match self.dispatcher.dispatch_sweep(epic, child) {
-                Ok(()) => {
-                    self.dispatched_children.insert(child);
-                    report.sweeps_dispatched += 1;
-                    any_new = true;
-                }
-                Err(e) => {
-                    report.errors += 1;
-                    log::warn!(
-                        "epic_supervisor: sweep dispatch for child #{child} of epic #{epic} \
-                         failed: {e}"
-                    );
-                }
-            }
-        }
-        if !any_new {
-            // Every open child was already dispatched — an unchanged tick.
-            report.skipped_in_flight += 1;
         }
     }
 
@@ -748,6 +948,46 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
         }
     }
 
+    /// Escalate a starved epic once: label first, then the question.
+    fn escalate(&mut self, epic: u32, shape: StallShape, report: &mut TickReport) {
+        if self.escalated.contains(&epic) {
+            return;
+        }
+        match self.dispatcher.escalate(epic, &escalation_comment(shape)) {
+            Ok(()) => {
+                self.escalated.insert(epic);
+                report.escalated += 1;
+            }
+            Err(e) => {
+                report.errors += 1;
+                log::warn!("epic_supervisor: revisit escalation for epic #{epic} failed: {e}");
+            }
+        }
+    }
+
+    /// Publish the per-epic `epic.issue.{N}.revisit` record.
+    fn emit_revisit(&self, epic: &EpicSnapshot, starvation: Option<Starvation>) {
+        let Some(bus) = self.bus.as_ref() else {
+            return;
+        };
+        let depth = child_depth(epic);
+        let held_epic = epic_is_held(epic);
+        let action = starvation.map_or(RevisitAction::None, |s| s.action);
+        let payload = serde_json::json!({
+            "epic": epic.number,
+            "drawable": depth.drawable,
+            "held": depth.held,
+            "parked": depth.parked,
+            "action": action.as_str(),
+            "shape": starvation.map(|s| s.shape.as_str()),
+            "epic_held": held_epic,
+        });
+        let topic = format!("epic.issue.{}.revisit", epic.number);
+        if bus.publish_generic(topic.clone(), payload).is_err() {
+            log::debug!("event_bus: published {topic} (no subscribers)");
+        }
+    }
+
     /// True when the same singleton transition is already in flight for `epic`
     /// and has not exceeded the TTL. An expired marker is cleared so a crashed
     /// role dispatch can be re-dispatched.
@@ -771,12 +1011,6 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     #[must_use]
     pub fn in_flight_len(&self) -> usize {
         self.in_flight.len()
-    }
-
-    /// Number of distinct child issues a sweep has been dispatched for.
-    #[must_use]
-    pub fn dispatched_children_len(&self) -> usize {
-        self.dispatched_children.len()
     }
 
     /// Shared #3707 mutex handle (cloned).
@@ -1227,7 +1461,7 @@ mod role_spawn;
 /// [`parse_epic_phase_marker`] — the rest shells out to `gh` and cannot be
 /// exercised without forge credentials.
 pub mod forge {
-    use super::{DispatchShape, EpicDispatcher, EpicSnapshot, EpicSource, PhaseChild};
+    use super::{ChildFacts, DispatchShape, EpicDispatcher, EpicSnapshot, EpicSource, PhaseChild};
     use crate::sweep_registry::SweepRegistry;
     use crate::types::SweepKind;
     use anyhow::{anyhow, Context, Result};
@@ -1379,6 +1613,7 @@ pub mod forge {
                 .map(|epic| {
                     let mut phase_children = Vec::new();
                     let mut open_issue_children = Vec::new();
+                    let mut child_facts = Vec::new();
                     for child in &children {
                         let Some((parent, phase)) = parse_epic_phase_marker(&child.body) else {
                             continue;
@@ -1387,12 +1622,22 @@ pub mod forge {
                             continue;
                         }
                         phase_children.push(PhaseChild::new(phase, child.is_open()));
+                        child_facts.push(ChildFacts {
+                            number: child.number,
+                            open: child.is_open(),
+                            held: child.has_label("loom:operator")
+                                || child.has_label("loom:frozen"),
+                            parked: child.has_label("loom:blocked"),
+                        });
                         // Build-ready children are open and carry loom:issue.
                         if child.is_open() && child.has_label("loom:issue") {
                             open_issue_children.push(child.number);
                         }
                     }
+                    let labels = epic.labels.iter().map(|l| l.name.clone()).collect();
                     EpicSnapshot::new(epic.number, epic.body, phase_children, open_issue_children)
+                        .with_labels(labels)
+                        .with_child_facts(child_facts)
                 })
                 .collect();
             Ok(snapshots)
@@ -1466,6 +1711,49 @@ pub mod forge {
                 return Err(anyhow!(
                     "{} dispatch for epic #{epic} exited with {status}",
                     shape.role
+                ));
+            }
+            Ok(())
+        }
+
+        fn escalate(&mut self, epic: u32, comment: &str) -> Result<()> {
+            use crate::claim_reconciliation::gh_call;
+            let root = {
+                let reg = self
+                    .registry
+                    .lock()
+                    .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
+                reg.config().workspace_root.clone()
+            };
+            let gh_bin = PathBuf::from(crate::gh_invocation::gh_bin());
+            // Forge-write scope (#9548): never label or comment in a repo this
+            // checkout may not write to.
+            if !crate::write_scope::gate_root_with(&root, &gh_bin, "epic revisit") {
+                return Err(anyhow!(
+                    "epic revisit escalation for #{epic} skipped: repo not writable"
+                ));
+            }
+            let n = epic.to_string();
+            let label = gh_call::output(
+                gh_call::write("epic_revisit.add_label", &gh_bin, &root)
+                    .args(["issue", "edit", &n, "--add-label", "loom:operator"])
+                    .args(gh_call::loom_repo_flag()),
+            )?;
+            if !label.status.success() {
+                return Err(anyhow!(
+                    "gh issue edit failed for epic #{epic}: {}",
+                    gh_call::stderr(&label)
+                ));
+            }
+            let posted = gh_call::output(
+                gh_call::write("epic_revisit.comment", &gh_bin, &root)
+                    .args(["issue", "comment", &n, "--body", comment])
+                    .args(gh_call::loom_repo_flag()),
+            )?;
+            if !posted.status.success() {
+                return Err(anyhow!(
+                    "gh issue comment failed for epic #{epic}: {}",
+                    gh_call::stderr(&posted)
                 ));
             }
             Ok(())
@@ -1653,6 +1941,8 @@ mod tests {
         sweeps: Vec<(u32, u32)>,
         fail_role: bool,
         fail_sweep_child: Option<u32>,
+        escalations: Vec<(u32, String)>,
+        fail_escalate: bool,
     }
 
     impl EpicDispatcher for RecordingDispatcher {
@@ -1661,6 +1951,13 @@ mod tests {
                 anyhow::bail!("forced role failure");
             }
             self.roles.push((epic, shape.clone()));
+            Ok(())
+        }
+        fn escalate(&mut self, epic: u32, comment: &str) -> Result<()> {
+            if self.fail_escalate {
+                anyhow::bail!("forced escalate failure");
+            }
+            self.escalations.push((epic, comment.to_string()));
             Ok(())
         }
         fn dispatch_sweep(&mut self, epic: u32, child: u32) -> Result<()> {
@@ -1789,7 +2086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tick_active_dispatches_sweep_per_child() {
+    async fn test_tick_active_dispatches_nothing_children_are_steps() {
         let mut sup = supervisor(vec![EpicSnapshot::new(
             3,
             body_with_phases(3),
@@ -1797,8 +2094,9 @@ mod tests {
             vec![301, 302, 303],
         )]);
         let report = sup.tick().await.unwrap();
-        assert_eq!(report.sweeps_dispatched, 3);
-        assert_eq!(sup.dispatcher.sweeps, vec![(3, 301), (3, 302), (3, 303)]);
+        assert_eq!(report.sweeps_dispatched, 0);
+        assert_eq!(report.noop, 1);
+        assert!(sup.dispatcher.sweeps.is_empty());
     }
 
     #[tokio::test]
@@ -1835,6 +2133,172 @@ mod tests {
     // ===================================================================
     // Event-bus action topics (#3873)
     // ===================================================================
+
+    // ===================================================================
+    // Epic revisit (#13099): starvation classification + escalation
+    // ===================================================================
+
+    fn fact(number: u32, open: bool, held: bool, parked: bool) -> ChildFacts {
+        ChildFacts {
+            number,
+            open,
+            held,
+            parked,
+        }
+    }
+
+    fn labelled(snap: EpicSnapshot, l: &str) -> EpicSnapshot {
+        snap.with_labels(vec![l.to_string()])
+    }
+
+    /// (a) Phase 1 closed, phase 2 never filed.
+    fn shape_a() -> EpicSnapshot {
+        EpicSnapshot::new(10, body_with_phases(3), vec![closed(1)], vec![])
+            .with_child_facts(vec![fact(11, false, false, false)])
+    }
+    /// (b) every child closed, but the body has too little phase structure to
+    /// ever reach `done`.
+    fn shape_b() -> EpicSnapshot {
+        EpicSnapshot::new(20, body_with_phases(1), vec![closed(1)], vec![])
+            .with_child_facts(vec![fact(21, false, false, false)])
+    }
+    /// (c) open children, all held or parked.
+    fn shape_c() -> EpicSnapshot {
+        EpicSnapshot::new(30, body_with_phases(3), vec![open(1), open(1)], vec![])
+            .with_child_facts(vec![fact(31, true, true, false), fact(32, true, false, true)])
+    }
+    /// (d) a concrete single-phase epic with no children.
+    fn shape_d() -> EpicSnapshot {
+        EpicSnapshot::new(40, body_with_phases(1), vec![], vec![])
+    }
+
+    #[test]
+    fn test_classify_shape_a_phase_not_filed_expands() {
+        let s = classify_starvation(&shape_a()).unwrap();
+        assert_eq!((s.shape, s.action), (StallShape::PhaseNotFiled, RevisitAction::Expand));
+    }
+
+    #[test]
+    fn test_classify_shape_b_all_closed_escalates() {
+        let s = classify_starvation(&shape_b()).unwrap();
+        assert_eq!((s.shape, s.action), (StallShape::AllChildrenClosed, RevisitAction::Escalate));
+    }
+
+    #[test]
+    fn test_classify_shape_c_children_held_escalates() {
+        let s = classify_starvation(&shape_c()).unwrap();
+        assert_eq!((s.shape, s.action), (StallShape::ChildrenHeld, RevisitAction::Escalate));
+        let depth = child_depth(&shape_c());
+        assert_eq!((depth.drawable, depth.held, depth.parked), (0, 1, 1));
+    }
+
+    #[test]
+    fn test_classify_shape_d_concrete_escalates() {
+        let s = classify_starvation(&shape_d()).unwrap();
+        assert_eq!((s.shape, s.action), (StallShape::ConcreteNoChildren, RevisitAction::Escalate));
+    }
+
+    #[test]
+    fn test_classify_drawable_child_is_not_starved() {
+        let snap = EpicSnapshot::new(1, body_with_phases(3), vec![open(1)], vec![101])
+            .with_child_facts(vec![fact(101, true, false, false)]);
+        assert_eq!(classify_starvation(&snap), None);
+    }
+
+    #[test]
+    fn test_classify_done_epic_is_left_to_close_dispatch() {
+        let snap = EpicSnapshot::new(1, body_with_phases(2), vec![closed(1), closed(2)], vec![]);
+        assert_eq!(classify_starvation(&snap), None);
+    }
+
+    #[test]
+    fn test_classify_flat_epic_is_left_to_architect() {
+        let snap = EpicSnapshot::new(1, "flat body", vec![], vec![]);
+        assert_eq!(classify_starvation(&snap), None);
+    }
+
+    #[test]
+    fn test_classify_held_epics_yield_nothing_per_label() {
+        for l in EPIC_HOLD_LABELS {
+            for snap in [shape_a(), shape_b(), shape_c(), shape_d()] {
+                assert_eq!(classify_starvation(&labelled(snap, l)), None, "{l}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_held_epic_writes_no_label_or_comment() {
+        for l in EPIC_HOLD_LABELS {
+            let mut sup = supervisor(vec![labelled(shape_c(), l)]);
+            let report = sup.tick().await.unwrap();
+            assert_eq!(report.escalated, 0);
+            assert!(sup.dispatcher.escalations.is_empty(), "{l}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_escalates_each_starved_shape_once_across_ticks() {
+        for snap in [shape_b(), shape_c(), shape_d()] {
+            let mut sup = supervisor(vec![snap.clone()]);
+            let first = sup.tick().await.unwrap();
+            assert_eq!(first.escalated, 1);
+            // A second tick over the unchanged epic posts nothing more.
+            let second = sup.tick().await.unwrap();
+            assert_eq!(second.escalated, 0);
+            assert_eq!(sup.dispatcher.escalations.len(), 1);
+            let (epic, comment) = &sup.dispatcher.escalations[0];
+            assert_eq!(*epic, snap.number);
+            assert!(comment.contains(REVISIT_COMMENT_MARKER));
+            // Escalation never dispatches a role or a sweep.
+            assert!(sup.dispatcher.roles.is_empty());
+            assert!(sup.dispatcher.sweeps.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_shape_a_expands_via_existing_dispatch_without_escalating() {
+        let mut sup = supervisor(vec![shape_a()]);
+        let report = sup.tick().await.unwrap();
+        assert_eq!(report.escalated, 0);
+        assert_eq!(report.roles_dispatched, 1);
+        assert_eq!(sup.dispatcher.roles[0].1.role, "Champion");
+        assert!(sup.dispatcher.escalations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tick_failed_escalation_is_retried_next_tick() {
+        let mut sup = supervisor(vec![shape_c()]);
+        sup.dispatcher.fail_escalate = true;
+        let first = sup.tick().await.unwrap();
+        assert_eq!((first.escalated, first.errors), (0, 1));
+        sup.dispatcher.fail_escalate = false;
+        assert_eq!(sup.tick().await.unwrap().escalated, 1);
+    }
+
+    #[tokio::test]
+    async fn test_tick_emits_one_revisit_event_per_epic() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["epic.issue"]);
+        let mut sup = supervisor(vec![shape_c(), shape_a()]).with_event_bus(bus.clone());
+        sup.tick().await.unwrap();
+        let mut seen = Vec::new();
+        while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
+            seen.push(ev);
+        }
+        let revisits: Vec<_> = seen
+            .iter()
+            .filter(|e| e.topic().ends_with(".revisit"))
+            .collect();
+        assert_eq!(revisits.len(), 2);
+        let Event::Generic { topic, payload } = revisits[0] else {
+            panic!("revisit must be a generic event");
+        };
+        assert_eq!(topic, "epic.issue.30.revisit");
+        assert_eq!(payload["action"], "escalate");
+        assert_eq!(payload["held"], 1);
+        assert_eq!(payload["parked"], 1);
+        assert_eq!(payload["drawable"], 0);
+    }
 
     #[test]
     fn test_transition_kind_action_class_mapping() {
@@ -1936,11 +2400,13 @@ mod tests {
         .with_event_bus(bus.clone());
 
         let report = sup.tick().await.unwrap();
-        assert_eq!(report.sweeps_dispatched, 1);
-        assert!(
-            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
-            "BuildChildren must not publish an epic-action event"
-        );
+        assert_eq!(report.sweeps_dispatched, 0);
+        while let Ok(event) = sub.try_recv() {
+            assert!(
+                event.topic().ends_with(".revisit"),
+                "BuildChildren must not publish an epic-action event"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1969,44 +2435,6 @@ mod tests {
         assert_eq!(r2.roles_dispatched, 0, "unchanged epic must not re-dispatch");
         assert_eq!(r2.skipped_in_flight, 1);
         assert_eq!(sup.dispatcher.roles.len(), 1, "still exactly one dispatch");
-    }
-
-    #[tokio::test]
-    async fn test_active_sweeps_dedup_per_child() {
-        let mut sup = supervisor(vec![EpicSnapshot::new(
-            3,
-            body_with_phases(3),
-            vec![open(1)],
-            vec![301, 302],
-        )]);
-        let r1 = sup.tick().await.unwrap();
-        assert_eq!(r1.sweeps_dispatched, 2);
-        // Second identical tick: both children already dispatched ⇒ no new
-        // sweeps, counted as an in-flight skip.
-        let r2 = sup.tick().await.unwrap();
-        assert_eq!(r2.sweeps_dispatched, 0);
-        assert_eq!(r2.skipped_in_flight, 1);
-        assert_eq!(sup.dispatcher.sweeps.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_active_new_child_appears_next_tick() {
-        // First tick has one build-ready child; a later wave adds another.
-        let first = EpicSnapshot::new(3, body_with_phases(3), vec![open(1)], vec![301]);
-        let mut sup = supervisor(vec![first]);
-        let r1 = sup.tick().await.unwrap();
-        assert_eq!(r1.sweeps_dispatched, 1);
-
-        // Swap the source's epic for one with an additional open child.
-        sup.source.epics = vec![EpicSnapshot::new(
-            3,
-            body_with_phases(3),
-            vec![open(1)],
-            vec![301, 350],
-        )];
-        let r2 = sup.tick().await.unwrap();
-        assert_eq!(r2.sweeps_dispatched, 1, "only the new child #350 dispatches");
-        assert_eq!(sup.dispatcher.sweeps, vec![(3, 301), (3, 350)]);
     }
 
     // ===================================================================
@@ -2060,7 +2488,7 @@ mod tests {
         let report = sup.tick().await.unwrap();
         assert_eq!(report.epics_seen, 4);
         assert_eq!(report.roles_dispatched, 3); // architect, champion-expand, champion-close
-        assert_eq!(report.sweeps_dispatched, 1);
+        assert_eq!(report.sweeps_dispatched, 0);
     }
 
     #[tokio::test]
@@ -2080,32 +2508,6 @@ mod tests {
         assert_eq!(report.roles_dispatched, 0);
         // A failed dispatch is NOT recorded in flight, so the next tick retries.
         assert_eq!(sup.in_flight_len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_partial_sweep_failure_still_dispatches_others() {
-        let mut sup = EpicSupervisor::new(
-            FixedSource {
-                epics: vec![EpicSnapshot::new(
-                    3,
-                    body_with_phases(2),
-                    vec![open(1)],
-                    vec![301, 302, 303],
-                )],
-            },
-            RecordingDispatcher {
-                fail_sweep_child: Some(302),
-                ..RecordingDispatcher::default()
-            },
-            IssueCreationMutex::new(),
-        );
-        let report = sup.tick().await.unwrap();
-        assert_eq!(report.sweeps_dispatched, 2);
-        assert_eq!(report.errors, 1);
-        // The failed child is not recorded, so a later tick retries just it.
-        assert!(!sup.dispatched_children.contains(&302));
-        assert!(sup.dispatched_children.contains(&301));
-        assert!(sup.dispatched_children.contains(&303));
     }
 
     // ===================================================================
@@ -2258,6 +2660,9 @@ mod tests {
         }
         fn dispatch_sweep(&mut self, _epic: u32, _child: u32) -> Result<()> {
             self.sweeps.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn escalate(&mut self, _epic: u32, _comment: &str) -> Result<()> {
             Ok(())
         }
     }

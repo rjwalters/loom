@@ -221,3 +221,8 @@ fn dry_runs_and_legacy_explicit_profiles_keep_escape_flag_behavior() {
         .unwrap();
     assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

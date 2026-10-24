@@ -102,7 +102,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::wip::Out;
+use super::wip::{git_ok, Out};
 
 /// Everything the arm needs, all of it already resolved by `worktree.sh`.
 pub struct Options {
@@ -244,10 +244,20 @@ pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome 
         }
         out.info("Worktree is registered with git");
         if resolved.ahead > 0 {
+            let behind = if resolved.behind > 0 {
+                format!(" and {} behind", resolved.behind)
+            } else {
+                String::new()
+            };
             out.info(&format!(
-                "Worktree has {} commit(s) ahead of {} - preserving existing work",
+                "Worktree has {} commit(s) ahead{behind} of {} - preserving existing work",
                 resolved.ahead, resolved.display
             ));
+            if resolved.behind > 0 {
+                if let Some(note) = merge_base_note(&opts.worktree, &resolved.reference) {
+                    out.warning(&note);
+                }
+            }
         } else if uncommitted {
             out.info("Worktree has uncommitted changes - preserving existing work");
         }
@@ -395,18 +405,6 @@ fn has_uncommitted(worktree: &Path) -> bool {
         .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
 }
 
-/// `git -C <dir> <args> >/dev/null 2>/dev/null` — did it exit 0?
-fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 // ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
@@ -470,3 +468,28 @@ impl Reporter {
 
 #[cfg(test)]
 mod tests;
+
+/// Merge-base age of a preserved-but-behind worktree vs `reference` (#13056),
+/// so a Builder resuming weeks-old work sees how stale it is. `None` when git
+/// cannot answer — the message then stays as before.
+fn merge_base_note(worktree: &std::path::Path, reference: &str) -> Option<String> {
+    use super::wip::git_stdout;
+    let mb = git_stdout(worktree, &["merge-base", reference, "HEAD"])?;
+    let secs: u64 = git_stdout(worktree, &["show", "-s", "--format=%ct", &mb])?
+        .parse()
+        .ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let days = now.saturating_sub(secs) / 86_400;
+    let loud = if days > super::branch_reuse::STALE_AGE_DAYS {
+        format!(
+            " WARNING: over {} days stale - rebase before building on it.",
+            super::branch_reuse::STALE_AGE_DAYS
+        )
+    } else {
+        String::new()
+    };
+    Some(format!("Preserved work branched from {reference} {days} day(s) ago.{loud}"))
+}

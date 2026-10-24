@@ -24,6 +24,8 @@ use tempfile::tempdir;
 /// - `api repos/<owner>/<repo>/issues/<pr> --jq .labels[].name` prints
 ///   `pr_labels` (whitespace-separated, one name per line);
 /// - the same endpoint for any OTHER number prints `issue_labels`;
+/// - the release's issue-signals read (`closed_at` in its `--jq`) reports
+///   the issue open, so the #11852 open-PR hold is asked;
 /// - the `--jq '{state, is_pr: …}'` form of that endpoint reports an open,
 ///   non-PR node so the 2.5 closed-issue guard passes;
 /// - `issue view` reports "not blocked" so `restore_label_to_ready` takes its
@@ -47,6 +49,10 @@ fn pr_park_registry(
              exit 0\n\
              fi\n\
              {gql}\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *closed_at* ]]; then\n\
+             printf '%s\\n' '{{\"state\":\"open\",\"closed_at\":null,\"labels\":[]}}'\n\
+             exit 0\n\
+             fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *is_pr* ]]; then\n\
              printf '%s\\n' '{state}'\n\
              exit 0\n\
@@ -200,11 +206,12 @@ async fn reaper_does_not_resume_when_the_linked_pr_is_blocked() {
         calls.contains("api repos/rjwalters/loom/issues/8682 --jq .labels[].name"),
         "the refusal must come from reading the PR's OWN labels; got: {calls:?}"
     );
-    // The park is on the PR, not the issue, so the issue is restored to the
-    // ready state on this very first reap (AC1's second half).
+    // The park is on the PR, not the issue, and the PR is open: the issue
+    // keeps `loom:building` while it is (#11852) — no release write at all.
     assert!(
-        calls.contains("issue edit 8668 --remove-label loom:building --add-label loom:issue"),
-        "the issue itself is unparked and must be restored to loom:issue; got: {calls:?}"
+        !calls.contains("issue edit 8668 --remove-label loom:building")
+            && !calls.contains("--add-label loom:issue"),
+        "the issue keeps its claim label beside the open PR; got: {calls:?}"
     );
     // Sanity: the fixture really produced the cap-exhausted shape — a clean
     // exit whose surviving checkpoint still classifies the entry as Crashed.

@@ -11,6 +11,9 @@
 //! Then the live `worktree.sh` is run end to end with the port pinned via
 //! `LOOM_DAEMON_SELF_BIN`, to prove the stub replays the records correctly.
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -26,6 +29,7 @@ fn fixture() -> PathBuf {
 }
 
 fn hermetic(cmd: &mut Command) -> &mut Command {
+    common::deny_real_gh(cmd);
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "t")
@@ -222,3 +226,8 @@ fn live_worktree_sh_replays_the_records_end_to_end() {
     assert!(!repo.join(".loom/worktrees/issue-78").exists());
     let _ = fs::remove_dir_all(repo.parent().unwrap());
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -45,7 +45,9 @@ pub(super) fn state_lines(s: &FleetSyncStatus) -> Vec<String> {
             ""
         };
         let actual = match s.enforced {
-            Enforcement::Proceed => "dispatching normally",
+            Enforcement::Proceed => {
+                "no fleet-store hold (dispatch may still be held locally; see Drain)"
+            }
             Enforcement::Hold => "new dispatch HELD, in-flight work finishes",
             Enforcement::Stop => "refusing to start / draining to exit",
         };

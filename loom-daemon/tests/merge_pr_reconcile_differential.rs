@@ -33,6 +33,16 @@
 //! the one wrong answer in this family that destroys uncommitted work, and it
 //! turns on a single `grep -qx` over a label list.
 //!
+//! # Deliberate divergence: the lease (#12759)
+//!
+//! The retired shell had no lease read. `reconcile-child` now refines the
+//! label-only [`child_route`] with `route_with_lease`: a `loom:building` child
+//! whose issue holds no live lease reconciles, because the label stays on until
+//! the PR merges and nothing else would ever pick the child up. This file
+//! compares only the pure label route, which is unchanged and still byte-equal
+//! to the shell; the lease cases are unit-tested in `merge_pr::reconcile::tests`
+//! (`building_child_*`, `lease_never_*`) since the shell has no oracle for them.
+//!
 //! # The divergence classes, named up front
 //!
 //! 1. **NUL bytes.** The retired implementation took the label list and the
@@ -604,3 +614,8 @@ fn the_deferral_comment_is_byte_identical_to_the_retired_heredoc() {
         );
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

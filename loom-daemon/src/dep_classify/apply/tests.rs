@@ -8,13 +8,14 @@ use super::*;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Output};
 
+// An unmigrated escalation (#11795): the retired hold plus its sub-kind.
 const OPERATOR_ONLY: &str = "loom:operator-only";
 const OPERATOR_BLOCKED: &str = "loom:operator-blocked";
 
 fn labels() -> Labels<'static> {
     Labels {
-        operator_only: OPERATOR_ONLY,
-        operator_blocked: OPERATOR_BLOCKED,
+        hold: OPERATOR_ONLY,
+        also: &[OPERATOR_BLOCKED],
     }
 }
 
@@ -177,7 +178,7 @@ fn the_two_failure_modes_are_distinguishable() {
 
 #[test]
 fn the_cleared_body_carries_its_marker_and_names_the_blockers() {
-    let body = cleared_body(OPERATOR_ONLY, OPERATOR_BLOCKED, "o/r#3", "<!-- m:abc -->");
+    let body = cleared_body(&labels(), "o/r#3", "<!-- m:abc -->");
     assert!(body.contains("the recorded blocker has closed"), "{body}");
     assert!(body.contains("**Cleared blockers**: o/r#3"), "{body}");
     assert!(body.trim_end().ends_with("<!-- m:abc -->"), "the marker must be last: {body}");
@@ -185,13 +186,7 @@ fn the_cleared_body_carries_its_marker_and_names_the_blockers() {
 
 #[test]
 fn the_subset_body_carries_its_marker_and_the_subset_text() {
-    let body = subset_body(
-        OPERATOR_ONLY,
-        OPERATOR_BLOCKED,
-        "o/r#3",
-        "- the independent half",
-        "<!-- m:subset-abc -->",
-    );
+    let body = subset_body(&labels(), "o/r#3", "- the independent half", "<!-- m:subset-abc -->");
     assert!(body.contains("a startable subset was never actually blocked"), "{body}");
     assert!(body.contains("- the independent half"), "{body}");
     assert!(body.contains("scoped to the"), "{body}");
@@ -203,8 +198,8 @@ fn both_bodies_say_a_human_can_re_park_the_proposal() {
     // The escape hatch matters: this mechanism must never read as overriding a
     // human decision, and the comment is where an operator learns that.
     for body in [
-        cleared_body(OPERATOR_ONLY, OPERATOR_BLOCKED, "o/r#3", "<!-- m -->"),
-        subset_body(OPERATOR_ONLY, OPERATOR_BLOCKED, "o/r#3", "- w", "<!-- m -->"),
+        cleared_body(&labels(), "o/r#3", "<!-- m -->"),
+        subset_body(&labels(), "o/r#3", "- w", "<!-- m -->"),
     ] {
         assert!(
             body.contains("re-add") && body.contains("not be un-escalated again"),
@@ -220,10 +215,10 @@ fn both_bodies_say_a_human_can_re_park_the_proposal() {
 const OPERATOR_DECISION: &str = "loom:operator-decision";
 const REVISION_MARKER: &str = "<!-- curator:fact-revision:fact-abc -->";
 
-fn fact_labels() -> FactLabels<'static> {
-    FactLabels {
-        operator_only: OPERATOR_ONLY,
-        operator_decision: OPERATOR_DECISION,
+fn fact_labels() -> Labels<'static> {
+    Labels {
+        hold: OPERATOR_ONLY,
+        also: &[OPERATOR_DECISION],
     }
 }
 
@@ -292,10 +287,9 @@ fn a_retry_after_a_failed_label_removal_does_not_append_the_section_twice() {
 }
 
 #[test]
-fn the_fact_path_drops_operator_decision_not_operator_blocked() {
-    // The two mechanisms park proposals under DIFFERENT sub-kind labels.
-    // Removing the wrong one fails silently — removing an absent label
-    // succeeds — so this asserts the name, not just that two removals happened.
+fn the_fact_path_drops_only_the_names_it_was_given() {
+    // #11795: the caller passes the hold names actually present; nothing else
+    // is removed.
     let mut w = Recorder::default();
     apply_fact(&mut w, "body").unwrap();
     assert!(w
@@ -357,15 +351,37 @@ fn the_revision_section_preserves_the_body_it_appends_to() {
 
 #[test]
 fn the_fact_comment_names_both_labels_and_ends_with_its_marker() {
-    let out = fact_comment_body(
-        OPERATOR_ONLY,
-        OPERATOR_DECISION,
-        "abc1234",
-        "- first",
-        "<!-- m:fact-abc -->",
-    );
+    let out = fact_comment_body(&fact_labels(), "abc1234", "- first", "<!-- m:fact-abc -->");
     assert!(out.contains(OPERATOR_ONLY) && out.contains(OPERATOR_DECISION), "{out}");
     assert!(out.contains("`abc1234`"), "{out}");
     assert!(out.contains("re-add the label"), "the escape hatch: {out}");
     assert!(out.ends_with("<!-- m:fact-abc -->"), "{out:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The folded hold (#11795)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_migrated_escalation_removes_loom_operator_alone() {
+    let labels = Labels {
+        hold: "loom:operator",
+        also: &[],
+    };
+    let mut w = Recorder::default();
+    apply_unescalation(&mut w, &labels, "body").unwrap();
+    assert_eq!(
+        w.calls,
+        vec![
+            "remove-label loom:operator".to_string(),
+            "comment body".to_string()
+        ]
+    );
+    let body = cleared_body(&labels, "o/r#3", "<!-- m -->");
+    assert!(body.contains("Removed `loom:operator`;"), "{body}");
+}
+
+#[test]
+fn the_audit_text_names_every_removed_name() {
+    assert_eq!(labels().removed_text(), "`loom:operator-only` (and `loom:operator-blocked`)");
 }

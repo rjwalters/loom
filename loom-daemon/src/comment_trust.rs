@@ -255,6 +255,25 @@ impl TrustPolicy {
         self
     }
 
+    /// Whether `login` is this workspace's own self identity (its writer
+    /// App), by the same name-and-kind rule the trust check uses. `false`
+    /// when no self identity resolved: an unknown self is nobody (#12105).
+    #[must_use]
+    pub fn is_self(&self, login: &str) -> bool {
+        let author = Author::new(Some(login), None);
+        let Some(norm) = author
+            .login
+            .as_deref()
+            .map(normalise_login)
+            .filter(|n| !n.is_empty())
+        else {
+            return false;
+        };
+        self.self_login
+            .as_deref()
+            .is_some_and(|me| names(me, author.app, &norm))
+    }
+
     /// Whether `author` is believed.
     #[must_use]
     pub fn trusts(&self, author: &Author) -> bool {

@@ -52,8 +52,7 @@ pub(in crate::sweep_registry) fn failing_gh(
     let gh = ws.join("fake-gh.sh");
     let body = format!(
         "#!/usr/bin/env bash\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> '{log}'\n\
-         case \"$*\" in\n  'api rate_limit') printf '{{\"resources\":{{\"core\":{{\"remaining\":0,\"used\":15000,\"reset\":{reset}}}}}}}' ;;\n  \
-         'api -i graphql'*) printf 'HTTP/2.0 200 OK\\r\\n\\r\\n{{\"data\":{{\"rateLimit\":{{\"used\":3,\"remaining\":4997,\"resetAt\":\"2026-07-29T19:20:35Z\"}}}}}}' ;;\n  \
+         case \"$*\" in\n  'api rate_limit') printf '{{\"resources\":{{\"core\":{{\"remaining\":0,\"used\":15000,\"reset\":{reset}}},\"graphql\":{{\"remaining\":4997,\"used\":3,\"reset\":{reset}}}}}}}' ;;\n  \
          *) echo '{err}' >&2; exit 1 ;;\nesac\n",
         log = log.display(),
         err = stderr.replace('\'', ""),
@@ -177,7 +176,7 @@ fn real_probe_reads_the_workspace_credential_reset() {
     assert!(reg.flip_label_to_building(8997).is_err());
     let until = b.snapshot(Utc::now()).cooldown_until.unwrap();
     assert_eq!(until.timestamp(), reset, "core reset from the probe, not the 900s fallback");
-    assert_eq!(probe_calls(&log), 2, "one bounded probe = two calls");
+    assert_eq!(probe_calls(&log), 1, "one bounded `/rate_limit` read, no GraphQL leg (#12204)");
     let root = dir.path().canonicalize().unwrap();
     for call in lines(&log).iter().filter(|l| l.contains("|api ")) {
         let pwd = Path::new(call.split('|').next().unwrap())

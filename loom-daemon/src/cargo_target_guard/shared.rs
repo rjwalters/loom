@@ -1,5 +1,5 @@
-//! The `loom:cargo-shared-target` half of the guard (issue #10646): ask before
-//! a cargo build in a Loom-managed worktree falls through to a shared
+//! The `loom:cargo-shared-target` half of the guard (issue #10646): deny a
+//! cargo build in a Loom-managed worktree falls through to a shared
 //! `build.target-dir`.
 //!
 //! The deny half ([`super::evaluate`]) judges only an *explicit* target dir and
@@ -11,9 +11,12 @@
 //! per-worktree `CARGO_TARGET_DIR`; an in-session Task subagent never passes
 //! through it, so this is where that case is caught.
 //!
-//! The verdict is an **ask**, not a deny: an operator may share a target dir on
-//! purpose (with sccache, say). It has its own toggle,
-//! `guards.cargoSharedTarget` / `LOOM_GUARD_CARGO_SHARED_TARGET`.
+//! The verdict is a **deny** (#11625), not an ask: a headless run cannot answer
+//! an ask, and Claude Code shows an ask's reason to the human, not to the
+//! model, so only a deny lets the agent read the `CARGO_TARGET_DIR` prefix and
+//! rerun. An operator who shares a target dir on purpose (with sccache, say)
+//! turns the check off with its own toggle, `guards.cargoSharedTarget` /
+//! `LOOM_GUARD_CARGO_SHARED_TARGET`.
 
 use std::path::{Path, PathBuf};
 
@@ -23,8 +26,8 @@ use super::{forms, normalize, under, Context};
 pub const TOGGLE_KEY: &str = "guards.cargoSharedTarget";
 /// The toggle's env override (Claude Code settings `env`).
 pub const TOGGLE_ENV: &str = "LOOM_GUARD_CARGO_SHARED_TARGET";
-/// Every ask starts with this; the hook matches on it.
-pub const ASK_PREFIX: &str = "ASK [cargo-shared-target]";
+/// Every denial starts with this; the hook matches on it.
+pub const BLOCKED_PREFIX: &str = "BLOCKED [cargo-shared-target]";
 /// The sentinel `worktree.sh` writes at every Loom-managed worktree root.
 pub const MANAGED_SENTINEL: &str = ".loom-managed";
 
@@ -169,7 +172,7 @@ pub fn judge(ctx: &Context) -> Option<SharedAsk> {
     })
 }
 
-/// The ask text the hook passes through verbatim.
+/// The denial text the hook passes through verbatim.
 #[must_use]
 pub fn ask_reason(a: &SharedAsk) -> String {
     let from = match &a.origin {
@@ -177,11 +180,11 @@ pub fn ask_reason(a: &SharedAsk) -> String {
         Origin::File(f) => format!("build.target-dir in {}", f.display()),
     };
     format!(
-        "{ASK_PREFIX}: this cargo command sets no CARGO_TARGET_DIR, so it will build into '{}' \
+        "{BLOCKED_PREFIX}: this cargo command sets no CARGO_TARGET_DIR, so it will build into '{}' \
          (from {from}), outside this Loom worktree ({}). Nothing reclaims a worktree's \
          artifacts there once the worktree is gone, and concurrent worktree builds can clobber \
          each other's binaries (#10646). Prefix the command instead: CARGO_TARGET_DIR=\"{}\" \
-         cargo …. Approve only if sharing that dir is deliberate. To turn this check off: \
+         cargo …. If sharing that dir is deliberate, turn this check off: \
          {TOGGLE_ENV}=0 in Claude Code's settings env, or guards.cargoSharedTarget=false.",
         a.target.display(),
         a.worktree.display(),

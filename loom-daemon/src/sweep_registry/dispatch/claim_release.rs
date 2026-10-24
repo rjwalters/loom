@@ -64,13 +64,16 @@ impl SweepRegistry {
     /// `restore_label_to_ready`, whose independent state probes can fail and
     /// fall back to re-adding `loom:issue` to the known-closed issue. The
     /// caller must not have spawned a child yet.
-    pub(super) fn release_claim_if_closed_after_flip(
-        &mut self,
+    pub(super) fn release_claim_if_closed_after_flip_via<
+        A: super::registry_access::RegistryAccess,
+    >(
+        acc: &mut A,
         issue_number: u32,
         sweep_id: &str,
         idempotency_key: Option<&String>,
     ) -> Result<()> {
-        if self.guard_closed_or_pr(issue_number) != Some(true) {
+        // Lock-free (#9573): the re-probe is a forge read.
+        if acc.unlocked(|r| r.guard_closed_or_pr(issue_number)) != Some(true) {
             return Ok(());
         }
         log::warn!(
@@ -78,11 +81,12 @@ impl SweepRegistry {
              PR) right after the claim flip (#11304) - the pre-flip guard failed open. \
              Releasing the claim instead of spawning a builder."
         );
-        let restore = self.remove_building_claim(issue_number);
+        let restore = acc.unlocked(|r| r.remove_building_claim(issue_number));
+        let sr = acc.reg();
         if restore.is_ok() {
-            self.note_label_flip(issue_number); // #4485 flap detection
+            sr.note_label_flip(issue_number); // #4485 flap detection
         }
-        self.unwind_local_claim(issue_number, sweep_id, idempotency_key);
+        sr.unwind_local_claim(issue_number, sweep_id, idempotency_key);
         match restore {
             Ok(()) => Err(anyhow!(
                 "refusing to dispatch issue #{issue_number}: it was found closed on the forge \

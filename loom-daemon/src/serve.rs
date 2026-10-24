@@ -442,15 +442,8 @@ pub struct PipelineRow {
 /// shape is unrecognized.
 #[must_use]
 fn derive_forge_url(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Bounded (#9715): a hung `git` must not stall the dashboard.
+    let raw = crate::forge_cmd::get_remote_url(root)?;
     normalize_forge_url(&raw)
 }
 
@@ -648,6 +641,12 @@ async fn handle_health(
         .then(crate::health::probe_work_finder_log_tick_age)
         .flatten();
 
+    // #11970: local `.loom/resync-ignore` reads, as `cli::health` does.
+    let resync_pins = report
+        .iter()
+        .flat_map(|r| r.per_repo.iter())
+        .map(|r| (r.root.display().to_string(), crate::resync_pin::read_pins(&r.root)))
+        .collect();
     let health = crate::health::assess(&crate::health::HealthInputs {
         at: chrono::Utc::now(),
         window: HEALTH_WINDOW,
@@ -711,6 +710,7 @@ async fn handle_health(
         // #11740: the in-process last fleet-sync pass, so the dashboard's
         // health route raises `fleet_identity` too.
         fleet_sync: crate::fleet_sync::cached_status(),
+        resync_pins,
     });
 
     let mut body = serde_json::to_value(&health)?;
@@ -2490,6 +2490,7 @@ mod tests {
                 operator_held_conflicting: Some(1),
                 operator_held_oldest_days: Some(4),
                 operator_only_issues: Some(6),
+                champion_held: Some(7),
                 error: None,
             },
         )]);
@@ -2512,6 +2513,8 @@ mod tests {
         assert_eq!(value[0]["operator_held_conflicting"], serde_json::json!(1));
         assert_eq!(value[0]["operator_held_oldest_days"], serde_json::json!(4));
         assert_eq!(value[0]["operator_only_issues"], serde_json::json!(6));
+        // #11905: the Champion-held sibling count rides the same row.
+        assert_eq!(value[0]["champion_held"], serde_json::json!(7));
         // `/repos/loom` is not a real git checkout, so the URL derivation is
         // expected to fail gracefully rather than fabricate a link.
         assert_eq!(value[0]["forge_url"], serde_json::Value::Null);

@@ -34,12 +34,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
-use crate::forge_identity::{served, ReadClass};
+use crate::forge_identity::ReadClass;
 use crate::forge_listing::{parse_http_response, HttpResponse};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
@@ -198,33 +198,24 @@ pub(crate) fn write_private_json<T: serde::Serialize>(path: &Path, value: &T) {
 /// only inside a [`private_dir`]. Best-effort, like [`write_disk_entry`]:
 /// any failure leaves the previous file (or none) in place.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
-    use std::io::Write;
     let Some(dir) = path.parent() else { return };
     if !private_dir(dir, true) {
         return;
     }
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("entry")
-    ));
-    // A stale temp from a crashed writer with a recycled pid: drop and retry.
-    let file = create_private_file(&tmp).or_else(|_| {
-        let _ = std::fs::remove_file(&tmp);
-        create_private_file(&tmp)
-    });
-    let Ok(mut file) = file else { return };
-    if file.write_all(bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    );
 }
 
 mod deferrable;
 #[cfg(test)]
 pub(crate) use deferrable::install_test_route;
-pub(crate) use deferrable::ReadShed;
+pub(crate) use deferrable::{ReadShed, TickDeadlineReached};
 
 /// Who issued a conditional read and which inventoried forge operation it
 /// serves (#9831).
@@ -250,6 +241,42 @@ pub(crate) struct ConditionalRead {
     /// [`ReadClass::Gate`], the default, retries on the writer;
     /// a deferrable class is shed instead, see [`deferrable`].
     pub(crate) class: ReadClass,
+    /// Which forge's REST shape the listing speaks (#12312).
+    pub(crate) shape: Shape,
+}
+
+/// The forge REST shape a listing URL takes (#12312). GitHub's `/issues`
+/// includes pull requests and pages by `per_page`; Gitea's returns issues
+/// only unless `type=pulls`, and pages by `limit` (capped at 50 by default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Shape {
+    #[default]
+    GitHub,
+    /// `/issues?type=issues`.
+    GiteaIssues,
+    /// `/issues?type=pulls`, or `/pulls`.
+    GiteaPulls,
+}
+
+impl Shape {
+    /// The forge's page size: a page shorter than this is the last one.
+    #[must_use]
+    pub(crate) const fn page_size(self) -> usize {
+        match self {
+            Self::GitHub => 100,
+            Self::GiteaIssues | Self::GiteaPulls => 50,
+        }
+    }
+
+    /// The shapes a repo's open items are listed in: GitHub's one walk
+    /// already holds the PRs, Gitea needs one walk per kind.
+    #[must_use]
+    pub(crate) fn for_forge(forge: crate::forge_cmd::ForgeType) -> &'static [Shape] {
+        match forge {
+            crate::forge_cmd::ForgeType::GitHub => &[Shape::GitHub],
+            crate::forge_cmd::ForgeType::Gitea => &[Shape::GiteaIssues, Shape::GiteaPulls],
+        }
+    }
 }
 
 impl ConditionalRead {
@@ -261,7 +288,15 @@ impl ConditionalRead {
             timeout: None,
             item_scoped: false,
             class: ReadClass::Gate,
+            shape: Shape::GitHub,
         }
+    }
+
+    /// This read in `shape`'s REST dialect.
+    #[must_use]
+    pub(crate) const fn shaped(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
     }
 
     /// This read as a deferrable one of `class`: when every reader that can
@@ -326,115 +361,9 @@ pub(crate) fn fetch_conditional_via(
         &crate::forge_identity::RouteRequest<'_>,
     ) -> crate::forge_identity::RouteDecision,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    if site.class != ReadClass::Gate && deferrable::shedding_enabled() {
-        return deferrable::fetch(site, gh_bin, cwd, target, url, etag, route);
-    }
-    // #9537: a listing is a read, so it goes to the repo's reader App when one
-    // is usable. On a credential failure the reader is withdrawn and the SAME
-    // request is retried once on the writer, so a broken reader costs one
-    // extra call, never a failed poll (the shared shape,
-    // `forge_identity::reader_then_writer`, #9872). The cache key deliberately
-    // stays on the writer's credential scope: reader choice is deterministic
-    // per URL (W4-B: the URL is the affinity key, so a split repo's URL
-    // always lands on the same reader), so keeping the key means no ETag is
-    // invalidated when readers come online. The caller's stored ETag is sent
-    // to whichever reader serves the read; GitHub answers 304 only when that
-    // reader's own validator matches, so a URL that moved readers (a spill,
-    // or a split rolled out) costs at most one 200, never a stale body.
-    let affinity = crate::gh_invocation::url_affinity_key(url);
-    let reader = target.repo.as_deref().and_then(|r| {
-        route(
-            &crate::forge_identity::RouteRequest::gate(
-                r,
-                target.host.as_deref(),
-                crate::forge_bucket_book::Resource::Core,
-            )
-            .affinity(Some(&affinity)),
-        )
-        .into_credential()
-    });
-    let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
-    let gateway_down = std::cell::Cell::new(false);
-    let family = served::endpoint_family(url);
-    let now = std::time::SystemTime::now;
-    let http_ok = |r: &FetchResult| {
-        r.0.success() || matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304))
-    };
-    crate::forge_identity::reader_then_writer(
-        reader_dir,
-        // The reader attempt drops env tokens (#9872): `gh` prefers an env
-        // `GH_TOKEN`/`GITHUB_TOKEN` over `GH_CONFIG_DIR`, so without this an
-        // ambient personal token would serve the "reader" read.
-        |dir, role| {
-            // The reader's public bucket label (#10232), only on the reader attempt.
-            let bucket = dir.and(reader.as_ref()).map(|(_, app_id)| {
-                crate::forge_identity::reader_bucket(
-                    app_id,
-                    target.repo.as_deref().unwrap_or_default(),
-                )
-            });
-            let fetched = run_fetch_with(
-                site,
-                gh_bin,
-                cwd,
-                target,
-                url,
-                etag,
-                dir,
-                dir.is_some(),
-                role,
-                bucket.as_deref(),
-            );
-            if let (Some((_, app_id)), Some(_), Ok(r)) = (reader.as_ref(), dir, fetched.as_ref()) {
-                if matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304)) {
-                    served::note_reader_served(app_id, repo_of(target), family, now());
-                }
-            }
-            fetched
-        },
-        http_ok,
-        |r: &FetchResult| {
-            // 2am#4367 P4: the relay down or unreachable is not a credential
-            // failure: withdraw it for the default window and use the writer.
-            let fault = gateway_fault(reader.as_ref().map(|(_, a)| a.as_str()), r);
-            if fault.reruns() {
-                gateway_down.set(true);
-                if fault == crate::forge_gateway::outage::Fault::Withdraw {
-                    crate::forge_gateway::outage::withdraw_for_outage(site.caller);
-                }
-                return Some(crate::forge_identity::Failure::Credential);
-            }
-            let failure = reader_failure(r)?;
-            let item_404 = site.item_scoped
-                && failure == crate::forge_identity::Failure::Coverage
-                && r.1.as_ref().map(|h| h.status) == Some(404);
-            let covered = reader.as_ref().is_some_and(|(_, app_id)| {
-                served::reader_recently_served(app_id, repo_of(target), family, now())
-            });
-            if item_404 && covered {
-                // The reader covers this repo's `family`: the 404 is the
-                // item's own answer. No writer retry, no withdrawal (W6).
-                crate::forge_call_stats::counters::bump(served::ITEM_SCOPED_404);
-                return None;
-            }
-            Some(failure)
-        },
-        |failure, _| {
-            if gateway_down.get() {
-                return;
-            }
-            if let Some((_, app_id)) = &reader {
-                let repo = target.repo.as_deref().unwrap_or_default();
-                let why = format!("{} {url}", site.caller);
-                crate::forge_identity::withdraw_after(app_id, repo, failure, &why);
-            }
-        },
-    )
-}
-
-/// `target`'s `owner/repo`, or `""` (a placeholder read has no reader).
-fn repo_of(target: &Target) -> &str {
-    target.repo.as_deref().unwrap_or_default()
+    // #12394: every conditional read — whatever its class — runs the
+    // reader-only chain; none falls through to the writer.
+    deferrable::fetch(site, gh_bin, cwd, target, url, etag, route)
 }
 
 /// What a failed conditional read says about its credential. The parsed
@@ -449,7 +378,11 @@ pub(crate) fn gateway_fault(
     if app != Some(crate::forge_gateway::GATEWAY_APP_ID) || r.0.success() {
         return crate::forge_gateway::outage::Fault::None;
     }
-    crate::forge_gateway::outage::fault(r.1.as_ref(), "", &r.2)
+    crate::forge_gateway::outage::escalate(crate::forge_gateway::outage::fault(
+        r.1.as_ref(),
+        "",
+        &r.2,
+    ))
 }
 
 pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {
@@ -534,6 +467,9 @@ fn run_fetch_with(
         .execute()
     {
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+        // #12074: the tick deadline passed; nothing was sent.
+        Ok(GhCompletion::Shed { until, .. }) => return Err(anyhow::Error::new(ReadShed { until })),
+        Ok(GhCompletion::DeadlineReached) => return Err(anyhow::Error::new(TickDeadlineReached)),
         Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", timeout.as_secs()),
         Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
     };
@@ -585,16 +521,8 @@ pub(crate) fn remote_identity(cwd: &Path) -> Option<(String, String)> {
     if let Some(hit) = memo.lock().ok().and_then(|m| m.get(cwd).cloned()) {
         return Some(hit);
     }
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let resolved = parse_remote_url(&String::from_utf8_lossy(&output.stdout))?;
+    // Bounded (#9715): a hung `git` must not stall the caller.
+    let resolved = parse_remote_url(&crate::forge_cmd::get_remote_url(cwd)?)?;
     if let Ok(mut m) = memo.lock() {
         m.insert(cwd.to_path_buf(), resolved.clone());
     }

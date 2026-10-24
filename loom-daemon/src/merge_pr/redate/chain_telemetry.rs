@@ -36,9 +36,10 @@ const RECORD_SEP: char = '\u{1e}';
 const SUBJECT_PREFIX: &str = "chore: re-date required checks for PR #";
 
 /// A PR with at least this many re-dates is flagged (`stuck` when also
-/// unlanded). Matches the default re-date budget: a chain that has spent it
-/// is the one that escalates to an operator hold.
-pub const LIVELOCK_REDATES: usize = super::budget::DEFAULT_BUDGET as usize;
+/// unlanded). The retired re-date budget's default (`champion.redateBudget`,
+/// 3; deleted with the remedy by #12063 slice 1): a chain that had spent it
+/// was the one that escalated to an operator hold.
+pub const LIVELOCK_REDATES: usize = 3;
 
 /// One re-date commit with its committer time.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -57,7 +57,7 @@ pub enum Exists {
 pub enum Verdict {
     /// Curation proceeds normally.
     Clear,
-    /// `loom:operator-only` + `loom:operator-decision`, no enrichment pass.
+    /// `loom:operator` with a decision block (#11795), no enrichment pass.
     OperatorDecision,
 }
 
@@ -252,8 +252,8 @@ pub fn check(rec: &Record, repo_root: &Path) -> Outcome {
             return Outcome::Malformed(
                 "deliberate=yes reversal=yes requires verdict=operator-decision. Reversing a \
                  documented decision is an operator ruling; an issue's own filing is never that \
-                 approval (#7855, #8309). Route it: \
-                 --add-label \"loom:operator-only,loom:operator-decision\""
+                 approval (#7855, #8309). Route it with `loom-daemon operator-decision apply`, \
+                 which writes the decision block and labels it loom:operator (#11795)"
                     .to_string(),
             );
         }

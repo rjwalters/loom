@@ -44,3 +44,8 @@ fn long_help_carries_the_safety_caveat() {
         assert!(h.contains(needle), "--help lost `{needle}`:\n{h}");
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

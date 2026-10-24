@@ -21,8 +21,12 @@
 //!    exhausted bucket whose reset is still in the future.
 //! 3. A probe that reads *healthy* during a **primary** rate-limit failure
 //!    contradicts the failure it is meant to explain: it is untrustworthy
-//!    (the false-full case), so the trip takes the configured fallback and
-//!    the reading is not cached as the status surface's "last budget".
+//!    (the false-full case, or a credential the probe cannot see), so the
+//!    reading is not cached as the status surface's "last budget" and the
+//!    trip takes the *minimum* cooldown ([`ResetEvidence::Contradicted`],
+//!    #10375) rather than the full fallback: one unexplained error must not
+//!    pause the whole host for 15 minutes. If the bucket really is dry, the
+//!    next failing call re-trips once the short window ends.
 //! 4. A secondary-limit failure does not zero a primary bucket, so a healthy
 //!    probe is expected there — fallback cooldown, reading kept for status.
 //!
@@ -65,7 +69,15 @@ pub enum ResetEvidence {
     Probe { reset: DateTime<Utc> },
     /// No trustworthy reset: the configured fallback cooldown applies.
     Fallback { reason: &'static str },
+    /// A non-exhausted probe reading during a primary rate-limit failure
+    /// (rule 3): untrusted, and the minimum cooldown applies (#10375).
+    Contradicted,
 }
+
+/// [`ResetEvidence::Contradicted`]'s log reason.
+const CONTRADICTED_REASON: &str = "probe reads a non-exhausted budget during a primary \
+                                   rate-limit failure (wrong credential or false-full \
+                                   /rate_limit) — reading untrusted";
 
 impl ResetEvidence {
     /// Release time for a cooldown starting at `now`, clamped to
@@ -77,6 +89,7 @@ impl ResetEvidence {
             Self::Fallback { .. } => {
                 now + Duration::seconds(i64::try_from(fallback_secs).unwrap_or(MAX_COOLDOWN_SECS))
             }
+            Self::Contradicted => now + Duration::seconds(MIN_COOLDOWN_SECS),
         };
         candidate.clamp(
             now + Duration::seconds(MIN_COOLDOWN_SECS),
@@ -84,10 +97,18 @@ impl ResetEvidence {
         )
     }
 
-    /// Whether this is a real reset reading (not the fallback guess).
+    /// Whether this is a real reset reading (not a fallback guess).
     #[must_use]
     pub fn is_trusted(&self) -> bool {
-        !matches!(self, Self::Fallback { .. })
+        !matches!(self, Self::Fallback { .. } | Self::Contradicted)
+    }
+
+    /// Whether a refine may replace the provisional window with this
+    /// evidence's release time: a trusted reset, or a contradicted reading
+    /// (which shortens the provisional fallback to the minimum, #10375).
+    #[must_use]
+    pub fn replaces_provisional(&self) -> bool {
+        self.is_trusted() || matches!(self, Self::Contradicted)
     }
 
     /// One-line description for the trip/refine log.
@@ -99,6 +120,7 @@ impl ResetEvidence {
             }
             Self::Probe { reset } => format!("contextual budget probe (resets {reset})"),
             Self::Fallback { reason } => format!("fallback cooldown — {reason}"),
+            Self::Contradicted => format!("minimum cooldown — {CONTRADICTED_REASON}"),
         }
     }
 }
@@ -198,11 +220,5 @@ pub fn from_probe(
             true,
         );
     }
-    (
-        ResetEvidence::Fallback {
-            reason: "probe reads a non-exhausted budget during a primary rate-limit failure \
-                     (wrong credential or false-full /rate_limit) — reading untrusted",
-        },
-        false,
-    )
+    (ResetEvidence::Contradicted, false)
 }

@@ -977,6 +977,8 @@ impl SweepRegistry {
                 .map(ParkKind::failure_class),
             exit_code == Some(0),
         );
+        // Issue #11854: a reported `failure` never goes out without a class.
+        let failure_class = telemetry::ensure_failure_class(reported_result, failure_class);
         let process_result = result;
         let result = reported_result;
 
@@ -1162,13 +1164,7 @@ impl SweepRegistry {
         );
         envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
-        // #11348: shadow into the J2 `sweep` stream only after this succeeds.
-        if let Err(e) = telemetry::journal_shadow::after_legacy(
-            &self.config.workspace_root,
-            telemetry::journal_shadow::TelemetryStream::Sweep,
-            || sweep_outcomes::append_outcome_telemetry(&path, &envelope),
-            |()| telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
-        ) {
+        if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
             log::warn!(
                 "sweep_outcomes: failed to append sweep.outcome telemetry record for issue \
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
@@ -1233,8 +1229,11 @@ impl SweepRegistry {
         kind: &SweepKind,
         started_at: DateTime<Utc>,
     ) {
-        let SweepKind::Issue(issue) = kind else {
-            return;
+        let issue = match kind {
+            SweepKind::Issue(issue) => issue,
+            // A step writes no sweep checkpoint, so it has no phase to sample;
+            // its role is its phase (#11898).
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => return,
         };
         let checkpoint = self
             .config
@@ -1595,9 +1594,3 @@ mod tokens_status_tests;
     unused_imports
 )]
 mod pr_link_tests;
-
-// #11348: the T1 call site shadows into the J2 `sweep` stream only after the
-// legacy `sweep.outcome` append succeeded, and never when disabled.
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod shadow_tests;

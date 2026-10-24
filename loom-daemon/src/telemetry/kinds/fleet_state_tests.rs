@@ -71,14 +71,14 @@ fn record() -> FleetStateRecord {
             visibility: RepoVisibility::Public,
             main_ci: None,
             halt: None,
-            in_flight: None,
-            cap: None,
-            deferred_repo_cap: None,
+
             queue_depth: None,
             queue_flow: None,
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus {
@@ -103,14 +103,14 @@ fn anchor_with(n: u32) -> FleetStateRecord {
             visibility: RepoVisibility::Private,
             main_ci: None,
             halt: None,
-            in_flight: None,
-            cap: None,
-            deferred_repo_cap: None,
+
             queue_depth: None,
             queue_flow: None,
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -124,8 +124,8 @@ fn anchor_with(n: u32) -> FleetStateRecord {
     r
 }
 
-/// OTLP-only log kind on the shared post-#8921 gate. It is not native: it is a
-/// replay record, not a dashboard state key.
+/// OTLP-only log kind on the shared post-#8921 gate: a replay record, not a
+/// dashboard state key.
 #[test]
 fn fleet_state_is_registered_as_an_otlp_only_log_kind() {
     let meta = TELEMETRY_KINDS
@@ -135,12 +135,10 @@ fn fleet_state_is_registered_as_an_otlp_only_log_kind() {
     assert_eq!(meta.variant, "FleetState");
     assert_eq!(meta.schema_version, NEW_KIND_SCHEMA_VERSION);
     assert_eq!(meta.otlp, TelemetryKindOtlp::Logs);
-    assert!(!meta.native_ingest);
 
     let record = TelemetryRecord::FleetState(record());
     assert_eq!(record.kind(), "fleet.state");
     assert_eq!(record.otlp_class(), TelemetryKindOtlp::Logs);
-    assert!(!record.accepted_by_native_ingest());
     assert_eq!(TelemetryEnvelope::new("host", record).schema_version, NEW_KIND_SCHEMA_VERSION);
 }
 
@@ -405,14 +403,14 @@ fn removals_and_census_only_repos_survive_a_split() {
             visibility: RepoVisibility::Private,
             main_ci: None,
             halt: None,
-            in_flight: None,
-            cap: None,
-            deferred_repo_cap: None,
+
             queue_depth: None,
             queue_flow: None,
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: None,
@@ -425,14 +423,14 @@ fn removals_and_census_only_repos_survive_a_split() {
             visibility: RepoVisibility::Private,
             main_ci: None,
             halt: None,
-            in_flight: None,
-            cap: None,
-            deferred_repo_cap: None,
+
             queue_depth: None,
             queue_flow: None,
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -475,14 +473,14 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
         visibility: RepoVisibility::Private,
         main_ci: None,
         halt: None,
-        in_flight: None,
-        cap: None,
-        deferred_repo_cap: None,
+
         queue_depth: None,
         queue_flow: None,
         triage_depth: None,
         triage_flow: None,
         curator: None,
+        pending_queue: None,
+        operator_recency: None,
         ready_complete: false,
         ready_replace: true,
         census: None,

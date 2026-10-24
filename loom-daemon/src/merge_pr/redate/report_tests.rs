@@ -1,8 +1,7 @@
 //! Tests for `merge-pr redate-report` (#9746), over fixture `git log` output.
 
 use super::*;
-use crate::merge_pr::redate::attribution::Attribution;
-use crate::merge_pr::redate::commit_message_with;
+use crate::merge_pr::redate::commit_message;
 
 const SUBJ: &str = " (#8248 guard, automated by #8508)";
 
@@ -119,10 +118,11 @@ fn missing_path_trailers_read_as_none() {
     assert_eq!((key.clause.as_str(), key.base_path.as_str()), ("none", "none"));
 }
 
-/// End to end against a real repository: the producer's message, committed and
+/// End to end against a real repository: a re-date message as the retired
+/// producer wrote it (#9746 trailers as the final paragraph), committed and
 /// read back through the report's own `git log` invocation.
 #[test]
-fn the_report_reads_back_what_commit_message_with_writes() {
+fn the_report_reads_back_what_the_retired_producer_wrote() {
     let dir = std::env::temp_dir().join(format!("loom-redate-report-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("tmp dir");
@@ -144,25 +144,23 @@ fn the_report_reads_back_what_commit_message_with_writes() {
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     git(&["init", "-q", "-b", "main"]);
-    let a = Attribution {
-        check: "Structural Checks (Role Prompt Prefix Ratchet)".into(),
-        clause: "the base move and this PR both touch this check's coupled inputs".into(),
-        base_path: Some("CLAUDE.md".into()),
-        pr_path: Some("defaults/docs/eta.md".into()),
-    };
+    let trailers = "Stale-Check: Structural Checks (Role Prompt Prefix Ratchet)\n\
+Stale-Clause: the base move and this PR both touch this check's coupled inputs\n\
+Coupled-Base-Path: CLAUDE.md\n\
+Coupled-PR-Path: defaults/docs/eta.md";
     git(&[
         "commit",
         "-q",
         "--allow-empty",
         "-m",
-        &commit_message_with("9743", Some(&a)),
+        &format!("{}\n\n{trailers}", commit_message("9743")),
     ]);
     git(&[
         "commit",
         "-q",
         "--allow-empty",
         "-m",
-        &commit_message_with("9698", None),
+        &commit_message("9698"),
     ]);
     git(&["commit", "-q", "--allow-empty", "-m", "feat: unrelated"]);
 

@@ -34,6 +34,15 @@
 //! rather than `Closes #N` — so a flipped label mostly *misreports* state
 //! rather than causing a duplicate build.
 //!
+//! **Superseded in part by #11852.** An issue now keeps `loom:building` while
+//! its PR is open (Loom's state machine), so [`reclaim_and_warn`] holds — writes
+//! nothing — when the open-PR listing names a linked PR
+//! ([`crate::claim_reconciliation::open_pr_hold`]). The premise above, that a
+//! `loom:issue` beside an open PR is harmless, was wrong: every tick paid to
+//! refuse it. An abandoned PR is not stranded by the hold: closing it unmerged
+//! lets the next pass reclaim. The warning below still fires when the listing
+//! could not be read and the reclaim went ahead.
+//!
 //! What was missing was the ability to see it happen. `daemon.log` recorded the
 //! reclaim and its reason, and an operator had no way to tell that particular
 //! line apart from the thousands of legitimate ones without manually
@@ -56,6 +65,9 @@ pub(crate) enum Reclaim {
     /// The issue is `loom:frozen` (#11743): nothing was written, so the
     /// caller must not count or log it as a reclaim.
     Frozen,
+    /// The issue has this open linked PR (#11852): it keeps `loom:building`
+    /// while the PR is open, so nothing was written and it is not a reclaim.
+    HeldByOpenPr(u32),
 }
 
 /// Reclaim `issue`'s `loom:building` label, then warn if the forge says
@@ -64,7 +76,8 @@ pub(crate) enum Reclaim {
 /// A wrapper around [`crate::claim_reconciliation::forge::reclaim`]: an error
 /// is that call's, unchanged, and the diagnostic runs only on success (a
 /// failed flip changed nothing worth explaining). `Ok(Reclaim::Frozen)` is the
-/// frozen skip, which wrote nothing.
+/// frozen skip and `Ok(Reclaim::HeldByOpenPr)` the open-PR hold (#11852);
+/// neither wrote anything.
 pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result<Reclaim> {
     // #11480: an item another hold took out of the queue loses only the stale
     // claim; `loom:issue` is not re-added.
@@ -83,6 +96,12 @@ pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result
             root.display()
         );
         return release_claim_only(gh_bin, root, issue).map(|()| Reclaim::Released);
+    }
+    // #11852: last, and only when the reclaim would re-add `loom:issue` — an
+    // issue keeps `loom:building` while its PR is open. Fail-open.
+    if let Some(pr) = crate::claim_reconciliation::open_pr_hold::open_linked_pr(gh_bin, root, issue)
+    {
+        return Ok(Reclaim::HeldByOpenPr(pr));
     }
     crate::claim_reconciliation::forge::reclaim(gh_bin, root, issue)?;
     if let Some(pr) = open_pr_on_issue_branch(gh_bin, root, issue) {

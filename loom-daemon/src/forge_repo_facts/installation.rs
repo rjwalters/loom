@@ -387,18 +387,33 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
     }
 }
 
-/// The credentials a read of `owner_repo` would run under, in order: the
-/// repo's reader App (when one is usable), then the writer's credential for
-/// the owner (else this process's own).
+/// The credentials a telemetry read of `owner_repo` may run under: the
+/// repo's reader App when one is usable. The writer's credential for the
+/// owner (else this process's own) only on a host with **no reader pool**
+/// (#12394, #12584: the writer is never used for reads); a pooled host whose
+/// readers cannot serve the owner gets no credential, so the lookup answers
+/// [`Answer::Unavailable`] and visibility fails private.
 pub(crate) fn read_credentials(owner_repo: &str) -> Vec<Credential> {
-    let mut creds = Vec::new();
-    if let Some((dir, app_id)) = crate::forge_identity::read_credential(owner_repo, None) {
-        creds.push(Credential::reader(dir, &app_id, owner_repo));
-    }
-    creds.push(Credential::writer(crate::credential_preflight::gh_config_dir_for_owner_slug(
+    read_credentials_with(
+        crate::forge_identity::read_credential(owner_repo, None),
+        crate::gh_invocation::host_has_read_pool(),
         owner_repo,
-    )));
-    creds
+    )
+}
+
+/// [`read_credentials`] with the reader lookup and the pool test injected.
+pub(crate) fn read_credentials_with(
+    reader: Option<(PathBuf, String)>,
+    pooled: bool,
+    owner_repo: &str,
+) -> Vec<Credential> {
+    match reader {
+        Some((dir, app_id)) => vec![Credential::reader(dir, &app_id, owner_repo)],
+        None if pooled => Vec::new(),
+        None => vec![Credential::writer(
+            crate::credential_preflight::gh_config_dir_for_owner_slug(owner_repo),
+        )],
+    }
 }
 
 /// [`lookup_repo_with`] for a telemetry read of `owner_repo` under the

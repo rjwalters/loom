@@ -90,6 +90,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use super::floor_roll;
 use super::pause_classify::{self, ClassifyInput};
 use super::pause_manifest::{
     self, Disposition, ItemStatus, ManifestEvent, ManifestItem, PauseManifest, Phase, Roll,
@@ -156,6 +157,10 @@ pub struct RollTarget {
     /// The artifact identity a later tick compares a fresh release against to
     /// supersede this roll (#8514). `None` for a roll with no artifact.
     pub label: Option<String>,
+    /// The fleet floor in force when this roll was armed (#12610), so H4 can
+    /// tell a floor lowered since from one that stood. `None` when the roll
+    /// is not floor-driven or no floor was known.
+    pub floor_at_arm: Option<String>,
 }
 
 impl RollTarget {
@@ -169,6 +174,7 @@ impl RollTarget {
             to_version: None,
             to_artifact_sha256: None,
             label: None,
+            floor_at_arm: None,
         }
     }
 
@@ -180,6 +186,7 @@ impl RollTarget {
             to_version: None,
             to_artifact_sha256: None,
             label: None,
+            floor_at_arm: None,
         }
     }
 }
@@ -422,7 +429,7 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         status: ItemStatus::Planned,
         reason: verdict.reason,
         issue: c.issue,
-        pr: None,
+        pr: c.pr,
         pid: c.pid,
         // The observed process start when the snapshot has one (it is the
         // identity the teardown checks), else the registry's record.
@@ -438,10 +445,17 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         worktree: c.worktree.clone(),
         // A sweep's claim is its issue's `loom:building`; a role run's is
         // whatever its claim breadcrumb recorded (#10832), if anything.
-        claim: c.issue.map_or_else(
-            || c.role_claim().map(|claim| claim.manifest_value()),
-            |_| Some(serde_json::json!({ "label": "loom:building", "on": "issue" })),
-        ),
+        claim: match (c.step, c.issue) {
+            // A step's claim is its role's (#11898): the claim label on its
+            // item, or, for the merge step, the PR lease alone.
+            (Some(step), _) => Some(serde_json::json!({
+                "label": step.claim_label(),
+                "on": if step.acts_on_pr() { "pr" } else { "issue" },
+                "step": step.as_str(),
+            })),
+            (None, Some(_)) => Some(serde_json::json!({ "label": "loom:building", "on": "issue" })),
+            (None, None) => c.role_claim().map(|claim| claim.manifest_value()),
+        },
         lease_comment_id: None,
         lease_refreshed_at: None,
         log_path: c.log_path.clone(),
@@ -450,6 +464,7 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         timeout_remaining_secs: c.timeout_remaining_secs,
         holds_issue_creation_mutex: c.holds_issue_creation_mutex,
         stopped_at: None,
+        step: c.step,
     }
 }
 
@@ -549,6 +564,51 @@ impl Run<'_> {
                 p.exited += 1;
             }
         });
+    }
+
+    /// Why the floor no longer asks for this roll, when it does not (#12610).
+    /// Only a floor-driven roll can be withdrawn this way.
+    fn floor_withdrawn(&self) -> Option<String> {
+        if self.plan.target.source != TargetSource::Floor || self.drain.then_exit() {
+            return None;
+        }
+        let driving = crate::fleet_sync::repo_ahead_min().is_some();
+        floor_roll::disarm_reason(
+            self.plan.target.floor_at_arm.as_deref(),
+            &self.host.fresh_floor(),
+            &self.plan.from_version,
+            driving,
+        )
+    }
+
+    /// Disarm a roll the floor withdrew: nothing has been stopped, so end the
+    /// pause, resume dispatch, drop the pending roll and say why. The staged
+    /// binary stays on disk unused.
+    fn disarm(&mut self, why: &str) -> H4Outcome {
+        let to = self.plan.target.to_version.clone().unwrap_or_default();
+        let note = format!("roll to {to} disarmed: {why}. Dispatch resumed; no agent was stopped.");
+        if !self
+            .drain
+            .pause_abort_uncommitted(self.plan.generation, note.clone())
+        {
+            // Promoted or already gone: someone else owns the drain.
+            let promoted =
+                self.drain.pause_ownership(self.plan.generation) == PauseOwnership::Promoted;
+            return self.stand_down(promoted);
+        }
+        self.ledger.undo(self.host.as_ref());
+        self.host.close_dispatch(false, &self.manifest.manifest_id);
+        log::warn!("auto_update: {note}");
+        self.host.emit(
+            "daemon.roll.disarmed",
+            serde_json::json!({
+                "manifest_id": self.manifest.manifest_id,
+                "reason": why,
+                "to_version": self.plan.target.to_version,
+                "trigger": self.plan.target.source.as_str(),
+            }),
+        );
+        H4Outcome::StoodDown { promoted: false }
     }
 
     /// Undo a pause that has stopped nothing: withdraw every pause request,
@@ -799,8 +859,16 @@ pub(crate) fn run_h4_with(
         }
     }
 
-    // ---- Step 4: tear down the requeue items at once --------------------------
+    // ---- Step 3b: is the floor still asking for this roll? (#12610) ------------
+    // The floor may have been rolled back since the roll was armed, and this
+    // host's last sync may predate it. Re-read it from the store before the
+    // first agent is stopped; after that the roll is committed and completes.
     enter!(4);
+    if let Some(why) = run.floor_withdrawn() {
+        return run.disarm(&why);
+    }
+
+    // ---- Step 4: tear down the requeue items at once --------------------------
     let stop_started = Instant::now();
     let deadline = stop_started + tuning.pause_budget;
     let stop_bound = stop_started + tuning.stop_bound();
