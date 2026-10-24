@@ -24,23 +24,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DAEMON_BUILD="$REPO_ROOT/scripts/daemon-build.sh"
 INSTALL_LOOM="$REPO_ROOT/scripts/install-loom.sh"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  TOTAL=$((TOTAL + 1))
-  if [[ "$expected" == "$actual" ]]; then
-    echo "PASS: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo "FAIL: $desc"
-    echo "  expected: '$expected'"
-    echo "  actual:   '$actual'"
-    FAIL=$((FAIL + 1))
-  fi
-}
+source "$SCRIPT_DIR/lib/assert.sh"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT

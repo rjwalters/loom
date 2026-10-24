@@ -157,6 +157,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_account_ms",
     // #12410: the tick's draws and passes by reason (`ops::dispatch_facts`).
     "loom.dispatch.passes",
+    // #13008: the tick's exclusions by reason, `held_at_head` among them.
+    "loom.dispatch.excluded",
     "loom.dispatch.draws",
     "loom.dispatch.draws_unspawned",
     // #12494: merge steps held back before the draw by a repo's merge in

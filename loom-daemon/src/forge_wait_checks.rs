@@ -480,8 +480,8 @@ fn poll(
     // A failure needs no required set, `--settle-red` included (#12022): it
     // waits only on observed pending checks, so a failed lookup (#11837)
     // cannot hide a finished red.
-    let needs_required =
-        opts.required_only || (rollup.blocking_pending().is_empty() && rollup.failing.is_empty());
+    let needs_required = opts.required_only
+        || (rollup.blocking_pending().is_empty() && rollup.blocking_failing().is_empty());
     let required = if needs_required {
         resolve_required(reads, st)?
     } else {
@@ -510,7 +510,7 @@ fn poll(
         verdict::decide(&rollup, required.as_deref(), opts.required_only)
     };
     st.early_red = if opts.settle_red && matches!(decision, Decision::Pending(_)) {
-        rollup.failing.clone()
+        rollup.blocking_failing()
     } else {
         Vec::new()
     };

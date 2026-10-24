@@ -1,7 +1,7 @@
 //! The detached renewal loop behind a won `lease pr claim` (#9401).
 //!
 //! The issue path's renewer is `sweep-lease-renew.sh` (#6180), a shell
-//! `contract` file whose portable growth the shell budget refuses outright
+//! `contract` file whose portable growth is not admitted
 //! (see `cli::lease_ensure`'s module docs), and whose readers all assume the
 //! `loom:lease host=` marker. So the PR lease gets a small Rust loop, reusing
 //! the issue renewer's single-owner bookkeeping (`cli::lease_renewer`, #10229):

@@ -23,7 +23,7 @@
 //! lint script is not admissible. A `#[test]` in `loom-daemon/tests/` is
 //! already wired into CI (`cargo nextest run --workspace`, the `backend-tests`
 //! job) and needs no new workflow step. The precedent it follows is
-//! `defaults_symlink_containment.rs` / `shell_budget_ratchet.rs`: static
+//! `defaults_symlink_containment.rs`: static
 //! assertions over the repo tree, no daemon needed.
 //!
 //! # The fix a finding wants

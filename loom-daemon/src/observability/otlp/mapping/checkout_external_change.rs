@@ -40,8 +40,7 @@ pub(super) fn log_parts(
     if let Some(repo) = &r.repo {
         attributes.push(kv_string("loom.repo", repo.clone()));
     }
-    attributes
-        .push(kv_string("loom.repo.visibility", super::metadata::visibility_str(r.visibility)));
+    attributes.push(kv_string("loom.repo.visibility", r.visibility.as_str()));
     let body = serde_json::to_string(r).unwrap_or_default();
     Some(("checkout.external_change", SeverityNumber::Warn, nanos(r.at), attributes, body))
 }

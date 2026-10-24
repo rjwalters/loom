@@ -1048,6 +1048,31 @@ mod tests {
         Ok(())
     }
 
+    /// #13100: a quality row recorded through `record_quality_from_output` with a
+    /// real input id must join to its `agent_inputs` row in the effectiveness view.
+    #[test]
+    fn test_quality_from_output_joins_effectiveness() -> rusqlite::Result<()> {
+        let (conn, _temp_dir) = setup_test_db()?;
+        conn.execute(
+            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
+              VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
+            [],
+        )?;
+        let input_id: i64 = conn.last_insert_rowid();
+
+        let output = "running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored\n";
+        let recorded = super::super::quality::record_quality_from_output(&conn, input_id, output)
+            .expect("record quality");
+        assert!(recorded.is_some());
+
+        let effectiveness = query_agent_effectiveness(&conn, Some("builder"))?;
+        assert_eq!(effectiveness.len(), 1);
+        assert_eq!(effectiveness[0].successful_prompts, 1);
+        assert!(effectiveness[0].quality_data_available);
+
+        Ok(())
+    }
+
     /// #6128: a role whose prompts were only ever recorded via `SendInput`
     /// (an `agent_inputs` row) and never correlated with a
     /// `GetTerminalOutput`-parsed `resource_usage`/`quality_metrics` row

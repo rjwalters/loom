@@ -442,6 +442,7 @@ fn pr_hold(
     }
     let hold = match kind {
         HoldKind::MergeRisk => "merge-risk",
+        HoldKind::Ratification => "ratification",
         HoldKind::CriticalFile => "critical-file",
     };
     // Only `loom:operator` itself, the one name Champion ever wrote for its

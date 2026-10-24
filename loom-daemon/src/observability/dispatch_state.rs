@@ -109,6 +109,14 @@ pub struct StateRow {
     pub reeval_next: Option<DateTime<Utc>>,
     pub iw: Option<u64>,
     pub weight: Option<u64>,
+    /// The issue a PR row closes, for locating its sweep checkpoint. Never
+    /// emitted.
+    pub issue: Option<u32>,
+    /// Qualifying Judge rejections of this Doctor PR's GLM attempts, from the
+    /// sweep checkpoint; `None` when no escalation state was read for this PR.
+    pub doctor_rejections: Option<u32>,
+    /// The GLM-to-Claude escalation latch for this Doctor PR, same source.
+    pub doctor_escalated: Option<bool>,
 }
 
 /// A [`StateRow`] with its repo resolved.
@@ -144,6 +152,10 @@ impl Signature {
 struct Tracked {
     signature: Signature,
     emitted_at: DateTime<Utc>,
+    /// First tick this process saw the item `claimed`, kept while it stays
+    /// claimed. A lower bound on the claim start: a restart or a claim made
+    /// between ticks is first observed late.
+    claimed_since: Option<DateTime<Utc>>,
 }
 
 /// Per-`(slug, number)` last-emitted signature and emission time. A pure
@@ -175,6 +187,12 @@ impl StateTracker {
         for (i, r) in rows.iter().enumerate() {
             let key = (r.slug.clone(), r.row.number);
             let signature = Signature::of(&r.row);
+            let claimed_since = (r.row.exclusion.as_deref() == Some("claimed")).then(|| {
+                self.last
+                    .get(&key)
+                    .and_then(|prev| prev.claimed_since)
+                    .unwrap_or(now)
+            });
             let (transition, emitted_at) = match self.last.get(&key) {
                 Some(prev) if prev.signature == signature => {
                     if now.signed_duration_since(prev.emitted_at) >= refresh {
@@ -193,6 +211,7 @@ impl StateTracker {
                 Tracked {
                     signature,
                     emitted_at,
+                    claimed_since,
                 },
             );
         }
@@ -203,6 +222,17 @@ impl StateTracker {
         }
         self.last = next;
         out
+    }
+}
+
+impl StateTracker {
+    /// When `(slug, number)` was first observed `claimed`, as of the last
+    /// [`Self::diff`]; `None` when it is not claimed or not tracked.
+    #[must_use]
+    pub fn claimed_since(&self, slug: &str, number: u32) -> Option<DateTime<Utc>> {
+        self.last
+            .get(&(slug.to_string(), number))
+            .and_then(|t| t.claimed_since)
     }
 }
 
@@ -222,6 +252,7 @@ pub fn build_record(
     transition: StateTransition,
     host: &str,
     sampled_at: DateTime<Utc>,
+    claimed_since: Option<DateTime<Utc>>,
 ) -> DispatchStateRecord {
     let row = &r.row;
     DispatchStateRecord {
@@ -238,6 +269,9 @@ pub fn build_record(
         reeval_next: row.reeval_next,
         iw: row.iw,
         weight: row.weight,
+        claimed_since,
+        doctor_rejections: row.doctor_rejections,
+        doctor_escalated: row.doctor_escalated,
         transition,
         sampled_at,
         visibility: r.visibility,
@@ -251,9 +285,9 @@ pub fn build_record(
 pub fn resolve_rows(
     rows: Vec<StateRow>,
     observed: &BTreeSet<usize>,
-    resolve: impl Fn(usize) -> Option<crate::telemetry::queue_snapshot::QueueRepoRef>,
+    resolve: impl Fn(usize) -> Option<crate::telemetry::queue_repo::QueueRepoRef>,
 ) -> (Vec<ResolvedRow>, HashSet<String>) {
-    let mut by_idx: HashMap<usize, Option<crate::telemetry::queue_snapshot::QueueRepoRef>> =
+    let mut by_idx: HashMap<usize, Option<crate::telemetry::queue_repo::QueueRepoRef>> =
         HashMap::new();
     let mut resolved = Vec::with_capacity(rows.len());
     for row in rows {
@@ -283,10 +317,15 @@ static TRACKER: OnceLock<Mutex<StateTracker>> = OnceLock::new();
 /// workspaces classified this tick (a held one is not), `roots` the tick's
 /// workspace roots by index. A no-op without the OTLP sink. Makes no forge
 /// call.
-pub fn observe(rows: Vec<StateRow>, observed: &BTreeSet<usize>, roots: &[PathBuf]) {
+pub fn observe(mut rows: Vec<StateRow>, observed: &BTreeSet<usize>, roots: &[PathBuf]) {
     let Some(sink) = GLOBAL_SINK.get() else {
         return;
     };
+    for row in &mut rows {
+        if let Some(root) = roots.get(row.ws_idx) {
+            attach_doctor_state(row, root);
+        }
+    }
     let (resolved, slugs) = resolve_rows(rows, observed, |idx| {
         roots
             .get(idx)
@@ -294,14 +333,51 @@ pub fn observe(rows: Vec<StateRow>, observed: &BTreeSet<usize>, roots: &[PathBuf
     });
     let now = Utc::now();
     let refresh = Duration::seconds(refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref()));
-    let emissions = TRACKER
+    let mut tracker = TRACKER
         .get_or_init(|| Mutex::new(StateTracker::default()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .diff(&resolved, &slugs, now, refresh);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let emissions = tracker.diff(&resolved, &slugs, now, refresh);
     for (i, transition) in emissions {
-        sink.push(build_record(&resolved[i], transition, &sink.host_id, now));
+        let r = &resolved[i];
+        let claimed_since = tracker.claimed_since(&r.slug, r.row.number);
+        sink.push(build_record(r, transition, &sink.host_id, now, claimed_since));
     }
+}
+
+/// Fill a Doctor PR row's escalation facts from the workspace's sweep
+/// checkpoint (a local read, no forge call). Unread or unrelated state leaves
+/// them `None`: unknown, never `0` or `false`.
+fn attach_doctor_state(row: &mut StateRow, root: &std::path::Path) {
+    if row.artifact != Artifact::Pr || row.step.as_deref() != Some("doctor") {
+        return;
+    }
+    let dir = root.join(".loom/sweep-checkpoint");
+    let mut candidates = Vec::new();
+    if let Some(issue) = row.issue {
+        candidates.push(dir.join(format!("issue-{issue}.json")));
+    }
+    candidates.push(dir.join(format!("pr-{}-doctor.json", row.number)));
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Some((rejections, escalated)) = doctor_state_from(&bytes, row.number) {
+            row.doctor_rejections = Some(rejections);
+            row.doctor_escalated = Some(escalated);
+            return;
+        }
+    }
+}
+
+/// `(rejections, escalated)` from a checkpoint's `doctor_escalation` state,
+/// only when that state belongs to `pr`.
+#[must_use]
+pub fn doctor_state_from(checkpoint: &[u8], pr: u32) -> Option<(u32, bool)> {
+    let value: serde_json::Value = serde_json::from_slice(checkpoint).ok()?;
+    let state: crate::doctor_escalation::State =
+        serde_json::from_value(value.get("doctor_escalation")?.clone()).ok()?;
+    (state.pr == u64::from(pr)).then_some((state.rejections, state.escalated))
 }
 
 #[cfg(test)]

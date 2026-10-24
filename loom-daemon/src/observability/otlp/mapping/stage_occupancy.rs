@@ -13,14 +13,7 @@ use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::{kv_string, nanos};
-use crate::telemetry::{RepoVisibility, TelemetryRecord};
-
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
+use crate::telemetry::TelemetryRecord;
 
 /// `(event_name, severity, record time, attributes, body)` for an
 /// `eta.stage_occupancy` record; `None` for every other kind.
@@ -30,10 +23,7 @@ pub(super) fn log_parts(
     let TelemetryRecord::StageOccupancy(r) = record else {
         return None;
     };
-    let mut attributes = vec![kv_string(
-        "loom.repo.visibility",
-        visibility_str(r.visibility),
-    )];
+    let mut attributes = vec![kv_string("loom.repo.visibility", r.visibility.as_str())];
     if let Some(repo) = &r.repo {
         attributes.push(kv_string("loom.repo", repo.clone()));
     }

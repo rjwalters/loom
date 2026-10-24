@@ -293,6 +293,20 @@ fn hold_reason_code(reason: Option<&str>) -> &'static str {
     }
 }
 
+/// Env the critical-file hold tick sets on a re-arm whose cause was an
+/// unreadable forge compare (`unread`), so the `hold.transition` trigger can
+/// tell it from a real change (#13114). The park `--reason` must stay the
+/// exact hold reason `body_declares_hold` matches, so it cannot carry this.
+pub const HOLD_EQUIVALENCE_ENV: &str = "LOOM_HOLD_EQUIVALENCE";
+
+/// The `hold.transition` trigger token for a Champion park.
+fn hold_trigger(equivalence: Option<&str>) -> &'static str {
+    match equivalence {
+        Some("unread") => "champion_role_equivalence_unread",
+        _ => "champion_role",
+    }
+}
+
 /// Journal the `loom:blocked` write on a Champion park of a PR as a hold
 /// `add` (#12665). `confirmed` is `false` for a write that failed. Best-effort
 /// and a no-op outside a journaled run or for any other role.
@@ -304,7 +318,7 @@ fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
         req.number,
         crate::telemetry::kinds::hold_transition::transition::ADD,
         hold_reason_code(req.reason.as_deref()),
-        "champion_role",
+        hold_trigger(std::env::var(HOLD_EQUIVALENCE_ENV).ok().as_deref()),
         confirmed,
         None,
     );
@@ -328,6 +342,18 @@ pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::hold_trigger;
+
+    #[test]
+    fn an_unread_compare_rearm_has_its_own_trigger() {
+        assert_eq!(hold_trigger(Some("unread")), "champion_role_equivalence_unread");
+        assert_eq!(hold_trigger(Some("changed")), "champion_role");
+        assert_eq!(hold_trigger(None), "champion_role");
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
