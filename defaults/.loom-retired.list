@@ -179,3 +179,6 @@ scripts/tests/test-judge-fanout-experiment.sh
 
 # #13020 (2026-10-21) — the orphaned heredoc-body-safety test lib is removed (PR #13023).
 scripts/tests/lib/heredoc-body-safety.sh
+
+# #13118 (2026-10-24) — worktree-return.sh and worktree.sh --return-to are removed (PR #13160).
+scripts/worktree-return.sh
