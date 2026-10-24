@@ -66,6 +66,7 @@ pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
         MetricName::QueueListingIncompleteRepos,
         int(summary.listing_incomplete.len()),
     ));
+    points.push(MetricPoint::int(MetricName::QueueSeen, int(summary.seen)));
     points.extend(already_landed_points(summary));
     points.extend(host_shard_point(summary));
     points

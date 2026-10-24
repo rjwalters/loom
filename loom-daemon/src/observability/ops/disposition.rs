@@ -144,6 +144,8 @@ pub const UNKNOWN_VALUE: &str = "unknown";
 /// | `gate` | `RowPlan::gate` | `loom.queue.gate` | `capacity`/`build_backoff`/`file_overlap`/`unknown`; only when the plan names one |
 /// | `step` | `RowPlan::step` | `loom.queue.step` | a `Step` name or `unknown`; only when the row names one (absent = `builder`, as on the wire) |
 /// | `owning_shard` | `RowPlan::owning_shard` | `loom.queue.owning_shard` | integer < `shard_count`; only when sharding is configured |
+/// | `level` | `ReadyQueueRow::level` | `loom.queue.level` | `default`/`important`/`very-important`; present on every emission that has a row |
+/// | `workspace_weight` | `ReadyQueueRow::workspace_weight` | `loom.queue.workspace_weight` | integer (the owning workspace's draw weight) |
 /// | `created_at` | `ReadyQueueRow::created_at` | `loom.queue.created_at` | RFC 3339 UTC, seconds precision; only when the listing supplied a parseable one |
 ///
 /// Every field is `None` on a `left_queue` emission.
@@ -154,6 +156,8 @@ pub struct PlanAttributes {
     pub gate: Option<&'static str>,
     pub step: Option<&'static str>,
     pub owning_shard: Option<u32>,
+    pub level: Option<&'static str>,
+    pub workspace_weight: Option<u32>,
     pub created_at: Option<String>,
 }
 
@@ -216,6 +220,8 @@ impl PlanAttributes {
             gate: row.plan.gate.map(plan_gate_token),
             step: row.plan.step.as_ref().map(plan_step_token),
             owning_shard: row.plan.owning_shard,
+            level: Some(row.level.as_str()),
+            workspace_weight: Some(row.workspace_weight),
             created_at: created_at_token(row.created_at.as_deref()),
         }
     }
@@ -236,6 +242,12 @@ impl PlanAttributes {
         }
         if let Some(shard) = self.owning_shard {
             attributes.insert("loom.queue.owning_shard".to_string(), shard.to_string());
+        }
+        if let Some(level) = self.level {
+            attributes.insert("loom.queue.level".to_string(), level.to_string());
+        }
+        if let Some(weight) = self.workspace_weight {
+            attributes.insert("loom.queue.workspace_weight".to_string(), weight.to_string());
         }
         if let Some(created_at) = &self.created_at {
             attributes.insert("loom.queue.created_at".to_string(), created_at.clone());
