@@ -598,6 +598,7 @@ fn judge_step(item: u32, outcome_line: Option<&str>) -> Source {
         step: StepRole::Judge,
         item,
         log_text: Some(text),
+        hold_auth_before: None,
     })
 }
 
