@@ -132,6 +132,9 @@ pub const LINEAGE_MAX: usize = 4096;
 /// How long a lineage record outlives the end it records (#12875): the
 /// no-progress ladder's last rung, so a retry after a long hold still joins.
 pub const LINEAGE_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+/// How long an ended assignment id is remembered (#13009): well past the
+/// assignment TTL, which bounds how stale a heartbeat can be.
+const ENDED_ID_MAX_AGE: Duration = Duration::from_secs(3600);
 /// The most expired assignments buffered for the server to report between
 /// two drains (#12875).
 const EXPIRED_BUFFER_MAX: usize = 1024;
@@ -419,6 +422,9 @@ pub struct ExpiredAssignment {
     pub item: u64,
     pub step: String,
     pub assignment_id: String,
+    /// The repo's `champion_merge` holder once this row was gone, for a
+    /// `champion_merge` row (#13009).
+    pub merge_slot_holder: Option<String>,
 }
 
 /// A no-progress hold on one `(repo, item, step)` (module docs).
@@ -447,6 +453,10 @@ pub struct Table {
     hosts: BTreeMap<String, HostState>,
     cooldowns: BTreeMap<(String, u64, String), Cooldown>,
     lineage: BTreeMap<(String, u64, String), LineageRecord>,
+    /// Assignment ids that ended here (released, refused or expired), with
+    /// when. A heartbeat built before the end can still list the step; it
+    /// must not bring the row back (#13009). Bounded like `lineage`.
+    ended_ids: BTreeMap<String, Mono>,
     expired_rows: Vec<ExpiredAssignment>,
     next_id: u64,
 }
@@ -473,6 +483,7 @@ impl Table {
             hosts: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
             lineage: BTreeMap::new(),
+            ended_ids: BTreeMap::new(),
             expired_rows: Vec::new(),
             next_id: 0,
         }
@@ -603,6 +614,9 @@ impl Table {
                     RowState::Granted | RowState::Live => {
                         expired.assignments += 1;
                         self.note_ended(&key, &row, PrevEnd::Expired, now);
+                        let merge_slot_holder = (row.step == StepRole::ChampionMerge.as_str())
+                            .then(|| self.merge_holder(&key.0).map(str::to_string))
+                            .flatten();
                         if self.expired_rows.len() < EXPIRED_BUFFER_MAX {
                             self.expired_rows.push(ExpiredAssignment {
                                 host: row.host,
@@ -610,6 +624,7 @@ impl Table {
                                 item: key.1,
                                 step: row.step,
                                 assignment_id: row.assignment_id,
+                                merge_slot_holder,
                             });
                         }
                     }
@@ -617,6 +632,8 @@ impl Table {
             }
         }
         self.lineage.retain(|_, l| l.at.plus(LINEAGE_MAX_AGE) > now);
+        self.ended_ids
+            .retain(|_, at| at.plus(ENDED_ID_MAX_AGE) > now);
         // A streak is forgotten once its hold has been over for the
         // ladder's last rung (module docs), which also bounds the map.
         let forget = self.policy.no_progress[self.policy.no_progress.len() - 1];
@@ -634,6 +651,18 @@ impl Table {
 
     /// Record that `row`, at `key`, ended as `end`.
     fn note_ended(&mut self, key: &(String, u64), row: &Row, end: PrevEnd, now: Mono) {
+        self.ended_ids.insert(row.assignment_id.clone(), now);
+        while self.ended_ids.len() > LINEAGE_MAX {
+            let oldest = self
+                .ended_ids
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => self.ended_ids.remove(&id),
+                None => break,
+            };
+        }
         let triple = (key.0.clone(), key.1, row.step.clone());
         let ended = self
             .lineage
@@ -710,6 +739,16 @@ impl Table {
                 // first holder.
                 Some(_) => {}
             }
+            return;
+        }
+        // An id this captain already ended: the heartbeat was built before
+        // the end, and a row for it would hold the item (and the repo's
+        // merge slot) until its lease ran out (#13009).
+        if live
+            .assignment_id
+            .as_ref()
+            .is_some_and(|id| self.ended_ids.contains_key(id))
+        {
             return;
         }
         // A new row. Keep the worker's assignment id (a grant from before a
@@ -978,6 +1017,17 @@ impl Table {
             },
         );
         true
+    }
+
+    /// The assignment id of the repo's `champion_merge` row, if any (#13009):
+    /// what a span reports so a holder that outlives its release shows.
+    #[must_use]
+    pub fn merge_holder(&self, repo: &str) -> Option<&str> {
+        let merge = StepRole::ChampionMerge.as_str();
+        self.rows
+            .iter()
+            .find(|(k, row)| k.0 == repo && row.step == merge)
+            .map(|(_, row)| row.assignment_id.as_str())
     }
 
     fn own_key(&self, host: &str, assignment_id: &str) -> Option<(String, u64)> {
