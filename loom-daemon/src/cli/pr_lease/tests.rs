@@ -980,6 +980,44 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     assert!(!patched(dir.path()).contains("verdict=none"));
 }
 
+/// #13135: a pass a verdict gate refused is recorded as such, holds the PR
+/// only briefly, and a fresh Judge claims it once the cool-down is over.
+#[test]
+fn a_gate_refused_judge_pass_cools_down_briefly_then_a_fresh_judge_claims() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let a = on("host-a", "run-1");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+    let released = ctx(dir.path(), a.clone()).release(Some("gate-refused:stale-read"), None, None);
+    assert_eq!(released, EXIT_HELD);
+    assert!(
+        patched(dir.path()).contains(&a.released_marker_with(&format!(
+            " head={HEAD} verdict=none labels=review-requested refused=stale-read"
+        ))),
+        "{}",
+        patched(dir.path())
+    );
+    let fields = format!(" head={HEAD} verdict=none labels=review-requested refused=stale-read");
+    let marker = on("host-a", "run-1").released_marker_with(&fields);
+    // Inside the cool-down: refused, and the message names the gate.
+    let recent = Utc::now() - chrono::Duration::minutes(5);
+    fs::write(dir.path().join("rows"), row_at(10, recent, &marker)).unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    assert_eq!(c.claim(), backstop::EXIT_BACKSTOP);
+    let rows = c.gh.read_rows(77, &c.policy).unwrap();
+    let (until, why) = backstop::hold_with_reason(&rows, c.gh.pr_head(77), Utc::now()).unwrap();
+    assert_eq!(why.as_deref(), Some("stale-read"));
+    assert!(until > Utc::now());
+    // After it: a fresh Judge claims. Three such records never escalate.
+    let old = Utc::now() - chrono::Duration::minutes(30);
+    let rows = row_at(10, old, &marker)
+        + &row_at(11, old, &marker.replace("run-1", "run-0"))
+        + &row_at(12, old, &marker.replace("run-1", "run-9"));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), on("host-c", "run-3")).claim(), EXIT_HELD);
+}
+
 /// Acceptance (#11931): a timed-out run counts toward the three Judge runs an
 /// unchanged PR gets per 24 h.
 #[test]

@@ -1327,7 +1327,8 @@ impl Ctx {
                 match reaped {
                     None => {
                         let skipped = crate::judge_backstop::skipped_for_pending_ci(skip_reason);
-                        backstop::release_fields(self.me.role, head, |sha| {
+                        let refused = crate::judge_backstop::refusal_token(skip_reason);
+                        backstop::release_fields(self.me.role, head, refused.as_deref(), |sha| {
                             self.gh.ci_state(sha).exempts(skipped)
                         })
                     }
