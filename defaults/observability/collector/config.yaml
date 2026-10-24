@@ -233,11 +233,16 @@ processors:
           - 'replace_pattern(body, "github_pat_[A-Za-z0-9_]{20,}", "[REDACTED:github-token]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
           - 'replace_pattern(body, "sk-ant-[A-Za-z0-9_-]{16,}", "[REDACTED:anthropic-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
           - 'replace_pattern(body, "(?i)(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token)[\"'' ]*[:=][\"'' ]*sk-[A-Za-z0-9_-]{16,}", "[REDACTED:api-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
-          - 'replace_pattern(body, "AKIA[0-9A-Z]{16}", "[REDACTED:aws-access-key-id]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
-          - 'replace_pattern(body, "(?i)aws_secret_access_key[\"'' ]*[:=][\"'' ]*[A-Za-z0-9/+=]{40}", "[REDACTED:aws-secret-access-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?:AKIA|ASIA)[0-9A-Z]{16}", "[REDACTED:aws-access-key-id]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|secret[_-]?key)[\"'']?\\s*[:=]\\s*[\"'']?[A-Za-z0-9/+=]{40,}", "[REDACTED:aws-secret-access-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{6,}", "[REDACTED:jwt]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)(?:(?:\\?|&)(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\\s\"''()]*(?:&(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\\s\"''()]*)*&(?:sig|skoid|ske|skt)=[^&\\s\"''()]*(?:&(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\\s\"''()]*)*|(?:\\?|&)(?:sig|skoid|ske|skt)=[^&\\s\"''()]*(?:&(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\\s\"''()]*)+)", "[REDACTED:azure-sas]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)https?://[^\\s\"''()]*?(?:[?&](?:x-amz-signature|signature|sig)=)[^\\s\"''()]*", "[REDACTED:signed-url]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?:^|[\\s\"''=:;,(])(?:/harness-ops|/2am-logic)(?:/[A-Za-z0-9._*-]+)+", "[REDACTED:ssm-path]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
           - 'replace_pattern(body, "(?i)(?:password|passwd|secret|token|api[_-]?key)[\"'' ]*[:=][\"'' ]*[^\\s\"''&\\[]{6,}", "[REDACTED:credential]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
           - 'replace_pattern(body, "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[REDACTED:email]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
-          - 'replace_pattern(body, "(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "[REDACTED:private-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)[^\\n]*-----BEGIN[\\t ]+(?:[A-Z0-9]+[\\t ]+)*PRIVATE KEY-----(?s:.*?)(?:(?i:-----END[\\t ]+(?:[A-Z0-9]+[\\t ]+)*PRIVATE KEY-----)[^\\n]*|\\z)", "[REDACTED:private-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?i)-----BEGIN[\\t ]+(?:[A-Z0-9]+[\\t ]+)*PRIVATE KEY-----|-----END[\\t ]+(?:[A-Z0-9]+[\\t ]+)*PRIVATE KEY-----", "[REDACTED:private-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
   # Allow only Loom's structured operational attributes. Source-side privacy
   # enforcement owns free-text bodies, span names and nested values for every
   # record kind EXCEPT TWO:

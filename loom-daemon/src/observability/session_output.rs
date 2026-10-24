@@ -44,6 +44,7 @@
 //! 5 s, leaving ~3 s for the gateway, the backend and a consumer's polling
 //! cache. See `defaults/docs/session-output.md`.
 
+pub mod chunker;
 pub mod claude;
 pub mod latency;
 
@@ -196,7 +197,14 @@ impl SessionOutputSink {
     }
 
     /// Enqueue one record. Best-effort like every queue producer.
+    ///
+    /// The OTLP offer comes first and is unconditional; the S3 chunk tap
+    /// (2am#5933, when a store is registered) is an in-memory side copy and
+    /// can neither delay nor fail it.
     pub fn push(&self, record: SessionOutputRecord) {
+        if let Some(tap) = GLOBAL_CHUNKS.get() {
+            tap.offer(&record);
+        }
         self.queue.offer(TelemetryEnvelope::new(
             self.host_id.clone(),
             TelemetryRecord::SessionOutput(record),
@@ -219,6 +227,78 @@ impl std::fmt::Debug for SessionOutputSink {
             .field("host_id", &self.host_id)
             .field("queues", &self.queues.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// The S3 write path (2am#5933): the chunker plus the store its chunks go to.
+///
+/// Shared by every [`SessionOutputSink::push`]; the store is only ever called
+/// from [`Self::pump_due`], which the tick runs on the blocking pool.
+pub struct ChunkTap {
+    chunker: std::sync::Mutex<chunker::Chunker>,
+    store: Arc<dyn chunker::ChunkStore>,
+}
+
+impl ChunkTap {
+    fn offer(&self, record: &SessionOutputRecord) {
+        if !chunker::Chunker::admits(record) {
+            return;
+        }
+        if let Ok(mut chunker) = self.chunker.lock() {
+            chunker.offer(record, Utc::now());
+        }
+    }
+
+    /// Seal what is due and put whatever is queued. Blocking: runs the
+    /// store's I/O.
+    fn pump_due(&self, now: DateTime<Utc>) -> Vec<chunker::ChunkPointer> {
+        let Ok(mut chunker) = self.chunker.lock() else {
+            return Vec::new();
+        };
+        chunker.flush_due(now);
+        chunker.pump(self.store.as_ref())
+    }
+}
+
+static GLOBAL_CHUNKS: OnceLock<ChunkTap> = OnceLock::new();
+
+/// Register the artifact-store writer for chunked `session.output`
+/// (2am#5933). Until one is registered the S3 path is inert and the OTLP
+/// export is the only output.
+pub fn register_chunk_store(store: Arc<dyn chunker::ChunkStore>, host_id: &str) {
+    let _ = GLOBAL_CHUNKS.set(ChunkTap {
+        chunker: std::sync::Mutex::new(chunker::Chunker::new(host_id)),
+        store,
+    });
+}
+
+/// Run the tap's flush/put on the blocking pool and publish a pointer event
+/// for every chunk that was stored. A join failure is logged, never raised:
+/// the agent session and the OTLP path do not depend on this.
+async fn pump_chunks(sink: &SessionOutputSink, now: DateTime<Utc>) {
+    if GLOBAL_CHUNKS.get().is_none() {
+        return;
+    }
+    let pointers = tokio::task::spawn_blocking(move || {
+        GLOBAL_CHUNKS
+            .get()
+            .map(|tap| tap.pump_due(now))
+            .unwrap_or_default()
+    })
+    .await;
+    match pointers {
+        Ok(pointers) => {
+            for pointer in pointers {
+                sink.queue.offer(TelemetryEnvelope::new(
+                    sink.host_id.clone(),
+                    TelemetryRecord::DaemonEvent(crate::telemetry::DaemonEventRecord {
+                        topic: chunker::POINTER_TOPIC.to_string(),
+                        payload: pointer.payload(),
+                    }),
+                ));
+            }
+        }
+        Err(error) => log::warn!("session.output: chunk pump task failed: {error}"),
     }
 }
 
@@ -606,6 +686,7 @@ async fn tick(
     for record in records {
         sink.push(record);
     }
+    pump_chunks(sink, now).await;
 }
 
 /// Read every stream of one run and produce its records. Pure file I/O over
