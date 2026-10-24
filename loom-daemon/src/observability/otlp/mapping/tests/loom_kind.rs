@@ -185,6 +185,12 @@ fn samples() -> Vec<TelemetryRecord> {
         wire(json!({"kind": "hold.transition", "repo": "o/r", "pr": 7, "transition": "add",
                     "reason_code": "merge-risk-hold", "trigger": "champion_role",
                     "confirmed": true, "event_at": AT, "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "merge.lane_wait", "repo": "o/r", "pr": 7, "phase": "enter",
+                    "step": "champion_merge", "blocker_pr": 5, "blocker_source": "peer",
+                    "wait_started_at": AT, "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "champion.run", "repo": "o/r", "pr": 7,
+                    "sweep_id": "step-champion_merge-7-1", "outcome": "held",
+                    "verdict_reason": "held", "event_at": AT, "loom": p})),
         wire(json!({"kind": "merge_queue.event", "event": "merged", "pr": 7, "nonce": 1,
                     "at": AT, "loom": p})),
         wire(

@@ -13,8 +13,71 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-23
+
+- **PR #13067**: refactor: add fs_util::write_atomic and migrate five duplicate helpers
+- **Issue #13094** (closed): [ci-daily] Docker Image Smokes (unfiltered)
+- **PR #13092**: chore(harness): track latest CLIs — codex 0.163.0→0.164.0
+- **PR #13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
+- **Issue #13030** (closed): Name Champion's criteria and kept-set entries by meaning, not number (criterion #3 → critical-files)
+- **PR #12990**: refactor: share git/ANSI helpers across worktree_cli verb modules
+- **PR #13000**: feat: add Champion ratification hard hold for specs that ratify on merge
+- **PR #13058**: fix: refuse post-verdict approvals when the caller holds no live Judge lease
+- **PR #13002**: feat: hold criterion #3 only on suspect manifest lines
+- **PR #13018**: fix: classify champion blast-eval workflows by capability, not basename
+- **Issue #12985** (closed): Dedupe git/ANSI helpers copied across worktree_cli verb modules
+- **Issue #12992** (closed): Champion: hard-hold PRs whose merge ratifies a spec/decision record (operator-only; never waived)
+- **Issue #13055** (closed): post-verdict.sh accepts a Judge verdict after the Judge's lease reclaim was refused
+- **Issue #12999** (closed): Champion criterion #3: hold critical files on suspect edits (dependencies, sources, build/install hooks), not on any edit
+- **Issue #12988** (closed): Champion blast eval: classify workflows by capability, not basename (align #12677 with #12958)
+- **PR #12996**: fix: anchor labels kept-set globs and ignore comments/GITHUB_TOKEN in forbiddenDiffPatterns
+- **Issue #12995** (closed): Champion: fix pattern over-matches (labels.json kept-set, comment lines, GITHUB_TOKEN) in forbiddenDiffPatterns
+- **PR #13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
+- **Issue #13031** (closed): Champion champion_merge merged two PRs touching .github/workflows/ci.yml with no critical-file hold or self-release record
+- **PR #13083**: refactor(mcp-loom): remove empty log-tools stub module
+- **Issue #13079** (closed): Remove empty mcp-loom log-tools stub module (logs.ts)
+- **PR #13080**: fix(safehouse): send dispatch digests without a task_id
+- **Issue #13077** (closed): Narration: dispatch_digest_<seq> task ids collide across hosts and restarts
+- **PR #13084**: refactor(daemon): remove dead classify_input and stale dead_code allows
+- **Issue #13081** (closed): Remove dead InFlightAgent::classify_input and stale allow(dead_code) in activity db
+
+### 2026-10-22
+
+- **PR #13082**: test: pin stage-entry sources at tick level for mirror vs direct snapshots
+- **Issue #12312** (closed): Direct backend: standalone Loom discovery (GitHub or Gitea, `gh` only, the default), forge-neutral, one snapshot per tick, ETag cache and gatherConcurrency; CI parity tests for both forges
+- **PR #13075**: feat: keep one in-place status reaction per issue thread root in the fleet room
+- **Issue #13069** (closed): Narration: one status line per issue in the fleet room (react/edit in place, never touch the completion)
+- **PR #13072**: feat: route handoff envelopes to optional alerts room
+- **Issue #13070** (closed): Narration: optional alerts room for handoff/fleet-degraded envelopes (LOOM_SAFEHOUSE_ROOM_ALERTS)
+- **PR #13076**: fix(safehouse): stop claim ads threading, one heartbeat per host, qualify child task ids
+- **PR #13073**: chore(deps): Bump ip-address from 10.7.2 to 10.7.4 in /mcp-loom
+- **PR #13060**: feat: post a daemon-side reason comment when a Builder step ends noop or failed
+- **Issue #13054** (closed): Already-satisfied or verification-only issues loop: a no-op Builder result returns them to loom:issue and they are re-offered indefinitely
+- **PR #13066**: fix(security): refresh certificate validation and image runtimes
+- **PR #13064**: chore(harness): track latest CLIs — opencode 1.19.3→1.19.4
+- **PR #13061**: fix: clear check-claim MERGED_PR leg when issue was re-promoted after merge
+- **PR #13059**: fix: name MERGED_PR and TRIAGE as Builder refusal tokens
+- **Issue #13057** (closed): Dispatch keeps re-offering an issue whose claim guard deterministically hard-aborts
+- **Issue #13053** (closed): check-claim "work shipped" leg traps an issue the Champion re-promoted with remaining scope in a redispatch loop
+- **Issue #13024** (closed): [ci-daily] Supply Chain
+- **Issue #13006** (closed): Emit the daemon's captain status as a native OTLP carrier (is_captain) for the dashboard's SigNoz Live board
+- **PR #13010**: feat: emit loom.host.is_captain gauge over OTLP
+- **Issue #13047** (closed): Dedupe multi-line pass()/fail() helpers in 31 test suites via lib/assert.sh
+- **Issue #13045** (closed): Remove stale references to the retired shell-budget gate (#12106 leftovers)
+- **PR #13048**: refactor: source lib/assert.sh in 31 test suites with multi-line pass()/fail()
+- **PR #13047**: Dedupe multi-line pass()/fail() helpers in 31 test suites via lib/assert.sh
+- **PR #13046**: docs: remove stale references to the retired shell-budget gate
+- **PR #13045**: Remove stale references to the retired shell-budget gate (#12106 leftovers)
+- **Issue #12862** (closed): Design review: preserve worktree confinement while supporting orchestration checkpoint writes
+- **Issue #12808** (closed): The daemon stops calling the loom-ui dashboard: remove the /ingest exporter and the native-only queue.snapshot
+
 ### 2026-10-21
 
+- **PR #13039**: refactor: remove dead native_ingest column from telemetry kind registry
+- **Issue #13037** (closed): Remove dead native_ingest registry column left over from the /ingest exporter removal
+- **PR #13038**: chore: remove departed collaborator from live config and shipped defaults
+- **PR #12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
+- **Issue #12396** (closed): CI misses release-only build failures: check the macOS target and the release's test step on every PR
 - **PR #13035**: refactor: remove the native /ingest exporter and queue.snapshot
 - **Issue #12813** (closed): Daemon: remove the /ingest exporter, ingest key and native-only queue.snapshot
 - **PR #12865**: docs: assess checkpoint writes against worktree-isolation guard
@@ -5632,61 +5695,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6766**: fix(daemon): replace flaky fixed-sleep margin with a sync hook in the reaper lock-release test
 - **Issue #6712** (closed): Timing margin in reap_once_releasing_poll_lock_does_not_hold_lock_across_resume_poll is fragile under host load
 - **PR #6761**: chore(deps): bump uuid from 1.24.0 to 1.24.1 in the all-dependencies group
-
-### 2026-08-22
-
-- **PR #6754**: test: raise test-random-file.sh sample count to eliminate CI flake
-- **Issue #6749** (closed): test-random-file.sh: negated re-inclusion assertion flaky/failing on CI (unrelated to PR #6737 diff)
-- **Issue #6753** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **PR #6756**: fix(forge): route native loom-daemon forge auto-merge through the App-token permission ladder
-- **Issue #6752** (closed): merge-pr.sh: native loom-daemon forge auto-merge has no App-token-permission fallback (unlike forge_gh_perm_safe)
-- **PR #6751**: fix(worktree-reaper): resolve PR status correctly when a branch has multiple PRs
-- **Issue #6746** (closed): worktree reaper: gh pr list --limit 1 can misclassify a branch with multiple PRs (merged + later closed-without-merge)
-- **PR #6747**: fix(worktree-reaper): reclaim NoPr closed-issue worktrees, quarantine dirty ones instead of holding forever
-- **Issue #6653** (closed): Worktrees of closed issues (4449, 5179, 6199) unreaped since 2026-08-04, two of them dirty
-- **PR #6739**: feat(daemon): add a no-op re-dispatch cooldown, distinct from crash-loop quarantine
-- **Issue #6670** (closed): Work finder re-dispatches a standing tracking issue with no cooldown after a successful no-op re-verification pass
-- **PR #6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
-- **Issue #6654** (closed): Quarantine stashes for closed issues accumulate on robb-studio (19 of 32) — follow-up data for #5512
-- **PR #6743**: fix(tests): probe both installed and source-repo layouts for champion-doc paths in 7 more suites
-- **PR #6741**: ci: explicitly cancel superseded queued runs (concurrency gap)
-- **Issue #6683** (closed): CI concurrency does not cancel a superseded QUEUED run — a force-pushed rebase left the new run pending with zero jobs for 20 minutes
-- **PR #6738**: feat(daemon): add restart --reload-supervisor for launchd env changes
-- **Issue #6682** (closed): loom-daemon: no supervised way to reload launchd supervisor env — the manual bootout/bootstrap is racy and can leave the daemon stopped with nothing to restart it
-- **PR #6725**: fix: PROMPT_DIR/SWEEP_MD/CHAMPION_MD resolve correctly in both source and installed layouts
-- **PR #6731**: feat(champion): idempotent capacity-deferral comments for the tier backlog cap
-- **Issue #6729** (closed): Champion capacity-deferral comments lack idempotency — no-comment-stream treatment for unchanged capacity gates
-- **PR #6733**: fix(daemon): reclaim orphaned unregistered directories under .loom/worktrees/
-- **Issue #6652** (closed): Reaper/loom-clean should reclaim orphaned, unregistered directories under .loom/worktrees/ (issue-4343 residue)
-- **PR #6727**: fix(daemon): classify a load-saturated role-tick timeout as skipped, not failed
-- **Issue #6637** (closed): role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure
-- **Issue #6651** (closed): defaults/scripts/check-shutdown.sh is shepherd-era with no live caller — verify and remove
-- **PR #6710**: fix(daemon): release registry lock across reaper's crash-resume account-selection poll
-- **Issue #6691** (closed): sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll
-- **PR #6699**: fix(safehouse): key completion dedup on merged PR number, not issue alone
-- **Issue #6062** (closed): Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR
-- **PR #6711**: feat(daemon): prefer this host's shard slice in the work-finder tick
-- **Issue #6243** (closed): Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare
-- **PR #6708**: feat(daemon): shard role-runner ticks so each workspace rotates on exactly one host
-- **Issue #6374** (closed): Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case)
-- **PR #6706**: fix(worktree): rescue foreign work instead of discarding it on a raced reset/remove
-- **Issue #6334** (closed): Two builders can still enter the same issue worktree: the lease is evidence, not a mutex
-- **PR #6701**: fix(uninstall): harden orphan-worktree rm -rf predicate against error-string drift (#6159)
-- **Issue #6159** (closed): Check-in on #5999: has any live worktree been lost to a reinstall, and is the rm -rf fallback dead code?
-- **PR #6705**: fix(daemon): reclaim a closed-without-merge PR's worktree after its own grace period
-- **Issue #6418** (closed): worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure
-- **PR #6702**: fix(guard): block the background-subagent stop only in headless sessions
-- **Issue #6645** (closed): guard-background-subagents blocks the stop in interactive sessions while prescribing "just end the turn" as the recipe
-- **PR #6703**: test(init): assert Rust and shell resync-ignore parsers agree on a fixture
-- **Issue #6161** (closed): Check-in on #6018: after the next fleet resync, verify the ownership classifier neither deleted repo-owned files nor over-preserved stale ones
-- **PR #6700**: fix(daemon): derive install_state.started_at from process age, not stale marker
-- **Issue #6690** (closed): loom-daemon status --json's install_state.started_at does not match process_age_secs
-- **PR #6698**: feat(judge,champion): add mechanical docs-only fast path for WORK_LOG/WORK_PLAN/README PRs
-- **Issue #6134** (closed): Guide/Judge/Champion: fast-path review+merge for docs-only WORK_LOG/WORK_PLAN PRs
-- **PR #6693**: docs(sweep): verify Builder task liveness before re-dispatch on resume paths
-- **Issue #5897** (closed): sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard)
-- **PR #6697**: docs(guards): record rm-scope deny on the installed loom-daemon binary as kept-flagged, with the overwrite-in-place remedy
-- **Issue #5675** (closed): Guard rm-scope-outside-repo denies removing the installed loom-daemon binary during self-build/reinstall verification
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 

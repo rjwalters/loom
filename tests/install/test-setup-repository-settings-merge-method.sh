@@ -24,13 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SETUP_SCRIPT="$REPO_ROOT/scripts/install/setup-repository-settings.sh"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+source "$SCRIPT_DIR/lib/assert.sh"
 
 assert_contains() {
   local desc="$1" haystack="$2" needle="$3"
@@ -56,16 +50,6 @@ assert_not_contains() {
     echo "    expected output to NOT contain: '$needle'"
     FAIL=$((FAIL + 1))
   fi
-}
-
-# Build a throwaway git repo with a GitHub-style origin so
-# detect_forge_and_repo resolves FORGE_TYPE=github without any network call.
-make_fake_github_repo() {
-  local dir
-  dir="$(mktemp -d)"
-  git -C "$dir" init -q
-  git -C "$dir" remote add origin "https://github.com/owner/repo.git"
-  printf '%s\n' "$dir"
 }
 
 # ============================================================================

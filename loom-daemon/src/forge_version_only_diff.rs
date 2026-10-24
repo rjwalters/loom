@@ -1,9 +1,9 @@
 //! `loom-daemon forge version-only-diff <pr> <file>` (#9611) — the fail-closed
-//! decision behind Champion criterion #3's version-only carve-out (#6147).
+//! decision behind Champion's `critical-files` criterion's version-only carve-out (#6147).
 //!
 //! # What the question is
 //!
-//! Criterion #3 hard-fails any PR touching a critical file. The six
+//! The `critical-files` criterion hard-fails any PR touching a critical file. The six
 //! version-bearing files ([`ALLOWLIST`]) are rewritten with nothing but a
 //! version-string change on every version bump, so the carve-out exempts one of
 //! them when, and only when, every changed line in its diff is that format's
@@ -178,7 +178,7 @@ struct FileEntry {
 ///
 /// [`Reason::FetchFailed`] on any fetch or parse failure,
 /// [`Reason::FileNotInList`] when the list ends without `file`.
-fn find_patch<F>(file: &str, mut fetch_page: F) -> Result<Option<String>, Reason>
+pub(crate) fn find_patch<F>(file: &str, mut fetch_page: F) -> Result<Option<String>, Reason>
 where
     F: FnMut(u32) -> Result<Vec<u8>, String>,
 {
@@ -216,7 +216,7 @@ where
 
 /// Is `repo` a plain `OWNER/REPO`? It is interpolated into an API path, so
 /// `..`, extra `/` or anything outside `[A-Za-z0-9._-]` is refused.
-fn valid_repo(repo: &str) -> bool {
+pub(crate) fn valid_repo(repo: &str) -> bool {
     let mut parts = repo.split('/');
     let ok = |s: Option<&str>| {
         s.is_some_and(|s| {
@@ -231,7 +231,12 @@ fn valid_repo(repo: &str) -> bool {
 }
 
 /// Production fetcher: one `gh api` page read through the counted facade.
-fn gh_fetch_page(gh_bin: &Path, repo: &str, pr: u32, page: u32) -> Result<Vec<u8>, String> {
+pub(crate) fn gh_fetch_page(
+    gh_bin: &Path,
+    repo: &str,
+    pr: u32,
+    page: u32,
+) -> Result<Vec<u8>, String> {
     let path = format!("repos/{repo}/pulls/{pr}/files?per_page={PAGE_SIZE}&page={page}");
     crate::verdict_equivalence::gh_api("forge.version_only_diff", gh_bin, None, &path)
         .ok_or_else(|| format!("`gh api {path}` failed"))

@@ -2543,17 +2543,21 @@ fn handle_request(
 
                             // Parse terminal output for quality metrics (test results, lint errors, build status)
                             // Issue #1054: Track test and quality outcomes
-                            match db.record_quality_from_output(0, &output_str) {
-                                Ok(Some(metrics_id)) => {
-                                    log::debug!(
-                                        "Recorded quality metrics (id: {metrics_id}) from terminal output"
-                                    );
-                                }
-                                Ok(None) => {
-                                    // No quality metrics found in output - this is normal
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to record quality metrics: {e}");
+                            // Skipped when no input correlates (#13100): a row with a
+                            // placeholder input_id would never match the stats joins.
+                            if let Some(input_id) = correlated_input_id {
+                                match db.record_quality_from_output(input_id, &output_str) {
+                                    Ok(Some(metrics_id)) => {
+                                        log::debug!(
+                                            "Recorded quality metrics (id: {metrics_id}) from terminal output"
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        // No quality metrics found in output - this is normal
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to record quality metrics: {e}");
+                                    }
                                 }
                             }
 
@@ -3367,7 +3371,16 @@ fn handle_request(
             // topics and malformed payloads fall through to `Event::Generic`
             // unchanged (publish is fire-and-forget advisory).
             let topic_ack = topic.clone();
-            let event = Event::from_published(topic, payload);
+            let mut event = Event::from_published(topic, payload);
+            // A child that left `repo` out of its payload would narrate under
+            // a bare issue number, threading issue #N of every managed repo
+            // together. Stamp the one workspace running that issue, when
+            // there is exactly one; see `sweep_registry::published_repo`.
+            let mut registries = workspace_pool.provisioned_registries();
+            if !registries.iter().any(|r| Arc::ptr_eq(r, sweep_registry)) {
+                registries.push(sweep_registry.clone());
+            }
+            crate::sweep_registry::published_repo::backfill_published_repo(&mut event, &registries);
             match event_bus.publish(event) {
                 Ok(receivers) => Response::EventPublished {
                     topic: topic_ack,

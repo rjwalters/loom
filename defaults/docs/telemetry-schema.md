@@ -198,6 +198,8 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.authorization.evaluated`](#mergeauthorizationevaluated--one-merge-group-authorization-evaluation) | log, OTLP only | `forge_merge_queue/group_run.rs` (`run_group_check`) |
 | [`hold.transition`](#holdtransition--a-hold-label-applied-to-or-removed-from-a-pr) | log, OTLP only | `park_record/apply.rs` (`journal_hold_add`), `cli/park_record.rs` (`released`), drained by `observability/hold_transition.rs` |
+| [`merge.lane_wait`](#mergelane_wait--a-merge-step-held-behind-another-prs-merge) | log, OTLP only | `step_dispatch/driver.rs` (after `shape_pool`), `observability/lane_wait.rs` |
+| [`champion.run`](#championrun--what-one-champion-merge-or-hold-reevaluate-run-decided) | log, OTLP only | `observability/step_verdict.rs` (`emit_drain`), `observability/champion_run.rs` |
 | [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
 | [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) | log, OTLP only | `forge_merge_queue/group_run.rs` (`tick_groups`, from `preflight::github_preflight`) |
 | [`eta.dispatch_eligibility`](#etadispatch_eligibility--why-a-ready-item-is-or-is-not-schedulable) | log, OTLP only | `observability/dispatch_eligibility.rs` (collector sample of the last work-finder tick) |
@@ -2149,6 +2151,7 @@ spawn attempts:
 | `loom.dispatch.draws_unspawned` | Draws that never reached the spawner: a merge step drawn in a repo before the round that spawned the repo's merge applied it (count) |
 | `loom.dispatch.merge_deferred` | Merge steps (`champion_merge`, `champion_hold_reevaluate`) held back because their repo had a Champion merge in flight, this host's, a peer's, or one this tick spawned (#12494). They leave the pool before the draw, so they cost no draw and no pass; before #12494 they were `merge_in_flight` passes (count) |
 | `loom.dispatch.passes` | Passes by reason as comma-joined `reason=count` pairs in reason order (`claim_lost=3,backstop_hold=1`). The reasons are an open set, so they share one value; absent when nothing passed |
+| `loom.dispatch.excluded` | Items the tick excluded from its draw, by reason, summed over repos, as comma-joined `reason=count` pairs in reason order (`cooling_down=1,held_at_head=5`); absent when nothing was excluded (#13008) |
 | `loom.dispatch.budget` | The slots the tick could fill: its free slots (count) |
 | `loom.dispatch.stop` | Why the draw loop stopped, a closed set: `filled` (every free slot was filled), `no_slots`, `pool_drained` (nothing left to draw), `pass_limit` (the tick's 32 passes were spent), `slot_draws` (a slot gave up after 8 draws), `spawn_hold` (see `loom.dispatch.spawn_hold`), `captain_cap` (the fleet-dispatch captain refused a claim with `cap`, so every repo left the draw, #12450; only an older captain sends `cap`, since #12864 the captain applies no capacity limit), `weight_overflow` |
 
@@ -2298,9 +2301,9 @@ Guard denies (Issue #11582):
 |---|---|---|---|
 | `guard.cargo_target_dir.denied` span | instant; a child of the agent's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`), so only a session inside a traced execution exports one | `loom.guard.root` (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`), `loom.guard.source` (`inherited`, `inline`, `env`, `export`, `target-dir-flag`, `make-arg`), `loom.role` | one `loom:cargo-target-dir` deny: a cargo build whose target dir was under a root nothing owns ([`guard-hooks.md`](guard-hooks.md#cargo-target-dir-guard-guardscargotargetdir--loom_guard_cargo_target_dir)). Never the path or the command |
 | `build_gate.run` span | one per host-side run of `buildGate.command`; pre-flight's is a child of the sweep's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`; an attended session with no `LOOM_TRACEPARENT` emits none), the main-health gate's is its own root through the ops sink | `loom.build_gate.stage` (`preflight` / `main_health`), `loom.build_gate.tier` (`fast` / `full`), `loom.build_gate.outcome` (`pass` / `pass_flaky` / `fail` / `unresolved` / `timeout` / `unevaluated`), `loom.build_gate.duration_ms`, `loom.build_gate.attempt` (1-based within the pre-flight episode; `1` for main-health) | what host-side gating costs and how often it fails, per stage and tier (#11690: CI is the test gate, pre-flight is the fast tier). Status `error` unless `pass` / `pass_flaky`. Never the command, a path or the output |
-| `reaper.pass` span | one per worktree-reaper pass over one repo and worktree class, through the ops sink: an instant span, its own root (#12461) | `loom.repo` (workspace directory name, never a path), `loom.reaper.class` (`issue` / `pr`), `loom.reaper.phase` (`reap` removes worktrees; `reclaim` removes build-artifact directories from kept ones), `loom.reaper.scanned` / `removed` / `failed` / `preserved` (worktrees for `reap`; artifact directories removed and worktrees left whole for `reclaim`), `loom.reaper.bytes` (bytes freed; `reap` measures only while an ops sink is registered), `loom.reaper.preserved.<reason>` with `<reason>` one of `in_use` / `unmanaged` / `editable_install` / `issue_open` / `pr_open` / `pr_unknown` / `not_merged` / `grace` / `uncommitted` / `private_workspace` / `other` (the gate's fixed category, never its wording; absent when 0) | what the reaper scanned, removed, kept and freed per pass, where #12453 had only host logs and `du`. Status `error` when a removal failed. Carries the daemon version and full SHA like every span |
+| `reaper.pass` span | one per worktree-reaper pass over one repo and worktree class, through the ops sink: an instant span, its own root (#12461) | `loom.repo` (workspace directory name, never a path), `loom.reaper.class` (`issue` / `pr`), `loom.reaper.phase` (`reap` removes worktrees; `reclaim` removes build-artifact directories from kept ones), `loom.reaper.scanned` / `removed` / `failed` / `preserved` (worktrees for `reap`; artifact directories removed and worktrees left whole for `reclaim`), `loom.reaper.bytes` (bytes freed; `reap` measures only while an ops sink is registered), `loom.reaper.preserved.<reason>` with `<reason>` one of `in_use` / `unmanaged` / `editable_install` / `issue_open` / `pr_open` / `pr_unknown` / `not_merged` / `grace` / `uncommitted` / `private_workspace` / `backup_failed` / `other` (the gate's fixed category, never its wording; absent when 0), `loom.reaper.backed_up` (open-item worktrees whose whole state was pushed to a remote backup ref before removal, #12458; always `0` for `reclaim`), `loom.reaper.backup_refs` (those refs, space-separated — `refs/loom/backup/<issue-N or pr-N>/<branch or detached>/<UTC stamp>` on `origin`, the restore handle; absent when none) | what the reaper scanned, removed, kept and freed per pass, where #12453 had only host logs and `du`. Status `error` when a removal failed. Carries the daemon version and full SHA like every span |
 | `main_red.autofile` span | instant, its own root, through the ops sink; one per change the daemon makes to a red `main`'s auto-filed fix issue (Issue #11766) | `loom.repo`, `loom.issue`, `loom.main_red.sha` (the failing or green SHA, `unknown` when not known), `loom.main_red.action` (`created` / `reused` / `closed` / `closed_duplicate`; `reused` once per issue per daemon process), `loom.main_red.source` (`gate` / `ci`) | when a red `main` got its fix issue, and when it was closed again. Status `ok` |
-| `loom.fleet_dispatch.call` span | its own root, through the ops sink; one per call on each side, `loom.fleet_dispatch.side` says which: `captain`, one per request the fleet-dispatch captain (`loom-daemon fleet-dispatch serve`, #12449) answered; `worker`, one per call a worker makes to it (#12450). Spec `docs/design/fleet-captain-dispatch.md` | `loom.fleet_dispatch.side` (`captain` / `worker`), `loom.fleet_dispatch.host` (on the captain the caller's roster host id, `-` before it is identified; on a worker its own), `loom.fleet_dispatch.endpoint` (`/v1/heartbeat` / `/v1/claim` / `/v1/refuse` / `/v1/release`, `other` for a path the captain does not serve), `loom.fleet_dispatch.latency_ms`, `loom.fleet_dispatch.status` (HTTP status; on a worker `0` with no answer), `loom.fleet_dispatch.result` (`granted` / `refused` / `ok` / `error`, the same set on both sides), `loom.fleet_dispatch.reason` (the refusal reason, `refuse` token, release outcome, or the error class: on a worker `transport` / `status_5xx` / `status_4xx` / `malformed`), `loom.fleet_dispatch.server_epoch`, `loom.assignment.id`, `loom.fleet_dispatch.step` (the step's wire name, when the call names an item), and on a refused claim (#12707) `loom.fleet_dispatch.retry_after_s` (integer seconds), `loom.fleet_dispatch.held_by` (the holding host, only when the captain names one: absent on a no-progress hold), `loom.fleet_dispatch.holder_assignment_id` (#12740: the holder's assignment id, on the captain's span only, only on a `held` refusal from a live row, so absent on a no-progress hold; the wire response does not carry it) and, when the refusal is a no-progress hold (`reason` `no_progress_cooldown` on the captain, `cooldown` on a worker), `loom.fleet_dispatch.hold_until` (RFC 3339 UTC wall clock: the span's time plus `retry_after_s`; no monotonic value is exported). The captain's span also carries that hold's `loom.fleet_dispatch.hold_rung` (consecutive no-progress releases), `loom.fleet_dispatch.hold_set_by_outcome` and `loom.fleet_dispatch.hold_set_by_assignment_id` (the release that set it). Key ETA queries on `reason`, not on `held_by`. Each key is emitted only when known. And `loom.repo` with `loom.issue` or `loom.pr_number` (by whether the step acts on a PR) when the call names an item; a worker's span also carries `loom.role` (the step's role name, as on `loom.dispatch.step`) | which host asked for what and what the captain answered, and when a worker could not reach it (design §12). Both sides use the same keys and values, so one query joins them. Status `error` on a captain's non-200 answer and on a worker's call with no usable answer. `loom.dispatch.step` carries the same `loom.assignment.id` on a granted step, and on a step a captain refused `loom.dispatch.held_by`, `loom.dispatch.retry_after_s` and (for `captain_cooldown`) `loom.dispatch.hold_until` (#12707), and (#12875) on a step the captain granted after an earlier assignment of the same repo, item and step ended: `loom.dispatch.attempt` (how many earlier assignments ended), `loom.dispatch.prev_assignment_id` (join it to the earlier step's `loom.assignment.id`) and `loom.dispatch.prev_end` (`released` / `expired` / `host_lost`, the last when the worker released it because its host was lost to a spot interruption, #12876). A first grant, and a renewed one, carries none of the three. The captain's lineage record is bounded (4096 steps, 24 h) and in memory only: a captain restart resets `attempt`. Each assignment that expires also gets a captain span with `loom.fleet_dispatch.endpoint` `expire`, `loom.fleet_dispatch.result` `expired` and `loom.fleet_dispatch.reason` `lease_expired`, carrying the host, `loom.repo`, `loom.issue` or `loom.pr_number`, `loom.fleet_dispatch.step` and `loom.assignment.id` of the row (a held row's expiry emits none) |
+| `loom.fleet_dispatch.call` span | its own root, through the ops sink; one per call on each side, `loom.fleet_dispatch.side` says which: `captain`, one per request the fleet-dispatch captain (`loom-daemon fleet-dispatch serve`, #12449) answered; `worker`, one per call a worker makes to it (#12450). Spec `docs/design/fleet-captain-dispatch.md` | `loom.fleet_dispatch.side` (`captain` / `worker`), `loom.fleet_dispatch.host` (on the captain the caller's roster host id, `-` before it is identified; on a worker its own), `loom.fleet_dispatch.endpoint` (`/v1/heartbeat` / `/v1/claim` / `/v1/refuse` / `/v1/release`, `other` for a path the captain does not serve), `loom.fleet_dispatch.latency_ms`, `loom.fleet_dispatch.status` (HTTP status; on a worker `0` with no answer), `loom.fleet_dispatch.result` (`granted` / `refused` / `ok` / `error`, the same set on both sides), `loom.fleet_dispatch.reason` (the refusal reason, `refuse` token, release outcome, or the error class: on a worker `transport` / `status_5xx` / `status_4xx` / `malformed`), `loom.fleet_dispatch.server_epoch`, `loom.assignment.id`, `loom.fleet_dispatch.step` (the step's wire name, when the call names an item), and on a refused claim (#12707) `loom.fleet_dispatch.retry_after_s` (integer seconds), `loom.fleet_dispatch.held_by` (the holding host, only when the captain names one: absent on a no-progress hold), `loom.fleet_dispatch.holder_assignment_id` (#12740: the holder's assignment id, on the captain's span only, only on a `held` refusal from a live row, so absent on a no-progress hold; the wire response does not carry it) and, when the refusal is a no-progress hold (`reason` `no_progress_cooldown` on the captain, `cooldown` on a worker), `loom.fleet_dispatch.hold_until` (RFC 3339 UTC wall clock: the span's time plus `retry_after_s`; no monotonic value is exported). The captain's span also carries that hold's `loom.fleet_dispatch.hold_rung` (consecutive no-progress releases), `loom.fleet_dispatch.hold_set_by_outcome` and `loom.fleet_dispatch.hold_set_by_assignment_id` (the release that set it). On a `champion_merge` claim, release or expiry (#13009) the captain's span also carries `loom.fleet_dispatch.merge_slot_holder`: the repo's `champion_merge` holder (an assignment id) after the call, or `none`, so a holder that outlives its release is visible without joining refusals. Key ETA queries on `reason`, not on `held_by`. Each key is emitted only when known. And `loom.repo` with `loom.issue` or `loom.pr_number` (by whether the step acts on a PR) when the call names an item; a worker's span also carries `loom.role` (the step's role name, as on `loom.dispatch.step`) | which host asked for what and what the captain answered, and when a worker could not reach it (design §12). Both sides use the same keys and values, so one query joins them. Status `error` on a captain's non-200 answer and on a worker's call with no usable answer. `loom.dispatch.step` carries the same `loom.assignment.id` on a granted step, and on a step a captain refused `loom.dispatch.held_by`, `loom.dispatch.retry_after_s` and (for `captain_cooldown`) `loom.dispatch.hold_until` (#12707), and (#12875) on a step the captain granted after an earlier assignment of the same repo, item and step ended: `loom.dispatch.attempt` (how many earlier assignments ended), `loom.dispatch.prev_assignment_id` (join it to the earlier step's `loom.assignment.id`) and `loom.dispatch.prev_end` (`released` / `expired` / `host_lost`, the last when the worker released it because its host was lost to a spot interruption, #12876). A first grant, and a renewed one, carries none of the three. The captain's lineage record is bounded (4096 steps, 24 h) and in memory only: a captain restart resets `attempt`. Each assignment that expires also gets a captain span with `loom.fleet_dispatch.endpoint` `expire`, `loom.fleet_dispatch.result` `expired` and `loom.fleet_dispatch.reason` `lease_expired`, carrying the host, `loom.repo`, `loom.issue` or `loom.pr_number`, `loom.fleet_dispatch.step` and `loom.assignment.id` of the row (a held row's expiry emits none) |
 
 GitHub rate limit (Issue #10022):
 
@@ -2831,8 +2834,17 @@ attribute).
 | `gate_until` | when the gate lifts, where it has a per-item end (a `cooling_down` window). |
 | `reeval_rung` / `reeval_next` | the Champion re-evaluation ladder rung and `next` from the item's body marker (`champion_merge` on a PR, `champion_promote` on an issue); absent without a marker. |
 | `iw` / `weight` | when pooled: the item weight (priority × age term) and its weight in the host-wide draw (`iw` scaled by its repo's terms). |
+| `claimed_since` | when this daemon first observed the item `claimed` (a role session is treating it), kept while it stays claimed. A **lower bound** on the claim start (a restart or a claim between ticks is first observed late), never the exact start. Absent when not claimed. Body only. |
+| `doctor_rejections` / `doctor_escalated` | Doctor PR rows (`step: doctor`): qualifying Judge rejections of GLM Doctor attempts and the GLM-to-Claude escalation latch, read locally from the sweep checkpoint's `doctor_escalation` state for **this PR** (`issue-<N>.json`, else `pr-<P>-doctor.json`; another PR's state never applies). Absent (unknown, not `0`/`false`) when no state was read. Body only. |
 | `transition` | `changed` or `refresh`. |
 | `sampled_at` | the emission instant (record time). |
+
+The Doctor's park state is already a row: `exclusion: blocked` is parked and
+`claimed` is treating. Total completed cycles stay on `sweep.outcome`
+(`loom.doctor_cycles`, completion-time); these as-of facts are what a
+prediction made earlier can join without that later total. The park *cause*
+is not exported here (it is free text in the issue body, which this
+no-forge-call record does not read).
 
 ### `eta.stage_occupancy` — items still waiting in a pre-ready stage
 
@@ -3542,6 +3554,7 @@ absent measurement as "unknown", never as zero/full.
 | `managed_repos[]` | `loom.host.managed_repo` (1 per repo, `repo`, `visibility`); `weight` as `loom.host.managed_repo_weight` (`repo`), only when known |
 | `protection.state` | `loom.host.protection` (1, `state`) |
 | `built_at` | `loom.host.built_at_seconds` (Unix seconds) |
+| `is_captain` | `loom.host.is_captain` (1 = this host believes it is captain, 0 = a captain is declared and it is not this host); no point when `fleet.captain` is undeclared (`None`) |
 | `build_commit` | Resource `loom.daemon.revision` (full SHA) |
 | `roles.persistent[]` | `loom.host.role_persistent_failure` (failures) and `loom.host.role_persistent_failure_last_at_seconds`, both `role` + `workspace` (directory name, never the path); `detail` is not exported |
 | `worktree_root_total_gb` | `loom.host.worktree_volume.total_bytes` (`metric.points`, same `df -Pk` sample; GB = bytes / 1024^3, floored) |
@@ -3862,7 +3875,7 @@ ticks already record the prompt tree they launch from (`prompt` on
 daemon workspace, a sweep worker's clone) reported nothing, so "how often does a
 daemon host run from a stale or divergent checkout" had no answer. The checkout
 fast-forward pass visits every managed checkout, and emits **one record per
-checkout per pass**. **OTLP only** (`otlp: Logs`, `native: false`), and only when
+checkout per pass**. **OTLP only** (`otlp: Logs`), and only when
 the exporter is configured; `observability/otlp/mapping/checkout_freshness.rs`
 maps it, with the record's JSON as the body and `host` on the Resource.
 
@@ -4188,7 +4201,7 @@ One OTLP log per agent scope (`loom-agent-*.scope`, a sweep, step or role
 agent) when the daemon sees it end (Issue #12241). The daemon samples every
 live scope's cgroup each work-finder tick (`ram_peaks`); this record carries the
 last sample. Linux with cgroup v2 only. Envelopes carry `schema_version: 12`.
-**OTLP-only** (`native: false`). Severity `WARN` when the scope had OOM kills,
+**OTLP-only**. Severity `WARN` when the scope had OOM kills,
 else `INFO`.
 
 The JSON body contains:
@@ -4247,7 +4260,7 @@ collector's `transform/privacy` `keep_keys`, contract-tested).
 One OTLP log per deliberate daemon exit (Issue #11839), enqueued by the single
 exit funnel `observability::shutdown::exit` before the exporter's final flush,
 so the drain carries it. Envelopes carry `schema_version: 12`. **OTLP-only**
-(`native: false`), always on when OTLP export is on.
+(OTLP-only), always on when OTLP export is on.
 
 The JSON body contains `signal` (`SIGTERM` / `SIGINT`; absent for a non-signal
 exit), `exit_code`, `requested_by`, `relaunch_expected`, `supervisor`
@@ -4302,7 +4315,7 @@ the record then stays queued for the next start.
 One OTLP log per run-state IPC request (Issue #12546), emitted when the daemon
 **receives** it: `drain` (`DrainAndRestartDaemon`), `abort-drain`,
 `pause-then-exit` (`restart --pause --then-exit`), `restart` and `shutdown`.
-Envelopes carry `schema_version: 12`. **OTLP-only** (`native: false`), always
+Envelopes carry `schema_version: 12`. **OTLP-only**, always
 on when OTLP export is on. Exempt from the per-kind silence check: a quiet
 host runs no such verb.
 
@@ -4337,7 +4350,7 @@ One OTLP log (INFO) per `merge_queue.{enqueued,merged,removed}` record the
 sink appended (Issue #12653, F3). Emitted from `FileEventSink::record` only
 after the `seen/` marker and the JSONL append succeed, so the JSONL and its
 dedupe stay authoritative and a duplicate, a second reconcile pass or a restart
-emits nothing. No forge read is added. **OTLP-only** (`native: false`); the
+emits nothing. No forge read is added. **OTLP-only**; the
 short-lived CLI processes have no sink and export nothing.
 
 The JSON body holds `event` (`enqueued` / `merged` / `removed`), `pr`, `nonce`
@@ -4359,7 +4372,7 @@ every return path including an unreadable group listing. It explains the
 `loom/merge-authorization` status the evaluation concluded; it changes neither
 the decision nor the posted status, and adds no forge read (`states()` and
 `latest_status()` are each still read at most once). **OTLP-only**
-(`native: false`). The short-lived `group-check` CLI has no sink and exports
+(OTLP-only). The short-lived `group-check` CLI has no sink and exports
 nothing; production emission is the daemon's `tick_groups` pass.
 
 `reason` is a closed set: `pending-other-checks` (other required checks not
@@ -4391,7 +4404,7 @@ One OTLP log (INFO) per Champion hold-label write (Issue #12665, #12653 F2):
 holds) and `remove` from `park-record released` (Champion's reversal pass).
 The writers append to the role tick's pick journal and the daemon drains it at
 the end of the tick, so no forge read or polling is added. **OTLP-only**
-(`native: false`).
+(OTLP-only).
 
 One record per (PR, transition): an `add` is journaled only when `loom:blocked`
 was not already on the PR, so the every-tick idempotent re-apply emits nothing.
@@ -4421,7 +4434,7 @@ One OTLP log (INFO) per run of the existing `mergeQueue.entries` read behind
 `GroupForge::groups()` (Issue #12667, slice of #12653). **No forge call is
 added** and there is no timer: the record exists only when a Loom-owned
 transition ran the read, so a gap between records is **not** an empty queue.
-OTLP-only (`native: false`).
+OTLP-only.
 
 The JSON body holds `state`, `complete`, `order` (PR numbers in `position`
 order), `entries` (`position`, `pr`, `head`, `has_group_commit`),
@@ -4456,7 +4469,7 @@ One OTLP log (INFO) when the active `merge_queue` rule's settings
 differ from the last ones this daemon process saw for the repository, and once
 on first observation after a daemon start (the dedupe state is in-process, not
 persisted). They shape `merge_wait` / `merge_hold` duration. OTLP-only
-(`native: false`).
+(OTLP-only).
 
 **No forge call is added.** The values ride on the `rules/branches/<branch>`
 read that `tick_groups` already makes every daemon tick
@@ -4483,6 +4496,78 @@ Attributes: `loom.merge_queue.check_response_timeout_minutes` /
 `transform/privacy` `keep_keys`, contract-tested).
 
 
+### `merge.lane_wait` — a merge step held behind another PR's merge
+
+One OTLP log (INFO) each time a PR's Champion merge step (`champion_merge` or
+`champion_hold_reevaluate`) enters or leaves the wait behind a merge already in
+flight in the same repo (Issue #13029). Today the tick only counts these
+(`loom.dispatch.merge_deferred`, `excluded_items{reason=merge_in_flight}`); a
+count cannot give a wait duration. The record is derived from the exclusion the
+tick already makes (`step_dispatch/driver.rs`, right after `shape_pool`), diffed
+against the previous tick's view held in memory, so there is no forge read and
+no new poller. **OTLP-only** (`native: false`).
+
+`phase=enter` is emitted on the first tick that drops the PR behind a blocker;
+a change of blocker while the wait continues is another `enter` that keeps the
+original `wait_started_at`. `phase=leave` is emitted on the first tick the PR is
+no longer dropped: `left_as=admitted` (back in the drawable pool, or running)
+or `gone` (no longer a candidate in the repo), with `wait_secs` =
+`observed_at - wait_started_at`. After a daemon restart the first observation
+starts a fresh wait with `wait_started_at_lower_bound: true` (the duration is a
+lower bound). A repo the tick did not list (halted, listing failed) is not
+observed, so its open waits stay open until the next observed tick.
+
+Attributes: `loom.repo`, `loom.pr_number` (the waiting PR) and
+`loom.merge_lane.phase` / `step` / `blocker_pr` / `blocker_source` (`local` or
+`peer`) / `wait_started_at` / `wait_started_at_lower_bound` / `left_as` and
+`wait_secs` (leave only) / `version` / `revision` / `provenance_complete`
+(`MERGE_LANE_WAIT_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). Log time is the observing
+tick. Wait duration per PR is one query: `phase=leave`, `wait_secs`, grouped by
+`loom.repo`.
+
+
+### `champion.run` — what one Champion merge or hold-reevaluate run decided
+
+One OTLP log (INFO) per `champion_merge`-role step end on a PR (Issue #13029):
+the run's outcome and the standing-authorization policy it read (#12933). A hold
+re-evaluation and PR triage run as the same role, so they are covered too. It is
+built in `emit_drain` from the pick journal and the `pass.verdict` the step end
+already produces, plus the digest the hold recorded when the item was drawn
+(carried from the classifier through the spawn request); no forge read.
+**OTLP-only** (`native: false`).
+
+`loom.champion.outcome` is `merged`, `held` (a hold was applied or stands),
+`released` (a hold was removed), `error` (the step failed, or a hold write was
+attempted and failed) or `other` (requeued, rejected, head moved, not eligible,
+triage: none of the first four). `loom.champion.verdict_reason` is the run's
+`pass.verdict` reason for every outcome. `loom.champion.hold_class` is the
+`hold.transition` `reason_code` (`merge-risk-hold`, `critical-file-hold`,
+`champion-park`, `hold-released`) of the run's last hold write; absent when it
+wrote none. `loom.champion.auth_before` is the digest the standing hold recorded
+when drawn (absent: no hold, a legacy hold, or a step this daemon did not
+spawn); `auth_after` is the digest of the effective
+`champion.standingAuthorizations` at the step's end; `digest_recorded` is true
+when the run wrote a `champion:hold-state` record carrying an `auth=` digest.
+`loom.champion.sweep_id` joins the record to the step's session and its
+`loom.fleet_dispatch.call` span.
+
+Attributes: `loom.repo`, `loom.pr_number` and the `loom.champion.*` keys above
+plus `version` / `revision` / `provenance_complete`
+(`CHAMPION_RUN_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`
+`keep_keys`, contract-tested). Log time is the step's end.
+
+**`champion_merge` call outcome (one query).** The `loom.fleet_dispatch.call`
+span has no `outcome` key; its keys are `loom.fleet_dispatch.result`
+(`granted` / `refused` / `ok` / `error`), `loom.fleet_dispatch.reason` and
+`loom.fleet_dispatch.step`. A query on `outcome` reads empty. Whether a
+`champion_merge` claim was granted or refused, and why:
+`loom.fleet_dispatch.step = "champion_merge"` grouped by
+`loom.fleet_dispatch.result`, `loom.fleet_dispatch.reason`. What the granted run
+then did: `champion.run` on `loom.champion.sweep_id` = the span's
+`loom.assignment.id`'s sweep, grouped by `loom.champion.outcome`.
+
+
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused
 
 One OTLP log (WARN) per write the credential-scope gate refuses in a daemon
@@ -4494,7 +4579,7 @@ per-call checks the daemon's in-process `GhForge` writes make
 dependency parks, step refusals). Before #12606 those refused silently, with a
 `daemon.log` line only. **Not deduplicated**: the
 `daemon.log` WARN fires once per change of reason per key, this record fires
-on every refusal, because the point is a count. **OTLP-only** (`native: false`).
+on every refusal, because the point is a count. **OTLP-only**.
 
 **Scope.** The daemon process only. Short-lived `loom-daemon forge ...` / `cli/*`
 processes have no OTLP sink, so their refusals (the quoted `refusing the write

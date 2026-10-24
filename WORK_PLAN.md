@@ -9,14 +9,10 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
-- **#11803**: fix(daemon-stop): record operator stops instead of deleting intent; leave the watchdog armed
-- **#12000**: C18: finish retiring the old dispatch paths, one host budget
 - **#12262**: fix: track cd in subshells, brace groups and pushd in write-confinement guard
 - **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
 - **#12381**: ci: make the macOS flake-shell leg of CI Daily advisory
-- **#12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
-- **#12442**: feat: restart the daemon onto the same binary for restart-required config
 - **#12522**: fix: shed reads on failed roster load, withdraw evidence-free 404s briefly
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#12990**: refactor: share git/ANSI helpers across worktree_cli verb modules
@@ -29,6 +25,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13018**: fix: classify champion blast-eval workflows by capability, not basename
 - **#13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
 - **#13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
+- **#13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
 
 ## Very Important
 
@@ -69,7 +66,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
-- **#8779**: peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
 - **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
 - **#12117**: Telemetry: inventory every kind; fix or delete role_tick.outcome, ci.job.log, session.output
@@ -92,7 +88,6 @@ Issues currently being built (`loom:building`).
 - **#12085**: Telemetry(doctor): structured parked-PR cause (park reason, doctor_cycles, queue gate, treating age) (ETA doctor, loom-ui#4063 #6)
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes)
-- **#12396**: CI misses release-only build failures: check the macOS target and the release's test step on every PR
 - **#12425**: auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3)
 - **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue
 - **#12458**: Reap idle clean worktrees of open issues/PRs (configurable idle period)
@@ -118,6 +113,7 @@ Issues currently being built (`loom:building`).
 - **#13029**: Telemetry: merge-lane waits, Champion re-read outcomes, fleet_dispatch call outcomes, held-PR gauge (gaps found 2026-10-20/21)
 - **#13030**: Name Champion's criteria and kept-set entries by meaning, not number (criterion #3 → critical-files)
 - **#13031**: Champion champion_merge merged two PRs touching .github/workflows/ci.yml with no critical-file hold or self-release record
+- **#13042**: Champion: let criticalFilesOnly standing authorizations compose per critical file
 
 ## PRs Awaiting Review
 
@@ -127,7 +123,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
 - **#12960**: feat: let Champion self-release merge-risk holds above a confidence threshold
 - **#13013**: fix: ignore heartbeat steps for ended assignments in the fleet captain
 - **#13028**: feat: make Champion merges per repo a runtime tunable
@@ -138,13 +133,11 @@ PRs waiting on Judge (`loom:review-requested`).
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#11803**: fix(daemon-stop): record operator stops instead of deleting intent; leave the watchdog armed
-- **#12000**: C18: finish retiring the old dispatch paths, one host budget
 - **#12262**: fix: track cd in subshells, brace groups and pushd in write-confinement guard
 - **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
 - **#12381**: ci: make the macOS flake-shell leg of CI Daily advisory
-- **#12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
 - **#12442**: feat: restart the daemon onto the same binary for restart-required config
 - **#12522**: fix: shed reads on failed roster load, withdraw evidence-free 404s briefly
 - **#12969**: feat: age-bound Codex rollout history in live profiles
@@ -161,6 +154,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13018**: fix: classify champion blast-eval workflows by capability, not basename
 - **#13032**: fix: record criterion #3 standing-authorization waivers in pre-merge comment
 - **#13033**: docs: name Champion merge criteria and kept-set entries by meaning, not number
+- **#13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
 
 ## Proposed
 
@@ -203,6 +197,7 @@ Issues carrying `loom:curated`.
 - **#11703**: Config precedence: fleet-gitops values must override repo-committed .loom/config.json (general rule + enforcement) *(curated)*
 - **#11712**: Daemon: export OTLP only and remove inbound control channels other than config (2am#4300) *(curated)*
 - **#11787**: issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate) *(curated)*
+- **#11911**: Finish retiring daemon-spawned /loom:sweep and merge the two concurrency budgets *(curated)*
 - **#11928**: maintain_only dispatch aborts emit error-level telemetry for an intentional, configured refusal *(curated)*
 - **#12014**: ci: approved PRs touching workflow files need several CI rounds to land as main moves (no merge queue on a user-owned repo) *(curated)*
 - **#12029**: Telemetry: merge runs record PR number and observed result (merge-pr chokepoint) — Judge parts moved to #12362; held behind #12063 *(curated)*
@@ -225,7 +220,6 @@ Issues carrying `loom:curated`.
 - **#12320**: Cleanup once every worker reads the worklist: delete the per-call `forge_mirror` discovery path, `maxStalenessSecs` and `per_call`; docs and ADR-0024; direct backend preserved *(curated)*
 - **#12344**: Flow-change evidence review (#11708 slice B): verdict/merge gates and merge sequencing *(curated)*
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes) *(curated)*
-- **#12396**: CI misses release-only build failures: check the macOS target and the release's test step on every PR *(curated)*
 - **#12408**: Live-verify epic child discovery against sky130-sar-adc#23 (follow-up to #12388) *(curated)*
 - **#12418**: Verify epic #10698 acceptance: completed-vs-not-planned dispositions and live fleet receipts *(curated)*
 - **#12425**: auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3) *(curated)*
@@ -259,6 +253,7 @@ Issues carrying `loom:curated`.
 - **#13029**: Telemetry: merge-lane waits, Champion re-read outcomes, fleet_dispatch call outcomes, held-PR gauge (gaps found 2026-10-20/21) *(curated)*
 - **#13030**: Name Champion's criteria and kept-set entries by meaning, not number (criterion #3 → critical-files) *(curated)*
 - **#13031**: Champion champion_merge merged two PRs touching .github/workflows/ci.yml with no critical-file hold or self-release record *(curated)*
+- **#13042**: Champion: let criticalFilesOnly standing authorizations compose per critical file *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -283,14 +278,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 20 |
+| Operator merge-risk holds | 17 |
 | Very important | 1 |
 | Important | 23 |
-| Ready (`loom:issue`) | 9 |
+| Ready (`loom:issue`) | 8 |
 | In Progress (`loom:building`) | 36 |
-| PRs awaiting review | 9 |
-| Approved PRs awaiting merge | 24 |
-| Curated | 93 |
+| PRs awaiting review | 8 |
+| Approved PRs awaiting merge | 23 |
+| Curated | 94 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->

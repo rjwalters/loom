@@ -563,6 +563,8 @@ impl StepDriver {
             // items leave the pool.
             let in_flight = claims.items.len();
             let held = shape_pool(&mut weighing, &claims, listing);
+            // #13029: the merge lane's per-PR waits, from what the shape just did.
+            crate::observability::lane_wait::observe(&repo, &weighing, &claims);
             if held > 0 {
                 log::warn!(
                     "work_finder: {repo}: {held} Builder step(s) held this tick: the {} cannot \

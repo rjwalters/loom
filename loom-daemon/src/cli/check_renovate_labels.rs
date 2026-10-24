@@ -3,8 +3,8 @@
 //! `defaults/scripts/check-dependabot-labels.sh` (#7577).
 //!
 //! A subcommand rather than more lines in that script because the script is
-//! `contract`-category shell, which epic #7810's `shell-budget` gate ratchets
-//! down, never up (`.loom/docs/shell-language-policy.md`). The logic lives in
+//! `contract`-category shell, which epic #7810 is retiring
+//! (`.loom/docs/shell-language-policy.md`). The logic lives in
 //! [`crate::renovate_labels`].
 //!
 //! Runs in CI's `Installer Integration Tests` job, next to the Dependabot

@@ -853,7 +853,7 @@ pub enum Commands {
     },
 
     /// Shadow-mode Jev (TypeSafe) pre-score for Champion's PR auto-merge
-    /// criterion #2 (issue #8545) — read-only telemetry, never a merge
+    /// the `merge-risk` criterion (issue #8545) — read-only telemetry, never a merge
     /// decision. Prints a JSON object with four calibrated
     /// probability/confidence pairs (diff composition, blast radius, Judge
     /// review depth, revertability) to stdout; exits non-zero with no stdout

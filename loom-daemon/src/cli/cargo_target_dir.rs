@@ -1,7 +1,7 @@
 //! `loom-daemon cargo-target-dir` — the creation-time half of the per-worktree
 //! target-dir scheme (issue #8458), behind a CLI so `worktree.sh` and
-//! `spawn-claude.sh` can use it without growing the shell budget's portable
-//! pool (epic #7810, `.loom/docs/shell-language-policy.md`).
+//! `spawn-claude.sh` can use it without new portable shell (epic #7810,
+//! `.loom/docs/shell-language-policy.md`).
 //!
 //! Seven verbs, deliberately narrow. Two write (the creation half):
 //!

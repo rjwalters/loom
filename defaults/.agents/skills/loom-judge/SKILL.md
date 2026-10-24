@@ -1676,7 +1676,7 @@ ineligible; only the repo-root file qualifies):
 # Docs-only fast path (#6134): eligible ONLY if every changed file is EXACTLY
 # one of these three root-level filenames, or a month-rotated archive (#12636,
 # DOCS_FAST_PATH_ARCHIVE_RE below). This is the same allowlist
-# Champion's criterion #2 re-derives independently (see champion-pr-merge.md)
+# Champion's merge-risk criterion re-derives independently (see champion-pr-merge.md)
 # — the two checks are mirrored, not shared, so a change to one without the
 # other is a visible drift, not a silent gap.
 DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")
@@ -1774,7 +1774,7 @@ EOF
 - **Mechanical, not judgment-based**: eligibility is a literal string-equality
   check over a freshly-fetched file list, not an LLM inference from the PR's
   title or description.
-- **Independently re-verified by Champion**: Champion's criterion #2 (see
+- **Independently re-verified by Champion**: Champion's `merge-risk` criterion (see
   "Docs-only fast path" in champion-pr-merge.md) re-runs its own copy of this
   same check against its own fresh paginated-files read — it never trusts
   this comment's claim, so a compromised or buggy Judge pass cannot smuggle a
