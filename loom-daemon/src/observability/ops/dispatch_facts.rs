@@ -133,6 +133,9 @@ pub fn discovery_attributes(d: &crate::discovery::SnapshotStats) -> Vec<(String,
         ("loom.discovery.tier".into(), d.tier.to_string()),
         ("loom.discovery.items".into(), d.items.to_string()),
         ("loom.discovery.forge_reads".into(), d.discovery_forge_reads.to_string()),
+        ("loom.discovery.live_reads.landed".into(), d.live_reads.landed.to_string()),
+        ("loom.discovery.live_reads.markers".into(), d.live_reads.markers.to_string()),
+        ("loom.discovery.live_reads.ci".into(), d.live_reads.ci.to_string()),
     ];
     if let Some(reason) = &d.fallback_reason {
         out.push(("loom.discovery.fallback_reason".into(), reason.clone()));
@@ -354,6 +357,11 @@ mod tests {
             oldest_watermark_age_secs: Some(90),
             stale_repos: 2,
             discovery_forge_reads: 4,
+            live_reads: crate::discovery::LiveReads {
+                landed: 2,
+                markers: 3,
+                ci: 1,
+            },
         };
         let report = TickReport {
             discovery: Some(mirror),
@@ -376,6 +384,9 @@ mod tests {
         assert_eq!(get("loom.discovery.items"), Some("1555"));
         assert_eq!(get("loom.discovery.oldest_watermark_age_secs"), Some("90"));
         assert_eq!(get("loom.discovery.forge_reads"), Some("4"));
+        assert_eq!(get("loom.discovery.live_reads.landed"), Some("2"));
+        assert_eq!(get("loom.discovery.live_reads.markers"), Some("3"));
+        assert_eq!(get("loom.discovery.live_reads.ci"), Some("1"));
         for (key, _) in &attrs {
             assert!(
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
