@@ -903,6 +903,10 @@ pub struct SweepRegistry {
     /// daemon did not spawn (adopted after a restart) reads as unsized.
     /// Pruned to the registry's entries on every insert.
     step_points: HashMap<SweepId, u32>,
+    /// #13029: each live step's recorded hold digest, keyed by sweep id, from
+    /// its spawn request: `champion.run`'s `auth_before`. In memory only;
+    /// pruned to the registry's entries on every insert.
+    step_hold_auth: HashMap<SweepId, String>,
 }
 
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
@@ -1123,6 +1127,7 @@ impl SweepRegistry {
             roll_gate: roll_gate::RollGate::default(),
             missing_command_warned: HashSet::new(),
             step_points: HashMap::new(),
+            step_hold_auth: HashMap::new(),
         };
         registry.restore_step_ledger();
         registry

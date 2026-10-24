@@ -572,3 +572,35 @@ ORDER BY rubric_revision, story_points, churn_class;
 DROP VIEW IF EXISTS spc_scored;
 DROP VIEW IF EXISTS spc_landings;
 DROP VIEW IF EXISTS spc_window;
+
+-- COV1. issue.estimate COVERAGE (#11787) — SigNoz / ClickHouse dialect, NOT
+-- D1: kept commented so this file still runs unchanged under wrangler. Copy
+-- into the SigNoz query editor. Target: >= 95% of issues newly labeled
+-- `loom:curated` carry an `issue.estimate` fact (the emitter is
+-- `loom-daemon curation-complete`; a bare label write skips it).
+--
+-- The denominator (issues that gained `loom:curated` in the window) is not a
+-- telemetry fact: bind it from the forge timeline as `curated(repo, issue)`
+-- rows (e.g. `gh api repos/O/R/issues/events` `labeled` events). The numerator
+-- dedupes by `loom.fact_id`, so export retries and re-curations never count
+-- an issue twice. Do NOT backfill or re-emit historical estimates to move
+-- this number (per-event facts; duplicates are pseudo-replication).
+--
+-- WITH curated AS (
+--     SELECT lower(repo) AS repo, issue FROM <bound curated-label rows>
+-- ),
+-- estimated AS (
+--     SELECT DISTINCT lower(attributes_string['loom.repo']) AS repo,
+--            toUInt64(attributes_number['loom.issue']) AS issue
+--     FROM signoz_logs.distributed_logs_v2
+--     WHERE attributes_string['loom.kind'] = 'issue.estimate'
+--       AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 7 DAY)
+-- )
+-- SELECT c.repo,
+--        count() AS curated_issues,
+--        countIf(e.issue != 0) AS with_estimate,
+--        round(100 * with_estimate / curated_issues, 1) AS coverage_pct
+-- FROM curated c
+-- LEFT JOIN estimated e ON e.repo = c.repo AND e.issue = c.issue
+-- GROUP BY c.repo
+-- ORDER BY c.repo;

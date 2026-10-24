@@ -346,6 +346,10 @@ pub struct Item {
     /// ([`crate::story_points`]): absent, never `0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub story_points: Option<u32>,
+    /// The standing-authorization digest the PR's hold recorded
+    /// ([`PullMarkers::hold_auth`]); telemetry only (#13029), never a draw term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_auth: Option<String>,
 }
 
 impl Item {
@@ -702,6 +706,7 @@ fn classify_item(
         lane,
         send_back: issue.is_some_and(|i| i.markers.send_back),
         story_points: None,
+        hold_auth: pr.and_then(|p| p.markers.hold_auth.clone()),
     }
 }
 

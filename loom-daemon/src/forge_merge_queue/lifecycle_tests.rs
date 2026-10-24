@@ -58,6 +58,8 @@ struct Gh {
     /// Pushed to the head the instant the enqueue mutation arrives.
     push_during_enqueue: RefCell<Option<String>>,
     calls: Cell<u32>,
+    /// GitHub's `headCommit` for a queued entry can be the merge-group commit.
+    entry_reports_group_commit: Cell<bool>,
 }
 
 impl Gh {
@@ -78,6 +80,7 @@ impl Gh {
             cannot_post: Cell::new(false),
             push_during_enqueue: RefCell::new(None),
             calls: Cell::new(0),
+            entry_reports_group_commit: Cell::new(false),
         }
     }
     fn tick(&self) {
@@ -143,7 +146,11 @@ impl QueueApi for Gh {
             entry: self.queued.borrow().clone().map(|h| QueueEntry {
                 state: "AWAITING_CHECKS".into(),
                 position: Some(1),
-                head_oid: Some(h),
+                head_oid: Some(if self.entry_reports_group_commit.get() {
+                    GROUP_SHA.into()
+                } else {
+                    h
+                }),
             }),
         })
     }
@@ -306,6 +313,35 @@ fn enqueue_is_not_merge_and_merge_is_confirmed_once() {
         }
     );
     assert_eq!(kinds(&ev), vec![EventKind::Enqueued, EventKind::Merged]);
+}
+
+#[test]
+fn a_merge_group_head_on_the_entry_does_not_revoke_a_same_head_grant() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    gh.entry_reports_group_commit.set(true);
+    hand(&gh, &ev).unwrap();
+    let r = reconcile_pr(&ctx(&gh, &ev, MergeMode::Queue, t0()), PR);
+    assert!(matches!(r, Reconciled::StillQueued { .. }), "{r:?}");
+    assert_eq!(gh.count("loom:merge-queue-revoke"), 0);
+    assert!(gh.queued.borrow().is_some(), "still queued");
+    assert!(matches!(hand(&gh, &ev), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+}
+
+#[test]
+fn a_moved_head_after_the_grant_is_still_revoked_withdrawing_the_status() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    gh.entry_reports_group_commit.set(true);
+    hand(&gh, &ev).unwrap();
+    *gh.head.borrow_mut() = SHA2.into();
+    let r = reconcile_pr(&ctx(&gh, &ev, MergeMode::Queue, t0()), PR);
+    assert!(matches!(r, Reconciled::Continue(Some(_))), "{r:?}");
+    assert_eq!(gh.count("loom:merge-queue-revoke"), 1);
+    assert!(gh.queued.borrow().is_none(), "dequeued");
+    assert_eq!(
+        gh.head_status.borrow().get(SHA1),
+        Some(&StatusState::Failure),
+        "no success status beside a revoked grant"
+    );
 }
 
 #[test]

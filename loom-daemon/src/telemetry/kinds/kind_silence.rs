@@ -57,6 +57,8 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("merge_queue.event", None),
     ("merge.authorization.evaluated", None),
     ("hold.transition", None),
+    ("merge.lane_wait", None),
+    ("champion.run", None),
     ("merge.queue.observed", None),
     ("merge.queue.regime", None),
     ("daemon.exit", None),
