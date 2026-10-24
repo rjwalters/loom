@@ -95,6 +95,11 @@ pub enum SpanName {
     /// until.
     #[serde(rename = "forge.read.shed")]
     ForgeReadShed,
+    /// One safehouse forge lookup that produced no answer (#13156): an
+    /// instant span, its own root trace, naming the call, repo and reason
+    /// class. Emitted on every failure, not just the first per workspace.
+    #[serde(rename = "safehouse.forge_lookup.failed")]
+    SafehouseForgeLookupFailed,
     /// One provider request observed by the egress proxy (Issue #11300): its
     /// own root trace, counts and classified codes only, never a body.
     #[serde(rename = "loom.egress.request")]
@@ -157,6 +162,7 @@ impl SpanName {
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
             Self::ForgeReaderSpill => "forge.reader.spill",
             Self::ForgeReadShed => "forge.read.shed",
+            Self::SafehouseForgeLookupFailed => "safehouse.forge_lookup.failed",
             Self::EgressRequest => "loom.egress.request",
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",

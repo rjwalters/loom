@@ -291,6 +291,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.read.owner",
     "forge.read.resource",
     "forge.read.until",
+    // `safehouse.forge_lookup.failed` spans (#13156): the failed call, the
+    // workspace repo and the reason class. Never stderr or a path.
+    "safehouse.call",
+    "loom.repo",
+    "safehouse.reason",
     // `loom.egress.request` spans (#11300): one proxied provider request.
     // Counts, classified codes and ids only, never a body or credential.
     "loom.egress.seat",

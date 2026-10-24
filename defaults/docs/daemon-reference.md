@@ -8977,6 +8977,10 @@ rate-limit signature, so it never trips the breaker. A shed books an
 (`forge.read.{op,class,app,owner,resource,until}`); the daemon log gets one
 `info` line per operation at most every 300 s (the rest at `debug`), and
 `intake_reconcile` reports a shed listing as a skipped pass, not a failure.
+A safehouse forge lookup that yields no answer (timeout, shed, `gh` unavailable)
+exports a `safehouse.forge_lookup.failed` span on every occurrence
+(`safehouse.call`, `loom.repo`, `safehouse.reason` in
+`timed_out`/`unavailable`/`shed`), while the log stays one-shot (#13156).
 Classified sites:
 Hygiene — `worktree.issue_state`, `worktree.has_open_pr`, `clean.pr_list`,
 `clean.pr_status_rest`, `worktree.landed_pulls`, `intake.list_open`, and
