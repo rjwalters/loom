@@ -157,6 +157,52 @@ fn a_stale_snapshot_is_never_served() {
 }
 
 #[test]
+fn a_miss_on_a_fresh_snapshot_refreshes_once_per_window() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "acme/old", false)]));
+    let cred = writer(&env);
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), Answer::Listed(None));
+    // The repo appears after the snapshot; within the window it is still a miss.
+    fake.set("page1", &page(2, &[(1, "acme/old", false), (2, "acme/new", true)]));
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), Answer::Listed(None));
+    assert_eq!(fake.listing_calls(), 1, "{:?}", fake.calls());
+    // Past the window the miss revalidates and finds it, well inside the TTL.
+    state::advance_test_clock(SNAPSHOT_MISS_REFRESH_SECS + 1);
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), listed("acme/new", 2, true));
+    assert_eq!(fake.listing_calls(), 2);
+}
+
+#[test]
+fn a_genuinely_absent_repo_costs_at_most_one_refresh_per_window() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "acme/old", false)]));
+    let cred = writer(&env);
+    state::advance_test_clock(0);
+    assert_eq!(lookup(&fake.gh, &cred, "acme/gone"), Answer::Listed(None));
+    state::advance_test_clock(SNAPSHOT_MISS_REFRESH_SECS + 1);
+    for _ in 0..10 {
+        assert_eq!(lookup(&fake.gh, &cred, "acme/gone"), Answer::Listed(None));
+    }
+    assert_eq!(fake.listing_calls(), 2, "{:?}", fake.calls());
+}
+
+#[test]
+fn a_failed_miss_refresh_is_unavailable_not_a_verdict() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "acme/old", false)]));
+    let cred = writer(&env);
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), Answer::Listed(None));
+    state::advance_test_clock(SNAPSHOT_MISS_REFRESH_SECS + 1);
+    fake.set("mode", "fail");
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), Answer::Unavailable);
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), Answer::Unavailable, "backing off");
+    assert_eq!(fake.listing_calls(), 2);
+}
+
+#[test]
 fn a_304_revalidation_keeps_the_data_and_is_booked_not_modified() {
     let env = Env::new(&[]);
     let fake = Listing::new(env.tmp.path());
