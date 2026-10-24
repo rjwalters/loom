@@ -1,5 +1,5 @@
-//! Proactive landing-order planning for overlapping PRs (#9686 — the first
-//! release of the #9063 epic: automatic ordering, not combinations).
+//! Landing-order planning for stacked PRs (#9686, narrowed by #12775 from
+//! "overlapping PRs" to stacked pairs only).
 //!
 //! # The problem
 //!
@@ -14,32 +14,21 @@
 //! - **Trigger.** Repos with ≤2 open PRs are a byte-identical no-op (the
 //!   trigger counts ALL open PRs, including drafts and held ones — only the
 //!   *ordering* excludes them).
-//! - **Plan.** Eligible open PRs (not draft, no hold label, no agent
-//!   mid-flight, pinnable head) are grouped into connected components of the
-//!   REAL-conflict graph (#10350, [`conflict`]): a shared changed filename is
-//!   only the prefilter, and a pair is an edge only when `git merge-tree` of
-//!   the two heads conflicts (any unknown counts as a conflict — fail
-//!   closed); stacked bases are edges unconditionally. A clean merge is not
-//!   proof of semantic compatibility either — the pass only orders, it never
-//!   merges, vouches, or combines. Within a component, existing
-//!   trusted `loom:sequence` markers and base-branch stacking are
-//!   authoritative constraints; everything else orders ready-first (#10371,
-//!   [`ready`]: approved PRs ahead of non-approved ones), then oldest-first
-//!   within a tier (stable tiebreak on PR number), except that a placeable
-//!   PR of a higher priority level (`loom:very-important`, then
-//!   `loom:important`, #11103) goes before a lower one of its tier and a
-//!   stalled no-verdict PR goes last (#10060). A constraint
-//!   cycle skips the whole component for that tick — a half-rewritten order
-//!   is worse than a deferred one.
-//! - **Apply.** Edges are a DAG over DIRECT overlap (#10060): a follower
-//!   waits only for its nearest earlier member it really conflicts with
-//!   (or that it is stacked on), never for a PR it reaches only
-//!   through a third PR — so the marker's "changes files #N also changes" is
-//!   always true. No edge is written behind a predecessor that is not ready
-//!   to land (#10371). The follower gets `loom:sequenced` (#9378's durable gate)
-//!   and a trusted `source=pass` marker pinning both heads and the plan id.
+//! - **Plan (#12775).** Only STACKED pairs are ordered: eligible open PRs (not
+//!   draft, no hold label, no agent mid-flight, pinnable head) form a group
+//!   when a follower's base branch is a predecessor's head branch AND the pair
+//!   shares a changed file. PRs that merely overlap — however really they
+//!   conflict — are never ordered against each other; the planner reads no
+//!   `git merge-tree` verdict and no readiness. A stacking cycle skips its
+//!   component for that tick.
+//! - **Apply.** The follower gets `loom:sequenced` (#9378's durable gate) and a
+//!   trusted `source=pass` marker pinning both heads and the plan id.
 //!   Followers that already carry a trusted marker are never re-planned —
-//!   a human's or another pass's "after" wins over the computed order.
+//!   a human's or another pass's "after" wins.
+//! - **Retired automatic holds (#12775).** A recorded `source=pass` hold the
+//!   pass itself generated between independent (not stacked) PRs is released
+//!   once ([`retired_generated_hold`]), on positive evidence only; hard,
+//!   markerless, consolidation, stacked and unreadable holds stay.
 //! - **Release / replan.** Every open holder is re-evaluated with #9378's
 //!   [`evaluate`]: predecessor landed at the recorded head ⇒ release;
 //!   predecessor closed unmerged ⇒ release with that reason; any moved head
@@ -144,8 +133,6 @@ pub mod landing;
 // The real-merge-conflict pair predicate edges require (#10350).
 #[path = "merge_sequence_conflict.rs"]
 pub mod conflict;
-pub use conflict::overlap_components_with;
-use conflict::Conflicts;
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -248,15 +235,6 @@ pub fn sequence_prs(rows: &[super::open_pr_listing::RestPull]) -> Vec<SequencePr
     rows.iter().take(cap).map(SequencePr::from).collect()
 }
 
-/// Why a component/edge exists — recorded on the plan, consumed by telemetry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EdgeReason {
-    /// Shared changed filenames inside the component.
-    SharedFiles,
-    /// The follower's base branch is the predecessor's head branch (stacked).
-    StackedBase,
-}
-
 /// One planned ordering edge: `follower` waits for `after` (chain order).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceEdge {
@@ -268,7 +246,6 @@ pub struct SequenceEdge {
     pub follower_head: String,
     /// Deterministic plan id shared by every edge of one component.
     pub plan: String,
-    pub reason: EdgeReason,
 }
 
 /// A planned component: ordered members plus the chain edges to apply.
@@ -301,221 +278,123 @@ pub fn plan_id(members: &[(u32, &str)]) -> String {
     format!("seq-{}", &digest[..8])
 }
 
-/// Order one component's members: constraint edges first (trusted markers
-/// among members, stacked bases), then oldest-first with a stable number
-/// tiebreak. `None` on a constraint cycle — the caller skips the component
-/// whole rather than applying a partial order.
-///
-/// Ranking over the placeable set: among members that
-/// are placeable right now (no unplaced constraint predecessor), ready
-/// members go first (#10371, [`ready::tier`]); within a tier a `stalled`
-/// member goes last and a higher priority level goes first (#10060,
-/// #11510), then oldest-first. A rank never overrides a constraint edge;
-/// with every member in one tier, one level and no stall the order is
-/// exactly the oldest-first one.
+/// Each eligible follower's stacked predecessor: the eligible PR whose head
+/// branch is the follower's base branch (the lowest number if several share
+/// that head). The only relation the pass orders by since #12775.
 #[must_use]
-pub fn order_component_with(
-    members: &[&SequencePr],
-    constraints: &[(u32, u32)],
-    stalled: &BTreeSet<u32>,
-) -> Option<Vec<u32>> {
-    let nums: BTreeSet<u32> = members.iter().map(|p| p.number).collect();
-    let mut succ: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    let mut indegree: BTreeMap<u32, usize> = members.iter().map(|p| (p.number, 0)).collect();
-    for (follower, after) in constraints {
-        if nums.contains(follower) && nums.contains(after) && follower != after {
-            succ.entry(*after).or_default().push(*follower);
-            indegree.entry(*follower).and_modify(|d| *d += 1);
-        }
-    }
-    let by_number: BTreeMap<u32, &SequencePr> = members.iter().map(|p| (p.number, *p)).collect();
-    let mut ready: Vec<u32> = indegree
+pub fn stacked_preds(open_prs: &[SequencePr]) -> BTreeMap<u32, u32> {
+    let eligible: Vec<&SequencePr> = open_prs
         .iter()
-        .filter(|(_, d)| **d == 0)
-        .map(|(n, _)| *n)
+        .filter(|p| p.eligible_for_ordering() && p.pinnable())
         .collect();
-    let mut ordered = Vec::with_capacity(members.len());
-    while !ready.is_empty() {
-        // Among the currently placeable: ready before not ready, then
-        // not-stalled before stalled, higher level before lower, then
-        // oldest-first — a stable total order independent of listing order.
-        let rank = |p: &SequencePr| {
-            (ready::tier(p), stalled.contains(&p.number), std::cmp::Reverse(stall::level(p)))
-        };
-        ready.sort_by(|a, b| {
-            let (pa, pb) = (by_number[a], by_number[b]);
-            (rank(pa), &pa.created_at, pa.number).cmp(&(rank(pb), &pb.created_at, pb.number))
-        });
-        let n = ready.remove(0);
-        ordered.push(n);
-        for next in succ.get(&n).into_iter().flatten() {
-            let d = indegree.get_mut(next).expect("edge target is a member");
-            *d -= 1;
-            if *d == 0 {
-                ready.push(*next);
-            }
+    let mut pred_of = BTreeMap::new();
+    for fol in &eligible {
+        if fol.base_ref.is_empty() {
+            continue;
+        }
+        if let Some(after) = eligible
+            .iter()
+            .filter(|o| o.number != fol.number && o.head_ref == fol.base_ref)
+            .map(|o| o.number)
+            .min()
+        {
+            pred_of.insert(fol.number, after);
         }
     }
-    (ordered.len() == members.len()).then_some(ordered)
+    pred_of
 }
 
-/// Plan edges for one ordered component — a DAG over direct overlap (#10060).
+/// The full plan for one repo's open set: stacked-base edges only. Pure.
 ///
-/// Each follower waits for its NEAREST earlier member (latest in `order`)
-/// that directly shares a changed file with it or whose head branch is its
-/// base; a follower with no such member gets no edge. Two members linked
-/// only through a third PR's files are never ordered against each other.
-/// Followers with no pinnable head SHA yield no edge: an unpinned hold
-/// cannot be re-checked safely. Edges carry [`EdgeReason::SharedFiles`]
-/// except where the follower's base branch IS the predecessor's head branch
-/// ([`EdgeReason::StackedBase`]). A shared file yields an edge only when
-/// `conflicts` says the pair really conflicts (#10350); stacking is
-/// unconditional.
+/// A follower waits for its [`stacked_preds`] predecessor, provided the pair
+/// still shares a changed file per `files` (a stacked pair that touches
+/// disjoint files has never been ordered). Nothing else is planned: PRs that
+/// merely overlap are never ordered against each other (#12775, #12344), and
+/// trusted markers are not consulted because a follower that already carries
+/// one is never re-planned. A stacking cycle skips its component whole. A
+/// component is a connected set of stacked PRs; size-1 components are not
+/// groups. Only PRs [`stacked_preds`] names need an entry in `files`.
 #[must_use]
-pub fn plan_group_with(
-    plan: &str,
-    order: &[u32],
-    by_number: &BTreeMap<u32, SequencePr>,
+pub fn plan_repo(
+    open_prs: &[SequencePr],
     files: &BTreeMap<u32, BTreeSet<String>>,
-    conflicts: Conflicts<'_>,
-) -> SequenceGroup {
+) -> Vec<SequenceGroup> {
+    if open_prs.len() <= TRIGGER_OPEN_PRS {
+        return Vec::new();
+    }
+    let eligible: BTreeMap<u32, &SequencePr> = open_prs
+        .iter()
+        .filter(|p| p.eligible_for_ordering() && p.pinnable())
+        .map(|p| (p.number, p))
+        .collect();
     let shares = |a: u32, b: u32| {
         files
             .get(&a)
             .zip(files.get(&b))
             .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)))
     };
-    let mut edges = Vec::new();
-    for (i, &follower) in order.iter().enumerate() {
-        let Some(fol) = by_number.get(&follower) else {
-            continue;
-        };
-        let Some(&after) = order[..i].iter().rev().find(|&&a| {
-            by_number.get(&a).is_some_and(|p| {
-                fol.base_ref == p.head_ref || (shares(a, follower) && conflicts(p, fol))
-            })
-        }) else {
-            continue;
-        };
-        let Some(pred) = by_number.get(&after) else {
-            continue;
-        };
-        let (Some(pred_head), Some(follower_head)) =
-            (pred.head_sha.as_deref(), fol.head_sha.as_deref())
-        else {
-            continue;
-        };
-        edges.push(SequenceEdge {
-            follower: fol.number,
-            after,
-            pred_head: pred_head.to_string(),
-            follower_head: follower_head.to_string(),
-            plan: plan.to_string(),
-            reason: if fol.base_ref == pred.head_ref {
-                EdgeReason::StackedBase
-            } else {
-                EdgeReason::SharedFiles
-            },
-        });
-    }
-    SequenceGroup {
-        plan: plan.to_string(),
-        order: order.to_vec(),
-        edges,
-    }
-}
-
-/// The full plan for one repo's open set. Pure: the caller fetched listing +
-/// files + trusted markers, and gets back the groups to apply. Constraints
-/// come from `markers` (trusted, by follower) and from base-branch stacking
-/// among members. Components of size 1 are not groups. Stalled no-verdict
-/// PRs are judged against the wall clock and [`stall_hours`].
-/// With the real-conflict predicate (#10350) — the live pass.
-#[must_use]
-pub fn plan_repo_checked(
-    open_prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    markers: &BTreeMap<u32, SequenceMarker>,
-    conflicts: Conflicts<'_>,
-) -> Vec<SequenceGroup> {
-    let stalled = stall::stalled_for_ordering(open_prs, Utc::now(), stall_hours());
-    plan_repo_conflicts(open_prs, files, markers, &stalled, conflicts)
-}
-
-/// [`plan_repo_checked`] with an explicit stalled set (deterministic for tests).
-#[must_use]
-pub fn plan_repo_with(
-    open_prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    markers: &BTreeMap<u32, SequenceMarker>,
-    stalled: &BTreeSet<u32>,
-) -> Vec<SequenceGroup> {
-    plan_repo_conflicts(open_prs, files, markers, stalled, &conflict::assume_conflict)
-}
-
-/// [`plan_repo_with`] with an explicit pair-conflict predicate (#10350).
-#[must_use]
-pub fn plan_repo_conflicts(
-    open_prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    markers: &BTreeMap<u32, SequenceMarker>,
-    stalled: &BTreeSet<u32>,
-    conflicts: Conflicts<'_>,
-) -> Vec<SequenceGroup> {
-    if open_prs.len() <= TRIGGER_OPEN_PRS {
-        return Vec::new();
-    }
-    // #10465: readiness is transitive across the recorded holds.
-    let demoted = ready::demote_unlandable(open_prs, markers);
-    let open_prs = demoted.as_slice();
-    let eligible: Vec<&SequencePr> = open_prs
-        .iter()
-        .filter(|p| p.eligible_for_ordering() && p.pinnable())
+    let pred_of: BTreeMap<u32, u32> = stacked_preds(open_prs)
+        .into_iter()
+        .filter(|(f, a)| shares(*f, *a))
         .collect();
-    let by_number: BTreeMap<u32, SequencePr> =
-        open_prs.iter().map(|p| (p.number, p.clone())).collect();
+    // Components over the stacked links (union by walking to the chain root).
+    let mut components: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut cyclic: BTreeSet<u32> = BTreeSet::new();
+    for n in pred_of.keys().chain(pred_of.values()) {
+        let mut cur = *n;
+        let mut seen = BTreeSet::from([cur]);
+        while let Some(next) = pred_of.get(&cur) {
+            if !seen.insert(*next) {
+                cyclic.insert(*next);
+                break;
+            }
+            cur = *next;
+        }
+        components.entry(cur).or_default().push(*n);
+    }
     let mut groups = Vec::new();
-    for component in overlap_components_with(&eligible, files, conflicts) {
-        if component.len() < 2 {
-            continue;
-        }
-        let mut constraints: Vec<(u32, u32)> = Vec::new();
-        for n in &component {
-            if let Some(m) = markers.get(n) {
-                constraints.push((*n, m.after));
-            }
-            if let Some(p) = by_number.get(n) {
-                for other in &component {
-                    if other != n
-                        && by_number
-                            .get(other)
-                            .is_some_and(|o| p.base_ref == o.head_ref)
-                    {
-                        constraints.push((*n, *other));
-                    }
-                }
-            }
-        }
-        let members: Vec<&SequencePr> = component.iter().filter_map(|n| by_number.get(n)).collect();
-        let Some(order) = order_component_with(&members, &constraints, stalled) else {
+    for (root, mut members) in components {
+        members.sort_unstable();
+        members.dedup();
+        if cyclic.contains(&root) || members.iter().any(|m| cyclic.contains(m)) {
             log::info!(
-                "merge_sequence: component {component:?} has a constraint cycle — skipped this tick"
+                "merge_sequence: stacked component {members:?} has a cycle — skipped this tick"
             );
             continue;
+        }
+        let depth = |n: u32| {
+            let mut d = 0;
+            let mut cur = n;
+            while let Some(next) = pred_of.get(&cur) {
+                d += 1;
+                cur = *next;
+            }
+            d
         };
-        let member_pins: Vec<(u32, &str)> = order
+        members.sort_by_key(|n| (depth(*n), eligible[n].created_at.clone(), *n));
+        let pins: Vec<(u32, &str)> = members
+            .iter()
+            .filter_map(|n| eligible[n].head_sha.as_deref().map(|h| (*n, h)))
+            .collect();
+        let plan = plan_id(&pins);
+        let edges = members
             .iter()
             .filter_map(|n| {
-                by_number
-                    .get(n)
-                    .and_then(|p| p.head_sha.as_deref())
-                    .map(|h| (*n, h))
+                let after = *pred_of.get(n)?;
+                Some(SequenceEdge {
+                    follower: *n,
+                    after,
+                    pred_head: eligible[&after].head_sha.clone()?,
+                    follower_head: eligible[n].head_sha.clone()?,
+                    plan: plan.clone(),
+                })
             })
             .collect();
-        let id = plan_id(&member_pins);
-        let mut group = plan_group_with(&id, &order, &by_number, files, conflicts);
-        ready::drop_edges_behind_unready(&mut group, &by_number);
-        groups.push(group);
+        groups.push(SequenceGroup {
+            plan,
+            order: members,
+            edges,
+        });
     }
     groups
 }
@@ -562,6 +441,10 @@ pub enum HoldAction {
     /// changes-requested / ci-failure / blocked label): release (#10371).
     /// Decided by [`ready::with_readiness`].
     ReleaseNotReady,
+    /// A recorded hold this pass generated for PRs that are not stacked: the
+    /// automatic ordering is retired (#12775), so release it. Decided by
+    /// [`retired_generated_hold`] on positive evidence only.
+    ReleaseRetired,
 }
 
 /// Pure Phase-1 decision for one hold.
@@ -617,6 +500,26 @@ pub fn hold_action(
     }
 }
 
+/// Is this recorded hold a retired, generated ordering (#12775)? Positive
+/// evidence only: [`overlap::release_candidate`] (a trusted `source=pass`
+/// marker, no `cons-` consolidation plan, the predecessor named by the marker
+/// present in this tick's listing, and the follower's live base not that
+/// predecessor's head) AND the follower is not stacked on any other open PR.
+/// Hard holds, label-without-marker, consolidation plans, stacked pairs and
+/// an unreadable predecessor all fail it and stay held.
+#[must_use]
+pub fn retired_generated_hold(
+    marker: &SequenceMarker,
+    follower: &SequencePr,
+    open: &[SequencePr],
+) -> bool {
+    let pred = open.iter().find(|p| p.number == marker.after);
+    overlap::release_candidate(marker, follower, pred)
+        && !open
+            .iter()
+            .any(|o| o.number != follower.number && o.head_ref == follower.base_ref)
+}
+
 /// Hours since the predecessor's last activity, or `None` when unknown —
 /// unknown never expires.
 #[must_use]
@@ -632,11 +535,8 @@ pub fn pred_quiet_hours(pred: &PredecessorState) -> Option<f64> {
 /// The apply comment body. Carries the marker (the machine state) and a
 /// concise human explanation.
 #[must_use]
-pub fn apply_comment_body(marker: &SequenceMarker, reason: EdgeReason) -> String {
-    let why = match reason {
-        EdgeReason::StackedBase => format!("its base branch is #{}'s head branch", marker.after),
-        EdgeReason::SharedFiles => format!("it changes files #{} also changes", marker.after),
-    };
+pub fn apply_comment_body(marker: &SequenceMarker) -> String {
+    let why = format!("its base branch is #{}'s head branch", marker.after);
     format!(
         "**Landing order recorded** — this PR overlaps other open work\n\n\
          Planned by the merge-sequencing pass (#9686): this PR lands AFTER #{}, because {why}. \
@@ -682,6 +582,11 @@ pub fn release_comment_body(
              this PR is approved — ready work lands first and #{} is rebased afterwards",
             marker.after,
             stall_hours(),
+            marker.after
+        ),
+        HoldAction::ReleaseRetired => format!(
+            "automatic ordering between PRs that are not stacked has been retired — #{} was only \
+             a scheduling preference derived from overlapping changes, not an explicit dependency",
             marker.after
         ),
         HoldAction::ReleaseNoOverlap => overlap::release_reason(marker),
@@ -814,6 +719,8 @@ pub struct MergeSequenceStats {
     pub overlap_released: usize,
     /// Soft holds released because the predecessor is not ready (#10371).
     pub not_ready_released: usize,
+    /// Generated holds released because automatic ordering is retired (#12775).
+    pub retired_released: usize,
     /// Stalled-chain escalations posted this tick (#10060).
     pub escalated: usize,
     pub held: usize,
@@ -937,6 +844,9 @@ pub struct PlanReport {
     /// Existing holds Phase 1 would release as no-overlap (#10077):
     /// `(follower, predecessor)`.
     pub would_release_no_overlap: Vec<(u32, u32)>,
+    /// Generated holds Phase 1 would release as retired (#12775):
+    /// `(follower, predecessor)`.
+    pub would_release_retired: Vec<(u32, u32)>,
     /// Existing holds and why each is still kept (#12595):
     /// `(follower, predecessor, reason)`. Read-only; nothing is written.
     pub held_because: Vec<(u32, u32, String)>,
@@ -971,12 +881,15 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     let conflicts = |a: &SequencePr, b: &SequencePr| pairs.conflicts(a, b);
     report.would_release_no_overlap =
         overlap::would_release(gh_bin, root, &open, &mut cache, &conflicts);
-    for pr in &eligible {
+    let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
+    let stacked = stacked_preds(&open);
+    for pr in eligible
+        .iter()
+        .filter(|p| stacked.contains_key(&p.number) || stacked.values().any(|a| *a == p.number))
+    {
         cache.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
-    let files = cache.known(eligible.iter().map(|p| p.number));
-    let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
-    report.groups = plan_repo_checked(&open, &files, &markers, &conflicts);
+    report.groups = plan_repo(&open, &cache.known(stacked.iter().flat_map(|(f, a)| [*f, *a])));
     let bin = gh_bin.to_string_lossy().to_string();
     let open_ready = ready::demote_unlandable(&open, &markers);
     for (n, marker) in &markers {
@@ -985,6 +898,9 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
         };
         let pred = predecessor(&bin, root, &open, marker.after);
         let head = open_ready.iter().find(|p| p.number == marker.after);
+        if retired_generated_hold(marker, follower, &open) {
+            report.would_release_retired.push((*n, marker.after));
+        }
         let why = ready::hold_reason(marker, pred.as_ref(), follower, head);
         report.held_because.push((*n, marker.after, why));
     }
@@ -1058,7 +974,7 @@ fn apply_edge(
     let wrote = if plan.write == landing::LandingWrite::Keep && label_present {
         false
     } else {
-        landing::write(gh_bin, root, edge.follower, edge.reason, plan)?;
+        landing::write(gh_bin, root, edge.follower, plan)?;
         if !label_present {
             let n = edge.follower.to_string();
             gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
@@ -1201,6 +1117,7 @@ pub(super) fn reconcile_merge_sequences_gated(
             sticky::forge_same_tree(gh_bin, root, pinned, live)
         });
         let pr: &SequencePr = &held;
+        let retire = retired_generated_hold(&marker, pr, &open);
         let pred = predecessor(&bin, root, &open, marker.after);
         // #10465: a predecessor head that moved by a tree-identical commit is
         // re-anchored, not voided; the hold is evaluated at the new head.
@@ -1213,14 +1130,18 @@ pub(super) fn reconcile_merge_sequences_gated(
         let head = open.iter().find(|p| p.number == marker.after);
         let cause = head.and_then(|h| stall::stall_cause(h, now, stall_bound));
         let approved = pr.has("loom:pr");
-        let action = stall::hold_action_with_stall(
-            &marker,
-            pred.as_ref(),
-            pr.head_sha.as_deref(),
-            approved,
-            max_age,
-            cause.as_ref(),
-        );
+        let action = if retire {
+            HoldAction::ReleaseRetired
+        } else {
+            stall::hold_action_with_stall(
+                &marker,
+                pred.as_ref(),
+                pr.head_sha.as_deref(),
+                approved,
+                max_age,
+                cause.as_ref(),
+            )
+        };
         if let (Some(h), Some(c), true) = (head, cause.as_ref(), approved) {
             if matches!(action, HoldAction::ReleaseStalled | HoldAction::HoldHard) {
                 let quiet = stall::quiet_hours(h, now).unwrap_or(stall_bound);
@@ -1242,7 +1163,8 @@ pub(super) fn reconcile_merge_sequences_gated(
             | HoldAction::Expire
             | HoldAction::ReleaseStalled
             | HoldAction::ReleaseNoOverlap
-            | HoldAction::ReleaseNotReady => {
+            | HoldAction::ReleaseNotReady
+            | HoldAction::ReleaseRetired => {
                 let body = release_comment_body(&marker, action, ready_head);
                 release_hold(gh_bin, root, pr.number, &body).map(|_| action)
             }
@@ -1264,6 +1186,7 @@ pub(super) fn reconcile_merge_sequences_gated(
             Ok(HoldAction::ReleaseStalled) => stats.stall_released += 1,
             Ok(HoldAction::ReleaseNoOverlap) => stats.overlap_released += 1,
             Ok(HoldAction::ReleaseNotReady) => stats.not_ready_released += 1,
+            Ok(HoldAction::ReleaseRetired) => stats.retired_released += 1,
             Ok(HoldAction::VoidAndReplan) => stats.voided += 1,
             Ok(_) => stats.held += 1,
             Err(e) => {
@@ -1317,13 +1240,18 @@ pub(super) fn reconcile_merge_sequences_gated(
     if eligible.len() < 2 {
         return stats;
     }
-    for pr in &eligible {
+    // Only stacked PRs need their changed files read (#12775).
+    let stacked = stacked_preds(&open);
+    for pr in eligible
+        .iter()
+        .filter(|p| stacked.contains_key(&p.number) || stacked.values().any(|a| *a == p.number))
+    {
         files.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
-    let files = files.known(eligible.iter().map(|p| p.number));
+    let plan_files = files.known(stacked.iter().flat_map(|(f, a)| [*f, *a]));
     let markers = fetch_markers(gh_bin, root, &eligible, &read_markers);
     let fleet = crate::forge_identity::FleetLogins::for_root(root);
-    for group in plan_repo_checked(&open, &files, &markers, &conflicts) {
+    for group in plan_repo(&open, &plan_files) {
         stats.groups += 1;
         for edge in group.edges {
             // Never re-plan a follower that already carries an ordering
@@ -1372,12 +1300,11 @@ pub(super) fn reconcile_merge_sequences_gated(
                     stats.applied += 1;
                     log::info!(
                         "claim_reconciliation (merge sequence): PR #{} in {} now sequenced after \
-                         #{} (plan {}, {:?})",
+                         #{} (plan {}, stacked)",
                         edge.follower,
                         root.display(),
                         edge.after,
-                        edge.plan,
-                        edge.reason
+                        edge.plan
                     );
                 }
                 Ok(false) => stats.held += 1,
