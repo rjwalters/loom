@@ -38,7 +38,11 @@ pub fn record_for(
                 reason_code,
                 confirmed,
                 ..
-            } if mine(*number) => last_hold = Some((t, reason_code, *confirmed)),
+            } if mine(*number) && t != transition::DECISION => {
+                // A `decision` entry records a merge-risk verdict and writes no
+                // label, so it is neither a hold nor a release.
+                last_hold = Some((t, reason_code, *confirmed));
+            }
             JournalEntry::Marker { number, marker, .. }
                 if mine(*number)
                     && marker.starts_with("<!-- champion:hold-state")
@@ -166,6 +170,31 @@ mod tests {
         );
         assert_eq!(run(&v, Some(&journal(vec![hold("remove", true)]))).outcome, "released");
         assert_eq!(run(&v, Some(&journal(vec![hold("add", false)]))).outcome, "error");
+    }
+
+    #[test]
+    fn a_decision_entry_is_not_a_hold() {
+        let decision = |code: &str| JournalEntry::Hold {
+            at: now(),
+            number: 7,
+            transition: "decision".into(),
+            reason_code: code.into(),
+            trigger: "champion_role".into(),
+            confirmed: true,
+            entered_at: None,
+            confidence_pct: Some(90),
+        };
+        for code in ["merge-risk-pass", "merge-risk-self-release"] {
+            let r = run(&verdict("noop", "ci_pending", "pr"), Some(&journal(vec![decision(code)])));
+            assert_eq!((r.outcome.as_str(), r.hold_class), ("other", None), "{code}");
+        }
+        // A real hold written before a later decision still decides the outcome.
+        let j = journal(vec![hold("add", true), decision("merge-risk-pass")]);
+        let r = run(&verdict("noop", "held", "pr"), Some(&j));
+        assert_eq!(
+            (r.outcome.as_str(), r.hold_class.as_deref()),
+            ("held", Some("merge-risk-hold"))
+        );
     }
 
     #[test]
