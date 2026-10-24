@@ -46,6 +46,7 @@ fn applied(minute: u32, number: u32, action: &str, by: &str) -> JournalEntry {
         is_pr: false,
         action: action.to_string(),
         by: by.to_string(),
+        head_sha: None,
     }
 }
 
@@ -574,6 +575,130 @@ fn a_marker_cut_at_the_journal_bound_still_projects() {
     assert!(key.starts_with("Check Check"));
 }
 
+// ---------------------------------------------------------------------------
+// Judge (#12362)
+// ---------------------------------------------------------------------------
+
+fn judge_ctx(now: DateTime<Utc>) -> Context<'static> {
+    Context {
+        role: "judge",
+        ..ctx(now)
+    }
+}
+
+fn judge_step(item: u32, outcome_line: Option<&str>) -> Source {
+    let id = format!("step-judge-{item}-1");
+    let mut text = format!("==== loom-daemon dispatch: t sweep_id={id} item={item} ====\n");
+    if let Some(line) = outcome_line {
+        text.push_str(line);
+        text.push('\n');
+    }
+    Source::Step(StepSource {
+        sweep_id: id,
+        step: StepRole::Judge,
+        item,
+        log_text: Some(text),
+        hold_auth_before: None,
+    })
+}
+
+fn verdict_write(minute: u32, number: u32, action: &str, sha: &str) -> JournalEntry {
+    JournalEntry::Applied {
+        at: t(minute),
+        number,
+        is_pr: true,
+        action: action.to_string(),
+        by: "verdict-labels".to_string(),
+        head_sha: Some(sha.to_string()),
+    }
+}
+
+#[test]
+fn a_judge_step_with_a_verdict_write_is_verdict_with_the_observed_head() {
+    let mut store = RefusalStore::default();
+    for (action, sha) in [("approved", "aaa111"), ("changes_requested", "bbb222")] {
+        let j = journal(vec![verdict_write(1, 31, action, sha)]);
+        let mut records = records_for(
+            &judge_ctx(t(5)),
+            &judge_step(31, Some("LOOM_STEP_OUTCOME role=judge target=31 class=verdict reason=x")),
+            Some(&j),
+            &mut store,
+        );
+        assert_eq!(records.len(), 1);
+        let r = records.remove(0);
+        assert_eq!(class_reason(&r), ("verdict", action));
+        assert_eq!(r.mechanism, "step:judge");
+        assert_eq!(r.artifact, "pr");
+        assert_eq!(r.step.step.as_deref(), Some("judge_pr"));
+        assert_eq!(r.step.reason_set.as_deref(), Some(judge::REASON_SET));
+        assert_eq!(r.step.head_sha.as_deref(), Some(sha));
+        assert!(r.applied);
+    }
+}
+
+#[test]
+fn a_judge_step_with_a_noop_line_and_no_write_is_that_noop() {
+    let mut store = RefusalStore::default();
+    let mut records = records_for(
+        &judge_ctx(t(5)),
+        &judge_step(
+            31,
+            Some("LOOM_STEP_OUTCOME role=judge target=31 class=noop reason=already_judged"),
+        ),
+        Some(&journal(vec![])),
+        &mut store,
+    );
+    let r = records.remove(0);
+    assert_eq!(class_reason(&r), ("noop", "already_judged"));
+    assert!(!r.applied);
+    // A line for another target or role is not this step's.
+    let mut records = records_for(
+        &judge_ctx(t(5)),
+        &judge_step(31, Some("LOOM_STEP_OUTCOME role=judge target=99 class=noop reason=x")),
+        Some(&journal(vec![])),
+        &mut store,
+    );
+    assert_eq!(class_reason(&records.remove(0)), ("failed", "unclassified"));
+}
+
+#[test]
+fn a_tick_with_two_verdicts_on_two_prs_projects_two_records_and_a_claim_none() {
+    let mut store = RefusalStore::default();
+    let j = journal(vec![
+        verdict_write(1, 10, "approved", "aaa"),
+        verdict_write(2, 11, "changes_requested", "bbb"),
+        JournalEntry::Applied {
+            at: t(3),
+            number: 12,
+            is_pr: true,
+            action: "claimed".into(),
+            by: "lease".into(),
+            head_sha: None,
+        },
+    ]);
+    let source = Source::Tick { started_at: t(0) };
+    let records = records_for(&judge_ctx(t(5)), &source, Some(&j), &mut store);
+    let got: Vec<_> = records
+        .iter()
+        .map(|r| (r.number, r.reason.clone().unwrap(), r.step.head_sha.clone().unwrap()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (10, "approved".into(), "aaa".into()),
+            (11, "changes_requested".into(), "bbb".into())
+        ]
+    );
+    let again = records_for(&judge_ctx(t(5)), &source, Some(&j), &mut store);
+    assert_eq!(
+        records.iter().map(|r| &r.step.fact_id).collect::<Vec<_>>(),
+        again.iter().map(|r| &r.step.fact_id).collect::<Vec<_>>(),
+        "fact_id is stable across re-emits in the same hour"
+    );
+    let idle = records_for(&judge_ctx(t(5)), &source, Some(&journal(vec![])), &mut store);
+    assert!(idle.is_empty(), "an idle tick projects nothing");
+}
+
 /// #12715: a requeue or skip names its gate, carries the sweep id and the raw
 /// token, and is never ledgered `failed` even with no readable journal.
 #[test]
@@ -687,6 +812,7 @@ fn a_doctor_hand_off_write_is_escalated_whatever_the_line_says() {
         is_pr: true,
         action: "escalated".to_string(),
         by: "operator_decision".to_string(),
+        head_sha: None,
     }]);
     let r =
         one_for("doctor", &role_step(StepRole::Doctor, 77, Some(("verdict", "fixed"))), Some(&j));
@@ -751,8 +877,8 @@ fn curator_journaled_writes_outrank_the_outcome_line() {
 }
 
 #[test]
-fn judge_stays_unregistered_and_a_role_tick_projects_nothing_for_doctor_or_curator() {
-    assert!(projector("judge").is_none());
+fn a_role_tick_projects_nothing_for_doctor_or_curator() {
+    assert!(projector("judge").is_some());
     assert!(projector("doctor").is_some() && projector("curator").is_some());
     for role in ["doctor", "curator"] {
         let ctx = Context { role, ..ctx(t(5)) };
