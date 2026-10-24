@@ -521,7 +521,13 @@ fn an_uncovered_or_refusing_reader_is_withdrawn_for_the_repo_and_the_next_serves
         assert_eq!(withdrawn.len(), 1, "{name}: {withdrawn:?}");
         assert_eq!(withdrawn[0].0, "app-2", "{name}");
         assert_eq!(withdrawn[0].1, format!("acme/{name}"), "{name}");
-        assert_eq!(withdrawn[0].2, Failure::Coverage, "{name}");
+        // A plain 404 with no evidence is withdrawn briefly (#12511).
+        let want = if name == "blind-c" {
+            Failure::CoverageUnproven
+        } else {
+            Failure::Coverage
+        };
+        assert_eq!(withdrawn[0].2, want, "{name}");
     }
 }
 
@@ -541,7 +547,12 @@ fn every_reader_refusing_the_repo_sheds_never_absent_and_never_the_writer() {
         );
         assert!(matches!(out, GhCompletion::Shed { .. }), "{name}: {out:?}");
         assert_eq!(p.who(), vec![Who::R2, Who::R1], "{name}: writer stub NOT invoked");
-        assert!(withdrawn.iter().all(|w| w.2 == Failure::Coverage), "{name}: {withdrawn:?}");
+        assert!(
+            withdrawn
+                .iter()
+                .all(|w| matches!(w.2, Failure::Coverage | Failure::CoverageUnproven)),
+            "{name}: {withdrawn:?}"
+        );
         // The caller sees "no answer", never a 404 it would read as absent.
         let outcome = super::super::outcome::classify(Ok(out), Duration::from_secs(10));
         assert!(
