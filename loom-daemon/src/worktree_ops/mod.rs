@@ -61,6 +61,7 @@ pub mod logs;
 /// `strip_prefix("feature/issue-")` in the CLI would be a copy of the
 /// convention, not a use of it.
 pub mod naming;
+pub mod open_backup;
 pub mod orphan_recovery;
 pub mod removal_log;
 pub mod repo;
