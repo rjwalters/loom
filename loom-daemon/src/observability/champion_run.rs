@@ -130,6 +130,7 @@ mod tests {
             trigger: "champion_role".into(),
             confirmed,
             entered_at: None,
+            confidence_pct: None,
         }
     }
 
