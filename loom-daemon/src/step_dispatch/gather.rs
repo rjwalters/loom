@@ -442,6 +442,41 @@ pub fn hold_at_recorded_head(
     held
 }
 
+/// Turn every [`Step::ChampionPromote`] whose issue the promotion author gate
+/// already holds into a [`PassReason::AuthorGateHeld`] pass (#13142), and
+/// return how many it held. Such a draw is a full Champion session that finds
+/// the issue still gated and changes nothing. `gates` maps an issue to the
+/// [`Stamp`]s of its trusted gate comments; `revs` to the revision of its
+/// current title and body. The issue is held while one stamp names that
+/// revision and the current trust digest: an edit, a trust change, or a
+/// legacy (unstamped) notice makes it drawn once, and its re-gate posts a
+/// notice with the new stamp. A trusted `loom:issue` leaves the
+/// `ChampionPromote` queue by itself. Fails open: an issue with no readable
+/// stamp, revision or trust digest is drawn. Pure.
+pub fn hold_author_gated(
+    items: &mut [Item],
+    gates: &HashMap<u32, Vec<crate::promotion_author::Stamp>>,
+    revs: &HashMap<u32, String>,
+    trust: Option<&str>,
+) -> usize {
+    let Some(trust) = trust else { return 0 };
+    let mut held = 0usize;
+    for item in items.iter_mut() {
+        if item.step() != Some(Step::ChampionPromote) {
+            continue;
+        }
+        let Some(n) = item.target() else { continue };
+        let (Some(stamps), Some(rev)) = (gates.get(&n), revs.get(&n)) else {
+            continue;
+        };
+        if stamps.iter().any(|s| s.rev == *rev && s.trust == trust) {
+            item.verdict = Verdict::Pass(PassReason::AuthorGateHeld);
+            held += 1;
+        }
+    }
+    held
+}
+
 // ---------------------------------------------------------------------------
 // The forge half
 // ---------------------------------------------------------------------------
@@ -496,6 +531,69 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
         let markers = PullMarkers::from_trusted(&TrustedComments::filtered(&policy, trusted));
         cache().insert(key, (row.updated_at.clone(), markers.clone()));
         out.insert(row.number, markers);
+    }
+    out
+}
+
+type GateCache = HashMap<(String, u32), (Option<String>, Vec<crate::promotion_author::Stamp>)>;
+
+fn gate_cache() -> &'static Mutex<GateCache> {
+    static CACHE: OnceLock<Mutex<GateCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The gate stamps of the trusted comments on the curated issues among
+/// `numbers` (the `ChampionPromote` candidates), cached per `updated_at`, at
+/// most [`MAX_MARKER_READS`] reads per tick. An issue whose comments cannot
+/// be read, or are past the budget, is absent: it is drawn.
+fn gate_stamps(
+    slug: &str,
+    root: &Path,
+    rows: &[RestIssue],
+    numbers: &[u32],
+) -> HashMap<u32, Vec<crate::promotion_author::Stamp>> {
+    let mut out = HashMap::new();
+    let mut reads = 0usize;
+    let cache = || {
+        gate_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    // #12310: the gate-marker comment reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
+    for row in rows
+        .iter()
+        .filter(|r| numbers.contains(&r.number) && r.comments > 0)
+    {
+        let key = (slug.to_string(), row.number);
+        let cached = cache()
+            .get(&key)
+            .filter(|(at, _)| *at == row.updated_at)
+            .map(|(_, s)| s.clone());
+        if let Some(stamps) = cached {
+            out.insert(row.number, stamps);
+            continue;
+        }
+        if reads >= MAX_MARKER_READS {
+            continue;
+        }
+        reads += 1;
+        let Some(trusted) = crate::comment_trust::records::fetch_trusted_comments(
+            slug,
+            &row.number.to_string(),
+            root,
+            true,
+        ) else {
+            continue;
+        };
+        let stamps: Vec<_> = TrustedComments::filtered(&policy, trusted)
+            .bodies()
+            .iter()
+            .filter_map(|b| crate::promotion_author::Stamp::parse(b))
+            .collect();
+        cache().insert(key, (row.updated_at.clone(), stamps.clone()));
+        out.insert(row.number, stamps);
     }
     out
 }
@@ -678,6 +776,33 @@ pub fn list(
     );
     if at_head > 0 {
         log::debug!("work_finder: {slug}: {at_head} held PR(s) unchanged since their hold");
+    }
+    let promote: Vec<u32> = items
+        .iter()
+        .filter(|i| i.step() == Some(Step::ChampionPromote))
+        .filter_map(Item::target)
+        .collect();
+    if !promote.is_empty() {
+        let revs: HashMap<u32, String> = rows
+            .iter()
+            .filter(|r| promote.contains(&r.number))
+            .map(|r| {
+                let rev = crate::promotion_author::revision(
+                    r.title.as_deref().unwrap_or_default(),
+                    r.body.as_deref().unwrap_or_default(),
+                );
+                (r.number, rev)
+            })
+            .collect();
+        let gated = hold_author_gated(
+            &mut items,
+            &gate_stamps(&slug, root, &rows, &promote),
+            &revs,
+            Some(policy.digest().as_str()),
+        );
+        if gated > 0 {
+            log::debug!("work_finder: {slug}: {gated} curated issue(s) held by the author gate");
+        }
     }
     Ok(Some(Listed {
         slug,
