@@ -85,6 +85,10 @@ pub(crate) const SNAPSHOT_TTL_DEFAULT_SECS: i64 = 3600;
 /// the TTL is the bound on an unseen public → private flip, so a typo must
 /// not stretch it to a day.
 pub(crate) const SNAPSHOT_TTL_MAX_SECS: i64 = 3600;
+/// A fresh snapshot that lacks the asked-for repo is revalidated once if it
+/// was verified at least this long ago (#13152): a repo created after the
+/// snapshot was taken would otherwise read as absent until the TTL expired.
+pub(crate) const SNAPSHOT_MISS_REFRESH_SECS: i64 = 60;
 /// No new read of a snapshot whose last revalidation failed, for this long.
 pub(crate) const SNAPSHOT_FAILURE_BACKOFF_SECS: i64 = super::SUSPECT_BACKOFF_SECS;
 const PER_PAGE: u64 = 100;
@@ -334,12 +338,15 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
             .filter(|s| s.fresh(now, ttl))
             .map(|s| s.answer(owner_repo))
     });
-    if let Some(answer) = hot {
+    if let Some(answer) = hot.filter(|a| !refresh_on_miss(a, &key, now)) {
         return answer;
     }
     let prior = load(&key, now);
     if let Some(s) = prior.as_ref().filter(|s| s.fresh(now, ttl)) {
-        return s.answer(owner_repo);
+        let answer = s.answer(owner_repo);
+        if !refresh_on_miss(&answer, &key, now) {
+            return answer;
+        }
     }
     // A credential the endpoint refused stays a user token: a failed recheck
     // keeps the per-repo path rather than inventing an outage.
@@ -385,6 +392,16 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
             unavailable()
         }
     }
+}
+
+/// Whether a fresh snapshot's `Listed(None)` should be rechecked against the
+/// forge (#13152): the repo may have been created after the snapshot was
+/// taken. Rate-limited by the snapshot's own `verified_at`, which a refresh
+/// (success) advances, so N misses in a window cost at most one refresh.
+fn refresh_on_miss(answer: &Answer, key: &str, now: i64) -> bool {
+    matches!(answer, Answer::Listed(None))
+        && state::with(|s| s.snapshots.get(key).map(|m| m.verified_at))
+            .is_some_and(|v| now - v >= SNAPSHOT_MISS_REFRESH_SECS)
 }
 
 /// The credentials a telemetry read of `owner_repo` may run under: the

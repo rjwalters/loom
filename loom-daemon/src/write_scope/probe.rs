@@ -26,7 +26,10 @@
 //! answer is then cached here for [`ttl`]. So a repository removed from the
 //! installation can keep a cached WRITE for up to about two hours with the
 //! defaults (snapshot TTL + probe TTL), not one. The write itself is still
-//! refused by the forge; what lags is this pre-check.
+//! refused by the forge; what lags is this pre-check. A repository the
+//! snapshot does not list is the exception (#13152): the snapshot is
+//! revalidated on such a miss (at most once a minute) and a cached
+//! [`NOT_IN_INSTALLATION`] lives for only a minute, like an `Unknown`.
 //!
 //! A forced per-owner re-mint cuts both short (#9247): the stale-token write
 //! retry forgets the credential's snapshot and expires every answer cached
@@ -639,11 +642,11 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
             credential_tag(self.key_dir.as_deref(), &self.inner.cache_scope()).unwrap_or_default();
         let now = SystemTime::now();
         let fresh = |at: SystemTime, p: &Permission| {
-            let limit = if matches!(p, Permission::Unknown(_)) {
-                UNKNOWN_TTL
-            } else {
-                ttl()
-            };
+            // A snapshot miss is short-lived too (#13152): a repo added to a
+            // selected-repositories install later must be picked up quickly.
+            let short = matches!(p, Permission::Unknown(_))
+                || matches!(p, Permission::Insufficient(d) if d == NOT_IN_INSTALLATION);
+            let limit = if short { UNKNOWN_TTL } else { ttl() };
             now.duration_since(at).is_ok_and(|age| age < limit)
         };
         let mem = memory().lock().ok().and_then(|m| m.get(&key).cloned());
