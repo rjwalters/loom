@@ -118,6 +118,10 @@ pub struct Billing {
     /// remote ([`super::accounting::resolved_identity`]). `None` when nothing
     /// named one, or nothing was sent. The span's `github.repo`.
     pub repo: Option<String>,
+    /// Why a discovery read got no answer (#12310): `reserve` when the read
+    /// gateway refused it below its quota reserve. The span's
+    /// `loom.discovery.fallback_reason`.
+    pub fallback_reason: Option<&'static str>,
 }
 
 /// A label value through the ledger's sanitizer and narrowed to a short
@@ -188,7 +192,15 @@ impl Billing {
             cred_owner: clean(cred.owner.as_deref().unwrap_or("-"), "-"),
             role: clean(role, "unknown"),
             repo: None,
+            fallback_reason: None,
         }
+    }
+
+    /// These facts with a discovery fallback reason (#12310).
+    #[must_use]
+    pub fn with_fallback_reason(mut self, reason: Option<&'static str>) -> Self {
+        self.fallback_reason = reason;
+        self
     }
 
     /// These facts with the ledger's resolved `owner/repo` (#10752). A value

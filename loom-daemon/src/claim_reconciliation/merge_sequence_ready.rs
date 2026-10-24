@@ -57,10 +57,15 @@
 //! 1-3 above all become transitive. Hard (human) holds are untouched, as
 //! before: only the predicate for *predecessors* changes.
 //!
-//! "Ready" is read from labels only: CI state and mergeability are not in the
-//! open-PR listing, and fetching them per PR per tick would spend the API
-//! budget #10332 is reducing. `loom:ci-failure` is the CI proxy the fleet
-//! already maintains.
+//! **Landable now (#12010).** Labels alone miss an approved PR that later
+//! goes red or conflicting (the Judge's `loom:ci-failure` is only applied
+//! during a review). [`super::landable::tag_unlandable`] reads each ready
+//! PR's CI on its current head and its mergeability (conditional, ETag'd
+//! reads) and tags a definite failure or conflict in memory
+//! ([`super::landable::CI_RED_LABEL`], [`super::landable::CONFLICTING_LABEL`]),
+//! so every rule above treats it as not ready. Pending or unknown CI and
+//! unknown mergeability change nothing, and [`release_reason`] names the
+//! concrete cause.
 
 use std::collections::BTreeMap;
 
@@ -74,14 +79,16 @@ use super::{
 pub const APPROVED_LABEL: &str = "loom:pr";
 
 /// Labels that make an approved PR not ready to land: a review finding, a
-/// red CI run, or a block.
-pub const NOT_READY_LABELS: [&str; 5] = [
+/// red CI run, or a block, plus the in-memory "not landable now" tags.
+pub const NOT_READY_LABELS: [&str; 7] = [
     "loom:changes-requested",
     "loom:ci-failure",
     "loom:blocked",
     // Parked for a human; a re-date budget that ran out lands here (#10465).
     "loom:operator",
     NOT_LANDABLE_LABEL,
+    super::landable::CI_RED_LABEL,
+    super::landable::CONFLICTING_LABEL,
 ];
 
 /// In-memory only (never written to the forge): set by [`demote_unlandable`]
@@ -207,9 +214,61 @@ pub fn with_readiness(
     }
 }
 
-/// The release reason for [`HoldAction::ReleaseNotReady`].
+/// Why an existing hold is still kept, for the read-only `sequence-plan`
+/// output (#12595): the first [`with_readiness`] condition that fails, or
+/// "predecessor ready". Mirrors that function's order; writes nothing.
 #[must_use]
-pub fn release_reason(marker: &SequenceMarker) -> String {
+pub fn hold_reason(
+    marker: &SequenceMarker,
+    pred: Option<&PredecessorState>,
+    follower: &SequencePr,
+    head: Option<&SequencePr>,
+) -> String {
+    if marker.source.as_deref() != Some(SOURCE_PASS) {
+        return "human hold (no `source=pass`): never auto-released".into();
+    }
+    if marker.plan.starts_with(CONSOLIDATION_PLAN_PREFIX) {
+        return "consolidation reservation: keeps its own contract".into();
+    }
+    let Some(h) = head else {
+        return format!("predecessor #{} is outside this tick's listing", marker.after);
+    };
+    let in_flight = pred
+        .zip(follower.head_sha.as_deref())
+        .is_some_and(|(p, fh)| {
+            matches!(evaluate(marker, p, fh), Verdict::Keep(KeepReason::InFlight))
+        });
+    if !in_flight {
+        return format!(
+            "predecessor #{} is not read open at the recorded head (moved, closed, unreadable, \
+             or the follower head moved): the other hold rules decide",
+            marker.after
+        );
+    }
+    if !provably_unstacked(follower, h) {
+        return format!(
+            "stacked on #{} (or a branch name is unknown): readiness does not release it",
+            marker.after
+        );
+    }
+    if ready(h) {
+        return format!("predecessor #{} is ready", marker.after);
+    }
+    format!("predecessor #{} is not ready: released on the next tick", marker.after)
+}
+
+/// The release reason for [`HoldAction::ReleaseNotReady`]. `head` is the
+/// predecessor's row as this tick read it: a live red or conflicting head is
+/// named concretely (#12010).
+#[must_use]
+pub fn release_reason(marker: &SequenceMarker, head: Option<&SequencePr>) -> String {
+    if let Some(cause) = head.and_then(super::landable::cause) {
+        return format!(
+            "#{} is not landable now: {cause} — ready work is not held behind it (#12010), \
+             and the order is re-derived from current readiness on the next tick",
+            marker.after
+        );
+    }
     format!(
         "#{} is not ready to land (no `loom:pr` verdict, it carries `loom:changes-requested`, \
          `loom:ci-failure`, `loom:blocked` or `loom:operator`, or it is itself sequenced behind a \

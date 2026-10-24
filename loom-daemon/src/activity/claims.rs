@@ -657,7 +657,7 @@ mod tests {
             params![old_time.to_rfc3339()],
         )?;
 
-        let stale = db.get_stale_claims(3600)?;
+        let stale = get_stale_claims(&db.conn, 3600)?;
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].number, 123);
 

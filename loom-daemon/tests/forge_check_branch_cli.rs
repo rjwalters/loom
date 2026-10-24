@@ -182,3 +182,8 @@ fn closed_pr_head_but_an_open_linked_pr_stays_a_collision() {
     assert_eq!(r.out.status.code(), Some(0), "stderr: {stderr}");
     assert!(stderr.contains("open linked PR #900"), "stderr: {stderr}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

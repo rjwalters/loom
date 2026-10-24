@@ -221,12 +221,11 @@ fn the_file_is_read_again_on_every_load() {
 #[test]
 fn entry_policy_is_a_no_op_without_a_headers_file() {
     // Existing configs: any kind, any endpoint the other checks allow.
-    assert_eq!(entry_policy(false, "http://collector.internal:4318", None), Ok(()));
-    assert_eq!(entry_policy(true, "http://collector.internal:4318", None), Ok(()));
+    assert_eq!(entry_policy("http://collector.internal:4318", None), Ok(()));
 }
 
 #[test]
-fn entry_policy_requires_otlp_a_path_and_an_encrypted_or_loopback_endpoint() {
+fn entry_policy_requires_a_path_and_an_encrypted_or_loopback_endpoint() {
     let path = Some("/run/secrets/otlp-headers");
     for endpoint in [
         "https://otlp.internal",
@@ -235,17 +234,14 @@ fn entry_policy_requires_otlp_a_path_and_an_encrypted_or_loopback_endpoint() {
         "http://localhost:4318",
         "http://[::1]:4318",
     ] {
-        assert_eq!(entry_policy(true, endpoint, path), Ok(()), "{endpoint}");
+        assert_eq!(entry_policy(endpoint, path), Ok(()), "{endpoint}");
     }
     for endpoint in ["http://collector.internal:4318", "http://10.0.0.5:4318"] {
-        let detail = entry_policy(true, endpoint, path).unwrap_err();
+        let detail = entry_policy(endpoint, path).unwrap_err();
         assert!(detail.contains("cleartext"), "{detail}");
     }
-    assert!(entry_policy(false, "https://otlp.internal", path)
-        .unwrap_err()
-        .contains("only supported on an otlp"));
     for empty in ["", "   "] {
-        assert!(entry_policy(true, "https://otlp.internal", Some(empty))
+        assert!(entry_policy("https://otlp.internal", Some(empty))
             .unwrap_err()
             .contains("non-empty"));
     }

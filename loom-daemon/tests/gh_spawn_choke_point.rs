@@ -259,3 +259,8 @@ fn allowlist_parsing_skips_comments_and_blanks() {
     let parsed = parse_allowlist("# header\n\nsrc/a.rs | x\n  # indented\nsrc/b.rs | y  \n");
     assert_eq!(parsed, vec!["src/a.rs | x".to_string(), "src/b.rs | y".to_string()]);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -88,6 +88,7 @@ fn sweep(dir: &Path, id: &str, issue: u32) -> ManifestItem {
         timeout_remaining_secs: None,
         holds_issue_creation_mutex: false,
         stopped_at: Some(Utc::now()),
+        step: None,
     }
 }
 
@@ -1072,6 +1073,8 @@ fn a_rolled_back_binary_resumes_and_holds_the_failed_target_back() {
 mod exits;
 #[path = "tests/fake_host.rs"]
 mod fake_host;
+#[path = "tests/host_maintenance.rs"]
+mod host_maintenance;
 #[path = "tests/integration.rs"]
 mod integration;
 use fake_host::{refusal, FakeHost};

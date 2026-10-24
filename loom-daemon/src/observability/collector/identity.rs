@@ -75,6 +75,12 @@ impl Sampler {
                 sweep_id,
                 ..
             } => (*issue, Some(sweep_id)),
+            // A step's identity is sampled from the registry (`sample`), not
+            // replayed from a dispatch event: it has no lifecycle row (#11898).
+            Event::SweepGlobalDispatch {
+                kind: SweepKind::Step { .. } | SweepKind::PrSet(_),
+                ..
+            } => return,
             Event::SweepPhase { issue, .. } => (*issue, None),
             _ => return,
         };
@@ -128,8 +134,11 @@ impl Sampler {
                         (guard.config().workspace_root.clone(), guard.snapshot())
                     };
                     for info in snapshot.list(None) {
-                        let SweepKind::Issue(issue) = info.kind else {
-                            continue;
+                        // A step's identity is keyed by its item (#11898),
+                        // as a sweep's by its issue.
+                        let issue = match info.kind {
+                            SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                            SweepKind::PrSet(_) => continue,
                         };
                         if info.state.is_terminal() {
                             continue;

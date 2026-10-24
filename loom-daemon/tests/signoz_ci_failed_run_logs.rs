@@ -868,3 +868,8 @@ fn section_eighteen_joins_on_the_run_attempt() {
     let rows = section_eighteen_rows(&sql.replacen(from, "", 1));
     assert_eq!(num(&rows[0], "cancelled_after_start"), Some(2), "{rows:?}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

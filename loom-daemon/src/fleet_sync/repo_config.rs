@@ -73,6 +73,14 @@ pub struct RepoConfigPass {
     /// Why the half could not be completed, when it could not be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// How many repos failed in this pass; [`Self::error`] carries the first
+    /// message plus this count when it is more than one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failures: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl RepoConfigPass {
@@ -100,8 +108,7 @@ pub(super) fn pass(
     mode: Mode,
     now: DateTime<Utc>,
 ) -> RepoConfigPass {
-    let commit = Some(snapshot.manifest.commit.clone());
-    apply(render::repo_targets(snapshot, home, is_cloned), mode, now, &commit)
+    apply(render::repo_targets(snapshot, home, is_cloned), mode, now)
 }
 
 /// [`pass`] once the targets are rendered: a seam so tests need no snapshot.
@@ -109,7 +116,6 @@ pub(super) fn apply(
     targets: Result<Vec<RepoTarget>>,
     mode: Mode,
     now: DateTime<Utc>,
-    commit: &Option<String>,
 ) -> RepoConfigPass {
     let targets = match targets {
         Ok(t) => t,
@@ -122,6 +128,7 @@ pub(super) fn apply(
     };
     let stamp = now.format("%Y%m%dT%H%M%SZ").to_string();
     let mut out = RepoConfigPass::default();
+    let mut failures: Vec<String> = Vec::new();
     for t in &targets {
         let drift = render::repo_drift(t);
         let on_disk = std::fs::symlink_metadata(&t.path).is_ok();
@@ -140,37 +147,34 @@ pub(super) fn apply(
             detail: describe_drift(&drift),
         };
         if mode == Mode::Write && drifted {
-            write_one(t, &stamp, commit, &mut report, &mut out.error);
+            failures.extend(write_one(t, &stamp, &mut report));
         }
         out.repos.push(report);
     }
+    // Report the first failure, and how many more there were, rather than
+    // letting the last one overwrite the rest.
+    out.failures = failures.len();
+    out.error = failures.first().map(|first| match failures.len() {
+        1 => first.clone(),
+        n => format!("{first} (+{} more repo failures)", n - 1),
+    });
     out
 }
 
-fn write_one(
-    t: &RepoTarget,
-    stamp: &str,
-    commit: &Option<String>,
-    report: &mut RepoTierReport,
-    error: &mut Option<String>,
-) {
+fn write_one(t: &RepoTarget, stamp: &str, report: &mut RepoTierReport) -> Option<String> {
     let result = match t.target() {
-        Some(target) => {
-            let keys = crate::config_journal::restart_keys(&target, true);
-            render::write(&target, stamp).map(|(wrote, backup)| {
-                crate::config_journal::record_rendered(wrote, &target, backup, commit, &keys);
-                report.wrote = wrote;
-                report.present = true;
-            })
-        }
-        None => render::remove(&t.path, stamp).map(|(removed, _)| {
+        Some(target) => render::write(&target, stamp).map(|(wrote, _backup)| {
+            report.wrote = wrote;
+            report.present = true;
+        }),
+        None => render::remove(&t.path, stamp).map(|(removed, _backup)| {
             report.removed = removed;
             report.present = false;
         }),
     };
-    if let Err(e) = result {
-        *error = Some(format!("{} for {}: {e:#}", render::Tier::Repo.name(), t.name));
-    }
+    result
+        .err()
+        .map(|e| format!("{} for {}: {e:#}", render::Tier::Repo.name(), t.name))
 }
 
 fn top_level_keys(value: Option<&Value>) -> Vec<String> {

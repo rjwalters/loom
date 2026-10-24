@@ -97,10 +97,10 @@ mod resolve_tokens_pool_dir_for_cli_tests {
     //! workspace" register the test's *actual* `current_dir()` (or a sibling
     //! of it) in a scratch `LOOM_WORKSPACES_PATH` registry instead.
     use super::super::resolve_tokens_pool_dir_for_cli;
-    use loom_daemon::tokens_pool::paths::{
+    use crate::tokens_pool::paths::{
         per_repo_tokens_dir, shared_tokens_dir, SHARED_TOKENS_DIR_ENV,
     };
-    use loom_daemon::workspace_registry::{
+    use crate::workspace_registry::{
         normalize_path, Workspace, WorkspaceRegistry, REGISTRY_PATH_ENV,
     };
     use serial_test::serial;
@@ -161,7 +161,7 @@ mod resolve_tokens_pool_dir_for_cli_tests {
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
         let cwd = std::env::current_dir().unwrap();
-        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert_eq!(dir, crate::tokens_pool::paths::resolve_tokens_dir(&cwd));
         assert!(!anchored);
 
         std::env::remove_var(REGISTRY_PATH_ENV);
@@ -179,7 +179,7 @@ mod resolve_tokens_pool_dir_for_cli_tests {
         std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
-        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert_eq!(dir, crate::tokens_pool::paths::resolve_tokens_dir(&cwd));
         assert!(!anchored);
 
         std::env::remove_var(REGISTRY_PATH_ENV);
@@ -197,12 +197,16 @@ mod resolve_tokens_pool_dir_for_cli_tests {
         let registry_dir = tempfile::tempdir().unwrap();
         write_registry(&registry_dir.path().join("workspaces.json"), &[unrelated.path()]);
         std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
-        std::env::remove_var(SHARED_TOKENS_DIR_ENV); // default shared dir enabled
+        // Shared dir enabled. The lib's test build has no home-dir default, so
+        // set it explicitly rather than relying on the unset-env fallback.
+        let shared = tempfile::tempdir().unwrap();
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path());
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
         assert_eq!(dir, shared_tokens_dir().unwrap());
         assert!(anchored);
 
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
 
@@ -220,7 +224,7 @@ mod resolve_tokens_pool_dir_for_cli_tests {
         std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
-        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert_eq!(dir, crate::tokens_pool::paths::resolve_tokens_dir(&cwd));
         assert!(!anchored);
 
         std::env::remove_var(REGISTRY_PATH_ENV);

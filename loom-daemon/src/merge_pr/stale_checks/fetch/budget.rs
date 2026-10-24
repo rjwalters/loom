@@ -1,4 +1,6 @@
-//! How fast the freshness guard may ask GitHub (#11418).
+//! How fast the required-context reads may ask GitHub (#11418). The
+//! freshness guard they were built for is gone (#12063 slice 1); `required-checks`
+//! still reads through them.
 //!
 //! GitHub's secondary limits trip on bursts, not on hourly totals. So the
 //! guard spaces its own requests ([`before_request`]) and, once GitHub
@@ -103,7 +105,7 @@ pub(crate) fn before_request(scope: &str) -> Result<(), String> {
     let now = now();
     if let Some(until) = hold_until(scope, now) {
         return Err(format!(
-            "GitHub answered a secondary rate limit; the freshness guard sends no request \
+            "GitHub answered a secondary rate limit; the required-context read sends no request \
              on this credential for another {}s (until epoch {until}) rather than retrying \
              into it (#11418)",
             until - now
@@ -178,7 +180,9 @@ fn gap() -> Duration {
 }
 
 #[cfg(test)]
-pub(crate) use state::{reset as reset_for_test, slept as slept_for_test};
+pub(crate) use state::{
+    reset as reset_for_test, set_gap as set_gap_for_test, slept as slept_for_test,
+};
 
 /// Process state. Test builds keep it per thread and never really sleep.
 #[cfg(not(test))]
@@ -226,6 +230,7 @@ mod state {
         static HELD: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
         static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
         static SLEPT: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
+        static GAP: Cell<Option<Duration>> = const { Cell::new(None) };
     }
 
     pub(super) fn held(scope: &str) -> Option<i64> {
@@ -242,6 +247,7 @@ mod state {
 
     /// Records the wait instead of sleeping (see [`slept`]).
     pub(super) fn pace(gap: Duration) {
+        let gap = GAP.with(Cell::get).unwrap_or(gap);
         if let Some(prev) = LAST.with(Cell::get) {
             let wait = gap.saturating_sub(prev.elapsed());
             if !wait.is_zero() {
@@ -249,6 +255,13 @@ mod state {
             }
         }
         LAST.with(|l| l.set(Some(Instant::now())));
+    }
+
+    /// Use `gap` in place of the real spacing on this thread, so a test's
+    /// assertion on [`slept`] does not depend on how long the code between two
+    /// requests took. Cleared by [`reset`].
+    pub(crate) fn set_gap(gap: Duration) {
+        GAP.with(|g| g.set(Some(gap)));
     }
 
     /// The waits this thread's pacing asked for so far.
@@ -261,5 +274,6 @@ mod state {
         HELD.with(|h| h.borrow_mut().clear());
         LAST.with(|l| l.set(None));
         SLEPT.with(|s| s.borrow_mut().clear());
+        GAP.with(|g| g.set(None));
     }
 }

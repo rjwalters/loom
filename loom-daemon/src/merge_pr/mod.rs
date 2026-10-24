@@ -27,28 +27,11 @@
 //! this run's OWN base-sync push, and may therefore be retried once against a
 //! freshly-read head, versus a foreign push that must stay a hard stop.
 //!
-//! Slice 3 is [`stale_checks`]: the required-check freshness guard (#8248) —
-//! refusing a merge whose green required-check results predate the base
-//! branch's current tip, which is how a ratchet baseline tightened under an
-//! in-flight PR red-lined main on 2026-09-18.
-//!
-//! [`redate`] is not a port — it is new functionality (#8508) closing the gap
-//! #8248 left open: once that guard blocks a merge, nothing automatically
-//! produces the fresh evidence it is waiting for when the merge token lacks
-//! `actions:write` to re-run the stale check directly. It pushes a
-//! tree-identical no-op commit instead, which re-triggers CI without
-//! weakening the guard itself — bounded to one attempt per head, after which
-//! the PR is escalated to a durable `loom:operator` hold rather than pushed
-//! at forever.
-//!
-//! #8914's in-place re-run once ran before [`redate`], on the theory that
-//! re-running a workflow run keeps the head SHA and with it the Judge verdict.
-//! It was **removed in #8919**: GitHub replays a run against the ORIGINAL
-//! `GITHUB_SHA`, which for a `pull_request` run is the test merge commit built
-//! on the base already tested, so an in-place re-run re-dates the evidence
-//! without re-validating anything. Only a new `pull_request` event rebuilds the
-//! merge commit against the current base — which is exactly what [`redate`]'s
-//! tree-identical push produces.
+//! Slice 3 was the required-check freshness guard (#8248), and [`redate`]
+//! its no-op-push remedy (#8508); #12063 slice 1 deleted both, with the
+//! CI-run conclusion gate (#10444): required checks at the head are GitHub's
+//! to enforce. [`stale_checks`] keeps only the shared check-run reads, and
+//! [`redate`] only the commit vocabulary `redate-report` measures.
 //!
 //! [`zero_checks`] is not a port either — it is #9091's narrowing of the
 //! #6169 zero-row settle guard inside `_wait_for_checks_then_sync_merge`:
@@ -65,7 +48,7 @@
 //! still pending (keep waiting, unchanged). The `comm -12` overlap test
 //! becomes a set intersection; both input lists (`failing`/`pending` from the
 //! check-runs rollup, `required` from `forge_get_required_status_check_contexts`,
-//! which — unlike [`stale_checks`]'s GitHub-only lookup — also covers Gitea)
+//! which also covers Gitea)
 //! stay forge reads in the shell.
 //!
 //! [`check_runs_rollup`] is the READ both of those classifications start
@@ -249,6 +232,16 @@
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
 //!
+//! [`post_merge_cleanup`] is where the cleanup family above stops being a set of
+//! verbs the shell sequences and becomes one orchestrator (#8191, slice 1 of
+//! `docs/migration/merge-pr-orchestrator-port.md`): target naming, the
+//! remove-vs-preserve decision, the primary/sentinel/uncommitted-work guards, the
+//! removal, the ledger, the local-branch delete and the cargo-target reclaim run
+//! in one process, in the order the shell ran them. Forge facts it needs are
+//! asked for (`LOOM-NEED`, exit 3, nothing done) rather than fetched, so the
+//! Gitea-aware shell libraries keep serving them and the lazy-read behaviour is
+//! unchanged.
+//!
 //! [`retarget_children`] is not a port — it is #9372's gate in front of the
 //! post-merge remote-branch delete: a bare ref delete makes GitHub CLOSE every
 //! open PR based on that branch (unrecoverably), so each open child is
@@ -268,7 +261,6 @@
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;
-pub mod ci_result;
 pub mod cleanup_paths;
 pub mod closed_building;
 pub mod closed_by_merge;
@@ -286,6 +278,8 @@ pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
 pub mod poll_wait;
+pub mod post_merge_bookkeeping;
+pub mod post_merge_cleanup;
 pub mod pr_state;
 pub mod reconcile;
 pub mod redate;
@@ -297,6 +291,7 @@ pub mod retries_used;
 pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
+pub mod stacked_reconcile;
 pub mod stale_checks;
 pub mod superseded_runs;
 pub mod tree_checks;

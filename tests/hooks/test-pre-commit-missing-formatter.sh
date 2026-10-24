@@ -1,5 +1,5 @@
 #!/bin/sh
-# Tests .githooks/pre-commit: a missing or failing cargo/pnpm formatter must
+# Tests .githooks/pre-commit: a missing or failing cargo formatter must
 # stop the commit with a clear message, never silently skip (#10123).
 set -u
 HOOK="$(cd "$(dirname "$0")/../.." && pwd)/.githooks/pre-commit"
@@ -40,21 +40,35 @@ new_repo foo.rs
 run_hook "" 
 if { [ "$RC" -ne 0 ] && echo "$ERR" | grep -q cargo; }; then ok "missing cargo stops commit"; else bad "missing cargo (rc=$RC: $ERR)"; fi
 
-new_repo src/a/x.ts
-run_hook ""
-if { [ "$RC" -ne 0 ] && echo "$ERR" | grep -q pnpm; }; then ok "missing pnpm stops commit"; else bad "missing pnpm (rc=$RC: $ERR)"; fi
-
 new_repo foo.rs
 run_hook "" cargo=fail
 if [ "$RC" -ne 0 ]; then ok "failing cargo stops commit"; else bad "failing cargo (rc=$RC)"; fi
 
-new_repo src/a/x.ts
-run_hook "" pnpm=fail
-if [ "$RC" -ne 0 ]; then ok "failing pnpm stops commit"; else bad "failing pnpm (rc=$RC)"; fi
+new_repo foo.rs
+run_hook "" cargo=ok
+if [ "$RC" -eq 0 ]; then ok "working formatter passes"; else bad "working formatter (rc=$RC: $ERR)"; fi
 
-new_repo foo.rs src/a/x.ts
-run_hook "" cargo=ok pnpm=ok
-if [ "$RC" -eq 0 ]; then ok "working formatters pass"; else bad "working formatters (rc=$RC: $ERR)"; fi
+# Biome was removed from the repo: staged JSON/TS with no pnpm/biome must not block
+new_repo defaults/x/y.json
+run_hook ""
+if { [ "$RC" -eq 0 ] && ! echo "$ERR" | grep -qiE 'pnpm|biome'; }; then ok "staged defaults JSON, no pnpm/biome: not blocked"; else bad "staged JSON (rc=$RC: $ERR)"; fi
+
+new_repo defaults/x/y.json
+run_hook "" pnpm=fail
+if [ "$RC" -eq 0 ]; then ok "pnpm is never invoked for staged JSON"; else bad "pnpm invoked for JSON (rc=$RC: $ERR)"; fi
+
+# cargo fmt still runs alongside staged JSON
+new_repo foo.rs defaults/x/y.json
+printf '#!/bin/sh\necho ran >"%s/cargo.ran"\nexit 0\n' "$TMP" >"$STUBS/cargo-rec"; chmod +x "$STUBS/cargo-rec"
+rm -f "$TMP/cargo.ran"; run_hook "" cargo=cargo-rec
+if { [ "$RC" -eq 0 ] && [ -f "$TMP/cargo.ran" ]; }; then ok "cargo fmt still runs with staged JSON"; else bad "cargo fmt with JSON (rc=$RC: $ERR)"; fi
+
+# secret-scan still blocks a commit that stages JSON
+printf '#!/bin/sh\n[ "$1" = "secret-scan" ] && [ "$2" = "--help" ] && exit 0\nexit 1\n' >"$STUBS/scanfail"; chmod +x "$STUBS/scanfail"
+new_repo defaults/x/y.json
+d="$TMP/path.$N"; mkdir -p "$d"; cp -P "$BIN"/* "$d"/
+ERR=$(cd "$R" && env PATH="$d" LOOM_DAEMON_SELF_BIN="$STUBS/scanfail" /bin/sh "$HOOK" 2>&1 >/dev/null); RC=$?
+if [ "$RC" -ne 0 ]; then ok "secret-scan failure still blocks staged JSON"; else bad "secret-scan (rc=$RC)"; fi
 
 new_repo README.md
 run_hook ""

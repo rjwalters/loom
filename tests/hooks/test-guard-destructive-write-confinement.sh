@@ -2471,6 +2471,69 @@ assert_deny "write-confinement (#6968 control): cp with an embedded-apostrophe s
 
 rm -rf "$WT5674_REPO"
 
+# --- #12285: literal loop variable under a literal `cd /tmp/<dir>` -----------
+assert_allow "write-confinement (#12285): for-loop var write under cd /tmp/probe -> allow" \
+    'cd /tmp/probe && for name in a b; do echo x > "$name.gds"; done' "$WT_REPO"
+assert_allow "write-confinement (#12285): \${name} form -> allow" \
+    'cd /tmp/probe && for name in a b; do echo x > "${name}.gds"; done' "$WT_REPO"
+assert_allow "write-confinement (#12285): literal name=a assignment -> allow" \
+    'cd /tmp/probe && name=a && echo x > "$name.gds"' "$WT_REPO"
+assert_allow "write-confinement (#12285): unquoted target -> allow" \
+    'cd /tmp/probe && for name in a b; do echo x > $name.gds; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): absolute loop value stays denied" \
+    "cd /tmp/probe && for n in $WT_REPO/x; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+assert_deny "write-confinement (#12285 control): loop value with .. stays denied" \
+    'cd /tmp/probe && for n in ../x; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): loop value with / stays denied" \
+    'cd /tmp/probe && for n in a/b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): var with no same-command assignment stays denied" \
+    'cd /tmp/probe && echo x > "$name.gds"' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): \$var/ directory component stays denied" \
+    'cd /tmp/probe && for n in a b; do echo x > "$n/f.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): cd target with \$ stays denied" \
+    'cd /tmp/$D && for n in a b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): cd target with .. stays denied" \
+    'cd /tmp/../x && for n in a b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): cwd at the checkout itself (under /tmp here) stays denied" \
+    "cd $WT_REPO && for n in a b; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+assert_deny "write-confinement (#12285 control): write preceding the cd stays denied" \
+    'for n in a b; do echo x > "$n.gds"; done; cd /tmp/probe' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): ln -s in the command stays denied" \
+    'cd /tmp/probe && ln -s /repo/x link && for n in a b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): var rebound by read stays denied" \
+    'cd /tmp/probe && read n && echo x > "$n.gds"' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): second non-literal binding stays denied" \
+    'cd /tmp/probe && for n in a b; do n=$(pwd); echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): loop value from \$(...) stays denied" \
+    'cd /tmp/probe && for n in $(ls); do echo x > "$n.gds"; done' "$WT_REPO"
+
+# --- #12596: containment is a resolved path-component test, never a substring
+# of the path string; and an interpreter-fed heredoc body that opens a literal
+# path outside every repo is not a write into the checkout. Measured on main:
+# neither reported false deny reproduces, so these pin the current behaviour.
+# (An unexpanded `$HOME/...` target is a different, documented fail-closed
+# shape, #4921, and is deliberately not covered here.)
+_C12596_NAME=$(basename "$WT_REPO")
+_C12596_OUT=$(mktemp -d)
+_C12596_OUT="$_C12596_OUT/-home-user-GitHub-$_C12596_NAME/memory"
+mkdir -p "$_C12596_OUT"
+assert_allow "write-confinement (#12596): outside target whose dir name embeds the repo dir name allows" \
+    "echo x > $_C12596_OUT/note.md" "$WT_REPO"
+assert_allow "write-confinement (#12596): same, from inside the managed worktree" \
+    "echo x > $_C12596_OUT/note.md" "$WT_DIR"
+assert_allow "write-confinement (#12596): python3 - <<'PY' open(literal /tmp path, 'w') allows" \
+    "python3 - <<'PY'
+with open('/tmp/loom-12596-scratch.txt', 'w') as f:
+    f.write('x')
+PY" "$WT_REPO"
+assert_deny "write-confinement (#12596 control): bash <<'EOF' redirect into the main checkout still denies" \
+    "bash <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+assert_deny "write-confinement (#12596 control): plain write into the main checkout still denies" \
+    "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+rm -rf "${_C12596_OUT%/*/*}"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 

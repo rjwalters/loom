@@ -36,16 +36,7 @@ GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
 CURATOR_SKILL="$REPO_ROOT/defaults/.agents/skills/loom-curator/SKILL.md"
 GUIDE_SKILL="$REPO_ROOT/defaults/.agents/skills/loom-guide/SKILL.md"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 for f in "$CURATOR_MD" "$GUIDE_MD" "$CURATOR_SKILL" "$GUIDE_SKILL"; do
     if [[ ! -f "$f" ]]; then
@@ -87,7 +78,7 @@ echo ""
 echo "Test group 2: the consolidation gate's guardrails"
 expect "gate runs before loom:curated"                "$RS" "Consolidation gate — before \`loom:curated\`"
 expect "only triage/unlabeled siblings"               "$RS" "\`loom:triage\`/unlabeled siblings"
-for label in 'loom:curating' 'loom:building' 'loom:issue' 'loom:blocked' 'loom:operator-only'; do
+for label in 'loom:curating' 'loom:building' 'loom:issue' 'loom:blocked' 'loom:operator'; do
     expect "never absorbs a $label issue"             "$RS" "$label"
 done
 expect "never absorbs a hard-excluded issue"          "$RS" "hard-exclusion label"
@@ -148,9 +139,10 @@ echo "Test group 6: Curator refuses a PR target before its first claim write (#9
 # Not rightsizing, but the same prompt-lint shape: a trim must not drop the
 # kind probe, and it must precede the `loom:curating` write on the claim path.
 ARGS="$(section "$CURATOR_MD" '^## Argument Handling')"
-expect "kind probe reads the target url"            "$ARGS" "gh issue view <number> --json url"
-expect "a /pull/ url or failed read means refuse"   "$ARGS" "a \`/pull/\` URL or a failed read means refuse"
-probe_line="$(grep -nF -- "--json url --jq .url" <<< "$ARGS" | head -1 | cut -d: -f1)"
+# #11863: the probe is one live REST read that answers kind, state and labels.
+expect "kind probe reads pull_request off the REST issue" "$ARGS" "--jq '[(.pull_request != null), .state"
+expect "a PR or a failed read means refuse"         "$ARGS" "\`true\` (a PR) or a failed read means refuse"
+probe_line="$(grep -nF -- "(.pull_request != null)" <<< "$ARGS" | head -1 | cut -d: -f1)"
 claim_line="$(grep -nF -- "labels[]=loom:curating" <<< "$ARGS" | head -1 | cut -d: -f1)"
 if [[ -n "$probe_line" && -n "$claim_line" && "$probe_line" -lt "$claim_line" ]]; then
     pass "probe precedes the loom:curating claim write"

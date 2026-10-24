@@ -769,6 +769,11 @@ impl SweepRegistry {
             .start_facts
             .get(sweep_id)
             .and_then(|facts| facts.dispatch_origin.clone());
+        // 2am#4393: the draw that chose this sweep's tap, from the same facts.
+        let role_draw = self
+            .start_facts
+            .get(sweep_id)
+            .and_then(|facts| facts.role_draw.clone());
         let (attempt_index, previous_sweep_id, trigger) =
             if let Some(facts) = self.start_facts.get(sweep_id) {
                 (facts.attempt_index, facts.previous_sweep_id.clone(), facts.trigger.clone())
@@ -972,6 +977,8 @@ impl SweepRegistry {
                 .map(ParkKind::failure_class),
             exit_code == Some(0),
         );
+        // Issue #11854: a reported `failure` never goes out without a class.
+        let failure_class = telemetry::ensure_failure_class(reported_result, failure_class);
         let process_result = result;
         let result = reported_result;
 
@@ -1010,6 +1017,7 @@ impl SweepRegistry {
             previous_sweep_id,
             trigger,
             dispatch_origin,
+            role_draw,
             rework_events,
             pr_numbers,
             hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),
@@ -1044,8 +1052,10 @@ impl SweepRegistry {
         // slow or hung `gh` can never delay (or, via a daemon restart in that
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
         // doc for the full fail-open contract.
-        let writeback_record =
-            (process_result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
+        // #11743: and only on an issue the same read shows is not frozen.
+        let writeback_record = (process_result == telemetry::SweepResult::Success
+            && writeback::writeback_admitted(issue, &issue_signals))
+        .then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -1154,13 +1164,7 @@ impl SweepRegistry {
         );
         envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
-        // #11348: shadow into the J2 `sweep` stream only after this succeeds.
-        if let Err(e) = telemetry::journal_shadow::after_legacy(
-            &self.config.workspace_root,
-            telemetry::journal_shadow::TelemetryStream::Sweep,
-            || sweep_outcomes::append_outcome_telemetry(&path, &envelope),
-            |()| telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
-        ) {
+        if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
             log::warn!(
                 "sweep_outcomes: failed to append sweep.outcome telemetry record for issue \
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
@@ -1225,8 +1229,11 @@ impl SweepRegistry {
         kind: &SweepKind,
         started_at: DateTime<Utc>,
     ) {
-        let SweepKind::Issue(issue) = kind else {
-            return;
+        let issue = match kind {
+            SweepKind::Issue(issue) => issue,
+            // A step writes no sweep checkpoint, so it has no phase to sample;
+            // its role is its phase (#11898).
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => return,
         };
         let checkpoint = self
             .config
@@ -1587,9 +1594,3 @@ mod tokens_status_tests;
     unused_imports
 )]
 mod pr_link_tests;
-
-// #11348: the T1 call site shadows into the J2 `sweep` stream only after the
-// legacy `sweep.outcome` append succeeded, and never when disabled.
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod shadow_tests;

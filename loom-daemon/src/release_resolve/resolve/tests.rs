@@ -225,6 +225,7 @@ fn why_no_artifact(asset_count: Option<usize>, age_minutes: Option<i64>) -> Stri
         "loom-daemon-x86_64-unknown-linux-gnu.sha256",
         asset_count,
         age_minutes,
+        None,
     )
 }
 
@@ -676,4 +677,83 @@ fn no_complete_release_names_the_newest_and_inspects_a_bounded_number() {
     );
     assert_eq!(calls, WALK_MAX_RELEASES);
     assert_eq!(pick_complete(&[], |_| true), None);
+}
+
+// ---- retry + error detail on unreadable release metadata (#12849) ----
+
+fn failed<T>(stderr: &str) -> Query<T> {
+    Query::Failed {
+        status: "exit status: 1".to_string(),
+        stderr: stderr.to_string(),
+    }
+}
+
+#[test]
+fn a_read_that_fails_once_then_succeeds_resolves() {
+    let mut calls = 0;
+    let got = read_retrying(
+        || {
+            calls += 1;
+            if calls == 1 {
+                failed("HTTP 502: Bad Gateway")
+            } else {
+                Query::Populated(7)
+            }
+        },
+        2,
+        Duration::ZERO,
+    );
+    assert_eq!(got, Ok(7));
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn a_read_that_always_fails_reports_the_last_error_after_bounded_retries() {
+    let mut calls = 0;
+    let got: Result<u8, String> = read_retrying(
+        || {
+            calls += 1;
+            failed("HTTP 403: API rate limit exceeded")
+        },
+        2,
+        Duration::ZERO,
+    );
+    assert_eq!(calls, 3, "one attempt plus two retries");
+    let e = got.unwrap_err();
+    assert!(e.contains("rate limit"), "{e}");
+    assert!(e.contains("3 attempts"), "{e}");
+}
+
+#[test]
+fn an_empty_result_is_an_answer_and_is_not_retried() {
+    let mut calls = 0;
+    let got: Result<u8, String> = read_retrying(
+        || {
+            calls += 1;
+            Query::Empty
+        },
+        2,
+        Duration::ZERO,
+    );
+    assert!(got.is_err());
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn an_unreadable_asset_list_carries_the_error_and_cannot_rule_out_an_upload() {
+    let why = no_artifact_reason(
+        "v0.19.1193",
+        "o/r",
+        "x86_64-unknown-linux-gnu",
+        "loom-daemon-x86_64-unknown-linux-gnu",
+        "loom-daemon-x86_64-unknown-linux-gnu.sha256",
+        None,
+        None,
+        Some("gh exit status: 1: HTTP 403: API rate limit exceeded"),
+    );
+    assert!(
+        why.contains("asset list could not be read (gh exit status: 1: HTTP 403"),
+        "{why}"
+    );
+    assert!(why.contains("in-flight upload cannot be ruled out"), "{why}");
 }

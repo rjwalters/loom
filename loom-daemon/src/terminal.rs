@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod keychain_write;
+
 /// Per-agent `CLAUDE_CONFIG_DIR` isolation.
 ///
 /// Creates isolated Claude Code config directories for each terminal so concurrent
@@ -19,6 +21,7 @@ use std::process::Command;
 /// claude-config` CLI. The `_SHARED_CONFIG_FILES` / `_MUTABLE_DIRS` comments
 /// below still name their historical Python counterparts for provenance.
 mod claude_config {
+    use super::keychain_write::{keychain_write_command, run_keychain_write};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -120,31 +123,17 @@ mod claude_config {
             return;
         }
 
-        let cred_hex = hex::encode(cred.as_bytes());
+        let Some(write) = keychain_write_command(&account, &target_service, &cred) else {
+            log::warn!(
+                "Keychain credential too large to clone to {target_service} via `security -i`; skipping"
+            );
+            return;
+        };
 
-        // Write to the hashed service name
-        let write = std::process::Command::new("security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-a",
-                &account,
-                "-s",
-                &target_service,
-                "-X",
-                &cred_hex,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-
-        match write {
-            Ok(s) if s.success() => {
-                log::debug!("Cloned keychain credential to {target_service}");
-            }
-            _ => {
-                log::warn!("Failed to clone keychain credential to {target_service}");
-            }
+        if run_keychain_write(&write) {
+            log::debug!("Cloned keychain credential to {target_service}");
+        } else {
+            log::warn!("Failed to clone keychain credential to {target_service}");
         }
     }
 

@@ -66,6 +66,8 @@ pub mod removal_log;
 pub mod repo;
 pub(crate) mod safety;
 mod spawn_loop_state;
+/// Report-only listing of unfamiliar worktree-root directories (#11194).
+pub(crate) mod unrecognized_report;
 
 pub use claim_file::{
     has_valid_claim, is_abandoned as claim_is_abandoned, is_expired as claim_is_expired,

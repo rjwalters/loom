@@ -11,21 +11,12 @@
 
 use std::collections::BTreeMap;
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
-use crate::telemetry::kinds::pass::{PassOutcome, PassSummaryRecord, PassVerdictRecord};
+use super::{kv_bool, kv_int, kv_string, nanos};
+use crate::telemetry::kinds::pass::{PassOutcome, PassSummaryRecord, PassVerdictRecord, StepFacts};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 fn int(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
@@ -52,7 +43,7 @@ fn summary_severity(r: &PassSummaryRecord) -> SeverityNumber {
 }
 
 fn summary(r: &PassSummaryRecord) -> (&'static str, SeverityNumber, u64, Vec<KeyValue>, String) {
-    let attributes = vec![
+    let mut attributes = vec![
         kv_string("loom.repo", r.repo.clone()),
         kv_string("loom.pass.id", r.pass_id.clone()),
         kv_string("loom.pass.mechanism", r.mechanism.clone()),
@@ -72,8 +63,55 @@ fn summary(r: &PassSummaryRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
         kv_string("loom.pass.version", r.loom.version.clone()),
         kv_string("loom.pass.revision", r.loom.revision.clone()),
     ];
+    if !r.unevaluated_reasons.is_empty() {
+        attributes
+            .push(kv_string("loom.pass.unevaluated_reasons", flatten(&r.unevaluated_reasons)));
+    }
+    if let Some(b) = &r.budget {
+        for (key, v) in [
+            ("loom.pass.budget.core_start", b.core_start),
+            ("loom.pass.budget.core_end", b.core_end),
+            ("loom.pass.budget.graphql_start", b.graphql_start),
+            ("loom.pass.budget.graphql_end", b.graphql_end),
+            ("loom.pass.budget.core_floor", Some(b.core_floor)),
+            ("loom.pass.budget.graphql_floor", Some(b.graphql_floor)),
+        ] {
+            if let Some(v) = v {
+                attributes.push(kv_int(key, int(v)));
+            }
+        }
+    }
     let body = serde_json::to_string(r).unwrap_or_default();
     ("pass.summary", summary_severity(r), nanos(r.ended_at), attributes, body)
+}
+
+/// A role step's facts (#12027), each only when present.
+fn step_attributes(s: &StepFacts, attributes: &mut Vec<KeyValue>) {
+    let first_refused_at = s
+        .first_refused_at
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    for (key, value) in [
+        ("loom.sweep_id", s.sweep_id.as_ref()),
+        ("loom.pass.head_sha", s.head_sha.as_ref()),
+        ("loom.pass.step", s.step.as_ref()),
+        ("loom.pass.class", s.class.as_ref()),
+        ("loom.pass.reason_set", s.reason_set.as_ref()),
+        ("loom.pass.ledger_class", s.ledger_class.as_ref()),
+        ("loom.pass.ledger_reason", s.ledger_reason.as_ref()),
+        ("loom.pass.fact_id", s.fact_id.as_ref()),
+        ("loom.pass.first_refused_at", first_refused_at.as_ref()),
+        ("loom.pass.criterion", s.criterion_key.as_ref()),
+        ("loom.pass.proposal_label", s.proposal_label.as_ref()),
+        ("loom.pass.body_hash", s.body_hash.as_ref()),
+    ] {
+        if let Some(value) = value {
+            attributes.push(kv_string(key, value.clone()));
+        }
+    }
+    if let Some(loom) = &s.loom {
+        attributes.push(kv_string("loom.pass.version", loom.version.clone()));
+        attributes.push(kv_string("loom.pass.revision", loom.revision.clone()));
+    }
 }
 
 fn verdict(r: &PassVerdictRecord) -> (&'static str, SeverityNumber, u64, Vec<KeyValue>, String) {
@@ -93,6 +131,14 @@ fn verdict(r: &PassVerdictRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
     if let Some(reason) = &r.reason {
         attributes.push(kv_string("loom.pass.reason", reason.clone()));
     }
+    if let Some(reason) = &r.unevaluated_reason {
+        attributes.push(kv_string("loom.pass.unevaluated_reason", reason.clone()));
+    }
+    if let Some(b) = &r.budget {
+        attributes.push(kv_string("loom.pass.budget.bucket", b.bucket.clone()));
+        attributes.push(kv_int("loom.pass.budget.remaining", int(b.remaining)));
+        attributes.push(kv_int("loom.pass.budget.floor", int(b.floor)));
+    }
     if !r.blockers.is_empty() {
         let blockers = r
             .blockers
@@ -109,6 +155,12 @@ fn verdict(r: &PassVerdictRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
         if !labels.is_empty() {
             attributes.push(kv_string(key, labels.join(",")));
         }
+    }
+    step_attributes(&r.step, &mut attributes);
+    // A step's detail is the session's own reason token (#12715), bounded and
+    // token-only; any other record's detail stays body-only.
+    if let (Some(_), Some(detail)) = (&r.step.step, &r.detail) {
+        attributes.push(kv_string("loom.pass.reason_detail", detail.clone()));
     }
     let severity = if r.verdict == "failed" {
         SeverityNumber::Warn

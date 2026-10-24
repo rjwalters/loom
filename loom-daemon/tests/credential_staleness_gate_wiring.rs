@@ -28,7 +28,7 @@ fn refresh_loop_failures_are_visible_to_the_main_health_gate() {
     // #11295: success resolves `forge.credential-missing` in a ledger; keep
     // it in a temp dir, never the operator's ~/.loom/loom-ui-alerts.
     let ledgers = tempfile::tempdir().unwrap();
-    std::env::set_var(loom_daemon::loom_ui_alerts::ledger::DIR_ENV, ledgers.path());
+    std::env::set_var(loom_daemon::alerts::ledger::DIR_ENV, ledgers.path());
     let gate_view = GlobalCredentialFreshness;
 
     assert!(!forge_credential_stale(), "a fresh process has no failing credential source");
@@ -80,3 +80,8 @@ fn refresh_loop_failures_are_visible_to_the_main_health_gate() {
     );
     assert!(forge_credential_stale_summary().is_none());
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

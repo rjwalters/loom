@@ -62,6 +62,12 @@ pub(crate) enum Rule {
     /// markers leave the file as it is. Co-owned, so never recorded as
     /// Loom-owned.
     LabelsBlock,
+    /// Verbatim copy of every file the payload ships under a directory, only
+    /// when the workspace has a real directory there (#11033). A symlinked
+    /// directory (the Loom repo's dogfood `.claude/agents` link) is never
+    /// staged, so nothing is copied; a directory the repo never had is not
+    /// created. A file in it the payload does not ship is the repo's own.
+    CopyTreeIfDir,
 }
 
 /// One surface the daemon resync refreshes beyond the installer's payload
@@ -98,6 +104,10 @@ pub(crate) const EXTRA_SURFACES: &[Surface] = &[
     Surface {
         path: ".github/CONFIGURATION.md",
         rule: Rule::CopyIfPresent,
+    },
+    Surface {
+        path: ".claude/agents",
+        rule: Rule::CopyTreeIfDir,
     },
     Surface {
         path: ".claude/biome.jsonc",
@@ -153,6 +163,13 @@ pub(crate) const INSTALL_TIME_ONLY: &[(&str, &str)] = &[
          cannot be committed",
     ),
     (
+        ".claude/settings.json",
+        "the repo's own hook wiring: no resync writes it. The upstream wiring table lives in \
+         scripts/install/provision-hooks.sh, which is not in the payload, so only \
+         resync-installed.sh can warn about a hook wired upstream and not here (#11033); a \
+         daemon-dispatched launch injects the roll-pause wiring itself (#11049)",
+    ),
+    (
         "forge labels",
         "the drift check against .github/labels.yml is a forge read and a report, not an \
          installed file; it stays with sync-labels.sh",
@@ -178,17 +195,18 @@ pub(crate) fn export_pathspecs() -> Vec<&'static str> {
     specs
 }
 
+/// Is `root` one of the payload trees (the installer's `.loom` files and
+/// Loom's slash commands), as opposed to an extra surface?
+pub(crate) fn is_payload_tree(root: &str) -> bool {
+    PAYLOAD_TREES.iter().any(|tree| within(root, tree))
+}
+
 /// `path` is `root` or lies under it.
 fn within(path: &str, root: &str) -> bool {
     path == root
         || path
             .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// Is `path` one of the extra surfaces (as opposed to the installer's)?
-pub(super) fn is_extra(path: &str) -> bool {
-    EXTRA_SURFACES.iter().any(|s| within(path, s.path))
 }
 
 /// May a resync record `path` in `installed_files`? That list is deletion
@@ -209,6 +227,7 @@ pub(super) fn pin_names(path: &str) -> Vec<String> {
     let mut names = vec![path.to_string()];
     for (prefix, report) in [
         (".claude/commands/loom/", "commands/loom/"),
+        (".claude/agents/", "agents/"),
         (".agents/skills/", "agents-skills/"),
     ] {
         if let Some(rest) = path.strip_prefix(prefix) {
@@ -241,6 +260,10 @@ pub(crate) enum SkipReason {
     /// or END, END before BEGIN, a lone or near-miss marker. Not guessed at;
     /// the run is reported failed so someone fixes the markers.
     MalformedMarkers(String),
+    /// A directory above it is a symlink the resync cannot write through:
+    /// it points outside the repo, dangles, loops, or resolves onto another
+    /// root (#11426). The reason names the link and where it points.
+    BehindSymlink(String),
 }
 
 /// Run every extra step over `stage`, which already holds the workspace's
@@ -267,13 +290,17 @@ pub(super) fn stage_extras(
             stage_skills(defaults, stage, shipped, skipped)?;
             continue;
         }
+        if surface.rule == Rule::CopyTreeIfDir {
+            copy_tree_if_dir(&defaults.join(surface.path), &dst, surface.path, shipped)?;
+            continue;
+        }
         if let Some(why) = not_a_file(&dst) {
             skipped.push(Skipped::unusable(surface.path, why));
             continue;
         }
         let present = is_regular_file(&dst);
         let wrote = match surface.rule {
-            Rule::MarkerGatedSkills => false,
+            Rule::MarkerGatedSkills | Rule::CopyTreeIfDir => false,
             Rule::CopyIfPresent => present && copy_file(&defaults.join(surface.path), &dst)?,
             Rule::CopyOrBackfill => copy_file(&defaults.join(surface.path), &dst)?,
             Rule::GitignoreBlock => {
@@ -385,6 +412,17 @@ pub(crate) fn log_skipped_once(repo: &Path, skipped: &[Skipped]) {
                 repo.display(),
                 skip.path
             ),
+            SkipReason::BehindSymlink(why) => log::warn!(
+                "resync: {}: {} is NOT resynced: {why}. Loom's files there stay at their \
+                 current release{}",
+                repo.display(),
+                skip.path,
+                if is_payload_tree(&skip.path) {
+                    ", and the install stamp is held at it until the link is fixed"
+                } else {
+                    ""
+                }
+            ),
         }
     }
 }
@@ -399,6 +437,42 @@ fn copy_file(src: &Path, dst: &Path) -> Result<bool, String> {
     }
     fs::copy(src, dst).map_err(|e| format!("copy {}: {e}", src.display()))?;
     Ok(true)
+}
+
+/// [`Rule::CopyTreeIfDir`]: copy each regular file under `src` to the same
+/// place under `dst`, when `dst` is a directory in staging. Whatever else is
+/// in `dst` stays. Each file written is added to `shipped`; a payload with no
+/// `src` writes nothing.
+fn copy_tree_if_dir(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    shipped: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    if !fs::symlink_metadata(dst).is_ok_and(|m| m.file_type().is_dir()) {
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(src) else {
+        return Ok(());
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (from, to, child) = (entry.path(), dst.join(&name), format!("{rel}/{name}"));
+        // A directory or odd file at the destination is the repo's: not ours
+        // to replace.
+        if from.is_file() && fs::symlink_metadata(&to).is_ok_and(|m| !m.file_type().is_file()) {
+            continue;
+        }
+        if from.is_dir() {
+            fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
+            copy_tree_if_dir(&from, &to, &child, shipped)?;
+        } else if copy_file(&from, &to)? {
+            shipped.insert(child);
+        }
+    }
+    Ok(())
 }
 
 /// The skills step: the installer's own marker-gated write, then the removal
@@ -600,6 +674,9 @@ fn sweep_retired(defaults: &Path, stage: &Path, shipped: &BTreeSet<String>) -> R
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "surfaces_agents_tests.rs"]
+mod agents_tests;
 #[cfg(test)]
 #[path = "surfaces_tests.rs"]
 mod tests;

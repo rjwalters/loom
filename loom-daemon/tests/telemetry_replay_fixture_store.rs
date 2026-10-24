@@ -206,3 +206,8 @@ fn telemetry_replay_check_agrees_when_only_uncovered_or_short_disagreements_rema
     // --threshold raises the bar: neither 2700 s nor 1200 s fails at 3000 s.
     assert_eq!(run_check(&check_params("", 3000)).exit_code(), EXIT_AGREE);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -21,9 +21,11 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
         effort: Some("high".to_string()),
         detail: None,
         gated_pool: None,
+        failure_class: None,
         preference_tier: None,
         preference_tap: None,
         role_draw: None,
+        prompt: None,
         runtime: Some("opencode".to_string()),
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
@@ -43,6 +45,10 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
             prs_merged: 1,
             comments_posted: 4,
         }),
+        source: None,
+        sweep_id: None,
+        deferred_by: None,
+        shard_owner: None,
     })
 }
 
@@ -81,6 +87,7 @@ fn role_tick_result_serializes_every_skip_class_distinctly() {
     );
     assert_eq!(wire(RoleTickResult::SkippedLoad), "skipped_load");
     assert_eq!(wire(RoleTickResult::SkippedQueueEmpty), "skipped_queue_empty");
+    assert_eq!(wire(RoleTickResult::SkippedDeferred), "skipped_deferred");
 }
 
 /// The "unknown != zero" contract, on the wire: an unobserved measurement is
@@ -99,21 +106,28 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         effort: None,
         detail: Some("no-token-pool".to_string()),
         gated_pool: None,
+        failure_class: None,
         preference_tier: None,
         preference_tap: None,
         role_draw: None,
+        prompt: None,
         runtime: None,
         provider: None,
         profile: None,
         tokens_by_model: None,
         models_used: None,
         actions: None,
+        source: None,
+        sweep_id: None,
+        deferred_by: None,
+        shard_owner: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for key in [
         "model",
         "effort",
         "gated_pool",
+        "failure_class",
         "preference_tier",
         "preference_tap",
         "runtime",

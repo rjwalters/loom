@@ -173,41 +173,15 @@ pub fn claim_at(path: &Path, pid: u32) -> ClaimOutcome {
 /// umask, and unlike the autonomy marker (which records paths and is written
 /// under `umask 077`) a pid file carries nothing sensitive.
 fn write_pid_atomic(path: &Path, pid: u32) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(format!("could not create {}: {e}", parent.display()));
-        }
-    }
-    let tmp = path.with_extension(format!("pid.tmp.{}", uuid::Uuid::new_v4()));
-    let contents = format!("{pid}\n");
-
-    let write_result = {
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(&tmp)
-                .and_then(|mut f| f.write_all(contents.as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, contents.as_bytes())
-        }
-    };
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not write temp pid file {}: {e}", tmp.display()));
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not rename pid file into place {}: {e}", path.display()));
-    }
-    Ok(())
+    crate::fs_util::write_atomic(
+        path,
+        format!("{pid}\n").as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: false,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("could not write pid file {}: {e}", path.display()))
 }
 
 /// Parse a pid file into its recorded pid — `None` when the file is missing,
@@ -218,6 +192,117 @@ pub fn read_pid_file(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+// ============================================================================
+// Shared-state ownership guard (#9816)
+// ============================================================================
+
+/// Env override acknowledging a deliberate second daemon on shared real state.
+pub const ALLOW_PARALLEL_DAEMON_ENV: &str = "LOOM_ALLOW_PARALLEL_DAEMON";
+
+/// How long a refusal is re-evaluated before it is final, so a supervisor
+/// relaunch (old daemon still exiting) does not flap.
+pub const OWNERSHIP_RECHECK_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Interval between re-reads inside [`OWNERSHIP_RECHECK_WINDOW`].
+pub const OWNERSHIP_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Verdict of [`decide_ownership`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipDecision {
+    /// No live incumbent holds this pid file (absent, stale, own pid, scratch).
+    Proceed,
+    /// A live incumbent exists but `LOOM_ALLOW_PARALLEL_DAEMON=1` acknowledges it.
+    ProceedWithWarn { incumbent: u32 },
+    /// A live loom-daemon already owns this (non-scratch) pid file.
+    Refuse { incumbent: u32 },
+}
+
+/// Pure rule: refuse iff a different, live loom-daemon pid is recorded in a
+/// non-scratch pid file and the override is not set. Every input is injected.
+#[must_use]
+pub fn decide_ownership(
+    recorded_pid: Option<u32>,
+    own_pid: u32,
+    alive: bool,
+    is_daemon: bool,
+    is_scratch: bool,
+    allow_parallel: bool,
+) -> OwnershipDecision {
+    if is_scratch {
+        return OwnershipDecision::Proceed;
+    }
+    let Some(incumbent) = recorded_pid.filter(|p| *p != own_pid) else {
+        return OwnershipDecision::Proceed;
+    };
+    if !alive || !is_daemon {
+        return OwnershipDecision::Proceed;
+    }
+    if allow_parallel {
+        OwnershipDecision::ProceedWithWarn { incumbent }
+    } else {
+        OwnershipDecision::Refuse { incumbent }
+    }
+}
+
+/// Check the pid file at `path` against the shared-state ownership rule,
+/// re-reading for up to `window` before a refusal is final. Read-only and
+/// fail-open: nothing here writes, and an unreadable file proceeds.
+pub async fn check_ownership_at(
+    path: &Path,
+    own_pid: u32,
+    is_scratch: bool,
+    allow_parallel: bool,
+    alive: impl Fn(u32) -> bool,
+    is_daemon: impl Fn(u32) -> bool,
+    window: std::time::Duration,
+) -> OwnershipDecision {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        let recorded = read_pid_file(path);
+        // Only probe the process table when the cheap checks already point at
+        // an incumbent (`pgrep` is a subprocess).
+        let candidate = recorded.filter(|p| *p != own_pid && !is_scratch);
+        let (a, d) = match candidate {
+            Some(p) => {
+                let a = alive(p);
+                (a, a && is_daemon(p))
+            }
+            None => (false, false),
+        };
+        let decision = decide_ownership(recorded, own_pid, a, d, is_scratch, allow_parallel);
+        if !matches!(decision, OwnershipDecision::Refuse { .. })
+            || std::time::Instant::now() >= deadline
+        {
+            return decision;
+        }
+        tokio::time::sleep(OWNERSHIP_RECHECK_INTERVAL).await;
+    }
+}
+
+/// [`check_ownership_at`] against the process environment and real probes.
+/// `None` when no pid file path resolves (fail-open).
+pub async fn check_ownership_for_current_process() -> Option<(PathBuf, OwnershipDecision)> {
+    let path = resolve_pid_file_path()?;
+    let is_scratch = crate::daemon_start::guards::is_scratch_style_path(&path.to_string_lossy());
+    let allow_parallel = std::env::var(ALLOW_PARALLEL_DAEMON_ENV).is_ok_and(|v| v == "1");
+    let daemons: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let decision = check_ownership_at(
+        &path,
+        std::process::id(),
+        is_scratch,
+        allow_parallel,
+        crate::daemon_install_state::pid_alive,
+        |p| {
+            daemons
+                .get_or_init(crate::daemon_install_state::pgrep_daemon_pids)
+                .contains(&p)
+        },
+        OWNERSHIP_RECHECK_WINDOW,
+    )
+    .await;
+    Some((path, decision))
 }
 
 // ============================================================================
@@ -496,6 +581,118 @@ mod tests {
         fs::write(&blocker, "not a directory").unwrap();
         let path = blocker.join(PID_FILENAME);
         assert!(matches!(claim_at(&path, 5), ClaimOutcome::WriteFailed { .. }));
+    }
+
+    // ---------------- shared-state ownership (#9816) ----------------
+
+    const OWN: u32 = 100;
+    const OTHER: u32 = 200;
+
+    #[test]
+    fn live_foreign_daemon_on_real_state_is_refused() {
+        assert_eq!(
+            decide_ownership(Some(OTHER), OWN, true, true, false, false),
+            OwnershipDecision::Refuse { incumbent: OTHER }
+        );
+    }
+
+    #[test]
+    fn ownership_negative_controls_proceed() {
+        // dead pid, own pid, absent/unparseable file, live non-daemon pid
+        assert_eq!(
+            decide_ownership(Some(OTHER), OWN, false, false, false, false),
+            OwnershipDecision::Proceed
+        );
+        assert_eq!(
+            decide_ownership(Some(OWN), OWN, true, true, false, false),
+            OwnershipDecision::Proceed
+        );
+        assert_eq!(
+            decide_ownership(None, OWN, false, false, false, false),
+            OwnershipDecision::Proceed
+        );
+        assert_eq!(
+            decide_ownership(Some(OTHER), OWN, true, false, false, false),
+            OwnershipDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn scratch_pid_file_never_refuses() {
+        assert_eq!(
+            decide_ownership(Some(OTHER), OWN, true, true, true, false),
+            OwnershipDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn override_proceeds_with_warn() {
+        assert_eq!(
+            decide_ownership(Some(OTHER), OWN, true, true, false, true),
+            OwnershipDecision::ProceedWithWarn { incumbent: OTHER }
+        );
+    }
+
+    #[tokio::test]
+    async fn two_daemons_one_real_pid_file_second_is_refused_and_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PID_FILENAME);
+        // First daemon claims the file.
+        let _ = claim_at(&path, OTHER);
+        let zero = std::time::Duration::ZERO;
+        // Scratch predicate injected: the tempdir is scratch-style for real.
+        let second = check_ownership_at(&path, OWN, false, false, |_| true, |_| true, zero).await;
+        assert_eq!(second, OwnershipDecision::Refuse { incumbent: OTHER });
+        assert_eq!(read_pid_file(&path), Some(OTHER));
+
+        // Override starts it, with a warning decision.
+        let allowed = check_ownership_at(&path, OWN, false, true, |_| true, |_| true, zero).await;
+        assert_eq!(allowed, OwnershipDecision::ProceedWithWarn { incumbent: OTHER });
+    }
+
+    #[tokio::test]
+    async fn two_scratch_rooted_daemons_both_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PID_FILENAME);
+        let _ = claim_at(&path, OTHER);
+        let zero = std::time::Duration::ZERO;
+        let d = check_ownership_at(&path, OWN, true, false, |_| true, |_| true, zero).await;
+        assert_eq!(d, OwnershipDecision::Proceed);
+    }
+
+    #[tokio::test]
+    async fn relaunch_handoff_within_window_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PID_FILENAME);
+        let _ = claim_at(&path, OTHER);
+        let alive = std::sync::atomic::AtomicBool::new(true);
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let d = check_ownership_at(
+            &path,
+            OWN,
+            false,
+            false,
+            |_| {
+                // Incumbent exits after the first probe.
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    alive.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                alive.load(std::sync::atomic::Ordering::SeqCst)
+            },
+            |_| true,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(d, OwnershipDecision::Proceed);
+    }
+
+    #[tokio::test]
+    async fn unreadable_pid_file_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join(PID_FILENAME);
+        let zero = std::time::Duration::ZERO;
+        let d = check_ownership_at(&path, OWN, false, false, |_| true, |_| true, zero).await;
+        assert_eq!(d, OwnershipDecision::Proceed);
     }
 
     // ---------------- stale detection ----------------

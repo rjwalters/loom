@@ -34,9 +34,11 @@ migrated (table below).
 **Priority changes order, never eligibility or admission** (operator ruling,
 #11508). A priority issue is dispatched only once it is `loom:issue` (there is
 no priority side listing), and no priority exempts a candidate from any gate
-(caps, build back-off, file overlap, repo-sharding slice).
+(caps, build back-off, file overlap).
 
 ## Selection: workspace first, then issue
+
+> **Step dispatch (#11894, live since #11909; one pool since #12185).** The step tick no longer picks a workspace first. It draws one *item* from a single pool of every actionable item across the workspaces, seeded and weighted `w_repo × priority × age × S_r^(α−1) × (1 + in_flight_repo)^(−β)` (`loom-draw/v3`), over items at every stage, not only `loom:issue`. `w_repo` is the workspace base weight described below; the repo-level bonuses below are retired. The knobs, the formula and what each does are in [`hyperparameters.md`](hyperparameters.md#the-item-draw-12185); the design is [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §1 ruling 1 and §4.2. The numbered steps below describe the legacy pass-1 queue order (`workspace_draw::order`), which the step tick does not use.
 
 1. **Pick a workspace** among those with dispatchable work, at random, with
    probability **P = w / Σw** (#11742; operator ruling 2026-10-13). There are **no tiers**:
@@ -45,14 +47,15 @@ no priority side listing), and no priority exempts a candidate from any gate
      set from the fleet store's required `repos[].weight`; higher = more draws,
      `0` = never drawn) is its share of draws. N repos at weight 1 and loom at
      weight N give loom about half the draws while every repo has work.
-   - **Bonuses.** While a workspace's remaining candidates include a verified
+   - **Bonuses (retired for the step tick, #12185).** While a workspace's remaining candidates include a verified
      red-main fix, `loom:very-important` work or `loom:important` work, the
      matching bonus is added to its weight; bonuses stack:
      `w = weight + redMainFix? + veryImportant? + important?`. The points are
-     hyperparameters `dispatch.weightBonusRedMainFix` (default `400`),
+     formerly hyperparameters `dispatch.weightBonusRedMainFix` (default `400`),
      `dispatch.weightBonusVeryImportant` (`100`) and
-     `dispatch.weightBonusImportant` (`20`), re-read every tick (see
-     [`hyperparameters.md`](hyperparameters.md)). A workspace of weight `0`
+     `dispatch.weightBonusImportant` (`20`); the keys are now accepted and
+     ignored (see [`hyperparameters.md`](hyperparameters.md)), and this legacy
+     order uses the defaults. A workspace of weight `0`
      earns no bonus: it stays off. `priority_pick::draw_workspace` is the one
      implementation.
    - **Reproducibility.** The draw uses a seedable RNG (`PickRng`, SplitMix64).
@@ -76,7 +79,7 @@ red-main fix is an issue carrying `<!-- loom:main-red-fix -->` whose repo's
 `main` is verified red this tick. While `main` is red nothing in that repo can
 merge, so the fix leads its workspace and adds the red-main bonus to the
 workspace's weight in the draw. It is not a level and changes no gate: it keeps only its existing bypass
-of the build back-off, the file-overlap gate and the repo-sharding slice,
+of the build back-off and the file-overlap gate,
 which a red `main` would otherwise deadlock. On a green `main` the marker
 grants nothing. With `autonomous.workFinder.redMainAutofile.enabled` on (off
 by default), the daemon files that issue itself when `main` turns red, and

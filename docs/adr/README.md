@@ -54,7 +54,7 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Key Decision**: Merge commits first (full commit/author/timestamp history preserved for blame and audit), rebase second, squash only when it is a repo's sole allowed strategy; the stacked-PR machinery (`reconcile-stack.sh`, the #3747 pre-merge ordering guard, the #3752 amend rebase) is merge-method-agnostic and unchanged
 
 - [ADR-0024: Dedupe Read-Only Forge Pollers Across Hosts With One Captain-Published Snapshot per Repo](0024-cross-host-read-poller-dedupe.md)
-  - **Status**: Proposed
+  - **Status**: Superseded (pending rollout) by the GitHub state mirror (`forge.mirror`, 2AMLogic/2am#4367 P5)
   - **Summary**: Design note for the cross-host slice of #10512: the `fleet.captain` host (or the loom-ui mirror) publishes one snapshot per repo of the `star_liveness`, `stage_dwell` and `work_finder` listings; other hosts read it when fresh and fall back to their own conditional reads otherwise
   - **Key Decision**: Additive over an unchanged polling floor, observability/discovery reads only (gate reads stay local); projected fleet total about 8.4k to about 2.7k billable calls/h
 
@@ -62,6 +62,16 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Status**: Accepted
   - **Summary**: Records the #11112 decision made while removing the safehouse (Matrix) integration: the `loom:lease` comment plus the claim-then-verify-order tie-break is the only cross-host claim (pinned by `lease_cross_host_tests.rs`). The #7477 no-op cooldown broadcast is removed and stays per-host. The #9936 quarantine broadcast was never implemented and is dropped
   - **Key Decision**: Accept up to N× no-op cooldown dilution on an N-host fleet rather than add a forge marker or keep a side channel. Correctness comes from the lease, not the cooldown
+
+- [ADR-0026: Consumer Hook Settings Ownership: Non-Mutating Surfaces Only](0026-consumer-hook-settings-ownership.md)
+  - **Status**: Proposed
+  - **Summary**: Records the #11514 decision on who owns Loom hook registrations in consumer Claude settings: resync never writes the consumer `.claude/settings.json`; hooks ship through launch-time `--settings` or user-scope entries, and project scope is only reported on
+  - **Key Decision**: A resync-managed delimited block is rejected; the Claude Code settings-merge semantics must be cited or fixture-proven before Accepted
+
+- [ADR-0027: Captain-Owned Fleet Coordination for the Landed Cooldown and the Fleet Streaks](0027-captain-owned-fleet-coordination.md)
+  - **Status**: Proposed
+  - **Summary**: Design for #12050: the `fleet.captain` host becomes the single writer of cross-host tallies for the landed cooldown, fleet fast-fail streak and fleet no-op streak, replacing the lossy peer-claim ads. Workers report with idempotent, acknowledged reports and query a tri-state `Known`/`Unknown` result; per-lane evidence, dedup, windows, reset epochs, failover and a shadow-to-cutover plan are specified
+  - **Key Decision**: Unknown counts never become zero; no backend is selected; existing safeguards stay until each lane's cutover is reviewed and accepted
 
 ### Orchestration Architecture
 

@@ -25,16 +25,19 @@
 //!   exits `1`, removes the staged file and leaves `<dest>` as it was.
 //! * Everything human-facing goes to stderr.
 //!
+//! When `LOOM_INSTALL_IDENTITY_SINK` names a file, `publish` appends the
+//! identity of the install it made to it (`provision::txn::report_identity`).
+//!
 //! There is no restore here and no decision about whether an install was
 //! healthy: see `daemon_update::provision::txn`.
 
 use std::path::PathBuf;
 
+use crate::daemon_update::{out, provision};
 use anyhow::Result;
-use loom_daemon::daemon_update::{out, provision};
 
 #[derive(clap::Subcommand)]
-pub(crate) enum InstallBinaryCommand {
+pub enum InstallBinaryCommand {
     /// Copy CANDIDATE to a temp file beside DEST and print that file's path.
     /// DEST is not touched.
     Stage {
@@ -56,7 +59,7 @@ pub(crate) enum InstallBinaryCommand {
 
 impl InstallBinaryCommand {
     /// Never returns: exits `0` on success, `1` on failure.
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         // stdout is the `stage` contract; keep every other line off it.
         out::divert_stdout_to_stderr();
         match self {
@@ -75,6 +78,8 @@ impl InstallBinaryCommand {
                     if let Some(line) = done.retained_line() {
                         out::say(&line);
                     }
+                    // The parent's restore is bound to THIS publish (#12776).
+                    provision::txn::report_identity(&dest, &done);
                     std::process::exit(0);
                 }
                 Err(e) => {

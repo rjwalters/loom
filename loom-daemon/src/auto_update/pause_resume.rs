@@ -251,6 +251,10 @@ pub struct PauseResumeStatus {
     pub pause_to_resume_secs: Option<u64>,
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
+    /// When the current H5 `step` began, so `status` can show how long this
+    /// phase has been running (#12147).
+    #[serde(default)]
+    pub step_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub finished_at: Option<DateTime<Utc>>,
     /// A short note on the last transition.
@@ -447,6 +451,9 @@ impl Run<'_> {
     }
 
     fn step(&mut self, step: &str) {
+        if self.status.step != step || self.status.step_started_at.is_none() {
+            self.status.step_started_at = Some(Utc::now());
+        }
         self.status.step = step.to_string();
         self.status.phase = Some(self.manifest.phase.as_str().to_string());
         self.status.holding = self.held;
@@ -553,6 +560,7 @@ impl Run<'_> {
             "role": item.role,
             "from_version": self.manifest.roll.from_version,
             "to_version": self.manifest.roll.to_version,
+            "trigger": self.manifest.roll.target_source.as_ref().map(|t| t.as_str().to_string()),
             "running_version": self.plan.running_version,
             "resumed_on": self.status.resumed_on,
             "verify_probation_secs": self.plan.tuning.verify_probation.as_secs(),
@@ -1182,6 +1190,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
             "phase": run.manifest.phase.as_str(),
             "from_version": run.manifest.roll.from_version,
             "to_version": run.manifest.roll.to_version,
+            "trigger": run.manifest.roll.target_source.as_ref().map(|t| t.as_str().to_string()),
             "running_version": plan.running_version,
             "resumed_on": on,
             "items": run.status.items,
@@ -1215,3 +1224,7 @@ pub(crate) mod test_support;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "pause_resume/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pause_resume/step_tests.rs"]
+mod step_tests;

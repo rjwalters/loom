@@ -561,3 +561,23 @@ fn phase_tap_usage_is_a_nested_array_with_only_the_counters_that_were_reported()
         assert!(get(1, counter).is_none(), "unmeasured row must omit {counter}");
     }
 }
+#[test]
+fn a_drawn_sweep_outcome_carries_the_pick_and_model_pinned() {
+    let mut record = outcome_record();
+    let undrawn = map(TelemetryRecord::SweepOutcome(record.clone()));
+    assert_eq!(attribute(&undrawn, "loom.role_draw.pick"), None);
+    assert_eq!(attribute(&undrawn, "loom.role_draw.model_pinned"), None);
+    record.role_draw = Some(crate::telemetry::SweepRoleDraw {
+        pick: "codex".into(),
+        model_pinned: false,
+    });
+    let drawn = map(TelemetryRecord::SweepOutcome(record));
+    assert_eq!(
+        attribute(&drawn, "loom.role_draw.pick"),
+        Some(any_value::Value::StringValue("codex".into()))
+    );
+    assert_eq!(
+        attribute(&drawn, "loom.role_draw.model_pinned"),
+        Some(any_value::Value::BoolValue(false))
+    );
+}

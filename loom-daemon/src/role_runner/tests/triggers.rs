@@ -140,11 +140,16 @@ fn curator_skips_with_zero_untriaged_issues() {
 }
 
 #[test]
-fn curator_work_observation_counts_pending_revision_requests() {
-    // A revision request carries `loom:needs-revision`, not `loom:triage`; with
-    // zero triage issues it must still be observed, or the gate skips Curator.
+fn curator_work_observation_counts_triage_including_revise_send_backs() {
+    // Champion's revise verdict sets `loom:triage` (#11860), so the triage
+    // listing is what observes a pending revision. Every label here must be a
+    // declared registry label: a retired one would count nothing once
+    // `labels migrate` has run.
     assert!(CURATOR_WORK_LABELS.contains(&"loom:triage"));
-    assert!(CURATOR_WORK_LABELS.contains(&"loom:needs-revision"));
+    let reg = crate::label_registry::Registry::embedded();
+    for l in CURATOR_WORK_LABELS {
+        assert!(reg.get(l).is_some(), "{l} is not a declared label");
+    }
 }
 
 #[test]

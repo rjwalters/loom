@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Plan with no stalled PRs: the deterministic spelling of the live pass.
+fn plan_repo(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+) -> Vec<SequenceGroup> {
+    plan_repo_with(open_prs, files, markers, &BTreeSet::new())
+}
+
 /// An open, Judge-approved PR. Approved by default: these fixtures exercise
 /// grouping and constraints, and since #10371 no hold is planned behind a
 /// predecessor without `loom:pr` (`merge_sequence_ready_tests.rs` covers that).
@@ -53,7 +62,7 @@ fn drafts_holds_and_in_flight_prs_are_ineligible() {
     let base = pr(1, "2026-01-01T00:00:00Z");
     assert!(base.eligible_for_ordering());
     assert!(!base.clone().draft().eligible_for_ordering());
-    for hold in super::super::VERDICT_HOLD_LABELS {
+    for hold in super::super::VERDICT_HOLD_LABELS.iter() {
         assert!(!base.clone().held(hold).eligible_for_ordering(), "{hold}");
     }
     assert!(!base.clone().held("loom:reviewing").eligible_for_ordering());
@@ -418,7 +427,7 @@ fn apply_and_release_comments_carry_marker_and_reason() {
     let apply = apply_comment_body(&m, EdgeReason::SharedFiles);
     assert!(apply.contains(&marker_text(&m)), "the marker is the state: {apply}");
     assert!(apply.contains("#11"), "{apply}");
-    let release = release_comment_body(&m, HoldAction::Release);
+    let release = release_comment_body(&m, HoldAction::Release, None);
     assert!(release.contains("loom:sequence released"), "{release}");
     assert!(release.contains("merged at the recorded head"), "{release}");
     let defer = defer_comment_body(&m);
@@ -556,7 +565,7 @@ fn a_new_pr_chains_behind_a_held_predecessor() {
     assert_eq!(groups.len(), 1, "{groups:?}");
     let g = &groups[0];
     // The held #1 participates in the order (its marker points out-of-group,
-    // which order_component ignores; it is still a group member and lands
+    // which order_component_with ignores; it is still a group member and lands
     // first by age), and the fresh #2 is planned after it.
     assert_eq!(g.order, vec![1, 2], "{g:?}");
     assert_eq!(g.edges.len(), 1);

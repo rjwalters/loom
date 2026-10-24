@@ -192,7 +192,7 @@ fn a_rewrite_keeps_exactly_one_backup() {
 
 #[test]
 fn a_render_error_is_reported_not_raised() {
-    let got = apply(Err(anyhow::anyhow!("boom")), Mode::Write, now(), &None);
+    let got = apply(Err(anyhow::anyhow!("boom")), Mode::Write, now());
     assert_eq!(got.error.as_deref(), Some("boom"));
     assert!(lines(&got)[0].contains("per-repo fleet tier: ERROR — boom"));
 }
@@ -219,4 +219,26 @@ fn an_unset_half_is_omitted_from_the_snapshot_json() {
     assert_eq!(back, status);
     let line = render_line(Some(&status), status.at).unwrap();
     assert!(line.contains("per-repo fleet tier: app applied"), "{line}");
+}
+
+#[test]
+fn several_failing_repos_are_all_visible_in_the_error() {
+    let root = cloned_root();
+    let snap = snapshot(root.path(), Some(json!({"a": 1})));
+    let targets = render::repo_targets(&snap, Path::new("/home/x"), &is_cloned).unwrap();
+    // A directory where each file belongs makes every write fail.
+    let mut targets = targets;
+    for t in &mut targets {
+        std::fs::create_dir_all(&t.path).unwrap();
+    }
+    let two = vec![targets[0].clone(), {
+        let mut b = targets[0].clone();
+        b.name = "other".into();
+        b
+    }];
+    let got = apply(Ok(two), Mode::Write, now());
+    assert_eq!(got.failures, 2, "{got:?}");
+    let err = got.error.expect("both failures are reported");
+    assert!(err.contains("for app"), "the first failure is named: {err}");
+    assert!(err.contains("+1 more"), "the rest are counted: {err}");
 }

@@ -109,6 +109,35 @@ pub const SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch_origin",
 ];
 
+/// The `sweep.outcome` log attributes [`SweepRoleDraw`] maps to. The
+/// collector's log `keep_keys` must include every key (contract-tested).
+pub const SWEEP_ROLE_DRAW_LOG_ATTRIBUTE_KEYS: &[&str] =
+    &["loom.role_draw.pick", "loom.role_draw.model_pinned"];
+
+/// The weighted agent draw that chose a sweep's tap (#11726;
+/// 2AMLogic/2am#4393): the grouping keys only. The full decision record
+/// (seed, table, rolls) stays on the daemon log's preference marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepRoleDraw {
+    /// The candidate key the draw picked (`none` when nothing could launch).
+    pub pick: String,
+    /// Whether the sweep was launched pinned to the pick's `/<model>`.
+    /// `false` today: a sweep does not pin `/model`, so the pick's model is
+    /// not what the sweep ran (rjwalters/loom#11782 item 2).
+    pub model_pinned: bool,
+}
+
+impl SweepRoleDraw {
+    /// The summary of `draw`, as a sweep records it.
+    #[must_use]
+    pub fn from_draw(draw: &crate::runtime_preference::role_draw::RoleDrawRecord) -> Self {
+        Self {
+            pick: draw.pick.clone().unwrap_or_else(|| "none".into()),
+            model_pinned: false,
+        }
+    }
+}
+
 /// Dispatch-time facts of one sweep. Every field is absent when unknown,
 /// never guessed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +173,10 @@ pub struct SweepStartFacts {
     /// Who asked for this sweep ([`DispatchOrigin`], Issue #11444).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_origin: Option<String>,
+    /// The weighted agent draw that chose the tap, when a `roleDraw` table
+    /// decided (2AMLogic/2am#4393). Carried to `sweep.outcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<SweepRoleDraw>,
 }
 
 #[cfg(test)]
@@ -162,7 +195,10 @@ mod tests {
                     && l.contains("loom.eta.pr.state")
             })
             .expect("the transform/privacy log keep_keys line");
-        for key in SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS {
+        for key in SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS
+            .iter()
+            .chain(super::SWEEP_ROLE_DRAW_LOG_ATTRIBUTE_KEYS)
+        {
             assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
         }
     }

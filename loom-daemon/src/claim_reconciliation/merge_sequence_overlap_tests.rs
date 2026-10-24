@@ -5,10 +5,19 @@
 use std::cell::Cell;
 
 use super::super::{
-    plan_repo, plan_repo_with, release_comment_body, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
+    plan_repo_with, release_comment_body, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
 };
 use super::*;
 use crate::merge_pr::sequence::marker_text;
+
+/// Plan with no stalled PRs: the deterministic spelling of the live pass.
+fn plan_repo(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+) -> Vec<SequenceGroup> {
+    plan_repo_with(open_prs, files, markers, &BTreeSet::new())
+}
 
 fn sha(n: u32) -> String {
     format!("{n:040x}")
@@ -142,7 +151,7 @@ fn a_shared_file_keeps_the_hold() {
 
 #[test]
 fn the_release_comment_names_the_reason_and_the_counter_is_separate() {
-    let body = release_comment_body(&soft(10, 9), HoldAction::ReleaseNoOverlap);
+    let body = release_comment_body(&soft(10, 9), HoldAction::ReleaseNoOverlap, None);
     assert!(body.contains("share no changed files"), "{body}");
     assert!(
         body.contains("#9") && body.contains("transitive-only") && body.contains("#10077"),

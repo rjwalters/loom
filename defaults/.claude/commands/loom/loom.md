@@ -125,7 +125,7 @@ The `loom-daemon` binary talks to the same running daemon over the same Unix-soc
 
 | MCP tool | CLI equivalent | Notes |
 |---|---|---|
-| `mcp__loom__list_sweeps` | `loom-daemon status` [`--json`] [`--pipeline`] | Richer than `list_sweeps`: also reports the three dynamic-cap inputs (disk headroom, ram headroom, configured ceiling) + their `min`, the main-health-gate halt state, and per-token usage. `--pipeline` adds the forge-side `gh` snapshot (opt-in — extra API calls). |
+| `mcp__loom__list_sweeps` | `loom-daemon status` [`--json`] [`--pipeline`] | Richer than `list_sweeps`: also reports the dynamic-cap inputs (disk headroom, configured ceiling) + their `min`, the main-health-gate halt state, and per-token usage. `--pipeline` adds the forge-side `gh` snapshot (opt-in — extra API calls). |
 | `mcp__loom__dispatch_sweep` | `loom-daemon dispatch <N>` [`--model`] [`--effort`] [`--depends-on`] [`--workspace`] | First-class non-MCP entry point (#3952) over the same IPC `DispatchSweep` request. Bounded client-side ack timeout — exits nonzero fast instead of hanging (built explicitly to avoid the #4043 MCP wedge). |
 | `mcp__loom__cancel_sweep` | `loom-daemon cancel <sweep-id>` \| `--issue <N>` [`--grace`] [`--workspace`] | First-class non-MCP entry point (#4980) over the same IPC `CancelSweep` request — the `dispatch` sibling, usable over ssh. **Do NOT `kill -TERM <pid>` from `loom-daemon status` instead** (the pre-#4980 fallback): the daemon tracks the *wrapper* pid, so killing it leaves the underlying `claude` agent alive — on 2026-08-03 that survivor relaunched its workload against an issue whose claim had already been returned to the queue. The CLI signals the whole process group. `.loom/sweep-checkpoint/` still survives a cancel, so redispatch still resumes. |
 | `mcp__loom__get_sweep_status` | *(none, partial)* | `loom-daemon status` gives fleet-wide state, not one sweep's phase/blockers. `loom-daemon watch add <N>` (add `--pr` to watch a PR instead of an issue) registers a durable watch on that issue/PR's terminal state instead (persisted to `~/.loom/watches.json`; results in `~/.loom/logs/watch-results.log`). |
@@ -201,7 +201,7 @@ When the daemon is running, you coordinate work via MCP tools where available, a
    ```
    The frozen v0.10.0 topic taxonomy is:
    - `sweep.issue.{N}.phase`     — phase transitions (curator → builder → judge → doctor → merge)
-   - `sweep.issue.{N}.blocker`   — a sweep added a `loom:blocked` or `loom:operator-only` label
+   - `sweep.issue.{N}.blocker`   — a sweep added a `loom:blocked` or `loom:operator` label
    - `sweep.issue.{N}.exited`    — clean exit (with `exit_code` and `duration_sec`)
    - `sweep.issue.{N}.crashed`   — non-zero exit / OOM (with `checkpoint_phase`)
    - `sweep.global.dispatch`     — daemon accepted a new `dispatch_sweep` request
@@ -659,8 +659,9 @@ loom-clean --deep       # Also remove build artifacts
 | `loom:curated` | Enhanced, awaiting approval | Curator |
 | `loom:issue` | Approved and ready for work | Champion/Human |
 | `loom:building` | Being implemented | Builder |
-| `loom:blocked` | Work is blocked | Builder |
-| `loom:operator-only` | Needs a human; sweep skips | Human |
+| `loom:blocked` | Waiting; self-releases | Builder |
+| `loom:operator` | A human must act or decide | Any role |
+| `loom:frozen` | Not now | Human |
 | `loom:important`, `loom:very-important` | Order, promotion cap | Human/Guide/Champion |
 
 **Workflow labels (PR lifecycle):**
@@ -686,12 +687,7 @@ loom-clean --deep       # Also remove build artifacts
 
 **Troubleshooting**
 
-**Issue stuck in `loom:building`:**
-```bash
-loom-recover-orphans --recover
-```
-
-**Orphaned sweeps after daemon crash:**
+**Issue stuck in `loom:building`, or orphaned sweeps after a daemon crash:**
 ```bash
 loom-recover-orphans --recover
 ```

@@ -898,3 +898,50 @@ fn native_adapter_fails_closed_naming_both_attempts_when_replacement_is_gone() {
         rejected.reason
     );
 }
+
+// #9851: `.cargo/config.toml` `[env]` forces every runtime pin
+// `resolve_binding` reads to "" so an agent session's inherited pin cannot
+// reroute unit tests. Ties that list to the role set here so a new role is
+// not silently left out.
+#[test]
+fn cargo_env_clears_every_role_runtime_pin() {
+    let aliases = [
+        "curator",
+        "issue-curator",
+        "judge",
+        "code-review-specialist",
+        "builder",
+        "development-worker",
+        "doctor",
+        "pr-fixer",
+        "champion",
+        "auditor",
+        "guide",
+        "architect",
+        "hermit",
+        "driver",
+        "loom",
+        "sweep-lifecycle",
+        "sweep",
+    ];
+    for alias in aliases {
+        let canonical = canonical_role(alias).unwrap();
+        assert!(KNOWN_ROLE_KEYS.contains(&canonical), "{canonical} missing from KNOWN_ROLE_KEYS");
+    }
+    let cfg_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cargo/config.toml");
+    let cfg = fs::read_to_string(&cfg_path).unwrap();
+    let forced = |var: &str| {
+        cfg.lines()
+            .any(|l| l.trim() == format!(r#"{var} = {{ value = "", force = true }}"#))
+    };
+    assert!(
+        forced("LOOM_RUNTIME"),
+        "LOOM_RUNTIME not forced empty in {}",
+        cfg_path.display()
+    );
+    for role in KNOWN_ROLE_KEYS {
+        assert_eq!(canonical_role(role), Some(*role));
+        let var = role_env_var(role);
+        assert!(forced(&var), "{var} not forced empty in {}", cfg_path.display());
+    }
+}

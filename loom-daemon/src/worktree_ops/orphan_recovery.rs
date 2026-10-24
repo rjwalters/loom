@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use super::claim_file::has_valid_claim;
 use super::gh;
 use super::gh::OpenPrProbe;
-use super::liveness::{active_locked_issues, locks_dir};
+use super::liveness::active_locked_issues;
 use super::spawn_loop_state::{read_spawn_loop_state, SpawnLoopState};
 
 pub const DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECS: i64 = 300;
@@ -62,6 +62,10 @@ pub(crate) const BUILD_ARTIFACT_PATTERNS: &[&str] = &[
     "node_modules",
     "pnpm-lock.yaml",
     ".venv",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    "__pycache__/",
     "target/",
     "Cargo.lock",
     "coverage/",
@@ -266,7 +270,7 @@ pub fn gather_liveness_evidence(
 /// mirroring the `evidence.available == false` short-circuit in
 /// [`check_untracked_building`] — absent evidence means treat the claim as
 /// ALIVE (#3651).
-fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
+pub(super) fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
     match gh::probe_open_linked_pr(repo_root, issue) {
         OpenPrProbe::Open(pr) => {
             eprintln!(
@@ -393,7 +397,25 @@ pub fn check_untracked_building(
             };
 
         if threshold_seconds > 0.0 {
-            let label_age = gh::building_label_age_seconds(repo_root, issue_num);
+            let label_age = match gh::building_label_age(repo_root, issue_num) {
+                gh::LabelAge::Known(age) => Some(age),
+                // Unchanged: no claim event read as "past the grace period".
+                gh::LabelAge::NoEvent => None,
+                gh::LabelAge::Unknown => {
+                    // #12389: the label-age read was shed or failed. "No
+                    // answer" must not read as "past the grace period": a
+                    // claim made a minute ago has no PR or lease yet, so the
+                    // later gates would pass it. Skip the issue this pass.
+                    result.watched.push(WatchedEntry {
+                        issue: issue_num,
+                        title: Some(issue_title.clone()),
+                        reason: "label_age_unverifiable",
+                        age_seconds: None,
+                        threshold_seconds,
+                    });
+                    continue;
+                }
+            };
             if let Some(age) = label_age {
                 if (age as f64) < threshold_seconds {
                     result.watched.push(WatchedEntry {
@@ -622,14 +644,24 @@ pub fn recover_issue(
     label_grace_period_secs: i64,
 ) {
     if label_grace_period_secs > 0 {
-        if let Some(age) = gh::building_label_age_seconds(repo_root, issue) {
-            if age < label_grace_period_secs {
+        match gh::building_label_age(repo_root, issue) {
+            gh::LabelAge::Known(age) if age < label_grace_period_secs => {
                 eprintln!(
                     "Skipping recovery for issue #{issue}: loom:building label applied {age}s ago \
                      (grace period: {label_grace_period_secs}s)"
                 );
                 return;
             }
+            gh::LabelAge::Unknown => {
+                // #12389: a shed or failed label-age read is no answer;
+                // never delete a worktree or flip the label on it.
+                eprintln!(
+                    "Skipping recovery for issue #{issue}: the loom:building label age could not \
+                     be read (shed or failed); retrying next pass"
+                );
+                return;
+            }
+            gh::LabelAge::Known(_) | gh::LabelAge::NoEvent => {}
         }
     }
 
@@ -1004,13 +1036,6 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
     serde_json::to_string_pretty(&obj).unwrap_or_default()
 }
 
-/// Path to the spawn-loop claim-lock directory (re-exported for the CLI's
-/// help text / diagnostics).
-#[must_use]
-pub fn locks_dir_for(repo_root: &Path) -> PathBuf {
-    locks_dir(repo_root)
-}
-
 /// The one-line stderr diagnostic printed for the CLI's exit code `2`
 /// ("orphaned claims found in dry-run mode") — issue #6392. Exit `2` here is
 /// a *report*, not a failure: the assessment ran cleanly and simply found
@@ -1058,6 +1083,7 @@ pub fn format_dry_run_orphans_found_stderr(orphaned_count: usize) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::liveness::locks_dir;
     use crate::write_scope_test_support::WritableRoot;
     use serial_test::serial;
     use tempfile::tempdir;

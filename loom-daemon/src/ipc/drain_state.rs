@@ -836,7 +836,7 @@ pub fn evaluate_drain_tick(in_flight: usize, past_deadline: bool, force: bool) -
 mod pause;
 #[path = "drain_resume.rs"]
 mod resume;
-pub use pause::PauseOwnership;
+pub use pause::{MaintenanceBegin, PauseOwnership, TookOver};
 pub use resume::ResumeHold;
 
 #[cfg(test)]

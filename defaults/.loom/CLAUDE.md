@@ -149,9 +149,8 @@ Agents coordinate through labels. See `.github/labels.yml` for full definitions.
 **Epic Lifecycle**: `loom:epic` → phased `loom:architect` + `loom:epic-phase`
 child issues.
 
-**Escape-hatch / status labels**: `loom:blocked` (needs help),
-`loom:operator-only` (human action outside automation: credentials, infra,
-hardware; dispatch skips it), `loom:abort` (abort in-flight work, returns to
+**Holds**: `loom:blocked` (waiting), `loom:operator` (a human must act or
+decide; no role acts on it), `loom:abort` (abort in-flight work, returns to
 `loom:issue`). Priority: `loom:very-important` / `loom:important` (set by
 humans, Guide, Champion); order only, never a hold or an approval.
 `loom:frozen`: not now. Every agent and daemon path ignores it; only a human removes it (#11743).
@@ -170,7 +169,7 @@ it is not the best outcome. Comment the rationale before closing; rescope
 instead of closing when the core is worth keeping (drop back to
 `loom:triage`/`loom:curated`, removing `loom:issue`, so it isn't re-dispatched
 with a stale scope). Never close an issue that encodes a pending human
-decision — route it to `loom:blocked` or `loom:operator-only` instead.
+decision — route it to `loom:operator` instead.
 
 ## Git Worktree Workflow
 
@@ -252,9 +251,9 @@ readily as a dispatched one; only Curator may be skipped.
    all-clear (`--help` has it). A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
 2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
-   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`.
+   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (the process doing the work, never a subagent's inherited `$PPID`).
    Step 3's `worktree.sh` does this itself; a lane NOT using it MUST call `lease ensure`
-   directly — a leaseless claim is invisible to other lanes and gets reclaimed (#9453)
+   directly — a leaseless claim is invisible to other lanes and gets reclaimed (#9453); `lease release 42` hands it back (#12103)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
 5. Create PR: `git push -u origin feature/issue-42 &&

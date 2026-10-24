@@ -59,8 +59,7 @@
 //! The covered slugs are logged once when this host becomes the captain and
 //! again whenever the set changes. A captain that is down means no intake
 //! anywhere; the signals are `intake-reconcile` missing from its
-//! `host.health.armed_singleton_jobs` and, since #10924, the completed-pass
-//! heartbeat (below) going stale in the singleton-output watchdog.
+//! `host.health.armed_singleton_jobs`.
 //!
 //! # Modes ([`Mode`], re-read every [`GATE_INTERVAL`], so an edit needs no restart)
 //!
@@ -76,22 +75,6 @@
 //! ETA fleet refresh (#10329): a duplicate label attempt costs budget, never
 //! correctness, and a single-host install must not lose intake for want of a
 //! captain.
-//!
-//! # The completed-pass heartbeat (#10924)
-//!
-//! A healthy pass that labels nothing emits no forge output, so a watcher
-//! could not tell a quiet fleet from a stopped reconciler. After every pass
-//! the captain folds the outcome into
-//! `<root>/.loom/state/intake-reconcile/last-pass.json`
-//! ([`PassHeartbeat`]): `last_completed_at` advances only when the pass
-//! completed its whole scan — every repo walked ([`PassReport::stopped_early`]
-//! false) and every listing read ([`PassReport::listing_failed`] zero). A
-//! shed, failed or early-stopped pass records its outcome but keeps the
-//! previous stamp. The `fleet_outputs::SINGLETON_OUTPUTS` row for this job
-//! (record kind [`PASS_HEARTBEAT_KIND`]) judges that stamp against twice the
-//! default pass cadence — a fixed 600 s; the
-//! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` override does not move the row's
-//! deadline.
 //!
 //! # Rate limits
 //!
@@ -115,9 +98,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::demote::{self, DemoteForge, LabelEvent};
 use super::{select_unlabeled, IntakeRow, TRIAGE_LABEL};
 use crate::claim_reconciliation::gh_call;
 use crate::fleet_captain::{self as captain, CaptainGate};
@@ -128,11 +111,6 @@ use crate::forge_etag_store as store;
 pub const SINGLETON_JOB_NAME: &str = "intake-reconcile";
 /// Config key: hand the pass to the declared fleet captain.
 pub const SINGLETON_KEY: &str = "fleet.intakeReconcile.singleton";
-/// Record kind of the completed-pass heartbeat (#10924): the durable output
-/// the `fleet_outputs::SINGLETON_OUTPUTS` row for this job judges.
-pub const PASS_HEARTBEAT_KIND: &str = "intake-reconcile.pass";
-/// The heartbeat's schema tag; a record carrying another is ignored on read.
-pub const HEARTBEAT_SCHEMA: &str = "intake-reconcile/pass/v1";
 /// How often the mode is re-read. The pass itself keeps the legacy cadence
 /// (`LOOM_INTAKE_RECONCILE_INTERVAL_SECS`).
 pub const GATE_INTERVAL: Duration = Duration::from_secs(60);
@@ -344,28 +322,21 @@ pub fn registered_repos(daemon_root: &Path) -> Option<Vec<Repo>> {
 // ---------------------------------------------------------------------------
 
 /// The forge calls of one pass, injected so the pass is testable offline.
-pub trait IntakeForge {
+///
+/// The per-issue calls shared with the demotion step (#11820) live on the
+/// supertrait [`DemoteForge`]: the re-read (`current_labels`), the label
+/// write (`add_triage`), and the demotion's events read, label removal and
+/// comment.
+pub trait IntakeForge: DemoteForge<Repo> {
     /// Every open issue (never a pull request) of `repo`.
     ///
     /// # Errors
     /// The listing is incomplete or failed: the repo is skipped this pass.
     fn list_open(&mut self, repo: &Repo) -> Result<Vec<IntakeRow>>;
 
-    /// Issue `number`'s labels as of now, or `None` when it is no longer an
-    /// open issue (closed, deleted, or a pull request).
-    ///
-    /// # Errors
-    /// The read failed: nothing is labelled on a guess.
-    fn current_labels(&mut self, repo: &Repo, number: u32) -> Result<Option<Vec<String>>>;
-
     /// May this host write to `repo`? Asked once per repo, and only when
-    /// there is something to label.
+    /// there is something to label or demote.
     fn may_write(&mut self, repo: &Repo) -> bool;
-
-    /// Add [`TRIAGE_LABEL`] to issue `number`: the issue's label set as the
-    /// forge answered the write (`Some(vec![])` when the answer did not
-    /// parse), or `None` on any failure.
-    fn add_triage(&mut self, repo: &Repo, number: u32) -> Option<Vec<String>>;
 
     /// Remove [`TRIAGE_LABEL`] from issue `number`; already absent is
     /// success. `false` on any failure.
@@ -383,6 +354,9 @@ pub struct RepoReport {
     /// Labelled, then un-labelled: the write's answer showed another
     /// `loom:*` label.
     pub reverted: usize,
+    /// Issues opened as `loom:issue`/`loom:curated`, demoted to
+    /// [`TRIAGE_LABEL`] (#11820). Kept apart from `raced`/`reverted`.
+    pub demoted: usize,
     /// The listing failed or was incomplete.
     pub listing_failed: bool,
     /// The listing was shed: every reader was out of budget. Implies
@@ -421,14 +395,23 @@ pub fn run_repo(
             report.listing_shed = true;
             return report;
         }
+        Err(e) if e.downcast_ref::<store::TickDeadlineReached>().is_some() => {
+            // An expected deferral, not a reader-budget shed: no shed accounting.
+            log::debug!("intake_reconcile: {} listing deferred to the next tick: {e:#}", repo.slug);
+            report.listing_failed = true;
+            return report;
+        }
         Err(e) => {
             log::warn!("intake_reconcile: {} listing skipped this pass: {e:#}", repo.slug);
             report.listing_failed = true;
             return report;
         }
     };
-    let picked = select_unlabeled(&rows, now, cap);
-    if picked.is_empty() {
+    // #11820: issues opened as `loom:issue`/`loom:curated` (a separate
+    // selector, so the unlabelled step's accounting below is untouched).
+    let to_demote = demote::candidates(&repo.slug, &rows, now, cap);
+    let mut picked = select_unlabeled(&rows, now, cap);
+    if picked.is_empty() && to_demote.is_empty() {
         return report;
     }
     // Forge-write scope (#9548): never label issues in a repo this host may
@@ -436,6 +419,15 @@ pub fn run_repo(
     if !forge.may_write(repo) {
         report.denied = true;
         return report;
+    }
+    if !to_demote.is_empty() {
+        let out = demote::demote_step(forge, repo, &repo.slug, &repo.slug, &to_demote);
+        report.demoted = out.demoted;
+        if out.stopped {
+            return report; // likely rate limited / auth; retry next pass
+        }
+        // Events reads count against the same per-pass cap.
+        picked.truncate(cap.saturating_sub(out.reads));
     }
     for number in picked {
         // The listing is a snapshot: confirm, immediately before the write,
@@ -494,24 +486,14 @@ pub struct PassReport {
     pub raced: usize,
     /// Labels removed again after the write's answer (see [`RepoReport`]).
     pub reverted: usize,
+    /// Issues opened past intake, demoted to [`TRIAGE_LABEL`] (#11820).
+    pub demoted: usize,
     /// Repos whose listing was shed (readers out of budget).
     pub shed: usize,
     /// Repos whose listing failed or was shed (`shed` is a subset).
     pub listing_failed: usize,
     /// The rate-limit breaker stopped the pass before the last repo(s).
     pub stopped_early: bool,
-}
-
-impl PassReport {
-    /// Whether the pass completed its intended scan: every repo was walked
-    /// (not [`stopped_early`](Self::stopped_early)) and every listing was
-    /// read. Label outcomes — a denied write scope, races, reverts, cap
-    /// leftovers — do not count against it: the pass retries them next pass
-    /// by design.
-    #[must_use]
-    pub fn completed_scan(&self, repos: usize) -> bool {
-        !self.stopped_early && self.listing_failed == 0 && self.repos == repos
-    }
 }
 
 /// One pass over `repos`, stopping early while `suppressed` (the rate-limit
@@ -536,117 +518,10 @@ pub fn run_pass(
         pass.labelled += report.labelled;
         pass.raced += report.raced;
         pass.reverted += report.reverted;
+        pass.demoted += report.demoted;
         pass.shed += usize::from(report.listing_shed);
     }
     pass
-}
-
-// ---------------------------------------------------------------------------
-// The completed-pass heartbeat (#10924)
-// ---------------------------------------------------------------------------
-
-/// What the captain recorded about its latest pass, folded into
-/// [`heartbeat_path`] after every one. `last_completed_at` is the timestamp a
-/// watchdog ages; it advances only when a pass completed its whole scan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PassHeartbeat {
-    /// [`HEARTBEAT_SCHEMA`]; a mismatched tag is ignored on read.
-    pub schema: String,
-    /// The host that ran the pass.
-    pub host: String,
-    /// When this pass ran, completed or not.
-    pub pass_at: DateTime<Utc>,
-    /// When a pass last completed its whole scan; `None` = never. A shed,
-    /// failed or early-stopped pass keeps the previous value.
-    pub last_completed_at: Option<DateTime<Utc>>,
-    /// Repos whose listing was read this pass.
-    pub repos: usize,
-    /// Repos whose listing failed or was shed this pass.
-    pub listing_failed: usize,
-    /// Repos whose listing was shed (a subset of `listing_failed`).
-    pub shed: usize,
-    /// The breaker stopped this pass before every repo was walked.
-    pub stopped_early: bool,
-    /// Issues given [`TRIAGE_LABEL`] this pass.
-    pub labelled: usize,
-    /// Issues left alone: labelled, closed or gone at the re-read.
-    pub raced: usize,
-    /// Labels removed again after the write's answer showed another `loom:*`.
-    pub reverted: usize,
-}
-
-impl PassHeartbeat {
-    /// The timestamp a watchdog may treat as "the singleton produced": the
-    /// latest pass that completed its whole scan. Readers age it against
-    /// their own clock, so a stopped writer cannot keep itself fresh.
-    #[must_use]
-    pub fn success_at(&self) -> Option<DateTime<Utc>> {
-        self.last_completed_at
-    }
-}
-
-/// `<root>/.loom/state/intake-reconcile/last-pass.json`.
-#[must_use]
-pub fn heartbeat_path(root: &Path) -> PathBuf {
-    root.join(".loom")
-        .join("state")
-        .join("intake-reconcile")
-        .join("last-pass.json")
-}
-
-/// Fold one pass into the heartbeat: a pass that completed its intended scan
-/// (see [`PassReport::completed_scan`]) over `repos` of them stamps
-/// `last_completed_at = pass_at`; any other outcome keeps the previous stamp,
-/// so the success timestamp cannot be refreshed accidentally. Pure.
-#[must_use]
-pub fn next_heartbeat(
-    prev: Option<&PassHeartbeat>,
-    host: &str,
-    pass_at: DateTime<Utc>,
-    pass: &PassReport,
-    repos: usize,
-) -> PassHeartbeat {
-    PassHeartbeat {
-        schema: HEARTBEAT_SCHEMA.to_string(),
-        host: host.to_string(),
-        last_completed_at: if pass.completed_scan(repos) {
-            Some(pass_at)
-        } else {
-            prev.and_then(|p| p.last_completed_at)
-        },
-        pass_at,
-        repos: pass.repos,
-        listing_failed: pass.listing_failed,
-        shed: pass.shed,
-        stopped_early: pass.stopped_early,
-        labelled: pass.labelled,
-        raced: pass.raced,
-        reverted: pass.reverted,
-    }
-}
-
-/// The heartbeat on disk: `None` when absent, unreadable, or of another
-/// schema (a foreign record proves nothing either way).
-#[must_use]
-pub fn read_heartbeat(root: &Path) -> Option<PassHeartbeat> {
-    let bytes = std::fs::read(heartbeat_path(root)).ok()?;
-    let hb: PassHeartbeat = serde_json::from_slice(&bytes).ok()?;
-    (hb.schema == HEARTBEAT_SCHEMA).then_some(hb)
-}
-
-/// Persist `hb`. Health state never costs a pass: a failure is logged only.
-fn write_heartbeat(root: &Path, hb: &PassHeartbeat) {
-    let path = heartbeat_path(root);
-    let write = || -> Result<()> {
-        let text = serde_json::to_string_pretty(hb).context("encode the heartbeat")?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).context("create the state dir")?;
-        }
-        std::fs::write(&path, text + "\n").with_context(|| format!("write {}", path.display()))
-    };
-    if let Err(e) = write() {
-        log::warn!("intake_reconcile: could not write the pass heartbeat: {e:#}");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +541,7 @@ impl GhIntakeForge {
 }
 
 /// The names in a label-array answer (`POST …/labels`).
-fn label_names(body: &str) -> Option<Vec<String>> {
+pub(super) fn label_names(body: &str) -> Option<Vec<String>> {
     let labels: Vec<Value> = serde_json::from_str(body.trim()).ok()?;
     Some(
         labels
@@ -677,7 +552,7 @@ fn label_names(body: &str) -> Option<Vec<String>> {
 }
 
 /// An issue row's labels when it is still an open issue, else `None`.
-fn open_issue_labels(body: &str) -> Result<Option<Vec<String>>> {
+pub(super) fn open_issue_labels(body: &str) -> Result<Option<Vec<String>>> {
     let issue: Value = serde_json::from_str(body.trim()).context("parse the issue")?;
     if issue.get("pull_request").is_some_and(|p| !p.is_null())
         || !issue["state"]
@@ -697,27 +572,50 @@ fn open_issue_labels(body: &str) -> Result<Option<Vec<String>>> {
 
 impl IntakeForge for GhIntakeForge {
     fn list_open(&mut self, repo: &Repo) -> Result<Vec<IntakeRow>> {
+        // #12310: the intake walk is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let rows = crate::forge_listing::list_open_issues_cached_all_as(
             "intake.list_open",
             &self.gh_bin,
             Some(&repo.root),
             None,
         )?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| !row.is_pull_request)
-            .map(|row| IntakeRow {
-                number: row.number,
-                created_at: row
-                    .created_at
-                    .as_deref()
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|d| d.with_timezone(&Utc)),
-                labels: row.labels,
-            })
-            .collect())
+        // #12118: the walk journals `issue.estimate` for freshly curated
+        // issues (was the stage-queue walk, removed with the sampler, #12316).
+        crate::telemetry::kinds::issue_estimate::observe::observe(
+            &repo.root,
+            &repo.slug,
+            &rows,
+            &crate::comment_trust::TrustPolicy::for_root(&repo.root),
+            Utc::now(),
+        );
+        Ok(super::rows_from_listing(rows))
     }
 
+    fn may_write(&mut self, repo: &Repo) -> bool {
+        crate::write_scope::gate_repo_with(&repo.root, &repo.slug, &self.gh_bin, "intake reconcile")
+    }
+
+    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
+        let path = format!("repos/{}/issues/{number}/labels/{TRIAGE_LABEL}", repo.slug);
+        let mut call = gh_call::write("intake.remove_triage", &self.gh_bin, &repo.root)
+            .args(["api", "-X", "DELETE", &path]);
+        if let Some(host) = &repo.host {
+            call = call.arg("--hostname").arg(host);
+        }
+        match gh_call::output(call) {
+            Ok(o) if o.status.success() => true,
+            // Already absent is the end state we want.
+            Ok(o) => {
+                let err = gh_call::stderr(&o);
+                err.contains("404") || err.to_ascii_lowercase().contains("does not exist")
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl DemoteForge<Repo> for GhIntakeForge {
     fn current_labels(&mut self, repo: &Repo, number: u32) -> Result<Option<Vec<String>>> {
         const CALLER: &str = "intake.recheck";
         let site =
@@ -744,10 +642,6 @@ impl IntakeForge for GhIntakeForge {
         }
     }
 
-    fn may_write(&mut self, repo: &Repo) -> bool {
-        crate::write_scope::gate_repo_with(&repo.root, &repo.slug, &self.gh_bin, "intake reconcile")
-    }
-
     fn add_triage(&mut self, repo: &Repo, number: u32) -> Option<Vec<String>> {
         let path = format!("repos/{}/issues/{number}/labels", repo.slug);
         let label = format!("labels[]={TRIAGE_LABEL}");
@@ -762,22 +656,19 @@ impl IntakeForge for GhIntakeForge {
         Some(label_names(&String::from_utf8_lossy(&out.stdout)).unwrap_or_default())
     }
 
-    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
-        let path = format!("repos/{}/issues/{number}/labels/{TRIAGE_LABEL}", repo.slug);
-        let mut call = gh_call::write("intake.remove_triage", &self.gh_bin, &repo.root)
-            .args(["api", "-X", "DELETE", &path]);
-        if let Some(host) = &repo.host {
-            call = call.arg("--hostname").arg(host);
-        }
-        match gh_call::output(call) {
-            Ok(o) if o.status.success() => true,
-            // Already absent is the end state we want.
-            Ok(o) => {
-                let err = gh_call::stderr(&o);
-                err.contains("404") || err.to_ascii_lowercase().contains("does not exist")
-            }
-            Err(_) => false,
-        }
+    fn label_events(&mut self, repo: &Repo, number: u32) -> Result<Vec<LabelEvent>> {
+        let issue = format!("repos/{}/issues/{number}", repo.slug);
+        demote::read_label_events(&self.gh_bin, &repo.root, &issue, repo.host.as_deref())
+    }
+
+    fn remove_label(&mut self, repo: &Repo, number: u32, label: &str) -> bool {
+        let issue = format!("repos/{}/issues/{number}", repo.slug);
+        demote::delete_label(&self.gh_bin, &repo.root, &issue, label, repo.host.as_deref())
+    }
+
+    fn comment(&mut self, repo: &Repo, number: u32, body: &str) -> bool {
+        let issue = format!("repos/{}/issues/{number}", repo.slug);
+        demote::post_comment(&self.gh_bin, &repo.root, &issue, body, repo.host.as_deref())
     }
 }
 
@@ -810,12 +701,14 @@ fn run_production_pass(daemon_root: &Path) {
         cap,
         &crate::rate_limit_breaker::global_is_suppressed,
     );
-    // The completed-pass heartbeat (#10924): durable output for a pass that
-    // labelled nothing, refreshed only by a pass that completed its scan.
-    let host = crate::sweep_registry::host_identity();
-    let hb =
-        next_heartbeat(read_heartbeat(daemon_root).as_ref(), &host, ran_at, &pass, repos.len());
-    write_heartbeat(daemon_root, &hb);
+    if pass.demoted > 0 {
+        log::info!(
+            "intake_reconcile: demoted {} issue(s) opened past intake to {TRIAGE_LABEL} across \
+             {} repo(s) (#11820)",
+            pass.demoted,
+            pass.repos
+        );
+    }
     if pass.labelled > 0 || pass.raced > 0 || pass.reverted > 0 {
         log::info!(
             "intake_reconcile: applied {TRIAGE_LABEL} to {} unlabelled issue(s) across {} \

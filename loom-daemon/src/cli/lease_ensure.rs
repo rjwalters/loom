@@ -20,11 +20,9 @@
 //! ## Why this lives in `loom-daemon` rather than in `worktree.sh`
 //!
 //! `defaults/scripts/worktree.sh` — the one call site every builder runs
-//! immediately after claiming — is a shell-budget `contract` file, i.e. part of
-//! the **portable** pool epic #7810 exists to retire. `check_against_rev`
-//! refuses portable growth *unconditionally*: unlike floor growth, it has no
-//! `Shell-Budget-Growth:` override (see `shell_budget.rs`, "Portable growth is
-//! NOT overridable, deliberately"). So the ADR-0018 shape is not merely
+//! immediately after claiming — is a `contract` file, i.e. part of
+//! the **portable** pool epic #7810 exists to retire, and new portable shell
+//! is not admitted. So the ADR-0018 shape is not merely
 //! preferred here, it is the only admissible one — the behavior goes into this
 //! subcommand and `worktree.sh` keeps a two-line reach into it.
 //!
@@ -64,22 +62,6 @@
 //! ([`session_sweep_id`]) so a session's second call re-attaches to its own
 //! lease instead of being declined by it.
 //!
-//! ## Live output for the same claim (#10116)
-//!
-//! The same blind spot hides the agent's output: the daemon's `session.output`
-//! producer only follows runs it dispatched. So after the lease, `run` also
-//! asks `observability::session_output::attended` to start a tailer for this
-//! agent's own transcript when the agent is a subagent, or a top-level
-//! session running a `/loom:<role>` command that names this issue (an inline
-//! claim by an operator's main agent is refused, with the reason on stderr,
-//! #10129). That call is a few
-//! local file reads and a detached spawn, a silent no-op unless live output
-//! and an OTLP exporter are
-//! configured, and skipped outright for a daemon-dispatched child, whose
-//! output the daemon already publishes. Like the lease, it never fails or
-//! delays the claim. Because `worktree.sh` discards this stderr, the outcome
-//! line is also kept in `.loom/logs/live-output-attended/last-start.log`
-//! (#10125).
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -134,6 +116,12 @@ pub(crate) enum LeaseCommand {
     /// See `cli::lease_co_occupancy`.
     CoOccupancy(super::lease_co_occupancy::LeaseCoOccupancyArgs),
 
+    /// Hand back this host's lease on `<issue>`: stop its renewer(s) and post
+    /// a `loom:lease-yield` so `forge check-claim` stops counting it (#12103).
+    /// Idempotent; refuses (exit 1) a live lease held by another host. See
+    /// `cli::lease_release`.
+    Release(super::lease_release::LeaseReleaseArgs),
+
     /// Single-owner bookkeeping and the per-cycle completion gate for
     /// `sweep-lease-renew.sh`'s renewal loops (#10229). See
     /// `cli::lease_renewer`.
@@ -151,6 +139,7 @@ impl LeaseCommand {
         match self {
             LeaseCommand::Ensure(args) => args.run(),
             LeaseCommand::CoOccupancy(args) => args.run(),
+            LeaseCommand::Release(args) => args.run(),
             LeaseCommand::Renewer(action) => action.run(),
             LeaseCommand::Pr(action) => action.run(),
         }
@@ -367,10 +356,6 @@ impl LeaseEnsureArgs {
         let line = outcome.describe(self.issue);
         eprintln!("lease ensure: {line}");
         deferred::record(&self.workspace, self.issue, &line);
-        if let Outcome::Renewing { sweep_id, .. } = &outcome {
-            // #11563: an in-session sweep is an operator-origin sweep.start.
-            super::presence::on_lease_published(&self.workspace, self.issue, sweep_id);
-        }
         // #10570: a declined publish used to be final, so a claim made while a
         // released sweep's lease was still inside its TTL never got a lease of
         // its own and was reclaimed once that leftover aged out.
@@ -379,36 +364,7 @@ impl LeaseEnsureArgs {
             eprintln!("lease ensure: {line}");
             deferred::record(&self.workspace, self.issue, &line);
         }
-        self.attend_live_output(&outcome);
         Ok(())
-    }
-
-    /// Start this claim's attended live-output tailer (#10116). Independent
-    /// of whether the lease itself published: a declined publish (another
-    /// lease, a forge outage) says nothing about whether this agent's output
-    /// should be visible.
-    fn attend_live_output(&self, outcome: &Outcome) {
-        use loom_daemon::observability::session_output::attended;
-        // A daemon child is covered by the daemon's own producer, and with no
-        // agent session there is no transcript to follow.
-        if matches!(outcome, Outcome::AlreadyDispatched | Outcome::NoAgentSession) {
-            return;
-        }
-        let Ok(issue) = u32::try_from(self.issue) else {
-            return;
-        };
-        let request = attended::StartRequest {
-            watch_pid: Some(self.watch_pid),
-            // `0` means "unbounded" for the lease loop; a tailer is always capped.
-            max_age_secs: if self.max_age == 0 {
-                attended::DEFAULT_MAX_AGE_SECS
-            } else {
-                self.max_age
-            },
-            ..super::attend_hook::request(issue, PathBuf::from(&self.workspace))
-        };
-        let live = attended::start(&request, &attended::AttendEnv::from_process());
-        eprintln!("lease ensure: live output: {}", live.describe(issue));
     }
 
     /// The whole decision, with the environment injected so it is testable.
@@ -431,7 +387,7 @@ impl LeaseEnsureArgs {
             return Outcome::NoAgentSession;
         }
 
-        let root = match loom_daemon::repo_root::resolve_repo_root(&self.workspace) {
+        let root = match crate::repo_root::resolve_repo_root(&self.workspace) {
             Ok(r) => r,
             Err(e) => return Outcome::NoRepoRoot(e.to_string()),
         };

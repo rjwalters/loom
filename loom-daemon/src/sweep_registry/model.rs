@@ -511,6 +511,7 @@ pub fn generate_sweep_id(kind: &SweepKind) -> SweepId {
     let ts = Utc::now().timestamp();
     match kind {
         SweepKind::Issue(n) => format!("sweep-issue-{n}-{ts}"),
+        SweepKind::Step { item, role } => format!("step-{role}-{item}-{ts}"),
         SweepKind::PrSet(prs) => {
             let joined = prs
                 .iter()

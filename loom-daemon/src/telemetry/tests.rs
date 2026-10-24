@@ -5,7 +5,6 @@
 
 use super::*;
 
-mod admission_brake;
 mod daemon_event;
 mod export_coverage;
 mod fleet_captain;
@@ -13,6 +12,7 @@ mod host_health;
 mod host_health_omissions;
 mod kind_registry;
 mod retired_complexity;
+mod role_draw;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
@@ -135,6 +135,7 @@ pub(super) fn sweep_outcome() -> TelemetryRecord {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -143,6 +144,38 @@ pub(super) fn sweep_outcome() -> TelemetryRecord {
         generated_lines: None,
         test_lines: None,
     })
+}
+
+/// A `HostHealthRecord` with nothing measured: every optional field `None`
+/// or empty. Tests name only the field they are about via struct-update
+/// syntax. A plain function, not a `Default` impl on the production type,
+/// which would invite fabricated zeros.
+pub(super) fn baseline_host_health() -> HostHealthRecord {
+    HostHealthRecord {
+        captured_at: ts(),
+        daemon_version: "0.17.0".to_string(),
+        build_commit: "unknown".to_string(),
+        built_at: None,
+        uptime_sec: 1,
+        logical_cpus: 4,
+        cpu_idle_fraction: None,
+        load_per_core: None,
+        worktree_root_free_gb: None,
+        worktree_root_total_gb: None,
+        active_sweep_ids: Vec::new(),
+        managed_repos: Vec::new(),
+        roles: RoleTickHealth::default(),
+        protection: None,
+        is_captain: None,
+        armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
+        exported_kinds: Vec::new(),
+        exporters: Vec::new(),
+        otlp_export: None,
+        memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
+    }
 }
 
 fn host_health() -> TelemetryRecord {
@@ -158,20 +191,16 @@ fn host_health() -> TelemetryRecord {
         worktree_root_free_gb: Some(200),
         worktree_root_total_gb: Some(1000),
         active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: vec![
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
                 weight: Some(0),
-                stale_blocked_release: None,
             },
             ManagedRepoEntry {
                 slug: "2AMLogic/gf180-pll".to_string(),
                 visibility: RepoVisibility::Private,
                 weight: None,
-                stale_blocked_release: None,
             },
         ],
         roles: RoleTickHealth {
@@ -189,7 +218,6 @@ fn host_health() -> TelemetryRecord {
             state: "protected".to_string(),
             watchdog_provisioned: Some(true),
         }),
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -197,6 +225,8 @@ fn host_health() -> TelemetryRecord {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     })
 }
 
@@ -293,6 +323,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -429,6 +460,7 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -494,6 +526,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -815,6 +848,7 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,

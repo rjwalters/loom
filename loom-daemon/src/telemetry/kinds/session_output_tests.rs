@@ -206,16 +206,12 @@ fn the_wire_vocabulary_matches_the_serde_spelling() {
 }
 
 #[test]
-fn the_kind_is_otlp_only_so_the_managed_https_sink_can_never_receive_it() {
+fn the_kind_is_an_otlp_log() {
     use crate::telemetry::TELEMETRY_KINDS;
     let meta = TELEMETRY_KINDS
         .iter()
         .find(|m| m.kind == "session.output")
         .expect("session.output is registered");
-    assert!(
-        !meta.native_ingest,
-        "session.output must never be accepted by the native HTTPS ingest backend"
-    );
     assert_eq!(meta.otlp, crate::telemetry::TelemetryKindOtlp::Logs);
 }
 

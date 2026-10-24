@@ -168,7 +168,6 @@ fn a_tick_with_no_journal_attached_takes_none() {
 fn writers_are_no_ops_outside_a_role_tick() {
     // PICK_JOURNAL_ENV is never set in the test process.
     if std::env::var_os(PICK_JOURNAL_ENV).is_none() {
-        record_pr_queue("judge", &[]);
         record_gh_actions(&[OsString::from("pr")]);
     }
 }
@@ -209,4 +208,68 @@ fn a_queue_line_written_before_the_total_field_still_parses() {
         [JournalEntry::Queue { total, .. }] => assert_eq!(*total, 0),
         other => panic!("unexpected {other:?}"),
     }
+}
+
+/// #11858: a passed-through `gh issue list --json …labels` call's rows, in
+/// `gh`'s order, with `gh`'s label objects read by name.
+#[test]
+fn a_passed_through_gh_listing_journals_its_rows() {
+    let stdout = r#"[{"labels":[{"id":"x","name":"loom:triage","color":"c"}],"number":12},
+        {"labels":[],"number":9},{"title":"no number"}]"#;
+    let rows = gh_listing_rows("loom:triage", stdout).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].number, 12);
+    assert_eq!(rows[0].stage, "loom:triage");
+    assert_eq!(rows[0].labels, vec!["loom:triage".to_string()]);
+    assert_eq!(rows[1].sort_key.as_ref().unwrap().value, "2");
+    assert_eq!(gh_listing_rows("search", "not json"), None);
+    assert_eq!(gh_listing_rows("search", "{\"number\":1}"), None, "an object is not rows");
+}
+
+/// #11906: a step's journal, named by its sweep id, drains through the same
+/// `take` a role tick uses once the step's end adopts it on its thread.
+#[test]
+fn an_adopted_step_journal_drains_like_a_role_ticks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Path::new("/journal-test/step");
+    let path = dir.path().join("step.jsonl");
+    let line = r#"{"kind":"queue","at":"2026-10-04T12:00:00Z","role":"judge","acts_observable":true,"rows":[],"total":0}"#;
+    std::fs::write(&path, format!("{line}\n")).unwrap();
+    discard();
+    adopt(root, path.clone());
+    let got = take(root).unwrap();
+    assert!(got.read);
+    assert_eq!(got.entries.len(), 1);
+    assert!(!path.exists(), "drained");
+    assert!(step_path("step-judge-7-1").ends_with("step-step-judge-7-1.jsonl"));
+}
+
+#[test]
+fn dispatch_journals_the_pr_queue_only_for_a_journaled_pr_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j.jsonl");
+    let rows = || Ok(vec![serde_json::json!({"number": 7, "labels": []})]);
+    let queue_entries = |p: &Path| {
+        parse(&std::fs::read_to_string(p).unwrap_or_default())
+            .into_iter()
+            .filter(|e| matches!(e, JournalEntry::Queue { .. }))
+            .count()
+    };
+
+    // No journal attached (no exporter): nothing is fetched.
+    let bare = Command::new("true");
+    record_queue_with(&bare, "judge", |_| panic!("fetched without a journal"));
+
+    let mut cmd = Command::new("true");
+    cmd.env(PICK_JOURNAL_ENV, &journal);
+    // A role without a PR queue is not fetched.
+    record_queue_with(&cmd, "curator", |_| panic!("curator has no PR queue"));
+    // A failed listing journals nothing.
+    record_queue_with(&cmd, "judge", |_| anyhow::bail!("forge down"));
+    assert_eq!(queue_entries(&journal), 0);
+
+    for role in ["judge", "doctor", "champion"] {
+        record_queue_with(&cmd, role, |_| rows());
+    }
+    assert_eq!(queue_entries(&journal), 3);
 }

@@ -50,6 +50,9 @@ fn test_role_tick_prompt_carries_no_volatile_content() {
                 spec.name,
                 resolve_architect_max_proposals(&config)
             )
+        } else if spec.name == "champion" {
+            // #11909: Champion's interval run is non-item only.
+            "/loom:champion --non-item".to_string()
         } else {
             format!("/loom:{}", spec.name)
         };

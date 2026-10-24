@@ -25,6 +25,10 @@
 //!   Judge, Doctor or Champion agent issued on a PR (its claim label, verdict
 //!   or merge), from the tick's pick journal. `started_at` is when the agent
 //!   issued that write.
+//! - **A step this host spawned** (`source` [`source::STEP`]): an issue-acting
+//!   Builder or Curator step whose claim was accepted and whose child
+//!   launched. A `sweep.builder` start with `source=step` is the exit from
+//!   `ready_wait` (#12904). PR-acting steps are covered by the role tick.
 //!
 //! **OTLP only.** **Provenance is required.**
 
@@ -46,6 +50,9 @@ pub mod source {
     pub const SWEEP_OBSERVED: &str = "sweep_observed";
     /// A role-runner agent's first forge write on the item in its tick.
     pub const ROLE_ACT: &str = "role_act";
+    /// A step's spawn succeeded: its claim was accepted and its child
+    /// launched (Issue #12904). `started_at` is the spawn instant.
+    pub const STEP: &str = "step";
 }
 
 /// `role` values.
@@ -117,8 +124,7 @@ pub struct WorkStartedRecord {
 
 /// The role a sweep checkpoint marker hands the item to, and that role's
 /// stage. `None` (no marker) is the Curator in `sweep.curator`; `merge-done`
-/// starts no work, and an unknown marker is never guessed at. The stage agrees
-/// with `fleet_state::held_stage` for every known marker (tested).
+/// starts no work, and an unknown marker is never guessed at.
 #[must_use]
 pub fn sweep_role_for_marker(marker: Option<&str>) -> Option<(FleetStage, &'static str)> {
     Some(match marker {
@@ -148,19 +154,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sweep_stage_agrees_with_fleet_state_for_every_marker() {
-        let at = Utc::now();
-        for marker in [
-            None,
-            Some("curator-done"),
-            Some("builder-done"),
-            Some("doctor-done"),
-            Some("judge-rejected"),
-            Some("judge-done"),
+    fn every_known_marker_maps_to_its_stage() {
+        for (marker, want) in [
+            (None, FleetStage::SweepCurator),
+            (Some("curator-done"), FleetStage::SweepBuilder),
+            (Some("builder-done"), FleetStage::ReviewWait),
+            (Some("doctor-done"), FleetStage::ReviewWait),
+            (Some("judge-rejected"), FleetStage::Doctor),
+            (Some("judge-done"), FleetStage::MergeWait),
         ] {
             let (stage, _) = sweep_role_for_marker(marker).unwrap_or_else(|| panic!("{marker:?}"));
-            let (held, ..) = crate::observability::fleet_state::held_stage(marker, Some(at), at);
-            assert_eq!(stage, held, "{marker:?}");
+            assert_eq!(stage, want, "{marker:?}");
         }
         assert_eq!(sweep_role_for_marker(Some("merge-done")), None);
         assert_eq!(sweep_role_for_marker(Some("future-marker")), None);

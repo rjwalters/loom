@@ -16,6 +16,9 @@ pub struct Selection {
 
 struct Prepared {
     lease: lease::Lease,
+    /// The clone THIS execution was prepared in (#10796). Every later proof,
+    /// admission and launch is bound to it, never to the account's primary.
+    target: Target,
     record: Option<export::PreparedRecord>,
     handed_off: std::cell::Cell<bool>,
 }
@@ -153,7 +156,7 @@ impl Selection {
         adapter::check(Some(&selection.profile))?;
         let (config, dir) = lifecycle::resolve(root, &selection.name)?;
         export::check_failover(root, issue, &selection.name)?;
-        verify_repository(root, &config.repository)?;
+        let target = select_target(root, &config)?;
         let lease = lease::Lease::acquire(&dir)?;
         let state = docker::inspect(&config.container)?
             .context("private account session is unavailable (container stopped or missing)")?;
@@ -172,10 +175,11 @@ impl Selection {
             base_revision: String::new(),
             host_pid: std::process::id(),
             control: String::new(),
+            repository: job_repository(&target),
         };
         lease.begin(&job)?;
         // The issue helper owns creation of its worktree/branch in the clone.
-        job.base_revision = docker::prepare(&config, id, None)?;
+        job.base_revision = docker::prepare_target(&config, &target, id, None)?;
         docker::setup(&config)?;
         // Bind the verified control boundary to this account/container/lease
         // BEFORE any mutable work is admitted. Spawn rechecks the same identity.
@@ -184,6 +188,7 @@ impl Selection {
         let record = export::record_prepared(root, &config, &job)?;
         selection.prepared = Some(Prepared {
             lease,
+            target,
             record: Some(record),
             handed_off: std::cell::Cell::new(false),
         });
@@ -229,7 +234,12 @@ impl Selection {
             bail!("{}", containment::DRIFTED);
         }
         let report = docker::recheck_control(&config, &job.container_id, &job.control)?;
-        containment::host_proof(&config, &report, &job)
+        containment::host_proof(&config, &report, &job, &prepared.target)
+    }
+
+    /// The clone this selection was prepared in, when it holds a lease.
+    pub(super) fn target(&self) -> Option<&Target> {
+        self.prepared.as_ref().map(|p| &p.target)
     }
 
     /// Persist the secret-free containment provenance beside the durable job,
@@ -320,18 +330,10 @@ pub(super) fn inherited_lease(dir: &Path) -> Result<Option<lease::Lease>> {
 /// The workspace's logical repository: its `origin` URL, with an SSH
 /// `git@host:path` remote written as `https://host/path` and any `.git`
 /// suffix dropped. `None` when it cannot be read.
-fn logical_repository(root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let remote = String::from_utf8(output.stdout).ok()?;
-    let remote = remote.trim();
+pub(super) fn logical_repository(root: &Path) -> Option<String> {
+    // Bounded (#9715): a hung `git` must not stall the launch.
+    let remote = crate::forge_cmd::get_remote_url(root)?;
+    let remote = remote.as_str();
     let normalized = if let Some(ssh) = remote.strip_prefix("git@") {
         let (host, path) = ssh.split_once(':')?;
         format!("https://{host}/{path}")
@@ -355,16 +357,33 @@ fn serves_repository(profile: &Path, logical: Option<&str>) -> bool {
         return true;
     }
     match (load(&dir), logical) {
-        (Ok(config), Some(logical)) => config.repository.trim_end_matches(".git") == logical,
+        (Ok(config), Some(logical)) => config.target(Some(logical)).is_ok(),
         _ => false,
     }
 }
 
-fn verify_repository(root: &Path, expected: &str) -> Result<()> {
-    if logical_repository(root).as_deref() != Some(expected.trim_end_matches(".git")) {
-        bail!("private workspace repository differs from the logical host repository");
+/// What a durable job records for `target`: the canonical repository of an
+/// additional clone, empty for the legacy primary (the `run_job` convention).
+pub(super) fn job_repository(target: &Target) -> String {
+    if target.slug.is_some() {
+        target.repository.clone()
+    } else {
+        String::new()
     }
-    Ok(())
+}
+
+/// The clone of the logical host repository this account holds: its primary or
+/// a registered additional one. An account that holds neither is refused, never
+/// registered implicitly, and a firewalled repository is refused before any
+/// clone is touched.
+fn select_target(root: &Path, config: &Config) -> Result<Target> {
+    let target = logical_repository(root)
+        .and_then(|logical| config.target(Some(&logical)).ok())
+        .context("private workspace repository differs from the logical host repository")?;
+    if target.slug.is_some() {
+        lifecycle::check_firewall(root, &identify(&target.repository)?)?;
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -404,6 +423,7 @@ mod tests {
             docker_desktop: false,
             repository: repository.into(),
             base: "main".into(),
+            repositories: vec![],
             volume: format!("loom-codex-workspace-{name}"),
             profile: profile.canonicalize().unwrap(),
             gh_config: None,
@@ -451,6 +471,46 @@ mod tests {
         let corrupt = private_profile(root.path(), "corrupt", here);
         std::fs::write(state_dir(&corrupt).unwrap().join("workspace.json"), "{not json").unwrap();
         assert!(!serves_repository(&corrupt, Some(here)));
+    }
+
+    /// A seat holding several private clones serves each of its repositories
+    /// (#10796), and the target selected for a workspace is that repository's
+    /// own clone, not the account's primary. An unregistered one is refused.
+    #[test]
+    fn a_multi_repository_seat_serves_and_selects_each_registered_clone() {
+        let _fork = super::super::tests::fork_guard();
+        let root = tempfile::tempdir().unwrap();
+        let primary = "https://github.com/2AMLogic/gf180-parasynth";
+        let second = "https://github.com/2AMLogic/vibesql";
+        let profile = private_profile(root.path(), "seat", primary);
+        let dir = state_dir(&profile).unwrap();
+        let mut config = load(&dir).unwrap();
+        let id = identify(second).unwrap();
+        config.repositories.push(Registered {
+            repository: id.url.clone(),
+            base: "main".into(),
+            slug: id.slug.clone(),
+        });
+        save(&dir.join("workspace.json"), &config).unwrap();
+
+        assert!(serves_repository(&profile, Some(primary)));
+        assert!(serves_repository(&profile, Some(&format!("{second}.git"))));
+        assert!(!serves_repository(&profile, Some("https://github.com/2AMLogic/other")));
+
+        let ws = workspace_with_origin(&format!("{second}.git"));
+        let target = select_target(ws.path(), &config).unwrap();
+        assert_eq!(target.path, format!("{WORK_ROOT}/{}", id.slug));
+        assert_eq!(job_repository(&target), id.url);
+        let ws = workspace_with_origin(primary);
+        let target = select_target(ws.path(), &config).unwrap();
+        assert_eq!(target.path, REPO);
+        assert_eq!(
+            job_repository(&target),
+            "",
+            "the primary stays the legacy empty job repository"
+        );
+        let ws = workspace_with_origin("https://github.com/2AMLogic/other");
+        assert!(select_target(ws.path(), &config).is_err());
     }
 
     /// The robb-studio failure (2026-10-02): with one account moved to a
@@ -514,6 +574,21 @@ mod tests {
         );
         assert!(none.is_err());
     }
+    fn fixture_config() -> Config {
+        Config {
+            schema_version: 1,
+            account: "fixture".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://example.invalid/owner/repo".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: PathBuf::from("/nonexistent"),
+            gh_config: None,
+        }
+    }
     fn reservation(dir: &Path) -> Selection {
         let lease = lease::Lease::acquire(dir).unwrap();
         lease
@@ -526,6 +601,7 @@ mod tests {
                 base_revision: String::new(),
                 host_pid: std::process::id(),
                 control: "c".repeat(64),
+                repository: String::new(),
             })
             .unwrap();
         Selection {
@@ -533,6 +609,7 @@ mod tests {
             profile: dir.join("profile"),
             prepared: Some(Prepared {
                 lease,
+                target: Config::primary(&fixture_config()),
                 record: None,
                 handed_off: std::cell::Cell::new(false),
             }),

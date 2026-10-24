@@ -77,61 +77,6 @@ pub struct AgentOutput {
     pub metadata: Option<String>,
 }
 
-/// Agent productivity metrics for a task
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AgentMetric {
-    pub id: Option<i64>,
-    pub terminal_id: String,
-    pub agent_role: String,
-    pub agent_system: String,
-    pub task_type: Option<String>,
-    pub github_issue: Option<i32>,
-    pub github_pr: Option<i32>,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub wall_time_seconds: Option<i64>,
-    pub active_time_seconds: Option<i64>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub total_tokens: i64,
-    pub estimated_cost_usd: f64,
-    pub status: String,
-    pub outcome_type: Option<String>,
-    pub test_failures: i32,
-    pub ci_failures: i32,
-    pub commits_count: i32,
-    pub lines_changed: i32,
-    pub context: Option<String>,
-}
-
-/// Token usage record for a single API request
-///
-/// Enhanced to track cache tokens, duration, and provider for LLM resource usage
-/// analytics (Issue #1013).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TokenUsage {
-    pub id: Option<i64>,
-    pub input_id: Option<i64>,
-    pub metric_id: Option<i64>,
-    pub timestamp: DateTime<Utc>,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
-    pub total_tokens: i64,
-    pub model: Option<String>,
-    pub estimated_cost_usd: f64,
-    // Enhanced fields for resource tracking (Issue #1013)
-    /// Cache read tokens (prompt caching - reduces input cost)
-    pub tokens_cache_read: Option<i64>,
-    /// Cache write tokens (prompt caching - initial cache creation)
-    pub tokens_cache_write: Option<i64>,
-    /// API response time in milliseconds
-    pub duration_ms: Option<i64>,
-    /// LLM provider: 'anthropic', 'openai', 'google', etc.
-    pub provider: Option<String>,
-}
-
 /// Combined activity entry (input + output)
 /// Used for displaying terminal activity history in UI
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,9 +94,6 @@ pub struct ActivityEntry {
     pub exit_code: Option<i32>,
     pub output_timestamp: Option<DateTime<Utc>>,
 }
-
-/// Type alias for productivity summary: (`agent_system`, `tasks_completed`, `avg_minutes`, `avg_tokens`, `total_cost`)
-pub type ProductivitySummary = Vec<(String, i64, f64, f64, f64)>;
 
 /// Git changes associated with a prompt
 /// Links individual prompts to the git commits/changes they caused
@@ -241,30 +183,6 @@ pub struct LintResults {
     pub format_errors: i32,
 }
 
-/// PR rework statistics for tracking review cycles
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PrReworkStats {
-    /// Average number of rework cycles for PRs that needed changes
-    pub avg_rework_count: f64,
-    /// Maximum rework count seen for any PR
-    pub max_rework_count: i32,
-    /// Number of PRs that required at least one rework cycle
-    pub prs_with_rework: i64,
-    /// Total number of PRs with review tracking
-    pub total_prs_tracked: i64,
-}
-
-/// Prompt-to-test success correlation statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PromptSuccessStats {
-    /// Total number of prompts that have test results
-    pub total_prompts_with_tests: i64,
-    /// Number of prompts where all tests passed (failed = 0, passed > 0)
-    pub prompts_with_all_passing: i64,
-    /// Average test pass rate across all prompts (passed / (passed + failed))
-    pub avg_test_pass_rate: f64,
-}
-
 /// Quality metrics record for tracking test outcomes and code quality
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -302,96 +220,6 @@ pub struct QualityMetrics {
 // Cost Analytics Models (Issue #1064)
 // ============================================================================
 
-/// Budget period type for budget configuration
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BudgetPeriod {
-    Daily,
-    Weekly,
-    Monthly,
-}
-
-impl BudgetPeriod {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Daily => "daily",
-            Self::Weekly => "weekly",
-            Self::Monthly => "monthly",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "daily" => Some(Self::Daily),
-            "weekly" => Some(Self::Weekly),
-            "monthly" => Some(Self::Monthly),
-            _ => None,
-        }
-    }
-}
-
-/// Budget configuration record for tracking spending limits
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BudgetConfig {
-    pub id: Option<i64>,
-    pub period: BudgetPeriod,
-    pub limit_usd: f64,
-    /// Alert threshold as a fraction (0.0-1.0), default 0.8 (80%)
-    pub alert_threshold: f64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub is_active: bool,
-}
-
-impl Default for BudgetConfig {
-    fn default() -> Self {
-        Self {
-            id: None,
-            period: BudgetPeriod::Monthly,
-            limit_usd: 100.0,
-            alert_threshold: 0.8,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            is_active: true,
-        }
-    }
-}
-
-/// Cost summary for a specific time period
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CostSummary {
-    /// Start of the period
-    pub start_date: DateTime<Utc>,
-    /// End of the period
-    pub end_date: DateTime<Utc>,
-    /// Total cost in USD
-    pub total_cost: f64,
-    /// Number of API requests
-    pub request_count: i64,
-    /// Total input tokens consumed
-    pub total_input_tokens: i64,
-    /// Total output tokens consumed
-    pub total_output_tokens: i64,
-    /// Average cost per request
-    pub avg_cost_per_request: f64,
-}
-
-/// Cost breakdown by agent role
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CostByRole {
-    pub agent_role: String,
-    pub total_cost: f64,
-    pub request_count: i64,
-    pub avg_cost: f64,
-    pub total_input_tokens: i64,
-    pub total_output_tokens: i64,
-    pub first_usage: Option<DateTime<Utc>>,
-    pub last_usage: Option<DateTime<Utc>>,
-}
-
 /// Cost breakdown by GitHub issue
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -403,57 +231,6 @@ pub struct CostByIssue {
     pub total_output_tokens: i64,
     pub first_usage: Option<DateTime<Utc>>,
     pub last_usage: Option<DateTime<Utc>>,
-}
-
-/// Cost breakdown by pull request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CostByPr {
-    pub pr_number: i32,
-    pub total_cost: f64,
-    pub prompt_count: i64,
-    pub total_input_tokens: i64,
-    pub total_output_tokens: i64,
-    pub first_usage: Option<DateTime<Utc>>,
-    pub last_usage: Option<DateTime<Utc>>,
-}
-
-/// Budget status showing current spend against limits
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BudgetStatus {
-    /// The budget configuration
-    pub config: BudgetConfig,
-    /// Amount spent in the current period
-    pub spent: f64,
-    /// Remaining budget
-    pub remaining: f64,
-    /// Usage as a percentage (0-100)
-    pub usage_percent: f64,
-    /// Whether the alert threshold has been crossed
-    pub alert_triggered: bool,
-    /// Whether the budget has been exceeded
-    pub budget_exceeded: bool,
-    /// Current period start
-    pub period_start: DateTime<Utc>,
-    /// Current period end
-    pub period_end: DateTime<Utc>,
-}
-
-/// Runway projection based on burn rate
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunwayProjection {
-    /// Current remaining budget
-    pub remaining_budget: f64,
-    /// Average daily cost over the lookback period
-    pub avg_daily_cost: f64,
-    /// Estimated days until budget exhaustion
-    pub days_remaining: f64,
-    /// Projected exhaustion date
-    pub exhaustion_date: Option<DateTime<Utc>>,
-    /// Number of days used for the calculation
-    pub lookback_days: i32,
 }
 
 // ============================================================================

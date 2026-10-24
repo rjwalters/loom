@@ -301,6 +301,33 @@ fn a_credential_store_write_through_the_write_tool_is_denied() {
     assert!(!reason.contains("role-tool-policy"), "{d}: {reason}");
 }
 
+/// #11227: a dotfiles-manager layout (`~/.config/gh -> ~/dotfiles/gh`) erases
+/// the credential name from the canonicalized path, so the hook must also judge
+/// the raw spelling.
+#[test]
+fn a_symlinked_credential_dir_is_denied_through_the_write_tool() {
+    let f = Fixture::new();
+    let dotfiles = f.home().join("dotfiles");
+    std::fs::create_dir_all(dotfiles.join("gh")).unwrap();
+    std::fs::create_dir_all(dotfiles.join("notes")).unwrap();
+    std::fs::create_dir_all(f.home().join(".config")).unwrap();
+    std::os::unix::fs::symlink(dotfiles.join("gh"), f.home().join(".config/gh")).unwrap();
+    std::os::unix::fs::symlink(dotfiles.join("notes"), f.home().join(".config/notes")).unwrap();
+
+    for target in ["hosts.yml", "brand-new-file.yml"] {
+        let path = f.home().join(".config/gh").join(target);
+        let (d, reason) = f.write(&path, Some("judge"), BIN);
+        assert_eq!(d, "deny", "{target}: {reason}");
+        assert!(reason.contains("credential-store"), "{reason}");
+        let (_, reason) = f.write(&path, Some("builder"), BIN);
+        assert!(!reason.contains("role-tool-policy"), "builder: {reason}");
+    }
+
+    // A symlinked path that is not a credential store stays writable.
+    let (d, reason) = f.write(&f.home().join(".config/notes/todo.md"), Some("judge"), BIN);
+    assert!(!reason.contains("role-tool-policy"), "{d}: {reason}");
+}
+
 #[test]
 fn codex_gets_the_same_denial_through_the_bridge() {
     let f = Fixture::new();
@@ -339,3 +366,8 @@ fn no_usable_daemon_fails_closed_for_read_only_roles_only() {
         }
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

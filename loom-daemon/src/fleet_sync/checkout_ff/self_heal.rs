@@ -6,14 +6,18 @@
 //! it is often only a resync that never landed: `chore: resync installed Loom
 //! surfaces` commits whose push a ruleset refused, modified installed files,
 //! or the rebase that same script abandoned. [`heal`] runs before the rules.
-//! When **every** blocker is Loom-owned ([`classify`]) it:
+//! When **every** blocker is Loom-owned ([`classify`]: `installed_files`, or a
+//! surface the resync overwrites wholesale and `.loom/resync-ignore` does not
+//! pin, [`managed`]) it:
 //!
 //! 1. makes `refs/loom/rescue/<ts>` at HEAD (and `<ts>-branch` at the branch
 //!    tip, when an operation moved HEAD off it);
 //! 2. removes a stale, empty `index.lock`;
 //! 3. stashes the dirty Loom paths as `loom-rescue-<ts>` (not during an
 //!    operation: its abort discards them, and the rescue ref holds the work);
-//! 4. aborts the operation;
+//! 4. aborts the operation, or, for a HEAD left detached for
+//!    [`managed::detached_after`] and behind, checks the branch out again at
+//!    `origin/<default>` (#11989);
 //! 5. `reset --hard origin/<default>`.
 //!
 //! Any failure stops the repair and the ordinary rules report the checkout as
@@ -26,6 +30,7 @@
 //! [`retain`].
 
 mod classify;
+mod managed;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -247,6 +252,21 @@ fn repair(
             Some(on) if on == branch => {}
             other => return Err(format!("after the abort HEAD is on {other:?}, not `{branch}`")),
         }
+    }
+
+    // 4b. A HEAD left detached goes back on the branch, at origin's tip
+    // (#11989). The old branch tip has its rescue ref (`branch_differs`); a
+    // file git would overwrite stops the checkout, and untracked ones are kept.
+    if plan.detached {
+        let tracking = git::tracking(branch);
+        write(&["checkout", "--quiet", "-B", branch, "--track", &tracking])?;
+        say(
+            net,
+            root,
+            "reattached",
+            Level::Info,
+            format!("detached HEAD put back on `{branch}` at origin/{branch}"),
+        );
     }
 
     // 5. Only Loom's paths differ.

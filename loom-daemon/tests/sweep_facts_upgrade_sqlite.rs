@@ -381,3 +381,8 @@ fn the_migration_lists_every_non_key_rollup_column() {
     assert!(table.len() > 30, "column parse came back short: {table:?}");
     assert_eq!(listed, table, "sweep-facts-migrate.sql and the rollup's CREATE TABLE disagree");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

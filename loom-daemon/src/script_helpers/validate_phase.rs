@@ -359,8 +359,6 @@ fn log_recovery_event(
             "Failed to write recovery event to {}",
             recovery_file.display()
         ));
-    } else {
-        crate::journal::execution::recovery_event(repo_root, issue, &recovery_file, &event);
     }
 }
 

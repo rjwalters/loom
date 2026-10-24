@@ -341,18 +341,7 @@ fn git_common_dir() -> Option<PathBuf> {
 /// the "Removing orphan worktree dir" warning is the one an operator reads
 /// back to themselves, and it should be the path they typed.
 fn logical_cwd() -> PathBuf {
-    let physical = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let Some(pwd) = std::env::var_os("PWD") else {
-        return physical;
-    };
-    let logical = PathBuf::from(pwd);
-    if !logical.is_absolute() {
-        return physical;
-    }
-    match (std::fs::canonicalize(&logical), std::fs::canonicalize(&physical)) {
-        (Ok(a), Ok(b)) if a == b => logical,
-        _ => physical,
-    }
+    crate::daemon_start::paths::logical_cwd().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `cd "$dir" && pwd` — make `dir` absolute against the logical cwd without

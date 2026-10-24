@@ -58,6 +58,24 @@ pub trait RollTrigger: Send {
         let _ = (from, to);
         false
     }
+
+    /// Disarm the armed roll because the fleet floor no longer asks for it
+    /// (#12610). Returns `true` when a roll was discarded; only a pause roll
+    /// that has not stopped any agent can be.
+    fn disarm_roll(&self, why: &str) -> bool {
+        let _ = why;
+        false
+    }
+
+    /// Why a roll cannot start on this host because nothing would relaunch
+    /// the daemon (Issue #11042), or `None` when a supervisor is present.
+    ///
+    /// The tick reads this to stop re-fetching a target it already installed
+    /// and could not roll to ([`super::not_rolling`]). Defaults to `None`
+    /// (supervised) so test and alternative triggers behave as before.
+    fn unsupervised(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The production [`RollTrigger`]: starts the H4 pause inside a captured
@@ -132,6 +150,26 @@ impl RollTrigger for IpcRollTrigger {
                 || snap.pause.as_ref().is_some_and(|p| p.stopped),
             then_exit: snap.then_exit,
         })
+    }
+
+    /// The same check `start_pause_roll` refuses on (H7 `unsupervised`).
+    fn unsupervised(&self) -> Option<String> {
+        crate::ipc::detect_supervisor()
+            .is_none()
+            .then(|| "no supervisor is detected (LOOM_DAEMON_SUPERVISOR unset)".to_string())
+    }
+
+    fn disarm_roll(&self, why: &str) -> bool {
+        let disarmed = self.drain.abort_pause_roll();
+        if disarmed {
+            let note = format!("pause roll disarmed: {why} — dispatch resumed");
+            self.drain.set_note(note.clone());
+            let _ = self
+                .event_bus
+                .publish_generic("daemon.roll.disarmed", serde_json::json!({ "reason": why }));
+            log::warn!("auto_update: {note}");
+        }
+        disarmed
     }
 
     fn supersede_roll(&self, from: &str, to: &str) -> bool {

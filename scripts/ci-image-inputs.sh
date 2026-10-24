@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ci-image-inputs.sh — does this change touch anything the image smokes prove?
 # (#10825). The answer gates ci.yml's `worker-base-image` and the three
-# `*-image-smoke` jobs on BOTH `pull_request` (the `changes` job) and `push` to
-# main (the `changes-push` job). It is the ONE definition of "image input":
+# `*-image-smoke` jobs on BOTH `pull_request` and `push` to main (the `changes`
+# job, which runs it from the PR base commit, never PR-head code). It is the ONE definition of "image input":
 # there is no second copy in a paths-filter group (ci-principles rule 9).
 #
 # An image input is:

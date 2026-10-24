@@ -118,16 +118,20 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
+mod fast_fail_fleet;
+mod fast_fail_park;
+mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
-mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
+pub mod lease_step;
 mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
 mod overflow;
+pub(crate) mod published_repo;
 mod resolved_facts;
 // `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
 // by the stale-blocked readers (#10556, #10558).
@@ -148,6 +152,14 @@ pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
 mod start_facts;
+mod step_adopt;
+pub mod step_cap_notice;
+mod step_issue;
+pub mod step_lease_owner;
+pub mod step_ledger;
+pub mod step_outcome_notice;
+mod step_reap;
+pub mod step_spawn;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
@@ -168,6 +180,9 @@ pub use crash_signals::*;
 pub use decline_cooldown::*;
 #[allow(unused_imports)]
 pub use dispatch::*;
+pub use fast_fail_park::{
+    fast_fail_class, fast_fail_parks, is_fast_failure, FAST_FAIL_WINDOW_SECS,
+};
 #[allow(unused_imports)]
 pub use guards::*;
 #[allow(unused_imports)]
@@ -233,6 +248,13 @@ pub struct SweepRegistryConfig {
     /// When `true`, skip the actual label flip via `gh`. Used by unit tests
     /// that don't have GitHub credentials.
     pub skip_label_flip: bool,
+    /// Test seam (#12571): let the issue-sweep lease tie-break go ahead
+    /// blind on an unverifiable read, as it did before it failed closed. On
+    /// by default under `cfg(test)` because most dispatch fixtures' fake `gh`
+    /// never serves the lease comments; the tests that pin the fail-closed
+    /// behaviour turn it off.
+    #[cfg(test)]
+    pub(crate) blind_lease_order: bool,
     /// Override the machine-level sweep journal path (Issue #3953). Defaults
     /// to [`sweep_journal::default_journal_path`] (`~/.loom/sweeps.json`,
     /// env-overridable via `LOOM_SWEEPS_JOURNAL_PATH`). Tests set this to a
@@ -272,6 +294,8 @@ impl SweepRegistryConfig {
             spawn_bin: None,
             gh_bin: None,
             skip_label_flip: false,
+            #[cfg(test)]
+            blind_lease_order: true,
             journal_path: None,
             outcomes_journal_path: None,
             outcome_telemetry_path: None,
@@ -353,6 +377,24 @@ impl SweepRegistryConfig {
             .join("loom")
             .join("sweep.md")
             .exists()
+    }
+
+    /// The workspace file holding `role`'s slash command (`/loom:<role>`).
+    #[must_use]
+    pub fn role_command_path(&self, role: crate::step_role::StepRole) -> PathBuf {
+        self.workspace_root
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join(format!("{}.md", role.role_name()))
+    }
+
+    /// Whether `role`'s command is absent from this workspace (#12048): the
+    /// step-dispatch counterpart of [`Self::has_sweep_command`]. One `stat`
+    /// that follows symlinks, so a dangling one counts as missing.
+    #[must_use]
+    pub fn role_command_missing(&self, role: crate::step_role::StepRole) -> bool {
+        !self.role_command_path(role).exists()
     }
 }
 
@@ -626,6 +668,16 @@ pub struct SweepRegistry {
     /// quarantining. This map counts *every* no-progress outcome, so the retry
     /// cadence is bounded regardless of blame.
     dispatch_backoff: HashMap<u32, DispatchBackoffState>,
+    /// The step-outcome ledger (#11900): per-`(item, step)` outcomes and
+    /// short cooldowns. See [`step_ledger`].
+    step_ledger: crate::step_dispatch::outcome_ledger::OutcomeLedger,
+    /// The ledger's durable part as last written (#12251): an unchanged
+    /// ledger is not rewritten.
+    step_ledger_persisted: String,
+    /// Per item, when the last Builder repeat-cap notice's window ends (#12500).
+    step_cap_notices: HashMap<u32, DateTime<Utc>>,
+    /// Sweep ids whose Builder `noop` / `failed` reason comment was posted (#13054).
+    step_outcome_notices: std::collections::HashSet<String>,
     /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -681,7 +733,7 @@ pub struct SweepRegistry {
     /// #4256 resume decision, and its #4366 no-progress predicate) — none of
     /// which should be forced to `&mut self` for what is a pure read-through
     /// cache. Never held across a `gh` invocation.
-    open_pr_memo: Mutex<HashMap<u32, OpenPrMemoEntry>>,
+    open_pr_memo: Arc<Mutex<HashMap<u32, OpenPrMemoEntry>>>,
     /// When each *source* most recently observed `spawn-claude.sh`'s
     /// token-selection pre-flight step being unsatisfiable (exit 78 /
     /// `EX_CONFIG`), keyed by
@@ -809,7 +861,7 @@ pub struct SweepRegistry {
     /// env override is checked before this cache on every call — env reads
     /// are free and tests toggle the var directly, so caching it would only
     /// add a staleness hazard for zero benefit.
-    owner_repo_cache: Mutex<Option<(String, String)>>,
+    owner_repo_cache: Arc<Mutex<Option<(String, String)>>>,
     /// In-flight idempotency-key -> sweep-id map (Issue #9572).
     ///
     /// [`find_running_by_key`](Self::find_running_by_key) — the step-1 dedup
@@ -841,6 +893,16 @@ pub struct SweepRegistry {
     inflight_idempotency: HashMap<String, SweepId>,
     /// #10974: the dispatch gate a daemon roll closes (`roll_gate`).
     roll_gate: roll_gate::RollGate,
+    /// #12048: roles whose missing workspace command has already been WARNed
+    /// about, so the refusal logs once rather than every tick. A role leaves
+    /// the set when its command file is seen again.
+    missing_command_warned: HashSet<&'static str>,
+    /// #12957: each live step's story points, keyed by sweep id, from its
+    /// spawn request: the step's `loom.sweep` close and the
+    /// `running_by_points` gauge read them. In memory only, so a step this
+    /// daemon did not spawn (adopted after a restart) reads as unsized.
+    /// Pruned to the registry's entries on every insert.
+    step_points: HashMap<SweepId, u32>,
 }
 
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
@@ -998,7 +1060,7 @@ impl SweepRegistry {
     /// or [`with_event_bus`](Self::with_event_bus) to attach a bus.
     #[must_use]
     pub fn new(config: SweepRegistryConfig) -> Self {
-        Self {
+        let mut registry = Self {
             config,
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -1037,13 +1099,17 @@ impl SweepRegistry {
             preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
+            step_ledger: Default::default(),
+            step_ledger_persisted: String::new(),
+            step_cap_notices: HashMap::new(),
+            step_outcome_notices: std::collections::HashSet::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),
             prless_retry: PrlessTally::default(),
-            open_pr_memo: Mutex::new(HashMap::new()),
+            open_pr_memo: Arc::new(Mutex::new(HashMap::new())),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
@@ -1052,10 +1118,14 @@ impl SweepRegistry {
             start_facts: HashMap::new(),
             pending_group_reaps: HashMap::new(),
             activity_window: None,
-            owner_repo_cache: Mutex::new(None),
+            owner_repo_cache: Arc::new(Mutex::new(None)),
             inflight_idempotency: HashMap::new(),
             roll_gate: roll_gate::RollGate::default(),
-        }
+            missing_command_warned: HashSet::new(),
+            step_points: HashMap::new(),
+        };
+        registry.restore_step_ledger();
+        registry
     }
 
     /// Construct an empty registry with the given event bus pre-attached.
@@ -1123,7 +1193,23 @@ impl SweepRegistry {
     /// and the workspace pool call this once at provision time with the
     /// resolved env > config > default value, mirroring
     /// [`set_quarantine_config`](Self::set_quarantine_config).
-    pub fn set_dispatch_backoff_config(&mut self, config: DispatchBackoffConfig) {
+    ///
+    /// A zero `base` or `max` is clamped to one second with a warning
+    /// (#11952): a zero window on a ladder ad is the old encoding of a
+    /// fleet-wide fast-fail streak break, and the resolver already refuses a
+    /// zero from env or config, so only a hand-built config reaches this.
+    pub fn set_dispatch_backoff_config(&mut self, mut config: DispatchBackoffConfig) {
+        let floor = Duration::from_secs(1);
+        if config.base < floor || config.max < floor {
+            log::warn!(
+                "sweep_registry: dispatch backoff base={}s max={}s clamped to at least 1s — a \
+                 zero window would read as a fleet-wide fast-fail streak break (#11952)",
+                config.base.as_secs(),
+                config.max.as_secs()
+            );
+            config.base = config.base.max(floor);
+            config.max = config.max.max(config.base);
+        }
         self.dispatch_backoff_config = config;
     }
 
@@ -1292,7 +1378,8 @@ impl SweepRegistry {
     #[must_use]
     pub fn tracked_sweep_identity(&self, issue: u32) -> Option<TrackedSweepIdentity> {
         let mut candidates = self.entries.values().filter(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(n) if n == issue)
+            // A step on the item is the item's tracked run (#11898).
+            !info.state.is_terminal() && info.kind.item_number() == Some(issue)
         });
         let found = candidates.next()?;
         if candidates.next().is_some() {
@@ -1467,11 +1554,16 @@ fn overlay_live_phase_at(checkpoint_dir: &Path, info: &mut SweepInfo) {
     if info.latest_phase.is_none()
         && matches!(info.state, SweepState::Running | SweepState::Pending)
     {
-        if let SweepKind::Issue(issue) = info.kind {
-            let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
-            if checkpoint_written_by_run(&checkpoint, info.started_at) {
-                info.latest_phase = read_checkpoint_phase(&checkpoint);
+        match info.kind {
+            SweepKind::Issue(issue) => {
+                let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
+                if checkpoint_written_by_run(&checkpoint, info.started_at) {
+                    info.latest_phase = read_checkpoint_phase(&checkpoint);
+                }
             }
+            // A step writes no sweep checkpoint: its role is its phase (#11898).
+            SweepKind::Step { role, .. } => info.latest_phase = Some(role.as_str().to_string()),
+            SweepKind::PrSet(_) => {}
         }
     }
 }
@@ -1555,9 +1647,9 @@ impl RegistrySnapshot {
     /// helper `unregistered_locked_issues` depends on.
     #[must_use]
     fn has_tracked_sweep_for(&self, issue: u32) -> bool {
-        self.entries.values().any(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
-        })
+        self.entries
+            .values()
+            .any(|info| !info.state.is_terminal() && info.kind.issue_number() == Some(issue))
     }
 }
 
@@ -1606,7 +1698,8 @@ mod tests {
     // RAII guard: saves and clears every host-identity input (`LOOM_HOST_ID`,
     // `HOSTNAME`, `LOOM_HOST_ID_FILE`, `LOOM_CONFIG_DEFAULTS_FILE`) and
     // restores the ambient values on drop.
-    use crate::host_identity::tests::EnvGuard as HostIdentityEnvGuard;
+    use crate::env_test_support::EnvGuard as HostIdentityEnvGuard;
+    use crate::host_identity::tests::GUARDED_ENV as HOST_IDENTITY_ENV;
 
     /// Issue #5063 / #11530: `fleet.hostId` > `LOOM_HOST_ID` > the persisted
     /// id, blanks ignored, and never `$HOSTNAME`. Holds `loom_config_env`
@@ -1616,7 +1709,7 @@ mod tests {
     fn host_identity_env_precedence() {
         #[serial]
         fn inner() {
-            let _guard = HostIdentityEnvGuard::clear();
+            let _guard = HostIdentityEnvGuard::clear(HOST_IDENTITY_ENV);
             let dir = tempfile::tempdir().unwrap();
             let id_file = dir.path().join("host-id");
             std::fs::write(&id_file, "persisted-studio\n").unwrap();

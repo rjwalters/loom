@@ -90,27 +90,8 @@ impl WorkSource for GhWorkSource {
         // A label-transition write, so it runs on every tick, outside the gate.
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
-            // The `loom:blocked` release pass (#10556) has its own task since
-            // #10763: `crate::stale_blocked::release_task`.
         }
-        // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
-        // off): while the feed is `healthy`, a repo with no event since its
-        // last poll returns its held *candidate* listing. Off, this is a bare
-        // call. The claim itself (`dispatch`) re-reads the forge and is never
-        // gated.
-        let repo = self.repo.clone();
-        let cwd = self.cwd.clone();
-        let listed =
-            crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
-                self.list_ready_issues_uncached()
-            });
-        // #11139: a fresh listing that fell short is never held, so a gated
-        // tick cannot serve partial rows as the whole queue. (A held listing
-        // leaves `complete` at its per-tick default, `true`.)
-        if !self.complete {
-            crate::forge_events::poll_gate::forget_held(cwd.as_deref());
-        }
-        listed
+        self.list_ready_issues_uncached()
     }
 
     fn listing_complete(&self) -> bool {
@@ -124,6 +105,8 @@ impl WorkSource for GhWorkSource {
     /// the cap unions with the ready listing); it never marks the ready queue incomplete, because
     /// the ready rows themselves were read whole.
     fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        // #12310: the work finder's listings are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
         let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
         match crate::forge_listing::list_issues_cached_paged_as(
@@ -223,6 +206,8 @@ impl GhWorkSource {
     /// change) returns what it read and clears [`Self::complete`]; only page
     /// 1 failing is an error. Without `all_pages`, page 1 alone.
     fn list_label(&mut self, label: &str, all_pages: bool) -> Result<Vec<WorkItem>> {
+        // #12310: the work finder's listings are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
         let listing = if all_pages {
             crate::forge_listing::list_issues_cached_paged_as(
@@ -289,8 +274,7 @@ pub struct RegistryDispatcher {
 }
 
 impl RegistryDispatcher {
-    /// Construct a dispatcher over the shared registry. Production goes
-    /// through [`dispatcher_pairs`].
+    /// Construct a dispatcher over the shared registry.
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
         Self { registry }
@@ -324,7 +308,8 @@ impl WorkDispatcher for RegistryDispatcher {
         let mut set = HashSet::new();
         for state in [SweepState::Running, SweepState::Pending] {
             for info in reg.list(Some(&state)) {
-                if let SweepKind::Issue(n) = info.kind {
+                // A step holds its item's slot like a sweep (#11898).
+                if let Some(n) = info.kind.item_number() {
                     set.insert(n);
                 }
             }
@@ -608,6 +593,24 @@ impl WorkDispatcher for RegistryDispatcher {
         super::open_pr_prefilter::blocked_in(&self.registry, candidates)
     }
 
+    /// The same read with its outcome (#12025); see
+    /// [`super::open_pr_prefilter::answer_in`].
+    fn open_pr_answer(&self, candidates: &[u32]) -> super::open_pr_prefilter::OpenPrAnswer {
+        super::open_pr_prefilter::answer_in(&self.registry, candidates)
+    }
+
+    /// Open candidates whose closing PR merged (#11853); see
+    /// [`super::landed_prefilter::landed_in`].
+    fn landed_closing_prs(&self, candidates: &[u32], open_pr: &[u32]) -> HashMap<u32, u32> {
+        super::landed_prefilter::landed_in(&self.registry, candidates, open_pr)
+    }
+
+    /// Landed cooldowns to lift early (#11901); see
+    /// [`super::landed_prefilter::lift_in`].
+    fn lift_landed_cooldowns(&self, held: &[u32]) -> HashSet<u32> {
+        super::landed_prefilter::lift_in(&self.registry, held)
+    }
+
     /// Whether a live sweep in this registry is the host's overflow sweep
     /// (#9244). The multi-workspace tick ORs this across every root.
     fn overflow_in_flight(&self) -> bool {
@@ -694,21 +697,6 @@ impl WorkDispatcher for RegistryDispatcher {
         }
         Ok(outcome.was_new)
     }
-}
-
-/// Build the per-tick `(source, dispatcher)` pair for every root (#3924).
-#[must_use]
-pub fn dispatcher_pairs(
-    pool: &crate::workspace_pool::WorkspacePool,
-    roots: &[PathBuf],
-) -> Vec<(GhWorkSource, RegistryDispatcher)> {
-    roots
-        .iter()
-        .map(|root| {
-            let registry = pool.get_or_provision(root);
-            (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
-        })
-        .collect()
 }
 
 #[cfg(test)]

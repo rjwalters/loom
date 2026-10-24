@@ -7,6 +7,14 @@ readers, the authority, the schema/version field, the recovery behaviour and a
 proposed disposition. It then proposes a target journal schema with one writer
 per concern.
 
+> **SUPERSEDED (operator ruling, 2026-10-19, #9908 closed as not planned;
+> unwound by #12848).** The journals described in section 9 (J1 execution,
+> J2 telemetry, J3 configuration-snapshot) and their shadow-write code
+> (`loom_daemon::journal`, `telemetry::journal_shadow`, `config_journal`,
+> `LOOM_TELEMETRY_JOURNAL*`) were removed. The daemon produces telemetry and
+> session transcripts only. Sections 1-8 remain as a store inventory; sections
+> 9-14 are kept as history only and describe no live code.
+
 **Status: proposal for curation.** This phase changes documentation only. It
 creates no runtime store, migrates no reader, deletes no format, and changes no
 forge authority. Phase 4, which retires old formats, still needs the
@@ -156,7 +164,7 @@ prove a claim *dead on this host* (`worktree_ops/orphan_recovery.rs:15-18`).
 | T12 | Forge call stats sink | `<host tmp>/loom-forge-call-stats/calls-<hour>.jsonl` (`forge_call_stats.rs:804`, `forge_call_stats_sink.rs:11`) | `forge_call_stats_sink.rs:23` | `forge_call_stats_ingest.rs` | Per-host and owner-only by design | Row schema | Pruned after `RETAIN_HOURS` (`forge_call_stats.rs:93`) | **RETAIN** (Q3: high volume, deliberately in host tmp) |
 | T13 | `gh` invocation failures | `<host tmp>/loom-gh-invocations/failures-<hour>.jsonl` (`gh_invocation/telemetry.rs:526`, `:549`) | `gh_invocation/telemetry.rs:561` | Ingest | Per-host | Row | Hourly files | **RETAIN** (with T12) |
 | T14 | Pick journal | `<host tmp>/loom-pick-journal/<role>-<n>.jsonl` (`observability/pick_journal.rs:103`) | `observability/pick_journal.rs:237` | Ingest | Per-tick diagnostics | Row | Tmp | **RETAIN** |
-| T15 | Trace joins / attended output | `<ws>/.loom/logs/trace-joins/` (`observability/runtime_usage/join.rs:40`); attended `session.output` lock and queue files under `<ws>/.loom/logs/live-output-attended/` (`observability/session_output/attended.rs:523`) | Same modules | Exporter | Derived join artifacts | Row | Locked segments | **RETAIN** (derived, bounded) |
+| T15 | Trace joins | `<ws>/.loom/logs/trace-joins/` (`observability/runtime_usage/join.rs:40`) | Same modules | Exporter | Derived join artifacts | Row | Locked segments | **RETAIN** (derived, bounded) |
 | T16 | Activity database | `~/.loom/activity.db` (`daemon_service.rs:259`, `limit_calibration.rs:343`), SQLite with 23 `CREATE TABLE IF NOT EXISTS` tables (19 from `activity/schema.rs:17` onward, 4 in `activity/tuning.rs`) | IPC handlers, transcript ingest, weekly-point sampler, tuning | `loom-daemon stats`, usage report, limit calibration. **`loom-api` reads `<workspace>/.loom/activity.db` instead** (`loom-api/src/main.rs:59`, `:194`) | Analytics store | `CREATE TABLE IF NOT EXISTS` plus ad-hoc `PRAGMA table_info` migrations (`activity/schema.rs:613-643`) | SQLite | **RETAIN** (analytics, not a journal). **FIX**: `loom-api` path divergence. E6 deleted. |
 | T17 | Release signature evidence | `<repo>/.loom/logs/signature-evidence.jsonl` (`release_fetch/evidence.rs:67`, `:430-438`) | `release_fetch/evidence.rs:445` | Release adoption | Security audit | Schema-versioned records | Append without fsync. Rotates to one `.1` file past a size cap (`release_fetch/evidence.rs:449-453`). | **RETAIN** (audit; separate trust domain) |
 
@@ -171,7 +179,7 @@ prove a claim *dead on this host* (`worktree_ops/orphan_recovery.rs:15-18`).
 | C5 | Fleet-store cache | `~/.loom/fleet-store/<owner>/<repo>/{manifest.json, blobs/<sha>}` (`fleet_store/mod.rs:224`, `fleet_store/fetch.rs:58-60`) | `fleet_store/fetch.rs:438` (atomic). Blobs are written before the manifest. | `fleet-config`, `fleet_sync` | **Cache** of the forge-hosted store; the forge is authoritative | `MANIFEST_VERSION` 1 (`fleet_store/fetch.rs:60`, checked `:402`) | Version mismatch or missing blob → refetch | **RETAIN** (cache, rebuildable from the forge) |
 | C6 | Pending-restart marker | `<loom_dir>/fleet-config-pending-restart.json` (`fleet_store/pending_restart.rs:39`) | `fleet_store/pending_restart.rs:85` | `fleet-config status`, `loom-daemon status` | Derived: rendered-at PID compared with the current PID | Unversioned | Missing → nothing pending | **J3** `config.rendered` + **PROJECTION → DELETE** |
 | C7 | Fleet sync status | `<loom_dir>/fleet-sync-status.json` (`fleet_sync.rs:121`, written `:770`) | `fleet_sync::publish` | `loom-daemon status` | Last-pass snapshot | Unversioned | Best effort | **J3** `fleet.sync` + **PROJECTION → DELETE** |
-| C8 | Effective-config snapshot | **Does not exist.** Only hashes are persisted: `planner_config_hash` / `fleet_config_hash` on `fleet.state` telemetry (`observability/fleet_state.rs:634`, `telemetry/kinds/fleet_state.rs:420`, `:424`) | — | Backend | No local authority. A hash cannot be resolved back to a config. | — | — | **J3** `config.resolved` (new, content-addressed) |
+| C8 | Effective-config snapshot | **Does not exist.** Only hashes are persisted: `planner_config_hash` / `fleet_config_hash` on `fleet.state` telemetry (`telemetry/kinds/fleet_state.rs`; no producer since #11301) | — | Backend | No local authority. A hash cannot be resolved back to a config. | — | — | **J3** `config.resolved` (new, content-addressed) |
 | C9 | Install metadata | `<ws>/.loom/install-metadata.json` (`install_compat.rs:68`) | `scripts/install-loom.sh`, `defaults/scripts/resync-installed.sh` | Version gates, `create-pr.sh`, `check-main-freshness.sh` | Authoritative install record | Fields | — | **RETAIN** (install contract) |
 | C10 | MCP state / command files | `~/.loom/state.json`, `~/.loom/mcp-command.json` (`mcp-loom/src/shared/config.ts:25`, `:28`) | `mcp-loom/src/shared/config.ts:189`, `mcp-loom/src/shared/ipc.ts:43` | `mcp-loom` | MCP-local | — | — | **RETAIN** (out of daemon scope) |
 
@@ -192,7 +200,7 @@ enum (`:148`), and temp + fsync + rename + directory fsync (`:207`).
 | H7 | Watch registry + results | `~/.loom/watches.json`, `~/.loom/logs/watch-results.log` (`watch_registry.rs:273`, `:285`) | `watch_registry.rs:326`, `:354` | `WATCHES_VERSION` (`:69`) | **RETAIN** |
 | H8 | Fleet host roster | `~/.loom/fleet.json` (`fleet/mod.rs:710`) | `fleet/mod.rs:797` | Fields | **RETAIN** |
 | H9 | Daemon liveness markers | autonomy-desired marker (`daemon_start/marker.rs`), pidfile (`daemon_pidfile.rs`), heartbeat (`daemon_heartbeat.rs`), `.daemon.pid` (`autonomy_marker.rs:65`), operator-stop record (`operator_stop.rs:50`), host opt-out (`host_optout.rs`), idle-exit marker (`idle_exit.rs:20`) | Their modules | Text / JSON | **RETAIN** (OS-level supervision contract) |
-| H10 | Dispatch / admission ledgers | drain-paused ledger (`ipc/drain_ledger.rs:47`), `ram-peaks.json` (`ram_peaks.rs:264-271`), `disk-footprints.json` (`disk_footprint.rs:632-642`), bucket book (`forge_bucket_book.rs:62`), stale-blocked release status (`stale_blocked/release_outcome.rs:27`), fleet-captain arm registry (`fleet_captain.rs:374`), fleet-alert state (`fleet_alert/task.rs:147`), safehouse completed (`safehouse.rs:2599`, being deleted by #11112) | Their modules | Mostly unversioned | **RETAIN** (each is the sole authority for its own observation) |
+| H10 | Dispatch / admission ledgers | drain-paused ledger (`ipc/drain_ledger.rs:47`), `ram-peaks.json` (`ram_peaks.rs:264-271`), bucket book (`forge_bucket_book.rs:62`), fleet-captain arm registry (`fleet_captain.rs:374`), fleet-alert state (`fleet_alert/task.rs:147`), safehouse completed (`safehouse.rs:2599`, being deleted by #11112) | Their modules | Mostly unversioned | **RETAIN** (each is the sole authority for its own observation) |
 
 ## 7. Adjacent stores (catalogued, out of consolidation scope)
 
@@ -355,7 +363,7 @@ start and on live reload, from `fleet_store::render`, and from `fleet_sync`.
 
 | Kind | `data` |
 |------|--------|
-| `config.resolved` | `effective_hash` (the same function as `planner_config_hash`, `observability/fleet_state.rs:634`); `tiers[{tier, path, sha256\|absent}]`; `body`, redacted and included **only** the first time a hash is seen (content-addressed) |
+| `config.resolved` | `effective_hash` (`planner_config_hash`, `config_journal/mod.rs`); `tiers[{tier, path, sha256\|absent}]`; `body`, redacted and included **only** the first time a hash is seen (content-addressed) |
 | `config.rendered` | `target`, `backup`, `store_commit`, `restart_required_keys[]`, `daemon_pid_at_render` (replaces C6) |
 | `fleet.sync` | the `FleetSyncStatus` fields (replaces C7) |
 

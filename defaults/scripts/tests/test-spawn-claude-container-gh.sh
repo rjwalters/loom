@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests spawn-claude.sh's container gh credentials and ledger-sink mount
-# (2AMLogic/2am#4367 P0, rjwalters/loom#11790). Hermetic: stub docker and a
+# (rjwalters/loom#11790). Hermetic: stub docker and a
 # stub daemon under mktemp -d; no network, forge or real daemon binary.
 #
 # Pins (a) the forge auth block: GH_TOKEN/GITHUB_TOKEN forwarded by NAME, and

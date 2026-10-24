@@ -179,7 +179,7 @@ pub fn perform_relaunch(sup: &Detected, start_script: &Path) -> i32 {
         "Invoking {} to re-render the supervised plist and relaunch.",
         start_script.display()
     ));
-    run_start_script(start_script)
+    run_start_script(start_script, &relaunch_args(&harvested))
 }
 
 /// `perform_systemd_relaunch <unit_path> <unit>`.
@@ -229,7 +229,7 @@ pub fn perform_systemd_relaunch(sup: &Detected, start_script: &Path) -> i32 {
         "Invoking {} to re-render the supervised unit and relaunch.",
         start_script.display()
     ));
-    run_start_script(start_script)
+    run_start_script(start_script, &relaunch_args(&harvested))
 }
 
 /// `export "$k=$v"` for each harvested pair; returns the count.
@@ -262,9 +262,39 @@ fn sigterm_and_wait(pid: i32) {
     }
 }
 
-/// `"$START_SCRIPT"` with stdio inherited — its exit code is the relaunch's.
-fn run_start_script(start_script: &Path) -> i32 {
+/// The start-wrapper arguments that reproduce the harvested autonomy state
+/// (#11934).
+///
+/// Every harvested key is re-exported, and an exported value always wins in
+/// the start wrapper, so a key the live file carried needs no flag. A key it
+/// did NOT carry is the problem: the live daemon resolved that loop from
+/// config (a `--from-config` render, a `fleet add-worker` unit), and a bare
+/// start would export the FLAGS-OFF `0` over it, switching off a work finder
+/// the config enables. `--from-config` leaves exactly those keys unset, so the
+/// relaunched daemon resolves them the way the old one did.
+#[must_use]
+pub fn relaunch_args(harvested: &BTreeMap<String, String>) -> Vec<&'static str> {
+    let config_driven = ["LOOM_WORK_FINDER", "LOOM_MAIN_HEALTH_GATE"]
+        .iter()
+        .any(|k| harvested.get(*k).is_none_or(String::is_empty));
+    if config_driven {
+        vec!["--from-config"]
+    } else {
+        Vec::new()
+    }
+}
+
+/// `"$START_SCRIPT" <args>` with stdio inherited — its exit code is the
+/// relaunch's.
+fn run_start_script(start_script: &Path, args: &[&str]) -> i32 {
+    if !args.is_empty() {
+        out::say(&format!(
+            "Passing {} so the loop(s) the live file left to config stay config-driven (#11934).",
+            args.join(" ")
+        ));
+    }
     Command::new(start_script)
+        .args(args)
         .status()
         .ok()
         .and_then(|s| s.code())
@@ -314,6 +344,28 @@ mod tests {
         assert!(!harvested.contains_key("PATH"));
         assert!(!harvested.contains_key("LOOM_DAEMON_SUPERVISOR"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_harvest_carrying_both_loops_relaunches_bare() {
+        // The exported values win in the start wrapper; no flag needed.
+        let h: BTreeMap<String, String> = [
+            ("LOOM_WORK_FINDER".to_string(), "1".to_string()),
+            ("LOOM_MAIN_HEALTH_GATE".to_string(), "0".to_string()),
+        ]
+        .into();
+        assert!(relaunch_args(&h).is_empty());
+    }
+
+    #[test]
+    fn a_config_driven_unit_relaunches_from_config() {
+        // #11934: a unit with no LOOM_WORK_FINDER line left the loop to config.
+        // A bare re-render would export LOOM_WORK_FINDER=0 over that config.
+        let h: BTreeMap<String, String> = [("LOOM_WORKSPACE".to_string(), "/w".to_string())].into();
+        assert_eq!(relaunch_args(&h), vec!["--from-config"]);
+        let only_wf: BTreeMap<String, String> =
+            [("LOOM_WORK_FINDER".to_string(), "1".to_string())].into();
+        assert_eq!(relaunch_args(&only_wf), vec!["--from-config"]);
     }
 
     #[test]

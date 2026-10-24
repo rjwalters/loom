@@ -112,6 +112,15 @@ impl FloorState {
         self.alert.as_ref().map(|alert| alert.declared_at)
     }
 
+    /// #12652: whether a stall was alerted as of this tick, including one
+    /// dropped earlier in it (a basis change or a satisfying release). Feeds
+    /// [`loom_ui_alert`]'s `was_alerted`, which
+    /// [`Self::stall_declared_at`] cannot: the drop has already cleared it.
+    #[must_use]
+    pub fn was_alerted(&self) -> bool {
+        self.alert.is_some() || self.alert_dropped
+    }
+
     /// The alert record to persist, `None` when no stall has been alerted.
     #[must_use]
     pub fn stall_state(&self) -> Option<FloorStallState> {
@@ -150,8 +159,8 @@ pub fn loom_ui_alert(
     stall: Option<&FloorStallReport>,
     alerted: bool,
     was_alerted: bool,
-) -> Option<crate::loom_ui_alerts::Alert> {
-    use crate::loom_ui_alerts::{Alert, Severity, State};
+) -> Option<crate::alerts::Alert> {
+    use crate::alerts::{Alert, Severity, State};
     const RULE: &str = "fleet.floor-unsatisfiable";
     match stall {
         Some(stall) if alerted => Some(
@@ -339,7 +348,7 @@ mod tests {
 
     #[test]
     fn loom_ui_opens_when_alerted_and_resolves_when_the_stall_clears() {
-        use crate::loom_ui_alerts::State;
+        use crate::alerts::State;
         let mut state = stalled();
         let was = state.stall_declared_at().is_some();
         let alerted = state.alert_due(t0(), REMINDER);
@@ -352,5 +361,67 @@ mod tests {
         // Cleared after it was alerted: resolve once.
         assert_eq!(loom_ui_alert(None, false, true).map(|a| a.state), Some(State::Resolved));
         assert!(loom_ui_alert(None, false, false).is_none());
+    }
+
+    /// One tick as `runner.rs` runs it: basis, observe, then the loom-ui edge.
+    fn loom_ui_tick(
+        state: &mut FloorState,
+        floor: &str,
+        running: &str,
+        newest: &str,
+        now: DateTime<Utc>,
+    ) -> Option<crate::alerts::State> {
+        state.set_basis(FloorKnowledge::Set(floor.to_string()), running);
+        state.observe(Some(&rel(newest)));
+        let was = state.was_alerted();
+        let alerted = state.alert_due(now, REMINDER);
+        loom_ui_alert(state.stall(), alerted, was).map(|a| a.state)
+    }
+
+    /// #12652: a host that rolls to the floor resolves the incident it opened.
+    #[test]
+    fn loom_ui_resolves_when_a_basis_change_removes_an_alerted_stall() {
+        use crate::alerts::State;
+        let mut state = FloorState::default();
+        let open = loom_ui_tick(&mut state, FLOOR, RUNNING, "0.19.900", t0());
+        assert_eq!(open, Some(State::Open));
+        // The host rolls to the floor: the basis changes and the stall is gone.
+        let resolved = loom_ui_tick(&mut state, FLOOR, FLOOR, "0.19.900", t0() + mins(15));
+        assert_eq!(resolved, Some(State::Resolved));
+        // Once, not on every later tick.
+        assert_eq!(loom_ui_tick(&mut state, FLOOR, FLOOR, "0.19.900", t0() + mins(30)), None);
+    }
+
+    /// #12652: a stall cleared by a satisfying release, with no basis change.
+    #[test]
+    fn loom_ui_resolves_when_a_published_release_satisfies_an_alerted_stall() {
+        use crate::alerts::State;
+        let mut state = FloorState::default();
+        assert_eq!(loom_ui_tick(&mut state, FLOOR, RUNNING, "0.19.900", t0()), Some(State::Open));
+        let resolved = loom_ui_tick(&mut state, FLOOR, RUNNING, "9.0.1", t0() + mins(15));
+        assert_eq!(resolved, Some(State::Resolved));
+        assert_eq!(loom_ui_tick(&mut state, FLOOR, RUNNING, "9.0.1", t0() + mins(30)), None);
+    }
+
+    /// #12652: a stall that was never alerted clears silently.
+    #[test]
+    fn loom_ui_posts_nothing_when_a_never_alerted_stall_clears() {
+        let mut state = stalled();
+        state.set_basis(FloorKnowledge::Set(FLOOR.to_string()), FLOOR);
+        state.observe(Some(&rel("0.19.900")));
+        assert!(!state.was_alerted());
+        assert_eq!(loom_ui_alert(state.stall(), false, state.was_alerted()), None);
+    }
+
+    /// #10866 still holds: a restored matching record neither re-alerts nor
+    /// resolves.
+    #[test]
+    fn loom_ui_is_quiet_on_a_restart_that_restores_a_matching_record() {
+        let mut first = stalled();
+        assert!(first.alert_due(t0(), REMINDER));
+        let mut restarted = FloorState::default();
+        restarted.restore_stall_state(first.stall_state());
+        let edge = loom_ui_tick(&mut restarted, FLOOR, RUNNING, "0.19.900", t0() + mins(5));
+        assert_eq!(edge, None);
     }
 }

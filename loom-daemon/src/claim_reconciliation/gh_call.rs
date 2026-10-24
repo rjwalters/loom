@@ -56,6 +56,13 @@ fn build(
     let inv = GhInvocation::new(Operation::new(op), intent, GhTarget::None, timeout)
         .program(gh_bin)
         .current_dir(root);
+    // #12555: a daemon read is a reader's or the gateway's, or it is shed —
+    // never the writer's (#12394).
+    let inv = if intent == AccessIntent::Read {
+        inv.reader_only()
+    } else {
+        inv
+    };
     match forge_op_for(op) {
         Some(fop) => inv.forge_op(fop),
         None => inv,
@@ -83,7 +90,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "guard.open_pr_timeline"
         | "outcome.label_timeline"
         | "restore.label_timeline"
-        | "sequence.label_timeline" => ops::TIMELINE_READ,
+        | "sequence.label_timeline"
+        | "intake.label_events"
+        | "champion.label_events" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
         | "guard.lease_comments"
@@ -91,19 +100,31 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
-        | "roster.comments" => ops::COMMENT_LIST,
+        | "roster.comments"
+        | "landed.route_marker"
+        | "orphan_stack.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
-        "park_hold.issue_view" | "release_veto.issue_labels" => ops::ISSUE_VIEW_STATE,
+        "orphan_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
+        "orphan_stack.retarget" => ops::PR_EDIT_BASE,
+        "park_hold.issue_view"
+        | "release_veto.issue_labels"
+        | "intake.recheck"
+        | "landed.issue_labels" => ops::ISSUE_VIEW_STATE,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
-        "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
+        "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
         | "claim.pr_add_label"
         | "claim.pr_reclaim"
         | "quarantine.issue_release"
         | "heal.issue_add_label"
+        | "epic_revisit.add_label"
         | "intake.add_triage"
         | "intake.remove_triage"
+        | "intake.remove_label"
+        | "landed.add_triage"
+        | "landed.remove_issue"
         | "verdict.clear_labels"
+        | "ci_gate.recovery_labels"
         | "verdict.requeue_unanchored"
         | "sequence.pr_edit"
         | "review_conflict.pr_edit"
@@ -112,10 +133,13 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.release"
         | "restore.label"
         | "prless.hold_label"
-        | "park_hold.issue_labels" => ops::ISSUE_EDIT_LABELS,
+        | "park_hold.issue_labels"
+        | "orphan_stack.label" => ops::ISSUE_EDIT_LABELS,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"
+        | "ci_gate.recovery_comment"
+        | "epic_revisit.comment"
         | "verdict.requeue_unanchored_comment"
         | "sequence.pr_comment"
         | "review_conflict.pr_comment"
@@ -125,7 +149,10 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "watchdog.gaveup_comment"
         | "watchdog.stale_comment"
         | "outcome.writeback_comment"
-        | "prless.comment" => ops::COMMENT_CREATE,
+        | "prless.comment"
+        | "intake.demote_comment"
+        | "landed.comment"
+        | "orphan_stack.comment" => ops::COMMENT_CREATE,
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }
@@ -133,15 +160,18 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
     })
 }
 
-/// A read ([`AccessIntent::Read`]) — the common case.
+/// A read ([`AccessIntent::Read`]) — the common case. Reader-only
+/// ([`GhInvocation::reader_only`], #12555): served by a reader App or the
+/// read gateway, else shed; never the writer.
+///
+/// That includes a read-back of a fact this daemon just wrote. Read-your-write
+/// does not need the writer: the read is sent unconditionally (no
+/// `If-None-Match` from this daemon), the gateway's ETag cache revalidates
+/// every hit upstream, and GitHub's replica lag after a write is the same
+/// whichever credential asks. See `daemon-reference.md` ("The writer is
+/// never used for reads").
 pub(crate) fn read(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
     inv(op, AccessIntent::Read, gh_bin, root)
-}
-
-/// A read pinned to the writer: a read-back of a forge fact this daemon just
-/// wrote itself, where a reader App could still lag the write (W4-C).
-pub(crate) fn read_own_write(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
-    read(op, gh_bin, root).writer_identity()
 }
 
 /// A write ([`AccessIntent::Write`]).

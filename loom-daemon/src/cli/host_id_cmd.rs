@@ -1,6 +1,6 @@
 //! `loom-daemon host-id` (Issue #11530): print this host's identity.
 //!
-//! The resolution lives in [`loom_daemon::host_identity`]: `fleet.hostId` in
+//! The resolution lives in [`crate::host_identity`]: `fleet.hostId` in
 //! the machine-tier config, then `$LOOM_HOST_ID`, then the persisted
 //! `~/.loom/host-id` (created on first use). Never the hostname.
 //!
@@ -14,8 +14,8 @@
 //! string on every such host, so a shell caller that adopted it would collide
 //! fleet-wide (#5063).
 
+use crate::host_identity::{HostIdSource, CONFIG_KEY, HOST_ID_ENV};
 use anyhow::{bail, Result};
-use loom_daemon::host_identity::{HostIdSource, CONFIG_KEY, HOST_ID_ENV};
 
 #[derive(clap::Args)]
 pub(crate) struct HostIdArgs {
@@ -27,7 +27,7 @@ pub(crate) struct HostIdArgs {
 
 impl HostIdArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let resolved = loom_daemon::host_identity::resolve();
+        let resolved = crate::host_identity::resolve();
         if resolved.source == HostIdSource::Unknown {
             let at = resolved
                 .path

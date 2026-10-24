@@ -13,7 +13,7 @@
 //! shell-language policy points into `loom-daemon`. A subcommand is also what
 //! lets the doctor and CI-fix paths mark an event later without a second copy
 //! of the marker format. The format itself lives in
-//! [`loom_daemon::rework_events`], beside the reader's delegation to it.
+//! [`crate::rework_events`], beside the reader's delegation to it.
 //!
 //! **Always exits 0.** A marker is telemetry attached to an operation that
 //! matters — a merge, a doctor claim. Refusing to record must never refuse the
@@ -28,8 +28,8 @@
 
 use std::path::PathBuf;
 
-use loom_daemon::rework_events::{self, Marker};
-use loom_daemon::worktree_ops::naming::issue_from_branch;
+use crate::rework_events::{self, Marker};
+use crate::worktree_ops::naming::issue_from_branch;
 
 #[derive(clap::Args)]
 pub(crate) struct RecordReworkArgs {
@@ -95,7 +95,7 @@ impl RecordReworkArgs {
             Some(root) => Some(root),
             None => std::env::current_dir()
                 .ok()
-                .and_then(|cwd| loom_daemon::repo_root::find_repo_root(&cwd)),
+                .and_then(|cwd| crate::repo_root::find_repo_root(&cwd)),
         };
         let Some(workspace_root) = workspace_root else {
             return serde_json::json!({

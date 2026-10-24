@@ -452,3 +452,8 @@ fn a_credential_pool_on_an_array_form_credential_env_is_rejected_before_launch()
     assert!(stderr.contains("single-string credentialEnv"), "{stderr}");
     assert!(out.stdout.is_empty());
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

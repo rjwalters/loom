@@ -19,9 +19,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{PlanShard, PlanState, RowPlan};
+use super::{PlanShard, PlanState, PlanStep, RowPlan};
 
-/// One row of one host's plan, keyed by the fleet-stable `repo#issue`.
+/// One row of one host's plan, keyed by the fleet-stable `repo#issue` plus
+/// the row's `step` (an absent `step` is `builder`).
 ///
 /// The plan fields are flattened beside `repo`/`issue`, exactly as
 /// [`ReadyQueueRow`](super::ReadyQueueRow) flattens them, so a queue row and
@@ -62,21 +63,27 @@ pub struct FleetPlanObservation {
     pub plan: RowPlan,
 }
 
-/// One `repo#issue` as the fleet sees it: the observation that classifies it
-/// plus every other host's view of the same issue.
+/// One `repo#issue` + `step` as the fleet sees it: the observation that
+/// classifies it plus every other host's view of the same item and step.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetPlanItem {
     #[serde(default)]
     pub repo: String,
     #[serde(default)]
     pub issue: u32,
+    /// The step every folded observation shares (Issue #11910), resolved:
+    /// a host row with no `step` was folded here as `builder`. A fleet plan
+    /// from before the field parses as `builder` too.
+    #[serde(default)]
+    pub step: PlanStep,
     /// The primary's `plan_state` — what the fleet says this issue is doing.
     #[serde(default)]
     pub plan_state: PlanState,
     /// The most advanced observation (see the merge rule).
     #[serde(default)]
     pub primary: FleetPlanObservation,
-    /// Every other host's observation, best first by the same rule.
+    /// Every other host's observation of the same item and step, best first
+    /// by the same rule.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<FleetPlanObservation>,
 }
@@ -88,7 +95,7 @@ pub struct FleetPlan {
     /// no rows, so an idle host is visibly present rather than missing.
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// One item per `repo#issue`, in fleet order.
+    /// One item per `repo#issue` + `step`, in fleet order.
     #[serde(default)]
     pub items: Vec<FleetPlanItem>,
 }

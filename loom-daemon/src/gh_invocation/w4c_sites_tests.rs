@@ -23,7 +23,6 @@ fn exhausted() -> TestRouting {
         },
         env: DeriveEnv::default(),
         checkout: CwdAnswer::Sole("acme/shed".into()),
-        shed: true,
     }
 }
 
@@ -58,19 +57,22 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
         "clean.pr_status_rest",
         clean::check_pr_status_for_branch_rest(root, "acme", "feature/x") == PrStatus::Unknown,
     );
-    step(
-        "intake.list_open",
-        crate::intake_reconcile::run_once(Path::new("gh"), root, chrono::Utc::now(), 5) == 0,
-    );
+    // `intake.list_open` left this list in #11897: the inline pass now reads
+    // the shared ETag walk, whose shed is the store's (`ReadShed`), proven
+    // by `forge_listing_open_pages_tests` and `intake_reconcile::tests`.
     {
-        use crate::observability::ops::stage_dwell::{GhStageFetcher, StageFetcher};
         step(
-            "stage_dwell.label_times",
-            GhStageFetcher.label_times(root, "acme/shed", 3).is_none(),
-        );
-        step(
-            "stage_dwell.merged_at",
-            GhStageFetcher.merged_at(root, "acme/shed", 3).is_none(),
+            "stage_entry.events",
+            crate::step_dispatch::stage_entry::EventsSource::label_times(
+                &mut crate::step_dispatch::stage_entry::GhEventsReader,
+                root,
+                "acme/shed",
+                3,
+                "loom:issue",
+                3,
+            )
+            .times
+            .is_none(),
         );
     }
     step(
@@ -192,16 +194,6 @@ fn the_carry_over_reads_route_to_the_reader() {
         ),
         shape("clean.pr_by_number_rest", &["api", "repos/{owner}/{repo}/pulls/9"]),
         shape(
-            "intake.list_open",
-            &[
-                "api",
-                "--paginate",
-                "repos/{owner}/{repo}/issues?state=open&per_page=100",
-                "--jq",
-                ".",
-            ],
-        ),
-        shape(
             "guard.lease_comments",
             &["api", "repos/{owner}/{repo}/issues/7/comments?per_page=100"],
         ),
@@ -266,14 +258,14 @@ fn the_asker_dependent_reads_stay_on_the_writer() {
 }
 
 #[test]
-fn the_seam_routes_a_gate_read_to_the_writer_not_a_shed() {
-    // A Gate site under the same exhaustion is NOT shed: it reaches the
-    // (non-existent) writer program and reports a spawn failure.
+fn the_seam_sheds_a_gate_read_too_and_never_routes_it_to_the_writer() {
+    // #12394: a Gate site under the same exhaustion is shed like any other
+    // read: no request, nothing on the writer.
     let root = tempfile::tempdir().unwrap();
     let _g = install(exhausted());
     let out = crate::worktree_ops::gh::resolve_owner_repo(root.path());
     assert!(out.is_none());
-    assert_eq!(sheds(), 0);
+    assert_eq!(sheds(), 1);
 }
 
 /// A routing that would put any derivable read on a reader.
@@ -286,16 +278,15 @@ fn deriving(root: &Path) -> TestRouting {
         },
         env: DeriveEnv::default(),
         checkout: CwdAnswer::Sole("acme/widget".into()),
-        shed: true,
     }
 }
 
-/// The claim check's reads (its caller may just have written the label or
-/// lease it checks) and `merge_group_ci.read` (`permissions` depend on who
-/// asks) are pinned to the writer: driven through their own helpers with a
-/// reader on offer, none derives a route. The unpinned shapes would.
+/// `merge_group_ci.read` (`permissions` depend on who asks) is pinned to the
+/// writer: driven through its own helper with a reader on offer, it derives
+/// no route. The claim check's reads are not (#12555: they are reader-only
+/// daemon reads), so they take the reader route. The unpinned shapes derive.
 #[test]
-fn claim_check_and_merge_group_reads_never_derive() {
+fn claim_check_reads_ride_the_reader_and_merge_group_reads_never_derive() {
     let root = tempfile::tempdir().unwrap();
     let _g = install(deriving(root.path()));
     let gh = Path::new("gh");
@@ -309,14 +300,17 @@ fn claim_check_and_merge_group_reads_never_derive() {
     );
     let _ = crate::merge_group_ci::eligibility::probe("gh", "acme/widget", Some("main"));
     let seen = seen();
-    for op in [
-        "claim.labels",
-        "claim.lease_comments",
-        "merge_group_ci.read",
+    for (op, derives) in [
+        ("claim.labels", true),
+        ("claim.lease_comments", true),
+        ("merge_group_ci.read", false),
     ] {
         let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
         assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
-        assert!(mine.iter().all(|s| s.route_slug.is_none()), "{op} derived: {mine:?}");
+        assert!(
+            mine.iter().all(|s| s.route_slug.is_some() == derives),
+            "{op} (derives: {derives}): {mine:?}"
+        );
     }
     // Control: unpinned, the same shapes derive (merge_group_ci's has no
     // cwd, and still derives because its path names the repo).

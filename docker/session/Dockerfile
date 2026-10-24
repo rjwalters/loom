@@ -54,7 +54,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # test-image.sh, including the real-engine hook check, against the new CLI. CODEX_MIN_VERSION is the
 # runtime-adapter floor this build enforces regardless of which version is
 # pinned above it; bump both deliberately together when the floor moves.
-ARG CODEX_VERSION=0.162.1
+ARG CODEX_VERSION=0.164.0
 ARG CODEX_MIN_VERSION=0.146.0
 
 # Node.js LTS release, pinned + checksum-verified below — Codex CLI's only
@@ -74,9 +74,9 @@ ARG CODEX_MIN_VERSION=0.146.0
 # https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt at pin time, not
 # fabricated.
 ARG TARGETARCH
-ARG NODE_VERSION=24.19.0
-ARG NODE_SHA256_AMD64=14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647
-ARG NODE_SHA256_ARM64=01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc
+ARG NODE_VERSION=24.22.1
+ARG NODE_SHA256_AMD64=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+ARG NODE_SHA256_ARM64=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e
 
 USER root
 
@@ -109,6 +109,24 @@ RUN apt-get update -qq \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm -f /tmp/node.tar.xz \
     && node --version && npm --version
+
+# --- uv (Python project runner) ---------------------------------------
+# python3 and git are already in loom-worker; uv is the missing piece for a
+# Judge/Auditor session to run a Python repo's tests (`uv run pytest`). Pinned
+# static multi-arch binary copied from Astral's official image — not the
+# unpinned `curl | sh` installer.
+#
+# UV_PROJECT_ENVIRONMENT keeps uv's venv out of the mounted checkout, whose
+# `.venv` may be a macOS one that exec-fails on Linux. It lives under /tmp
+# because private-workspace sessions run `--read-only --user 1000:1000` with
+# only /tmp (tmpfs) and the workspace volume writable, so a path under
+# /home/loom would be read-only there; /tmp is writable in both session
+# shapes. UV_CACHE_DIR is moved for the same reason (default ~/.cache/uv).
+# The env dir is shared by every project in the container, so uv recreates it
+# when switching repos.
+COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /uvx /usr/local/bin/
+ENV UV_PROJECT_ENVIRONMENT=/tmp/loom-uv-venv
+ENV UV_CACHE_DIR=/tmp/loom-uv-cache
 
 USER loom
 WORKDIR /home/loom
