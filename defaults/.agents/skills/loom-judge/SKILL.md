@@ -199,7 +199,8 @@ own discipline:
 
 - **Never wait indefinitely on a single tool call.** Long-running commands
   (a scoped `cargo test`, `gh pr checks --watch`) MUST be given an explicit
-  timeout — e.g. `loom-daemon forge wait-checks <n> --timeout 20`, not `--watch` with no
+  timeout — e.g. `loom-daemon forge wait-checks <n> --timeout 20` (`--timeout` is in **seconds**; 20 is a
+  short slice, not minutes), not `--watch` with no
   bound; wrap a build in `timeout <secs> …`. If it does not return, treat the
   check as **inconclusive** and proceed to a verdict rather than blocking.
 - **Emit progress as you go.** Print a short line at each step (checkout, check,
@@ -306,9 +307,9 @@ section for the full carve-out list).
     --body "Issues found that need addressing before approval..."
 ```
 
-**Stale-Read Gate (#12614).** A review is a statement about the spec as you read it. If the operator comments on the PR or the linked issue, or rewrites the issue body, while you review, your approval is against a stale read (PR #12512 / #12509: approved the old design after the operator said it was rescoped). So capture `REVIEW_STARTED` (UTC, RFC 3339) before reading the PR or issue, and the sha256 of each linked issue body as you read it, and give both to every `approved` call: `--review-started "$REVIEW_STARTED" --issue-body-sha "N=$HASH"`. `verdict-gate` then refuses (exit 7, nothing posted, naming the comment or issue) when a trusted human comment on the PR or a linked issue is newer than `REVIEW_STARTED`, or a body no longer hashes to what you reviewed. Remedy: read what changed, re-review against the **current** spec, capture a fresh `REVIEW_STARTED` and hashes, and retry. Bot and Loom-marker comments never trigger it; `changes-requested` is never refused by it. A missing `--review-started` skips the check with a warning, so never omit it on an approval.
+**Stale-Read Gate (#12614).** A review is a statement about the spec as you read it. If the operator comments on the PR or the linked issue, or rewrites the issue body, while you review, your approval is against a stale read (PR #12512 / #12509: approved the old design after the operator said it was rescoped). So capture `REVIEW_STARTED` (UTC, RFC 3339) before reading the PR or issue, and the sha256 of each linked issue body as you read it, and give both to every `approved` call: `--review-started "$REVIEW_STARTED" --issue-body-sha "N=$HASH"`. `verdict-gate` then refuses (exit 7, nothing posted, naming the comment or issue) when a trusted human comment on the PR or a linked issue is newer than `REVIEW_STARTED`, or a body no longer hashes to what you reviewed. Bot and Loom-marker comments never trigger it; `changes-requested` is never refused by it. The gate takes the real start from the dispatch epoch in `$LOOM_SWEEP_ID` (or the PR's judge lease) and uses your `--review-started` only if it is *earlier*, so a late value cannot hide anything; it also refuses when a human edited a linked issue's body after the start (named in the refusal), and follows `Part of` / `Contributes to` links as well as `Closes`. Remedy: read what changed and re-review against the **current** spec. Because the start is the dispatch time, **a retry in this same dispatch is refused again** (a fresh `REVIEW_STARTED` cannot move it later): if the PR still meets the current spec, end without a verdict — the next Judge dispatch starts after the change and approves; if it no longer does, post `changes-requested`. Only a manual run with no dispatch epoch and no lease can retry with a fresh `REVIEW_STARTED`. An approval with no resolvable start (no dispatch epoch, no lease, no flag) is refused, so still pass `--review-started` on a manual run.
 
-**`post-verdict.sh` applies the verdict label itself (#10581)** and verifies it: approve leaves `loom:pr` and strips `loom:changes-requested`, `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`; changes-requested leaves `loom:changes-requested` and strips `loom:pr`, `loom:reviewing`, `loom:review-requested`. A trailing `&& gh pr edit` in older examples below is redundant but harmless **only because `post-verdict.sh` ran first and stamped the marker**; never add `loom:pr` with a bare `gh pr edit` as the approval itself (#12136). Add only companions (`loom:ci-failure`, `loom:merge-conflict`) yourself. The label is the PRIMARY deliverable — the sweep validates labels, not comments — so **exit 8** (comment posted, labels did not hold) means run the printed repair command now. **Exit 7**, no approval stands: a human commented or the issue was rescoped since `REVIEW_STARTED` (Stale-Read Gate: re-review, do not just re-run), `loom:ci-failure` is on the PR, another verdict at this same head is changes-requested (do not approve over it without a new push; `--overrules-prior "<why each point no longer blocks>"` only when you verified every point), the PR state was unreadable, or a concurrent changes-requested from another host won (labels flipped). A same-head repeat within 10 minutes is deduped: stand down.
+**`post-verdict.sh` applies the verdict label itself (#10581)** and verifies it: approve leaves `loom:pr` and strips `loom:changes-requested`, `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`; changes-requested leaves `loom:changes-requested` and strips `loom:pr`, `loom:reviewing`, `loom:review-requested`. A trailing `&& gh pr edit` in older examples below is redundant but harmless **only because `post-verdict.sh` ran first and stamped the marker**; never add `loom:pr` with a bare `gh pr edit` as the approval itself (#12136). Add only companions (`loom:ci-failure`, `loom:merge-conflict`) yourself. The label is the PRIMARY deliverable — the sweep validates labels, not comments — so **exit 8** (comment posted, labels did not hold) means run the printed repair command now. **Exit 7**, no approval stands: a human commented or the issue was rescoped since `REVIEW_STARTED` (Stale-Read Gate: re-review, do not just re-run), `loom:ci-failure` is on the PR, another verdict at this same head is changes-requested (do not approve over it without a new push; `--overrules-prior "<why each point no longer blocks>"` only when you verified every point), the PR state was unreadable, or a concurrent changes-requested from another host won (labels flipped). A same-head repeat within 10 minutes is deduped: stand down. **Exit 10** (#13055), approvals only: `lease pr check` shows you do not hold a live Judge lease on the PR (your reclaim was refused, you were displaced, or the state was unreadable). Stand down: do not retry, release the lease (`lease pr release`), post nothing; a `changes-requested` verdict is never gated. A binary without `lease pr` (exit 2) warns and proceeds.
 
 **Label transitions:**
 - `loom:review-requested` (green) → `loom:pr` (blue) [approved, ready for Champion auto-merge]
@@ -447,7 +448,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or a priority label.
 2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
-2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` / `NONE` → continue. Pending is never red.
+2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` / `NONE` → continue. Pending is never red.
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -1340,7 +1341,7 @@ read via ETag, so it is live too.) See "Cached Forge Reads" for the full policy.
 **Step 1: Snapshot all PR checks** (`--timeout 0` would read a no-checks repo as `TIMEOUT`)
 
 ```bash
-loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # seconds
 ```
 
 Branch on the first stdout line:
@@ -1386,7 +1387,7 @@ If checks are still running, **do not block on them or approve on a guess**: in 
 2. **Release your claim** — remove `loom:reviewing`; release the lease with `--skip-reason ci-pending` (below).
 3. **Skip and continue the batch** — next PR; a later tick re-evaluates this one once CI settles.
 
-**Pending-CI skip check.** Reuse Step 1's snapshot: `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20` is a short ETag'd poll that also handles the empty-rollup trap (#6169); `--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has nothing to wait for. Branch on the first **stdout** line:
+**Pending-CI skip check.** Reuse Step 1's snapshot: `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20` (seconds) is a short ETag'd poll that also handles the empty-rollup trap (#6169); `--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has nothing to wait for. Branch on the first **stdout** line:
 
 ```bash
 first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1)"
@@ -1578,7 +1579,7 @@ Red flags that should trigger a full evaluation instead:
 **3. Verify CI passes — and reconcile formal reviews/inline threads:**
 
 ```bash
-loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # GREEN/NONE (Step 1)
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # seconds; GREEN/NONE (Step 1)
 gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 # A conflict-only re-push does not resolve anyone's outstanding review (#7647).
 ./.loom/scripts/check-review-feedback.sh --number <PR_NUMBER> --head-sha "$REVIEW_HEAD_SHA"
