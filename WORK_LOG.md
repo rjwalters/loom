@@ -15,6 +15,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-25
 
+- **PR #13181**: fix: admit champion pin/facts files in worktree write guards
+- **Issue #13180** (closed): Champion --pr steps blocked by Loom's own guards writing the head-pin file (rm-scope + worktree-isolation)
+- **Issue #13179** (closed): Telemetry: PR-pipeline gauge (open PRs by stage/hold, oldest age) so stuck approved PRs show up in ClickHouse
+- **Issue #13178** (closed): merge-pr: null allow_* flags read as disabled, so Champion can't merge on ruleset repos (13 approved PRs stuck)
 - **PR #13172**: refactor: remove dead file-IPC MCP tools and writeMCPCommand
 - **PR #13168**: fix: drop stored ETags on miss-triggered installation refresh
 - **Issue #13174** (closed): labels: registry aliases for common non-Loom labels, and a 'labels check' for made-up labels
