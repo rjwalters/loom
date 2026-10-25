@@ -29,7 +29,7 @@ pub const TRIAGE_REASONS: [&str; 3] = ["review_requested", "blocked", "operator"
 /// v2 (#12715) adds the stop gates a non-merging step names with `reason=`
 /// ([`STOP_REASONS`], plus `merge_rc<N>`, see [`stop_reason`]) and
 /// `unspecified` for a stop that named none.
-pub const MERGE_REASONS: [&str; 21] = [
+pub const MERGE_REASONS: [&str; 22] = [
     "merged",
     "ci_failing",
     "conflict",
@@ -49,6 +49,7 @@ pub const MERGE_REASONS: [&str; 21] = [
     "verdict_rc11",
     "mergeable_unknown",
     "pin_missing",
+    "guard_refused",
     "unspecified",
     "skipped",
 ];
@@ -56,13 +57,14 @@ pub const MERGE_REASONS: [&str; 21] = [
 /// The `reason=` tokens a `requeued` or `skipped` step may name, besides
 /// `merge_rc<N>`: the gate it stopped at. `ci_pending` is one of them only
 /// when the step says so, never by default.
-pub const STOP_REASONS: [&str; 6] = [
+pub const STOP_REASONS: [&str; 7] = [
     "facts_unread",
     "janitor_rc3",
     "verdict_rc11",
     "ci_pending",
     "mergeable_unknown",
     "pin_missing",
+    "guard_refused",
 ];
 
 /// Every reason of [`PROMOTION_REASON_SET`].
