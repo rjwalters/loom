@@ -72,7 +72,7 @@ fn project(e: &Evidence) -> Option<Projection> {
     let detail = e.reason.as_deref().map(super::sanitize_detail);
     for event in e.events.iter().rev() {
         let (at, class, reason) = match event {
-            Event::Applied { at, action, by }
+            Event::Applied { at, action, by, .. }
                 if matches!(
                     (action.as_str(), by.as_str()),
                     ("escalated", "operator_decision") | ("blocked", "park_record")

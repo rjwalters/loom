@@ -608,6 +608,7 @@ fn a_traced_role_ticks_session_summary_and_usage_span_share_one_trace_id() {
         execution: execution.clone(),
         started_at,
         failure: None,
+        judge: None,
     };
     crate::role_tick_telemetry::usage::journal_execution(
         &workspace,

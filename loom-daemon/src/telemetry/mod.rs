@@ -1292,6 +1292,38 @@ pub struct RoleTickOutcomeRecord {
     /// absent when unsharded, never a guessed `0/1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_owner: Option<String>,
+    /// A launched Judge tick won a PR claim or wrote a verdict (#12362).
+    /// Omitted for any other role and for a tick that never launched; `false`
+    /// is an observation (an idle tick), never a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found_work: Option<bool>,
+    /// Why a Judge tick found no work: the session's own `LOOM_STEP_OUTCOME`
+    /// reason (advisory), else the daemon-observed `no_claim_no_verdict`.
+    /// Set exactly when `found_work` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noop_reason: Option<String>,
+    /// The verdicts a Judge tick wrote, one per PR (#12362), from the
+    /// `forge verdict-labels` write. Omitted when it wrote none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdicts: Option<Vec<JudgeVerdictRecord>>,
+    /// The step's `LOOM_STEP_OUTCOME` class (#12362), on a step-sourced record:
+    /// `result` keeps its `tick_outcome` mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_class: Option<String>,
+    /// The step's `LOOM_STEP_OUTCOME` reason (#12362); see `step_class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_reason: Option<String>,
+}
+
+/// One verdict a Judge tick wrote ([`RoleTickOutcomeRecord::verdicts`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeVerdictRecord {
+    pub pr_number: u32,
+    /// The head the verdict was written against, when the writer passed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// `approved` or `changes_requested`.
+    pub verdict: String,
 }
 
 /// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).

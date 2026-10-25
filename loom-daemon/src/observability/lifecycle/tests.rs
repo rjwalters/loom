@@ -41,9 +41,13 @@ fn completion_markers_preserve_each_repair_attempt_without_invented_duration() {
         .filter(|s| s.name == SpanName::RoleAttempt && s.attributes["loom.role"] == "judge")
         .collect();
     assert_eq!(judges.len(), 2);
-    assert_eq!(judges[0].attributes["loom.judge_verdict"], "rejected");
+    // #12362: the checkpoint phase is not the verdict; `loom.result` still
+    // says how the phase ended, and no verdict is invented from it.
+    assert!(!judges[0].attributes.contains_key("loom.judge_verdict"));
+    assert_eq!(judges[0].attributes["loom.result"], "rejected");
     assert_eq!(judges[0].status, SpanStatus::Error);
-    assert_eq!(judges[1].attributes["loom.judge_verdict"], "approved");
+    assert!(!judges[1].attributes.contains_key("loom.judge_verdict"));
+    assert_eq!(judges[1].attributes["loom.result"], "success");
     assert_eq!(judges[1].status, SpanStatus::Ok);
     assert_ne!(judges[0].context.span_id, judges[1].context.span_id);
     for span in &spans {
