@@ -34,6 +34,7 @@ fn record() -> AutoUpdateTickRecord {
         roll_held: None,
         host_state: Some("H4".to_string()),
         target_source: Some("floor".to_string()),
+        config_restart_paths: Some(3),
         consecutive_failures: 0,
         duration_ms: 4200,
         loom: Provenance {
@@ -200,5 +201,31 @@ fn collector_keeps_every_auto_update_log_attribute() {
         .expect("the transform/privacy log keep_keys line");
     for key in AUTO_UPDATE_LOG_ATTRIBUTE_KEYS {
         assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
+    }
+}
+
+/// #12425: a config restart names its source and a path count, and is a
+/// warning only while the restart is refused.
+#[test]
+fn a_config_restart_tick_reports_source_and_count_and_warns_when_refused() {
+    for (armed, severity) in [(true, SeverityNumber::Info), (false, SeverityNumber::Warn)] {
+        let mut tick = record();
+        tick.decision = TickDecisionKind::ConfigRestart;
+        tick.target_source = Some("config_restart".to_string());
+        tick.config_restart_paths = Some(3);
+        tick.roll_armed = armed;
+        tick.outcome = None;
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::AutoUpdateTick(tick));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.severity_number, severity as i32, "armed={armed}");
+        assert_eq!(
+            attr(&log, "loom.auto_update.decision"),
+            Some(Value::StringValue("config_restart".into()))
+        );
+        assert_eq!(
+            attr(&log, "loom.auto_update.target_source"),
+            Some(Value::StringValue("config_restart".into()))
+        );
+        assert_eq!(attr(&log, "loom.auto_update.config_restart_paths"), Some(Value::IntValue(3)));
     }
 }

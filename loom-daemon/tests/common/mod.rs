@@ -875,3 +875,19 @@ pub fn hermetic_git(cmd: &mut Command) -> &mut Command {
         .env("LC_ALL", "C")
         .env("TERM", "dumb")
 }
+
+/// Run `git -C <dir> <args>` under [`hermetic_git`] and assert it succeeded,
+/// naming the directory and git's stderr on failure. Shared by the
+/// `worktree_*_differential` tests' fixture builders.
+#[allow(dead_code)]
+pub fn git(dir: &Path, args: &[&str]) {
+    let mut cmd = Command::new("git");
+    hermetic_git(&mut cmd);
+    let out = cmd.arg("-C").arg(dir).args(args).output().expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -6365,6 +6365,7 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
 | set | below; the newest release is below it | `FLEET FLOOR UNSATISFIABLE` at ERROR. No roll; dispatch continues |
 | set | below; no release resolved | No roll; the next tick asks again |
 | set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists, unless a registered workspace needs a newer daemon (the next row) |
+| set or unknown, `fleet.autoApply` on | restart-required config changed since boot (#12425), and none of the rows above is rolling | Pause-and-roll now onto the **running** binary (`from_version == to_version`), even with `autoUpdate.enabled=false`; no fetch, no window, settle or debounce. `target_source = config_restart`; the tick reports `decision = config_restart` with `target_source` and `config_restart_paths` (a count, never the paths). See [fleet-config-lifecycle](fleet-config-lifecycle.md) |
 | any store, floor unknown included | a workspace's installed Loom needs a newer daemon (`W4`, #10719) | Pause-and-roll now, no settle, to the newest published release (binary and `.sha256` present) at or above its `requires_daemon`. `target_source = repo_ahead` (`floor` when the floor drives too). See [Dispatch holds](#dispatch-holds-10719) |
 
 - **A fleet host moves only when the floor moves.** It does not chase the
@@ -11640,8 +11641,8 @@ marker and the `.stopped` operator-stop record (#9588). `loom-daemon host disabl
 --reason "<why>"` writes `<loom_dir>/autonomy-disabled` (`reason=`/`who=`/`when=`;
 the machine-level `~/.loom`, so it covers every repo on the host; a
 `LOOM_AUTONOMY_MARKER` override moves it too), removes `autonomy-desired`, and runs
-`loom-daemon-stop.sh` to stop the daemon and its launchd/systemd daemon + watchdog
-jobs. While it exists each of these exits non-zero naming reason, who, when and
+`loom-daemon-stop.sh` to stop the daemon and remove its launchd/systemd daemon
+job (the watchdog job stays loaded, #9957, and refuses every tick as below). While it exists each of these exits non-zero naming reason, who, when and
 `loom-daemon host enable`, with no side effects: `daemon-start` /
 `loom-daemon-start.sh`, the watchdog tick (no recovery, no page), the watchdog
 provisioning guard, `daemon-update` (restart / relaunch / provision, and so the
@@ -11923,7 +11924,7 @@ contract the healing + detection below implement:
 | Surface | Marker behavior | Reference |
 |---------|-----------------|-----------|
 | `loom-daemon-start.sh` | **Creates** it (`write_intent_marker`) on every successful start (launchd, systemd, nohup) | `loom-daemon-start.sh` (`write_intent_marker`) |
-| `loom-daemon-stop.sh` | **Removes** it + tears down the watchdog — unless `--restarting` / `LOOM_DAEMON_STOP_KEEP_INTENT=1`, which **preserves** both | `loom-daemon-stop.sh` |
+| `loom-daemon-stop.sh` | **Moves it aside** into the `.stopped` operator-stop record (reason + caller `comm` chain) via `loom-daemon operator-stop record`; the watchdog stays armed and silent (#9957; a binary without the verb falls back to removing it) — unless `--restarting` / `LOOM_DAEMON_STOP_KEEP_INTENT=1`, which **preserves** it and records nothing | `loom-daemon-stop.sh` |
 | `loom-daemon-update.sh` (full roll) | **Preserves + re-creates**: `stop --restarting` (preserve) then `start.sh` (re-write) | `loom-daemon-update.sh` |
 | `loom-daemon restart` (#4054 primitive) | **Preserved if present** (the daemon exits `EXIT_RESTART`; the supervisor relaunches, marker untouched). An **absent** marker is **healed at startup** — see below | `ipc.rs`, `autonomy_marker.rs` |
 | in-daemon self-update loop | Uses `update.sh --no-restart` + the restart primitive — bypasses the stop/start rewrite; relies on **startup healing** | `main.rs`, `autonomy_marker.rs` |

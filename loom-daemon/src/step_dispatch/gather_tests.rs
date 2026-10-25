@@ -380,3 +380,76 @@ mod held_at_head {
         assert_eq!(run(&HashMap::new(), &map(HEAD), &[]).0, 0);
     }
 }
+
+mod author_gate_held {
+    use super::*;
+    use crate::promotion_author::{revision, Stamp};
+
+    const TRUST: &str = "0123456789abcdef";
+
+    /// Issue 7, `loom:curated` only: a `ChampionPromote` step.
+    fn curated() -> Vec<Item> {
+        let rows = vec![row(7, &["loom:curated"], "body", false)];
+        let items = classify_rows(&rows, &IssueFacts::default());
+        assert_eq!(items[0].step(), Some(Step::ChampionPromote), "{items:?}");
+        items
+    }
+
+    fn stamp(body: &str, trust: &str) -> Stamp {
+        Stamp {
+            rev: revision("item 7", body),
+            trust: trust.to_string(),
+        }
+    }
+
+    fn run(stamps: Vec<Stamp>, body: &str, trust: Option<&str>) -> (usize, Verdict) {
+        let mut items = curated();
+        let gates = HashMap::from([(7, stamps)]);
+        let revs = HashMap::from([(7, revision("item 7", body))]);
+        let n = hold_author_gated(&mut items, &gates, &revs, trust);
+        (n, items[0].verdict)
+    }
+
+    #[test]
+    fn a_gated_issue_with_unchanged_inputs_is_not_drawn() {
+        let (n, v) = run(vec![stamp("body", TRUST)], "body", Some(TRUST));
+        assert_eq!((n, v), (1, Verdict::Pass(PassReason::AuthorGateHeld)));
+        assert_eq!(PassReason::AuthorGateHeld.as_str(), "author_gate_held");
+    }
+
+    #[test]
+    fn a_body_edit_after_the_gate_makes_it_drawable() {
+        assert_eq!(run(vec![stamp("body", TRUST)], "edited", Some(TRUST)).0, 0);
+    }
+
+    #[test]
+    fn a_trust_change_makes_it_drawable() {
+        assert_eq!(run(vec![stamp("body", TRUST)], "body", Some("fedcba9876543210")).0, 0);
+    }
+
+    #[test]
+    fn an_older_matching_stamp_still_holds_an_edit_reverted() {
+        let stamps = vec![stamp("body", TRUST), stamp("edited", TRUST)];
+        assert_eq!(run(stamps, "body", Some(TRUST)).0, 1);
+    }
+
+    #[test]
+    fn no_stamp_no_digest_or_no_marker_read_fails_open() {
+        // A legacy notice parses to no stamp; an unreadable read has no entry.
+        assert_eq!(run(vec![], "body", Some(TRUST)).0, 0);
+        assert_eq!(run(vec![stamp("body", TRUST)], "body", None).0, 0);
+        let mut items = curated();
+        let revs = HashMap::from([(7, revision("item 7", "body"))]);
+        assert_eq!(hold_author_gated(&mut items, &HashMap::new(), &revs, Some(TRUST)), 0);
+        assert_eq!(items[0].step(), Some(Step::ChampionPromote));
+    }
+
+    #[test]
+    fn only_promote_steps_are_held() {
+        let rows = vec![row(7, &["loom:issue"], "body", false)];
+        let mut items = classify_rows(&rows, &IssueFacts::default());
+        let gates = HashMap::from([(7, vec![stamp("body", TRUST)])]);
+        let revs = HashMap::from([(7, revision("item 7", "body"))]);
+        assert_eq!(hold_author_gated(&mut items, &gates, &revs, Some(TRUST)), 0);
+    }
+}
