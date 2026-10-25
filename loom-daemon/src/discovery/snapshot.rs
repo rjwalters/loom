@@ -161,4 +161,17 @@ pub struct SnapshotStats {
     /// markers and CI at a Judge head, are not listings and are counted
     /// elsewhere.)
     pub discovery_forge_reads: u64,
+    /// Live per-item reads the snapshot cannot answer (#12317), by kind.
+    pub live_reads: LiveReads,
+}
+
+/// The per-item reads of the step gather that stay live on a worklist host
+/// (#12317): the mirror holds neither the merged-PR closes-graph nor
+/// comments. `ci` counts the Judge heads the snapshot had no check summary
+/// for, so the gather read CI itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveReads {
+    pub landed: u64,
+    pub markers: u64,
+    pub ci: u64,
 }

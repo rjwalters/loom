@@ -174,6 +174,22 @@ fn a_miss_on_a_fresh_snapshot_refreshes_once_per_window() {
 }
 
 #[test]
+fn a_miss_refresh_ignores_a_stale_304_and_finds_the_new_repo() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "acme/old", false)]));
+    let cred = writer(&env);
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), Answer::Listed(None));
+    // The forge now lists the repo but still answers any conditional read 304.
+    fake.set("page1", &page(2, &[(1, "acme/old", false), (2, "acme/new", true)]));
+    fake.set("notmodified", "");
+    state::advance_test_clock(SNAPSHOT_MISS_REFRESH_SECS + 1);
+    assert_eq!(lookup(&fake.gh, &cred, "acme/new"), listed("acme/new", 2, true));
+    let calls = fake.calls();
+    assert!(!calls[1].contains("If-None-Match"), "{calls:?}");
+}
+
+#[test]
 fn a_genuinely_absent_repo_costs_at_most_one_refresh_per_window() {
     let env = Env::new(&[]);
     let fake = Listing::new(env.tmp.path());
