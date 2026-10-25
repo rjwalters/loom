@@ -16,7 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 ### 2026-10-25
 
 - **PR #12442**: feat: restart the daemon onto the same binary for restart-required config
+- **PR #12262**: fix: track cd in subshells, brace groups and pushd in write-confinement guard
 - **Issue #12425** (closed): auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3)
+- **Issue #12419** (closed): fleet-sync: a restart-only fleet config change arms the pause-and-roll restart
+- **Issue #12082** (closed): Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout
 
 ### 2026-10-24
 
