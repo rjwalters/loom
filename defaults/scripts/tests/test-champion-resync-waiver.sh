@@ -177,6 +177,33 @@ echo "--- mixed PR: matches plus one mismatch holds ---"
 new_fx "$V"; sed -i 's/bbb222/bbb000/' "$FX/files.json"
 assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "one mismatching kept-set file among matches holds"
 
+echo "--- roles and skills map to regular-file counterparts ---"
+new_rs_fx() {
+    new_fx "$V"
+    local u="$FX/upstream/v$V/defaults"
+    mkdir -p "$u/.agents/skills/loom-judge" "$u/roles"
+    echo "sss111" >"$u/.agents/skills/loom-judge/SKILL.md"
+    echo "rrr222" >"$u/.claude/commands/loom/judge.md"
+    echo "jjj333" >"$u/roles/judge.json"
+    cat >"$FX/files.json" <<JSON
+[{"filename":".agents/skills/loom-judge/SKILL.md","sha":"sss111","status":"modified"},
+ {"filename":".loom/roles/judge.md","sha":"rrr222","status":"modified"},
+ {"filename":".loom/roles/judge.json","sha":"jjj333","status":"modified"}]
+JSON
+}
+new_rs_fx
+assert_eq "ELIGIBLE" "$(result_of "$(run_eval)")" "byte-identical skill + role .md + role .json resync is eligible"
+new_rs_fx; sed -i 's/sss111/sss999/' "$FX/files.json"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a one-byte skill mismatch holds"
+new_rs_fx; sed -i 's/rrr222/rrr999/' "$FX/files.json"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a one-byte role .md mismatch holds"
+new_rs_fx; sed -i 's/jjj333/jjj999/' "$FX/files.json"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a one-byte role .json mismatch holds"
+new_rs_fx; rm "$FX/upstream/v$V/defaults/.claude/commands/loom/judge.md"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a local-only role .md (absent upstream) holds"
+new_rs_fx; sed -i '0,/"modified"/s//"removed"/' "$FX/files.json"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a removed skill holds"
+
 echo "--- docs ---"
 assert_doc() { assert_contains "$(cat "$1")" "$2" "$3"; }
 assert_doc "$CHAMPION_MD" "Resync waiver for the kept-set hold (#13096)" "champion-pr-merge.md documents the waiver"

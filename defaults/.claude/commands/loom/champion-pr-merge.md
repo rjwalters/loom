@@ -1121,8 +1121,8 @@ It is eligible only when **all** hold, each read live in this pass:
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
   `defaults/` counterpart through the surface map in `resync-installed.sh` (`.loom/hooks`,
-  `.loom/scripts`, `.loom/docs`, `.loom/runtimes`, `.loom/bin`, `.claude/commands/loom`,
-  `.claude/agents`; any other kept-set path, such as `.claude/settings.json`, `.githooks/*` or
+  `.loom/scripts`, `.loom/docs`, `.loom/runtimes`, `.loom/bin`, `.loom/roles`, `.agents/skills`,
+  `.claude/commands/loom`, `.claude/agents`; any other kept-set path, such as `.claude/settings.json`, `.githooks/*` or
   `.loom/config.json`, has none and holds), and its head blob SHA equals that counterpart's blob SHA
   at the tag;
 - the PR head did not move while it was read.
@@ -1132,8 +1132,9 @@ A differing byte, a local-only file, a missing or unparsable tag, or any failed 
 
 ```bash
 # resync_upstream_path <installed-path>: the defaults/ counterpart per resync-installed.sh's
-# surface map, empty when the path has none. Roles and skills are symlinks or generated
-# upstream, so their blobs never compare equal: no mapping, hold.
+# surface map, empty when the path has none. defaults/roles/*.md are symlinks (never a "file"
+# blob), so an installed role .md maps to the regular file it resolves to under
+# defaults/.claude/commands/loom/; role .json files and skills are regular files.
 resync_upstream_path() {
   case "$1" in
     .loom/hooks/*)            printf 'defaults/hooks/%s' "${1#.loom/hooks/}" ;;
@@ -1141,6 +1142,9 @@ resync_upstream_path() {
     .loom/docs/*)             printf 'defaults/docs/%s' "${1#.loom/docs/}" ;;
     .loom/runtimes/*)         printf 'defaults/runtimes/%s' "${1#.loom/runtimes/}" ;;
     .loom/bin/*)              printf 'defaults/.loom/bin/%s' "${1#.loom/bin/}" ;;
+    .loom/roles/*.md)         printf 'defaults/.claude/commands/loom/%s' "${1#.loom/roles/}" ;;
+    .loom/roles/*)            printf 'defaults/roles/%s' "${1#.loom/roles/}" ;;
+    .agents/skills/*)         printf 'defaults/.agents/skills/%s' "${1#.agents/skills/}" ;;
     .claude/commands/loom/*)  printf 'defaults/.claude/commands/loom/%s' "${1#.claude/commands/loom/}" ;;
     .claude/agents/*)         printf 'defaults/.claude/agents/%s' "${1#.claude/agents/}" ;;
     *) return 0 ;;
