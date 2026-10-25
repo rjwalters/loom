@@ -175,6 +175,48 @@ fi
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null) || COMMAND=""
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null) || CWD=""
 
+# Champion state files (#13180). `/loom:champion --pr N` keeps a pin file and a
+# PR-facts file directly under the git common dir. The shell would expand
+# `$(git rev-parse --git-common-dir)/loom-champion-{pin,facts}-pr-<digits>` to
+# exactly that directory, but this guard cannot evaluate a substitution and
+# fails closed on it. Rewrite ONLY that exact, anchored spelling (literal PR
+# digits, fixed basename) to the resolved absolute path so the ordinary
+# containment logic judges a literal path; _champion_state_path_ok() below then
+# admits that one shape. Any other `$(…)` target stays unresolvable and denied.
+_CHAMPION_STATE_RE='\$\(git rev-parse --git-common-dir\)/(loom-champion-(pin|facts)-pr-[0-9]+(\.json)?)([^A-Za-z0-9._/-]|$)'
+_CHAMPION_COMMON_DIR=""
+if [[ -n "$CWD" && -d "$CWD" ]]; then
+    _CHAMPION_COMMON_DIR=$(cd "$CWD" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P) || _CHAMPION_COMMON_DIR=""
+fi
+if [[ -n "$_CHAMPION_COMMON_DIR" && "$COMMAND" == *'$(git rev-parse --git-common-dir)/loom-champion-'* ]]; then
+    _cs_rest="$COMMAND"
+    _cs_out=""
+    while [[ "$_cs_rest" =~ $_CHAMPION_STATE_RE ]]; do
+        _cs_whole="${BASH_REMATCH[0]}"
+        _cs_name="${BASH_REMATCH[1]}"
+        _cs_term="${BASH_REMATCH[4]}"
+        _cs_out+="${_cs_rest%%"$_cs_whole"*}${_CHAMPION_COMMON_DIR}/${_cs_name}${_cs_term}"
+        _cs_rest="${_cs_rest#*"$_cs_whole"}"
+    done
+    COMMAND="${_cs_out}${_cs_rest}"
+fi
+
+# True if $1 (an absolute, normalized path) is exactly one of the Champion
+# state files, a DIRECT child of the git common dir. Anchored on the basename
+# pattern and the resolved directory, so `.git/config`, a sibling file, a
+# `..` traversal or a nested path never matches.
+_champion_state_path_ok() {
+    local p="$1"
+    [[ -n "$_CHAMPION_COMMON_DIR" && -n "$p" ]] || return 1
+    [[ "$p" =~ ^(.*)/(loom-champion-(pin|facts)-pr-[0-9]+(\.json)?)$ ]] || return 1
+    local dir="${BASH_REMATCH[1]}"
+    [[ "$dir" == *"/../"* || "$dir" == */.. || "$dir" == *"/./"* ]] && return 1
+    [[ "$dir" == "$_CHAMPION_COMMON_DIR" ]] && return 0
+    local phys
+    phys=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+    [[ "$phys" == "$_CHAMPION_COMMON_DIR" ]]
+}
+
 # If no command to check, allow
 if [[ -z "$COMMAND" ]]; then
     exit 0
@@ -10501,6 +10543,10 @@ if worktree_isolation_guard_enabled && \
             continue
         fi
         _wabs=$(normalize_abs_path "$_wabs")
+
+        # (a0) The Champion pin / PR-facts file, a direct child of the git
+        # common dir (#13180) -> allow. Exactly those two name patterns.
+        _champion_state_path_ok "$_wabs" && continue
 
         # (a) Already inside some managed worktree -> allow. This is exactly
         # where a builder is supposed to write.

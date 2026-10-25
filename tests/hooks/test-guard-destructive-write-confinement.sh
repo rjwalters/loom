@@ -2559,6 +2559,33 @@ assert_deny "write-confinement (#12596 control): plain write into the main check
     "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
 rm -rf "${_C12596_OUT%/*/*}"
 
+# --- #13180: Champion pin / PR-facts files are the one write the main
+# checkout's .git admits while a managed worktree exists. Exactly those two
+# basenames, direct children of the git common dir; nothing else under .git.
+_C13180_CD='$(git rev-parse --git-common-dir)'
+assert_allow "write-confinement (#13180): pin write via \$(git rev-parse --git-common-dir) allows" \
+    "printf 'sha 1\\n' > \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): same, from inside the linked worktree" \
+    "printf 'sha 1\\n' > \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED/.loom/worktrees/issue-1"
+assert_allow "write-confinement (#13180): facts write via \$(git rev-parse --git-common-dir) allows" \
+    "jq . x > \"$_C13180_CD/loom-champion-facts-pr-42.json\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): rm of the pin via \$(git rev-parse --git-common-dir) allows" \
+    "rm -f \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): literal absolute pin path allows" \
+    "echo x > $WT_REPO_LINKED/.git/loom-champion-pin-pr-42" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): .git/config via git-common-dir denies" \
+    "printf a > \"$_C13180_CD/config\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): sibling file in git common dir denies" \
+    "printf a > \"$_C13180_CD/other-file\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): non-numeric PR suffix denies" \
+    "printf a > \"$_C13180_CD/loom-champion-pin-pr-\$N\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): traversal after the pin name denies" \
+    "printf a > \"$_C13180_CD/loom-champion-pin-pr-1/../config\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): literal .git/config denies" \
+    "echo x > $WT_REPO_LINKED/.git/config" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): literal pin name at checkout root denies" \
+    "echo x > $WT_REPO_LINKED/loom-champion-pin-pr-42" "$WT_REPO_LINKED"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
