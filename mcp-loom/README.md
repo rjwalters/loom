@@ -75,22 +75,18 @@ You can still register per-repo if needed (e.g. Claude Desktop), but set
 | `LOOM_WORKSPACE` | Path to the Loom workspace (bypasses CWD discovery) | CWD-based repo-root discovery; **no** `~/GitHub/loom` fallback |
 | `LOOM_SOCKET_PATH` | Path to daemon socket | `~/.loom/loom-daemon.sock` |
 
-## Available Tools (30 total)
+## Available Tools (23 total)
 
-The MCP server provides 30 tools organized by function.
+The MCP server provides 23 tools organized by function.
 
-### UI/Engine Control (6 tools)
+### UI/Engine Control (2 tools)
 
 | Tool | Description |
 |------|-------------|
-| `trigger_start` | Start engine with confirmation dialog |
-| `trigger_force_start` | Start engine without confirmation |
-| `trigger_force_factory_reset` | Reset workspace without confirmation |
 | `get_heartbeat` | Check if Loom app is running |
-| `stop_engine` | Stop all terminals |
 | `get_ui_state` | Get comprehensive UI state (workspace, config, terminals) |
 
-### Terminal Management (13 tools)
+### Terminal Management (10 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -103,9 +99,6 @@ The MCP server provides 30 tools organized by function.
 | `restart_terminal` | Restart a terminal preserving config |
 | `configure_terminal` | Update terminal settings |
 | `set_primary_terminal` | Set primary terminal in UI |
-| `start_autonomous_mode` | Start autonomous mode |
-| `stop_autonomous_mode` | Stop autonomous mode |
-| `launch_interval` | Trigger interval prompt manually |
 | `get_agent_metrics` | Get agent performance metrics |
 
 ### Sweep Dispatch (8 tools)
@@ -153,9 +146,9 @@ The following tools were removed to reduce complexity. Use the alternatives list
 | `read_console_log` | `tail -n 20 ~/.loom/console.log` |
 | `read_state_file` | Use `get_ui_state` (provides state + context) |
 | `read_config_file` | Use `get_ui_state` (provides config + context) |
-| `trigger_factory_reset` | Use `trigger_force_factory_reset` |
+| `trigger_factory_reset`, `trigger_start`, `trigger_force_start`, `trigger_force_factory_reset`, `stop_engine` | Removed (no daemon-era equivalent; file IPC had no consumer) |
 | `trigger_restart_terminal` | Use `restart_terminal` |
-| `trigger_run_now` | Use `launch_interval` |
+| `trigger_run_now`, `start_autonomous_mode`, `stop_autonomous_mode`, `launch_interval` | Removed (use `dispatch_sweep` / the daemon) |
 | `get_random_file` | Use `.loom/scripts/random-file.sh` |
 | `check_tmux_server_health` | tmux debugging - use bash directly |
 | `get_tmux_server_info` | tmux debugging - use bash directly |
@@ -175,9 +168,6 @@ await mcp__loom__configure_terminal({
   terminal_id: "terminal-1",
   role_config: { targetInterval: 300000 }
 });
-
-// Trigger autonomous work
-await mcp__loom__launch_interval({ terminal_id: "terminal-1" });
 ```
 
 ## Development

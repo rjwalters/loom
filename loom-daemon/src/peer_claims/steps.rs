@@ -136,11 +136,12 @@ impl PeerClaimView {
             .and_then(|e| e.step)
     }
 
-    /// A live peer Champion merge step in `repo` at local time `now`: the PR
-    /// and the host merging it. The lowest PR number when several are live.
+    /// Every live peer Champion merge step in `repo` at local time `now`: the
+    /// PR and the host merging it, by PR number.
     #[must_use]
-    pub fn merge_in_flight_at(&self, repo: &str, now: Instant) -> Option<(u32, String)> {
-        self.claims
+    pub fn merges_in_flight_at(&self, repo: &str, now: Instant) -> Vec<(u32, String)> {
+        let mut merges: Vec<(u32, String)> = self
+            .claims
             .iter()
             .filter(|((r, _), e)| {
                 r == repo
@@ -148,7 +149,15 @@ impl PeerClaimView {
                     && now.saturating_duration_since(e.received_at) < self.ttl
             })
             .map(|((_, pr), e)| (*pr, e.host.clone()))
-            .min()
+            .collect();
+        merges.sort();
+        merges
+    }
+
+    /// The live peer Champion merge in `repo` with the lowest PR number.
+    #[must_use]
+    pub fn merge_in_flight_at(&self, repo: &str, now: Instant) -> Option<(u32, String)> {
+        self.merges_in_flight_at(repo, now).into_iter().next()
     }
 }
 

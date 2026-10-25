@@ -52,9 +52,11 @@ pub struct Seen {
 /// What `weighing` (after the claims were taken out of it) and `claims` say.
 #[must_use]
 pub fn seen_from(weighing: &Weighing, claims: &DrawClaims, local_host: &str) -> Seen {
+    // With a merge concurrency above one (#13026) several merges can hold the
+    // lane; the lowest-numbered one stands as the blocker.
     let blocker = claims
-        .merge_in_flight
-        .as_ref()
+        .merges_in_flight
+        .first()
         .map(|(pr, host)| (*pr, host == local_host));
     let mut seen = Seen {
         blocker,

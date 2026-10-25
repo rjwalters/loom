@@ -505,6 +505,13 @@ pub enum PassReason {
     /// tick's gather applies it (`step_dispatch::gather::hold_at_recorded_head`),
     /// because a `PullInput` carries no head SHA.
     HeldAtHead,
+    /// A curated issue the promotion author gate holds (#10827) whose verdict
+    /// would be the same again (#13142): its trusted gate marker names the
+    /// issue's current title and body and the current trust rules, and no
+    /// `loom:issue` has been applied. The classifier never answers it: the
+    /// step tick's gather applies it
+    /// (`step_dispatch::gather::hold_author_gated`).
+    AuthorGateHeld,
 }
 
 impl PassReason {
@@ -527,6 +534,7 @@ impl PassReason {
             Self::Draft => "draft",
             Self::CiPending => "ci_pending",
             Self::HeldAtHead => "held_at_head",
+            Self::AuthorGateHeld => "author_gate_held",
         }
     }
 }

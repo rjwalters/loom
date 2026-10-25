@@ -225,6 +225,27 @@ impl TrustPolicy {
         )
     }
 
+    /// A short digest of the rules (#13142): the first 16 hex of the sha256 of
+    /// the fleet logins, self identity, allowlist and admin roster. A change to
+    /// who is trusted changes it, so a verdict that depended on trust can be
+    /// re-reached once.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        let canon = serde_json::json!({
+            "fleet": self.fleet.names(),
+            "self": self.self_login,
+            "allow": sorted(&self.allowlist),
+            "admins": sorted(&self.admins),
+        });
+        hex::encode(Sha256::digest(canon.to_string().as_bytes()))[..16].to_string()
+    }
+
     /// The rules for the workspace at `root`: its fleet roster, its writer
     /// App as the self identity, and its configured allowlist.
     #[must_use]

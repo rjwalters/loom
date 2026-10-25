@@ -695,3 +695,88 @@ fn first_drop_total_observation_is_a_baseline_not_a_gap() {
     assert_eq!(newly_dropped_since(&mut last, 10_582), 0);
     assert_eq!(newly_dropped_since(&mut last, 10_584), 2);
 }
+
+// ---------------------------------------------------------------------------
+// The chunk tap does not hold its lock across store I/O (2am#13158)
+// ---------------------------------------------------------------------------
+
+struct BlockingStore {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl chunker::ChunkStore for BlockingStore {
+    fn put(&self, _chunk: &chunker::Chunk) -> Result<(), String> {
+        self.entered.send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        Ok(())
+    }
+}
+
+#[test]
+fn offer_returns_while_a_store_put_is_in_flight() {
+    use crate::telemetry::kinds::session_output::{Launch, RunIdentity};
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let tap = Arc::new(ChunkTap {
+        chunker: std::sync::Mutex::new(chunker::Chunker::with_limits(
+            "host-a",
+            1,
+            std::time::Duration::from_secs(5),
+            8,
+        )),
+        store: Arc::new(BlockingStore {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }),
+    });
+    let record = |sequence: u64| {
+        SessionOutputRecord::new_output(
+            RunIdentity {
+                repo: Some("o/r".to_string()),
+                visibility: crate::telemetry::RepoVisibility::Private,
+                issue: Some(13158),
+                session_kind: Some(crate::telemetry::SessionKind::Sweep),
+                sweep_id: Some("sweep-1".to_string()),
+                session_id: Some("sess-1".to_string()),
+                attempt: Some(1),
+                runtime: "claude".to_string(),
+                role: Some("builder".to_string()),
+                launch: Launch::Daemon,
+            },
+            "s1",
+            sequence,
+            now(),
+            now(),
+            "text",
+        )
+    };
+    tap.offer(&record(0));
+    let pumping = {
+        let tap = Arc::clone(&tap);
+        std::thread::spawn(move || tap.pump_due(now()))
+    };
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+
+    // The put is parked inside the store; `offer` must still complete.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let offering = {
+        let tap = Arc::clone(&tap);
+        let r = record(1);
+        std::thread::spawn(move || {
+            tap.offer(&r);
+            done_tx.send(()).unwrap();
+        })
+    };
+    let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+    release_tx.send(()).unwrap();
+    returned.expect("offer blocked behind an in-flight put");
+    offering.join().unwrap();
+    let pointers = pumping.join().unwrap();
+    // Only the chunk that was stored is committed; the one sealed mid-put stays.
+    assert_eq!(pointers.len(), 1);
+    assert_eq!(pointers[0].first_sequence, 0);
+    assert_eq!(tap.chunker.lock().unwrap().queued(), 1);
+}

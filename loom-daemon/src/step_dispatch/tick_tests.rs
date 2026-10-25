@@ -97,6 +97,9 @@ fn workspace_cooling(
         weighing: weigh(&items, &ctx, &ItemWeights::default()),
         halted: false,
         created_at: HashMap::new(),
+        merge_slots: 1,
+        merge_concurrency: 1,
+        merges_in_flight: 0,
     }
 }
 
@@ -299,7 +302,8 @@ fn live_claims_leave_the_pool_as_claimed_and_a_peer_merge_as_merge_in_flight() {
     let before = ws.weighing.pool.len();
     let claims = DrawClaims {
         items: std::collections::HashSet::from([1, 40]),
-        merge_in_flight: Some((61, "peer".to_string())),
+        merges_in_flight: vec![(61, "peer".to_string())],
+        ..DrawClaims::default()
     };
     let claimed_before = ws
         .weighing
@@ -352,7 +356,8 @@ fn a_repo_with_a_merge_in_flight_spends_no_draw_or_pass_on_its_merges() {
     assert_eq!(merge_steps(&busy), 6);
     let claims = DrawClaims {
         items: std::collections::HashSet::new(),
-        merge_in_flight: Some((999, "peer".to_string())),
+        merges_in_flight: vec![(999, "peer".to_string())],
+        ..DrawClaims::default()
     };
     exclude_claimed(&mut busy.weighing, &claims);
     assert_eq!(merge_steps(&busy), 0);
@@ -461,6 +466,85 @@ fn a_merge_spawned_mid_tick_defers_the_repos_other_merges() {
     assert_eq!(replay_record(record).unwrap().len(), 2);
 }
 
+/// `ws` allowed `n` merges at once with `in_flight` already running.
+fn merge_lane(mut ws: StepWorkspace, n: usize, in_flight: usize) -> StepWorkspace {
+    ws.merge_concurrency = n;
+    ws.merges_in_flight = in_flight;
+    ws.merge_slots = n.saturating_sub(in_flight);
+    ws
+}
+
+#[test]
+fn a_merge_concurrency_of_two_spawns_two_merges_then_defers_the_rest() {
+    // #13026: with `champion.mergeConcurrencyPerRepo = 2` the repo's merge
+    // steps close only once the second merge is spawned.
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(
+        vec![merge_lane(
+            workspace(0, "acme/one", &merges_and_a_curator(5)),
+            2,
+            0,
+        )],
+        limits(10),
+        &mut spawner,
+    );
+    let merges = spawner
+        .asked
+        .iter()
+        .filter(|a| a.2 == StepRole::ChampionMerge)
+        .count();
+    assert_eq!(merges, 2, "{:?}", spawner.asked);
+    assert_eq!(tick.report.dispatched, 3);
+    assert_eq!(tick.merge_deferred, 3);
+    assert_eq!(tick.merge_concurrency, 2);
+    assert_eq!(tick.merges_in_flight, 2);
+    assert!(tick.passes.is_empty(), "{:?}", tick.passes);
+}
+
+#[test]
+fn a_merge_already_in_flight_leaves_one_slot_at_a_concurrency_of_two() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(
+        vec![merge_lane(
+            workspace(0, "acme/one", &merges_and_a_curator(5)),
+            2,
+            1,
+        )],
+        limits(10),
+        &mut spawner,
+    );
+    let merges = spawner
+        .asked
+        .iter()
+        .filter(|a| a.2 == StepRole::ChampionMerge)
+        .count();
+    assert_eq!(merges, 1, "{:?}", spawner.asked);
+    assert_eq!(tick.merges_in_flight, 2);
+}
+
+#[test]
+fn exclude_claimed_defers_merges_only_when_the_lane_is_full() {
+    let in_flight = |n: usize, limit: usize| DrawClaims {
+        items: std::collections::HashSet::new(),
+        merges_in_flight: (0..n)
+            .map(|i| (900 + i as u32, "peer".to_string()))
+            .collect(),
+        merge_concurrency: limit,
+    };
+    let merges_left = |claims: DrawClaims| {
+        let mut ws = workspace(0, "acme/one", &merges_and_a_curator(3));
+        exclude_claimed(&mut ws.weighing, &claims);
+        merge_steps(&ws)
+    };
+    // Unset (0) reads as 1: one merge in flight fills the lane.
+    assert_eq!(merges_left(in_flight(1, 0)), 0);
+    assert_eq!(merges_left(in_flight(1, 1)), 0);
+    // Two allowed: one in flight leaves the lane open, two fill it.
+    assert_eq!(merges_left(in_flight(1, 2)), 3);
+    assert_eq!(merges_left(in_flight(2, 2)), 0);
+    assert_eq!(merges_left(in_flight(0, 1)), 3);
+}
+
 #[test]
 fn a_hold_reevaluation_stays_serialised_behind_the_repos_merge() {
     // #12494 asked whether `champion_hold_reevaluate` needs the repo's merge
@@ -484,7 +568,8 @@ fn a_hold_reevaluation_stays_serialised_behind_the_repos_merge() {
         &mut ws.weighing,
         &DrawClaims {
             items: std::collections::HashSet::new(),
-            merge_in_flight: Some((101, "peer".to_string())),
+            merges_in_flight: vec![(101, "peer".to_string())],
+            ..DrawClaims::default()
         },
     );
     assert!(ws

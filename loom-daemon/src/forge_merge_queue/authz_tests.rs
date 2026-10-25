@@ -455,8 +455,13 @@ fn a_new_head_never_inherits_the_old_success() {
     let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
     handoff(&f, &s).unwrap();
     f.push_head(SHA2);
+    // GitHub dequeues a PR whose head moves.
+    *f.queued.borrow_mut() = None;
     assert_eq!(f.head_status.borrow().get(SHA2), None);
-    assert!(handoff_at(&f, &s, SHA2).is_err(), "SHA2 needs its own grant and status");
+    // SHA2 is enqueued only after it earns its own grant and status.
+    assert!(matches!(handoff_at(&f, &s, SHA2), Ok(EnqueueOutcome::Enqueued { .. })));
+    assert_eq!(f.head_status.borrow().get(SHA2), Some(&StatusState::Success));
+    assert_eq!(s.get(PR).unwrap().unwrap().approved_sha, SHA2);
 }
 
 fn handoff_at(

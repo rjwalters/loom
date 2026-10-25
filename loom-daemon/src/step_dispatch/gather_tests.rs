@@ -252,6 +252,77 @@ mod ci_hold {
         let held = hold_ci_pending(&mut items, &HashMap::new(), 4, |_| None, |_| panic!("no read"));
         assert_eq!(held, 0, "a PR with no known head is drawn unread");
     }
+
+    fn extras(
+        state: Option<&str>,
+        hours_ago: i64,
+    ) -> std::collections::BTreeMap<u32, crate::discovery::ItemExtras> {
+        let checks = state.map(|s| crate::discovery::Checks {
+            state: s.to_string(),
+            started_at: Some((now() - chrono::Duration::hours(hours_ago)).to_rfc3339()),
+        });
+        std::collections::BTreeMap::from([(
+            5,
+            crate::discovery::ItemExtras {
+                checks,
+                ..Default::default()
+            },
+        )])
+    }
+
+    /// Run the gather's wiring: the snapshot's verdict first, a counted read
+    /// only for a head with no summary (#12317).
+    fn with_snapshot(
+        items: &mut [Item],
+        summaries: &std::collections::BTreeMap<u32, crate::discovery::ItemExtras>,
+    ) -> (usize, usize) {
+        let verdicts = summary_verdicts(&heads(), summaries, now());
+        let reads = std::cell::Cell::new(0usize);
+        let held = hold_ci_pending(
+            items,
+            &heads(),
+            4,
+            |sha| verdicts.get(sha).copied(),
+            |_| {
+                reads.set(reads.get() + 1);
+                false
+            },
+        );
+        (held, reads.get())
+    }
+
+    #[test]
+    fn a_pending_summary_holds_the_judge_step_without_a_read() {
+        let mut items = judge_and_issue();
+        let (held, reads) = with_snapshot(&mut items, &extras(Some("pending"), 1));
+        assert_eq!((held, reads), (1, 0));
+        assert_eq!(judge(&items), Verdict::Pass(PassReason::CiPending));
+    }
+
+    #[test]
+    fn a_success_or_failure_summary_admits_the_judge_step_without_a_read() {
+        for state in ["success", "failure"] {
+            let mut items = judge_and_issue();
+            let (held, reads) = with_snapshot(&mut items, &extras(Some(state), 1));
+            assert_eq!((held, reads), (0, 0), "{state}");
+            assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+        }
+    }
+
+    #[test]
+    fn a_pending_summary_older_than_six_hours_is_drawn() {
+        let mut items = judge_and_issue();
+        let (held, reads) = with_snapshot(&mut items, &extras(Some("pending"), 7));
+        assert_eq!((held, reads), (0, 0));
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn a_missing_summary_falls_back_to_one_counted_read() {
+        let mut items = judge_and_issue();
+        let (held, reads) = with_snapshot(&mut items, &extras(None, 0));
+        assert_eq!((held, reads), (0, 1));
+    }
 }
 
 /// #12074: a failed open-PR listing keeps the last good PR set but never
@@ -378,5 +449,78 @@ mod held_at_head {
     fn it_fails_open_without_a_recorded_or_current_head() {
         assert_eq!(run(&map(HEAD), &HashMap::new(), &[]).0, 0);
         assert_eq!(run(&HashMap::new(), &map(HEAD), &[]).0, 0);
+    }
+}
+
+mod author_gate_held {
+    use super::*;
+    use crate::promotion_author::{revision, Stamp};
+
+    const TRUST: &str = "0123456789abcdef";
+
+    /// Issue 7, `loom:curated` only: a `ChampionPromote` step.
+    fn curated() -> Vec<Item> {
+        let rows = vec![row(7, &["loom:curated"], "body", false)];
+        let items = classify_rows(&rows, &IssueFacts::default());
+        assert_eq!(items[0].step(), Some(Step::ChampionPromote), "{items:?}");
+        items
+    }
+
+    fn stamp(body: &str, trust: &str) -> Stamp {
+        Stamp {
+            rev: revision("item 7", body),
+            trust: trust.to_string(),
+        }
+    }
+
+    fn run(stamps: Vec<Stamp>, body: &str, trust: Option<&str>) -> (usize, Verdict) {
+        let mut items = curated();
+        let gates = HashMap::from([(7, stamps)]);
+        let revs = HashMap::from([(7, revision("item 7", body))]);
+        let n = hold_author_gated(&mut items, &gates, &revs, trust);
+        (n, items[0].verdict)
+    }
+
+    #[test]
+    fn a_gated_issue_with_unchanged_inputs_is_not_drawn() {
+        let (n, v) = run(vec![stamp("body", TRUST)], "body", Some(TRUST));
+        assert_eq!((n, v), (1, Verdict::Pass(PassReason::AuthorGateHeld)));
+        assert_eq!(PassReason::AuthorGateHeld.as_str(), "author_gate_held");
+    }
+
+    #[test]
+    fn a_body_edit_after_the_gate_makes_it_drawable() {
+        assert_eq!(run(vec![stamp("body", TRUST)], "edited", Some(TRUST)).0, 0);
+    }
+
+    #[test]
+    fn a_trust_change_makes_it_drawable() {
+        assert_eq!(run(vec![stamp("body", TRUST)], "body", Some("fedcba9876543210")).0, 0);
+    }
+
+    #[test]
+    fn an_older_matching_stamp_still_holds_an_edit_reverted() {
+        let stamps = vec![stamp("body", TRUST), stamp("edited", TRUST)];
+        assert_eq!(run(stamps, "body", Some(TRUST)).0, 1);
+    }
+
+    #[test]
+    fn no_stamp_no_digest_or_no_marker_read_fails_open() {
+        // A legacy notice parses to no stamp; an unreadable read has no entry.
+        assert_eq!(run(vec![], "body", Some(TRUST)).0, 0);
+        assert_eq!(run(vec![stamp("body", TRUST)], "body", None).0, 0);
+        let mut items = curated();
+        let revs = HashMap::from([(7, revision("item 7", "body"))]);
+        assert_eq!(hold_author_gated(&mut items, &HashMap::new(), &revs, Some(TRUST)), 0);
+        assert_eq!(items[0].step(), Some(Step::ChampionPromote));
+    }
+
+    #[test]
+    fn only_promote_steps_are_held() {
+        let rows = vec![row(7, &["loom:issue"], "body", false)];
+        let mut items = classify_rows(&rows, &IssueFacts::default());
+        let gates = HashMap::from([(7, vec![stamp("body", TRUST)])]);
+        let revs = HashMap::from([(7, revision("item 7", "body"))]);
+        assert_eq!(hold_author_gated(&mut items, &gates, &revs, Some(TRUST)), 0);
     }
 }

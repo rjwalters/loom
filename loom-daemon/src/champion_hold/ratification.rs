@@ -58,7 +58,7 @@ pub const DEFAULT_PHRASES: [&str; 3] = [
 
 /// A `Status: Proposed|Ratified` line: a hold only when the file also carries
 /// a ratification clause ([`CLAUSE`]), so a bare status line never holds.
-const STATUS: &str = r"status:\s*(proposed|ratified)\b";
+pub(crate) const STATUS: &str = r"status:\s*(proposed|ratified)\b";
 /// "ratif…" within one clause of a merge / approval / operator.
 const CLAUSE: &str = r"ratif\w*[^.\n]{0,80}\b(merge|merging|merged|approv\w*|operator)\b";
 

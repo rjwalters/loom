@@ -583,6 +583,48 @@ pub fn fleet_captain_arm_ttl_secs(repo_root: &Path) -> u64 {
         .unwrap_or(DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS)
 }
 
+/// Dotted key of the per-repo Champion merge concurrency (#13026).
+pub const CHAMPION_MERGE_CONCURRENCY_KEY: &str = "champion.mergeConcurrencyPerRepo";
+
+/// Env override of [`CHAMPION_MERGE_CONCURRENCY_KEY`].
+pub const CHAMPION_MERGE_CONCURRENCY_ENV: &str = "LOOM_CHAMPION_MERGE_CONCURRENCY";
+
+/// How many Champion merges may run at once in one repo when the key is
+/// unset: one, the serial lane of design §6.
+pub const DEFAULT_CHAMPION_MERGE_CONCURRENCY: usize = 1;
+
+/// The value of `raw` as a merge concurrency: a positive integer, else
+/// `None`. A zero, negative, fractional or non-numeric value fails closed to
+/// the default rather than lifting or removing the lane.
+fn merge_concurrency_value(raw: &Value) -> Option<usize> {
+    raw.as_u64()
+        .filter(|v| *v > 0)
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+}
+
+/// [`champion_merge_concurrency`] from an already-resolved config.
+#[must_use]
+pub fn champion_merge_concurrency_in(effective: &Value) -> usize {
+    get_path(effective, CHAMPION_MERGE_CONCURRENCY_KEY)
+        .and_then(merge_concurrency_value)
+        .unwrap_or(DEFAULT_CHAMPION_MERGE_CONCURRENCY)
+}
+
+/// Read `champion.mergeConcurrencyPerRepo` (env > config > default `1`): how
+/// many Champion merges may run at once in `repo_root`'s repo (#13026).
+/// Read fresh each tick, so a change needs no daemon roll. An unparsable or
+/// non-positive value is ignored, falling through to the next source, and an
+/// unset key is `1`: today's one merge in flight per repo.
+#[must_use]
+pub fn champion_merge_concurrency(repo_root: &Path) -> usize {
+    if let Ok(raw) = std::env::var(CHAMPION_MERGE_CONCURRENCY_ENV) {
+        if let Some(parsed) = raw.trim().parse::<u64>().ok().filter(|v| *v > 0) {
+            return usize::try_from(parsed).unwrap_or(usize::MAX);
+        }
+    }
+    champion_merge_concurrency_in(&resolve_effective_config(repo_root))
+}
+
 /// Dotted key of the retired `curator.backlogTarget` (#11819, retired #12077).
 pub const CURATOR_BACKLOG_TARGET_KEY: &str = "curator.backlogTarget";
 
@@ -1538,5 +1580,21 @@ mod tests {
         assert!(!second, "already warned");
         // Another test in this process may have warned first.
         let _ = first;
+    }
+
+    #[test]
+    fn test_champion_merge_concurrency_defaults_to_one_and_fails_closed() {
+        let key = |v: Value| serde_json::json!({ "champion": { "mergeConcurrencyPerRepo": v } });
+        assert_eq!(champion_merge_concurrency_in(&serde_json::json!({})), 1);
+        assert_eq!(champion_merge_concurrency_in(&key(serde_json::json!(3))), 3);
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-2),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+            Value::Null,
+        ] {
+            assert_eq!(champion_merge_concurrency_in(&key(bad.clone())), 1, "{bad}");
+        }
     }
 }

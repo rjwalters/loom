@@ -722,6 +722,7 @@ fn a_stop_projects_the_gate_it_names_and_is_never_ledger_failed() {
         ("requeued", "ci_pending", "ci_pending"),
         ("requeued", "mergeable_unknown", "mergeable_unknown"),
         ("requeued", "pin_missing", "pin_missing"),
+        ("requeued", "guard_refused", "guard_refused"),
         ("requeued", "merge_rc7", "merge_rc7"),
         ("requeued", "merge_rc123", "unspecified"),
         ("requeued", "bogus", "unspecified"),

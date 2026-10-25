@@ -388,6 +388,38 @@ pub fn hold_ci_pending(
     held
 }
 
+/// Whether a head's snapshot check summary holds a Judge step (#12317): the
+/// same rule as `ci_pending_at_sha` (pending, and started inside the 6-hour
+/// window of #12003), evaluated on the summary's newest run time. A
+/// `success` or `failure` summary never holds; a pending one with no usable
+/// start stamp counts as stuck, as the live read does. Pure.
+#[must_use]
+pub fn summary_pending(checks: &crate::discovery::Checks, now: DateTime<Utc>) -> bool {
+    checks.state.eq_ignore_ascii_case("pending")
+        && crate::judge_backstop::pending_exempts(
+            std::slice::from_ref(&checks.started_at.clone().unwrap_or_default()),
+            now,
+        )
+}
+
+/// Each PR's head → whether its snapshot check summary holds a Judge step.
+/// A head the snapshot carries no summary for is absent (the caller falls
+/// back to a conditional read). Pure.
+#[must_use]
+pub fn summary_verdicts(
+    heads: &HashMap<u32, String>,
+    extras: &std::collections::BTreeMap<u32, crate::discovery::ItemExtras>,
+    now: DateTime<Utc>,
+) -> HashMap<String, bool> {
+    heads
+        .iter()
+        .filter_map(|(n, sha)| {
+            let checks = extras.get(n)?.checks.as_ref()?;
+            Some((sha.clone(), summary_pending(checks, now)))
+        })
+        .collect()
+}
+
 /// Turn every [`Step::ChampionHoldReevaluate`] whose PR is still at the head
 /// its hold recorded into a [`PassReason::HeldAtHead`] pass (#12900), and
 /// return how many it held. Such a run re-reads the same head and ends
@@ -442,6 +474,41 @@ pub fn hold_at_recorded_head(
     held
 }
 
+/// Turn every [`Step::ChampionPromote`] whose issue the promotion author gate
+/// already holds into a [`PassReason::AuthorGateHeld`] pass (#13142), and
+/// return how many it held. Such a draw is a full Champion session that finds
+/// the issue still gated and changes nothing. `gates` maps an issue to the
+/// [`Stamp`]s of its trusted gate comments; `revs` to the revision of its
+/// current title and body. The issue is held while one stamp names that
+/// revision and the current trust digest: an edit, a trust change, or a
+/// legacy (unstamped) notice makes it drawn once, and its re-gate posts a
+/// notice with the new stamp. A trusted `loom:issue` leaves the
+/// `ChampionPromote` queue by itself. Fails open: an issue with no readable
+/// stamp, revision or trust digest is drawn. Pure.
+pub fn hold_author_gated(
+    items: &mut [Item],
+    gates: &HashMap<u32, Vec<crate::promotion_author::Stamp>>,
+    revs: &HashMap<u32, String>,
+    trust: Option<&str>,
+) -> usize {
+    let Some(trust) = trust else { return 0 };
+    let mut held = 0usize;
+    for item in items.iter_mut() {
+        if item.step() != Some(Step::ChampionPromote) {
+            continue;
+        }
+        let Some(n) = item.target() else { continue };
+        let (Some(stamps), Some(rev)) = (gates.get(&n), revs.get(&n)) else {
+            continue;
+        };
+        if stamps.iter().any(|s| s.rev == *rev && s.trust == trust) {
+            item.verdict = Verdict::Pass(PassReason::AuthorGateHeld);
+            held += 1;
+        }
+    }
+    held
+}
+
 // ---------------------------------------------------------------------------
 // The forge half
 // ---------------------------------------------------------------------------
@@ -454,8 +521,9 @@ fn marker_cache() -> &'static Mutex<MarkerCache> {
 }
 
 /// The hold markers of the `loom:blocked` PRs among `rows`, from their
-/// trusted comments, cached per `updated_at`.
-fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, PullMarkers> {
+/// trusted comments, cached per `updated_at`, and how many comment reads that
+/// took (`loom.discovery.live_reads.markers`, #12317).
+fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> (HashMap<u32, PullMarkers>, u64) {
     let mut out = HashMap::new();
     let mut reads = 0usize;
     let cache = || {
@@ -496,6 +564,69 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
         let markers = PullMarkers::from_trusted(&TrustedComments::filtered(&policy, trusted));
         cache().insert(key, (row.updated_at.clone(), markers.clone()));
         out.insert(row.number, markers);
+    }
+    (out, reads as u64)
+}
+
+type GateCache = HashMap<(String, u32), (Option<String>, Vec<crate::promotion_author::Stamp>)>;
+
+fn gate_cache() -> &'static Mutex<GateCache> {
+    static CACHE: OnceLock<Mutex<GateCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The gate stamps of the trusted comments on the curated issues among
+/// `numbers` (the `ChampionPromote` candidates), cached per `updated_at`, at
+/// most [`MAX_MARKER_READS`] reads per tick. An issue whose comments cannot
+/// be read, or are past the budget, is absent: it is drawn.
+fn gate_stamps(
+    slug: &str,
+    root: &Path,
+    rows: &[RestIssue],
+    numbers: &[u32],
+) -> HashMap<u32, Vec<crate::promotion_author::Stamp>> {
+    let mut out = HashMap::new();
+    let mut reads = 0usize;
+    let cache = || {
+        gate_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    // #12310: the gate-marker comment reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
+    for row in rows
+        .iter()
+        .filter(|r| numbers.contains(&r.number) && r.comments > 0)
+    {
+        let key = (slug.to_string(), row.number);
+        let cached = cache()
+            .get(&key)
+            .filter(|(at, _)| *at == row.updated_at)
+            .map(|(_, s)| s.clone());
+        if let Some(stamps) = cached {
+            out.insert(row.number, stamps);
+            continue;
+        }
+        if reads >= MAX_MARKER_READS {
+            continue;
+        }
+        reads += 1;
+        let Some(trusted) = crate::comment_trust::records::fetch_trusted_comments(
+            slug,
+            &row.number.to_string(),
+            root,
+            true,
+        ) else {
+            continue;
+        };
+        let stamps: Vec<_> = TrustedComments::filtered(&policy, trusted)
+            .bodies()
+            .iter()
+            .filter_map(|b| crate::promotion_author::Stamp::parse(b))
+            .collect();
+        cache().insert(key, (row.updated_at.clone(), stamps.clone()));
+        out.insert(row.number, stamps);
     }
     out
 }
@@ -570,13 +701,19 @@ pub fn list(
             .map_err(|e| anyhow::anyhow!("{e:#}")),
     )?;
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    // #12317: a worklist repo's per-PR check summaries.
+    let summaries = repo_snapshot
+        .as_ref()
+        .ok()
+        .filter(|r| r.source == crate::discovery::Source::Worklist)
+        .map(|r| r.extras.clone());
     let pull_listing = repo_snapshot
         .ok()
         .and_then(|r| r.pulls.clone())
         .ok_or_else(|| anyhow::anyhow!("open-PR listing unavailable"));
     let (pulls, pulls_complete) = pulls_or_last_good(&slug, pull_listing);
     let full: HashMap<u32, RestPull> = pulls.into_iter().map(|p| (p.number, p)).collect();
-    let markers = pull_markers(&slug, root, &rows);
+    let (markers, marker_reads) = pull_markers(&slug, root, &rows);
     let pulls: Vec<PullInput> = rows
         .iter()
         .filter(|r| r.is_pull_request)
@@ -608,10 +745,10 @@ pub fn list(
         .filter(|r| !r.is_pull_request && has(&r.labels, ISSUE))
         .map(|r| r.number)
         .collect();
+    let (landed, landed_reads) =
+        crate::work_finder::landed_prefilter::landed_in_counted(registry, &ready, &linked_by_pr);
     let facts = IssueFacts {
-        landed: crate::work_finder::landed_prefilter::landed_in(registry, &ready, &linked_by_pr)
-            .into_iter()
-            .collect(),
+        landed: landed.into_iter().collect(),
         red_fix: rows
             .iter()
             .filter(|r| !r.is_pull_request && has_red_fix_marker(r.body.as_deref()))
@@ -653,13 +790,30 @@ pub fn list(
         .iter()
         .filter_map(|(n, p)| p.head_sha.clone().map(|sha| (*n, sha)))
         .collect();
+    // #12317: on a worklist repo the snapshot's check summary answers; a
+    // head with none is read once (conditionally) and counted.
+    let verdicts = summaries
+        .as_ref()
+        .map(|extras| summary_verdicts(&heads, extras, Utc::now()));
+    let ci_fallbacks = std::cell::Cell::new(0u64);
     let held = hold_ci_pending(
         &mut items,
         &heads,
         MAX_CI_READS,
-        |sha| crate::pr_planning::ci_pending_cached(&root_dir, sha),
-        |sha| crate::pr_planning::ci_pending_at_sha(&root_dir, &gh_bin, sha),
+        |sha| {
+            verdicts
+                .as_ref()
+                .and_then(|v| v.get(sha).copied())
+                .or_else(|| crate::pr_planning::ci_pending_cached(&root_dir, sha))
+        },
+        |sha| {
+            if verdicts.is_some() {
+                ci_fallbacks.set(ci_fallbacks.get() + 1);
+            }
+            crate::pr_planning::ci_pending_at_sha(&root_dir, &gh_bin, sha)
+        },
     );
+    snapshot.note_live_reads(landed_reads, marker_reads, ci_fallbacks.get());
     if held > 0 {
         log::debug!("work_finder: {slug}: {held} Judge step(s) held while CI runs at the head");
     }
@@ -678,6 +832,33 @@ pub fn list(
     );
     if at_head > 0 {
         log::debug!("work_finder: {slug}: {at_head} held PR(s) unchanged since their hold");
+    }
+    let promote: Vec<u32> = items
+        .iter()
+        .filter(|i| i.step() == Some(Step::ChampionPromote))
+        .filter_map(Item::target)
+        .collect();
+    if !promote.is_empty() {
+        let revs: HashMap<u32, String> = rows
+            .iter()
+            .filter(|r| promote.contains(&r.number))
+            .map(|r| {
+                let rev = crate::promotion_author::revision(
+                    r.title.as_deref().unwrap_or_default(),
+                    r.body.as_deref().unwrap_or_default(),
+                );
+                (r.number, rev)
+            })
+            .collect();
+        let gated = hold_author_gated(
+            &mut items,
+            &gate_stamps(&slug, root, &rows, &promote),
+            &revs,
+            Some(policy.digest().as_str()),
+        );
+        if gated > 0 {
+            log::debug!("work_finder: {slug}: {gated} curated issue(s) held by the author gate");
+        }
     }
     Ok(Some(Listed {
         slug,
