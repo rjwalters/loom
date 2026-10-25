@@ -20,6 +20,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #12425** (closed): auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3)
 - **Issue #12419** (closed): fleet-sync: a restart-only fleet config change arms the pause-and-roll restart
 - **Issue #12082** (closed): Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout
+- **Issue #12863** (closed): Review dated guard-confinement evidence and owner-specific cases from gf180-opamp #214
 
 ### 2026-10-24
 
