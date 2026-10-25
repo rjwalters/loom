@@ -13,8 +13,93 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-25
+
+- **PR #12442**: feat: restart the daemon onto the same binary for restart-required config
+- **Issue #12425** (closed): auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3)
+
+### 2026-10-24
+
+- **PR #13161**: fix: run chunk store puts outside the ChunkTap mutex
+- **PR #13157**: feat(session-output): chunk post-scrub records to logs/ with pointer events
+- **PR #13153**: fix: refresh installation snapshot on a miss and short-cache NOT_IN_INSTALLATION
+- **PR #13145**: fix: hold author-gated curated issues out of champion_promote draws
+- **PR #13138**: fix: short cool-down for gate-refused Judge passes in the no-verdict backstop
+- **PR #13133**: fix: lease pr release names the claimant and exits 8 on an identity mismatch
+- **PR #13131**: fix: drop removed native column from MergeLaneWait and ChampionRun telemetry entries
+- **PR #13129**: fix: compare PR head, not queue entry head, in merge-queue enqueue
+- **PR #13127**: test: share assert helpers across tests/install suites
+- **PR #13125**: fix: compare merge-queue grant to the PR head, not the entry's group commit
+- **PR #13121**: fix(wait-checks): ignore a failed merge-authorization status in the CI verdict
+- **PR #13107**: feat: add additive-migrations verb and opt-in Champion class for additive SQL
+- **PR #13086**: refactor(tests): share one hermetic git helper across worktree differential tests
+- **PR #13034**: feat: export merge-lane waits and Champion run outcomes to OTLP
+- **PR #13028**: feat: make Champion merges per repo a runtime tunable
+- **PR #13013**: fix: ignore heartbeat steps for ended assignments in the fleet captain
+- **PR #13012**: feat: carry queue level, workspace_weight and seen over OTLP
+- **PR #13011**: fix: keep holds with no recorded auth digest at their head; export tick exclusions
+- **PR #12466**: feat: reap idle worktrees of open issues and PRs
+- **PR #11803**: fix(daemon-stop): record operator stops instead of deleting intent; leave the watchdog armed
+- **PR #11800**: fix(guard): scan subagent transcripts for background Bash (#9081)
+- **PR #11791**: fix: route every loom:curated write through curation-complete (#11787)
+- **Issue #13158** (closed): session.output chunk tap: don't hold chunker mutex across ChunkStore::put
+- **Issue #13152** (closed): write-scope: a repo created after the installation snapshot is refused 'not-in-installation' for up to ~2h, and the miss is cached
+- **Issue #13142** (closed): Champion re-draws issues held by the promotion author gate: 144 no-op champion_promote sessions on 12 issues in 4 days
+- **Issue #13135** (closed): Judge no-verdict backstop holds re-review for hours after a gate-artifact refusal, not a real no-verdict
+- **Issue #13132** (closed): lease pr release without --watch-pid silently releases nothing and leaves the lease live
+- **Issue #13130** (closed): main fails to compile: MergeLaneWait still uses removed 'native:' telemetry column
+- **Issue #13128** (closed): merge queue: enqueue still compares the queue entry's headCommit (merge-group commit) to the approved head (ops.rs, sibling of #13124)
+- **Issue #13126** (closed): Consolidate duplicated assert_eq helpers across 17 tests/install suites
+- **Issue #13124** (closed): merge queue: same-head grant revoked as revoked-grant-for-other-head; PR never enqueued (loom-ui#5446, #12579 regression?)
+- **Issue #13120** (closed): Judge's red-CI gate treats loom/merge-authorization "revoked" as CI, deadlocking a fixed PR into loom:operator
+- **Issue #13102** (closed): Champion: opt-in additive-migrations exception to the migrations kept-set (CREATE IF NOT EXISTS / ADD COLUMN / INSERT OR IGNORE backfill)
+- **Issue #13029** (closed): Telemetry: merge-lane waits, Champion re-read outcomes, fleet_dispatch call outcomes, held-PR gauge (gaps found 2026-10-20/21)
+- **Issue #13009** (closed): Captain champion_merge slot stays held ~20 min after a successful /v1/release (holder outlives its release until lease expiry)
+- **Issue #13008** (closed): Merge-risk holds are redrawn at their held head again: #12933 draws holds with no auth= digest, and only critical-file holds record one
+- **Issue #13007** (closed): Carry the remaining queue-plan fields (urgent, operator_priority, tier, workspace_weight, shard, listing_failed, seen) over OTLP for the dashboard's SigNoz Live board
+- **Issue #12458** (closed): Reap idle clean worktrees of open issues/PRs (configurable idle period)
+- **Issue #12453** (closed): Worktree reaper keeps every open item's worktree forever: ~400 idle worktrees per host; reap idle clean worktrees, reclaim Python caches, bound tool caches, export reaper telemetry
+- **Issue #12311** (closed): Discovery interface: mirror backend (one worklist read per tick, in-memory 304 cache), the config-chosen tier chain, and the step gather reading one snapshot
+- **Issue #11787** (closed): issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate)
+- **Issue #9957** (closed): daemon: deliberate stops (SIGTERM) are silent autonomy losses — the watchdog goes down with it, the intent marker is deleted, and bootstrap cannot recover
+- **Issue #9081** (closed): guard-background-subagents misses a background Bash started by a foreground subagent: headless sweep exits, Builder's make verify reaped
+
 ### 2026-10-23
 
+- **PR #13123**: chore(deps): Bump body-parser from 2.3.0 to 2.4.0 in /mcp-loom
+- **PR #13122**: chore(deps): Bump fast-uri from 3.1.8 to 3.1.9 in /mcp-loom
+- **PR #13119**: feat(telemetry): export Doctor claim lower bound and escalation facts on eta.dispatch_state
+- **PR #13117**: fix(champion): retry unreadable compares and carry a release across the requested change
+- **PR #13116**: docs(champion): close confirmed-superseded PRs during triage
+- **PR #13112**: chore(deps): Bump zod from 4.3.6 to 4.6.7 in /mcp-loom
+- **PR #13111**: refactor: rename lib/loom-tools.sh to lib/repo-root.sh with compat alias
+- **PR #13110**: refactor: drop shadowing assert_* copies from 15 test suites
+- **PR #13108**: fix: record quality metrics against the correlated input id
+- **PR #13106**: feat(merge-pr): port the post-merge stacked-child reconcile to one Rust orchestrator (#8191 slice)
+- **PR #13105**: feat: add epic revisit pass for starved epics
+- **PR #13103**: refactor: route five remaining atomic-write copies through fs_util::write_atomic
+- **PR #13097**: feat(champion): pass the kept-set hold for byte-matching resync PRs
+- **PR #13090**: fix: refuse to commit under a hostname-fallback git identity
+- **PR #13063**: feat: report and reset stale local branches reused by worktree.sh
+- **PR #13043**: fix: compose criticalFilesOnly standing authorizations per critical-file hit
+- **PR #13015**: feat(merge-pr): port the post-merge issue bookkeeping to one Rust orchestrator (#8191 slice)
+- **PR #13014**: feat: publish loom-tools release assets and add a daemon-free tools-only installer
+- **PR #11802**: ci: run Rust tests on label-file and defaults/forge-only PRs
+- **Issue #13115** (closed): Champion: close superseded PRs instead of parking them open under loom:blocked
+- **Issue #13114** (closed): Champion: carry an operator hold release across Doctor rebases when the PR's own diff is unchanged (or only the requested change)
+- **Issue #13109** (closed): Remove 26 shadowing assert_* copies (same arg order) in 15 test suites that already source lib/assert.sh
+- **Issue #13100** (closed): Quality-metrics capture writes input_id=0 so stats joins never match
+- **Issue #13099** (closed): Epic revisit: a periodic role pass that expands starved epics (or escalates them) so the fleet doesn't run dry with open epics
+- **Issue #13096** (closed): Champion: let a Loom resync pass the kept-set hold when every kept-set file byte-matches the upstream tag
+- **Issue #13088** (closed): Workers with no git identity commit as user@hostname; DCO repos then cycle Judge/Doctor before reaching the operator
+- **Issue #13065** (closed): Consolidate ~10 hand-rolled atomic-write helpers into fs_util::write_atomic
+- **Issue #13056** (closed): worktree.sh reuses a weeks-old local branch/worktree for an issue instead of starting from origin/main
+- **Issue #13042** (closed): Champion: let criticalFilesOnly standing authorizations compose per critical file
+- **Issue #12994** (closed): Champion: let the union of eligible criticalFilesOnly classes cover a PR's critical files
+- **Issue #12941** (closed): loom-tools Phase 2e: retire the historical lib/loom-tools.sh name — epic #12708
+- **Issue #12940** (closed): loom-tools Phase 2d: release loom-tools assets and a tools-only installer — epic #12708
+- **Issue #10181** (closed): ci: backend paths filter omits defaults/forge/**, so forge_inventory tests skip on manifest/baseline-only PRs
+- **Issue #10083** (closed): CI path filter skips label_registry Rust tests on label-file-only PRs (how #10072 turned main red)
 - **PR #13067**: refactor: add fs_util::write_atomic and migrate five duplicate helpers
 - **Issue #13094** (closed): [ci-daily] Docker Image Smokes (unfiltered)
 - **PR #13092**: chore(harness): track latest CLIs — codex 0.163.0→0.164.0
