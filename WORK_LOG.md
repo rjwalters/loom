@@ -15,6 +15,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-25
 
+- **PR #13172**: refactor: remove dead file-IPC MCP tools and writeMCPCommand
+- **PR #13168**: fix: drop stored ETags on miss-triggered installation refresh
+- **Issue #13174** (closed): labels: registry aliases for common non-Loom labels, and a 'labels check' for made-up labels
+- **Issue #13167** (closed): Remove dead MCP file-IPC (writeMCPCommand) and the seven tools that can never succeed
+- **Issue #12589** (closed): Archive older WORK_PLAN and WORK_LOG content through shared Loom maintenance
+- **Issue #9736** (closed): health: detect stalled release updates without a source checkout
 - **PR #12442**: feat: restart the daemon onto the same binary for restart-required config
 - **PR #12262**: fix: track cd in subshells, brace groups and pushd in write-confinement guard
 - **Issue #12425** (closed): auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3)
