@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-26
 
+- **PR #13207**: build(deps): Bump the cargo-minor-patch group across 1 directory with 4 updates
+- **PR #13206**: build(deps-dev): Bump the npm-minor-patch group across 1 directory with 2 updates
 - **PR #13201**: fix: keep Champion pin and facts files out of .git
 - **Issue #13200** (closed): Champion pin/facts still refused after #13181: Repo Skills' guard-destructive.sh blocks .git writes; move them to a temp dir
 - **PR #13202**: test: reuse common hermetic_git/git in four worktree differential tests
