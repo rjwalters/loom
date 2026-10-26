@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-26
 
+- **PR #13202**: test: reuse common hermetic_git/git in four worktree differential tests
+- **Issue #13085** (closed): Consolidate 20 copy-pasted git() test helpers into loom-daemon/tests/common
 - **PR #13151**: test: fold per-file git/hermetic helpers into common::git
 - **PR #13197**: feat: dispatch isolated EE and market ratification review sessions
 - **Issue #13189** (closed): Ratification lane: two isolated key-review sessions with pinned instructions
