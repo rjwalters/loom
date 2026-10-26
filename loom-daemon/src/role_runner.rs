@@ -3927,6 +3927,7 @@ pub mod champion_mode;
 
 // Ratification reviewer lane selection layer (#13187); see
 // `role_runner/ratification_lane.rs`.
+pub mod ratification_dispatch;
 pub mod ratification_lane;
 
 #[cfg(test)]
