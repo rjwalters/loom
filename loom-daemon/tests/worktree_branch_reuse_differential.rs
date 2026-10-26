@@ -24,6 +24,7 @@
 mod common;
 
 use common::git;
+use common::hermetic_git as hermetic;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -36,10 +37,6 @@ fn scripts() -> PathBuf {
 }
 fn fixture_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worktree-branch-reuse-retired.sh")
-}
-
-fn hermetic(cmd: &mut Command) -> &mut Command {
-    common::hermetic_git(cmd)
 }
 
 fn rev(dir: &Path, r: &str) -> String {
