@@ -13,6 +13,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-26
+
+- **PR #13151**: test: fold per-file git/hermetic helpers into common::git
+- **PR #13197**: feat: dispatch isolated EE and market ratification review sessions
+- **Issue #13189** (closed): Ratification lane: two isolated key-review sessions with pinned instructions
+
 ### 2026-10-25
 
 - **PR #13191**: feat: add ratification lane selection layer
