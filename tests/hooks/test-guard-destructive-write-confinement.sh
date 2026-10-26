@@ -2586,6 +2586,22 @@ assert_deny "write-confinement (#13180 control): literal .git/config denies" \
 assert_deny "write-confinement (#13180 control): literal pin name at checkout root denies" \
     "echo x > $WT_REPO_LINKED/loom-champion-pin-pr-42" "$WT_REPO_LINKED"
 
+# --- #13200: the pin / facts files moved out of .git into
+# /tmp/loom-champion/<key>/ so a guard that refuses .git writes
+# (Repo Skills') never sees one. The docs' exact spelling: the dir in its own
+# plain assignment, then a write to "/tmp/loom-champion/$CHAMPION_KEY/pin-pr-<digits>".
+_C13200_DEF='CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)'
+assert_allow "write-confinement (#13200): mkdir of the temp champion dir allows" \
+    "$_C13200_DEF; mkdir -p -m 700 /tmp/loom-champion \"/tmp/loom-champion/\$CHAMPION_KEY\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): pin write under the temp dir allows" \
+    "$_C13200_DEF; printf 'sha 1\\n' > \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): facts write under the temp dir allows" \
+    "$_C13200_DEF; jq . x > \"/tmp/loom-champion/\$CHAMPION_KEY/facts-pr-42.json\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): rm of the pin under the temp dir allows" \
+    "$_C13200_DEF; rm -f \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): same, from inside the linked worktree" \
+    "$_C13200_DEF; printf 'sha 1\\n' > \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED/.loom/worktrees/issue-1"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
