@@ -21,6 +21,9 @@
 //! Then the live `worktree.sh` is driven end to end with the port pinned via
 //! `LOOM_DAEMON_SELF_BIN`, to prove the one-line stub wires it correctly.
 
+mod common;
+
+use common::git;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -36,19 +39,7 @@ fn fixture_script() -> PathBuf {
 }
 
 fn hermetic(cmd: &mut Command) -> &mut Command {
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = hermetic(Command::new("git").arg("-C").arg(dir).args(args))
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    common::hermetic_git(cmd)
 }
 
 fn rev(dir: &Path, r: &str) -> String {
