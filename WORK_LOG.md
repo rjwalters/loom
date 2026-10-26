@@ -15,6 +15,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-25
 
+- **PR #13191**: feat: add ratification lane selection layer
+- **PR #13184**: refactor: remove unwired session.output S3 chunker
+- **PR #13177**: docs: stop roles passing --signoff; route DCO-gated PRs to the operator
+- **PR #13159**: feat: export a span on every safehouse forge-lookup failure
+- **PR #13154**: feat: serve Judge CI hold from worklist check summaries and count live discovery reads
+- **Issue #13187** (closed): Ratification lane core: config, candidate finder, head-marker skip, self-author refusal
+- **Issue #13183** (closed): Remove the inert session.output S3 chunker (never registered; operator ruled per-session archives instead)
+- **Issue #13156** (closed): safehouse: emit a counted event when a forge lookup fails and narration degrades
+- **Issue #13089** (closed): DCO-gated repos: reconcile role sign-off with route-to-operator at PR open
+- **Issue #12317** (closed): Step gather's per-item reads: CI at Judge heads and stage-entry times from the snapshot; classify the landed closes-graph and hold-marker reads
 - **PR #13181**: fix: admit champion pin/facts files in worktree write guards
 - **Issue #13180** (closed): Champion --pr steps blocked by Loom's own guards writing the head-pin file (rm-scope + worktree-isolation)
 - **Issue #13179** (closed): Telemetry: PR-pipeline gauge (open PRs by stage/hold, oldest age) so stuck approved PRs show up in ClickHouse
