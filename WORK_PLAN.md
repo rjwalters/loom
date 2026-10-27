@@ -76,7 +76,7 @@ Issues currently being built (`loom:building`).
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes)
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
-- **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
+- **#12727**: Daemon-root checkout (~/loom-daemon) is never fast-forwarded on release-roll hosts (worker-1 2,764 / worker-2 5,135 commits behind)
 - **#12945**: Champion: let a resync PR that is byte-identical to a released tag skip the kept-set hold; close superseded resyncs
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
@@ -85,6 +85,8 @@ Issues currently being built (`loom:building`).
 - **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds
 - **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
 - **#13148**: Remove scripts/install/sync-labels.sh: installer can call the installed defaults copy instead of a 427-line fork
+- **#13222**: In-session /loom:sweep: verdict and claim gates misfire because all agents share the operator's GitHub account
+- **#13228**: fleet.autoApply: gate everything beyond roster registration behind its own flag
 
 ## PRs Awaiting Review
 
@@ -93,7 +95,9 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
+- **#13223**: chore(harness): track latest CLIs — codex 0.164.0→0.165.0
+- **#13224**: docs: stop in-session sweep gates misreading the sweep's own activity
+- **#13227**: feat: sample daemon-root checkout lag and dirt as checkout.freshness
 
 ## Approved (Awaiting Merge)
 
@@ -161,7 +165,6 @@ Issues carrying `loom:curated`.
 - **#12085**: Telemetry(doctor): structured parked-PR cause (park reason, doctor_cycles, queue gate, treating age) (ETA doctor, loom-ui#4063 #6) *(curated)*
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301 *(curated)*
 - **#12127**: ci: rebalance Native Port Suites legs so none runs over ~3 min (next PR critical path after #12089) *(curated)*
-- **#12186**: Issue-phase claim_state from the lease: delete label-age inference (slice of #11118) *(curated)*
 - **#12220**: Rate-limit probe cache follow-ups: quiet-bucket gauge gap, ambient-login docs, post-rollout measurement *(curated)*
 - **#12248**: Retired hold labels: remove core registry/work_finder readers (1/3 of #11843) *(curated)*
 - **#12304**: Epic: fleet discovery from one mirror read per tick — zero forge reads for discovery; delete per-host listing paths *(curated)*
@@ -182,7 +185,6 @@ Issues carrying `loom:curated`.
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR) *(curated)*
 - **#12703**: Add a per-repo setting to turn off Champion's out-of-band acceptance-criteria hold (#6883) *(curated)*
 - **#12713**: Part-of merges re-queue the issue to Builders: landed-route marker is read as a Curator 'kept' decision *(curated)*
-- **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies *(curated)*
 - **#12809**: Remove the daemon's dashboard wake source (forge_events /v1/hosts/{host}/events client) *(curated)*
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20) *(curated)*
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
@@ -204,6 +206,8 @@ Issues carrying `loom:curated`.
 - **#13185**: Champion ratification hold misses ratification/requests/** — a key-review request PR auto-merged with no key reviews *(curated)*
 - **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
+- **#13222**: In-session /loom:sweep: verdict and claim gates misfire because all agents share the operator's GitHub account *(curated)*
+- **#13228**: fleet.autoApply: gate everything beyond roster registration behind its own flag *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -235,8 +239,8 @@ Issues carrying `loom:curated`.
 | Very important | 2 |
 | Important | 13 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 13 |
-| PRs awaiting review | 4 |
+| In Progress (`loom:building`) | 15 |
+| PRs awaiting review | 6 |
 | Approved PRs awaiting merge | 18 |
 | Curated | 82 |
 | Architect / Hermit proposals | 6 |
