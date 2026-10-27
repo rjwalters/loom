@@ -15,6 +15,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-27
 
+- **PR #13215**: refactor: remove never-populated QualityMetrics fields
+- **Issue #13163** (closed): Remove never-populated QualityMetrics fields (pr_approved, rework_count, human_rating): always None
+- **Issue #12975** (closed): pick.decision payload archive: S3 sink keyed by tick_id (depends on #12974)
 - **Issue #13026** (closed): Champion: make per-repo merge concurrency a runtime tunable, and take hold re-reads out of the merge lane
 - **Issue #11113** (closed): Umbrella: guard hooks parse shell commands ad hoc — false denies and fail-open gaps (17 bugs)
 
