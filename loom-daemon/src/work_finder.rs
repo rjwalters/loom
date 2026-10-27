@@ -1976,17 +1976,7 @@ pub fn spawn_multi_work_finder_task(
         // `configured_max` module) — no longer a frozen startup value.
         let mut configured_max_reload =
             ConfiguredMaxReloader::new(fallback_root.clone(), configured_max);
-        // An `Interval` that a `forge.event` prompt may also tick early
-        // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on
-        // for `fallback_root` — the daemon's primary workspace, which is also
-        // where every other machine-level knob is resolved from. When
-        // disarmed this is exactly `tokio::time::interval(interval)`: no bus
-        // subscription, no bridge task, no wake path.
-        let mut ticker = crate::forge_events::wake::EarlyTicker::for_work_finder(
-            interval,
-            &event_bus,
-            &fallback_root,
-        );
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;

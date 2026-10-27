@@ -55,7 +55,6 @@ pub enum StatusSection {
     RoleAgents,
     PreflightAdvisory,
     Observability,
-    ForgeEvents,
     DeepClean,
     DynamicCap,
     Capacity,
@@ -131,13 +130,11 @@ impl StatusSection {
             S::Observability => (
                 "observability",
                 &[
-                    "observability_host_id_mismatch",
                     "observability_export",
                     "observability_exports",
                     "otlp_export",
                 ],
             ),
-            S::ForgeEvents => ("forge_events", &["forge_events"]),
             S::DeepClean => ("deep_clean", &["deep_clean"]),
             S::DynamicCap => ("dynamic_cap", &["dynamic_cap"]),
             S::Capacity => ("capacity", &["capacity"]),

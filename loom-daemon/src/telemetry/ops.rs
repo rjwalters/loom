@@ -67,8 +67,26 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
+    // #12038: `loom.forge.hold_items` / `hold_age_seconds`: the artifact
+    // (issue | pr), the hold label's short name, how the start was known
+    // (labels_at | unknown) and the age statistic (oldest | p50 | p90).
+    "artifact",
+    "hold",
+    "basis",
+    "stat",
     // #12734: `loom.dispatch.pool_items{repo, step}`, a closed set (`Step`).
     "step",
+    // #12827: `loom.queue.host_shard{shard_count}`, the host's configured
+    // shard count (one fixed value per host, so it adds no series).
+    "shard_count",
+    // #12873: `loom.fleet_dispatch.*` captain gauges' worker `host` (a
+    // roster host id, never worker-supplied text) and
+    // `loom.dispatch.running_by_age`'s `age` bucket (a closed set of four).
+    "host",
+    "age",
+    // #12957: `loom.dispatch.running_by_points`' `points` class
+    // (`1|2|3|5|8|13|unsized`, a closed set of seven).
+    "points",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -124,6 +142,10 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.repos.error",
     "loom.discovery.items",
     "loom.discovery.forge_reads",
+    // #12317: the per-item reads the snapshot cannot answer.
+    "loom.discovery.live_reads.landed",
+    "loom.discovery.live_reads.markers",
+    "loom.discovery.live_reads.ci",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
@@ -139,11 +161,17 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_account_ms",
     // #12410: the tick's draws and passes by reason (`ops::dispatch_facts`).
     "loom.dispatch.passes",
+    // #13008: the tick's exclusions by reason, `held_at_head` among them.
+    "loom.dispatch.excluded",
     "loom.dispatch.draws",
     "loom.dispatch.draws_unspawned",
     // #12494: merge steps held back before the draw by a repo's merge in
     // flight.
     "loom.dispatch.merge_deferred",
+    // #13026: the per-repo Champion merge concurrency in force, and the
+    // merges in flight once the tick drew.
+    "loom.champion.merge_concurrency",
+    "loom.champion.merges_in_flight",
     "loom.dispatch.budget",
     "loom.dispatch.stop",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
@@ -186,11 +214,16 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.in_flight_repo",
     "loom.step.model_selected",
     "loom.step.model_launched",
+    // #12957: the item's story points, on `loom.dispatch.step` and on the
+    // step's `loom.sweep` close (the key `sweep.started` already exports).
+    "loom.story_points",
     // `loom.dispatch.step` claim facts (Issue #12183).
     "loom.dispatch.claim_outcome",
     "loom.dispatch.claim_exit_code",
     "loom.dispatch.claim_ms",
     "loom.dispatch.claim_stderr_tail",
+    // A refused Builder claim's rollback (Issue #12822).
+    "loom.dispatch.claim_rollback",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",
@@ -203,6 +236,17 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.queue.total_candidates",
     "loom.queue.priority_score",
     "loom.queue.halt_cause",
+    // The dispatch-plan fields loom-ui's Backlog reads, carried over OTLP
+    // before `queue.snapshot` is retired (#12827, #12813). Closed sets or
+    // bounded integers, plus the issue's RFC 3339 creation time.
+    "loom.queue.plan_state",
+    "loom.queue.position",
+    "loom.queue.gate",
+    "loom.queue.step",
+    "loom.queue.owning_shard",
+    "loom.queue.level",
+    "loom.queue.workspace_weight",
+    "loom.queue.created_at",
     // Repo lockout weights on a pr-open-skip row's disposition/admission
     // spans (Issue #9674).
     "lockout.duration_seconds",
@@ -251,6 +295,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.read.owner",
     "forge.read.resource",
     "forge.read.until",
+    // `safehouse.forge_lookup.failed` spans (#13156): the failed call, the
+    // workspace repo and the reason class. Never stderr or a path.
+    "safehouse.call",
+    "loom.repo",
+    "safehouse.reason",
     // `loom.egress.request` spans (#11300): one proxied provider request.
     // Counts, classified codes and ids only, never a body or credential.
     "loom.egress.seat",
@@ -304,9 +353,15 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.hold_rung",
     "loom.fleet_dispatch.hold_set_by_outcome",
     "loom.fleet_dispatch.hold_set_by_assignment_id",
+    "loom.fleet_dispatch.holder_assignment_id",
+    "loom.fleet_dispatch.merge_slot_holder",
     "loom.dispatch.held_by",
     "loom.dispatch.retry_after_s",
     "loom.dispatch.hold_until",
+    // Attempt lineage on a re-granted step (#12875).
+    "loom.dispatch.attempt",
+    "loom.dispatch.prev_assignment_id",
+    "loom.dispatch.prev_end",
     // `reaper.pass` spans (#12461): one worktree-reaper pass over one repo and
     // worktree class — counts, bytes and preserved-by-fixed-reason.
     "loom.reaper.class",
@@ -327,6 +382,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.reaper.preserved.uncommitted",
     "loom.reaper.preserved.private_workspace",
     "loom.reaper.preserved.other",
+    // #12458: open-item worktrees pushed to a remote backup ref before
+    // removal (count, and the refs as the restore handle), and the preserve
+    // category for a backup that failed.
+    "loom.reaper.backed_up",
+    "loom.reaper.backup_refs",
+    "loom.reaper.preserved.backup_failed",
 ];
 
 /// Longest label value kept, in bytes.
@@ -425,11 +486,20 @@ pub enum MetricName {
     /// backlog.
     #[serde(rename = "loom.queue.listing_incomplete_repos")]
     QueueListingIncompleteRepos,
+    /// Ready issues the last work-finder tick listed (`queue.snapshot`'s
+    /// `seen`).
+    #[serde(rename = "loom.queue.seen")]
+    QueueSeen,
     /// `already_landed` rows on the last tick by evidence, labelled `reason`
     /// (`forge_closed`, `forge_closed_not_planned`, `journal_landed`,
     /// `unknown`; #11858).
     #[serde(rename = "loom.queue.already_landed")]
     QueueAlreadyLanded,
+    /// This host's shard index on the last work-finder tick's dispatch plan,
+    /// labelled `shard_count` (#12827). Emitted only when sharding is
+    /// configured and the index is known.
+    #[serde(rename = "loom.queue.host_shard")]
+    QueueHostShard,
     // ---- Quota burn and pool state (Issue #8857) ------------------------
     /// Uncached input tokens consumed since the previous sample.
     #[serde(rename = "loom.llm.tokens.input")]
@@ -500,10 +570,30 @@ pub enum MetricName {
     /// Role-runner agent slots idle: the ceiling minus agents in flight.
     #[serde(rename = "loom.dispatch.role_idle_slots")]
     DispatchRoleIdleSlots,
+    /// Seconds the oldest live step of a role has been running, labelled
+    /// `role` and `pool="step"` (#12873). No point for a role with none.
+    #[serde(rename = "loom.dispatch.running_oldest_age_sec")]
+    DispatchRunningOldestAgeSec,
+    /// Live steps per running-age bucket, labelled `role`, `pool="step"`
+    /// and `age` (`lt_15m` / `15m_1h` / `1h_4h` / `ge_4h`), #12873.
+    #[serde(rename = "loom.dispatch.running_by_age")]
+    DispatchRunningByAge,
+    /// Live steps per story-point class, labelled `role`, `pool="step"` and
+    /// `points` (`1|2|3|5|8|13|unsized`), #12957. A count, never a sum.
+    #[serde(rename = "loom.dispatch.running_by_points")]
+    DispatchRunningByPoints,
     /// Items the step tick could draw (weight > 0, after the live claims),
     /// labelled `repo`, sampled every work-finder tick (#11909).
     #[serde(rename = "loom.step.actionable")]
     StepActionable,
+    /// Open items carrying a hold or park label, labelled `repo`,
+    /// `artifact`, `hold`, `basis` (#12038, #12369).
+    #[serde(rename = "loom.forge.hold_items")]
+    ForgeHoldItems,
+    /// Seconds held (from `labels_at`), labelled `repo`, `artifact`,
+    /// `hold`, `stat` (#12038, #12369).
+    #[serde(rename = "loom.forge.hold_age_seconds")]
+    ForgeHoldAgeSeconds,
     /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
     /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
     /// (over the per-call row cap) — Issue #9222.
@@ -673,6 +763,43 @@ pub enum MetricName {
     /// `claim_lost`): the split-brain and attended-claim measure.
     #[serde(rename = "loom.fleet_dispatch.claim_lost_after_grant")]
     FleetDispatchClaimLostAfterGrant,
+    /// The captain's rows by `state` (`granted` / `live` per `host`; `held`
+    /// with no host), sampled every server sweep (#12873).
+    #[serde(rename = "loom.fleet_dispatch.rows")]
+    FleetDispatchRows,
+    /// Free slots a host reported in its last fresh heartbeat, by `host`.
+    #[serde(rename = "loom.fleet_dispatch.free_slots_reported")]
+    FleetDispatchFreeSlotsReported,
+    /// Steps a host listed in its last fresh heartbeat, by `host`.
+    #[serde(rename = "loom.fleet_dispatch.live_reported")]
+    FleetDispatchLiveReported,
+    /// Seconds the oldest step in a host's last fresh heartbeat has been
+    /// running, by `host`; no point when the heartbeat carried no start.
+    #[serde(rename = "loom.fleet_dispatch.oldest_live_age_sec")]
+    FleetDispatchOldestLiveAgeSec,
+    // ---- CI telemetry poller cycles (Issue #12793) ------------------------
+    /// CI telemetry poll cycles finished since the previous point, by
+    /// `outcome` (`ok`, `busy`, `backing_off`, `rate_limited`,
+    /// `credential_rejected`, `discovery_failed`, `io_failed`, `panicked`).
+    #[serde(rename = "loom.ci_telemetry.cycles")]
+    CiTelemetryCycles,
+    /// What finished CI telemetry cycles did since the previous point, by
+    /// `kind` (`repos_polled`, `runs_emitted`, `jobs_emitted`,
+    /// `recovered_units`).
+    #[serde(rename = "loom.ci_telemetry.cycle_items")]
+    CiTelemetryCycleItems,
+    /// Wall time of the last finished CI telemetry cycle, by `outcome`.
+    #[serde(rename = "loom.ci_telemetry.cycle_duration")]
+    CiTelemetryCycleDuration,
+    /// Size of the CI telemetry local journal.
+    #[serde(rename = "loom.ci_telemetry.journal_bytes")]
+    CiTelemetryJournalBytes,
+    /// Journal byte offset of the first line the exporter has not yet offered.
+    #[serde(rename = "loom.ci_telemetry.export_cursor_offset")]
+    CiTelemetryExportCursorOffset,
+    /// Age of the oldest journal line not yet exported; `0` when caught up.
+    #[serde(rename = "loom.ci_telemetry.export_lag")]
+    CiTelemetryExportLag,
 }
 
 impl MetricName {
@@ -701,7 +828,9 @@ impl MetricName {
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
+            Self::QueueSeen => "loom.queue.seen",
             Self::QueueAlreadyLanded => "loom.queue.already_landed",
+            Self::QueueHostShard => "loom.queue.host_shard",
             Self::LlmTokensInput => "loom.llm.tokens.input",
             Self::LlmTokensOutput => "loom.llm.tokens.output",
             Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
@@ -722,7 +851,12 @@ impl MetricName {
             Self::DispatchBusySlots => "loom.dispatch.busy_slots",
             Self::DispatchRoleMaxConcurrent => "loom.dispatch.role_max_concurrent",
             Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
+            Self::DispatchRunningOldestAgeSec => "loom.dispatch.running_oldest_age_sec",
+            Self::DispatchRunningByAge => "loom.dispatch.running_by_age",
+            Self::DispatchRunningByPoints => "loom.dispatch.running_by_points",
             Self::StepActionable => "loom.step.actionable",
+            Self::ForgeHoldItems => "loom.forge.hold_items",
+            Self::ForgeHoldAgeSeconds => "loom.forge.hold_age_seconds",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
             Self::GithubRateLimitUsed => "github.ratelimit.used",
@@ -755,10 +889,20 @@ impl MetricName {
             Self::FeedCompletions => "loom.feed.completions",
             Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
             Self::CiQueueDepth => "loom.ci.queue_depth",
+            Self::CiTelemetryCycles => "loom.ci_telemetry.cycles",
+            Self::CiTelemetryCycleItems => "loom.ci_telemetry.cycle_items",
+            Self::CiTelemetryCycleDuration => "loom.ci_telemetry.cycle_duration",
+            Self::CiTelemetryJournalBytes => "loom.ci_telemetry.journal_bytes",
+            Self::CiTelemetryExportCursorOffset => "loom.ci_telemetry.export_cursor_offset",
+            Self::CiTelemetryExportLag => "loom.ci_telemetry.export_lag",
             Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
             Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
+            Self::FleetDispatchRows => "loom.fleet_dispatch.rows",
+            Self::FleetDispatchFreeSlotsReported => "loom.fleet_dispatch.free_slots_reported",
+            Self::FleetDispatchLiveReported => "loom.fleet_dispatch.live_reported",
+            Self::FleetDispatchOldestLiveAgeSec => "loom.fleet_dispatch.oldest_live_age_sec",
         }
     }
 
@@ -803,7 +947,9 @@ impl MetricName {
             | Self::FleetDispatchFallbackTicks
             | Self::FleetDispatchRefusals
             | Self::FleetDispatchExpired
-            | Self::FleetDispatchClaimLostAfterGrant => MetricKind::DeltaCounter,
+            | Self::FleetDispatchClaimLostAfterGrant
+            | Self::CiTelemetryCycles
+            | Self::CiTelemetryCycleItems => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -820,10 +966,12 @@ impl MetricName {
             | Self::QueueStarvedByReason
             | Self::QueueDispatchWaitSamples => "{issue}",
             Self::DispatchMaxConcurrent | Self::DispatchCapTerm => "{sweep}",
-            Self::QueueIssues | Self::QueueAlreadyLanded | Self::DispatchPrOpenPrefiltered => {
-                "{issue}"
-            }
+            Self::QueueIssues
+            | Self::QueueSeen
+            | Self::QueueAlreadyLanded
+            | Self::DispatchPrOpenPrefiltered => "{issue}",
             Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
+            Self::QueueHostShard => "{shard}",
             Self::LlmTokensInput
             | Self::LlmTokensOutput
             | Self::LlmTokensCacheRead
@@ -839,8 +987,15 @@ impl MetricName {
             | Self::DispatchIdleSlots
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
-            | Self::DispatchRoleIdleSlots => "{slot}",
-            Self::StepActionable => "{item}",
+            | Self::DispatchRoleIdleSlots
+            | Self::DispatchRunningByAge
+            | Self::DispatchRunningByPoints
+            | Self::FleetDispatchFreeSlotsReported => "{slot}",
+            Self::DispatchRunningOldestAgeSec | Self::FleetDispatchOldestLiveAgeSec => "s",
+            Self::FleetDispatchRows => "{row}",
+            Self::FleetDispatchLiveReported => "{step}",
+            Self::StepActionable | Self::ForgeHoldItems => "{item}",
+            Self::ForgeHoldAgeSeconds => "s",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset => "s",
@@ -868,6 +1023,10 @@ impl MetricName {
             Self::FeedCompletions => "{completion}",
             Self::FeedReconcilePasses => "{pass}",
             Self::CiQueueDepth => "{run}",
+            Self::CiTelemetryCycles => "{cycle}",
+            Self::CiTelemetryCycleItems => "{item}",
+            Self::CiTelemetryCycleDuration | Self::CiTelemetryExportLag => "s",
+            Self::CiTelemetryJournalBytes | Self::CiTelemetryExportCursorOffset => "By",
             Self::AgentScopeOomKills => "{kill}",
             Self::FleetDispatchFallbackTicks => "{tick}",
             Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
@@ -904,10 +1063,12 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
+            Self::QueueSeen => "Ready issues listed on the last work-finder tick.",
             Self::QueueListingIncompleteRepos => {
                 "Repos whose ready-issue listing came back partial last tick."
             }
             Self::QueueAlreadyLanded => "Already-landed ready issues last tick, by evidence.",
+            Self::QueueHostShard => "This host's dispatch-plan shard index, by shard count.",
             Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
             Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
             Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",
@@ -936,7 +1097,20 @@ impl MetricName {
             }
             Self::DispatchRoleMaxConcurrent => "The role-runner concurrent agent ceiling.",
             Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
+            Self::DispatchRunningOldestAgeSec => {
+                "Seconds the oldest live step of a role has been running (pool=step)."
+            }
+            Self::DispatchRunningByAge => "Live steps per running-age bucket, by role (pool=step).",
+            Self::DispatchRunningByPoints => {
+                "Live steps per story-point class, by role (pool=step)."
+            }
             Self::StepActionable => "Items the step tick could draw this tick, per repo.",
+            Self::ForgeHoldItems => {
+                "Open items per repo carrying a hold or park label, by artifact, hold and basis."
+            }
+            Self::ForgeHoldAgeSeconds => {
+                "Seconds a hold label has been applied (oldest, p50, p90), by repo, artifact and hold."
+            }
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
@@ -1004,6 +1178,18 @@ impl MetricName {
             Self::CiQueueDepth => {
                 "Workflow runs queued for a runner in the CI poll window at the end of a poll, by repo."
             }
+            Self::CiTelemetryCycles => "CI telemetry poll cycles finished, by outcome.",
+            Self::CiTelemetryCycleItems => {
+                "Repos polled, runs and jobs emitted and units recovered by CI telemetry cycles, by kind."
+            }
+            Self::CiTelemetryCycleDuration => "Wall time of the last CI telemetry cycle, by outcome.",
+            Self::CiTelemetryJournalBytes => "Size of the CI telemetry local journal.",
+            Self::CiTelemetryExportCursorOffset => {
+                "Journal byte offset of the first CI telemetry line not yet exported."
+            }
+            Self::CiTelemetryExportLag => {
+                "Age of the oldest CI telemetry journal line not yet exported; 0 when caught up."
+            }
             Self::FleetDispatchFallbackTicks => {
                 "Step ticks run in fleet-dispatch fallback, by the reason fallback began."
             }
@@ -1015,6 +1201,18 @@ impl MetricName {
             }
             Self::FleetDispatchClaimLostAfterGrant => {
                 "Captain grants whose worker then lost the forge order (claim_lost)."
+            }
+            Self::FleetDispatchRows => {
+                "Captain assignment rows by state (granted / live by host, held fleet-wide)."
+            }
+            Self::FleetDispatchFreeSlotsReported => {
+                "Free slots a worker host reported in its last fresh heartbeat."
+            }
+            Self::FleetDispatchLiveReported => {
+                "Steps a worker host listed in its last fresh heartbeat."
+            }
+            Self::FleetDispatchOldestLiveAgeSec => {
+                "Seconds the oldest step in a worker host's last fresh heartbeat has run."
             }
         }
     }

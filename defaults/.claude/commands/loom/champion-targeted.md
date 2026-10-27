@@ -44,6 +44,7 @@ release (`--reason <gate>`), from this closed list, so the lease comment and
 | `ci_pending` | CI checks were still running when you read them (say it only if that is what you saw) |
 | `mergeable_unknown` | `mergeable` read `UNKNOWN` (GitHub still computing) |
 | `pin_missing` | Step 3 printed `CHAMPION-PIN-MISSING` |
+| `guard_refused` | A guard hook refused the step's own pin or PR-facts write or removal (#13180) |
 | `merge_rc<N>` | `merge-pr.sh` exited `N` (3, 4, 5, 7 or 9) |
 
 Anything else is recorded as `unspecified`; never write `ci_pending` as a
@@ -63,10 +64,17 @@ default.
    UNTRUSTED_FORK=$(printf '%s' "$PR_JSON" | jq -r '(.author_association // "NONE") as $a | select((.head.repo.full_name // "") != .base.repo.full_name and ((["OWNER","MEMBER","COLLABORATOR"] | index($a)) == null)) | "yes"')
    echo "UNTRUSTED_FORK=${UNTRUSTED_FORK:-no}"
    EVALUATED_SHA=$(printf '%s' "$PR_JSON" | jq -r 'select(.state == "open" and any(.labels[]; .name == "loom:pr") and (any(.labels[]; .name | startswith("loom:operator")) | not)) | .head.sha // empty')
-   PIN_FILE="$(git rev-parse --git-common-dir)/loom-champion-pin-pr-$PR_NUMBER"; rm -f "$PIN_FILE"
-   [ -n "$EVALUATED_SHA" ] && printf '%s %s\n' "$EVALUATED_SHA" "$PPID" > "$PIN_FILE"
+   CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+   mkdir -p -m 700 /tmp/loom-champion "/tmp/loom-champion/$CHAMPION_KEY"
+   rm -f "/tmp/loom-champion/$CHAMPION_KEY/pin-pr-N"
+   [ -n "$EVALUATED_SHA" ] && printf '%s %s\n' "$EVALUATED_SHA" "$PPID" > "/tmp/loom-champion/$CHAMPION_KEY/pin-pr-N"
    echo "EVALUATED_SHA=${EVALUATED_SHA:-none}"
    ```
+
+   Write `N` in the two pin-file paths as the PR number's digits (not `$PR_NUMBER`):
+   the worktree-write guard admits only that exact spelling and fails closed on a
+   variable path (#13180). A step whose own pin or facts write a guard refused is
+   released with `reason=guard_refused`.
 
    `TRIAGE=yes` (open, not a draft, no stage label, no hold, no claim):
    run **"`--pr N` on an unlabelled PR: triage"** below instead of the rest
@@ -84,8 +92,8 @@ default.
    agent process it records still runs (#11902, up to 24h), a Step 3 run without
    that `EXPECTED_HEAD` prints `CHAMPION-PIN-MISSING` and merges nothing.
    **Last action, whatever the outcome:**
-   `rm -f "$(git rev-parse --git-common-dir)/loom-champion-pin-pr-N"`
-   (and the PR facts file, `loom-champion-facts-pr-N.json`, beside it)
+   `rm -f "/tmp/loom-champion/$CHAMPION_KEY/pin-pr-N"` (`CHAMPION_KEY` as in step 1)
+   (and the PR facts file, `/tmp/loom-champion/$CHAMPION_KEY/facts-pr-N.json`, beside it)
 3. **Run `champion-pr-merge.md` for this one PR, as one batch row.** The
    Verdict-State Janitor (Parts 1 and 2), "0. PR facts" (one read for every
    criterion, #12242), all 6 Safety Criteria with the merge-risk
@@ -130,13 +138,14 @@ open PRs on that issue. Do not review the code: that is Judge's.
 | Outcome | When | Write |
 |---|---|---|
 | `triaged` | **The normal case**: none of the rows below applies | `gh pr edit N --add-label loom:review-requested` |
-| `triage-blocked` | A **duplicate** of another open PR on the same issue, **superseded** (its change is already on the default branch, or a newer PR replaces it), or it **closes an issue that is already closed** | A comment naming the reason and the PR or issue it points at, then `loom-daemon park-record apply --pr N --by champion --reason "<duplicate of #M, superseded by #M, or closes #K, already closed>"` (it adds `loom:blocked`; a reason-only park, so the PR is not released back here when #M closes) |
+| `triage-blocked` | A **duplicate** of another open PR on the same issue, **superseded** (its change is already on the default branch, or a newer PR replaces it), or it **closes an issue that is already closed** | **Duplicate / closes an already-closed issue**: a comment naming the reason and the PR or issue it points at, then `loom-daemon park-record apply --pr N --by champion --reason "<duplicate of #M or closes #K, already closed>"` (it adds `loom:blocked`; a reason-only park, so the PR is not released back here when #M closes). **Superseded, confirmed**: the superseder is a PR that `gh pr view M --json state,mergedAt` shows **merged** into the default branch, or a commit that `git merge-base --is-ancestor <sha> origin/<default>` shows is on it; read it live, then comment `Superseded by #M` (or `by <sha>`), then `gh pr close N`. **Superseded, not confirmed** (superseder still open, unreadable, or only "looks similar"): park it with `--reason "superseded (unconfirmed): <what you could not verify>"` |
 | `triage-operator` | `UNTRUSTED_FORK=yes`, whatever else applies; or it **needs a human decision** that an agent may not make ("Routing to a human" in `label-state-machine.md`), e.g. it carries a change no issue asks for and only the operator can rule on its scope | A ruling: `loom-daemon operator-decision apply N --input d.json` (2-4 ranked options; for an outside contribution, admit it to review or close it), which adds `loom:operator` itself. Only a human-hands step: a comment opening `Operator reason: <class> — <one line>`, then `gh pr edit N --add-label loom:operator` |
 | `not-eligible` | Re-read the labels just before the write: a stage label, hold or claim appeared (a peer moved it) | No writes |
 
 When in doubt between `triaged` and the others, choose `triaged`: Judge
 reviews it, and Judge can still reject it. The one exception is
-`UNTRUSTED_FORK=yes`, which is never `triaged`. Never close the PR, push to it, or
+`UNTRUSTED_FORK=yes`, which is never `triaged`. Close a PR only when its
+supersession is confirmed (the `triage-blocked` row); never push to it or
 add `loom:pr`.
 
 ## `--issue N`: one promotion verdict

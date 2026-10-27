@@ -210,8 +210,11 @@ blocks self-review and Loom agents often create and review the same PR.
 
 Find unlabeled issues (use `-label:` search terms, **not** `--label` — gh ANDs
 `--label` values with no negation syntax, so a negated `--label` always returns
-empty), enhance with technical detail, then `gh issue edit 42 --add-label
-"loom:curated"`.
+empty), enhance with technical detail,
+then write the standalone `<!-- loom:points=3 -->`
+marker and run `loom-daemon curation-complete --repo OWNER/REPO --issue 42 --model M
+--runtime R --completion-id $(uuidgen) --workspace-root ROOT` (it applies `loom:curated`;
+never a bare `--add-label`, #11787; recipe: `.loom/roles/curator-estimate.md`).
 
 ### Overnight / long-running orchestration
 
@@ -234,7 +237,7 @@ Configuration lives in `.loom/config.json` (committed): a `terminals` array
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
-- **Large files** — no size gate; Hermit may propose splits.
+- **Fail closed** — success must be positively proven; a null, empty, or bare exit-0 result is a failure, not a result: [`.loom/docs/fail-closed.md`](.loom/docs/fail-closed.md).
 - **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh` (a review standard, not a CI gate): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
 - **Role-prompt authoring discipline** — pressure-test a non-trivial role-prompt/operator-dispatch-brief change against a resisting scenario, audit it for rule conflicts, and load-gate by default: [`.loom/docs/role-prompt-authoring.md`](.loom/docs/role-prompt-authoring.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).

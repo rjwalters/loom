@@ -303,6 +303,32 @@ pub fn in_flight_sweep_ids(
     ids
 }
 
+/// The in-flight sweeps with the workspace root each one belongs to (#12876).
+#[must_use]
+pub fn in_flight_sweeps(
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+) -> Vec<crate::host_loss::InFlight> {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let mut out = Vec::new();
+    for root in &workspace_registry.effective_roots(fallback_root) {
+        let registry = workspace_pool.get_or_provision(root);
+        let sr = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        out.extend(
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| crate::host_loss::InFlight {
+                    root: root.clone(),
+                    sweep_id: info.sweep_id,
+                }),
+        );
+    }
+    out
+}
+
 /// Cancel every in-flight sweep across all managed roots via the existing
 /// [`SweepRegistry::cancel`] path (Issue #4090, `--force-after-timeout`).
 /// Returns the number cancelled. Blocking cancel is acceptable here: this runs
@@ -1684,6 +1710,7 @@ pub fn build_daemon_status_for(
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
         auto_update_floor_not_rolling: au.floor_not_rolling, // #11042
+        auto_update_freshness: au.freshness,                 // #9736
         host_update,
         auto_update_config_enabled: crate::auto_update::loop_mode::current()
             .map(crate::auto_update::loop_mode::LoopMode::config_enabled),
@@ -1705,7 +1732,6 @@ pub fn build_daemon_status_for(
         // Observability host-identity mismatch (#4830) — same process-global
         // snapshot pattern again, registered only when the exporter actually
         // starts, so a disabled/keyless exporter always reads `None`.
-        observability_host_id_mismatch: crate::observability::global_host_id_mismatch(),
         // Positive export-liveness signal (#5083) — the counterpart to the
         // anomaly-only field above. Always `Some` from a daemon of this
         // vintage: an exporter that never started reports `disabled`, which is
@@ -1723,12 +1749,6 @@ pub fn build_daemon_status_for(
         otlp_export: Some(crate::observability::otlp_health::check_global(
             &crate::observability::read_config(workspace_root),
         )),
-        // Forge event-feed consumer (ADR-0021, #8765) — same process-global
-        // snapshot pattern. Always `Some` from a daemon of this vintage: a
-        // consumer that never started reports `disabled`, so "is my cursor
-        // advancing, and if not, why" is always answered rather than inferred
-        // from an absent warning.
-        forge_events: Some(crate::forge_events::global_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).
@@ -2523,17 +2543,21 @@ fn handle_request(
 
                             // Parse terminal output for quality metrics (test results, lint errors, build status)
                             // Issue #1054: Track test and quality outcomes
-                            match db.record_quality_from_output(0, &output_str) {
-                                Ok(Some(metrics_id)) => {
-                                    log::debug!(
-                                        "Recorded quality metrics (id: {metrics_id}) from terminal output"
-                                    );
-                                }
-                                Ok(None) => {
-                                    // No quality metrics found in output - this is normal
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to record quality metrics: {e}");
+                            // Skipped when no input correlates (#13100): a row with a
+                            // placeholder input_id would never match the stats joins.
+                            if let Some(input_id) = correlated_input_id {
+                                match db.record_quality_from_output(input_id, &output_str) {
+                                    Ok(Some(metrics_id)) => {
+                                        log::debug!(
+                                            "Recorded quality metrics (id: {metrics_id}) from terminal output"
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        // No quality metrics found in output - this is normal
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to record quality metrics: {e}");
+                                    }
                                 }
                             }
 
@@ -3347,7 +3371,16 @@ fn handle_request(
             // topics and malformed payloads fall through to `Event::Generic`
             // unchanged (publish is fire-and-forget advisory).
             let topic_ack = topic.clone();
-            let event = Event::from_published(topic, payload);
+            let mut event = Event::from_published(topic, payload);
+            // A child that left `repo` out of its payload would narrate under
+            // a bare issue number, threading issue #N of every managed repo
+            // together. Stamp the one workspace running that issue, when
+            // there is exactly one; see `sweep_registry::published_repo`.
+            let mut registries = workspace_pool.provisioned_registries();
+            if !registries.iter().any(|r| Arc::ptr_eq(r, sweep_registry)) {
+                registries.push(sweep_registry.clone());
+            }
+            crate::sweep_registry::published_repo::backfill_published_repo(&mut event, &registries);
             match event_bus.publish(event) {
                 Ok(receivers) => Response::EventPublished {
                     topic: topic_ack,

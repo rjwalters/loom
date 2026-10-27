@@ -105,6 +105,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "orphan_stack.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
         "orphan_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
+        "orphan_stack.retarget" => ops::PR_EDIT_BASE,
         "park_hold.issue_view"
         | "release_veto.issue_labels"
         | "intake.recheck"
@@ -116,6 +117,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "claim.pr_reclaim"
         | "quarantine.issue_release"
         | "heal.issue_add_label"
+        | "epic_revisit.add_label"
         | "intake.add_triage"
         | "intake.remove_triage"
         | "intake.remove_label"
@@ -137,6 +139,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"
         | "ci_gate.recovery_comment"
+        | "epic_revisit.comment"
         | "verdict.requeue_unanchored_comment"
         | "sequence.pr_comment"
         | "review_conflict.pr_comment"

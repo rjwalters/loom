@@ -24,10 +24,10 @@ pub(crate) enum ScriptPortCommand {
     Preflight(super::preflight::PreflightArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
-    SessionExec(loom_daemon::session_exec::SessionExecCommand),
+    SessionExec(crate::session_exec::SessionExecCommand),
     /// Private workspace endpoint used inside a session container.
     #[command(subcommand)]
-    PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    PrivateWorkspace(crate::tokens_pool::private_workspace::WorkerCommand),
     /// Readiness of Loom's managed Codex hook, behind
     /// `provision-codex-hooks.sh verify` (#9390).
     #[command(subcommand)]
@@ -378,6 +378,14 @@ pub(crate) enum ScriptPortCommand {
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 
+    /// The git half of Doctor's orphan-stack replacement recipe (#12767): in a
+    /// merge-mode repository, replay a stacked child's own commits (the closed
+    /// parent's excluded) onto the default branch as a NEW branch, never
+    /// rewriting the original. Exit 0 done, 1 refused with nothing pushed,
+    /// 2 transient.
+    #[command(subcommand)]
+    OrphanReplace(super::orphan_replace::OrphanReplaceCommand),
+
     /// Build a PINNED `--force-with-lease=<branch>:<oid>` push argument, or
     /// refuse (#9487). Backs the lease capture in `reconcile-stack.sh` and
     /// `rebase-stacked-children.sh`. A bare `--force-with-lease` compares
@@ -452,6 +460,13 @@ pub(crate) enum ScriptPortCommand {
     /// on the same no-op branch as an unavailable binary.
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
+
+    /// Shared command-lexer verdicts for the guard hooks (#12236): `gh-pr-merge`
+    /// exits 0 when a command line would execute it, 1 when not (a heredoc body
+    /// or quoted argument is data). Any other exit means unanswered; the hook
+    /// fails closed.
+    #[command(subcommand)]
+    CommandAnalysis(super::command_analysis::CommandAnalysisCommand),
 
     /// Per-stage runtime selection views (#11726): `roles draw --explain`
     /// prints each stage's effective weighted, per-attempt draw table on this
@@ -655,6 +670,14 @@ pub(crate) enum ScriptPortCommand {
     /// the persisted `~/.loom/host-id`, never the hostname. One line on
     /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
     HostId(super::host_id_cmd::HostIdArgs),
+
+    /// Write the #9588 operator-stop record on behalf of
+    /// `loom-daemon-stop.sh` (#9957), so the shell stop never carries its own
+    /// copy of the record format. Hidden: a plumbing verb, not an operator
+    /// command. Optional to its caller — an older binary lacking it leaves the
+    /// script on its `rm -f` fallback.
+    #[command(subcommand, hide = true)]
+    OperatorStop(crate::operator_stop::OperatorStopCommand),
 }
 
 impl ScriptPortCommand {
@@ -712,6 +735,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::OrphanReplace(cmd) => cmd.run(),
             ScriptPortCommand::PushLease(cmd) => cmd.run(),
             ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
@@ -720,6 +744,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorkDocs(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::CommandAnalysis(cmd) => cmd.run(),
             ScriptPortCommand::Roles(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
@@ -742,6 +767,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
             ScriptPortCommand::HostId(args) => args.run(),
+            ScriptPortCommand::OperatorStop(cmd) => cmd.run(),
             ScriptPortCommand::HooksHome(args) => args.run(),
         }
     }
@@ -1116,6 +1142,28 @@ pub(crate) enum MergePrCommand {
     /// AWAIT|SYNC|FAIL` plus its narration, exit 0. The shell routes on the
     /// classifier's kind itself on any fault — see `cli::merge_pr_merge_route`.
     MergeRoute(super::merge_pr_merge_route::MergeRouteArgs),
+
+    /// The whole post-merge worktree/branch cleanup block (#8191, slice 1 of
+    /// the orchestrator port): target naming, the remove-vs-preserve decision,
+    /// the primary/sentinel/dirty-work guards, the removal, the ledger, the
+    /// local-branch delete and the cargo-target reclaim, sequenced in one
+    /// process. Prints `LEVEL<TAB>message` records to replay, or `LOOM-NEED
+    /// <fact>` (exit 3, nothing done) when a forge fact must be fetched first
+    /// — see `cli::merge_pr_post_merge_cleanup`.
+    PostMergeCleanup(super::merge_pr_post_merge_cleanup::PostMergeCleanupArgs),
+
+    /// The post-merge issue bookkeeping (#8191, slice 2): the partial-increment
+    /// reset, the branch-derived issue close and the closed-issue label strip,
+    /// one `--step` per call. Prints `LEVEL<TAB>message` records ending in a
+    /// terminator, or `LOOM-NEED close-targets` (exit 3, nothing done) — see
+    /// `cli::merge_pr_post_merge_bookkeeping`.
+    PostMergeBookkeeping(super::merge_pr_post_merge_bookkeeping::PostMergeBookkeepingArgs),
+
+    /// The whole post-merge stacked-child reconcile pass (#8191 slice 3): plan,
+    /// per-child route, deferral comment or `reconcile-stack.sh`. Snapshot on
+    /// stdin; `LEVEL<TAB>message` records ended by `LOOM-STACKED-RECONCILE DONE`
+    /// — see `cli::merge_pr_stacked_reconcile`.
+    StackedReconcile(super::merge_pr_stacked_reconcile::StackedReconcileArgs),
 }
 
 impl MergePrCommand {
@@ -1169,6 +1217,9 @@ impl MergePrCommand {
             MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
+            MergePrCommand::PostMergeCleanup(args) => args.run(),
+            MergePrCommand::PostMergeBookkeeping(args) => args.run(),
+            MergePrCommand::StackedReconcile(args) => args.run(),
         }
     }
 }

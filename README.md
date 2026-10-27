@@ -185,7 +185,7 @@ stateDiagram-v2
 **Developer Experience**
 - Git worktree isolation per issue
 - Simple slash command: `/loom:sweep 42` runs a single issue end-to-end
-- MCP integration for programmatic control (30 tools)
+- MCP integration for programmatic control (23 tools)
 - Crash-safe checkpoints: restart `/loom:sweep N` to resume from the last completed phase
 
 ## Forge Support
@@ -215,6 +215,7 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
   platform, Linux is the primary fleet-worker platform.
 - Git repository
 - tmux (`brew install tmux`)
+- bash >= 4 (`brew install bash` on macOS; stock macOS ships 3.2)
 - [Claude Code](https://claude.ai/code) for AI agents
 
 ### Install Options

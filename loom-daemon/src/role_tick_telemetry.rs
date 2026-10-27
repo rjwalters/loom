@@ -876,13 +876,7 @@ fn emit_correlated(
         TelemetryRecord::RoleTickOutcome(record),
     );
     envelope.trace_context = trace.as_ref().map(|t| t.context.clone());
-    // #11348: shadow into the J2 `role_tick` stream only after this succeeds.
-    if let Err(e) = crate::telemetry::journal_shadow::after_legacy(
-        &tick.root,
-        crate::telemetry::journal_shadow::TelemetryStream::RoleTick,
-        || crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope),
-        |()| crate::telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
-    ) {
+    if let Err(e) = crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope) {
         log::warn!(
             "role_tick_telemetry: failed to append {} tick record for {} at {}: {e} — \
              best-effort, never fatal to the tick (#8056)",

@@ -198,27 +198,18 @@ pub(crate) fn write_private_json<T: serde::Serialize>(path: &Path, value: &T) {
 /// only inside a [`private_dir`]. Best-effort, like [`write_disk_entry`]:
 /// any failure leaves the previous file (or none) in place.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
-    use std::io::Write;
     let Some(dir) = path.parent() else { return };
     if !private_dir(dir, true) {
         return;
     }
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("entry")
-    ));
-    // A stale temp from a crashed writer with a recycled pid: drop and retry.
-    let file = create_private_file(&tmp).or_else(|_| {
-        let _ = std::fs::remove_file(&tmp);
-        create_private_file(&tmp)
-    });
-    let Ok(mut file) = file else { return };
-    if file.write_all(bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    );
 }
 
 mod deferrable;
@@ -250,6 +241,42 @@ pub(crate) struct ConditionalRead {
     /// [`ReadClass::Gate`], the default, retries on the writer;
     /// a deferrable class is shed instead, see [`deferrable`].
     pub(crate) class: ReadClass,
+    /// Which forge's REST shape the listing speaks (#12312).
+    pub(crate) shape: Shape,
+}
+
+/// The forge REST shape a listing URL takes (#12312). GitHub's `/issues`
+/// includes pull requests and pages by `per_page`; Gitea's returns issues
+/// only unless `type=pulls`, and pages by `limit` (capped at 50 by default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Shape {
+    #[default]
+    GitHub,
+    /// `/issues?type=issues`.
+    GiteaIssues,
+    /// `/issues?type=pulls`, or `/pulls`.
+    GiteaPulls,
+}
+
+impl Shape {
+    /// The forge's page size: a page shorter than this is the last one.
+    #[must_use]
+    pub(crate) const fn page_size(self) -> usize {
+        match self {
+            Self::GitHub => 100,
+            Self::GiteaIssues | Self::GiteaPulls => 50,
+        }
+    }
+
+    /// The shapes a repo's open items are listed in: GitHub's one walk
+    /// already holds the PRs, Gitea needs one walk per kind.
+    #[must_use]
+    pub(crate) fn for_forge(forge: crate::forge_cmd::ForgeType) -> &'static [Shape] {
+        match forge {
+            crate::forge_cmd::ForgeType::GitHub => &[Shape::GitHub],
+            crate::forge_cmd::ForgeType::Gitea => &[Shape::GiteaIssues, Shape::GiteaPulls],
+        }
+    }
 }
 
 impl ConditionalRead {
@@ -261,7 +288,15 @@ impl ConditionalRead {
             timeout: None,
             item_scoped: false,
             class: ReadClass::Gate,
+            shape: Shape::GitHub,
         }
+    }
+
+    /// This read in `shape`'s REST dialect.
+    #[must_use]
+    pub(crate) const fn shaped(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
     }
 
     /// This read as a deferrable one of `class`: when every reader that can

@@ -17,7 +17,7 @@
 //! [`CHUNK_BYTES`] is split by [`split_into_chunks`] into several records
 //! that share `tick_id` and carry `chunk_index` / `chunk_count`; the union
 //! of the chunks in `chunk_index` order is exactly the original. The chunk
-//! size exists only because one OTLP/gRPC message is limited to about 4 MB.
+//! size is the ~16 KB log ingest cap, so each chunk stays queryable in SigNoz.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,10 +31,12 @@ use crate::work_finder::step_item::PassReason;
 pub const PICK_DECISION_SCHEMA_VERSION: u32 = 2;
 
 /// A record whose JSON is larger than this is split into several records
-/// (`chunk_index` / `chunk_count`), never truncated. One OTLP/gRPC message is
-/// limited to about 4 MB; [`crate::telemetry::kinds::fleet_state::CHUNK_BYTES`]
-/// uses the same value.
-pub const CHUNK_BYTES: usize = 1_000_000;
+/// (`chunk_index` / `chunk_count`), never truncated. This is the fleet's
+/// ~16 KB log ingest cap (2AMLogic/2am#5541), so every exported chunk stays
+/// queryable in SigNoz. It is independent of
+/// [`crate::telemetry::kinds::fleet_state::CHUNK_BYTES`], which stays at the
+/// 1 MB OTLP/gRPC message budget.
+pub const CHUNK_BYTES: usize = 16 * 1024;
 
 /// The `chunk_count` default for `#[serde(default)]` (1 = unsplit).
 fn one() -> u32 {
@@ -210,7 +212,7 @@ impl PickSkipReason {
                 P::Blocked => Self::Blocked,
                 P::CapabilityMissing => Self::HostConstraint,
                 P::Epic | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
-                P::CiPending => Self::Backoff,
+                P::CiPending | P::HeldAtHead | P::AuthorGateHeld => Self::Backoff,
             },
         }
     }

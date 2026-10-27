@@ -69,6 +69,7 @@ fn step(role: StepRole, item: u32, outcome: Option<&str>) -> Source {
         step: role,
         item,
         log_text: Some(text),
+        hold_auth_before: None,
     })
 }
 
@@ -439,6 +440,7 @@ fn the_staged_step_reads_only_its_own_log_section() {
         step: StepRole::ChampionMerge,
         item: 9,
         log,
+        hold_auth_before: None,
     };
     stage_step(staged.clone());
     assert_eq!(take_staged_step(), Some(staged.clone()));
@@ -492,11 +494,17 @@ fn the_exporter_leaves_the_registrys_step_cooldowns_unchanged() {
                 step: StepRole::ChampionMerge,
                 item: 11277,
                 log: dir.path().join("missing.log"),
+                hold_auth_before: None,
             }),
             Some(&j),
         );
     });
-    assert_eq!(captured.records.len(), 1);
+    // The verdict and, for a Champion merge step, its run fact (#13029).
+    assert_eq!(captured.records.len(), 2);
+    assert!(captured
+        .records
+        .iter()
+        .any(|r| matches!(r, crate::telemetry::TelemetryRecord::ChampionRun(_))));
     assert_eq!(reg.step_cooldowns(now), before);
 }
 
@@ -589,6 +597,7 @@ fn a_stop_projects_the_gate_it_names_and_is_never_ledger_failed() {
         ("requeued", "ci_pending", "ci_pending"),
         ("requeued", "mergeable_unknown", "mergeable_unknown"),
         ("requeued", "pin_missing", "pin_missing"),
+        ("requeued", "guard_refused", "guard_refused"),
         ("requeued", "merge_rc7", "merge_rc7"),
         ("requeued", "merge_rc123", "unspecified"),
         ("requeued", "bogus", "unspecified"),
@@ -603,5 +612,153 @@ fn a_stop_projects_the_gate_it_names_and_is_never_ledger_failed() {
             assert_eq!(r.step.sweep_id.as_deref(), Some("step-champion_merge-9-1"));
             assert!(champion::MERGE_REASONS.contains(&want) || want.starts_with("merge_rc"));
         }
+    }
+}
+
+/// A Doctor or Curator step's source: its log ends with the step's
+/// `LOOM_STEP_OUTCOME` line (none when `line` is `None`).
+fn role_step(role: StepRole, item: u32, line: Option<(&str, &str)>) -> Source {
+    let id = format!("step-{}-{item}-1", role.as_str());
+    let mut text = format!("==== loom-daemon dispatch: t sweep_id={id} item={item} ====\n");
+    if let Some((class, reason)) = line {
+        text.push_str(&format!(
+            "LOOM_STEP_OUTCOME role={} target={item} class={class} reason={reason}\n",
+            role.role_name()
+        ));
+    }
+    Source::Step(StepSource {
+        sweep_id: id,
+        step: role,
+        item,
+        log_text: Some(text),
+        hold_auth_before: None,
+    })
+}
+
+fn one_for(role: &'static str, source: &Source, journal: Option<&Journal>) -> PassVerdictRecord {
+    let ctx = Context { role, ..ctx(t(5)) };
+    let mut records = records_for(&ctx, source, journal, &mut RefusalStore::default());
+    assert_eq!(records.len(), 1, "{records:?}");
+    records.remove(0)
+}
+
+#[test]
+fn every_doctor_result_class_projects_its_reason() {
+    for (line, class, reason) in [
+        (Some(("verdict", "fixed")), "verdict", "fixed_pushed"),
+        (Some(("noop", "no_fix_needed")), "noop", "no_change"),
+        (Some(("refused", "escalated")), "refused", "escalated"),
+        (Some(("refused", "gave-up")), "refused", "gave_up"),
+        (Some(("failed", "crash")), "failed", "failed"),
+        (None, "failed", "failed"),
+    ] {
+        let r = one_for("doctor", &role_step(StepRole::Doctor, 77, line), Some(&journal(vec![])));
+        assert_eq!(class_reason(&r), (class, reason), "{line:?}");
+        assert_eq!(r.mechanism, "step:doctor");
+        assert_eq!(r.artifact, "pr");
+        assert_eq!(r.step.step.as_deref(), Some("doctor"));
+        assert_eq!(r.step.reason_set.as_deref(), Some(doctor::REASON_SET));
+        assert_eq!(r.step.sweep_id.as_deref(), Some("step-doctor-77-1"));
+        assert!(doctor::REASONS.contains(&reason));
+        assert_eq!(r.step.head_sha, None, "no journaled head, none guessed");
+        assert_eq!(r.step.proposal_label, None);
+    }
+}
+
+#[test]
+fn a_doctor_record_takes_its_head_from_the_journal_only() {
+    let j = journal(vec![marker(
+        1,
+        77,
+        true,
+        "<!-- loom:doctor-note -->",
+        Some("def5678"),
+    )]);
+    let r =
+        one_for("doctor", &role_step(StepRole::Doctor, 77, Some(("verdict", "fixed"))), Some(&j));
+    assert_eq!(r.step.head_sha.as_deref(), Some("def5678"));
+    assert_eq!(r.detail.as_deref(), Some("fixed"));
+}
+
+#[test]
+fn a_doctor_hand_off_write_is_escalated_whatever_the_line_says() {
+    let j = journal(vec![JournalEntry::Applied {
+        at: t(2),
+        number: 77,
+        is_pr: true,
+        action: "escalated".to_string(),
+        by: "operator_decision".to_string(),
+    }]);
+    let r =
+        one_for("doctor", &role_step(StepRole::Doctor, 77, Some(("verdict", "fixed"))), Some(&j));
+    assert_eq!(class_reason(&r), ("refused", "escalated"));
+    assert!(r.applied);
+}
+
+#[test]
+fn a_doctor_step_with_no_journal_still_emits() {
+    let r = one_for("doctor", &role_step(StepRole::Doctor, 77, Some(("noop", "x"))), None);
+    assert_eq!(class_reason(&r), ("noop", "no_change"));
+    assert_eq!(r.step.ledger_reason.as_deref(), Some("probe_failed"));
+}
+
+#[test]
+fn every_curator_result_class_projects_its_reason() {
+    for (line, class, reason) in [
+        (Some(("verdict", "curated")), "verdict", "curated"),
+        (Some(("verdict", "unheard_of")), "verdict", "curated"),
+        (Some(("verdict", "rescoped")), "verdict", "rescoped"),
+        (Some(("verdict", "closed")), "verdict", "closed"),
+        (Some(("verdict", "decomposed")), "verdict", "decomposed"),
+        (Some(("verdict", "routed_operator")), "refused", "routed_operator"),
+        (Some(("refused", "needs_human")), "refused", "routed_operator"),
+        (Some(("noop", "already_curated")), "noop", "noop"),
+        (Some(("failed", "x")), "failed", "failed"),
+        (None, "failed", "failed"),
+    ] {
+        let r = one_for("curator", &role_step(StepRole::Curator, 5, line), Some(&journal(vec![])));
+        let class = if reason == "routed_operator" {
+            "refused"
+        } else {
+            class
+        };
+        assert_eq!(class_reason(&r), (class, reason), "{line:?}");
+        assert_eq!(r.mechanism, "step:curator");
+        assert_eq!(r.artifact, "issue");
+        assert_eq!(r.step.step.as_deref(), Some("curator"));
+        assert_eq!(r.step.reason_set.as_deref(), Some(curator::REASON_SET));
+        assert!(curator::REASONS.contains(&reason));
+        assert_eq!(r.step.proposal_label, None, "curated is not a Champion proposal label");
+    }
+}
+
+#[test]
+fn curator_journaled_writes_outrank_the_outcome_line() {
+    let curated = journal(vec![act(2, 5, "curated")]);
+    let r =
+        one_for("curator", &role_step(StepRole::Curator, 5, Some(("noop", "x"))), Some(&curated));
+    assert_eq!(class_reason(&r), ("verdict", "curated"));
+    assert!(r.applied);
+    let parked = journal(vec![applied(2, 5, "blocked", "park_record")]);
+    let r = one_for(
+        "curator",
+        &role_step(StepRole::Curator, 5, Some(("verdict", "curated"))),
+        Some(&parked),
+    );
+    assert_eq!(class_reason(&r), ("refused", "routed_operator"));
+    let escalated = journal(vec![applied(2, 5, "escalated", "operator_decision")]);
+    let r = one_for("curator", &role_step(StepRole::Curator, 5, None), Some(&escalated));
+    assert_eq!(class_reason(&r), ("refused", "routed_operator"));
+}
+
+#[test]
+fn judge_stays_unregistered_and_a_role_tick_projects_nothing_for_doctor_or_curator() {
+    assert!(projector("judge").is_none());
+    assert!(projector("doctor").is_some() && projector("curator").is_some());
+    for role in ["doctor", "curator"] {
+        let ctx = Context { role, ..ctx(t(5)) };
+        let j = journal(vec![act(1, 5, "curated")]);
+        let source = Source::Tick { started_at: t(0) };
+        assert!(records_for(&ctx, &source, Some(&j), &mut RefusalStore::default()).is_empty());
     }
 }

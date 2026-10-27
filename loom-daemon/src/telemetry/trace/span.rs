@@ -95,6 +95,11 @@ pub enum SpanName {
     /// until.
     #[serde(rename = "forge.read.shed")]
     ForgeReadShed,
+    /// One safehouse forge lookup that produced no answer (#13156): an
+    /// instant span, its own root trace, naming the call, repo and reason
+    /// class. Emitted on every failure, not just the first per workspace.
+    #[serde(rename = "safehouse.forge_lookup.failed")]
+    SafehouseForgeLookupFailed,
     /// One provider request observed by the egress proxy (Issue #11300): its
     /// own root trace, counts and classified codes only, never a body.
     #[serde(rename = "loom.egress.request")]
@@ -125,6 +130,10 @@ pub enum SpanName {
     /// bytes reclaimed. Never a path or the gate's free-text wording.
     #[serde(rename = "reaper.pass")]
     ReaperPass,
+    /// One EC2 spot interruption or rebalance notice (#12876): an instant
+    /// span, its own root, naming the kind, the host and the sweeps it ended.
+    #[serde(rename = "loom.host.interruption_notice")]
+    HostInterruptionNotice,
 }
 
 impl SpanName {
@@ -153,12 +162,14 @@ impl SpanName {
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
             Self::ForgeReaderSpill => "forge.reader.spill",
             Self::ForgeReadShed => "forge.read.shed",
+            Self::SafehouseForgeLookupFailed => "safehouse.forge_lookup.failed",
             Self::EgressRequest => "loom.egress.request",
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",
             Self::MainRedAutofile => "main_red.autofile",
             Self::FleetDispatchCall => "loom.fleet_dispatch.call",
             Self::ReaperPass => "reaper.pass",
+            Self::HostInterruptionNotice => "loom.host.interruption_notice",
         }
     }
 }
@@ -250,6 +261,12 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.host.oom_kill_total"
                     | "loom.host.pressure"
                     | "loom.host.load_per_core"
+                    | "loom.host.logical_cpus"
+                    | "loom.host.loadavg_1m"
+                    | "loom.host.start.loadavg_1m"
+                    | "loom.host.start.load_per_core"
+                    | "loom.host.cpu_budget_cores"
+                    | "loom.host.sweeps_in_flight"
                     | "loom.admission.reason"
                     | "loom.admission.load_per_core"
                     | "loom.admission.load_threshold"
@@ -267,6 +284,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::observability::llm_billing::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::roll_interruption::KEYS.contains(&key.as_str())
+                || crate::host_loss::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_runtime::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_draw::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))

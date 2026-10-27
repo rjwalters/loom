@@ -327,14 +327,12 @@ pub fn config_pass(
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
         let mut detail = describe_drift(&drift);
-        let keys = crate::config_journal::restart_keys(target, mode == Mode::Write && drifted);
         if mode == Mode::Write && drifted {
             let lost = render::lost_top_level_keys(target);
             if lost.is_empty() {
                 match render::write(target, &stamp) {
-                    Ok((w, backup)) => {
+                    Ok((w, _backup)) => {
                         wrote = w;
-                        crate::config_journal::record_rendered(w, target, backup, &commit, &keys);
                     }
                     Err(e) => {
                         error = Some(format!("writing {}: {e:#}", target.path.display()));
@@ -605,6 +603,31 @@ fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+/// What [`refresh_floor`] needs to reach the store: set once by [`start`].
+fn fresh_floor_inputs() -> &'static OnceLock<(PathBuf, StoreLocation, PathBuf)> {
+    static INPUTS: OnceLock<(PathBuf, StoreLocation, PathBuf)> = OnceLock::new();
+    &INPUTS
+}
+
+/// Re-read the floor from the store now (#12610), not from the last timer
+/// pass, and publish it like a pass would. A roll about to stop agents calls
+/// this so a floor rolled back since the roll was armed is seen before work is
+/// stopped. A store that cannot be reached keeps the last good floor
+/// ([`resolve_floor`]); a host with no fleet store just answers
+/// [`floor_knowledge`]. Blocking (it shells out to `gh`).
+#[must_use]
+pub fn refresh_floor() -> FloorKnowledge {
+    if let Some((workspace, location, cache)) = fresh_floor_inputs().get() {
+        let transport = crate::fleet_store::gh::GhTransport::new(workspace, &location.repo);
+        let read = fetch::load(&transport, cache, location, Policy::AllowStale, Utc::now())
+            .map(|loaded| floor::read(&loaded.snapshot))
+            .map_err(|e| format!("{e:#}"));
+        let pass = resolve_floor(read, last_good_floor().as_deref());
+        floor_knowledge::record_floor(&pass);
+    }
+    floor_knowledge()
+}
+
 #[cfg(test)]
 fn set_floor(floor: Option<String>) {
     if let Ok(mut guard) = floor_cell().lock() {
@@ -624,7 +647,7 @@ pub fn loom_min_version() -> Option<String> {
 
 /// #12424: restart-required config changes since this process booted, beside
 /// the floor. See [`config_restart`].
-pub use config_restart::config_restart_demand;
+pub use config_restart::{armable_demand, config_restart_demand};
 
 /// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
 /// daemon version a registered workspace NEEDS and this host does not run.
@@ -820,7 +843,6 @@ fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
     fetch::write_atomic(path, &body)?;
-    crate::config_journal::record_sync(status); // J3 shadow, after the legacy write
     Ok(())
 }
 
@@ -878,7 +900,6 @@ pub fn clear_status() {
                 "fleet_sync: no fleet store configured — removed the stale snapshot {}",
                 path.display()
             );
-            crate::config_journal::record_sync_cleared();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::debug!("fleet_sync: could not remove {}: {e:#}", path.display()),
@@ -1041,8 +1062,6 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // #10885: a floor that differs from the previous pass's wakes the
     // self-update loop, so it acts now and not at its next interval.
     floor_knowledge::record_floor(&floor);
-    // J3 shadow (#11349): config as resolved after this pass (deduplicated).
-    crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -1317,6 +1336,11 @@ pub async fn start(
         auto_apply,
         clones: roster_clone::resolve_config(&effective, &|k| std::env::var(k).ok()),
     };
+    let _ = fresh_floor_inputs().set((
+        inputs.workspace.clone(),
+        inputs.location.clone(),
+        inputs.cache.clone(),
+    ));
     log::info!(
         "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={auto_apply}",
         inputs.location.repo,

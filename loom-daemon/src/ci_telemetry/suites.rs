@@ -370,10 +370,7 @@ pub fn suite_envelopes(
             status: outcome_status(outcome),
             attributes: super::records::span_attributes(vec![
                 ("loom.repo", Some(target.repo.to_string())),
-                (
-                    "loom.repo.visibility",
-                    Some(super::records::visibility_str(target.visibility).to_string()),
-                ),
+                ("loom.repo.visibility", Some(target.visibility.as_str().to_string())),
                 ("loom.ci.run_id", Some(target.run_id.to_string())),
                 ("loom.ci.job_id", Some(target.job_id.to_string())),
                 ("loom.ci.workflow", Some(target.workflow.to_string())),

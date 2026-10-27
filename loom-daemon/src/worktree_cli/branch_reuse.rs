@@ -100,10 +100,9 @@
 //! of its fixture under a directory named `re po` for exactly that reason.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use super::branch_landed::{self, Verdict};
-use super::wip::Out;
+use super::wip::{git_ok, git_stdout, Out};
 
 mod holder;
 
@@ -201,16 +200,139 @@ pub fn run_with(opts: &Options, forge: &dyn Fn(&str) -> branch_landed::ForgeProb
         return 1;
     }
 
-    // Step 4. The base-ref divergence warning. `$JSON_OUTPUT != "true"` gated
-    // the whole statement, including the `git merge-base` call — so this is an
-    // early skip rather than a suppressed print.
-    if !json && !contains_base_history(repo, opts) {
+    // Step 4. The base-ref staleness check (#13056, widening #8280's
+    // divergence warning). Measured in both modes because the reset below is a
+    // behaviour, not a message; only the human lines are `--json`-suppressed.
+    match staleness(repo, opts) {
+        Staleness::Current => {}
+        Staleness::Unique {
+            ahead,
+            behind,
+            merge_base_secs,
+        } => {
+            if !json {
+                out.warning(&divergence_warning(opts, ahead, behind, merge_base_secs));
+            }
+        }
+        Staleness::NoUniqueWork { behind } => reset_stale_branch(repo, opts, &out, behind),
+    }
+    0
+}
+
+/// A branch older than this (by merge-base commit date) gets the louder
+/// warning. A constant, deliberately not a config key (#13056).
+pub const STALE_AGE_DAYS: u64 = 7;
+
+/// How a reused local branch relates to the base ref.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staleness {
+    /// Contains all of the base ref's history, or git could not answer — the
+    /// fail-open direction, so no action and no message.
+    Current,
+    /// Behind with 0 commits of its own: nothing unique to lose.
+    NoUniqueWork { behind: u64 },
+    /// Behind and carrying commits of its own — kept, never discarded.
+    Unique {
+        ahead: u64,
+        behind: u64,
+        merge_base_secs: Option<u64>,
+    },
+}
+
+/// The pure classification over resolved counts.
+#[must_use]
+pub fn classify(ahead: u64, behind: u64, merge_base_secs: Option<u64>) -> Staleness {
+    match (ahead, behind) {
+        (_, 0) => Staleness::Current,
+        (0, behind) => Staleness::NoUniqueWork { behind },
+        (ahead, behind) => Staleness::Unique {
+            ahead,
+            behind,
+            merge_base_secs,
+        },
+    }
+}
+
+fn staleness(repo: &Path, opts: &Options) -> Staleness {
+    // `Option`, not `stale_ref::rev_count`'s 0-on-failure: a failed `ahead`
+    // read must not look like "no unique work" and license a reset.
+    let count = |range: String| {
+        git_stdout(repo, &["rev-list", "--count", &range]).and_then(|n| n.parse::<u64>().ok())
+    };
+    let (Some(ahead), Some(behind)) = (
+        count(format!("{}..{}", opts.base_ref, opts.branch)),
+        count(format!("{}..{}", opts.branch, opts.base_ref)),
+    ) else {
+        return Staleness::Current;
+    };
+    let merge_base_secs = git_stdout(repo, &["merge-base", &opts.base_ref, &opts.branch])
+        .and_then(|mb| git_stdout(repo, &["show", "-s", "--format=%ct", &mb]))
+        .and_then(|t| t.parse::<u64>().ok());
+    classify(ahead, behind, merge_base_secs)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Whole days between a merge-base commit time and `now`.
+#[must_use]
+pub fn age_days(now: u64, merge_base_secs: u64) -> u64 {
+    now.saturating_sub(merge_base_secs) / 86_400
+}
+
+/// The warning for a behind branch that carries its own commits. Keeps the
+/// `has diverged from <base>` prefix the retained suites match on.
+#[must_use]
+pub fn divergence_warning(
+    opts: &Options,
+    ahead: u64,
+    behind: u64,
+    merge_base_secs: Option<u64>,
+) -> String {
+    let age = merge_base_secs.map(|t| age_days(now_secs(), t));
+    let base_note = age.map_or_else(String::new, |d| format!(", merge-base is {d} day(s) old"));
+    let loud = age.filter(|d| *d > STALE_AGE_DAYS).map_or_else(String::new, |d| {
+        format!(
+            " WARNING: this branch is {d} days behind (> {STALE_AGE_DAYS}); building on it measures stale code and pushing it re-proposes old commits."
+        )
+    });
+    format!(
+        "Branch '{}' has diverged from {} ({ahead} commit(s) ahead, {behind} behind{base_note}) - reusing it as-is; rebase or delete it if that is not what you want.{loud}",
+        opts.branch, opts.base_display
+    )
+}
+
+/// Fast-forward a 0-ahead branch ref to the base ref. Safe because it has no
+/// commit of its own; skipped when a worktree holds the branch, where moving
+/// the ref under a checkout would desync its index.
+fn reset_stale_branch(repo: &Path, opts: &Options, out: &Out, behind: u64) {
+    if let Some(h) = holder::find(repo, &opts.branch) {
+        if !opts.json() {
+            out.warning(&format!(
+                "Branch '{}' is {behind} commit(s) behind {} with no work of its own, but is checked out at {} - not resetting it",
+                opts.branch,
+                opts.base_display,
+                h.path.display()
+            ));
+        }
+        return;
+    }
+    if git_ok(repo, &["branch", "-f", &opts.branch, &opts.base_ref]) {
+        if !opts.json() {
+            out.info(&format!(
+                "Branch '{}' was {behind} commit(s) behind {} with no work of its own - reset to {}",
+                opts.branch, opts.base_display, opts.base_display
+            ));
+        }
+    } else if !opts.json() {
         out.warning(&format!(
-            "Branch '{}' has diverged from {} (does not contain all of its history) - reusing it as-is; rebase or delete it if that is not what you want",
+            "Branch '{}' is {behind} commit(s) behind {} with no work of its own, and could not be reset - reusing it as-is",
             opts.branch, opts.base_display
         ));
     }
-    0
 }
 
 /// `[[ "$(git rev-parse "$BRANCH_NAME")" == "$(git rev-parse "origin/$DEFAULT_BRANCH")" ]]`
@@ -221,15 +343,10 @@ pub fn run_with(opts: &Options, forge: &dyn Fn(&str) -> branch_landed::ForgeProb
 /// as equal (and so suppressed the refusal), and an unresolvable tip is not
 /// evidence of anything.
 fn tip_is_current_default(repo: &Path, opts: &Options) -> bool {
-    let tip = git_stdout(repo, &["rev-parse", &opts.branch]);
-    let default_tip = git_stdout(repo, &["rev-parse", &format!("origin/{}", opts.default_branch)]);
+    let tip = git_stdout(repo, &["rev-parse", &opts.branch]).unwrap_or_default();
+    let default_tip = git_stdout(repo, &["rev-parse", &format!("origin/{}", opts.default_branch)])
+        .unwrap_or_default();
     tip == default_tip
-}
-
-/// `git merge-base --is-ancestor "$BASE_REF" "$BRANCH_NAME"` — does the branch
-/// contain all of the base ref's history?
-fn contains_base_history(repo: &Path, opts: &Options) -> bool {
-    git_ok(repo, &["merge-base", "--is-ancestor", &opts.base_ref, &opts.branch])
 }
 
 /// The refusal, in whichever of the two output modes the caller is in — an
@@ -325,32 +442,6 @@ fn json_pr(number: Option<&str>) -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     }
-}
-
-fn git_ok(repo: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-fn git_stdout(repo: &Path, args: &[&str]) -> String {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

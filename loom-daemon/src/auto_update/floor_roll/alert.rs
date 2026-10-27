@@ -159,8 +159,8 @@ pub fn loom_ui_alert(
     stall: Option<&FloorStallReport>,
     alerted: bool,
     was_alerted: bool,
-) -> Option<crate::loom_ui_alerts::Alert> {
-    use crate::loom_ui_alerts::{Alert, Severity, State};
+) -> Option<crate::alerts::Alert> {
+    use crate::alerts::{Alert, Severity, State};
     const RULE: &str = "fleet.floor-unsatisfiable";
     match stall {
         Some(stall) if alerted => Some(
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn loom_ui_opens_when_alerted_and_resolves_when_the_stall_clears() {
-        use crate::loom_ui_alerts::State;
+        use crate::alerts::State;
         let mut state = stalled();
         let was = state.stall_declared_at().is_some();
         let alerted = state.alert_due(t0(), REMINDER);
@@ -370,7 +370,7 @@ mod tests {
         running: &str,
         newest: &str,
         now: DateTime<Utc>,
-    ) -> Option<crate::loom_ui_alerts::State> {
+    ) -> Option<crate::alerts::State> {
         state.set_basis(FloorKnowledge::Set(floor.to_string()), running);
         state.observe(Some(&rel(newest)));
         let was = state.was_alerted();
@@ -381,7 +381,7 @@ mod tests {
     /// #12652: a host that rolls to the floor resolves the incident it opened.
     #[test]
     fn loom_ui_resolves_when_a_basis_change_removes_an_alerted_stall() {
-        use crate::loom_ui_alerts::State;
+        use crate::alerts::State;
         let mut state = FloorState::default();
         let open = loom_ui_tick(&mut state, FLOOR, RUNNING, "0.19.900", t0());
         assert_eq!(open, Some(State::Open));
@@ -395,7 +395,7 @@ mod tests {
     /// #12652: a stall cleared by a satisfying release, with no basis change.
     #[test]
     fn loom_ui_resolves_when_a_published_release_satisfies_an_alerted_stall() {
-        use crate::loom_ui_alerts::State;
+        use crate::alerts::State;
         let mut state = FloorState::default();
         assert_eq!(loom_ui_tick(&mut state, FLOOR, RUNNING, "0.19.900", t0()), Some(State::Open));
         let resolved = loom_ui_tick(&mut state, FLOOR, RUNNING, "9.0.1", t0() + mins(15));

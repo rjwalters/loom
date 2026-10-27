@@ -6,7 +6,7 @@
 //! telemetry-reader, or reads an export of their output (`--from-file`),
 //! and prints every emitting host's coverage — `covered`, or `unknown` with
 //! the reason — and every reconstructed item. The logic lives in
-//! [`loom_daemon::telemetry_replay`]; this is the thin CLI.
+//! [`crate::telemetry_replay`]; this is the thin CLI.
 //!
 //! `--check` (#11128) runs queries 6 and 7 instead: each covered host's view
 //! against the webhook-derived label state over sample instants. Exit 0: every
@@ -22,13 +22,11 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 
-use loom_daemon::signoz_read::{
-    EndpointConfig, TelemetryReader, ENDPOINT_CONFIG_KEY, ENDPOINT_ENV,
-};
-use loom_daemon::telemetry_replay::check::{
+use crate::signoz_read::{EndpointConfig, TelemetryReader, ENDPOINT_CONFIG_KEY, ENDPOINT_ENV};
+use crate::telemetry_replay::check::{
     self, CheckParams, DEFAULT_SPAN_SEC, DEFAULT_THRESHOLD_SEC, EXIT_UNREADABLE,
 };
-use loom_daemon::telemetry_replay::{
+use crate::telemetry_replay::{
     self, ReplayParams, DEFAULT_STEP_SEC, DEFAULT_WINDOW_SEC, REPLAY_QUERIES,
 };
 

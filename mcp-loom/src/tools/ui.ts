@@ -16,7 +16,6 @@ import { join } from "node:path";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { CONSOLE_LOG_PATH, getWorkspacePath, readConfigFile } from "../shared/config.js";
 import { sendDaemonRequest } from "../shared/daemon.js";
-import { writeMCPCommand } from "../shared/ipc.js";
 
 /**
  * Desktop-app (retired Electron UI) console-log-derived signal — the ONLY
@@ -318,52 +317,18 @@ async function getUIState(): Promise<string> {
  * - read_console_log: Use `tail ~/.loom/console.log` for debugging
  * - read_state_file: Use get_ui_state instead (provides state + more context)
  * - read_config_file: Use get_ui_state instead (provides config + more context)
- * - trigger_factory_reset: Use trigger_force_factory_reset (bypasses confirmation)
+ * - trigger_start, trigger_force_start, trigger_force_factory_reset, stop_engine: removed; they
+ *   relied on a file IPC nothing consumed (the daemon is driven via dispatch_sweep etc.)
+ * - trigger_factory_reset: Removed with the tools above
  * - trigger_restart_terminal: Use restart_terminal from terminals module
- * - trigger_run_now: Use launch_interval from terminals module
+ * - trigger_run_now: Removed (launch_interval was removed too)
  * - get_random_file: Use .loom/scripts/random-file.sh instead
  */
 export const uiTools: Tool[] = [
   {
-    name: "trigger_start",
-    description:
-      "Start the Loom engine using EXISTING workspace config (.loom/config.json). Shows confirmation dialog before creating terminals and launching agents. Does NOT reset or overwrite config. Use this to restart terminals with current configuration (e.g., after app restart or crash). Requires workspace to be selected.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "trigger_force_start",
-    description:
-      "Start the Loom engine using existing config WITHOUT confirmation dialog. Same as trigger_start but bypasses confirmation prompt. Use this for MCP automation, testing, or when you're certain the user wants to start. Does NOT reset config. Requires workspace to be selected.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "trigger_force_factory_reset",
-    description:
-      "Reset workspace to factory defaults WITHOUT confirmation dialog. Overwrites .loom/config.json with defaults/config.json. Does NOT auto-start - must run trigger_force_start after reset to create terminals. Use this for MCP automation or when you're certain the user wants to reset.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
     name: "get_heartbeat",
     description:
       "Get Loom's heartbeat status. Checks the running loom-daemon over its Unix socket FIRST (status 'daemon_healthy' whenever the daemon responds, with an in-flight sweep count) and only falls back to the retired Electron desktop app's console log (healthy/active/idle/stale/not_running) when the daemon itself is unreachable. Returns both signals: top-level status/message plus 'daemon' and 'desktopApp' detail objects.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "stop_engine",
-    description:
-      "Stop the Loom engine by destroying all terminal sessions and cleaning up resources. This will close all terminals and stop all running agents. Use trigger_start or trigger_force_start to restart the engine afterwards.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -388,29 +353,9 @@ export async function handleUITool(
   _args?: Record<string, unknown>
 ): Promise<{ type: "text"; text: string }[]> {
   switch (name) {
-    case "trigger_start": {
-      const result = await writeMCPCommand("trigger_start");
-      return [{ type: "text", text: result }];
-    }
-
-    case "trigger_force_start": {
-      const result = await writeMCPCommand("trigger_force_start");
-      return [{ type: "text", text: result }];
-    }
-
-    case "trigger_force_factory_reset": {
-      const result = await writeMCPCommand("trigger_force_factory_reset");
-      return [{ type: "text", text: result }];
-    }
-
     case "get_heartbeat": {
       const heartbeat = await getHeartbeat();
       return [{ type: "text", text: heartbeat }];
-    }
-
-    case "stop_engine": {
-      const result = await writeMCPCommand("stop_engine");
-      return [{ type: "text", text: result }];
     }
 
     case "get_ui_state": {

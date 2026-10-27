@@ -73,6 +73,11 @@ treats it as a conflict.
   post-merge reconcile rebases it. `reconcile-child` defers a `loom:building`
   child only while its issue lease is live (`route_with_lease`); the label alone
   stays on until the PR merges.
+- **Parent closes unmerged.** In a merge-mode repo the child is flagged
+  (`loom:merge-conflict`) and Doctor recovers it with a replacement PR
+  (`orphan-stack-replacement.md`, #12767), never a rewrite or a retarget. Keep
+  `stacking.onConflict.enabled` **off fleet-wide** until that path has been
+  qualified on a real orphan, or the operator accepts the flag-only behaviour.
 - **#11708 / #12344.** Stacking does not depend on their ruling. If either
   deletes or simplifies the sequencer further, `merge_tree_conflicts` must
   stay: the stacking verb uses it (#12775 kept it).

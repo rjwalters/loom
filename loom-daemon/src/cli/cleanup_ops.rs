@@ -4,9 +4,9 @@
 
 use anyhow::Result;
 
-use loom_daemon::worktree_ops::clean;
+use crate::worktree_ops::clean;
 
-use crate::CleanupAction;
+use crate::cli::CleanupAction;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_clean_command(
@@ -23,8 +23,8 @@ pub(crate) fn handle_clean_command(
     aggressive: bool,
     aggressive_min_age: u64,
 ) -> Result<()> {
-    use loom_daemon::worktree_ops::aggressive as agg;
-    use loom_daemon::worktree_ops::repo;
+    use crate::worktree_ops::aggressive as agg;
+    use crate::worktree_ops::repo;
 
     let repo_root = repo::resolve_repo_root(workspace)?;
 
@@ -124,6 +124,7 @@ pub(crate) fn handle_clean_command(
         // typed the command is the authority on a sentinel-less worktree. Only
         // the unattended reaper (#4876) requires the `.loom-managed` sentinel.
         require_managed_sentinel: false,
+        idle_open_secs: None,
     };
     let exit_code = clean::run_clean(&repo_root, &opts);
     if !worktrees_only && !branches_only && !tmux_only {
@@ -151,7 +152,7 @@ pub(crate) fn handle_clean_command(
 /// here would mean removing files after the operator said no. The fleet's
 /// scheduled `clean --deep --safe -y` passes `-y` and therefore reclaims.
 fn clean_native_launch_state(dry_run: bool, force: bool) {
-    use loom_daemon::native_tools::provision::reap;
+    use crate::native_tools::provision::reap;
 
     let Some(base) = reap::default_base() else {
         return;
@@ -179,7 +180,7 @@ fn clean_native_launch_state(dry_run: bool, force: bool) {
 /// report-unless-forced rule as [`clean_native_launch_state`], for the same
 /// reason; `--dry-run` never removes and reports the bytes it would free.
 fn clean_cargo_target_orphans(repo_root: &std::path::Path, dry_run: bool, force: bool) {
-    use loom_daemon::target_orphan_reclaim as orphans;
+    use crate::target_orphan_reclaim as orphans;
 
     let config = orphans::read_config(repo_root);
     if !orphans::resolve_enabled(&config) {
@@ -199,7 +200,7 @@ fn clean_cargo_target_orphans(repo_root: &std::path::Path, dry_run: bool, force:
             "  {} {} ({})",
             if remove { "removed" } else { "orphaned" },
             candidate.path.display(),
-            loom_daemon::tmpfs_reclaim::human_size(candidate.size_bytes)
+            crate::tmpfs_reclaim::human_size(candidate.size_bytes)
         );
     }
     for (path, why) in &report.failed {
@@ -219,23 +220,19 @@ fn clean_cargo_target_orphans(repo_root: &std::path::Path, dry_run: bool, force:
 /// gain a free-space-blind trim of every kept worktree's cache as a side
 /// effect; the daemon's own passes own the removal.
 fn clean_idle_worktree_targets(repo_root: &std::path::Path) {
-    use loom_daemon::worktree_reaper as reaper;
+    use crate::worktree_reaper as reaper;
 
     println!();
     println!("Idle Worktree Build Caches (report only)\n");
     let report = reaper::clean_idle_targets(&[repo_root.to_path_buf()], true);
     for a in &report.removed {
-        println!(
-            "  idle {} ({})",
-            a.path().display(),
-            loom_daemon::tmpfs_reclaim::human_size(a.bytes)
-        );
+        println!("  idle {} ({})", a.path().display(), crate::tmpfs_reclaim::human_size(a.bytes));
     }
     println!("  category={} {}", reaper::IDLE_TARGET_CATEGORY, report.detail());
 }
 
 pub(crate) fn handle_cleanup_command(action: CleanupAction) -> Result<()> {
-    use loom_daemon::worktree_ops::{logs, repo};
+    use crate::worktree_ops::{logs, repo};
     match action {
         CleanupAction::Logs {
             workspace,
@@ -259,7 +256,7 @@ pub(crate) fn handle_recover_orphans_command(
     json: bool,
     verbose: bool,
 ) -> Result<()> {
-    use loom_daemon::worktree_ops::{orphan_recovery as orphans, repo};
+    use crate::worktree_ops::{orphan_recovery as orphans, repo};
 
     let repo_root = repo::resolve_repo_root(workspace)?;
 

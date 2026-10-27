@@ -56,7 +56,7 @@ this doc, verified against source:
 | `autonomous.roleRunner.*` (`enabled`, `roles`, `onIdle`, `model`, …) | **Live** — re-read from `.loom/config.json` every role-runner tick, per registered root | `read_role_runner_config` is called inside the per-tick loop body (`loom-daemon/src/role_runner.rs`), not cached at spawn |
 | `autonomous.workFinder.maxConcurrent` | **Live** — re-read every multi-workspace tick since #9060/#9090. It is the only admission cap since #12406; the env override `LOOM_WORK_FINDER_MAX_CONCURRENT` is restart-only | `ConfiguredMaxReloader::refresh()` in `loom-daemon/src/work_finder/configured_max.rs`, called from the tick body |
 | `autonomous.workFinder.enabled` (the work-finder **master switch**) | **Requires a daemon restart** — read once when the daemon decides whether to spawn the loop at all | `loom-daemon/src/daemon_service.rs` (`read_work_finder_config` called once, outside any loop, gating the `tokio::spawn`) |
-| `autonomous.workFinder.intervalSecs` | **Requires a daemon restart** — the ticker's period also seeds the forge-event poll gate's cadence and the early-tick registration, so a ticker-only re-arm would leave them stale | `loom-daemon/src/daemon_service.rs` startup block (`resolve_interval_with_config`, `poll_gate::configure_for`) |
+| `autonomous.workFinder.intervalSecs` | **Requires a daemon restart** — the ticker is built once at startup with this period | `loom-daemon/src/daemon_service.rs` startup block (`resolve_interval_with_config`) |
 | `autonomous.rateLimitBreaker.*` | **Requires a daemon restart** — resolved once at startup, before any loop is spawned | `loom-daemon/src/daemon_service.rs`, registered unconditionally ahead of the work-finder branch |
 | `autonomous.mainHealthGate.suppressDispatchDuringGate` | **Requires a daemon restart** — resolved once at startup from the primary workspace config | `loom-daemon/src/daemon_service.rs` comment: "Resolved once at startup from the same primary workspace config as the gate's master switch" |
 | `autonomous.transcriptIngest.*` (`enabled`, `intervalSecs`, `windowHours`) | **Requires a daemon restart** — resolved once before the ingestion thread is spawned, then frozen for the life of that thread | `read_transcript_ingest_config` + `resolve_settings` are called inside `try_init_transcript_ingest` (`loom-daemon/src/activity/transcript_ingest.rs`), which `daemon_service.rs` invokes once at bring-up; the spawned thread's `loop` body reads only the already-resolved `interval`/`window_hours` locals |
@@ -130,6 +130,27 @@ between passes. A store commit with no host reporting it is exactly the
 The timer half is **detection, not convergence** by default: it reports drift
 and writes nothing unless `fleet.autoApply` is on. A change that must take
 effect without waiting for a restart still needs one.
+
+### Restart-required changes restart the daemon on a `fleet.autoApply` host (#12425)
+
+A host that writes its config (`fleet.autoApply`) also applies what needs a
+restart. Each timer pass compares the rendered tiers with how they looked at
+boot (`config_restart_demand()`); while that demand is non-empty, the
+self-update loop's next tick starts the one roll path (`trigger_pause_roll`)
+onto the binary already running, with `target_source = config_restart`. It
+fetches nothing and waits for nothing: no window, jitter, debounce or minimum
+interval, and it runs with `autonomous.autoUpdate.enabled=false`. Several keys
+changed before the tick are one restart; the restarted daemon boots with a
+fresh snapshot, has no demand, and arms nothing. Live (hot-reloadable) keys
+never arm. It is not armed while a version roll (floor or repo-ahead) is
+arming or armed, whose restart clears the demand too. A host without
+`fleet.autoApply` (and a host with no fleet store) arms nothing: it reports
+the demand in `status` and waits for an operator restart.
+
+A same-binary restart is not a version roll: the settle clocks and the
+unsatisfiable-floor episode are restored across it (#10877), and `last_roll`,
+the artifact-roll record, the roll-attempt guard and the backoff are left
+alone. The pause manifest has `from_version == to_version`.
 
 ## The per-repo fleet tier (#11738)
 

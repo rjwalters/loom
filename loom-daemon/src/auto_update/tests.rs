@@ -94,6 +94,8 @@ fn test_config_reads_all_fields() {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
+            overdue_secs: None,
+            converge_deadline_secs: None,
             removed_keys: Vec::new(),
         }
     );
@@ -1111,6 +1113,8 @@ mod supersede_tick;
 mod running_basis;
 // Floor-driven roll targets (#10712).
 mod floor_roll;
+// Restart-required config arms a same-binary restart (#12425).
+mod config_restart;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

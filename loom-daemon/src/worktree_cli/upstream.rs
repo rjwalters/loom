@@ -109,6 +109,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::wip::{git_status_code, BLUE, NC, YELLOW};
+
 /// Which of the two retired blocks to run.
 ///
 /// The arms differ in exactly two observable ways — the noun in the two
@@ -306,19 +308,6 @@ fn git_stdout_lossy(dir: &Path, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// `git -C "$dir" … >/dev/null 2>&1; echo $?` — a git that cannot be spawned
-/// answers 127, matching bash's own report for that failure.
-fn git_status_code(dir: &Path, args: &[&str]) -> i32 {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_or(127, |s| s.code().unwrap_or(127))
-}
-
 /// `git -C "$dir" … 2>/dev/null || true` where the result is not read.
 ///
 /// **stderr is discarded; stdout is INHERITED**, because the retired shell
@@ -354,10 +343,6 @@ fn git_discard(dir: &Path, args: &[&str]) {
 struct Reporter {
     quiet: bool,
 }
-
-const YELLOW: &str = "\x1b[1;33m";
-const BLUE: &str = "\x1b[0;34m";
-const NC: &str = "\x1b[0m";
 
 impl Reporter {
     fn info(&self, msg: &str) {

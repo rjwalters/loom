@@ -349,6 +349,7 @@ impl SweepRegistry {
             role,
             info.and_then(|i| i.model.as_deref()),
             info.and_then(|i| i.effort.as_deref()),
+            self.step_points(sweep_id),
         );
         self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached
@@ -360,6 +361,7 @@ impl SweepRegistry {
                 step: role,
                 item,
                 log: log_path,
+                hold_auth_before: self.step_hold_auth(sweep_id),
             };
             let spawned = std::thread::Builder::new()
                 .name("step-capture".to_string())

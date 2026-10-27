@@ -17,8 +17,9 @@
 //! # Projections
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
-//! item to a closed, versioned `(class, reason)`. This change registers
-//! `champion` only ([`champion`]); other roles add theirs (#12029).
+//! item to a closed, versioned `(class, reason)`. Registered: `champion`
+//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921);
+//! other roles add theirs (#12029).
 //!
 //! # The ledger's view, record-only
 //!
@@ -59,6 +60,8 @@ use crate::telemetry::kinds::pass::{PassMode, PassVerdictRecord, StepFacts};
 use crate::telemetry::provenance::Provenance;
 
 pub mod champion;
+pub mod curator;
+pub mod doctor;
 pub mod refusals;
 
 use refusals::{Observed, RefusalStore};
@@ -152,8 +155,45 @@ pub struct Projector {
 pub fn projector(role: &str) -> Option<Projector> {
     match role {
         "champion" => Some(champion::PROJECTOR),
+        "doctor" => Some(doctor::PROJECTOR),
+        "curator" => Some(curator::PROJECTOR),
         _ => None,
     }
+}
+
+/// `key=` of the last `LOOM_STEP_OUTCOME` line in `text` for `role` and
+/// `item`, verbatim (the ledger's own line, [`outcome_ledger::OUTCOME_LINE_PREFIX`]).
+fn outcome_field(text: &str, role: &str, item: u32, key: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        let rest = line
+            .trim()
+            .strip_prefix(outcome_ledger::OUTCOME_LINE_PREFIX)?;
+        let field = |key: &str| {
+            rest.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        };
+        (field("role")? == role && field("target")?.parse::<u32>().ok()? == item)
+            .then(|| field(key).map(str::to_string))
+            .flatten()
+    })
+}
+
+fn projection(class: &'static str, reason: &str, set: &'static str) -> Projection {
+    Projection {
+        class,
+        reason: reason.to_string(),
+        reason_set: set,
+        ..Projection::default()
+    }
+}
+
+/// The session's raw `reason=` token for a record's `detail`: the token
+/// characters only, bounded.
+fn sanitize_detail(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(48)
+        .collect()
 }
 
 /// The step whose end drains a journal.
@@ -164,6 +204,8 @@ pub struct StepSource {
     pub item: u32,
     /// The session's own section of its log, `None` when unreadable.
     pub log_text: Option<String>,
+    /// The digest the item's hold recorded when it was drawn (#13029).
+    pub hold_auth_before: Option<String>,
 }
 
 /// What a drained journal belongs to.
@@ -180,6 +222,8 @@ pub struct StagedStep {
     pub step: StepRole,
     pub item: u32,
     pub log: PathBuf,
+    /// The digest the item's hold recorded when it was drawn (#13029).
+    pub hold_auth_before: Option<String>,
 }
 
 impl StagedStep {
@@ -202,6 +246,7 @@ impl StagedStep {
             step: self.step,
             item: self.item,
             log_text,
+            hold_auth_before: self.hold_auth_before,
         }
     }
 }
@@ -294,7 +339,9 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     by: by.clone(),
                 },
             )),
-            JournalEntry::Queue { .. } | JournalEntry::Listing { .. } => None,
+            JournalEntry::Queue { .. }
+            | JournalEntry::Listing { .. }
+            | JournalEntry::Hold { .. } => None,
         })
         .collect()
 }
@@ -463,7 +510,7 @@ fn record(
         p.reason_key.as_deref().unwrap_or_default(),
         &hour,
     ]);
-    let proposal_label = (!evidence.is_pr)
+    let proposal_label = (!evidence.is_pr && ctx.role == "champion")
         .then(|| {
             champion::PROPOSAL_LABELS
                 .into_iter()
@@ -539,6 +586,22 @@ pub fn emit_drain(
         let changed = *store != before;
         (records, changed)
     });
+    // #13029: a Champion merge step's run fact, from the verdict just built.
+    if let Source::Step(step) = &source {
+        let auth_after = Some(crate::champion_hold::standing_auth_digest(root));
+        for verdict in &records {
+            if let Some(run) = super::champion_run::record_for(
+                repo,
+                step,
+                journal,
+                verdict,
+                auth_after.clone(),
+                ctx.now,
+            ) {
+                super::ops::emit_record(crate::telemetry::TelemetryRecord::ChampionRun(run));
+            }
+        }
+    }
     for record in records {
         super::ops::emit_record(crate::telemetry::TelemetryRecord::PassVerdict(record));
     }

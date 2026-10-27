@@ -17,7 +17,6 @@
 //! argv for every call, so the tests can say which credential each call ran
 //! under.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -28,33 +27,7 @@ use crate::telemetry::kinds::write_scope_refused::RefusalClass;
 
 const OWNER_B: &str = "xowner-b-12606";
 
-/// Set process environment variables for one test and restore them on drop.
-struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
-
-impl EnvGuard {
-    fn set(vars: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
-        let mut prior = Vec::new();
-        for (k, v) in vars {
-            prior.push((*k, std::env::var_os(k)));
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-        Self(prior)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, v) in self.0.drain(..) {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 /// The two-owner host: A's writer as the process credential, B's checkout
 /// registered against B's writer, and the fake `gh`.
@@ -128,16 +101,14 @@ impl TwoOwners {
         std::fs::write(&gh, script).unwrap();
         std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let cache = tmp.path().join("write-scope-cache");
-        let env = EnvGuard::set(&[
-            ("GH_CONFIG_DIR", Some(a_cfg.as_os_str())),
-            ("LOOM_GH_BIN", Some(gh.as_os_str())),
-            ("LOOM_WRITE_SCOPE_CACHE_DIR", Some(cache.as_os_str())),
-            ("LOOM_INSTALLATION_SNAPSHOT", Some(std::ffi::OsStr::new("0"))),
-            ("GH_TOKEN", None),
-            ("GITHUB_TOKEN", None),
-            ("GH_REPO", None),
-            ("LOOM_REPO", None),
-        ]);
+        let env = EnvGuard::set("GH_CONFIG_DIR", &a_cfg)
+            .and_set("LOOM_GH_BIN", Some(gh.as_os_str()))
+            .and_set("LOOM_WRITE_SCOPE_CACHE_DIR", Some(cache.as_os_str()))
+            .and_set("LOOM_INSTALLATION_SNAPSHOT", Some(std::ffi::OsStr::new("0")))
+            .and_set("GH_TOKEN", None)
+            .and_set("GITHUB_TOKEN", None)
+            .and_set("GH_REPO", None)
+            .and_set("LOOM_REPO", None);
         Self {
             _tmp: tmp,
             _env: env,
@@ -229,7 +200,7 @@ fn the_ladder_write_on_a_cross_owner_repo_runs_and_is_vetted_under_the_item_owne
 fn the_refusal_ledger_write_targets_the_item_repo_and_runs_under_the_owners_writer() {
     for register_root in [true, false] {
         let h = TwoOwners::new(register_root, true);
-        let _repo = EnvGuard::set(&[("LOOM_REPO", Some(std::ffi::OsStr::new(&h.repo_b)))]);
+        let _repo = EnvGuard::set("LOOM_REPO", &h.repo_b);
         let reg = crate::sweep_registry::SweepRegistry::new(
             crate::sweep_registry::SweepRegistryConfig::new(h.root_b.clone()),
         );

@@ -4314,6 +4314,7 @@ mod llm_gateway;
 mod model_resolution;
 mod pipeline_idle_gate;
 mod prompt_cache_prefix;
+mod ratification_dispatch;
 mod roster_fence;
 mod run_target_dir;
 mod shard_dispatch;

@@ -7,31 +7,6 @@
 use super::*;
 use crate::telemetry::kinds::session_output::OutputCategory;
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "loom-live-output-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn now() -> DateTime<Utc> {
     Utc::now()
 }
@@ -60,7 +35,7 @@ fn live_output_is_off_unless_something_asks_for_it() {
 #[test]
 fn an_absent_config_block_resolves_to_the_documented_defaults() {
     let scratch = Scratch::new("defaults");
-    let config = read_config(&scratch.0);
+    let config = read_config(scratch.root());
     assert_eq!(config, LiveOutputConfig::default());
     let resolved = resolve(&config);
     assert_eq!(resolved.interval.as_millis(), u128::from(DEFAULT_INTERVAL_MS));
@@ -77,7 +52,7 @@ fn the_config_block_is_read_from_loom_config_json() {
         r#"{"observability":{"liveOutput":{"enabled":true,"intervalMs":1500,"heartbeatSecs":10,"maxRuns":8}}}"#,
     )
     .unwrap();
-    let config = read_config(&scratch.0);
+    let config = read_config(scratch.root());
     assert_eq!(config.enabled, Some(true));
     let resolved = resolve(&config);
     assert_eq!(resolved.interval.as_millis(), 1_500);
@@ -94,7 +69,7 @@ fn nonsense_knob_values_fall_back_rather_than_producing_a_zero_interval() {
         r#"{"observability":{"liveOutput":{"enabled":true,"intervalMs":0,"heartbeatSecs":0,"maxRuns":0}}}"#,
     )
     .unwrap();
-    let resolved = resolve(&read_config(&scratch.0));
+    let resolved = resolve(&read_config(scratch.root()));
     assert_eq!(resolved.interval.as_millis(), u128::from(DEFAULT_INTERVAL_MS));
     assert_eq!(resolved.heartbeat.as_secs(), DEFAULT_HEARTBEAT_SECS);
     assert_eq!(resolved.max_runs, DEFAULT_MAX_RUNS);
@@ -122,27 +97,15 @@ fn enabling_live_output_does_not_add_or_change_an_exporter() {
         r#"{"observability":{"enabled":true,"endpoint":"https://example.invalid/ingest","liveOutput":{"enabled":true}}}"#,
     )
     .unwrap();
-    let read = super::super::read_config(&scratch.0);
+    let read = super::super::read_config(scratch.root());
     assert_eq!(super::super::resolve_exporters(&read), baseline);
     // And the block genuinely was read, so the assertion above is not vacuous.
-    assert_eq!(read_config(&scratch.0).enabled, Some(true));
+    assert_eq!(read_config(scratch.root()).enabled, Some(true));
 }
 
 #[test]
 fn no_otlp_queue_means_no_sink_and_therefore_no_publication() {
     assert!(SessionOutputSink::new(Vec::new(), "host").is_none());
-}
-
-#[test]
-fn the_kind_is_refused_by_the_native_ingest_backend() {
-    // Restated here, next to the producer, because this is the property that
-    // makes "live output cannot start a managed-cloud export" true rather
-    // than merely configured.
-    let meta = crate::telemetry::TELEMETRY_KINDS
-        .iter()
-        .find(|m| m.kind == "session.output")
-        .unwrap();
-    assert!(!meta.native_ingest);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +195,7 @@ fn an_unsupported_runtime_is_flagged_and_never_read() {
     assert!(!run.supported());
     let scratch = Scratch::new("unsupported");
     assert!(
-        advance_run(run, &scratch.0, now()).is_empty(),
+        advance_run(run, scratch.root(), now()).is_empty(),
         "an unsupported runtime produces no content records"
     );
     for runtime in SUPPORTED_RUNTIMES {

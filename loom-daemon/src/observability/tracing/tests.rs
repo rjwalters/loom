@@ -1,11 +1,11 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
-use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
+use crate::telemetry::trace::TraceContext;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 #[test]
-fn legacy_queue_envelope_stays_compatible_and_native_context_is_stripped() {
-    let mut old = TelemetryEnvelope::new(
+fn legacy_queue_envelope_stays_compatible() {
+    let old = TelemetryEnvelope::new(
         "host",
         TelemetryRecord::SweepStarted(crate::telemetry::SweepStartedRecord {
             story_points: None,
@@ -22,24 +22,6 @@ fn legacy_queue_envelope_stays_compatible_and_native_context_is_stripped() {
     let parsed: TelemetryEnvelope = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed.schema_version, 2);
     assert!(parsed.trace_context.is_none());
-    old.trace_context = Some(TraceContext::root(true));
-    let now = chrono::Utc::now();
-    let trace = TelemetryEnvelope::new(
-        "host",
-        TelemetryRecord::Span(SpanRecord {
-            context: TraceContext::root(true),
-            parent_span_id: None,
-            name: SpanName::Sweep,
-            started_at: now,
-            ended_at: now,
-            status: SpanStatus::Ok,
-            attributes: TraceAttributes::new(),
-            events: vec![],
-            links: vec![],
-        }),
-    );
-    let filtered = native_envelopes(&[trace, old]);
-    assert_eq!(filtered, vec![parsed]);
 }
 
 #[cfg(unix)]

@@ -6,12 +6,27 @@
 //!   `loom.repo` / `loom.issue` or `loom.pr_number` when an item is named.
 //!   `loom.fleet_dispatch.side` is `captain` here; the worker's span of the
 //!   same name says `worker`.
+//! - The same span, with endpoint `expire`, result `expired` and reason
+//!   `lease_expired`, once per assignment row that expires (#12875): the host,
+//!   repo, item, step and assignment id the counter below does not carry.
 //! - Counters, accumulated and flushed as delta points by the server's sweep
 //!   task: `loom.fleet_dispatch.refusals` by `reason` (claim refusals and
 //!   `refuse` tokens, `kind` = `claim` / `refuse`; `reason` is bounded to the
 //!   known tokens, anything else is `other`),
 //!   `loom.fleet_dispatch.expired` by `kind` (`assignment` / `hold`) and
 //!   `loom.fleet_dispatch.claim_lost_after_grant`.
+//! - Gauges read from the table on the same sweep ([`gauge_points`], #12873):
+//!   `loom.fleet_dispatch.rows{host, state}` (`granted` / `live`, `0`
+//!   included, for every host with a row or a fresh heartbeat),
+//!   `loom.fleet_dispatch.rows{state="held"}` (fleet-wide, no `host`), and,
+//!   for a host whose last heartbeat is within
+//!   [`super::table::HEARTBEAT_FRESH`] only, `free_slots_reported{host}`,
+//!   `live_reported{host}` and `oldest_live_age_sec{host}` (the last only
+//!   when the heartbeat carried a step start). `rows{state="live"}` minus
+//!   `live_reported` is a host's stale-claim count. Ages use the captain's
+//!   wall clock against the workers' `started_at`; cross-host skew (NTP,
+//!   seconds) is negligible at minute scale, and a start ahead of the
+//!   captain reads `0`.
 //!
 //! Everything goes through the daemon's ops sink
 //! ([`crate::observability::ops`]); with no OTLP exporter it is a no-op.
@@ -28,7 +43,7 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 /// Span attribute keys the call span carries beyond the lifecycle allowlist.
 /// Listed in [`crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS`] and the
 /// gateway collector's `keep_keys`.
-pub const KEYS: [&str; 16] = [
+pub const KEYS: [&str; 18] = [
     "loom.fleet_dispatch.side",
     "loom.fleet_dispatch.host",
     "loom.fleet_dispatch.endpoint",
@@ -45,7 +60,17 @@ pub const KEYS: [&str; 16] = [
     "loom.fleet_dispatch.hold_rung",
     "loom.fleet_dispatch.hold_set_by_outcome",
     "loom.fleet_dispatch.hold_set_by_assignment_id",
+    "loom.fleet_dispatch.holder_assignment_id",
+    "loom.fleet_dispatch.merge_slot_holder",
 ];
+
+/// `loom.fleet_dispatch.endpoint` of the span the captain emits when an
+/// assignment expires: no request, so no route (#12875).
+pub const EXPIRE_ENDPOINT: &str = "expire";
+/// `loom.fleet_dispatch.result` of that span.
+pub const RESULT_EXPIRED: &str = "expired";
+/// `loom.fleet_dispatch.reason` of that span: why the assignment ended.
+pub const CAUSE_LEASE_EXPIRED: &str = "lease_expired";
 
 /// The wall-clock end of a hold that has `retry_after_s` left, as RFC 3339
 /// UTC (#12707). The table's monotonic deadline never leaves the process.
@@ -78,7 +103,7 @@ pub struct Call {
     /// The request path (a fixed route, or `other`).
     pub endpoint: String,
     pub status: u16,
-    /// `granted` / `refused` / `ok` / `error`.
+    /// `granted` / `refused` / `ok` / `error` / `expired`.
     pub result: &'static str,
     /// The refusal reason, `refuse` token, release outcome or error class.
     pub reason: Option<String>,
@@ -89,6 +114,12 @@ pub struct Call {
     pub latency_ms: u64,
     /// The host holding the item, on a refusal that knows it (#12707).
     pub held_by: Option<String>,
+    /// The holder's assignment id, on a `held` refusal from a live row (#12740).
+    pub holder_assignment_id: Option<String>,
+    /// The repo's `champion_merge` slot holder once this call was applied:
+    /// an assignment id, or `none` (#13009). Set only on a call that touched
+    /// a `champion_merge` row.
+    pub merge_slot_holder: Option<String>,
     /// Seconds before asking again is worthwhile, on a refusal (#12707).
     pub retry_after_s: Option<u64>,
     /// The no-progress hold that refused a claim (#12707).
@@ -140,6 +171,12 @@ pub fn span(call: &Call, started_at: DateTime<Utc>, seq: u64) -> SpanRecord {
     }
     if let Some(held_by) = &call.held_by {
         a.insert("loom.fleet_dispatch.held_by".into(), held_by.clone());
+    }
+    if let Some(id) = &call.holder_assignment_id {
+        a.insert("loom.fleet_dispatch.holder_assignment_id".into(), id.clone());
+    }
+    if let Some(holder) = &call.merge_slot_holder {
+        a.insert("loom.fleet_dispatch.merge_slot_holder".into(), holder.clone());
     }
     if let Some(retry) = call.retry_after_s {
         a.insert("loom.fleet_dispatch.retry_after_s".into(), retry.to_string());
@@ -255,6 +292,47 @@ impl Counters {
     }
 }
 
+/// The table's gauge points at wall-clock `now` (module docs, #12873). Pure.
+#[must_use]
+pub fn gauge_points(gauges: &super::table::TableGauges, now: DateTime<Utc>) -> Vec<MetricPoint> {
+    let count = |n: u32| i64::from(n);
+    let mut points = Vec::new();
+    for (host, g) in &gauges.hosts {
+        for (state, n) in [("granted", g.granted), ("live", g.live)] {
+            points.push(
+                MetricPoint::int(MetricName::FleetDispatchRows, count(n))
+                    .label("host", host.as_str())
+                    .label("state", state),
+            );
+        }
+        let Some(reported) = &g.reported else {
+            continue;
+        };
+        points.push(
+            MetricPoint::int(
+                MetricName::FleetDispatchFreeSlotsReported,
+                count(reported.free_slots),
+            )
+            .label("host", host.as_str()),
+        );
+        points.push(
+            MetricPoint::int(MetricName::FleetDispatchLiveReported, count(reported.live_reported))
+                .label("host", host.as_str()),
+        );
+        if let Some(started) = reported.oldest_live_started_at {
+            let age = (now - started).num_seconds().max(0);
+            points.push(
+                MetricPoint::int(MetricName::FleetDispatchOldestLiveAgeSec, age)
+                    .label("host", host.as_str()),
+            );
+        }
+    }
+    points.push(
+        MetricPoint::int(MetricName::FleetDispatchRows, count(gauges.held)).label("state", "held"),
+    );
+    points
+}
+
 /// Emit `call`'s span through the ops sink (a no-op without one).
 pub fn emit_call(call: &Call, started_at: DateTime<Utc>, seq: u64) {
     if crate::observability::ops::spans_exported() {
@@ -306,6 +384,34 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_call_exports_the_slot_holder_after_it() {
+        let mut call = claim_call();
+        let key = "loom.fleet_dispatch.merge_slot_holder";
+        assert!(!span(&call, Utc::now(), 1).attributes.contains_key(key));
+        for holder in ["a-9", "none"] {
+            call.merge_slot_holder = Some(holder.into());
+            let s = span(&call, Utc::now(), 1);
+            assert_eq!(s.attributes.get(key).map(String::as_str), Some(holder));
+            assert!(s.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_live_row_refusal_exports_the_holders_assignment_id() {
+        let mut call = claim_call();
+        call.held_by = Some("worker-b".into());
+        call.holder_assignment_id = Some("a-7".into());
+        let s = span(&call, Utc::now(), 1);
+        assert_eq!(
+            s.attributes
+                .get("loom.fleet_dispatch.holder_assignment_id")
+                .map(String::as_str),
+            Some("a-7")
+        );
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
     fn a_cooldown_refusal_carries_the_hold_with_a_wall_clock_end() {
         let mut call = claim_call();
         call.retry_after_s = Some(1800);
@@ -324,6 +430,7 @@ mod tests {
         assert_eq!(attr("loom.fleet_dispatch.hold_set_by_outcome").as_deref(), Some("noop"));
         assert_eq!(attr("loom.fleet_dispatch.hold_set_by_assignment_id").as_deref(), Some("a-9"));
         assert_eq!(attr("loom.fleet_dispatch.held_by"), None, "a hold names no host");
+        assert_eq!(attr("loom.fleet_dispatch.holder_assignment_id"), None);
         assert!(s.validate().is_ok());
         let plain = span(&claim_call(), at, 2);
         assert!(!plain
@@ -361,6 +468,92 @@ mod tests {
         assert_eq!(held.name, MetricName::FleetDispatchRefusals);
         assert_eq!(held.labels.get("kind").map(String::as_str), Some("claim"));
         assert!(c.take_points().is_empty(), "flushed counters reset");
+    }
+
+    /// #12873: a fresh host gets rows and reported points; a stale host
+    /// keeps only its rows; held is fleet-wide with no host; no start, no
+    /// age; a start ahead of the captain reads 0.
+    #[test]
+    fn gauge_points_follow_the_absent_vs_zero_rules() {
+        use super::super::table::{HostGauges, Reported, TableGauges};
+        let now: DateTime<Utc> = "2026-10-20T12:00:00Z".parse().unwrap();
+        let reported = |started: Option<&str>| {
+            Some(Reported {
+                free_slots: 3,
+                live_reported: 1,
+                oldest_live_started_at: started.map(|s| s.parse().unwrap()),
+            })
+        };
+        let gauges = TableGauges {
+            hosts: BTreeMap::from([
+                (
+                    "fresh".to_string(),
+                    HostGauges {
+                        granted: 1,
+                        live: 2,
+                        reported: reported(Some("2026-10-20T11:30:00Z")),
+                    },
+                ),
+                (
+                    "stale".to_string(),
+                    HostGauges {
+                        granted: 0,
+                        live: 4,
+                        reported: None,
+                    },
+                ),
+                (
+                    "old-worker".to_string(),
+                    HostGauges {
+                        reported: reported(None),
+                        ..HostGauges::default()
+                    },
+                ),
+                (
+                    "ahead".to_string(),
+                    HostGauges {
+                        reported: reported(Some("2026-10-20T12:00:09Z")),
+                        ..HostGauges::default()
+                    },
+                ),
+            ]),
+            held: 0,
+        };
+        let points = gauge_points(&gauges, now);
+        let find = |name: MetricName, host: Option<&str>, state: Option<&str>| {
+            points
+                .iter()
+                .find(|p| {
+                    p.name == name
+                        && p.labels.get("host").map(String::as_str) == host
+                        && p.labels.get("state").map(String::as_str) == state
+                })
+                .map(|p| match p.value {
+                    crate::telemetry::ops::MetricValue::Int(v) => v,
+                    crate::telemetry::ops::MetricValue::Double(_) => panic!("int gauges"),
+                })
+        };
+        let rows = MetricName::FleetDispatchRows;
+        assert_eq!(find(rows, Some("fresh"), Some("granted")), Some(1));
+        assert_eq!(find(rows, Some("fresh"), Some("live")), Some(2));
+        assert_eq!(find(rows, Some("stale"), Some("live")), Some(4));
+        assert_eq!(find(rows, Some("stale"), Some("granted")), Some(0), "0, not absent");
+        assert_eq!(find(rows, None, Some("held")), Some(0), "held is fleet-wide, 0 included");
+        let free = MetricName::FleetDispatchFreeSlotsReported;
+        let live = MetricName::FleetDispatchLiveReported;
+        let age = MetricName::FleetDispatchOldestLiveAgeSec;
+        assert_eq!(find(free, Some("fresh"), None), Some(3));
+        assert_eq!(find(live, Some("fresh"), None), Some(1));
+        assert_eq!(find(age, Some("fresh"), None), Some(1800));
+        for name in [free, live, age] {
+            assert_eq!(find(name, Some("stale"), None), None, "a stale host reports nothing");
+        }
+        assert_eq!(find(live, Some("old-worker"), None), Some(1));
+        assert_eq!(find(age, Some("old-worker"), None), None, "no start, no age");
+        assert_eq!(find(age, Some("ahead"), None), Some(0), "a start ahead clamps to 0");
+        for p in &points {
+            assert_eq!(crate::telemetry::ops::bounded_labels(&p.labels), p.labels);
+        }
     }
 
     #[test]

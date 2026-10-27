@@ -21,6 +21,7 @@
 #                              (forwarded to scripts/install-loom.sh)
 #   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
 #                              (forwarded to scripts/install-loom.sh)
+#   --tools-only [ARGS]        Install only loom-tools (no loom-daemon); see scripts/install/provision-tools.sh
 #   -h, --help                 Show this help message
 #
 # Examples:
@@ -681,6 +682,7 @@ verify_install() {
     ".loom/config.json"
     ".loom/scripts/worktree.sh"
     ".loom/scripts/lib/loom-tools.sh"
+    ".loom/scripts/lib/repo-root.sh"
     ".loom/install-metadata.json"
     ".loom/config/skill-routes.json"
   )
@@ -1194,6 +1196,7 @@ while [[ "${1:-}" == -* ]]; do
       shift
       ;;
     --confirm-reinstall) CONFIRM_REINSTALL=true; shift ;;
+    --tools-only) shift; exec "$LOOM_ROOT/scripts/install/provision-tools.sh" "$@" ;;  # #12940: no daemon needed
     --dry-run) DRY_RUN=true; shift ;;
     --mode)
       # `default` is accepted as an explicit no-op so a caller can be explicit;
@@ -1224,6 +1227,8 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             .loom/scripts/resync-installed.sh in the target repo"
       echo "                             instead; --confirm-reinstall uninstalls before"
       echo "                             reinstalling."
+      echo "  --tools-only [ARGS]        Install only loom-tools (+ payload), no loom-daemon; ARGS go to"
+      echo "                             scripts/install/provision-tools.sh (--help there)"
       echo "  --dry-run                  Print what would be written/removed and exit 0 without"
       echo "                             creating, modifying, or removing anything. Short-circuits"
       echo "                             before any interactive prompt. Composes with"

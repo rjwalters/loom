@@ -128,8 +128,11 @@ the tools CLI, while the daemon calls library functions directly. The migration
 is tracked in [epic #12708](https://github.com/rjwalters/loom/issues/12708),
 with a Claude-coordinated Fable proposal review requested.
 
-The command layout, extraction boundaries and installation/version contract
-remain design work under the epic. Reuse the current Rust implementations,
+The Phase 1 inventory, command mapping, shared CLI seam, mode-resolution
+behavior and first slice are in
+[Loom tools CLI boundary and migration map](design/loom-tools-cli-boundary.md)
+(proposal for review). The installation/version contract remains design work
+under the epic. Reuse the current Rust implementations,
 migrate coherent command families, preserve compatibility through thin wrappers,
 then retire migrated wrappers once consumers have moved. This does not require
 a wholesale crate rewrite, a daemon token-vending service or Cloudflare for

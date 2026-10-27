@@ -97,6 +97,9 @@ pub struct ApplyRequest {
     /// Labels to drop once parked (e.g. `loom:building`).
     pub remove_labels: Vec<String>,
     pub dry_run: bool,
+    /// The target is a PR (not an issue). Only a PR park is a merge hold, so
+    /// only it journals a `hold.transition` (#12665).
+    pub is_pr: bool,
 }
 
 /// Why a request is refused before any forge call, or `None` when it may run.
@@ -261,7 +264,10 @@ pub fn apply(
         }
     }
     if !add.is_empty() {
-        if let Err(e) = forge.add_labels(n, &add) {
+        let added = forge.add_labels(n, &add);
+        // #12665: the hold transition, only when the label was not already on.
+        journal_hold_add(req, added.is_ok());
+        if let Err(e) = added {
             let _ = writeln!(err, "park-record apply: labeling #{n} failed: {e}");
             return exit::FORGE;
         }
@@ -277,11 +283,54 @@ pub fn apply(
     exit::OK
 }
 
-/// Journal a Champion park that [`apply`] landed (exit `0`, not a dry run,
-/// `--by champion`) for the role run's verdict record (#12027). Best-effort
-/// and a no-op outside a journaled run: it never changes output or exit.
+/// The `hold.transition` reason code for a Champion park's `--reason`.
+fn hold_reason_code(reason: Option<&str>) -> &'static str {
+    use crate::telemetry::kinds::hold_transition::reason;
+    match reason {
+        Some(r) if r.contains("merge-risk") => reason::MERGE_RISK_HOLD,
+        Some(r) if r.contains("critical-file") => reason::CRITICAL_FILE_HOLD,
+        _ => reason::CHAMPION_PARK,
+    }
+}
+
+/// Env the critical-file hold tick sets on a re-arm whose cause was an
+/// unreadable forge compare (`unread`), so the `hold.transition` trigger can
+/// tell it from a real change (#13114). The park `--reason` must stay the
+/// exact hold reason `body_declares_hold` matches, so it cannot carry this.
+pub const HOLD_EQUIVALENCE_ENV: &str = "LOOM_HOLD_EQUIVALENCE";
+
+/// The `hold.transition` trigger token for a Champion park.
+fn hold_trigger(equivalence: Option<&str>) -> &'static str {
+    match equivalence {
+        Some("unread") => "champion_role_equivalence_unread",
+        _ => "champion_role",
+    }
+}
+
+/// Journal the `loom:blocked` write on a Champion park of a PR as a hold
+/// `add` (#12665). `confirmed` is `false` for a write that failed. Best-effort
+/// and a no-op outside a journaled run or for any other role.
+fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
+    if req.dry_run || !req.is_pr || req.by.as_deref() != Some("champion") {
+        return;
+    }
+    crate::observability::pick_journal::record_hold(
+        req.number,
+        crate::telemetry::kinds::hold_transition::transition::ADD,
+        hold_reason_code(req.reason.as_deref()),
+        hold_trigger(std::env::var(HOLD_EQUIVALENCE_ENV).ok().as_deref()),
+        confirmed,
+        None,
+    );
+}
+
+/// Journal a Champion or Curator park that [`apply`] landed (exit `0`, not a
+/// dry run, `--by champion` / `--by curator`) for the role run's verdict
+/// record (#12027, #12921). Best-effort and a no-op outside a journaled run:
+/// it never changes output or exit.
 pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
-    if code == exit::OK && !req.dry_run && req.by.as_deref() == Some("champion") {
+    if code == exit::OK && !req.dry_run && matches!(req.by.as_deref(), Some("champion" | "curator"))
+    {
         crate::observability::pick_journal::record_applied(
             req.number,
             is_pr,
@@ -293,6 +342,18 @@ pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::hold_trigger;
+
+    #[test]
+    fn an_unread_compare_rearm_has_its_own_trigger() {
+        assert_eq!(hold_trigger(Some("unread")), "champion_role_equivalence_unread");
+        assert_eq!(hold_trigger(Some("changed")), "champion_role");
+        assert_eq!(hold_trigger(None), "champion_role");
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

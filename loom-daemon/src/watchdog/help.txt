@@ -312,9 +312,11 @@ GENERAL-CASE BOUNDED RECOVERY + CIRCUIT BREAKER (#5391)
        the state file. A broken binary therefore gets at most 5 restarts,
        never an unbounded loop.
     4. NEVER REVIVES A DELIBERATE STOP — KEYED ON THE MARKER, NOT THE EXIT
-       CODE (#6388). A scripted stop (loom-daemon-stop.sh) removes the
-       autonomy-desired marker BEFORE it kills the daemon, so a deliberate
-       stop never reaches this block at all — the marker-ABSENT branch near
+       CODE (#6388). A scripted stop (loom-daemon-stop.sh) replaces the
+       autonomy-desired marker with an operator-stop record (#9957) and
+       leaves this watchdog loaded; a tick that sees the record exits 0
+       without reviving or paging, so a deliberate stop never reaches this
+       block at all — the marker-ABSENT branch near
        the top of this script is the ONLY place "never revive" fires, and it
        fires unconditionally there, before any exit code is ever read. A
        signal-shaped exit code recorded HERE (marker confirmed present) —
@@ -515,82 +517,22 @@ Environment:
   LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS  #6222: hard external budget for the
                                `loom-daemon peer-claims --json` query (default:
                                same as LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS).
-  LOOM_WATCHDOG_PEER_COORD_SENTINEL  #6222: dedupe sentinel for the peer-
-                               coordination escalation (default <loom dir>
-                               /.watchdog-peer-coordination-escalated). Stores
-                               `<timestamp> <issue-url>` so recovery can
-                               comment on and close the exact filed issue.
-  LOOM_WATCHDOG_PEER_COORD_COOLDOWN_SECS  #7258: post-recovery hysteresis —
-                               after clear_peer_coordination_escalation()
-                               closes an episode's tracking issue, a repeat
-                               DEGRADED excursion within this many seconds is
-                               suppressed (logged, no new issue filed) rather
-                               than filing a fresh one. Default 21600 (6h),
-                               comfortably above the ~1-2h flap interval
-                               observed on a flapping host (#7258). This is
-                               LAYERED ON TOP of, and does not replace, the
-                               PEER_COORD_SENTINEL within-episode dedupe
-                               above — it only governs repeat episodes AFTER
-                               a recovery already cleared that sentinel. The
-                               comparison is strict `<` (elapsed < cooldown):
-                               an excursion landing exactly AT the boundary
-                               is treated as cooldown-elapsed and escalates
-                               fresh, same as one landing after it. 0
-                               disables the cooldown outright (fires every
-                               time — as a dedup comment rather than a fresh
-                               issue when a #7664 tracking ref exists).
-  LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE  #7258/#7664: path to the cooldown
-                               state file a successful recovery writes
-                               (default <loom dir>
-                               /.watchdog-peer-coordination-cooldown), read
-                               back by the next escalation attempt. A
-                               missing OR corrupt/non-numeric file fails
-                               OPEN — treated as "no cooldown in effect",
-                               i.e. today's fire-every-time behavior — never
-                               an error and never a reason to skip
-                               escalating a genuine degradation. #7664 widened
-                               the file's format from a bare epoch to
-                               `<epoch> <issue-ref> <flap-count>` (still
-                               parsed via `read`, so an old bare-epoch file
-                               from before #7664 keeps working — the extra
-                               fields just read empty and the dedup window
-                               below fails open exactly like a corrupt file).
-  LOOM_WATCHDOG_PEER_COORD_DEDUP_WINDOW_SECS  #7664: a REPEAT DEGRADED
-                               excursion landing after the #7258 cooldown
-                               above has elapsed, but still within this many
-                               seconds of the last recovery, comments on (and
-                               reopens if needed) the SAME tracking issue
-                               that cooldown window's recovery closed —
-                               instead of calling create-issue.sh again —
-                               and bumps a running flap count carried in
-                               PEER_COORD_COOLDOWN_STATE. This is the fix for
-                               a chronically-flapping host (anvil#1270):
-                               the #7258 cooldown alone still refiles once
-                               per cooldown window forever; this widens the
-                               same-issue window so a flapping host
-                               accumulates comments on ONE tracking issue
-                               instead of a fresh issue every cooldown cycle.
-                               Default 86400 (24h) — deliberately longer than
-                               the default 21600s (6h) cooldown so it covers
-                               at least one full cooldown cycle of slack. A
-                               non-numeric override fails open to the
-                               default. Comparison is strict `<`, matching
-                               the cooldown boundary convention: an excursion
-                               landing exactly AT the window boundary is
-                               treated as window-elapsed and files a fresh
-                               issue, resetting the flap count to 1. Any
-                               failure along this path — no `gh` on PATH, a
-                               missing/corrupt issue reference in the state
-                               file, or a failed `gh issue comment`/`reopen`
-                               call — FAILS OPEN to filing a fresh issue,
-                               same fail-open contract as the cooldown state
-                               file itself: a genuine degradation is never
-                               silently dropped.
+  LOOM_WATCHDOG_PEER_COORD_SENTINEL  #6222/#12818: retired. Peer-coordination
+                               no longer files, comments on, reopens or closes
+                               a GitHub issue; it reports DEGRADED (DIVERGENCE)
+                               and healthy (OK) to the watchdog log only. A
+                               sentinel/cooldown file left by the old lifecycle
+                               (default <loom dir>/.watchdog-peer-coord-
+                               escalated and .watchdog-peer-coord-cooldown) is
+                               never read or written and is safe to delete.
+                               The path survives only as the key for the
+                               loom-ui alert record (#11295). The
+                               PEER_COORD_COOLDOWN_SECS, _COOLDOWN_STATE and
+                               _DEDUP_WINDOW_SECS knobs are likewise ignored.
   LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR  #6272: test seam ONLY — overrides
                                the third (production-intent) branch of the
                                create-issue.sh resolution shared by
-                               escalate_daemon_outage() and
-                               escalate_peer_coordination_degraded(), which
+                               escalate_daemon_outage(), which
                                otherwise resolves relative to wherever THIS
                                SCRIPT lives on disk (default
                                $_LOOM_WATCHDOG_CLI_DIR/..), not relative to

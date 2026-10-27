@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
-use loom_daemon::forge_identity::{FleetLogins, Roster};
+use crate::forge_identity::{FleetLogins, Roster};
 
 fn now() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-10-11T12:00:00Z")
@@ -81,7 +81,7 @@ fn issue_leases_and_pr_leases_never_read_as_each_other() {
     // The issue-path readers match `<!-- loom:lease host=`; a PR lease must
     // not, and an issue lease must not read as a PR lease.
     let pr = who(Role::Doctor, "s").lease_marker();
-    assert!(!pr.starts_with(loom_daemon::sweep_registry::LEASE_MARKER_PREFIX));
+    assert!(!pr.starts_with(crate::sweep_registry::LEASE_MARKER_PREFIX));
     assert!(!pr.starts_with("<!-- loom:lease-yield host="));
     assert_eq!(parse_record("<!-- loom:lease host=h sweep=s -->"), None);
 }
@@ -774,6 +774,43 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     assert!(patched.contains(&a.released_marker()), "{patched}");
 }
 
+/// #13132: a release missing the claim's identity names the claimant and
+/// exits nonzero, leaving the lease untouched; the right identity releases.
+#[test]
+fn a_release_under_the_wrong_identity_names_the_claimant_and_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let claimant = who(Role::Doctor, "sweep-pid-1");
+    fs::write(dir.path().join("rows"), live_row(100, &claimant)).unwrap();
+    let wrong = who(Role::Doctor, "pr-lease-unknown");
+    assert_eq!(ctx(dir.path(), wrong).release(None, None, None), EXIT_MISMATCH);
+    assert!(patched(dir.path()).is_empty(), "the lease is untouched");
+    assert_eq!(ctx(dir.path(), claimant).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).contains("issues/comments/100"));
+}
+
+#[test]
+fn a_release_with_no_matching_same_host_lease_of_the_role_still_exits_zero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = who(Role::Doctor, "sweep-b");
+    // nothing at all
+    assert_eq!(ctx(dir.path(), me.clone()).release(None, None, None), EXIT_HELD);
+    // another host's lease, another role's lease, an expired lease
+    let mut other_host = who(Role::Doctor, "sweep-a");
+    other_host.host = "elsewhere".into();
+    let rows = live_row(100, &other_host)
+        + &live_row(101, &who(Role::Judge, "sweep-j"))
+        + &row_at(
+            102,
+            Utc::now() - chrono::Duration::days(1),
+            &who(Role::Doctor, "old").lease_marker(),
+        );
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), me).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty());
+}
+
 #[test]
 fn claim_refuses_without_writing_when_write_scope_denies_the_repo() {
     let dir = TempDir::new().unwrap();
@@ -894,7 +931,7 @@ fn a_timed_out_judge_is_reaped_into_a_record_that_holds_the_pr_on_every_host() {
     claimant.lease_file = Some(lease_file.clone());
     assert_eq!(claimant.claim(), EXIT_HELD);
     // The won lease is listed for the daemon.
-    let listed = loom_daemon::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
+    let listed = crate::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
     assert_eq!(listed, vec![claimant.held()]);
     // The run times out; the role runner reaps on the claimant's behalf.
     assert_eq!(ctx(dir.path(), dead.clone()).reap("timeout"), EXIT_HELD);
@@ -943,6 +980,44 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     assert!(!patched(dir.path()).contains("verdict=none"));
 }
 
+/// #13135: a pass a verdict gate refused is recorded as such, holds the PR
+/// only briefly, and a fresh Judge claims it once the cool-down is over.
+#[test]
+fn a_gate_refused_judge_pass_cools_down_briefly_then_a_fresh_judge_claims() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let a = on("host-a", "run-1");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+    let released = ctx(dir.path(), a.clone()).release(Some("gate-refused:stale-read"), None, None);
+    assert_eq!(released, EXIT_HELD);
+    assert!(
+        patched(dir.path()).contains(&a.released_marker_with(&format!(
+            " head={HEAD} verdict=none labels=review-requested refused=stale-read"
+        ))),
+        "{}",
+        patched(dir.path())
+    );
+    let fields = format!(" head={HEAD} verdict=none labels=review-requested refused=stale-read");
+    let marker = on("host-a", "run-1").released_marker_with(&fields);
+    // Inside the cool-down: refused, and the message names the gate.
+    let recent = Utc::now() - chrono::Duration::minutes(5);
+    fs::write(dir.path().join("rows"), row_at(10, recent, &marker)).unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    assert_eq!(c.claim(), backstop::EXIT_BACKSTOP);
+    let rows = c.gh.read_rows(77, &c.policy).unwrap();
+    let (until, why) = backstop::hold_with_reason(&rows, c.gh.pr_head(77), Utc::now()).unwrap();
+    assert_eq!(why.as_deref(), Some("stale-read"));
+    assert!(until > Utc::now());
+    // After it: a fresh Judge claims. Three such records never escalate.
+    let old = Utc::now() - chrono::Duration::minutes(30);
+    let rows = row_at(10, old, &marker)
+        + &row_at(11, old, &marker.replace("run-1", "run-0"))
+        + &row_at(12, old, &marker.replace("run-1", "run-9"));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), on("host-c", "run-3")).claim(), EXIT_HELD);
+}
+
 /// Acceptance (#11931): a timed-out run counts toward the three Judge runs an
 /// unchanged PR gets per 24 h.
 #[test]
@@ -970,7 +1045,7 @@ fn a_timed_out_judge_run_counts_toward_the_three_per_day_cap() {
     let rows = c.gh.read_rows(77, &c.policy).unwrap();
     assert_eq!(
         backstop::hold(&rows, c.gh.pr_head(77), Utc::now()),
-        Some(first + chrono::Duration::hours(loom_daemon::judge_backstop::WINDOW_HOURS))
+        Some(first + chrono::Duration::hours(crate::judge_backstop::WINDOW_HOURS))
     );
 }
 
@@ -1147,7 +1222,7 @@ fn a_labelless_claim_renews_without_a_label_check() {
 /// #11898) agrees with this module's parser on every record shape.
 #[test]
 fn the_lib_role_lease_reader_agrees_with_parse_record() {
-    use loom_daemon::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
+    use crate::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
     let me = Identity::new(Role::Champion, "host-a".into(), "s1".into(), None).unwrap();
     let peer = who(Role::Judge, "s2");
     let bodies = [
@@ -1249,7 +1324,7 @@ fn an_issue_scoped_release_reads_no_pr_head() {
 /// next lease is the holder on both.
 #[test]
 fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
-    use loom_daemon::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
+    use crate::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
     let stepped =
         Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
     let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();

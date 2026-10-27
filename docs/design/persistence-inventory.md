@@ -7,6 +7,14 @@ readers, the authority, the schema/version field, the recovery behaviour and a
 proposed disposition. It then proposes a target journal schema with one writer
 per concern.
 
+> **SUPERSEDED (operator ruling, 2026-10-19, #9908 closed as not planned;
+> unwound by #12848).** The journals described in section 9 (J1 execution,
+> J2 telemetry, J3 configuration-snapshot) and their shadow-write code
+> (`loom_daemon::journal`, `telemetry::journal_shadow`, `config_journal`,
+> `LOOM_TELEMETRY_JOURNAL*`) were removed. The daemon produces telemetry and
+> session transcripts only. Sections 1-8 remain as a store inventory; sections
+> 9-14 are kept as history only and describe no live code.
+
 **Status: proposal for curation.** This phase changes documentation only. It
 creates no runtime store, migrates no reader, deletes no format, and changes no
 forge authority. Phase 4, which retires old formats, still needs the
@@ -173,7 +181,7 @@ prove a claim *dead on this host* (`worktree_ops/orphan_recovery.rs:15-18`).
 | C7 | Fleet sync status | `<loom_dir>/fleet-sync-status.json` (`fleet_sync.rs:121`, written `:770`) | `fleet_sync::publish` | `loom-daemon status` | Last-pass snapshot | Unversioned | Best effort | **J3** `fleet.sync` + **PROJECTION → DELETE** |
 | C8 | Effective-config snapshot | **Does not exist.** Only hashes are persisted: `planner_config_hash` / `fleet_config_hash` on `fleet.state` telemetry (`telemetry/kinds/fleet_state.rs`; no producer since #11301) | — | Backend | No local authority. A hash cannot be resolved back to a config. | — | — | **J3** `config.resolved` (new, content-addressed) |
 | C9 | Install metadata | `<ws>/.loom/install-metadata.json` (`install_compat.rs:68`) | `scripts/install-loom.sh`, `defaults/scripts/resync-installed.sh` | Version gates, `create-pr.sh`, `check-main-freshness.sh` | Authoritative install record | Fields | — | **RETAIN** (install contract) |
-| C10 | MCP state / command files | `~/.loom/state.json`, `~/.loom/mcp-command.json` (`mcp-loom/src/shared/config.ts:25`, `:28`) | `mcp-loom/src/shared/config.ts:189`, `mcp-loom/src/shared/ipc.ts:43` | `mcp-loom` | MCP-local | — | — | **RETAIN** (out of daemon scope) |
+| C10 | MCP state file | `~/.loom/state.json` (`mcp-loom/src/shared/config.ts`) | `mcp-loom/src/shared/config.ts` | `mcp-loom` | MCP-local | — | — | **RETAIN** (out of daemon scope) |
 
 ## 6. Inventory: host control state
 

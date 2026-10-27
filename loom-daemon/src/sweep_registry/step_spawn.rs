@@ -67,6 +67,7 @@ use crate::observability::ops::dispatch_step::{self, StepDispatch};
 use crate::step_role::StepRole;
 use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 
+mod builder_rollback;
 pub(crate) mod capture;
 pub mod draw_claims;
 pub mod ended;
@@ -109,6 +110,14 @@ pub struct StepSpawnRequest {
     pub resumed: bool,
     /// The draw that picked it; `None` for a step not drawn (a resume).
     pub draw: Option<StepDrawTerms>,
+    /// The item's story points from the classifier (#12957,
+    /// [`crate::work_finder::step_item::Item::story_points`]): a telemetry
+    /// fact only, never a gate. `None` when unsized or not drawn.
+    pub story_points: Option<u32>,
+    /// The standing-authorization digest the item's Champion hold recorded
+    /// (#13029): read at the step's end for `champion.run`'s `auth_before`.
+    /// `None` for a legacy hold or an item with no hold.
+    pub hold_auth: Option<String>,
 }
 
 impl StepSpawnRequest {
@@ -122,6 +131,8 @@ impl StepSpawnRequest {
             age_source: "unknown".to_string(),
             resumed: false,
             draw: None,
+            story_points: None,
+            hold_auth: None,
         }
     }
 
@@ -539,41 +550,65 @@ impl SweepRegistry {
     /// lease write, the earliest live lease comment must be this step's own:
     /// a peer's earlier one is `claim_lost`; a lease that could not be written,
     /// or an order that could not be read, is `claim_unverified`. (An issue
-    /// sweep falls open on an unreadable forge; a step must not.) Either
-    /// refusal leaves the label as it is: it may be the winner's claim.
+    /// sweep falls open on an unreadable forge; a step must not.)
+    ///
+    /// A refusal after the lease write rolls back what this step wrote
+    /// ([`builder_rollback`], #12822): its own lease is yielded, so no reader
+    /// counts it as a running Builder. The label is restored only when no
+    /// peer lease is live; behind a peer's lease it is the winner's claim and
+    /// stays.
     fn pre_claim_builder_step(
         &mut self,
         item: u32,
         sweep_id: &str,
     ) -> std::result::Result<(), StepRefusal> {
+        use builder_rollback::Loss;
         let episode_start = Utc::now();
         self.flip_label_to_building(item)
             .map_err(|e| StepRefusal::new("label_flip_failed", format!("{e:#}")))?;
         let wrote = self.write_lease_comment_for(item, sweep_id, Some(StepRole::Builder));
         self.note_label_flip(item);
-        if !wrote {
-            return Err(StepRefusal::new(
-                "claim_unverified",
-                "the Builder lease comment could not be written",
-            ));
-        }
-        match self.resolve_lease_order_strict(item, sweep_id, episode_start) {
-            LeaseOrderDecision::Proceed => Ok(()),
-            LeaseOrderDecision::Unverified => {
-                Err(StepRefusal::new("claim_unverified", "the lease order could not be read back"))
+        let (loss, refusal) = if !wrote {
+            (
+                Loss::Unverified,
+                StepRefusal::new(
+                    "claim_unverified",
+                    "the Builder lease comment could not be written",
+                ),
+            )
+        } else {
+            match self.resolve_lease_order_strict(item, sweep_id, episode_start) {
+                LeaseOrderDecision::Proceed => return Ok(()),
+                LeaseOrderDecision::Unverified => (
+                    Loss::Unverified,
+                    StepRefusal::new("claim_unverified", "the lease order could not be read back"),
+                ),
+                LeaseOrderDecision::Yield {
+                    earliest_host,
+                    earliest_sweep_id,
+                } => {
+                    let detail = format!(
+                        "a peer's earlier lease holds it ({earliest_host} {earliest_sweep_id})"
+                    );
+                    (
+                        Loss::Peer {
+                            host: earliest_host,
+                            sweep: earliest_sweep_id,
+                        },
+                        StepRefusal::new("claim_lost", detail),
+                    )
+                }
+                // Not produced in the strict mode; a refusal is the safe reading.
+                LeaseOrderDecision::YieldToLeaselessClaim { .. } => (
+                    Loss::Peer {
+                        host: "leaseless".to_string(),
+                        sweep: "leaseless".to_string(),
+                    },
+                    StepRefusal::new("claim_lost", "a leaseless claim holds it"),
+                ),
             }
-            LeaseOrderDecision::Yield {
-                earliest_host,
-                earliest_sweep_id,
-            } => Err(StepRefusal::new(
-                "claim_lost",
-                format!("a peer's earlier lease holds it ({earliest_host} {earliest_sweep_id})"),
-            )),
-            // Not produced in the strict mode; a refusal is the safe reading.
-            LeaseOrderDecision::YieldToLeaselessClaim { .. } => {
-                Err(StepRefusal::new("claim_lost", "a leaseless claim holds it"))
-            }
-        }
+        };
+        Err(self.roll_back_builder_claim(item, sweep_id, wrote, &loss, episode_start, refusal))
     }
 
     /// Undo a step's claim: the peer advertisement, the forge claim when one
@@ -684,9 +719,20 @@ impl SweepRegistry {
                 overflow: false,
             },
         );
+        if let Some(points) = request.story_points {
+            let entries = &self.entries;
+            self.step_points.retain(|id, _| entries.contains_key(id));
+            self.step_points.insert(sweep_id.clone(), points);
+        }
+        if let Some(auth) = &request.hold_auth {
+            let entries = &self.entries;
+            self.step_hold_auth.retain(|id, _| entries.contains_key(id));
+            self.step_hold_auth.insert(sweep_id.clone(), auth.clone());
+        }
         self.start_step_lease_renewal(item, role, &sweep_id, pid, &log_path);
         self.publish_step_slots();
         self.emit_dispatch(&sweep_id, &launch.admission, None, None);
+        self.emit_step_work_started(&sweep_id, item, role);
         // A named account proves the role's pool works again (#11909).
         if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
             self.clear_role_tick_pool_exhausted(role.role_name());
@@ -709,6 +755,7 @@ impl SweepRegistry {
                 selected: selected.as_deref(),
                 launched: launch.model.as_deref(),
             }),
+            assignment.as_ref().and_then(|g| g.lineage.as_ref()),
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -753,6 +800,7 @@ impl SweepRegistry {
             assignment_id,
             captain,
             None,
+            None,
         );
     }
 
@@ -769,6 +817,7 @@ impl SweepRegistry {
         assignment_id: Option<&str>,
         captain: Option<&crate::fleet_dispatch::worker::Refusal>,
         models: Option<dispatch_step::StepModels<'_>>,
+        lineage: Option<&crate::fleet_dispatch::worker::GrantLineage>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -781,26 +830,45 @@ impl SweepRegistry {
                 age_source: &request.age_source,
                 resumed: request.resumed,
                 draw: request.draw,
+                story_points: request.story_points,
                 sweep_id,
                 claim,
                 assignment_id,
+                lineage,
                 captain,
                 models,
             },
         );
     }
 
-    /// Publish this registry's live steps by role to `busy_slots` (#11906).
+    /// Publish this registry's live steps by role, each as its start time and
+    /// story points, to `busy_slots` (#11906; the start times feed the age
+    /// gauges, #12873, and the points the size gauge, #12957).
     pub(crate) fn publish_step_slots(&self) {
-        let mut running: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        use crate::observability::ops::busy_slots::{self, LiveStep, LiveSteps};
+        let mut running = LiveSteps::new();
         for info in self.entries.values() {
             if let (SweepKind::Step { role, .. }, SweepState::Running | SweepState::Pending) =
                 (&info.kind, &info.state)
             {
-                *running.entry(role.role_name()).or_insert(0) += 1;
+                running.entry(role.role_name()).or_default().push(LiveStep {
+                    started_at: info.started_at,
+                    points: self.step_points(&info.sweep_id),
+                });
             }
         }
-        crate::observability::ops::busy_slots::set_steps(&self.config.workspace_root, running);
+        busy_slots::set_steps(&self.config.workspace_root, running);
+    }
+
+    /// The story points step `sweep_id` was spawned with (#12957), `None`
+    /// when unsized or unknown to this daemon.
+    pub(crate) fn step_points(&self, sweep_id: &str) -> Option<u32> {
+        self.step_points.get(sweep_id).copied()
+    }
+
+    /// The hold digest step `sweep_id` was spawned with (#13029).
+    pub(crate) fn step_hold_auth(&self, sweep_id: &str) -> Option<String> {
+        self.step_hold_auth.get(sweep_id).cloned()
     }
 }
 

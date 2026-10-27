@@ -3,29 +3,15 @@
 //! record's JSON; the scalars ride as `loom.merge_queue.*` attributes. An
 //! unknown field is omitted, never defaulted.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::session_output::LogParts;
-use super::{kv, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::TelemetryRecord;
 
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
-
-fn kv_int(key: &str, value: u64) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::IntValue(i64::try_from(value).unwrap_or(i64::MAX))),
-        },
-    )
+fn kv_u64(key: &str, value: u64) -> KeyValue {
+    kv_int(key, i64::try_from(value).unwrap_or(i64::MAX))
 }
 
 pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
@@ -42,10 +28,10 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
         kv_bool("loom.merge_queue.provenance_complete", r.loom.complete),
     ];
     if let Some(v) = r.regime.check_response_timeout_minutes {
-        attributes.push(kv_int("loom.merge_queue.check_response_timeout_minutes", v));
+        attributes.push(kv_u64("loom.merge_queue.check_response_timeout_minutes", v));
     }
     if let Some(v) = r.regime.max_entries_to_build {
-        attributes.push(kv_int("loom.merge_queue.max_entries_to_build", v));
+        attributes.push(kv_u64("loom.merge_queue.max_entries_to_build", v));
     }
     if let Some(v) = &r.regime.grouping_strategy {
         attributes.push(kv_string("loom.merge_queue.grouping_strategy", v));

@@ -34,6 +34,10 @@
 //! re-implements one. The fixture `loom-daemon/tests/fixtures/
 //! step-item-classifier.json` pins the table for a later TypeScript twin.
 //!
+//! Each item also carries its story points ([`Item::story_points`], #12957),
+//! read from the issue labels already in [`Inputs`] through
+//! [`crate::story_points`]: a telemetry fact the verdict never reads.
+//!
 //! # The table (design §4.1)
 //!
 //! Checked in this order; the first rule that matches decides.
@@ -291,6 +295,15 @@ pub struct PullMarkers {
     /// ([`crate::champion_hold::doctor_cycle_capped`]).
     #[serde(default)]
     pub doctor_cycle_capped: bool,
+    /// The head SHA the standing hold recorded
+    /// ([`crate::champion_hold::unreleased_hold_head`]); `None` when there is
+    /// no parseable record, or a release signal followed it (fail open).
+    #[serde(default)]
+    pub hold_head: Option<String>,
+    /// The standing-authorization digest that hold recorded beside its head
+    /// (#12933); `None` for a legacy hold, which is redrawn once.
+    #[serde(default)]
+    pub hold_auth: Option<String>,
 }
 
 /// One repository's lanes this tick.
@@ -326,6 +339,17 @@ pub struct Item {
     pub lane: Lane,
     /// [`IssueMarkers::send_back`].
     pub send_back: bool,
+    /// The item's story points (#12957), a telemetry fact and never a draw
+    /// term: its issue's single legal `points:*` label, or for an item with
+    /// a PR, the label of the open issue the PR closes (its lowest closing
+    /// link, the one it joins). `None` when unsized or the label is a defect
+    /// ([`crate::story_points`]): absent, never `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
+    /// The standing-authorization digest the PR's hold recorded
+    /// ([`PullMarkers::hold_auth`]); telemetry only (#13029), never a draw term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_auth: Option<String>,
 }
 
 impl Item {
@@ -476,6 +500,18 @@ pub enum PassReason {
     /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
     /// copy of the #12003 Judge gate.
     CiPending,
+    /// A Champion-held PR still at the head its hold recorded, with no
+    /// release signal (#12900). The classifier never answers it: the step
+    /// tick's gather applies it (`step_dispatch::gather::hold_at_recorded_head`),
+    /// because a `PullInput` carries no head SHA.
+    HeldAtHead,
+    /// A curated issue the promotion author gate holds (#10827) whose verdict
+    /// would be the same again (#13142): its trusted gate marker names the
+    /// issue's current title and body and the current trust rules, and no
+    /// `loom:issue` has been applied. The classifier never answers it: the
+    /// step tick's gather applies it
+    /// (`step_dispatch::gather::hold_author_gated`).
+    AuthorGateHeld,
 }
 
 impl PassReason {
@@ -497,6 +533,8 @@ impl PassReason {
             Self::NoStage => "no_stage",
             Self::Draft => "draft",
             Self::CiPending => "ci_pending",
+            Self::HeldAtHead => "held_at_head",
+            Self::AuthorGateHeld => "author_gate_held",
         }
     }
 }
@@ -564,26 +602,68 @@ pub fn classify(inputs: &Inputs) -> Vec<Item> {
             .collect()
     };
 
+    // The listed open issue a PR closes (its lowest closing link): whose
+    // points a PR step carries (#12957).
+    let closes_of = |pr: &PullInput| -> Option<&IssueInput> {
+        links[&pr.number]
+            .iter()
+            .find(|(_, k)| **k == LinkageKind::Closes)
+            .and_then(|(n, _)| by_number.get(n).copied())
+    };
+
     let mut items = Vec::with_capacity(by_number.len() + pulls.len());
     for (&n, &issue) in &by_number {
-        let item = if let Some(pr) = joined.get(&n).and_then(|&p| pr_of(p)) {
+        let (mut item, sized) = if let Some(pr) = joined.get(&n).and_then(|&p| pr_of(p)) {
             let mut linked = linked_of(pr);
             linked.retain(|i| i.number != n);
             linked.insert(0, issue);
-            classify_item(Some(issue), Some(pr), false, &linked, inputs)
+            let item = classify_item(Some(issue), Some(pr), false, &linked, inputs);
+            (item, closes_of(pr))
         } else if let Some(pr) = linking.get(&n).and_then(|&p| pr_of(p)) {
-            classify_item(Some(issue), Some(pr), true, &[issue], inputs)
+            // Another item's PR: this item is still its own issue.
+            let item = classify_item(Some(issue), Some(pr), true, &[issue], inputs);
+            (item, Some(issue))
         } else {
-            classify_item(Some(issue), None, false, &[issue], inputs)
+            let item = classify_item(Some(issue), None, false, &[issue], inputs);
+            (item, Some(issue))
         };
+        item.story_points = sized.and_then(story_points);
         items.push(item);
     }
     for pr in &pulls {
         if !primary.contains(&pr.number) {
-            items.push(classify_item(None, Some(pr), false, &linked_of(pr), inputs));
+            let mut item = classify_item(None, Some(pr), false, &linked_of(pr), inputs);
+            item.story_points = closes_of(pr).and_then(story_points);
+            items.push(item);
         }
     }
     items
+}
+
+/// `issue`'s story points ([`Item::story_points`]). A stacked or
+/// out-of-vocabulary label is warned about once per process and issue (the
+/// classifier runs every tick), then logged at debug.
+fn story_points(issue: &IssueInput) -> Option<u32> {
+    use crate::story_points::{classify_points_labels, resolve_story_points, PointsLabels};
+    use std::sync::{Mutex, OnceLock};
+    match classify_points_labels(&issue.labels) {
+        PointsLabels::One(points) => Some(points),
+        PointsLabels::Absent => None,
+        defect => {
+            static WARNED: OnceLock<Mutex<BTreeSet<(u32, String)>>> = OnceLock::new();
+            let fresh = WARNED
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((issue.number, format!("{defect:?}")));
+            if fresh {
+                resolve_story_points(issue.number, &issue.labels)
+            } else {
+                log::debug!("issue #{}: story points omitted ({defect:?})", issue.number);
+                None
+            }
+        }
+    }
 }
 
 /// The issue a PR with links `l` joins: its lowest closing link, else its
@@ -633,6 +713,8 @@ fn classify_item(
         verdict,
         lane,
         send_back: issue.is_some_and(|i| i.markers.send_back),
+        story_points: None,
+        hold_auth: pr.and_then(|p| p.markers.hold_auth.clone()),
     }
 }
 
@@ -956,9 +1038,12 @@ impl PullMarkers {
     #[must_use]
     pub fn from_trusted(trusted: &TrustedComments) -> Self {
         let bodies = trusted.bodies();
+        let (hold_head, hold_auth) = crate::champion_hold::unreleased_hold(bodies).unzip();
         Self {
             champion_hold: crate::champion_hold::standing_hold(bodies).is_some(),
             doctor_cycle_capped: crate::champion_hold::doctor_cycle_capped(bodies),
+            hold_head,
+            hold_auth: hold_auth.flatten(),
         }
     }
 }

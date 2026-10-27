@@ -255,9 +255,7 @@ fn ambient_parsing_rejects_garbage_and_never_reads_third_party_traceparent() {
 
 #[test]
 fn every_span_attribute_survives_export_bounding() {
-    // A write inside a caller scope, so the #10752 keys (`github.caller`,
-    // `github.number`, `github.repo`) are set too.
-    let _scope = super::super::caller_scope::enter("stale_blocked_release");
+    // A write, so the #10752 keys (`github.number`, `github.repo`) are set too.
     let inv = GhInvocation::new(
         Operation::new("api.rest"),
         AccessIntent::Write,

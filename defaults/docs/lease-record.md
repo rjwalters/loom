@@ -452,7 +452,11 @@ EITHER leg holds:
    (genuinely **renewed**, not merely created) and still within the
    reclamation TTL (`LOOM_LEASE_TTL_MINUTES`, default 15 — the same window
    the #6286 reclamation gate and `sweep-lease-fence.sh` use) — Issue
-   **#8840**.
+   **#8840**. A never-renewed record (`updated_at == created_at`) is also
+   admitted while it is younger than `FIRST_RENEWAL_WINDOW_SECS` (360s: the
+   renewer's 300s cadence plus grace), because the renewer sleeps first and a
+   live lease is otherwise invisible from 90s to its first renewal — Issue
+   **#12825**. Older never-renewed records stay excluded.
 
 Leg 2 exists because **a lease is renewed in place**: `sweep-lease-renew.sh`
 PATCHes the same comment, so a live owner's `created_at` stays frozen at the
@@ -810,7 +814,11 @@ the same lease semantics, **keyed by role**:
   hold at once. Removing and re-adding the same label does not (the set is
   unchanged); to force a re-review, push or run with
   `LOOM_JUDGE_BACKSTOP=0`, which turns the backstop off. An unreadable record
-  list serves the PR. Rules: `loom-daemon/src/judge_backstop.rs`.
+  list serves the PR. A pass a verdict gate refused (`post-verdict.sh` exit 7,
+  e.g. the stale-read gate) releases with `--skip-reason gate-refused:<token>`
+  (#13135): its record carries `refused=<token>`, holds the PR for only 15
+  minutes, and counts toward neither the window cap nor the escalation; exit
+  6 names the token. Rules: `loom-daemon/src/judge_backstop.rs`.
 - **A Judge the timeout kills is still counted (#11931).** The role runner
   ends a role run at its fixed 1800 s ceiling (`DEFAULT_ROLE_TIMEOUT` in
   `loom-daemon/src/role_runner.rs`; there is no per-role or config knob),

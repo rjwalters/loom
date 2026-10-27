@@ -103,6 +103,9 @@
 #
 #   PATH may be "-" to read the body from stdin.
 #
+#   Aliases (exact, lowercase): `approve` -> approved, `request-changes` ->
+#   changes-requested. Anything else is rejected (exit 2).
+#
 #   --reviews-reconciled TEXT   Explicit disposition of the outstanding formal
 #       reviews / inline threads that check-review-feedback.sh reported. Must
 #       cite every blocking review id it named. Ignored for
@@ -116,10 +119,14 @@
 #   --review-started RFC3339   Approvals only (#12614): when this review began
 #       (capture `date -u +%Y-%m-%dT%H:%M:%SZ` when you claim the PR). The gate
 #       refuses the approval when a trusted human comment on the PR or a linked
-#       issue is newer, or a linked issue body no longer matches its
-#       --issue-body-sha; the refusal (exit 7) names the comment or issue. Re-review
-#       against the current spec, then retry with a fresh value. Absent: no such
-#       check, and the gate warns.
+#       issue is newer, a human edited a linked issue body after it, or a body
+#       no longer matches its --issue-body-sha; the refusal (exit 7) names the
+#       comment or edit. The gate's start is the dispatch epoch in $LOOM_SWEEP_ID
+#       (or the PR's judge lease); this value can only move it earlier (#12714),
+#       so a retry in the same dispatch is refused again: re-review against the
+#       current spec and either end without a verdict (a fresh dispatch approves)
+#       or post changes-requested. With no start resolvable at all (no epoch, no
+#       lease, no flag) the approval is refused.
 #
 #   --issue-body-sha N=HASH   (repeatable) Issue N's body as you reviewed it:
 #       `printf %s "$(gh api repos/OWNER/REPO/issues/N --jq .body)" | sha256sum | cut -d' ' -f1`.
@@ -146,6 +153,10 @@
 #       hold; stderr carries the repair command (#10581)
 #   9 - the per-PR verdict lock is held by another verdict transaction on
 #       this host (loom-daemon forge verdict-lock, #10581); nothing was posted
+#  10 - approval refused, the caller does not hold a live Judge lease on the PR
+#       (loom-daemon lease pr check, #13055): its reclaim was refused, it was
+#       displaced, or the state is unreadable. Stand down: do NOT retry, release
+#       the lease; nothing was posted. changes-requested is never gated.
 #
 #   A resolved loom-daemon without the #10581 verdict verbs (a capability
 #   probe, not a version guess) takes the legacy path for either verdict: the
@@ -159,7 +170,10 @@
 set -uo pipefail
 
 usage() {
-  sed -n '2,145p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  # Print the whole leading comment block (line 2 to the first non-comment
+  # line). A hard-coded line range fell behind the header and cut --help off
+  # mid-sentence at exit code 8 (#12692).
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]:-$0}"
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -176,6 +190,12 @@ PR="$1"
 VERDICT="$2"
 SHA="$3"
 shift 3
+
+# Accept the natural imperatives; everything downstream sees canonical values.
+case "$VERDICT" in
+  approve) VERDICT="approved" ;;
+  request-changes) VERDICT="changes-requested" ;;
+esac
 
 BODY=""
 BODY_FILE=""
@@ -428,6 +448,27 @@ if [[ "$VERDICT" == "approved" ]]; then
   esac
 fi
 
+# --- Judge lease gate (#13055) ----------------------------------------------
+# Approvals only. A Judge whose `lease pr claim` / reclaim was refused (stand
+# down) must not land an approval. `check`, not `fence`: fence exits 0 on "no
+# evidence either way", which is exactly the refused-reclaim case. Parse the
+# PR_LEASE_STATE= line; check exits 0 for free AND held-self. Only held-self
+# proceeds; free / held-peer / unknown / no line refuse (exit 10). A binary
+# without `lease pr` exits 2 (lease-record.md "Older binaries"): warn, proceed.
+if [[ "$VERDICT" == "approved" ]]; then
+  LEASE_RC=0
+  LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$PR" --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" 2>&1)" || LEASE_RC=$?
+  if [[ "$LEASE_RC" -eq 2 ]]; then
+    echo "post-verdict.sh: WARNING — '${LOOM_DAEMON_BIN:-loom-daemon} lease pr check' is unavailable (older binary); not gating the approval on the Judge lease (#13055)" >&2
+  else
+    LEASE_STATE="$(printf '%s\n' "$LEASE_OUT" | sed -n 's/^PR_LEASE_STATE=\([a-z-]*\).*/\1/p' | head -n1)"
+    if [[ "$LEASE_STATE" != "held-self" ]]; then
+      echo "post-verdict.sh: REFUSING to post an approval on PR #$PR — the caller does not hold a live Judge lease (PR_LEASE_STATE=${LEASE_STATE:-unknown}, exit $LEASE_RC) (#13055). Nothing was posted. Stand down: do NOT retry; release the lease (loom-daemon lease pr release $PR --role judge --watch-pid ...)." >&2
+      exit 10
+    fi
+  fi
+fi
+
 # --- The marker is appended HERE, never accepted as part of $BODY ----------
 # This is the entire point of the script: omission becomes structurally
 # impossible instead of a matter of remembering to type it. Format must stay
@@ -525,7 +566,6 @@ fi
 # the build that merges #10684; no version floor is declared for them, because the
 # capability probe above checks them on the resolved binary. Roll loom-daemon
 # before (or with) these scripts: until then, verdicts take the legacy path.
-[[ "$VERDICT" == "approved" && -z "$REVIEW_STARTED" ]] && echo "post-verdict.sh: WARNING — no --review-started, so an operator comment or issue rescope made during this review is not checked (#12614)" >&2
 VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" ${REVIEW_STARTED:+--review-started "$REVIEW_STARTED"} ${ISSUE_HASHES[@]+"${ISSUE_HASHES[@]/#/--issue-body-sha=}"} 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
 case "$VG_RC:$VG_OUT" in
   "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;

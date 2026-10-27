@@ -1566,6 +1566,12 @@ pub struct DaemonStatusReport {
     /// the spawn decision and from an older daemon.
     #[serde(default)]
     pub auto_update_config_enabled: Option<bool>,
+    /// #9736: the loop's progress clocks (last successful check, unapplied
+    /// release age, next attempt, blocking reason, thresholds), stamped with the
+    /// daemon's own running version. `None` when the loop has not ticked and
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_freshness: Option<crate::auto_update::freshness::FreshnessReport>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
@@ -1818,27 +1824,13 @@ pub struct DaemonStatusReport {
     /// as warming up. `None` when the gate is unarmed or for an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_jitter_delay_secs: Option<u64>,
-    /// An observability-exporter host-identity mismatch detected this process
-    /// (Issue #4830): the ingest key installed on this host is bound to a
-    /// *different* `host_id` than the one this daemon reports for itself, so
-    /// every record it pushes is filed under the wrong host.
-    ///
-    /// `None` in the overwhelmingly common case — the ids agree, the exporter
-    /// is disabled/keyless, or no batch has been acked yet this process — and
-    /// for a pre-#4830 wire payload. Published by
-    /// [`crate::observability::HostIdStatus`] and read here via
-    /// [`crate::observability::global_host_id_mismatch`]. `#[serde(default)]`
-    /// keeps older wire data / older clients compatible.
-    #[serde(default)]
-    pub observability_host_id_mismatch: Option<ObservabilityHostIdMismatch>,
     /// **Positive** confirmation of whether telemetry is actually reaching the
     /// backend, and under which `host_id` (Issue #5083).
     ///
-    /// [`Self::observability_host_id_mismatch`] above is anomaly-only by
-    /// design (#4830), which left "exporting fine", "observability disabled",
-    /// and "configured but silently never exported" all rendering as the same
-    /// thing: nothing at all. This field is the counterpart that always has an
-    /// answer — see [`ObservabilityExportStatus`].
+    /// Without it "exporting fine", "observability disabled", and
+    /// "configured but silently never exported" all render as the same thing:
+    /// nothing at all. This field always has an answer — see
+    /// [`ObservabilityExportStatus`].
     ///
     /// With the multi-exporter fan-out (#8756) this is the **first configured
     /// exporter's** cell — byte-identical to the pre-fan-out status for every
@@ -1867,16 +1859,6 @@ pub struct DaemonStatusReport {
     /// pre-#11353 daemon; never read as `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
-    /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
-    /// daemon is polling its operator-provisioned per-host event feed, under
-    /// which `host_id`, how far its cursor has advanced, and — when it is not
-    /// advancing — which class of failure is responsible.
-    ///
-    /// `None` **only** from a pre-ADR-0021 daemon binary that never computed
-    /// one. A daemon of this vintage with no `forgeEvents` block reports
-    /// `Some(ForgeEventsStatus::disabled())`, so silence is never the answer.
-    #[serde(default)]
-    pub forge_events: Option<ForgeEventsStatus>,
     /// The daemon-wide peer-claim view + transport counters (Issue #5921):
     /// which issues THIS host currently sees claimed, by which host and with
     /// what remaining TTL, plus how many claims have been advertised /
@@ -1984,13 +1966,7 @@ pub struct DeepCleanRepoStatus {
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
-};
-
-mod forge_events;
-pub use forge_events::{
-    ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus, PollGatingStatus,
-    PollGatingWorkspace,
+    ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod ready_queue;

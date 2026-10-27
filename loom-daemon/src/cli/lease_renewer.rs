@@ -563,7 +563,7 @@ pub(crate) fn repo_identity(env_repo: Option<&str>, cwd: &Path) -> String {
         (out.status.success() && !s.is_empty()).then_some(s)
     };
     if let Some(url) = git(&["remote", "get-url", "origin"]) {
-        let slug = loom_daemon::release_resolve::host::slug_from_remote_url(&url);
+        let slug = crate::release_resolve::host::slug_from_remote_url(&url);
         return slug.unwrap_or(url).to_ascii_lowercase();
     }
     git(&["rev-parse", "--show-toplevel"])
@@ -593,7 +593,7 @@ pub(crate) fn start_identity(pid: u32) -> Option<String> {
 }
 
 pub(crate) fn owner_is_live(pid: u32, ident: &str) -> bool {
-    loom_daemon::live_claim::pid_is_live_process(pid)
+    crate::live_claim::pid_is_live_process(pid)
         && (ident.is_empty() || start_identity(pid).as_deref() == Some(ident))
 }
 
@@ -661,7 +661,7 @@ impl RenewerAction {
                 };
                 if let Some(issue) = issue {
                     let live = |p: u32, ident: &str| {
-                        loom_daemon::live_claim::pid_is_live_process(p)
+                        crate::live_claim::pid_is_live_process(p)
                             && issue_owner_signalable(p, ident, &start_identity, &process_argv)
                     };
                     let n = end_owners(

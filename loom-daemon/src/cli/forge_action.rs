@@ -55,7 +55,7 @@ pub(crate) struct CreateIssueCli {
 }
 
 fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
-    use loom_daemon::forge_create_issue::{create, CreateError, RealGh, Request};
+    use crate::forge_create_issue::{create, CreateError, RealGh, Request};
     let fail = |e: &CreateError, json: bool| -> ! {
         if json {
             println!("{}", e.to_json());
@@ -76,7 +76,7 @@ fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
         std::process::exit(2);
     };
     // Label guard first: a refusal makes no forge call, not even a probe.
-    if let Err(e) = loom_daemon::forge_create_issue::normalize_labels(&a.labels) {
+    if let Err(e) = crate::forge_create_issue::normalize_labels(&a.labels) {
         fail(&e, a.json);
     }
     let body = match (&a.body, &a.body_file) {
@@ -95,9 +95,9 @@ fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
     }
     // #9548: Loom writes only to repos it manages; the verdict names the repo.
     let cwd = std::env::current_dir()?;
-    let repo = match loom_daemon::write_scope::may_write_from(&cwd, a.repo.as_deref()) {
-        loom_daemon::write_scope::Verdict::Allow(nwo) => nwo,
-        loom_daemon::write_scope::Verdict::Deny(why) => {
+    let repo = match crate::write_scope::may_write_from(&cwd, a.repo.as_deref()) {
+        crate::write_scope::Verdict::Allow(nwo) => nwo,
+        crate::write_scope::Verdict::Deny(why) => {
             fail(&CreateError::RestFailed(format!("refusing the write (#9548): {why}")), a.json)
         }
     };
@@ -181,7 +181,7 @@ pub(crate) enum ForgeAction {
     /// line. `Part of #N` copies nothing. A failed lookup warns on stderr,
     /// naming the issue, and still exits 0 (fail open). `--audit-pr` is
     /// accepted and does nothing (#11104). See
-    /// `loom_daemon::forge_priority_labels`.
+    /// `crate::forge_priority_labels`.
     #[command(name = "priority-labels")]
     PriorityLabels(PriorityLabelsCli),
 
@@ -192,9 +192,9 @@ pub(crate) enum ForgeAction {
     /// Exit 0 is BLOCKED and prints `EMPTIED` (the rebase left the PR with no
     /// content) or `RESOLUTION_DISCARDED <merge-sha>` (a hand-made conflict
     /// resolution is not carried by `<new>`); exit 1 is verified safe; any
-    /// other exit is unanswered. See `loom_daemon::rebase_guard`.
+    /// other exit is unanswered. See `crate::rebase_guard`.
     #[command(name = "rebase-guard")]
-    RebaseGuard(loom_daemon::rebase_guard::Args),
+    RebaseGuard(crate::rebase_guard::Args),
 
     /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
     /// #9063 **Phase 1** congestion signal, report-only: approved-queue
@@ -214,12 +214,12 @@ pub(crate) enum ForgeAction {
 
         /// Congestion threshold: trip when the approved queue is strictly
         /// deeper than this (the issue's ">5 open PRs" example).
-        #[arg(long, default_value_t = loom_daemon::forge_pr_congestion::DEFAULT_MAX_OPEN)]
+        #[arg(long, default_value_t = crate::forge_pr_congestion::DEFAULT_MAX_OPEN)]
         max_open: usize,
 
         /// Congestion threshold: trip when known story points awaiting merge
         /// strictly exceed this.
-        #[arg(long, default_value_t = loom_daemon::forge_pr_congestion::DEFAULT_MAX_POINTS)]
+        #[arg(long, default_value_t = crate::forge_pr_congestion::DEFAULT_MAX_POINTS)]
         max_points: u32,
     },
 
@@ -233,7 +233,7 @@ pub(crate) enum ForgeAction {
     /// GitHub Actions run for the head, #11389) — and, on RED, one
     /// `<name>\t<url>\t<run_id>` line per failing check on stderr. Branch
     /// on the sentinel, not the exit code (0/1/2/3/4/5). `--timeout 0` takes
-    /// one snapshot. See `loom_daemon::forge_wait_checks`.
+    /// one snapshot. See `crate::forge_wait_checks`.
     #[command(name = "wait-checks")]
     WaitChecks {
         /// A PR number, or a commit SHA (7-40 hex).
@@ -250,7 +250,7 @@ pub(crate) enum ForgeAction {
         base: Option<String>,
 
         /// Seconds to wait before `LOOM-CHECKS-TIMEOUT`; `0` = one poll.
-        #[arg(long, default_value_t = loom_daemon::forge_wait_checks::DEFAULT_TIMEOUT)]
+        #[arg(long, default_value_t = crate::forge_wait_checks::DEFAULT_TIMEOUT)]
         timeout: u64,
 
         /// Settle on the base branch's required contexts only.
@@ -281,7 +281,7 @@ pub(crate) enum ForgeAction {
     /// `credential` / `forbidden`, 2 for `secondary-rate-limit` /
     /// `rate-limit`), `LOOM-RERUN-ERROR <reason>` (3). A `permission`
     /// detail names the App permission to grant. See
-    /// `loom_daemon::forge_rerun`.
+    /// `crate::forge_rerun`.
     #[command(name = "rerun")]
     Rerun {
         /// The workflow run id (omit with `--job`).
@@ -526,11 +526,19 @@ pub(crate) enum ForgeAction {
         /// The PR's current head (7-40 lowercase hex).
         #[arg(value_name = "HEAD")]
         head: String,
+
+        /// Paths an operator's release named as the requested change (#13114).
+        /// When the PR's patch differs ONLY in these paths the answer is
+        /// `EQUIVALENCE_KIND=requested-change`; any other delta, or an empty
+        /// list, answers as without the flag. Only Champion's critical-file
+        /// hold passes it; a Judge verdict never carries on this kind.
+        #[arg(long = "allowed-paths", value_name = "PATH", num_args = 1..)]
+        allowed_paths: Vec<String>,
     },
 
     /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
     /// is `<file>`'s diff in PR `<pr>` nothing but a version-string change?
-    /// Champion criterion #3's version-only carve-out (#6147).
+    /// Champion's `critical-files` criterion's version-only carve-out (#6147).
     ///
     /// Exits 0 (`VERSION_ONLY=1`) ONLY when `<file>` is exactly one of the six
     /// version-bearing files (`package.json`, `mcp-loom/package.json`,
@@ -543,6 +551,57 @@ pub(crate) enum ForgeAction {
     /// on stderr. Callers treat any non-zero exit as "not eligible".
     #[command(name = "version-only-diff")]
     VersionOnlyDiff {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// Repo-relative path of the changed file.
+        #[arg(value_name = "FILE")]
+        file: String,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
+    /// `forge additive-migrations <pr> [--repo OWNER/REPO]` (#13102) — is every
+    /// migration file PR `<pr>` touches a newly added `.sql` file containing only
+    /// additive statements (`CREATE TABLE/INDEX IF NOT EXISTS`, `ALTER TABLE … ADD
+    /// COLUMN`, `INSERT OR IGNORE INTO … SELECT`)? Backs Champion's opt-in
+    /// `additiveMigrations` class key.
+    ///
+    /// Exits 0 (`ADDITIVE_MIGRATIONS=1`) ONLY when the whole file list and every
+    /// migration file were read and parsed and nothing else is touched in the
+    /// migration paths. Any other outcome — a forbidden statement, an edited,
+    /// removed or renamed migration, a non-`.sql` migration path, unparsable SQL,
+    /// a forge error — exits 1 with the reason on stderr. Callers treat any
+    /// non-zero exit as "hold".
+    #[command(name = "additive-migrations")]
+    AdditiveMigrations {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
+    /// `forge suspect-critical-diff <pr> <file> [--repo OWNER/REPO]` (#12999) —
+    /// does any changed line of `<file>` (a `Cargo.toml` or `package.json`) in
+    /// PR `<pr>` touch a suspect surface? Champion's `critical-files` criterion's hunk-aware
+    /// carve-out for harmless manifest edits (e.g. new `[[bin]]` entries).
+    ///
+    /// Exits 0 (`SUSPECT=0`) ONLY when the file list and `patch` were read, every
+    /// hunk parsed, and no changed line is in a dependency, patch, replace or
+    /// features table, a `build`/`links`/`git`/`registry`/`path` source key, or
+    /// (package.json) a dependency/override key or install lifecycle script. A
+    /// suspect line exits 1 with `SUSPECT_LINE=` and `SUSPECT_SECTION=` on
+    /// stdout; every other outcome — forge error, no patch, unparseable hunk,
+    /// unreadable head file — exits 1 with the reason on stderr. Callers treat
+    /// any non-zero exit as "hold".
+    #[command(name = "suspect-critical-diff")]
+    SuspectCriticalDiff {
         /// Pull request number.
         #[arg(value_name = "PR")]
         pr_number: u32,
@@ -750,7 +809,7 @@ pub(crate) enum ForgeAction {
     /// `LOOM-VERDICT-BODY REJECT <why>` (exit 1) for an empty body, a lone `-`,
     /// a lone `@`-token (`@-`, `@path`) or one under 20 non-whitespace
     /// characters. `post-verdict.sh` calls it before posting. See
-    /// `loom_daemon::verdict_body`.
+    /// `crate::verdict_body`.
     #[command(name = "verdict-body-check")]
     VerdictBodyCheck,
 
@@ -760,7 +819,7 @@ pub(crate) enum ForgeAction {
     /// (same verdict at the same head just landed: post nothing, still apply
     /// labels) or 3. An approval is refused over `loom:ci-failure`, over a
     /// same-head changes-requested marker without `--overrules-prior`, and
-    /// whenever either read fails. See `loom_daemon::verdict_gate`.
+    /// whenever either read fails. See `crate::verdict_gate`.
     #[command(name = "verdict-gate")]
     VerdictGate {
         /// The PR number.
@@ -779,12 +838,15 @@ pub(crate) enum ForgeAction {
         #[arg(long, default_value = "")]
         overrules_prior: String,
         /// How recent a same-verdict marker must be to dedupe against.
-        #[arg(long, default_value_t = loom_daemon::verdict_gate::DEFAULT_WINDOW_SECS)]
+        #[arg(long, default_value_t = crate::verdict_gate::DEFAULT_WINDOW_SECS)]
         window_secs: i64,
-        /// RFC 3339 time the Judge began this review (#12614). With it, an
-        /// approval is refused when a trusted human comment on the PR or a
-        /// linked issue is newer, or a linked issue body no longer matches
-        /// `--issue-body-sha`. Absent: unchanged behaviour, with a warning.
+        /// RFC 3339 time the Judge began this review (#12614). An approval is
+        /// refused when a trusted human comment on the PR or a linked issue,
+        /// or a human edit of a linked issue body, is newer than the start,
+        /// or a body no longer matches `--issue-body-sha`. The start is the
+        /// dispatch epoch in `$LOOM_SWEEP_ID` (or the PR's judge lease); this
+        /// value can only move it earlier (#12714). With no start at all the
+        /// approval is refused.
         #[arg(long)]
         review_started: Option<String>,
         /// `N=HASH` (repeatable): issue N's body as the Judge reviewed it,
@@ -983,14 +1045,14 @@ pub(crate) enum ForgeAction {
 /// exec `gh` / exit the process directly, so this only returns `Err` when a
 /// child process cannot be spawned. See `loom-daemon/src/forge_cmd.rs`.
 pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
-    use loom_daemon::forge_cmd::{dispatch, ForgeCmd};
+    use crate::forge_cmd::{dispatch, ForgeCmd};
     // #9548: the verbs that write are vetted before they run. `issue`/`pr`
     // pass straight through to `gh`, which would otherwise pick an `upstream`
     // remote over `origin`; the arm/disarm verbs mutate a PR.
     if let Some(repo) = write_target(&action) {
         let cwd = std::env::current_dir()?;
-        if let loom_daemon::write_scope::Verdict::Deny(why) =
-            loom_daemon::write_scope::may_write_from(&cwd, repo.as_deref())
+        if let crate::write_scope::Verdict::Deny(why) =
+            crate::write_scope::may_write_from(&cwd, repo.as_deref())
         {
             eprintln!("loom-daemon forge: refusing the write (#9548): {why}");
             std::process::exit(1);
@@ -1021,8 +1083,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let nwo = format!("{owner}/{name}");
             print!(
                 "{}",
-                loom_daemon::forge_comment::build_dashboard_footer(
-                    &loom_daemon::forge_comment::dashboard_base_url(),
+                crate::forge_comment::build_dashboard_footer(
+                    &crate::forge_comment::dashboard_base_url(),
                     &nwo,
                     number,
                     pr,
@@ -1039,16 +1101,14 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             pr,
             patch_created,
         } => {
-            return loom_daemon::forge_comment::cli_entrypoint(
-                loom_daemon::forge_comment::CommentArgs {
-                    number,
-                    repo,
-                    body,
-                    body_file,
-                    is_pr: pr,
-                    patch_created,
-                },
-            );
+            return crate::forge_comment::cli_entrypoint(crate::forge_comment::CommentArgs {
+                number,
+                repo,
+                body,
+                body_file,
+                is_pr: pr,
+                patch_created,
+            });
         }
         ForgeAction::TrustedComments {
             self_login,
@@ -1142,8 +1202,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             repo,
             audit_pr,
         }) => {
-            return loom_daemon::forge_priority_labels::cli_entrypoint(
-                loom_daemon::forge_priority_labels::PriorityLabelsArgs {
+            return crate::forge_priority_labels::cli_entrypoint(
+                crate::forge_priority_labels::PriorityLabelsArgs {
                     issues,
                     body_file,
                     repo,
@@ -1151,7 +1211,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 },
             );
         }
-        ForgeAction::RebaseGuard(args) => loom_daemon::rebase_guard::cli_entrypoint(&args),
+        ForgeAction::RebaseGuard(args) => crate::rebase_guard::cli_entrypoint(&args),
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
@@ -1164,24 +1224,22 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             settle_red,
             min_interval,
             max_interval,
-        } => loom_daemon::forge_wait_checks::cli_entrypoint(
-            loom_daemon::forge_wait_checks::WaitArgs {
-                selector,
-                repo,
-                base,
-                timeout,
-                required_only,
-                settle_red,
-                min_interval,
-                max_interval,
-            },
-        ),
+        } => crate::forge_wait_checks::cli_entrypoint(crate::forge_wait_checks::WaitArgs {
+            selector,
+            repo,
+            base,
+            timeout,
+            required_only,
+            settle_red,
+            min_interval,
+            max_interval,
+        }),
         ForgeAction::Rerun {
             run_id,
             failed,
             job,
             repo,
-        } => loom_daemon::forge_rerun::cli_entrypoint(&loom_daemon::forge_rerun::RerunArgs {
+        } => crate::forge_rerun::cli_entrypoint(&crate::forge_rerun::RerunArgs {
             run_id,
             failed,
             job,
@@ -1204,7 +1262,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             issue,
             branch,
             closed_pr_head,
-        } => ForgeCmd::CheckBranch(loom_daemon::forge_check_branch::CheckBranchArgs {
+        } => ForgeCmd::CheckBranch(crate::forge_check_branch::CheckBranchArgs {
             issue,
             branch,
             closed_pr_head,
@@ -1233,16 +1291,33 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             pr_number,
             reviewed,
             head,
+            allowed_paths,
         } => ForgeCmd::VerdictEquivalent {
             pr: pr_number,
             reviewed,
             head,
+            allowed_paths,
         },
         ForgeAction::VersionOnlyDiff {
             pr_number,
             file,
             repo,
-        } => ForgeCmd::VersionOnlyDiff(loom_daemon::forge_version_only_diff::Args {
+        } => ForgeCmd::VersionOnlyDiff(crate::forge_version_only_diff::Args {
+            pr: pr_number,
+            file,
+            repo,
+        }),
+        ForgeAction::AdditiveMigrations { pr_number, repo } => {
+            ForgeCmd::AdditiveMigrations(crate::forge_additive_migrations::Args {
+                pr: pr_number,
+                repo,
+            })
+        }
+        ForgeAction::SuspectCriticalDiff {
+            pr_number,
+            file,
+            repo,
+        } => ForgeCmd::SuspectCriticalDiff(crate::forge_suspect_critical_diff::Args {
             pr: pr_number,
             file,
             repo,
@@ -1404,7 +1479,7 @@ mod write_target_tests {
         // stack, never libtest's 2 MiB worker (the #10581 verdict verbs pushed
         // the debug-build `ForgeAction` frames past it).
         let cli = super::super::whole_cli_parse::try_parse_cli(&argv).expect("parse");
-        let Some(crate::Commands::Forge {
+        let Some(crate::cli::Commands::Forge {
             action: ForgeAction::MergeQueue { action },
         }) = cli.command
         else {
@@ -1424,7 +1499,7 @@ mod write_target_tests {
             "merge-queue-verbs-8MiB",
             super::super::whole_cli_parse::MAIN_THREAD_STACK,
             || {
-                let mut cmd = crate::Cli::command();
+                let mut cmd = crate::cli::Cli::command();
                 cmd.build();
                 let mq = cmd
                     .find_subcommand("forge")

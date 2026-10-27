@@ -18,7 +18,7 @@
 `loom-daemon-stop.sh` is "stopped for now"; the watchdog, a supervised relaunch, the
 auto-update roll or `loom update` can bring a daemon back. For a durable opt-out run
 `loom-daemon host disable --reason "<why>"` (writes `~/.loom/autonomy-disabled`, stops
-the daemon and removes its jobs). Every start/re-provision path then refuses with the
+the daemon; the watchdog job stays loaded and refuses on the marker). Every start/re-provision path then refuses with the
 reason, who and when; `loom-daemon status` shows `disabled by operator: <reason>
 (<when>)`. Undo with `loom-daemon host enable` (it does not start anything). Agents must
 not start or repair a daemon on such a host. See `daemon-reference.md`.
@@ -3412,5 +3412,12 @@ heartbeats but its work finder has not ticked for 2x its own interval.
    manual run is the way past it.
 4. Reclaim only touches Loom-managed paths. Space held by anything else (logs,
    caches, another tenant) must be freed by hand.
+   **The uv cache** (`~/.cache/uv`, 28 GB on one busy host, #12460) is such a
+   path: the daemon never prunes it, because uv is a host tool provisioned from
+   the worker spec (`infra/aws/loom-worker/` in 2AMLogic/2am), not by Loom.
+   uv has no size cap, so the bound is a periodic `uv cache prune --ci` (drops
+   pre-built wheels, keeps source-built ones; add it to the worker spec's
+   housekeeping, not to a sweep) or `UV_CACHE_DIR` pointed at a volume that can
+   fill harmlessly. `uv cache prune` alone removes only unreferenced entries.
 5. If the host keeps filling, lower its `autonomous.workFinder.maxConcurrent`
    in fleet config.

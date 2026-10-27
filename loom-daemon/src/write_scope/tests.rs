@@ -267,6 +267,40 @@ fn the_cache_answers_repeat_questions_without_a_second_probe() {
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
 }
 
+/// #13152: a snapshot miss is cached for a minute only, so a repo added to
+/// the installation later is re-probed soon.
+#[test]
+#[serial_test::serial(write_scope_cache)]
+fn a_not_in_installation_answer_is_cached_for_a_minute_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
+    probe::clear_memory();
+    let kd = dir.path().join("cred-m");
+    let cached = probe::Cached {
+        inner: FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into())),
+        key_dir: Some(kd.clone()),
+    };
+    let key = probe::cache_key(Some(&kd), &cached.cache_scope(), "acme/new").unwrap();
+    assert!(matches!(cached.permission("acme/new"), Permission::Insufficient(_)));
+    assert!(matches!(cached.permission("acme/new"), Permission::Insufficient(_)));
+    assert_eq!(cached.inner.calls.get(), 1, "a fresh miss is reused");
+    // Two minutes on (memory dropped, disk entry aged): re-probed.
+    probe::clear_memory();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 120;
+    let body = serde_json::json!({
+        "write": false, "detail": probe::NOT_IN_INSTALLATION, "at": at
+    });
+    std::fs::write(probe::cache_dir().join(format!("{key}.json")), body.to_string()).unwrap();
+    let _ = cached.permission("acme/new");
+    assert_eq!(cached.inner.calls.get(), 2, "a miss older than a minute is re-probed");
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+}
+
 /// The library-test fixture is admitted by the real decision, and only
 /// because its credential reports WRITE: the same registered checkout with a
 /// `pull` answer is refused. Neither answer is cached across the two, since
@@ -446,6 +480,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("epic_supervisor.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         (
             "intake_reconcile/demote.rs",
@@ -465,6 +500,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "sweep_registry/lease_step.rs",
             Via(DISPATCH, "the lease record of a dispatched sweep or step (moved from guards.rs, #11898)"),
+        ),
+        (
+            "sweep_registry/step_spawn/builder_rollback.rs",
+            Via(DISPATCH, "yields the lease + restores the label of a refused dispatched Builder step (#12822)"),
         ),
         (
             "sweep_registry/dispatch/claim_release.rs",
@@ -487,6 +526,10 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/step_cap_notice.rs",
             Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
         ),
+        (
+            "sweep_registry/step_outcome_notice.rs",
+            Via(DISPATCH, "noop/failed reason comment on an item whose Builder step was dispatched (#13054)"),
+        ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
@@ -508,6 +551,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
+        ),
+        (
+            "script_helpers/validate_phase_curator.rs",
+            Via(DISPATCH, "curator recovery split out of validate_phase.rs; runs inside a dispatched sweep"),
         ),
         ("forge_rerun.rs", Gated),
         (
@@ -604,10 +651,6 @@ fn daemon_write_paths_are_scoped() {
             OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
         ),
         (
-            "watchdog/peer_coord.rs",
-            NotAWrite("follow-up on the issue this watchdog filed"),
-        ),
-        (
             "forge_probe.rs",
             NotAWrite(
                 "the hosted-trial probe writes to the candidate instance's disposable \
@@ -681,6 +724,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "fleet_dispatch/server.rs",
             NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
+        ),
+        (
+            "host_loss/imds.rs",
+            NotAWrite("IMDSv2 token `PUT` to the link-local metadata endpoint, not the forge"),
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

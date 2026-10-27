@@ -1,6 +1,6 @@
 //! `loom-daemon merge-pr retarget-children` (#9372): the gate in front of
 //! `merge-pr.sh`'s post-merge remote-branch delete. See
-//! [`loom_daemon::merge_pr::retarget_children`] for the failure it closes.
+//! [`crate::merge_pr::retarget_children`] for the failure it closes.
 //!
 //! # Exit codes
 //!
@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::retarget_children::{prepare_delete, GhForge, Level, Verdict};
+use crate::merge_pr::retarget_children::{prepare_delete, GhForge, Level, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct RetargetChildrenArgs {

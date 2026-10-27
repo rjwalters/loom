@@ -9,7 +9,7 @@
 //! daemon subcommands' own writes (`park-record`, `operator-decision`), then
 //! the step's `CHAMPION-STEP … outcome=` word.
 
-use super::{Event, Evidence, Projection, Projector, StoreOp};
+use super::{projection, sanitize_detail, Event, Evidence, Projection, Projector, StoreOp};
 
 /// The merge gate's reason set.
 pub const MERGE_REASON_SET: &str = "champion_merge_v2";
@@ -29,7 +29,7 @@ pub const TRIAGE_REASONS: [&str; 3] = ["review_requested", "blocked", "operator"
 /// v2 (#12715) adds the stop gates a non-merging step names with `reason=`
 /// ([`STOP_REASONS`], plus `merge_rc<N>`, see [`stop_reason`]) and
 /// `unspecified` for a stop that named none.
-pub const MERGE_REASONS: [&str; 21] = [
+pub const MERGE_REASONS: [&str; 22] = [
     "merged",
     "ci_failing",
     "conflict",
@@ -49,6 +49,7 @@ pub const MERGE_REASONS: [&str; 21] = [
     "verdict_rc11",
     "mergeable_unknown",
     "pin_missing",
+    "guard_refused",
     "unspecified",
     "skipped",
 ];
@@ -56,13 +57,14 @@ pub const MERGE_REASONS: [&str; 21] = [
 /// The `reason=` tokens a `requeued` or `skipped` step may name, besides
 /// `merge_rc<N>`: the gate it stopped at. `ci_pending` is one of them only
 /// when the step says so, never by default.
-pub const STOP_REASONS: [&str; 6] = [
+pub const STOP_REASONS: [&str; 7] = [
     "facts_unread",
     "janitor_rc3",
     "verdict_rc11",
     "ci_pending",
     "mergeable_unknown",
     "pin_missing",
+    "guard_refused",
 ];
 
 /// Every reason of [`PROMOTION_REASON_SET`].
@@ -188,15 +190,6 @@ fn marker_parts(marker: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
-fn projection(class: &'static str, reason: &str, set: &'static str) -> Projection {
-    Projection {
-        class,
-        reason: reason.to_string(),
-        reason_set: set,
-        ..Projection::default()
-    }
-}
-
 /// The merge-gate refusal a marker states: `(criterion_key, reason_key,
 /// reason)`.
 #[must_use]
@@ -233,15 +226,6 @@ fn body_hash(marker: &str) -> Option<String> {
         }
         _ => None,
     }
-}
-
-/// The session's raw `reason=` token for the record's `detail`: the token
-/// characters only, bounded.
-fn sanitize_detail(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .take(48)
-        .collect()
 }
 
 fn project(e: &Evidence) -> Option<Projection> {

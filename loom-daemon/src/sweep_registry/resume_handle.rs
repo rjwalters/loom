@@ -279,34 +279,6 @@ pub(crate) struct InFlightAgent {
     pub(crate) resume_handle: Option<ResumeHandle>,
 }
 
-#[allow(dead_code)] // consumed by the H4 pause (#10831)
-impl InFlightAgent {
-    /// The classifier input at `now`.
-    pub(crate) fn classify_input(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> crate::auto_update::pause_classify::ClassifyInput {
-        use crate::auto_update::pause_manifest::{ItemKind, Runtime};
-        let age = self
-            .agent_started_at
-            .as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .and_then(|t| u64::try_from((now - t.with_timezone(&chrono::Utc)).num_seconds()).ok());
-        crate::auto_update::pause_classify::ClassifyInput {
-            kind: ItemKind::Sweep,
-            agent_age_secs: age,
-            runtime: self
-                .resume_handle
-                .as_ref()
-                .map(|h| Runtime::from(h.runtime.clone())),
-            session_id: self
-                .resume_handle
-                .as_ref()
-                .and_then(|h| h.session_id.clone()),
-        }
-    }
-}
-
 /// Fill a dispatch-time handle with what the spawn script captured after
 /// launch (the Codex session id, its store, account and container).
 pub(crate) fn merge_captured(handle: &mut ResumeHandle, captured: &resume::CapturedHandle) {
@@ -365,13 +337,10 @@ impl SweepRegistry {
             .join("owner.json");
         let result = std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
-            .and_then(|raw| Ok((serde_json::from_str::<LockOwner>(&raw)?, raw)))
-            .and_then(|(mut owner, raw)| {
+            .and_then(|raw| Ok(serde_json::from_str::<LockOwner>(&raw)?))
+            .and_then(|mut owner| {
                 session.stamp(&mut owner, model, effort);
                 std::fs::write(&path, serde_json::to_string_pretty(&owner)?)?;
-                let before = serde_json::from_str(&raw).unwrap_or_default();
-                let ns = super::journal_shadow::LockNs::Issue;
-                self.shadow_owner_updated(ns, issue, &before, &owner);
                 Ok(())
             });
         if let Err(e) = result {
