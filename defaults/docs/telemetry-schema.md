@@ -3881,6 +3881,11 @@ checkout per pass**. **OTLP only** (`otlp: Logs`), and only when
 the exporter is configured; `observability/otlp/mapping/checkout_freshness.rs`
 maps it, with the record's JSON as the body and `host` on the Resource.
 
+The daemon root (`~/loom-daemon` on a release-roll host) is not a registered
+workspace, so `daemon_root_freshness.rs` samples it every 15 minutes and emits
+the same record with `checkout_role = daemon-root` (#12727). Measurement only:
+one `git ls-remote` plus local reads, never a fetch, merge or write.
+
 Hosts with no daemon (dev boxes, Macs running hand-driven sessions) are out of
 scope by operator ruling: no hook and no CLI command emits this.
 
@@ -3890,6 +3895,9 @@ scope by operator ruling: no hook and no CLI command emits this.
 | `repo` | string? | the workspace's `owner/repo` (`loom.repo`); absent when `origin` is foreign or unparseable |
 | `pass_skipped_reason` | string? | why the pass could not measure against GitHub's tip: `budget` (the pass ran out of time before this checkout; no `prompt`), `low-disk`, `breaker-open`, `backing-off`, `network-off`, `unreachable-stop` or `no-head`. Absent when a tip was known. A stale count never looks fresh |
 | `prompt` | object? | `commit`, `loom_version`, `commits_behind`, `on_branch` as on `role_tick.outcome`, plus the five remote fields below; each inner key is absent when it cannot be read |
+| `checkout_role` | string? | `daemon-root` (`loom.checkout.role`) on the sample of the daemon's own root checkout (#12727); absent on a registered workspace |
+| `dirty_tracked_files` | int? | `loom.checkout.dirty_tracked_files`: tracked files with a staged or unstaged change; daemon-root samples only |
+| `dirty_identical_to_remote` | bool? | `loom.checkout.dirty_identical_to_remote`: every dirty tracked file is byte-identical to `remote_tip`, so a fast-forward could pass through it; absent when nothing is dirty or the tip is not in the object store |
 
 The remote fields (all optional, additive, no `schema_version` bump) also ride
 on `role_tick.outcome`'s `prompt`:
