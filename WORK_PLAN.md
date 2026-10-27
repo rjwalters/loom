@@ -49,7 +49,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
-- **#13026**: Champion: make per-repo merge concurrency a runtime tunable, and take hold re-reads out of the merge lane
 
 ## Ready
 
@@ -82,6 +81,8 @@ Issues currently being built (`loom:building`).
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
 - **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds
 - **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
+- **#13148**: Remove scripts/install/sync-labels.sh: installer can call the installed defaults copy instead of a 427-line fork
+- **#13163**: Remove never-populated QualityMetrics fields (pr_approved, rework_count, human_rating): always None
 
 ## PRs Awaiting Review
 
@@ -90,6 +91,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
+- **#13215**: refactor: remove never-populated QualityMetrics fields
 
 ## Approved (Awaiting Merge)
 
@@ -183,7 +185,6 @@ Issues carrying `loom:curated`.
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
 - **#12978**: Codex shared-seat dispatch: live receipts and startup measurements (split from #10796) *(curated)*
 - **#13025**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)*
-- **#13026**: Champion: make per-repo merge concurrency a runtime tunable, and take hold re-reads out of the merge lane *(curated)*
 - **#13134**: post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback *(curated)*
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal *(curated)*
 - **#13140**: judge-ci-red flake note has no Loom marker, so it trips post-verdict.sh's stale-read gate on the Judge's own verdict *(curated)*
@@ -207,8 +208,6 @@ Issues carrying `loom:curated`.
 - **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(hermit)*
 - **#13017**: Split run_daemon (~1960-line fn) in daemon_service.rs into startup-phase modules *(hermit)*
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller *(hermit)*
-- **#13148**: Remove scripts/install/sync-labels.sh: installer can call the installed defaults copy instead of a 427-line fork *(hermit)*
-- **#13163**: Remove never-populated QualityMetrics fields (pr_approved, rework_count, human_rating): always None *(hermit)*
 - **#13195**: Dead auto-unpin: failure_counts::record_failure has no production caller *(hermit)*
 - **#13198**: Remove retired desktop console-log fallback from get_heartbeat *(hermit)*
 
@@ -231,12 +230,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 15 |
 | Very important | 2 |
-| Important | 14 |
+| Important | 13 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 11 |
-| PRs awaiting review | 3 |
+| In Progress (`loom:building`) | 13 |
+| PRs awaiting review | 4 |
 | Approved PRs awaiting merge | 16 |
-| Curated | 84 |
-| Architect / Hermit proposals | 8 |
+| Curated | 83 |
+| Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
