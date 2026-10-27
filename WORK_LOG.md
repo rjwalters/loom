@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-27
 
+- **PR #13218**: fix: chunk pick.decision at the 16 KB ingest cap instead of exporting a summary
+- **Issue #12973** (closed): Daemon role-run records (6–116 KB) leave SigNoz: archive to S3, keep a bounded summary log
 - **PR #13215**: refactor: remove never-populated QualityMetrics fields
 - **Issue #13163** (closed): Remove never-populated QualityMetrics fields (pr_approved, rework_count, human_rating): always None
 - **Issue #12975** (closed): pick.decision payload archive: S3 sink keyed by tick_id (depends on #12974)
