@@ -18,7 +18,7 @@ label for each follower. That machinery is gone from the planner: two
 independent PRs are never held against each other, however much they change
 the same files. The accepted trade-off is more conflict-resolution work and CI
 reruns when overlapping PRs land one after another. That cost is unmeasured
-(2AMLogic/2am#5211 owns the conflict-versus-review-churn measurement; #12506
+(a conflict-versus-review-churn measurement is still outstanding; #12506
 owns kept/released explanations), so nothing here claims a runtime improvement.
 
 What is still ordered, and still held by `merge-pr.sh`:
