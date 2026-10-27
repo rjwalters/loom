@@ -24,6 +24,8 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
+- **#13213**: refactor: remove forked installer sync-labels.sh in favour of installed copy
+- **#13220**: feat(champion): narrow resync waiver to non-gate files, close superseded resyncs
 
 ## Very Important
 
@@ -75,6 +77,7 @@ Issues currently being built (`loom:building`).
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
+- **#12945**: Champion: let a resync PR that is byte-identical to a released tag skip the kept-set hold; close superseded resyncs
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
 - **#13134**: post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback
@@ -82,7 +85,6 @@ Issues currently being built (`loom:building`).
 - **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds
 - **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
 - **#13148**: Remove scripts/install/sync-labels.sh: installer can call the installed defaults copy instead of a 427-line fork
-- **#13163**: Remove never-populated QualityMetrics fields (pr_approved, rework_count, human_rating): always None
 
 ## PRs Awaiting Review
 
@@ -91,7 +93,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#13215**: refactor: remove never-populated QualityMetrics fields
+- **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
 
 ## Approved (Awaiting Merge)
 
@@ -113,6 +115,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
+- **#13213**: refactor: remove forked installer sync-labels.sh in favour of installed copy
+- **#13220**: feat(champion): narrow resync waiver to non-gate files, close superseded resyncs
 
 ## Proposed
 
@@ -167,7 +171,6 @@ Issues carrying `loom:curated`.
 - **#12318**: Claim refusals report back: `POST /v1/mirror/recheck` when the live claim read disagrees with the drawn snapshot *(curated)*
 - **#12319**: Wakes: a change in a served repo ticks the step tick early (trigger attribute, one worklist read per wake), gated on mirror health *(curated)*
 - **#12320**: Cleanup once every worker reads the worklist: delete the per-call `forge_mirror` discovery path, `maxStalenessSecs` and `per_call`; docs and ADR-0024; direct backend preserved *(curated)*
-- **#12344**: Flow-change evidence review (#11708 slice B): verdict/merge gates and merge sequencing *(curated)*
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes) *(curated)*
 - **#12408**: Live-verify epic child discovery against sky130-sar-adc#23 (follow-up to #12388) *(curated)*
 - **#12418**: Verify epic #10698 acceptance: completed-vs-not-planned dispositions and live fleet receipts *(curated)*
@@ -228,14 +231,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 15 |
+| Operator merge-risk holds | 17 |
 | Very important | 2 |
 | Important | 13 |
 | Ready (`loom:issue`) | 11 |
 | In Progress (`loom:building`) | 13 |
 | PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 16 |
-| Curated | 83 |
+| Approved PRs awaiting merge | 18 |
+| Curated | 82 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->

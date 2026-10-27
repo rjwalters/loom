@@ -15,6 +15,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-27
 
+- **Issue #10472** (closed): [Parent #10470] Follow-up A: Provider-side authority map, independent approval/promotion boundary, Latest-promotion protection
+- **Issue #12344** (closed): Flow-change evidence review (#11708 slice B): verdict/merge gates and merge sequencing
+- **Issue #11706** (closed): Hold: flow-changing requests pending operator ruling (2026-10-13)
 - **PR #13218**: fix: chunk pick.decision at the 16 KB ingest cap instead of exporting a summary
 - **Issue #12973** (closed): Daemon role-run records (6–116 KB) leave SigNoz: archive to S3, keep a bounded summary log
 - **PR #13215**: refactor: remove never-populated QualityMetrics fields
