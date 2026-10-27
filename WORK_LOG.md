@@ -15,6 +15,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-27
 
+- **PR #13227**: feat: sample daemon-root checkout lag and dirt as checkout.freshness
+- **PR #13225**: feat: derive issue-phase claim state from lease records
+- **Issue #12186** (closed): Issue-phase claim_state from the lease: delete label-age inference (slice of #11118)
+- **Issue #8570** (closed): Guard: refuse a build/scratch dir assignment that resolves onto a tmpfs mount (upstream PR to rjwalters/repo, split from #8512)
 - **PR #12780**: refactor: stop planning automatic merge-order holds between independent PRs
 - **Issue #13021** (closed): Rollout and latency evidence for captain work requests (split from #12817)
 - **Issue #12775** (closed): Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
