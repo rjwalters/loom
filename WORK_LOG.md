@@ -15,6 +15,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-27
 
+- **PR #12780**: refactor: stop planning automatic merge-order holds between independent PRs
+- **Issue #13021** (closed): Rollout and latency evidence for captain work requests (split from #12817)
+- **Issue #12775** (closed): Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
 - **Issue #10472** (closed): [Parent #10470] Follow-up A: Provider-side authority map, independent approval/promotion boundary, Latest-promotion protection
 - **Issue #12344** (closed): Flow-change evidence review (#11708 slice B): verdict/merge gates and merge sequencing
 - **Issue #11706** (closed): Hold: flow-changing requests pending operator ruling (2026-10-13)
