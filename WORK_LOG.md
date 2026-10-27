@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-27
 
+- **Issue #13026** (closed): Champion: make per-repo merge concurrency a runtime tunable, and take hold re-reads out of the merge lane
 - **Issue #11113** (closed): Umbrella: guard hooks parse shell commands ad hoc — false denies and fail-open gaps (17 bugs)
 
 ### 2026-10-26
