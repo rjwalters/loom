@@ -13,6 +13,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-27
+
+- **Issue #11113** (closed): Umbrella: guard hooks parse shell commands ad hoc — false denies and fail-open gaps (17 bugs)
+
 ### 2026-10-26
 
 - **PR #13207**: build(deps): Bump the cargo-minor-patch group across 1 directory with 4 updates
