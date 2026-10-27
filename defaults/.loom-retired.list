@@ -179,3 +179,6 @@ scripts/tests/test-judge-fanout-experiment.sh
 
 # #13020 (2026-10-21) — the orphaned heredoc-body-safety test lib is removed (PR #13023).
 scripts/tests/lib/heredoc-body-safety.sh
+
+# #13148 (2026-10-27) — the forked installer sync-labels test is removed with the fork (PR #13213).
+scripts/tests/test-install-sync-labels.sh
