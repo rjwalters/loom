@@ -23,6 +23,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
 - **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
+- **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
 
 ## Very Important
 
@@ -54,38 +55,33 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
-- **#9508**: forge polling: ADR-0021 amendment step 3 — cross-host dedup (one host polls a repo, the others reuse the answer)
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
+- **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
 - **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
 - **#12117**: Telemetry: inventory every kind; fix or delete role_tick.outcome, ci.job.log, session.output
 - **#12167**: telemetry: export peer_coordination verdict and degraded duration on host.health
+- **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue
 - **#12506**: merge sequencing: Phase 1 release skips some followers whose predecessor merged at the recorded head, and fail-closed holds emit no telemetry
+- **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
 - **#12653**: Emit merge_hold hold-cause + release-actor + merge-queue facts to SigNoz (unblocks merge_hold ETA prediction)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
-- **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes)
-- **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue
-- **#12511**: Readers: a failed roster load still routes reads to the writer; evidence-free 404 withdrawal is an hour (follow-up to #12412)
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
-- **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
 - **#13134**: post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
-- **#13140**: judge-ci-red flake note has no Loom marker, so it trips post-verdict.sh's stale-read gate on the Judge's own verdict
 - **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds
 - **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
-- **#13185**: Champion ratification hold misses ratification/requests/** — a key-review request PR auto-merged with no key reviews
-- **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles
 
 ## PRs Awaiting Review
 
@@ -114,6 +110,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
 - **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
+- **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
 
 ## Proposed
 
@@ -202,6 +199,7 @@ Issues carrying `loom:curated`.
 - **#13176**: Builder: 16/26 sweeps on fleet-1 end no-outcome-line (exit 0, no outcome) — main throughput limit *(curated)*
 - **#13185**: Champion ratification hold misses ratification/requests/** — a key-review request PR auto-merged with no key reviews *(curated)*
 - **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles *(curated)*
+- **#13209**: [ci-daily] Supply Chain *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -231,14 +229,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 14 |
+| Operator merge-risk holds | 15 |
 | Very important | 2 |
 | Important | 14 |
-| Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 19 |
+| Ready (`loom:issue`) | 11 |
+| In Progress (`loom:building`) | 11 |
 | PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 15 |
-| Curated | 83 |
+| Approved PRs awaiting merge | 16 |
+| Curated | 84 |
 | Architect / Hermit proposals | 8 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
