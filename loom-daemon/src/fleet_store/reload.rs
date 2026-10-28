@@ -127,7 +127,7 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Resolved once before the ingestion thread is spawned, then frozen for
     // that thread's lifetime (`try_init_transcript_ingest`).
     ("autonomous.transcriptIngest", Reloadability::RestartRequired),
-    // `fleet.repo` / `fleet.ref` / `fleet.syncIntervalSecs` / `fleet.autoApply`
+    // `fleet.repo` / `fleet.ref` / `fleet.syncIntervalSecs` / `fleet.autoApply*`
     // are captured once into `PassInputs` in `fleet_sync::start()`, before
     // the timer task is spawned — including the very config this `render`
     // itself is driven by.
