@@ -22,6 +22,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #12511** (closed): Readers: a failed roster load still routes reads to the writer; evidence-free 404 withdrawal is an hour (follow-up to #12412)
 - **PR #13233**: feat: split fleet.autoApply into per-write flags
 - **Issue #13228** (closed): fleet.autoApply: gate everything beyond roster registration behind its own flag
+- **Issue #9508** (closed): forge polling: ADR-0021 amendment step 3 — cross-host dedup (one host polls a repo, the others reuse the answer)
 
 ### 2026-10-27
 
