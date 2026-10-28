@@ -254,6 +254,14 @@ impl SessionEnv {
     }
 }
 
+/// Lease-liveness TTL for the reuse check, resolved down the daemon's tier
+/// chain (`LOOM_LEASE_TTL_MINUTES`, hyperparameters, 15 min default) so
+/// `lease ensure` agrees with the other lease paths on what counts as live.
+fn reuse_ttl() -> chrono::Duration {
+    let minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+    chrono::Duration::seconds((minutes * 60.0) as i64)
+}
+
 /// A live lease this host already holds on the issue under a sweep id other
 /// than `own_id` — i.e. one an in-session orchestrator published (#13252).
 /// Exactly one such pair and no live foreign pair, else `None`: with a peer
@@ -448,7 +456,7 @@ impl LeaseEnsureArgs {
         }
 
         if let Some(rows) = env.lease_rows.as_deref().filter(|_| !env.run_id_set) {
-            let ttl = chrono::Duration::seconds(15 * 60);
+            let ttl = reuse_ttl();
             let own_id = session_sweep_id(self.watch_pid);
             let mine = super::lease_release::my_host_ids();
             if let Some((host, sweep_id)) =
