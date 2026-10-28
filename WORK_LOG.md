@@ -15,6 +15,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-28
 
+- **PR #13236**: chore: remove stale quickstart labels.yml copies
+- **Issue #13234** (closed): Remove stale quickstart labels.yml copies (3 files, drifted from canonical)
+- **PR #12522**: fix: shed reads on failed roster load, withdraw evidence-free 404s briefly
+- **Issue #12511** (closed): Readers: a failed roster load still routes reads to the writer; evidence-free 404 withdrawal is an hour (follow-up to #12412)
 - **PR #13233**: feat: split fleet.autoApply into per-write flags
 - **Issue #13228** (closed): fleet.autoApply: gate everything beyond roster registration behind its own flag
 
