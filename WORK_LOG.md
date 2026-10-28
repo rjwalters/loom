@@ -15,6 +15,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-28
 
+- **PR #13250**: docs: correct auto-unpin counter wording to match actual reset points
+- **PR #13249**: fix: bound lease and builder-outcome comment growth per issue
+- **PR #13247**: feat: pass <!-- loom:tracker --> issues silently in the step classifier
+- **Issue #13246** (closed): Auto-unpin failure counter is never reset on a successful spawn (not strictly consecutive)
+- **Issue #13245** (closed): Bound lease/outcome comment volume per issue (GitHub 2,500-comment cap)
+- **Issue #13244** (closed): Work finder draws gap-to-T1 tracker issues as work: lease-comment loops (one tracker hit GitHub's 2,500-comment cap)
 - **PR #13242**: fix(tokens): count attributed exhaustion marks toward auto-unpin
 - **PR #13241**: refactor(mcp-loom): make get_heartbeat daemon-only
 - **Issue #13195** (closed): Dead auto-unpin: failure_counts::record_failure has no production caller
