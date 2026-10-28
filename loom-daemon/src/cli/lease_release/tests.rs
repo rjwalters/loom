@@ -149,13 +149,12 @@ fn release_stops_a_real_renewer_under_a_long_lived_parent_and_yields_idempotentl
         &post,
     )
     .unwrap();
-    assert_eq!(
-        out,
-        Outcome::Released {
-            renewers: 1,
-            yielded: 1
-        }
-    );
+    let Outcome::Released { renewers, yielded } = out else {
+        panic!("expected Released, got {out:?}");
+    };
+    assert_eq!((renewers.len(), yielded), (1, 1));
+    assert_eq!(renewers[0].0, child.id(), "names the stopped pid");
+    assert!(!renewers[0].1.is_empty(), "names the sweep id");
     assert!(!child.wait().unwrap().success(), "renewer must be terminated");
     assert!(s.all()[0].1.released);
 
@@ -182,13 +181,10 @@ fn release_stops_a_real_renewer_under_a_long_lived_parent_and_yields_idempotentl
         &post,
     )
     .unwrap();
-    assert_eq!(
-        out,
-        Outcome::Released {
-            renewers: 1,
-            yielded: 0
-        }
-    );
+    let Outcome::Released { renewers, yielded } = out else {
+        panic!("expected Released, got {out:?}");
+    };
+    assert_eq!((renewers.len(), yielded), (1, 0));
     assert_eq!(posted.borrow().len(), 1, "no duplicate yield");
 }
 
@@ -209,7 +205,7 @@ fn no_lease_and_no_renewer_is_a_quiet_success() {
     assert_eq!(
         out,
         Outcome::Released {
-            renewers: 0,
+            renewers: vec![],
             yielded: 0
         }
     );
@@ -225,7 +221,7 @@ fn a_failed_post_is_reported_so_the_caller_can_retry() {
     assert_eq!(
         out,
         Outcome::PostFailed {
-            renewers: 0,
+            renewers: vec![],
             sweep: "s1".into()
         }
     );
