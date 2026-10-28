@@ -88,3 +88,42 @@ fn recording_a_builder_noop_claims_the_notice() {
     reg.record_step_outcome(&other, &mut NoForge);
     assert!(!reg.step_outcome_notices.contains("step-doctor-9-1"));
 }
+
+#[test]
+fn repeated_outcomes_edit_one_comment_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    let gh = ws.join("fake-gh.sh");
+    // `list` answers with the stored id once a comment exists; POST (issue
+    // comment) creates it; PATCH records the edit.
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/usr/bin/env bash
+D="{d}"
+case "$*" in
+  *"-X PATCH"*) echo "$*" >> "$D/patched" ;;
+  "api "*"/comments "*) [ -f "$D/created" ] && echo 4242 ;;
+  "issue comment"*) echo x >> "$D/created" ;;
+  *) exit 1 ;;
+esac
+"#,
+            d = ws.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = crate::sweep_registry::SweepRegistryConfig::new(ws.to_path_buf());
+    config.gh_bin = Some(gh);
+    let mut reg = crate::sweep_registry::SweepRegistry::new(config);
+    for i in 0..5 {
+        reg.note_builder_outcome(&run(OutcomeClass::Failed, "unclassified", &format!("s-{i}")));
+    }
+    let created = std::fs::read_to_string(ws.join("created")).unwrap();
+    assert_eq!(created.lines().count(), 1, "one comment posted, the rest edited");
+    let patched = std::fs::read_to_string(ws.join("patched")).unwrap();
+    assert_eq!(patched.matches("issues/comments/4242").count(), 4);
+    assert!(patched.contains("issues/comments/4242"));
+    assert!(patched.contains("sweep=s-4"), "latest outcome retained");
+}
