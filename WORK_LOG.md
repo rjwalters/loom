@@ -15,6 +15,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-28
 
+- **PR #13242**: fix(tokens): count attributed exhaustion marks toward auto-unpin
+- **PR #13241**: refactor(mcp-loom): make get_heartbeat daemon-only
+- **Issue #13195** (closed): Dead auto-unpin: failure_counts::record_failure has no production caller
+- **Issue #13198** (closed): Remove retired desktop console-log fallback from get_heartbeat
 - **PR #13224**: docs: stop in-session sweep gates misreading the sweep's own activity
 - **PR #13220**: feat(champion): narrow resync waiver to non-gate files, close superseded resyncs
 - **PR #13213**: refactor: remove forked installer sync-labels.sh in favour of installed copy
