@@ -60,6 +60,7 @@
 //! | PR `loom:pr` | Champion merge |
 //! | PR with none of those | Champion triage; a draft passes `draft` |
 //! | issue `loom:epic` | pass `epic` |
+//! | issue whose body carries the `<!-- loom:tracker -->` marker | pass `tracker` |
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
@@ -195,6 +196,10 @@ pub struct IssueInput {
     /// yet `loom:issue` ([`super::main_red_fix`], #10118).
     #[serde(default)]
     pub red_fix: bool,
+    /// The body carries the `<!-- loom:tracker -->` marker (#10886, #13244):
+    /// a living tracker with no finite deliverable, never drawn as work.
+    #[serde(default)]
+    pub tracker: bool,
 }
 
 /// A merged PR that references an issue.
@@ -387,6 +392,7 @@ pub enum ItemState {
     Landed,
     Blocked,
     Epic,
+    Tracker,
     Proposal,
     ReviewRequested,
     ChangesRequested,
@@ -491,6 +497,7 @@ pub enum PassReason {
     Blocked,
     CapabilityMissing,
     Epic,
+    Tracker,
     Proposal,
     NoStage,
     /// An open draft PR with no stage label (#12499): unfinished, never Judged.
@@ -529,6 +536,7 @@ impl PassReason {
             Self::Blocked => "blocked",
             Self::CapabilityMissing => "capability_missing",
             Self::Epic => "epic",
+            Self::Tracker => "tracker",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
             Self::Draft => "draft",
@@ -811,6 +819,9 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     let pass = |s: ItemState, r: PassReason| (s, Verdict::Pass(r));
     if has(labels, super::EPIC_LABEL) {
         return pass(ItemState::Epic, PassReason::Epic);
+    }
+    if issue.tracker {
+        return pass(ItemState::Tracker, PassReason::Tracker);
     }
     // A proposal that is already promoted (`loom:issue`) or curated is item
     // work; Champion's own proposal query skips those too (`champion.md`
