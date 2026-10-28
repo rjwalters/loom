@@ -15,6 +15,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-28
 
+- **PR #13224**: docs: stop in-session sweep gates misreading the sweep's own activity
+- **PR #13220**: feat(champion): narrow resync waiver to non-gate files, close superseded resyncs
+- **PR #13213**: refactor: remove forked installer sync-labels.sh in favour of installed copy
+- **Issue #13222** (closed): In-session /loom:sweep: verdict and claim gates misfire because all agents share the operator's GitHub account
+- **Issue #13148** (closed): Remove scripts/install/sync-labels.sh: installer can call the installed defaults copy instead of a 427-line fork
+- **Issue #12945** (closed): Champion: let a resync PR that is byte-identical to a released tag skip the kept-set hold; close superseded resyncs
 - **PR #13223**: chore(harness): track latest CLIs — codex 0.164.0→0.165.0 opencode 1.19.4→1.19.5
 - **PR #13236**: chore: remove stale quickstart labels.yml copies
 - **Issue #13234** (closed): Remove stale quickstart labels.yml copies (3 files, drifted from canonical)
