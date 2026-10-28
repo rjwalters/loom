@@ -521,6 +521,13 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows"
     echo "$first" >> "$D/posted"
     echo "$id" ;;
+  *" DELETE "*)
+    echo "$*" >> "$D/deleted"
+    [ -f "$D/fail_delete" ] && {{ echo 'HTTP 404' >&2; exit 1; }}
+    cid=""
+    for a in "$@"; do case "$a" in */issues/comments/*) cid="${{a##*/}}" ;; esac; done
+    grep -v "^{{\"id\":$cid," "$D/rows" > "$D/rows.tmp" || true
+    mv "$D/rows.tmp" "$D/rows" ;;
   *" PATCH "*)
     echo "$*" >> "$D/patched"
     [ -f "$D/fail_patch" ] && {{ echo 'HTTP 403' >&2; exit 1; }}
@@ -1345,4 +1352,66 @@ fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
         })
         .collect();
     assert_eq!(earliest_live_holder(&lib_rows, "judge", now(), ttl()).as_deref(), Some("run-2"));
+}
+
+// ---- pruning dead records (#13245) --------------------------------------
+
+fn released(id: u64, age_min: i64, holder: &Identity) -> Row {
+    row(id, age_min, format!("{}\nprose", holder.released_marker()))
+}
+
+#[test]
+fn prune_keeps_live_leases_peers_and_the_newest_dead() {
+    let me = who(Role::Doctor, "s-me");
+    let mut peer = who(Role::Doctor, "s-peer");
+    peer.host = "host-other".into();
+    let mut rows: Vec<Row> = (1..=6)
+        .map(|i| released(i, 5, &who(Role::Doctor, &format!("s{i}"))))
+        .collect();
+    rows.push(lease(7, 60, &who(Role::Doctor, "expired")));
+    rows.push(lease(8, 1, &who(Role::Judge, "live")));
+    rows.push(released(9, 5, &peer));
+    rows.push(lease(10, 90, &peer));
+    let ids = prune_candidates(&rows, &me.host, now(), ttl(), 3);
+    assert_eq!(ids, vec![1, 2, 3, 4], "7 dead own records, newest 3 kept");
+    assert!(prune_candidates(&rows, &me.host, now(), ttl(), 50).is_empty());
+}
+
+#[test]
+fn prune_spares_a_yield_whose_lease_is_still_live() {
+    let a = who(Role::Doctor, "s-a");
+    let peer = who(Role::Doctor, "s-peer");
+    let rows = vec![
+        lease(1, 1, &a),
+        row(2, 1, a.yield_marker(&peer)),
+        row(3, 1, who(Role::Doctor, "gone").yield_marker(&peer)),
+    ];
+    assert_eq!(prune_candidates(&rows, &a.host, now(), ttl(), 0), vec![3]);
+}
+
+#[test]
+fn repeated_claim_release_cycles_keep_the_comment_count_bounded() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    for i in 0..20 {
+        let me = who(Role::Doctor, &format!("sweep-{i}"));
+        let c = ctx(dir.path(), me);
+        assert_eq!(c.claim(), EXIT_HELD);
+        c.release(None, None, None);
+    }
+    let rows = fs::read_to_string(dir.path().join("rows")).unwrap();
+    assert!(rows.lines().count() <= KEEP_DEAD_RECORDS + 1, "{rows}");
+}
+
+#[test]
+fn a_failed_prune_delete_does_not_fail_the_claim() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail_delete"), "").unwrap();
+    for i in 0..6 {
+        let c = ctx(dir.path(), who(Role::Doctor, &format!("s{i}")));
+        assert_eq!(c.claim(), EXIT_HELD);
+        c.release(None, None, None);
+    }
+    assert!(dir.path().join("deleted").exists());
 }
