@@ -80,9 +80,6 @@ Issues currently being built (`loom:building`).
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
 - **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds
 - **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
-- **#13244**: Work finder draws gap-to-T1 tracker issues as work: lease-comment loops (one tracker hit GitHub's 2,500-comment cap)
-- **#13245**: Bound lease/outcome comment volume per issue (GitHub 2,500-comment cap)
-- **#13246**: Auto-unpin failure counter is never reset on a successful spawn (not strictly consecutive)
 
 ## PRs Awaiting Review
 
@@ -91,8 +88,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#13249**: fix: bound lease and builder-outcome comment growth per issue
-- **#13250**: docs: correct auto-unpin counter wording to match actual reset points
 
 ## Approved (Awaiting Merge)
 
@@ -113,7 +108,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
-- **#13247**: feat: pass <!-- loom:tracker --> issues silently in the step classifier
 
 ## Proposed
 
@@ -197,9 +191,6 @@ Issues carrying `loom:curated`.
 - **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
 - **#13238**: [ci-daily] Flake Detection (Rust) *(curated)*
-- **#13244**: Work finder draws gap-to-T1 tracker issues as work: lease-comment loops (one tracker hit GitHub's 2,500-comment cap) *(curated)*
-- **#13245**: Bound lease/outcome comment volume per issue (GitHub 2,500-comment cap) *(curated)*
-- **#13246**: Auto-unpin failure counter is never reset on a successful spawn (not strictly consecutive) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -229,10 +220,10 @@ Issues carrying `loom:curated`.
 | Very important | 2 |
 | Important | 13 |
 | Ready (`loom:issue`) | 12 |
-| In Progress (`loom:building`) | 12 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 16 |
-| Curated | 81 |
+| In Progress (`loom:building`) | 9 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 15 |
+| Curated | 78 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
