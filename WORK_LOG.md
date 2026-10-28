@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-28
 
+- **PR #13253**: fix: reuse orchestrator's live lease in lease ensure and name released renewers
+- **Issue #13252** (closed): In-session sweep lease friction: worktree.sh double-publishes, lease release stops the sweep's renewer, backgrounded renewers die
 - **PR #13250**: docs: correct auto-unpin counter wording to match actual reset points
 - **PR #13249**: fix: bound lease and builder-outcome comment growth per issue
 - **PR #13247**: feat: pass <!-- loom:tracker --> issues silently in the step classifier
