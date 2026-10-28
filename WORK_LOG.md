@@ -13,8 +13,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-28
+
+- **PR #13233**: feat: split fleet.autoApply into per-write flags
+- **Issue #13228** (closed): fleet.autoApply: gate everything beyond roster registration behind its own flag
+
 ### 2026-10-27
 
+- **PR #13231**: refactor: consolidate /proc/meminfo parsers in loom-daemon
+- **Issue #13230** (closed): Consolidate four /proc/meminfo parsers in loom-daemon into one
 - **PR #13227**: feat: sample daemon-root checkout lag and dirt as checkout.freshness
 - **PR #13225**: feat: derive issue-phase claim state from lease records
 - **Issue #12186** (closed): Issue-phase claim_state from the lease: delete label-age inference (slice of #11118)
