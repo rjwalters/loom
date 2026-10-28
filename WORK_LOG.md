@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-28
 
+- **PR #13223**: chore(harness): track latest CLIs — codex 0.164.0→0.165.0 opencode 1.19.4→1.19.5
 - **PR #13236**: chore: remove stale quickstart labels.yml copies
 - **Issue #13234** (closed): Remove stale quickstart labels.yml copies (3 files, drifted from canonical)
 - **PR #12522**: fix: shed reads on failed roster load, withdraw evidence-free 404s briefly
