@@ -859,3 +859,26 @@ fn ensure_with_a_live_orchestrator_lease_publishes_and_renews_nothing() {
     assert!(argv(&dir, "publish-argv").is_none(), "no second lease");
     assert!(argv(&dir, "renew-argv").is_none(), "no second renewer");
 }
+
+#[test]
+#[serial_test::serial(loom_auto_update_env)]
+fn the_reuse_decision_follows_the_lease_ttl_env() {
+    let env_var = crate::claim_reconciliation::LEASE_TTL_MINUTES_ENV;
+    // A lease aged 10 minutes: live under the 15 min default, expired under 5.
+    let rows = [lease_row("h-me", "run-1", 600)];
+    let reused = |ttl| reusable_lease(&rows, chrono::Utc::now(), ttl, &mine(), None).is_some();
+
+    std::env::remove_var(env_var);
+    assert_eq!(reuse_ttl(), chrono::Duration::minutes(15));
+    assert!(reused(reuse_ttl()), "default TTL reuses a 10 min old lease");
+
+    std::env::set_var(env_var, "5");
+    assert_eq!(reuse_ttl(), chrono::Duration::minutes(5));
+    assert!(!reused(reuse_ttl()), "a 5 min TTL treats it as expired");
+
+    for bad in ["0", "junk", "-3"] {
+        std::env::set_var(env_var, bad);
+        assert_eq!(reuse_ttl(), chrono::Duration::minutes(15), "{bad:?} falls back");
+    }
+    std::env::remove_var(env_var);
+}
