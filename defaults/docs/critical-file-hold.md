@@ -95,7 +95,7 @@ Two further cases cost operators a second release for the same concern:
   comment (the #9548 rule; never a bot or Champion) posted after the hold may
   carry one `release-scope: <path> [<path>...]` line naming the paths the Doctor
   was asked to change. The tick passes them as `forge verdict-equivalent
-  --allowed-paths`; the verb answers `EQUIVALENCE_KIND=requested-change` only
+  [--repo "$LOOM_REPO"] --allowed-paths`; the verb answers `EQUIVALENCE_KIND=requested-change` only
   when the per-file delta between the two three-dot compares is non-empty and
   lies wholly inside that set. The release comment records the kind and the
   paths so the Judge's re-verdict can confirm the change. Any other delta, no

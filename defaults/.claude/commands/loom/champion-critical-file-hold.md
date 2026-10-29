@@ -151,8 +151,14 @@ cf_change_unmoved() {
   CF_EQUIV_KIND="" CF_EQUIV_WHY="no head recorded (legacy hold)" CF_EQUIV_CAUSE=""
   [ -n "$STATE_HEAD" ] || return 1
   # shellcheck disable=SC2086  # CF_SCOPE is a space-joined, charset-checked path list
-  CF_EQUIV_WHY=$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent \
+  # #13150: pass --repo when LOOM_REPO is known; a daemon predating the flag (clap usage error
+  # naming `--repo`) is retried once without it so the fail-safe is not widened.
+  CF_EQUIV_WHY=$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent ${LOOM_REPO:+--repo "$LOOM_REPO"} \
     "$PR_NUMBER" "$STATE_HEAD" "$HEAD_SHA" ${CF_SCOPE:+--allowed-paths $CF_SCOPE} 2>&1)
+  if [ -n "${LOOM_REPO:-}" ] && ! grep -q '^EQUIVALENCE_KIND=' <<<"$CF_EQUIV_WHY" && grep -q -- '--repo' <<<"$CF_EQUIV_WHY"; then
+    CF_EQUIV_WHY=$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent \
+      "$PR_NUMBER" "$STATE_HEAD" "$HEAD_SHA" ${CF_SCOPE:+--allowed-paths $CF_SCOPE} 2>&1)
+  fi
   CF_EQUIV_KIND=$(sed -n 's/^EQUIVALENCE_KIND=//p' <<<"$CF_EQUIV_WHY")
   CF_EQUIV_WHY=$(grep -v '^[A-Z_]*=' <<<"$CF_EQUIV_WHY" | tail -1)
   case "$CF_EQUIV_WHY" in *equivalence=unread*) CF_EQUIV_CAUSE=unread ;; esac
