@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-29
 
+- **Issue #11708** (closed): Review merged flow changes (09-29 → 10-13) with evidence; revert or simplify per change
 - **PR #13262**: build(deps): Bump @hono/node-server from 2.0.12 to 2.1.5 in /mcp-loom
 
 ### 2026-10-28
