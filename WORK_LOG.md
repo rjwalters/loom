@@ -15,6 +15,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-29
 
+- **PR #13300**: chore(harness): track latest CLIs — codex 0.165.0→0.166.0
+- **PR #13271**: test: cross-tool guard test for Champion pin/facts commands
+- **PR #13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
+- **PR #13147**: feat: add --repo to forge verdict-equivalent and name forge-read failures
+- **PR #13144**: fix: add loom marker to judge-ci-red flake note template
+- **PR #13113**: feat(merge-pr): port the stale-mergeable recheck loop to Rust (#8191 slice)
+- **Issue #13269** (closed): Cross-tool guard test: Champion pin/facts writes must pass both Loom and Repo Skills hooks
+- **Issue #13185** (closed): Champion ratification hold misses ratification/requests/** — a key-review request PR auto-merged with no key reviews
+- **Issue #13146** (closed): verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
+- **Issue #13140** (closed): judge-ci-red flake note has no Loom marker, so it trips post-verdict.sh's stale-read gate on the Judge's own verdict
 - **PR #13295**: refactor: remove dead GraphQL path from ci_telemetry poller
 - **Issue #13292** (closed): Remove dead GraphQL path in ci_telemetry poller (story.rs caller deleted)
 - **PR #13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
