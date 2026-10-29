@@ -124,6 +124,7 @@ case "\$1 \$2" in
     printf '%s\n' "\$*" >>"\$S/ve.argv"
     case "\$(cat "\$S/mode")" in
       unread) echo "loom-daemon forge verdict-equivalent: could not decide — Why: rebase-patch-identical: equivalence=unread — forge compare unreadable after retries" >&2; exit 1 ;;
+      baseunread) echo "loom-daemon forge verdict-equivalent: could not decide — Why: equivalence=base-unread — could not read PR #$PR's base branch from the forge: gh exited with status 1" >&2; exit 1 ;;
       scoped)
         # The real verb's rule, stubbed: carry only when --allowed-paths names the whole delta.
         case "\$*" in *"--allowed-paths docs/run.md"*) echo VERDICT_EQUIVALENT=1; echo EQUIVALENCE_KIND=requested-change; exit 0 ;; esac
@@ -258,6 +259,10 @@ grep -q "equivalence=unread" "$T/last_why"; check 0 "$?" "unread: the notice quo
 grep -qx "TRIGGER:unread" "$T/triggers"; check 0 "$?" "unread: the park write is tagged for hold.transition telemetry"
 reset "$A"; tick; operator_release; tick; echo unknown >"$T/mode"; push "$D"; tick
 grep -qx "TRIGGER:" "$T/triggers"; check 0 "$?" "a changed/unknown re-arm is not tagged unread"
+
+echo "--- #13149: unreadable PR base branch ---"
+reset "$A"; tick; operator_release; tick; echo baseunread >"$T/mode"; push "$D"; tick
+grep -qx "TRIGGER:base-unread" "$T/triggers"; check 0 "$?" "base-unread: the park write carries the closed cause token only"
 
 reset "$A"; tick; operator_release; tick
 echo scoped >"$T/mode"; push "$D"

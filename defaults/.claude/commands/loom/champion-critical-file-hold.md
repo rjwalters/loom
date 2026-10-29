@@ -145,7 +145,7 @@ CF_SCOPE=$(jq -r --arg h "$HOLD_MARKER" --arg r "$RELEASED_MARKER" '
   | split(" ")[] | select(test("^[A-Za-z0-9._/@+-]+$"))' <<<"$CF_JSON" 2>/dev/null | head -50 | paste -sd' ')
 
 # Head moved; did the PR's change? Sets CF_EQUIV_KIND (empty => re-arm), CF_EQUIV_WHY,
-# CF_EQUIV_CAUSE (`unread`: the forge compare never answered, #13114).
+# CF_EQUIV_CAUSE (`unread`: the forge compare never answered, #13114; `base-unread`: the PR base branch was unreadable, #13149).
 # requires-daemon: forge optional   Without `forge verdict-equivalent` an equivalent head move re-arms (pre-#9416 behavior: one extra removal, never an unreviewed merge).
 cf_change_unmoved() {
   CF_EQUIV_KIND="" CF_EQUIV_WHY="no head recorded (legacy hold)" CF_EQUIV_CAUSE=""
@@ -155,7 +155,11 @@ cf_change_unmoved() {
     "$PR_NUMBER" "$STATE_HEAD" "$HEAD_SHA" ${CF_SCOPE:+--allowed-paths $CF_SCOPE} 2>&1)
   CF_EQUIV_KIND=$(sed -n 's/^EQUIVALENCE_KIND=//p' <<<"$CF_EQUIV_WHY")
   CF_EQUIV_WHY=$(grep -v '^[A-Z_]*=' <<<"$CF_EQUIV_WHY" | tail -1)
-  case "$CF_EQUIV_WHY" in *equivalence=unread*) CF_EQUIV_CAUSE=unread ;; esac
+  # First `equivalence=<cause>` token wins; only a fixed list becomes a cause, never raw text.
+  case "$(grep -o 'equivalence=[a-z-]*' <<<"$CF_EQUIV_WHY" | head -1)" in
+    equivalence=unread) CF_EQUIV_CAUSE=unread ;;
+    equivalence=base-unread) CF_EQUIV_CAUSE=base-unread ;;
+  esac
   [ -n "$CF_EQUIV_KIND" ]
 }
 

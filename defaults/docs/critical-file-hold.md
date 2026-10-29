@@ -90,7 +90,10 @@ Two further cases cost operators a second release for the same concern:
   "could not tell". A compare that stays unreadable still re-arms (fail closed),
   but its reason line carries `equivalence=unread`, and the re-arm's
   `hold.transition` record uses the trigger `champion_role_equivalence_unread`,
-  so an outage is countable apart from a real change.
+  so an outage is countable apart from a real change. An unreadable PR base
+  branch likewise carries `equivalence=base-unread` and the trigger
+  `champion_role_equivalence_base_unread` (#13149); any other `equivalence=…`
+  text maps to plain `champion_role`, never to the raw string.
 - **A Doctor push that makes only the requested change.** A trusted human
   comment (the #9548 rule; never a bot or Champion) posted after the hold may
   carry one `release-scope: <path> [<path>...]` line naming the paths the Doctor
