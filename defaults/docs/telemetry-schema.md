@@ -194,6 +194,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
+| [`completion.narrated`](#completionnarrated--a-public-feed-completion-the-narration-sink-built) | log, OTLP only | `safehouse/completion_runtime.rs` (`emit_narration_record`, from `build_and_narrate_completion`) |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.authorization.evaluated`](#mergeauthorizationevaluated--one-merge-group-authorization-evaluation) | log, OTLP only | `forge_merge_queue/group_run.rs` (`run_group_check`) |
@@ -4609,6 +4610,33 @@ span has no `outcome` key; its keys are `loom.fleet_dispatch.result`
 then did: `champion.run` on `loom.champion.sweep_id` = the span's
 `loom.assignment.id`'s sweep, grouped by `loom.champion.outcome`.
 
+
+### `completion.narrated` — a public-feed completion the narration sink built
+
+One OTLP log (INFO) per `completion` envelope the safehouse narration sink builds
+(Issue #13287), from `build_and_narrate_completion`, the core all three trigger
+paths share. `loom.feed.completions{kind,outcome}` counts narrations but has no
+repo, issue or token facts; this record is what answers "how many completions did
+each host narrate per repo, and how many carried tokens?" from the store.
+**OTLP-only.**
+
+The JSON body holds `repo`, `issue`, `pr`, `trigger` (`sweep_exit`,
+`champion_merge_step` or `reconcile`), `outcome` (`narrated`, or `seeded` for a
+fresh host's first reconciliation pass, which records merges without posting
+them, #4649), `tokens_present` (the payload carries a flat `tokens`),
+`tokens_by_model_rows` (rows in the payload's `tokens_by_model`), `narrated_at`
+and standard `loom` build provenance. A record whose provenance does not
+validate is not exported.
+
+**OTLP.** Attributes: `loom.repo`, `loom.issue` and `loom.completion.trigger` /
+`outcome` / `pr` / `tokens_present` / `tokens_by_model_rows`
+(`COMPLETION_NARRATED_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). Both timestamps are
+`narrated_at`; the executing host is `host.id` on the resource.
+
+Query (a token regression): in SigNoz Logs, filter `loom.kind = completion.narrated`
+and `loom.completion.outcome = narrated`, group by `loom.completion.tokens_present`
+and `host.id` over time; a healthy fleet is mostly `true`.
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused
 

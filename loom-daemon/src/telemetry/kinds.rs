@@ -178,6 +178,8 @@ pub mod stage_occupancy;
 
 /// `champion.run` (#13029) — what a Champion merge / hold-reevaluate run decided.
 pub mod champion_run;
+/// `completion.narrated` (#13287) — a public-feed completion the narration sink built.
+pub mod completion_narrated;
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `hold.transition` (#12665) — a hold label applied to or removed from a PR.
@@ -514,6 +516,12 @@ macro_rules! telemetry_kind_table {
             /// A role agent began working an item in a stage (#11641): the
             /// work-start that splits a stay into queue wait and work time.
             WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
+            /// One public-feed completion the narration sink built (#13287):
+            /// repo, issue, trigger path and whether tokens rode along.
+            /// OTLP-only. See [`completion_narrated`].
+            CompletionNarrated = "completion.narrated" => $crate::telemetry::kinds::completion_narrated::CompletionNarratedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One daemon-pass write the #9548 credential-scope gate refused
