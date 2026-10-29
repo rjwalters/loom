@@ -142,6 +142,7 @@
 
 pub mod activity;
 pub mod agent_gh;
+pub mod agent_residue_reaper;
 pub mod agent_session;
 pub mod agent_skills;
 /// Alert transitions as `alert.transition` OTLP log records (#11295, #12806).
