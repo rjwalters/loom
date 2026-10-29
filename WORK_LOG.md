@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-29
 
+- **PR #13288**: fix: attribute step-launched role sessions to their issue's completion tokens and record each narration
+- **Issue #13287** (closed): completion-v1 narration carries no tokens since ~2026-10-16; narration emits no telemetry
 - **Issue #13238** (closed): [ci-daily] Flake Detection (Rust)
 - **PR #13282**: refactor: retire the default-off pipeline-empty idle gate
 - **PR #13279**: feat: reap agent process residue after agent exit (ships dark)
