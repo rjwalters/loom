@@ -19,6 +19,7 @@
 #[allow(dead_code)]
 mod common;
 
+use common::git;
 use std::path::Path;
 
 use loom_daemon::worktree_ops::aggressive::{
@@ -26,19 +27,6 @@ use loom_daemon::worktree_ops::aggressive::{
     LOOM_MANAGED_SENTINEL,
 };
 use loom_daemon::worktree_ops::landed::Landed;
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "loom@example.com")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "loom@example.com")
-        .status()
-        .expect("git must spawn");
-    assert!(status.success(), "git {args:?} failed in {}", dir.display());
-}
 
 /// A repo with an `origin` remote and a seeded `main`, plus a managed
 /// (detached) worktree at `.loom/worktrees/pr-9999` sitting on `head_rev`.

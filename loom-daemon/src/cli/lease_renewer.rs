@@ -378,8 +378,21 @@ pub(crate) fn end_owners(
     is_live: LiveProbe<'_>,
     signal: &dyn Fn(u32),
 ) -> Result<usize> {
+    Ok(end_owners_detail(store, repo, issue, host, sweep, is_live, signal)?.len())
+}
+
+/// [`end_owners`], naming each owner it ended as `(pid, sweep)` (#13252).
+pub(crate) fn end_owners_detail(
+    store: &Store,
+    repo: &str,
+    issue: u64,
+    host: Option<&str>,
+    sweep: Option<&str>,
+    is_live: LiveProbe<'_>,
+    signal: &dyn Fn(u32),
+) -> Result<Vec<(u32, String)>> {
     let _lock = store.lock()?;
-    let mut n = 0;
+    let mut n = Vec::new();
     for (path, mut rec) in store.all() {
         if rec.repo != repo || rec.issue != issue || sweep.is_some_and(|s| s != rec.sweep) {
             continue;
@@ -387,7 +400,7 @@ pub(crate) fn end_owners(
         if host.is_some_and(|h| h != rec.host) {
             continue;
         }
-        n += 1;
+        n.push((rec.pid, rec.sweep.clone()));
         if is_live(rec.pid, &rec.ident) {
             signal(rec.pid);
         }

@@ -1,12 +1,13 @@
-//! Per-account consecutive-failure counter, ported from
+//! Per-account exhaustion-failure counter, ported from
 //! `loom_tools.tokens.failure_counts`.
 //!
-//! Tracks consecutive `TOKEN_EXHAUSTED` failures per account so the spawn
-//! wrapper can auto-unpin a stuck pin. Stored at `.loom/tokens/.failure_counts`
+//! Tracks a running total of `TOKEN_EXHAUSTED` failures per account (since its
+//! last reset) so the spawn wrapper can auto-unpin a stuck pin. Stored at `.loom/tokens/.failure_counts`
 //! as JSON: `{"<account_name>": {"count": <int>, "last_failure": "<ISO8601 UTC>"}}`.
 //!
-//! The counter is reset on a successful spawn for that account
-//! ([`record_success`]) or any operator allowlist mutation ([`reset_all`]).
+//! The counter is reset by `tokens unblock` for that account
+//! ([`record_success`]) or any operator allowlist mutation ([`reset_all`]); a
+//! successful spawn does not reset it, so the count is not strictly consecutive.
 //! Reaching the threshold (default 5) is checked `>= 5` — idempotent
 //! at-or-above, matching the Python semantics exactly.
 
@@ -98,7 +99,7 @@ fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Increment the consecutive-failure counter for `name`, capped at
+/// Increment the failure counter for `name`, capped at
 /// `threshold`. Returns the new (post-increment) count.
 ///
 /// # Errors
@@ -174,7 +175,7 @@ pub fn reset_all(workspace: &Path) -> Result<(), String> {
     }
 }
 
-/// Return the current consecutive-failure count for `name` (0 if absent).
+/// Return the current failure count for `name` (0 if absent).
 #[must_use]
 pub fn get_count(workspace: &Path, name: &str) -> u32 {
     let path = state_path(workspace);

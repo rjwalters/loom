@@ -69,8 +69,11 @@ fn the_merge_sequence_plan_reads_changed_files_over_rest_only() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
+    // PR 2 is stacked on PR 1; PR 3 is independent (#12775).
     let seq_row = |n: u32| {
+        let base = if n == 2 { "feature/issue-1" } else { "main" };
         row(n, &[])
+            .base(base)
             .sha(SHA)
             .created(&format!("2026-10-0{n}T00:00:00Z"))
             .updated("2026-10-03T00:00:00Z")
@@ -81,10 +84,11 @@ fn the_merge_sequence_plan_reads_changed_files_over_rest_only() {
     let log = calls(&log);
     assert!(!log.contains("FORBIDDEN"), "a GraphQL read was attempted: {log}");
     assert_eq!(report.open_prs, 3);
-    for n in 1..=3 {
+    for n in 1..=2 {
         assert!(log.contains(&format!("pulls/{n}/files?per_page=100&page=1")), "{log}");
     }
-    // Unchanged decision: only the two PRs sharing a file form a group.
+    assert!(!log.contains("pulls/3/files"), "an unstacked PR's files are never read: {log}");
+    // Only the stacked pair sharing a file forms a group.
     let groups: Vec<Vec<u32>> = report.groups.iter().map(|g| g.order.clone()).collect();
     assert_eq!(groups, vec![vec![1, 2]], "{report:?}");
 }
@@ -113,7 +117,10 @@ fn the_plan_counts_each_suppressed_edge_once() {
         std::fs::create_dir_all(&root).unwrap();
         // PR 1 is approved: only a ready predecessor is ever sequenced behind.
         let seq_row = |n: u32, labels: &[&str]| {
+            // PR 2 is stacked on PR 1 (#12775).
+            let base = if n == 2 { "feature/issue-1" } else { "main" };
             row(n, labels)
+                .base(base)
                 .sha(SHA)
                 .created(&format!("2026-10-0{n}T00:00:00Z"))
                 .updated("2026-10-03T00:00:00Z")

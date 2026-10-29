@@ -76,11 +76,13 @@ mod fetch_tests;
 #[cfg(test)]
 mod noop_chain_tests;
 #[cfg(test)]
+mod reason_tests;
+#[cfg(test)]
 mod tests;
 
 use std::path::{Path, PathBuf};
 
-use crate::forge_tree_unchanged::{tree_unchanged, verdict_tree_carveout_enabled};
+use crate::forge_tree_unchanged::{tree_unchanged_checked, verdict_tree_carveout_enabled};
 
 /// Env kill switch for the two equivalence kinds #9416 adds, nested inside
 /// [`crate::forge_tree_unchanged::VERDICT_TREE_CARVEOUT_ENABLED_ENV`]: turning
@@ -230,13 +232,43 @@ pub(crate) fn gh_api(
     cwd: Option<&Path>,
     path: &str,
 ) -> Option<Vec<u8>> {
+    gh_api_checked(op, gh_bin, cwd, path).ok()
+}
+
+/// [`gh_api`], naming the failure (#13146): `Err` carries the exit status and
+/// first stderr line, or why `gh` never ran.
+pub(crate) fn gh_api_checked(
+    op: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    path: &str,
+) -> Result<Vec<u8>, String> {
     // #10089: counted via the facade under `op`.
-    crate::claim_reconciliation::gh_call::ok_stdout(optional_cwd(
-        op,
-        gh_bin,
-        cwd,
-        ["api", path].iter().copied(),
-    ))
+    run_checked(optional_cwd(op, gh_bin, cwd, ["api", path].iter().copied()))
+}
+
+/// Run `inv`; stdout on exit 0, else a short reason naming the failure.
+pub(crate) fn run_checked(inv: crate::gh_invocation::GhInvocation) -> Result<Vec<u8>, String> {
+    let out = crate::claim_reconciliation::gh_call::output(inv).map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(out.stdout);
+    }
+    let first = crate::claim_reconciliation::gh_call::stderr(&out)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect::<String>();
+    let status = out
+        .status
+        .code()
+        .map_or_else(|| "a signal".to_string(), |c| format!("status {c}"));
+    Err(if first.is_empty() {
+        format!("gh exited with {status}")
+    } else {
+        format!("gh exited with {status}: {first}")
+    })
 }
 
 /// A facade read of `gh_bin` in `cwd` (when given), carrying `args`.
@@ -298,7 +330,17 @@ pub(crate) fn descends_from(
 
 /// The PR's base branch name, read from the forge. `None` on any failure, or
 /// for a name this code will not interpolate into an API path.
+#[cfg(test)]
 pub(crate) fn pr_base_ref(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Option<String> {
+    pr_base_ref_checked(gh_bin, cwd, pr).ok()
+}
+
+/// [`pr_base_ref`], naming which of the four failure causes it was (#13146).
+pub(crate) fn pr_base_ref_checked(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    pr: u32,
+) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct Pr {
         #[serde(rename = "baseRefName")]
@@ -310,12 +352,17 @@ pub(crate) fn pr_base_ref(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Option<
     let args = ["pr", "view", pr.as_str(), "--json", "baseRefName"]
         .into_iter()
         .chain(repo_flag.iter().map(String::as_str));
-    let out = crate::claim_reconciliation::gh_call::ok_stdout(
+    let out = run_checked(
         optional_cwd("verdict.pr_base_ref", gh_bin, cwd, args)
             .forge_op(crate::forge_call_stats::ops::PR_VIEW_STATE),
     )?;
-    let parsed: Pr = serde_json::from_slice(&out).ok()?;
-    is_safe_ref(&parsed.base_ref_name).then_some(parsed.base_ref_name)
+    let parsed: Pr = serde_json::from_slice(&out)
+        .map_err(|_| "unparseable response from `gh pr view`".to_string())?;
+    if is_safe_ref(&parsed.base_ref_name) {
+        Ok(parsed.base_ref_name)
+    } else {
+        Err("unsafe base ref name".to_string())
+    }
 }
 
 /// The repository the local-git kinds run in: the caller's root when it named
@@ -486,12 +533,12 @@ fn assess_with_scope(
 
     // Kind 1 — tree-identical (#9124/#9576). Owned by forge_tree_unchanged.
     let mut unavailable = Vec::new();
-    match tree_unchanged(gh_bin, cwd, reviewed, head) {
-        Some(true) => {
-            return Assessment::determinate(Equivalence::Equivalent(EquivalenceKind::Tree))
+    match tree_unchanged_checked(gh_bin, cwd, reviewed, head) {
+        Ok(true) => return Assessment::determinate(Equivalence::Equivalent(EquivalenceKind::Tree)),
+        Ok(false) => {}
+        Err(why) => {
+            unavailable.push(format!("tree: forge compare {reviewed}...{head} unavailable: {why}"));
         }
-        Some(false) => {}
-        None => unavailable.push(format!("tree: forge compare {reviewed}...{head} unavailable")),
     }
 
     if !new_kinds_enabled {
@@ -504,9 +551,13 @@ fn assess_with_scope(
     // clean-merge kind must confirm the merged parent is base content, and the
     // patch-identity kind compares two merge-base-relative diffs. An
     // unresolvable base is no answer.
-    let Some(base_ref) = pr_base_ref(gh_bin, cwd, pr) else {
-        unavailable.push(format!("could not read PR #{pr}'s base branch from the forge"));
-        return Assessment::indeterminate(unavailable);
+    let base_ref = match pr_base_ref_checked(gh_bin, cwd, pr) {
+        Ok(base_ref) => base_ref,
+        Err(why) => {
+            unavailable
+                .push(format!("could not read PR #{pr}'s base branch from the forge: {why}"));
+            return Assessment::indeterminate(unavailable);
+        }
     };
 
     // Kind 2 — the clean automatic merge of the base into the branch. Fetches
@@ -614,6 +665,19 @@ pub fn reanchor_body(
     )
 }
 
+/// Point every forge read of this process at `repo` (#13146). The facade turns
+/// `LOOM_REPO` into `GH_REPO` for `gh api` (resolving `{owner}/{repo}`) and into
+/// `--repo` for `gh pr view`, so one variable covers all three reads. Only the
+/// one-shot CLI path calls this, before any `gh` runs. `None` changes nothing.
+fn pin_repo(repo: Option<&str>) -> Result<(), String> {
+    let Some(repo) = repo else { return Ok(()) };
+    if !crate::forge_version_only_diff::valid_repo(repo) {
+        return Err("--repo is not a plain OWNER/REPO".to_string());
+    }
+    std::env::set_var("LOOM_REPO", repo);
+    Ok(())
+}
+
 /// Handle `loom-daemon forge verdict-equivalent <pr> <reviewed> <head>`. Never
 /// returns (exits).
 ///
@@ -631,7 +695,20 @@ pub fn reanchor_body(
 /// daemon predating this verb, a `gh` outage, a non-GitHub forge, the kill
 /// switch — collapses into the identical fail-closed arm. A caller MUST key on
 /// the `EQUIVALENCE_KIND=` line and treat its absence as "re-review".
-pub fn handle(pr: u32, reviewed: &str, head: &str, allowed_paths: &[String]) -> anyhow::Result<()> {
+pub fn handle(
+    pr: u32,
+    reviewed: &str,
+    head: &str,
+    allowed_paths: &[String],
+    repo: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Err(why) = pin_repo(repo) {
+        eprintln!(
+            "loom-daemon forge verdict-equivalent: could not decide whether the verdict for \
+             {reviewed} still describes {head} on PR #{pr} — re-review (fail closed). Why: {why}"
+        );
+        std::process::exit(1);
+    }
     let gh = crate::forge_cmd::gh_bin();
     let assessment = assess_scoped(Path::new(&gh), None, pr, reviewed, head, allowed_paths);
     match assessment.equivalence {

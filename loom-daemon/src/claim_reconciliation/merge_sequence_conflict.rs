@@ -1,5 +1,6 @@
-//! Ordering edges require a REAL merge conflict, not just a shared filename
-//! (#10350).
+//! The real merge-conflict pair predicate (#10350): a shared filename is not a
+//! conflict. Since #12775 the planner no longer orders by it; Phase 1's
+//! no-overlap release and conflict stacking (`stack_parent`) still do.
 //!
 //! A shared changed filename is a cheap prefilter: two PRs that each add one
 //! `pub mod` line to `loom-daemon/src/lib.rs` share a file, but their edits
@@ -41,10 +42,10 @@
 //! verdicts are stored — a failure is retried next tick.
 //!
 //! Stacked-base edges (follower base == predecessor head) never consult this
-//! predicate: the planner keeps them unconditionally.
+//! predicate, and since #12775 nothing in the planner does.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -118,13 +119,6 @@ impl Deadline {
 /// The pair predicate the planner and Phase 1 take: `true` = the two PRs
 /// really conflict (or it is unknown).
 pub type Conflicts<'a> = &'a dyn Fn(&SequencePr, &SequencePr) -> bool;
-
-/// The filename-only behaviour: every shared-file pair conflicts. Used by the
-/// pure planner entry points that take no predicate.
-#[must_use]
-pub fn assume_conflict(_: &SequencePr, _: &SequencePr) -> bool {
-    true
-}
 
 /// Per-tick pair-conflict predicate over an evaluator `E`, which returns
 /// `Some(true)` for a conflict, `Some(false)` for a clean merge and `None`
@@ -331,55 +325,6 @@ fn git_run(
             }
         }
     }
-}
-
-/// Connected components of the shared-file overlap graph over `eligible`.
-///
-/// `files` maps PR number → its changed paths. PRs without an entry (a
-/// failed files read) are singletons — a failed read must not widen a group
-/// by pretending to know the files. A shared-file pair is an edge only when
-/// the two PRs are stacked or `conflicts` says they really conflict (#10350).
-#[must_use]
-pub fn overlap_components_with(
-    eligible: &[&SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    conflicts: Conflicts<'_>,
-) -> Vec<Vec<u32>> {
-    let nums: Vec<u32> = eligible.iter().map(|p| p.number).collect();
-    let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (i, a) in eligible.iter().enumerate() {
-        for b in &eligible[i + 1..] {
-            let shared = files
-                .get(&a.number)
-                .zip(files.get(&b.number))
-                .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)));
-            let stacked = a.base_ref == b.head_ref || b.base_ref == a.head_ref;
-            if shared && (stacked || conflicts(a, b)) {
-                adj.entry(a.number).or_default().push(b.number);
-                adj.entry(b.number).or_default().push(a.number);
-            }
-        }
-    }
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut out = Vec::new();
-    for start in &nums {
-        if seen.contains(start) {
-            continue;
-        }
-        let mut component = Vec::new();
-        let mut queue = VecDeque::from([*start]);
-        seen.insert(*start);
-        while let Some(n) = queue.pop_front() {
-            component.push(n);
-            for next in adj.get(&n).into_iter().flatten() {
-                if seen.insert(*next) {
-                    queue.push_back(*next);
-                }
-            }
-        }
-        out.push(component);
-    }
-    out
 }
 
 #[cfg(test)]

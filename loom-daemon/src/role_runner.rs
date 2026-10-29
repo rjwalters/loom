@@ -2616,9 +2616,6 @@ pub fn plan_idle_runs(
     let ceiling = resolve_max_concurrent(config);
     let mut out = Vec::new();
     for spec in resolve_on_idle_roles(config) {
-        if matches!(idle_gate::gate(root, spec.name), Some(idle_gate::IdleGateDecision::Deny(_))) {
-            continue;
-        }
         if !trigger.debounce_ok(root, spec.name, now) {
             log::debug!(
                 "role_runner: idle edge for {} — {} within {}s debounce, skipping",
@@ -3872,10 +3869,6 @@ pub mod concurrent_dispatch;
 // `role_runner/demand.rs`.
 pub mod demand;
 
-// Pipeline-empty gate for hermit/architect idle generation (#10817) — see
-// `role_runner/idle_gate.rs`.
-pub mod idle_gate;
-
 // Event-driven curator/auditor/guide triggers (#10816) — see
 // `role_runner/triggers.rs`.
 pub mod triggers;
@@ -3927,6 +3920,7 @@ pub mod champion_mode;
 
 // Ratification reviewer lane selection layer (#13187); see
 // `role_runner/ratification_lane.rs`.
+pub mod ratification_dispatch;
 pub mod ratification_lane;
 
 #[cfg(test)]

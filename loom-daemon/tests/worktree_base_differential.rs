@@ -31,12 +31,7 @@ fn fixture() -> PathBuf {
 
 fn hermetic(cmd: &mut Command) -> &mut Command {
     common::deny_real_gh(cmd);
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
+    common::hermetic_git(cmd)
 }
 
 /// A repo with a bare origin: `main`, a pushed `feature/issue-1`, a local-only

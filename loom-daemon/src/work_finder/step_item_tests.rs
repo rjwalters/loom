@@ -328,3 +328,43 @@ fn items_carry_their_story_points_from_the_labels_in_hand() {
     assert_eq!(second.issue, None);
     assert_eq!(second.story_points, Some(2));
 }
+
+/// #13244: a body-marked tracker passes `tracker` for every audited label
+/// shape, and the same labels without the marker keep their normal step.
+#[test]
+fn a_tracker_marker_passes_whatever_the_labels() {
+    let shapes: [&[&str]; 3] = [
+        &["loom:issue", "loom:curated", "loom:blocked"],
+        &["loom:issue"],
+        &["loom:triage"],
+    ];
+    for l in shapes {
+        let issue = |tracker: bool| IssueInput {
+            number: 4,
+            labels: labels(l),
+            tracker,
+            ..IssueInput::default()
+        };
+        let marked = classify(&Inputs {
+            issues: vec![issue(true)],
+            ..Inputs::default()
+        });
+        assert_eq!(marked[0].step(), None, "{l:?}");
+        assert_eq!(marked[0].verdict, Verdict::Pass(PassReason::Tracker), "{l:?}");
+        assert_eq!(PassReason::Tracker.as_str(), "tracker");
+        let plain = classify(&Inputs {
+            issues: vec![issue(false)],
+            ..Inputs::default()
+        });
+        assert_ne!(plain[0].verdict, Verdict::Pass(PassReason::Tracker), "{l:?}");
+    }
+    let plain_ready = classify(&Inputs {
+        issues: vec![IssueInput {
+            number: 5,
+            labels: labels(&["loom:issue"]),
+            ..IssueInput::default()
+        }],
+        ..Inputs::default()
+    });
+    assert_eq!(plain_ready[0].target(), Some(5));
+}

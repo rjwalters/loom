@@ -7,19 +7,10 @@
 //! remote: a held branch is skipped before any remote or forge probe, so no
 //! network call is made.
 
-use std::path::Path;
-use std::process::{Command, Stdio};
+mod common;
 
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
-        .args(args)
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .status()
-        .expect("git must spawn");
-    assert!(status.success(), "git {args:?} failed");
-}
+use common::git;
+use std::process::{Command, Stdio};
 
 #[test]
 fn clean_prints_the_kept_line_and_counts_held_branches_as_in_use() {

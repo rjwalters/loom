@@ -62,7 +62,63 @@ pub(crate) fn lease_record_body(
     )
 }
 
+/// Expired lease records of one host kept per issue when a new claim prunes
+/// (#13245).
+const KEEP_EXPIRED_LEASES: usize = 3;
+
+/// Ids of `host`'s lease comments a new claim may delete (#13245): those whose
+/// own `updated_at` is past `ttl`, beyond the newest `keep`. A live lease, a
+/// record of another host and a record without `updated_at` are never listed.
+/// Pure.
+#[must_use]
+pub(crate) fn expired_lease_ids(
+    comments: &[LeaseComment],
+    host: &str,
+    now: chrono::DateTime<Utc>,
+    ttl: chrono::Duration,
+    keep: usize,
+) -> Vec<u64> {
+    let mut dead: Vec<u64> = comments
+        .iter()
+        .filter(|c| c.host == host)
+        .filter(|c| {
+            c.updated_at
+                .is_some_and(|u| now.signed_duration_since(u) >= ttl)
+        })
+        .map(|c| c.id)
+        .collect();
+    dead.sort_unstable();
+    dead.truncate(dead.len().saturating_sub(keep));
+    dead
+}
+
 impl SweepRegistry {
+    /// Delete this host's expired lease comments on `issue` beyond the newest
+    /// [`KEEP_EXPIRED_LEASES`] (#13245). Best-effort: any failure only logs.
+    fn prune_expired_leases(&self, issue: u32, host: &str) {
+        let Some(comments) = self.read_lease_comments(issue) else {
+            return;
+        };
+        let ttl_secs = (crate::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as i64;
+        let ids = expired_lease_ids(
+            &comments,
+            host,
+            Utc::now(),
+            chrono::Duration::seconds(ttl_secs),
+            KEEP_EXPIRED_LEASES,
+        );
+        for id in ids {
+            let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+            let del = ["api", "-X", "DELETE", path.as_str(), "--silent"];
+            if !self
+                .gh_write("guard.lease_prune", del)
+                .is_ok_and(|o| o.is_some_and(|o| o.status.success()))
+            {
+                log::debug!("lease prune of comment {id} on #{issue} failed (non-fatal)");
+            }
+        }
+    }
+
     /// Write a lease record (Issue #6179) for `issue`, naming `step` when the
     /// claimant is a step (#11898). Bounded, and a `gh` failure only logs and
     /// never fails the dispatch or undoes the claim; the result says whether
@@ -92,7 +148,10 @@ impl SweepRegistry {
         // Bounded so a wedged `gh` never blocks the dispatch path (#3973).
         let timeout = reaper::reap_gh_timeout();
         match self.run_counted(comment) {
-            Ok(Some(output)) if output.status.success() => true,
+            Ok(Some(output)) if output.status.success() => {
+                self.prune_expired_leases(issue, &host);
+                true
+            }
             Ok(Some(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 self.report_forge_failure(&stderr, "sweep_dispatch (lease comment)");
@@ -122,6 +181,26 @@ impl SweepRegistry {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn lc(id: u64, host: &str, age_min: i64) -> LeaseComment {
+        LeaseComment {
+            id,
+            created_at: None,
+            updated_at: Some(Utc::now() - chrono::Duration::minutes(age_min)),
+            host: host.into(),
+            sweep_id: format!("s{id}"),
+        }
+    }
+
+    #[test]
+    fn expired_leases_are_pruned_beyond_the_newest_k_and_live_or_peer_ones_survive() {
+        let mut cs: Vec<LeaseComment> = (1..=6).map(|i| lc(i, "h", 120)).collect();
+        cs.push(lc(7, "h", 1)); // live
+        cs.push(lc(8, "other", 120)); // peer host
+        let ttl = chrono::Duration::minutes(15);
+        assert_eq!(expired_lease_ids(&cs, "h", Utc::now(), ttl, 3), vec![1, 2, 3]);
+        assert!(expired_lease_ids(&cs, "h", Utc::now(), ttl, 9).is_empty());
+    }
 
     #[test]
     fn a_step_lease_keeps_the_first_line_every_older_reader_parses() {
