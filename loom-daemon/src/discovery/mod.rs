@@ -44,7 +44,7 @@ use chrono::{DateTime, Utc};
 
 pub use chain::{BackendKind, Chain, Mode, Tier};
 pub use snapshot::{
-    Checks, ItemExtras, RepoSnapshot, RepoStatus, SnapshotStats, Source, WatermarkView,
+    Checks, ItemExtras, LiveReads, RepoSnapshot, RepoStatus, SnapshotStats, Source, WatermarkView,
 };
 
 use fallback::{ListFailure, Served};
@@ -119,6 +119,9 @@ impl Discovery {
             repos: Mutex::new(BTreeMap::new()),
             notes: Mutex::new(Notes::default()),
             direct_reads: AtomicU64::new(0),
+            live_landed: AtomicU64::new(0),
+            live_markers: AtomicU64::new(0),
+            live_ci: AtomicU64::new(0),
             reserve_hit: AtomicBool::new(false),
             fallback: self.fallback.clone(),
             lister: if chain.is_fleet() {
@@ -168,6 +171,10 @@ pub struct TickSnapshot {
     repos: Mutex<BTreeMap<String, Arc<RepoSnapshot>>>,
     notes: Mutex<Notes>,
     direct_reads: AtomicU64,
+    /// Per-item reads that stay live (#12317, [`LiveReads`]).
+    live_landed: AtomicU64,
+    live_markers: AtomicU64,
+    live_ci: AtomicU64,
     /// The gateway refused a listing for its reserve: no more listings this
     /// tick.
     reserve_hit: AtomicBool,
@@ -322,6 +329,15 @@ impl TickSnapshot {
         })
     }
 
+    /// Record live per-item reads the gather made this tick (#12317):
+    /// closes-graph queries, hold-marker comment reads, and CI reads for a
+    /// head the snapshot had no check summary for.
+    pub fn note_live_reads(&self, landed: u64, markers: u64, ci: u64) {
+        self.live_landed.fetch_add(landed, Ordering::Relaxed);
+        self.live_markers.fetch_add(markers, Ordering::Relaxed);
+        self.live_ci.fetch_add(ci, Ordering::Relaxed);
+    }
+
     /// Every repo read so far this tick, for other readers (#12307).
     #[must_use]
     pub fn repos(&self) -> Vec<Arc<RepoSnapshot>> {
@@ -346,6 +362,11 @@ impl TickSnapshot {
             repos: notes.tiers.len(),
             items: repos.iter().map(|r| r.rows.len()).sum(),
             discovery_forge_reads: self.direct_reads.load(Ordering::Relaxed),
+            live_reads: LiveReads {
+                landed: self.live_landed.load(Ordering::Relaxed),
+                markers: self.live_markers.load(Ordering::Relaxed),
+                ci: self.live_ci.load(Ordering::Relaxed),
+            },
             ..SnapshotStats::default()
         };
         if let State::Mirror(w) = &self.state {

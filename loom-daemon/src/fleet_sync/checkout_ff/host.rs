@@ -299,7 +299,7 @@ pub(in crate::fleet_sync) fn startup(
     let gate = || HostGateInputs::at_boot(paused, floor.as_deref());
     let roots = crate::fleet_sync::workspace_resync::registered_roots();
     let mut guard = memory().lock().unwrap_or_else(PoisonError::into_inner);
-    let pass = boot_step(&mut guard, &roots, inputs.auto_apply, &gate);
+    let pass = boot_step(&mut guard, &roots, inputs.auto_apply.checkout, &gate);
     status.checkouts = pass.checkouts;
     pass.transitions
 }
@@ -444,7 +444,7 @@ pub(in crate::fleet_sync) fn after_resync(
     impl FnOnce(Instant, &WorkspacePass) -> Stepped + Send + 'static,
     impl FnOnce(Stepped) + Send + 'static,
 ) {
-    let (write, gate, bus) = (inputs.auto_apply, registered_gate(), bus.clone());
+    let (write, gate, bus) = (inputs.auto_apply.checkout, registered_gate(), bus.clone());
     let enforcer = enforcer.clone();
     let hold_bus = bus.clone();
     let step = move |began: Instant, resync: &WorkspacePass| {

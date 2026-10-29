@@ -367,9 +367,22 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     let repo = repo.unwrap_or("{owner}/{repo}");
     let issue =
         crate::comment_trust::records::fetch_issue_object(repo, &number.to_string(), &root, false);
-    let gate = classify(&crate::comment_trust::TrustPolicy::for_root(&root), issue.as_ref());
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let gate = classify(&policy, issue.as_ref());
     println!("{}", gate.token());
-    let body = notice_body(&gate);
+    let text = |key: &str| {
+        issue
+            .as_ref()
+            .and_then(|i| i.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let stamp = issue.as_ref().map(|_| crate::promotion_author::Stamp {
+        rev: crate::promotion_author::revision(&text("title"), &text("body")),
+        trust: policy.digest(),
+    });
+    let body = notice_body(&gate, stamp.as_ref());
     if !body.is_empty() {
         print!("{body}");
     }

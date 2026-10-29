@@ -324,6 +324,7 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LOCAL_CONFIG_REL)));
 
     warn_retired_curator_backlog_target(&effective);
+    warn_retired_idle_gate(&effective);
     effective
 }
 
@@ -643,6 +644,29 @@ pub fn warn_retired_curator_backlog_target(effective: &Value) -> bool {
     log::warn!(
         "config: {CURATOR_BACKLOG_TARGET_KEY} is retired and ignored: Curator no longer \
          admits by backlog pressure; remove the key (#12077)"
+    );
+    true
+}
+
+/// Dotted key of the retired `autonomous.balance.idleGate` (#10817, retired #13273).
+pub const IDLE_GATE_KEY: &str = "autonomous.balance.idleGate";
+
+/// Warn, once per process, that `autonomous.balance.idleGate` is set (#13273).
+///
+/// The key gated hermit/architect idle generation on an empty pipeline; it was
+/// default-off and never granted, so the gate is gone and the key is ignored
+/// (the `LOOM_BALANCE_IDLE_GATE` env var is likewise ignored, silently).
+/// Returns whether this call gave the warning.
+pub fn warn_retired_idle_gate(effective: &Value) -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if get_path(effective, IDLE_GATE_KEY).is_none()
+        || WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+    log::warn!(
+        "config: {IDLE_GATE_KEY} is retired and ignored: hermit/architect idle generation \
+         is no longer gated on an empty pipeline; remove the key (#13273)"
     );
     true
 }
@@ -1577,6 +1601,20 @@ mod tests {
         let set = serde_json::json!({"curator": {"backlogTarget": 100}});
         let first = warn_retired_curator_backlog_target(&set);
         let second = warn_retired_curator_backlog_target(&set);
+        assert!(!second, "already warned");
+        // Another test in this process may have warned first.
+        let _ = first;
+    }
+
+    // ===== retired autonomous.balance.idleGate (#13273) =====
+
+    #[test]
+    fn test_retired_idle_gate_warns_once_and_unset_is_silent() {
+        let unset = serde_json::json!({"autonomous": {"balance": {}}});
+        assert!(!warn_retired_idle_gate(&unset), "unset key is silent");
+        let set = serde_json::json!({"autonomous": {"balance": {"idleGate": true}}});
+        let first = warn_retired_idle_gate(&set);
+        let second = warn_retired_idle_gate(&set);
         assert!(!second, "already warned");
         // Another test in this process may have warned first.
         let _ = first;

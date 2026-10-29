@@ -910,6 +910,9 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         "observability/ops/hold_age_tests.rs",
         "step_dispatch/driver.rs",
         "step_dispatch/gather.rs",
+        // Seeds `ItemExtras`/`Checks` fixtures for the Judge CI hold (#12317);
+        // no claim, label-transition or merge read (invariant 3).
+        "step_dispatch/gather_tests.rs",
         // Whole-tick Gitea fixture seeds discovery; no live snapshot read.
         "step_dispatch/tick_tests.rs",
         "work_finder.rs",

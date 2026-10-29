@@ -13,33 +13,30 @@ MCP (Model Context Protocol) is a standard protocol for connecting AI agents to 
 
 ## Available Tools
 
-The unified `mcp-loom` package provides all 30 Loom MCP tools in a single server,
+The unified `mcp-loom` package provides all 23 Loom MCP tools in a single server,
 organized into four categories. The authoritative per-tool tables live in
-[`mcp-loom/README.md`](../../mcp-loom/README.md#available-tools-30-total) — the
+[`mcp-loom/README.md`](../../mcp-loom/README.md#available-tools-23-total) — the
 summary below is an orientation map, not a second source of truth.
 
-### UI/Engine Control (6 tools)
+### UI/Engine Control (2 tools)
 
-**Purpose**: Start/stop the engine and inspect app-level state
+**Purpose**: Inspect app-level state
 
-`trigger_start`, `trigger_force_start`, `trigger_force_factory_reset`,
-`get_heartbeat`, `stop_engine`, `get_ui_state`
+`get_heartbeat`, `get_ui_state`
 
 **When to Use**:
 - Checking application health (`get_heartbeat`)
-- Starting or stopping the engine, with or without confirmation
 - Reading comprehensive workspace/config/terminal state (`get_ui_state`)
 
 ---
 
-### Terminal Management (13 tools)
+### Terminal Management (10 tools)
 
-**Purpose**: Interact with terminal sessions via daemon IPC and control autonomous mode
+**Purpose**: Interact with terminal sessions via daemon IPC
 
 `list_terminals`, `get_terminal_output`, `get_selected_terminal`,
 `send_terminal_input`, `create_terminal`, `delete_terminal`, `restart_terminal`,
-`configure_terminal`, `set_primary_terminal`, `start_autonomous_mode`,
-`stop_autonomous_mode`, `launch_interval`, `get_agent_metrics`
+`configure_terminal`, `set_primary_terminal`, `get_agent_metrics`
 
 **When to Use**:
 - Sending commands to agent terminals
@@ -414,8 +411,8 @@ if (heartbeat.status === "not_running") {
 
 For detailed tool documentation, see:
 
-- **[`mcp-loom/README.md`](../../mcp-loom/README.md)** - authoritative table of all 30 tools
-- **[Terminal Tools Reference](./loom-terminals.md)** - detailed parameters for terminal and autonomous-mode tools
+- **[`mcp-loom/README.md`](../../mcp-loom/README.md)** - authoritative table of all 23 tools
+- **[Terminal Tools Reference](./loom-terminals.md)** - detailed parameters for terminal tools
 
 ---
 

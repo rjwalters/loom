@@ -31,6 +31,9 @@
 //! - **JSON that survives a hostile path**, which the shell's raw `printf`
 //!   interpolation did not.
 
+mod common;
+
+use common::git;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -109,15 +112,6 @@ impl Fixture {
     fn stash_list(&self) -> String {
         stdout(&git_out(&self.repo, &["stash", "list"]))
     }
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = git_out(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Output {

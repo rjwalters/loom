@@ -173,27 +173,59 @@ pub(crate) const LEASELESS_CLAIM_SWEEP_PREFIX: &str = "leaseless-loom-building-l
 pub(crate) const UNVERIFIED_LEASE_HOST: &str = "unverified";
 pub(crate) const UNVERIFIED_LEASE_SWEEP: &str = "lease-order-unverified";
 
-/// Whether `in_window` — the lease comments
-/// [`lease_episode::in_episode`](super::lease_episode::in_episode) admitted
-/// into the current claim episode — contains NOTHING but this dispatcher's own
-/// records (Issue #9453 Phase 3.1).
-///
-/// This is the precondition for consulting the label timeline at all, and it is
-/// load-bearing in **both** directions:
-///
-/// - **False** (a foreign lease record is in-window) ⇒ the #6287 comment-order
-///   tie-break already has better evidence than a label event and has already
-///   decided. Firing the label leg here would be actively harmful: in a genuine
-///   two-daemon race BOTH hosts see a young `loom:building` (whichever flipped
-///   first created it, and the second flip is a no-op that adds no event), so
-///   both would yield and nobody would build.
-/// - **True** ⇒ every compliant lane publishes a lease (#8193 + #9453 Phase 2),
-///   so a claim with no lease record at all is evidence of exactly the lane
-///   that publishes none: a hand-claim.
-pub(crate) fn is_sole_claimant(in_window: &[&LeaseComment], host: &str, sweep_id: &str) -> bool {
-    in_window
+/// The issue-phase claim state (Issue #12186, a slice of #11118): the
+/// issue-phase counterpart of
+/// [`pr_lease::ClaimState`](crate::cli::pr_lease::ClaimState), decided from
+/// lease records alone — never from a label's presence or age.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IssueClaimState {
+    /// No lease record in the claim episode.
+    Free,
+    /// Every lease record in the episode is this dispatcher's own.
+    HeldBySelf,
+    /// A peer's lease record is in the episode.
+    HeldByPeer { host: String, sweep_id: String },
+    /// The lease list could not be read. Never treated as [`Self::Free`].
+    Unknown,
+}
+
+impl IssueClaimState {
+    /// Whether the label leg ([`SweepRegistry::resolve_leaseless_claim_order`])
+    /// may be consulted: only when no peer lease record already decided the
+    /// order. `Unknown` is not a verdict either way, so it never reads as
+    /// `Free`; it leaves the label leg's own fail-open rule in force.
+    pub(crate) fn permits_leaseless_leg(&self) -> bool {
+        !matches!(self, Self::HeldByPeer { .. })
+    }
+}
+
+/// Decide [`IssueClaimState`] from the episode's lease comments (`None` = the
+/// read failed). Pure. The episode filter
+/// ([`lease_episode::in_episode`](super::lease_episode::in_episode)) has
+/// already applied lease liveness, so no TTL is re-derived here.
+pub(crate) fn issue_claim_state(
+    in_window: Option<&[&LeaseComment]>,
+    host: &str,
+    sweep_id: &str,
+) -> IssueClaimState {
+    let Some(in_window) = in_window else {
+        return IssueClaimState::Unknown;
+    };
+    if let Some(peer) = in_window
         .iter()
-        .all(|c| c.host == host && c.sweep_id == sweep_id)
+        .filter(|c| !(c.host == host && c.sweep_id == sweep_id))
+        .min_by_key(|c| c.id)
+    {
+        return IssueClaimState::HeldByPeer {
+            host: peer.host.clone(),
+            sweep_id: peer.sweep_id.clone(),
+        };
+    }
+    if in_window.is_empty() {
+        IssueClaimState::Free
+    } else {
+        IssueClaimState::HeldBySelf
+    }
 }
 
 /// Whether a `labeled loom:building` event at `labeled_at` is a **live foreign**
@@ -317,7 +349,7 @@ impl LeaseOrderDecision {
     /// Chain [`SweepRegistry::resolve_leaseless_claim_order`] onto a
     /// comment-order verdict (Issue #9453 Phase 3.1): the label leg runs ONLY
     /// when the comment-order leg found no reason to yield *and* this
-    /// dispatcher is the sole in-window claimant (see [`is_sole_claimant`]).
+    /// dispatcher is the sole in-window claimant (see [`issue_claim_state`]).
     /// Every other verdict — including every fail-open `Proceed` reached with a
     /// foreign lease record in the window — is returned untouched.
     pub(crate) fn or_leaseless_claim(

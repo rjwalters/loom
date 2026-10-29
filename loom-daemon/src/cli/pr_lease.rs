@@ -107,6 +107,11 @@ pub(crate) const EXIT_PEER: i32 = 4;
 /// `--watch-pid`/`--sweep-id`, #13132). The lease is untouched.
 pub(crate) const EXIT_MISMATCH: i32 = 8;
 
+/// Dead (released, expired or standdown) lease records of one host kept per PR
+/// when a new claim prunes (#13245); the rest are deleted so a PR or issue
+/// redrawn many times cannot approach the forge's per-thread comment cap.
+pub(crate) const KEEP_DEAD_RECORDS: usize = 3;
+
 /// Bounded read retries (mirrors `LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`).
 const READ_ATTEMPTS: u32 = 3;
 const READ_RETRY_DELAY: Duration = Duration::from_millis(300);
@@ -383,6 +388,42 @@ pub(crate) fn live_leases(
     live
 }
 
+/// Comment ids a new claim from `host` may delete (#13245): that host's own
+/// dead records beyond the newest `keep`. Dead = released, a lease past `ttl`,
+/// or a yield whose identity has no unexpired lease. A live lease, another
+/// host's record and the newest `keep` dead ones are never listed. Pure.
+pub(crate) fn prune_candidates(
+    rows: &[Row],
+    host: &str,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+    keep: usize,
+) -> Vec<u64> {
+    let live = |r: &Row| now.signed_duration_since(r.updated_at) < ttl;
+    let parsed: Vec<(&Row, Record)> = rows
+        .iter()
+        .filter_map(|r| parse_record(&r.body).map(|rec| (r, rec)))
+        .collect();
+    let mut dead: Vec<u64> = parsed
+        .iter()
+        .filter(|(r, rec)| match rec {
+            Record::Released(who) => who.host == host,
+            Record::Lease(who) => who.host == host && !live(r),
+            Record::Yield(who) => {
+                who.host == host
+                    && !parsed
+                        .iter()
+                        .any(|(l, lrec)| matches!(lrec, Record::Lease(w) if w == who) && live(l))
+            }
+        })
+        .map(|(r, _)| r.id)
+        .collect();
+    dead.sort_unstable();
+    let excess = dead.len().saturating_sub(keep);
+    dead.truncate(excess);
+    dead
+}
+
 /// The PR-phase claim state for one role (#11118's `claim_state(item)`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimState {
@@ -535,6 +576,18 @@ pub(crate) fn resolve_sweep(
         .unwrap_or_else(|| "pr-lease-unknown".to_string())
 }
 
+/// The stderr warning for a Judge claim that resolved to `pr-lease-unknown`
+/// (#13264): `post-verdict.sh` re-checks with `--watch-pid`, resolves a
+/// different identity, and sees the Judge's own lease as a peer's (exit 10).
+pub(crate) fn unknown_identity_warning(role: Role, sweep: &str) -> Option<&'static str> {
+    (role == Role::Judge && sweep == "pr-lease-unknown").then_some(
+        "lease pr: warning: this Judge claim has no sweep identity (no --sweep-id, \
+         LOOM_SWEEP_RUN_ID or --watch-pid), so post-verdict.sh approvals will refuse it as a \
+         peer's lease (exit 10); pass --watch-pid \"${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}\" \
+         on every call",
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Forge I/O
 // ---------------------------------------------------------------------------
@@ -651,6 +704,24 @@ impl Gh {
             Ok(o) => Err(String::from_utf8_lossy(&o.stderr).contains("HTTP 404")),
             Err(_) => Err(false),
         }
+    }
+
+    /// Delete a comment; best-effort, `false` on any failure (a 404 included).
+    pub(crate) fn delete(&self, comment_id: u64) -> bool {
+        let Ok(nwo) = self.write_repo.as_ref() else {
+            return false;
+        };
+        self.inv("pr_lease.delete", AccessIntent::Write, ops::COMMENT_EDIT_DELETE)
+            .args([
+                "api",
+                "-X",
+                "DELETE",
+                &format!("repos/{nwo}/issues/comments/{comment_id}"),
+                "--silent",
+            ])
+            .run()
+            .into_result()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// `(open, labels)` for `pr`; `None` when unreadable.
@@ -922,6 +993,9 @@ fn with_context_as(
     }
     let sweep =
         resolve_sweep(common.sweep_id.as_deref(), common.watch_pid, |k| std::env::var(k).ok());
+    if let Some(w) = unknown_identity_warning(common.role, &sweep) {
+        eprintln!("{w}");
+    }
     let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
     let me = match Identity::new(
         common.role,
@@ -1053,6 +1127,7 @@ impl Ctx {
                 EXIT_PEER
             }
             Ordering::Won | Ordering::Unverified => {
+                self.prune_dead(rows.as_deref());
                 self.start_renewal(own_id, leased_at);
                 self.say(&format!(
                     "lease {own_id} held (host={} sweep={}); add `{}` now",
@@ -1065,6 +1140,17 @@ impl Ctx {
                 println!("{} {}", self.me.host, self.me.sweep);
                 EXIT_HELD
             }
+        }
+    }
+
+    /// Delete this host's dead lease records beyond the newest
+    /// [`KEEP_DEAD_RECORDS`] (#13245). Non-fatal: a failed delete is ignored.
+    fn prune_dead(&self, rows: Option<&[Row]>) {
+        let Some(rows) = rows else { return };
+        let ids = prune_candidates(rows, &self.me.host, (self.now)(), self.ttl, KEEP_DEAD_RECORDS);
+        let gone = ids.iter().filter(|id| self.gh.delete(**id)).count();
+        if gone > 0 {
+            self.say(&format!("pruned {gone} dead lease record(s)"));
         }
     }
 
@@ -1327,7 +1413,8 @@ impl Ctx {
                 match reaped {
                     None => {
                         let skipped = crate::judge_backstop::skipped_for_pending_ci(skip_reason);
-                        backstop::release_fields(self.me.role, head, |sha| {
+                        let refused = crate::judge_backstop::refusal_token(skip_reason);
+                        backstop::release_fields(self.me.role, head, refused.as_deref(), |sha| {
                             self.gh.ci_state(sha).exempts(skipped)
                         })
                     }

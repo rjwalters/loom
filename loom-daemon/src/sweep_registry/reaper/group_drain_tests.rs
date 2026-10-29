@@ -103,6 +103,46 @@ fn a_live_wrapper_retry_keeps_the_claim_until_its_group_drains() {
     assert!(registry.pending_group_reaps.is_empty(), "the gate drops its pending reap");
 }
 
+/// #10802 (Judge finding 3 on #11238): the sweep reaper's terminal transition
+/// hands the run to the agent-residue exit teardown, with the scope unit read
+/// from the claim lock BEFORE that lock is released.
+#[test]
+#[serial]
+fn a_terminal_sweep_requests_the_exit_teardown_with_its_recorded_scope() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _log) = fixture_registry(dir.path());
+    let (leader_pid, _gone, mut leader) = dead_leader_with_survivor(dir.path(), "true");
+    let _ = leader.wait();
+    let sweep_id = "sweep-issue-10802-exit";
+    insert_running(&mut registry, sweep_id, 10802, leader_pid);
+    registry.children.insert(sweep_id.to_string(), leader);
+    let owner = registry.config.locks_dir().join("issue-10802/owner.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&owner).unwrap()).unwrap();
+    json["scope_unit"] = "loom-agent-sweep-issue-10802-exit.scope".into();
+    std::fs::write(&owner, json.to_string()).unwrap();
+    let root = registry.config.workspace_root.clone();
+    let _ = crate::agent_residue_reaper::take_requested(&root);
+
+    for _ in 0..20 {
+        registry.reap_once();
+        if !is_running(&registry, sweep_id) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!is_running(&registry, sweep_id), "the sweep must reach a terminal state");
+    let requested: Vec<_> = crate::agent_residue_reaper::take_requested(&root)
+        .into_iter()
+        .filter(|r| r.sweep_id == sweep_id)
+        .collect();
+    assert_eq!(requested.len(), 1, "{requested:?}");
+    let req = &requested[0];
+    assert_eq!(req.sweep_id, sweep_id);
+    assert_eq!((req.issue, req.pid, req.pgid), (Some(10802), leader_pid, Some(leader_pid)));
+    assert_eq!(req.scope_unit.as_deref(), Some("loom-agent-sweep-issue-10802-exit.scope"));
+}
+
 /// The gate hands back the exit code observed on the first tick (when
 /// `poll_liveness` consumed the `Child` handle), and its release cap bounds the
 /// wait for a group that will not drain, so the entry can never wedge.

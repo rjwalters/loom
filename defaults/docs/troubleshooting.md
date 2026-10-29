@@ -18,7 +18,7 @@
 `loom-daemon-stop.sh` is "stopped for now"; the watchdog, a supervised relaunch, the
 auto-update roll or `loom update` can bring a daemon back. For a durable opt-out run
 `loom-daemon host disable --reason "<why>"` (writes `~/.loom/autonomy-disabled`, stops
-the daemon and removes its jobs). Every start/re-provision path then refuses with the
+the daemon; the watchdog job stays loaded and refuses on the marker). Every start/re-provision path then refuses with the
 reason, who and when; `loom-daemon status` shows `disabled by operator: <reason>
 (<when>)`. Undo with `loom-daemon host enable` (it does not start anything). Agents must
 not start or repair a daemon on such a host. See `daemon-reference.md`.
@@ -1404,9 +1404,8 @@ with `git commit --allow-empty -m test && git log -1 --format='%an <%ae>'`
 ```
 
 Label sync is a manual/install-time step, not something CI re-applies when
-`.github/labels.yml` changes. (In an installed repo the script is
-`.loom/scripts/sync-labels.sh`, as above; `./scripts/install/sync-labels.sh` is
-the installer-side copy and exists only in a Loom source checkout.) If a label is
+`.github/labels.yml` changes. (The installer's Step 4 calls the same
+`.loom/scripts/sync-labels.sh`.) If a label is
 defined in `labels.yml` but missing from the live repo, applying it fails with
 `failed to update 1 issue` (the standard `gh` error for "label does not exist").
 Run the sync script — or create the one label directly — to reconcile:
