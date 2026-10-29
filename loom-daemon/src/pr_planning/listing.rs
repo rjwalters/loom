@@ -275,7 +275,7 @@ fn backstop_holds(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> b
         Some(until) => {
             eprintln!(
                 "Judge backstop: PR #{number} held until {} — its Judge passes at head {} ended \
-                 without a verdict (#11855); a push or label change releases it",
+                 without a verdict (#11855); a push or a change to the PR's `loom:*` label set releases it (re-adding the same label does not)",
                 until.to_rfc3339(),
                 &head[..head.len().min(12)]
             );
