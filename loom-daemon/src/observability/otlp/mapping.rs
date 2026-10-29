@@ -8,6 +8,7 @@ mod champion_run;
 mod checkout_external_change;
 mod checkout_freshness;
 mod ci;
+mod completion_narrated;
 mod daemon_event;
 mod daemon_exit;
 mod dispatch_eligibility;
@@ -654,6 +655,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
+        | TelemetryRecord::CompletionNarrated(_)
         | TelemetryRecord::MergeQueueEvent(_)
         | TelemetryRecord::MergeAuthorization(_)
         | TelemetryRecord::HoldTransition(_)
@@ -682,6 +684,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| run_state_request::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
+                .or_else(|| completion_narrated::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
                 .or_else(|| merge_authorization::log_parts(r))
                 .or_else(|| hold_transition::log_parts(r))
