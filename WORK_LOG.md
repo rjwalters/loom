@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-29
 
+- **Issue #13238** (closed): [ci-daily] Flake Detection (Rust)
 - **PR #13282**: refactor: retire the default-off pipeline-empty idle gate
 - **PR #13279**: feat: reap agent process residue after agent exit (ships dark)
 - **PR #13277**: feat: raise a Critical resync alert when a refused push leaves a resync PR open
