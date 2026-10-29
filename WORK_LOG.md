@@ -15,6 +15,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-29
 
+- **PR #13283**: feat: project Judge CI-gate refusals as pass.verdict telemetry
+- **PR #13278**: docs: delete superseded Champion tier-cap and promotion-slice text
+- **PR #13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
+- **Issue #13274** (closed): Telemetry: emit Judge CI-incomplete refusals (post-verdict exit 5/6) as daemon spans (#10486, flow review slice A)
+- **Issue #13272** (closed): Simplify: delete the superseded Champion tier-cap and promotion-slice text (#10759, flow review slice C)
+- **Issue #13264** (closed): Sweep Judge leases: claim without --watch-pid breaks post-verdict, backstop blocks the retry, lease not released after verdict
 - **PR #13300**: chore(harness): track latest CLIs — codex 0.165.0→0.166.0
 - **PR #13271**: test: cross-tool guard test for Champion pin/facts commands
 - **PR #13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
