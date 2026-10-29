@@ -204,6 +204,7 @@ Issues carrying `loom:curated`.
 - **#13269**: Cross-tool guard test: Champion pin/facts writes must pass both Loom and Repo Skills hooks *(curated)*
 - **#13272**: Simplify: delete the superseded Champion tier-cap and promotion-slice text (#10759, flow review slice C) *(curated)*
 - **#13274**: Telemetry: emit Judge CI-incomplete refusals (post-verdict exit 5/6) as daemon spans (#10486, flow review slice A) *(curated)*
+- **#13289**: Follow-on from PR #13288: verify completion.narrated tokens in SigNoz on a fleet host *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -238,7 +239,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 9 |
 | PRs awaiting review | 3 |
 | Approved PRs awaiting merge | 20 |
-| Curated | 81 |
+| Curated | 82 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
