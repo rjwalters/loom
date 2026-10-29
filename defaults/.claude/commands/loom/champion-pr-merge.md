@@ -1239,9 +1239,14 @@ to a CI workflow is not red on blast radius *because it is a workflow* when
   `claude-bot-deploy-plan.yml` is not. The list is the one #12954's
   `privilegedContentPatterns` classes use; both tests read it from this block;
 - every workflow file has a non-empty patch, and no added or removed workflow
-  line matches, case-insensitively, the words `permissions` or `secrets`, or
-  `id-token`, `pull_request_target`, `workflow_run`, `github.token`,
-  `GITHUB_TOKEN`; and no *added* `run:` or `uses:` line (YAML comments ignored)
+  line matches, case-insensitively, the words `secrets`, `id-token`,
+  `pull_request_target`, `workflow_run`, `github.token`, `GITHUB_TOKEN`; and
+  `permissions` is judged by direction (#13291): an *added* bare `permissions:`
+  or `permissions: {}` header reads green (its children are checked against
+  `PRIVILEGED_CONTENT_PATTERNS`, so `contents: read` passes while any `write`,
+  `write-all` or `id-token` child is red), but any *removed* line naming
+  `permissions`, and any other added shape (`read-all`, a flow map, a quoted
+  key, a comment) stays red; and no *added* `run:` or `uses:` line (YAML comments ignored)
   names publish, release, deploy or merge, which is a new release step;
 - the PR carries `loom:pr` (the `judge-approval` criterion has already checked that the approval
   is for this head) and CI is green right now, with at least one passing
@@ -1313,7 +1318,19 @@ ci_workflow_blast_eval() {
     standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" \
       || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
   fi
-  for rx in '\bpermissions\b' '\bsecrets\b' 'id-token' 'pull_request_target' 'workflow_run' \
+  # permissions (#13291): direction-aware. A removed line naming it is red (it
+  # widens the token back to the repo default); an added one is red unless it is
+  # exactly the header `permissions:` or `permissions: {}`. The children are
+  # judged above, by the head-contents check (`:\s*write\b`, `write-all`,
+  # `id-token`), so `read-all`, flow maps and quoted keys stay red here.
+  PERM_HIT=$(printf '%s' "$DIFF_JSON" | jq -r '
+    [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))
+         | .patch | split("\n")[] | select(test("^[+-]"))
+         | select(test("^-.*\\bpermissions\\b"; "i")
+             or (test("^\\+.*\\bpermissions\\b"; "i") and (test("^\\+\\s*permissions:\\s*(\\{\\s*\\})?\\s*$") | not)))]
+    | length' 2>/dev/null) || { WF_BLAST_REASON="workflow lines unparseable"; return 0; }
+  [ "$PERM_HIT" = "0" ] || { WF_BLAST_REASON="a workflow line removes or changes permissions beyond a bare 'permissions:' header"; return 0; }
+  for rx in '\bsecrets\b' 'id-token' 'pull_request_target' 'workflow_run' \
     'github\.token' 'github_token'; do
     printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
     rc=$?
