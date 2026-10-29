@@ -2,7 +2,7 @@
 //! its order key, with duplicates cleaned up and one writer per workspace.
 
 use super::super::{
-    apply_comment_body, reconcile_merge_sequences_gated, EdgeReason, MergeSequenceStats,
+    apply_comment_body, reconcile_merge_sequences_gated, MergeSequenceStats,
     MERGE_SEQUENCE_ENABLED_ENV,
 };
 use super::*;
@@ -34,12 +34,12 @@ fn comment(id: u64, author: &str, body: String) -> ThreadComment {
 }
 
 fn keyed(id: u64, m: &SequenceMarker) -> ThreadComment {
-    comment(id, BOT, landing_comment_body(m, EdgeReason::SharedFiles))
+    comment(id, BOT, landing_comment_body(m))
 }
 
 /// A comment written before #10634: the #9686 body with no key line.
 fn legacy(id: u64, m: &SequenceMarker) -> ThreadComment {
-    comment(id, BOT, apply_comment_body(m, EdgeReason::SharedFiles))
+    comment(id, BOT, apply_comment_body(m))
 }
 
 fn ours(login: &str) -> bool {
@@ -51,7 +51,7 @@ fn ours(login: &str) -> bool {
 #[test]
 fn the_key_line_round_trips_and_is_not_a_sequence_marker() {
     let m = marker(&sha(2), "seq-aaaa0000");
-    let body = landing_comment_body(&m, EdgeReason::SharedFiles);
+    let body = landing_comment_body(&m);
     let line = landing_marker_text(&LandingKey::of(&m));
     assert!(body.starts_with(&line), "{body}");
     assert_eq!(
@@ -102,7 +102,7 @@ fn a_changed_order_patches_our_comment_in_place() {
     // A pre-#10634 comment is upgraded the same way.
     assert_eq!(plan(&[legacy(10, &old)], &moved, ours).write, LandingWrite::Patch(10));
     // Never someone else's words, and never an id-less row.
-    let theirs = comment(10, "rjwalters", landing_comment_body(&old, EdgeReason::SharedFiles));
+    let theirs = comment(10, "rjwalters", landing_comment_body(&old));
     assert_eq!(plan(&[theirs], &moved, ours).write, LandingWrite::Create);
     let no_id = ThreadComment {
         id: None,
@@ -147,7 +147,7 @@ fn a_duplicate_of_our_key_is_deleted_and_the_newest_kept() {
     assert_eq!(p.delete, vec![10, 11]);
     // A different key is history, not a duplicate; a human's copy is never deleted.
     let other = marker(&sha(0x902), "seq-cccc2222");
-    let human = comment(9, "rjwalters", landing_comment_body(&a, EdgeReason::SharedFiles));
+    let human = comment(9, "rjwalters", landing_comment_body(&a));
     let thread = vec![human, keyed(10, &other), keyed(12, &a)];
     assert!(plan(&thread, &a, ours).delete.is_empty());
 }
@@ -230,6 +230,7 @@ fn setup_labeled(
             .created("2026-10-02T00:00:01Z")
             .updated(&now),
         row(2, labels2)
+            .base("feature/issue-1")
             .sha(head2)
             .created("2026-10-02T00:00:02Z")
             .updated(&now),
@@ -442,10 +443,7 @@ fn an_in_place_edit_after_an_operator_removal_is_not_an_operator_release() {
     // (2) #2 was pushed with a tree change: no release is recorded, and
     // (3) the pass edits comment 10 in place.
     let listing = setup(d, &pushed, &[keyed(10, &m1)]);
-    write(
-        "timeline-2.json",
-        timeline(landing_comment_body(&m1, EdgeReason::SharedFiles), "2026-10-05T07:00:00Z"),
-    );
+    write("timeline-2.json", timeline(landing_comment_body(&m1), "2026-10-05T07:00:00Z"));
     write(
         "compare.json",
         serde_json::json!({"status": "ahead", "files": [{"filename": "lib.rs"}]}),
@@ -459,10 +457,7 @@ fn an_in_place_edit_after_an_operator_removal_is_not_an_operator_release() {
     // still has no `loom:sequenced` on #2.
     let m2 = marker(&pushed, "seq-11111111");
     let listing = setup(d, &pushed, &[keyed(10, &m2)]);
-    write(
-        "timeline-2.json",
-        timeline(landing_comment_body(&m2, EdgeReason::SharedFiles), "2026-10-05T09:00:00Z"),
-    );
+    write("timeline-2.json", timeline(landing_comment_body(&m2), "2026-10-05T09:00:00Z"));
 
     // (4) The 08:00 removal predates the marker: heal the label, record nothing.
     let (stats, calls) = tick(d, &listing, true);
@@ -472,4 +467,113 @@ fn an_in_place_edit_after_an_operator_removal_is_not_an_operator_release() {
     assert_eq!(count(&calls, "pr edit 2 --add-label loom:sequenced"), 1, "{calls}");
     assert_eq!(count(&calls, "issues/comments/"), 0, "the key is unchanged:\n{calls}");
     assert_eq!(stats.applied, 1, "{calls}");
+}
+
+// --- Retired automatic ordering: transition of recorded holds (#12775) -------
+
+/// #2 holds `loom:sequenced` behind #1 with `m` on its thread. `stacked`
+/// keeps the setup's stacking (#2's base is #1's head); `false` makes the
+/// pair independent. Returns what one owning tick did.
+#[cfg(unix)]
+fn transition(m: &SequenceMarker, thread_ok: bool, stacked: bool) -> (MergeSequenceStats, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut listing = setup_labeled(d, &sha(2), &["loom:sequenced"], &[keyed(10, m)]);
+    if !stacked {
+        listing[1].base_ref = Some("main".to_string());
+    }
+    if !thread_ok {
+        std::fs::write(d.join("comments-2.json"), "not json").unwrap();
+    }
+    tick(d, &listing, true)
+}
+
+#[cfg(unix)]
+fn assert_released(out: &(MergeSequenceStats, String)) {
+    let (stats, calls) = out;
+    assert_eq!(stats.retired_released, 1, "{calls}");
+    assert_eq!(count(calls, "pr edit 2 --remove-label loom:sequenced"), 1, "{calls}");
+    assert_eq!(count(calls, "--add-label"), 0, "never re-added: {calls}");
+    assert!(calls.contains("automatic ordering between PRs that are not stacked has been retired"));
+}
+
+#[cfg(unix)]
+fn assert_held(out: &(MergeSequenceStats, String)) {
+    let (stats, calls) = out;
+    assert_eq!(stats.retired_released, 0, "{calls}");
+    assert_eq!(count(calls, "--remove-label"), 0, "{calls}");
+    assert_eq!(count(calls, "--add-label"), 0, "{calls}");
+    assert_eq!(stats.held, 1, "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_generated_hold_between_independent_prs_is_released_and_not_replanned() {
+    assert_released(&transition(&marker(&sha(2), "seq-aaaa0000"), true, false));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_stacked_hold_is_kept() {
+    assert_held(&transition(&marker(&sha(2), "seq-aaaa0000"), true, true));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn human_consolidation_and_ambiguous_holds_are_kept_even_when_independent() {
+    for (case, m) in [
+        (
+            "hard marker",
+            SequenceMarker {
+                source: None,
+                ..marker(&sha(2), "manual")
+            },
+        ),
+        (
+            "unknown source",
+            SequenceMarker {
+                source: Some("operator".into()),
+                ..marker(&sha(2), "seq-x")
+            },
+        ),
+        ("consolidation plan", marker(&sha(2), "cons-aaaa0000")),
+        (
+            "predecessor outside the listing",
+            SequenceMarker {
+                after: 99,
+                ..marker(&sha(2), "seq-x")
+            },
+        ),
+    ] {
+        let out = transition(&m, true, false);
+        assert_eq!(out.0.retired_released, 0, "{case}:\n{}", out.1);
+        assert_held(&out);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn an_unreadable_thread_or_a_markerless_label_is_kept() {
+    let m = marker(&sha(2), "seq-aaaa0000");
+    assert_held(&transition(&m, false, false));
+    // A bare label with no marker comment: a manual hold nothing here owns.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut listing = setup_labeled(d, &sha(2), &["loom:sequenced"], &[]);
+    listing[1].base_ref = Some("main".to_string());
+    assert_held(&tick(d, &listing, true));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_retired_candidate_with_a_moved_head_is_released_exactly_once() {
+    // The marker pins an older follower head: the hold is released once, as
+    // retired (positive provenance wins), never twice.
+    let out = transition(&marker(&sha(7), "seq-aaaa0000"), true, false);
+    assert_eq!(count(&out.1, "--remove-label loom:sequenced"), 1, "{}", out.1);
 }

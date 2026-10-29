@@ -259,3 +259,51 @@ mod tests {
         validate_completion_meta(&meta).unwrap();
     }
 }
+
+/// Which trigger path built a completion, and whether it is only being recorded
+/// (a fresh host's first reconciliation pass, #4649), for [`emit_narration_record`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Narration {
+    trigger: crate::observability::ops::feed::Trigger,
+    seeded: bool,
+}
+
+impl Narration {
+    pub(super) fn new(trigger: crate::observability::ops::feed::Trigger, seeded: bool) -> Self {
+        Self { trigger, seeded }
+    }
+}
+
+/// Emit one `completion.narrated` record (#13287) for a completion just built,
+/// so a token regression is visible from the store: `tokens_present` and
+/// `tokens_by_model_rows` are read off the payload's own meta. A no-op without
+/// an ops sink, and skipped when the build provenance is not valid.
+pub(super) fn emit_narration_record(meta: &CompletionMeta, issue: u32, pr: u32, n: Narration) {
+    use crate::observability::ops::feed::Trigger;
+    if !crate::observability::ops::records_exported() {
+        return;
+    }
+    let loom = crate::telemetry::provenance::Provenance::current();
+    if !loom.is_valid() {
+        return;
+    }
+    let trigger = match n.trigger {
+        Trigger::SweepExit => "sweep_exit",
+        Trigger::Step => "champion_merge_step",
+        Trigger::Reconcile => "reconcile",
+    };
+    crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::CompletionNarrated(
+        crate::telemetry::kinds::completion_narrated::CompletionNarratedRecord {
+            repo: meta.repo_slug.clone(),
+            issue,
+            pr,
+            trigger: trigger.to_owned(),
+            outcome: if n.seeded { "seeded" } else { "narrated" }.to_owned(),
+            tokens_present: meta.tokens.is_some(),
+            tokens_by_model_rows: u32::try_from(meta.tokens_by_model.as_ref().map_or(0, Vec::len))
+                .unwrap_or(u32::MAX),
+            narrated_at: Utc::now(),
+            loom,
+        },
+    ));
+}

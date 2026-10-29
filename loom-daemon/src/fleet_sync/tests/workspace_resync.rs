@@ -998,6 +998,9 @@ fn a_refused_default_branch_gets_a_resync_pull_request_once() {
     assert_eq!(*fx.forge.labels.borrow(), vec![(1, "loom:review-requested".to_string())]);
     assert_eq!(pass.alerts.len(), 1, "branch-protection stays raised while the PR is open");
     assert_eq!(pass.alerts[0].kind, "branch-protection");
+    for want in ["#1 ", "installed v", &format!("target v{RUNNING}")] {
+        assert!(pass.alerts[0].detail.contains(want), "{want}: {:?}", pass.alerts[0]);
+    }
     assert_eq!(fx.forge.ref_sha(CLAIM_REF), None, "claim released");
 
     // Past the backoff the PR is still open: no second branch, commit or PR.

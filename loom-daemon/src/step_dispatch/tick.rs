@@ -489,9 +489,10 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 &mut report.skipped_host_constraint
             }
             E::BuildBackoff => &mut report.deferred_build_backoff,
-            E::CoolingDown | E::Pass(PassReason::CiPending | PassReason::HeldAtHead) => {
-                &mut report.skipped_noop_cooldown
-            }
+            E::CoolingDown
+            | E::Pass(
+                PassReason::CiPending | PassReason::HeldAtHead | PassReason::AuthorGateHeld,
+            ) => &mut report.skipped_noop_cooldown,
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
                 PassReason::Frozen
@@ -499,6 +500,7 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::Sequenced
                 | PassReason::Blocked
                 | PassReason::Epic
+                | PassReason::Tracker
                 | PassReason::Proposal
                 | PassReason::NoStage
                 | PassReason::Draft,

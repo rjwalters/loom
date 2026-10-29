@@ -670,6 +670,14 @@ pub(crate) enum ScriptPortCommand {
     /// the persisted `~/.loom/host-id`, never the hostname. One line on
     /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
     HostId(super::host_id_cmd::HostIdArgs),
+
+    /// Write the #9588 operator-stop record on behalf of
+    /// `loom-daemon-stop.sh` (#9957), so the shell stop never carries its own
+    /// copy of the record format. Hidden: a plumbing verb, not an operator
+    /// command. Optional to its caller — an older binary lacking it leaves the
+    /// script on its `rm -f` fallback.
+    #[command(subcommand, hide = true)]
+    OperatorStop(crate::operator_stop::OperatorStopCommand),
 }
 
 impl ScriptPortCommand {
@@ -759,6 +767,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
             ScriptPortCommand::HostId(args) => args.run(),
+            ScriptPortCommand::OperatorStop(cmd) => cmd.run(),
             ScriptPortCommand::HooksHome(args) => args.run(),
         }
     }
@@ -791,6 +800,11 @@ pub(crate) enum MergePrCommand {
     /// forge's cached state is stale/unknown". Always exits 0 with exactly
     /// one `<action>:<reason>` line; the I/O loop stays in the shell.
     MergeableRecheck(super::merge_pr_mergeable_recheck::MergeableRecheckArgs),
+
+    /// The whole stale-mergeable recheck loop (#8191 slice): backoff, uncached
+    /// re-reads, ref vet, fetch and `git merge-tree`, then the same one
+    /// `<action>:<reason>` line — see `cli::merge_pr_mergeable_recheck_run`.
+    MergeableRecheckRun(super::merge_pr_mergeable_recheck_run::MergeableRecheckRunArgs),
 
     /// Decide whether a head-SHA-mismatch refusal was caused by THIS merge
     /// run's own base-sync push (#8164) and may be retried once against a
@@ -1162,6 +1176,7 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
+            MergePrCommand::MergeableRecheckRun(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),

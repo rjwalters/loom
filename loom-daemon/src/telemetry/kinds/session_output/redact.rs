@@ -63,6 +63,10 @@ pub const SESSION_OUTPUT_SCRUB_CLASSES: &[&str] = &[
     "api-key",
     "aws-access-key-id",
     "aws-secret-access-key",
+    "jwt",
+    "azure-sas",
+    "signed-url",
+    "ssm-path",
     "credential",
     "email",
     "private-key",
@@ -87,10 +91,30 @@ fn classes() -> &'static [Class] {
                 r#"(?i)(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token)["' ]*[:=]["' ]*sk-[A-Za-z0-9_-]{16,}"#,
                 "[REDACTED:api-key]",
             ),
-            (r"AKIA[0-9A-Z]{16}", "[REDACTED:aws-access-key-id]"),
+            (r"(?:AKIA|ASIA)[0-9A-Z]{16}", "[REDACTED:aws-access-key-id]"),
             (
-                r#"(?i)aws_secret_access_key["' ]*[:=]["' ]*[A-Za-z0-9/+=]{40}"#,
+                r#"(?i)(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|secret[_-]?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40,}"#,
                 "[REDACTED:aws-secret-access-key]",
+            ),
+            // The classes below were added (#5933, 2am) when `session.output`
+            // gained an S3 path that bypasses the captain edge's
+            // `transform/live-output`: the producer must carry that block's
+            // pattern set, since nothing downstream scrubs those bytes.
+            (
+                r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}",
+                "[REDACTED:jwt]",
+            ),
+            (
+                r#"(?i)(?:(?:\?|&)(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\s"'()]*(?:&(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\s"'()]*)*&(?:sig|skoid|ske|skt)=[^&\s"'()]*(?:&(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\s"'()]*)*|(?:\?|&)(?:sig|skoid|ske|skt)=[^&\s"'()]*(?:&(?:sv|sr|sp|spr|st|se|sig|skoid|ske|skt|skv)=[^&\s"'()]*)+)"#,
+                "[REDACTED:azure-sas]",
+            ),
+            (
+                r#"(?i)https?://[^\s"'()]*?(?:[?&](?:x-amz-signature|signature|sig)=)[^\s"'()]*"#,
+                "[REDACTED:signed-url]",
+            ),
+            (
+                r#"(?:^|[\s"'=:;,(])(?:/harness-ops|/2am-logic)(?:/[A-Za-z0-9._*-]+)+"#,
+                "[REDACTED:ssm-path]",
             ),
             (
                 r#"(?i)(?:password|passwd|secret|token|api[_-]?key)["' ]*[:=]["' ]*[^\s"'&\[]{6,}"#,
@@ -104,9 +128,16 @@ fn classes() -> &'static [Class] {
                 "[REDACTED:email]",
             ),
             // A PEM private-key header is never legitimate feed content, and
-            // the body that follows it is matched by nothing else here.
+            // the body that follows it is matched by nothing else here. The
+            // first pattern takes the whole block, running to the end of the
+            // text when the `END` line is missing (a chunk or a clipped
+            // record can cut a key short); the second takes a stray header.
             (
-                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+                r"(?i)[^\n]*-----BEGIN[\t ]+(?:[A-Z0-9]+[\t ]+)*PRIVATE KEY-----(?s:.*?)(?:(?i:-----END[\t ]+(?:[A-Z0-9]+[\t ]+)*PRIVATE KEY-----)[^\n]*|\z)",
+                "[REDACTED:private-key]",
+            ),
+            (
+                r"(?i)-----BEGIN[\t ]+(?:[A-Z0-9]+[\t ]+)*PRIVATE KEY-----|-----END[\t ]+(?:[A-Z0-9]+[\t ]+)*PRIVATE KEY-----",
                 "[REDACTED:private-key]",
             ),
         ];
@@ -173,7 +204,7 @@ mod tests {
     fn every_class_compiles() {
         // `classes()` drops a class that fails to compile rather than
         // panicking; this is the test that makes that degradation unreachable.
-        assert_eq!(classes().len(), 11, "a class silently failed to compile");
+        assert_eq!(classes().len(), 16, "a class silently failed to compile");
     }
 
     #[test]
@@ -183,6 +214,21 @@ mod tests {
             ("github_pat_11ABCDEFG0abcdefghijklmnop", "[REDACTED:github-token]"),
             ("sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "[REDACTED:anthropic-key]"),
             ("AKIAIOSFODNN7EXAMPLE", "[REDACTED:aws-access-key-id]"),
+            (concat!("ASIA", "IOSFODNN7EXAMPLE"), "[REDACTED:aws-access-key-id]"),
+            (
+                "secret_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "[REDACTED:aws-secret-access-key]",
+            ),
+            (
+                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP",
+                "[REDACTED:jwt]",
+            ),
+            (
+                "https://bucket.s3.amazonaws.com/k?X-Amz-Signature=0123abcd&X-Amz-Date=1",
+                "[REDACTED:signed-url]",
+            ),
+            ("/harness-ops/github/token", "[REDACTED:ssm-path]"),
+            ("/2am-logic/prod/db_password", "[REDACTED:ssm-path]"),
             (
                 "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
                 "[REDACTED:authorization]",
@@ -204,6 +250,33 @@ mod tests {
         assert!(!scrubbed.contains("MIIEow"));
         assert!(scrubbed.contains("[REDACTED:private-key]"));
         assert!(scrubbed.contains("done"));
+    }
+
+    #[test]
+    fn an_unterminated_or_header_only_pem_block_is_removed_to_the_end() {
+        let body = "log:\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nmore key bytes";
+        let scrubbed = scrub(body);
+        assert!(!scrubbed.contains("b3Blbn"), "{scrubbed}");
+        assert!(!scrubbed.contains("more key bytes"), "{scrubbed}");
+        assert!(scrubbed.contains("log:"));
+        let stray = scrub("tail -----END RSA PRIVATE KEY----- x");
+        assert!(!stray.contains("-----END"), "{stray}");
+    }
+
+    #[test]
+    fn an_azure_sas_query_string_is_removed_but_the_path_stays() {
+        let scrubbed = scrub("see https://acct.blob.core.windows.net/c/b?sv=2022-11-02&sr=b&sig=abc%2Fdef%3D&se=2026-10-23 ok");
+        assert!(!scrubbed.contains("sig=abc"), "{scrubbed}");
+        assert!(scrubbed.contains("[REDACTED:azure-sas]"), "{scrubbed}");
+        assert!(scrubbed.contains("acct.blob.core.windows.net/c/b"), "{scrubbed}");
+    }
+
+    #[test]
+    fn the_stricter_union_of_the_edge_and_producer_floors_applies() {
+        // The edge floors `github_pat_` at 22, the producer at 20: the
+        // producer keeps the lower floor so neither's catch is lost.
+        let scrubbed = scrub("x github_pat_abcdefghij0123456789 y");
+        assert!(scrubbed.contains("[REDACTED:github-token]"), "{scrubbed}");
     }
 
     #[test]

@@ -31,6 +31,9 @@
 //! nothing touching the network, a forge, `gh`, or any path outside the
 //! fixture.
 
+mod common;
+
+use common::git;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -44,26 +47,6 @@ use loom_daemon::refname::check_refname;
 /// `<path>` as the remote's upload-pack when the origin is a local path.
 fn payload_ref(payload: &Path) -> String {
     format!("--upload-pack={}", payload.display())
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "loom@example.com")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "loom@example.com")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("git must spawn");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// A clone whose `origin` is a bare repo reachable by PATH — the high-severity

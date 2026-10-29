@@ -117,12 +117,16 @@ impl SequencePlanArgs {
         for (follower, after, why) in &report.held_because {
             println!("held #{follower} (after #{after}): {why}");
         }
+        // #12775: generated holds the retired automatic ordering left behind.
+        for (follower, after) in &report.would_release_retired {
+            println!("would release #{follower} (after #{after}): automatic ordering retired");
+        }
         println!(
             "would release {} hold(s) with no shared files",
             report.would_release_no_overlap.len()
         );
         if report.groups.is_empty() {
-            println!("no overlapping groups planned");
+            println!("no stacked groups planned");
             return Ok(());
         }
         for g in &report.groups {
@@ -132,11 +136,10 @@ impl SequencePlanArgs {
             println!("group (plan {}) landing order: {}", g.plan, chain.join(" -> "));
             for e in &g.edges {
                 println!(
-                    "  would sequence #{follower} after #{after} at pred_head {} [{reason:?}]",
+                    "  would sequence #{follower} after #{after} at pred_head {} [stacked]",
                     e.pred_head,
                     follower = e.follower,
-                    after = e.after,
-                    reason = e.reason
+                    after = e.after
                 );
             }
         }

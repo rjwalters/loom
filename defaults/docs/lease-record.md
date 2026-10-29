@@ -814,7 +814,11 @@ the same lease semantics, **keyed by role**:
   hold at once. Removing and re-adding the same label does not (the set is
   unchanged); to force a re-review, push or run with
   `LOOM_JUDGE_BACKSTOP=0`, which turns the backstop off. An unreadable record
-  list serves the PR. Rules: `loom-daemon/src/judge_backstop.rs`.
+  list serves the PR. A pass a verdict gate refused (`post-verdict.sh` exit 7,
+  e.g. the stale-read gate) releases with `--skip-reason gate-refused:<token>`
+  (#13135): its record carries `refused=<token>`, holds the PR for only 15
+  minutes, and counts toward neither the window cap nor the escalation; exit
+  6 names the token. Rules: `loom-daemon/src/judge_backstop.rs`.
 - **A Judge the timeout kills is still counted (#11931).** The role runner
   ends a role run at its fixed 1800 s ceiling (`DEFAULT_ROLE_TIMEOUT` in
   `loom-daemon/src/role_runner.rs`; there is no per-role or config knob),
@@ -873,3 +877,20 @@ duplicated work.
   read against the reader's clock. The renewer's own offset cancels out, but a
   peer whose clock runs ahead of the forge by more than the remaining margin
   sees the lease expire early and may claim. Keep skew well under the margin.
+
+## Dead-record pruning keeps comment volume bounded (#13245)
+
+Every claim posts a new lease comment (the earliest-`id` tie-break needs
+that), so a repeatedly redrawn issue or PR would otherwise grow without bound
+toward GitHub's per-thread comment cap. A successful claim therefore deletes
+its **own host's** dead records beyond the newest 3, best-effort (a failed
+delete only logs; the claim proceeds):
+
+- Issue leases (`loom:lease`): comments whose own `updated_at` is past the TTL.
+- PR/step leases (`loom:pr-lease*`): released records, expired leases, and
+  yields whose lease is no longer live.
+
+A live lease, another host's record and the newest 3 dead ones are never
+deleted, so the released markers the Judge backstop and step-lease owner
+read back survive. The Builder step-outcome comment
+(`loom:builder-step-outcome`) is edited in place instead of re-posted.

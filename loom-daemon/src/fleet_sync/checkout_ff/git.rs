@@ -132,7 +132,7 @@ pub(crate) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String
 /// The default branch's name, from the clone's own `origin/HEAD`. Local: no
 /// remote is asked, and `main` is never guessed. `None` when `origin/HEAD` is
 /// unset, or names a branch git could read as an option (#9106).
-pub(super) fn default_branch(root: &Path, timeout: Duration) -> Option<String> {
+pub(crate) fn default_branch(root: &Path, timeout: Duration) -> Option<String> {
     let args = [
         "symbolic-ref",
         "--quiet",
