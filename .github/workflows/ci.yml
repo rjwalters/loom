@@ -2190,6 +2190,24 @@ jobs:
           git config --global user.name "Loom CI"
       - name: Assert the wired/excluded manifest invariant (#4455)
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
+      - name: Fetch pinned Repo Skills guard (#13269)
+        # tests/hooks/test-guard-cross-tool-champion.sh replays the Champion's
+        # pin/facts commands through Repo Skills' canonical guard too. The guard
+        # is fetched from a PINNED rjwalters/repo tag and sha256-checked; a fetch
+        # failure or hash mismatch fails the job (never a skip). To bump: change
+        # both values below to the new tag and the sha256 of
+        # hooks/repo/guard-destructive.sh at that tag.
+        env:
+          REPO_SKILLS_TAG: v0.24.9
+          REPO_SKILLS_GUARD_SHA256: d2108860006844a4fb4dddf6aadfe68af10d84eb346a1ffc214bcbcd40d11f3b
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/repo-skills-guard/guard-destructive.sh"
+          mkdir -p "$(dirname "$dest")"
+          curl -fsSL --retry 3 -o "$dest" \
+            "https://raw.githubusercontent.com/rjwalters/repo/${REPO_SKILLS_TAG}/hooks/repo/guard-destructive.sh"
+          echo "${REPO_SKILLS_GUARD_SHA256}  ${dest}" | sha256sum -c -
+          echo "LOOM_GUARD_CANONICAL=${dest}" >> "$GITHUB_ENV"
       # Retry-once-and-record (#7791): a suite that fails its first attempt is
       # re-run exactly once; a suite failing BOTH attempts still fails this
       # step exactly as before. Every retry is recorded twice — a distinct

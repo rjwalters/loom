@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-29
 
+- **PR #13295**: refactor: remove dead GraphQL path from ci_telemetry poller
+- **Issue #13292** (closed): Remove dead GraphQL path in ci_telemetry poller (story.rs caller deleted)
 - **PR #13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
 - **PR #13288**: fix: attribute step-launched role sessions to their issue's completion tokens and record each narration
 - **Issue #13287** (closed): completion-v1 narration carries no tokens since ~2026-10-16; narration emits no telemetry
