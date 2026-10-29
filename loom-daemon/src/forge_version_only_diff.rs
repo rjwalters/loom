@@ -238,8 +238,24 @@ pub(crate) fn gh_fetch_page(
     page: u32,
 ) -> Result<Vec<u8>, String> {
     let path = format!("repos/{repo}/pulls/{pr}/files?per_page={PAGE_SIZE}&page={page}");
-    crate::verdict_equivalence::gh_api("forge.version_only_diff", gh_bin, None, &path)
-        .ok_or_else(|| format!("`gh api {path}` failed"))
+    crate::verdict_equivalence::gh_api_result("forge.version_only_diff", gh_bin, None, &path)
+}
+
+/// The `OWNER/REPO` every `repos/<r>/…` read is addressed to (#13296): the
+/// caller's `--repo`, else the repo `gh`/the git remote resolves for the cwd.
+/// Never `gh`'s `{owner}/{repo}` placeholder, which expands from the cwd's
+/// remote and silently fails when the process runs outside the PR's checkout.
+pub(crate) fn resolve_repo(arg: Option<&str>, gh_bin: &str) -> Result<String, String> {
+    if let Some(r) = arg {
+        return Ok(r.to_string());
+    }
+    crate::forge_cmd::repo_nwo(gh_bin)
+        .filter(|r| valid_repo(r))
+        .ok_or_else(|| {
+            "cannot resolve OWNER/REPO (no --repo, and neither `gh repo view` nor the \
+             git remote of the working directory names one)"
+                .to_string()
+        })
 }
 
 /// Parsed `forge version-only-diff` arguments.
@@ -249,7 +265,7 @@ pub struct Args {
     pub pr: u32,
     /// Repo-relative path of the changed file.
     pub file: String,
-    /// `OWNER/REPO`; `None` lets `gh` resolve `{owner}/{repo}`.
+    /// `OWNER/REPO`; `None` resolves it from the cwd (never a `{owner}/{repo}` placeholder).
     pub repo: Option<String>,
 }
 
@@ -262,9 +278,11 @@ pub fn handle(args: &Args) -> Result<()> {
     let verdict = match repo {
         Some(r) if !valid_repo(r) => Err(Reason::InvalidRepo),
         _ => {
-            let repo = repo.unwrap_or("{owner}/{repo}");
             let gh = crate::forge_cmd::gh_bin();
-            decide(file, |page| gh_fetch_page(Path::new(&gh), repo, pr, page))
+            match resolve_repo(repo, &gh) {
+                Ok(repo) => decide(file, |page| gh_fetch_page(Path::new(&gh), &repo, pr, page)),
+                Err(why) => Err(Reason::FetchFailed(why)),
+            }
         }
     };
     match verdict {
@@ -283,6 +301,40 @@ pub fn handle(args: &Args) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// #13296: an executable stub `gh` that logs its args and fails like the forge.
+    #[cfg(unix)]
+    fn failing_gh(dir: &Path, stderr: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("gh");
+        let log = dir.join("args.log");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\necho '{stderr}' >&2\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolve_repo_prefers_explicit_arg() {
+        assert_eq!(
+            resolve_repo(Some("acme/widgets"), "/nonexistent/gh"),
+            Ok("acme/widgets".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_fetch_page_error_carries_http_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = failing_gh(dir.path(), "gh: Resource not accessible (HTTP 403)");
+        let err = gh_fetch_page(&gh, "acme/widgets", 7, 1).unwrap_err();
+        assert!(err.contains("HTTP 403"), "{err}");
+        assert!(err.contains("repos/acme/widgets/pulls/7/files"), "{err}");
+        assert!(!err.contains("{owner}"), "{err}");
+    }
 
     /// The PR #6118 fixtures (`test-champion-critical-file-check.sh`), one per
     /// allowlisted file.
