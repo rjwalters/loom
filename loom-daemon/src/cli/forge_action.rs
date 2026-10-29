@@ -223,6 +223,19 @@ pub(crate) enum ForgeAction {
         max_points: u32,
     },
 
+    /// `forge journal-ci-refusal <PR> --class ci_red|ci_incomplete [--head SHA]`
+    /// (#13274) — journal a Judge approval refused by the exact-head CI gate
+    /// so the step's `pass.verdict` carries it. Best-effort: always exits 0,
+    /// and is a no-op outside a journaled run or on an unknown class.
+    #[command(name = "journal-ci-refusal")]
+    JournalCiRefusal {
+        pr: u64,
+        #[arg(long)]
+        class: String,
+        #[arg(long)]
+        head: Option<String>,
+    },
+
     /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only] [--settle-red]`
     /// (#10330) — wait for a PR's (or commit's) CI with ETag'd REST reads
     /// (an unchanged poll is a free `304`) backing off 30s → 120s.
@@ -1215,6 +1228,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
+        ForgeAction::JournalCiRefusal { pr, class, head } => {
+            if matches!(class.as_str(), "ci_red" | "ci_incomplete") {
+                crate::observability::pick_journal::record_ci_refusal(pr, &class, head.as_deref());
+            }
+            return Ok(());
+        }
         ForgeAction::WaitChecks {
             selector,
             repo,

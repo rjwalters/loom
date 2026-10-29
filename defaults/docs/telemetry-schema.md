@@ -3011,9 +3011,9 @@ projected reason, so `passVerdictQuery` still parses both):
 | Field (`loom.pass.*`) | Notes |
 |---|---|
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
-| `step` | `champion_pr`, `champion_issue`, `doctor` or `curator` |
+| `step` | `champion_pr`, `champion_issue`, `doctor`, `curator` or `judge` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1` or `curator_step_v1` |
+| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1`, `curator_step_v1` or `judge_step_v1` |
 | `loom.sweep_id` | the step's sweep id, to join a verdict to its session (#12715) |
 | `reason_detail` | the raw `reason=` token of a `skipped` / `requeued` step (body `detail`), bounded to token characters (#12715) |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
@@ -3064,6 +3064,25 @@ has no journaled signal and is not emitted.
 | `noop` | `no_change` |
 | `refused` | `escalated` (a journaled `operator-decision` / park, or `class=refused`), `gave_up` (`class=refused reason=gave_up`) |
 | `failed` | `failed` (`class=failed`, or no outcome line) |
+
+**Judge step (`judge_step_v1`, `step=judge`, `artifact=pr`, #13274).**
+One record per Judge step end. When `post-verdict.sh` refuses an approval at
+the exact-head CI gate (#10486; it posts nothing), it journals the refusal
+through `loom-daemon forge journal-ci-refusal` (best-effort; an older daemon
+changes nothing) and the step's record carries it, with `head_sha` set. Without
+a refusal the step's `LOOM_STEP_OUTCOME role=judge` line projects.
+
+| `class` | `reason` |
+|---|---|
+| `refused` | `ci_red` (exit 6), `ci_incomplete` (exit 5: pending, timeout, head moved, unread), `declined` (`class=refused` with no CI refusal) |
+| `verdict` | `reviewed` |
+| `noop` | `no_change` |
+| `failed` | `failed` (`class=failed`, or no outcome line) |
+
+Refusal rate: count `step=judge class=refused reason in (ci_red, ci_incomplete)`
+over all `step=judge` records, by `loom.repo`. Time to next approval: join each
+such record to the next Judge `verdict` record for the same `loom.repo` and PR
+number with a later `evaluated_at`; the daemon keeps no timer for it.
 
 **Curator step (`curator_step_v1`, `step=curator`, `artifact=issue`, #12921).**
 One record per Curator step end, from the journaled writes (the `loom:curated`
