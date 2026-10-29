@@ -435,6 +435,12 @@ if [[ "$VERDICT" == "approved" ]]; then
       [[ -n "$CI_DETAIL" ]] && printf '%s\n' "${CI_DETAIL:0:4000}" | sed 's/^/  /'
       echo "$2"
     } >&2
+    # Telemetry (#13274): journal the refusal (5 = incomplete, 6 = red) for the
+    # step's pass.verdict. Best-effort: an older daemon or a failed write
+    # never changes the exit code, and nothing is posted.
+    "${LOOM_DAEMON_BIN:-loom-daemon}" forge journal-ci-refusal "$PR" \
+      --class "$([[ "$3" -eq 6 ]] && echo ci_red || echo ci_incomplete)" \
+      ${CI_SHA:+--head "$CI_SHA"} >/dev/null 2>&1 || true
     exit "$3"
   }
   PENDING_NEXT="Nothing was posted. Do NOT add loom:pr: release your claim, leave loom:review-requested, and re-evaluate once CI settles on this head."
