@@ -1673,6 +1673,38 @@ WHERE attributes_string['loom.topic'] = 'daemon.work_finder.first_tick'
 
 Other topics' fields stay inside `loom.payload` only.
 
+#### `daemon.agent_residue.reaped` (#10802)
+
+Also mirrored as a `daemon.event` record (the `daemon.agent_residue` prefix is
+subscribed). Published once per reap by the agent residue reaper
+(`agent_residue_reaper.rs`); the payload carries no absolute host path.
+
+```json
+{
+  "source": "agent-residue-reaper",
+  "path": "exit",
+  "kind": "scope",
+  "unit": "loom-agent-4242-99.scope",
+  "pids": [],
+  "issue": 7,
+  "sweep_id": "sweep-1",
+  "dry_run": false,
+  "detail": null
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `source` | string | Always `"agent-residue-reaper"`. |
+| `path` | string | `"exit"` (the run just ended) or `"periodic"` (the sweep on the worktree-reaper tick). |
+| `kind` | string | `"scope"` (a `loom-agent-*` scope stopped), `"tree"` (processes killed) or `"failed-scope"` (`reset-failed`). |
+| `unit` | string or null | The scope unit, for `scope` and `failed-scope`. |
+| `pids` | integer[] | The processes signalled, for `tree`. |
+| `issue` | integer or null | The issue the run or worktree belonged to, when known. |
+| `sweep_id` | string or null | The sweep (or a role run's `role-<role>-…` item id), on the exit path. |
+| `dry_run` | boolean | `true`: planned only, nothing was stopped, signalled or reset. |
+| `detail` | string or null | Why or the outcome: `worktree issue-N`, or `Result=… ExecMainStatus=…` for a failed scope. |
+
 **`daemon.start` (#11197)** — the one topic in this kind that is not a
 mirrored bus event. Exactly one record per daemon process, enqueued by
 `observability::spawn_task` when the exporters come up (never when telemetry
