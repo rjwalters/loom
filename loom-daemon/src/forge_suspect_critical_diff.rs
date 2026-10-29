@@ -611,8 +611,7 @@ fn gh_head_file(gh_bin: &Path, repo: &str, pr: u32, file: &str) -> Result<String
         return Err("unsafe file path".into());
     }
     let read = |path: &str| {
-        crate::verdict_equivalence::gh_api("forge.suspect_critical_diff", gh_bin, None, path)
-            .ok_or_else(|| format!("`gh api {path}` failed"))
+        crate::verdict_equivalence::gh_api_result("forge.suspect_critical_diff", gh_bin, None, path)
     };
     let pr_body = read(&format!("repos/{repo}/pulls/{pr}"))?;
     let v: serde_json::Value = serde_json::from_slice(&pr_body).map_err(|e| e.to_string())?;
@@ -631,7 +630,7 @@ pub struct Args {
     pub pr: u32,
     /// Repo-relative path of the changed file.
     pub file: String,
-    /// `OWNER/REPO`; `None` lets `gh` resolve `{owner}/{repo}`.
+    /// `OWNER/REPO`; `None` resolves it from the cwd (never a `{owner}/{repo}` placeholder).
     pub repo: Option<String>,
 }
 
@@ -640,22 +639,30 @@ pub struct Args {
 /// otherwise 1 (`SUSPECT_LINE=`/`SUSPECT_SECTION=` on stdout for a match, the
 /// reason on stderr).
 pub fn handle(args: &Args) -> Result<()> {
-    use crate::forge_version_only_diff::{find_patch, gh_fetch_page, valid_repo};
+    use crate::forge_version_only_diff::{find_patch, gh_fetch_page, resolve_repo, valid_repo};
     let (pr, file) = (args.pr, args.file.as_str());
     let repo = args.repo.as_deref();
     let verdict = match repo {
         Some(r) if !valid_repo(r) => Err(Reason::InvalidRepo),
         _ if kind_for(file).is_none() => Err(Reason::NotApplicable),
         _ => {
-            let repo = repo.unwrap_or("{owner}/{repo}");
             let gh = crate::forge_cmd::gh_bin();
-            let gh = Path::new(&gh);
-            match find_patch(file, |page| gh_fetch_page(gh, repo, pr, page)) {
-                Ok(patch) => classify(file, patch.as_deref(), || gh_head_file(gh, repo, pr, file)),
-                Err(r) => Err(match r {
-                    crate::forge_version_only_diff::Reason::FileNotInList => Reason::FileNotInList,
-                    other => Reason::FetchFailed(other.to_string()),
-                }),
+            match resolve_repo(repo, &gh) {
+                Err(why) => Err(Reason::FetchFailed(why)),
+                Ok(repo) => {
+                    let gh = Path::new(&gh);
+                    match find_patch(file, |page| gh_fetch_page(gh, &repo, pr, page)) {
+                        Ok(patch) => {
+                            classify(file, patch.as_deref(), || gh_head_file(gh, &repo, pr, file))
+                        }
+                        Err(r) => Err(match r {
+                            crate::forge_version_only_diff::Reason::FileNotInList => {
+                                Reason::FileNotInList
+                            }
+                            other => Reason::FetchFailed(other.to_string()),
+                        }),
+                    }
+                }
             }
         }
     };

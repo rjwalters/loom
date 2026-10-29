@@ -230,13 +230,31 @@ pub(crate) fn gh_api(
     cwd: Option<&Path>,
     path: &str,
 ) -> Option<Vec<u8>> {
+    gh_api_result(op, gh_bin, cwd, path).ok()
+}
+
+/// [`gh_api`], keeping why a read failed: `gh`'s own stderr (which carries the
+/// HTTP status, e.g. `HTTP 403`) and exit code, or why `gh` never ran (#13296).
+pub(crate) fn gh_api_result(
+    op: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    path: &str,
+) -> Result<Vec<u8>, String> {
     // #10089: counted via the facade under `op`.
-    crate::claim_reconciliation::gh_call::ok_stdout(optional_cwd(
-        op,
-        gh_bin,
-        cwd,
-        ["api", path].iter().copied(),
-    ))
+    let inv = optional_cwd(op, gh_bin, cwd, ["api", path].iter().copied());
+    match crate::claim_reconciliation::gh_call::output(inv) {
+        Ok(out) if out.status.success() => Ok(out.stdout),
+        Ok(out) => {
+            let err = crate::claim_reconciliation::gh_call::stderr(&out);
+            let code = out
+                .status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string());
+            Err(format!("`gh api {path}` failed (exit {code}): {err}"))
+        }
+        Err(e) => Err(format!("`gh api {path}` failed: {e}")),
+    }
 }
 
 /// A facade read of `gh_bin` in `cwd` (when given), carrying `args`.
