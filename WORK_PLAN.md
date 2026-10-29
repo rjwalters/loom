@@ -24,6 +24,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
+- **#13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
 
 ## Very Important
 
@@ -54,7 +55,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
@@ -71,6 +71,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
+- **#10802**: General cleanup: reap agent process residue (dev servers, orphaned children) after any agent exit
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes)
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
@@ -80,6 +82,10 @@ Issues currently being built (`loom:building`).
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
 - **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds
 - **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
+- **#13264**: Sweep Judge leases: claim without --watch-pid breaks post-verdict, backstop blocks the retry, lease not released after verdict
+- **#13268**: Resync must land without the Champion merge path on repos that refuse direct pushes
+- **#13269**: Cross-tool guard test: Champion pin/facts writes must pass both Loom and Repo Skills hooks
+- **#13270**: Resync PR fallback must raise a loom:important attention item (interim for #13268)
 
 ## PRs Awaiting Review
 
@@ -108,6 +114,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
+- **#13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
 
 ## Proposed
 
@@ -191,6 +198,10 @@ Issues carrying `loom:curated`.
 - **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
 - **#13238**: [ci-daily] Flake Detection (Rust) *(curated)*
+- **#13264**: Sweep Judge leases: claim without --watch-pid breaks post-verdict, backstop blocks the retry, lease not released after verdict *(curated)*
+- **#13268**: Resync must land without the Champion merge path on repos that refuse direct pushes *(curated)*
+- **#13269**: Cross-tool guard test: Champion pin/facts writes must pass both Loom and Repo Skills hooks *(curated)*
+- **#13270**: Resync PR fallback must raise a loom:important attention item (interim for #13268) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -198,6 +209,8 @@ Issues carrying `loom:curated`.
 - **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(hermit)*
 - **#13017**: Split run_daemon (~1960-line fn) in daemon_service.rs into startup-phase modules *(hermit)*
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller *(hermit)*
+- **#13261**: Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon *(hermit)*
+- **#13263**: Dedupe four identical outcome_journal test registry builders into test_support *(hermit)*
 
 ## Epics
 
@@ -216,14 +229,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 15 |
+| Operator merge-risk holds | 16 |
 | Very important | 2 |
 | Important | 13 |
-| Ready (`loom:issue`) | 12 |
-| In Progress (`loom:building`) | 9 |
+| Ready (`loom:issue`) | 11 |
+| In Progress (`loom:building`) | 15 |
 | PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 15 |
-| Curated | 78 |
-| Architect / Hermit proposals | 4 |
+| Approved PRs awaiting merge | 16 |
+| Curated | 82 |
+| Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
