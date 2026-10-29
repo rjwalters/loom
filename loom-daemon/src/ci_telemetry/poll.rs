@@ -134,9 +134,6 @@ pub struct CycleReport {
     pub ledger_repaired: bool,
     /// At least one job log was downloaded successfully this cycle (#8825).
     pub logs_fetched: bool,
-    /// Cleared when GraphQL rate-limits a closing-reference lookup (#9088):
-    /// no further lookup is made this cycle.
-    pub graphql_suppressed: bool,
     /// Each owner's kind / eligible repo count / skip reason (#9188).
     pub owners: Vec<OwnerStatus>,
 }
