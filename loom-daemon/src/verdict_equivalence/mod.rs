@@ -251,9 +251,9 @@ pub(crate) fn gh_api_result(
                 .status
                 .code()
                 .map_or("signal".to_string(), |c| c.to_string());
-            Err(format!("`gh api {path}` failed (exit {code}): {err}"))
+            Err(format!("forge read of `{path}` failed (exit {code}): {err}"))
         }
-        Err(e) => Err(format!("`gh api {path}` failed: {e}")),
+        Err(e) => Err(format!("forge read of `{path}` failed: {e}")),
     }
 }
 
