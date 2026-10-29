@@ -84,6 +84,9 @@ pub fn state_rows(
             reeval_next: reeval.map(|(_, next)| next),
             iw: Some(c.terms.weight),
             weight: Some(weight),
+            issue: c.item.issue,
+            doctor_rejections: None,
+            doctor_escalated: None,
         });
     }
     for w in &live {
@@ -104,6 +107,9 @@ pub fn state_rows(
                 reeval_next: reeval.map(|(_, next)| next),
                 iw: None,
                 weight: None,
+                issue: e.item.issue,
+                doctor_rejections: None,
+                doctor_escalated: None,
             });
         }
     }

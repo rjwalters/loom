@@ -1165,7 +1165,7 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
     _account_provider="$(_loom_account_provider_for_runtime claude)"
     _select_args=(tokens select --workspace "$WORKSPACE" --provider "$_account_provider" --export)
     # Pre-flight: auto-unpin if every allowlisted account has hit the
-    # consecutive-failure threshold (default 5). Without this, an
+    # failure-count threshold (default 5). Without this, an
     # operator-set pin can trap the spawner once all pinned accounts
     # exhaust their weekly quota. Empty-pool guard: we never silently
     # clear .bad_tokens — if that file blocks every account, the user
@@ -1278,6 +1278,21 @@ if [[ "$_loom_print_mode" == "true" ]]; then
     export LOOM_HEADLESS_SESSION=1
 fi
 unset _loom_print_mode
+
+# --- Refuse to invent a git identity (issue #13088) ---
+# A worker with no user.name/user.email commits as `user@hostname` (git's
+# auto-detected fallback), which fails DCO/attribution checks only after a full
+# Judge/Doctor cycle. `user.useConfigOnly=true` makes git refuse to commit
+# unless the identity is explicit (config or GIT_AUTHOR_*/GIT_COMMITTER_*
+# env). Injected per-process via GIT_CONFIG_COUNT/KEY_n/VALUE_n, appending
+# after any count already set, so no config file (the shared primary clone or
+# the host-global config) is written. Fix on refusal: set a real identity
+# (git config --global user.name/user.email, or GIT_AUTHOR_* env).
+_gc_count="${GIT_CONFIG_COUNT:-0}"
+[[ "$_gc_count" =~ ^[0-9]+$ ]] || _gc_count=0
+export "GIT_CONFIG_KEY_${_gc_count}=user.useConfigOnly" "GIT_CONFIG_VALUE_${_gc_count}=true"
+export GIT_CONFIG_COUNT=$((_gc_count + 1))
+unset _gc_count
 
 # --- Session pinning and roll resume (issue #10830) ---
 # Pause-and-roll (docs/design/daemon-roll-pause-resume.md) resumes a paused

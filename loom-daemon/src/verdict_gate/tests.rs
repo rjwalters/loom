@@ -442,6 +442,8 @@ fn dispatch_epoch_is_read_from_the_step_sweep_id() {
     assert_eq!(t("step-judge-12512-1792184656"), Some(1_792_184_656));
     assert_eq!(t("step-judge-12512-1792184656-r2"), Some(1_792_184_656));
     assert_eq!(t("sweep-issue-12512-1792184656"), None);
+    // An in-session orchestrator run id must never be read as a dispatch time (#13222).
+    assert_eq!(t("sweep-20261027T183521Z-75446-0a9c5bc7"), None);
     assert_eq!(t("step-judge-12512"), None);
     assert_eq!(t(""), None);
 }

@@ -533,14 +533,14 @@ if [[ ! -d "$LIB_DIR" ]]; then
   fail ".loom/scripts/lib/ directory missing (regression of #3220)"
   LIB_MISSING=1
 else
-  for lib_file in loom-tools.sh forge-helpers.sh pipe-pane-cmd.sh; do
+  for lib_file in loom-tools.sh repo-root.sh forge-helpers.sh pipe-pane-cmd.sh; do
     if [[ ! -f "$LIB_DIR/$lib_file" ]]; then
       fail ".loom/scripts/lib/$lib_file missing (regression of #3220)"
       LIB_MISSING=1
     fi
   done
   if [[ $LIB_MISSING -eq 0 ]]; then
-    pass ".loom/scripts/lib/ contains all required helpers (loom-tools.sh, forge-helpers.sh, pipe-pane-cmd.sh)"
+    pass ".loom/scripts/lib/ contains all required helpers (loom-tools.sh, repo-root.sh, forge-helpers.sh, pipe-pane-cmd.sh)"
   fi
 fi
 
@@ -3648,31 +3648,6 @@ if [[ -f "$SYNC_LABELS_TEST" ]]; then
   fi
 else
   fail "test-sync-labels-repo-flag.sh not found at $SYNC_LABELS_TEST"
-fi
-echo ""
-
-# ==========================================================================
-# scripts/install/sync-labels.sh --prune-defaults / --force (#5066)
-# ==========================================================================
-# Its own unit suite lives at defaults/scripts/tests/test-install-sync-labels.sh
-# (additive-by-default with no flags, --prune-defaults restoring the old
-# unconditional deletion, and the in-use-label warn/refuse-without-force
-# guard) — the source-only counterpart of the --repo/--dry-run suite above.
-echo "Test: scripts/install/sync-labels.sh --prune-defaults suite (test-install-sync-labels.sh)"
-INSTALL_SYNC_LABELS_TEST="$DEFAULTS_DIR/scripts/tests/test-install-sync-labels.sh"
-if [[ -f "$INSTALL_SYNC_LABELS_TEST" ]]; then
-  set +e
-  INSTALL_SYNC_LABELS_TEST_OUT=$(bash "$INSTALL_SYNC_LABELS_TEST" 2>&1)
-  INSTALL_SYNC_LABELS_TEST_RC=$?
-  set -e
-  if [[ $INSTALL_SYNC_LABELS_TEST_RC -eq 0 ]]; then
-    pass "test-install-sync-labels.sh: all cases passed"
-  else
-    fail "test-install-sync-labels.sh failed (rc=$INSTALL_SYNC_LABELS_TEST_RC)"
-    echo "$INSTALL_SYNC_LABELS_TEST_OUT" | tail -20
-  fi
-else
-  fail "test-install-sync-labels.sh not found at $INSTALL_SYNC_LABELS_TEST"
 fi
 echo ""
 

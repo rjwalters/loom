@@ -16,6 +16,7 @@
 //! | a tree-identical commit (a #8248/#8508 re-date push, an empty commit) | always | [`EquivalenceKind::Tree`] |
 //! | a clean automatic merge of the base into the branch, possibly with tree-identical commits before or after it (#10875) | the merge is two-parent, its FIRST parent reduces to the reviewed head, its second parent is on the PR's base branch, and its tree equals `git merge-tree --write-tree <first> <base-parent>` | [`EquivalenceKind::CleanMerge`] |
 //! | a rebase onto a newer base | the PR's own merge-base-relative patch is byte-identical | [`EquivalenceKind::RebasePatchIdentical`] |
+//! | a Doctor push that changed only the paths an operator's `release-scope:` line named (#13114; critical-file hold only, caller passes `--allowed-paths`) | the per-file delta between the two three-dot compares is non-empty and inside the named set | [`EquivalenceKind::RequestedChange`] |
 //! | anything else (new commits, edited hunks, conflict resolution) | never | — |
 //!
 //! The first row shipped as #9124/#9576 and lives in
@@ -116,6 +117,10 @@ pub enum EquivalenceKind {
     /// The PR's own merge-base-relative patch is byte-identical across the move
     /// ([`patch_identity`]).
     RebasePatchIdentical,
+    /// The PR's patch changed, but only in paths the operator's release named
+    /// as the requested change (#13114). Never produced unless the caller
+    /// passed an allowed-path set; Judge verdicts never carry on it.
+    RequestedChange,
 }
 
 impl EquivalenceKind {
@@ -130,6 +135,7 @@ impl EquivalenceKind {
             Self::Tree => "tree",
             Self::CleanMerge => "clean-merge",
             Self::RebasePatchIdentical => "rebase-patch-identical",
+            Self::RequestedChange => "requested-change",
         }
     }
 
@@ -154,6 +160,11 @@ impl EquivalenceKind {
                  after the move (same file set, same statuses, same resulting blob ids, same \
                  patch text), so the change that was reviewed is still exactly the change in \
                  front of us"
+            }
+            Self::RequestedChange => {
+                "the PR's own patch changed, but every changed path is one the operator's \
+                 release named as the requested change; nothing else in the PR's diff moved. \
+                 The Judge's re-verdict confirms the change itself"
             }
         }
     }
@@ -409,7 +420,23 @@ pub fn assess(
     reviewed: &str,
     head: &str,
 ) -> Assessment {
-    assess_with(
+    assess_scoped(gh_bin, cwd, pr, reviewed, head, &[])
+}
+
+/// [`assess`], additionally willing to answer [`EquivalenceKind::RequestedChange`]
+/// when the PR's patch differs only in `allowed_paths` (#13114). An empty set
+/// is exactly [`assess`]. Both kill switches disable it, as they do the kinds
+/// it extends.
+#[must_use]
+pub fn assess_scoped(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    pr: u32,
+    reviewed: &str,
+    head: &str,
+    allowed_paths: &[String],
+) -> Assessment {
+    assess_with_scope(
         verdict_tree_carveout_enabled(),
         verdict_equivalence_enabled(),
         gh_bin,
@@ -417,9 +444,11 @@ pub fn assess(
         pr,
         reviewed,
         head,
+        allowed_paths,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn assess_with(
     carveout_enabled: bool,
@@ -429,6 +458,20 @@ fn assess_with(
     pr: u32,
     reviewed: &str,
     head: &str,
+) -> Assessment {
+    assess_with_scope(carveout_enabled, new_kinds_enabled, gh_bin, cwd, pr, reviewed, head, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assess_with_scope(
+    carveout_enabled: bool,
+    new_kinds_enabled: bool,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    pr: u32,
+    reviewed: &str,
+    head: &str,
+    allowed_paths: &[String],
 ) -> Assessment {
     if !is_sha(reviewed) || !is_sha(head) {
         return Assessment::indeterminate(vec!["an argument is not a bare hex SHA".into()]);
@@ -487,18 +530,33 @@ fn assess_with(
     // the broadest test (it also catches a merge whose objects are not local),
     // and the only one that works when the reviewed head has been orphaned by a
     // force-push, because it never touches the object store.
-    match patch_identity::evidence(gh_bin, cwd, reviewed, head, &base_ref) {
-        Evidence::Proven => {
+    match patch_identity::outcome(gh_bin, cwd, reviewed, head, &base_ref) {
+        patch_identity::Outcome::Proven => {
             Assessment::determinate(Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical))
+        }
+        // #13114: the delta is non-empty and lies wholly inside the operator's
+        // named paths. Any path outside the set, or an empty set, fails closed.
+        patch_identity::Outcome::Differs(paths)
+            if !paths.is_empty() && paths.iter().all(|p| allowed_paths.iter().any(|a| a == p)) =>
+        {
+            Assessment::determinate(Equivalence::Equivalent(EquivalenceKind::RequestedChange))
         }
         // #10134: still Changed (fail closed), but keep any reason an earlier
         // kind could not answer — dropping it would make a failed fetch in
         // the incident's shared-file shape clear the verdict silently.
-        Evidence::Refuted => Assessment {
+        patch_identity::Outcome::Differs(_) => Assessment {
             equivalence: Equivalence::Changed,
             unavailable,
         },
-        Evidence::Indeterminate => {
+        // #13114: the forge never answered, even after the retries. Distinct
+        // from `changed` so a re-arm caused by an outage is visible as one.
+        patch_identity::Outcome::Unread => {
+            unavailable.push(format!(
+                "rebase-patch-identical: {UNREAD_TOKEN} — forge compare unreadable after retries"
+            ));
+            Assessment::indeterminate(unavailable)
+        }
+        patch_identity::Outcome::Inconclusive => {
             unavailable.push(
                 "rebase-patch-identical: forge compare unavailable or inconclusive (gh failure, \
                  truncated or patch-less file list, or two empty diffs)"
@@ -508,6 +566,10 @@ fn assess_with(
         }
     }
 }
+
+/// The token a re-arm caused by an unreadable forge compare carries in its
+/// reason line and in `hold.transition` telemetry (#13114).
+pub const UNREAD_TOKEN: &str = "equivalence=unread";
 
 /// The body of the re-anchor comment the daemon pass posts when a verdict is
 /// carried forward.
@@ -569,9 +631,9 @@ pub fn reanchor_body(
 /// daemon predating this verb, a `gh` outage, a non-GitHub forge, the kill
 /// switch — collapses into the identical fail-closed arm. A caller MUST key on
 /// the `EQUIVALENCE_KIND=` line and treat its absence as "re-review".
-pub fn handle(pr: u32, reviewed: &str, head: &str) -> anyhow::Result<()> {
+pub fn handle(pr: u32, reviewed: &str, head: &str, allowed_paths: &[String]) -> anyhow::Result<()> {
     let gh = crate::forge_cmd::gh_bin();
-    let assessment = assess(Path::new(&gh), None, pr, reviewed, head);
+    let assessment = assess_scoped(Path::new(&gh), None, pr, reviewed, head, allowed_paths);
     match assessment.equivalence {
         Equivalence::Equivalent(kind) => {
             println!("VERDICT_EQUIVALENT=1");

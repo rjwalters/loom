@@ -82,6 +82,7 @@
 
 pub mod agent_relay;
 pub mod backfill;
+pub mod champion_run;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod daemon_event;
@@ -93,6 +94,7 @@ pub mod endpoint_policy;
 pub mod exporter;
 pub mod hold_transition;
 mod ingest_key;
+pub mod lane_wait;
 pub mod lifecycle;
 pub mod llm_billing;
 pub mod loss_ledger;
@@ -103,7 +105,6 @@ pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
 pub mod pick_journal;
-pub mod pick_payload_archive;
 pub mod queue;
 pub mod queue_blocked;
 pub mod repo_ref;

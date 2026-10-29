@@ -5,7 +5,7 @@
 //! when the Builder got far enough to write `.no-changes-needed`; a step run
 //! by the step engine, or one cut short, left no trace of why it looped.
 //! [`SweepRegistry::note_builder_outcome`] makes the comment a daemon-side
-//! guarantee: one marked comment per step (keyed by its sweep id) carrying
+//! guarantee: one marked comment per issue, edited in place on later steps (#13245), carrying
 //! the outcome's reason token and, when the marker file is still on disk, its
 //! first 200 characters. It is a comment only: no label change.
 
@@ -101,6 +101,26 @@ impl SweepRegistry {
             return;
         }
         let issue_arg = run.item.to_string();
+        // #13245: one outcome comment per issue, edited in place, so an issue
+        // redrawn many times does not grow a comment per pass.
+        if let Some(id) = self.latest_outcome_comment(&issue_arg) {
+            let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+            let patch = [
+                "api",
+                "-X",
+                "PATCH",
+                path.as_str(),
+                "-f",
+                &format!("body={body}"),
+                "--silent",
+            ];
+            if self
+                .gh_write("step_outcome.edit", patch)
+                .is_ok_and(|o| o.is_some_and(|o| o.status.success()))
+            {
+                return;
+            }
+        }
         let mut comment = vec![
             "issue",
             "comment",
@@ -113,6 +133,25 @@ impl SweepRegistry {
         if let Err(e) = self.gh_write("step_outcome.comment", comment) {
             log::debug!("step_ledger: builder outcome comment for #{} failed: {e}", run.item);
         }
+    }
+
+    /// Id of the newest outcome comment on `issue`, if one can be read. A
+    /// comment by another author fails the edit and falls back to a post.
+    fn latest_outcome_comment(&self, issue: &str) -> Option<u64> {
+        let jq = format!(
+            r#".[] | select(.body != null and (.body | startswith("{STEP_OUTCOME_COMMENT_MARKER}"))) | .id"#
+        );
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments");
+        let out = self
+            .gh_read("step_outcome.list", ["api", path.as_str(), "--paginate", "--jq", jq.as_str()])
+            .ok()??;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .next_back()
     }
 }
 

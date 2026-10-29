@@ -102,6 +102,15 @@ pub(crate) const EXIT_UNVERIFIED: i32 = 5;
 pub(crate) const EXIT_EXPIRED: i32 = 3;
 /// A peer holds the earliest live lease of this role.
 pub(crate) const EXIT_PEER: i32 = 4;
+/// release: nothing matched this identity, but this host holds a live lease
+/// of the role under another sweep id (a release that omitted the claim's
+/// `--watch-pid`/`--sweep-id`, #13132). The lease is untouched.
+pub(crate) const EXIT_MISMATCH: i32 = 8;
+
+/// Dead (released, expired or standdown) lease records of one host kept per PR
+/// when a new claim prunes (#13245); the rest are deleted so a PR or issue
+/// redrawn many times cannot approach the forge's per-thread comment cap.
+pub(crate) const KEEP_DEAD_RECORDS: usize = 3;
 
 /// Bounded read retries (mirrors `LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`).
 const READ_ATTEMPTS: u32 = 3;
@@ -379,6 +388,42 @@ pub(crate) fn live_leases(
     live
 }
 
+/// Comment ids a new claim from `host` may delete (#13245): that host's own
+/// dead records beyond the newest `keep`. Dead = released, a lease past `ttl`,
+/// or a yield whose identity has no unexpired lease. A live lease, another
+/// host's record and the newest `keep` dead ones are never listed. Pure.
+pub(crate) fn prune_candidates(
+    rows: &[Row],
+    host: &str,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+    keep: usize,
+) -> Vec<u64> {
+    let live = |r: &Row| now.signed_duration_since(r.updated_at) < ttl;
+    let parsed: Vec<(&Row, Record)> = rows
+        .iter()
+        .filter_map(|r| parse_record(&r.body).map(|rec| (r, rec)))
+        .collect();
+    let mut dead: Vec<u64> = parsed
+        .iter()
+        .filter(|(r, rec)| match rec {
+            Record::Released(who) => who.host == host,
+            Record::Lease(who) => who.host == host && !live(r),
+            Record::Yield(who) => {
+                who.host == host
+                    && !parsed
+                        .iter()
+                        .any(|(l, lrec)| matches!(lrec, Record::Lease(w) if w == who) && live(l))
+            }
+        })
+        .map(|(r, _)| r.id)
+        .collect();
+    dead.sort_unstable();
+    let excess = dead.len().saturating_sub(keep);
+    dead.truncate(excess);
+    dead
+}
+
 /// The PR-phase claim state for one role (#11118's `claim_state(item)`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimState {
@@ -649,6 +694,24 @@ impl Gh {
         }
     }
 
+    /// Delete a comment; best-effort, `false` on any failure (a 404 included).
+    pub(crate) fn delete(&self, comment_id: u64) -> bool {
+        let Ok(nwo) = self.write_repo.as_ref() else {
+            return false;
+        };
+        self.inv("pr_lease.delete", AccessIntent::Write, ops::COMMENT_EDIT_DELETE)
+            .args([
+                "api",
+                "-X",
+                "DELETE",
+                &format!("repos/{nwo}/issues/comments/{comment_id}"),
+                "--silent",
+            ])
+            .run()
+            .into_result()
+            .is_ok_and(|o| o.status.success())
+    }
+
     /// `(open, labels)` for `pr`; `None` when unreadable.
     pub(crate) fn pr_state(&self, pr: u64) -> Option<(bool, Vec<String>)> {
         let out = self
@@ -766,7 +829,11 @@ pub(crate) enum PrLeaseAction {
     /// Pre-push / pre-verdict fence. Exit 0 = proceed; 3 = this claimant's
     /// lease is no longer live; 4 = a peer holds this role's lease.
     Fence(Common),
-    /// Stop the renewer and mark this claimant's lease released. Always 0.
+    /// Stop the renewer and mark this claimant's lease released. Exit 0 =
+    /// released, or nothing of this role was live; 8 = nothing matched this
+    /// identity but this host holds a live lease of the role under another
+    /// sweep id (the claim's `--watch-pid`/`--sweep-id` was omitted; the
+    /// output names it), nothing released (#13132).
     Release(ReleaseArgs),
     /// Print `PR_LEASE_STATE=free|held-self|held-peer|unknown` (+ holder).
     /// Exit 0 free/held-self, 4 held-peer, 5 unknown.
@@ -1045,6 +1112,7 @@ impl Ctx {
                 EXIT_PEER
             }
             Ordering::Won | Ordering::Unverified => {
+                self.prune_dead(rows.as_deref());
                 self.start_renewal(own_id, leased_at);
                 self.say(&format!(
                     "lease {own_id} held (host={} sweep={}); add `{}` now",
@@ -1057,6 +1125,17 @@ impl Ctx {
                 println!("{} {}", self.me.host, self.me.sweep);
                 EXIT_HELD
             }
+        }
+    }
+
+    /// Delete this host's dead lease records beyond the newest
+    /// [`KEEP_DEAD_RECORDS`] (#13245). Non-fatal: a failed delete is ignored.
+    fn prune_dead(&self, rows: Option<&[Row]>) {
+        let Some(rows) = rows else { return };
+        let ids = prune_candidates(rows, &self.me.host, (self.now)(), self.ttl, KEEP_DEAD_RECORDS);
+        let gone = ids.iter().filter(|id| self.gh.delete(**id)).count();
+        if gone > 0 {
+            self.say(&format!("pruned {gone} dead lease record(s)"));
         }
     }
 
@@ -1227,7 +1306,9 @@ impl Ctx {
     }
 
     /// `release`: stop the renewer, then rewrite every live lease of this
-    /// identity to the released marker. Best-effort; always 0. `skip_reason`
+    /// identity to the released marker. Best-effort; 0, except [`EXIT_MISMATCH`]
+    /// when nothing matched but this host holds a live lease of the role under
+    /// another sweep id (#13132). `skip_reason`
     /// is the pass's own `--skip-reason` (#11972): a Judge pass that stood
     /// down for pending CI is not recorded if CI has settled since, only if
     /// it is stuck ([`backstop::CiState::exempts`]).
@@ -1240,14 +1321,40 @@ impl Ctx {
         if let Some(path) = &self.lease_file {
             crate::pr_lease_reap::forget_in(path, &self.held());
         }
-        self.release_with(None, skip_reason, outcome, stop_reason)
+        let (code, released) = self.release_with(None, skip_reason, outcome, stop_reason);
+        if released > 0 || code != EXIT_HELD {
+            return code;
+        }
+        // #13132: patched nothing. A live lease of this role written by this
+        // host under a different sweep id means the caller omitted the claim's
+        // identity flag; exiting 0 would read as success and leave it live.
+        let Some(rows) = self.gh.read_rows_retrying(self.pr(), &self.policy) else {
+            return EXIT_HELD;
+        };
+        let stray = live_leases(&rows, self.me.role, (self.now)(), self.ttl)
+            .into_iter()
+            .find(|l| l.holder.host == self.me.host && l.holder != self.me);
+        match stray {
+            Some(l) => {
+                self.say(&format!(
+                    "NOT RELEASED: this host holds a live {} lease under sweep={} (not {}); \
+                     re-run with --sweep-id {} (or the claim's --watch-pid)",
+                    self.me.role.as_str(),
+                    l.holder.sweep,
+                    self.me.sweep,
+                    l.holder.sweep
+                ));
+                EXIT_MISMATCH
+            }
+            None => EXIT_HELD,
+        }
     }
 
     /// `reap`: [`release`](Self::release) on behalf of a claimant the role
     /// runner terminated (#11931). A Judge's reap records the no-verdict pass
     /// whatever the head's CI is doing ([`backstop::reaped_release_fields`]).
     pub(crate) fn reap(&self, reason: &str) -> i32 {
-        self.release_with(Some(reason), None, None, None)
+        self.release_with(Some(reason), None, None, None).0
     }
 
     fn release_with(
@@ -1256,7 +1363,7 @@ impl Ctx {
         skip_reason: Option<&str>,
         outcome: Option<&str>,
         stop_reason: Option<&str>,
-    ) -> i32 {
+    ) -> (i32, usize) {
         let stopped = if self.manage_renewer {
             renew::stop(self)
         } else {
@@ -1268,7 +1375,7 @@ impl Ctx {
         }
         let Some(rows) = self.gh.read_rows_retrying(self.pr(), &self.policy) else {
             self.say("could not read lease records; the lease will age out at the TTL");
-            return EXIT_HELD;
+            return (EXIT_HELD, 0);
         };
         let mut released = 0;
         // #11855: a Judge leaving the PR still waiting for review records it.
@@ -1291,7 +1398,8 @@ impl Ctx {
                 match reaped {
                     None => {
                         let skipped = crate::judge_backstop::skipped_for_pending_ci(skip_reason);
-                        backstop::release_fields(self.me.role, head, |sha| {
+                        let refused = crate::judge_backstop::refusal_token(skip_reason);
+                        backstop::release_fields(self.me.role, head, refused.as_deref(), |sha| {
                             self.gh.ci_state(sha).exempts(skipped)
                         })
                     }
@@ -1328,7 +1436,7 @@ impl Ctx {
             "released"
         };
         self.say(&format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)"));
-        EXIT_HELD
+        (EXIT_HELD, released)
     }
 
     /// `check`.

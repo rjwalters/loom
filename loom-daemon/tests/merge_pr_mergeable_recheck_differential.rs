@@ -31,6 +31,9 @@
 //! tree-clean, tree-conflict) AND the `recheck #N` interpolation was seen
 //! with at least two different `N` values.
 
+mod common;
+
+use common::git;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,17 +54,6 @@ struct Fixtures {
     root: PathBuf,
     work: PathBuf,
     no_origin: PathBuf,
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let rc = Command::new("git")
-        .args(["-C", dir.to_str().unwrap()])
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .status()
-        .expect("git ran");
-    assert!(rc.success(), "git {args:?} in {dir:?} failed");
 }
 
 fn build_fixtures() -> Fixtures {

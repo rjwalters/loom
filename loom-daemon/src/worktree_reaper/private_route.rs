@@ -1,5 +1,6 @@
 //! Host reaping never treats a private job as authority over a host worktree.
 use super::*;
+use crate::worktree_ops::open_backup::BackupRecord;
 /// The shared removal loop behind [`reap_worktrees`] and [`reap_pr_worktrees`]
 /// (issue #5939).
 ///
@@ -21,11 +22,21 @@ use super::*;
 /// the gates decided to remove, immediately before the quarantine or the
 /// removal, and `Some(reason)` keeps the worktree. It is never asked about a
 /// worktree a gate already preserved.
+///
+/// `backup` handles [`WorktreeDecision::RemoveWithBackup`] (issue #12458) —
+/// the worktree of an **open** item the idle gates found reapable — by
+/// pushing a snapshot of its whole state to a remote backup ref and verifying
+/// the remote holds it (`open_backup::backup_to_remote`). The `Ok` record
+/// names what was pushed where, and is logged and recorded in
+/// [`ReapReport::backed_up`] before the removal; `Err(why)` keeps the
+/// worktree, exactly like any other skip. It runs **after** `confirm`, so a
+/// worktree the fresh read keeps is never pushed for nothing.
 pub(super) fn reap_worktrees_generic(
     repo_root: &Path,
     parse_name: &dyn Fn(&str) -> Option<u32>,
     classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
     quarantine: &dyn Fn(&Path, u32) -> Option<String>,
+    backup: &dyn Fn(&Path, u32) -> Result<BackupRecord, String>,
     remove: &dyn Fn(&Path, u32) -> bool,
     confirm: &dyn Fn(u32) -> Option<String>,
 ) -> ReapReport {
@@ -91,6 +102,33 @@ pub(super) fn reap_worktrees_generic(
                     continue;
                 }
             }
+        } else if matches!(decision, WorktreeDecision::RemoveWithBackup) {
+            // #12458: an OPEN item's worktree. The gates say clean, idle and
+            // pushed; the backup is the proof. Nothing is removed until the
+            // remote has been read back holding the snapshot.
+            match backup(&worktree_path, num) {
+                Ok(record) => {
+                    log::warn!(
+                        "worktree_reaper: {} {name} (open item, idle) — pushed a remote \
+                         backup before removal: {}",
+                        repo_root.display(),
+                        record.describe()
+                    );
+                    report.backed_up.push((num, record));
+                }
+                Err(why) => {
+                    clear_stuck_record(&worktree_path);
+                    log::warn!(
+                        "worktree_reaper: {} keeping {name} (open item, idle) — remote backup \
+                         failed, nothing removed: {why}",
+                        repo_root.display()
+                    );
+                    report
+                        .skipped
+                        .push((num, format!("remote backup failed: {why}")));
+                    continue;
+                }
+            }
         } else if let Some(reason) = skip_reason(&decision) {
             // #7939: every `Skip*`/`ConfirmClosedIssue` route below makes this
             // worktree ineligible for removal — via `remove_with_backoff`'s
@@ -132,6 +170,7 @@ pub(super) fn reap_worktrees_confirmed(
     opts: &CleanOptions,
     probes: &WorktreeProbes<'_>,
     quarantine: &dyn Fn(&Path, u32) -> Option<String>,
+    backup: &dyn Fn(&Path, u32) -> Result<BackupRecord, String>,
     remove: &dyn Fn(&Path, u32) -> bool,
     confirm: &dyn Fn(u32) -> Option<String>,
 ) -> ReapReport {
@@ -140,6 +179,7 @@ pub(super) fn reap_worktrees_confirmed(
         &crate::worktree_ops::naming::issue_from_worktree,
         &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
         quarantine,
+        backup,
         remove,
         confirm,
     )
@@ -150,6 +190,7 @@ pub(super) fn reap_pr_worktrees_confirmed(
     repo_root: &Path,
     opts: &CleanOptions,
     probes: &clean::PrWorktreeProbes<'_>,
+    backup: &dyn Fn(&Path, u32) -> Result<BackupRecord, String>,
     remove: &dyn Fn(&Path, u32) -> bool,
     confirm: &dyn Fn(u32) -> Option<String>,
 ) -> ReapReport {
@@ -162,6 +203,7 @@ pub(super) fn reap_pr_worktrees_confirmed(
         // worktrees only, so far) — this closure is unreachable for the
         // `pr-<N>` pass.
         &|_: &Path, _: u32| None,
+        backup,
         remove,
         confirm,
     )
@@ -187,6 +229,7 @@ mod tests {
             &crate::worktree_ops::naming::issue_from_worktree,
             &|_, _| panic!("host worktree classification must not run"),
             &|_, _| panic!("host quarantine must not run"),
+            &|_, _| panic!("host backup must not run"),
             &|_, _| panic!("host removal must not run"),
             &|_| panic!("the confirm must not run"),
         );

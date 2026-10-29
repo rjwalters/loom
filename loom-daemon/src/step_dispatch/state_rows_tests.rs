@@ -31,6 +31,7 @@ fn input(issue: Option<u32>, pr: Option<u32>, verdict: Verdict) -> DrawInput {
             lane: Lane::Normal,
             send_back: false,
             story_points: None,
+            hold_auth: None,
         },
         labels: Vec::new(),
         created_at: Some(t("2026-10-01T00:00:00Z")),
@@ -54,6 +55,9 @@ fn workspace(idx: usize, inputs: &[DrawInput], cooldowns: StepCooldowns) -> Step
         weighing: weigh(inputs, &ctx, &ItemWeights::default()),
         halted: false,
         created_at: Default::default(),
+        merge_slots: 1,
+        merge_concurrency: 1,
+        merges_in_flight: 0,
     }
 }
 
@@ -171,7 +175,8 @@ fn items_the_shaping_took_out_of_the_pool_keep_their_exclusion() {
         &mut ws.weighing,
         &DrawClaims {
             items: [2].into_iter().collect(),
-            merge_in_flight: Some((50, "peer".into())),
+            merges_in_flight: vec![(50, "peer".into())],
+            ..DrawClaims::default()
         },
     );
     exclude_builders(&mut ws.weighing);

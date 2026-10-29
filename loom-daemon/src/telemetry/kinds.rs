@@ -176,12 +176,18 @@ pub mod stage_entry;
 /// still waiting in a pre-ready stage (count, oldest age, age buckets).
 pub mod stage_occupancy;
 
+/// `champion.run` (#13029) — what a Champion merge / hold-reevaluate run decided.
+pub mod champion_run;
+/// `completion.narrated` (#13287) — a public-feed completion the narration sink built.
+pub mod completion_narrated;
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `hold.transition` (#12665) — a hold label applied to or removed from a PR.
 pub mod hold_transition;
 /// `merge.authorization.evaluated` (#12666) — one merge-group authorization evaluation.
 pub mod merge_authorization;
+/// `merge.lane_wait` (#13029) — a Champion merge step held behind another PR's merge.
+pub mod merge_lane_wait;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
 pub mod merge_queue_event;
 /// `merge.queue.observed` (#12667) — the merge queue as one existing read saw it.
@@ -224,9 +230,6 @@ pub mod pass;
 
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
-
-/// `pick.decision` bounded summary (#12974) — the exported form; the full record is archived.
-pub mod pick_summary;
 
 /// `pr.resolved` (#10519) — a PR's merge or close instant, from `fleet.state`.
 pub mod pr_resolved;
@@ -515,6 +518,12 @@ macro_rules! telemetry_kind_table {
             WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
+            /// One public-feed completion the narration sink built (#13287):
+            /// repo, issue, trigger path and whether tokens rode along.
+            /// OTLP-only. See [`completion_narrated`].
+            CompletionNarrated = "completion.narrated" => $crate::telemetry::kinds::completion_narrated::CompletionNarratedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
             /// One daemon-pass write the #9548 credential-scope gate refused
             /// (Issue #12168): repo, credential identity, call site and a
             /// closed reason class. OTLP-only. See [`write_scope_refused`].
@@ -566,6 +575,18 @@ macro_rules! telemetry_kind_table {
             /// structured reason and attempted-vs-confirmed state (#12665).
             /// OTLP-only. See [`hold_transition`].
             HoldTransition = "hold.transition" => $crate::telemetry::kinds::hold_transition::HoldTransitionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
+            /// A Champion merge step entering or leaving the wait behind
+            /// another PR's merge in the same repo (#13029). OTLP-only. See
+            /// [`merge_lane_wait`].
+            MergeLaneWait = "merge.lane_wait" => $crate::telemetry::kinds::merge_lane_wait::MergeLaneWaitRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
+            /// What one Champion merge / hold-reevaluate run decided, with the
+            /// standing-authorization digests it read (#13029). OTLP-only. See
+            /// [`champion_run`].
+            ChampionRun = "champion.run" => $crate::telemetry::kinds::champion_run::ChampionRunRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// The merge queue (order, membership, completeness) as the existing

@@ -15,17 +15,8 @@ import { resolveEffectiveConfig } from "./config-resolver.js";
 /** Global Loom directory in user's home */
 export const LOOM_DIR = join(homedir(), ".loom");
 
-/** Browser console log file path */
-export const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
-
 /** Global state file path */
 export const STATE_FILE = join(LOOM_DIR, "state.json");
-
-/** MCP command file for file-based IPC */
-export const MCP_COMMAND_FILE = join(LOOM_DIR, "mcp-command.json");
-
-/** MCP acknowledgment file for file-based IPC */
-export const MCP_ACK_FILE = join(LOOM_DIR, "mcp-ack.json");
 
 /** Daemon socket path (can be overridden via LOOM_SOCKET_PATH env var) */
 export const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(LOOM_DIR, "loom-daemon.sock");

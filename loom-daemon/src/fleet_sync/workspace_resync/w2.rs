@@ -278,9 +278,14 @@ pub(super) fn attempt(
             // so the alert stays raised and the 6 h backoff paces the next
             // look. W0 clears both.
             let pr = number.map_or(url.clone(), |n| format!("#{n} {url}"));
-            let detail =
-                format!("push refused by a branch rule: {rule}; resync pull request open: {pr}");
+            let installed = report.installed.as_deref().unwrap_or("unknown");
+            let detail = format!(
+                "push refused by a branch rule: {rule}; resync pull request open: {pr} \
+                 (installed v{installed}, target v{})",
+                env.running
+            );
             record_failure(env, report, FailureKind::Protected, &detail, memory, &mut scan.alerts);
+            memory.mark_pr_open(&report.root);
         }
         Err(e) => fail_attempt(env, &candidate.nwo, report, &e, memory, scan),
     }

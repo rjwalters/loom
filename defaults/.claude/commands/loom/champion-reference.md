@@ -573,6 +573,20 @@ roll) is never satisfiable by a class. Revertability is red only for a one-way
 effect that happens on merge or roll, not for one an operator later triggers
 by hand. Absent `coversCriticalFiles`, nothing changes.
 
+**Resync waiver (#13096)**: the one exception to the kept-set hold is not a
+class and has no config key. A `chore(loom): resync installed Loom to vX` PR
+passes the `merge-risk` kept-set entries when `resync_waiver_eval` proves every
+changed kept-set file has the same blob SHA as its `defaults/` counterpart at
+tag `vX` (the title and `.loom/install-metadata.json` must both name `X`). A
+differing byte, a removed or renamed file, a kept-set file with no upstream
+counterpart, a missing tag or a failed read holds as before. So does any changed
+file outside `.loom/` and `.claude/`, or any merge-gate path (`champion*`,
+`judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`, comment trust, `config.json`;
+`RESYNC_GATE_PATTERNS`, #12945). After a resync PR merges, Step 3b closes open
+resync PRs for lower versions as superseded. The pre-merge
+comment lists the tag and each file's SHA. See `champion-pr-merge.md`
+"Resync waiver for the kept-set hold".
+
 **Critical files only (#12648)**: `"criticalFilesOnly": true` narrows a class
 to the critical-file hits. Its `filePatterns`, `excludeFilePatterns` and
 `forbiddenDiffPatterns` are applied to the files the `critical-files` criterion flags (and each

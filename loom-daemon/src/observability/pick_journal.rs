@@ -582,16 +582,25 @@ fn is_marker(line: &str) -> bool {
 }
 
 /// The head Champion pinned for PR `number`, from its pin file
-/// (`$(git rev-parse --git-common-dir)/loom-champion-pin-pr-N`, first token;
-/// `champion-targeted.md` step 1). A local read; `None` when there is none.
+/// (`/tmp/loom-champion/<sha256(git common dir)[..12]>/pin-pr-N`, first
+/// token; `champion-targeted.md` step 1, #13200). A local read; `None` when
+/// there is none.
 fn champion_pin_head(number: u32) -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let text = std::fs::read_to_string(dir.join(format!("loom-champion-pin-pr-{number}"))).ok()?;
+    // The shell side hashes `git rev-parse ... | sha256sum`: the path plus a newline.
+    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let key = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(format!("{common}\n").as_bytes()))[..12].to_string()
+    };
+    let path = PathBuf::from("/tmp/loom-champion")
+        .join(key)
+        .join(format!("pin-pr-{number}"));
+    let text = std::fs::read_to_string(path).ok()?;
     let sha = text.split_whitespace().next()?;
     (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sha.to_string())
 }

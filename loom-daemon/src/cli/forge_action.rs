@@ -526,6 +526,14 @@ pub(crate) enum ForgeAction {
         /// The PR's current head (7-40 lowercase hex).
         #[arg(value_name = "HEAD")]
         head: String,
+
+        /// Paths an operator's release named as the requested change (#13114).
+        /// When the PR's patch differs ONLY in these paths the answer is
+        /// `EQUIVALENCE_KIND=requested-change`; any other delta, or an empty
+        /// list, answers as without the flag. Only Champion's critical-file
+        /// hold passes it; a Judge verdict never carries on this kind.
+        #[arg(long = "allowed-paths", value_name = "PATH", num_args = 1..)]
+        allowed_paths: Vec<String>,
     },
 
     /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
@@ -550,6 +558,29 @@ pub(crate) enum ForgeAction {
         /// Repo-relative path of the changed file.
         #[arg(value_name = "FILE")]
         file: String,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
+    /// `forge additive-migrations <pr> [--repo OWNER/REPO]` (#13102) — is every
+    /// migration file PR `<pr>` touches a newly added `.sql` file containing only
+    /// additive statements (`CREATE TABLE/INDEX IF NOT EXISTS`, `ALTER TABLE … ADD
+    /// COLUMN`, `INSERT OR IGNORE INTO … SELECT`)? Backs Champion's opt-in
+    /// `additiveMigrations` class key.
+    ///
+    /// Exits 0 (`ADDITIVE_MIGRATIONS=1`) ONLY when the whole file list and every
+    /// migration file were read and parsed and nothing else is touched in the
+    /// migration paths. Any other outcome — a forbidden statement, an edited,
+    /// removed or renamed migration, a non-`.sql` migration path, unparsable SQL,
+    /// a forge error — exits 1 with the reason on stderr. Callers treat any
+    /// non-zero exit as "hold".
+    #[command(name = "additive-migrations")]
+    AdditiveMigrations {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
 
         /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
         #[arg(long, value_name = "OWNER/REPO")]
@@ -1260,10 +1291,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             pr_number,
             reviewed,
             head,
+            allowed_paths,
         } => ForgeCmd::VerdictEquivalent {
             pr: pr_number,
             reviewed,
             head,
+            allowed_paths,
         },
         ForgeAction::VersionOnlyDiff {
             pr_number,
@@ -1274,6 +1307,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             file,
             repo,
         }),
+        ForgeAction::AdditiveMigrations { pr_number, repo } => {
+            ForgeCmd::AdditiveMigrations(crate::forge_additive_migrations::Args {
+                pr: pr_number,
+                repo,
+            })
+        }
         ForgeAction::SuspectCriticalDiff {
             pr_number,
             file,

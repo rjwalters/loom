@@ -183,3 +183,6 @@ scripts/tests/lib/heredoc-body-safety.sh
 # #12094 (2026-10-16) — the telemetry-replay CLI and its SigNoz replay queries
 # are deleted; the replay doc goes with them.
 docs/telemetry-replay.md
+
+# #13148 (2026-10-27) — the forked installer sync-labels test is removed with the fork (PR #13213).
+scripts/tests/test-install-sync-labels.sh

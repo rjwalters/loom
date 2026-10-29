@@ -57,6 +57,7 @@ mod tests {
             at: chrono::Utc::now(),
             interval_secs: 300,
             auto_apply: false,
+            auto_apply_writes: Default::default(),
             config: fleet_sync::ConfigPass::default(),
             roster: fleet_sync::RosterPass::default(),
             state: crate::fleet_state::StatePass::default(),
@@ -83,6 +84,7 @@ mod tests {
             at: chrono::Utc::now(),
             interval_secs: 300,
             auto_apply: false,
+            auto_apply_writes: Default::default(),
             config: fleet_sync::ConfigPass::default(),
             roster: fleet_sync::RosterPass::default(),
             state: crate::fleet_state::StatePass {

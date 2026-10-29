@@ -207,6 +207,13 @@ pub fn mark_claude_bad(
     signature: &str,
 ) -> Result<(), String> {
     crate::tokens_pool::bad_tokens::mark_bad(workspace, token_name, reason)?;
+    // Count the exhaustion toward `maybe_auto_unpin` (#13195). Best-effort: a
+    // counter write failure must never lose the mark that was just recorded.
+    let _ = crate::tokens_pool::failure_counts::record_failure(
+        workspace,
+        token_name,
+        crate::tokens_pool::failure_counts::DEFAULT_THRESHOLD,
+    );
     if let Some(reason) = MarkReason::from_claude_signature(signature) {
         record_mark("claude", reason);
     }
