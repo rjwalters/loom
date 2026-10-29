@@ -20,7 +20,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 ### 2026-10-28
 
 - **PR #13260**: test: share assert_grep/assert_no_grep via tests/lib/assert.sh
-- **PR #13258**: Move duplicated assert_grep/assert_no_grep from 30 test suites into lib/assert.sh
+- **Issue #13258** (closed): Move duplicated assert_grep/assert_no_grep from 30 test suites into lib/assert.sh
 - **PR #13257**: fix: honor LOOM_LEASE_TTL_MINUTES in lease ensure reuse check
 - **Issue #13255** (closed): lease ensure reuse check hardcodes 15m TTL instead of honoring LOOM_LEASE_TTL_MINUTES
 - **PR #13253**: fix: reuse orchestrator's live lease in lease ensure and name released renewers
