@@ -25,6 +25,10 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
 - **#13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
+- **#13271**: test: cross-tool guard test for Champion pin/facts commands
+- **#13278**: docs: delete superseded Champion tier-cap and promotion-slice text
+- **#13280**: feat: daemon lands its own resync PR through the merge queue
+- **#13283**: feat: project Judge CI-gate refusals as pass.verdict telemetry
 
 ## Very Important
 
@@ -55,6 +59,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
@@ -71,21 +76,15 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
-- **#10802**: General cleanup: reap agent process residue (dev servers, orphaned children) after any agent exit
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
-- **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes)
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
 - **#13134**: post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
-- **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds
 - **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
-- **#13264**: Sweep Judge leases: claim without --watch-pid breaks post-verdict, backstop blocks the retry, lease not released after verdict
 - **#13268**: Resync must land without the Champion merge path on repos that refuse direct pushes
-- **#13269**: Cross-tool guard test: Champion pin/facts writes must pass both Loom and Repo Skills hooks
-- **#13270**: Resync PR fallback must raise a loom:important attention item (interim for #13268)
+- **#13272**: Simplify: delete the superseded Champion tier-cap and promotion-slice text (#10759, flow review slice C)
 
 ## PRs Awaiting Review
 
@@ -115,6 +114,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
 - **#13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
+- **#13271**: test: cross-tool guard test for Champion pin/facts commands
+- **#13278**: docs: delete superseded Champion tier-cap and promotion-slice text
+- **#13280**: feat: daemon lands its own resync PR through the merge queue
+- **#13283**: feat: project Judge CI-gate refusals as pass.verdict telemetry
 
 ## Proposed
 
@@ -136,7 +139,6 @@ Issues carrying `loom:curated`.
 - **#10512**: Fleet reader-App pool near exhaustion: cut top billable pollers (visibility.repo cache, issue_state ETag, cross-host dedupe) — ~8k REST/h *(curated)*
 - **#10698**: Fleet version floor: the daemon enforces `loom_min_version` from the fleet store, rolls itself forward, and brings each repo's installed Loom up to its own version *(curated)*
 - **#10755**: gh telemetry: record 304 Not Modified as success (not error), stop writing it to the failures log *(curated)*
-- **#10802**: General cleanup: reap agent process residue (dev servers, orphaned children) after any agent exit *(curated)*
 - **#10838**: merge_pr_reconcile_differential: claim-gate differential disagrees on case-variant duplicate label (loom:buildinG) *(curated)*
 - **#10941**: No-PR retry hold fires when the only remaining work is a live check or a cross-repo PR *(curated)*
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default) *(curated)*
@@ -197,11 +199,11 @@ Issues carrying `loom:curated`.
 - **#13185**: Champion ratification hold misses ratification/requests/** — a key-review request PR auto-merged with no key reviews *(curated)*
 - **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
-- **#13238**: [ci-daily] Flake Detection (Rust) *(curated)*
 - **#13264**: Sweep Judge leases: claim without --watch-pid breaks post-verdict, backstop blocks the retry, lease not released after verdict *(curated)*
 - **#13268**: Resync must land without the Champion merge path on repos that refuse direct pushes *(curated)*
 - **#13269**: Cross-tool guard test: Champion pin/facts writes must pass both Loom and Repo Skills hooks *(curated)*
-- **#13270**: Resync PR fallback must raise a loom:important attention item (interim for #13268) *(curated)*
+- **#13272**: Simplify: delete the superseded Champion tier-cap and promotion-slice text (#10759, flow review slice C) *(curated)*
+- **#13274**: Telemetry: emit Judge CI-incomplete refusals (post-verdict exit 5/6) as daemon spans (#10486, flow review slice A) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -229,14 +231,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 16 |
+| Operator merge-risk holds | 20 |
 | Very important | 2 |
 | Important | 13 |
-| Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 15 |
+| Ready (`loom:issue`) | 12 |
+| In Progress (`loom:building`) | 9 |
 | PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 16 |
-| Curated | 82 |
+| Approved PRs awaiting merge | 20 |
+| Curated | 81 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
