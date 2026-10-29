@@ -286,7 +286,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build -p loom-daemon --bin loom-daemon
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: loom-daemon-debug
           path: target/debug/loom-daemon
@@ -335,7 +335,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --package loom-daemon --features otlp
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: loom-daemon-release-linux-amd64
           path: target/release/loom-daemon
@@ -394,7 +394,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
       # --- MCP Server Build ---
@@ -515,7 +515,7 @@ jobs:
         # `ci_telemetry::tests::test_spans` asserts against this file. See
         # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-test-timings-rust-unit-tests-${{ matrix.partition }}-${{ strategy.job-total }}
           path: target/nextest/ci/junit.xml
@@ -548,7 +548,7 @@ jobs:
           fetch-depth: 0
       # download-artifact FAILS when the artifact is missing, so a broken build
       # turns the daemon gates red rather than letting them pass on nothing.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: ${{ !cancelled() }}
         with:
           name: loom-daemon-debug
@@ -1327,7 +1327,7 @@ jobs:
       # Built once by build-daemon (#9065). download-artifact FAILS
       # when the artifact is missing, so a broken build turns this job red
       # rather than letting it pass on nothing (ci-principles.md rule 6).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-debug
           path: target/debug
@@ -1716,7 +1716,7 @@ jobs:
       # Built once by build-daemon (#9065). download-artifact FAILS
       # when the artifact is missing, so a broken build turns this job red
       # rather than letting it pass on nothing (ci-principles.md rule 6).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-debug
           path: target/debug
@@ -2091,7 +2091,7 @@ jobs:
       # Built once by build-daemon (#9065). download-artifact FAILS
       # when the artifact is missing, so a broken build turns this job red
       # rather than letting it pass on nothing (ci-principles.md rule 6).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-debug
           path: target/debug
@@ -2213,7 +2213,7 @@ jobs:
         run: bash defaults/scripts/tests/run-ci-suites.sh
       - name: Upload CI suite retry log (#7791)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-suite-retry-log-${{ matrix.shard }}
           path: /tmp/ci-suite-retry-log.tsv
@@ -2230,7 +2230,7 @@ jobs:
         # defaults/docs/ci-observability.md §"Suite spans (#9089)"), so renaming
         # this silently stops suite spans.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-suite-timings-${{ matrix.shard }}
           path: /tmp/ci-suite-timings.json
@@ -2288,7 +2288,7 @@ jobs:
       # not a build of our own. download-artifact fails on a missing artifact,
       # so a failed producer turns this job red rather than skipped.
       # upload-artifact drops the executable bit, hence the chmod.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-release-linux-amd64
           path: dist
@@ -2313,7 +2313,7 @@ jobs:
             -t ghcr.io/rjwalters/loom-worker:ci-smoke \
             .
       - name: Upload the base image for the smoke jobs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: loom-worker-base-image
           path: /tmp/loom-worker-base.tar
@@ -2365,7 +2365,7 @@ jobs:
         with:
           persist-credentials: false
       # --- Binary staging seam (#10824), same as worker-base-image ---------
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-release-linux-amd64
           path: dist
@@ -2422,7 +2422,7 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download the loom-worker base image
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-worker-base-image
           path: /tmp/loom-worker-base
@@ -2470,7 +2470,7 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download the loom-worker base image
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-worker-base-image
           path: /tmp/loom-worker-base
@@ -2519,7 +2519,7 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download the loom-worker base image
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-worker-base-image
           path: /tmp/loom-worker-base
