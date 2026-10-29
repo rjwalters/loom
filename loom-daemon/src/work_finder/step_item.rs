@@ -60,6 +60,7 @@
 //! | PR `loom:pr` | Champion merge |
 //! | PR with none of those | Champion triage; a draft passes `draft` |
 //! | issue `loom:epic` | pass `epic` |
+//! | issue whose body carries the `<!-- loom:tracker -->` marker | pass `tracker` |
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
@@ -195,6 +196,10 @@ pub struct IssueInput {
     /// yet `loom:issue` ([`super::main_red_fix`], #10118).
     #[serde(default)]
     pub red_fix: bool,
+    /// The body carries the `<!-- loom:tracker -->` marker (#10886, #13244):
+    /// a living tracker with no finite deliverable, never drawn as work.
+    #[serde(default)]
+    pub tracker: bool,
 }
 
 /// A merged PR that references an issue.
@@ -387,6 +392,7 @@ pub enum ItemState {
     Landed,
     Blocked,
     Epic,
+    Tracker,
     Proposal,
     ReviewRequested,
     ChangesRequested,
@@ -491,6 +497,7 @@ pub enum PassReason {
     Blocked,
     CapabilityMissing,
     Epic,
+    Tracker,
     Proposal,
     NoStage,
     /// An open draft PR with no stage label (#12499): unfinished, never Judged.
@@ -505,6 +512,13 @@ pub enum PassReason {
     /// tick's gather applies it (`step_dispatch::gather::hold_at_recorded_head`),
     /// because a `PullInput` carries no head SHA.
     HeldAtHead,
+    /// A curated issue the promotion author gate holds (#10827) whose verdict
+    /// would be the same again (#13142): its trusted gate marker names the
+    /// issue's current title and body and the current trust rules, and no
+    /// `loom:issue` has been applied. The classifier never answers it: the
+    /// step tick's gather applies it
+    /// (`step_dispatch::gather::hold_author_gated`).
+    AuthorGateHeld,
 }
 
 impl PassReason {
@@ -522,11 +536,13 @@ impl PassReason {
             Self::Blocked => "blocked",
             Self::CapabilityMissing => "capability_missing",
             Self::Epic => "epic",
+            Self::Tracker => "tracker",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
             Self::Draft => "draft",
             Self::CiPending => "ci_pending",
             Self::HeldAtHead => "held_at_head",
+            Self::AuthorGateHeld => "author_gate_held",
         }
     }
 }
@@ -803,6 +819,9 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     let pass = |s: ItemState, r: PassReason| (s, Verdict::Pass(r));
     if has(labels, super::EPIC_LABEL) {
         return pass(ItemState::Epic, PassReason::Epic);
+    }
+    if issue.tracker {
+        return pass(ItemState::Tracker, PassReason::Tracker);
     }
     // A proposal that is already promoted (`loom:issue`) or curated is item
     // work; Champion's own proposal query skips those too (`champion.md`

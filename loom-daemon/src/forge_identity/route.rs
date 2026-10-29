@@ -711,6 +711,33 @@ fn log_owner_uncovered(owner: &str, now: SystemTime) {
     }
 }
 
+/// Counter bumped per read shed because the reader roster failed to load.
+pub(crate) const ROSTER_LOAD_FAILED: &str = "forge_identity.roster_load_failed";
+
+/// How often a roster load failure is logged at `error`.
+const LOAD_FAILED_LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// Count (always) and log (at most every [`LOAD_FAILED_LOG_EVERY`]) a read
+/// shed because the reader roster failed to load.
+fn note_roster_load_failed(now: SystemTime) {
+    static LAST: OnceLock<Mutex<Option<SystemTime>>> = OnceLock::new();
+    let n = crate::forge_call_stats::counters::bump(ROSTER_LOAD_FAILED);
+    let Ok(mut last) = LAST.get_or_init(|| Mutex::new(None)).lock() else {
+        return;
+    };
+    let due = last.is_none_or(|at| {
+        now.duration_since(at)
+            .is_ok_and(|d| d >= LOAD_FAILED_LOG_EVERY)
+    });
+    if due {
+        *last = Some(now);
+        log::error!(
+            "forge_identity: the reader roster failed to load (a config tier is unreadable or              malformed), so reads are shed, never sent to the writer, until it loads              ({ROSTER_LOAD_FAILED}={n}; logged at most every {}s)",
+            LOAD_FAILED_LOG_EVERY.as_secs()
+        );
+    }
+}
+
 /// What [`route_read_in`] needs beyond the roster.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteEnv<'a> {
@@ -773,6 +800,16 @@ pub fn route_read_in(
     let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo);
     if owner.is_empty() {
         return RouteDecision::NoPool;
+    }
+    if roster.load_failed && roster.readers.is_empty() {
+        // A broken config looks like "no readers configured", and `NoPool`
+        // sends the read to the writer, which never serves reads (#12394):
+        // shed it instead (#12511).
+        note_roster_load_failed(now);
+        return RouteDecision::Exhausted {
+            until: now + forge_read_pool::DEFAULT_WITHDRAWAL,
+            cause: ExhaustCause::Unavailable,
+        };
     }
     // Legacy: the pre-W4 walk exactly — every reader, no owners filter.
     let readers: Vec<&Identity> = if legacy {

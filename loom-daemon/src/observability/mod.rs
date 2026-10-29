@@ -105,7 +105,6 @@ pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
 pub mod pick_journal;
-pub mod pick_payload_archive;
 pub mod queue;
 pub mod queue_blocked;
 pub mod repo_ref;

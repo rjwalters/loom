@@ -14,97 +14,8 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { CONSOLE_LOG_PATH, getWorkspacePath, readConfigFile } from "../shared/config.js";
+import { getWorkspacePath, readConfigFile } from "../shared/config.js";
 import { sendDaemonRequest } from "../shared/daemon.js";
-import { writeMCPCommand } from "../shared/ipc.js";
-
-/**
- * Desktop-app (retired Electron UI) console-log-derived signal — the ONLY
- * signal `getHeartbeat` used before Issue #4794. `status` here is never
- * surfaced verbatim as the top-level heartbeat status anymore (see
- * {@link classifyHeartbeat}) — it is folded into `desktopApp` in the response
- * so a healthy daemon with a stale/absent desktop log never reports
- * top-level `stale`.
- */
-export interface DesktopLogStatus {
-  status: "healthy" | "active" | "idle" | "stale" | "unknown" | "not_running";
-  message: string;
-  lastLogTime: string | null;
-  logCount: number;
-  recentLogs?: string[];
-}
-
-/**
- * Read the retired Electron desktop app's console log and classify its
- * freshness. This is a legacy signal (the desktop app has been retired in
- * favor of the Rust `loom-daemon`) — see {@link classifyHeartbeat} for how it
- * is combined with actual daemon liveness.
- */
-async function getDesktopLogStatus(): Promise<DesktopLogStatus> {
-  try {
-    await access(CONSOLE_LOG_PATH);
-    const content = await readFile(CONSOLE_LOG_PATH, "utf-8");
-    const lines = content.split("\n").filter(Boolean);
-
-    if (lines.length === 0) {
-      return {
-        status: "unknown",
-        message: "Console log is empty - app may not have started yet",
-        lastLogTime: null,
-        logCount: 0,
-      };
-    }
-
-    // Get last log entry
-    const lastLine = lines[lines.length - 1];
-    const timestampMatch = lastLine.match(/\[([^\]]+)\]/);
-    const lastLogTime = timestampMatch ? timestampMatch[1] : null;
-
-    // Calculate time since last log
-    let timeSinceLastLog = "unknown";
-    let status: DesktopLogStatus["status"] = "unknown";
-    if (lastLogTime) {
-      const lastLogDate = new Date(lastLogTime);
-      const now = new Date();
-      const diffMs = now.getTime() - lastLogDate.getTime();
-      const diffSeconds = Math.floor(diffMs / 1000);
-
-      if (diffSeconds < 10) {
-        status = "healthy";
-        timeSinceLastLog = `${diffSeconds}s ago`;
-      } else if (diffSeconds < 60) {
-        status = "active";
-        timeSinceLastLog = `${diffSeconds}s ago`;
-      } else if (diffSeconds < 300) {
-        status = "idle";
-        const diffMinutes = Math.floor(diffSeconds / 60);
-        timeSinceLastLog = `${diffMinutes}m ago`;
-      } else {
-        status = "stale";
-        const diffMinutes = Math.floor(diffSeconds / 60);
-        timeSinceLastLog = `${diffMinutes}m ago`;
-      }
-    }
-
-    return {
-      status,
-      message: `Last log entry was ${timeSinceLastLog}`,
-      lastLogTime,
-      logCount: lines.length,
-      recentLogs: lines.slice(-5),
-    };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return {
-        status: "not_running",
-        message: "Console log file not found - app is not running or console logging is disabled",
-        lastLogTime: null,
-        logCount: 0,
-      };
-    }
-    throw error;
-  }
-}
 
 /**
  * Best-effort daemon liveness/detail probe used by {@link getHeartbeat}.
@@ -153,44 +64,16 @@ async function probeDaemon(): Promise<DaemonProbeResult> {
 }
 
 /**
- * Combine the daemon liveness probe with the (legacy) desktop-app log signal
- * into the final heartbeat payload (Issue #4794).
+ * Turn the daemon liveness probe into the heartbeat payload.
  *
- * Before this, `get_heartbeat` derived its ENTIRE status from the retired
- * Electron desktop app's console log, so a perfectly healthy `loom-daemon`
- * with an ancient/absent desktop log (the common case now that the desktop
- * app is retired) was reported as `status: "stale"` / `"not_running"` — the
- * wrong answer for "is the fleet running?". Now:
- *
- * - A live daemon always yields a top-level `daemon_healthy` status,
- *   regardless of desktop-log freshness — the daemon is the source of truth.
- * - A dead/unreachable daemon falls back to the desktop-log-derived status
- *   (preserving the original behavior for hosts that still run the legacy
- *   desktop app, or as a last-resort diagnostic when neither is running).
- * - The raw desktop-log signal is always included under `desktopApp` so
- *   nothing is lost relative to the old response shape.
+ * The daemon is the only source of truth: `daemon_healthy` when it answers
+ * on its Unix socket, `daemon_unreachable` otherwise.
  */
-export function classifyHeartbeat(
-  daemon: DaemonProbeResult,
-  desktopApp: DesktopLogStatus
-): {
-  status: string;
+export function classifyHeartbeat(daemon: DaemonProbeResult): {
+  status: "daemon_healthy" | "daemon_unreachable";
   message: string;
-  daemon: { alive: boolean; inFlightSweeps: number | null };
-  desktopApp: DesktopLogStatus;
-  // Legacy top-level fields preserved for backwards compatibility with
-  // existing callers that read `lastLogTime` / `logCount` / `recentLogs`
-  // directly off the heartbeat response instead of `desktopApp.*`.
-  lastLogTime: string | null;
-  logCount: number;
-  recentLogs?: string[];
+  daemon: DaemonProbeResult;
 } {
-  const legacyFields = {
-    lastLogTime: desktopApp.lastLogTime,
-    logCount: desktopApp.logCount,
-    recentLogs: desktopApp.recentLogs,
-  };
-
   if (daemon.alive) {
     const sweepNote =
       daemon.inFlightSweeps === null
@@ -198,33 +81,23 @@ export function classifyHeartbeat(
         : ` (${daemon.inFlightSweeps} sweep${daemon.inFlightSweeps === 1 ? "" : "s"} in flight)`;
     return {
       status: "daemon_healthy",
-      message: `loom-daemon is responding on its Unix socket${sweepNote}. Desktop app console log status: ${desktopApp.status} (${desktopApp.message}).`,
+      message: `loom-daemon is responding on its Unix socket${sweepNote}.`,
       daemon,
-      desktopApp,
-      ...legacyFields,
     };
   }
 
-  // Daemon unreachable — fall back to the desktop-log-derived status, but
-  // make the daemon's absence explicit so "stale" never gets misread as
-  // "the fleet is down" when it may simply mean "no desktop app installed".
   return {
-    status: desktopApp.status,
-    message: `${desktopApp.message} (loom-daemon did not respond on its Unix socket — this reflects the retired desktop app's log only, not fleet health)`,
+    status: "daemon_unreachable",
+    message: "loom-daemon did not respond on its Unix socket.",
     daemon,
-    desktopApp,
-    ...legacyFields,
   };
 }
 
 /**
- * Get app heartbeat - check daemon liveness first (Issue #4794), falling
- * back to the retired desktop app's console log only when the daemon itself
- * is unreachable.
+ * Get heartbeat - reports loom-daemon liveness over its Unix socket.
  */
 async function getHeartbeat(): Promise<string> {
-  const [daemon, desktopApp] = await Promise.all([probeDaemon(), getDesktopLogStatus()]);
-  return JSON.stringify(classifyHeartbeat(daemon, desktopApp), null, 2);
+  return JSON.stringify(classifyHeartbeat(await probeDaemon()), null, 2);
 }
 
 /**
@@ -318,52 +191,18 @@ async function getUIState(): Promise<string> {
  * - read_console_log: Use `tail ~/.loom/console.log` for debugging
  * - read_state_file: Use get_ui_state instead (provides state + more context)
  * - read_config_file: Use get_ui_state instead (provides config + more context)
- * - trigger_factory_reset: Use trigger_force_factory_reset (bypasses confirmation)
+ * - trigger_start, trigger_force_start, trigger_force_factory_reset, stop_engine: removed; they
+ *   relied on a file IPC nothing consumed (the daemon is driven via dispatch_sweep etc.)
+ * - trigger_factory_reset: Removed with the tools above
  * - trigger_restart_terminal: Use restart_terminal from terminals module
- * - trigger_run_now: Use launch_interval from terminals module
+ * - trigger_run_now: Removed (launch_interval was removed too)
  * - get_random_file: Use .loom/scripts/random-file.sh instead
  */
 export const uiTools: Tool[] = [
   {
-    name: "trigger_start",
-    description:
-      "Start the Loom engine using EXISTING workspace config (.loom/config.json). Shows confirmation dialog before creating terminals and launching agents. Does NOT reset or overwrite config. Use this to restart terminals with current configuration (e.g., after app restart or crash). Requires workspace to be selected.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "trigger_force_start",
-    description:
-      "Start the Loom engine using existing config WITHOUT confirmation dialog. Same as trigger_start but bypasses confirmation prompt. Use this for MCP automation, testing, or when you're certain the user wants to start. Does NOT reset config. Requires workspace to be selected.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "trigger_force_factory_reset",
-    description:
-      "Reset workspace to factory defaults WITHOUT confirmation dialog. Overwrites .loom/config.json with defaults/config.json. Does NOT auto-start - must run trigger_force_start after reset to create terminals. Use this for MCP automation or when you're certain the user wants to reset.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
     name: "get_heartbeat",
     description:
-      "Get Loom's heartbeat status. Checks the running loom-daemon over its Unix socket FIRST (status 'daemon_healthy' whenever the daemon responds, with an in-flight sweep count) and only falls back to the retired Electron desktop app's console log (healthy/active/idle/stale/not_running) when the daemon itself is unreachable. Returns both signals: top-level status/message plus 'daemon' and 'desktopApp' detail objects.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "stop_engine",
-    description:
-      "Stop the Loom engine by destroying all terminal sessions and cleaning up resources. This will close all terminals and stop all running agents. Use trigger_start or trigger_force_start to restart the engine afterwards.",
+      "Get Loom's heartbeat status. Checks the running loom-daemon over its Unix socket: status 'daemon_healthy' (with an in-flight sweep count) when it responds, 'daemon_unreachable' otherwise. Returns top-level status/message plus a 'daemon' detail object.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -388,29 +227,9 @@ export async function handleUITool(
   _args?: Record<string, unknown>
 ): Promise<{ type: "text"; text: string }[]> {
   switch (name) {
-    case "trigger_start": {
-      const result = await writeMCPCommand("trigger_start");
-      return [{ type: "text", text: result }];
-    }
-
-    case "trigger_force_start": {
-      const result = await writeMCPCommand("trigger_force_start");
-      return [{ type: "text", text: result }];
-    }
-
-    case "trigger_force_factory_reset": {
-      const result = await writeMCPCommand("trigger_force_factory_reset");
-      return [{ type: "text", text: result }];
-    }
-
     case "get_heartbeat": {
       const heartbeat = await getHeartbeat();
       return [{ type: "text", text: heartbeat }];
-    }
-
-    case "stop_engine": {
-      const result = await writeMCPCommand("stop_engine");
-      return [{ type: "text", text: result }];
     }
 
     case "get_ui_state": {

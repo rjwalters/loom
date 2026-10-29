@@ -268,7 +268,6 @@ Loom provides a unified MCP server (`mcp-loom`) for AI-powered testing and debug
 **UI Tools:**
 - `read_state_file` - Application state
 - `read_config_file` - Terminal configurations
-- `trigger_force_start` - Start engine
 - `trigger_factory_reset` - Reset to defaults
 - `get_heartbeat` - Health status
 

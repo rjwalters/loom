@@ -200,3 +200,25 @@ fn two_pools_holding_from_the_same_instant_get_distinct_ids() {
     let again = hold_span(&a, since, cleared + Duration::seconds(5), true, 3);
     assert_eq!(again.context, x.context, "a re-reported hold keeps its IDs");
 }
+
+/// #13195: an attributed exhaustion mark feeds the consecutive-failure counter,
+/// so every pinned account reaching the threshold lets `maybe_auto_unpin` fire.
+#[test]
+fn claude_exhaustion_marks_drive_auto_unpin() {
+    use crate::tokens_pool::{allowlist, failure_counts, maybe_auto_unpin};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.token"), "key-a").unwrap();
+    allowlist::write_allowlist(tmp.path(), &["a".to_string()]).unwrap();
+
+    for _ in 0..failure_counts::DEFAULT_THRESHOLD - 1 {
+        mark_claude_bad(tmp.path(), "a", "exhausted: rate-limited", "rate-limited").unwrap();
+    }
+    assert!(maybe_auto_unpin(tmp.path()).is_none());
+
+    mark_claude_bad(tmp.path(), "a", "exhausted: rate-limited", "rate-limited").unwrap();
+    assert!(maybe_auto_unpin(tmp.path()).is_some());
+    assert!(allowlist::read_allowlist(tmp.path()).is_empty());
+}

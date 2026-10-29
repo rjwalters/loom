@@ -185,7 +185,7 @@ stateDiagram-v2
 **Developer Experience**
 - Git worktree isolation per issue
 - Simple slash command: `/loom:sweep 42` runs a single issue end-to-end
-- MCP integration for programmatic control (30 tools)
+- MCP integration for programmatic control (23 tools)
 - Crash-safe checkpoints: restart `/loom:sweep N` to resume from the last completed phase
 
 ## Forge Support

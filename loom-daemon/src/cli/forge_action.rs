@@ -534,6 +534,12 @@ pub(crate) enum ForgeAction {
         /// hold passes it; a Judge verdict never carries on this kind.
         #[arg(long = "allowed-paths", value_name = "PATH", num_args = 1..)]
         allowed_paths: Vec<String>,
+
+        /// `OWNER/REPO` every forge read targets (#13146). Without it `gh`
+        /// resolves the repository from the process cwd (or `LOOM_REPO`), so a
+        /// caller outside the checkout fails every read at once.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
     },
 
     /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
@@ -1299,11 +1305,13 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             reviewed,
             head,
             allowed_paths,
+            repo,
         } => ForgeCmd::VerdictEquivalent {
             pr: pr_number,
             reviewed,
             head,
             allowed_paths,
+            repo,
         },
         ForgeAction::VersionOnlyDiff {
             pr_number,

@@ -466,6 +466,17 @@ fn unchanged_issue_body_proceeds() {
 }
 
 #[test]
+fn same_user_ci_flake_note_does_not_refuse_an_approval() {
+    let mut note = human(8, "2026-10-06T13:30:00Z");
+    note["body"] = json!("CI flake rerun: `t` failed on `job`.\n<!-- loom:ci-flake-note -->");
+    let d = gate(VerdictKind::Approved, &[note], Some(started()), Some(&[]));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+    let bare = human(9, "2026-10-06T13:30:00Z");
+    let d = gate(VerdictKind::Approved, &[bare], Some(started()), Some(&[]));
+    assert!(matches!(d, Decision::Refuse(_)), "a marker-less comment still refuses: {d:?}");
+}
+
+#[test]
 fn human_issue_comment_after_start_refuses() {
     let iss = [issue(9, "b", "b", vec![human(5, "2026-10-06T13:30:00Z")])];
     let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
@@ -512,6 +523,8 @@ fn dispatch_epoch_is_read_from_the_step_sweep_id() {
     assert_eq!(t("step-judge-12512-1792184656"), Some(1_792_184_656));
     assert_eq!(t("step-judge-12512-1792184656-r2"), Some(1_792_184_656));
     assert_eq!(t("sweep-issue-12512-1792184656"), None);
+    // An in-session orchestrator run id must never be read as a dispatch time (#13222).
+    assert_eq!(t("sweep-20261027T183521Z-75446-0a9c5bc7"), None);
     assert_eq!(t("step-judge-12512"), None);
     assert_eq!(t(""), None);
 }

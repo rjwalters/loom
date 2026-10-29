@@ -160,7 +160,7 @@ fn a_not_found_through_the_gateway_is_not_an_outage() {
     assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
     assert_eq!(s.calls(), ["gateway"], "writer stub NOT invoked");
     assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
-    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::Coverage)]);
+    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::CoverageUnproven)]);
 
     // No evidence, a reader behind it: the reader serves the read.
     let s = stub(NOT_FOUND, OK, NOT_FOUND);
@@ -168,7 +168,7 @@ fn a_not_found_through_the_gateway_is_not_an_outage() {
     assert!(ok(&out), "{out:?}");
     assert_eq!(s.calls(), ["gateway", "reader"]);
     assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
-    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::Coverage)]);
+    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::CoverageUnproven)]);
 
     // The gateway recently served the repo's `issues`: its 404 is the answer.
     crate::forge_identity::served::note_reader_served(

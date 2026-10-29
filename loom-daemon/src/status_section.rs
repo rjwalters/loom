@@ -78,6 +78,7 @@ pub enum StatusSection {
     Safehouse,
     PeerClaims,
     Protection,
+    AgentResidue,
     JournalAdoptedAtStartup,
     FleetStore,
     PendingRestart,
@@ -160,6 +161,7 @@ impl StatusSection {
             S::Safehouse => ("safehouse", &["safehouse"]),
             S::PeerClaims => ("peer_claims", &["peer_claims"]),
             S::Protection => ("protection", &["protection"]),
+            S::AgentResidue => ("agent_residue", &["agent_residue"]),
             S::JournalAdoptedAtStartup => {
                 ("journal_adopted_at_startup", &["journal_adopted_at_startup"])
             }

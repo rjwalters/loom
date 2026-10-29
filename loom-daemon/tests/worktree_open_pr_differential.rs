@@ -36,6 +36,9 @@
 //! Test 8 Gitea-decline shape and the two no-forge-remote/no-remote-at-all
 //! cases that skip the forge round-trip entirely.
 
+mod common;
+
+use common::git;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,22 +49,6 @@ fn bin() -> &'static str {
 
 fn lib_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts/lib/worktree-forge-pr-check.sh")
-}
-
-fn hermetic(cmd: &mut Command) -> &mut Command {
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = hermetic(Command::new("git").arg("-C").arg(dir).args(args))
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 
 struct Fx {
