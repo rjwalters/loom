@@ -162,6 +162,35 @@ comment carrying two further markers:
 No marker comment is ever rewritten or deleted. A cleared notice ends an episode;
 a later FAIL is a fresh episode, never a permanent exemption.
 
+## Queue-mode handoff for a released PR (#13321)
+
+The release is the operator's decision; on a `merge-queue` repo the merge itself is
+not the operator's to finish. `merge-pr.sh` holds (exit 5) for lack of the
+`loom/merge-authorization` context that only the queue handoff posts, and
+`forge merge-queue step` needs the status-posting credential, which lives on fleet
+hosts by design. Left alone, a released PR sat green and approved forever, and the only
+exit was disabling the ruleset by hand.
+
+So when the tick finds `loom-daemon forge merge-queue mode` answering a literal
+`mode=queue`, a **released** PR is handed to the queue by Champion, exactly as an
+ordinary approved PR is: the tick prints `CF-RELEASED-HANDOFF pr=N head=<sha>`,
+`critical-files` is treated as passed for that pass, the other criteria run as usual,
+and Step 3 calls `forge merge-queue step --approved-sha <sha>` with the released head.
+No new marker, flag or config key: the existing release record is the evidence.
+
+The handoff is gated, each leg failing closed:
+
+| Case | Result |
+|---|---|
+| `released` at the current head (or carried there by #9416/#13114 equivalence), trusted record, `loom:blocked` absent | handoff |
+| `held`, `none`, `stands`, `rearm`, `defer` (untrusted or unreadable marker read) | no handoff |
+| `loom:blocked` present (it is shared with the `merge-risk` hold) | no handoff |
+| head moved after the release and not provably equivalent | re-armed hold, no handoff; Step 3 also re-reads the head and refuses a mismatch |
+| direct mode, an older daemon, an unreadable `mode` answer | no handoff; the operator merges with `merge-pr.sh`, as before |
+
+Step 3 never merges a handed-off PR directly: a `DIRECT` answer from `merge-queue step`
+is not a merge for it. Who may release and the hold criteria are unchanged.
+
 ## Workflow files need the `workflow` token scope (#10539)
 
 A hold whose PR touches `.github/workflows/` ends in a human `merge-pr.sh`, and

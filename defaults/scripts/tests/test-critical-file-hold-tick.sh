@@ -119,6 +119,13 @@ case "\$1 \$2" in
   "forge trusted-comments")
     [ -e "\$S/trust_down" ] && { echo "forge trusted-comments: --fetch failed" >&2; exit 1; }
     jq -c --arg bot "$BOT" '[.[] | select(.author.login == \$bot or .author.login == "rjwalters")]' "\$S/comments.json" ;;
+  "forge merge-queue")
+    [ "\$3" = mode ] || exit 0
+    case "\$(cat "\$S/qmode" 2>/dev/null)" in
+      queue) echo "merge-queue: mode=queue source=config execution=enabled" ;;
+      broken) exit 2 ;;
+      *) echo "merge-queue: mode=direct source=config execution=enabled" ;;
+    esac ;;
   "forge verdict-equivalent")
     rec=\$4 head=\$5
     printf '%s\n' "\$*" >>"\$S/ve.argv"
@@ -169,7 +176,7 @@ chmod +x "$T/bin/gh" "$T/bin/loom-daemon" "$T/w/.loom/scripts/"*.sh
 # --- harness -------------------------------------------------------------------
 reset() { # <head>
     echo '[]' >"$T/comments.json"; echo '[]' >"$T/events.json"; : >"$T/labels"; echo "$1" >"$T/head"
-    echo repo >"$T/mode"; rm -f "$T/trust_down" "$T/last_why" "$T/ve.argv" "$T/triggers"
+    echo repo >"$T/mode"; echo direct >"$T/qmode"; rm -f "$T/trust_down" "$T/last_why" "$T/ve.argv" "$T/triggers"
 }
 tick() { # [FAIL|PASS] — sets WRITES (";"-joined) and OUT
     : >"$T/writes"
@@ -336,6 +343,45 @@ reset "$A"
 tick
 check "0" "$(jq -r '[.[].body | select(contains("Matched suspect line"))] | length' "$T/comments.json")" \
     "a plain pattern hit (no suspect line) carries no matched-line bullet"
+
+handoff() { grep -q "^CF-RELEASED-HANDOFF pr=$PR head=$1" <<<"$OUT" && echo yes || echo no; }
+
+echo "--- #13321: a released critical-file PR on a queue repo is handed to the queue ---"
+reset "$A"; echo queue >"$T/qmode"
+tick; check "no" "$(handoff "$A")" "fresh hold on a queue repo: not handed off"
+operator_release
+tick; check "COMMENT:released:same-head" "$WRITES" "queue repo: release recorded as before"
+check "yes" "$(handoff "$A")" "release at the current head: handoff pinned to the released head"
+grep -q 'merge queue' "$T/comments.json"; check 0 "$?" "release comment says the queue merges it, not the operator"
+tick; check "yes" "$(handoff "$A")" "repeat tick at the released head: handoff persists"
+push "$B"; tick
+check "yes" "$(handoff "$B")" "tree-identical head move: carried by equivalence, handoff at the new head"
+push "$D"; tick
+check "COMMENT:hold(rearm);LABEL+:loom:blocked" "$WRITES" "a new head that is not equivalent re-arms the hold"
+check "no" "$(handoff "$D")" "re-armed at a moved head: no handoff"
+tick; check "no" "$(handoff "$D")" "label back on: still no handoff"
+
+echo "--- #13321: unreleased, untrusted, shared-label and direct cases never hand off ---"
+reset "$A"; echo queue >"$T/qmode"; tick; tick
+check "no" "$(handoff "$A")" "held, never released: no handoff"
+reset "$A"; echo queue >"$T/qmode"; tick; operator_release; tick; operator_reassert; tick
+check "no" "$(handoff "$A")" "operator re-added loom:blocked (shared with merge-risk): no handoff"
+reset "$A"; echo queue >"$T/qmode"; comment_as outsider "$forged"
+tick; check "no" "$(handoff "$A")" "outsider-forged release marker: no handoff"
+reset "$A"; echo queue >"$T/qmode"; comment_as outsider "$forged"; touch "$T/trust_down"
+tick; check "no" "$(handoff "$A")" "forged release, trust filter down: no handoff"
+reset "$A"; echo queue >"$T/qmode"; tick; operator_release; tick; push "$B"; touch "$T/trust_down"
+tick; check "no" "$(handoff "$B")" "genuine release but trust filter down: deferred, no handoff"
+reset "$A"; echo queue >"$T/qmode"; comment_as "$BOT" "As the notice said:
+> $forged"
+tick; check "no" "$(handoff "$A")" "quoted release marker: no handoff"
+reset "$A"; tick; operator_release; tick
+check "no" "$(handoff "$A")" "direct-mode repo: released PR is not handed off (operator merges)"
+grep -q 'merge-pr.sh' "$T/comments.json"; check 0 "$?" "direct mode: release comment still points at merge-pr.sh"
+reset "$A"; echo broken >"$T/qmode"; tick; operator_release; tick
+check "no" "$(handoff "$A")" "mode unreadable: fails closed to direct, no handoff"
+reset "$A"; echo queue >"$T/qmode"; tick PASS
+check "no" "$(handoff "$A")" "PASS (no critical file): the tick emits no handoff"
 
 echo
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed, $TESTS_FAILED failed"
