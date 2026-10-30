@@ -186,7 +186,9 @@ fn row(index: usize, element: &serde_json::Value) -> Row {
         // A non-negative JSON integer, or a digit string — `jq`'s `"\(.number)"`
         // rendered either identically.
         Some(serde_json::Value::Number(n)) if n.as_u64().is_some() => n.to_string(),
-        Some(serde_json::Value::String(s)) if is_ascii_digits(s) => s.clone(),
+        Some(serde_json::Value::String(s)) if crate::worktree_ops::naming::is_issue_digits(s) => {
+            s.clone()
+        }
         other => {
             return Row::Malformed {
                 index,
@@ -250,7 +252,7 @@ fn json_kind(value: &serde_json::Value) -> String {
 pub fn issue_from_branch(branch: &str) -> Option<String> {
     for prefix in super::stacked_children::STACKABLE_PARENT_PREFIXES {
         if let Some(rest) = branch.strip_prefix(prefix) {
-            return if is_ascii_digits(rest) {
+            return if crate::worktree_ops::naming::is_issue_digits(rest) {
                 Some(rest.to_string())
             } else {
                 None
@@ -258,16 +260,6 @@ pub fn issue_from_branch(branch: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// A non-empty run of ASCII digits and nothing else — `[0-9]+` under an anchored
-/// ERE. `all`, not `any`: one digit anywhere is not what `^…([0-9]+)$` accepted,
-/// and reading `feature/issue-12a` as issue `12a` would address the claim lookup
-/// at an issue that does not exist, whose "no labels" answer is the route that
-/// force-pushes. `!s.is_empty()` carries the `+` — `all` is vacuously true on the
-/// empty slice, which is exactly the `feature/issue-` case the `+` rejects.
-fn is_ascii_digits(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Which route one child takes.

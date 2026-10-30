@@ -160,7 +160,7 @@ pub fn issue_from_branch(branch: &str) -> Option<u32> {
                     .next()
                     .is_none_or(|c| matches!(c, '-' | '_' | '.'));
                 if boundary_ok {
-                    return digits.parse::<u32>().ok();
+                    return crate::worktree_ops::naming::parse_issue_digits(&digits);
                 }
             }
         }
