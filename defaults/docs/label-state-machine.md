@@ -356,6 +356,19 @@ issue; an automated Champion verdict alone is not adoption. Trusted authors see 
 change. This is admission control for external submissions, not protection against
 a compromised trusted agent, and it adds no signed decisions or keys.
 
+**Workflow-filed CI trackers (#13337).** `ci-daily.yml` files its `[ci-daily]`
+trackers as `github-actions[bot]`, which is neither a repo insider nor a fleet App,
+so they stalled at `loom:curated`. This repo lists that login in
+`forge.trustedCommenters` (`.loom/config.json`), the same allowlist the predicate
+above already reads, so Champion promotes those trackers on the Curator spec like
+any trusted filer. The trade-off: the allowlist is per login, not per workflow, so
+every issue or comment authored by `github-actions[bot]` here is now trusted. That
+is acceptable because only a writer can add a workflow, and no workflow in
+`.github/workflows/` has a `pull_request_target` or `issue_comment` trigger that
+could carry untrusted text into a bot-authored comment (checked 2026-10-30; re-check
+before adding one). A per-workflow predicate is out of scope. A bot not on the list
+(e.g. `dependabot[bot]`) stays `UNTRUSTED`.
+
 ## Current implementation
 
 - **The `merge-risk` criterion (merge-risk hold)** — `champion-pr-merge.md`: entry in
