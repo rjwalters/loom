@@ -1596,7 +1596,7 @@ pub fn force_refresh_owner_credential_with(
 }
 
 /// The mint + publish + register core shared by [`force_refresh_owner_credential_with`]
-/// and [`force_refresh_owner_credential_for_repo_with`]: force-mints for
+/// and [`force_refresh_owner_credential_for_repo`]: force-mints for
 /// `owner_repo`'s owner and publishes into the owner's `gh` config dir,
 /// returning that dir on success.
 fn force_mint_owner_credential(
