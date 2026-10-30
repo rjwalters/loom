@@ -134,10 +134,13 @@ A park written to a forge that lacks `loom:operator` (a consumer repo that never
 **Same pre-wave timing and sibling role as the five checks above** — run it and surface its output to the user:
 
 ```bash
-./.loom/scripts/sync-labels.sh --check 2>&1 | grep -E '^MISSING (loom:(operator|blocked|frozen|issue|curated|building)) '
+out=$(./.loom/scripts/sync-labels.sh --check 2>&1); rc=$?   # capture first: a pipe would hide the exit status
+printf '%s\n' "$out" | grep -E '^[[:space:]]*MISSING[[:space:]]+loom:(operator|blocked|frozen|issue|curated|building)[[:space:]]'
 ```
 
-Advisory-only: **must not block** the sweep, strictly **read-only** (`--check` never creates a label). Reuse `sync-labels.sh --check` (it reads the live label set once); do not write a second lister. Print **one line** naming the missing hold/state labels (`loom:operator`, `loom:blocked`, `loom:frozen`, `loom:issue`, `loom:curated`, `loom:building`) and pointing at `./.loom/scripts/sync-labels.sh`. Every other missing label is out of this check's scope. If `--check` exits `4` (forge unreachable), say "hold labels not evaluated" — never claim they exist. All present: print nothing to stderr.
+`--check` prints each line as `  MISSING       <label> (declared in labels.yml, absent on <repo>)` (leading spaces, padded), and exits `3` on drift, so match with `[[:space:]]` and read `$rc`, not the `grep` status.
+
+Advisory-only: **must not block** the sweep, strictly **read-only** (`--check` never creates a label). Reuse `sync-labels.sh --check` (it reads the live label set once); do not write a second lister. Print **one line** naming the missing hold/state labels (`loom:operator`, `loom:blocked`, `loom:frozen`, `loom:issue`, `loom:curated`, `loom:building`) and pointing at `./.loom/scripts/sync-labels.sh`. Every other missing label is out of this check's scope. If `$rc` is `4` (forge unreachable), say "hold labels not evaluated" — never claim they exist. All present: print nothing to stderr.
 
 If a park write later fails anyway (`park-record apply` / `operator-decision apply` exit non-zero with a `sync-labels.sh` hint), the summary reports it as `park failed (label missing)` — see `sweep-summary-output.md`.
 
