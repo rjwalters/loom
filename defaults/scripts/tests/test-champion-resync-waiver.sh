@@ -189,6 +189,15 @@ assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a champion prompt change 
 new_fx "$V"
 jq '.[2].filename = "src/app.rs"' "$FX/files.json" >"$FX/f.tmp" && mv "$FX/f.tmp" "$FX/files.json"
 assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a file outside the install set holds"
+new_fx "$V"
+jq '.[2].filename = ".agents/skills/loom-builder-worktree/SKILL.md"' "$FX/files.json" >"$FX/f.tmp" && mv "$FX/f.tmp" "$FX/files.json"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a .agents/skills file holds: deliberately unwaivable (ruling #13313)"
+new_fx "$V"
+jq '.[2].filename = ".loom/roles/builder-worktree.md"' "$FX/files.json" >"$FX/f.tmp" && mv "$FX/f.tmp" "$FX/files.json"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a .loom/roles file holds: no upstream mapping (ruling #13313)"
+new_fx "$V"
+jq '.[2].filename = ".loom/roles/judge.md"' "$FX/files.json" >"$FX/f.tmp" && mv "$FX/f.tmp" "$FX/files.json"
+assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a .loom/roles/judge.md file holds as a merge-gate path (ruling #13313)"
 
 echo "--- docs ---"
 assert_doc() { assert_contains "$(cat "$1")" "$2" "$3"; }
