@@ -2900,8 +2900,9 @@ esac
 case "$MERGE_RC ${QOUT%%$'\n'*}" in "0 "*) ;; # direct: merge-pr.sh below
   "7 LOOM-MERGE-QUEUE-"QUEUED*|"7 LOOM-MERGE-QUEUE-"DROPPED*|"7 LOOM-MERGE-QUEUE-"HANDED-OFF*|\
   "7 LOOM-MERGE-QUEUE-"MERGED*) echo "$QOUT (rc=$QRC)" ;; # queue protocol working: silent
-  *) QWHY="$(printf '%s' "$QOUT" | head -n2 | tr '\n' ' ')$QWHY (rc=$QRC)" # a stall: surface it, 1 notice/head
-     echo "CHAMPION-MERGE-QUEUE-STALL pr=$PR_NUMBER: $QWHY"; QM="<!-- champion:merge-queue-stall pr=$PR_NUMBER sha=$HEAD_SHA -->"
+  *) QWHY="$(printf '%s' "$QOUT" | head -n2 | tr '\n' ' ')$QWHY (rc=$QRC)" # a stall: surface it, 1 notice/head+reason
+     QH=$(printf '%s' "$QWHY" | cksum | cut -d' ' -f1) # a changed reason on the same head posts a new notice (#13357)
+     echo "CHAMPION-MERGE-QUEUE-STALL pr=$PR_NUMBER: $QWHY"; QM="<!-- champion:merge-queue-stall pr=$PR_NUMBER sha=$HEAD_SHA why=$QH -->"
      gh pr view "$PR_NUMBER" --json comments -q '.comments[].body' 2>/dev/null | grep -qF "$QM" || gh pr comment "$PR_NUMBER" \
        --body "**Champion: merge blocked** by \`forge merge-queue step\`: \`$QWHY\`. Not merged, still approved, retried next pass. \`unrecognized subcommand\`: upgrade \`loom-daemon\`.
 

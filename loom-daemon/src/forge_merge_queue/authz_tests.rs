@@ -34,6 +34,8 @@ struct FakeForge {
     dequeue_fails: Cell<bool>,
     revoke_on_enqueue: Cell<bool>,
     enqueue_fails: Cell<bool>,
+    /// The next N enqueues are refused with `QueueUnavailable` (#13357).
+    queue_unavailable_for: Cell<u32>,
 }
 
 impl FakeForge {
@@ -51,6 +53,7 @@ impl FakeForge {
             dequeue_fails: Cell::new(false),
             revoke_on_enqueue: Cell::new(false),
             enqueue_fails: Cell::new(false),
+            queue_unavailable_for: Cell::new(0),
         }
     }
     fn read_facts(&self) -> Result<AuthzFacts, String> {
@@ -118,6 +121,13 @@ impl QueueApi for FakeForge {
         })
     }
     fn enqueue(&self, _pr: u32, _n: &str, expected: &str) -> Result<EnqueueAck, QueueError> {
+        if self.queue_unavailable_for.get() > 0 {
+            self.queue_unavailable_for
+                .set(self.queue_unavailable_for.get() - 1);
+            return Err(QueueError::QueueUnavailable {
+                detail: "gh: No merge queue found for branch 'main'".into(),
+            });
+        }
         if self.enqueue_fails.get() {
             return Err(QueueError::Forge {
                 detail: "502 transient".into(),
@@ -448,6 +458,25 @@ fn transient_enqueue_failure_leaves_pending_not_failure_and_retry_enqueues() {
     assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Pending));
     f.enqueue_fails.set(false);
     assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::Enqueued { .. })));
+}
+
+#[test]
+fn one_queue_unavailable_is_retried_and_keeps_the_grant() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.queue_unavailable_for.set(1);
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::Enqueued { .. })));
+    assert!(s.get(PR).unwrap().is_some(), "grant live");
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Success));
+}
+
+#[test]
+fn two_queue_unavailable_still_roll_back() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.queue_unavailable_for.set(2);
+    let e = handoff(&f, &s).unwrap_err();
+    assert!(matches!(e, HandoffError::Enqueue(QueueError::QueueUnavailable { .. })), "{e:?}");
+    assert_eq!(s.get(PR).unwrap(), None, "grant revoked");
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Pending));
 }
 
 #[test]
