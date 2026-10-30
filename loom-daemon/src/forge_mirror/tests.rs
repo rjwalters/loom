@@ -254,6 +254,11 @@ fn only_the_discovery_and_wake_modules_name_the_mirror() {
         // The reconciliation readers resolve a workspace's repo slug to find
         // its part of the tick's snapshot (#12307); they make no read.
         "discovery/published.rs",
+        // The stale-draw recheck (#12318) only POSTs "re-read this item" to
+        // the mirror and reads nothing back; the driver's refusal path is
+        // its one call site and resolves the repo slug for it.
+        "discovery/recheck.rs",
+        "step_dispatch/driver.rs",
         // The task spawn and the telemetry drain.
         "daemon_service/observer_tasks.rs",
         "observability/ops/ratelimit.rs",
