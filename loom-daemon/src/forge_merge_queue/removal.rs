@@ -32,6 +32,10 @@ pub enum RemovalKind {
     /// An operator's own dequeue (GitHub's `manual` token); no human decision
     /// is pending, so it is not routed to `loom:operator`.
     Manual,
+    /// GitHub cleared the whole queue (`queue_cleared`): a queue-wide event,
+    /// not a verdict on this PR (e.g. an org-wide plan downgrade making the
+    /// rules unreadable).
+    QueueCleared,
     Unknown,
 }
 
@@ -46,6 +50,7 @@ impl RemovalKind {
             RemovalKind::Timeout => "timeout",
             RemovalKind::HeadChanged => "head-changed",
             RemovalKind::Manual => "manual",
+            RemovalKind::QueueCleared => "queue-cleared",
             RemovalKind::Unknown => "unknown",
         }
     }
@@ -63,6 +68,8 @@ pub fn classify(reason: Option<&str>) -> RemovalKind {
     let any = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
     if t == "manual" {
         RemovalKind::Manual
+    } else if t == "queue cleared" {
+        RemovalKind::QueueCleared
     } else if any(&["merge conflict", "conflicts with", "conflicting"]) {
         RemovalKind::Conflict
     } else if any(&["timed out", "timeout", "time limit"]) {
@@ -131,6 +138,13 @@ pub fn route(kind: RemovalKind) -> Route {
             remove: Vec::new(),
             handler: "Labels unchanged: the PR was dequeued manually, so no human decision is \
                       pending; the next Champion pass decides whether to re-enqueue.",
+        },
+        RemovalKind::QueueCleared => Route {
+            add: Vec::new(),
+            remove: Vec::new(),
+            handler: "Not a verdict on this PR: GitHub cleared the whole merge queue, so \
+                      `loom:pr` is kept and the next Champion pass re-checks the current head \
+                      and re-enqueues it as usual.",
         },
         RemovalKind::HeadChanged => Route {
             add: Vec::new(),

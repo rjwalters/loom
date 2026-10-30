@@ -801,6 +801,11 @@ pub(crate) enum MergePrCommand {
     /// one `<action>:<reason>` line; the I/O loop stays in the shell.
     MergeableRecheck(super::merge_pr_mergeable_recheck::MergeableRecheckArgs),
 
+    /// The whole stale-mergeable recheck loop (#8191 slice): backoff, uncached
+    /// re-reads, ref vet, fetch and `git merge-tree`, then the same one
+    /// `<action>:<reason>` line — see `cli::merge_pr_mergeable_recheck_run`.
+    MergeableRecheckRun(super::merge_pr_mergeable_recheck_run::MergeableRecheckRunArgs),
+
     /// Decide whether a head-SHA-mismatch refusal was caused by THIS merge
     /// run's own base-sync push (#8164) and may be retried once against a
     /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
@@ -1171,6 +1176,7 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
+            MergePrCommand::MergeableRecheckRun(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),

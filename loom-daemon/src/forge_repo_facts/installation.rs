@@ -345,9 +345,23 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
     if let Some(s) = prior.as_ref().filter(|s| s.fresh(now, ttl)) {
         let answer = s.answer(owner_repo);
         if !refresh_on_miss(&answer, &key, now) {
+            if matches!(answer, Answer::Listed(None)) {
+                log::info!(
+                    "forge_repo_facts: {} does not list {owner_repo}; no miss refresh due \
+                     (verified {}s ago, window {SNAPSHOT_MISS_REFRESH_SECS}s)",
+                    label(&key, cred),
+                    now - s.verified_at
+                );
+            }
             return answer;
         }
     }
+    // Reaching here with a fresh snapshot means a miss-triggered refresh. It
+    // must not send the stored validators (#13166): a `304` would re-stamp the
+    // very listing that lacks the repo and re-arm the window for good.
+    let miss_refresh = prior
+        .as_ref()
+        .is_some_and(|s| s.fresh(now, ttl) && s.verified_installation());
     // A credential the endpoint refused stays a user token: a failed recheck
     // keeps the per-repo path rather than inventing an outage.
     let known_user = prior
@@ -372,13 +386,33 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
     if crate::rate_limit_breaker::global_skip_pass(SNAPSHOT_CALLER) {
         return unavailable();
     }
-    match revalidate(&request, prior.as_ref(), now) {
+    match revalidate(&request, prior.as_ref(), now, !miss_refresh) {
         Ok(snap) => {
             save(&key, &snap);
             note_recovered(&key, cred);
-            snap.answer(owner_repo)
+            let answer = snap.answer(owner_repo);
+            if miss_refresh {
+                log::info!(
+                    "forge_repo_facts: miss refresh for {owner_repo} on {}: {} \
+                     (unconditional, {} repos listed)",
+                    label(&key, cred),
+                    if matches!(answer, Answer::Listed(Some(_))) {
+                        "found"
+                    } else {
+                        "still absent"
+                    },
+                    snap.total_count
+                );
+            }
+            answer
         }
         Err(why) => {
+            if miss_refresh {
+                log::info!(
+                    "forge_repo_facts: miss refresh for {owner_repo} on {} failed ({why})",
+                    label(&key, cred)
+                );
+            }
             let mut snap = prior.unwrap_or(Snapshot {
                 kind: Kind::Installation,
                 total_count: 0,
@@ -484,10 +518,17 @@ struct Request<'a> {
 /// validators `prior` holds. Any page failing fails the whole revalidation:
 /// a listing is never assembled from some pages of this read and none of
 /// another.
-fn revalidate(req: &Request<'_>, prior: Option<&Snapshot>, now: i64) -> Result<Snapshot, Failure> {
+///
+/// `conditional = false` sends no validators: every page is re-read in full.
+fn revalidate(
+    req: &Request<'_>,
+    prior: Option<&Snapshot>,
+    now: i64,
+    conditional: bool,
+) -> Result<Snapshot, Failure> {
     let prior_page = |i: usize| {
         prior
-            .filter(|p| p.verified_installation())
+            .filter(|p| conditional && p.verified_installation())
             .and_then(|p| p.pages.get(i))
     };
     let first = fetch_page(req, 1, prior_page(0))?;

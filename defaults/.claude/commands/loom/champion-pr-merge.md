@@ -255,7 +255,13 @@ re-checks with single targeted reads (Step 3's hold classify and
 
 ```bash
 PR_NUMBER=<number>
-PR_FACTS="$(git rev-parse --git-common-dir)/loom-champion-facts-pr-$PR_NUMBER.json"; rm -f "$PR_FACTS"
+# Pin and facts files live under a per-repo dir in `/tmp`, never under `.git`: a guard that
+# refuses writes into the main checkout's `.git` (Repo Skills') would otherwise end the
+# step `guard_refused` (#13200). The dir is computed in its own plain assignment and
+# the PR number is written out as digits in the written/removed paths below.
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+mkdir -p -m 700 /tmp/loom-champion "/tmp/loom-champion/$CHAMPION_KEY"
+rm -f "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json"
 # gh's `--json` shape, so every reader below is unchanged. Comments: TRUSTED
 # authors only (#9548). Any failed read -> skip the PR this pass.
 P=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER") &&
@@ -264,14 +270,14 @@ C=$(loom-daemon forge trusted-comments --fetch "$PR_NUMBER" --gh-shape) &&
 printf '%s\n' "$P" "$K" "$C" | jq -s '.[0] as $p | {labels: [$p.labels[] | {name}], headRefOid: $p.head.sha,
   mergeable: (if $p.mergeable == true then "MERGEABLE" elif $p.mergeable == false then "CONFLICTING" else "UNKNOWN" end),
   createdAt: $p.created_at, updatedAt: $p.updated_at, additions: $p.additions, deletions: $p.deletions,
-  commits: [.[1:-1][][] | {oid: .sha, committedDate: .commit.committer.date}], comments: .[-1]}' > "$PR_FACTS" \
-  || { rm -f "$PR_FACTS"; echo "SKIP #$PR_NUMBER: PR facts unread (or comments unauthenticated) — no merge, no comment"; continue; }  # single-PR step: outcome=skipped reason=facts_unread
+  commits: [.[1:-1][][] | {oid: .sha, committedDate: .commit.committer.date}], comments: .[-1]}' > "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json" \
+  || { rm -f "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json"; echo "SKIP #$PR_NUMBER: PR facts unread (or comments unauthenticated) — no merge, no comment"; continue; }  # single-PR step: outcome=skipped reason=facts_unread
 ```
 
 The other blocks re-derive the path with the same `PR_FACTS=` line, because
 shell variables do not survive between tool calls. After the PR's last step
 (merged, held, rejected or skipped), remove it with
-`rm -f "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-<number>.json"`.
+`rm -f "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json"` (`CHAMPION_KEY` as defined above).
 
 ### `judge-approval`: Label Check
 - [ ] PR has `loom:pr` label (Judge approval)
@@ -281,7 +287,8 @@ shell variables do not survive between tool calls. After the PR's last step
 ```bash
 # Labels from "0. PR facts" (this pass's live read, never "$GH_READ"): all 6
 # safety criteria are merge-gating (see "Cached forge reads").
-PR_FACTS="$(git rev-parse --git-common-dir)/loom-champion-facts-pr-<number>.json"
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+PR_FACTS="/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json"
 if [ -z "$(find "$PR_FACTS" -mmin -30 2>/dev/null)" ]; then
   echo "FAIL: no PR facts from this pass — run \"0. PR facts\" first"
   exit 1
@@ -335,7 +342,8 @@ gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[] | "\(.
 gh pr diff "$PR_NUMBER"
 
 # The Judge's verdict comment (how deeply was this verified?), from "0. PR facts"
-jq -r '.comments[] | select(.body | test("Judge"; "i")) | .body' "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-$PR_NUMBER.json"
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+jq -r '.comments[] | select(.body | test("Judge"; "i")) | .body' "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-$PR_NUMBER.json"
 ```
 
 **Docs-only fast path (#6134)** — run this check immediately after the
@@ -1115,6 +1123,9 @@ still cannot waive the kept set, and `KEPT_SET_PATTERNS` stays hardcoded (no con
 It is eligible only when **all** hold, each read live in this pass:
 
 - the PR title is `chore(loom): resync installed Loom to v<X.Y.Z>`;
+- every changed file is under `.loom/` or `.claude/`, and none is a merge-gate path
+  (`RESYNC_GATE_PATTERNS`: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
+  comment-trust files, `config.json`): the gate never waives a change to itself (#12945);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
@@ -1131,6 +1142,17 @@ A differing byte, a local-only file, a missing or unparsable tag, or any failed 
 `NOT ELIGIBLE` and the kept-set hold applies exactly as before. A non-resync PR never matches.
 
 ```bash
+# Merge-gate entries of the kept set (operator ruling on #12945, option a): a resync that
+# changes any of these keeps the human hold, because the gate cannot vouch for a change to
+# itself. Hardcoded, like KEPT_SET_PATTERNS; the first two blocks of that array.
+RESYNC_GATE_PATTERNS=(
+  "*champion*" "*judge*"
+  "*merge-pr.sh" "*merge_pr*" "*verdict*" "*check-review-feedback.sh"
+  "*comment_trust*" "*trusted_comments*" "*claim_reconciliation*"
+  "*version_only_diff*" "*version-only-diff*"
+  "*.loom/config.json" "*defaults/config.json"
+)
+
 # resync_upstream_path <installed-path>: the defaults/ counterpart per resync-installed.sh's
 # surface map, empty when the path has none. Roles and skills are symlinks or generated
 # upstream, so their blobs never compare equal: no mapping, hold.
@@ -1172,6 +1194,12 @@ resync_waiver_eval() {
     || { RESYNC_WAIVER_REASON="files read incomplete"; return 0; }
   while IFS=$'\t' read -r file prev head_sha status; do
     [ -z "$file" ] && continue
+    # Install set only (#12945): any file outside .loom/ and .claude/ holds the whole PR.
+    case "$file" in .loom/* | .claude/*) ;; *) RESYNC_WAIVER_REASON="$file is outside the install set"; RESYNC_WAIVER_RECORD=""; return 0 ;; esac
+    for pattern in "${RESYNC_GATE_PATTERNS[@]}"; do
+      # shellcheck disable=SC2053
+      if [[ "$file" == $pattern || "$prev" == $pattern ]]; then RESYNC_WAIVER_REASON="$file is a merge-gate path"; RESYNC_WAIVER_RECORD=""; return 0; fi
+    done
     is_kept=0
     for pattern in "${KEPT_SET_PATTERNS[@]}"; do
       # shellcheck disable=SC2053
@@ -1486,7 +1514,8 @@ SELF_RELEASE_BLOCK=""
 # "0. PR facts" — this pass's live read, NOT "$GH_READ": it gates the merge.
 # Comments are TRUSTED authors only (#9548, `.loom/docs/comment-trust.md`): an
 # outsider's marker, release phrase or ✅ is prose. No facts -> skip the PR.
-PR_JSON=$(cat "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-$PR_NUMBER.json") \
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+PR_JSON=$(cat "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-$PR_NUMBER.json") \
   || { echo "SKIP #$PR_NUMBER: no PR facts — no merge, no comment"; MERGE_BLOCKED_BY_HOLD=true; continue; }
 
 # `startswith`, not `contains`: a later comment may quote the marker in prose;
@@ -1904,7 +1933,8 @@ The concern must be **specific and falsifiable**. Good: *"touches `merge-pr.sh`'
 **`loom:auto-merge-ok` override**: this label is an explicit human/Judge statement that the PR is safe to auto-merge. It **overrides a merge-risk hold on this criterion only** — it does **not** waive the `critical-files` criterion (critical file exclusion), nor any of the `judge-approval`, `mergeable`, `recency` and `ci-green` criteria. A human who wants a critical-file PR merged should merge it themselves.
 
 ```bash
-HAS_AUTO_MERGE_OK=$(jq '[.labels[].name] | any(. == "loom:auto-merge-ok")' "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-<number>.json")
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+HAS_AUTO_MERGE_OK=$(jq '[.labels[].name] | any(. == "loom:auto-merge-ok")' "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json")
 if [ "$HAS_AUTO_MERGE_OK" = "true" ]; then
   echo "PASS: Merge-risk hold overridden by loom:auto-merge-ok label"
 fi
@@ -2144,7 +2174,8 @@ Run [`champion-ratification-hold.md`](champion-ratification-hold.md)'s tick on e
 ```bash
 # Check merge status, from "0. PR facts" (live this pass, NOT "$GH_READ":
 # merge-gating, see "Cached forge reads").
-MERGEABLE=$(jq -r '.mergeable' "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-<number>.json")
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+MERGEABLE=$(jq -r '.mergeable' "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json")
 
 # Verify mergeable state
 if [ "$MERGEABLE" != "MERGEABLE" ]; then
@@ -2188,7 +2219,8 @@ produce. Never let a hold be the reason a conflict goes unreported.
 # `createdAt` is the floor, so a PR with no commits and no non-Champion
 # comments still ages from when it was opened rather than reading as
 # eternally fresh. The facts' comments are already the trusted set.
-PR_DATA=$(cat "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-<number>.json")
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+PR_DATA=$(cat "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json")
 
 LAST_ACTIVITY=$(jq -r '
   [
@@ -2382,7 +2414,8 @@ from a hold-plus-feedback one before it acts on either.
 ```bash
 PR_NUMBER=<number>
 # The same "0. PR facts" value the mergeable criterion already read.
-MERGEABLE=$(jq -r '.mergeable' "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-$PR_NUMBER.json")
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+MERGEABLE=$(jq -r '.mergeable' "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-$PR_NUMBER.json")
 
 if [ "$MERGEABLE" = "CONFLICTING" ] && [ "${MERGE_BLOCKED_BY_HOLD:-false}" = true ]; then
   CONFLICT_MARKER="<!-- champion:held-pr-conflict-notice -->"
@@ -2836,7 +2869,8 @@ PR_NUMBER=$1
 
 # "0. PR facts", NOT "$GH_READ": each bullet below claims a result from THIS
 # pass; a cached answer is restating from memory (#4613, "Cached forge reads").
-PR_DATA=$(cat "$(git rev-parse --git-common-dir)/loom-champion-facts-pr-$PR_NUMBER.json")
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+PR_DATA=$(cat "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-$PR_NUMBER.json")
 ADDITIONS=$(printf '%s\n' "$PR_DATA" | jq -r '.additions')
 DELETIONS=$(printf '%s\n' "$PR_DATA" | jq -r '.deletions')
 TOTAL_LINES=$((ADDITIONS + DELETIONS))
@@ -2952,7 +2986,8 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 git checkout main 2>/dev/null || true
 
 # `--pr N` (#11859): a live pin means this block MUST set EXPECTED_HEAD=<sha>. Live: <60 min old, or <24h while its step's agent runs (#11902).
-PF="$(git rev-parse --git-common-dir)/loom-champion-pin-pr-$PR_NUMBER"; PIN=; PIN_PID=; { read -r PIN PIN_PID < "$PF"; } 2>/dev/null
+CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)
+PF="/tmp/loom-champion/$CHAMPION_KEY/pin-pr-$PR_NUMBER"; PIN=; PIN_PID=; { read -r PIN PIN_PID < "$PF"; } 2>/dev/null
 { [ -n "$(find "$PF" -mmin -60)" ] || { [ "${PIN_PID:-0}" -gt 1 ] && kill -0 "$PIN_PID" && [ -n "$(find "$PF" -mmin -1440)" ]; } || PIN=; } 2>/dev/null
 if [ -n "$PIN" ] && [ "${EXPECTED_HEAD:-}" != "$PIN" ]; then MERGE_RC=9; echo "CHAMPION-PIN-MISSING pr=$PR_NUMBER: set EXPECTED_HEAD=$PIN in this block; not merging";
 # #11932: only `state=clear` (or exit 2: a daemon older than the verb) merges.
@@ -3035,6 +3070,29 @@ Champion: #$PR_NUMBER merged and this bump now conflicts. Requesting a rebase.
 
 $MARK"
   done
+fi
+```
+
+### Step 3b: Close Superseded Resync PRs (#12945)
+
+When the PR just merged is a `chore(loom): resync installed Loom to vY` PR, every other open resync PR
+in this repo for a lower version is superseded by it. Close each with a comment. A title that does not
+parse as `X.Y.Z` is left alone; a failed read or close skips that PR (best effort, never blocks Step 4).
+
+```bash
+MERGED_TITLE=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.title' 2>/dev/null) || MERGED_TITLE=""
+if [[ "$MERGED_TITLE" =~ ^chore\(loom\):\ resync\ installed\ Loom\ to\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  NEW_VER="${BASH_REMATCH[1]}"
+  while IFS=$'\t' read -r OLD_PR OLD_TITLE; do
+    [ -n "$OLD_PR" ] && [ "$OLD_PR" != "$PR_NUMBER" ] || continue
+    [[ "$OLD_TITLE" =~ ^chore\(loom\):\ resync\ installed\ Loom\ to\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || continue
+    OLD_VER="${BASH_REMATCH[1]}"
+    [ "$OLD_VER" != "$NEW_VER" ] && [ "$(printf '%s\n%s\n' "$OLD_VER" "$NEW_VER" | sort -V | head -1)" = "$OLD_VER" ] || continue
+    ./.loom/scripts/post-comment.sh "$OLD_PR" --pr --body "Champion: closing as superseded by #$PR_NUMBER (resync to v$NEW_VER merged; this PR targets v$OLD_VER).
+
+<!-- champion:resync-superseded by=$PR_NUMBER -->" || continue
+    gh pr close "$OLD_PR" >/dev/null 2>&1 || true
+  done < <(gh pr list --state open --limit 100 --json number,title --jq '.[] | [.number, .title] | @tsv' 2>/dev/null)
 fi
 ```
 
@@ -4259,7 +4317,7 @@ fi
 
 Evaluate `loom-daemon pr-queue --role champion` rows in order (`.loom/docs/pr-planning.md`). Continue past holds and CI/dependency waits.
 
-After each completed/skipped PR, refresh the queue and take the next unvisited row; keep a per-pass visited set. It pauses once after `${LOOM_CHAMPION_PR_SLICE:-10}` rows for promotion, then resumes (`champion.md`, #10753). Continue past individual merge failures.
+After each completed/skipped PR, refresh the queue and take the next unvisited row; keep a per-pass visited set. Continue past individual merge failures.
 
 **Congestion signal, report-only.** At the start of the pass, run
 `loom-daemon forge pr-congestion` from the repo root and copy its verdict

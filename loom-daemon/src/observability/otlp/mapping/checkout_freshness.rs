@@ -7,7 +7,7 @@
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv_int, kv_string, nanos, prompt_tree};
+use super::{kv_bool, kv_int, kv_string, nanos, prompt_tree};
 use crate::telemetry::TelemetryRecord;
 
 /// `(event_name, severity, record time, attributes, body)` for a
@@ -28,6 +28,18 @@ pub(super) fn log_parts(
     if let Some(age) = r.remote_tip_age_s {
         attributes
             .push(kv_int("loom.prompt.remote_tip_age_s", i64::try_from(age).unwrap_or(i64::MAX)));
+    }
+    if let Some(role) = &r.checkout_role {
+        attributes.push(kv_string("loom.checkout.role", role.clone()));
+    }
+    if let Some(n) = r.dirty_tracked_files {
+        attributes.push(kv_int(
+            "loom.checkout.dirty_tracked_files",
+            i64::try_from(n).unwrap_or(i64::MAX),
+        ));
+    }
+    if let Some(same) = r.dirty_identical_to_remote {
+        attributes.push(kv_bool("loom.checkout.dirty_identical_to_remote", same));
     }
     attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
     let body = serde_json::to_string(r).unwrap_or_default();
@@ -55,6 +67,9 @@ mod tests {
             repo: Some("o/r".to_string()),
             pass_skipped_reason: skipped.map(str::to_string),
             remote_tip_age_s: Some(120),
+            checkout_role: Some("daemon-root".to_string()),
+            dirty_tracked_files: Some(1),
+            dirty_identical_to_remote: Some(true),
             prompt: Some(PromptTree {
                 commit: "a".repeat(40),
                 loom_version: Some("0.19.1100".to_string()),
@@ -85,6 +100,9 @@ mod tests {
             "loom.pass_skipped_reason",
             "loom.prompt.commits_behind_remote",
             "loom.prompt.origin_ref_stale",
+            "loom.checkout.role",
+            "loom.checkout.dirty_tracked_files",
+            "loom.checkout.dirty_identical_to_remote",
         ] {
             assert!(has(&attributes, key), "{key}");
         }

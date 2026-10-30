@@ -27,7 +27,6 @@ import {
 } from "../shared/config-resolver.js";
 import { sendDaemonRequest } from "../shared/daemon.js";
 import { formatTerminalOutput } from "../shared/formatting.js";
-import { writeMCPCommand } from "../shared/ipc.js";
 import type {
   ConfigureTerminalOptions,
   CreateTerminalConfig,
@@ -708,39 +707,6 @@ export const terminalTools: Tool[] = [
     },
   },
   {
-    name: "start_autonomous_mode",
-    description:
-      "Start autonomous mode for all configured terminals. This starts the interval prompt timers for all terminals that have a targetInterval configured. Terminals will receive their intervalPrompt at their configured intervals when idle.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "stop_autonomous_mode",
-    description:
-      "Stop autonomous mode for all terminals. This pauses all interval prompt timers, preventing automatic prompts from being sent. Terminals remain running but won't receive autonomous prompts until autonomous mode is started again.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "launch_interval",
-    description:
-      "Manually trigger the interval prompt for a specific terminal immediately. This sends the terminal's configured intervalPrompt without waiting for the next scheduled interval. Works regardless of whether autonomous mode is enabled. Useful for testing autonomous behavior or manually triggering work.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        terminal_id: {
-          type: "string",
-          description: "Terminal ID to trigger the interval prompt for (e.g., 'terminal-1')",
-        },
-      },
-      required: ["terminal_id"],
-    },
-  },
-  {
     // The `enum`s below are advertised to the client; they are NOT enforced by
     // the MCP SDK. The server-side allow-lists in `agent-metrics.ts` are what
     // actually gate these values (Issue #9107) — keep the two in sync.
@@ -1093,75 +1059,6 @@ export async function handleTerminalTool(
         {
           type: "text",
           text: `=== Set Primary Terminal ===\n\nSuccess\n\nTerminal ${terminalId} is now the primary (selected) terminal.\n\nThe UI will focus on this terminal.`,
-        },
-      ];
-    }
-
-    case "start_autonomous_mode": {
-      const result = await writeMCPCommand("start_autonomous_mode");
-      const success = result.includes("successfully");
-
-      if (!success) {
-        return [
-          {
-            type: "text",
-            text: `=== Start Autonomous Mode ===\n\nFailed\n\n${result}`,
-          },
-        ];
-      }
-
-      return [
-        {
-          type: "text",
-          text: `=== Start Autonomous Mode ===\n\nSuccess\n\nAutonomous mode has been started for all configured terminals.\n\nTerminals with targetInterval > 0 will now receive their intervalPrompt when idle.\n\n${result}`,
-        },
-      ];
-    }
-
-    case "stop_autonomous_mode": {
-      const result = await writeMCPCommand("stop_autonomous_mode");
-      const success = result.includes("successfully");
-
-      if (!success) {
-        return [
-          {
-            type: "text",
-            text: `=== Stop Autonomous Mode ===\n\nFailed\n\n${result}`,
-          },
-        ];
-      }
-
-      return [
-        {
-          type: "text",
-          text: `=== Stop Autonomous Mode ===\n\nSuccess\n\nAutonomous mode has been stopped for all terminals.\n\nTerminals will no longer receive automatic interval prompts until autonomous mode is started again.\n\n${result}`,
-        },
-      ];
-    }
-
-    case "launch_interval": {
-      const terminalId = args?.terminal_id as string;
-
-      if (!terminalId) {
-        return [{ type: "text", text: "Error: terminal_id is required" }];
-      }
-
-      const result = await writeMCPCommand(`launch_interval:${terminalId}`);
-      const success = result.includes("successfully");
-
-      if (!success) {
-        return [
-          {
-            type: "text",
-            text: `=== Launch Interval ===\n\nFailed\n\n${result}`,
-          },
-        ];
-      }
-
-      return [
-        {
-          type: "text",
-          text: `=== Launch Interval ===\n\nSuccess\n\nInterval prompt triggered for terminal ${terminalId}.\n\nThe terminal's configured intervalPrompt has been sent.\n\n${result}`,
         },
       ];
     }

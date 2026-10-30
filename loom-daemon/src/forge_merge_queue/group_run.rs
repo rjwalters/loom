@@ -378,6 +378,50 @@ fn emit_regime_on_change(nwo: &str, regime: QueueRegime) {
     ));
 }
 
+/// Repositories whose last rules-unreadable failure was already signalled as
+/// plan/billing, in this process only (cleared when the rules read again).
+static PLAN_GATE_SIGNALLED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Record a rules-read failure for `nwo`; true when it is a plan/billing gate
+/// that was not already signalled. A successful read (`err` None) or a non-plan
+/// failure re-arms the signal. Pure over `signalled`.
+fn plan_gate_newly_seen(
+    signalled: &mut std::collections::HashSet<String>,
+    nwo: &str,
+    err: Option<&str>,
+) -> bool {
+    match err {
+        Some(e) if crate::merge_pr::stale_checks::fetch::is_plan_gated(e) => {
+            signalled.insert(nwo.to_string())
+        }
+        _ => {
+            signalled.remove(nwo);
+            false
+        }
+    }
+}
+
+/// Once per change, say that the repo's rules are unreadable because of the
+/// GitHub plan or billing (an org-wide cause), not because of any one PR.
+/// Telemetry only; the caller still fails closed.
+pub(super) fn signal_rules_unreadable(nwo: &str, err: Option<&str>) {
+    let fresh = {
+        let mut guard = PLAN_GATE_SIGNALLED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        plan_gate_newly_seen(guard.get_or_insert_with(Default::default), nwo, err)
+    };
+    if fresh {
+        log::error!(
+            "loom.alert merge-queue.rules-unreadable cause=plan-or-billing repo={nwo}: GitHub \
+             refuses to read the rules on this repository (\"Upgrade to GitHub Pro or make this \
+             repository public\"); the org's plan or billing has lapsed. Failing closed: no \
+             enqueue, no direct merge."
+        );
+    }
+}
+
 /// Daemon pass: evaluate every live merge group so a group whose other
 /// checks finished since the last look gets its verdict without waiting for
 /// a workflow. Queue mode only. This is an accelerator: the enforcement is
@@ -389,9 +433,11 @@ pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
     let required = match super::preflight::github_preflight(gh, &nwo, None) {
         Ok(c) => {
             emit_regime_on_change(&nwo, c.regime);
+            signal_rules_unreadable(&nwo, None);
             c.required_checks
         }
         Err(e) => {
+            signal_rules_unreadable(&nwo, Some(&e.to_string()));
             log::warn!("merge-queue: group pass skipped, required contexts unreadable: {e}");
             return;
         }
@@ -428,6 +474,25 @@ pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #[test]
+    fn plan_gate_signals_once_and_only_for_plan_gates() {
+        let gate = "HTTP 403: Upgrade to GitHub Pro or make this repository public to enable this feature.";
+        let mut seen = std::collections::HashSet::new();
+        assert!(super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        // A successful read re-arms the signal.
+        assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", None));
+        assert!(super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        // A non-plan 403 (scope, rate limit) is never labelled plan/billing.
+        let mut seen = std::collections::HashSet::new();
+        for e in [
+            "HTTP 403: Resource not accessible by integration",
+            "HTTP 403: API rate limit exceeded",
+        ] {
+            assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", Some(e)));
+        }
+    }
+
     use std::cell::RefCell;
 
     use super::super::authz::AuthzFacts;

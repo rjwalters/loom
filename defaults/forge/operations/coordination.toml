@@ -381,9 +381,6 @@ unknowns = [
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/sync-labels.sh"
-[[operation.callers]]
-kind = "installer"
-path = "scripts/install/sync-labels.sh"
 
 # --- issue-pr-conversation ---------------------------------------------------
 

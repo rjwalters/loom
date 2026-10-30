@@ -274,6 +274,7 @@ pub mod labels;
 pub mod loom_pr_guard;
 pub mod merge_route;
 pub mod mergeable_recheck;
+pub mod mergeable_recheck_run;
 pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;

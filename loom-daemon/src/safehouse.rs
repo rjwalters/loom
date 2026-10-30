@@ -1730,10 +1730,18 @@ async fn run_sink_gh(
         .args(args);
     let why = match inv.run_async().await {
         CmdOutcome::Ran(output) => return Some(output),
-        CmdOutcome::Unavailable(Unavailable::TimedOut { .. }) => {
-            format!("timed out after {}s", timeout.as_secs())
+        CmdOutcome::Unavailable(u) => {
+            // Every failure is counted (#13156); the log below stays one-shot.
+            crate::observability::ops::safehouse_forge_lookup::record_failed(
+                call,
+                &crate::peer_claims::repo_slug(workspace_root),
+                &u,
+            );
+            match u {
+                Unavailable::TimedOut { .. } => format!("timed out after {}s", timeout.as_secs()),
+                u => format!("could not run gh: {u}"),
+            }
         }
-        CmdOutcome::Unavailable(u) => format!("could not run gh: {u}"),
     };
     log_gh_failure_once(call, workspace_root, &why);
     None
@@ -2249,6 +2257,10 @@ async fn completion_for_exit(
         already_narrated,
         activity_db,
         peer_completions,
+        completion_runtime::Narration::new(
+            crate::observability::ops::feed::Trigger::SweepExit,
+            false,
+        ),
     )
     .await
 }
@@ -2287,6 +2299,7 @@ async fn build_and_narrate_completion(
     already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
+    narration: completion_runtime::Narration,
 ) -> Option<Envelope> {
     let key = (workspace_root.to_owned(), issue, merged.number);
     if already_narrated.contains(&key) {
@@ -2367,6 +2380,7 @@ async fn build_and_narrate_completion(
     {
         Ok(envelope) => {
             let pr = key.2;
+            completion_runtime::emit_narration_record(&meta, issue, pr, narration);
             already_narrated.insert(key);
             // Issue #6352: this host is the one narrating — tell peers so
             // they don't also narrate it. Fire-and-forget; a dropped ad
@@ -2688,6 +2702,7 @@ async fn completion_for_merged_step(
         already_narrated,
         activity_db,
         peer_completions,
+        completion_runtime::Narration::new(crate::observability::ops::feed::Trigger::Step, false),
     )
     .await
 }
@@ -2728,6 +2743,7 @@ async fn reconcile_recent_merges(
         already_narrated,
         activity_db,
         peer_completions,
+        false,
     )
     .await
     .map(|pass| pass.envelopes)

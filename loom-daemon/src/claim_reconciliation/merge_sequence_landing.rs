@@ -52,7 +52,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{apply_comment_body, gh_call, gh_pr, EdgeReason, SequenceMarker, SOURCE_PASS};
+use super::{apply_comment_body, gh_call, gh_pr, SequenceMarker, SOURCE_PASS};
 use crate::merge_pr::sequence::{html_comment_spans, is_full_sha, parse, states_or_ends_hold};
 
 /// The key line's prefix. Versioned so a later key shape can coexist.
@@ -120,11 +120,11 @@ fn parse_key_span(span: &str) -> Option<LandingKey> {
 /// The full comment the pass writes: the key line, then the #9686 body
 /// (which carries the `loom:sequence` marker the gate reads).
 #[must_use]
-pub fn landing_comment_body(marker: &SequenceMarker, reason: EdgeReason) -> String {
+pub fn landing_comment_body(marker: &SequenceMarker) -> String {
     format!(
         "{}\n{}",
         landing_marker_text(&LandingKey::of(marker)),
-        apply_comment_body(marker, reason)
+        apply_comment_body(marker)
     )
 }
 
@@ -282,14 +282,8 @@ pub fn plan(
 
 /// Carry out `plan`'s comment write for `follower`. `Ok(false)` on
 /// [`LandingWrite::Keep`].
-pub(super) fn write(
-    gh_bin: &Path,
-    root: &Path,
-    follower: u32,
-    reason: EdgeReason,
-    plan: &LandingPlan,
-) -> Result<bool> {
-    let body = landing_comment_body(&plan.marker, reason);
+pub(super) fn write(gh_bin: &Path, root: &Path, follower: u32, plan: &LandingPlan) -> Result<bool> {
+    let body = landing_comment_body(&plan.marker);
     match plan.write {
         LandingWrite::Keep => return Ok(false),
         LandingWrite::Create => {

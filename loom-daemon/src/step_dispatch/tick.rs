@@ -500,6 +500,7 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::Sequenced
                 | PassReason::Blocked
                 | PassReason::Epic
+                | PassReason::Tracker
                 | PassReason::Proposal
                 | PassReason::NoStage
                 | PassReason::Draft,
