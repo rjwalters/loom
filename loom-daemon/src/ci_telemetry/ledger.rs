@@ -124,10 +124,9 @@ pub const COMPACT_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 ///   watermark and `now - rescan window` ([`super::poll::runs_floor`]); a
 ///   watermark is a GitHub `created_at`, never ahead of now, so a key
 ///   committed (hence created) before `watermark - RETENTION` is below both;
-/// - the feed-driven single-run path ([`super::poll::targeted`]) records any
-///   run GitHub reports as completed, and a run can be re-run — re-listing
-///   its earlier attempts' jobs under `filter=all` — for up to 30 days after
-///   it was created; a workflow run can last at most 35 days;
+/// - a run can be re-run — re-listing its earlier attempts' jobs under
+///   `filter=all` — for up to 30 days after it was created; a workflow run
+///   can last at most 35 days;
 /// - the initial lookback and the rescan window (both far shorter, asserted
 ///   below).
 ///
@@ -442,8 +441,8 @@ impl Ledger {
     ///
     /// - run listing, per-run and per-job dedupe, and the artifact-span gate
     ///   all key on runs the sweep lists (`created >= runs_floor`, the older
-    ///   of the watermark and the rescan window) or the feed path records
-    ///   (re-runnable for 30 days) — see [`SEEN_RETENTION_DAYS`];
+    ///   of the watermark and the rescan window), and a run is re-runnable
+    ///   for 30 days — see [`SEEN_RETENTION_DAYS`];
     /// - a job-log key is the "logs done" marker for its `log_wanted` line.
     ///   That line is always written *before* the log unit (a log is only
     ///   captured once wanted, and a captured job is never wanted again), so
@@ -684,19 +683,6 @@ impl Ledger {
     #[must_use]
     pub fn repaired(&self) -> bool {
         self.repaired
-    }
-
-    /// Whether a run created at `created_at` is older than `repo`'s retention
-    /// boundary (watermark − [`SEEN_RETENTION_DAYS`]). Such a run's keys may
-    /// have been dropped by [`open`](Self::open), so [`is_seen`](Self::is_seen)
-    /// can no longer vouch for it and a consumer fed an arbitrary run key (the
-    /// feed-driven path) must refuse it rather than record it again (#11159).
-    /// `false` when the repo has no watermark (nothing is ever expired there).
-    #[must_use]
-    pub fn run_is_past_retention(&self, repo: &str, created_at: DateTime<Utc>) -> bool {
-        self.watermarks
-            .get(repo)
-            .is_some_and(|watermark| created_at < *watermark - Duration::days(SEEN_RETENTION_DAYS))
     }
 
     #[must_use]
