@@ -208,7 +208,7 @@ mod tests {
     fn a_label_flip_failure_rechecks_only_when_the_item_moved() {
         let (r, calls) = recording();
         r.begin_tick();
-        assert!(!r.report("o/a", 1, "label_flip_failed", "gh issue edit failed: timeout"));
+        assert!(!r.report("o/a", 1, "label_flip_failed", "label edit failed: timeout"));
         assert!(r.report(
             "o/a",
             2,
