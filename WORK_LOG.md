@@ -13,6 +13,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-30
+
+- **PR #13315**: refactor: remove orphaned feed-client helpers and stale docs
+- **PR #13312**: fix: treat merge-queue queue_cleared as queue-wide, signal plan-gated rules reads
+- **PR #13310**: fix: ignore quoted spans in dependency parsing, quote edge lines in cycle report
+- **PR #13302**: test: pin PR write-gate reads to Gate and assert listing transport per mode
+- **PR #13311**: test: cover a new repo after the snapshot through the cached write-scope probe
+- **PR #13280**: feat: daemon lands its own resync PR through the merge queue
+- **Issue #13314** (closed): Remove dead pub fns left by feed-client removal: run_is_past_retention, uname_m, halted_reason
+- **Issue #13309** (closed): Merge-queue revoke: treat GitHub queue_cleared as a queue-wide removal, not dropped-unknown + loom:operator
+- **Issue #13303** (closed): Champion cycle detector reads "Blocks #N" / quoted text as a dependency (false cycle stalled sg13g2-sram#27)
+- **Issue #13268** (closed): Resync must land without the Champion merge path on repos that refuse direct pushes
+
 ### 2026-10-29
 
 - **PR #13283**: feat: project Judge CI-gate refusals as pass.verdict telemetry
@@ -5664,13 +5677,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7071** (closed): WORK_PLAN Ready section and urgent-eligibility never exclude loom:blocked (only operator-only was fixed in #7008)
 - **Issue #7069** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7067** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-
-### 2026-08-30
-- **PR #7063**: fix: feed crash/timeout fixture payloads via process substitution
-- **Issue #7060** (closed): Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case
-- **PR #7052**: chore(deps): bump the all-dependencies group with 2 updates
-- **Issue #7053** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7051** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 
