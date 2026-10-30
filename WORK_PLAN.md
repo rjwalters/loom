@@ -20,6 +20,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
 - **#13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
 - **#13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
+- **#13325**: feat: hand operator-released critical-file PRs to the merge queue
 
 ## Very Important
 
@@ -61,6 +62,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
 - **#12653**: Emit merge_hold hold-cause + release-actor + merge-queue facts to SigNoz (unblocks merge_hold ETA prediction)
+- **#13313**: Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate
 
 ## In Progress
 
@@ -74,6 +76,7 @@ Issues currently being built (`loom:building`).
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
 - **#13149**: Export forge verdict-equivalent failure reasons as SigNoz span attributes
 - **#13150**: Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent
+- **#13263**: Dedupe four identical outcome_journal test registry builders into test_support
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits
 - **#13321**: champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator
@@ -85,6 +88,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
+- **#13326**: test: share one forge-probing registry builder across outcome_journal tests
 
 ## Approved (Awaiting Merge)
 
@@ -104,6 +108,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
 - **#13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
 - **#13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
+- **#13325**: feat: hand operator-released critical-file PRs to the merge queue
 
 ## Proposed
 
@@ -188,8 +193,11 @@ Issues carrying `loom:curated`.
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius *(curated)*
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
 - **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories) *(curated)*
+- **#13313**: Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate *(curated)*
 - **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
 - **#13321**: champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator *(curated)*
+- **#13323**: [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 1) *(curated)*
+- **#13324**: [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 8) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -198,7 +206,6 @@ Issues carrying `loom:curated`.
 - **#13017**: Split run_daemon (~1960-line fn) in daemon_service.rs into startup-phase modules *(hermit)*
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller *(hermit)*
 - **#13261**: Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon *(hermit)*
-- **#13263**: Dedupe four identical outcome_journal test registry builders into test_support *(hermit)*
 
 ## Epics
 
@@ -217,14 +224,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 11 |
+| Operator merge-risk holds | 12 |
 | Very important | 2 |
 | Important | 13 |
-| Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 11 |
-| PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 14 |
-| Curated | 81 |
-| Architect / Hermit proposals | 6 |
+| Ready (`loom:issue`) | 12 |
+| In Progress (`loom:building`) | 12 |
+| PRs awaiting review | 4 |
+| Approved PRs awaiting merge | 15 |
+| Curated | 84 |
+| Architect / Hermit proposals | 5 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
