@@ -227,7 +227,7 @@ jobs:
         # up here days before release day instead of on it.
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
