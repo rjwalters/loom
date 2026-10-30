@@ -15,12 +15,14 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13139**: fix: verdict-gate ignores the Judge's own notes and accepts --acknowledged-comment
 - **#13143**: docs: state that judge wait-checks --timeout is in seconds
 - **#13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
-- **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13293**: fix: let a bare permissions header read green on workflow blast radius
 - **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
 - **#13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
 - **#13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
 - **#13325**: feat: hand operator-released critical-file PRs to the merge queue
+- **#13328**: test: pin resync waiver to hold roles and skills copies
+- **#13340**: fix: trust github-actions[bot] as a promotion author for CI trackers
+- **#13344**: ci: move macOS runners from macos-14 to macos-15
 
 ## Very Important
 
@@ -62,7 +64,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
 - **#12653**: Emit merge_hold hold-cause + release-actor + merge-queue facts to SigNoz (unblocks merge_hold ETA prediction)
-- **#13313**: Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate
 
 ## In Progress
 
@@ -76,10 +77,21 @@ Issues currently being built (`loom:building`).
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
 - **#13149**: Export forge verdict-equivalent failure reasons as SigNoz span attributes
 - **#13150**: Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent
-- **#13263**: Dedupe four identical outcome_journal test registry builders into test_support
+- **#13289**: Follow-on from PR #13288: verify completion.narrated tokens in SigNoz on a fleet host
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits
+- **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories)
+- **#13313**: Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate
 - **#13321**: champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator
+- **#13324**: [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 8)
+- **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge
+- **#13331**: Cleared-blocker notice doesn't unpark: issue stays loom:blocked for hours after its sole blocker merges
+- **#13332**: merge-pr stacked reconcile retargets a non-feature/issue-N child to main without stripping squashed parent commits (left CONFLICTING)
+- **#13337**: Workflow-filed trackers never enter the fleet: the author gate refuses github-actions[bot] and ci-daily.yml rewrites the body nightly
+- **#13343**: CI: macos-check fails during macOS 14 runner brownout; image retires 2026-11-02
+- **#13345**: Ratification lane: wire the lane into the tick and post per-key RATIFY markers as comments
+- **#13346**: Consolidate seven duplicated feature/issue-N branch parsers in loom-daemon
+- **#13350**: simplify: remove the per-dispatch runtime/modelProfile override (#11493): zero uses in 7 days
 
 ## PRs Awaiting Review
 
@@ -88,7 +100,12 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#13326**: test: share one forge-probing registry builder across outcome_journal tests
+- **#13338**: feat: unpark Curator-parked issues once their blockers resolve
+- **#13339**: fix: supply canonical guard to ci-daily flake-shell; portable sed in waiver suite
+- **#13341**: feat: warn on missing hold labels and hint sync-labels on failed park
+- **#13348**: fix: re-mint the writer token when a miss refresh still lacks the repo
+- **#13349**: feat: post per-key ratification markers and run the lane from the champion tick
+- **#13351**: refactor: route feature/issue-N branch parsing through worktree_ops::naming
 
 ## Approved (Awaiting Merge)
 
@@ -103,12 +120,14 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13139**: fix: verdict-gate ignores the Judge's own notes and accepts --acknowledged-comment
 - **#13143**: docs: state that judge wait-checks --timeout is in seconds
 - **#13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
-- **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
 - **#13293**: fix: let a bare permissions header read green on workflow blast radius
 - **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
 - **#13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
 - **#13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
 - **#13325**: feat: hand operator-released critical-file PRs to the merge queue
+- **#13328**: test: pin resync waiver to hold roles and skills copies
+- **#13340**: fix: trust github-actions[bot] as a promotion author for CI trackers
+- **#13344**: ci: move macOS runners from macos-14 to macos-15
 
 ## Proposed
 
@@ -180,24 +199,27 @@ Issues carrying `loom:curated`.
 - **#13149**: Export forge verdict-equivalent failure reasons as SigNoz span attributes *(curated)*
 - **#13150**: Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent *(curated)*
 - **#13155**: [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1) *(curated)*
-- **#13166**: write-scope: a repo created after daemon start is still refused 'not-in-installation' 19h later on 0.19.1221 (the #13153 refresh does not clear it) *(curated)*
 - **#13169**: tracing: put the work item's keys (pr_number, role, head/base SHA) on every step and tick span at open *(curated)*
 - **#13170**: agent gh front: one span per GitHub write (operation, repo, number, head SHA) *(curated)*
 - **#13171**: tracing: daemon 'invoke github' calls outside a step have no sweep_id or role *(curated)*
 - **#13173**: docs: tracing.md and ci-observability.md still describe the story join removed in #11984 *(curated)*
 - **#13175**: role_tick telemetry: loom.actions.prs_merged overcounts ~10x (whole-transcript rescans + counts merge attempts) *(curated)*
 - **#13176**: Builder: 16/26 sweeps on fleet-1 end no-outcome-line (exit 0, no outcome) — main throughput limit *(curated)*
-- **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
 - **#13289**: Follow-on from PR #13288: verify completion.narrated tokens in SigNoz on a fleet host *(curated)*
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius *(curated)*
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
-- **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories) *(curated)*
 - **#13313**: Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate *(curated)*
 - **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
 - **#13321**: champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator *(curated)*
 - **#13323**: [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 1) *(curated)*
-- **#13324**: [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 8) *(curated)*
+- **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge *(curated)*
+- **#13331**: Cleared-blocker notice doesn't unpark: issue stays loom:blocked for hours after its sole blocker merges *(curated)*
+- **#13332**: merge-pr stacked reconcile retargets a non-feature/issue-N child to main without stripping squashed parent commits (left CONFLICTING) *(curated)*
+- **#13337**: Workflow-filed trackers never enter the fleet: the author gate refuses github-actions[bot] and ci-daily.yml rewrites the body nightly *(curated)*
+- **#13343**: CI: macos-check fails during macOS 14 runner brownout; image retires 2026-11-02 *(curated)*
+- **#13345**: Ratification lane: wire the lane into the tick and post per-key RATIFY markers as comments *(curated)*
+- **#13350**: simplify: remove the per-dispatch runtime/modelProfile override (#11493): zero uses in 7 days *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -224,14 +246,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 12 |
+| Operator merge-risk holds | 14 |
 | Very important | 2 |
 | Important | 13 |
-| Ready (`loom:issue`) | 12 |
-| In Progress (`loom:building`) | 12 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 15 |
-| Curated | 84 |
+| Ready (`loom:issue`) | 11 |
+| In Progress (`loom:building`) | 23 |
+| PRs awaiting review | 9 |
+| Approved PRs awaiting merge | 17 |
+| Curated | 87 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
