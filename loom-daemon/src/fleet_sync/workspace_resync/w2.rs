@@ -13,6 +13,7 @@ use super::{
     WorkspaceReport,
 };
 use crate::fleet_store::resync_claim::{stale_after, Acquire, Claimant, ForgeUnreachable, Held};
+use crate::forge_merge_queue::gh_lifecycle::Landed;
 use crate::init::payload::{gate_metadata, resync_workspace_with, Payload, ResyncOutcome};
 
 // ============================================================================
@@ -468,6 +469,7 @@ impl Step<'_, '_> {
         };
         let existing: serde_json::Value = serde_json::from_str(&listed.body).unwrap_or_default();
         if let Some(pr) = existing.as_array().and_then(|a| a.first()) {
+            let rule = self.land(pr_number(pr), rule);
             return Ok(Done::PrOpen(pr_number(pr), pr_url(pr), rule));
         }
         match git::push(self.worktree, self.root, &branch) {
@@ -513,7 +515,32 @@ impl Step<'_, '_> {
             }
         }
         log::info!("workspace_resync: {nwo}: opened resync PR for {new}: {}", pr_url(&pr));
+        let rule = self.land(number, rule);
         Ok(Done::PrOpen(number, pr_url(&pr), rule))
+    }
+
+    /// Hand the open resync PR to the merge queue from the daemon (#13268),
+    /// and say how that stands after `rule`. Never an error: a PR that cannot
+    /// land yet (no Judge approval, a red check) is retried on the next pass,
+    /// and the Champion's installed path stays as the other way in.
+    fn land(&self, number: Option<u64>, rule: String) -> String {
+        let Some(n) = number.and_then(|n| u32::try_from(n).ok()) else {
+            return rule;
+        };
+        let nwo = &self.candidate.nwo;
+        let landed = (self.env.land)(self.root, nwo, n);
+        log::info!("workspace_resync: {nwo}: resync PR #{n}: landing {landed:?}");
+        format!("{rule}; landing: {}", landed_note(&landed))
+    }
+}
+
+fn landed_note(landed: &Landed) -> String {
+    match landed {
+        Landed::NotQueueMode(why) => format!("not handed to a merge queue ({why})"),
+        Landed::Waiting(why) => format!("waiting ({why})"),
+        Landed::Queued => "queued".to_string(),
+        Landed::Merged => "merged".to_string(),
+        Landed::Failed(why) => format!("failed ({why})"),
     }
 }
 

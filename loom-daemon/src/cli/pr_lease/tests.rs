@@ -1415,3 +1415,11 @@ fn a_failed_prune_delete_does_not_fail_the_claim() {
     }
     assert!(dir.path().join("deleted").exists());
 }
+
+#[test]
+fn judge_claim_without_identity_warns_about_watch_pid() {
+    let w = unknown_identity_warning(Role::Judge, "pr-lease-unknown").unwrap();
+    assert!(w.contains("--watch-pid") && w.contains("post-verdict.sh"));
+    assert!(unknown_identity_warning(Role::Judge, "sweep-x").is_none());
+    assert!(unknown_identity_warning(Role::Doctor, "pr-lease-unknown").is_none());
+}

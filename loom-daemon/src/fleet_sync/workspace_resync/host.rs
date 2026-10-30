@@ -395,6 +395,13 @@ fn run_live(
         spent: &|| started.elapsed() >= PASS_BUDGET,
         overdue: &|| started.elapsed() >= PASS_DEADLINE,
         heads: &super::heads::live,
+        land: &|root, _, pr| {
+            crate::forge_merge_queue::gh_lifecycle::land_for_root(
+                std::path::Path::new(&crate::gh_invocation::gh_bin()),
+                root,
+                pr,
+            )
+        },
     };
     let mut pass = super::run(&env, &registered_roots(), mode, &mut guard);
     // #10719: rebuild the dispatch holds and the roll demand from this pass.

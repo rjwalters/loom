@@ -122,6 +122,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Mode;
 use crate::fleet_store::resync_claim::ClaimForge;
+use crate::forge_merge_queue::gh_lifecycle::Landed;
 use crate::init::payload::{gate_metadata, materialize_with, Payload, ResyncRefusal};
 use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS_INSTALLED};
 
@@ -409,6 +410,10 @@ pub struct Env<'a> {
     /// requests as that takes ([`heads::live`]). Called at most once per
     /// pass, and never by a host that may not write.
     pub heads: &'a dyn Fn(&[HeadAsk]) -> Heads,
+    /// Hand the resync pull request `(root, OWNER/REPO, number)` to the
+    /// merge queue (#13268). The daemon owns this, so no installed hook or
+    /// prompt that is itself stale can stop its own replacement.
+    pub land: &'a dyn Fn(&Path, &str, u32) -> Landed,
 }
 
 /// A stale workspace this pass may resync.
