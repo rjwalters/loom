@@ -172,3 +172,8 @@ pub(crate) fn pull_row(state: &str, merged_at: Option<&str>, base_full_name: &st
         r#"{{"state":"{state}","merged_at":{merged},"closed_at":"2020-01-01T00:00:00Z","head":{{"sha":"abc","repo":{{"owner":{{"login":"x"}}}}}},"base":{{"repo":{{"full_name":"{base_full_name}"}}}}}}"#
     )
 }
+
+/// Advance the facts layer's test clock (for tests outside this module).
+pub(crate) fn advance_clock(secs: i64) {
+    state::advance_test_clock(secs);
+}
