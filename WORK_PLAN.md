@@ -187,6 +187,7 @@ Issues carrying `loom:curated`.
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius *(curated)*
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
 - **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories) *(curated)*
+- **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -221,7 +222,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 10 |
 | PRs awaiting review | 3 |
 | Approved PRs awaiting merge | 14 |
-| Curated | 79 |
+| Curated | 80 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
