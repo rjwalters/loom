@@ -268,7 +268,13 @@ pub fn apply(
         // #12665: the hold transition, only when the label was not already on.
         journal_hold_add(req, added.is_ok());
         if let Err(e) = added {
-            let _ = writeln!(err, "park-record apply: labeling #{n} failed: {e}");
+            let _ = writeln!(
+                err,
+                "park-record apply: labeling #{n} failed: {e}\n\
+                 park-record apply: the park record is in the body but the hold label is not on \
+                 the issue; if the label is missing on the forge, run \
+                 ./.loom/scripts/sync-labels.sh --check (then without --check) and re-apply"
+            );
             return exit::FORGE;
         }
     }
