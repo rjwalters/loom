@@ -76,6 +76,7 @@ Issues currently being built (`loom:building`).
 - **#13150**: Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits
+- **#13321**: champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator
 
 ## PRs Awaiting Review
 
@@ -188,6 +189,7 @@ Issues carrying `loom:curated`.
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
 - **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories) *(curated)*
 - **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
+- **#13321**: champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -219,10 +221,10 @@ Issues carrying `loom:curated`.
 | Very important | 2 |
 | Important | 13 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 10 |
+| In Progress (`loom:building`) | 11 |
 | PRs awaiting review | 3 |
 | Approved PRs awaiting merge | 14 |
-| Curated | 80 |
+| Curated | 81 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
