@@ -34,9 +34,12 @@
 //!
 //! # This command WRITES, unlike `check-stale-blocked`
 //!
-//! It posts one comment per newly-cleared artifact; it never edits a label —
-//! removing `loom:blocked` stays a Curator/human decision, exactly as with the
-//! advisory. `--dry-run` restores a read-only preview.
+//! It posts one comment per newly-cleared artifact. It edits labels only in the
+//! one carve-out of #13331 ([`unpark_eligible`]): an issue parked by the
+//! Curator whose every blocker has resolved gets `loom:blocked` swapped for
+//! `loom:curated` (never `loom:issue` — promotion stays Champion/human), and
+//! the comment states the transition. Every other case stays comment-only.
+//! `--dry-run` restores a read-only preview.
 //!
 //! # Idempotency
 //!
@@ -58,7 +61,7 @@ use anyhow::Result;
 use crate::cmd_out::CmdOutcome;
 use crate::script_helpers::run_gh;
 use crate::stale_blocked::notify::{self, marker_for};
-use crate::stale_blocked::{batch, budget, classify, Artifact, Verdict};
+use crate::stale_blocked::{batch, budget, classify, resolved, Artifact, Evidence, Verdict};
 
 use super::stale_blocked::DEFAULT_LIMIT;
 
@@ -110,6 +113,8 @@ struct Notified {
     cited: Vec<i64>,
     reasons: Vec<String>,
     posted: bool,
+    /// `loom:blocked` was swapped for `loom:curated` (or would be, `--dry-run`).
+    unparked: bool,
 }
 
 impl NotifyClearedBlockersArgs {
@@ -177,14 +182,19 @@ impl NotifyClearedBlockersArgs {
                     continue
                 }
             };
-            let posted =
-                !self.dry_run && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);
+            let eligible = unpark_eligible(g.kind, &g.labels, &g.body, &evidence);
+            // Label first, comment second: the comment is the audit trail and
+            // must only claim a transition that actually happened.
+            let unparked = eligible && (self.dry_run || unpark(g.number, repo, &root));
+            let posted = !self.dry_run
+                && post_comment(g.kind, g.number, &cited, &reasons, unparked, repo, &root);
             notified.push(Notified {
                 kind: g.kind,
                 number: g.number,
                 cited,
                 reasons,
                 posted,
+                unparked,
             });
         }
 
@@ -249,7 +259,7 @@ fn unticked_reason(resolved_refs: &[String], unparsed: usize) -> String {
 }
 
 /// The notification comment. Pure, so the wording is unit-tested.
-fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String]) -> String {
+fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String], unparked: bool) -> String {
     let refs: Vec<String> = cited.iter().map(|n| format!("#{n}")).collect();
     let mut body = format!(
         "**Cited blocker cleared**: {} just closed, and this {}'s `loom:blocked` cites it. \
@@ -260,9 +270,19 @@ fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String]) -> String {
     for r in reasons {
         body.push_str(&format!("- {r}\n"));
     }
+    if unparked {
+        body.push_str(
+            "\n**Unparked**: every blocker in this issue's Curator park record has resolved, \
+             so `loom:blocked` was removed and `loom:curated` restored (#13331). Promotion to \
+             `loom:issue` is unchanged: Champion or a human decides.\n",
+        );
+    } else {
+        body.push_str(
+            "\nRe-check whether the block still applies and remove `loom:blocked` if not.\n",
+        );
+    }
     body.push_str(
-        "\nRe-check whether the block still applies and remove `loom:blocked` if not. \
-         Posted at merge time by `loom-daemon notify-cleared-blockers` (#9102), rather \
+        "Posted at merge time by `loom-daemon notify-cleared-blockers` (#9102), rather \
          than waiting for the next `check-stale-blocked` sweep pass (#8927).\n",
     );
     for n in cited {
@@ -278,6 +298,7 @@ fn post_comment(
     number: i64,
     cited: &[i64],
     reasons: &[String],
+    unparked: bool,
     repo: Option<&str>,
     root: &Path,
 ) -> bool {
@@ -286,8 +307,63 @@ fn post_comment(
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    let body = comment_body(kind, cited, reasons);
+    let body = comment_body(kind, cited, reasons, unparked);
     let mut args = vec![entity, "comment", n.as_str(), "--body", body.as_str()];
+    if let Some(r) = repo {
+        args.extend(["--repo", r]);
+    }
+    matches!(run_gh(&args, root, false), CmdOutcome::Ran(o) if o.status.success())
+}
+
+/// Whether a newly-cleared artifact may be unparked mechanically (#13331).
+///
+/// All must hold: an issue carrying `loom:blocked` and none of `loom:operator`,
+/// `loom:frozen` or a hard-exclusion label; a body whose park records are all
+/// `by=curator` and all name a blocker (a reason-only record is a deliberate
+/// hold); no unticked `## Dependencies` line; and every blocker the artifact
+/// cites, local or cross-repo, resolved (a PR closed unmerged does not count,
+/// see [`resolved`]). `by=` is a self-declared attribute, accepted because the
+/// action only restores `loom:curated` and approves nothing. Pure, so tested.
+fn unpark_eligible(kind: Artifact, labels: &[String], body: &str, ev: &Evidence) -> bool {
+    let has = |l: &str| labels.iter().any(|x| x == l);
+    if kind != Artifact::Issue
+        || !has("loom:blocked")
+        || has("loom:operator")
+        || has("loom:frozen")
+        || crate::hard_exclusion::is_hard_excluded(labels)
+    {
+        return false;
+    }
+    let records = crate::park_record::parse(body);
+    if records.is_empty()
+        || !records.iter().all(|r| {
+            r.blocker.is_some()
+                && r.by
+                    .as_deref()
+                    .is_some_and(|b| b.eq_ignore_ascii_case("curator"))
+        })
+    {
+        return false;
+    }
+    ev.unparsed_unchecked == 0
+        && ev.named.iter().all(|d| d.checked)
+        && !ev.prose.is_empty()
+        && ev.prose.iter().all(|r| resolved(&r.state))
+        && ev.remote.iter().all(|r| resolved(&r.state))
+}
+
+/// Swap `loom:blocked` for `loom:curated`. Returns whether `gh` reported success.
+fn unpark(number: i64, repo: Option<&str>, root: &Path) -> bool {
+    let n = number.to_string();
+    let mut args = vec![
+        "issue",
+        "edit",
+        n.as_str(),
+        "--remove-label",
+        "loom:blocked",
+        "--add-label",
+        "loom:curated",
+    ];
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
@@ -314,8 +390,13 @@ fn report(notified: &[Notified], closed: &[i64], unread: &[String], dry_run: boo
             (false, false) => "FAILED to notify",
         };
         let cited: Vec<String> = n.cited.iter().map(|c| format!("#{c}")).collect();
+        let unpark = match (n.unparked, dry_run) {
+            (false, _) => "",
+            (true, true) => ", would unpark to loom:curated",
+            (true, false) => ", unparked to loom:curated",
+        };
         let line = format!(
-            "[notify-cleared-blockers] {verb} {} #{} (cites {})",
+            "[notify-cleared-blockers] {verb} {} #{} (cites {}{unpark})",
             n.kind.label(),
             n.number,
             cited.join(", ")
