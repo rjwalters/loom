@@ -77,3 +77,5 @@ Invalid phrase regexes degrade to literals.
 
 Out of scope: judging whether a spec *should* be ratified; changing the
 critical-file hold, the kept set or `merge-pr.sh`.
+
+The reviewer lane that produces the key markers this hold waits on is documented in [`ratification-lane.md`](ratification-lane.md).
