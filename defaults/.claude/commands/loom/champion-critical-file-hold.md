@@ -161,6 +161,7 @@ cf_change_unmoved() {
   [ -n "$CF_EQUIV_KIND" ]
 }
 
+CF_HANDOFF=0; CF_HANDOFF_SHA=""   # reset every tick, whatever the verdict (#13321)
 if [ "$CRITICAL_FILES_RESULT" = "FAIL" ]; then
   CF_EQUIV_KIND=""
   if [ "$CF_STATE" = released ] && [ "$STATE_HEAD" = "$HEAD_SHA" ]; then
@@ -287,7 +288,6 @@ $CF_EQUIV_LINE
   # shared with a merge-risk hold, is never a release), queue mode proven. `defer`, `stands`,
   # `hold`, `rearm` never reach it. The consumer is Step 3, which pins `--approved-sha` to
   # $CF_HANDOFF_SHA and never falls back to `merge-pr.sh` for this PR.
-  CF_HANDOFF=0; CF_HANDOFF_SHA=""
   if [ "$CF_QUEUE" = 1 ] && [ "$CF_TRUST" = ok ] && [ "$HOLD_LABEL_NOW" = false ] \
      && { [ "$CF_ACTION" = none ] || [ "$CF_ACTION" = respect ]; }; then
     CF_HANDOFF=1; CF_HANDOFF_SHA=$HEAD_SHA
