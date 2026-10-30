@@ -2002,6 +2002,7 @@ EXPECTED_FILES=(
   ".loom/config.json"
   ".loom/roles"
   ".loom/scripts/worktree.sh"
+  ".loom/scripts/sync-labels.sh"
   ".loom/scripts/lib/loom-tools.sh"
   ".loom/scripts/lib/repo-root.sh"
   ".loom/scripts/lib/forge-helpers.sh"
@@ -2090,11 +2091,14 @@ CURRENT_STEP="Sync Labels"
 header "Step 4: Syncing Workflow Labels"
 echo ""
 
-if [[ ! -x "$LOOM_ROOT/scripts/install/sync-labels.sh" ]]; then
-  error "Installation script not found: sync-labels.sh"
+# Step 4 runs after defaults are copied and verified (above), so the installed
+# copy is the single label-sync implementation (#13148).
+INSTALLED_SYNC_LABELS="$TARGET_PATH/$WORKTREE_PATH/.loom/scripts/sync-labels.sh"
+if [[ ! -x "$INSTALLED_SYNC_LABELS" ]]; then
+  error "Installed script not found: .loom/scripts/sync-labels.sh"
 fi
 
-"$LOOM_ROOT/scripts/install/sync-labels.sh" "$TARGET_PATH/$WORKTREE_PATH" || \
+"$INSTALLED_SYNC_LABELS" "$TARGET_PATH/$WORKTREE_PATH" || \
   warning "Label sync had issues but continuing..."
 
 echo ""

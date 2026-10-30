@@ -2471,6 +2471,31 @@ assert_deny "write-confinement (#6968 control): cp with an embedded-apostrophe s
 
 rm -rf "$WT5674_REPO"
 
+# --- #12082: a `cd` inside a subshell / brace group / pushd must be tracked, so
+# a RELATIVE write after it that lands outside the repo is not denied as a
+# main-checkout write. cwd is the main checkout throughout.
+OUT12082="/tmp/loom-test-$$-12082"
+assert_allow "write-confinement (#12082): absolute out-of-repo target at main-checkout cwd allows" \
+    "echo x > $OUT12082/a.txt" "$WT_REPO"
+assert_allow "write-confinement (#12082): ( cd /tmp/x && echo > rel ) subshell allows" \
+    "( cd $OUT12082 && echo x > a.txt )" "$WT_REPO"
+assert_allow "write-confinement (#12082): (cd /tmp/x && echo > rel) with no inner spaces allows" \
+    "(cd $OUT12082 && echo x > a.txt)" "$WT_REPO"
+assert_allow "write-confinement (#12082): { cd /tmp/x; echo > rel; } brace group allows" \
+    "{ cd $OUT12082; echo x > a.txt; }" "$WT_REPO"
+assert_allow "write-confinement (#12082): pushd /tmp/x && echo > rel allows" \
+    "pushd $OUT12082 >/dev/null && echo x > a.txt" "$WT_REPO"
+assert_allow "write-confinement (#12082): cd persists after a closed subshell group" \
+    "cd $OUT12082 && (echo y > b.txt); echo x > a.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): a subshell cd does not leak past its closing paren" \
+    "(cd $OUT12082 && echo x > a.txt); echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): a paren inside a quoted string does not close the subshell" \
+    "(cd $OUT12082; echo \")\" > a.txt); echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): popd restores the pre-pushd cwd" \
+    "pushd $OUT12082 >/dev/null; popd >/dev/null; echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): main-checkout target still denies" \
+    "echo hi > $WT_REPO/zz.txt" "$WT_REPO"
+
 # --- #12285: literal loop variable under a literal `cd /tmp/<dir>` -----------
 assert_allow "write-confinement (#12285): for-loop var write under cd /tmp/probe -> allow" \
     'cd /tmp/probe && for name in a b; do echo x > "$name.gds"; done' "$WT_REPO"
@@ -2533,6 +2558,49 @@ EOF" "$WT_REPO"
 assert_deny "write-confinement (#12596 control): plain write into the main checkout still denies" \
     "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
 rm -rf "${_C12596_OUT%/*/*}"
+
+# --- #13180: Champion pin / PR-facts files are the one write the main
+# checkout's .git admits while a managed worktree exists. Exactly those two
+# basenames, direct children of the git common dir; nothing else under .git.
+_C13180_CD='$(git rev-parse --git-common-dir)'
+assert_allow "write-confinement (#13180): pin write via \$(git rev-parse --git-common-dir) allows" \
+    "printf 'sha 1\\n' > \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): same, from inside the linked worktree" \
+    "printf 'sha 1\\n' > \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED/.loom/worktrees/issue-1"
+assert_allow "write-confinement (#13180): facts write via \$(git rev-parse --git-common-dir) allows" \
+    "jq . x > \"$_C13180_CD/loom-champion-facts-pr-42.json\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): rm of the pin via \$(git rev-parse --git-common-dir) allows" \
+    "rm -f \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): literal absolute pin path allows" \
+    "echo x > $WT_REPO_LINKED/.git/loom-champion-pin-pr-42" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): .git/config via git-common-dir denies" \
+    "printf a > \"$_C13180_CD/config\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): sibling file in git common dir denies" \
+    "printf a > \"$_C13180_CD/other-file\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): non-numeric PR suffix denies" \
+    "printf a > \"$_C13180_CD/loom-champion-pin-pr-\$N\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): traversal after the pin name denies" \
+    "printf a > \"$_C13180_CD/loom-champion-pin-pr-1/../config\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): literal .git/config denies" \
+    "echo x > $WT_REPO_LINKED/.git/config" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): literal pin name at checkout root denies" \
+    "echo x > $WT_REPO_LINKED/loom-champion-pin-pr-42" "$WT_REPO_LINKED"
+
+# --- #13200: the pin / facts files moved out of .git into
+# /tmp/loom-champion/<key>/ so a guard that refuses .git writes
+# (Repo Skills') never sees one. The docs' exact spelling: the dir in its own
+# plain assignment, then a write to "/tmp/loom-champion/$CHAMPION_KEY/pin-pr-<digits>".
+_C13200_DEF='CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)'
+assert_allow "write-confinement (#13200): mkdir of the temp champion dir allows" \
+    "$_C13200_DEF; mkdir -p -m 700 /tmp/loom-champion \"/tmp/loom-champion/\$CHAMPION_KEY\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): pin write under the temp dir allows" \
+    "$_C13200_DEF; printf 'sha 1\\n' > \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): facts write under the temp dir allows" \
+    "$_C13200_DEF; jq . x > \"/tmp/loom-champion/\$CHAMPION_KEY/facts-pr-42.json\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): rm of the pin under the temp dir allows" \
+    "$_C13200_DEF; rm -f \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): same, from inside the linked worktree" \
+    "$_C13200_DEF; printf 'sha 1\\n' > \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED/.loom/worktrees/issue-1"
 
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"

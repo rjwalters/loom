@@ -46,6 +46,7 @@
 mod common;
 
 use common::git;
+use common::hermetic_git as hermetic;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -112,10 +113,6 @@ impl Fixture {
 
 fn tmpdir(tag: &str) -> PathBuf {
     common::unique_tmpdir("loom-wt-return-diff", tag)
-}
-
-fn hermetic(cmd: &mut Command) -> &mut Command {
-    common::hermetic_git(cmd)
 }
 
 /// A repo with a commit, a subdirectory, and a linked worktree laid out the way

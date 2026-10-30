@@ -252,6 +252,77 @@ mod ci_hold {
         let held = hold_ci_pending(&mut items, &HashMap::new(), 4, |_| None, |_| panic!("no read"));
         assert_eq!(held, 0, "a PR with no known head is drawn unread");
     }
+
+    fn extras(
+        state: Option<&str>,
+        hours_ago: i64,
+    ) -> std::collections::BTreeMap<u32, crate::discovery::ItemExtras> {
+        let checks = state.map(|s| crate::discovery::Checks {
+            state: s.to_string(),
+            started_at: Some((now() - chrono::Duration::hours(hours_ago)).to_rfc3339()),
+        });
+        std::collections::BTreeMap::from([(
+            5,
+            crate::discovery::ItemExtras {
+                checks,
+                ..Default::default()
+            },
+        )])
+    }
+
+    /// Run the gather's wiring: the snapshot's verdict first, a counted read
+    /// only for a head with no summary (#12317).
+    fn with_snapshot(
+        items: &mut [Item],
+        summaries: &std::collections::BTreeMap<u32, crate::discovery::ItemExtras>,
+    ) -> (usize, usize) {
+        let verdicts = summary_verdicts(&heads(), summaries, now());
+        let reads = std::cell::Cell::new(0usize);
+        let held = hold_ci_pending(
+            items,
+            &heads(),
+            4,
+            |sha| verdicts.get(sha).copied(),
+            |_| {
+                reads.set(reads.get() + 1);
+                false
+            },
+        );
+        (held, reads.get())
+    }
+
+    #[test]
+    fn a_pending_summary_holds_the_judge_step_without_a_read() {
+        let mut items = judge_and_issue();
+        let (held, reads) = with_snapshot(&mut items, &extras(Some("pending"), 1));
+        assert_eq!((held, reads), (1, 0));
+        assert_eq!(judge(&items), Verdict::Pass(PassReason::CiPending));
+    }
+
+    #[test]
+    fn a_success_or_failure_summary_admits_the_judge_step_without_a_read() {
+        for state in ["success", "failure"] {
+            let mut items = judge_and_issue();
+            let (held, reads) = with_snapshot(&mut items, &extras(Some(state), 1));
+            assert_eq!((held, reads), (0, 0), "{state}");
+            assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+        }
+    }
+
+    #[test]
+    fn a_pending_summary_older_than_six_hours_is_drawn() {
+        let mut items = judge_and_issue();
+        let (held, reads) = with_snapshot(&mut items, &extras(Some("pending"), 7));
+        assert_eq!((held, reads), (0, 0));
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn a_missing_summary_falls_back_to_one_counted_read() {
+        let mut items = judge_and_issue();
+        let (held, reads) = with_snapshot(&mut items, &extras(None, 0));
+        assert_eq!((held, reads), (0, 1));
+    }
 }
 
 /// #12074: a failed open-PR listing keeps the last good PR set but never
@@ -452,4 +523,16 @@ mod author_gate_held {
         let revs = HashMap::from([(7, revision("item 7", "body"))]);
         assert_eq!(hold_author_gated(&mut items, &gates, &revs, Some(TRUST)), 0);
     }
+}
+
+/// #13244: the tracker marker counts alone on a line, outside a code fence.
+#[test]
+fn the_tracker_marker_must_be_its_own_line_outside_a_fence() {
+    assert!(has_tracker_marker(Some("hub\n<!-- loom:tracker -->\n- [ ] #1")));
+    assert!(has_tracker_marker(Some("  <!-- loom:tracker -->  ")));
+    assert!(!has_tracker_marker(Some("see <!-- loom:tracker --> inline")));
+    assert!(!has_tracker_marker(Some("> <!-- loom:tracker -->")));
+    assert!(!has_tracker_marker(Some("```\n<!-- loom:tracker -->\n```")));
+    assert!(!has_tracker_marker(Some("no marker here")));
+    assert!(!has_tracker_marker(None));
 }

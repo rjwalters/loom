@@ -194,6 +194,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
+| [`completion.narrated`](#completionnarrated--a-public-feed-completion-the-narration-sink-built) | log, OTLP only | `safehouse/completion_runtime.rs` (`emit_narration_record`, from `build_and_narrate_completion`) |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.authorization.evaluated`](#mergeauthorizationevaluated--one-merge-group-authorization-evaluation) | log, OTLP only | `forge_merge_queue/group_run.rs` (`run_group_check`) |
@@ -1673,6 +1674,38 @@ WHERE attributes_string['loom.topic'] = 'daemon.work_finder.first_tick'
 
 Other topics' fields stay inside `loom.payload` only.
 
+#### `daemon.agent_residue.reaped` (#10802)
+
+Also mirrored as a `daemon.event` record (the `daemon.agent_residue` prefix is
+subscribed). Published once per reap by the agent residue reaper
+(`agent_residue_reaper.rs`); the payload carries no absolute host path.
+
+```json
+{
+  "source": "agent-residue-reaper",
+  "path": "exit",
+  "kind": "scope",
+  "unit": "loom-agent-4242-99.scope",
+  "pids": [],
+  "issue": 7,
+  "sweep_id": "sweep-1",
+  "dry_run": false,
+  "detail": null
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `source` | string | Always `"agent-residue-reaper"`. |
+| `path` | string | `"exit"` (the run just ended) or `"periodic"` (the sweep on the worktree-reaper tick). |
+| `kind` | string | `"scope"` (a `loom-agent-*` scope stopped), `"tree"` (processes killed) or `"failed-scope"` (`reset-failed`). |
+| `unit` | string or null | The scope unit, for `scope` and `failed-scope`. |
+| `pids` | integer[] | The processes signalled, for `tree`. |
+| `issue` | integer or null | The issue the run or worktree belonged to, when known. |
+| `sweep_id` | string or null | The sweep (or a role run's `role-<role>-…` item id), on the exit path. |
+| `dry_run` | boolean | `true`: planned only, nothing was stopped, signalled or reset. |
+| `detail` | string or null | Why or the outcome: `worktree issue-N`, or `Result=… ExecMainStatus=…` for a failed scope. |
+
 **`daemon.start` (#11197)** — the one topic in this kind that is not a
 mirrored bus event. Exactly one record per daemon process, enqueued by
 `observability::spawn_task` when the exporters come up (never when telemetry
@@ -2178,6 +2211,9 @@ chain has no worklist tier, never a 0):
 | `loom.discovery.repos.{ok,unknown,backfilling,error}` | Of those, by the worklist's `status` for the repo (a repo the worklist omits counts as `unknown`; a failed request counts every repo as `error`) |
 | `loom.discovery.items` | Open issues and PRs in the snapshot (count) |
 | `loom.discovery.forge_reads` | Per-repo forge listing calls made for discovery. `0` while every repo is served by the mirror tier. Per-item gate reads (hold markers, CI at a Judge head) are not listings and are not counted (count) |
+| `loom.discovery.live_reads.landed` | Closes-graph queries the landed pre-filter sent this tick (#12317). The mirror lists open items only, so "has a merged PR closed this candidate?" stays a live forge read (`purpose = discovery`; GitHub only). It and `.markers` are the only discovery reads left while `tier = mirror`; the way to zero is for the mirror to serve merged PRs that close #N (count) |
+| `loom.discovery.live_reads.markers` | Trusted-comment reads for the hold markers of `loom:blocked` PRs this tick (#12317). Comments are outside the mirror's scope by design, so these stay live (`purpose = discovery`; count) |
+| `loom.discovery.live_reads.ci` | Judge heads the snapshot had no check summary for, so the gather read CI at the head itself (`pr_planning`, cached 60 s per head). `0` while the worklist summarises every head; always `0` on the direct backend, which reads CI as before (count) |
 | `loom.discovery.stale_repos` | Repos whose newest watermark evidence is older than `forge.mirror.maxStalenessSecs`. They are served anyway (worklist only; count) |
 | `loom.discovery.oldest_watermark_age_secs` | Age of the stalest repo's newest watermark evidence (worklist only; seconds) |
 
@@ -2718,10 +2754,6 @@ the `workspace_draw` (seed, and each draw's candidates with `weight` =
 `base_weight` + `bonus` since #11742; read a draw as `weight / total_weight`).
 Its seed's inputs (`seed_scheme`, `seed_minute`, `seed_host`, #11683) were added
 as optional fields under the stability promise above.
-Since #12974 the exported record is a **bounded summary** (at most 16 KB, flagged
-by `payload_ref`; no `candidates[]`, `skipped[]` or draw lists, with
-`skipped_counts` / `exclusion_counts` instead); the full record is archived
-locally under that `payload_ref`. Additive: `schema_version` stays `2`.
 Full field reference, the SigNoz rank-at-instant query and the rows/day volume:
 [`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
 
@@ -3012,9 +3044,9 @@ projected reason, so `passVerdictQuery` still parses both):
 | Field (`loom.pass.*`) | Notes |
 |---|---|
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
-| `step` | `champion_pr`, `champion_issue`, `doctor` or `curator` |
+| `step` | `champion_pr`, `champion_issue`, `doctor`, `curator` or `judge` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1` or `curator_step_v1` |
+| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1`, `curator_step_v1` or `judge_step_v1` |
 | `loom.sweep_id` | the step's sweep id, to join a verdict to its session (#12715) |
 | `reason_detail` | the raw `reason=` token of a `skipped` / `requeued` step (body `detail`), bounded to token characters (#12715) |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
@@ -3030,7 +3062,7 @@ projected reason, so `passVerdictQuery` still parses both):
 `size`, `critical_file`, `stale`, `head_moved`, `not_eligible` or `unknown`
 (an unnamed criterion). `noop` carries `held`, or, for a `skipped` / `requeued`
 step, the gate it names with `reason=` (#12715): `facts_unread`, `janitor_rc3`,
-`verdict_rc11`, `ci_pending`, `mergeable_unknown`, `pin_missing`, `merge_rc<N>`,
+`verdict_rc11`, `ci_pending`, `mergeable_unknown`, `pin_missing`, `guard_refused`, `merge_rc<N>`,
 or `unspecified` when it named none or an unknown one. `ci_pending` is never
 inferred from the word `requeued`. A `skipped` / `requeued` step is never
 ledgered `failed`, even with no readable journal. `failed` carries
@@ -3065,6 +3097,25 @@ has no journaled signal and is not emitted.
 | `noop` | `no_change` |
 | `refused` | `escalated` (a journaled `operator-decision` / park, or `class=refused`), `gave_up` (`class=refused reason=gave_up`) |
 | `failed` | `failed` (`class=failed`, or no outcome line) |
+
+**Judge step (`judge_step_v1`, `step=judge`, `artifact=pr`, #13274).**
+One record per Judge step end. When `post-verdict.sh` refuses an approval at
+the exact-head CI gate (#10486; it posts nothing), it journals the refusal
+through `loom-daemon forge journal-ci-refusal` (best-effort; an older daemon
+changes nothing) and the step's record carries it, with `head_sha` set. Without
+a refusal the step's `LOOM_STEP_OUTCOME role=judge` line projects.
+
+| `class` | `reason` |
+|---|---|
+| `refused` | `ci_red` (exit 6), `ci_incomplete` (exit 5: pending, timeout, head moved, unread), `declined` (`class=refused` with no CI refusal) |
+| `verdict` | `reviewed` |
+| `noop` | `no_change` |
+| `failed` | `failed` (`class=failed`, or no outcome line) |
+
+Refusal rate: count `step=judge class=refused reason in (ci_red, ci_incomplete)`
+over all `step=judge` records, by `loom.repo`. Time to next approval: join each
+such record to the next Judge `verdict` record for the same `loom.repo` and PR
+number with a later `evaluated_at`; the daemon keeps no timer for it.
 
 **Curator step (`curator_step_v1`, `step=curator`, `artifact=issue`, #12921).**
 One record per Curator step end, from the journaled writes (the `loom:curated`
@@ -3882,6 +3933,11 @@ checkout per pass**. **OTLP only** (`otlp: Logs`), and only when
 the exporter is configured; `observability/otlp/mapping/checkout_freshness.rs`
 maps it, with the record's JSON as the body and `host` on the Resource.
 
+The daemon root (`~/loom-daemon` on a release-roll host) is not a registered
+workspace, so `daemon_root_freshness.rs` samples it every 15 minutes and emits
+the same record with `checkout_role = daemon-root` (#12727). Measurement only:
+one `git ls-remote` plus local reads, never a fetch, merge or write.
+
 Hosts with no daemon (dev boxes, Macs running hand-driven sessions) are out of
 scope by operator ruling: no hook and no CLI command emits this.
 
@@ -3891,6 +3947,9 @@ scope by operator ruling: no hook and no CLI command emits this.
 | `repo` | string? | the workspace's `owner/repo` (`loom.repo`); absent when `origin` is foreign or unparseable |
 | `pass_skipped_reason` | string? | why the pass could not measure against GitHub's tip: `budget` (the pass ran out of time before this checkout; no `prompt`), `low-disk`, `breaker-open`, `backing-off`, `network-off`, `unreachable-stop` or `no-head`. Absent when a tip was known. A stale count never looks fresh |
 | `prompt` | object? | `commit`, `loom_version`, `commits_behind`, `on_branch` as on `role_tick.outcome`, plus the five remote fields below; each inner key is absent when it cannot be read |
+| `checkout_role` | string? | `daemon-root` (`loom.checkout.role`) on the sample of the daemon's own root checkout (#12727); absent on a registered workspace |
+| `dirty_tracked_files` | int? | `loom.checkout.dirty_tracked_files`: tracked files with a staged or unstaged change; daemon-root samples only |
+| `dirty_identical_to_remote` | bool? | `loom.checkout.dirty_identical_to_remote`: every dirty tracked file is byte-identical to `remote_tip`, so a fast-forward could pass through it; absent when nothing is dirty or the tip is not in the object store |
 
 The remote fields (all optional, additive, no `schema_version` bump) also ride
 on `role_tick.outcome`'s `prompt`:
@@ -4570,6 +4629,33 @@ span has no `outcome` key; its keys are `loom.fleet_dispatch.result`
 then did: `champion.run` on `loom.champion.sweep_id` = the span's
 `loom.assignment.id`'s sweep, grouped by `loom.champion.outcome`.
 
+
+### `completion.narrated` — a public-feed completion the narration sink built
+
+One OTLP log (INFO) per `completion` envelope the safehouse narration sink builds
+(Issue #13287), from `build_and_narrate_completion`, the core all three trigger
+paths share. `loom.feed.completions{kind,outcome}` counts narrations but has no
+repo, issue or token facts; this record is what answers "how many completions did
+each host narrate per repo, and how many carried tokens?" from the store.
+**OTLP-only.**
+
+The JSON body holds `repo`, `issue`, `pr`, `trigger` (`sweep_exit`,
+`champion_merge_step` or `reconcile`), `outcome` (`narrated`, or `seeded` for a
+fresh host's first reconciliation pass, which records merges without posting
+them, #4649), `tokens_present` (the payload carries a flat `tokens`),
+`tokens_by_model_rows` (rows in the payload's `tokens_by_model`), `narrated_at`
+and standard `loom` build provenance. A record whose provenance does not
+validate is not exported.
+
+**OTLP.** Attributes: `loom.repo`, `loom.issue` and `loom.completion.trigger` /
+`outcome` / `pr` / `tokens_present` / `tokens_by_model_rows`
+(`COMPLETION_NARRATED_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). Both timestamps are
+`narrated_at`; the executing host is `host.id` on the resource.
+
+Query (a token regression): in SigNoz Logs, filter `loom.kind = completion.narrated`
+and `loom.completion.outcome = narrated`, group by `loom.completion.tokens_present`
+and `host.id` over time; a healthy fleet is mostly `true`.
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused
 

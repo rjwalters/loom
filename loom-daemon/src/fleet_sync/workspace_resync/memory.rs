@@ -37,6 +37,9 @@ pub(super) struct Backoff {
     pub(super) refusal: Option<crate::init::payload::ResyncRefusal>,
     /// How the last failure counted.
     pub(super) kind: FailureKind,
+    /// The failure is a refused push whose resync pull request is open: the
+    /// repo stays stale until someone merges it, so the alert is Critical.
+    pub(super) pr_open: bool,
 }
 
 /// What a workspace was found to be at one default-branch commit, for one
@@ -168,6 +171,7 @@ impl Memory {
                 requires_daemon: report.requires_daemon.clone(),
                 refusal: report.refusal.clone(),
                 kind,
+                pr_open: false,
             },
         );
         let alerts = match kind {
@@ -190,6 +194,14 @@ impl Memory {
             next_attempt,
         });
         (next_attempt, alert)
+    }
+
+    /// Note that the failure just recorded for `root` left a resync pull
+    /// request open.
+    pub(super) fn mark_pr_open(&mut self, root: &Path) {
+        if let Some(b) = self.backoff.get_mut(root) {
+            b.pr_open = true;
+        }
     }
 
     /// Remember what `root` is at `commit`.

@@ -18,7 +18,7 @@
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
 //! item to a closed, versioned `(class, reason)`. Registered: `champion`
-//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921);
+//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921) and `judge` ([`judge`], #13274);
 //! other roles add theirs (#12029).
 //!
 //! # The ledger's view, record-only
@@ -62,6 +62,7 @@ use crate::telemetry::provenance::Provenance;
 pub mod champion;
 pub mod curator;
 pub mod doctor;
+pub mod judge;
 pub mod refusals;
 
 use refusals::{Observed, RefusalStore};
@@ -157,6 +158,7 @@ pub fn projector(role: &str) -> Option<Projector> {
         "champion" => Some(champion::PROJECTOR),
         "doctor" => Some(doctor::PROJECTOR),
         "curator" => Some(curator::PROJECTOR),
+        "judge" => Some(judge::PROJECTOR),
         _ => None,
     }
 }
