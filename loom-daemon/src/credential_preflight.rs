@@ -1586,27 +1586,44 @@ pub fn force_refresh_owner_credential_with(
     let Some(owner_repo) = nwo_from_git_remote(repo_root) else {
         return false;
     };
-    let owner = owner_of(&owner_repo).to_string();
-    let source = credential_source_for_owner(&owner_repo);
-    match minter.mint_forced(&owner_repo) {
+    match force_mint_owner_credential(workspace_root, &owner_repo, minter) {
+        Some(owner_dir) => {
+            register_root_gh_config_dir(repo_root, &owner_dir);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The mint + publish + register core shared by [`force_refresh_owner_credential_with`]
+/// and [`force_refresh_owner_credential_for_repo_with`]: force-mints for
+/// `owner_repo`'s owner and publishes into the owner's `gh` config dir,
+/// returning that dir on success.
+fn force_mint_owner_credential(
+    workspace_root: &Path,
+    owner_repo: &str,
+    minter: &dyn GithubAppMinter,
+) -> Option<PathBuf> {
+    let owner = owner_of(owner_repo).to_string();
+    let source = credential_source_for_owner(owner_repo);
+    match minter.mint_forced(owner_repo) {
         ref outcome @ GithubAppOutcome::Minted {
             ref installation_id,
             ref app_id,
             ..
         } => {
             let owner_dir = github_app_gh_config_dir_for_owner(workspace_root, &owner);
-            match publish_outcome(&owner_dir, outcome, &owner_repo) {
+            match publish_outcome(&owner_dir, outcome, owner_repo) {
                 Ok(()) => {
-                    register_root_gh_config_dir(repo_root, &owner_dir);
                     register_owner_gh_config_dir(&owner, &owner_dir);
-                    register_owner_refresh_source(&owner_repo, &owner_dir);
+                    register_owner_refresh_source(owner_repo, &owner_dir);
                     record_forge_credential_success(&source);
                     log::info!(
                         "credential_preflight: forced per-owner github-app refresh for {owner} \
-                         ({owner_repo}) after a registered-workspace scan failure — retrying (app \
-                         {app_id} installation {installation_id}) — #6171"
+                         ({owner_repo}) — retrying (app {app_id} installation {installation_id}) \
+                         — #6171"
                     );
-                    true
+                    Some(owner_dir)
                 }
                 Err(e) => {
                     log::warn!(
@@ -1614,20 +1631,34 @@ pub fn force_refresh_owner_credential_with(
                          could not publish it to {} ({e}) — #6171",
                         owner_dir.display()
                     );
-                    false
+                    None
                 }
             }
         }
-        GithubAppOutcome::NotConfigured => false,
+        GithubAppOutcome::NotConfigured => None,
         GithubAppOutcome::Error(reason) => {
             record_forge_credential_failure(&source, &reason);
             log::warn!(
                 "credential_preflight: forced per-owner github-app refresh for {owner_repo} \
                  failed ({reason}) — #6171"
             );
-            false
+            None
         }
     }
+}
+
+/// Force-mint a fresh installation token for `owner_repo`'s owner and publish
+/// it, with no checkout root involved (#13306): the write-scope probe knows
+/// only the repo's slug. Returns the owner's `gh` config dir on success.
+#[must_use]
+pub fn force_refresh_owner_credential_for_repo(owner_repo: &str) -> Option<PathBuf> {
+    let workspace_root = PRIMARY_WORKSPACE_ROOT.get()?;
+    let script_path = resolve_github_app_script(workspace_root)?;
+    let minter = RealGithubAppMinter {
+        script_path,
+        cwd: workspace_root.clone(),
+    };
+    force_mint_owner_credential(workspace_root, owner_repo, &minter)
 }
 
 /// Production entry point for the #6171 404-recovery path: resolves the real
