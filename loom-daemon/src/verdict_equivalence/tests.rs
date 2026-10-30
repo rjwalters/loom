@@ -1031,3 +1031,78 @@ fn the_kill_switches_disable_the_requested_change_carry() {
         assert_eq!(a.equivalence, Equivalence::Indeterminate, "outer={outer} inner={inner}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// local patch-identity fallback (#13359) — real git fixtures
+// ---------------------------------------------------------------------------
+
+/// `fixture` plus a rebase of the PR onto the moved main, with
+/// `refs/remotes/origin/main` pointing at the new base. Returns
+/// `(tempdir, reviewed, rebased_head)`; `rebased_content` is the PR file's
+/// content on the rebased head (the reviewed one is `feature-1`).
+fn rebased_fixture(rebased_content: &str) -> (TempDir, String, String) {
+    let (dir, reviewed, base1) = fixture("f.txt", "feature-1\n");
+    let repo = dir.path();
+    git_ok(repo, &["checkout", "--quiet", "-b", "rebased", &base1]);
+    write(repo, "f.txt", rebased_content);
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "the PR's own change, rebased"]);
+    let head = git_ok(repo, &["rev-parse", "HEAD"]);
+    git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base1]);
+    (dir, reviewed, head)
+}
+
+fn assess_unreadable(repo: &Path, gh_dir: &Path, reviewed: &str, head: &str) -> Assessment {
+    let gh = flaky_gh_main_only(gh_dir);
+    assess_with(true, true, &gh, Some(repo), 9416, reviewed, head)
+}
+
+/// Answers the base-branch lookup and nothing else, so every compare is
+/// unreadable (the tree kind's `Err` and the patch kind's `Unread`).
+fn flaky_gh_main_only(dir: &Path) -> PathBuf {
+    let bin = dir.join("main-only-gh.sh");
+    std::fs::write(
+        &bin,
+        "#!/usr/bin/env bash\ncase \"$*\" in\n  *\"--json baseRefName\"*) printf '%s' \
+         '{\"baseRefName\": \"main\"}'; exit 0 ;;\nesac\nexit 1\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    bin
+}
+
+#[test]
+fn an_unreadable_compare_falls_back_to_local_patch_identity() {
+    let (dir, reviewed, head) = rebased_fixture("feature-1\n");
+    let gh_dir = tempdir().unwrap();
+    let a = assess_unreadable(dir.path(), gh_dir.path(), &reviewed, &head);
+    assert_eq!(
+        a.equivalence,
+        Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_compare_and_an_absent_reviewed_head_name_both_failures() {
+    let (dir, _reviewed, head) = rebased_fixture("feature-1\n");
+    let gh_dir = tempdir().unwrap();
+    let absent = "d".repeat(40);
+    let a = assess_unreadable(dir.path(), gh_dir.path(), &absent, &head);
+    assert_eq!(a.equivalence, Equivalence::Indeterminate);
+    let note = a.unavailable_note().unwrap();
+    assert!(note.contains(UNREAD_TOKEN), "{note}");
+    assert!(note.contains("unreadable after retries"), "{note}");
+    assert!(note.contains("not fetchable"), "{note}");
+}
+
+#[test]
+fn an_unreadable_compare_and_differing_local_patches_stay_indeterminate() {
+    let (dir, reviewed, head) = rebased_fixture("feature-2\n");
+    let gh_dir = tempdir().unwrap();
+    let a = assess_unreadable(dir.path(), gh_dir.path(), &reviewed, &head);
+    assert_eq!(a.equivalence, Equivalence::Indeterminate, "{a:?}");
+    assert!(a.unavailable_note().unwrap().contains("patches differ"));
+}
