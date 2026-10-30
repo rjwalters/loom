@@ -923,6 +923,34 @@ fn classify_matches_github_snake_case_tokens() {
 }
 
 #[test]
+fn classify_recognises_queue_cleared() {
+    for t in ["queue_cleared", "Queue cleared", "  QUEUE_CLEARED\n"] {
+        assert_eq!(classify(Some(t)), RemovalKind::QueueCleared, "{t:?}");
+    }
+    assert_eq!(classify(Some("queue_cleared_by_octocat")), RemovalKind::Unknown);
+    assert_eq!(RemovalKind::QueueCleared.as_str(), "queue-cleared");
+}
+
+#[test]
+fn queue_cleared_drop_keeps_loom_pr_and_does_not_page_the_operator() {
+    let (gh, _, r) = drop_with(Some("queue_cleared"));
+    assert!(matches!(
+        r,
+        Reconciled::Dropped {
+            kind: RemovalKind::QueueCleared,
+            route_error: None,
+            ..
+        }
+    ));
+    assert!(gh.has_label("loom:pr"), "loom:pr is kept");
+    assert!(!gh.has_label("loom:operator"), "no operator hold");
+    assert!(!gh.has_label("loom:changes-requested"));
+    // Unrelated unknown text still pages the operator.
+    let (gh, _, _) = drop_with(Some("some_new_token"));
+    assert!(gh.has_label("loom:operator"));
+}
+
+#[test]
 fn manual_removal_does_not_page_the_operator() {
     let r = super::removal::route(RemovalKind::Manual);
     assert!(r.add.is_empty() && r.remove.is_empty());
