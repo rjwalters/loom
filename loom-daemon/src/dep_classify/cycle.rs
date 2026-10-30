@@ -194,6 +194,24 @@ where
         got
     }
 
+    /// For each consecutive pair on a cycle `path`, the source line of the
+    /// `from` node's body that declared the edge to `to`, as
+    /// `(from, to, line)`. A pair with no recoverable line is omitted.
+    #[must_use]
+    pub fn edge_lines(&self, path: &[String]) -> Vec<(String, String, String)> {
+        path.windows(2)
+            .filter_map(|w| {
+                let (from, to) = (&w[0], &w[1]);
+                let body = &self.cache.get(from)?.as_ref()?.body;
+                let default_repo = from.rsplit_once('#').map_or(from.as_str(), |(r, _)| r);
+                super::refs::dependency_lines(body, default_repo)
+                    .into_iter()
+                    .find(|(_, refs)| refs.contains(to))
+                    .map(|(line, _)| (from.clone(), to.clone(), line))
+            })
+            .collect()
+    }
+
     /// Walk from `root`, returning the first cycle reachable within budget.
     pub fn run(&mut self, root: &str) -> Outcome {
         // The root must be in the cache before its body can be read.
