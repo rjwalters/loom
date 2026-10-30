@@ -670,6 +670,14 @@ pub(crate) enum ScriptPortCommand {
     /// the persisted `~/.loom/host-id`, never the hostname. One line on
     /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
     HostId(super::host_id_cmd::HostIdArgs),
+
+    /// Write the #9588 operator-stop record on behalf of
+    /// `loom-daemon-stop.sh` (#9957), so the shell stop never carries its own
+    /// copy of the record format. Hidden: a plumbing verb, not an operator
+    /// command. Optional to its caller — an older binary lacking it leaves the
+    /// script on its `rm -f` fallback.
+    #[command(subcommand, hide = true)]
+    OperatorStop(crate::operator_stop::OperatorStopCommand),
 }
 
 impl ScriptPortCommand {
@@ -759,6 +767,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
             ScriptPortCommand::HostId(args) => args.run(),
+            ScriptPortCommand::OperatorStop(cmd) => cmd.run(),
             ScriptPortCommand::HooksHome(args) => args.run(),
         }
     }
@@ -1081,6 +1090,12 @@ pub(crate) enum MergePrCommand {
     /// terminator, or `LOOM-NEED close-targets` (exit 3, nothing done) — see
     /// `cli::merge_pr_post_merge_bookkeeping`.
     PostMergeBookkeeping(super::merge_pr_post_merge_bookkeeping::PostMergeBookkeepingArgs),
+
+    /// The whole post-merge stacked-child reconcile pass (#8191 slice 3): plan,
+    /// per-child route, deferral comment or `reconcile-stack.sh`. Snapshot on
+    /// stdin; `LEVEL<TAB>message` records ended by `LOOM-STACKED-RECONCILE DONE`
+    /// — see `cli::merge_pr_stacked_reconcile`.
+    StackedReconcile(super::merge_pr_stacked_reconcile::StackedReconcileArgs),
 }
 
 impl MergePrCommand {
@@ -1127,6 +1142,7 @@ impl MergePrCommand {
             MergePrCommand::CleanupPaths(args) => args.run(),
             MergePrCommand::PostMergeCleanup(args) => args.run(),
             MergePrCommand::PostMergeBookkeeping(args) => args.run(),
+            MergePrCommand::StackedReconcile(args) => args.run(),
         }
     }
 }

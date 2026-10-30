@@ -521,6 +521,13 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows"
     echo "$first" >> "$D/posted"
     echo "$id" ;;
+  *" DELETE "*)
+    echo "$*" >> "$D/deleted"
+    [ -f "$D/fail_delete" ] && {{ echo 'HTTP 404' >&2; exit 1; }}
+    cid=""
+    for a in "$@"; do case "$a" in */issues/comments/*) cid="${{a##*/}}" ;; esac; done
+    grep -v "^{{\"id\":$cid," "$D/rows" > "$D/rows.tmp" || true
+    mv "$D/rows.tmp" "$D/rows" ;;
   *" PATCH "*)
     echo "$*" >> "$D/patched"
     [ -f "$D/fail_patch" ] && {{ echo 'HTTP 403' >&2; exit 1; }}
@@ -774,6 +781,43 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     assert!(patched.contains(&a.released_marker()), "{patched}");
 }
 
+/// #13132: a release missing the claim's identity names the claimant and
+/// exits nonzero, leaving the lease untouched; the right identity releases.
+#[test]
+fn a_release_under_the_wrong_identity_names_the_claimant_and_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let claimant = who(Role::Doctor, "sweep-pid-1");
+    fs::write(dir.path().join("rows"), live_row(100, &claimant)).unwrap();
+    let wrong = who(Role::Doctor, "pr-lease-unknown");
+    assert_eq!(ctx(dir.path(), wrong).release(None, None, None), EXIT_MISMATCH);
+    assert!(patched(dir.path()).is_empty(), "the lease is untouched");
+    assert_eq!(ctx(dir.path(), claimant).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).contains("issues/comments/100"));
+}
+
+#[test]
+fn a_release_with_no_matching_same_host_lease_of_the_role_still_exits_zero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = who(Role::Doctor, "sweep-b");
+    // nothing at all
+    assert_eq!(ctx(dir.path(), me.clone()).release(None, None, None), EXIT_HELD);
+    // another host's lease, another role's lease, an expired lease
+    let mut other_host = who(Role::Doctor, "sweep-a");
+    other_host.host = "elsewhere".into();
+    let rows = live_row(100, &other_host)
+        + &live_row(101, &who(Role::Judge, "sweep-j"))
+        + &row_at(
+            102,
+            Utc::now() - chrono::Duration::days(1),
+            &who(Role::Doctor, "old").lease_marker(),
+        );
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), me).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty());
+}
+
 #[test]
 fn claim_refuses_without_writing_when_write_scope_denies_the_repo() {
     let dir = TempDir::new().unwrap();
@@ -941,6 +985,44 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     assert_eq!(ctx(dir.path(), a.clone()).reap("timeout"), EXIT_HELD);
     assert!(patched(dir.path()).contains(&format!("body={}", a.released_marker())));
     assert!(!patched(dir.path()).contains("verdict=none"));
+}
+
+/// #13135: a pass a verdict gate refused is recorded as such, holds the PR
+/// only briefly, and a fresh Judge claims it once the cool-down is over.
+#[test]
+fn a_gate_refused_judge_pass_cools_down_briefly_then_a_fresh_judge_claims() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let a = on("host-a", "run-1");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+    let released = ctx(dir.path(), a.clone()).release(Some("gate-refused:stale-read"), None, None);
+    assert_eq!(released, EXIT_HELD);
+    assert!(
+        patched(dir.path()).contains(&a.released_marker_with(&format!(
+            " head={HEAD} verdict=none labels=review-requested refused=stale-read"
+        ))),
+        "{}",
+        patched(dir.path())
+    );
+    let fields = format!(" head={HEAD} verdict=none labels=review-requested refused=stale-read");
+    let marker = on("host-a", "run-1").released_marker_with(&fields);
+    // Inside the cool-down: refused, and the message names the gate.
+    let recent = Utc::now() - chrono::Duration::minutes(5);
+    fs::write(dir.path().join("rows"), row_at(10, recent, &marker)).unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    assert_eq!(c.claim(), backstop::EXIT_BACKSTOP);
+    let rows = c.gh.read_rows(77, &c.policy).unwrap();
+    let (until, why) = backstop::hold_with_reason(&rows, c.gh.pr_head(77), Utc::now()).unwrap();
+    assert_eq!(why.as_deref(), Some("stale-read"));
+    assert!(until > Utc::now());
+    // After it: a fresh Judge claims. Three such records never escalate.
+    let old = Utc::now() - chrono::Duration::minutes(30);
+    let rows = row_at(10, old, &marker)
+        + &row_at(11, old, &marker.replace("run-1", "run-0"))
+        + &row_at(12, old, &marker.replace("run-1", "run-9"));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), on("host-c", "run-3")).claim(), EXIT_HELD);
 }
 
 /// Acceptance (#11931): a timed-out run counts toward the three Judge runs an
@@ -1270,4 +1352,74 @@ fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
         })
         .collect();
     assert_eq!(earliest_live_holder(&lib_rows, "judge", now(), ttl()).as_deref(), Some("run-2"));
+}
+
+// ---- pruning dead records (#13245) --------------------------------------
+
+fn released(id: u64, age_min: i64, holder: &Identity) -> Row {
+    row(id, age_min, format!("{}\nprose", holder.released_marker()))
+}
+
+#[test]
+fn prune_keeps_live_leases_peers_and_the_newest_dead() {
+    let me = who(Role::Doctor, "s-me");
+    let mut peer = who(Role::Doctor, "s-peer");
+    peer.host = "host-other".into();
+    let mut rows: Vec<Row> = (1..=6)
+        .map(|i| released(i, 5, &who(Role::Doctor, &format!("s{i}"))))
+        .collect();
+    rows.push(lease(7, 60, &who(Role::Doctor, "expired")));
+    rows.push(lease(8, 1, &who(Role::Judge, "live")));
+    rows.push(released(9, 5, &peer));
+    rows.push(lease(10, 90, &peer));
+    let ids = prune_candidates(&rows, &me.host, now(), ttl(), 3);
+    assert_eq!(ids, vec![1, 2, 3, 4], "7 dead own records, newest 3 kept");
+    assert!(prune_candidates(&rows, &me.host, now(), ttl(), 50).is_empty());
+}
+
+#[test]
+fn prune_spares_a_yield_whose_lease_is_still_live() {
+    let a = who(Role::Doctor, "s-a");
+    let peer = who(Role::Doctor, "s-peer");
+    let rows = vec![
+        lease(1, 1, &a),
+        row(2, 1, a.yield_marker(&peer)),
+        row(3, 1, who(Role::Doctor, "gone").yield_marker(&peer)),
+    ];
+    assert_eq!(prune_candidates(&rows, &a.host, now(), ttl(), 0), vec![3]);
+}
+
+#[test]
+fn repeated_claim_release_cycles_keep_the_comment_count_bounded() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    for i in 0..20 {
+        let me = who(Role::Doctor, &format!("sweep-{i}"));
+        let c = ctx(dir.path(), me);
+        assert_eq!(c.claim(), EXIT_HELD);
+        c.release(None, None, None);
+    }
+    let rows = fs::read_to_string(dir.path().join("rows")).unwrap();
+    assert!(rows.lines().count() <= KEEP_DEAD_RECORDS + 1, "{rows}");
+}
+
+#[test]
+fn a_failed_prune_delete_does_not_fail_the_claim() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail_delete"), "").unwrap();
+    for i in 0..6 {
+        let c = ctx(dir.path(), who(Role::Doctor, &format!("s{i}")));
+        assert_eq!(c.claim(), EXIT_HELD);
+        c.release(None, None, None);
+    }
+    assert!(dir.path().join("deleted").exists());
+}
+
+#[test]
+fn judge_claim_without_identity_warns_about_watch_pid() {
+    let w = unknown_identity_warning(Role::Judge, "pr-lease-unknown").unwrap();
+    assert!(w.contains("--watch-pid") && w.contains("post-verdict.sh"));
+    assert!(unknown_identity_warning(Role::Judge, "sweep-x").is_none());
+    assert!(unknown_identity_warning(Role::Doctor, "pr-lease-unknown").is_none());
 }

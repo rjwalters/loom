@@ -17,14 +17,7 @@
 //! [`CHUNK_BYTES`] is split by [`split_into_chunks`] into several records
 //! that share `tick_id` and carry `chunk_index` / `chunk_count`; the union
 //! of the chunks in `chunk_index` order is exactly the original. The chunk
-//! size exists only because one OTLP/gRPC message is limited to about 4 MB.
-//!
-//! **Exported as a summary (#12974).** The record above is what is *archived*
-//! ([`crate::observability::pick_payload_archive`]); the log carries only its
-//! bounded [`summarize`](PickDecisionRecord::summarize) form, flagged by
-//! `payload_ref` (see [`super::pick_summary`]).
-
-use std::collections::BTreeMap;
+//! size is the ~16 KB log ingest cap, so each chunk stays queryable in SigNoz.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -38,10 +31,12 @@ use crate::work_finder::step_item::PassReason;
 pub const PICK_DECISION_SCHEMA_VERSION: u32 = 2;
 
 /// A record whose JSON is larger than this is split into several records
-/// (`chunk_index` / `chunk_count`), never truncated. One OTLP/gRPC message is
-/// limited to about 4 MB; [`crate::telemetry::kinds::fleet_state::CHUNK_BYTES`]
-/// uses the same value.
-pub const CHUNK_BYTES: usize = 1_000_000;
+/// (`chunk_index` / `chunk_count`), never truncated. This is the fleet's
+/// ~16 KB log ingest cap (2AMLogic/2am#5541), so every exported chunk stays
+/// queryable in SigNoz. It is independent of
+/// [`crate::telemetry::kinds::fleet_state::CHUNK_BYTES`], which stays at the
+/// 1 MB OTLP/gRPC message budget.
+pub const CHUNK_BYTES: usize = 16 * 1024;
 
 /// The `chunk_count` default for `#[serde(default)]` (1 = unsplit).
 fn one() -> u32 {
@@ -216,8 +211,8 @@ impl PickSkipReason {
                 P::Sequenced => Self::OverlapChain,
                 P::Blocked => Self::Blocked,
                 P::CapabilityMissing => Self::HostConstraint,
-                P::Epic | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
-                P::CiPending | P::HeldAtHead => Self::Backoff,
+                P::Epic | P::Tracker | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
+                P::CiPending | P::HeldAtHead | P::AuthorGateHeld => Self::Backoff,
             },
         }
     }
@@ -650,19 +645,6 @@ pub struct PickDecisionRecord {
     /// never idle or ready. Additive beside the legacy `outcome`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_result: Option<String>,
-    /// Set only on the exported **summary** (#12974): the run id (the
-    /// `tick_id`) under which the full record sits in the payload archive.
-    /// Its presence is what marks a record as a summary: `candidates`,
-    /// `skipped` and every draw list are then empty. Absent on the full
-    /// record and on an older daemon's records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_ref: Option<String>,
-    /// Summary only: `skipped[]` entries per [`PickSkipReason`] token.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub skipped_counts: BTreeMap<String, usize>,
-    /// Summary only: the step engine's weight-0 items per skip-reason token.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub exclusion_counts: BTreeMap<String, usize>,
 }
 
 /// One repository's lane computation (#10630): `lanes = clamp(ceil(debt / k),
@@ -751,9 +733,6 @@ impl PickDecisionRecord {
             repo: None,
             item_draw: None,
             dispatch_result: None,
-            payload_ref: None,
-            skipped_counts: BTreeMap::new(),
-            exclusion_counts: BTreeMap::new(),
         }
     }
 

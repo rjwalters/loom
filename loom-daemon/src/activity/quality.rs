@@ -21,10 +21,9 @@ fn record_quality_metrics(conn: &Connection, metrics: &QualityMetrics) -> Result
         r"
         INSERT INTO quality_metrics (
             input_id, timestamp, tests_passed, tests_failed, tests_skipped,
-            test_runner, lint_errors, format_errors, build_success,
-            pr_approved, pr_changes_requested, rework_count, human_rating
+            test_runner, lint_errors, format_errors, build_success
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ",
         params![
             metrics.input_id,
@@ -36,10 +35,6 @@ fn record_quality_metrics(conn: &Connection, metrics: &QualityMetrics) -> Result
             metrics.lint_errors,
             metrics.format_errors,
             metrics.build_success,
-            metrics.pr_approved,
-            metrics.pr_changes_requested,
-            metrics.rework_count,
-            metrics.human_rating,
         ],
     )?;
 
@@ -65,7 +60,6 @@ pub(super) fn record_quality_from_output(
     }
 
     let metrics = QualityMetrics {
-        id: None,
         input_id: Some(input_id),
         timestamp: Utc::now(),
         tests_passed: test_results.as_ref().map(|t| t.passed),
@@ -75,10 +69,6 @@ pub(super) fn record_quality_from_output(
         lint_errors: lint_results.as_ref().map(|l| l.lint_errors),
         format_errors: lint_results.map(|l| l.format_errors),
         build_success: build_status,
-        pr_approved: None,
-        pr_changes_requested: None,
-        rework_count: None,
-        human_rating: None,
     };
 
     Ok(Some(record_quality_metrics(conn, &metrics)?))

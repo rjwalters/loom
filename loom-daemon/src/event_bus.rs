@@ -33,6 +33,7 @@
 //! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.close`     | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.revisit`   | Epic supervisor | `{epic, drawable, held, parked, action, shape, epic_held}` |
 //! | `daemon.capacity.advisory` | Work finder | `{pressured, queued, healthy_accounts, exhausted_accounts, total_accounts, estimated_drain_minutes?, message}` |
 //! | `daemon.drain.started`   | Drain supervisor | `{in_flight, timeout_secs, force_after_timeout, deadline}` |
 //! | `daemon.drain.completed` | Drain supervisor | `{in_flight}` (always 0) |
@@ -40,6 +41,7 @@
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
+//! | `daemon.agent_residue.reaped` | Agent residue reaper (#10802) | `{source, path, kind, unit, pids, issue, sweep_id, dry_run, detail}` |
 //! | `operator_priority.escalation` | `fleet_alert` (#10164; the star-liveness publisher, #9321, was removed by #11104) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally

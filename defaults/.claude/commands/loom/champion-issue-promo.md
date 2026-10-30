@@ -65,15 +65,7 @@ discover_project_goals
 
 ### Backlog Balance Check
 
-The caps map the old tier caps by **population**, not by name (#11512):
-`loom:very-important` and `loom:important` take the old Tier 1 slot
-(uncapped; very important is already bounded by "keep at most one eligible"),
-and an issue with no priority level, the majority, takes the old Tier 2
-per-pass cap (`tier2Cap`) with **no backlog gate**. Keyed on no level, the
-Tier 3 backlog gate would count 46 promoted issues against its cap of 5 in
-rjwalters/loom (3 when it counted Tier 3 only), freezing no-level promotion. `tier3Cap` / `tier3BacklogCap` stay parsed for config
-compatibility but govern no level today. The counts below are informational:
-promoted (`loom:issue` / `loom:building`), unheld (#7613) issues per level.
+Informational counts only: promoted (`loom:issue` / `loom:building`), unheld (#7613) issues per level. No count gates promotion.
 
 ```bash
 check_backlog_balance() {
@@ -92,14 +84,9 @@ check_backlog_balance() {
   important=$(_count "loom:important"); important_occupants=$(_occupants "loom:important")
   default=$(_count "default"); default_occupants=$(_occupants "default")
 
-  # Per-pass cap (#10753): env > default; empty or not an integer -> default.
-  _cap() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
-  DEFAULT_CAP=$(_cap "${LOOM_CHAMPION_TIER2_CAP:-}" 2)
-
   echo "loom:very-important: $very_important promoted"
   echo "loom:important:      $important promoted (occupants: ${important_occupants:-none})"
   echo "default (no level):  $default promoted (occupants: ${default_occupants:-none})"
-  echo "Caps this pass: DEFAULT_CAP=$DEFAULT_CAP (no-level promotions; priority levels uncapped; no backlog gate)"
 }
 check_backlog_balance
 ```
@@ -109,20 +96,6 @@ check_backlog_balance
 Evaluate proposals by level (`loom:very-important`, then `loom:important`,
 then the rest), oldest first within a level (#11103); `champion.md`'s
 discovery queries already return them in that order.
-
-**Rate Limiting by Level** (per pass; `$DEFAULT_CAP` is the value the Backlog
-Balance Check printed: env var `LOOM_CHAMPION_TIER2_CAP`, default 2, #10753;
-`LOOM_CHAMPION_TIER3_CAP` / `LOOM_CHAMPION_TIER3_BACKLOG_CAP` are currently
-unused; where a fleet sets them: `.loom/docs/promotion-throughput.md`):
-- `loom:very-important` / `loom:important`: promote all qualifying proposals (no limit)
-- No priority level: promote up to `$DEFAULT_CAP`
-
-Count each promotion under the level it is promoted with. Once a level's cap
-is spent, evaluate no more proposals at that level this pass: an unclaimed
-proposal was never evaluated, so nothing is left half-decided. There is no
-capacity deferral (#11860), and a targeted `--issue N` step has no cap. While
-PR rows wait, `LOOM_CHAMPION_PROMOTION_SLICE` also bounds fresh verdicts per
-pause (`champion.md` → "Autonomous Operation").
 
 ### Setting Priority
 
@@ -886,10 +859,14 @@ GATE_OUT="$(loom-daemon forge promotion-author --number "$ISSUE_NUMBER")" || GAT
 GATE="$(head -n1 <<<"$GATE_OUT")"
 if [ "$GATE" != "TRUSTED" ]; then
   # Fail closed: UNTRUSTED and UNKNOWN (unreadable evidence) both hold the issue.
-  # One deduplicated explanation per issue, keyed on the marker.
+  # One deduplicated explanation per verdict, keyed on the notice's marker line
+  # (it carries the issue's revision and the trust digest, #13142: the step
+  # tick stops drawing this issue while a trusted notice matches both, so a
+  # changed body or trust list posts a fresh notice).
+  NOTICE="$(tail -n +2 <<<"$GATE_OUT")"
   if ! loom-daemon forge trusted-comments --fetch "$ISSUE_NUMBER" 2>/dev/null \
-      | grep -q 'loom:promotion-author-gate'; then
-    tail -n +2 <<<"$GATE_OUT" | ./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body-file -
+      | grep -qF -- "$(head -n1 <<<"$NOTICE")"; then
+    printf '%s\n' "$NOTICE" | ./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body-file -
   fi
   gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"   # release the claim; stays loom:curated
   # HARD STOP for this issue: no loom:issue, no APPROVED comment. Continue the batch loop.
@@ -968,7 +945,7 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 fi
 ```
 
-**No Step 3c (#11860).** The capacity deferral (#6729) left a passing proposal `loom:curated` with no verdict. A level cap now stops evaluation before the claim ("Promotion Order"), so it never meets a passing proposal.
+**No Step 3c (#11860).** The capacity deferral (#6729) left a passing proposal `loom:curated` with no verdict; it is retired.
 
 ### Step 4: Reject (One or More Criteria Fail)
 
@@ -1156,9 +1133,9 @@ Both markers are load-bearing. Without `$VERDICT_MARKER` (keyed to the title + b
 
 ## Issue Promotion Batch Processing
 
-**Process all qualifying issues in one iteration, in "Promotion Order" (level, then oldest), governed by the per-level rate limits that prevent backlog flooding** ("Rate Limiting by Level" above: `loom:very-important` and `loom:important` uncapped, no level up to `$DEFAULT_CAP` per pass).
+**Process all qualifying issues in one iteration, in "Promotion Order" (level, then oldest).**
 
-Continue evaluating issues until all have been processed or all applicable level limits are reached — or, while PR rows still wait, until `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts are spent (`champion.md` → "Autonomous Operation", #10753). This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
+Continue evaluating issues until all have been processed. This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
 
 **Per-issue order in the loop**: run the "Dependency-Defer Fast Path" first — before anything else, including the Idempotency check — then the "Idempotency check", then the "Claim" step (skip if a concurrent evaluation holds a fresh `loom:evaluating`, reclaim if stale) — the latter two from "Concurrency Guard and Idempotency" above — before Step 1 (Read):
 
@@ -1170,7 +1147,7 @@ Continue evaluating issues until all have been processed or all applicable level
 | Marker match, `ALREADY_ROUTED=yes` (`loom:operator`, `loom:blocked`, or `loom:frozen` present, #8245) | Already terminal: no claim, no comment, no escalation; next issue |
 | Marker match, `OPERATOR_RULED=yes` (`loom:operator` removed after this revision's rejection, #8245) | Claim → Step 1 → Step 2 → Step 3 or 4. A human has ruled on this exact body, so Step 4 never escalates it: a failure is a revise verdict |
 
-**Every evaluation ends in exactly one verdict (#11860)**: promote (`loom:issue`), revise (`loom:triage`), block (`loom:blocked` + park record) or escalate (`loom:operator`), or the premise-false close. Each counts as a fresh verdict; only a promotion counts against the level caps. A fresh-claim skip or a verdict-time-recheck abort is not an evaluation: next issue.
+**Every evaluation ends in exactly one verdict (#11860)**: promote (`loom:issue`), revise (`loom:triage`), block (`loom:blocked` + park record) or escalate (`loom:operator`), or the premise-false close. A fresh-claim skip or a verdict-time-recheck abort is not an evaluation: next issue.
 
 ### When NOT to Promote
 

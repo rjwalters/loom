@@ -1249,108 +1249,26 @@ _notify_cleared_blockers() { [[ "$FORGE_TYPE" == "github" ]] || return 0; "${LOO
 # ratchet's threshold, so it may shrink but not grow (.loom/docs/file-size-policy.md).
 _mp_reconcile_roll_hint() { declare -F _mp_daemon_roll_hint >/dev/null || return 0; _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)"; }
 
-# Reconcile (or defer) one child PR from the plan. Best-effort; returns 0.
-_reconcile_one_stacked_child() {
-  local child_pr="$1" child_branch="$2" parent_branch="$3" child_issue="$4"
-
-  # Fresh (uncached) label read — mirrors post-merge-bookkeeping: use plain
-  # `gh api` (not $GH, which may be gh-cached) so a stale cached view cannot mask
-  # a live re-claim. Skipped entirely when the plan derived no issue number,
-  # which is the "child branch is not feature/issue-<N>, so no claim to race"
-  # case; the verb reaches the same answer from an empty --child-issue.
-  local issue_labels=""; [[ -z "$child_issue" ]] || issue_labels="$(gh api "repos/$REPO_NWO/issues/$child_issue" 2>/dev/null | jq -r '.labels[]?.name' 2>/dev/null || true)"
-
-  local out rc=0
-  out="$(printf '%s\n' "$issue_labels" | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" merge-pr reconcile-child --child-pr "$child_pr" --parent-branch "$parent_branch" --child-issue "$child_issue" 2>/dev/null)" || rc=$?
-  case "${out%%$'\n'*}" in
-    "LOOM-RECONCILE-CHILD defer")
-      # Unsafe: defer, do not rebase.
-      info "Stacked reconcile: child PR #$child_pr (issue #$child_issue) is still loom:building — deferring auto-rebase to avoid racing a live Builder"
-      # Everything after the marker is the comment body verbatim, so the text
-      # cannot be reshaped by a line-oriented read on this side.
-      local comment="${out#*$'\nLOOM-RECONCILE-COMMENT\n'}"
-      # forge_gh_comment_rl_safe (#4856): the REST comments endpoint is shared
-      # by issues and PRs, so the same helper covers this `gh pr comment` call
-      # site's GraphQL rate-limit fallback.
-      forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" 2>/dev/null || \
-        warning "Could not post deferred-reconciliation comment on PR #$child_pr"
-      ;;
-    "LOOM-RECONCILE-CHILD reconcile")
-      # Safe: no live claim — run the existing reconcile script unmodified. Do
-      # NOT re-implement the rebase/force-with-lease/retarget logic inline.
-      info "Stacked reconcile: parent '$parent_branch' merged; reconciling child PR #$child_pr onto the default branch"
-      if "$SCRIPT_DIR/reconcile-stack.sh" "$child_pr" "$parent_branch"; then
-        success "Stacked reconcile: child PR #$child_pr reconciled onto the default branch"
-      else
-        warning "Stacked reconcile: reconcile-stack.sh failed for child PR #$child_pr (rebase conflict, rejected force-with-lease push, or retarget failure). The parent merge is unaffected — reconcile manually: ./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch"
-      fi
-      ;;
-    *)
-      warning "Stacked reconcile: SKIPPING child PR #$child_pr — 'loom-daemon merge-pr reconcile-child' exited $rc without a LOOM-RECONCILE-CHILD verdict, so whether a Builder still holds issue #${child_issue:-?} is unknown. Rebasing on a guess could force-push over uncommitted work, so nothing was done. The parent merge is unaffected — reconcile by hand once that is answered: ./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch $(_mp_reconcile_roll_hint)" ;;
-  esac
-  return 0
-}
-
-# Discover open child PRs stacked on the just-merged parent branch and reconcile
-# (or defer) each. Best-effort; returns 0 unconditionally.
+# The whole pass (plan, per-child route, deferral comment or reconcile-stack.sh)
+# is `loom-daemon merge-pr stacked-reconcile` (#8191 slice 3). This wrapper only
+# replays its `LEVEL<TAB>message` records; best-effort, returns 0 unconditionally.
+# No `LOOM-STACKED-RECONCILE DONE` terminator means the verb did not run: nothing
+# was rebased or commented, and the manual command is named.
 _auto_reconcile_stacked_children() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-
-  # Prefer the pre-merge snapshot the guard above already captured (#8010
-  # item 2) over a fresh post-merge query: GitHub retargets an open child PR
-  # the instant delete_branch_on_merge removes this parent branch, so a query
-  # run AFTER the merge can return zero rows even though children existed
-  # seconds earlier — the guard's own pre-merge query already paid for this
-  # exact answer. Live forge discovery (uncached `gh`, NEVER the daemon
-  # registry) is only a fallback for when the guard never ran (e.g. this
-  # function invoked standalone, as the unit tests do).
-  local children_json="${STACKED_CHILDREN_JSON:-}"
-
-  # AT MOST TWO plan calls, which is what the `for` bounds structurally.
-  #
-  # Pass `gate`: the parent-branch gate. NOT-STACKED is decided from
-  # --parent-branch alone, so feeding it `[]` when no snapshot exists answers
-  # the gate without a forge round trip — which is why the live query below
-  # still costs nothing on an ordinary non-stacked merge. Only a stacked parent
-  # with no snapshot falls through to pass `live` and queries, precisely when
-  # the retired shell queried.
-  #
-  # The gate is also where the fail-OPEN skip is taken, BEFORE the query rather
-  # than after it. An unanswered gate is indistinguishable from NOT-STACKED, so
-  # on a host whose daemon predates these verbs this path runs once per merge;
-  # it must not also spend a `gh pr list` on a rollup nothing will read.
-  local plan rc verdict count _pass bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}"
-  for _pass in gate live; do
-    rc=0; plan="$(printf '%s' "${children_json:-[]}" | "$bin" merge-pr reconcile-plan --parent-branch "$PR_BRANCH" 2>/dev/null)" || rc=$?
-    verdict="${plan%%$'\n'*}"
-    [[ "$verdict" == "LOOM-RECONCILE-PLAN NOT-STACKED" ]] && return 0
-    [[ "$verdict" == "LOOM-RECONCILE-PLAN COUNT "* ]] || { warning "Stacked reconcile: skipping auto-reconciliation for '$PR_BRANCH' — 'loom-daemon merge-pr reconcile-plan' exited $rc without a plan${verdict:+ (it said: $verdict)}. The parent merge is unaffected; reconcile any stacked child by hand: ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH $(_mp_reconcile_roll_hint)"; return 0; }
-    [[ -z "$children_json" ]] || break   # the snapshot (or pass `live`'s query) already answered
-    children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
-      --json number,headRefName 2>/dev/null || echo '[]')"; children_json="${children_json:-[]}"
-  done
-  count="${verdict#LOOM-RECONCILE-PLAN COUNT }"; [[ "$count" -gt 0 ]] || return 0
-
-  info "Stacked reconcile: found $count open child PR(s) based on '$PR_BRANCH'"
-
-  if [[ ! -x "$SCRIPT_DIR/reconcile-stack.sh" ]]; then
-    warning "Stacked reconcile: reconcile-stack.sh not found or not executable at $SCRIPT_DIR — skipping auto-reconciliation"
+  local bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" out="" rc=0 level text
+  out="$(printf '%s' "${STACKED_CHILDREN_JSON:-}" | "$bin" merge-pr stacked-reconcile --repo "$REPO_NWO" --parent-branch "$PR_BRANCH" --script-dir "$SCRIPT_DIR" --forge-helpers "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-helpers.sh" --roll-hint "$(_mp_reconcile_roll_hint)")" || rc=$?
+  if [[ $rc -ne 0 || "${out##*$'\n'}" != "LOOM-STACKED-RECONCILE DONE" ]]; then
+    warning "Stacked reconcile: skipping auto-reconciliation for '$PR_BRANCH' — '$bin merge-pr stacked-reconcile' exited $rc without finishing (no LOOM-STACKED-RECONCILE DONE terminator). The parent merge is unaffected; reconcile any stacked child by hand: ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH $(_mp_reconcile_roll_hint)"
     return 0
   fi
-
-  local line child_pr child_branch child_issue
-  while IFS= read -r line; do
-    case "$line" in
-      "LOOM-RECONCILE-PLAN CHILD "*)
-        IFS=$'\t' read -r child_pr child_branch child_issue <<<"${line#LOOM-RECONCILE-PLAN CHILD }"
-        [[ -n "$child_pr" ]] || continue
-        _reconcile_one_stacked_child "$child_pr" "$child_branch" "$PR_BRANCH" "$child_issue"
-        ;;
-      "LOOM-RECONCILE-PLAN MALFORMED "*)
-        warning "Stacked reconcile: ignoring an unusable child row from the forge — ${line#LOOM-RECONCILE-PLAN MALFORMED }" ;;
+  while IFS=$'\t' read -r level text; do
+    case "$level" in
+      INFO) info "$text" ;;
+      WARNING) warning "$text" ;;
+      SUCCESS) success "$text" ;;
     esac
-  done <<< "$plan"
-
+  done <<<"$out"
   return 0
 }
 

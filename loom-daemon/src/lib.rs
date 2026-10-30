@@ -142,6 +142,7 @@
 
 pub mod activity;
 pub mod agent_gh;
+pub mod agent_residue_reaper;
 pub mod agent_session;
 pub mod agent_skills;
 /// Alert transitions as `alert.transition` OTLP log records (#11295, #12806).
@@ -175,6 +176,7 @@ pub mod daemon_bin_resolve;
 pub mod daemon_heartbeat;
 pub mod daemon_install_state;
 pub mod daemon_pidfile;
+pub mod daemon_root_freshness;
 pub mod daemon_start;
 /// Non-blocking wrapper around the startup claim-reconciliation +
 /// stranded-quarantine reconciliation passes (Issue #7974) — a new sibling
@@ -210,6 +212,7 @@ pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
+pub mod forge_additive_migrations;
 pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;

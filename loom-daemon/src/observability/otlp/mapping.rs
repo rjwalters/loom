@@ -4,9 +4,11 @@
 
 mod alert_transition;
 mod auto_update;
+mod champion_run;
 mod checkout_external_change;
 mod checkout_freshness;
 mod ci;
+mod completion_narrated;
 mod daemon_event;
 mod daemon_exit;
 mod dispatch_eligibility;
@@ -21,6 +23,7 @@ mod host_resource;
 mod host_status;
 mod issue_estimate;
 mod merge_authorization;
+mod merge_lane_wait;
 mod merge_queue_event;
 mod merge_queue_observed;
 mod merge_queue_regime;
@@ -652,9 +655,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
+        | TelemetryRecord::CompletionNarrated(_)
         | TelemetryRecord::MergeQueueEvent(_)
         | TelemetryRecord::MergeAuthorization(_)
         | TelemetryRecord::HoldTransition(_)
+        | TelemetryRecord::MergeLaneWait(_)
+        | TelemetryRecord::ChampionRun(_)
         | TelemetryRecord::MergeQueueObserved(_)
         | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
@@ -678,9 +684,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| run_state_request::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
+                .or_else(|| completion_narrated::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
                 .or_else(|| merge_authorization::log_parts(r))
                 .or_else(|| hold_transition::log_parts(r))
+                .or_else(|| merge_lane_wait::log_parts(r))
+                .or_else(|| champion_run::log_parts(r))
                 .or_else(|| merge_queue_observed::log_parts(r))
                 .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;

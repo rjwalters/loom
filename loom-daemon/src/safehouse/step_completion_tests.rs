@@ -457,3 +457,167 @@ fn watermarks_never_move_backwards_and_carry_the_slack() {
         .windows(2)
         .any(|w| w[0] == "--search" && w[1].starts_with("merged:>=")));
 }
+
+/// Seed the transcript a dispatched **step** leaves behind (#13287): a
+/// `/loom:builder <issue>` session, not `/loom:sweep`, with one model's usage.
+fn seed_step_transcript(config: &Path, workspace: &str, command: &str, args: &str) {
+    let project = config
+        .join("projects")
+        .join(crate::transcript_tokens::project_slug(Path::new(workspace)));
+    std::fs::create_dir_all(&project).unwrap();
+    let body = format!(
+        "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\
+         \"<command-name>/loom:{command}</command-name>\\n\
+         <command-args>{args}</command-args>\"}}}}\n\
+         {{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-sonnet-4-5\",\
+         \"usage\":{{\"input_tokens\":10,\"output_tokens\":20,\
+         \"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":40}}}}}}\n"
+    );
+    std::fs::write(project.join(format!("{command}-{args}.jsonl").replace([' ', '-'], "_")), body)
+        .unwrap();
+}
+
+/// #13287: every trigger path carries `tokens` and `tokens_by_model` for a
+/// completion whose sessions are step-launched role commands, and emits one
+/// `completion.narrated` record naming the trigger, with `seeded` distinct.
+#[test]
+#[serial]
+fn each_trigger_path_carries_step_session_tokens_and_emits_a_narration_record() {
+    use crate::telemetry::TelemetryRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let root = ws.to_string_lossy().into_owned();
+    let config = dir.path().join("claude-config");
+    std::fs::create_dir_all(config.join("projects")).unwrap();
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+    // Issue 11 merges via sweep exit, 12 via a champion step, 13 and 14 via
+    // reconciliation (14 as a seeding pass), 15 has no sessions on disk.
+    seed_step_transcript(&config, &root, "builder", "11");
+    seed_step_transcript(&config, &root, "curator", "12");
+    seed_step_transcript(&config, &root, "champion", "--issue 13");
+    seed_step_transcript(&config, &root, "builder", "14");
+    let gh = FakeGh::new(dir.path());
+    gh.serve_view(&pr_row(602, 12, Some(1)));
+    gh.serve_list(&format!(
+        "[{},{},{},{}]",
+        pr_row(601, 11, Some(2)),
+        pr_row(603, 13, Some(2)),
+        pr_row(604, 14, Some(2)),
+        pr_row(605, 15, Some(2)),
+    ));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut slug_cache = HashMap::new();
+    let mut completed = std::collections::HashSet::new();
+    let ((exit, step, rows), captured) = crate::observability::ops::capture::capture(|| {
+        rt.block_on(forge_gate::scoped(None, async {
+            let exit = completion_for_exit(
+                "loom_daemon",
+                &root,
+                11,
+                120,
+                Utc::now(),
+                &mut slug_cache,
+                &mut completed,
+                None,
+                None,
+            )
+            .await;
+            let step = completion_for_merged_step(
+                "loom_daemon",
+                &root,
+                602,
+                &mut slug_cache,
+                &mut completed,
+                None,
+                None,
+            )
+            .await;
+            let n = completion_runtime::Narration::new(
+                crate::observability::ops::feed::Trigger::Reconcile,
+                false,
+            );
+            let s = completion_runtime::Narration::new(
+                crate::observability::ops::feed::Trigger::Reconcile,
+                true,
+            );
+            let rows = fetch_merged_prs_since(Path::new(&root), None)
+                .await
+                .unwrap()
+                .0;
+            let mut out = Vec::new();
+            for row in rows {
+                let narration = if row.issue == 14 { s } else { n };
+                out.push(
+                    build_and_narrate_completion(
+                        "loom_daemon",
+                        &root,
+                        row.issue,
+                        row.merged,
+                        60,
+                        row.merged_at,
+                        &mut slug_cache,
+                        &mut completed,
+                        None,
+                        None,
+                        narration,
+                    )
+                    .await,
+                );
+            }
+            (exit, step, out)
+        }))
+    });
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let has_tokens = |e: &Option<Envelope>| {
+        let meta = e.as_ref().expect("a completion").meta.as_ref().unwrap();
+        meta["tokens"] == serde_json::json!(370)
+            && meta["tokens_by_model"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+    };
+    assert!(has_tokens(&exit), "sweep_exit path: {exit:?}");
+    assert!(has_tokens(&step), "step path: {step:?}");
+    // Row 0 is issue 11's PR, already narrated by the exit path (dedup).
+    assert!(rows[0].is_none(), "the exit path's merge is not re-narrated");
+    assert!(has_tokens(&rows[1]), "reconcile path");
+    assert!(has_tokens(&rows[2]), "seeded reconcile row");
+    // Issue 15 has no sessions: the payload omits tokens, the record says so.
+    let bare = rows[3]
+        .as_ref()
+        .expect("a completion")
+        .meta
+        .as_ref()
+        .unwrap();
+    assert!(bare.get("tokens").is_none());
+
+    let mut got: Vec<(u32, String, String, bool, u32)> = captured
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            TelemetryRecord::CompletionNarrated(c) => Some((
+                c.issue,
+                c.trigger.clone(),
+                c.outcome.clone(),
+                c.tokens_present,
+                c.tokens_by_model_rows,
+            )),
+            _ => None,
+        })
+        .collect();
+    got.sort();
+    let want = |i: u32, t: &str, o: &str, p: bool, n: u32| (i, t.to_owned(), o.to_owned(), p, n);
+    assert_eq!(
+        got,
+        vec![
+            want(11, "sweep_exit", "narrated", true, 1),
+            want(12, "champion_merge_step", "narrated", true, 1),
+            want(13, "reconcile", "narrated", true, 1),
+            want(14, "reconcile", "seeded", true, 1),
+            want(15, "reconcile", "narrated", false, 0),
+        ]
+    );
+}

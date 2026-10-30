@@ -285,6 +285,7 @@ pub mod response;
 pub mod retarget_children;
 pub mod sequence;
 pub mod stacked_children;
+pub mod stacked_reconcile;
 pub mod stale_checks;
 pub mod superseded_runs;
 pub mod tree_checks;

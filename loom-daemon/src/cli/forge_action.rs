@@ -223,6 +223,19 @@ pub(crate) enum ForgeAction {
         max_points: u32,
     },
 
+    /// `forge journal-ci-refusal <PR> --class ci_red|ci_incomplete [--head SHA]`
+    /// (#13274) — journal a Judge approval refused by the exact-head CI gate
+    /// so the step's `pass.verdict` carries it. Best-effort: always exits 0,
+    /// and is a no-op outside a journaled run or on an unknown class.
+    #[command(name = "journal-ci-refusal")]
+    JournalCiRefusal {
+        pr: u64,
+        #[arg(long)]
+        class: String,
+        #[arg(long)]
+        head: Option<String>,
+    },
+
     /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only] [--settle-red]`
     /// (#10330) — wait for a PR's (or commit's) CI with ETag'd REST reads
     /// (an unchanged poll is a free `304`) backing off 30s → 120s.
@@ -526,6 +539,20 @@ pub(crate) enum ForgeAction {
         /// The PR's current head (7-40 lowercase hex).
         #[arg(value_name = "HEAD")]
         head: String,
+
+        /// Paths an operator's release named as the requested change (#13114).
+        /// When the PR's patch differs ONLY in these paths the answer is
+        /// `EQUIVALENCE_KIND=requested-change`; any other delta, or an empty
+        /// list, answers as without the flag. Only Champion's critical-file
+        /// hold passes it; a Judge verdict never carries on this kind.
+        #[arg(long = "allowed-paths", value_name = "PATH", num_args = 1..)]
+        allowed_paths: Vec<String>,
+
+        /// `OWNER/REPO` every forge read targets (#13146). Without it `gh`
+        /// resolves the repository from the process cwd (or `LOOM_REPO`), so a
+        /// caller outside the checkout fails every read at once.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
     },
 
     /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
@@ -550,6 +577,29 @@ pub(crate) enum ForgeAction {
         /// Repo-relative path of the changed file.
         #[arg(value_name = "FILE")]
         file: String,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
+    /// `forge additive-migrations <pr> [--repo OWNER/REPO]` (#13102) — is every
+    /// migration file PR `<pr>` touches a newly added `.sql` file containing only
+    /// additive statements (`CREATE TABLE/INDEX IF NOT EXISTS`, `ALTER TABLE … ADD
+    /// COLUMN`, `INSERT OR IGNORE INTO … SELECT`)? Backs Champion's opt-in
+    /// `additiveMigrations` class key.
+    ///
+    /// Exits 0 (`ADDITIVE_MIGRATIONS=1`) ONLY when the whole file list and every
+    /// migration file were read and parsed and nothing else is touched in the
+    /// migration paths. Any other outcome — a forbidden statement, an edited,
+    /// removed or renamed migration, a non-`.sql` migration path, unparsable SQL,
+    /// a forge error — exits 1 with the reason on stderr. Callers treat any
+    /// non-zero exit as "hold".
+    #[command(name = "additive-migrations")]
+    AdditiveMigrations {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
 
         /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
         #[arg(long, value_name = "OWNER/REPO")]
@@ -1184,6 +1234,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
+        ForgeAction::JournalCiRefusal { pr, class, head } => {
+            if matches!(class.as_str(), "ci_red" | "ci_incomplete") {
+                crate::observability::pick_journal::record_ci_refusal(pr, &class, head.as_deref());
+            }
+            return Ok(());
+        }
         ForgeAction::WaitChecks {
             selector,
             repo,
@@ -1260,10 +1316,14 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             pr_number,
             reviewed,
             head,
+            allowed_paths,
+            repo,
         } => ForgeCmd::VerdictEquivalent {
             pr: pr_number,
             reviewed,
             head,
+            allowed_paths,
+            repo,
         },
         ForgeAction::VersionOnlyDiff {
             pr_number,
@@ -1274,6 +1334,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             file,
             repo,
         }),
+        ForgeAction::AdditiveMigrations { pr_number, repo } => {
+            ForgeCmd::AdditiveMigrations(crate::forge_additive_migrations::Args {
+                pr: pr_number,
+                repo,
+            })
+        }
         ForgeAction::SuspectCriticalDiff {
             pr_number,
             file,

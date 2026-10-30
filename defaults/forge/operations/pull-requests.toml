@@ -288,6 +288,9 @@ kind = "rust"
 path = "loom-daemon/src/forge_suspect_critical_diff.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/forge_additive_migrations.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
 [[operation.callers]]
 kind = "script"
@@ -328,6 +331,9 @@ unknowns = [
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_tree_unchanged.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/verdict_equivalence/mod.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/blame-issue.sh"

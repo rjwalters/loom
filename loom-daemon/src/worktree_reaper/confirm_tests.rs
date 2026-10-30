@@ -34,6 +34,10 @@ fn pass_over(confirm: &dyn Fn(u32) -> Option<String>) -> (ReapReport, Vec<String
             Some("deadbeef".to_string())
         },
         &|_, n| {
+            ran.borrow_mut().push(format!("backup {n}"));
+            Err("no backup route in this test".to_string())
+        },
+        &|_, n| {
             ran.borrow_mut().push(format!("remove {n}"));
             true
         },

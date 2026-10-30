@@ -18,7 +18,7 @@
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
 //! item to a closed, versioned `(class, reason)`. Registered: `champion`
-//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921);
+//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921) and `judge` ([`judge`], #13274);
 //! other roles add theirs (#12029).
 //!
 //! # The ledger's view, record-only
@@ -62,6 +62,7 @@ use crate::telemetry::provenance::Provenance;
 pub mod champion;
 pub mod curator;
 pub mod doctor;
+pub mod judge;
 pub mod refusals;
 
 use refusals::{Observed, RefusalStore};
@@ -157,6 +158,7 @@ pub fn projector(role: &str) -> Option<Projector> {
         "champion" => Some(champion::PROJECTOR),
         "doctor" => Some(doctor::PROJECTOR),
         "curator" => Some(curator::PROJECTOR),
+        "judge" => Some(judge::PROJECTOR),
         _ => None,
     }
 }
@@ -204,6 +206,8 @@ pub struct StepSource {
     pub item: u32,
     /// The session's own section of its log, `None` when unreadable.
     pub log_text: Option<String>,
+    /// The digest the item's hold recorded when it was drawn (#13029).
+    pub hold_auth_before: Option<String>,
 }
 
 /// What a drained journal belongs to.
@@ -220,6 +224,8 @@ pub struct StagedStep {
     pub step: StepRole,
     pub item: u32,
     pub log: PathBuf,
+    /// The digest the item's hold recorded when it was drawn (#13029).
+    pub hold_auth_before: Option<String>,
 }
 
 impl StagedStep {
@@ -242,6 +248,7 @@ impl StagedStep {
             step: self.step,
             item: self.item,
             log_text,
+            hold_auth_before: self.hold_auth_before,
         }
     }
 }
@@ -581,6 +588,22 @@ pub fn emit_drain(
         let changed = *store != before;
         (records, changed)
     });
+    // #13029: a Champion merge step's run fact, from the verdict just built.
+    if let Source::Step(step) = &source {
+        let auth_after = Some(crate::champion_hold::standing_auth_digest(root));
+        for verdict in &records {
+            if let Some(run) = super::champion_run::record_for(
+                repo,
+                step,
+                journal,
+                verdict,
+                auth_after.clone(),
+                ctx.now,
+            ) {
+                super::ops::emit_record(crate::telemetry::TelemetryRecord::ChampionRun(run));
+            }
+        }
+    }
     for record in records {
         super::ops::emit_record(crate::telemetry::TelemetryRecord::PassVerdict(record));
     }

@@ -61,6 +61,7 @@ test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
 test-champion-ratification-hold.sh
+test-champion-resync-waiver.sh
 test-champion-standing-authorization.sh
 test-champion-targeted-modes.sh
 test-champion-terminal-verdicts.sh
@@ -148,7 +149,6 @@ test-install-lock.sh
 test-install-pr-markers.sh
 test-install-source-guard.sh
 test-install-stash-scope.sh
-test-install-sync-labels.sh
 test-jq-reserved-word-args.sh
 test-judge-fallback-cap.sh
 test-judge-payload-drop-guard.sh
@@ -247,6 +247,7 @@ test-worktree-root-override.sh
 test-worktree-sentinel.sh
 
 # tests/hooks/ (repo root) — Claude-path guard suites, wired since #4769.
+tests/hooks/test-guard-cross-tool-champion.sh
 tests/hooks/test-guard-destructive-dispatcher.sh
 tests/hooks/test-guard-install-matrix.sh
 tests/hooks/test-guard-destructive-cargo-and-perf.sh
@@ -345,3 +346,7 @@ test-ci-wait-prompt-consistency.sh
 # #12939: tools-first slice resolution on a clean install (loom-tools before
 # loom-daemon, transitional fallback). Hermetic.
 test-tools-first-clean-install.sh
+# #12941: lib/loom-tools.sh is a compat alias for lib/repo-root.sh. Hermetic.
+test-repo-root-alias.sh
+# #11787: create-issue.sh refuses a direct loom:curated write (exits 2 before forge_detect). Hermetic.
+test-create-issue-curated.sh

@@ -56,10 +56,31 @@ fn unreadable_evidence_is_unknown_never_trusted() {
 #[test]
 fn only_the_trusted_gate_has_no_notice_and_retries_render_identically() {
     let held = Gate::Untrusted(Some("drive-by".to_string()));
-    assert!(notice_body(&Gate::Trusted).is_empty());
-    let body = notice_body(&held);
+    assert!(notice_body(&Gate::Trusted, None).is_empty());
+    let body = notice_body(&held, None);
     assert!(body.starts_with(NOTICE_MARKER));
     assert!(body.contains("drive-by"));
-    assert_eq!(body, notice_body(&held), "a retry posts the same, marker-anchored text");
-    assert!(notice_body(&Gate::Unknown("x".into())).contains("could not be verified"));
+    assert_eq!(body, notice_body(&held, None), "a retry posts the same, marker-anchored text");
+    assert!(notice_body(&Gate::Unknown("x".into()), None).contains("could not be verified"));
+}
+
+#[test]
+fn a_stamped_notice_round_trips_and_a_legacy_one_has_no_stamp() {
+    let held = Gate::Untrusted(Some("drive-by".to_string()));
+    let stamp = Stamp {
+        rev: revision("t", "b"),
+        trust: "0123456789abcdef".to_string(),
+    };
+    let body = notice_body(&held, Some(&stamp));
+    assert!(body.starts_with("<!-- loom:promotion-author-gate rev="));
+    assert_eq!(Stamp::parse(&body), Some(stamp));
+    assert_eq!(Stamp::parse(&notice_body(&held, None)), None);
+    assert_eq!(Stamp::parse("no marker here"), None);
+}
+
+#[test]
+fn the_revision_moves_with_an_edit_and_ignores_trailing_newlines() {
+    assert_eq!(revision("t", "b"), revision("t", "b\n"));
+    assert_ne!(revision("t", "b"), revision("t", "b2"));
+    assert_ne!(revision("t", "b"), revision("t2", "b"));
 }

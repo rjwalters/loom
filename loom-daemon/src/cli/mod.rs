@@ -118,6 +118,7 @@ mod merge_pr_response;
 mod merge_pr_retarget_children;
 mod merge_pr_sequence;
 mod merge_pr_stacked_children;
+mod merge_pr_stacked_reconcile;
 mod merge_pr_tree_checks;
 mod merge_pr_usage;
 mod merge_pr_version_policy;

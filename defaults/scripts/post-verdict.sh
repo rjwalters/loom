@@ -435,6 +435,12 @@ if [[ "$VERDICT" == "approved" ]]; then
       [[ -n "$CI_DETAIL" ]] && printf '%s\n' "${CI_DETAIL:0:4000}" | sed 's/^/  /'
       echo "$2"
     } >&2
+    # Telemetry (#13274): journal the refusal (5 = incomplete, 6 = red) for the
+    # step's pass.verdict. Best-effort: an older daemon or a failed write
+    # never changes the exit code, and nothing is posted.
+    "${LOOM_DAEMON_BIN:-loom-daemon}" forge journal-ci-refusal "$PR" \
+      --class "$([[ "$3" -eq 6 ]] && echo ci_red || echo ci_incomplete)" \
+      ${CI_SHA:+--head "$CI_SHA"} >/dev/null 2>&1 || true
     exit "$3"
   }
   PENDING_NEXT="Nothing was posted. Do NOT add loom:pr: release your claim, leave loom:review-requested, and re-evaluate once CI settles on this head."
@@ -463,7 +469,7 @@ if [[ "$VERDICT" == "approved" ]]; then
   else
     LEASE_STATE="$(printf '%s\n' "$LEASE_OUT" | sed -n 's/^PR_LEASE_STATE=\([a-z-]*\).*/\1/p' | head -n1)"
     if [[ "$LEASE_STATE" != "held-self" ]]; then
-      echo "post-verdict.sh: REFUSING to post an approval on PR #$PR — the caller does not hold a live Judge lease (PR_LEASE_STATE=${LEASE_STATE:-unknown}, exit $LEASE_RC) (#13055). Nothing was posted. Stand down: do NOT retry; release the lease (loom-daemon lease pr release $PR --role judge --watch-pid ...)." >&2
+      echo "post-verdict.sh: REFUSING to post an approval on PR #$PR — the caller does not hold a live Judge lease (PR_LEASE_STATE=${LEASE_STATE:-unknown}, exit $LEASE_RC) (#13055). Nothing was posted. Stand down: do NOT retry; release the lease with the gate-refused reason so the no-verdict backstop holds the PR only briefly (loom-daemon lease pr release $PR --role judge --watch-pid ... --skip-reason gate-refused:lease)." >&2
       exit 10
     fi
   fi
@@ -615,4 +621,14 @@ if [[ "$VERDICT" == "approved" ]]; then
        gh api -X DELETE "repos/$REPO/issues/$PR/labels/loom%3Apr" >/dev/null 2>&1 || WITHDRAWN="loom:pr could NOT be withdrawn (the DELETE failed), so the unconfirmed approval may still be actionable. Remove it now: gh pr edit $PR --repo $REPO --remove-label loom:pr"
        echo "post-verdict.sh: the approval on PR #$PR was posted and labelled, but the post-label re-arbitration was unconfirmed (#10581): ${RC2_OUT:0:300}. $WITHDRAWN. Re-run this command." >&2; exit 8 ;;
   esac
+fi
+
+# --- Release the Judge lease once the verdict is posted (#13264) ------------
+# Best-effort: a subagent can skip the prompt's release step, and a surviving
+# Judge lease blocks the Doctor's `lease pr claim` (exit 7) until it expires.
+# Never fails the verdict: an older binary (exit 2) or any error only warns.
+REL_RC=0
+REL_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr release "$PR" --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" 2>&1)" || REL_RC=$?
+if [[ "$REL_RC" -ne 0 ]]; then
+  echo "post-verdict.sh: WARNING — the $VERDICT verdict on PR #$PR is posted, but releasing the Judge lease failed (exit $REL_RC): ${REL_OUT:0:200}. Release it yourself: loom-daemon lease pr release $PR --role judge --watch-pid ..." >&2
 fi

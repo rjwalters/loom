@@ -142,6 +142,10 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.repos.error",
     "loom.discovery.items",
     "loom.discovery.forge_reads",
+    // #12317: the per-item reads the snapshot cannot answer.
+    "loom.discovery.live_reads.landed",
+    "loom.discovery.live_reads.markers",
+    "loom.discovery.live_reads.ci",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
@@ -157,11 +161,17 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_account_ms",
     // #12410: the tick's draws and passes by reason (`ops::dispatch_facts`).
     "loom.dispatch.passes",
+    // #13008: the tick's exclusions by reason, `held_at_head` among them.
+    "loom.dispatch.excluded",
     "loom.dispatch.draws",
     "loom.dispatch.draws_unspawned",
     // #12494: merge steps held back before the draw by a repo's merge in
     // flight.
     "loom.dispatch.merge_deferred",
+    // #13026: the per-repo Champion merge concurrency in force, and the
+    // merges in flight once the tick drew.
+    "loom.champion.merge_concurrency",
+    "loom.champion.merges_in_flight",
     "loom.dispatch.budget",
     "loom.dispatch.stop",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
@@ -234,6 +244,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.queue.gate",
     "loom.queue.step",
     "loom.queue.owning_shard",
+    "loom.queue.level",
+    "loom.queue.workspace_weight",
     "loom.queue.created_at",
     // Repo lockout weights on a pr-open-skip row's disposition/admission
     // spans (Issue #9674).
@@ -283,6 +295,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.read.owner",
     "forge.read.resource",
     "forge.read.until",
+    // `safehouse.forge_lookup.failed` spans (#13156): the failed call, the
+    // workspace repo and the reason class. Never stderr or a path.
+    "safehouse.call",
+    "loom.repo",
+    "safehouse.reason",
     // `loom.egress.request` spans (#11300): one proxied provider request.
     // Counts, classified codes and ids only, never a body or credential.
     "loom.egress.seat",
@@ -337,6 +354,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.hold_set_by_outcome",
     "loom.fleet_dispatch.hold_set_by_assignment_id",
     "loom.fleet_dispatch.holder_assignment_id",
+    "loom.fleet_dispatch.merge_slot_holder",
     "loom.dispatch.held_by",
     "loom.dispatch.retry_after_s",
     "loom.dispatch.hold_until",
@@ -364,6 +382,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.reaper.preserved.uncommitted",
     "loom.reaper.preserved.private_workspace",
     "loom.reaper.preserved.other",
+    // #12458: open-item worktrees pushed to a remote backup ref before
+    // removal (count, and the refs as the restore handle), and the preserve
+    // category for a backup that failed.
+    "loom.reaper.backed_up",
+    "loom.reaper.backup_refs",
+    "loom.reaper.preserved.backup_failed",
 ];
 
 /// Longest label value kept, in bytes.
@@ -462,6 +486,10 @@ pub enum MetricName {
     /// backlog.
     #[serde(rename = "loom.queue.listing_incomplete_repos")]
     QueueListingIncompleteRepos,
+    /// Ready issues the last work-finder tick listed (`queue.snapshot`'s
+    /// `seen`).
+    #[serde(rename = "loom.queue.seen")]
+    QueueSeen,
     /// `already_landed` rows on the last tick by evidence, labelled `reason`
     /// (`forge_closed`, `forge_closed_not_planned`, `journal_landed`,
     /// `unknown`; #11858).
@@ -800,6 +828,7 @@ impl MetricName {
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
+            Self::QueueSeen => "loom.queue.seen",
             Self::QueueAlreadyLanded => "loom.queue.already_landed",
             Self::QueueHostShard => "loom.queue.host_shard",
             Self::LlmTokensInput => "loom.llm.tokens.input",
@@ -937,9 +966,10 @@ impl MetricName {
             | Self::QueueStarvedByReason
             | Self::QueueDispatchWaitSamples => "{issue}",
             Self::DispatchMaxConcurrent | Self::DispatchCapTerm => "{sweep}",
-            Self::QueueIssues | Self::QueueAlreadyLanded | Self::DispatchPrOpenPrefiltered => {
-                "{issue}"
-            }
+            Self::QueueIssues
+            | Self::QueueSeen
+            | Self::QueueAlreadyLanded
+            | Self::DispatchPrOpenPrefiltered => "{issue}",
             Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
             Self::QueueHostShard => "{shard}",
             Self::LlmTokensInput
@@ -1033,6 +1063,7 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
+            Self::QueueSeen => "Ready issues listed on the last work-finder tick.",
             Self::QueueListingIncompleteRepos => {
                 "Repos whose ready-issue listing came back partial last tick."
             }
