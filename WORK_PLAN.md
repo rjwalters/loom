@@ -10,21 +10,16 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
 
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
-- **#12960**: feat: let Champion self-release merge-risk holds above a confidence threshold
 - **#12969**: feat: age-bound Codex rollout history in live profiles
-- **#13113**: feat(merge-pr): port the stale-mergeable recheck loop to Rust (#8191 slice)
 - **#13137**: fix: accept trailing-newline issue-body hash in verdict gate
 - **#13139**: fix: verdict-gate ignores the Judge's own notes and accepts --acknowledged-comment
 - **#13143**: docs: state that judge wait-checks --timeout is in seconds
-- **#13144**: fix: add loom marker to judge-ci-red flake note template
-- **#13147**: feat: add --repo to forge verdict-equivalent and name forge-read failures
-- **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
+- **#13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
-- **#13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
-- **#13278**: docs: delete superseded Champion tier-cap and promotion-slice text
-- **#13280**: feat: daemon lands its own resync PR through the merge queue
-- **#13283**: feat: project Judge CI-gate refusals as pass.verdict telemetry
 - **#13293**: fix: let a bare permissions header read green on workflow blast radius
+- **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
+- **#13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
+- **#13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
 
 ## Very Important
 
@@ -55,7 +50,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
@@ -78,9 +72,8 @@ Issues currently being built (`loom:building`).
 - **#13118**: Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
 - **#13134**: post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
-- **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
-- **#13268**: Resync must land without the Champion merge path on repos that refuse direct pushes
-- **#13272**: Simplify: delete the superseded Champion tier-cap and promotion-slice text (#10759, flow review slice C)
+- **#13149**: Export forge verdict-equivalent failure reasons as SigNoz span attributes
+- **#13150**: Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits
 
@@ -96,23 +89,20 @@ PRs waiting on Judge (`loom:review-requested`).
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
 - **#12960**: feat: let Champion self-release merge-risk holds above a confidence threshold
 - **#12969**: feat: age-bound Codex rollout history in live profiles
-- **#13113**: feat(merge-pr): port the stale-mergeable recheck loop to Rust (#8191 slice)
 - **#13137**: fix: accept trailing-newline issue-body hash in verdict gate
 - **#13139**: fix: verdict-gate ignores the Judge's own notes and accepts --acknowledged-comment
 - **#13143**: docs: state that judge wait-checks --timeout is in seconds
-- **#13144**: fix: add loom marker to judge-ci-red flake note template
-- **#13147**: feat: add --repo to forge verdict-equivalent and name forge-read failures
-- **#13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
+- **#13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
 - **#13194**: fix: map installed roles and skills to defaults counterparts in the resync waiver
-- **#13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
-- **#13278**: docs: delete superseded Champion tier-cap and promotion-slice text
-- **#13280**: feat: daemon lands its own resync PR through the merge queue
-- **#13283**: feat: project Judge CI-gate refusals as pass.verdict telemetry
 - **#13293**: fix: let a bare permissions header read green on workflow blast radius
+- **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
+- **#13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
+- **#13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
 
 ## Proposed
 
@@ -180,9 +170,9 @@ Issues carrying `loom:curated`.
 - **#13025**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)*
 - **#13134**: post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback *(curated)*
 - **#13136**: Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal *(curated)*
-- **#13140**: judge-ci-red flake note has no Loom marker, so it trips post-verdict.sh's stale-read gate on the Judge's own verdict *(curated)*
 - **#13141**: judge.md: wait-checks --timeout examples don't say the unit is seconds *(curated)*
-- **#13146**: verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry *(curated)*
+- **#13149**: Export forge verdict-equivalent failure reasons as SigNoz span attributes *(curated)*
+- **#13150**: Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent *(curated)*
 - **#13155**: [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1) *(curated)*
 - **#13166**: write-scope: a repo created after daemon start is still refused 'not-in-installation' 19h later on 0.19.1221 (the #13153 refresh does not clear it) *(curated)*
 - **#13169**: tracing: put the work item's keys (pr_number, role, head/base SHA) on every step and tick span at open *(curated)*
@@ -191,16 +181,12 @@ Issues carrying `loom:curated`.
 - **#13173**: docs: tracing.md and ci-observability.md still describe the story join removed in #11984 *(curated)*
 - **#13175**: role_tick telemetry: loom.actions.prs_merged overcounts ~10x (whole-transcript rescans + counts merge attempts) *(curated)*
 - **#13176**: Builder: 16/26 sweeps on fleet-1 end no-outcome-line (exit 0, no outcome) — main throughput limit *(curated)*
-- **#13185**: Champion ratification hold misses ratification/requests/** — a key-review request PR auto-merged with no key reviews *(curated)*
 - **#13193**: Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
-- **#13264**: Sweep Judge leases: claim without --watch-pid breaks post-verdict, backstop blocks the retry, lease not released after verdict *(curated)*
-- **#13268**: Resync must land without the Champion merge path on repos that refuse direct pushes *(curated)*
-- **#13272**: Simplify: delete the superseded Champion tier-cap and promotion-slice text (#10759, flow review slice C) *(curated)*
-- **#13274**: Telemetry: emit Judge CI-incomplete refusals (post-verdict exit 5/6) as daemon spans (#10486, flow review slice A) *(curated)*
 - **#13289**: Follow-on from PR #13288: verify completion.narrated tokens in SigNoz on a fleet host *(curated)*
 - **#13291**: Champion: a read-only permissions block in a workflow should not read red on blast radius *(curated)*
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
+- **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -228,14 +214,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 16 |
+| Operator merge-risk holds | 11 |
 | Very important | 2 |
 | Important | 13 |
-| Ready (`loom:issue`) | 12 |
-| In Progress (`loom:building`) | 11 |
+| Ready (`loom:issue`) | 11 |
+| In Progress (`loom:building`) | 10 |
 | PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 17 |
-| Curated | 83 |
+| Approved PRs awaiting merge | 14 |
+| Curated | 79 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
