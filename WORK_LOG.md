@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-30
 
+- **Issue #13275** (closed): Measure the "not measured" flow-review rows with store access: #10855 skips, #11493 usage, #10128 firings
 - **Issue #13190** (closed): Ratification lane: post verdicts through the signing broker (ratify_review) and document the lane
 - **Issue #13166** (closed): write-scope: a repo created after daemon start is still refused 'not-in-installation' 19h later on 0.19.1221 (the #13153 refresh does not clear it)
 - **PR #13334**: fix: rebase-stacked-children handles parent branches of any name
