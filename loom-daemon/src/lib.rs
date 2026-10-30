@@ -192,7 +192,6 @@ pub mod dep_recheck;
 /// from the mirror's worklist or per-repo listings.
 pub mod discovery;
 pub mod disk_headroom;
-pub mod dispatch_tap;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
 pub mod eager_reclaim;

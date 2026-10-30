@@ -195,19 +195,6 @@ pub enum Request {
         /// byte-for-byte compatible) a tripped breaker refuses the dispatch.
         #[serde(default)]
         force: bool,
-        /// Per-dispatch runtime override for the coding phases (#11284).
-        /// Together with `model_profile` it names one explicit tap that the
-        /// sweep's Builder and Doctor phases launch on. An unavailable or
-        /// unadmitted tap is refused with a reason, never passed down the
-        /// preference list. Curator, Judge and the orchestrator keep their
-        /// role policy. `None` (or absent on the wire, `#[serde(default)]`)
-        /// preserves existing behavior byte-for-byte.
-        #[serde(default)]
-        runtime: Option<String>,
-        /// Model profile paired with `runtime` (e.g. `zai-flash`). Requires
-        /// `runtime`; absent preserves the runtime's own default resolution.
-        #[serde(default)]
-        model_profile: Option<String>,
         /// Who is asking (Issue #11444), recorded on the sweep's start facts
         /// and exported as `loom.dispatch_origin`. `loom-daemon dispatch`,
         /// the `dispatch_sweep` MCP tool and Safehouse ChatOps send
