@@ -16,6 +16,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13340**: fix: trust github-actions[bot] as a promotion author for CI trackers
 - **#13348**: fix: re-mint the writer token when a miss refresh still lacks the repo
 - **#13363**: fix: retry merge-queue enqueue once on QueueUnavailable and key stall notice on reason
+- **#13413**: feat: add champion-hold self-release-calibration verb
 
 ## Very Important
 
@@ -73,7 +74,6 @@ Issues currently being built (`loom:building`).
 - **#13357**: merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests
-- **#13414**: Guide unblock sweep treats acceptance-criteria checkboxes as dependencies, re-lifting operator parks (#10420, #12978)
 
 ## PRs Awaiting Review
 
@@ -86,7 +86,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#13349**: feat: post per-key ratification markers and run the lane from the champion tick
 - **#13364**: feat: fall back to local patch comparison when the forge compare is unreadable
 - **#13398**: test: write fake forge gh script atomically to avoid ETXTBSY
-- **#13415**: fix: guide unblock sweep honors park record over AC checkboxes
 
 ## Approved (Awaiting Merge)
 
@@ -101,6 +100,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13340**: fix: trust github-actions[bot] as a promotion author for CI trackers
 - **#13348**: fix: re-mint the writer token when a miss refresh still lacks the repo
 - **#13363**: fix: retry merge-queue enqueue once on QueueUnavailable and key stall notice on reason
+- **#13413**: feat: add champion-hold self-release-calibration verb
 
 ## Proposed
 
@@ -171,6 +171,7 @@ Issues carrying `loom:curated`.
 - **#13176**: Builder: 16/26 sweeps on fleet-1 end no-outcome-line (exit 0, no outcome) — main throughput limit *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
+- **#13317**: Audit Champion merge-risk self-releases two weeks after #12960 is live *(curated)*
 - **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
 - **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge *(curated)*
 - **#13332**: merge-pr stacked reconcile retargets a non-feature/issue-N child to main without stripping squashed parent commits (left CONFLICTING) *(curated)*
@@ -180,7 +181,6 @@ Issues carrying `loom:curated`.
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests *(curated)*
-- **#13414**: Guide unblock sweep treats acceptance-criteria checkboxes as dependencies, re-lifting operator parks (#10420, #12978) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -211,13 +211,13 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 7 |
+| Operator merge-risk holds | 8 |
 | Very important | 1 |
 | Important | 13 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 13 |
-| PRs awaiting review | 8 |
-| Approved PRs awaiting merge | 9 |
+| In Progress (`loom:building`) | 12 |
+| PRs awaiting review | 7 |
+| Approved PRs awaiting merge | 10 |
 | Curated | 75 |
 | Architect / Hermit proposals | 9 |
 | Active epics | 10 |
