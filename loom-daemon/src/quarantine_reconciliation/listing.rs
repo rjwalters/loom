@@ -162,6 +162,20 @@ mod tests {
             ]
         );
         assert_eq!(fixture.gh_calls(), before, "mirror mode made a listing call");
+
+        // Parity: the snapshot yields what a listing of the same blocked rows
+        // would (`blocked_numbers` is the listing path's own reduction).
+        let listing = vec![
+            issue(1, &["loom:blocked"], false),
+            issue(3, &["loom:blocked"], true),
+            issue(4, &["loom:blocked", "loom:operator"], false),
+        ];
+        assert_eq!(got, blocked_numbers(listing));
+
+        // The decision reads stay live: scanning a candidate still calls `gh`
+        // (comments), though no listing was made.
+        let _ = scan_issue(&fixture.gh, fixture.path(), 1, Some("2026-10-01T00:00:00Z"));
+        assert_ne!(fixture.gh_calls(), before, "the scan made no live read");
         set(Vec::new());
     }
 }
