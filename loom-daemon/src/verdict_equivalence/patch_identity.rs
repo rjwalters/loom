@@ -242,3 +242,69 @@ pub fn evidence(
         Outcome::Unread | Outcome::Inconclusive => Evidence::Indeterminate,
     }
 }
+
+/// Header-stripped patch text: a rebase shifts line offsets (`@@ … @@`) and,
+/// when the base edited the same file elsewhere, the pre-image blob
+/// (`index <old>..<new>`); those are the only things allowed to differ between
+/// two equal patches. Body lines always start with ` `, `+`, `-` or `\`, so a
+/// column-0 `index ` / `@@` line is always a header.
+fn strip_hunk_headers(patch: &str) -> String {
+    patch
+        .lines()
+        .filter(|l| !l.starts_with("@@") && !l.starts_with("index "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One head's merge-base-relative patch, computed locally against
+/// `origin/<base_ref>`. `Err(reason)` names the read that failed.
+fn local_patch(repo: &Path, pr: Option<u32>, head: &str, base_ref: &str) -> Result<String, String> {
+    use super::git_objects::{ensure_commit, git};
+    ensure_commit(repo, pr, head).map_err(|why| format!("head {head} not fetchable: {why}"))?;
+    let base = format!("origin/{base_ref}");
+    let mb = git(repo, &["merge-base", &base, head])
+        .filter(|s| super::is_sha(s))
+        .ok_or_else(|| format!("no merge-base of {base} and {head}"))?;
+    git(
+        repo,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--binary",
+            &format!("{mb}..{head}"),
+        ],
+    )
+    .map(|d| strip_hunk_headers(&d))
+    .ok_or_else(|| format!("`git diff {mb}..{head}` failed"))
+}
+
+/// Fallback for [`Outcome::Unread`] (#13359): compare the two heads' patches
+/// from local git. Returns `Ok(())` only for equal, non-empty patches; every
+/// other result — unfetchable head, git error, empty or differing patches —
+/// is `Err(note)` and leaves the caller `Indeterminate`. Never "changed": a
+/// partial local read must not refute what the forge could not be asked.
+pub fn local_outcome(
+    repo: &Path,
+    pr: Option<u32>,
+    reviewed: &str,
+    head: &str,
+    base_ref: &str,
+) -> Result<(), String> {
+    if !super::is_sha(reviewed) || !super::is_sha(head) || !super::is_safe_ref(base_ref) {
+        return Err("local: argument is not a bare SHA / safe ref".into());
+    }
+    if !super::git_objects::is_git_repo(repo) {
+        return Err("local: no git repository to compare in".into());
+    }
+    let before = local_patch(repo, pr, reviewed, base_ref).map_err(|e| format!("local: {e}"))?;
+    let after = local_patch(repo, pr, head, base_ref).map_err(|e| format!("local: {e}"))?;
+    if before.is_empty() && after.is_empty() {
+        return Err("local: both patches are empty".into());
+    }
+    if before == after {
+        Ok(())
+    } else {
+        Err("local: patches differ".into())
+    }
+}
