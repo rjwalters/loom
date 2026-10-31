@@ -39,7 +39,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12653**: Emit merge_hold hold-cause + release-actor + merge-queue facts to SigNoz (unblocks merge_hold ETA prediction)
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
-- **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
 
 ## Ready
@@ -64,7 +63,7 @@ Issues currently being built (`loom:building`).
 
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
-- **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
+- **#12952**: Champion: calibration check for merge-risk self-releases vs reverts (7-day)
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits
 - **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories)
 - **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge
@@ -74,6 +73,7 @@ Issues currently being built (`loom:building`).
 - **#13357**: merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests
+- **#13414**: Guide unblock sweep treats acceptance-criteria checkboxes as dependencies, re-lifting operator parks (#10420, #12978)
 
 ## PRs Awaiting Review
 
@@ -86,6 +86,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#13349**: feat: post per-key ratification markers and run the lane from the champion tick
 - **#13364**: feat: fall back to local patch comparison when the forge compare is unreadable
 - **#13398**: test: write fake forge gh script atomically to avoid ETXTBSY
+- **#13415**: fix: guide unblock sweep honors park record over AC checkboxes
 
 ## Approved (Awaiting Merge)
 
@@ -94,7 +95,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
-- **#12960**: feat: let Champion self-release merge-risk holds above a confidence threshold
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
 - **#13336**: fix: rebase children of non-feature/issue-N parents before retargeting
@@ -145,7 +145,6 @@ Issues carrying `loom:curated`.
 - **#12220**: Rate-limit probe cache follow-ups: quiet-bucket gauge gap, ambient-login docs, post-rollout measurement *(curated)*
 - **#12248**: Retired hold labels: remove core registry/work_finder readers (1/3 of #11843) *(curated)*
 - **#12304**: Epic: fleet discovery from one mirror read per tick — zero forge reads for discovery; delete per-host listing paths *(curated)*
-- **#12314**: Quarantine reconciliation reads the discovery snapshot; delete its `loom:blocked` listing *(curated)*
 - **#12320**: Cleanup once every worker reads the worklist: delete the per-call `forge_mirror` discovery path, `maxStalenessSecs` and `per_call`; docs and ADR-0024; direct backend preserved *(curated)*
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes) *(curated)*
 - **#12408**: Live-verify epic child discovery against sky130-sar-adc#23 (follow-up to #12388) *(curated)*
@@ -159,7 +158,7 @@ Issues carrying `loom:curated`.
 - **#12713**: Part-of merges re-queue the issue to Builders: landed-route marker is read as a Curator 'kept' decision *(curated)*
 - **#12727**: Daemon-root checkout (~/loom-daemon) is never fast-forwarded on release-roll hosts (worker-1 2,764 / worker-2 5,135 commits behind) *(curated)*
 - **#12809**: Remove the daemon's dashboard wake source (forge_events /v1/hosts/{host}/events client) *(curated)*
-- **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20) *(curated)*
+- **#12952**: Champion: calibration check for merge-risk self-releases vs reverts (7-day) *(curated)*
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
 - **#12978**: Codex shared-seat dispatch: live receipts and startup measurements (split from #10796) *(curated)*
 - **#13025**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)*
@@ -173,8 +172,6 @@ Issues carrying `loom:curated`.
 - **#13209**: [ci-daily] Supply Chain *(curated)*
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
 - **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
-- **#13323**: [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 1) *(curated)*
-- **#13324**: [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 8) *(curated)*
 - **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge *(curated)*
 - **#13332**: merge-pr stacked reconcile retargets a non-feature/issue-N child to main without stripping squashed parent commits (left CONFLICTING) *(curated)*
 - **#13337**: Workflow-filed trackers never enter the fleet: the author gate refuses github-actions[bot] and ci-daily.yml rewrites the body nightly *(curated)*
@@ -183,6 +180,7 @@ Issues carrying `loom:curated`.
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests *(curated)*
+- **#13414**: Guide unblock sweep treats acceptance-criteria checkboxes as dependencies, re-lifting operator parks (#10420, #12978) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -195,7 +193,6 @@ Issues carrying `loom:curated`.
 - **#13384**: Remove self-referential tests (Test 4/5) from test-guide-operator-attention-fold.sh *(hermit)*
 - **#13400**: Remove write-only role-runner skip-counter totals and unused *_count() wrappers *(hermit)*
 - **#13402**: Dead module merge_policy.rs: no production caller; fleet.state champion approval/merge never populated *(hermit)*
-- **#13406**: Dedupe 17 copies of registry-lock/poison boilerplate in work_finder/forge.rs *(hermit)*
 
 ## Epics
 
@@ -216,12 +213,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 7 |
 | Very important | 1 |
-| Important | 14 |
+| Important | 13 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 12 |
-| PRs awaiting review | 7 |
-| Approved PRs awaiting merge | 10 |
-| Curated | 77 |
-| Architect / Hermit proposals | 10 |
+| In Progress (`loom:building`) | 13 |
+| PRs awaiting review | 8 |
+| Approved PRs awaiting merge | 9 |
+| Curated | 75 |
+| Architect / Hermit proposals | 9 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
