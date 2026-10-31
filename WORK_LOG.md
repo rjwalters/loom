@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13360**: fix(install): build daemon and probe pnpm before reinstall uninstall
+- **Issue #13356** (closed): install --confirm-reinstall: daemon/toolchain failure after the uninstall leaves the target partially uninstalled
 - **PR #13374**: refactor: remove unused role-manifest interval fields
 - **PR #13328**: test: pin resync waiver to hold roles and skills copies
 - **PR #13325**: feat: hand operator-released critical-file PRs to the merge queue
