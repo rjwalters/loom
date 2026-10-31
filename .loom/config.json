@@ -27,6 +27,9 @@
     ],
     "strictRequiredStatusChecks": false
   },
+  "forge": {
+    "trustedCommenters": ["github-actions[bot]"]
+  },
   "terminals": [
     {
       "id": "terminal-1",
