@@ -84,3 +84,42 @@ fn the_revision_moves_with_an_edit_and_ignores_trailing_newlines() {
     assert_ne!(revision("t", "b"), revision("t", "b2"));
     assert_ne!(revision("t", "b"), revision("t2", "b"));
 }
+
+const TRACKER_BODY: &str = "x\n\nThis issue is opened, updated and closed by \
+                            `.github/workflows/ci-daily.yml`. It closes itself.";
+
+fn tracker(login: &str, title: &str, body: &str) -> Value {
+    let mut v = issue(login, "Bot", "NONE");
+    v["title"] = json!(title);
+    v["body"] = json!(body);
+    v
+}
+
+#[test]
+fn a_ci_daily_tracker_from_the_actions_bot_passes() {
+    let v = tracker("github-actions[bot]", "[ci-daily] build is red", TRACKER_BODY);
+    assert_eq!(classify(&policy(), Some(&v)), Gate::Trusted);
+}
+
+#[test]
+fn the_tracker_exception_needs_login_prefix_and_body_sentence() {
+    let p = policy();
+    let t = "[ci-daily] build is red";
+    for v in [
+        tracker("github-actions[bot]", "[ci-daily]", TRACKER_BODY),
+        tracker("github-actions[bot]", "ci-daily build is red", TRACKER_BODY),
+        tracker("github-actions[bot]", t, "no sentence"),
+        tracker("github-actions[bot]", t, ""),
+        tracker("other[bot]", t, TRACKER_BODY),
+        tracker("github-actions", t, TRACKER_BODY),
+        tracker("drive-by", t, TRACKER_BODY),
+    ] {
+        assert!(matches!(classify(&p, Some(&v)), Gate::Untrusted(_)), "{v}");
+    }
+    let mut no_fields = issue("github-actions[bot]", "Bot", "NONE");
+    assert!(matches!(classify(&p, Some(&no_fields)), Gate::Untrusted(_)));
+    no_fields["pull_request"] = json!({});
+    no_fields["title"] = json!(t);
+    no_fields["body"] = json!(TRACKER_BODY);
+    assert!(matches!(classify(&p, Some(&no_fields)), Gate::Unknown(_)), "a PR stays unknown");
+}

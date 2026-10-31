@@ -351,6 +351,14 @@ trusted notice matches both, the step tick excludes the issue from `champion_pro
 repeat the verdict. A body edit, a trust-list change, or a legacy unstamped notice
 makes it drawable once; a trusted `loom:issue` takes it out of the queue.
 
+**ci-daily tracker exception (#13378).** `promotion-author` also returns `TRUSTED` for an
+issue authored by exactly `github-actions[bot]` whose title starts with `[ci-daily] ` and
+whose body contains ``opened, updated and closed by `.github/workflows/ci-daily.yml` ``
+(the sentence the workflow writes into every tracker); all three must hold. The exception
+lives in the author gate only: the bot is not added to `forge.trustedCommenters`, so its
+comments and markers stay untrusted everywhere (`forge trusted-comments`, verdict and
+hold markers, PRs and non-tracker issues).
+
 Adoption is a trusted maintainer applying `loom:issue` by hand, or re-filing the
 issue; an automated Champion verdict alone is not adoption. Trusted authors see no
 change. This is admission control for external submissions, not protection against
