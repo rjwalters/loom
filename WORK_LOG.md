@@ -15,6 +15,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13351**: refactor: route feature/issue-N branch parsing through worktree_ops::naming
+- **Issue #13346** (closed): Consolidate seven duplicated feature/issue-N branch parsers in loom-daemon
+- **PR #13338**: feat: unpark Curator-parked issues once their blockers resolve
+- **Issue #13331** (closed): Cleared-blocker notice doesn't unpark: issue stays loom:blocked for hours after its sole blocker merges
+- **PR #13379**: feat: admit ci-daily trackers from the Actions bot at the promotion author gate
 - **PR #13360**: fix(install): build daemon and probe pnpm before reinstall uninstall
 - **Issue #13356** (closed): install --confirm-reinstall: daemon/toolchain failure after the uninstall leaves the target partially uninstalled
 - **PR #13374**: refactor: remove unused role-manifest interval fields
@@ -5716,12 +5721,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7080** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7078** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7076** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-
-### 2026-08-31
-- **PR #7072**: fix: exclude loom:blocked from WORK_PLAN Ready section and urgent-eligibility
-- **Issue #7071** (closed): WORK_PLAN Ready section and urgent-eligibility never exclude loom:blocked (only operator-only was fixed in #7008)
-- **Issue #7069** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7067** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 
