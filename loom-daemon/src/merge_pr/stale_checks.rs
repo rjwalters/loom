@@ -7,8 +7,8 @@
 //! re-date remedy (#8508) and the CI-run conclusion gate (#10444): required
 //! checks at the head are GitHub's to enforce (ruleset, `strict=false`), and
 //! the occasional semantic conflict is caught by main CI and reverted. The
-//! reads stay for `required-checks`, `checks-failure`, `zero-checks-settle`,
-//! `check-runs-rollup` and `forge wait-checks`, and go with them in slice 2.
+//! reads stay for `required-checks` and `forge wait-checks` (the other
+//! `merge-pr` verbs that shared them went in slice 2).
 
 use chrono::{DateTime, Utc};
 
