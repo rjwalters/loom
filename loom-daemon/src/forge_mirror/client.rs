@@ -319,6 +319,41 @@ pub async fn get_json(
         .map_err(|e| MirrorError::Malformed(classify_transport(&e)))
 }
 
+/// `POST <base>/<path>` with a JSON `body`; the answer's body is ignored.
+/// Same bearer-only, no-redirect, bounded-timeout rules as [`get_json`].
+///
+/// # Errors
+///
+/// [`MirrorError`]; a `401` also asks the refresher to re-read the key.
+pub async fn post_json(
+    http: &reqwest::Client,
+    active: &Active,
+    path: &str,
+    body: &Value,
+) -> Result<(), MirrorError> {
+    let url = reqwest::Url::parse(&format!("{}{path}", active.base_url))
+        .map_err(|e| MirrorError::Transport(format!("bad url: {e}")))?;
+    let res = http
+        .post(url)
+        .bearer_auth(active.key())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| MirrorError::Transport(classify_transport(&e)))?;
+    let status = res.status().as_u16();
+    if status == 401 || status == 403 {
+        if status == 401 {
+            super::note_key_rejected();
+        }
+        return Err(MirrorError::Auth(status));
+    }
+    if !(200..300).contains(&status) {
+        return Err(MirrorError::Status(status));
+    }
+    Ok(())
+}
+
 /// A conditional `GET`'s answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Conditional {
@@ -496,4 +531,23 @@ pub fn get_json_conditional_blocking(
     });
     wait(&rx, deadline + Duration::from_secs(1))
         .unwrap_or_else(|| Err(MirrorError::Transport("deadline".into())))
+}
+
+/// [`post_json`] fired off the calling thread: this returns at once, and
+/// `done` runs on the mirror runtime with the result. One attempt, never
+/// retried; the caller never waits on the network.
+pub fn post_json_detached(
+    active: &Active,
+    path: &str,
+    body: Value,
+    done: impl FnOnce(Result<(), MirrorError>) + Send + 'static,
+) {
+    let Some((rt, http)) = runtime() else {
+        done(Err(MirrorError::Transport("no runtime".into())));
+        return;
+    };
+    let (http, active, path) = (http.clone(), active.clone(), path.to_string());
+    rt.spawn(async move {
+        done(post_json(&http, &active, &path, &body).await);
+    });
 }

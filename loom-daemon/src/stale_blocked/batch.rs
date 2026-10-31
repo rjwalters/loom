@@ -161,6 +161,10 @@ pub struct Gathered {
     pub evidence: Result<Evidence, String>,
     /// The typed cause when `evidence` is an `Err` (#12036).
     pub cause: Option<Unreadable>,
+    /// The listing row's label names (#13331: the notifier's unpark gate).
+    pub labels: Vec<String>,
+    /// The listing row's body (#13331: park records are read from it).
+    pub body: String,
 }
 
 /// Which artifacts to examine.
@@ -312,6 +316,8 @@ pub fn gather_filtered(
                     title: row.title.unwrap_or_default(),
                     evidence: Err(why.to_string()),
                     cause: Some(why.clone()),
+                    labels: row.labels.clone(),
+                    body: row.body.clone().unwrap_or_default(),
                 })
                 .collect();
             cost.budget_refused = Some(why.to_string());
@@ -548,6 +554,8 @@ fn assemble(
         title: p.row.title.clone().unwrap_or_default(),
         evidence,
         cause,
+        labels: p.row.labels.clone(),
+        body: p.body.clone(),
     }
 }
 

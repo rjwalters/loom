@@ -494,8 +494,8 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
                 .ok_or_else(|| LaunchError::config(format!("cannot read PR #{pr} via gh")))?;
             let issue = view["headRefName"]
                 .as_str()
-                .and_then(|h| h.strip_prefix("feature/issue-"))
-                .and_then(|n| n.parse().ok())
+                .and_then(crate::worktree_ops::naming::issue_from_branch)
+                .map(u64::from)
                 .ok_or_else(|| LaunchError::config("PR head is not feature/issue-N"))?;
             (issue, view["headRefOid"].as_str().unwrap_or_default().to_string())
         }

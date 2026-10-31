@@ -407,6 +407,17 @@ pub fn body_sha(body: &str) -> String {
     hex::encode(Sha256::digest(body.trim_end_matches(['\n', '\r']).as_bytes()))
 }
 
+/// Whether `expected` is the hash of `body`: the canonical [`body_sha`], or that
+/// same trimmed body plus exactly one `\n`, which is what
+/// `gh api … --jq .body | sha256sum` yields (jq appends the newline).
+fn body_sha_matches(expected: &str, body: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let expected = expected.trim();
+    let trimmed = body.trim_end_matches(['\n', '\r']);
+    expected.eq_ignore_ascii_case(&body_sha(body))
+        || expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(format!("{trimmed}\n"))))
+}
+
 /// The issue numbers a PR body closes or contributes to (`Closes #N`,
 /// `Fixes: #N`, `Resolves #N` and their inflections, plus `Part of #N` and
 /// `Contributes to #N`, #12714), ascending and deduplicated.
@@ -434,14 +445,55 @@ fn comment_time(c: &Value) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// Comments the stale-read check must not count (#13134): the Judge's own
+/// notes and ones it was told to acknowledge. Neither excuses a body edit or
+/// an `--issue-body-sha` mismatch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StaleIgnore<'a> {
+    /// `$LOOM_SWEEP_ID`: a body carrying `sweep=<id>` is this dispatch's own
+    /// note, even if it was stamped without a `<!-- loom:` marker.
+    pub sweep: Option<&'a str>,
+    /// Comment ids the Judge re-read and confirmed spec-neutral.
+    pub acknowledged: &'a [u64],
+}
+
+impl StaleIgnore<'_> {
+    fn is_own_sweep_note(&self, body: &str) -> bool {
+        let Some(id) = self.sweep.map(str::trim).filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let needle = format!("sweep={id}");
+        body.match_indices(&needle).any(|(i, _)| {
+            body[i + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        })
+    }
+}
+
 /// The newest-first-found trusted *human* comment created after `started`:
 /// not an App/bot author, and carrying no Loom marker (verdict, lease,
 /// standdown, claim-activity … traffic is the fleet's own, even when it is
 /// posted through a human token). Returned as a description naming it.
-fn human_comment_after(comments: &[Value], started: DateTime<Utc>) -> Option<String> {
+fn human_comment_after(
+    comments: &[Value],
+    started: DateTime<Utc>,
+    ignore: &StaleIgnore<'_>,
+) -> Option<String> {
     comments
         .iter()
         .filter(|c| !crate::comment_trust::Author::from_json(c).app)
+        .filter(|c| {
+            !c.get("id")
+                .and_then(Value::as_u64)
+                .is_some_and(|i| ignore.acknowledged.contains(&i))
+        })
+        .filter(|c| {
+            !c.get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|b| ignore.is_own_sweep_note(b))
+        })
         .filter(|c| {
             !c.get("body")
                 .and_then(Value::as_str)
@@ -475,16 +527,20 @@ pub fn stale_read(
     started: DateTime<Utc>,
     pr_comments: &[Value],
     issues: Option<&[IssueSnapshot]>,
+    ignore: &StaleIgnore<'_>,
 ) -> Option<String> {
     let remedy = "re-review against the current spec (read the comment or edit first). The \
-                  start is the dispatch time, so a retry in this same dispatch is refused \
-                  again: if the PR still meets the spec, end without a verdict and let a fresh \
-                  dispatch approve it; if it no longer does, post changes-requested (never \
-                  refused). Only a manual run with no dispatch epoch and no lease may retry \
-                  with a fresh --review-started";
+                  start is the dispatch time, so a fresh --review-started does not help. If \
+                  you re-read the named comment and confirmed it is spec-neutral and the issue \
+                  body hash is unchanged, retry with --acknowledged-comment <id> for that \
+                  comment id (it never excuses a body edit, a hash mismatch or another \
+                  comment); otherwise, if the PR still meets the spec, end without a verdict \
+                  and let a fresh dispatch approve it; if it no longer does, post \
+                  changes-requested (never refused). Only a manual run with no dispatch epoch \
+                  and no lease may retry with a fresh --review-started";
     let at = started.to_rfc3339();
     let mut why: Vec<String> = Vec::new();
-    if let Some(d) = human_comment_after(pr_comments, started) {
+    if let Some(d) = human_comment_after(pr_comments, started, ignore) {
         why.push(format!(
             "a human comment landed on the PR after this review started ({at}): {d}"
         ));
@@ -509,7 +565,7 @@ pub fn stale_read(
             continue;
         };
         if let Some(expected) = issue.expected_body_sha.as_deref() {
-            if !expected.trim().eq_ignore_ascii_case(&body_sha(body)) {
+            if !body_sha_matches(expected, body) {
                 why.push(format!(
                     "issue #{n}'s body changed since this review started (it no longer matches \
                      the body you reviewed)"
@@ -527,7 +583,7 @@ pub fn stale_read(
                 e.at.to_rfc3339()
             ));
         }
-        if let Some(d) = human_comment_after(comments, started) {
+        if let Some(d) = human_comment_after(comments, started, ignore) {
             why.push(format!(
                 "a human comment landed on issue #{n} after this review started ({at}): {d}"
             ));
@@ -556,6 +612,10 @@ pub struct GateInput<'a> {
     pub review_started: Option<DateTime<Utc>>,
     /// The linked issues as re-read; see [`stale_read`].
     pub issues: Option<&'a [IssueSnapshot]>,
+    /// This dispatch's `$LOOM_SWEEP_ID`; its own notes never count (#13134).
+    pub own_sweep: Option<&'a str>,
+    /// `--acknowledged-comment` ids excluded from the comment check (#13134).
+    pub acknowledged: &'a [u64],
 }
 
 /// The pre-post decision. Pure; see the module docs for the rules.
@@ -594,7 +654,15 @@ pub fn decide(input: &GateInput<'_>) -> Decision {
                     .into(),
             );
         };
-        if let Some(why) = stale_read(started, comments, input.issues) {
+        if let Some(why) = stale_read(
+            started,
+            comments,
+            input.issues,
+            &StaleIgnore {
+                sweep: input.own_sweep,
+                acknowledged: input.acknowledged,
+            },
+        ) {
             return Decision::Refuse(why);
         }
     }
