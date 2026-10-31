@@ -99,6 +99,7 @@ fn workspace_cooling(
         created_at: HashMap::new(),
         merge_slots: 1,
         merge_concurrency: 1,
+        merge_eligible: 0,
         merges_in_flight: 0,
     }
 }

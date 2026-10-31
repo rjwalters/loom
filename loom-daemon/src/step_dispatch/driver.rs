@@ -465,6 +465,7 @@ impl StepDriver {
                     created_at: Default::default(),
                     merge_slots: 0,
                     merge_concurrency: 0,
+                    merge_eligible: 0,
                     merges_in_flight: 0,
                 });
                 continue;
@@ -587,16 +588,16 @@ impl StepDriver {
                 .iter()
                 .filter(|c| c.step == Step::ChampionMerge)
                 .count();
-            if matches!(
+            let queue_mode = matches!(
                 crate::forge_merge_queue::mode::resolve_merge_mode(root),
                 Ok(m) if m.mode == crate::forge_merge_queue::mode::MergeMode::Queue
-            ) {
-                claims.merge_concurrency = demand_merge_limit(
-                    claims.merge_concurrency,
-                    eligible,
-                    crate::role_runner::demand::read_demand_config(root).lane_k,
-                );
-            }
+            );
+            claims.merge_concurrency = effective_merge_limit(
+                queue_mode,
+                claims.merge_concurrency,
+                eligible,
+                crate::role_runner::demand::read_demand_config(root).lane_k,
+            );
             let listing = ListingState {
                 pulls_complete: gathered.pulls_complete,
                 stale_listing: gathered.stale_listing,
@@ -632,6 +633,7 @@ impl StepDriver {
                 created_at: gathered.created_at,
                 merge_slots: claims.merge_slots_free(),
                 merge_concurrency: claims.merge_limit(),
+                merge_eligible: eligible,
                 merges_in_flight: claims.merges_in_flight.len(),
             });
         }
@@ -749,6 +751,7 @@ impl StepDriver {
             draws_unspawned: result.draws_unspawned,
             merge_deferred: result.merge_deferred,
             merge_concurrency: result.merge_concurrency,
+            merge_eligible: result.merge_eligible,
             merges_in_flight: result.merges_in_flight,
             by_reason: result.passes.clone(),
             budget: result.budget,
@@ -791,6 +794,23 @@ pub fn demand_merge_limit(floor: usize, eligible: usize, lane_k: usize) -> usize
         .div_ceil(lane_k.max(1))
         .min(DEFAULT_QUEUE_BUILD_CAP)
         .max(floor)
+}
+
+/// The Champion merge limit a repo runs the tick with (#13367): the demand
+/// rule on a queue-mode repo, the configured `champion.mergeConcurrencyPerRepo`
+/// untouched on a direct-mode one, whatever its eligible debt. Pure.
+#[must_use]
+pub fn effective_merge_limit(
+    queue_mode: bool,
+    configured: usize,
+    eligible: usize,
+    lane_k: usize,
+) -> usize {
+    if queue_mode {
+        demand_merge_limit(configured, eligible, lane_k)
+    } else {
+        configured
+    }
 }
 
 #[cfg(test)]
