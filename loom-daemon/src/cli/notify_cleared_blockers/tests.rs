@@ -193,3 +193,49 @@ fn comment_states_the_unpark_transition_only_when_it_happened() {
     assert!(!no.contains("Unparked") && no.contains("Re-check whether"), "{no}");
     assert!(yes.contains(&marker_for(7)), "idempotency marker must survive");
 }
+
+#[test]
+fn resweep_cited_is_local_sorted_and_deduplicated() {
+    use crate::dep_recheck::{named::Dep, premise::Ref};
+    let ev = Evidence {
+        prose: vec![
+            Ref {
+                number: 9,
+                state: "CLOSED".into(),
+            },
+            Ref {
+                number: 3,
+                state: "CLOSED".into(),
+            },
+        ],
+        named: vec![
+            Dep {
+                number: 3,
+                repo: None,
+                ..Default::default()
+            },
+            Dep {
+                number: 77,
+                repo: Some("o/r".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(resweep_cited(&ev), vec![3, 9]);
+}
+
+#[test]
+fn resweep_conflicts_with_closed_and_pr_and_replaces_them() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct W {
+        #[command(flatten)]
+        a: NotifyClearedBlockersArgs,
+    }
+    assert!(W::try_parse_from(["x", "--resweep"]).is_ok());
+    assert!(W::try_parse_from(["x", "--resweep", "--closed", "5"]).is_err());
+    assert!(W::try_parse_from(["x", "--resweep", "--pr", "5"]).is_err());
+    assert!(W::try_parse_from(["x"]).is_err());
+    assert!(W::try_parse_from(["x", "--closed", "5"]).is_ok());
+}
