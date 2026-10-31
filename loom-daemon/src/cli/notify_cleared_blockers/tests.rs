@@ -239,3 +239,17 @@ fn resweep_conflicts_with_closed_and_pr_and_replaces_them() {
     assert!(W::try_parse_from(["x"]).is_err());
     assert!(W::try_parse_from(["x", "--closed", "5"]).is_ok());
 }
+
+#[test]
+fn resweep_comments_only_where_the_unpark_happened() {
+    assert!(resweep_skips_comment(true, false, false), "failed unpark: no comment");
+    assert!(!resweep_skips_comment(true, false, true));
+    assert!(!resweep_skips_comment(true, true, true), "dry run");
+    assert!(!resweep_skips_comment(false, false, false), "close-triggered mode unchanged");
+}
+
+#[test]
+fn resweep_comment_does_not_say_just_closed() {
+    let b = comment_body_for(Artifact::Issue, &[7], &[], true, true);
+    assert!(b.contains("#7 closed,") && !b.contains("just closed"));
+}

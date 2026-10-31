@@ -208,8 +208,27 @@ impl NotifyClearedBlockersArgs {
             // Label first, comment second: the comment is the audit trail and
             // must only claim a transition that actually happened.
             let unparked = eligible && (self.dry_run || unpark(g.number, repo, &root));
+            // Resweep has no marker short-circuit, so a comment posted after a
+            // failed unpark would repeat on every run. Report it instead.
+            if resweep_skips_comment(self.resweep, self.dry_run, unparked) {
+                unread.push(format!(
+                    "{} #{}: unpark failed; no comment posted",
+                    g.kind.label(),
+                    g.number
+                ));
+                continue;
+            }
             let posted = !self.dry_run
-                && post_comment(g.kind, g.number, &cited, &reasons, unparked, repo, &root);
+                && post_comment(
+                    g.kind,
+                    g.number,
+                    &cited,
+                    &reasons,
+                    unparked,
+                    self.resweep,
+                    repo,
+                    &root,
+                );
             notified.push(Notified {
                 kind: g.kind,
                 number: g.number,
@@ -223,6 +242,12 @@ impl NotifyClearedBlockersArgs {
         report(&notified, &closed, &unread, self.dry_run, self.quiet, self.resweep);
         Ok(())
     }
+}
+
+/// In `--resweep`, a comment is posted only where the unpark happened (or on a
+/// dry run). Pure, so tested.
+fn resweep_skips_comment(resweep: bool, dry_run: bool, unparked: bool) -> bool {
+    resweep && !dry_run && !unparked
 }
 
 /// The blocker numbers an artifact's evidence cites (`--resweep` has no closed
@@ -302,9 +327,22 @@ fn unticked_reason(resolved_refs: &[String], unparsed: usize) -> String {
 
 /// The notification comment. Pure, so the wording is unit-tested.
 fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String], unparked: bool) -> String {
+    comment_body_for(kind, cited, reasons, unparked, false)
+}
+
+/// [`comment_body`] with the `--resweep` wording: there is no close event, so
+/// the cited blockers are described as closed, not "just closed".
+fn comment_body_for(
+    kind: Artifact,
+    cited: &[i64],
+    reasons: &[String],
+    unparked: bool,
+    resweep: bool,
+) -> String {
     let refs: Vec<String> = cited.iter().map(|n| format!("#{n}")).collect();
+    let when = if resweep { "closed" } else { "just closed" };
     let mut body = format!(
-        "**Cited blocker cleared**: {} just closed, and this {}'s `loom:blocked` cites it. \
+        "**Cited blocker cleared**: {} {when}, and this {}'s `loom:blocked` cites it. \
          The block now reads as stale:\n",
         refs.join(", "),
         kind.label()
@@ -341,6 +379,7 @@ fn post_comment(
     cited: &[i64],
     reasons: &[String],
     unparked: bool,
+    resweep: bool,
     repo: Option<&str>,
     root: &Path,
 ) -> bool {
@@ -349,7 +388,7 @@ fn post_comment(
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    let body = comment_body(kind, cited, reasons, unparked);
+    let body = comment_body_for(kind, cited, reasons, unparked, resweep);
     let mut args = vec![entity, "comment", n.as_str(), "--body", body.as_str()];
     if let Some(r) = repo {
         args.extend(["--repo", r]);
