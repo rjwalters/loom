@@ -581,6 +581,22 @@ impl StepDriver {
                 cooldowns,
             };
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
+            // #13367: a queue-mode repo's merge limit follows its eligible debt.
+            let eligible = weighing
+                .pool
+                .iter()
+                .filter(|c| c.step == Step::ChampionMerge)
+                .count();
+            if matches!(
+                crate::forge_merge_queue::mode::resolve_merge_mode(root),
+                Ok(m) if m.mode == crate::forge_merge_queue::mode::MergeMode::Queue
+            ) {
+                claims.merge_concurrency = demand_merge_limit(
+                    claims.merge_concurrency,
+                    eligible,
+                    crate::role_runner::demand::read_demand_config(root).lane_k,
+                );
+            }
             let listing = ListingState {
                 pulls_complete: gathered.pulls_complete,
                 stale_listing: gathered.stale_listing,
@@ -756,6 +772,25 @@ impl StepDriver {
         }
         report
     }
+}
+
+/// The merge queue's `max_entries_to_build` when the ruleset is not read:
+/// GitHub's own default, so the demand rule never asks for more concurrent
+/// hand-offs than a default queue builds at once (#13367).
+pub const DEFAULT_QUEUE_BUILD_CAP: usize = 5;
+
+/// The effective Champion merge limit of a queue-mode repo (#13367):
+/// `clamp(ceil(eligible / laneK), floor, DEFAULT_QUEUE_BUILD_CAP)`, with the
+/// configured `champion.mergeConcurrencyPerRepo` as the floor (an operator who
+/// sets it higher than the cap keeps it). `eligible` is the repo's
+/// `champion_merge` pool, so a drained debt falls back to the floor. Pure.
+#[must_use]
+pub fn demand_merge_limit(floor: usize, eligible: usize, lane_k: usize) -> usize {
+    let floor = floor.max(1);
+    eligible
+        .div_ceil(lane_k.max(1))
+        .min(DEFAULT_QUEUE_BUILD_CAP)
+        .max(floor)
 }
 
 #[cfg(test)]
