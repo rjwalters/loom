@@ -152,6 +152,8 @@ pub struct StepDriver {
     /// The host's capacity-driven work requests to the fleet-dispatch captain
     /// (#12817), made on first use; idle while fleet mode is off.
     requests: Option<crate::fleet_dispatch::request::Loop>,
+    /// Reports stale-draw claim refusals to the mirror (#12318).
+    recheck: crate::discovery::recheck::Shared,
 }
 
 impl Default for StepDriver {
@@ -162,6 +164,7 @@ impl Default for StepDriver {
             next_start: 0,
             starvation: Starvation::default(),
             requests: None,
+            recheck: crate::discovery::recheck::Shared::default(),
         }
     }
 }
@@ -180,6 +183,8 @@ struct RegistrySpawner {
     concurrency: usize,
     /// Where the spawns' time went, summed over attempts (#12298).
     parts: StepSpawnTimings,
+    /// Mirror mode only (`forge.mirror.discovery = worklist`, #12318).
+    recheck: Option<crate::discovery::recheck::Shared>,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -250,6 +255,23 @@ impl StepSpawner for RegistrySpawner {
 }
 
 impl RegistrySpawner {
+    /// A refusal that means the drawn snapshot was stale tells the mirror to
+    /// re-read the item (#12318). The only call site of the recheck.
+    fn report_stale_draw(&self, idx: usize, item: u32, e: &anyhow::Error) {
+        let (Some(recheck), Some(refusal)) = (&self.recheck, e.downcast_ref::<StepRefusal>())
+        else {
+            return;
+        };
+        let Some(repo) = self
+            .roots
+            .get(idx)
+            .and_then(|root| crate::forge_mirror::resolve_repo(Some(root), None))
+        else {
+            return;
+        };
+        recheck.report(&repo, item, refusal.reason, &refusal.detail);
+    }
+
     /// One spawn. `host_gate`: the tick runs spawns concurrently, so the
     /// launch keeps the host-wide stagger gap (#3887, #12298); a serial
     /// tick (`spawnConcurrency` 1) launches exactly as before.
@@ -285,6 +307,7 @@ impl RegistrySpawner {
                         &reason,
                     );
                 }
+                self.report_stale_draw(idx, request.item, &e);
                 SpawnResult::Refused(reason)
             }
         };
@@ -659,7 +682,9 @@ impl StepDriver {
             attempts: 0,
             concurrency: input.spawn_concurrency.max(1),
             parts: StepSpawnTimings::default(),
+            recheck: input.discovery.is_worklist().then(|| self.recheck.clone()),
         };
+        self.recheck.begin_tick();
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);
         let seed = SeedBase {
             minute,

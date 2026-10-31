@@ -421,7 +421,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14 # Apple Silicon runner (native build)
+            os: macos-15 # Apple Silicon runner (native build)
             cross: false
           - target: x86_64-unknown-linux-gnu
             # Pinned, not `ubuntu-latest` (#8842): the shipped binary's glibc
@@ -563,7 +563,7 @@ jobs:
       # checked too. A release whose binaries lost the stamp would leave every
       # fleet host unable to resync, so that fails here instead.
       #
-      # The match MUST be byte-wise: `LC_ALL=C` (#11006). The macos-14 runner
+      # The match MUST be byte-wise: `LC_ALL=C` (#11006). The macos-15 runner
       # exports LC_ALL=en_US.UTF-8, and its BSD grep (2.6.0-FreeBSD) in a
       # UTF-8 locale does not find the marker in the Mach-O binary even though
       # the bytes are there: release run 37837360573 failed this step on
