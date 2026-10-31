@@ -722,6 +722,10 @@ pub enum MetricName {
     /// Changes the mirror's change stream delivered, by `repo` and `kind`.
     #[serde(rename = "loom.forge.mirror.changes")]
     ForgeMirrorChanges,
+    /// Rechecks the daemon asked the mirror for after a claim refusal showed
+    /// a stale draw (#12318), by `reason` and `outcome`.
+    #[serde(rename = "loom.discovery.recheck")]
+    DiscoveryRecheck,
     /// Summed seconds from a change at the mirror to the pull that saw it,
     /// by `repo` (mean = this / `loom.forge.mirror.changes`).
     #[serde(rename = "loom.forge.mirror.wake_latency")]
@@ -884,6 +888,7 @@ impl MetricName {
             Self::AgentScopeOomKills => "loom.agent_scope.oom_kills",
             Self::ForgeMirrorReads => "loom.forge.mirror.reads",
             Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
+            Self::DiscoveryRecheck => "loom.discovery.recheck",
             Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
             Self::StageEntryLookups => "loom.stage_entry.lookups",
             Self::FeedCompletions => "loom.feed.completions",
@@ -939,6 +944,7 @@ impl MetricName {
             | Self::DaemonIpcStatusBuilds
             | Self::ForgeMirrorReads
             | Self::ForgeMirrorChanges
+            | Self::DiscoveryRecheck
             | Self::ForgeMirrorWakeLatency
             | Self::StageEntryLookups
             | Self::FeedCompletions
@@ -1018,6 +1024,7 @@ impl MetricName {
             Self::CodexSessionMountDrift => "{path}",
             Self::ForgeMirrorReads => "{request}",
             Self::ForgeMirrorChanges => "{change}",
+            Self::DiscoveryRecheck => "{request}",
             Self::ForgeMirrorWakeLatency => "s",
             Self::StageEntryLookups => "{lookup}",
             Self::FeedCompletions => "{completion}",
@@ -1163,6 +1170,9 @@ impl MetricName {
                 "Reads that asked the GitHub state mirror, by caller, repo and outcome."
             }
             Self::ForgeMirrorChanges => "Changes the state mirror's change stream delivered.",
+            Self::DiscoveryRecheck => {
+                "Rechecks asked of the state mirror after a stale-draw claim refusal."
+            }
             Self::ForgeMirrorWakeLatency => {
                 "Summed seconds from a change at the state mirror to the pull that saw it."
             }
