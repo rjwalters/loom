@@ -176,7 +176,6 @@ const KNOWN_SITES: &[(&str, &[&str])] = &[
     ("auto_update/pause_resume/host.rs", &["item.step", "requeue_step("]),
     ("sweep_registry/reaper.rs", KIND_NEEDLES),
     ("cli/cancel.rs", KIND_NEEDLES),
-    ("dispatch_tap.rs", KIND_NEEDLES),
     ("sweep_registry/roll_resume.rs", KIND_NEEDLES),
     ("sweep_registry/model_dispatch.rs", KIND_NEEDLES),
     ("work_finder/forge.rs", KIND_NEEDLES),

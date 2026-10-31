@@ -39,6 +39,9 @@ pub mod ratification;
 pub const MERGE_RISK_HOLD_MARKER: &str = "<!-- champion:merge-risk-hold -->";
 /// The reversal block a merge after a merge-risk hold carries.
 pub const MERGE_RISK_CLEARED_MARKER: &str = "<!-- champion:merge-risk-hold-cleared -->";
+/// Champion judged a merge-risk hold clear to release on its own confidence
+/// (#12950); carried in the pre-merge comment beside the reversal block.
+pub const MERGE_RISK_SELF_RELEASE_MARKER: &str = "<!-- champion:merge-risk-self-release -->";
 /// The critical-file hold notice's first line.
 pub const CRITICAL_FILE_HOLD_MARKER: &str = "<!-- champion:critical-file-hold -->";
 /// A critical-file episode closed by a push that narrowed the diff.
@@ -375,6 +378,21 @@ pub fn body_declares_hold(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_self_release_rides_the_reversal_block_and_is_never_a_hold() {
+        let hold = format!("{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc -->");
+        // The self-release block is embedded in the pre-merge comment beside
+        // the reversal block (#12950): that, not the self-release marker, ends
+        // the episode.
+        let merge =
+            format!("{MERGE_RISK_CLEARED_MARKER}\n{MERGE_RISK_SELF_RELEASE_MARKER}\nconf 0.93");
+        assert_eq!(standing_hold(&[hold.as_str(), merge.as_str()]), None);
+        // The self-release marker alone neither opens nor closes a hold.
+        let lone = format!("{MERGE_RISK_SELF_RELEASE_MARKER}\nconf 0.93");
+        assert_eq!(standing_hold(&[lone.as_str()]), None);
+        assert_eq!(standing_hold(&[hold.as_str(), lone.as_str()]), Some(HoldKind::MergeRisk));
+    }
 
     #[test]
     fn a_merge_risk_hold_stands_until_a_reversal() {

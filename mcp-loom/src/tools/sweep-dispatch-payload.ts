@@ -43,11 +43,9 @@ export function buildDispatchSweepPayload(args: DispatchSweepArgs): Record<strin
     // default) dispatches into the daemon's default workspace, exactly as
     // before; a value routes the sweep into that managed repo's registry.
     workspace_root: args.workspace_root ?? null,
-    // `force` (#4317) and runtime/model_profile (#11284): see
-    // sweep-dispatch-options.ts. As there, `force` MUST default to `false`
-    // (never `null`/omitted: `null` fails serde deserialization on every
-    // dispatch); `runtime` / `model_profile` default to `null`, keeping the
-    // role policy.
+    // `force` (#4317): see sweep-dispatch-options.ts. As there, `force` MUST
+    // default to `false` (never `null`/omitted: `null` fails serde
+    // deserialization on every dispatch).
     ...dispatchOptionBodyFields(args),
     // Issue #11444: a person (or the agent session acting for one) called
     // this tool, so the sweep records `dispatch_origin=operator`. The daemon

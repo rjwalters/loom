@@ -45,6 +45,14 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
     if let Some(id) = &r.episode_id {
         attributes.push(kv_string("loom.hold.episode_id", id));
     }
+    if let Some(c) = r.confidence_pct {
+        attributes.push(kv(
+            "loom.hold.confidence_pct",
+            AnyValue {
+                value: Some(any_value::Value::IntValue(i64::from(c))),
+            },
+        ));
+    }
     if let Some(at) = r.entered_at {
         attributes.push(kv_string("loom.hold.entered_at", at.to_rfc3339()));
     }
@@ -83,6 +91,7 @@ mod tests {
             episode_id: Some("o/r#42@1792238400".into()),
             entered_at: Some(at),
             entered_at_lower_bound: false,
+            confidence_pct: Some(93),
             event_at: at,
             observed_at: at + chrono::Duration::seconds(30),
             loom: Provenance {

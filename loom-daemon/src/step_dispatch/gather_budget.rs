@@ -65,6 +65,9 @@ pub struct TickPasses {
     /// The largest `champion.mergeConcurrencyPerRepo` among the tick's repos
     /// (#13026): the span's `loom.champion.merge_concurrency`.
     pub merge_concurrency: usize,
+    /// Eligible `champion_merge` steps across the tick's repos (#13367): the
+    /// span's `loom.champion.merge_eligible`.
+    pub merge_eligible: usize,
     /// Champion merges in flight across the tick's repos after it drew
     /// (#13026): the span's `loom.champion.merges_in_flight`.
     pub merges_in_flight: usize,
