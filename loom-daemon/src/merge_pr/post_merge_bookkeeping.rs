@@ -277,8 +277,7 @@ fn reset_one(issue: &str, inputs: &Inputs, host: &dyn Host, out: &mut Vec<Record
 
 /// `feature/issue-<N>` exactly (the shell's `^feature/issue-([0-9]+)$`).
 fn branch_issue(branch: &str) -> Option<&str> {
-    let n = branch.strip_prefix("feature/issue-")?;
-    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(n)
+    crate::worktree_ops::naming::issue_digits_from_branch(branch)
 }
 
 /// The retired `grep -Eqi "\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#N\b"`
