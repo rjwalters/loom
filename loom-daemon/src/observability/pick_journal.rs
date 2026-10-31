@@ -634,6 +634,25 @@ pub fn record_marker(number: u64, is_pr: bool, body: &str) {
     }
 }
 
+/// Journal a Judge approval refused by the exact-head CI gate (#13274):
+/// `class` is `ci_red` (exit 6) or `ci_incomplete` (exit 5). A marker entry
+/// carrying the head, so the Judge projection reads it. A no-op outside a
+/// journaled run.
+pub fn record_ci_refusal(number: u64, class: &str, head_sha: Option<&str>) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(number) {
+        append(&JournalEntry::Marker {
+            at: Utc::now(),
+            number,
+            is_pr: true,
+            marker: format!("<!-- judge:ci-refused:{class} -->"),
+            head_sha: head_sha.map(str::to_string),
+        });
+    }
+}
+
 /// Journal a write a daemon subcommand made on `number` (#12027). A no-op
 /// outside a journaled run.
 pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {

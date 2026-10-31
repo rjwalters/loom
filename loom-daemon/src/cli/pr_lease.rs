@@ -576,6 +576,18 @@ pub(crate) fn resolve_sweep(
         .unwrap_or_else(|| "pr-lease-unknown".to_string())
 }
 
+/// The stderr warning for a Judge claim that resolved to `pr-lease-unknown`
+/// (#13264): `post-verdict.sh` re-checks with `--watch-pid`, resolves a
+/// different identity, and sees the Judge's own lease as a peer's (exit 10).
+pub(crate) fn unknown_identity_warning(role: Role, sweep: &str) -> Option<&'static str> {
+    (role == Role::Judge && sweep == "pr-lease-unknown").then_some(
+        "lease pr: warning: this Judge claim has no sweep identity (no --sweep-id, \
+         LOOM_SWEEP_RUN_ID or --watch-pid), so post-verdict.sh approvals will refuse it as a \
+         peer's lease (exit 10); pass --watch-pid \"${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}\" \
+         on every call",
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Forge I/O
 // ---------------------------------------------------------------------------
@@ -981,6 +993,9 @@ fn with_context_as(
     }
     let sweep =
         resolve_sweep(common.sweep_id.as_deref(), common.watch_pid, |k| std::env::var(k).ok());
+    if let Some(w) = unknown_identity_warning(common.role, &sweep) {
+        eprintln!("{w}");
+    }
     let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
     let me = match Identity::new(
         common.role,

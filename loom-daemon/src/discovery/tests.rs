@@ -895,6 +895,9 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         // The listing readers (#12307).
         "claim_reconciliation/open_pr_listing.rs",
         "claim_reconciliation/open_pr_listing_tests.rs",
+        // Seeds the mirror snapshot for the listing-transport test; no claim,
+        // label-transition or merge read (invariant 3).
+        "claim_reconciliation/rest_only_tests.rs",
         "observability/queue_blocked.rs",
         "observability/queue_blocked_tests.rs",
         // The eta.stage_entry producer diffs the published snapshot; no forge call.

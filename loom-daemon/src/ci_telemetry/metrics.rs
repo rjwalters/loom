@@ -2,9 +2,9 @@
 //!
 //! Before this, what a poll cycle concluded lived only in the daemon's text
 //! log and `loom-daemon ci-telemetry status`, so "why did CI records stop?"
-//! could not be answered from SigNoz (#12792). Both daemon loops (periodic
-//! and feed-driven) call [`record_cycle`] once per finished cycle, so they
-//! cannot drift. The CLI runs `run_cycle` too and deliberately does not.
+//! could not be answered from SigNoz (#12792). The daemon loop calls
+//! [`record_cycle`] once per finished cycle. The CLI runs `run_cycle` too and
+//! deliberately does not.
 
 use std::io;
 use std::path::Path;

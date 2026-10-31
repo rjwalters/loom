@@ -491,7 +491,10 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
             E::BuildBackoff => &mut report.deferred_build_backoff,
             E::CoolingDown
             | E::Pass(
-                PassReason::CiPending | PassReason::HeldAtHead | PassReason::AuthorGateHeld,
+                PassReason::CiPending
+                | PassReason::HeldAtHead
+                | PassReason::AuthorGateHeld
+                | PassReason::Conflicting,
             ) => &mut report.skipped_noop_cooldown,
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(

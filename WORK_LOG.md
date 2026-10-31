@@ -13,8 +13,82 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-31
+
+- **PR #13374**: refactor: remove unused role-manifest interval fields
+- **PR #13328**: test: pin resync waiver to hold roles and skills copies
+- **PR #13325**: feat: hand operator-released critical-file PRs to the merge queue
+- **PR #13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
+- **PR #13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
+- **PR #13293**: fix: let a bare permissions header read green on workflow blast radius
+- **PR #13143**: docs: state that judge wait-checks --timeout is in seconds
+- **PR #13139**: fix: verdict-gate ignores the Judge's own notes and accepts --acknowledged-comment
+- **PR #13137**: fix: accept trailing-newline issue-body hash in verdict gate
+- **Issue #13358** (closed): merge queue: a failed_checks drop whose only failed jobs were runner cancellations is classified as a check failure and routed to Doctor
+- **Issue #13354** (closed): Remove unused role-manifest fields: defaultInterval, defaultIntervalPrompt, autonomousRecommended
+- **Issue #13321** (closed): champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator
+- **Issue #13313** (closed): Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate
+- **Issue #13291** (closed): Champion: a read-only permissions block in a workflow should not read red on blast radius
+- **Issue #13150** (closed): Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent
+- **Issue #13149** (closed): Export forge verdict-equivalent failure reasons as SigNoz span attributes
+- **Issue #13141** (closed): judge.md: wait-checks --timeout examples don't say the unit is seconds
+- **Issue #13136** (closed): Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
+- **Issue #13134** (closed): post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback
+- **PR #13370**: feat: skip conflicting approved PRs and scale queue-mode Champion merge limit
+- **PR #13365**: feat: name cancelled jobs and declining guard in merge-queue drop comments
+- **PR #13353**: refactor: move completion narration items above the test module
+- **PR #13339**: fix: supply canonical guard to ci-daily flake-shell; portable sed in waiver suite
+- **PR #13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
+- **Issue #13118** (closed): Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
+- **PR #13371**: test: pin disk-warn floor to 0 in daemon-update fixtures
+- **PR #13368**: feat: report stale-draw claim refusals to the mirror for a recheck
+- **PR #13344**: ci: move macOS runners from macos-14 to macos-15
+- **Issue #13369** (closed): test flake: loom-daemon-update floor-confirm/fetch fail in Native Port Suites (embedded commit mismatch)
+- **Issue #13343** (closed): CI: macos-check fails during macOS 14 runner brownout; image retires 2026-11-02
+- **Issue #12318** (closed): Claim refusals report back: `POST /v1/mirror/recheck` when the live claim read disagrees with the drawn snapshot
+
+### 2026-10-30
+
+- **Issue #12319** (closed): Wakes: a change in a served repo ticks the step tick early (trigger attribute, one worklist read per wake), gated on mirror health
+- **Issue #13275** (closed): Measure the "not measured" flow-review rows with store access: #10855 skips, #11493 usage, #10128 firings
+- **Issue #13190** (closed): Ratification lane: post verdicts through the signing broker (ratify_review) and document the lane
+- **Issue #13166** (closed): write-scope: a repo created after daemon start is still refused 'not-in-installation' 19h later on 0.19.1221 (the #13153 refresh does not clear it)
+- **PR #13334**: fix: rebase-stacked-children handles parent branches of any name
+- **Issue #13333** (closed): rebase-stacked-children.sh silently no-ops on parent branches not named feature/issue-N
+- **PR #13326**: test: share one forge-probing registry builder across outcome_journal tests
+- **Issue #13263** (closed): Dedupe four identical outcome_journal test registry builders into test_support
+- **Issue #13193** (closed): Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles
+- **PR #13315**: refactor: remove orphaned feed-client helpers and stale docs
+- **PR #13312**: fix: treat merge-queue queue_cleared as queue-wide, signal plan-gated rules reads
+- **PR #13310**: fix: ignore quoted spans in dependency parsing, quote edge lines in cycle report
+- **PR #13302**: test: pin PR write-gate reads to Gate and assert listing transport per mode
+- **PR #13311**: test: cover a new repo after the snapshot through the cached write-scope probe
+- **PR #13280**: feat: daemon lands its own resync PR through the merge queue
+- **Issue #13314** (closed): Remove dead pub fns left by feed-client removal: run_is_past_retention, uname_m, halted_reason
+- **Issue #13309** (closed): Merge-queue revoke: treat GitHub queue_cleared as a queue-wide removal, not dropped-unknown + loom:operator
+- **Issue #13303** (closed): Champion cycle detector reads "Blocks #N" / quoted text as a dependency (false cycle stalled sg13g2-sram#27)
+- **Issue #13268** (closed): Resync must land without the Champion merge path on repos that refuse direct pushes
+
 ### 2026-10-29
 
+- **PR #13283**: feat: project Judge CI-gate refusals as pass.verdict telemetry
+- **PR #13278**: docs: delete superseded Champion tier-cap and promotion-slice text
+- **PR #13267**: fix: warn on identity-less Judge lease claims and release lease after verdict
+- **Issue #13274** (closed): Telemetry: emit Judge CI-incomplete refusals (post-verdict exit 5/6) as daemon spans (#10486, flow review slice A)
+- **Issue #13272** (closed): Simplify: delete the superseded Champion tier-cap and promotion-slice text (#10759, flow review slice C)
+- **Issue #13264** (closed): Sweep Judge leases: claim without --watch-pid breaks post-verdict, backstop blocks the retry, lease not released after verdict
+- **PR #13300**: chore(harness): track latest CLIs — codex 0.165.0→0.166.0
+- **PR #13271**: test: cross-tool guard test for Champion pin/facts commands
+- **PR #13188**: fix: hold ratification requests under ratification/** in the champion ratification hold
+- **PR #13147**: feat: add --repo to forge verdict-equivalent and name forge-read failures
+- **PR #13144**: fix: add loom marker to judge-ci-red flake note template
+- **PR #13113**: feat(merge-pr): port the stale-mergeable recheck loop to Rust (#8191 slice)
+- **Issue #13269** (closed): Cross-tool guard test: Champion pin/facts writes must pass both Loom and Repo Skills hooks
+- **Issue #13185** (closed): Champion ratification hold misses ratification/requests/** — a key-review request PR auto-merged with no key reviews
+- **Issue #13146** (closed): verdict-equivalent: 'could not read PR's base branch' re-arms human-released holds after every Doctor merge (5 PRs, 10-23/24); failure reason not in telemetry
+- **Issue #13140** (closed): judge-ci-red flake note has no Loom marker, so it trips post-verdict.sh's stale-read gate on the Judge's own verdict
+- **PR #13295**: refactor: remove dead GraphQL path from ci_telemetry poller
+- **Issue #13292** (closed): Remove dead GraphQL path in ci_telemetry poller (story.rs caller deleted)
 - **PR #13208**: build(deps): Bump the github-actions group across 1 directory with 6 updates
 - **PR #13288**: fix: attribute step-launched role sessions to their issue's completion tokens and record each narration
 - **Issue #13287** (closed): completion-v1 narration carries no tokens since ~2026-10-16; narration emits no telemetry
@@ -5646,13 +5720,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7071** (closed): WORK_PLAN Ready section and urgent-eligibility never exclude loom:blocked (only operator-only was fixed in #7008)
 - **Issue #7069** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7067** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-
-### 2026-08-30
-- **PR #7063**: fix: feed crash/timeout fixture payloads via process substitution
-- **Issue #7060** (closed): Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case
-- **PR #7052**: chore(deps): bump the all-dependencies group with 2 updates
-- **Issue #7053** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7051** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 
