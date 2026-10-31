@@ -10,7 +10,10 @@
 //! `loom:issue`) with no quarantine left anywhere to clear, forever.
 //!
 //! This module is the startup pass that closes that gap: for every registered
-//! workspace, list the open `loom:blocked` issues and release the ones that
+//! workspace, take the open `loom:blocked` issues from the discovery snapshot
+//! (on the mirror's worklist chain the pass runs before the first tick, so it
+//! asks the discovery backend for one on demand and the first tick reuses its
+//! ETag, #12314) and release the ones that
 //! carry a daemon-authored quarantine comment (identified by
 //! [`crate::sweep_registry::QUARANTINE_COMMENT_MARKER`]) back to `loom:issue`.
 //! An issue a human deliberately blocked by hand carries no such comment and

@@ -7,7 +7,8 @@
 //!
 //! 1. The `loom:blocked` set comes from [`crate::forge_listing`]'s ETag-cached
 //!    issues listing (an unchanged set is a free `304`), or, with the mirror's
-//!    worklist as the discovery chain, from the tick's snapshot (#12307).
+//!    worklist as the discovery chain, from the tick's snapshot (#12307); the startup pass runs before any tick, so
+//!    it takes that snapshot on demand (#12314).
 //! 2. Comments (and the timeline) are read per issue only on a
 //!    [`QUARANTINE_SCAN`] miss, keyed on the issue's `updatedAt` (a new comment
 //!    or label event bumps it), so an unchanged set costs no comment fetch.
@@ -27,15 +28,22 @@ const BLOCKED_LABEL: &str = "loom:blocked";
 /// The REST listing failed; the message carries the `gh` stderr tail so the
 /// rate-limit classifier sees it unchanged.
 pub(super) fn list_blocked(gh_bin: &Path, root: &Path) -> Result<Vec<(u32, Option<String>)>> {
-    use crate::discovery::published::{absent_error, lookup, Lookup};
-    let rows = match lookup(root) {
-        Lookup::Repo(repo) => repo
-            .rows
+    use crate::discovery::published::{lookup, on_demand, Lookup};
+    let blocked = |repo: &crate::discovery::RepoSnapshot| {
+        repo.rows
             .iter()
             .filter(|r| r.labels.iter().any(|l| l == BLOCKED_LABEL))
             .cloned()
-            .collect(),
-        Lookup::Absent => return Err(absent_error(root)),
+            .collect()
+    };
+    let rows = match lookup(root) {
+        Lookup::Repo(repo) => blocked(&repo),
+        // #12314: the startup pass runs before the first tick, so it asks the
+        // discovery backend for a snapshot rather than listing itself.
+        Lookup::Absent => {
+            let repo = on_demand(gh_bin, root)?;
+            blocked(&repo)
+        }
         Lookup::NotMirror => {
             // #12310: the blocked-issue listing is discovery.
             let _discovery = crate::gh_invocation::purpose::discovery();
@@ -129,7 +137,13 @@ mod tests {
     fn mirror_mode_reads_the_blocked_set_from_the_snapshot() {
         let fixture = MirrorRoot::new("acme/widgets");
         set(Vec::new());
+        crate::discovery::published::test_support::reset_on_demand();
+        // #12314: an unread repo is asked for on demand (the fallback tier's
+        // listing is the fake `gh`, which fails): still a failed listing.
         assert!(list_blocked(&fixture.gh, fixture.path()).is_err());
+        assert!(!fixture.gh_calls().is_empty(), "the on-demand snapshot never reached a tier");
+        crate::discovery::published::test_support::reset_on_demand();
+        let before = fixture.gh_calls();
 
         let mut snapshot = repo("acme/widgets");
         snapshot.rows = vec![
@@ -147,7 +161,7 @@ mod tests {
                 (4, Some("2026-10-01T00:00:00Z".to_string()))
             ]
         );
-        assert_eq!(fixture.gh_calls(), "", "mirror mode made a listing call");
+        assert_eq!(fixture.gh_calls(), before, "mirror mode made a listing call");
         set(Vec::new());
     }
 }

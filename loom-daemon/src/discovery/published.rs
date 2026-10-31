@@ -11,13 +11,16 @@
 //! last read, however old: the readers act on listings only after live
 //! checks of their own (`scan_issue`, `mergeable_of`, PR state). A repo the
 //! snapshot has never read is [`Lookup::Absent`]: the reader treats it as a
-//! failed listing, never as an empty one.
+//! failed listing, never as an empty one, unless it can ask for one
+//! ([`on_demand`], #12314).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use super::{BackendKind, Chain, RepoSnapshot, TickSnapshot};
+use std::time::{Duration, Instant};
+
+use super::{BackendKind, Chain, Discovery, RepoSnapshot, Target, TickSnapshot};
 
 static LATEST: Mutex<BTreeMap<String, Arc<RepoSnapshot>>> = Mutex::new(BTreeMap::new());
 
@@ -65,6 +68,71 @@ fn lookup_slug(slug: Option<&str>) -> Lookup {
         .map_or(Lookup::Absent, Lookup::Repo)
 }
 
+/// How long an on-demand tick is reused by the next root of the same startup
+/// pass, so N roots cost one worklist request, not N.
+const ON_DEMAND_TTL: Duration = Duration::from_secs(30);
+
+/// The discovery state of snapshots taken outside the step tick (#12314).
+struct OnDemand {
+    discovery: Discovery,
+    tick: Option<(Instant, Arc<TickSnapshot>)>,
+}
+
+static ON_DEMAND: Mutex<Option<OnDemand>> = Mutex::new(None);
+
+fn on_demand_state() -> std::sync::MutexGuard<'static, Option<OnDemand>> {
+    ON_DEMAND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The workspace's part of a snapshot taken now, for a reader that runs
+/// before the first step tick (quarantine reconciliation's startup pass,
+/// #12314). This is the one place a snapshot is taken outside the tick.
+///
+/// The repo is published like a tick's, and the mirror's worklist and ETag
+/// stay behind for the step driver ([`take_mirror_seed`]), so its first tick
+/// asks conditionally and gets a `304` instead of a second full worklist.
+///
+/// # Errors
+///
+/// The workspace has no `github.com` slug, or no tier answered for it.
+pub fn on_demand(gh_bin: &Path, root: &Path) -> anyhow::Result<Arc<RepoSnapshot>> {
+    let slug =
+        crate::forge_mirror::resolve_repo(Some(root), None).ok_or_else(|| absent_error(root))?;
+    let target = Target {
+        slug,
+        gh_bin: gh_bin.to_path_buf(),
+        root_dir: root.to_path_buf(),
+    };
+    let mut state = on_demand_state();
+    let state = state.get_or_insert_with(|| OnDemand {
+        discovery: Discovery::unseeded(crate::work_finder::resolve_interval()),
+        tick: None,
+    });
+    let tick = match &state.tick {
+        Some((at, tick)) if at.elapsed() < ON_DEMAND_TTL => tick.clone(),
+        _ => {
+            let tick = Arc::new(
+                state
+                    .discovery
+                    .begin_tick(Chain::for_root(root), chrono::Utc::now()),
+            );
+            state.tick = Some((Instant::now(), tick.clone()));
+            tick
+        }
+    };
+    let repo = tick.repo(&target);
+    publish(&tick);
+    repo
+}
+
+/// The mirror cache (last worklist and ETag) an on-demand snapshot left, for
+/// the step driver's [`Discovery`] to start from. Taken once.
+pub(super) fn take_mirror_seed() -> Option<super::mirror::MirrorBackend> {
+    on_demand_state().take().map(|s| s.discovery.mirror)
+}
+
 /// The error a reader reports for [`Lookup::Absent`], so its caller treats
 /// the listing as failed.
 #[must_use]
@@ -90,6 +158,11 @@ pub(crate) mod test_support {
             extras: BTreeMap::new(),
             watermark: None,
         }
+    }
+
+    /// Forget the on-demand snapshot state.
+    pub(crate) fn reset_on_demand() {
+        *on_demand_state() = None;
     }
 
     /// Replace the published repos.
