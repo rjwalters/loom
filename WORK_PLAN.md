@@ -12,6 +12,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
+- **#13336**: fix: rebase children of non-feature/issue-N parents before retargeting
 - **#13340**: fix: trust github-actions[bot] as a promotion author for CI trackers
 - **#13348**: fix: re-mint the writer token when a miss refresh still lacks the repo
 - **#13363**: fix: retry merge-queue enqueue once on QueueUnavailable and key stall notice on reason
@@ -74,6 +75,8 @@ Issues currently being built (`loom:building`).
 - **#13357**: merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming
 - **#13367**: champion: scale handoff throughput with loom:pr debt on queue-mode repositories (batch handoff or per-repository lanes); the merge queue sits half empty behind one-PR-per-pass Champion
+- **#13387**: Dedupe identical git test helpers in orphan_replace_tests and orphan_stack_tests
+- **#13388**: test: real-git 3-deep non-feature/issue-N stack for retarget-children rebase (#13332 AC4)
 
 ## PRs Awaiting Review
 
@@ -87,6 +90,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#13355**: refactor: remove unused per-dispatch runtime/modelProfile override
 - **#13364**: feat: fall back to local patch comparison when the forge compare is unreadable
 - **#13383**: feat: report eligible Champion merge count on the tick span
+- **#13390**: test: cover 3-deep non-feature/issue-N stack in reconcile-stack suite
 
 ## Approved (Awaiting Merge)
 
@@ -98,9 +102,11 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12960**: feat: let Champion self-release merge-risk holds above a confidence threshold
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13297**: fix: resolve repo explicitly and surface gh errors in suspect-critical-diff
+- **#13336**: fix: rebase children of non-feature/issue-N parents before retargeting
 - **#13340**: fix: trust github-actions[bot] as a promotion author for CI trackers
 - **#13348**: fix: re-mint the writer token when a miss refresh still lacks the repo
 - **#13363**: fix: retry merge-queue enqueue once on QueueUnavailable and key stall notice on reason
+- **#13389**: refactor: share hermetic git test helpers between orphan-stack test modules
 
 ## Proposed
 
@@ -187,6 +193,7 @@ Issues carrying `loom:curated`.
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming *(curated)*
 - **#13367**: champion: scale handoff throughput with loom:pr debt on queue-mode repositories (batch handoff or per-repository lanes); the merge queue sits half empty behind one-PR-per-pass Champion *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
+- **#13388**: test: real-git 3-deep non-feature/issue-N stack for retarget-children rebase (#13332 AC4) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -215,14 +222,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 6 |
+| Operator merge-risk holds | 7 |
 | Very important | 1 |
 | Important | 14 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 13 |
-| PRs awaiting review | 8 |
-| Approved PRs awaiting merge | 9 |
-| Curated | 81 |
+| In Progress (`loom:building`) | 15 |
+| PRs awaiting review | 9 |
+| Approved PRs awaiting merge | 11 |
+| Curated | 82 |
 | Architect / Hermit proposals | 7 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
