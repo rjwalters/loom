@@ -194,6 +194,8 @@ pub mod discovery;
 pub mod disk_headroom;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
+/// Doctor hand-back as a conditional, verified label transition (#9388).
+pub mod doctor_handback;
 pub mod eager_reclaim;
 #[cfg(test)]
 pub(crate) mod env_test_support;
