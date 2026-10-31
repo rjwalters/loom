@@ -1153,6 +1153,7 @@ RESYNC_GATE_PATTERNS=(
 # resync_upstream_path <installed-path>: the defaults/ counterpart per resync-installed.sh's
 # surface map, empty when the path has none. Roles and skills are symlinks or generated
 # upstream, so their blobs never compare equal: no mapping, hold.
+# `.loom/roles` and the generated skill copies are deliberately unmapped (operator ruling, #13313).
 resync_upstream_path() {
   case "$1" in
     .loom/hooks/*)            printf 'defaults/hooks/%s' "${1#.loom/hooks/}" ;;
