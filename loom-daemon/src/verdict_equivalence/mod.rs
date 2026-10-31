@@ -554,8 +554,9 @@ fn assess_with_scope(
     let base_ref = match pr_base_ref_checked(gh_bin, cwd, pr) {
         Ok(base_ref) => base_ref,
         Err(why) => {
-            unavailable
-                .push(format!("could not read PR #{pr}'s base branch from the forge: {why}"));
+            unavailable.push(format!(
+                "{BASE_UNREAD_TOKEN} — could not read PR #{pr}'s base branch from the forge: {why}"
+            ));
             return Assessment::indeterminate(unavailable);
         }
     };
@@ -621,6 +622,10 @@ fn assess_with_scope(
 /// The token a re-arm caused by an unreadable forge compare carries in its
 /// reason line and in `hold.transition` telemetry (#13114).
 pub const UNREAD_TOKEN: &str = "equivalence=unread";
+
+/// The token a re-arm caused by an unreadable PR base branch carries, ahead of
+/// the free-text reason, so the cause is exportable without that text (#13149).
+pub const BASE_UNREAD_TOKEN: &str = "equivalence=base-unread";
 
 /// The body of the re-anchor comment the daemon pass posts when a verdict is
 /// carried forward.

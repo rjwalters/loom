@@ -139,6 +139,7 @@ pub(crate) fn verdict_gate(
     window_secs: i64,
     review_started: Option<&str>,
     issue_body_sha: &[String],
+    acknowledged_comment: &[u64],
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-gate", verdict);
     let root = super::forge_identity_cmd::workspace();
@@ -177,6 +178,7 @@ pub(crate) fn verdict_gate(
         _ => Some(Vec::new()),
     };
     let labels = read_labels(repo, pr, &root);
+    let own_sweep = std::env::var("LOOM_SWEEP_ID").ok();
     let decision = gate::decide(&GateInput {
         verdict: kind,
         sha,
@@ -187,6 +189,8 @@ pub(crate) fn verdict_gate(
         window_secs,
         review_started: started,
         issues: issues.as_deref(),
+        own_sweep: own_sweep.as_deref(),
+        acknowledged: acknowledged_comment,
     });
     if matches!(decision, Decision::Proceed(_)) && (comments.is_none() || labels.is_none()) {
         eprintln!(

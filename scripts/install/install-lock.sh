@@ -178,7 +178,7 @@ install_lock_recovery_banner() {
   echo ""
   echo "  Inspect and recover before retrying:"
   echo "    git -C \"$target\" status --short"
-  echo "    git -C \"$target\" restore --staged --worktree -- .loom .claude CLAUDE.md .gitignore"
+  echo "    git -C \"$target\" restore --staged --worktree -- .loom .claude CLAUDE.md AGENTS.md .gitignore .gitattributes"
   echo "      # older git: git -C \"$target\" reset -q HEAD -- <paths> && git -C \"$target\" checkout -- <paths>"
   echo "    git -C \"$target\" stash list | grep loom-install   # changes this installer stashed, if any"
   echo ""

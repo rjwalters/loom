@@ -36,6 +36,8 @@ fn input<'a>(
         window_secs: DEFAULT_WINDOW_SECS,
         review_started: Some(now()),
         issues: Some(&[]),
+        own_sweep: None,
+        acknowledged: &[],
     }
 }
 
@@ -378,6 +380,74 @@ fn bot_and_loom_marker_comments_after_start_do_not_refuse() {
     assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
 }
 
+fn note(id: u64, body: &str) -> Value {
+    json!({"id": id, "body": body, "created_at": "2026-10-06T13:05:00Z",
+        "user": {"login": "operator", "type": "User"}, "author_association": "OWNER"})
+}
+
+fn gate_with(
+    pr_comments: &[Value],
+    issues: &[IssueSnapshot],
+    own_sweep: Option<&str>,
+    acknowledged: &[u64],
+) -> Decision {
+    let l = labels(&[]);
+    let mut i = input(VerdictKind::Approved, Some(pr_comments), Some(&l), "");
+    i.review_started = Some(started());
+    i.issues = Some(issues);
+    i.own_sweep = own_sweep;
+    i.acknowledged = acknowledged;
+    decide(&i)
+}
+
+#[test]
+fn own_sweep_note_without_a_loom_marker_is_ignored() {
+    let c = [note(
+        9,
+        "Judge progress: reviewing (sweep=step-judge-1-1792830000)",
+    )];
+    let d = gate_with(&c, &[], Some("step-judge-1-1792830000"), &[]);
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+    // A different sweep, or a longer id sharing the prefix, still counts.
+    let d = gate_with(&c, &[], Some("step-judge-1-17928300"), &[]);
+    assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
+    let d = gate_with(&c, &[], Some("other"), &[]);
+    assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
+    let d = gate_with(&c, &[], None, &[]);
+    assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
+}
+
+#[test]
+fn acknowledged_comment_is_ignored_but_others_still_refuse() {
+    let c = [note(9, "ruling"), note(10, "another")];
+    let d = gate_with(&c, &[], None, &[9]);
+    assert!(
+        matches!(&d, Decision::Refuse(m) if m.contains("comment 10")
+        && m.contains("--acknowledged-comment")),
+        "{d:?}"
+    );
+    let d = gate_with(&c, &[], None, &[9, 10]);
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+}
+
+#[test]
+fn acknowledged_comment_never_excuses_a_body_change() {
+    let c = [note(9, "ruling")];
+    let iss = [issue(7, "old", "new", vec![])];
+    let d = gate_with(&c, &iss, None, &[9]);
+    assert!(
+        matches!(&d, Decision::Refuse(m) if m.contains("issue #7's body changed")),
+        "{d:?}"
+    );
+    // Acknowledging an issue comment id works the same way and no further.
+    let iss = [issue(7, "b", "b", vec![note(11, "ruling")])];
+    let d = gate_with(&[], &iss, None, &[11]);
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+    let iss = [issue(7, "old", "new", vec![note(11, "ruling")])];
+    let d = gate_with(&[], &iss, None, &[11]);
+    assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
+}
+
 #[test]
 fn linked_issue_body_change_refuses_and_names_the_issue() {
     let iss = [issue(12509, "old design", "new daemon-only design", vec![])];
@@ -386,6 +456,29 @@ fn linked_issue_body_change_refuses_and_names_the_issue() {
         matches!(&d, Decision::Refuse(m) if m.contains("issue #12509's body changed")),
         "{d:?}"
     );
+}
+
+#[test]
+fn trailing_newline_hash_is_accepted_but_edited_body_still_refuses() {
+    use sha2::{Digest, Sha256};
+    let nl = hex::encode(Sha256::digest(b"same\n"));
+    let mut iss = [issue(12509, "same", "same\n\n", vec![])];
+    iss[0].expected_body_sha = Some(nl.clone());
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+
+    iss[0].body = Some("edited".into());
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(&d, Decision::Refuse(m) if m.contains("body changed")), "{d:?}");
+
+    // Empty body: "" and "\n" both hash-match; two newlines do not.
+    iss[0].body = Some(String::new());
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"\n")));
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"\n\n")));
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
 }
 
 #[test]

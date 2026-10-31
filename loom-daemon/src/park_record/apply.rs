@@ -303,6 +303,7 @@ pub const HOLD_EQUIVALENCE_ENV: &str = "LOOM_HOLD_EQUIVALENCE";
 fn hold_trigger(equivalence: Option<&str>) -> &'static str {
     match equivalence {
         Some("unread") => "champion_role_equivalence_unread",
+        Some("base-unread") => "champion_role_equivalence_base_unread",
         _ => "champion_role",
     }
 }
@@ -351,6 +352,9 @@ mod trigger_tests {
     fn an_unread_compare_rearm_has_its_own_trigger() {
         assert_eq!(hold_trigger(Some("unread")), "champion_role_equivalence_unread");
         assert_eq!(hold_trigger(Some("changed")), "champion_role");
+        assert_eq!(hold_trigger(Some("base-unread")), "champion_role_equivalence_base_unread");
+        assert_eq!(hold_trigger(Some("unread; echo hostile")), "champion_role");
+        assert_eq!(hold_trigger(Some("equivalence=base-unread")), "champion_role");
         assert_eq!(hold_trigger(None), "champion_role");
     }
 }
