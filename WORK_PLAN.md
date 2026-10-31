@@ -74,6 +74,7 @@ Issues currently being built (`loom:building`).
 - **#13345**: Ratification lane: wire the lane into the tick and post per-key RATIFY markers as comments
 - **#13357**: merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming
+- **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests
 
 ## PRs Awaiting Review
 
@@ -85,6 +86,8 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#13341**: feat: warn on missing hold labels and hint sync-labels on failed park
 - **#13349**: feat: post per-key ratification markers and run the lane from the champion tick
 - **#13364**: feat: fall back to local patch comparison when the forge compare is unreadable
+- **#13395**: feat: take quarantine reconciliation's blocked set from an on-demand discovery snapshot
+- **#13398**: test: write fake forge gh script atomically to avoid ETXTBSY
 
 ## Approved (Awaiting Merge)
 
@@ -182,6 +185,7 @@ Issues carrying `loom:curated`.
 - **#13357**: merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds *(curated)*
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
+- **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -214,10 +218,10 @@ Issues carrying `loom:curated`.
 | Very important | 1 |
 | Important | 14 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 12 |
-| PRs awaiting review | 6 |
+| In Progress (`loom:building`) | 13 |
+| PRs awaiting review | 8 |
 | Approved PRs awaiting merge | 10 |
-| Curated | 77 |
+| Curated | 78 |
 | Architect / Hermit proposals | 7 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
