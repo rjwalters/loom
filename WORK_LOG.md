@@ -15,6 +15,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13422**: feat(doctor): add forge doctor-handback, a verified add-first hand-back
+- **PR #13420**: feat: add --resweep to notify-cleared-blockers for marker-carrying parked issues
+- **Issue #9388** (closed): Doctor rechecks the head SHA before pushing but not the labels before writing them
+- **Issue #10234** (closed): check-claim treats an in-session sweep's own pre-flight lease as a foreign claim — add --sweep-id so builders need not --force-claim
+- **Issue #13418** (closed): notify-cleared-blockers: a resweep mode that unparks already-notified stale blocks (the #13331 carve-out never reaches them)
 - **PR #13415**: fix: guide unblock sweep honors park record over AC checkboxes
 - **Issue #13414** (closed): Guide unblock sweep treats acceptance-criteria checkboxes as dependencies, re-lifting operator parks
 - **PR #13410**: refactor: dedupe registry-lock poison handling in work_finder dispatcher
