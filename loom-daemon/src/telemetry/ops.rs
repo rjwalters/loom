@@ -171,6 +171,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // #13026: the per-repo Champion merge concurrency in force, and the
     // merges in flight once the tick drew.
     "loom.champion.merge_concurrency",
+    "loom.champion.merge_eligible",
     "loom.champion.merges_in_flight",
     "loom.dispatch.budget",
     "loom.dispatch.stop",
