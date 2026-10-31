@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **Issue #13324** (closed): [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 8)
+- **Issue #13323** (closed): [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 1)
 - **PR #13408**: feat: carry a redacted cause in forge_repo_facts read failures
 - **Issue #13405** (closed): forge_repo_facts: log the cause of a failed repo read, not just 'Failed'
 - **PR #13403**: test: cover on-demand ETag handoff and snapshot-vs-listing parity
