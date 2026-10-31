@@ -13,8 +13,25 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-31
+
+- **PR #13370**: feat: skip conflicting approved PRs and scale queue-mode Champion merge limit
+- **PR #13365**: feat: name cancelled jobs and declining guard in merge-queue drop comments
+- **PR #13353**: refactor: move completion narration items above the test module
+- **PR #13339**: fix: supply canonical guard to ci-daily flake-shell; portable sed in waiver suite
+- **PR #13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
+- **Issue #13118** (closed): Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
+- **PR #13371**: test: pin disk-warn floor to 0 in daemon-update fixtures
+- **PR #13368**: feat: report stale-draw claim refusals to the mirror for a recheck
+- **PR #13344**: ci: move macOS runners from macos-14 to macos-15
+- **Issue #13369** (closed): test flake: loom-daemon-update floor-confirm/fetch fail in Native Port Suites (embedded commit mismatch)
+- **Issue #13343** (closed): CI: macos-check fails during macOS 14 runner brownout; image retires 2026-11-02
+- **Issue #12318** (closed): Claim refusals report back: `POST /v1/mirror/recheck` when the live claim read disagrees with the drawn snapshot
+
 ### 2026-10-30
 
+- **Issue #12319** (closed): Wakes: a change in a served repo ticks the step tick early (trigger attribute, one worklist read per wake), gated on mirror health
+- **Issue #13275** (closed): Measure the "not measured" flow-review rows with store access: #10855 skips, #11493 usage, #10128 firings
 - **Issue #13190** (closed): Ratification lane: post verdicts through the signing broker (ratify_review) and document the lane
 - **Issue #13166** (closed): write-scope: a repo created after daemon start is still refused 'not-in-installation' 19h later on 0.19.1221 (the #13153 refresh does not clear it)
 - **PR #13334**: fix: rebase-stacked-children handles parent branches of any name

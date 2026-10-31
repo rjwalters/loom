@@ -227,7 +227,7 @@ jobs:
         # up here days before release day instead of on it.
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
@@ -554,6 +554,27 @@ jobs:
           git config --global user.name "Loom CI"
       - name: Assert the wired/excluded manifest invariant (#4455)
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
+      - name: Fetch pinned Repo Skills guard (#13324)
+        # tests/hooks/test-guard-cross-tool-champion.sh exits 3 (INCOMPLETE, by
+        # design) without LOOM_GUARD_CANONICAL. Same pinned tag + sha256 as the
+        # "Fetch pinned Repo Skills guard (#13269)" step in ci.yml -- bump both
+        # together. A fetch failure or hash mismatch fails the job (never a
+        # skip). sha256sum is absent on stock macOS, hence the shasum fallback.
+        env:
+          REPO_SKILLS_TAG: v0.24.9
+          REPO_SKILLS_GUARD_SHA256: d2108860006844a4fb4dddf6aadfe68af10d84eb346a1ffc214bcbcd40d11f3b
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/repo-skills-guard/guard-destructive.sh"
+          mkdir -p "$(dirname "$dest")"
+          curl -fsSL --retry 3 -o "$dest" \
+            "https://raw.githubusercontent.com/rjwalters/repo/${REPO_SKILLS_TAG}/hooks/repo/guard-destructive.sh"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${REPO_SKILLS_GUARD_SHA256}  ${dest}" | sha256sum -c -
+          else
+            echo "${REPO_SKILLS_GUARD_SHA256}  ${dest}" | shasum -a 256 -c -
+          fi
+          echo "LOOM_GUARD_CANONICAL=${dest}" >> "$GITHUB_ENV"
       - name: Ensure a per-suite timeout wrapper (#11964)
         # run-ci-suites.sh bounds each suite only through `timeout`/`gtimeout`
         # and, in CI, now refuses to run without one: with neither, one hung
