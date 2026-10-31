@@ -459,6 +459,29 @@ fn linked_issue_body_change_refuses_and_names_the_issue() {
 }
 
 #[test]
+fn trailing_newline_hash_is_accepted_but_edited_body_still_refuses() {
+    use sha2::{Digest, Sha256};
+    let nl = hex::encode(Sha256::digest(b"same\n"));
+    let mut iss = [issue(12509, "same", "same\n\n", vec![])];
+    iss[0].expected_body_sha = Some(nl.clone());
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+
+    iss[0].body = Some("edited".into());
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(&d, Decision::Refuse(m) if m.contains("body changed")), "{d:?}");
+
+    // Empty body: "" and "\n" both hash-match; two newlines do not.
+    iss[0].body = Some(String::new());
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"\n")));
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"\n\n")));
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
+}
+
+#[test]
 fn unchanged_issue_body_proceeds() {
     let iss = [issue(12509, "same\n", "same", vec![])];
     let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));

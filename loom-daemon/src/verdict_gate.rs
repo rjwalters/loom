@@ -407,6 +407,17 @@ pub fn body_sha(body: &str) -> String {
     hex::encode(Sha256::digest(body.trim_end_matches(['\n', '\r']).as_bytes()))
 }
 
+/// Whether `expected` is the hash of `body`: the canonical [`body_sha`], or that
+/// same trimmed body plus exactly one `\n`, which is what
+/// `gh api … --jq .body | sha256sum` yields (jq appends the newline).
+fn body_sha_matches(expected: &str, body: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let expected = expected.trim();
+    let trimmed = body.trim_end_matches(['\n', '\r']);
+    expected.eq_ignore_ascii_case(&body_sha(body))
+        || expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(format!("{trimmed}\n"))))
+}
+
 /// The issue numbers a PR body closes or contributes to (`Closes #N`,
 /// `Fixes: #N`, `Resolves #N` and their inflections, plus `Part of #N` and
 /// `Contributes to #N`, #12714), ascending and deduplicated.
@@ -554,7 +565,7 @@ pub fn stale_read(
             continue;
         };
         if let Some(expected) = issue.expected_body_sha.as_deref() {
-            if !expected.trim().eq_ignore_ascii_case(&body_sha(body)) {
+            if !body_sha_matches(expected, body) {
                 why.push(format!(
                     "issue #{n}'s body changed since this review started (it no longer matches \
                      the body you reviewed)"
