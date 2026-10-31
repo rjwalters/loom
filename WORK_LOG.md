@@ -15,6 +15,25 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13374**: refactor: remove unused role-manifest interval fields
+- **PR #13328**: test: pin resync waiver to hold roles and skills copies
+- **PR #13325**: feat: hand operator-released critical-file PRs to the merge queue
+- **PR #13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
+- **PR #13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
+- **PR #13293**: fix: let a bare permissions header read green on workflow blast radius
+- **PR #13143**: docs: state that judge wait-checks --timeout is in seconds
+- **PR #13139**: fix: verdict-gate ignores the Judge's own notes and accepts --acknowledged-comment
+- **PR #13137**: fix: accept trailing-newline issue-body hash in verdict gate
+- **Issue #13358** (closed): merge queue: a failed_checks drop whose only failed jobs were runner cancellations is classified as a check failure and routed to Doctor
+- **Issue #13354** (closed): Remove unused role-manifest fields: defaultInterval, defaultIntervalPrompt, autonomousRecommended
+- **Issue #13321** (closed): champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator
+- **Issue #13313** (closed): Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate
+- **Issue #13291** (closed): Champion: a read-only permissions block in a workflow should not read red on blast radius
+- **Issue #13150** (closed): Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent
+- **Issue #13149** (closed): Export forge verdict-equivalent failure reasons as SigNoz span attributes
+- **Issue #13141** (closed): judge.md: wait-checks --timeout examples don't say the unit is seconds
+- **Issue #13136** (closed): Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
+- **Issue #13134** (closed): post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback
 - **PR #13370**: feat: skip conflicting approved PRs and scale queue-mode Champion merge limit
 - **PR #13365**: feat: name cancelled jobs and declining guard in merge-queue drop comments
 - **PR #13353**: refactor: move completion narration items above the test module
