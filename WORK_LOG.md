@@ -15,6 +15,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13383**: feat: report eligible Champion merge count on the tick span
+- **PR #13389**: refactor: share hermetic git test helpers between orphan-stack test modules
+- **PR #13390**: test: cover 3-deep non-feature/issue-N stack in reconcile-stack suite
+- **Issue #13388** (closed): test: real-git 3-deep non-feature/issue-N stack for retarget-children rebase (#13332 AC4)
+- **Issue #13387** (closed): Dedupe identical git test helpers in orphan_replace_tests and orphan_stack_tests
+- **Issue #13367** (closed): champion: scale handoff throughput with loom:pr debt on queue-mode repositories (batch handoff or per-repository lanes); the merge queue sits half empty behind one-PR-per-pass Champion
 - **PR #13351**: refactor: route feature/issue-N branch parsing through worktree_ops::naming
 - **Issue #13346** (closed): Consolidate seven duplicated feature/issue-N branch parsers in loom-daemon
 - **PR #13338**: feat: unpark Curator-parked issues once their blockers resolve
