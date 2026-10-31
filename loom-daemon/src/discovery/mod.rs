@@ -82,6 +82,17 @@ impl Discovery {
     /// `backstop` (the work finder's base cadence).
     #[must_use]
     pub fn with_backstop(backstop: std::time::Duration) -> Self {
+        // #12314: an on-demand snapshot taken before the first tick leaves
+        // its worklist and ETag here, so that tick gets a `304`.
+        let mut discovery = Self::unseeded(backstop);
+        if let Some(mirror) = published::take_mirror_seed() {
+            discovery.mirror = mirror;
+        }
+        discovery
+    }
+
+    /// [`Self::with_backstop`] without the on-demand seed.
+    fn unseeded(backstop: std::time::Duration) -> Self {
         Self {
             mirror: mirror::MirrorBackend::default(),
             fallback: Arc::new(Mutex::new(fallback::Fallback::new(backstop))),
