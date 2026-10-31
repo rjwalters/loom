@@ -19,7 +19,7 @@ pub const REVERT_WINDOW_DAYS: i64 = 7;
 /// threshold, so a self-release at exactly 0.9 lands in the first bucket.
 pub const BUCKET_EDGES: [f64; 2] = [0.90, 0.95];
 
-/// The confidence in the first self-release record among `trusted` comment
+/// The confidence in the last self-release record among `trusted` comment
 /// bodies (oldest first) that has the marker and a valid `Confidence` line.
 /// With several records (one per head) the last one is the one on the merged
 /// head. `Err` when a marker is present but no confidence parses.

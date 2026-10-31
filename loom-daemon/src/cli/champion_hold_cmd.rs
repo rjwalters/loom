@@ -179,7 +179,17 @@ impl ChampionHoldCommand {
                 limit,
                 repo,
             } => {
-                let repo = repo.unwrap_or_else(|| "{owner}/{repo}".to_string());
+                // `gh pr list` does not expand `{owner}/{repo}` (only `gh api`
+                // does), so the real `owner/repo` is resolved once here.
+                let repo = resolve_repo(repo, || {
+                    crate::forge_cmd::repo_nwo_in(&crate::forge_cmd::gh_bin(), Some(&root))
+                })
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "champion-hold self-release-calibration: could not resolve the current repository (pass --repo owner/repo)"
+                    );
+                    std::process::exit(3)
+                });
                 match calibration_report(&repo, min_age_days, limit, &root) {
                     Ok(report) => {
                         print!("{report}");
@@ -298,6 +308,19 @@ fn ratification_candidate(
     cfg: &crate::champion_hold::ratification::Config,
 ) -> bool {
     crate::champion_hold::ratification::is_candidate(f, cfg)
+}
+
+/// The explicit `--repo`, else the resolved current checkout's `owner/repo`.
+/// Never the `{owner}/{repo}` placeholder: that only works in `gh api` paths.
+fn resolve_repo(
+    explicit: Option<String>,
+    resolve: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    explicit
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .or_else(resolve)
+        .filter(|r| r.contains('/') && !r.contains('{'))
 }
 
 /// The calibration report, or the first failed read (no partial rows).
@@ -420,14 +443,20 @@ fn revert_in_window(
     if !out.status.success() {
         return Err(format!("PR #{pr}: git log of origin/main failed"));
     }
+    revert_dates_in_window(&String::from_utf8_lossy(&out.stdout), window_end)
+        .map_err(|l| format!("PR #{pr}: unreadable revert date {l:?}"))
+}
+
+/// Whether any `%cI` line is at or before `window_end`; `Err(line)` on a bad date.
+fn revert_dates_in_window(
+    log: &str,
+    window_end: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, String> {
     let mut any = false;
-    for l in String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-    {
+    for l in log.lines().filter(|l| !l.is_empty()) {
         let at = l
             .parse::<chrono::DateTime<chrono::Utc>>()
-            .map_err(|_| format!("PR #{pr}: unreadable revert date {l:?}"))?;
+            .map_err(|_| l.to_string())?;
         any |= at <= window_end;
     }
     Ok(any)
@@ -465,7 +494,18 @@ fn reverts_by_pr(
         .ok_or_else(|| format!("PR #{pr}: revert search failed"))?;
     let found: Vec<Value> = serde_json::from_slice(&out.stdout)
         .map_err(|_| format!("PR #{pr}: revert search is not JSON"))?;
-    Ok(found.iter().any(|f| {
+    Ok(search_has_revert(&found, pr, sha, repo, window_end))
+}
+
+/// Whether any searched PR (not `pr` itself) created within the window reverts `pr`.
+fn search_has_revert(
+    found: &[Value],
+    pr: u64,
+    sha: &str,
+    repo: &str,
+    window_end: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    found.iter().any(|f| {
         let body = f.get("body").and_then(Value::as_str).unwrap_or("");
         let created = f
             .get("createdAt")
@@ -474,5 +514,83 @@ fn reverts_by_pr(
         f.get("number").and_then(Value::as_u64) != Some(pr)
             && created.is_some_and(|c| c <= window_end)
             && crate::champion_hold::calibration::reverts(body, sha, repo, pr)
-    }))
+    })
+}
+
+#[cfg(test)]
+mod calibration_io_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn t(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn resolve_repo_never_yields_the_placeholder() {
+        assert_eq!(resolve_repo(Some("o/r".into()), || panic!("not needed")), Some("o/r".into()));
+        assert_eq!(resolve_repo(None, || Some("a/b".into())), Some("a/b".into()));
+        assert_eq!(resolve_repo(None, || None), None);
+        assert_eq!(resolve_repo(None, || Some("{owner}/{repo}".into())), None);
+        assert_eq!(resolve_repo(Some("{owner}/{repo}".into()), || None), None);
+        assert_eq!(resolve_repo(Some(" ".into()), || Some("a/b".into())), Some("a/b".into()));
+    }
+
+    #[test]
+    fn revert_log_window() {
+        let end = t("2026-10-08T00:00:00Z");
+        assert_eq!(revert_dates_in_window("", end), Ok(false));
+        assert_eq!(revert_dates_in_window("2026-10-07T00:00:00+00:00\n", end), Ok(true));
+        assert_eq!(revert_dates_in_window("2026-10-09T00:00:00+00:00\n", end), Ok(false));
+        assert!(revert_dates_in_window("garbage\n", end).is_err());
+    }
+
+    #[test]
+    fn pr_body_revert_decisions() {
+        let end = t("2026-10-08T00:00:00Z");
+        let found = |n: u64, body: &str, at: &str| {
+            vec![json!({"number": n, "body": body, "createdAt": at})]
+        };
+        // reverted: a different PR in the window naming the real repo
+        assert!(search_has_revert(
+            &found(9, "Reverts o/r#5", "2026-10-02T00:00:00Z"),
+            5,
+            "abc",
+            "o/r",
+            end
+        ));
+        // the unresolved placeholder never matches a real revert body
+        assert!(!search_has_revert(
+            &found(9, "Reverts o/r#5", "2026-10-02T00:00:00Z"),
+            5,
+            "abc",
+            "{owner}/{repo}",
+            end
+        ));
+        // clean: no search hits
+        assert!(!search_has_revert(&[], 5, "abc", "o/r", end));
+        // outside the window
+        assert!(!search_has_revert(
+            &found(9, "Reverts o/r#5", "2026-10-09T00:00:00Z"),
+            5,
+            "abc",
+            "o/r",
+            end
+        ));
+        // the PR itself, an unrelated PR number
+        assert!(!search_has_revert(
+            &found(5, "Reverts o/r#5", "2026-10-02T00:00:00Z"),
+            5,
+            "abc",
+            "o/r",
+            end
+        ));
+        assert!(!search_has_revert(
+            &found(9, "Reverts o/r#55", "2026-10-02T00:00:00Z"),
+            5,
+            "abc",
+            "o/r",
+            end
+        ));
+    }
 }

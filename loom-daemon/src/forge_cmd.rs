@@ -632,7 +632,7 @@ pub(crate) fn repo_nwo(gh: &str) -> Option<String> {
     repo_nwo_in(gh, None)
 }
 
-fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
+pub(crate) fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
     // #7810 PR 2: `--json` without `--jq`. The scalar the filter produced could
     // not distinguish "not a repo", "gh not authenticated" and "empty name".
     #[derive(serde::Deserialize)]
