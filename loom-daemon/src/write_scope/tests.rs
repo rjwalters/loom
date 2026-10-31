@@ -301,6 +301,42 @@ fn a_not_in_installation_answer_is_cached_for_a_minute_only() {
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
 }
 
+/// #13306: a writer token minted before a repo joined the installation lists
+/// the installation without it. The probe re-mints once and re-reads, so the
+/// repo is answered WRITE; a repo that stays absent after the re-mint is
+/// still refused, and a failed re-mint stays fail-closed.
+#[test]
+fn a_repo_absent_from_a_stale_writer_listing_is_admitted_after_a_remint() {
+    use crate::forge_repo_facts::installation::tests::{page, Listing};
+    use crate::forge_repo_facts::test_support::Env;
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "remintco/old", false)]));
+    let probe = probe::GhProbe::new(fake.gh.clone(), Some(env.tmp.path().join("cfg-writer")));
+    let dir = fake.dir.clone();
+    let minted = std::rc::Rc::new(Cell::new(0));
+    let seen = minted.clone();
+    probe::TEST_REMINT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_repo: &str| {
+            seen.set(seen.get() + 1);
+            std::fs::write(
+                dir.join("page1"),
+                page(2, &[(1, "remintco/old", false), (2, "remintco/new", true)]),
+            )
+            .unwrap();
+            Some(std::path::PathBuf::new())
+        }));
+    });
+    assert_eq!(probe.permission("remintco/new"), Permission::Write);
+    assert_eq!(minted.get(), 1, "one forced mint");
+    assert_eq!(fake.listing_calls(), 2, "{:?}", fake.calls());
+    // A repo the fresh token also lacks stays refused; the owner's debounce
+    // window keeps this from minting again.
+    assert!(matches!(probe.permission("remintco/gone"), Permission::Insufficient(_)));
+    assert_eq!(minted.get(), 1, "debounced per owner");
+    probe::TEST_REMINT.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// The library-test fixture is admitted by the real decision, and only
 /// because its credential reports WRITE: the same registered checkout with a
 /// `pull` answer is refused. Neither answer is cached across the two, since
