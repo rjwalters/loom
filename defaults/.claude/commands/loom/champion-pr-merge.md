@@ -2071,7 +2071,7 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 
 Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITICAL_FILES_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise), plus `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION` when the FAIL named a suspect line. That file owns the whole state machine: the `loom:blocked` label and its reason-only park record (#11861, was `loom:operator`), the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:blocked` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
 
-A FAIL skips Steps 2-3 for this PR this pass in **every** one of those states, including a released one — releasing the hold hands the merge to the operator, never back to Champion — and `loom:auto-merge-ok` does not release it (that override is scoped to the `merge-risk` criterion).
+A FAIL skips Steps 2-3 for this PR this pass in **every** one of those states, including a released one — releasing the hold hands the merge to the operator, never back to Champion — and `loom:auto-merge-ok` does not release it (that override is scoped to the `merge-risk` criterion). **One exception (#13321)**: when the tick prints `CF-RELEASED-HANDOFF pr=N head=<sha>` (`CF_HANDOFF=1`: a trusted release record at the current head, `loom:blocked` absent, merge-queue mode proven), the PR continues to the remaining criteria and, if they all pass, to Step 3 with `CF_HANDOFF_SHA` as its `EXPECTED_HEAD`. Step 3 is a separate shell, so prefix its block with `CF_HANDOFF=1 CF_HANDOFF_SHA=<sha>` (the tick's variables do not carry over; without them the queue-only guards below are inert); Step 3 then only ever hands it to the merge queue and never merges it directly. Every other state (`held`, `defer`, `stands`, `rearm`, an untrusted marker, direct mode) skips Steps 2-3 exactly as before.
 
 ### `ratification`: Ratification Hold (#12992)
 - [ ] No spec/decision file in the PR declares that merging it ratifies it
@@ -2899,13 +2899,20 @@ PF="/tmp/loom-champion/$CHAMPION_KEY/pin-pr-$PR_NUMBER"; PIN=; PIN_PID=; { read 
 { [ -n "$(find "$PF" -mmin -60)" ] || { [ "${PIN_PID:-0}" -gt 1 ] && kill -0 "$PIN_PID" && [ -n "$(find "$PF" -mmin -1440)" ]; } || PIN=; } 2>/dev/null
 if [ -n "$PIN" ] && [ "${EXPECTED_HEAD:-}" != "$PIN" ]; then MERGE_RC=9; echo "CHAMPION-PIN-MISSING pr=$PR_NUMBER: set EXPECTED_HEAD=$PIN in this block; not merging";
 # #11932: only `state=clear` (or exit 2: a daemon older than the verb) merges.
-elif HC=$(loom-daemon champion-hold classify --pr "$PR_NUMBER" 2>/dev/null); case "$? $HC" in "0 "*" state=clear "*|"2 ") false ;; esac; then MERGE_RC=10; echo "CHAMPION-HOLD-SKIP pr=$PR_NUMBER: ${HC:-unreadable}; not merging"; else
+elif HC=$(loom-daemon champion-hold classify --pr "$PR_NUMBER" 2>/dev/null); case "$? $HC" in "0 "*" state=clear "*|"2 ") false ;; esac; then MERGE_RC=10; echo "CHAMPION-HOLD-SKIP pr=$PR_NUMBER: ${HC:-unreadable}; not merging"
+# #13321: a released critical-file handoff is pinned to the released head; a moved or unreadable head enqueues nothing.
+elif [ "${CF_HANDOFF:-0}" = 1 ] && [ "$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null)" != "${CF_HANDOFF_SHA:-unset}" ]; then MERGE_RC=9; echo "CHAMPION-HANDOFF-HEAD-MOVED pr=$PR_NUMBER: head != ${CF_HANDOFF_SHA:-unset}; not enqueued"; else
 # Queue mode (#10256): only a DIRECT first stdout line + rc 0 falls through.
 HEAD_SHA=${EXPECTED_HEAD:-$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)}
+[ "${CF_HANDOFF:-0}" = 1 ] && HEAD_SHA=$CF_HANDOFF_SHA   # #13321: the released head, nothing else
 QE=$(mktemp); QOUT=$(loom-daemon forge merge-queue step "$PR_NUMBER" \
   --approved-sha "$HEAD_SHA" 2>"$QE"); QRC=$?; QWHY=$(head -n1 "$QE"); rm -f "$QE"
 MERGE_RC=0; QCOMPAT=
 case "${QOUT%%$'\n'*}" in LOOM-MERGE-QUEUE-DIRECT*) [ "$QRC" -eq 0 ] || MERGE_RC=7 ;; *) MERGE_RC=7 ;; esac
+# #13321: a released critical-file PR (CF_HANDOFF=1, pinned to CF_HANDOFF_SHA) goes ONLY to the queue; direct/compat never merges it.
+if [ "${CF_HANDOFF:-0}" = 1 ]; then
+  case "${QOUT%%$'\n'*}" in LOOM-MERGE-QUEUE-DIRECT*) MERGE_RC=7; echo "CHAMPION-HANDOFF-NOT-QUEUE pr=$PR_NUMBER: critical-file release is the operator's merge in direct mode" ;; esac
+fi
 # #10628: a daemon without `step` merges directly only on PROVEN direct mode:
 # its own `mode` says direct, or it predates merge modes (no `merge-queue`).
 case "$QRC|$QOUT|$QWHY" in
@@ -2913,7 +2920,7 @@ case "$QRC|$QOUT|$QWHY" in
     [ "${QMODE%% source=*}" = "merge-queue: mode=direct" ] && QCOMPAT=1 ;;
   "2||error: unrecognized subcommand 'merge-queue'") QCOMPAT=1 ;;
 esac
-[ -n "$QCOMPAT" ] && { MERGE_RC=0; echo "LOOM-MERGE-QUEUE-COMPAT pr=$PR_NUMBER: $QWHY; direct mode proven, pre-#10256 merge"; }
+[ -n "$QCOMPAT" ] && [ "${CF_HANDOFF:-0}" != 1 ] && { MERGE_RC=0; echo "LOOM-MERGE-QUEUE-COMPAT pr=$PR_NUMBER: $QWHY; direct mode proven, pre-#10256 merge"; }
 case "$MERGE_RC ${QOUT%%$'\n'*}" in "0 "*) ;; # direct: merge-pr.sh below
   "7 LOOM-MERGE-QUEUE-"QUEUED*|"7 LOOM-MERGE-QUEUE-"DROPPED*|"7 LOOM-MERGE-QUEUE-"HANDED-OFF*|\
   "7 LOOM-MERGE-QUEUE-"MERGED*) echo "$QOUT (rc=$QRC)" ;; # queue protocol working: silent
