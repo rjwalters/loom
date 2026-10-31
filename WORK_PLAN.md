@@ -108,12 +108,12 @@ Issues carrying `loom:curated`.
 
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it) *(curated)*
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles *(curated)*
+- **#8609**: Configure and verify the provider-side hard spend ceiling for the shared metered key (ADR-0020 Option 1) *(curated)*
 - **#8698**: Live end-to-end verification of the credential egress proxy (AC5 of #8674) *(curated)*
 - **#8913**: observability: live-verify ci.job.log reconstruction in SigNoz and record it in evidence.md (#8825 AC1) *(curated)*
 - **#8950**: Live-verify Pi tokens_by_model against a real LOOM_RUNTIME=pi launch *(curated)*
 - **#9006**: observability: live-verify the SigNoz queue-starvation alert rule fires and resolves (#8856 / PR #8935 follow-up) *(curated)*
 - **#9136**: main ruleset: bypass_actors 'RepositoryRole:always' makes pull_request and required_status_checks advisory *(curated)*
-- **#9388**: Doctor rechecks the head SHA before pushing but not the labels before writing them *(curated)*
 - **#9978**: feat(champion): optional per-repo merge-queue mode — enqueue Judge-approved PRs to GitHub's merge queue instead of merge-pr.sh's freshness/re-date loop *(curated)*
 - **#10257**: merge queue Phase C: combined-tree CI qualification and eligible-repo live pilot (parent #9978) *(curated)*
 - **#10332**: Epic: cut GitHub API usage ~10x — per-consumer quotas, fix chatty loops, then push-not-poll via a loom-ui read mirror (baseline 105k gh calls/day) *(curated)*
@@ -124,6 +124,7 @@ Issues carrying `loom:curated`.
 - **#10755**: gh telemetry: record 304 Not Modified as success (not error), stop writing it to the failures log *(curated)*
 - **#10838**: merge_pr_reconcile_differential: claim-gate differential disagrees on case-variant duplicate label (loom:buildinG) *(curated)*
 - **#10941**: No-PR retry hold fires when the only remaining work is a live check or a cross-repo PR *(curated)*
+- **#11095**: Operator merges without actions:write can't converge against an active merge train — redate treadmill (#8248/#8919) *(curated)*
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default) *(curated)*
 - **#11112**: Remove the safehouse (Matrix) integration from Loom: narration, ChatOps/Concierge, peer-claim channel (forge leases remain) *(curated)*
 - **#11118**: Umbrella: claim and lease state is inferred from label age and presence — live work gets orphaned, stripped or doubled (13 bugs) *(curated)*
@@ -136,6 +137,8 @@ Issues carrying `loom:curated`.
 - **#11703**: Config precedence: fleet-gitops values must override repo-committed .loom/config.json (general rule + enforcement) *(curated)*
 - **#11712**: Daemon: export OTLP only and remove inbound control channels other than config (2am#4300) *(curated)*
 - **#11911**: Finish retiring daemon-spawned /loom:sweep and merge the two concurrency budgets *(curated)*
+- **#11925**: peer-claim coordination is DEGRADED on loom-worker-5 (#6157 Layer 3) *(curated)*
+- **#11926**: peer-claim coordination is DEGRADED on loom-worker-4 (#6157 Layer 3) *(curated)*
 - **#11928**: maintain_only dispatch aborts emit error-level telemetry for an intentional, configured refusal *(curated)*
 - **#12014**: ci: approved PRs touching workflow files need several CI rounds to land as main moves (no merge queue on a user-owned repo) *(curated)*
 - **#12029**: Telemetry: merge runs record PR number and observed result (merge-pr chokepoint) — Judge parts moved to #12362; held behind #12063 *(curated)*
@@ -153,11 +156,13 @@ Issues carrying `loom:curated`.
 - **#12481**: Roll-stopped role ticks export unclassified:pre-launch (#12028 follow-up) *(curated)*
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution *(curated)*
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out *(curated)*
+- **#12626**: docs: /repo:release Phase 1.5 CHANGELOG completeness gate has no seam for generated-notes policy *(curated)*
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR) *(curated)*
 - **#12703**: Add a per-repo setting to turn off Champion's out-of-band acceptance-criteria hold (#6883) *(curated)*
 - **#12713**: Part-of merges re-queue the issue to Builders: landed-route marker is read as a Curator 'kept' decision *(curated)*
 - **#12727**: Daemon-root checkout (~/loom-daemon) is never fast-forwarded on release-roll hosts (worker-1 2,764 / worker-2 5,135 commits behind) *(curated)*
 - **#12809**: Remove the daemon's dashboard wake source (forge_events /v1/hosts/{host}/events client) *(curated)*
+- **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures) *(curated)*
 - **#12952**: Champion: calibration check for merge-risk self-releases vs reverts (7-day) *(curated)*
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
 - **#12978**: Codex shared-seat dispatch: live receipts and startup measurements (split from #10796) *(curated)*
@@ -171,6 +176,7 @@ Issues carrying `loom:curated`.
 - **#13176**: Builder: 16/26 sweeps on fleet-1 end no-outcome-line (exit 0, no outcome) — main throughput limit *(curated)*
 - **#13209**: [ci-daily] Supply Chain *(curated)*
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits *(curated)*
+- **#13308**: Re-evaluate #13280 (daemon lands its own resync PRs through the merge queue) after one week: on or after 2026-11-05 *(curated)*
 - **#13317**: Audit Champion merge-risk self-releases two weeks after #12960 is live *(curated)*
 - **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
 - **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge *(curated)*
@@ -193,6 +199,7 @@ Issues carrying `loom:curated`.
 - **#13384**: Remove self-referential tests (Test 4/5) from test-guide-operator-attention-fold.sh *(hermit)*
 - **#13400**: Remove write-only role-runner skip-counter totals and unused *_count() wrappers *(hermit)*
 - **#13402**: Dead module merge_policy.rs: no production caller; fleet.state champion approval/merge never populated *(hermit)*
+- **#13421**: Consolidate duplicate find_repo_root gitdir walks in daemon_start/daemon_update onto repo_root.rs *(hermit)*
 
 ## Epics
 
@@ -218,7 +225,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 12 |
 | PRs awaiting review | 7 |
 | Approved PRs awaiting merge | 10 |
-| Curated | 75 |
-| Architect / Hermit proposals | 9 |
+| Curated | 81 |
+| Architect / Hermit proposals | 10 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
