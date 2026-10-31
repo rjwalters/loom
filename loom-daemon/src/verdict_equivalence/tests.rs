@@ -1086,6 +1086,54 @@ fn an_unreadable_compare_falls_back_to_local_patch_identity() {
 }
 
 #[test]
+fn local_fallback_survives_main_editing_the_same_file_elsewhere() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path();
+    let body = |l2: &str, l10: &str| -> String {
+        (1..=12)
+            .map(|i| match i {
+                2 => format!("{l2}\n"),
+                10 => format!("{l10}\n"),
+                _ => format!("line{i}\n"),
+            })
+            .collect()
+    };
+    git_ok(repo, &["init", "--quiet", "."]);
+    git_ok(repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    write(repo, "f.txt", &body("line2", "line10"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "base0"]);
+    let base0 = git_ok(repo, &["rev-parse", "HEAD"]);
+
+    git_ok(repo, &["checkout", "--quiet", "-b", "feature"]);
+    write(repo, "f.txt", &body("pr-change", "line10"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "the PR's own change"]);
+    let reviewed = git_ok(repo, &["rev-parse", "HEAD"]);
+
+    git_ok(repo, &["checkout", "--quiet", "-b", "moved", &base0]);
+    write(repo, "f.txt", &body("line2", "main-change"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "main edits the same file"]);
+    let base1 = git_ok(repo, &["rev-parse", "HEAD"]);
+
+    git_ok(repo, &["checkout", "--quiet", "-b", "rebased", &base1]);
+    write(repo, "f.txt", &body("pr-change", "main-change"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "the PR's own change, rebased"]);
+    let head = git_ok(repo, &["rev-parse", "HEAD"]);
+    git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base1]);
+
+    let gh_dir = tempdir().unwrap();
+    let a = assess_unreadable(repo, gh_dir.path(), &reviewed, &head);
+    assert_eq!(
+        a.equivalence,
+        Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical),
+        "{a:?}"
+    );
+}
+
+#[test]
 fn an_unreadable_compare_and_an_absent_reviewed_head_name_both_failures() {
     let (dir, _reviewed, head) = rebased_fixture("feature-1\n");
     let gh_dir = tempdir().unwrap();

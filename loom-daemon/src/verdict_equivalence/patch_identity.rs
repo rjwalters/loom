@@ -243,12 +243,15 @@ pub fn evidence(
     }
 }
 
-/// Hunk-header-stripped patch text: a rebase shifts line offsets, so `@@ … @@`
-/// lines are the one thing allowed to differ between two equal patches.
+/// Header-stripped patch text: a rebase shifts line offsets (`@@ … @@`) and,
+/// when the base edited the same file elsewhere, the pre-image blob
+/// (`index <old>..<new>`); those are the only things allowed to differ between
+/// two equal patches. Body lines always start with ` `, `+`, `-` or `\`, so a
+/// column-0 `index ` / `@@` line is always a header.
 fn strip_hunk_headers(patch: &str) -> String {
     patch
         .lines()
-        .filter(|l| !l.starts_with("@@"))
+        .filter(|l| !l.starts_with("@@") && !l.starts_with("index "))
         .collect::<Vec<_>>()
         .join("\n")
 }
