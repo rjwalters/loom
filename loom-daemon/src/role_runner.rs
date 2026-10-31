@@ -2890,6 +2890,11 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
     let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
+    // Ratification reviewer lane (#13345): a no-op unless `ratificationLane`
+    // is enabled for this root. Runs on the champion tick's blocking thread.
+    if role == "champion" {
+        ratification_lane::tick_for_root(root, runner);
+    }
     outcome
 }
 
