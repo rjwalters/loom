@@ -218,17 +218,10 @@ impl NotifyClearedBlockersArgs {
                 ));
                 continue;
             }
-            let posted = !self.dry_run
-                && post_comment(
-                    g.kind,
-                    g.number,
-                    &cited,
-                    &reasons,
-                    unparked,
-                    self.resweep,
-                    repo,
-                    &root,
-                );
+            let posted = !self.dry_run && {
+                let body = comment_body_for(g.kind, &cited, &reasons, unparked, self.resweep);
+                post_comment(g.kind, g.number, &body, repo, &root)
+            };
             notified.push(Notified {
                 kind: g.kind,
                 number: g.number,
@@ -325,7 +318,9 @@ fn unticked_reason(resolved_refs: &[String], unparsed: usize) -> String {
     r
 }
 
-/// The notification comment. Pure, so the wording is unit-tested.
+/// The close-triggered notification comment. Pure, so the wording is
+/// unit-tested; production code goes through [`comment_body_for`].
+#[cfg(test)]
 fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String], unparked: bool) -> String {
     comment_body_for(kind, cited, reasons, unparked, false)
 }
@@ -373,23 +368,13 @@ fn comment_body_for(
 }
 
 /// Post the notification comment. Returns whether `gh` reported success.
-fn post_comment(
-    kind: Artifact,
-    number: i64,
-    cited: &[i64],
-    reasons: &[String],
-    unparked: bool,
-    resweep: bool,
-    repo: Option<&str>,
-    root: &Path,
-) -> bool {
+fn post_comment(kind: Artifact, number: i64, body: &str, repo: Option<&str>, root: &Path) -> bool {
     let entity = match kind {
         Artifact::Issue => "issue",
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    let body = comment_body_for(kind, cited, reasons, unparked, resweep);
-    let mut args = vec![entity, "comment", n.as_str(), "--body", body.as_str()];
+    let mut args = vec![entity, "comment", n.as_str(), "--body", body];
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
