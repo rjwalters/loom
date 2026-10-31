@@ -446,6 +446,9 @@ pub mod telemetry_join;
 pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
+/// Test-only hermetic git helpers shared by the orphan-stack test modules.
+#[cfg(test)]
+pub mod test_git_helpers;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's
 /// one-per-process `log::set_boxed_logger` installation is shared by every test
 /// module that asserts on log severity.
