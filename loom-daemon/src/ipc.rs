@@ -774,8 +774,6 @@ async fn handle_client(
             depends_on,
             workspace_root,
             force,
-            runtime,
-            model_profile,
             dispatch_origin,
         } = request
         {
@@ -790,8 +788,6 @@ async fn handle_client(
                 depends_on,
                 workspace_root,
                 force,
-                runtime,
-                model_profile,
                 // #11444: absent on the wire records `unknown`, never `operator`.
                 crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             )
@@ -2960,8 +2956,6 @@ fn handle_request(
             depends_on,
             workspace_root,
             force,
-            runtime,
-            model_profile,
             dispatch_origin,
         } => {
             // GitHub rate-limit circuit breaker (#4429/#4440, gap closed by
@@ -3006,19 +3000,6 @@ fn handle_request(
             // daemon-dispatched child is pinned to an explicit model.
             let repo_root = sr.config().workspace_root.clone();
 
-            // Per-dispatch runtime/modelProfile (#11284): validate (refusing an
-            // unavailable or unadmitted tap, no silent fallback) with no side
-            // effects; the record is saved only after the dispatch is accepted.
-            let tap_plan = match crate::dispatch_tap::validate_request(
-                &repo_root,
-                &kind,
-                runtime.as_deref(),
-                model_profile.as_deref(),
-            ) {
-                Ok(plan) => plan,
-                Err(response) => return *response,
-            };
-
             // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
             // the same dynamic concurrency cap the autonomous work finder
             // applies to its own dispatches, and advise — never gate — an
@@ -3053,21 +3034,12 @@ fn handle_request(
                 depends_on,
                 crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             ) {
-                Ok(outcome) => {
-                    // Accepted and spawned. An idempotency hit is the
-                    // in-flight sweep itself: leave its record alone.
-                    if outcome.was_new {
-                        if let Err(response) = tap_plan.commit(&repo_root) {
-                            return *response;
-                        }
-                    }
-                    Response::SweepDispatched {
-                        sweep_id: outcome.sweep_id,
-                        pid: outcome.pid,
-                        token_name: outcome.token_name,
-                        log_path: outcome.log_path,
-                    }
-                }
+                Ok(outcome) => Response::SweepDispatched {
+                    sweep_id: outcome.sweep_id,
+                    pid: outcome.pid,
+                    token_name: outcome.token_name,
+                    log_path: outcome.log_path,
+                },
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
                     Err(e) => {

@@ -162,19 +162,19 @@ describe("formatStructuredError", () => {
   });
 });
 
-describe("dispatch_sweep per-dispatch tap schema (issue #11284)", () => {
+describe("dispatch_sweep schema", () => {
   const tool = sweepTools.find((t) => t.name === "dispatch_sweep");
   const schema = tool?.inputSchema as {
     properties: Record<string, { type: string }>;
     required: string[];
   };
 
-  it("accepts optional runtime and model_profile strings", () => {
-    expect(schema.properties.runtime?.type).toBe("string");
-    expect(schema.properties.model_profile?.type).toBe("string");
+  it("no longer advertises the removed per-dispatch runtime override", () => {
+    expect(schema.properties.runtime).toBeUndefined();
+    expect(schema.properties.model_profile).toBeUndefined();
   });
 
-  it("keeps them optional so legacy callers are unchanged", () => {
+  it("keeps kind the only required field so legacy callers are unchanged", () => {
     expect(schema.required).toEqual(["kind"]);
   });
 });
@@ -199,8 +199,6 @@ describe("buildDispatchSweepPayload", () => {
       depends_on: null,
       workspace_root: null,
       force: false,
-      runtime: null,
-      model_profile: null,
       dispatch_origin: "operator",
     });
   });
