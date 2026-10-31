@@ -322,6 +322,7 @@ fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
         hold_trigger(std::env::var(HOLD_EQUIVALENCE_ENV).ok().as_deref()),
         confirmed,
         None,
+        None,
     );
 }
 
