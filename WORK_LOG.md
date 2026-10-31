@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **Issue #13425** (closed): QueueSnapshotRow: ship operator_priority_inherited_from and why the source's starred-at was unknown
 - **PR #13422**: feat(doctor): add forge doctor-handback, a verified add-first hand-back
 - **PR #13420**: feat: add --resweep to notify-cleared-blockers for marker-carrying parked issues
 - **Issue #9388** (closed): Doctor rechecks the head SHA before pushing but not the labels before writing them
