@@ -15,6 +15,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **Issue #12313** (closed): `queue_blocked` reads the tick snapshot; delete its own listing and the captain queue-blocked facts on the mirror path
 - **Issue #13289** (closed): Follow-on from PR #13288: verify completion.narrated tokens in SigNoz on a fleet host
 - **PR #13355**: refactor: remove unused per-dispatch runtime/modelProfile override
 - **Issue #13350** (closed): simplify: remove the per-dispatch runtime/modelProfile override (#11493): zero uses in 7 days
