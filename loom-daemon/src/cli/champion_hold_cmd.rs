@@ -61,6 +61,25 @@ pub(crate) enum ChampionHoldCommand {
     /// unreadable> action=<none|hold|stands|release|clear|defer> pr=<N>
     /// head=<sha> files=<a,b|->`. Exit 3 with no stdout when a read failed.
     Ratification(TargetArgs),
+
+    /// Read-only calibration of merge-risk self-releases (#12952): lists PRs
+    /// carrying a trusted `champion:merge-risk-self-release` record that merged
+    /// at least `--min-age-days` ago with whether the merge commit was reverted
+    /// within 7 days, then the hit rate per recorded-confidence bucket. Exit 3
+    /// (no partial rows) when any read failed.
+    SelfReleaseCalibration {
+        /// Only PRs merged at least this many days ago are reported.
+        #[arg(long, default_value_t = 7, value_name = "DAYS")]
+        min_age_days: i64,
+
+        /// How many of the most recently merged PRs to scan.
+        #[arg(long, default_value_t = 200, value_name = "N")]
+        limit: u32,
+
+        /// Repository, `owner/repo`. Defaults to the current checkout's.
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -154,6 +173,23 @@ impl ChampionHoldCommand {
                 };
                 println!("{}", class.line(t.pr));
                 Ok(())
+            }
+            ChampionHoldCommand::SelfReleaseCalibration {
+                min_age_days,
+                limit,
+                repo,
+            } => {
+                let repo = repo.unwrap_or_else(|| "{owner}/{repo}".to_string());
+                match calibration_report(&repo, min_age_days, limit, &root) {
+                    Ok(report) => {
+                        print!("{report}");
+                        Ok(())
+                    }
+                    Err(what) => {
+                        eprintln!("champion-hold self-release-calibration: {what}");
+                        std::process::exit(3)
+                    }
+                }
             }
             ChampionHoldCommand::Ratification(t) => {
                 println!("{}", ratification_line(&t, &root));
@@ -262,4 +298,181 @@ fn ratification_candidate(
     cfg: &crate::champion_hold::ratification::Config,
 ) -> bool {
     crate::champion_hold::ratification::is_candidate(f, cfg)
+}
+
+/// The calibration report, or the first failed read (no partial rows).
+fn calibration_report(
+    repo: &str,
+    min_age_days: i64,
+    limit: u32,
+    root: &std::path::Path,
+) -> Result<String, String> {
+    use crate::champion_hold::calibration::{
+        is_mature, recorded_confidence, summarize, Row, REVERT_WINDOW_DAYS,
+    };
+    let now = chrono::Utc::now();
+    let list = crate::script_helpers::run_gh(
+        &[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "merged",
+            "--limit",
+            &limit.to_string(),
+            "--json",
+            "number,mergedAt,mergeCommit",
+        ],
+        root,
+        false,
+    );
+    let list = list.ok_output().ok_or("merged PR list could not be read")?;
+    let prs: Vec<Value> =
+        serde_json::from_slice(&list.stdout).map_err(|_| "merged PR list is not JSON")?;
+    let mut rows = Vec::new();
+    let mut immature = 0usize;
+    for p in &prs {
+        let pr = p
+            .get("number")
+            .and_then(Value::as_u64)
+            .ok_or("PR without a number")?;
+        let merged_at = p
+            .get("mergedAt")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .ok_or_else(|| format!("PR #{pr}: merge time unreadable"))?;
+        let trusted = crate::comment_trust::records::fetch_trusted_comments(
+            repo,
+            &pr.to_string(),
+            root,
+            false,
+        )
+        .ok_or_else(|| format!("PR #{pr}: comments unreadable"))?;
+        let bodies: Vec<String> = trusted
+            .iter()
+            .filter_map(|c| c.get("body").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let Some(confidence) =
+            recorded_confidence(&bodies).map_err(|e| format!("PR #{pr}: {e}"))?
+        else {
+            continue;
+        };
+        if !is_mature(merged_at, now, min_age_days) {
+            immature += 1;
+            continue;
+        }
+        let sha = p
+            .pointer("/mergeCommit/oid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("PR #{pr}: merge commit unreadable"))?;
+        let window_end = merged_at + chrono::Duration::days(REVERT_WINDOW_DAYS);
+        let reverted = revert_in_window(repo, pr, sha, window_end, root)?
+            || reverts_by_pr(repo, pr, sha, window_end, root)?;
+        rows.push(Row {
+            pr,
+            confidence,
+            merged_at,
+            reverted,
+        });
+    }
+    let mut out = format!(
+        "# merge-risk self-release calibration for {repo} (min age {min_age_days}d, scanned {} merged PRs)\n\
+         # revert detection is a heuristic: 'This reverts commit <sha>' on origin/main or a PR body 'Reverts {repo}#N', within {REVERT_WINDOW_DAYS}d of the merge\n\
+         # {immature} self-released PR(s) younger than the window omitted\n",
+        prs.len()
+    );
+    for r in &rows {
+        out.push_str(&format!(
+            "PR #{} confidence={:.2} merged_at={} reverted={}\n",
+            r.pr,
+            r.confidence,
+            r.merged_at.format("%Y-%m-%d"),
+            if r.reverted { "yes" } else { "no" }
+        ));
+    }
+    out.push_str("bucket n reverted hit_rate\n");
+    for b in summarize(&rows) {
+        let rate = b
+            .hit_rate
+            .map_or("-".to_string(), |h| format!("{:.0}%", h * 100.0));
+        out.push_str(&format!("{} {} {} {rate}\n", b.bucket, b.n, b.reverted));
+    }
+    Ok(out)
+}
+
+/// Whether a commit on `origin/main` reverts `sha` within the window.
+fn revert_in_window(
+    _repo: &str,
+    pr: u64,
+    sha: &str,
+    window_end: chrono::DateTime<chrono::Utc>,
+    root: &std::path::Path,
+) -> Result<bool, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["log", "origin/main", "-F", "--grep"])
+        .arg(format!("This reverts commit {sha}"))
+        .arg("--format=%cI")
+        .output()
+        .map_err(|e| format!("PR #{pr}: git log failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("PR #{pr}: git log of origin/main failed"));
+    }
+    let mut any = false;
+    for l in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+    {
+        let at = l
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .map_err(|_| format!("PR #{pr}: unreadable revert date {l:?}"))?;
+        any |= at <= window_end;
+    }
+    Ok(any)
+}
+
+/// Whether a PR created within the window says `Reverts <repo>#<pr>`.
+fn reverts_by_pr(
+    repo: &str,
+    pr: u64,
+    sha: &str,
+    window_end: chrono::DateTime<chrono::Utc>,
+    root: &std::path::Path,
+) -> Result<bool, String> {
+    let q = format!("\"Reverts {repo}#{pr}\" in:body");
+    let out = crate::script_helpers::run_gh(
+        &[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--search",
+            &q,
+            "--limit",
+            "20",
+            "--json",
+            "number,body,createdAt",
+        ],
+        root,
+        false,
+    );
+    let out = out
+        .ok_output()
+        .ok_or_else(|| format!("PR #{pr}: revert search failed"))?;
+    let found: Vec<Value> = serde_json::from_slice(&out.stdout)
+        .map_err(|_| format!("PR #{pr}: revert search is not JSON"))?;
+    Ok(found.iter().any(|f| {
+        let body = f.get("body").and_then(Value::as_str).unwrap_or("");
+        let created = f
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+        f.get("number").and_then(Value::as_u64) != Some(pr)
+            && created.is_some_and(|c| c <= window_end)
+            && crate::champion_hold::calibration::reverts(body, sha, repo, pr)
+    }))
 }
