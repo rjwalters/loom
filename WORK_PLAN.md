@@ -63,7 +63,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
-- **#12314**: Quarantine reconciliation reads the discovery snapshot; delete its `loom:blocked` listing
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
 - **#12950**: Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits
@@ -86,7 +85,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#13341**: feat: warn on missing hold labels and hint sync-labels on failed park
 - **#13349**: feat: post per-key ratification markers and run the lane from the champion tick
 - **#13364**: feat: fall back to local patch comparison when the forge compare is unreadable
-- **#13395**: feat: take quarantine reconciliation's blocked set from an on-demand discovery snapshot
 - **#13398**: test: write fake forge gh script atomically to avoid ETXTBSY
 
 ## Approved (Awaiting Merge)
@@ -148,7 +146,6 @@ Issues carrying `loom:curated`.
 - **#12248**: Retired hold labels: remove core registry/work_finder readers (1/3 of #11843) *(curated)*
 - **#12304**: Epic: fleet discovery from one mirror read per tick — zero forge reads for discovery; delete per-host listing paths *(curated)*
 - **#12314**: Quarantine reconciliation reads the discovery snapshot; delete its `loom:blocked` listing *(curated)*
-- **#12315**: Claim reconciliation's open-PR discovery listing reads the snapshot; its write-gating reads stay live *(curated)*
 - **#12320**: Cleanup once every worker reads the worklist: delete the per-call `forge_mirror` discovery path, `maxStalenessSecs` and `per_call`; docs and ADR-0024; direct backend preserved *(curated)*
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes) *(curated)*
 - **#12408**: Live-verify epic child discovery against sky130-sar-adc#23 (follow-up to #12388) *(curated)*
@@ -196,6 +193,9 @@ Issues carrying `loom:curated`.
 - **#13362**: Drop the fleet.json-absent legacy fallback and retire fleet_store/yaml.rs (#10705 follow-up) *(hermit)*
 - **#13376**: Consolidate ~14 duplicated env-truthy helpers in loom-daemon into one *(hermit)*
 - **#13384**: Remove self-referential tests (Test 4/5) from test-guide-operator-attention-fold.sh *(hermit)*
+- **#13400**: Remove write-only role-runner skip-counter totals and unused *_count() wrappers *(hermit)*
+- **#13402**: Dead module merge_policy.rs: no production caller; fleet.state champion approval/merge never populated *(hermit)*
+- **#13406**: Dedupe 17 copies of registry-lock/poison boilerplate in work_finder/forge.rs *(hermit)*
 
 ## Epics
 
@@ -218,10 +218,10 @@ Issues carrying `loom:curated`.
 | Very important | 1 |
 | Important | 14 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 13 |
-| PRs awaiting review | 8 |
+| In Progress (`loom:building`) | 12 |
+| PRs awaiting review | 7 |
 | Approved PRs awaiting merge | 10 |
-| Curated | 78 |
-| Architect / Hermit proposals | 7 |
+| Curated | 77 |
+| Architect / Hermit proposals | 10 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->
