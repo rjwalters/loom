@@ -101,8 +101,8 @@ fn fallback(row: &Value) -> bool {
 pub fn workflow_shaped(row: &Value) -> bool {
     let issue_branch = row["head"]["ref"]
         .as_str()
-        .and_then(|r| r.strip_prefix("feature/issue-"))
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        .and_then(crate::worktree_ops::naming::issue_digits_from_branch)
+        .is_some();
     let (head, base) = (&row["head"]["repo"], &row["base"]["repo"]);
     let same_repo = match (head["id"].as_u64(), base["id"].as_u64()) {
         (Some(h), Some(b)) => h == b,

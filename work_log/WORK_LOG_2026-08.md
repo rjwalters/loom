@@ -2,6 +2,12 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-08-31
+- **PR #7072**: fix: exclude loom:blocked from WORK_PLAN Ready section and urgent-eligibility
+- **Issue #7071** (closed): WORK_PLAN Ready section and urgent-eligibility never exclude loom:blocked (only operator-only was fixed in #7008)
+- **Issue #7069** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #7067** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+
 ### 2026-08-30
 - **PR #7063**: fix: feed crash/timeout fixture payloads via process substitution
 - **Issue #7060** (closed): Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case

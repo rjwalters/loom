@@ -174,7 +174,7 @@ impl RunJson {
     /// 1. `pull_requests[].number` — the true PR number, present only when
     ///    GitHub associates a PR with the run (typically `event ==
     ///    "pull_request"`).
-    /// 2. [`crate::claim_reconciliation::parse_issue_from_branch`] on
+    /// 2. [`crate::worktree_ops::naming::issue_from_branch`] on
     ///    `head_branch` — a `feature/issue-N` branch's **issue** number, used
     ///    as a fallback for `push`-triggered runs where no PR association is
     ///    reported. This is a different number space than (1) (issue vs. PR),
@@ -190,7 +190,7 @@ impl RunJson {
         }
         self.head_branch
             .as_deref()
-            .and_then(crate::claim_reconciliation::parse_issue_from_branch)
+            .and_then(crate::worktree_ops::naming::issue_from_branch)
     }
 
     /// Why this run attempt happened (#9337). Evaluated in order:
