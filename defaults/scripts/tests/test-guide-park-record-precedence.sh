@@ -28,7 +28,7 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
     PARK=$'<!-- loom:park Blocked by: #200 by=builder at=2026-10-31T00:00:00Z reason="see #300" -->'
     assert_eq "$(parse_dependencies "$AC$PARK")" "200" "park record wins over AC checkbox; reason refs ignored"
     assert_eq "$(parse_dependencies "$AC")" "100" "no park record: checkbox dep still parsed"
-    assert_eq "$(parse_dependencies $'- [ ] 2AMLogic/2am#55: x')" "2AMLogic/2am#55" "cross-repo ref keeps owner prefix"
+    assert_eq "$(parse_dependencies $'- [ ] example-org/tool-repo#55: x')" "example-org/tool-repo#55" "cross-repo ref keeps owner prefix"
     assert_eq "$(parse_dependencies $'<!-- loom:park Blocked by: (unstated) by=daemon at=x -->\n- [ ] #100')" "" "unstated park record gates nothing from AC"
 
     STUB_COMMENTS='[{"body":"old"},{"body":"Restored hold.\n<!-- loom:hold-restored -->"}]'
