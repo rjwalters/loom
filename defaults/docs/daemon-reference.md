@@ -4203,6 +4203,8 @@ still honored). An indeterminate answer's `Why:` line names the underlying
 failure (`gh` exit status and first stderr line, `unsafe base ref name`, or
 `unparseable response`) rather than only "could not read".
 
+The shell callers pass it when a repo is known (#13150): `verdict-staleness-guard.sh` uses `LOOM_REPO`, else the repo vetted by `forge may-write`; the Champion hold tick uses `LOOM_REPO`. With no known repo they omit the flag, and against a daemon that rejects `--repo` they retry once without it, so an older daemon keeps today's behavior.
+
 | Kind | Carried when | Computed by |
 |------|--------------|-------------|
 | `tree` (#9124, #9576) | the two heads' trees are byte-identical | `forge_tree_unchanged::tree_unchanged` — `compare/{marker}...{head}` reporting `files: []` **together with** `status` `identical`/`ahead` |

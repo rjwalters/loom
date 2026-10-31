@@ -270,6 +270,11 @@ comment_as rjwalters "Doctor: please fix the runbook.
 release-scope: docs/run.md"
 tick; check "COMMENT:released:requested-change" "$WRITES" "operator release-scope naming the delta: carried as requested-change"
 grep -q -- "--allowed-paths docs/run.md" "$T/ve.argv"; check 0 "$?" "the named path is passed to the verb"
+reset "$A"; tick; operator_release; tick; echo repo >"$T/mode"; rm -f "$T/ve.argv"; push "$D"
+LOOM_REPO=acme/widgets tick
+grep -q -- "forge verdict-equivalent --repo acme/widgets" "$T/ve.argv"; check 0 "$?" "LOOM_REPO known: --repo is passed to the verb (#13150)"
+reset "$A"; tick; operator_release; tick; echo repo >"$T/mode"; rm -f "$T/ve.argv"; push "$D"; tick
+grep -q -- "--repo" "$T/ve.argv"; check 1 "$?" "no LOOM_REPO: the flag is omitted (#13150)"
 reset "$A"; tick; operator_release; tick; echo scoped >"$T/mode"; push "$D"
 tick; check "COMMENT:hold(rearm);LABEL+:loom:blocked" "$WRITES" "no release-scope line: re-arms"
 grep -q -- "--allowed-paths" "$T/ve.argv"; check 1 "$?" "no line, no --allowed-paths"
