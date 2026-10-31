@@ -69,7 +69,7 @@ use super::stale_blocked::DEFAULT_LIMIT;
 pub(crate) struct NotifyClearedBlockersArgs {
     /// Issue/PR number(s) that just closed or merged. Repeatable, and also
     /// accepts several values after one flag, so one merge is one scan.
-    #[arg(long, value_name = "N", num_args = 1.., required_unless_present = "pr")]
+    #[arg(long, value_name = "N", num_args = 1.., required_unless_present_any = ["pr", "resweep"])]
     pub closed: Vec<i64>,
 
     /// A just-merged PR: adds the PR itself plus every issue it closed
@@ -77,6 +77,14 @@ pub(crate) struct NotifyClearedBlockersArgs {
     /// `forge_pr_close_targets`) to the closed set. What `merge-pr.sh` passes.
     #[arg(long, value_name = "N")]
     pub pr: Option<i64>,
+
+    /// Re-sweep every open `loom:blocked` issue instead of reacting to a close:
+    /// unpark (and comment on) each one that is `unpark_eligible`, even when it
+    /// already carries a `loom:blocker-cleared` marker from an earlier
+    /// comment-only notification. Non-eligible items are left untouched.
+    /// Conflicts with `--closed` and `--pr`.
+    #[arg(long, conflicts_with_all = ["closed", "pr"])]
+    pub resweep: bool,
 
     /// Print nothing when nothing was newly cleared.
     #[arg(long)]
@@ -144,10 +152,14 @@ impl NotifyClearedBlockersArgs {
             no_prs: self.no_prs,
             floor: budget::Floor::default(),
         };
-        let notify::CitedGathering {
-            gathering,
-            mut cited,
-        } = notify::gather_cited(&mut forge, &fleet, opts, &closed);
+        // `--resweep` skips `gather_cited`: its `has_marker` short-circuit is
+        // exactly what hides the already-notified parked issues.
+        let (gathering, mut cited) = if self.resweep {
+            (batch::gather_all(&mut forge, &fleet, opts), Default::default())
+        } else {
+            let c = notify::gather_cited(&mut forge, &fleet, opts, &closed);
+            (c.gathering, c.cited)
+        };
         if let Some(why) = gathering.enumerate_error {
             unread.push(format!("population: {why}"));
         }
@@ -161,8 +173,13 @@ impl NotifyClearedBlockersArgs {
                     continue;
                 }
             };
-            let Some(cited) = cited.remove(&(g.kind, g.number)) else {
-                continue;
+            let cited = if self.resweep {
+                resweep_cited(&evidence)
+            } else {
+                let Some(c) = cited.remove(&(g.kind, g.number)) else {
+                    continue;
+                };
+                c
             };
             let reasons = match classify(&evidence) {
                 Verdict::Stale(reasons) => reasons,
@@ -183,11 +200,28 @@ impl NotifyClearedBlockersArgs {
                 }
             };
             let eligible = unpark_eligible(g.kind, &g.labels, &g.body, &evidence);
+            // A resweep acts only on what it can unpark: everything else
+            // already got its advisory comment.
+            if self.resweep && !eligible {
+                continue;
+            }
             // Label first, comment second: the comment is the audit trail and
             // must only claim a transition that actually happened.
             let unparked = eligible && (self.dry_run || unpark(g.number, repo, &root));
-            let posted = !self.dry_run
-                && post_comment(g.kind, g.number, &cited, &reasons, unparked, repo, &root);
+            // Resweep has no marker short-circuit, so a comment posted after a
+            // failed unpark would repeat on every run. Report it instead.
+            if resweep_skips_comment(self.resweep, self.dry_run, unparked) {
+                unread.push(format!(
+                    "{} #{}: unpark failed; no comment posted",
+                    g.kind.label(),
+                    g.number
+                ));
+                continue;
+            }
+            let posted = !self.dry_run && {
+                let body = comment_body_for(g.kind, &cited, &reasons, unparked, self.resweep);
+                post_comment(g.kind, g.number, &body, repo, &root)
+            };
             notified.push(Notified {
                 kind: g.kind,
                 number: g.number,
@@ -198,9 +232,35 @@ impl NotifyClearedBlockersArgs {
             });
         }
 
-        report(&notified, &closed, &unread, self.dry_run, self.quiet);
+        report(&notified, &closed, &unread, self.dry_run, self.quiet, self.resweep);
         Ok(())
     }
+}
+
+/// In `--resweep`, a comment is posted only where the unpark happened (or on a
+/// dry run). Pure, so tested.
+fn resweep_skips_comment(resweep: bool, dry_run: bool, unparked: bool) -> bool {
+    resweep && !dry_run && !unparked
+}
+
+/// The blocker numbers an artifact's evidence cites (`--resweep` has no closed
+/// set to intersect with). Local numbers only (a cross-repo number would
+/// collide with a local one in the number-keyed idempotency markers). Sorted, deduplicated. Pure, so tested.
+fn resweep_cited(ev: &Evidence) -> Vec<i64> {
+    let mut v: Vec<i64> = ev
+        .prose
+        .iter()
+        .map(|r| r.number)
+        .chain(
+            ev.named
+                .iter()
+                .filter(|d| d.repo.is_none())
+                .map(|d| d.number),
+        )
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// The issues a merged PR closed, per the forge's own `closingIssuesReferences`.
@@ -258,11 +318,26 @@ fn unticked_reason(resolved_refs: &[String], unparsed: usize) -> String {
     r
 }
 
-/// The notification comment. Pure, so the wording is unit-tested.
+/// The close-triggered notification comment. Pure, so the wording is
+/// unit-tested; production code goes through [`comment_body_for`].
+#[cfg(test)]
 fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String], unparked: bool) -> String {
+    comment_body_for(kind, cited, reasons, unparked, false)
+}
+
+/// [`comment_body`] with the `--resweep` wording: there is no close event, so
+/// the cited blockers are described as closed, not "just closed".
+fn comment_body_for(
+    kind: Artifact,
+    cited: &[i64],
+    reasons: &[String],
+    unparked: bool,
+    resweep: bool,
+) -> String {
     let refs: Vec<String> = cited.iter().map(|n| format!("#{n}")).collect();
+    let when = if resweep { "closed" } else { "just closed" };
     let mut body = format!(
-        "**Cited blocker cleared**: {} just closed, and this {}'s `loom:blocked` cites it. \
+        "**Cited blocker cleared**: {} {when}, and this {}'s `loom:blocked` cites it. \
          The block now reads as stale:\n",
         refs.join(", "),
         kind.label()
@@ -293,22 +368,13 @@ fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String], unparked: boo
 }
 
 /// Post the notification comment. Returns whether `gh` reported success.
-fn post_comment(
-    kind: Artifact,
-    number: i64,
-    cited: &[i64],
-    reasons: &[String],
-    unparked: bool,
-    repo: Option<&str>,
-    root: &Path,
-) -> bool {
+fn post_comment(kind: Artifact, number: i64, body: &str, repo: Option<&str>, root: &Path) -> bool {
     let entity = match kind {
         Artifact::Issue => "issue",
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    let body = comment_body(kind, cited, reasons, unparked);
-    let mut args = vec![entity, "comment", n.as_str(), "--body", body.as_str()];
+    let mut args = vec![entity, "comment", n.as_str(), "--body", body];
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
@@ -372,19 +438,34 @@ fn unpark(number: i64, repo: Option<&str>, root: &Path) -> bool {
 
 /// Stdout: what was notified (or nothing). Stderr: what could not be read or
 /// posted — reported as unknown, never folded into "nothing to notify".
-fn report(notified: &[Notified], closed: &[i64], unread: &[String], dry_run: bool, quiet: bool) {
+fn report(
+    notified: &[Notified],
+    closed: &[i64],
+    unread: &[String],
+    dry_run: bool,
+    quiet: bool,
+    resweep: bool,
+) {
     let refs: Vec<String> = closed.iter().map(|n| format!("#{n}")).collect();
     let refs = refs.join(", ");
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     if notified.is_empty() && !quiet {
-        let _ = writeln!(
-            out,
-            "[notify-cleared-blockers] no open loom:blocked artifact newly cleared by {refs}."
-        );
+        let _ = if resweep {
+            writeln!(
+                out,
+                "[notify-cleared-blockers] resweep: no open loom:blocked issue is eligible to unpark."
+            )
+        } else {
+            writeln!(
+                out,
+                "[notify-cleared-blockers] no open loom:blocked artifact newly cleared by {refs}."
+            )
+        };
     }
     for n in notified {
         let verb = match (dry_run, n.posted) {
+            (true, _) if resweep && n.unparked => "would unpark",
             (true, _) => "would notify",
             (false, true) => "notified",
             (false, false) => "FAILED to notify",
