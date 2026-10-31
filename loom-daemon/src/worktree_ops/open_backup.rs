@@ -144,9 +144,14 @@ pub fn backup_ref_name(item: &str, branch: Option<&str>, at: DateTime<Utc>) -> S
 ///
 /// `Err` means **nothing may be removed**: the push was rejected, the remote
 /// is unreachable or unconfigured, `git` failed or timed out, or the remote
-/// read back a different sha. The worktree itself is never modified — only
+/// read back a different sha. `root` is the checkout root the worktree belongs
+/// to: the network calls (push, `ls-remote`) run under the per-owner
+/// `GH_CONFIG_DIR` registered for it (#13426), so a repo owned by a different
+/// account than the daemon's workspace-root owner authenticates as its own
+/// installation. The worktree itself is never modified — only
 /// a temporary index file is written, and it is removed on every path.
 pub fn backup_to_remote(
+    root: &Path,
     worktree: &Path,
     item: &str,
     at: DateTime<Utc>,
@@ -172,10 +177,12 @@ pub fn backup_to_remote(
     // pushes, not on the reaper's backup of their work. `GIT_TERMINAL_PROMPT=0`
     // turns a missing credential into a fast failure instead of a hang.
     let refspec = format!("{sha}:{ref_name}");
+    let net_env = network_env(root);
+    let net_env: Vec<(&str, &str)> = net_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     run_git_with_timeout(
         worktree,
         &["push", "--quiet", "--no-verify", BACKUP_REMOTE, &refspec],
-        &[("GIT_TERMINAL_PROMPT", "0")],
+        &net_env,
         PUSH_TIMEOUT,
     )
     .map_err(|e| format!("push of {ref_name} to {BACKUP_REMOTE} failed: {e}"))?;
@@ -183,7 +190,7 @@ pub fn backup_to_remote(
     let listed = run_git_with_timeout(
         worktree,
         &["ls-remote", "--exit-code", BACKUP_REMOTE, &ref_name],
-        &[("GIT_TERMINAL_PROMPT", "0")],
+        &net_env,
         LS_REMOTE_TIMEOUT,
     )
     .map_err(|e| format!("could not verify {ref_name} on {BACKUP_REMOTE}: {e}"))?;
@@ -206,6 +213,19 @@ pub fn backup_to_remote(
         head,
         branch,
     })
+}
+
+/// Environment for the git calls that talk to the remote. Besides
+/// `GIT_TERMINAL_PROMPT=0`, a root registered to a per-owner credential dir
+/// (cross-owner managed repo, #5401) gets that `GH_CONFIG_DIR`, the same
+/// resolution `gh_invocation` applies; an unregistered root's environment is
+/// unchanged (#13426).
+fn network_env(root: &Path) -> Vec<(&'static str, String)> {
+    let mut env = vec![("GIT_TERMINAL_PROMPT", "0".to_string())];
+    if let Some(dir) = crate::credential_preflight::gh_config_dir_for_root(root) {
+        env.push(("GH_CONFIG_DIR", dir.to_string_lossy().into_owned()));
+    }
+    env
 }
 
 /// The snapshot commit for `worktree` — `head` itself when the tree holds
