@@ -13,8 +13,55 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-31
+
+- **PR #13351**: refactor: route feature/issue-N branch parsing through worktree_ops::naming
+- **Issue #13346** (closed): Consolidate seven duplicated feature/issue-N branch parsers in loom-daemon
+- **PR #13338**: feat: unpark Curator-parked issues once their blockers resolve
+- **Issue #13331** (closed): Cleared-blocker notice doesn't unpark: issue stays loom:blocked for hours after its sole blocker merges
+- **PR #13379**: feat: admit ci-daily trackers from the Actions bot at the promotion author gate
+- **PR #13360**: fix(install): build daemon and probe pnpm before reinstall uninstall
+- **Issue #13356** (closed): install --confirm-reinstall: daemon/toolchain failure after the uninstall leaves the target partially uninstalled
+- **PR #13374**: refactor: remove unused role-manifest interval fields
+- **PR #13328**: test: pin resync waiver to hold roles and skills copies
+- **PR #13325**: feat: hand operator-released critical-file PRs to the merge queue
+- **PR #13305**: feat: export unreadable PR base branch as a closed hold.transition trigger
+- **PR #13304**: fix: pass --repo to forge verdict-equivalent from guard and Champion hold
+- **PR #13293**: fix: let a bare permissions header read green on workflow blast radius
+- **PR #13143**: docs: state that judge wait-checks --timeout is in seconds
+- **PR #13139**: fix: verdict-gate ignores the Judge's own notes and accepts --acknowledged-comment
+- **PR #13137**: fix: accept trailing-newline issue-body hash in verdict gate
+- **Issue #13358** (closed): merge queue: a failed_checks drop whose only failed jobs were runner cancellations is classified as a check failure and routed to Doctor
+- **Issue #13354** (closed): Remove unused role-manifest fields: defaultInterval, defaultIntervalPrompt, autonomousRecommended
+- **Issue #13321** (closed): champion: on merge-queue repos, hand a released critical-file PR to the queue instead of leaving the merge to the operator
+- **Issue #13313** (closed): Resync waiver: .agents/skills mapping and judge/champion roles stay unreachable under the #12945 gate
+- **Issue #13291** (closed): Champion: a read-only permissions block in a workflow should not read red on blast radius
+- **Issue #13150** (closed): Pass --repo through verdict-staleness-guard.sh and Champion to forge verdict-equivalent
+- **Issue #13149** (closed): Export forge verdict-equivalent failure reasons as SigNoz span attributes
+- **Issue #13141** (closed): judge.md: wait-checks --timeout examples don't say the unit is seconds
+- **Issue #13136** (closed): Judge role: the issue-body hash for post-verdict is easy to compute wrong (trailing newline), giving a spurious 'issue body changed' refusal
+- **Issue #13134** (closed): post-verdict stale-read gate counts the reviewing Judge's own comments and spec-neutral same-account rulings as newer human feedback
+- **PR #13370**: feat: skip conflicting approved PRs and scale queue-mode Champion merge limit
+- **PR #13365**: feat: name cancelled jobs and declining guard in merge-queue drop comments
+- **PR #13353**: refactor: move completion narration items above the test module
+- **PR #13339**: fix: supply canonical guard to ci-daily flake-shell; portable sed in waiver suite
+- **PR #13160**: refactor: remove worktree-return.sh and worktree.sh --return-to
+- **Issue #13118** (closed): Remove worktree-return.sh and --return-to: cd in a child process cannot return the caller
+- **PR #13371**: test: pin disk-warn floor to 0 in daemon-update fixtures
+- **PR #13368**: feat: report stale-draw claim refusals to the mirror for a recheck
+- **PR #13344**: ci: move macOS runners from macos-14 to macos-15
+- **Issue #13369** (closed): test flake: loom-daemon-update floor-confirm/fetch fail in Native Port Suites (embedded commit mismatch)
+- **Issue #13343** (closed): CI: macos-check fails during macOS 14 runner brownout; image retires 2026-11-02
+- **Issue #12318** (closed): Claim refusals report back: `POST /v1/mirror/recheck` when the live claim read disagrees with the drawn snapshot
+
 ### 2026-10-30
 
+- **Issue #12319** (closed): Wakes: a change in a served repo ticks the step tick early (trigger attribute, one worklist read per wake), gated on mirror health
+- **Issue #13275** (closed): Measure the "not measured" flow-review rows with store access: #10855 skips, #11493 usage, #10128 firings
+- **Issue #13190** (closed): Ratification lane: post verdicts through the signing broker (ratify_review) and document the lane
+- **Issue #13166** (closed): write-scope: a repo created after daemon start is still refused 'not-in-installation' 19h later on 0.19.1221 (the #13153 refresh does not clear it)
+- **PR #13334**: fix: rebase-stacked-children handles parent branches of any name
+- **Issue #13333** (closed): rebase-stacked-children.sh silently no-ops on parent branches not named feature/issue-N
 - **PR #13326**: test: share one forge-probing registry builder across outcome_journal tests
 - **Issue #13263** (closed): Dedupe four identical outcome_journal test registry builders into test_support
 - **Issue #13193** (closed): Champion resync waiver never eligible: resync_upstream_path lacks .agents/skills and .loom/roles
@@ -5674,12 +5721,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7080** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7078** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #7076** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-
-### 2026-08-31
-- **PR #7072**: fix: exclude loom:blocked from WORK_PLAN Ready section and urgent-eligibility
-- **Issue #7071** (closed): WORK_PLAN Ready section and urgent-eligibility never exclude loom:blocked (only operator-only was fixed in #7008)
-- **Issue #7069** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7067** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 

@@ -147,6 +147,7 @@ const REVIEW_REQUESTED: &str = "loom:review-requested";
 const CHANGES_REQUESTED: &str = "loom:changes-requested";
 const APPROVED: &str = "loom:pr";
 const SEQUENCED: &str = "loom:sequenced";
+const MERGE_CONFLICT: &str = "loom:merge-conflict";
 const FROZEN: &str = "loom:frozen";
 const DECISION_MALFORMED: &str = "loom:decision-malformed";
 
@@ -519,6 +520,10 @@ pub enum PassReason {
     /// step tick's gather applies it
     /// (`step_dispatch::gather::hold_author_gated`).
     AuthorGateHeld,
+    /// An approved PR flagged `loom:merge-conflict` (#13367): it cannot be
+    /// handed to the merge queue, and Doctor's conflict queue owns the fix, so
+    /// a `champion_merge` run would spend its slot on a rejection.
+    Conflicting,
 }
 
 impl PassReason {
@@ -543,6 +548,7 @@ impl PassReason {
             Self::CiPending => "ci_pending",
             Self::HeldAtHead => "held_at_head",
             Self::AuthorGateHeld => "author_gate_held",
+            Self::Conflicting => "conflicting",
         }
     }
 }
@@ -802,6 +808,9 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
     } else if has(labels, REVIEW_REQUESTED) {
         step(ItemState::ReviewRequested, Step::Judge)
     } else if has(labels, APPROVED) {
+        if has(labels, MERGE_CONFLICT) {
+            return (ItemState::Approved, Verdict::Pass(PassReason::Conflicting));
+        }
         step(ItemState::Approved, Step::ChampionMerge)
     } else if pr.draft {
         (ItemState::NoStage, Verdict::Pass(PassReason::Draft))

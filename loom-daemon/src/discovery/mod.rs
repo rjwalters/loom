@@ -30,6 +30,7 @@ pub mod direct;
 pub mod fallback;
 pub mod mirror;
 pub mod published;
+pub mod recheck;
 pub mod snapshot;
 pub mod worklist;
 
