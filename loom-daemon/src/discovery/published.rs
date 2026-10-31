@@ -252,6 +252,78 @@ mod tests {
         set(Vec::new());
     }
 
+    /// #12314: the worklist and ETag an on-demand snapshot left are the step
+    /// driver's first tick's cache: it asks conditionally, a `304` reuses the
+    /// worklist without a second full fetch, and the seed is taken once.
+    #[test]
+    #[serial_test::serial]
+    fn the_on_demand_seed_makes_the_first_tick_conditional() {
+        use super::super::mirror::Fetched;
+        use super::super::{Mode, Target, Tier};
+        use crate::forge_mirror::client::Conditional;
+
+        let now = chrono::Utc::now();
+        let chain = || Chain::fleet(Mode::Worklist, Tier::Gateway);
+        let body = serde_json::json!({ "repos": { "acme/widgets": {
+            "watermark": { "known": true, "repo": "acme/widgets", "latest_seq": 1,
+                           "last_reconciled_at": "2026-10-16T08:00:00Z" },
+            "items": [{ "number": 7, "type": "issue", "state": "open",
+                        "labels": ["loom:blocked"] }],
+        } } });
+
+        // The on-demand snapshot's one full fetch.
+        let mut on_demand_discovery = Discovery::unseeded(Duration::from_secs(3600));
+        on_demand_discovery.begin_mirror_tick_with(chain(), now, |etag| {
+            assert_eq!(etag, None, "the on-demand fetch is unconditional");
+            Fetched {
+                outcome: Ok(Conditional::Modified {
+                    etag: Some("\"w1\"".to_string()),
+                    body,
+                }),
+                latency: Duration::from_millis(1),
+            }
+        });
+        reset_on_demand_with(on_demand_discovery);
+
+        // The first tick's Discovery starts from that seed.
+        let mut first = Discovery::with_backstop(Duration::from_secs(3600));
+        let mut requests = 0;
+        let snap = first.begin_mirror_tick_with(chain(), now, |etag| {
+            requests += 1;
+            assert_eq!(etag, Some("\"w1\""), "the first tick must be conditional");
+            Fetched {
+                outcome: Ok(Conditional::NotModified),
+                latency: Duration::from_millis(1),
+            }
+        });
+        assert_eq!(requests, 1);
+        let target = Target {
+            slug: "acme/widgets".to_string(),
+            gh_bin: std::path::PathBuf::from("gh"),
+            root_dir: std::path::PathBuf::from("."),
+        };
+        assert_eq!(snap.repo(&target).unwrap().rows.len(), 1, "the 304 reused the worklist");
+        assert_eq!(snap.stats().not_modified, Some(true));
+
+        // Taken once: a later Discovery starts cold (unconditional).
+        assert!(take_mirror_seed().is_none());
+        let mut later = Discovery::with_backstop(Duration::from_secs(3600));
+        later.begin_mirror_tick_with(chain(), now, |etag| {
+            assert_eq!(etag, None);
+            Fetched {
+                outcome: Err(crate::forge_mirror::client::MirrorError::Status(503)),
+                latency: Duration::from_millis(1),
+            }
+        });
+    }
+
+    fn reset_on_demand_with(discovery: Discovery) {
+        *on_demand_state() = Some(OnDemand {
+            discovery,
+            tick: None,
+        });
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_non_mirror_chain_is_not_served_from_the_snapshot() {
