@@ -15,6 +15,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13415**: fix: guide unblock sweep honors park record over AC checkboxes
+- **Issue #13414** (closed): Guide unblock sweep treats acceptance-criteria checkboxes as dependencies, re-lifting operator parks
+- **PR #13410**: refactor: dedupe registry-lock poison handling in work_finder dispatcher
+- **Issue #13406** (closed): Dedupe 17 copies of registry-lock/poison boilerplate in work_finder/forge.rs
+- **PR #12960**: feat: let Champion self-release merge-risk holds above a confidence threshold
+- **Issue #12950** (closed): Champion: self-release merge-risk holds at ≥90% confidence (operator direction 2026-10-20)
 - **Issue #13324** (closed): [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 8)
 - **Issue #13323** (closed): [ci-daily] Flake Detection (shell suites, ubuntu-latest, parallelism 1)
 - **PR #13408**: feat: carry a redacted cause in forge_repo_facts read failures
