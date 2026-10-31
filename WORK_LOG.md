@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13408**: feat: carry a redacted cause in forge_repo_facts read failures
+- **Issue #13405** (closed): forge_repo_facts: log the cause of a failed repo read, not just 'Failed'
 - **PR #13403**: test: cover on-demand ETag handoff and snapshot-vs-listing parity
 - **PR #13395**: feat: take quarantine reconciliation's blocked set from an on-demand discovery snapshot
 - **Issue #12315** (closed): Claim reconciliation's open-PR discovery listing reads the snapshot; its write-gating reads stay live
