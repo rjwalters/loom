@@ -442,7 +442,6 @@ pub mod task_dump;
 pub mod task_liveness;
 pub mod telemetry;
 pub mod telemetry_join;
-pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
 /// Test-only hermetic git helpers shared by the orphan-stack test modules.
