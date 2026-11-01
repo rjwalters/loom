@@ -1125,7 +1125,9 @@ It is eligible only when **all** hold, each read live in this pass:
 - the PR title is `chore(loom): resync installed Loom to v<X.Y.Z>`;
 - every changed file is under `.loom/` or `.claude/`, and none is a merge-gate path
   (`RESYNC_GATE_PATTERNS`: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
-  comment-trust files, `config.json`): the gate never waives a change to itself (#12945);
+  comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
+  under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
+  path sources it: it is compared byte-for-byte like any kept-set file (#13486);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
@@ -1174,7 +1176,7 @@ resync_upstream_path() {
 # RESYNC_WAIVER_RECORD (one "path: sha" line per kept-set file) and RESYNC_WAIVER_REASON.
 # Reads PR_NUMBER and KEPT_SET_PATTERNS. Every step fails closed.
 resync_waiver_eval() {
-  local title ver tag sha1 sha2 meta_ver changed n file prev pattern is_kept up enc up_sha up_type head_sha status
+  local title ver tag sha1 sha2 meta_ver changed n file prev pattern is_kept is_test up enc up_sha up_type head_sha status
   RESYNC_WAIVER_RESULT="NOT ELIGIBLE"; RESYNC_WAIVER_TAG=""; RESYNC_WAIVER_RECORD=""; RESYNC_WAIVER_REASON=""
   [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { RESYNC_WAIVER_REASON="kept set not loaded"; return 0; }
   title=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.title' 2>/dev/null) || { RESYNC_WAIVER_REASON="PR unreadable"; return 0; }
@@ -1197,10 +1199,17 @@ resync_waiver_eval() {
     [ -z "$file" ] && continue
     # Install set only (#12945): any file outside .loom/ and .claude/ holds the whole PR.
     case "$file" in .loom/* | .claude/*) ;; *) RESYNC_WAIVER_REASON="$file is outside the install set"; RESYNC_WAIVER_RECORD=""; return 0 ;; esac
-    for pattern in "${RESYNC_GATE_PATTERNS[@]}"; do
-      # shellcheck disable=SC2053
-      if [[ "$file" == $pattern || "$prev" == $pattern ]]; then RESYNC_WAIVER_REASON="$file is a merge-gate path"; RESYNC_WAIVER_RECORD=""; return 0; fi
-    done
+    # A test under .loom/scripts/tests/ decides nothing at merge time (#13486): it is compared
+    # byte-for-byte below, not refused as a gate path. Both names must be under tests/, so a
+    # rename from a gate path into tests/ still hits the gate loop.
+    is_test=0
+    case "$file" in .loom/scripts/tests/*) case "$prev" in .loom/scripts/tests/*) is_test=1 ;; esac ;; esac
+    if [ "$is_test" -eq 0 ]; then
+      for pattern in "${RESYNC_GATE_PATTERNS[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$file" == $pattern || "$prev" == $pattern ]]; then RESYNC_WAIVER_REASON="$file is a merge-gate path"; RESYNC_WAIVER_RECORD=""; return 0; fi
+      done
+    fi
     is_kept=0
     for pattern in "${KEPT_SET_PATTERNS[@]}"; do
       # shellcheck disable=SC2053
