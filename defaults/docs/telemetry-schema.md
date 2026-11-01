@@ -248,7 +248,7 @@ stage journal until #11126 and from `fleet.state` views since.
 ## Span join-facts contract (external provenance join, #11982)
 
 Provenance is moving out of Loom (parent #11776): an external join
-rebuilds story/build/sweep → PR linkage from telemetry
+rebuilds issue/build/sweep → PR linkage from telemetry
 instead of from stamps in commits, PR bodies and comments. This section is the
 stable contract for the plain span attributes that join reads. Changes are
 additive only; a key is never renamed, removed or re-meant without an issue the
@@ -256,16 +256,16 @@ join's owner has agreed to. No `schema_version` bump is needed for a new key.
 
 | Fact | Key | On which spans | Notes |
 |---|---|---|---|
-| repo | `loom.repo` | sweep root, phase/role spans, role-tick root and story copies | GitHub's own `owner/name` spelling when `repo_id` resolved, else the `origin`-derived slug |
-| issue | `loom.issue` | sweep root (**even when `repo_id` does not resolve**), phase/role spans, story copies; role-tick root when the tick was assigned one | A role tick that picks its own target has `loom.issue` only on its story copy spans, never on its root |
+| repo | `loom.repo` | sweep root, phase/role spans, role-tick root | GitHub's own `owner/name` spelling when `repo_id` resolved, else the `origin`-derived slug |
+| issue | `loom.issue` | sweep root (**even when `repo_id` does not resolve**), phase/role spans; role-tick root when the tick was assigned one | A role tick that picks its own target carries no `loom.issue` on its root |
 | sweep id | `loom.sweep_id` | every span of the execution | A role tick's id is `role-<role>-<instant>` |
-| PR number | `loom.pr_number` | phase/role spans once a PR exists; role-tick root of an assigned or claiming Judge/Doctor; story copies of PR targets | Absent before a PR exists |
+| PR number | `loom.pr_number` | phase/role spans once a PR exists; role-tick root of an assigned or claiming Judge/Doctor | Absent before a PR exists |
 | head SHA | `loom.head_sha` | sweep root | Full 40-hex tip of `feature/issue-N` (local, else `origin`), read when the sweep closes. The branch does not exist at dispatch, so the root cannot carry it earlier. Absent if the branch never existed |
 | base SHA | `loom.base_sha` | sweep root | Full 40-hex tip of `origin/HEAD` (else `origin/main`) at dispatch |
 | build version | `loom.daemon.version` | every span | `CARGO_PKG_VERSION` of the binary that created the span |
 | build commit | `loom.daemon.revision` | every span | Full git SHA of that binary; `loom.daemon.tree_state` says whether it was clean |
 | host | `host.id` / `host.name` / `service.instance.id` | OTLP `Resource`, not a span attribute | One value per exporting host; see [Envelope](#envelope) |
-| role | `loom.role` | phase/role spans, role-tick root and story copies | |
+| role | `loom.role` | phase/role spans, role-tick root | |
 
 A fact that is not known when a span is created is attached when it first is,
 and an unresolvable fact is omitted rather than guessed. Every key above
@@ -2415,7 +2415,6 @@ span's `github.account`, `account` is `app-<app id>`,
 |---|---|---|
 | `execution` | a daemon sweep's last `loom.runtime.run` (else its root) | the sweep's terminal transition, from `sweep.outcome`'s `tokens_by_model` |
 | `execution` | a role-runner tick's own `loom.role_attempt` root | the tick's transcript/native-store scan |
-| `attempt` | the tick's story span, **only when the tick stitched exactly one target** | the role runner; a multi-target tick is never split |
 
 #### LLM billing class (#10749)
 
@@ -2709,8 +2708,7 @@ The log record's **time is `left_at`** and its **observed timestamp is
 `loom.eta.stage_outcome.*` attributes (`stage`, `exit`, `next_stage`,
 `entered_at`, `left_at`, `dwell_sec`), in `OUTCOME_FACT_LOG_ATTRIBUTE_KEYS`.
 Provenance is required and exports as `loom.eta.version` / `revision` /
-`tree_state` / `provenance_complete`. The record no longer joins a story
-trace (that needed the dropped `repo_id`).
+`tree_state` / `provenance_complete`. The record carries no `repo_id`.
 
 **Changed by #11126 (loom-ui sign-off:
 https://github.com/rjwalters/loom/issues/11098#issuecomment-6081499763).**
