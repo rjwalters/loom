@@ -272,6 +272,7 @@ fn a_sectioned_payload_is_exactly_those_keys_of_the_default_payload() {
         health_gate_enabled: Some(true),
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: Some("full".to_string()),

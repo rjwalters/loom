@@ -65,6 +65,7 @@ fn test_daemon_status_request_response_round_trip() {
             health_gate_enabled: Some(true),
             health_gate_verdict_at: Some(chrono::Utc::now()),
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: Some("full".to_string()),
