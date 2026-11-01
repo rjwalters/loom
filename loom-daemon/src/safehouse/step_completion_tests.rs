@@ -465,9 +465,7 @@ fn watermarks_never_move_backwards_and_carry_the_slack() {
 #[test]
 fn a_full_page_of_out_of_window_history_is_not_saturated() {
     let cutoff = Utc::now() - chrono::Duration::days(7);
-    let row = |merged_at: DateTime<Utc>| {
-        serde_json::json!({ "mergedAt": merged_at.to_rfc3339_opts(SecondsFormat::Secs, true) })
-    };
+    let row = |merged_at: DateTime<Utc>| serde_json::json!({ "mergedAt": merged_at.to_rfc3339_opts(SecondsFormat::Secs, true) });
     let limit = RECONCILE_PR_LIMIT;
     let old: Vec<Value> = (0..limit)
         .map(|_| row(cutoff - chrono::Duration::days(30)))
