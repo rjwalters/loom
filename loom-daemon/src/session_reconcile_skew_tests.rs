@@ -102,6 +102,21 @@ fn images_are_pinned_by_tag_and_downgrades_refused() {
     );
     assert_eq!(pinned_image("localhost:5000/s:0.19.1", &host), "localhost:5000/s:0.19.1151");
     assert_eq!(pinned_image("r/s@sha256:abc", &host), "r/s:0.19.1151");
+    // Tag AND digest (#13479): what the last-start sidecar records for an
+    // image pulled by tag. The repository ends before the tag; re-pinning
+    // must not stack a second tag onto the first.
+    assert_eq!(
+        pinned_image("ghcr.io/rjwalters/loom-worker-session:0.19.1209@sha256:305364f5", &host),
+        "ghcr.io/rjwalters/loom-worker-session:0.19.1151"
+    );
+    assert_eq!(
+        pinned_image("localhost:5000/s:0.19.1@sha256:abc", &host),
+        "localhost:5000/s:0.19.1151"
+    );
+    // The digest, not the tag, names a digest-pinned image: still unjudged.
+    assert_eq!(DaemonVersion::from_image("r/s:0.19.624@sha256:abc"), None);
+    assert!(refuse_downgrade("r/s:0.19.624@sha256:abc", &[&host]).is_ok());
+    assert_eq!(DaemonVersion::from_image("r/s:0.19.624"), Some(v("0.19.624")));
     let floors = [&host];
     assert!(refuse_downgrade("r/s:0.19.624", &floors).is_err());
     assert!(refuse_downgrade("r/s:0.19.1151", &floors).is_ok());

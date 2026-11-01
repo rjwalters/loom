@@ -41,6 +41,7 @@
 
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::merge_pr::stacked_children::is_stackable_parent_branch;
 
 /// Upper bound on one child listing. A parent with more open children than
 /// this still cannot be deleted early: the post-retarget re-check sees the
@@ -84,6 +85,12 @@ pub trait Forge {
     fn open_children(&self, repo: &str, branch: &str) -> Result<Vec<Child>, String>;
     /// Change PR `number`'s base to `base`.
     fn retarget(&self, repo: &str, number: i64, base: &str) -> Result<(), String>;
+    /// Rebase child `number` onto the default branch, stripping the merged
+    /// parent's squashed commits (`reconcile-stack.sh <number> <parent_branch>`,
+    /// which also retargets). Only asked for children of a parent that
+    /// [`is_stackable_parent_branch`] rejects, whose post-merge reconcile never
+    /// ran (#13332).
+    fn rebase_child(&self, repo: &str, number: i64, parent_branch: &str) -> Result<(), String>;
 }
 
 /// Parse `gh pr list --json number,headRefName` strictly.
@@ -185,7 +192,22 @@ pub fn prepare_delete(forge: &impl Forge, repo: &str, branch: &str, base: &str) 
 
     let mut lines = Vec::new();
     let mut failed = Vec::new();
+    // #13332: the post-merge reconcile is gated on a `feature/issue-<N>` parent,
+    // so a child of any other branch name still carries the parent's squashed
+    // commits. Retargeting it bare would leave it CONFLICTING; rebase it first,
+    // and treat a failed rebase like a failed retarget (child stays on the
+    // parent base, branch kept).
+    let needs_rebase = !is_stackable_parent_branch(branch);
     for child in &children {
+        if needs_rebase {
+            if let Err(e) = forge.rebase_child(repo, child.number, branch) {
+                failed.push(format!(
+                    "#{} (rebase onto the default branch failed: {e}; run ./.loom/scripts/reconcile-stack.sh {} {branch})",
+                    child.number, child.number
+                ));
+                continue;
+            }
+        }
         match forge.retarget(repo, child.number, base) {
             Ok(()) => lines.push((
                 Level::Info,
@@ -200,8 +222,10 @@ pub fn prepare_delete(forge: &impl Forge, repo: &str, branch: &str, base: &str) 
         }
     }
     if !failed.is_empty() {
-        let reason =
-            format!("could not retarget stacked child PR(s) {} to '{base}'", failed.join(", "));
+        let reason = format!(
+            "could not rebase/retarget stacked child PR(s) {} to '{base}'; they stay on '{branch}'",
+            failed.join(", ")
+        );
         return keep(repo, branch, base, &reason, lines);
     }
 
@@ -228,7 +252,12 @@ pub fn prepare_delete(forge: &impl Forge, repo: &str, branch: &str, base: &str) 
 
 /// The live forge: uncached `gh`, resolved by the facade's usual ladder
 /// (policy launcher → `LOOM_GH_BIN` → `PATH`).
-pub struct GhForge;
+#[derive(Default)]
+pub struct GhForge {
+    /// Directory holding `reconcile-stack.sh`; empty means unknown, which makes
+    /// a needed rebase fail closed.
+    pub script_dir: String,
+}
 
 fn stderr_tail(o: &std::process::Output) -> String {
     let s = String::from_utf8_lossy(&o.stderr);
@@ -298,6 +327,33 @@ impl Forge for GhForge {
             CmdOutcome::Ran(o) if o.status.success() => Ok(()),
             CmdOutcome::Ran(o) => Err(stderr_tail(&o)),
             CmdOutcome::Unavailable(u) => Err(format!("gh did not answer: {u:?}")),
+        }
+    }
+
+    fn rebase_child(&self, repo: &str, number: i64, parent_branch: &str) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+        if self.script_dir.is_empty() {
+            return Err("no --script-dir given".to_string());
+        }
+        let script = std::path::Path::new(&self.script_dir).join("reconcile-stack.sh");
+        if !std::fs::metadata(&script)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        {
+            return Err(format!("{} is not executable", script.display()));
+        }
+        let out = std::process::Command::new(&script)
+            .args([number.to_string().as_str(), parent_branch])
+            .env("LOOM_REPO", repo)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("could not run reconcile-stack.sh ({e})"))?;
+        // Its output is diagnostics; stdout here is the INFO/WARNING protocol.
+        eprint!("{}", String::from_utf8_lossy(&out.stdout));
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!("reconcile-stack.sh exited {}", out.status.code().unwrap_or(-1)))
         }
     }
 }
