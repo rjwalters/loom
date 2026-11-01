@@ -901,7 +901,15 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
     let host = Host::new(&fx, "host-a");
     let before = fx.origin_head();
 
-    let pass = host.pass();
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // No PR was opened, so this stays an ERROR (#13465).
+    assert!(
+        logs.iter()
+            .any(|l| l.0 == log::Level::Error && l.1.contains("branch rule")),
+        "{logs:?}"
+    );
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     let until = t0() + ChronoDuration::hours(6);
@@ -979,7 +987,13 @@ fn a_refused_default_branch_gets_a_resync_pull_request_once() {
     let before = fx.origin_head();
     let branch = format!("chore/loom-resync-v{RUNNING}");
 
-    let pass = host.pass();
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // The refused push ended in an open PR: expected path, so never ERROR (#13465).
+    let line = |l: &&(log::Level, String)| l.1.contains("resync pull request open");
+    assert!(logs.iter().filter(line).all(|l| l.0 == log::Level::Warn), "{logs:?}");
+    assert!(logs.iter().any(|l| line(&l) && l.0 == log::Level::Warn), "{logs:?}");
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     assert!(reason(report).contains("resync pull request open: #1 "), "{report:?}");

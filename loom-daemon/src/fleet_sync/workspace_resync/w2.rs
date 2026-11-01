@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 
 use super::memory::FailureKind;
 use super::{
-    daemon, git, record_failure, refused, stamp, Alert, Candidate, Env, Memory, Scan, WState,
-    WorkspaceReport,
+    daemon, git, record_failure, record_failure_at, refused, stamp, Alert, Candidate, Env, Memory,
+    Scan, WState, WorkspaceReport,
 };
 use crate::fleet_store::resync_claim::{stale_after, Acquire, Claimant, ForgeUnreachable, Held};
 use crate::forge_merge_queue::gh_lifecycle::Landed;
@@ -285,7 +285,15 @@ pub(super) fn attempt(
                  (installed v{installed}, target v{})",
                 env.running
             );
-            record_failure(env, report, FailureKind::Protected, &detail, memory, &mut scan.alerts);
+            record_failure_at(
+                env,
+                report,
+                FailureKind::Protected,
+                &detail,
+                memory,
+                &mut scan.alerts,
+                log::Level::Warn,
+            );
             memory.mark_pr_open(&report.root);
         }
         Err(e) => fail_attempt(env, &candidate.nwo, report, &e, memory, scan),

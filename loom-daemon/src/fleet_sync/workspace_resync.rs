@@ -679,10 +679,27 @@ fn record_failure(
     memory: &mut Memory,
     alerts: &mut Vec<Alert>,
 ) {
+    record_failure_at(env, report, kind, detail, memory, alerts, log::Level::Error);
+}
+
+/// [`record_failure`] with the level of the alert line chosen by the caller.
+/// A refused push that still ended in an open resync PR is the expected first
+/// step of a path that succeeded (#13465), so it logs at WARN; the alert and
+/// backoff are identical.
+fn record_failure_at(
+    env: &Env<'_>,
+    report: &mut WorkspaceReport,
+    kind: FailureKind,
+    detail: &str,
+    memory: &mut Memory,
+    alerts: &mut Vec<Alert>,
+    level: log::Level,
+) {
     let (until, alert) = memory.fail(report, kind, detail, env.interval, (env.clock)());
     report.reason = Some(format!("backoff until {}: {detail}", stamp(until)));
     if let Some(alert) = alert {
-        log::error!(
+        log::log!(
+            level,
             "workspace_resync: {} ({}): {} failure(s): {detail}; next attempt {}",
             report.repo.as_deref().unwrap_or("unknown repo"),
             report.root.display(),
