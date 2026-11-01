@@ -65,16 +65,15 @@ Issues currently being built (`loom:building`).
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
 - **#12952**: Champion: calibration check for merge-risk self-releases vs reverts (7-day)
+- **#13209**: [ci-daily] Supply Chain
 - **#13296**: suspect-critical-diff fails closed with "could not read the PR's file list" on script-only package.json edits
 - **#13306**: write-scope: NOT_IN_INSTALLATION still refused for new repos on 0.19.1227 despite #13153 (installation is on All repositories)
-- **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge
 - **#13332**: merge-pr stacked reconcile retargets a non-feature/issue-N child to main without stripping squashed parent commits (left CONFLICTING)
 - **#13337**: Workflow-filed trackers never enter the fleet: the author gate refuses github-actions[bot] and ci-daily.yml rewrites the body nightly
 - **#13345**: Ratification lane: wire the lane into the tick and post per-key RATIFY markers as comments
 - **#13357**: merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests
-- **#13428**: pool_preflight: an empty sweep-lifecycle preference list arms the EXHAUSTED hold and logs a WARN/recovered pair every tick
 
 ## PRs Awaiting Review
 
@@ -83,10 +82,10 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#13341**: feat: warn on missing hold labels and hint sync-labels on failed park
 - **#13349**: feat: post per-key ratification markers and run the lane from the champion tick
 - **#13364**: feat: fall back to local patch comparison when the forge compare is unreadable
 - **#13398**: test: write fake forge gh script atomically to avoid ETXTBSY
+- **#13436**: fix: bump zstd to 0.14.3 to clear RUSTSEC-2026-0391
 
 ## Approved (Awaiting Merge)
 
@@ -180,7 +179,6 @@ Issues carrying `loom:curated`.
 - **#13308**: Re-evaluate #13280 (daemon lands its own resync PRs through the merge queue) after one week: on or after 2026-11-05 *(curated)*
 - **#13317**: Audit Champion merge-risk self-releases two weeks after #12960 is live *(curated)*
 - **#13319**: accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac *(curated)*
-- **#13330**: sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge *(curated)*
 - **#13332**: merge-pr stacked reconcile retargets a non-feature/issue-N child to main without stripping squashed parent commits (left CONFLICTING) *(curated)*
 - **#13337**: Workflow-filed trackers never enter the fleet: the author gate refuses github-actions[bot] and ci-daily.yml rewrites the body nightly *(curated)*
 - **#13345**: Ratification lane: wire the lane into the tick and post per-key RATIFY markers as comments *(curated)*
@@ -188,7 +186,6 @@ Issues carrying `loom:curated`.
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests *(curated)*
-- **#13428**: pool_preflight: an empty sweep-lifecycle preference list arms the EXHAUSTED hold and logs a WARN/recovered pair every tick *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -224,10 +221,10 @@ Issues carrying `loom:curated`.
 | Very important | 1 |
 | Important | 13 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 13 |
+| In Progress (`loom:building`) | 12 |
 | PRs awaiting review | 7 |
 | Approved PRs awaiting merge | 10 |
-| Curated | 82 |
+| Curated | 80 |
 | Architect / Hermit proposals | 10 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->

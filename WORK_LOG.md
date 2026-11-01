@@ -13,6 +13,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-01
+
+- **PR #13430**: fix: skip pool hold for tap-less sweep-lifecycle preference resolution
+- **Issue #13428** (closed): pool_preflight: an empty sweep-lifecycle preference list arms the EXHAUSTED hold and logs a WARN/recovered pair every tick
+
 ### 2026-10-31
 
 - **PR #13341**: feat: warn on missing hold labels and hint sync-labels on failed park
