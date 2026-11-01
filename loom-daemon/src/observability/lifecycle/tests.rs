@@ -1329,3 +1329,75 @@ fn a_checkpoint_completion_keeps_the_begin_load_and_a_synthetic_one_its_only_sam
         assert_start_and_close_load(span, open, close);
     }
 }
+
+/// #13439: stale-journal handling in `backfill`.
+mod stale_journals {
+    use super::*;
+
+    fn traced_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom/logs/trace-context")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn age(path: &Path, secs: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn dir(root: &Path) -> PathBuf {
+        root.join(".loom/logs/trace-context")
+    }
+
+    #[test]
+    fn an_old_zero_byte_journal_is_retired() {
+        let root = traced_root();
+        let path = dir(root.path()).join("old.jsonl");
+        std::fs::write(&path, "").unwrap();
+        age(&path, 2 * 3600);
+        backfill(root.path(), &SpanSink::default());
+        assert!(!path.exists());
+        assert!(!dir(root.path()).join("old.drain-lock").exists());
+    }
+
+    #[test]
+    fn a_fresh_zero_byte_journal_is_untouched() {
+        let root = traced_root();
+        let path = dir(root.path()).join("new.jsonl");
+        std::fs::write(&path, "").unwrap();
+        backfill(root.path(), &SpanSink::default());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn retire_stale_keeps_undrained_and_young_journals() {
+        let root = traced_root();
+        let path = dir(root.path()).join("j.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let journal = Journal::from_path(path.clone());
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let hour = std::time::Duration::from_secs(3600);
+        age(&path, 48 * 3600);
+        // No cursor: spans not drained, never quarantined.
+        assert!(!journal.retire_stale(hour, day).unwrap());
+        std::fs::write(path.with_extension("cursor"), "3").unwrap();
+        // Young.
+        age(&path, 60);
+        assert!(!journal.retire_stale(hour, day).unwrap());
+        // Old and drained: moved with sidecars; same-named stale file survives.
+        age(&path, 48 * 3600);
+        let stale = dir(root.path()).join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("j.jsonl"), "keep").unwrap();
+        assert!(journal.retire_stale(hour, day).unwrap());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(stale.join("j.jsonl")).unwrap(), "keep");
+        assert_eq!(std::fs::read_dir(&stale).unwrap().count(), 3);
+    }
+}

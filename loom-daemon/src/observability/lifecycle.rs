@@ -1143,6 +1143,13 @@ fn step_sweep_id(active: &[ActiveSpan]) -> Option<&str> {
         .filter(|id| crate::step_role::StepRole::parse_sweep_id(id).is_some())
 }
 
+/// A drained journal that no running step owns and that has not been written
+/// for this long is moved to `trace-context/stale/` (#13439).
+const STALE_JOURNAL_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// A zero-byte journal with no running step is removed once this old, so a
+/// journal just created by a live step is never raced.
+const EMPTY_JOURNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
     if !super::tracing::enabled(root) {
         return 0;
@@ -1173,7 +1180,17 @@ pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
         }) {
             Ok(n) => {
                 count += n;
-                if journal.retire_if_drained().is_err() {
+                let retired = journal.retire_if_drained();
+                if !matches!(retired, Ok(true))
+                    && !running_step(root, &journal)
+                    && matches!(
+                        journal.retire_stale(EMPTY_JOURNAL_GRACE, STALE_JOURNAL_AGE),
+                        Ok(true)
+                    )
+                {
+                    continue;
+                }
+                if retired.is_err() {
                     log::warn!("observability: completed trace journal retained");
                 }
             }
