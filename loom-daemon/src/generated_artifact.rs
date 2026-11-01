@@ -307,15 +307,7 @@ mod tests {
         assert!(!is_under_build_tree("target-xy/a.o", &dirs));
     }
 
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
+    use crate::test_git_helpers::run as git;
 
     fn write(root: &Path, rel: &str, body: &str) {
         let path = root.join(rel);

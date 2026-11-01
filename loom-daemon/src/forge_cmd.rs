@@ -937,7 +937,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serial_test::serial;
-    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     /// Disable the private-defaults config tier so tests only see the config
@@ -956,16 +955,7 @@ mod tests {
         std::env::remove_var("LOOM_ALLOW_INSECURE_BASIC_AUTH");
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let ok = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?} failed in {}", dir.display());
-    }
+    use crate::test_git_helpers::run as git;
 
     fn init_repo(dir: &Path, remote: &str) {
         git(dir, &["init", "-q"]);
