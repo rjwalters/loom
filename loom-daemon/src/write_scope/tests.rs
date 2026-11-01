@@ -1,6 +1,7 @@
 use super::probe::{classify_repo_permissions, Permission, PermissionProbe};
 use super::target::{gh_target, parse_remote_config, parse_remote_url};
 use super::*;
+use crate::test_git_helpers::run as git;
 use std::cell::Cell;
 
 // ---- gh's base-repo resolution --------------------------------------------
@@ -195,17 +196,6 @@ fn repo_permissions_classify_user_roles() {
 }
 
 // ---- a real checkout -------------------------------------------------------
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
-}
 
 #[test]
 fn a_fork_checkout_with_an_upstream_remote_is_refused() {
