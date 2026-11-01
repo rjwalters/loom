@@ -2,7 +2,7 @@
 //!
 //! # What this owns
 //!
-//! The 147-line `show_help` heredoc: the option list, the cleanup /
+//! The 150-line `show_help` heredoc: the option list, the cleanup /
 //! local-branch / primary-checkout semantics, the cleanup precedence table,
 //! the **exit-code table** and the examples. It was the largest remaining
 //! block of pure data in `merge-pr.sh` — about an eighth of the script — and
@@ -39,7 +39,7 @@
 pub const USAGE_SENTINEL: &str = "LOOM-MERGE-PR-USAGE";
 
 /// The usage text, byte-for-byte what the retired `show_help` heredoc
-/// printed: 147 lines, ending in exactly one newline.
+/// printed: 150 lines, ending in exactly one newline.
 pub const USAGE: &str = include_str!("usage.txt");
 
 /// The whole stdout of `loom-daemon merge-pr usage`: the sentinel, a
@@ -60,7 +60,7 @@ mod tests {
         // after `$(...)` strips it, so a second one would print a blank line.
         assert!(USAGE.ends_with('\n'));
         assert!(!USAGE.ends_with("\n\n"));
-        assert_eq!(USAGE.lines().count(), 157);
+        assert_eq!(USAGE.lines().count(), 150);
     }
 
     #[test]

@@ -1,11 +1,8 @@
 //! Tests for the bounded zero-row settle.
 //!
-//! These are the assertions that used to live as scenarios (e)-(i) of
-//! `defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh`,
-//! moved here with the decision they exercise (#9091's Doctor pass). The shell
-//! suite keeps the wiring — that `merge-pr.sh` consults this subcommand, obeys
-//! its verdict, and fails closed when it cannot be run — because that is what
-//! is still shell. What is decided, and under which knob values, is here.
+//! These are the assertions that used to live as scenarios (e)-(i) of the
+//! retired `test-merge-pr-wait-for-checks-empty-settle.sh` (#9091's Doctor
+//! pass); what is decided, and under which knob values, is here.
 //!
 //! The through-line of every case below is that the bounded settle is a
 //! NARROWING of #6169's wait, admissible only where the forge itself says no
