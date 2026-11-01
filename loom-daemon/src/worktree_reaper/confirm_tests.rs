@@ -95,3 +95,58 @@ fn only_the_disagreeing_worktree_is_kept() {
     assert_eq!(ran, ["confirm 7", "remove 7", "confirm 8"]);
     assert_eq!(report.removed, vec![7]);
 }
+
+/// #13442: a successful pre-removal remote backup is the reaper doing its job,
+/// so it logs at INFO (restore recipe kept); a failed backup stays WARN.
+#[test]
+#[serial]
+fn backup_success_logs_info_and_backup_failure_logs_warn() {
+    let run = |ok: bool| {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".loom/worktrees/issue-7")).unwrap();
+        let previous = std::env::var(ACTIVITY_WINDOW_ENV).ok();
+        std::env::set_var(ACTIVITY_WINDOW_ENV, "0");
+        let logs = crate::test_log_capture::capture_logs(|| {
+            let _ = reap_worktrees_generic(
+                root.path(),
+                &crate::worktree_ops::naming::issue_from_worktree,
+                &|_, _| WorktreeDecision::RemoveWithBackup,
+                &|_, _| None,
+                &|_, _| {
+                    if ok {
+                        Ok(crate::worktree_ops::open_backup::BackupRecord {
+                            remote: "origin".to_string(),
+                            ref_name: "refs/loom/backup/issue-7/x".to_string(),
+                            sha: "b".repeat(40),
+                            head: "b".repeat(40),
+                            branch: Some("feature/issue-7".to_string()),
+                        })
+                    } else {
+                        Err("push refused".to_string())
+                    }
+                },
+                &|_, _| true,
+                &|_| None,
+            );
+        });
+        match previous {
+            Some(value) => std::env::set_var(ACTIVITY_WINDOW_ENV, value),
+            None => std::env::remove_var(ACTIVITY_WINDOW_ENV),
+        }
+        logs
+    };
+    let ok_logs = run(true);
+    let backup = ok_logs
+        .iter()
+        .find(|(_, m)| m.contains("pushed a remote backup before removal"))
+        .expect("backup success line is still logged");
+    assert_eq!(backup.0, log::Level::Info);
+    assert!(backup.1.contains("restore:"), "restore recipe kept: {}", backup.1);
+
+    let fail_logs = run(false);
+    let failed = fail_logs
+        .iter()
+        .find(|(_, m)| m.contains("remote backup failed"))
+        .expect("failure line is logged");
+    assert_eq!(failed.0, log::Level::Warn);
+}
