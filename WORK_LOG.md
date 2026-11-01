@@ -15,6 +15,52 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-01
 
+- **PR #13446**: docs: remove story-trace/stitching text deleted by #11984
+- **PR #13447**: fix: require the outcome line in the Builder prompt's Completion step
+- **PR #13448**: fix: fast-forward the daemon-root checkout in the checkout_ff pass
+- **PR #13449**: feat: stamp loom.sweep_id and loom.role on invoke github spans
+- **PR #13453**: feat: stamp pr_number, role and head_sha on step spans at open
+- **PR #13454**: release gate: count loom-daemon/ and loom-api/ changes as releasable, not only defaults/ (#13452)
+- **Issue #10890** (closed): Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
+- **Issue #11095** (closed): Operator merges without actions:write can't converge against an active merge train — redate treadmill (#8248/#8919)
+- **Issue #11301** (closed): check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
+- **Issue #11490** (closed): Codex pool: add Joseph's personal ChatGPT account (profile turian)
+- **Issue #11593** (closed): Builder/Doctor prompts: require repo-documented final-commit validation gates (exact SHA, remeasure on HEAD change) before requesting review
+- **Issue #11619** (closed): Remote CI bootstrap and pre-PR receipt adoption for unavailable AWS hosts
+- **Issue #11712** (closed): Daemon: export OTLP only and remove inbound control channels other than config (2am#4300)
+- **Issue #11925** (closed): peer-claim coordination is DEGRADED on a worker host (#6157 Layer 3)
+- **Issue #11928** (closed): maintain_only dispatch aborts emit error-level telemetry for an intentional, configured refusal
+- **Issue #11979** (closed): peer-claim coordination is DEGRADED on a worker host (#6157 Layer 3)
+- **Issue #12014** (closed): ci: approved PRs touching workflow files need several CI rounds to land as main moves (no merge queue on a user-owned repo)
+- **Issue #12065** (closed): Telemetry: emit a pass.verdict mechanism=step:merge row for the sweep merge phase (follow-up to #12029)
+- **Issue #12085** (closed): Telemetry(doctor): structured parked-PR cause (park reason, doctor_cycles, queue gate, treating age) (ETA doctor, loom-ui#4063 #6)
+- **Issue #12126** (closed): ci-telemetry: no CI run/job records in SigNoz since 2026-10-14 04:32Z (poller on loom-fleet-captain stopped?)
+- **Issue #12127** (closed): ci: rebalance Native Port Suites legs so none runs over ~3 min (next PR critical path after #12089)
+- **Issue #12148** (closed): Delete the operator wait-for-zero drain path once pause-and-roll resumes work (from #11812)
+- **Issue #12203** (closed): stage_dwell: every host re-lists every repo every 5 min (~8.9k billable GitHub calls/h fleet-wide)
+- **Issue #12217** (closed): github-events mirror reads stale for quiet repos (1555 stale vs 1049 hits/h), so the step gather falls back to REST
+- **Issue #12220** (closed): Rate-limit probe cache follow-ups: quiet-bucket gauge gap, ambient-login docs, post-rollout measurement
+- **Issue #12279** (closed): Gate: re-measure pause-and-roll resume on two hosts (blocks #12148)
+- **Issue #12323** (closed): merge queue: ship queue execution for the 2AMLogic/loom-ui pilot (Phase C, #10257)
+- **Issue #12447** (closed): Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue
+- **Issue #12481** (closed): Roll-stopped role ticks export unclassified:pre-launch (#12028 follow-up)
+- **Issue #12506** (closed): merge sequencing: Phase 1 release skips some followers whose predecessor merged at the recorded head, and fail-closed holds emit no telemetry
+- **Issue #12551** (closed): fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
+- **Issue #12653** (closed): Emit merge_hold hold-cause + release-actor + merge-queue facts to SigNoz (unblocks merge_hold ETA prediction)
+- **Issue #12727** (closed): Daemon-root checkout (~/loom-daemon) is never fast-forwarded on release-roll hosts (worker-1 2,764 / worker-2 5,135 commits behind)
+- **Issue #12809** (closed): Remove the daemon's dashboard wake source (forge_events /v1/hosts/{host}/events client)
+- **Issue #13169** (closed): tracing: put the work item's keys (pr_number, role, head/base SHA) on every step and tick span at open
+- **Issue #13173** (closed): docs: tracing.md and ci-observability.md still describe the story join removed in #11984
+- **Issue #13337** (closed): Workflow-filed trackers never enter the fleet: the author gate refuses github-actions[bot] and ci-daily.yml rewrites the body nightly
+- **Issue #13404** (closed): joseph-laptop: daemon forge reads fail host-wide (forge_repo_facts errors, operator gate 'identity could not be read', check-claim GH read failure) — App credential path broken
+- **Issue #13452** (closed): release gate: a Rust-only daemon change never cuts a version (gate and push trigger see only defaults/), so a floor cannot ship a daemon fix
+- **Issue #7810** (closed): [epic] Retire shell: 10 sequential PRs, two foundational then update + agent execution
+- **Issue #8609** (closed): Configure and verify the provider-side hard spend ceiling for the shared metered key (ADR-0020 Option 1)
+- **Issue #8913** (closed): observability: live-verify ci.job.log reconstruction in SigNoz and record it in evidence.md (#8825 AC1)
+- **Issue #8950** (closed): Live-verify Pi tokens_by_model against a real LOOM_RUNTIME=pi launch
+- **Issue #9006** (closed): observability: live-verify the SigNoz queue-starvation alert rule fires and resolves (#8856 / PR #8935 follow-up)
+- **Issue #9504** (closed): Enforce operator sub-kind mutual exclusivity; settle the loom:operator / loom:operator-only base pair (#9496)
+- **Issue #9804** (closed): role prompts: consume the merge-sequencing state (Doctor defer-repair awareness, Champion scheduling-hold disposition)
 - **PR #13444**: fix: log reaper backup success at info and skip vanished git pid in tmp-reclaim probe
 - **PR #13441**: fix: age out empty and drained stale trace journals in backfill
 - **PR #13440**: fix: demote steady-state tmux and slow-build daemon log lines
