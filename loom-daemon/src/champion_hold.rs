@@ -32,6 +32,7 @@
 //!
 //! The marker strings are a wire format: they live in comments on open PRs.
 
+pub mod calibration;
 pub mod classify;
 pub mod ratification;
 
