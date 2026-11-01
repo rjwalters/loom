@@ -433,6 +433,74 @@ impl Journal {
         Ok(true)
     }
 
+    /// Retire a journal nothing will ever finish (#13439), after a successful
+    /// drain. A zero-byte journal untouched for `empty_after` is removed with
+    /// its sidecars; a fully drained journal (cursor at EOF) untouched for
+    /// `quarantine_after` is moved with its sidecars into a `stale/` directory
+    /// beside it, which the backfill scan does not enter. A journal with
+    /// undrained bytes is never touched, so no span is lost. The caller has
+    /// already established that no running step owns the journal.
+    pub fn retire_stale(
+        &self,
+        empty_after: std::time::Duration,
+        quarantine_after: std::time::Duration,
+    ) -> Result<bool> {
+        let _drain_lock = self.drain_lock()?;
+        let file = self.lock()?;
+        let meta = file.metadata()?;
+        let idle = meta
+            .modified()?
+            .elapsed()
+            .unwrap_or(std::time::Duration::ZERO);
+        let parent = self.path.parent().context("journal has no parent")?;
+        let cursor_path = self.path.with_extension("cursor");
+        let json_path = self.path.with_extension("json");
+        if meta.len() == 0 {
+            if idle < empty_after {
+                return Ok(false);
+            }
+            for sidecar in [&json_path, &cursor_path] {
+                match std::fs::remove_file(sidecar) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            std::fs::remove_file(&self.path)?;
+            let _ = std::fs::remove_file(self.path.with_extension("drain-lock"));
+            File::open(parent)?.sync_all()?;
+            return Ok(true);
+        }
+        let cursor = std::fs::read_to_string(&cursor_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if idle < quarantine_after || cursor != Some(meta.len()) {
+            return Ok(false);
+        }
+        let stale = parent.join("stale");
+        std::fs::create_dir_all(&stale)?;
+        let name = self
+            .path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .context("journal has no name")?;
+        let mut tag = String::new();
+        while stale.join(format!("{name}{tag}.jsonl")).exists() {
+            tag = format!("-{}", Utc::now().timestamp_nanos_opt().unwrap_or_default());
+        }
+        std::fs::rename(&self.path, stale.join(format!("{name}{tag}.jsonl")))?;
+        for (sidecar, ext) in [(&json_path, "json"), (&cursor_path, "cursor")] {
+            match std::fs::rename(sidecar, stale.join(format!("{name}{tag}.{ext}"))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let _ = std::fs::remove_file(self.path.with_extension("drain-lock"));
+        File::open(parent)?.sync_all()?;
+        Ok(true)
+    }
+
     /// Atomically replace the byte cursor and durably link the replacement:
     /// two barriers (the temp file's `sync_all`, the parent directory's
     /// `fsync`) every time it is called, which is why [`Self::drain`] commits
