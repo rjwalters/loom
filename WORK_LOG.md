@@ -16,6 +16,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-01
 
+- **PR #13348**: fix: re-mint the writer token when a miss refresh still lacks the repo
+- **PR #13364**: feat: fall back to local patch comparison when the forge compare is unreadable
+- **Issue #13359** (closed): champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming
+- **PR #13363**: fix: retry merge-queue enqueue once on QueueUnavailable and key stall notice on reason
+- **Issue #13357** (closed): merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds
 - **PR #13398**: test: write fake forge gh script atomically to avoid ETXTBSY
 - **Issue #13396** (closed): test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests
 - **PR #13475**: refactor: replace eight more test-local git helpers with shared test_git_helpers::run
