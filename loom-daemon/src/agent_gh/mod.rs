@@ -53,6 +53,7 @@ pub mod next_gh;
 pub mod pr_checks;
 pub mod read_route;
 pub mod session_env;
+pub mod write_span;
 
 #[cfg(test)]
 mod tests;
@@ -262,7 +263,20 @@ pub fn run(raw: &[OsString]) -> i32 {
             );
             return EX_TEMPFAIL;
         }
-        ledger::book(raw, cwd.as_deref(), None, route.read);
+        let booked_repo = ledger::book(raw, cwd.as_deref(), None, route.read);
+        // #13170: a classified write inside a traced execution runs as a
+        // spanned child instead of the exec below, which has no "after".
+        if !route.read {
+            if let Some(code) = write_span::run(
+                &next,
+                raw,
+                (SENTINEL_ENV, OsString::from((depth + 1).to_string())),
+                cwd.as_deref(),
+                booked_repo.as_deref(),
+            ) {
+                return code;
+            }
+        }
         // #11858: a role tick's passed-through `--json` listing runs
         // captured, so its rows reach the tick's `pick.decision`.
         if let Some(code) = listing_capture::run(&next, raw, depth) {

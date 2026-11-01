@@ -175,6 +175,9 @@ pub struct Row {
     pub identity: CallIdentity,
     pub pool: Pool,
     pub attribution: CallAttribution,
+    /// The `owner/repo` the row is booked under (#13170: the write span's
+    /// `github.repo`), when one was resolved.
+    pub repo: Option<String>,
 }
 
 /// The row for one passthrough, or `None` for a call that is not booked.
@@ -222,6 +225,7 @@ pub fn plan(
     if let Some(repo) = &repo {
         identity = identity.with_repo(repo);
     }
+    let booked_repo = repo.clone();
     let attribution = CallAttribution {
         ro: Some(origin.to_string()),
         ca: forge_call_stats::sanitize(&cred.account),
@@ -246,6 +250,7 @@ pub fn plan(
         identity,
         pool,
         attribution,
+        repo: booked_repo,
     })
 }
 
@@ -253,14 +258,19 @@ pub fn plan(
 /// — a gateway profile or a reader App's directory — or, when `None`, the
 /// session's own credential. `read` is the front's classification. Never
 /// fails, never panics into the caller.
-pub fn book(args: &[OsString], cwd: Option<&Path>, profile: Option<&Path>, read: bool) {
-    book_as(args, cwd, profile, read, Outcome::Ok);
+pub fn book(
+    args: &[OsString],
+    cwd: Option<&Path>,
+    profile: Option<&Path>,
+    read: bool,
+) -> Option<String> {
+    book_as(args, cwd, profile, read, Outcome::Ok)
 }
 
 /// Book a read the front shed instead of exec'ing it on the writer (#12394):
 /// the same row as [`book`], `o=shed`.
 pub fn book_shed(args: &[OsString], cwd: Option<&Path>) {
-    book_as(args, cwd, None, true, Outcome::Shed);
+    let _ = book_as(args, cwd, None, true, Outcome::Shed);
 }
 
 fn book_as(
@@ -269,10 +279,10 @@ fn book_as(
     profile: Option<&Path>,
     read: bool,
     outcome: Outcome,
-) {
-    let _ = std::panic::catch_unwind(|| {
+) -> Option<String> {
+    std::panic::catch_unwind(|| {
         if std::env::var_os(crate::gh_invocation::BOOKED_ENV).is_some_and(|v| v == "1") {
-            return;
+            return None;
         }
         let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         let session = Session {
@@ -305,8 +315,12 @@ fn book_as(
                 None,
                 &row.attribution,
             );
+            return row.repo;
         }
-    });
+        None
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

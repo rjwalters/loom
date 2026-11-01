@@ -286,6 +286,9 @@ fn every_span_attribute_survives_export_bounding() {
     let bounded = span.clone().bounded();
     for key in SPAN_ATTRIBUTE_KEYS {
         assert_eq!(bounded.attributes.get(*key), span.attributes.get(*key), "{key}");
+        if OPTIONAL_SPAN_ATTRIBUTE_KEYS.contains(key) {
+            continue;
+        }
         assert!(span.attributes.contains_key(*key), "record() never sets {key}");
     }
 }

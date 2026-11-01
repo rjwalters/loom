@@ -89,7 +89,13 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.route",
     "github.command",
     "http.request.method",
+    // #13170: the pushed branch head on a `pr.create` write span of the agent
+    // `gh` front. Optional: omitted, never guessed, when unknown.
+    "loom.head_sha",
 ];
+
+/// The keys of [`SPAN_ATTRIBUTE_KEYS`] only some spans carry.
+pub const OPTIONAL_SPAN_ATTRIBUTE_KEYS: &[&str] = &["loom.head_sha"];
 
 /// At most this many numbers in a write span's `github.number`.
 const MAX_WRITE_NUMBERS: usize = 5;
@@ -382,6 +388,8 @@ pub struct InvocationSpan {
     pub started_at: DateTime<Utc>,
     pub invocation: String,
     delivery: Delivery,
+    /// `loom.head_sha` (#13170); set only by [`Self::with_head_sha`].
+    head_sha: Option<String>,
 }
 
 impl InvocationSpan {
@@ -414,7 +422,19 @@ impl InvocationSpan {
             started_at,
             invocation,
             delivery: delivery(&inv.parent),
+            head_sha: None,
         }
+    }
+
+    /// Record the commit a `pr.create` call published as `loom.head_sha`
+    /// (#13170). Anything but a full 40-hex SHA is dropped, never exported.
+    #[must_use]
+    pub fn with_head_sha(mut self, sha: Option<&str>) -> Self {
+        self.head_sha = sha
+            .map(str::trim)
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase);
+        self
     }
 
     /// The context to hand the child as its `traceparent`: this span's own
@@ -479,6 +499,9 @@ impl InvocationSpan {
             if let Some(numbers) = write_numbers(inv) {
                 attributes.insert("github.number".into(), numbers);
             }
+        }
+        if let Some(sha) = &self.head_sha {
+            attributes.insert("loom.head_sha".into(), sha.clone());
         }
         crate::telemetry::trace::provenance::stamp(&mut attributes);
         SpanRecord {
