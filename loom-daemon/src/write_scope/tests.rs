@@ -703,6 +703,14 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         (
+            "agent_gh/write_span.rs",
+            NotAWrite(
+                "classifies the agent's own gh write argv for a span and re-runs it unchanged \
+                 as a child, in place of the exec it replaces: same argv, same credential, no \
+                 target chosen and no write added by the daemon (#13170)",
+            ),
+        ),
+        (
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
         ),

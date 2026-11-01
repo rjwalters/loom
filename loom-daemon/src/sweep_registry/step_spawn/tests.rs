@@ -1135,3 +1135,22 @@ fn a_champion_requeued_noop_line_releases_as_ci_wait_for_any_gate() {
     assert_eq!(rel(&line("requeued")), "ci_wait");
     assert_eq!(rel(&line("skipped")), "noop");
 }
+
+/// #13176: a Builder that opens a PR ends on the prompt's `## Completion`
+/// section. If that section does not tell it to write the outcome line, the
+/// step exits 0 with no line and is recorded `no-outcome-line`.
+#[test]
+fn builders_completion_section_requires_a_parseable_outcome_line() {
+    let prompt = include_str!("../../../../defaults/.claude/commands/loom/builder.md");
+    let completion = &prompt[prompt.rfind("\n## Completion").expect("Completion section")..];
+    let line = completion
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix('`').and_then(|l| l.strip_suffix('`')))
+        .find(|l| l.starts_with("LOOM_STEP_OUTCOME role=builder"))
+        .expect("Completion names the builder outcome line");
+    let concrete = line.replace("<n>", "13176");
+    let parsed = parse_outcome_line(&concrete).expect("the template parses once <n> is filled");
+    assert_eq!(parsed.class, StepOutcomeClass::Verdict);
+    assert_eq!(parsed.reason, "pr_opened");
+    assert_eq!(parsed.target, 13176);
+}

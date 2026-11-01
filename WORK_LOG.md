@@ -15,6 +15,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-01
 
+- **PR #13444**: fix: log reaper backup success at info and skip vanished git pid in tmp-reclaim probe
+- **PR #13441**: fix: age out empty and drained stale trace journals in backfill
+- **PR #13440**: fix: demote steady-state tmux and slow-build daemon log lines
+- **PR #13436**: fix: bump zstd to 0.14.3 to clear RUSTSEC-2026-0391
+- **Issue #13442** (closed): daemon.log: three more steady-state WARN lines (reaper backup success, git_tmp_reclaim vanished-pid race, per-tick DEFAULT_ROLES notice) keep a healthy worker at ~300 WARN/h
+- **Issue #13439** (closed): observability: stale trace-context journals are re-drained and logged at WARN on every backfill pass, with no ageing-out
+- **Issue #13438** (closed): daemon.log: tmux socket probe (60/h) and within-budget slow build are logged at WARN forever on headless workers
+- **Issue #13209** (closed): [ci-daily] Supply Chain
 - **PR #13430**: fix: skip pool hold for tap-less sweep-lifecycle preference resolution
 - **Issue #13428** (closed): pool_preflight: an empty sweep-lifecycle preference list arms the EXHAUSTED hold and logs a WARN/recovered pair every tick
 

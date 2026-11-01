@@ -452,6 +452,38 @@ fn a_thread_parent_is_the_ambient_parent_until_its_guard_drops() {
     assert_eq!(ParentContext::ambient(), ParentContext::Missing);
 }
 
+fn sweep_span_attrs() -> SpanRecord {
+    let (_, mut spans, _) = run(read_op(), "true");
+    spans.remove(0)
+}
+
+#[test]
+fn a_thread_sweep_stamps_sweep_id_and_role_until_its_guard_drops() {
+    set_test_ambient(None, None);
+    {
+        let _g = enter_sweep("step-builder-1-2", Some("builder"));
+        let rec = sweep_span_attrs();
+        assert_eq!(attr(&rec, "loom.sweep_id"), Some("step-builder-1-2"));
+        assert_eq!(attr(&rec, "loom.role"), Some("builder"));
+        std::thread::spawn(|| assert_eq!(ambient_sweep(), (None, None)))
+            .join()
+            .unwrap();
+    }
+    let rec = sweep_span_attrs();
+    assert_eq!(attr(&rec, "loom.sweep_id"), None);
+    assert_eq!(attr(&rec, "loom.role"), None);
+}
+
+#[test]
+fn env_sourced_sweep_identity_omits_absent_and_blank_values() {
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(sweep_identity(s("sw-1"), s("judge")), (s("sw-1"), s("judge")));
+    assert_eq!(sweep_identity(s("sw-1"), None), (s("sw-1"), None));
+    assert_eq!(sweep_identity(s("sw-1"), s("  ")), (s("sw-1"), None));
+    assert_eq!(sweep_identity(s(""), s("judge")), (None, None));
+    assert_eq!(sweep_identity(None, s("judge")), (None, None));
+}
+
 fn api_op(intent: AccessIntent) -> GhInvocation {
     GhInvocation::new(
         Operation::new("api.rest"),
