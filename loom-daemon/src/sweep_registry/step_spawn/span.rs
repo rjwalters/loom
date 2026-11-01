@@ -15,7 +15,8 @@
 //!
 //! - [`sweep_close`] is the close a step's end records: the same
 //!   `loom.result` its `role_tick.outcome` reports (`success` / `failure`),
-//!   the step's role, its story points when the item is sized
+//!   the step's role, the PR a Builder step opened (`loom.pr_number`, #13169;
+//!   a PR step's number is already on its open root), its story points when the item is sized
 //!   (`loom.story_points`, #12957), and on a failure a [`StepFailure`] class
 //!   from the closed vocabulary below. [`SweepRegistry::end_step`] journals it at the moment
 //!   it sees the end. A step a roll stopped closes as `interrupted_by_roll`,
@@ -90,8 +91,10 @@ pub(crate) fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> Role
 /// The `loom.result` and close attributes of a step's `loom.sweep` span.
 /// `outcome` is the tick outcome the step's `role_tick.outcome` reports
 /// ([`super::capture::tick_outcome`]), so the two agree. `story_points` are
-/// the step's spawn-time points (#12957), absent when unsized. Pure.
+/// the step's spawn-time points (#12957), absent when unsized. `pr_number` is
+/// the PR a Builder step opened, absent when it opened none. Pure.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_close(
     end: StepEnd,
     line: Option<&StepOutcomeLine>,
@@ -100,6 +103,7 @@ pub(crate) fn sweep_close(
     model: Option<&str>,
     effort: Option<&str>,
     story_points: Option<u32>,
+    pr_number: Option<u32>,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -108,6 +112,9 @@ pub(crate) fn sweep_close(
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             close.insert(key.into(), value.to_owned());
         }
+    }
+    if let Some(pr) = pr_number {
+        close.insert("loom.pr_number".into(), pr.to_string());
     }
     if let Some(points) = story_points {
         close.insert(

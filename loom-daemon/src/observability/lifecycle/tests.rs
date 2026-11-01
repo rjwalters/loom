@@ -1114,7 +1114,7 @@ fn sweep_root_carries_issue_and_commit_facts_without_a_resolved_identity() {
     TraceStore::new(root_dir)
         .load_or_create(root_dir, "sweep-11982")
         .unwrap();
-    prepare_execution(&mut command, root_dir, "sweep-11982", Some(42));
+    prepare_execution(&mut command, root_dir, "sweep-11982", &StepKeys::issue(Some(42)));
     let journal = Journal::for_context(&TraceStore::new(root_dir).path(root_dir, "sweep-11982"));
     let open = journal.active().unwrap();
     let attrs = &open[0].record.attributes;
@@ -1269,7 +1269,7 @@ fn drained_sweep_and_phase_spans_keep_the_open_load_beside_the_close_load() {
     let saved = store.load_or_create(root_dir, "sweep-12884").unwrap();
     let journal = Journal::for_context(&store.path(root_dir, "sweep-12884"));
     publish_load(0.5);
-    prepare_execution(&mut Command::new("true"), root_dir, "sweep-12884", None);
+    prepare_execution(&mut Command::new("true"), root_dir, "sweep-12884", &StepKeys::default());
     checkpoint_begin_observation(&journal, &saved.context, None, 12884, "builder", None, None)
         .unwrap();
     publish_load(3.25);
@@ -1400,4 +1400,35 @@ mod stale_journals {
         assert_eq!(std::fs::read_to_string(stale.join("j.jsonl")).unwrap(), "keep");
         assert_eq!(std::fs::read_dir(&stale).unwrap().count(), 3);
     }
+}
+
+/// #13169: a step root names its PR, role and PR head from the moment it
+/// opens, so a step that never closes still carries its keys.
+#[test]
+fn a_step_root_carries_its_item_keys_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let store = TraceStore::new(root_dir);
+    store.load_or_create(root_dir, "step-judge-77-1").unwrap();
+    let head = "b".repeat(40);
+    let keys = StepKeys {
+        issue: None,
+        pr_number: Some(77),
+        role: Some("judge"),
+        head_sha: Some(head.clone()),
+    };
+    prepare_execution(&mut Command::new("true"), root_dir, "step-judge-77-1", &keys);
+    let journal = Journal::for_context(&store.path(root_dir, "step-judge-77-1"));
+    let open = journal.active().unwrap();
+    let attrs = &open[0].record.attributes;
+    assert_eq!(attrs["loom.pr_number"], "77");
+    assert_eq!(attrs["loom.role"], "judge");
+    assert_eq!(attrs["loom.head_sha"], head);
+    assert!(!attrs.contains_key("loom.issue"), "an unlinked PR names no issue");
 }
