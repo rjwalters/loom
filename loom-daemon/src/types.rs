@@ -2751,6 +2751,12 @@ pub struct RepoStatus {
     /// absent field parses as `false`, i.e. "not known to be missing").
     #[serde(default)]
     pub root_missing: bool,
+    /// This root's sweep-registry mutex stayed held past the status build's
+    /// bounded wait (#13443), so its registry-derived fields (in-flight count,
+    /// quarantines) are empty rather than known. Omitted when `false`;
+    /// `#[serde(default)]` keeps older wire data parsing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lock_busy: bool,
     /// Whether this repo's most recent gate tick DEFERRED for host load (#4259)
     /// — a bounded, load-aware scheduling decision distinct from both
     /// `health_gate_halted` (verified-red) and `health_gate_not_evaluated`

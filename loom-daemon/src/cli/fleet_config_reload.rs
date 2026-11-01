@@ -239,6 +239,7 @@ mod tests {
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
