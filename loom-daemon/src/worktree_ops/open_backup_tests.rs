@@ -114,7 +114,7 @@ fn backup_ref_name_nests_item_branch_and_stamp_under_the_loom_namespace() {
 fn a_clean_pushed_worktree_anchors_head_itself_on_the_remote() {
     let f = fixture();
     let head = git(&f.work, &["rev-parse", "HEAD"]);
-    let rec = backup_to_remote(&f.work, "issue-42", at()).expect("backup");
+    let rec = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect("backup");
     assert_eq!(rec.remote, "origin");
     assert_eq!(rec.ref_name, "refs/loom/backup/issue-42/feature/issue-42/20261020T123456Z");
     assert_eq!(rec.sha, head, "nothing beyond HEAD: the ref anchors HEAD");
@@ -142,7 +142,7 @@ fn uncommitted_tracked_untracked_and_staged_changes_are_all_in_the_snapshot_and_
     let status_before = git(&f.work, &["status", "--porcelain=v1", "-z"]);
     let index_before = git(&f.work, &["write-tree"]);
 
-    let rec = backup_to_remote(&f.work, "issue-42", at()).expect("backup");
+    let rec = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect("backup");
 
     assert!(rec.captured_changes());
     assert_ne!(rec.sha, head);
@@ -205,7 +205,7 @@ fn ignored_files_build_trees_and_loom_markers_are_never_pushed() {
     // ...and one real untracked file, so a snapshot commit is actually built.
     fs::write(f.work.join("real.txt"), "real\n").unwrap();
 
-    let rec = backup_to_remote(&f.work, "issue-42", at()).expect("backup");
+    let rec = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect("backup");
     assert!(rec.captured_changes());
     let tree = remote_tree(&f.bare, &rec.sha);
     assert!(tree.iter().any(|p| p == "real.txt"), "{tree:?}");
@@ -234,7 +234,7 @@ fn unpushed_commits_reach_the_remote_through_the_backup_ref_without_touching_the
     let local_tip = git(&f.work, &["rev-parse", "HEAD"]);
     assert!(!git_ok(&f.bare, &["cat-file", "-e", &local_tip]), "precondition: not on remote");
 
-    let rec = backup_to_remote(&f.work, "issue-42", at()).expect("backup");
+    let rec = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect("backup");
     assert_eq!(rec.sha, local_tip, "clean tree: the ref anchors the unpushed tip");
     assert_eq!(remote_sha(&f.bare, &rec.ref_name).as_deref(), Some(local_tip.as_str()));
     assert!(git_ok(&f.bare, &["cat-file", "-e", &local_tip]), "the commit is on the remote");
@@ -251,7 +251,7 @@ fn a_detached_head_is_backed_up_under_detached() {
     let head = git(&f.work, &["rev-parse", "HEAD"]);
     git(&f.work, &["checkout", "-q", "--detach"]);
     fs::write(f.work.join("scratch.txt"), "detached work\n").unwrap();
-    let rec = backup_to_remote(&f.work, "pr-7", at()).expect("backup");
+    let rec = backup_to_remote(&f.work, &f.work, "pr-7", at()).expect("backup");
     assert_eq!(rec.branch, None);
     assert_eq!(rec.ref_name, "refs/loom/backup/pr-7/detached/20261020T123456Z");
     assert_eq!(rec.head, head);
@@ -267,7 +267,7 @@ fn a_failed_push_is_an_error_and_leaves_the_worktree_and_its_files_alone() {
     fs::write(f.work.join("precious.txt"), "do not lose\n").unwrap();
     let missing = f.bare.with_file_name("no-such-remote.git");
     git(&f.work, &["remote", "set-url", "origin", missing.to_str().unwrap()]);
-    let err = backup_to_remote(&f.work, "issue-42", at()).expect_err("push must fail");
+    let err = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect_err("push must fail");
     assert!(err.contains("push of refs/loom/backup/"), "{err}");
     assert_eq!(fs::read_to_string(f.work.join("precious.txt")).unwrap(), "do not lose\n");
     assert!(!git_ok(&f.work, &["rev-parse", "--verify", "--quiet", "refs/stash"]));
@@ -278,7 +278,7 @@ fn a_failed_push_is_an_error_and_leaves_the_worktree_and_its_files_alone() {
 fn a_missing_origin_remote_is_an_error_before_anything_is_built() {
     let f = fixture();
     git(&f.work, &["remote", "remove", "origin"]);
-    let err = backup_to_remote(&f.work, "issue-42", at()).expect_err("no origin");
+    let err = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect_err("no origin");
     assert!(err.contains("remote 'origin' is not configured"), "{err}");
 }
 
@@ -293,7 +293,7 @@ fn a_rejected_push_is_an_error() {
     let ref_name = backup_ref_name("issue-42", Some("feature/issue-42"), at());
     git(&f.work, &["push", "-q", "origin", &format!("{orphan}:{ref_name}")]);
     fs::write(f.work.join("x.txt"), "x\n").unwrap();
-    let err = backup_to_remote(&f.work, "issue-42", at()).expect_err("rejected");
+    let err = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect_err("rejected");
     assert!(err.contains("push of refs/loom/backup/") && err.contains("failed"), "{err}");
     assert_eq!(remote_sha(&f.bare, &ref_name).as_deref(), Some(orphan.as_str()), "untouched");
 }
@@ -305,7 +305,7 @@ fn an_untracked_nested_repository_is_refused_rather_than_recorded_as_an_empty_gi
     fs::create_dir_all(&nested).unwrap();
     git(&nested, &["init", "-q"]);
     fs::write(nested.join("lib.rs"), "nested work\n").unwrap();
-    let err = backup_to_remote(&f.work, "issue-42", at()).expect_err("nested repo");
+    let err = backup_to_remote(&f.work, &f.work, "issue-42", at()).expect_err("nested repo");
     assert!(err.contains("nested repository 'vendor/dep/'"), "{err}");
     assert!(
         remote_sha(&f.bare, &backup_ref_name("issue-42", Some("feature/issue-42"), at())).is_none()
@@ -315,8 +315,8 @@ fn an_untracked_nested_repository_is_refused_rather_than_recorded_as_an_empty_gi
 #[test]
 fn a_directory_that_is_not_a_worktree_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(backup_to_remote(tmp.path(), "issue-1", at()).is_err());
-    assert!(backup_to_remote(&tmp.path().join("absent"), "issue-1", at()).is_err());
+    assert!(backup_to_remote(tmp.path(), tmp.path(), "issue-1", at()).is_err());
+    assert!(backup_to_remote(tmp.path(), &tmp.path().join("absent"), "issue-1", at()).is_err());
 }
 
 #[test]
@@ -332,4 +332,75 @@ fn the_temporary_index_is_removed_afterwards() {
     drop(index);
     assert!(!path.exists(), "index file left behind");
     assert!(!lock.exists(), "index lock left behind");
+}
+
+/// Point `origin`'s transport at a wrapper that records the `GH_CONFIG_DIR`
+/// the git child handed it, then runs the real receive/upload pack.
+fn install_env_recorder(f: &Fixture) -> PathBuf {
+    let log = f._tmp.path().join("env.log");
+    let script = f._tmp.path().join("record-env.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"${{GH_CONFIG_DIR-UNSET}}\" >> '{}'\nexec git \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let s = script.to_str().unwrap();
+    git(
+        &f.work,
+        &[
+            "config",
+            "remote.origin.receivepack",
+            &format!("{s} receive-pack"),
+        ],
+    );
+    git(
+        &f.work,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            &format!("{s} upload-pack"),
+        ],
+    );
+    log
+}
+
+#[test]
+#[serial_test::serial]
+fn a_registered_root_runs_push_and_ls_remote_under_its_gh_config_dir() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let f = fixture();
+    let log = install_env_recorder(&f);
+    let cfg = f._tmp.path().join("owner-config");
+    crate::credential_preflight::register_root_gh_config_dir(&f.work, &cfg);
+
+    backup_to_remote(&f.work, &f.work, "issue-42", at()).expect("backup");
+    crate::credential_preflight::clear_owner_root_registry();
+
+    let seen = fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(lines.len(), 2, "push and ls-remote each hit the remote: {seen}");
+    assert!(lines.iter().all(|l| *l == cfg.to_str().unwrap()), "{seen}");
+}
+
+#[test]
+#[serial_test::serial]
+fn an_unregistered_root_leaves_gh_config_dir_as_inherited() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let f = fixture();
+    let log = install_env_recorder(&f);
+
+    backup_to_remote(&f.work, &f.work, "issue-42", at()).expect("backup");
+
+    let seen = fs::read_to_string(&log).unwrap();
+    // Unchanged environment: whatever the daemon process itself carries.
+    let inherited = std::env::var("GH_CONFIG_DIR").unwrap_or_else(|_| "UNSET".to_string());
+    assert_eq!(seen.lines().count(), 2, "{seen}");
+    assert!(seen.lines().all(|l| l == inherited), "{seen}");
 }

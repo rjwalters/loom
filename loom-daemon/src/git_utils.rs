@@ -419,16 +419,7 @@ mod tests {
     // `#[serial]` test (the single largest env-mutation lock domain in this
     // crate) — closing the race window instead of just hiding the symptom by
     // serializing this module against itself.
-    fn git(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?} failed in {}", dir.display());
-    }
+    use crate::test_git_helpers::run as git;
 
     /// A repo with `main` at one commit and a `feature` branch (checked out)
     /// carrying one additional commit that adds `new.txt` (3 lines) and

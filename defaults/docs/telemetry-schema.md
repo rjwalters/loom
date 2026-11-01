@@ -248,7 +248,7 @@ stage journal until #11126 and from `fleet.state` views since.
 ## Span join-facts contract (external provenance join, #11982)
 
 Provenance is moving out of Loom (parent #11776): an external join
-rebuilds story/build/sweep → PR linkage from telemetry
+rebuilds issue/build/sweep → PR linkage from telemetry
 instead of from stamps in commits, PR bodies and comments. This section is the
 stable contract for the plain span attributes that join reads. Changes are
 additive only; a key is never renamed, removed or re-meant without an issue the
@@ -256,16 +256,16 @@ join's owner has agreed to. No `schema_version` bump is needed for a new key.
 
 | Fact | Key | On which spans | Notes |
 |---|---|---|---|
-| repo | `loom.repo` | sweep root, phase/role spans, role-tick root and story copies | GitHub's own `owner/name` spelling when `repo_id` resolved, else the `origin`-derived slug |
-| issue | `loom.issue` | sweep root (**even when `repo_id` does not resolve**), phase/role spans, story copies; role-tick root when the tick was assigned one | A role tick that picks its own target has `loom.issue` only on its story copy spans, never on its root |
+| repo | `loom.repo` | sweep root, phase/role spans, role-tick root | GitHub's own `owner/name` spelling when `repo_id` resolved, else the `origin`-derived slug |
+| issue | `loom.issue` | sweep root (**even when `repo_id` does not resolve**), phase/role spans; role-tick root when the tick was assigned one | A role tick that picks its own target carries no `loom.issue` on its root |
 | sweep id | `loom.sweep_id` | every span of the execution | A role tick's id is `role-<role>-<instant>` |
-| PR number | `loom.pr_number` | phase/role spans once a PR exists; role-tick root of an assigned or claiming Judge/Doctor; story copies of PR targets | Absent before a PR exists |
+| PR number | `loom.pr_number` | phase/role spans once a PR exists; role-tick root of an assigned or claiming Judge/Doctor | Absent before a PR exists |
 | head SHA | `loom.head_sha` | sweep root | Full 40-hex tip of `feature/issue-N` (local, else `origin`), read when the sweep closes. The branch does not exist at dispatch, so the root cannot carry it earlier. Absent if the branch never existed |
 | base SHA | `loom.base_sha` | sweep root | Full 40-hex tip of `origin/HEAD` (else `origin/main`) at dispatch |
 | build version | `loom.daemon.version` | every span | `CARGO_PKG_VERSION` of the binary that created the span |
 | build commit | `loom.daemon.revision` | every span | Full git SHA of that binary; `loom.daemon.tree_state` says whether it was clean |
 | host | `host.id` / `host.name` / `service.instance.id` | OTLP `Resource`, not a span attribute | One value per exporting host; see [Envelope](#envelope) |
-| role | `loom.role` | phase/role spans, role-tick root and story copies | |
+| role | `loom.role` | phase/role spans, role-tick root | |
 
 A fact that is not known when a span is created is attached when it first is,
 and an unresolvable fact is omitted rather than guessed. Every key above
@@ -2351,7 +2351,7 @@ GitHub rate limit (Issue #10022):
 | `loom.ratelimit.trip` span | instant span, own root trace (derived from `loom.ratelimit.source` + trip instant) | `loom.ratelimit.source` (the tripping job), `loom.ratelimit.cooldown_until` (RFC 3339), the tripping credential (`github.account` — `app-<id>`, `ambient`, `env-token` —, `github.cred_owner`, `github.installation` when known), and per pool `github.ratelimit.core.used`, `.core.own`, `.core.own_daemon`, `.core.own_agent`, `.core.unattributed`, and the same five for `graphql` | one per rate-limit breaker trip; a re-trip while cooling emits nothing. `used` is the trip-time probe's count for the tripping credential; `own` is this host's forge-call ledger for the window **on that credential only** (#12238), `own_daemon` + `own_agent` (rows an agent session's `gh` front wrote); `unattributed` = `used − own` — **other hosts or processes on the same credential**, which on a fleet sharing one App installation is mostly other hosts' daemons, not callers outside Loom. A ledger row that names no credential counts toward `unattributed`. Binaries before #12238 sent `.external` with the same arithmetic but an `own` summed over every credential the host used. Each count is **omitted** (not 0) when unknown: no `used` in the probe, an untrusted probe reading (#8997), or the ledger sink off; the credential is named whenever a probe ran |
 | `forge.reader.withdrawn` span | instant span, own root trace (derived from the App, owner, resource and the instant) | `forge.reader.app` (the reader App id), `forge.reader.owner` (lowercased; `-` for an App-wide withdrawal), `forge.reader.resource` (`core`, `graphql`, `search`, `all`, or `app` for an App-wide withdrawal), `forge.reader.until` (RFC 3339), `forge.reader.source` (`header`, `probe` or `default`: where the end came from), `forge.reader.secondary` (`true` for a secondary limit) | one per reader withdrawal (W4-A). A rate limit withdraws only the refused `(owner, resource)` bucket; a secondary limit or a refused credential withdraws that owner's `all`; a mint or key failure, or any failure under `LOOM_READ_ROUTING=legacy`, withdraws the App (`app`). A per-repo coverage withdrawal emits nothing |
 | `forge.reader.spill` span | instant span, own root trace (derived from the repo, resource, home reader, mode and instant) | `forge.spill.owner_repo`, `forge.spill.resource` (`core` / `graphql` / `search`), `forge.spill.from` (home reader App id), `forge.spill.to` (target reader App id, or `home` when none has headroom and on release), `forge.spill.mode` (`partial` / `full` / `off`), `forge.spill.until` (RFC 3339 release instant) | one per read-pool spill-latch transition (W4-B, [daemon-reference](daemon-reference.md) `forge.readPool.routing`): engaged when the home bucket is projected at or above `spillProjectedPct` / `spillFullPct` or is withdrawn, released at the home bucket's reset; one more when a held latch re-picks a target that was withdrawn, went stale or reached `spillFullPct` (current mode, new `to`). A few per repo per day is normal; a steady stream means the pool is short of readers |
-| `invoke github` span | one per `gh` facade execution; child of the caller's span (or `LOOM_TRACEPARENT`), else its own root (derived per [`trace-identity.md`](trace-identity.md)) | process truth: `github.operation`, `github.access_intent`, `loom.forge.purpose` (#12310: `discovery` / `gate` / `write` / `hygiene` / `observability`, as the `purpose` label of `loom.forge.calls`; a write is `write`, a read `gate` unless its site marked it `discovery` or gave it a deferrable class), `loom.discovery.fallback_reason` (only on a discovery read the gateway refused for its quota reserve: `reserve`), `github.target`, `github.outcome` (`ok`, `exit_nonzero`, `signaled`, `timeout`, `spawn_failed`, `collect_failed`, `routing_refused`, `routing_blocked`, `adapter_unavailable`), `github.exit_code`, `github.invocation`, `github.launcher`, `github.api`, `context_source`. What GitHub billed (#10343): `github.http.status` (`200`, `304`, `403`, … or `unknown`), `github.http.not_modified` (`true`/`false`, `unknown` without a status), `github.http.requests` (pages of a `--paginate --include` call, `1` for one `--include` block, `2` for `run download`, `0` when nothing was sent, else `unknown`), `github.http.source` (`headers`, `stderr`, `none`), `github.billing` (`ok`, `not_modified`, `rate_limited`, `secondary_limited`, `error`, `not_sent`), and the bucket join keys `github.resource`, `github.account`, `github.cred_owner` (`-` when not an App installation), `github.role` (`reader`, `writer`; `writer-fallback` only on rows from before #12394). Since #10752: `github.repo` (the `owner/repo` the ledger booked the call under) and, on a write, `github.number` (the issue/PR number(s) its argv targets). Since #11407: `github.route` (a `gh api` endpoint as a template from gh-shim's finite table, e.g. `/repos/{owner}/{repo}/pulls/{n}/reviews`, query dropped; `/graphql`; `(unknown)` for a path the table lacks; `(other-host)`; `(none)` for no endpoint; `(porcelain)` for a non-`api` command), `http.request.method` (`gh api` only: `GET`, `POST`, … or `_OTHER`) and `github.command` (the gh command group, e.g. `api`, `pr view`, `issue list`; in the agent `gh` front, the agent's command rather than the `gh api` the front sent). No raw path, query or argument value is recorded | one per execution (a shed read sends nothing; no read is retried on the writer, #12394). The status comes from the `--include` status line, else `gh`'s `(HTTP NNN)` / `HTTP NNN:` stderr marker, else it is `unknown` — never guessed; a passthrough run is always `unknown`. A `304` is `github.billing=not_modified` while `github.outcome=exit_nonzero` (gh exits non-zero on it) |
+| `invoke github` span | one per `gh` facade execution; child of the caller's span (or `LOOM_TRACEPARENT`), else its own root (derived per [`trace-identity.md`](trace-identity.md)) | process truth: `github.operation`, `github.access_intent`, `loom.forge.purpose` (#12310: `discovery` / `gate` / `write` / `hygiene` / `observability`, as the `purpose` label of `loom.forge.calls`; a write is `write`, a read `gate` unless its site marked it `discovery` or gave it a deferrable class), `loom.discovery.fallback_reason` (only on a discovery read the gateway refused for its quota reserve: `reserve`), `github.target`, `github.outcome` (`ok`, `exit_nonzero`, `signaled`, `timeout`, `spawn_failed`, `collect_failed`, `routing_refused`, `routing_blocked`, `adapter_unavailable`), `github.exit_code`, `github.invocation`, `github.launcher`, `github.api`, `context_source`. What GitHub billed (#10343): `github.http.status` (`200`, `304`, `403`, … or `unknown`), `github.http.not_modified` (`true`/`false`, `unknown` without a status), `github.http.requests` (pages of a `--paginate --include` call, `1` for one `--include` block, `2` for `run download`, `0` when nothing was sent, else `unknown`), `github.http.source` (`headers`, `stderr`, `none`), `github.billing` (`ok`, `not_modified`, `rate_limited`, `secondary_limited`, `error`, `not_sent`), and the bucket join keys `github.resource`, `github.account`, `github.cred_owner` (`-` when not an App installation), `github.role` (`reader`, `writer`; `writer-fallback` only on rows from before #12394). Since #10752: `github.repo` (the `owner/repo` the ledger booked the call under) and, on a write, `github.number` (the issue/PR number(s) its argv targets). Since #11407: `github.route` (a `gh api` endpoint as a template from gh-shim's finite table, e.g. `/repos/{owner}/{repo}/pulls/{n}/reviews`, query dropped; `/graphql`; `(unknown)` for a path the table lacks; `(other-host)`; `(none)` for no endpoint; `(porcelain)` for a non-`api` command), `http.request.method` (`gh api` only: `GET`, `POST`, … or `_OTHER`) and `github.command` (the gh command group, e.g. `api`, `pr view`, `issue list`; in the agent `gh` front, the agent's command rather than the `gh api` the front sent). Since #13170: a classified write through the agent `gh` front (`pr create`, `pr|issue edit` label changes, `pr|issue comment`) inside a traced execution (`LOOM_TRACEPARENT`) runs as a child of the front and emits one of these spans (`github.operation` `pr.create`, `label.add`, `label.remove`, `label.edit`, `comment.create`, `comment.edit`, `comment.delete`, `pr.edit`, `issue.edit`), with `github.repo`, `github.number`, outcome and exit code; a `pr.create` span also carries `loom.head_sha` (the checkout's `HEAD`; omitted when the call names `--head` or `HEAD` is unreadable). With no ambient context the front still `exec`s and emits nothing No raw path, query or argument value is recorded | one per execution (a shed read sends nothing; no read is retried on the writer, #12394). The status comes from the `--include` status line, else `gh`'s `(HTTP NNN)` / `HTTP NNN:` stderr marker, else it is `unknown` — never guessed; a passthrough run is always `unknown`. A `304` is `github.billing=not_modified` while `github.outcome=exit_nonzero` (gh exits non-zero on it) |
 | `github.ratelimit.remaining` | `Gauge` | `{request}`; labels `resource`, `account`, `owner`, `role` (+ `installation` on a bucket point) | requests left in one bucket. On an App host every point is a bucket-book reading (below); the 60 s tick's cached `gh api rate_limit` reading (no forge call of its own since #12204) is booked there as the `(writer account, workspace owner, resource)` bucket (`role=writer`), never exported bare. On an ambient-login host the gauge appears only once the process-wide budget cache holds a reading (filled by a cold-start budget check or a breaker trip) or the breaker has a trip-time reading with open reset windows (it falls back to that); it is then exported with `owner="-"`, `role="ambient"`; an unresolvable `account` stays `unknown` and is retried at most every 20 min, never while the breaker is suppressing |
 | `github.ratelimit.used` | `Gauge` | `{request}`; labels as above | requests spent this window; absent when the response carried no `used`. Monotone only within one window (`github.ratelimit.reset`): several hosts export one bucket with readings of different ages, and a pre-#10571 daemon's label set can carry two interleaved windows, so GitHub's bill is each window's high-water mark (`github-shadow.sql`), never Σ of drops-as-resets |
 | `github.ratelimit.reset` | `Gauge` | `s` (Unix epoch seconds); labels as above | when the bucket's window resets |
@@ -2361,6 +2361,7 @@ GitHub rate limit (Issue #10022):
 | `loom.forge.facade.events` | delta `Sum` | `{event}`; label `reason` = the counter name | named `gh`-facade events that are not forge calls, since the previous point, flushed on the same tick: `facade.cwd_route.disagree` (a checkout whose local sources name different repositories, so its untargeted reads have no reader route and are shed, never sent to the writer — counted once per call, whether W1's accounting or W4-C's derivation saw it), `repo_facts.redirected`, `repo_facts.resolver_disagree`, and the dispatch guard's W9 counters: `guard.open_pr.refused_memo` / `guard.open_pr.refused_probed` (an open-PR refusal at the 2.5 memo short circuit / at the 2.6 probe; the 2.6 probe of an ordinary dispatch can itself be answered from the memo and still counts as `refused_probed`), `guard.open_pr.refused_distinct` (the first refusal of an `(issue, PR)` pair in a workspace this UTC hour; all three count in-`dispatch()` refusals only, so they fall to near zero on the work-finder route, whose #8865 pre-filter skips PR-blocked candidates before `dispatch()`) and `guard.issue_view.fallback` (a conditional 2.5/2.7 issue read fell back to the unconditional one); the captain's intake pass (W7): `intake.listing_shed` (a repo's open-issue walk was shed because every reader was out of budget; the repo is skipped this pass, nothing is sent to the writer), `intake.triage_reverted` (the label write's answer carried another `loom:*` label, so the `loom:triage` just added was removed) and `bucket_book.writer_identity_mismatch` (#10571). Only counters that moved emit a point. Exported only while an ops sink is registered |
 | `loom.forge.mirror.reads` | delta `Sum` | `{request}`; labels `caller`, `repo`, `outcome` | reads that asked the state mirror (`forge.mirror`, see [`forge-events.md`](forge-events.md) §8) since the previous point, flushed on the same tick: one per discovery listing (`caller` `work_finder` or `step_engine`, the step engine's all-open listing (#11897); `repo` the lowercase `owner/name`) and one per change-stream request (`caller` = `wake`, `repo` = `-`). `outcome` ∈ `hit` (served from the mirror), `stale` (watermark older than `maxStalenessSecs`), `unknown` (the mirror cannot vouch for the repo: unknown, moved, never reconciled), `error` (the request failed), `skipped` (no request: a recent stale/unknown verdict or the error backoff); every non-`hit` listing read the forge instead. Past 1024 series a new one is counted under `repo` = `overflow`. Accumulated only while an ops sink is registered |
 | `loom.forge.mirror.changes` | delta `Sum` | `{change}`; labels `repo`, `kind` | changes the state mirror's change stream delivered since the previous point; `kind` ∈ `issue`, `pr`, `label`, `check`, `pr_merged`, `other` |
+| `loom.discovery.recheck` | delta `Sum` | `{request}`; labels `reason`, `outcome` | rechecks the daemon asked the state mirror for (`POST /v1/mirror/recheck`) after a claim refusal showed a stale draw (#12318); `reason` is the refusal token (`claimed`, `label_flip_failed`), `outcome` ∈ `sent`, `error` (a failed POST, `429` or `403`; never retried), `skipped` (over the local 60/h bucket) |
 | `loom.forge.mirror.wake_latency` | delta `Sum` | `s`; label `repo` | summed seconds from a change at the mirror (its `at`) to the pull that saw it; divided by `loom.forge.mirror.changes` it is the mean wake latency |
 | `loom.stage_entry.lookups` | delta `Sum` | `{lookup}`; labels `repo`, `kind` | stage-entry times the step engine's provider (`step_dispatch::stage_entry`, #11897) looked up since the previous point, flushed on the same tick, by the source that answered in `kind`: `mirror` (the state mirror's per-item `labels_at`), `events` (the issue's `labeled` events, from the provider's persisted cache or one budgeted read), `created` (the item's creation time) or `none` (not even that). The `mirror` + `events` share is the stage-age coverage the step-dispatch design gates on (#11894). Nothing consumes the provider yet, so the series is empty until the item draw lands. Past 1024 series a new one is counted under `repo` = `overflow`. Accumulated only while an ops sink is registered |
 | `loom.feed.completions` | delta `Sum` | `{completion}`; labels `kind`, `outcome` | public-feed `completion` envelopes the safehouse narration sink built since the previous point (#12152), flushed on the same tick, by the trigger that found the merge in `kind`: `sweep_exit` (an issue sweep's `SweepExited`), `step` (a Champion merge step's `step.item.{N}.ended`) or `reconcile` (the periodic merge-reconciliation pass); `outcome` is `narrated`, or `seeded` for a fresh host's first pass, which records merges without posting them (#4649). The direct measure of merged work reaching the feed: a step emits no `sweep.completed`, so since step dispatch (#12009) that record no longer tracks it. Accumulated only while an ops sink is registered |
@@ -2414,7 +2415,6 @@ span's `github.account`, `account` is `app-<app id>`,
 |---|---|---|
 | `execution` | a daemon sweep's last `loom.runtime.run` (else its root) | the sweep's terminal transition, from `sweep.outcome`'s `tokens_by_model` |
 | `execution` | a role-runner tick's own `loom.role_attempt` root | the tick's transcript/native-store scan |
-| `attempt` | the tick's story span, **only when the tick stitched exactly one target** | the role runner; a multi-target tick is never split |
 
 #### LLM billing class (#10749)
 
@@ -2708,8 +2708,7 @@ The log record's **time is `left_at`** and its **observed timestamp is
 `loom.eta.stage_outcome.*` attributes (`stage`, `exit`, `next_stage`,
 `entered_at`, `left_at`, `dwell_sec`), in `OUTCOME_FACT_LOG_ATTRIBUTE_KEYS`.
 Provenance is required and exports as `loom.eta.version` / `revision` /
-`tree_state` / `provenance_complete`. The record no longer joins a story
-trace (that needed the dropped `repo_id`).
+`tree_state` / `provenance_complete`. The record carries no `repo_id`.
 
 **Changed by #11126 (loom-ui sign-off:
 https://github.com/rjwalters/loom/issues/11098#issuecomment-6081499763).**
@@ -3044,9 +3043,9 @@ projected reason, so `passVerdictQuery` still parses both):
 | Field (`loom.pass.*`) | Notes |
 |---|---|
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
-| `step` | `champion_pr`, `champion_issue`, `doctor` or `curator` |
+| `step` | `champion_pr`, `champion_issue`, `doctor`, `curator` or `judge` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1` or `curator_step_v1` |
+| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1`, `curator_step_v1` or `judge_step_v1` |
 | `loom.sweep_id` | the step's sweep id, to join a verdict to its session (#12715) |
 | `reason_detail` | the raw `reason=` token of a `skipped` / `requeued` step (body `detail`), bounded to token characters (#12715) |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
@@ -3097,6 +3096,25 @@ has no journaled signal and is not emitted.
 | `noop` | `no_change` |
 | `refused` | `escalated` (a journaled `operator-decision` / park, or `class=refused`), `gave_up` (`class=refused reason=gave_up`) |
 | `failed` | `failed` (`class=failed`, or no outcome line) |
+
+**Judge step (`judge_step_v1`, `step=judge`, `artifact=pr`, #13274).**
+One record per Judge step end. When `post-verdict.sh` refuses an approval at
+the exact-head CI gate (#10486; it posts nothing), it journals the refusal
+through `loom-daemon forge journal-ci-refusal` (best-effort; an older daemon
+changes nothing) and the step's record carries it, with `head_sha` set. Without
+a refusal the step's `LOOM_STEP_OUTCOME role=judge` line projects.
+
+| `class` | `reason` |
+|---|---|
+| `refused` | `ci_red` (exit 6), `ci_incomplete` (exit 5: pending, timeout, head moved, unread), `declined` (`class=refused` with no CI refusal) |
+| `verdict` | `reviewed` |
+| `noop` | `no_change` |
+| `failed` | `failed` (`class=failed`, or no outcome line) |
+
+Refusal rate: count `step=judge class=refused reason in (ci_red, ci_incomplete)`
+over all `step=judge` records, by `loom.repo`. Time to next approval: join each
+such record to the next Judge `verdict` record for the same `loom.repo` and PR
+number with a later `evaluated_at`; the daemon keeps no timer for it.
 
 **Curator step (`curator_step_v1`, `step=curator`, `artifact=issue`, #12921).**
 One record per Curator step end, from the journaled writes (the `loom:curated`
@@ -3300,12 +3318,9 @@ Each row:
 #### Champion dispatch metadata (`fleet.state.repos[].champion`)
 
 Additive on `fleet-state/v1`; missing means an older emitter, not human approval.
-`approval` and `merge` read the per-repo policy contract (#11674): the Fleet key
-`repos[]` = `{repo, policy: {approval, merge}}` (each `auto` | `human`; defined
-once in `loom-daemon/src/merge_policy.rs`, the exporter only reads it). A repo
-with no entry, or a value outside `auto`/`human`, is null (unknown), never
-guessed. ETA join: `champion.merge` (`auto`/`human`/null) keyed by the repo's
-`fleet.state` row is the `merge_wait` predictor feature. Scheduling, role absence and elapsed approval waits never imply human authority.
+The block carries no approval or merge policy: the `approval` / `merge` fields
+(#11674) were never populated and were removed (#13402). Scheduling, role
+absence and elapsed approval waits never imply human authority.
 `prompt_source` is the actual runner command (`/loom:champion`); `prompt_hash`
 is SHA-256 of the installed command and promotion/merge companions, or null
 when any file is unavailable. A custom prompt changes provenance without

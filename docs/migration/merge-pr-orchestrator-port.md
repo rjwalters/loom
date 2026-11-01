@@ -240,3 +240,30 @@ three-part test with named successors; the two "no live lease" failures also fai
 on `main` and are untouched. `reconcile-plan` / `reconcile-child` remain as verbs
 (their differential tests still pin them) but the script no longer calls them.
 Still shell: the cleared-blocker notify (already one verb call) and the merge loop.
+
+## Slice 4 status: stale-mergeable recheck loop (`merge-pr mergeable-recheck-run`)
+
+What moved: the I/O loop of `_recheck_mergeable_before_refusal` (backoff, the
+uncached PR re-reads, the #9106 ref vet, `git fetch`, `git merge-tree`) into
+`loom-daemon/src/merge_pr/mergeable_recheck_run.rs`, calling the existing
+`mergeable_recheck::decide` in-process. The shell keeps the function name and
+signature as a ~6-line wrapper that locates the binary and echoes the verb's one
+`<action>:<reason>` line; an unclassifiable answer is the same positive
+`refuse-stale` as before.
+
+Design decisions a later slice should know about:
+
+- **The PR read still goes through `forge_get_pr_nocache`**, sourced from
+  `lib/forge-helpers.sh` in a child `bash` (the slice 2-3 bridge), so the Gitea
+  branch and the `gh` / `gh-cached` `--no-cache` split stay in one place.
+- **The wrapper passes every value as `--flag=value`.** A forge-controlled ref
+  such as `--upload-pack=/tmp/x` would otherwise be parsed by clap as a flag and
+  never reach the ref vet. The retained suite's case (g) pins this.
+- **Fail direction unchanged: toward refusing.** A daemon lacking the verb makes
+  the stale-`false` path answer `refuse-stale` with the roll hint; the
+  `merge-pr >=` floor is not raised (see the note beside the markers).
+
+Suite: `test-merge-pr-stale-mergeable.sh` behavioural cases (a)-(f) run unchanged
+against the real wrapper and verb; the canned `.mergeable` sequence is now served
+by a fake `gh` on `PATH` instead of a shell-function stub. Two source-text greps
+are retired under the three-part test with named successors.

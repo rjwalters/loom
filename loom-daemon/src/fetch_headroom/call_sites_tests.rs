@@ -4,26 +4,8 @@
 
 use super::test_override::with_free_gb;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t.t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
+use crate::test_git_helpers::{configure, run as git};
 
 /// A bare origin with one commit on `main`, a clone of it, and then a second
 /// commit pushed to origin so the clone is one fetch behind.
@@ -32,6 +14,7 @@ fn clone_one_fetch_behind() -> (tempfile::TempDir, tempfile::TempDir) {
     git(origin.path(), &["init", "-q", "--bare", "--initial-branch=main"]);
     let seed = tempfile::tempdir().unwrap();
     git(seed.path(), &["init", "-q", "--initial-branch=main"]);
+    configure(seed.path());
     std::fs::write(seed.path().join("f"), "v1\n").unwrap();
     git(seed.path(), &["add", "."]);
     git(seed.path(), &["commit", "-q", "-m", "one"]);

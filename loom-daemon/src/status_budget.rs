@@ -189,9 +189,19 @@ pub struct StatusBuildPhases {
 /// startup-cost `INFO` line (Issue #8163 AC3).
 static STARTUP_COST_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Log level for a slow status build: only an over-budget build is a `WARN`;
+/// a build that is slow but within budget is normal on multi-repo hosts (#13438).
+fn slow_build_level(total: Duration, budget: Duration) -> log::Level {
+    if total >= budget {
+        log::Level::Warn
+    } else {
+        log::Level::Info
+    }
+}
+
 /// Record one completed [`crate::ipc::build_daemon_status`]: emit the
 /// one-time per-root cost line at `INFO` and, when the build is slow, the
-/// #7513 phase breakdown at `WARN` — now naming the budget it was compared
+/// #7513 phase breakdown at `WARN` (over budget) or `INFO` (within budget) — now naming the budget it was compared
 /// against (Issue #8163 AC3).
 ///
 /// The `INFO` line fires on the **first** build this process performs rather
@@ -232,7 +242,8 @@ pub fn record_status_build(total: Duration, root_count: usize, phases: &StatusBu
         .slowest_root
         .as_ref()
         .map_or_else(|| "n/a".to_string(), |(root, d)| format!("{} ({d:?})", root.display()));
-    log::warn!(
+    log::log!(
+        slow_build_level(total, budget),
         "build_daemon_status: slow build took {total:?} across {root_count} roots — {verdict} \
          (budget {budget:?} = {STATUS_BUILD_FIXED_BUDGET:?} + \
          {STATUS_BUILD_PER_ROOT_BUDGET:?}/root; the health client's escalated IPC retry is \

@@ -779,9 +779,6 @@ cat > .loom/roles/my-role.json <<'EOF'
 {
   "name": "My Custom Role",
   "description": "Brief description",
-  "defaultInterval": 600000,
-  "defaultIntervalPrompt": "Continue working",
-  "autonomousRecommended": true,
   "suggestedWorkerType": "claude"
 }
 EOF

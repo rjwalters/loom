@@ -917,7 +917,7 @@ fn backup_open_worktree(
     path: &Path,
     item: &str,
 ) -> Result<open_backup::BackupRecord, String> {
-    let record = open_backup::backup_to_remote(path, item, Utc::now())?;
+    let record = open_backup::backup_to_remote(repo_root, path, item, Utc::now())?;
     crate::worktree_ops::removal_log::record(
         repo_root,
         "worktree_reaper",

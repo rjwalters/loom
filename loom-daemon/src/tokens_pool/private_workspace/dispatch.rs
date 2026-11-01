@@ -390,15 +390,7 @@ fn select_target(root: &Path, config: &Config) -> Result<Target> {
 mod tests {
     use super::*;
 
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
-    }
+    use crate::test_git_helpers::run as git;
 
     /// A workspace whose `origin` is `remote`.
     fn workspace_with_origin(remote: &str) -> tempfile::TempDir {

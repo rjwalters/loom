@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_git_helpers::run as git;
 use crate::worktree_cli::branch_landed::{Caps, ForgeProbe, ForgeStatus};
 
 fn wt() -> WorktreeInfo {
@@ -665,17 +666,6 @@ fn enumerate_git_worktrees_returns_empty_on_non_repo() {
 }
 
 // --- end-to-end `clean_aggressive` regression coverage (#5735) --------
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?} failed in {}", dir.display());
-}
 
 /// Build a repo with a real `origin/main` remote-tracking ref (via a bare
 /// "origin" and a push) plus one `.loom-managed`, `.loom/worktrees/`-nested

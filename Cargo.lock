@@ -1293,7 +1293,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "loom-api"
-version = "0.19.1236"
+version = "0.19.1248"
 dependencies = [
  "anyhow",
  "axum",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "loom-daemon"
-version = "0.19.1236"
+version = "0.19.1248"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3405,9 +3405,9 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zstd"
-version = "0.14.2"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "057cfd910cfac363a0ada849592624b4c9ff2e10bef504c3433810d78ed96f93"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]

@@ -314,6 +314,15 @@ pub fn probe_git_liveness(roots: &[PathBuf]) -> GitLiveness {
     probe_platform(roots)
 }
 
+/// Whether a failed `/proc/<pid>/cwd` read means the process is gone (#13442).
+/// `NotFound` is the exit race (`/proc/<pid>` still lists but the cwd link is
+/// already torn down), so it cannot hold the repo; any other error (e.g.
+/// `PermissionDenied`) stays unanswerable and the probe fails closed.
+#[cfg(any(target_os = "linux", test))]
+fn cwd_read_means_vanished(e: &std::io::Error, proc_dir: &Path) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || !proc_dir.exists()
+}
+
 #[cfg(target_os = "linux")]
 fn probe_platform(roots: &[PathBuf]) -> GitLiveness {
     let self_pid = std::process::id();
@@ -346,7 +355,7 @@ fn probe_platform(roots: &[PathBuf]) -> GitLiveness {
             }
             Ok(_) => {}
             Err(e) => {
-                if dir.exists() {
+                if !cwd_read_means_vanished(&e, &dir) {
                     return GitLiveness::Unknown(format!(
                         "cannot read cwd of git pid {pid} ({comm}): {e}"
                     ));

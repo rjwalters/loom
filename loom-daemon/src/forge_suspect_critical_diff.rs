@@ -611,7 +611,12 @@ fn gh_head_file(gh_bin: &Path, repo: &str, pr: u32, file: &str) -> Result<String
         return Err("unsafe file path".into());
     }
     let read = |path: &str| {
-        crate::verdict_equivalence::gh_api_result("forge.suspect_critical_diff", gh_bin, None, path)
+        crate::verdict_equivalence::gh_api_checked(
+            "forge.suspect_critical_diff",
+            gh_bin,
+            None,
+            path,
+        )
     };
     let pr_body = read(&format!("repos/{repo}/pulls/{pr}"))?;
     let v: serde_json::Value = serde_json::from_slice(&pr_body).map_err(|e| e.to_string())?;

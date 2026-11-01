@@ -591,7 +591,10 @@ pub(crate) enum ScriptPortCommand {
     /// cites one of them as a blocker and now classifies stale. Reuses
     /// `check-stale-blocked`'s enumeration and the `dep_recheck` parsers.
     /// Called from `merge-pr.sh`'s post-merge path. Unlike
-    /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
+    /// `CheckStaleBlocked` it WRITES: a comment, plus the #13331 carve-out
+    /// that swaps `loom:blocked` for `loom:curated` on a fully-resolved
+    /// Curator park. `--resweep` applies that carve-out to every open
+    /// `loom:blocked` issue regardless of prior markers; `--dry-run`
     /// previews. Always exits 0.
     NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
     /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
@@ -800,6 +803,11 @@ pub(crate) enum MergePrCommand {
     /// forge's cached state is stale/unknown". Always exits 0 with exactly
     /// one `<action>:<reason>` line; the I/O loop stays in the shell.
     MergeableRecheck(super::merge_pr_mergeable_recheck::MergeableRecheckArgs),
+
+    /// The whole stale-mergeable recheck loop (#8191 slice): backoff, uncached
+    /// re-reads, ref vet, fetch and `git merge-tree`, then the same one
+    /// `<action>:<reason>` line — see `cli::merge_pr_mergeable_recheck_run`.
+    MergeableRecheckRun(super::merge_pr_mergeable_recheck_run::MergeableRecheckRunArgs),
 
     /// Decide whether a head-SHA-mismatch refusal was caused by THIS merge
     /// run's own base-sync push (#8164) and may be retried once against a
@@ -1171,6 +1179,7 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
+            MergePrCommand::MergeableRecheckRun(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),

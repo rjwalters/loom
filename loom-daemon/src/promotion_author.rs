@@ -93,6 +93,25 @@ impl Gate {
     }
 }
 
+/// The Actions bot, the only login the tracker exception admits (#13378).
+const CI_DAILY_AUTHOR: &str = "github-actions[bot]";
+/// Title prefix of a `ci-daily.yml` tracker.
+const CI_DAILY_TITLE_PREFIX: &str = "[ci-daily] ";
+/// The sentence `ci-daily.yml` writes into every tracker body it files.
+const CI_DAILY_BODY_MARKER: &str = "opened, updated and closed by `.github/workflows/ci-daily.yml`";
+
+/// Whether `issue` is a `ci-daily.yml` tracker filed by the Actions bot.
+///
+/// This is an exception to the *promotion author gate only*: it is not part of
+/// [`TrustPolicy`], so the bot's comments and markers stay untrusted everywhere
+/// (verdicts, holds, `forge trusted-comments`). All three conditions must hold.
+fn is_ci_daily_tracker(author: &Author, issue: &Value) -> bool {
+    let field = |key: &str| issue.get(key).and_then(Value::as_str).unwrap_or_default();
+    author.login.as_deref() == Some(CI_DAILY_AUTHOR)
+        && field("title").starts_with(CI_DAILY_TITLE_PREFIX)
+        && field("body").contains(CI_DAILY_BODY_MARKER)
+}
+
 /// Classify the REST issue object `issue` (`None`: it could not be read).
 ///
 /// An issue object with no author (a deleted account) is untrusted, as for any
@@ -107,7 +126,7 @@ pub fn classify(policy: &TrustPolicy, issue: Option<&Value>) -> Gate {
         return Gate::Unknown("the target is a pull request, not an issue".to_string());
     }
     let author = Author::from_json(issue);
-    if policy.trusts(&author) {
+    if policy.trusts(&author) || is_ci_daily_tracker(&author, issue) {
         Gate::Trusted
     } else {
         Gate::Untrusted(author.login)

@@ -362,7 +362,7 @@ fn decode_contents(body: &[u8]) -> Result<String, String> {
 }
 
 fn gh_read(gh_bin: &Path, path: &str) -> Result<Vec<u8>, String> {
-    crate::verdict_equivalence::gh_api_result("forge.additive_migrations", gh_bin, None, path)
+    crate::verdict_equivalence::gh_api_checked("forge.additive_migrations", gh_bin, None, path)
 }
 
 /// The PR head SHA.

@@ -24,6 +24,59 @@ fn graph(entries: &[(&str, &str, &[&str])]) -> impl FnMut(&str) -> Option<Node> 
     move |n: &str| map.get(n).cloned()
 }
 
+fn bodies(entries: &[(&str, &str)]) -> impl FnMut(&str) -> Option<Node> {
+    let map: HashMap<String, Node> = entries
+        .iter()
+        .map(|(n, body)| {
+            (
+                (*n).to_string(),
+                Node {
+                    state: "OPEN".to_string(),
+                    body: (*body).to_string(),
+                },
+            )
+        })
+        .collect();
+    move |n: &str| map.get(n).cloned()
+}
+
+// #13303: the false 27 -> 28 -> 27 cycle from a quoted "Depends on" phrase.
+#[test]
+fn a_blocks_line_quoting_the_other_issues_dependency_is_not_a_cycle() {
+    let mut w = Walk::new(
+        bodies(&[
+            (
+                "o/r#27",
+                "None open. Blocks #28 (macro layout generator, which \"Depends on #27 and #24\").",
+            ),
+            ("o/r#28", "Depends on #27 and #24"),
+        ]),
+        Budgets::default(),
+    );
+    assert_eq!(w.run("o/r#27"), Outcome::NoCycle);
+}
+
+#[test]
+fn a_cycle_reports_the_line_that_declared_each_edge() {
+    let mut w = Walk::new(
+        bodies(&[
+            ("o/r#1", "intro\nBlocked by #2"),
+            ("o/r#2", "Depends on #1"),
+        ]),
+        Budgets::default(),
+    );
+    let Outcome::Cycle(path) = w.run("o/r#1") else {
+        panic!("expected a cycle");
+    };
+    assert_eq!(
+        w.edge_lines(&path),
+        vec![
+            ("o/r#1".to_string(), "o/r#2".to_string(), "Blocked by #2".to_string()),
+            ("o/r#2".to_string(), "o/r#1".to_string(), "Depends on #1".to_string()),
+        ]
+    );
+}
+
 #[test]
 fn a_chain_with_no_loop_reports_no_cycle() {
     let mut w = Walk::new(

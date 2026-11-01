@@ -54,18 +54,47 @@ fn role_head(role: &str) -> String {
     )
 }
 
+/// RFC 3339 timestamp for `at(secs)`.
+fn ts(secs: i64) -> String {
+    at(secs).to_rfc3339()
+}
+
 fn usage_line(model: &str, input: i64, output: i64) -> String {
+    usage_line_at(10, model, input, output)
+}
+
+fn usage_line_at(secs: i64, model: &str, input: i64, output: i64) -> String {
     format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"model\":\"{model}\",\
-         \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output}}}}}}}\n"
+        "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"{model}\",\
+         \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output}}}}}}}\n",
+        ts(secs)
     )
 }
 
+/// Re-stamp a fixture transcript (stamped `at(10)`) to 10s ago, for tests that
+/// run through `emit_for_tick`, whose window is real wall-clock time.
+fn restamp_now(transcript: &str) -> String {
+    transcript.replace(&ts(10), &(Utc::now() - chrono::Duration::seconds(10)).to_rfc3339())
+}
+
 fn bash_line(command: &str) -> String {
+    bash_line_at(10, "toolu_x", command)
+}
+
+fn bash_line_at(secs: i64, id: &str, command: &str) -> String {
     let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\
-         \"name\":\"Bash\",\"input\":{{\"command\":\"{escaped}\"}}}}]}}}}\n"
+        "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\
+         \"id\":\"{id}\",\"name\":\"Bash\",\"input\":{{\"command\":\"{escaped}\"}}}}]}}}}\n",
+        ts(secs)
+    )
+}
+
+fn result_line_at(secs: i64, id: &str, is_error: bool, text: &str) -> String {
+    format!(
+        "{{\"type\":\"user\",\"timestamp\":\"{}\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\
+         \"tool_use_id\":\"{id}\",\"is_error\":{is_error},\"content\":\"{text}\"}}]}}}}\n",
+        ts(secs)
     )
 }
 
@@ -132,9 +161,11 @@ fn tally_command_classifies_each_forge_action() {
     tally_command("gh pr edit 7 --remove-label loom:review-requested", &mut a);
     assert_eq!(a.issues_labeled, 2);
 
+    // A merge command alone is an attempt, not a merge: `prs_merged` is only
+    // counted from a confirmed `tool_result` (see the scan tests).
     tally_command("./.loom/scripts/merge-pr.sh 99", &mut a);
-    tally_command("gh pr merge 100 --squash", &mut a);
-    assert_eq!(a.prs_merged, 2);
+    assert_eq!(a.prs_merged, 0);
+    assert!(is_merge_command("gh pr merge 100 --squash"));
 
     tally_command("gh issue comment 42 --body-file /tmp/x", &mut a);
     tally_command("gh pr comment 7 --body hi", &mut a);
@@ -179,7 +210,8 @@ fn scan_transcripts_folds_tokens_and_actions_in_one_pass() {
     text.push_str(&bash_line("gh pr comment 9 --body ok"));
     fs::write(&path, text).unwrap();
 
-    let scan = scan_transcripts(&[path]).expect("a readable transcript yields a scan");
+    let scan =
+        scan_transcripts(&[path], at(0), at(42)).expect("a readable transcript yields a scan");
     let actions = scan
         .actions
         .expect("a read transcript always yields measured actions");
@@ -202,9 +234,9 @@ fn scan_transcripts_folds_tokens_and_actions_in_one_pass() {
 
 #[test]
 fn scan_transcripts_returns_none_when_nothing_is_readable() {
-    assert_eq!(scan_transcripts(&[]), None);
+    assert_eq!(scan_transcripts(&[], at(0), at(42)), None);
     let dir = tempdir().unwrap();
-    assert_eq!(scan_transcripts(&[dir.path().join("absent.jsonl")]), None);
+    assert_eq!(scan_transcripts(&[dir.path().join("absent.jsonl")], at(0), at(42)), None);
 }
 
 #[test]
@@ -213,13 +245,71 @@ fn scan_transcripts_distinguishes_observed_zero_from_unobserved() {
     let path = dir.path().join("quiet.jsonl");
     // A real session that did nothing forge-mutating and reported no usage.
     fs::write(&path, role_head("guide")).unwrap();
-    let scan = scan_transcripts(&[path]).expect("a readable transcript is an observation");
+    let scan =
+        scan_transcripts(&[path], at(0), at(42)).expect("a readable transcript is an observation");
     assert_eq!(
         scan.actions,
         Some(RoleTickActions::default()),
         "a transcript WAS read, so a zero count is an observation, not an absence"
     );
     assert!(scan.tokens_by_model.is_empty());
+}
+
+#[test]
+fn scan_transcripts_counts_each_record_once_across_adjacent_ticks() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("growing.jsonl");
+    // Tick 1 window is [0, 42); tick 2 is [42, 84). The same file is in both.
+    let mut text = role_head("judge");
+    text.push_str(&usage_line_at(5, "claude-sonnet-5", 100, 10));
+    text.push_str(&bash_line_at(6, "t1", "gh pr comment 9 --body a"));
+    text.push_str(&usage_line_at(50, "claude-sonnet-5", 7, 3));
+    text.push_str(&bash_line_at(51, "t2", "gh pr comment 9 --body b"));
+    text.push_str(&bash_line_at(52, "t3", "gh issue edit 1 --add-label x"));
+    fs::write(&path, text).unwrap();
+
+    let one = scan_transcripts(std::slice::from_ref(&path), at(0), at(42)).unwrap();
+    let two = scan_transcripts(&[path], at(42), at(84)).unwrap();
+    let a1 = one.actions.clone().unwrap();
+    let a2 = two.actions.clone().unwrap();
+    assert_eq!((a1.comments_posted, a1.issues_labeled), (1, 0));
+    assert_eq!((a2.comments_posted, a2.issues_labeled), (1, 1));
+    let sum = |s: &TranscriptScan| s.tokens_by_model.iter().map(|r| r.input).sum::<i64>();
+    assert_eq!((sum(&one), sum(&two)), (100, 7));
+}
+
+#[test]
+fn scan_transcripts_window_is_start_inclusive_end_exclusive_and_drops_untimestamped() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("edge.jsonl");
+    let mut text = role_head("judge");
+    text.push_str(&bash_line_at(0, "a", "gh pr comment 1 --body s")); // included
+    text.push_str(&bash_line_at(42, "b", "gh pr comment 1 --body e")); // excluded
+                                                                       // No timestamp at all.
+    text.push_str(
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"c\",\
+         \"input\":{\"command\":\"gh pr comment 1 --body n\"}}]}}\n",
+    );
+    fs::write(&path, text).unwrap();
+    let scan = scan_transcripts(&[path], at(0), at(42)).unwrap();
+    assert_eq!(scan.actions.unwrap().comments_posted, 1);
+}
+
+#[test]
+fn scan_transcripts_counts_only_confirmed_merges() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("merge.jsonl");
+    let mut text = role_head("champion");
+    text.push_str(&bash_line_at(1, "ok", "./.loom/scripts/merge-pr.sh 5"));
+    text.push_str(&result_line_at(2, "ok", false, "PR #5 merged successfully"));
+    text.push_str(&bash_line_at(3, "fail", "./.loom/scripts/merge-pr.sh 6"));
+    text.push_str(&result_line_at(4, "fail", true, "Exit code 1\\nrefused: checks red"));
+    text.push_str(&bash_line_at(5, "dry", "./.loom/scripts/merge-pr.sh 7 --dry-run"));
+    text.push_str(&result_line_at(6, "dry", false, "[dry-run] Would merge PR #7"));
+    text.push_str(&bash_line_at(7, "none", "./.loom/scripts/merge-pr.sh 8"));
+    fs::write(&path, text).unwrap();
+    let scan = scan_transcripts(&[path], at(0), at(42)).unwrap();
+    assert_eq!(scan.actions.unwrap().prs_merged, 1);
 }
 
 // ------------------------------------------------------------------------
@@ -450,12 +540,12 @@ fn a_successful_tick_writes_a_self_sufficient_journal_record() {
     transcript.push_str(&usage_line("claude-sonnet-5", 900, 120));
     transcript.push_str(&bash_line("gh issue edit 42 --add-label loom:pr"));
     transcript.push_str(&bash_line("gh pr comment 42 --body approved"));
-    let journal = stage_tick_env(dir.path(), &root, "judge", &transcript);
+    let journal = stage_tick_env(dir.path(), &root, "judge", &restamp_now(&transcript));
 
     emit_for_tick(
         &root,
         "judge",
-        Utc::now(),
+        Utc::now() - chrono::Duration::seconds(60),
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
     );
@@ -497,12 +587,12 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
 
     let mut transcript = role_head("champion");
     transcript.push_str(&usage_line("claude-sonnet-5", 5_000, 500));
-    let journal = stage_tick_env(dir.path(), &root, "champion", &transcript);
+    let journal = stage_tick_env(dir.path(), &root, "champion", &restamp_now(&transcript));
 
     emit_for_tick(
         &root,
         "champion",
-        Utc::now(),
+        Utc::now() - chrono::Duration::seconds(60),
         &RoleTickOutcome::PoolExhausted {
             total: 4,
             next_clear_at: at(9_000),

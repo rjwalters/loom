@@ -2394,6 +2394,11 @@ pub(crate) fn print_status_human(
             if let Some(mark) = &r.maintain_only {
                 println!("        {}: kept current, never dispatched into (#11186)", mark.label());
             }
+            if r.lock_busy {
+                println!(
+                    "        sweep registry lock busy — in-flight/quarantine data omitted (#13443)"
+                );
+            }
             if r.root_missing {
                 println!(
                     "        root does not exist on disk — dispatch is skipped; \
@@ -4229,6 +4234,7 @@ mod stash_status_render_tests {
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -4478,6 +4484,7 @@ mod role_runner_diagnostic_source_render_tests {
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,

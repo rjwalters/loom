@@ -77,12 +77,6 @@ pub fn uname_s() -> String {
     uname_flag("-s")
 }
 
-/// `uname -m`, or `unknown`.
-#[must_use]
-pub fn uname_m() -> String {
-    uname_flag("-m")
-}
-
 fn uname_flag(flag: &str) -> String {
     Command::new("uname")
         .arg(flag)

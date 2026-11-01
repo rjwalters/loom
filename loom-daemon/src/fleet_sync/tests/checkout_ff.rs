@@ -20,32 +20,10 @@ use super::git::{classify_refusal, Refusal};
 use super::host::{hold_for_move, hold_for_self_update};
 use super::*;
 use crate::fleet_sync::FleetSyncStatus;
+use crate::test_git_helpers::{git_out as git_in, run as git};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap()
-}
-
-fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = git_in(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, contents: &str) {
@@ -1129,3 +1107,56 @@ fn a_maintain_only_workspace_is_still_fast_forwarded() {
 
 #[path = "checkout_ff_freshness.rs"]
 mod freshness_tests;
+
+// ------------------------------------------------------------------------
+// The daemon root as an extra, unregistered root (#12727)
+// ------------------------------------------------------------------------
+
+#[test]
+fn the_daemon_root_is_added_to_the_registered_roots() {
+    let fx = Fixture::new();
+    let other = PathBuf::from("/nonexistent/registered");
+    let roots = with_daemon_root(vec![other.clone()], &fx.host);
+    assert_eq!(roots, vec![other, fx.host.clone()]);
+}
+
+#[test]
+fn a_daemon_root_that_is_also_registered_is_visited_once() {
+    let fx = Fixture::new();
+    let roots = with_daemon_root(vec![fx.host.clone()], &fx.host);
+    assert_eq!(roots, vec![fx.host.clone()]);
+    // Reached through a different spelling of the same path.
+    let spelled = fx.host.join("..").join("host");
+    assert_eq!(with_daemon_root(vec![fx.host.clone()], &spelled), vec![fx.host.clone()]);
+}
+
+#[test]
+fn an_absent_or_non_git_daemon_root_adds_nothing() {
+    let tmp = TempDir::new().unwrap();
+    assert!(with_daemon_root(Vec::new(), &tmp.path().join("missing")).is_empty());
+    assert!(with_daemon_root(Vec::new(), tmp.path()).is_empty());
+}
+
+#[test]
+fn a_stale_daemon_root_is_fast_forwarded() {
+    let fx = Fixture::new();
+    let tip = fx.push("README.md", "two\n");
+    let roots = with_daemon_root(Vec::new(), &fx.host);
+    pass_over(&roots, &Knobs::default(), &mut Memory::default());
+    assert_eq!(fx.head(), tip);
+}
+
+#[test]
+fn a_daemon_root_with_divergent_dirt_is_left_alone() {
+    let fx = Fixture::new();
+    fx.push("README.md", "two\n");
+    write(&fx.host.join("README.md"), "my local edit\n");
+    let before = snapshot(&fx.host);
+    let roots = with_daemon_root(Vec::new(), &fx.host);
+    pass_over(&roots, &Knobs::default(), &mut Memory::default());
+    assert_eq!(
+        snapshot(&fx.host),
+        before,
+        "divergent dirt must not be reset, stashed or merged over"
+    );
+}

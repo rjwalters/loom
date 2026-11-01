@@ -70,7 +70,19 @@ impl MetricsState {
         let contents =
             fs::read_to_string(&state_path).context("Failed to read metrics state file")?;
 
-        serde_json::from_str(&contents).context("Failed to parse metrics state JSON")
+        // An empty or corrupt file (e.g. a write interrupted by a restart) must not
+        // fail every collection tick forever: warn and start from defaults; the
+        // next save overwrites the bad file.
+        match serde_json::from_str(&contents) {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Ignoring unreadable metrics state file {} ({e}); starting from defaults",
+                    state_path.display()
+                );
+                Ok(Self::default())
+            }
+        }
     }
 
     fn save_to_workspace(&self, workspace_path: &str) -> Result<()> {
@@ -81,7 +93,14 @@ impl MetricsState {
         let contents =
             serde_json::to_string_pretty(self).context("Failed to serialize metrics state")?;
 
-        fs::write(&state_path, contents).context("Failed to write metrics state file")?;
+        // Atomic write: temp file in the same dir, then rename over the target, so an
+        // interrupted write can never leave a truncated metrics_state.json.
+        let tmp_path = state_path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
+        fs::write(&tmp_path, contents).context("Failed to write metrics state temp file")?;
+        if let Err(e) = fs::rename(&tmp_path, &state_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).context("Failed to rename metrics state file into place");
+        }
 
         Ok(())
     }
@@ -624,8 +643,58 @@ mod tests {
         fs::create_dir_all(&loom_dir).unwrap();
         fs::write(loom_dir.join("metrics_state.json"), "not json").unwrap();
 
-        let result = MetricsState::load_from_workspace(dir.path().to_str().unwrap());
-        assert!(result.is_err());
+        let state = MetricsState::load_from_workspace(dir.path().to_str().unwrap()).unwrap();
+        assert!(state.pr_sync.is_none());
+    }
+
+    #[test]
+    fn test_metrics_state_load_empty_and_whitespace_file_returns_default() {
+        for body in ["", "  \n\t"] {
+            let dir = tempdir().unwrap();
+            let loom_dir = dir.path().join(".loom");
+            fs::create_dir_all(&loom_dir).unwrap();
+            fs::write(loom_dir.join("metrics_state.json"), body).unwrap();
+
+            let state = MetricsState::load_from_workspace(dir.path().to_str().unwrap()).unwrap();
+            assert!(state.pr_sync.is_none());
+            assert!(state.issue_sync.is_none());
+            assert!(state.commit_sync.is_none());
+        }
+    }
+
+    #[test]
+    fn test_metrics_state_load_truncated_json_returns_default() {
+        let dir = tempdir().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+        fs::write(loom_dir.join("metrics_state.json"), r#"{"pr_sync": "2026-01"#).unwrap();
+
+        let state = MetricsState::load_from_workspace(dir.path().to_str().unwrap()).unwrap();
+        assert!(state.pr_sync.is_none());
+    }
+
+    #[test]
+    fn test_metrics_state_save_overwrites_empty_file_and_leaves_no_temp_files() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_str().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+        fs::write(loom_dir.join("metrics_state.json"), "").unwrap();
+
+        let state = MetricsState {
+            pr_sync: Some("2026-01-01T00:00:00Z".to_string()),
+            ..MetricsState::default()
+        };
+        state.save_to_workspace(workspace).unwrap();
+
+        let loaded = MetricsState::load_from_workspace(workspace).unwrap();
+        assert_eq!(loaded.pr_sync, Some("2026-01-01T00:00:00Z".to_string()));
+
+        let names: Vec<String> = fs::read_dir(&loom_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["metrics_state.json".to_string()], "stray temp files: {names:?}");
     }
 
     // ===== insert_github_event tests =====

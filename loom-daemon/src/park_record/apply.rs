@@ -268,7 +268,13 @@ pub fn apply(
         // #12665: the hold transition, only when the label was not already on.
         journal_hold_add(req, added.is_ok());
         if let Err(e) = added {
-            let _ = writeln!(err, "park-record apply: labeling #{n} failed: {e}");
+            let _ = writeln!(
+                err,
+                "park-record apply: labeling #{n} failed: {e}\n\
+                 park-record apply: the park record is in the body but the hold label is not on \
+                 the issue; if the label is missing on the forge, run \
+                 ./.loom/scripts/sync-labels.sh --check (then without --check) and re-apply"
+            );
             return exit::FORGE;
         }
     }
@@ -303,6 +309,7 @@ pub const HOLD_EQUIVALENCE_ENV: &str = "LOOM_HOLD_EQUIVALENCE";
 fn hold_trigger(equivalence: Option<&str>) -> &'static str {
     match equivalence {
         Some("unread") => "champion_role_equivalence_unread",
+        Some("base-unread") => "champion_role_equivalence_base_unread",
         _ => "champion_role",
     }
 }
@@ -320,6 +327,7 @@ fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
         hold_reason_code(req.reason.as_deref()),
         hold_trigger(std::env::var(HOLD_EQUIVALENCE_ENV).ok().as_deref()),
         confirmed,
+        None,
         None,
     );
 }
@@ -351,6 +359,9 @@ mod trigger_tests {
     fn an_unread_compare_rearm_has_its_own_trigger() {
         assert_eq!(hold_trigger(Some("unread")), "champion_role_equivalence_unread");
         assert_eq!(hold_trigger(Some("changed")), "champion_role");
+        assert_eq!(hold_trigger(Some("base-unread")), "champion_role_equivalence_base_unread");
+        assert_eq!(hold_trigger(Some("unread; echo hostile")), "champion_role");
+        assert_eq!(hold_trigger(Some("equivalence=base-unread")), "champion_role");
         assert_eq!(hold_trigger(None), "champion_role");
     }
 }

@@ -238,7 +238,8 @@ pub(crate) fn gh_fetch_page(
     page: u32,
 ) -> Result<Vec<u8>, String> {
     let path = format!("repos/{repo}/pulls/{pr}/files?per_page={PAGE_SIZE}&page={page}");
-    crate::verdict_equivalence::gh_api_result("forge.version_only_diff", gh_bin, None, &path)
+    crate::verdict_equivalence::gh_api_checked("forge.version_only_diff", gh_bin, None, &path)
+        .map_err(|e| format!("forge read of `{path}` failed: {e}"))
 }
 
 /// The `OWNER/REPO` every `repos/<r>/…` read is addressed to (#13296): the

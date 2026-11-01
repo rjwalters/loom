@@ -4,29 +4,16 @@
 
 use super::*;
 use crate::activity::{AgentInput, InputContext, InputType};
+use crate::test_git_helpers::run as git;
 use crate::types::{AgentStatus, TerminalInfo};
 use chrono::Utc;
 use serde_json::json;
 use serial_test::serial;
-use std::process::Command;
 use tempfile::{tempdir, TempDir};
 
 fn isolate_env() {
     std::env::set_var("LOOM_CONFIG_DEFAULTS_FILE", "");
     std::env::remove_var("LOOM_FORGE_TYPE");
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// A git repo with `origin` = `remote` (if any) and `.loom/config.json`

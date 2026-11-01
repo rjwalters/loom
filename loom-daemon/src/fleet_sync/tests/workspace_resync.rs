@@ -23,6 +23,7 @@ use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
 use crate::init::payload::{resync_workspace_with, ResyncOutcome, Stamp};
 use crate::install_compat::INSTALL_METADATA_PATH;
+use crate::test_git_helpers::run as git;
 
 const RUNNING: &str = "0.19.880";
 const REPO: &str = "acme/app";
@@ -34,22 +35,6 @@ fn t0() -> DateTime<Utc> {
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, contents: &str) {
@@ -257,6 +242,10 @@ struct Host<'f> {
     /// deadline.
     heads: head_check::ForgeHeads,
     overdue: Cell<bool>,
+    /// What the daemon-owned landing answers, and every `(repo, PR)` it was
+    /// asked about (#13268).
+    landing: RefCell<Landed>,
+    landed: RefCell<Vec<(String, u32)>>,
 }
 
 impl<'f> Host<'f> {
@@ -289,6 +278,8 @@ impl<'f> Host<'f> {
             before_claim: RefCell::new(None),
             heads: head_check::ForgeHeads::default(),
             overdue: Cell::new(false),
+            landing: RefCell::new(Landed::Waiting("no Judge approval".to_string())),
+            landed: RefCell::new(Vec::new()),
         }
     }
 
@@ -350,6 +341,10 @@ impl<'f> Host<'f> {
             },
             overdue: &|| self.overdue.get(),
             heads: &|asks| self.heads.answer(asks),
+            land: &|_, nwo, pr| {
+                self.landed.borrow_mut().push((nwo.to_string(), pr));
+                self.landing.borrow().clone()
+            },
         };
         run(&env, roots, mode, &mut self.memory.borrow_mut())
     }
@@ -906,7 +901,15 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
     let host = Host::new(&fx, "host-a");
     let before = fx.origin_head();
 
-    let pass = host.pass();
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // No PR was opened, so this stays an ERROR (#13465).
+    assert!(
+        logs.iter()
+            .any(|l| l.0 == log::Level::Error && l.1.contains("branch rule")),
+        "{logs:?}"
+    );
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     let until = t0() + ChronoDuration::hours(6);
@@ -984,7 +987,13 @@ fn a_refused_default_branch_gets_a_resync_pull_request_once() {
     let before = fx.origin_head();
     let branch = format!("chore/loom-resync-v{RUNNING}");
 
-    let pass = host.pass();
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // The refused push ended in an open PR: expected path, so never ERROR (#13465).
+    let line = |l: &&(log::Level, String)| l.1.contains("resync pull request open");
+    assert!(logs.iter().filter(line).all(|l| l.0 == log::Level::Warn), "{logs:?}");
+    assert!(logs.iter().any(|l| line(&l) && l.0 == log::Level::Warn), "{logs:?}");
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     assert!(reason(report).contains("resync pull request open: #1 "), "{report:?}");
@@ -1010,6 +1019,50 @@ fn a_refused_default_branch_gets_a_resync_pull_request_once() {
     assert_eq!(fx.forge.pulls.borrow().len(), 1);
     assert_eq!(git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]), pushed);
     assert!(again.alerts.is_empty(), "alerted once per repo");
+}
+
+#[test]
+fn the_daemon_hands_its_own_resync_pull_request_to_the_queue() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+
+    // Opening the PR asks for the landing at once; no approval yet, so it waits.
+    let first = host.pass();
+    assert!(
+        reason(only(&first)).contains("landing: waiting (no Judge approval)"),
+        "{first:?}"
+    );
+    assert_eq!(*host.landed.borrow(), vec![(REPO.to_string(), 1)]);
+
+    // Judge approves; the next look hands it over without any Champion step.
+    *host.landing.borrow_mut() = Landed::Queued;
+    host.now.set(t0() + ChronoDuration::hours(7));
+    let second = host.pass();
+    assert!(reason(only(&second)).contains("landing: queued"), "{second:?}");
+    assert_eq!(host.landed.borrow().len(), 2);
+    assert_eq!(fx.forge.pulls.borrow().len(), 1, "still one PR");
+}
+
+#[test]
+fn a_landing_that_fails_leaves_the_pull_request_and_the_alert() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    *host.landing.borrow_mut() = Landed::Failed("head moved".to_string());
+    let pass = host.pass();
+    let report = only(&pass);
+    assert_eq!(report.state, WState::W1, "{report:?}");
+    assert!(reason(report).contains("landing: failed (head moved)"), "{report:?}");
+    assert_eq!(pass.alerts.len(), 1, "branch-protection stays raised");
+}
+
+#[test]
+fn a_direct_push_never_asks_for_a_landing() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    assert_eq!(only(&host.pass()).state, WState::W0);
+    assert!(host.landed.borrow().is_empty());
 }
 
 #[test]
