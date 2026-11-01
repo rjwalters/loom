@@ -458,6 +458,35 @@ fn watermarks_never_move_backwards_and_carry_the_slack() {
         .any(|w| w[0] == "--search" && w[1].starts_with("merged:>=")));
 }
 
+/// #13481: a full page is only "saturated" (may hide an in-window merge)
+/// when every row on it is inside the lookback window. A long-lived repo's
+/// unwatermarked page is full of history older than the window and must not
+/// warn "filled its page (0 rows)".
+#[test]
+fn a_full_page_of_out_of_window_history_is_not_saturated() {
+    let cutoff = Utc::now() - chrono::Duration::days(7);
+    let row = |merged_at: DateTime<Utc>| {
+        serde_json::json!({ "mergedAt": merged_at.to_rfc3339_opts(SecondsFormat::Secs, true) })
+    };
+    let limit = RECONCILE_PR_LIMIT;
+    let old: Vec<Value> = (0..limit)
+        .map(|_| row(cutoff - chrono::Duration::days(30)))
+        .collect();
+    assert!(!page_may_hide_in_window_merges(&old, limit, cutoff));
+    let fresh: Vec<Value> = (0..limit).map(|_| row(Utc::now())).collect();
+    assert!(page_may_hide_in_window_merges(&fresh, limit, cutoff));
+    // Short of a full page: never saturated, whatever the dates.
+    assert!(!page_may_hide_in_window_merges(&fresh[..3], limit, cutoff));
+    // One out-of-window row anywhere on a full page: the page reached past
+    // the window, so it cannot hide an in-window merge.
+    let mut mixed = fresh.clone();
+    mixed[limit as usize - 1] = row(cutoff - chrono::Duration::hours(1));
+    assert!(!page_may_hide_in_window_merges(&mixed, limit, cutoff));
+    // An undated row counts as in-window (errs towards the warning).
+    let undated: Vec<Value> = (0..limit).map(|_| serde_json::json!({})).collect();
+    assert!(page_may_hide_in_window_merges(&undated, limit, cutoff));
+}
+
 /// Seed the transcript a dispatched **step** leaves behind (#13287): a
 /// `/loom:builder <issue>` session, not `/loom:sweep`, with one model's usage.
 fn seed_step_transcript(config: &Path, workspace: &str, command: &str, args: &str) {
