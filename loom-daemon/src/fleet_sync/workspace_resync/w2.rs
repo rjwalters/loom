@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
 use super::memory::FailureKind;
+use super::waiver::Waived;
 use super::{
     daemon, git, record_failure, record_failure_at, refused, stamp, Alert, Candidate, Env, Memory,
     Scan, WState, WorkspaceReport,
@@ -477,7 +478,7 @@ impl Step<'_, '_> {
         };
         let existing: serde_json::Value = serde_json::from_str(&listed.body).unwrap_or_default();
         if let Some(pr) = existing.as_array().and_then(|a| a.first()) {
-            let rule = self.land(pr_number(pr), rule);
+            let rule = self.land_pr(pr_number(pr), rule, false);
             return Ok(Done::PrOpen(pr_number(pr), pr_url(pr), rule));
         }
         match git::push(self.worktree, self.root, &branch) {
@@ -510,7 +511,35 @@ impl Step<'_, '_> {
             Err(e) => return Ok(failed(format!("opening the PR: {e:#}"))),
         };
         let number = pr_number(&pr);
-        if let Some(n) = number {
+        log::info!("workspace_resync: {nwo}: opened resync PR for {new}: {}", pr_url(&pr));
+        let rule = self.land_pr(number, rule, true);
+        Ok(Done::PrOpen(number, pr_url(&pr), rule))
+    }
+
+    /// Land the resync PR on the waiver proof (#13487), or leave it to the
+    /// ordinary lane: `loom:review-requested` (only on a PR this pass opened,
+    /// `label_lane`), then the merge-queue hand-off (#13268). The proof is
+    /// the daemon's own; the host gate is read again first, so a pause or a
+    /// roll that began since the push holds it.
+    fn land_pr(&self, number: Option<u64>, rule: String, label_lane: bool) -> String {
+        let nwo = &self.candidate.nwo;
+        let waived = match number.and_then(|n| u32::try_from(n).ok()) {
+            None => Waived::Lane("no PR number in the reply".to_string()),
+            Some(n) => match (self.env.gate)() {
+                Err(why) => Waived::Held(format!("{} before landing", why.host_note())),
+                Ok(()) => (self.env.waive)(self.root, nwo, n),
+            },
+        };
+        log::info!(
+            "workspace_resync: {nwo}: resync PR {number:?}: {}: {}",
+            waived.word(),
+            waived.reason()
+        );
+        let note = format!("{}: {}", waived.word(), waived.reason());
+        if matches!(waived, Waived::Landed(_)) {
+            return format!("{rule}; {note}");
+        }
+        if let (Some(n), true) = (number, label_lane) {
             // The label Judge and then Champion work from. A failure leaves a
             // PR a person can label; it is not worth abandoning the route.
             let labelled = self.claimant.write.write(
@@ -522,9 +551,7 @@ impl Step<'_, '_> {
                 log::warn!("workspace_resync: {nwo}: could not label resync PR #{n}");
             }
         }
-        log::info!("workspace_resync: {nwo}: opened resync PR for {new}: {}", pr_url(&pr));
-        let rule = self.land(number, rule);
-        Ok(Done::PrOpen(number, pr_url(&pr), rule))
+        format!("{}; {note}", self.land(number, rule))
     }
 
     /// Hand the open resync PR to the merge queue from the daemon (#13268),
