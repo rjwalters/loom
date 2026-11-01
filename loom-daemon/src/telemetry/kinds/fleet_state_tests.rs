@@ -532,8 +532,6 @@ fn collector_keeps_every_fleet_state_log_attribute() {
 fn champion_metadata_survives_all_repo_chunks() {
     let mut r = anchor_with(100);
     let metadata = ChampionState {
-        approval: None,
-        merge: None,
         prompt_source: "/loom:champion".into(),
         prompt_hash: Some("a".repeat(64)),
         interval_enabled: true,
