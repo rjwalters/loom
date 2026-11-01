@@ -74,6 +74,7 @@ Issues currently being built (`loom:building`).
 - **#13357**: merge queue: enqueue intermittently refused with "No merge queue found for branch" while the ruleset is active; the handoff rolls back and later succeeds
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests
+- **#13428**: pool_preflight: an empty sweep-lifecycle preference list arms the EXHAUSTED hold and logs a WARN/recovered pair every tick
 
 ## PRs Awaiting Review
 
@@ -187,6 +188,7 @@ Issues carrying `loom:curated`.
 - **#13359**: champion: critical-file hold re-armed on a tree-equivalent Doctor rebase when the forge compare is unreadable (equivalence=unread); retry or local fallback before re-arming *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
 - **#13396**: test flake: safehouse run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh fails with ETXTBSY on Rust Unit Tests *(curated)*
+- **#13428**: pool_preflight: an empty sweep-lifecycle preference list arms the EXHAUSTED hold and logs a WARN/recovered pair every tick *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -222,10 +224,10 @@ Issues carrying `loom:curated`.
 | Very important | 1 |
 | Important | 13 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 12 |
+| In Progress (`loom:building`) | 13 |
 | PRs awaiting review | 7 |
 | Approved PRs awaiting merge | 10 |
-| Curated | 81 |
+| Curated | 82 |
 | Architect / Hermit proposals | 10 |
 | Active epics | 10 |
 <!-- guide:plan-body:end -->

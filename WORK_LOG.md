@@ -15,6 +15,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-31
 
+- **PR #13341**: feat: warn on missing hold labels and hint sync-labels on failed park
+- **Issue #13330** (closed): sweep: park-for-operator silently fails when loom:operator label doesn't exist on the forge
+- **PR #13432**: fix: run idle-worktree backup under the root's per-owner GH_CONFIG_DIR
+- **Issue #13426** (closed): open_backup: reaper backup push runs under the workspace-root owner's credential, so every cross-owner backup 403s and nothing is reaped
+- **PR #13431**: fix(metrics): tolerate empty metrics state file and save it atomically
+- **Issue #13427** (closed): metrics_collector: a 0-byte metrics_state.json fails every collection tick forever
+- **Issue #13425** (closed): QueueSnapshotRow: ship operator_priority_inherited_from and why the source's starred-at was unknown
 - **PR #13422**: feat(doctor): add forge doctor-handback, a verified add-first hand-back
 - **PR #13420**: feat: add --resweep to notify-cleared-blockers for marker-carrying parked issues
 - **Issue #9388** (closed): Doctor rechecks the head SHA before pushing but not the labels before writing them
