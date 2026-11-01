@@ -254,6 +254,7 @@ pub(super) fn attempt(
             report.state = WState::W0;
             report.reason = None;
             settle_current(env, &root, &candidate.branch, &commit, report, memory);
+            super::supersede::close_superseded(&claimant, env.running, None);
             report.reason = Some("already current once the claim was held; no commit".to_string());
         }
         Ok(Done::NoWrite(state, reason)) => {
@@ -295,6 +296,7 @@ pub(super) fn attempt(
                 log::Level::Warn,
             );
             memory.mark_pr_open(&report.root);
+            super::supersede::close_superseded(&claimant, env.running, number);
         }
         Err(e) => fail_attempt(env, &candidate.nwo, report, &e, memory, scan),
     }
