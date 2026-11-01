@@ -3,10 +3,16 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use super::waiver::{self, Checks, File, Landing, Pr, Source, Waived};
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+
+/// Per-call deadline for one `gh` request.
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Upstream, where the tag and the `defaults/` blobs live.
 const UPSTREAM: &str = "rjwalters/loom";
@@ -18,22 +24,29 @@ pub struct Gh<'a> {
 }
 
 impl Gh<'_> {
-    fn gh(&self, args: &[&str]) -> Result<String, String> {
-        let out = Command::new(crate::gh_invocation::gh_bin())
+    /// One `gh` call through the facade (counted, bounded, credentialed),
+    /// accounted under `op`. A read is reader-only, as every daemon read is.
+    fn gh(&self, op: &'static str, intent: AccessIntent, args: &[&str]) -> Result<String, String> {
+        let inv = GhInvocation::new(Operation::new(op), intent, GhTarget::None, GH_TIMEOUT)
             .args(args)
-            .current_dir(self.root)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("gh: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            .current_dir(self.root);
+        let inv = if intent == AccessIntent::Read {
+            inv.reader_only()
         } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+            inv
+        };
+        match inv.run() {
+            CmdOutcome::Ran(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+            CmdOutcome::Ran(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            CmdOutcome::Unavailable(u) => Err(format!("gh ({op}): {u}")),
         }
     }
 
-    fn json(&self, path: &str) -> Result<Value, String> {
-        serde_json::from_str(&self.gh(&["api", path])?).map_err(|e| e.to_string())
+    fn json(&self, op: &'static str, path: &str) -> Result<Value, String> {
+        serde_json::from_str(&self.gh(op, AccessIntent::Read, &["api", path])?)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -57,7 +70,7 @@ fn encode_path(path: &str) -> String {
 
 impl Source for Gh<'_> {
     fn pr(&self, number: u32) -> Result<Pr, String> {
-        let v = self.json(&format!("repos/{}/pulls/{number}", self.nwo))?;
+        let v = self.json("resync_waiver.pr", &format!("repos/{}/pulls/{number}", self.nwo))?;
         Ok(Pr {
             title: v["title"].as_str().ok_or("no title")?.to_string(),
             head_sha: v["head"]["sha"].as_str().ok_or("no head")?.to_string(),
@@ -67,16 +80,25 @@ impl Source for Gh<'_> {
     }
 
     fn files(&self, number: u32) -> Result<Vec<File>, String> {
-        let raw = self.gh(&[
-            "api",
-            "--paginate",
-            "--slurp",
-            &format!("repos/{}/pulls/{number}/files?per_page=100", self.nwo),
-        ])?;
-        let pages: Vec<Vec<Value>> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        Ok(pages
+        // `--jq '.[]'` instead of `--slurp`: the page walk carries `--jq`, not
+        // `--slurp`, and one object per file is all the proof reads.
+        let raw = self.gh(
+            "resync_waiver.files",
+            AccessIntent::Read,
+            &[
+                "api",
+                "--paginate",
+                "--jq",
+                ".[]",
+                &format!("repos/{}/pulls/{number}/files?per_page=100", self.nwo),
+            ],
+        )?;
+        let files: Vec<Value> = serde_json::Deserializer::from_str(&raw)
+            .into_iter::<Value>()
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(files
             .into_iter()
-            .flatten()
             .map(|f| File {
                 filename: f["filename"].as_str().unwrap_or_default().to_string(),
                 previous_filename: f["previous_filename"].as_str().map(str::to_string),
@@ -87,21 +109,28 @@ impl Source for Gh<'_> {
     }
 
     fn metadata(&self, sha: &str) -> Result<String, String> {
-        self.gh(&[
-            "api",
-            "-H",
-            "Accept: application/vnd.github.raw",
-            &format!("repos/{}/contents/.loom/install-metadata.json?ref={sha}", self.nwo),
-        ])
+        self.gh(
+            "resync_waiver.metadata",
+            AccessIntent::Read,
+            &[
+                "api",
+                "-H",
+                "Accept: application/vnd.github.raw",
+                &format!("repos/{}/contents/.loom/install-metadata.json?ref={sha}", self.nwo),
+            ],
+        )
     }
 
     fn tag_exists(&self, tag: &str) -> Result<bool, String> {
-        let v = self.json(&format!("repos/{UPSTREAM}/git/ref/tags/{tag}"))?;
+        let v = self.json("resync_waiver.tag", &format!("repos/{UPSTREAM}/git/ref/tags/{tag}"))?;
         Ok(v["ref"].as_str() == Some(&format!("refs/tags/{tag}")))
     }
 
     fn upstream_blob(&self, path: &str, tag: &str) -> Result<Option<String>, String> {
-        let v = self.json(&format!("repos/{UPSTREAM}/contents/{}?ref={tag}", encode_path(path)))?;
+        let v = self.json(
+            "resync_waiver.upstream_blob",
+            &format!("repos/{UPSTREAM}/contents/{}?ref={tag}", encode_path(path)),
+        )?;
         Ok((v["type"].as_str() == Some("file"))
             .then(|| v["sha"].as_str().map(str::to_string))
             .flatten())
@@ -136,35 +165,51 @@ impl Landing for Gh<'_> {
 
     fn relabel(&self, number: u32, add: &[&str], remove: &[&str]) -> Result<(), String> {
         for label in add {
-            self.gh(&[
-                "api",
-                "-X",
-                "POST",
-                &format!("repos/{}/issues/{number}/labels", self.nwo),
-                "-f",
-                &format!("labels[]={label}"),
-            ])?;
+            self.gh(
+                "resync_waiver.add_label",
+                AccessIntent::Write,
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    &format!("repos/{}/issues/{number}/labels", self.nwo),
+                    "-f",
+                    &format!("labels[]={label}"),
+                ],
+            )?;
         }
         for label in remove {
-            self.gh(&[
-                "api",
-                "-X",
-                "DELETE",
-                &format!("repos/{}/issues/{number}/labels/{}", self.nwo, label.replace(':', "%3A")),
-            ])?;
+            self.gh(
+                "resync_waiver.remove_label",
+                AccessIntent::Write,
+                &[
+                    "api",
+                    "-X",
+                    "DELETE",
+                    &format!(
+                        "repos/{}/issues/{number}/labels/{}",
+                        self.nwo,
+                        label.replace(':', "%3A")
+                    ),
+                ],
+            )?;
         }
         Ok(())
     }
 
     fn comment(&self, number: u32, body: &str) -> Result<(), String> {
-        self.gh(&[
-            "api",
-            "-X",
-            "POST",
-            &format!("repos/{}/issues/{number}/comments", self.nwo),
-            "-f",
-            &format!("body={body}"),
-        ])
+        self.gh(
+            "resync_waiver.comment",
+            AccessIntent::Write,
+            &[
+                "api",
+                "-X",
+                "POST",
+                &format!("repos/{}/issues/{number}/comments", self.nwo),
+                "-f",
+                &format!("body={body}"),
+            ],
+        )
         .map(|_| ())
     }
 
@@ -190,6 +235,16 @@ impl Landing for Gh<'_> {
 
 /// The production `waive` hook.
 pub fn waive(root: &Path, nwo: &str, number: u32) -> Waived {
+    // The label, comment and merge below are daemon forge writes: scoped by
+    // `write_scope` (#9548) here too, not only by the pass that calls this.
+    if !crate::write_scope::gate_repo_with(
+        root,
+        nwo,
+        &crate::write_scope::default_gh(),
+        "resync waiver landing (#13487)",
+    ) {
+        return Waived::Held("the write scope does not allow this repo".to_string());
+    }
     let gh = Gh { root, nwo };
     waiver::land(&gh, &gh, number)
 }
@@ -209,14 +264,18 @@ pub fn cli(pr: u32, repo: Option<&str>) -> i32 {
                 root: &root,
                 nwo: "",
             };
-            match probe.gh(&[
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ]) {
+            match probe.gh(
+                "resync_waiver.repo_view",
+                AccessIntent::Read,
+                &[
+                    "repo",
+                    "view",
+                    "--json",
+                    "nameWithOwner",
+                    "--jq",
+                    ".nameWithOwner",
+                ],
+            ) {
                 Ok(out) if out.trim().contains('/') => out.trim().to_string(),
                 _ => {
                     println!("RESYNC_WAIVER=NOT_ELIGIBLE");
