@@ -442,10 +442,11 @@ assert_present 'branches: [main]' \
     "Case 6: trigger is restricted to pushes on main"
 
 TRIGGER_PATHS="$(workflow_code | awk '/^ +paths:/{found=1; next} found {if ($1 == "-") print $2; else exit}')"
-if [[ "$TRIGGER_PATHS" == '"defaults/**"' ]]; then
-    pass "Case 6: path filter is exactly defaults/** (one entry)"
+EXPECTED_PATHS=$'"defaults/**"\n"loom-daemon/**"\n"loom-api/**"'
+if [[ "$TRIGGER_PATHS" == "$EXPECTED_PATHS" ]]; then
+    pass "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)"
 else
-    fail "Case 6: path filter is exactly defaults/** (one entry)" \
+    fail "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
         "Parsed path list was: '${TRIGGER_PATHS:-<none>}'" \
         "Widening this filter lets the bump commit re-trigger the workflow." \
         "Publisher App commits DO trigger workflows, so this is the real loop guard."
@@ -456,13 +457,13 @@ fi
 FILE_SETS="$(workflow_code | awk '/files\+?=\(/{f=1} f {print} f && /\)$/{f=0}')"
 SET_COUNT="$(grep -c 'files=(' <<<"$FILE_SETS" || true)"
 if [[ "$SET_COUNT" -ne 2 ]]; then
-    fail "Case 6: version-file sets stage no defaults/ path" \
+    fail "Case 6: version-file sets stage no defaults/, loom-daemon/ or loom-api/ path" \
         "expected 2 files=(...) sets (bump-version, publish), found $SET_COUNT"
-elif grep -q 'defaults/' <<<"$FILE_SETS"; then
-    fail "Case 6: version-file sets stage no defaults/ path" \
-        "A defaults/ path would make the bump commit re-trigger the workflow:" "$FILE_SETS"
+elif grep -qE '(defaults|loom-daemon|loom-api)/' <<<"$FILE_SETS"; then
+    fail "Case 6: version-file sets stage no defaults/, loom-daemon/ or loom-api/ path" \
+        "A path under a trigger-filter dir would make the bump commit re-trigger the workflow:" "$FILE_SETS"
 else
-    pass "Case 6: version-file sets stage no defaults/ path (cannot re-trigger itself)"
+    pass "Case 6: version-file sets stage no defaults/, loom-daemon/ or loom-api/ path (cannot re-trigger itself)"
 fi
 
 for managed in VERSION package.json mcp-loom/package.json mcp-loom/package-lock.json \
@@ -797,7 +798,7 @@ ANCHORS
     # Widen the trigger path filter (would let the bump commit re-trigger).
     awk '/- "defaults\/\*\*"/ { print; sub(/"defaults\/\*\*"/, "\"docs/**\""); print; next } { print }' \
         "$WORKFLOW" >"$MUTANT"
-    expect_child_fails "Case 6: path filter is exactly defaults/** (one entry)" \
+    expect_child_fails "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
         "Case 8: widened paths: filter is rejected"
 
     # Grant contents: write at workflow level.
@@ -807,7 +808,7 @@ ANCHORS
 
     # A defaults/ path in the version-file set (self-trigger loop).
     sed 's|files=(VERSION package.json|files=(VERSION defaults/VERSION package.json|' "$WORKFLOW" >"$MUTANT"
-    expect_child_fails "Case 6: version-file sets stage no defaults/ path" \
+    expect_child_fails "Case 6: version-file sets stage no defaults/, loom-daemon/ or loom-api/ path" \
         "Case 8: a defaults/ path in the version-file set is rejected"
 
     # An unnamed answer logged and retried instead of failing red.

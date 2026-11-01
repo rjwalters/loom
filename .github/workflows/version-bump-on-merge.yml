@@ -16,11 +16,11 @@ name: Version Bump on Merge
 # since that value change should only ever come from this workflow.
 #
 # Self-trigger note: the bump commit this workflow publishes never touches
-# `defaults/` (it only rewrites the version-bearing files themselves --
+# `defaults/`, `loom-daemon/` or `loom-api/` (it only rewrites the version-bearing files themselves --
 # `package.json`, `mcp-loom/package.json`, `Cargo.toml`,
 # `VERSION`, `.loom/install-metadata.json` if present, plus the derived
-# `Cargo.lock` / `mcp-loom/package-lock.json`), so the `paths: ['defaults/**']`
-# filter below can never see its own push and re-trigger a loop. Do NOT add
+# `Cargo.lock` / `mcp-loom/package-lock.json`), so the `paths:` filter (`defaults/**`,
+# `loom-daemon/**`, `loom-api/**`; both crates inherit `version.workspace = true`) below can never see its own push and re-trigger a loop. Do NOT add
 # an extra guard for that -- a naive one (e.g. skipping when the pusher is
 # this workflow's own bot identity) would also suppress a legitimate human
 # push that happens to share that identity, for no benefit, since the path
@@ -60,11 +60,11 @@ name: Version Bump on Merge
 # no `gh` call at all and is off the bypass ledger), whether this run bumps:
 #   push              bump if the window has elapsed, else `deferred:` (exit 0)
 #   schedule (hourly) the catch-up for a quiet day: bump if the window has
-#                     elapsed AND defaults/ changed since the last bump
+#                     elapsed AND a releasable change landed since the last bump
 #   workflow_dispatch `force: true` + `reason` skips the window (operator
 #                     hotfix path, e.g. a fix a `loom_min_version` floor needs
 #                     now); the reason and actor are recorded in the commit
-# Every path still requires an unreleased defaults/ change, so no no-op
+# Every path still requires an unreleased releasable change (defaults/, loom-daemon/, loom-api/), so no no-op
 # version is ever cut. The gate runs before any toolchain setup, so a
 # deferred run costs seconds.
 
@@ -73,6 +73,8 @@ on:
     branches: [main]
     paths:
       - "defaults/**"
+      - "loom-daemon/**"
+      - "loom-api/**"
   # Hourly, not daily: against a 24 h window that started at an arbitrary
   # time, a once-a-day cron can push the catch-up out to ~48 h. Hourly bounds
   # the worst case at RELEASE_MIN_INTERVAL + ~1 h (+ GitHub's own schedule

@@ -22,7 +22,7 @@
 #   or empty. A non-integer or negative value is an error, never "always bump".
 #   0 is accepted and means "no rate limit" (the pre-#11174 behaviour).
 #   --force (workflow_dispatch only) skips the interval check, never the
-#   "is there anything unreleased under defaults/" check; it needs a --reason.
+#   "is there anything unreleased" (releasable change) check; it needs a --reason.
 #
 # Output (stdout, key=value): decision=bump|deferred|nothing|error,
 #   last_bump_sha=, last_bump_at=, eligible_at=, forced=, reason=
@@ -110,19 +110,21 @@ if [[ "$subject" != "chore: bump version to "* ]]; then
 fi
 eligible_ct=$((last_ct + interval))
 
-# Anything unreleased? Same filter as the push trigger's `paths: defaults/**`,
+# Anything unreleased? A releasable change is one under defaults/, loom-daemon/
+# or loom-api/ (the latter two compile into the released loom-daemon binary).
+# Same filter as the push trigger's `paths:`,
 # which a scheduled or dispatched run does not get. diff-tree compares tree
 # ids only, so a blob:none partial clone answers it without fetching blobs.
 rc=0
-git diff-tree --quiet -r "$last_sha" "$ref" -- defaults/ || rc=$?
+git diff-tree --quiet -r "$last_sha" "$ref" -- defaults/ loom-daemon/ loom-api/ || rc=$?
 case "$rc" in
   0)
     eligible_ct=""
-    emit nothing "nothing to release: no defaults/ change on ${ref} since the last bump ${last_sha:0:12}"
+    emit nothing "nothing to release: no releasable change (defaults/, loom-daemon/, loom-api/) on ${ref} since the last bump ${last_sha:0:12}"
     exit 0
     ;;
   1) ;;
-  *) die "git diff-tree ${last_sha:0:12} ${ref} -- defaults/ failed (rc=${rc})" ;;
+  *) die "git diff-tree ${last_sha:0:12} ${ref} -- defaults/ loom-daemon/ loom-api/ failed (rc=${rc})" ;;
 esac
 
 if [[ "$force" == "true" ]]; then
@@ -131,7 +133,7 @@ if [[ "$force" == "true" ]]; then
 fi
 
 if ((now - last_ct >= interval)); then
-  emit bump "${interval}s elapsed since the last bump ${last_sha:0:12} and defaults/ changed since it"
+  emit bump "${interval}s elapsed since the last bump ${last_sha:0:12} and a releasable change landed since it"
   exit 0
 fi
 

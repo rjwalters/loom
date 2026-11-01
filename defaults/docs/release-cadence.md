@@ -2,7 +2,7 @@
 
 `VERSION` (and the other five `scripts/version.sh`-managed files, #5517) is
 bumped by `version-bump-on-merge.yml` (#7743) **at most once per
-`RELEASE_MIN_INTERVAL`** (default 24 h, #11174): `defaults/` merges inside the
+`RELEASE_MIN_INTERVAL`** (default 24 h, #11174): releasable merges (`defaults/`, `loom-daemon/`, `loom-api/`) inside the
 window accumulate, unreleased, and ship together in the next bump. A GitHub
 Release is a **separate event with its own rule**, stated below, and not every
 `VERSION` gets one. This doc states the bump cadence, the release rule, and
@@ -20,8 +20,8 @@ direction (2026-10-09) is **at most one release a day**.
   last bump is the newest **first-parent** `main` commit that changed
   `VERSION`, timed by its **committer** time (PRs cannot change `VERSION`, so
   only bump commits match; tags and Release dates are never read). A run bumps
-  only when `now - last_bump >= RELEASE_MIN_INTERVAL` **and** something under
-  `defaults/` changed since that bump. Otherwise it exits green and changes
+  only when `now - last_bump >= RELEASE_MIN_INTERVAL` **and** a releasable change (under
+  `defaults/`, `loom-daemon/` or `loom-api/`) landed since that bump. Otherwise it exits green and changes
   nothing, with `deferred: last bump <sha> at <UTC>; next bump eligible at
   <UTC>` (or `nothing to release`) in the job summary. The gate is re-checked
   after every `git fetch` in the publish-retry loop, so a bump that lands
@@ -43,7 +43,7 @@ direction (2026-10-09) is **at most one release a day**.
   never falls back to "always bump". `0` explicitly disables the limit. A
   missing bump commit or a shallow checkout also fails red: a gate wrong in
   the "defer" direction would silently stop releases.
-- **Triggers.** A `defaults/**` push to `main` (as before); an **hourly**
+- **Triggers.** A push to `main` touching `defaults/**`, `loom-daemon/**` or `loom-api/**`; an **hourly**
   `schedule` catch-up, which is what ships a quiet day's merges; and
   `workflow_dispatch`. Worst-case delay from the first unreleased merge to its
   bump is `RELEASE_MIN_INTERVAL` + about 1 h, plus GitHub's own schedule delay
@@ -52,7 +52,7 @@ direction (2026-10-09) is **at most one release a day**.
   time it can stretch the wait to about 48 h.
 - **Hotfix path.** Dispatch the workflow with `force: true` and a `reason`
   (required) to bump now. `force` skips only the interval: there must still be
-  an unreleased `defaults/` change, so no no-op version is cut. The commit body
+  an unreleased releasable change, so no no-op version is cut. The commit body
   records `Forced-by: <actor>` and `Reason: <reason>`; a bot actor is refused.
   Anyone with `workflow_dispatch` (write) access can force; it is the operator
   path. A forced bump starts a new window. `force: false` runs the normal gate,
