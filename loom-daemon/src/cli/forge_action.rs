@@ -606,6 +606,22 @@ pub(crate) enum ForgeAction {
         repo: Option<String>,
     },
 
+    /// `forge resync-waiver <pr> [--repo OWNER/REPO]` (#13487) — the resync waiver proof
+    /// (#13096): is PR `<pr>` a `chore(loom): resync installed Loom to vX` whose changed
+    /// kept-set files are byte-identical to the tag? Exit 0 prints `RESYNC_WAIVER=ELIGIBLE`,
+    /// `RESYNC_WAIVER_TAG=` and `RESYNC_WAIVER_RECORD=` lines; anything else exits 1.
+    /// The daemon's own resync landing runs the same function.
+    #[command(name = "resync-waiver")]
+    ResyncWaiver {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge suspect-critical-diff <pr> <file> [--repo OWNER/REPO]` (#12999) —
     /// does any changed line of `<file>` (a `Cargo.toml` or `package.json`) in
     /// PR `<pr>` touch a suspect surface? Champion's `critical-files` criterion's hunk-aware
@@ -1379,6 +1395,10 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 repo,
             })
         }
+        ForgeAction::ResyncWaiver { pr_number, repo } => ForgeCmd::ResyncWaiver {
+            pr: pr_number,
+            repo,
+        },
         ForgeAction::SuspectCriticalDiff {
             pr_number,
             file,

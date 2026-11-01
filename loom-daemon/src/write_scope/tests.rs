@@ -495,6 +495,7 @@ fn daemon_write_paths_are_scoped() {
                 "the resync PR of a workspace repo the pass vetted with repo_writable (#12572)",
             ),
         ),
+        ("fleet_sync/workspace_resync/waiver_gh.rs", Gated),
         (
             "fleet_sync/workspace_resync/supersede.rs",
             Via(
