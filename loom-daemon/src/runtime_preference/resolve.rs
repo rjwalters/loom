@@ -199,6 +199,15 @@ pub struct Resolution<T> {
 }
 
 impl<T> Resolution<T> {
+    /// `true` when the walk ran over no taps at all (an empty preference
+    /// list or an empty role-draw table). That is a configuration outcome —
+    /// nothing may serve the role here — not "every tap was skipped", so
+    /// pool pre-flight must not read it as pool exhaustion (#13428).
+    #[must_use]
+    pub fn is_empty_list(&self) -> bool {
+        self.order.is_empty()
+    }
+
     /// `true` when the chosen tap is not the most-preferred one — i.e. the
     /// fall-through actually fired. The question "how much work is going to
     /// the backstop" reduces to counting these.
