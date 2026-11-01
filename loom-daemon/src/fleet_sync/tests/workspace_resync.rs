@@ -23,6 +23,7 @@ use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
 use crate::init::payload::{resync_workspace_with, ResyncOutcome, Stamp};
 use crate::install_compat::INSTALL_METADATA_PATH;
+use crate::test_git_helpers::run as git;
 
 const RUNNING: &str = "0.19.880";
 const REPO: &str = "acme/app";
@@ -34,22 +35,6 @@ fn t0() -> DateTime<Utc> {
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, contents: &str) {

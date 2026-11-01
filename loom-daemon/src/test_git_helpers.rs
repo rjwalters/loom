@@ -8,6 +8,11 @@ pub fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args(args)
         .current_dir(dir)
+        // Hermetic even when run from inside a git hook environment.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_REFLOG_ACTION")
         .env("GIT_AUTHOR_NAME", "Loom Test")
         .env("GIT_AUTHOR_EMAIL", "loom@example.com")
         .env("GIT_COMMITTER_NAME", "Loom Test")
