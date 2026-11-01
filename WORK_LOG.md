@@ -15,6 +15,30 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-01
 
+- **PR #13470**: refactor: drop stale dead_code allows on in-flight snapshot
+- **PR #13469**: fix: bound per-root registry lock wait in daemon status build
+- **PR #13468**: fix: dedup role_draw EMPTY-table WARN per root and table
+- **PR #13467**: test: use shared test_git_helpers in five more loom-daemon test modules
+- **PR #13466**: fix: log resync push refusal with PR opened at WARN, tmux missing socket as empty restore
+- **Issue #13465** (closed): workspace_resync: a direct push to a protected main is logged at ERROR on every roll even though the PR fallback works (2–3 ERROR lines per worker per roll)
+- **Issue #13464** (closed): Remove stale allow(dead_code) on InFlightAgent / in_flight_snapshot (H4 consumer has landed)
+- **Issue #13463** (closed): role_draw: EMPTY-table WARN fires every tick for a permanent config exclusion (codex-only pilot repos on codex-excluded workers), ~60 WARN/h per worker
+- **PR #13461**: test: use shared test_git_helpers in fleet_sync tests
+- **PR #13460**: refactor: share the gitdir pointer parse between daemon_start and daemon_update
+- **PR #13459**: refactor: remove dead merge_policy module and unpopulated champion policy fields
+- **PR #13458**: test: run guide.md's real held filter instead of self-referential reconstructions
+- **PR #13457**: test: pin resync waiver notice to name the offending file
+- **PR #13455**: feat: span traced write passthroughs in the agent gh front
+- **PR #13451**: fix: window-filter role-tick transcript scan and count only confirmed merges
+- **PR #13450**: fix: stop accounts read-only actions from chmod-ing the shared Codex profile root
+- **Issue #13443** (closed): build_daemon_status: one root's registry lock (45 s under a reaper backup push) stalls the whole status reply past the client budget → Broken pipe ERRORs
+- **Issue #13421** (closed): Consolidate duplicate find_repo_root gitdir walks in daemon_start/daemon_update onto repo_root.rs
+- **Issue #13402** (closed): Dead module merge_policy.rs: no production caller; fleet.state champion approval/merge never populated
+- **Issue #13384** (closed): Remove self-referential tests (Test 4/5) from test-guide-operator-attention-fold.sh
+- **Issue #13382** (closed): Resync waiver (#13096) cannot cover generated .agents/skills/*/SKILL.md copies, so every fleet resync PR is held for a human merge
+- **Issue #13319** (closed): accounts check --live leaves the shared Codex profile root at 0700 — fights chezmoi-managed mode on the operator Mac
+- **Issue #13175** (closed): role_tick telemetry: loom.actions.prs_merged overcounts ~10x (whole-transcript rescans + counts merge attempts)
+- **Issue #13170** (closed): agent gh front: one span per GitHub write (operation, repo, number, head SHA)
 - **PR #13446**: docs: remove story-trace/stitching text deleted by #11984
 - **PR #13447**: fix: require the outcome line in the Builder prompt's Completion step
 - **PR #13448**: fix: fast-forward the daemon-root checkout in the checkout_ff pass
