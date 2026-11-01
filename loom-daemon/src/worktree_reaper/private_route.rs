@@ -108,7 +108,9 @@ pub(super) fn reap_worktrees_generic(
             // remote has been read back holding the snapshot.
             match backup(&worktree_path, num) {
                 Ok(record) => {
-                    log::warn!(
+                    // Success path (#13442): the log record carries the restore
+                    // recipe, but a working backup is not a warning.
+                    log::info!(
                         "worktree_reaper: {} {name} (open item, idle) — pushed a remote \
                          backup before removal: {}",
                         repo_root.display(),
