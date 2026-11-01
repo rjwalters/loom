@@ -5,6 +5,7 @@ use crate::install_compat_harness::{
     floors_above_claim, hard_floors, installed_shell_files, invoked_files_from_source,
     optional_subs, parse_detector_list, subcommand_unrecognized,
 };
+use crate::test_git_helpers::run as git;
 use std::path::PathBuf;
 
 /// Today's `.loom/install-metadata.json` shape (this repo, 2026-10-07): no
@@ -338,16 +339,6 @@ fn only_claps_refusal_counts_as_a_missing_subcommand() {
 }
 
 // ---- reader -----------------------------------------------------------------
-
-fn git(dir: &Path, args: &[&str]) {
-    let st = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(st.success(), "git {args:?}");
-}
 
 fn repo_with_origin_main(metadata: Option<&str>) -> tempfile::TempDir {
     let tmp = tempfile::TempDir::new().unwrap();

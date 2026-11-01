@@ -2,6 +2,7 @@
 //! [`cargo_tree`] and friends are shared with the reaper's tests.
 
 use super::*;
+use crate::test_git_helpers::run as git;
 use std::os::unix::fs::symlink;
 
 pub(crate) const SIG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n";
@@ -35,18 +36,6 @@ pub(crate) fn cargo_tree(dir: &Path) {
 pub(crate) fn mixed_tree(dir: &Path) {
     cargo_tree(dir);
     write(&dir.join("notes.rs"), b"fn hand_written() {}\n");
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
 }
 
 pub(crate) fn seeded_repo(dir: &Path) {

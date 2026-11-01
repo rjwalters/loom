@@ -25,6 +25,7 @@
 //! `#[serial] fn t_body()`, that key outside and the default inside (the
 //! order `role_collision` documents).
 
+use crate::test_git_helpers::run as git;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -121,15 +122,6 @@ impl Drop for WritableRoot {
             let _ = std::fs::remove_file(dir.join(format!("{key}.json")));
         }
     }
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(ok, "git {args:?} in {}", dir.display());
 }
 
 /// A machine-level Claude token pool for a registered checkout.

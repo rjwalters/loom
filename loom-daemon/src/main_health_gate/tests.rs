@@ -1,5 +1,6 @@
 use super::*;
 use crate::build_slot::test_support::{with_isolated_slot, BuildSlotEnvGuard};
+use crate::test_git_helpers::run as git;
 use serial_test::serial;
 use std::collections::VecDeque;
 
@@ -1408,20 +1409,6 @@ fn test_parse_gh_run_list_real_data_fixture() {
 // ===================================================================
 // Workspace preparation — sync to origin/main before a gate run (#3885)
 // ===================================================================
-
-/// Run `git <args>` in `dir`, asserting success. Test-only helper for
-/// building throwaway repos.
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?} failed in {}", dir.display());
-}
 
 /// Create an `origin` bare repo with an initial `main` commit and a working
 /// clone checked out on `main`. Returns `(origin_dir, clone_dir)` — both
