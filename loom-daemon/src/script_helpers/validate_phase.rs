@@ -2314,14 +2314,7 @@ mod tests {
         assert!(!is_substantive_path(""));
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git must be available");
-        assert!(out.status.success(), "git {args:?} failed");
-    }
+    use crate::test_git_helpers::run as git;
 
     /// A repo whose branch carries `commit_files` on top of a faked
     /// `origin/main`, i.e. exactly the post-push state of a Builder whose
