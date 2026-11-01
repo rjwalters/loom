@@ -317,6 +317,75 @@ pub fn enter_parent(parent: Option<TraceContext>) -> ParentGuard {
     }
 }
 
+thread_local! {
+    static THREAD_SWEEP: std::cell::RefCell<Option<(String, Option<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous thread sweep identity when dropped. `!Send`.
+#[must_use = "the sweep identity ends when the guard is dropped"]
+pub struct SweepGuard {
+    previous: Option<(String, Option<String>)>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        THREAD_SWEEP.with(|p| *p.borrow_mut() = previous);
+    }
+}
+
+/// Stamp every `invoke github` span this thread opens with `loom.sweep_id`
+/// (and `loom.role`) until the guard drops (#13171) — for daemon-side forge
+/// calls made on behalf of a known sweep/step.
+pub fn enter_sweep(sweep_id: &str, role: Option<&str>) -> SweepGuard {
+    let value = Some((sweep_id.to_string(), role.map(str::to_string)));
+    let previous = THREAD_SWEEP.with(|p| p.replace(value));
+    SweepGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// A raw `(sweep id, role)` pair: no (or blank) sweep id means no identity at
+/// all — never an empty-string attribute, never a role without a sweep.
+#[must_use]
+pub fn sweep_identity(
+    id: Option<String>,
+    role: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match non_empty(id) {
+        Some(id) => (Some(id), non_empty(role)),
+        None => (None, None),
+    }
+}
+
+/// `(sweep_id, role)` for this call: the thread identity ([`enter_sweep`]),
+/// else `LOOM_SWEEP_ID` / `LOOM_ROLE` (CLI-side calls; not read in test
+/// builds). Empty values are absent.
+#[must_use]
+pub fn ambient_sweep() -> (Option<String>, Option<String>) {
+    if let Some((id, role)) = THREAD_SWEEP.with(|p| p.borrow().clone()) {
+        let found = sweep_identity(Some(id), role);
+        if found.0.is_some() {
+            return found;
+        }
+    }
+    #[cfg(not(test))]
+    {
+        sweep_identity(std::env::var("LOOM_SWEEP_ID").ok(), std::env::var("LOOM_ROLE").ok())
+    }
+    #[cfg(test)]
+    {
+        (None, None)
+    }
+}
+
 /// The ambient execution's `(parent, trace journal)` — what a short-lived CLI
 /// span delivers through when no ops sink is registered (#11690). Test builds
 /// read the per-thread [`set_test_ambient`] value, never the real environment.
@@ -478,6 +547,13 @@ impl InvocationSpan {
         if inv.intent == super::AccessIntent::Write {
             if let Some(numbers) = write_numbers(inv) {
                 attributes.insert("github.number".into(), numbers);
+            }
+        }
+        let (sweep_id, role) = ambient_sweep();
+        if let Some(id) = sweep_id {
+            attributes.insert("loom.sweep_id".into(), id);
+            if let Some(role) = role {
+                attributes.insert("loom.role".into(), role);
             }
         }
         crate::telemetry::trace::provenance::stamp(&mut attributes);
