@@ -122,13 +122,22 @@ impl std::fmt::Display for DaemonVersion {
 
 /// `(repository, tag)` of an image reference; a digest pin has no tag, and a
 /// registry port (`host:5000/img`) is not a tag.
+///
+/// A reference may carry both a tag and a digest (`repo:0.19.1209@sha256:…`,
+/// which is what `docker inspect` and the last-start sidecar record for a
+/// pulled-by-tag image). The repository is still everything before the tag:
+/// returning `repo:0.19.1209` as the repository made [`pinned_image`] build
+/// `repo:0.19.1209:<host>`, an invalid reference `docker pull` refuses, so a
+/// skewed seat was never recreated (#13479). The tag is still reported as
+/// `None` for a digest pin: the digest, not the tag, names the image, so it
+/// says nothing [`refuse_downgrade`] may act on.
 fn image_repo_and_tag(image: &str) -> (&str, Option<&str>) {
     let name = image.split('@').next().unwrap_or(image);
-    if name.len() != image.len() {
-        return (name, None);
-    }
+    let digest_pinned = name.len() != image.len();
     match name.rsplit_once(':') {
-        Some((repo, tag)) if !tag.contains('/') => (repo, Some(tag)),
+        Some((repo, tag)) if !tag.contains('/') => {
+            (repo, if digest_pinned { None } else { Some(tag) })
+        }
         _ => (name, None),
     }
 }
