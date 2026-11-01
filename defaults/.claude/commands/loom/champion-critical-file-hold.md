@@ -230,6 +230,10 @@ if [ "$CRITICAL_FILES_RESULT" = "FAIL" ]; then
       [ -n "${CRITERION3_SUSPECT_LINE:-}" ] &&
         CF_SUSPECT_NOTE="
 - **Matched suspect line** (in \`[${CRITERION3_SUSPECT_SECTION:-?}]\`): \`${CRITERION3_SUSPECT_LINE}\`"
+      # #13296: a forge read failure holds too; show its HTTP status/message, not just "could not read".
+      [ -n "${CRITERION3_SUSPECT_ERROR:-}" ] &&
+        CF_SUSPECT_NOTE="${CF_SUSPECT_NOTE}
+- **Suspect-line check error**: \`${CRITERION3_SUSPECT_ERROR}\`"
       CF_WF_NOTE=""   # #10539
       gh pr diff "$PR_NUMBER" --name-only 2>/dev/null | grep -q '^\.github/workflows/' &&
         CF_WF_NOTE="

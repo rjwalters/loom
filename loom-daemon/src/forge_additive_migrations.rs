@@ -362,8 +362,7 @@ fn decode_contents(body: &[u8]) -> Result<String, String> {
 }
 
 fn gh_read(gh_bin: &Path, path: &str) -> Result<Vec<u8>, String> {
-    crate::verdict_equivalence::gh_api("forge.additive_migrations", gh_bin, None, path)
-        .ok_or_else(|| format!("`gh api {path}` failed"))
+    crate::verdict_equivalence::gh_api_checked("forge.additive_migrations", gh_bin, None, path)
 }
 
 /// The PR head SHA.
@@ -382,7 +381,7 @@ fn gh_head_sha(gh_bin: &Path, repo: &str, pr: u32) -> Result<String, String> {
 pub struct Args {
     /// Pull request number.
     pub pr: u32,
-    /// `OWNER/REPO`; `None` lets `gh` resolve `{owner}/{repo}`.
+    /// `OWNER/REPO`; `None` resolves it from the cwd (never a `{owner}/{repo}` placeholder).
     pub repo: Option<String>,
 }
 
@@ -390,31 +389,36 @@ pub struct Args {
 /// Never returns (exits): 0 with `ADDITIVE_MIGRATIONS=1` when every migration file is
 /// additive, otherwise 1 with the reason on stderr.
 pub fn handle(args: &Args) -> Result<()> {
-    use crate::forge_version_only_diff::{gh_fetch_page, valid_repo};
+    use crate::forge_version_only_diff::{gh_fetch_page, resolve_repo, valid_repo};
     let pr = args.pr;
     let verdict = match args.repo.as_deref() {
         Some(r) if !valid_repo(r) => Err(Reason::InvalidRepo),
         r => {
-            let repo = r.unwrap_or("{owner}/{repo}");
             let gh = crate::forge_cmd::gh_bin();
-            let gh = Path::new(&gh);
-            let mut head: Option<String> = None;
-            decide(
-                |page| gh_fetch_page(gh, repo, pr, page),
-                |file| {
-                    if !safe_path(file) {
-                        return Err("unsafe file path".into());
-                    }
-                    if head.is_none() {
-                        head = Some(gh_head_sha(gh, repo, pr)?);
-                    }
-                    let sha = head.as_deref().unwrap_or_default();
-                    decode_contents(&gh_read(
-                        gh,
-                        &format!("repos/{repo}/contents/{file}?ref={sha}"),
-                    )?)
-                },
-            )
+            match resolve_repo(r, &gh) {
+                Err(why) => Err(Reason::FetchFailed(why)),
+                Ok(repo) => {
+                    let repo = repo.as_str();
+                    let gh = Path::new(&gh);
+                    let mut head: Option<String> = None;
+                    decide(
+                        |page| gh_fetch_page(gh, repo, pr, page),
+                        |file| {
+                            if !safe_path(file) {
+                                return Err("unsafe file path".into());
+                            }
+                            if head.is_none() {
+                                head = Some(gh_head_sha(gh, repo, pr)?);
+                            }
+                            let sha = head.as_deref().unwrap_or_default();
+                            decode_contents(&gh_read(
+                                gh,
+                                &format!("repos/{repo}/contents/{file}?ref={sha}"),
+                            )?)
+                        },
+                    )
+                }
+            }
         }
     };
     match verdict {
