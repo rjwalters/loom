@@ -20,32 +20,10 @@ use super::git::{classify_refusal, Refusal};
 use super::host::{hold_for_move, hold_for_self_update};
 use super::*;
 use crate::fleet_sync::FleetSyncStatus;
+use crate::test_git_helpers::{git_out as git_in, run as git};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap()
-}
-
-fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = git_in(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, contents: &str) {
