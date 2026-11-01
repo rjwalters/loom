@@ -163,6 +163,18 @@ impl Landing for Gh<'_> {
         }
     }
 
+    fn labels(&self, number: u32) -> Result<Vec<String>, String> {
+        let v = self.json(
+            "resync_waiver.labels",
+            &format!("repos/{}/issues/{number}/labels?per_page=100", self.nwo),
+        )?;
+        Ok(v.as_array()
+            .ok_or("labels: not a list")?
+            .iter()
+            .filter_map(|l| l["name"].as_str().map(str::to_string))
+            .collect())
+    }
+
     fn relabel(&self, number: u32, add: &[&str], remove: &[&str]) -> Result<(), String> {
         for label in add {
             self.gh(

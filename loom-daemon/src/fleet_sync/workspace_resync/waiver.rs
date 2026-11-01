@@ -331,6 +331,8 @@ pub enum Checks {
 pub trait Landing {
     /// Checks on exactly `head`.
     fn checks(&self, number: u32, head: &str) -> Checks;
+    /// The PR's current label names.
+    fn labels(&self, number: u32) -> Result<Vec<String>, String>;
     /// Add and remove labels on the PR.
     fn relabel(&self, number: u32, add: &[&str], remove: &[&str]) -> Result<(), String>;
     /// Post a comment on the PR.
@@ -362,17 +364,29 @@ pub fn land(src: &dyn Source, landing: &dyn Landing, number: u32) -> Waived {
     if let Checks::NotGreen(why) = landing.checks(number, &head) {
         return Waived::Lane(format!("checks not green on {head}: {why}"));
     }
-    if let Err(e) = landing.comment(number, &record_comment(&tag, &head, &record)) {
-        return Waived::Lane(format!("could not post the waiver record: {e}"));
-    }
-    if let Err(e) = landing.relabel(number, &["loom:pr"], &[]) {
-        return Waived::Lane(format!("could not label loom:pr: {e}"));
+    // `loom:pr` may already be a Judge's approval: add it only if absent, and
+    // take back only what this call added.
+    let had_pr = match landing.labels(number) {
+        Ok(l) => l.iter().any(|n| n == "loom:pr"),
+        Err(e) => return Waived::Lane(format!("could not read labels: {e}")),
+    };
+    if !had_pr {
+        if let Err(e) = landing.relabel(number, &["loom:pr"], &[]) {
+            return Waived::Lane(format!("could not label loom:pr: {e}"));
+        }
     }
     match landing.merge(number, &head) {
-        Ok(()) => Waived::Landed(format!("merged on the waiver proof against {tag}")),
+        Ok(()) => {
+            // Record only a merge that happened: a refusal retried every pass
+            // must not accumulate "the daemon merges this" comments.
+            let _ = landing.comment(number, &record_comment(&tag, &head, &record));
+            Waived::Landed(format!("merged on the waiver proof against {tag}"))
+        }
         Err(e) => {
-            // Put the PR back on the ordinary lane's label.
-            let _ = landing.relabel(number, &[], &["loom:pr"]);
+            if !had_pr {
+                // Put the PR back on the ordinary lane's label.
+                let _ = landing.relabel(number, &[], &["loom:pr"]);
+            }
             Waived::Lane(format!("merge-pr.sh refused: {e}"))
         }
     }

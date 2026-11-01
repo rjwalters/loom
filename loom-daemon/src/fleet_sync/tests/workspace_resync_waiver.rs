@@ -204,6 +204,7 @@ struct Fx {
     comments: RefCell<Vec<String>>,
     labels: RefCell<Vec<(Vec<String>, Vec<String>)>>,
     merged: Cell<Option<String>>,
+    present: Vec<String>,
 }
 
 impl Fx {
@@ -214,6 +215,7 @@ impl Fx {
             comments: RefCell::default(),
             labels: RefCell::default(),
             merged: Cell::new(None),
+            present: Vec::new(),
         }
     }
 }
@@ -222,6 +224,9 @@ impl Landing for Fx {
     fn checks(&self, _: u32, head: &str) -> Checks {
         assert_eq!(head, HEAD, "checks are read on the proven head");
         self.checks.clone()
+    }
+    fn labels(&self, _: u32) -> Result<Vec<String>, String> {
+        Ok(self.present.clone())
     }
     fn relabel(&self, _: u32, add: &[&str], remove: &[&str]) -> Result<(), String> {
         self.labels.borrow_mut().push((
@@ -298,6 +303,23 @@ fn a_refused_merge_such_as_a_queue_repo_without_a_verdict_restores_the_lane_labe
             (vec![], vec!["loom:pr".to_string()])
         ]
     );
+}
+
+#[test]
+fn a_refusing_merge_leaves_no_comment_across_passes() {
+    let fx = Fx::new(Checks::Green, Err("hold".to_string()));
+    for _ in 0..2 {
+        assert_eq!(land(&Fake::ok(), &fx, 1).word(), "handed-to-lane");
+    }
+    assert!(fx.comments.borrow().is_empty());
+}
+
+#[test]
+fn a_refused_merge_keeps_a_loom_pr_the_daemon_did_not_add() {
+    let mut fx = Fx::new(Checks::Green, Err("hold".to_string()));
+    fx.present = vec!["loom:pr".to_string()];
+    assert_eq!(land(&Fake::ok(), &fx, 1).word(), "handed-to-lane");
+    assert!(fx.labels.borrow().is_empty(), "{:?}", fx.labels.borrow());
 }
 
 /// `KEPT_SET` is a copy of Champion's hardcoded `KEPT_SET_PATTERNS` (still
