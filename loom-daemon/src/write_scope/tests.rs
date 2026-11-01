@@ -495,6 +495,14 @@ fn daemon_write_paths_are_scoped() {
                 "the resync PR of a workspace repo the pass vetted with repo_writable (#12572)",
             ),
         ),
+        (
+            "fleet_sync/workspace_resync/supersede.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "closes the older daemon resync PRs (title + branch + version trailer) of a \
+                 workspace repo the pass vetted with repo_writable before w2::attempt (#13488)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         (
             "parent_link.rs",
