@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-01
 
+- **PR #13475**: refactor: replace eight more test-local git helpers with shared test_git_helpers::run
+- **Issue #13456** (closed): Consolidate duplicated test git helpers into test_git_helpers (loom-daemon)
 - **PR #13473**: refactor: replace eight test-local git helpers with shared test_git_helpers::run
 - **PR #13472**: refactor: replace five test-local git helpers with shared test_git_helpers::run
 - **Issue #12807** (closed): Crew get work from the captain on a faster poll; the captain follows GitHub via the Cloudflare Workers, not the dashboard
