@@ -320,7 +320,6 @@ fn a_verdict_clears_the_items_history_and_cooldowns() {
 /// #12042: a Judge step that stood down for pending CI cools down for the
 /// short refusal window, not the no-op hour, so a PR whose CI concludes in
 /// minutes gets its Judge back in minutes.
-#[test]
 /// #13500: the Judge spells the reason `ci-pending` on its line; the parser
 /// folds it to `ci_pending`, so it is an external wait (the short window,
 /// not a run) however the role spells it.
