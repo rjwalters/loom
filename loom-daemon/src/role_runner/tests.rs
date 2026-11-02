@@ -696,6 +696,56 @@ fn test_missing_defaults_uncovered_by_on_idle_excludes_on_idle_covered_roles() {
 }
 
 #[test]
+#[serial(loom_config_env)]
+fn test_missing_defaults_repo_pinned_allowlist_is_a_warn() {
+    // The #6163 case: the repo's own .loom/config.json pins `roles`, so a
+    // default it omits is a stale pin somebody can update — WARN, same
+    // line as before.
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let root = tempfile::tempdir().unwrap();
+    let legacy = root.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(&legacy, r#"{"autonomous": {"roleRunner": {"roles": ["curator"]}}}"#).unwrap();
+    let pinned = roles_allowlist_is_repo_pinned(root.path());
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    assert!(pinned, "a roles key in the repo's own tier is a pin");
+    let (level, line) = missing_defaults_log_level(root.path(), &["auditor"], pinned).unwrap();
+    assert_eq!(level, log::Level::Warn);
+    assert_eq!(
+        line,
+        missing_defaults_warning_line(root.path(), &["auditor"]).unwrap(),
+        "the WARN text is unchanged for a repo pin"
+    );
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn test_missing_defaults_machine_tier_allowlist_is_an_info() {
+    // A fleet worker: no repo tier sets `roles`; the private/shared
+    // defaults file does. That is a fleet policy, not a stale pin — INFO,
+    // with the suffix that says so.
+    let defaults = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        defaults.path(),
+        r#"{"autonomous": {"roleRunner": {"roles": ["curator", "champion", "judge", "doctor", "guide"]}}}"#,
+    )
+    .unwrap();
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, defaults.path());
+    let root = tempfile::tempdir().unwrap();
+    let pinned = roles_allowlist_is_repo_pinned(root.path());
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    assert!(!pinned, "a roles key only in the machine tier is not a repo pin");
+    let (level, line) = missing_defaults_log_level(root.path(), &["auditor"], pinned).unwrap();
+    assert_eq!(level, log::Level::Info);
+    assert!(line.contains("will not be dispatched on either path: auditor"), "{line}");
+    assert!(line.contains("machine tier"), "{line}");
+    assert!(
+        missing_defaults_log_level(root.path(), &[], pinned).is_none(),
+        "nothing missing, nothing logged"
+    );
+}
+
+#[test]
 fn test_missing_defaults_uncovered_by_on_idle_no_on_idle_reports_everything_missing() {
     let names = vec!["curator".to_string()];
     let missing = missing_defaults_uncovered_by_on_idle(&names, &[]);

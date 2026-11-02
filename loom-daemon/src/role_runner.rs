@@ -1641,6 +1641,66 @@ fn missing_defaults_warning_line(repo_root: &Path, missing: &[&'static str]) -> 
     ))
 }
 
+/// Whether `repo_root`'s `autonomous.roleRunner.roles` allowlist is set by one
+/// of the repo's **own** tier files (host-local, per-repo fleet, project or
+/// legacy `.loom/config.json`) rather than by the machine-level private/shared
+/// defaults file.
+///
+/// The distinction decides the level of the [`missing_defaults_warning_line`]
+/// diagnostic. #6163's case — and [`missing_defaults`]' own reason to exist —
+/// is a *repo-pinned* list that went stale when a new default role shipped:
+/// somebody can and should update that file, so it is a WARN. A machine-tier
+/// allowlist is a fleet policy applied to every workspace on the host (on a
+/// fleet worker: auditor and architect switched off by operator ruling); the
+/// role is absent on purpose and there is no per-repo file to update. On a
+/// 107-workspace host the once-per-workspace-per-boot line then showed as a
+/// steady 30 WARN/h for the ~3.5 h the reporter loop takes to reach every
+/// workspace, tripping the fleet's log-rate probe on every roll — so that
+/// case is INFO (see [`missing_defaults_log_level`]; #13496).
+#[must_use]
+fn roles_allowlist_is_repo_pinned(repo_root: &Path) -> bool {
+    use crate::config_resolver::{
+        FLEET_REPO_CONFIG_REL, LEGACY_CONFIG_REL, LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
+    };
+    crate::config_resolver::source_of(repo_root, "autonomous.roleRunner.roles").is_some_and(
+        |path| {
+            [
+                LOCAL_CONFIG_REL,
+                FLEET_REPO_CONFIG_REL,
+                PROJECT_CONFIG_REL,
+                LEGACY_CONFIG_REL,
+            ]
+            .iter()
+            .any(|rel| path == repo_root.join(rel))
+        },
+    )
+}
+
+/// The level and text of the missing-defaults diagnostic for `repo_root`
+/// (pure, so the choice is unit-testable): the [`missing_defaults_warning_line`]
+/// at WARN when the allowlist is the repo's own pin, the same line at INFO
+/// with a machine-tier suffix when it is the private/shared defaults' —
+/// see [`roles_allowlist_is_repo_pinned`] for why the two differ.
+#[must_use]
+fn missing_defaults_log_level(
+    repo_root: &Path,
+    missing: &[&'static str],
+    repo_pinned: bool,
+) -> Option<(log::Level, String)> {
+    let line = missing_defaults_warning_line(repo_root, missing)?;
+    Some(if repo_pinned {
+        (log::Level::Warn, line)
+    } else {
+        (
+            log::Level::Info,
+            format!(
+                "{line} (allowlist set by the machine tier, not by this repo's own config — a \
+                 fleet policy, not a stale pin)"
+            ),
+        )
+    })
+}
+
 /// Whether `spec`'s multi-workspace loop is the one designated to emit the
 /// per-workspace [`missing_defaults_warning_line`] diagnostic (#6163 AC3).
 ///
@@ -3049,8 +3109,12 @@ fn decide_root_tick_detailed(
             }
             (false, Some(prev)) if *prev == missing => {}
             (false, _) => {
-                if let Some(line) = missing_defaults_warning_line(root, &missing) {
-                    log::warn!("{line}");
+                // WARN only when the allowlist is this repo's own pin; a
+                // machine-tier allowlist is a fleet policy and logs at INFO
+                // (see `roles_allowlist_is_repo_pinned`).
+                let pinned = roles_allowlist_is_repo_pinned(root);
+                if let Some((level, line)) = missing_defaults_log_level(root, &missing, pinned) {
+                    log::log!(level, "{line}");
                 }
                 missing_defaults_logged.insert(root.to_path_buf(), missing);
             }
