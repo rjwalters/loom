@@ -20,7 +20,7 @@
 //! | `approval_wait` | open issues carrying `loom:curated` and not `loom:issue` |
 //! | `operator_hold` | open issues carrying `loom:operator` |
 //!
-//! The first two reuse the [`FleetStage`](super::fleet_state::FleetStage) wire
+//! The first two reuse the [`FleetStage`](super::work_started::FleetStage) wire
 //! names; `operator_hold` has no `FleetStage` counterpart.
 //!
 //! # Age

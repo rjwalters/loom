@@ -56,28 +56,6 @@
 /// a kind the daemon no longer emits. Removing the last producer of a kind is a
 /// reviewed act *because* it must land as a row here.
 pub const PRODUCER_LESS_KINDS: &[(&str, &str)] = &[
-    // #11301 removed the `fleet.state` producer (the `loom:blocked` release
-    // pass); the replacement reader lives in loom-ui ui#4380.
-    (
-        "fleet.state",
-        "#11301: fleet.state producer retired; replacement reader loom-ui ui#4380",
-    ),
-    // Derived from `fleet.state` (#11126) and died with it in #11301.
-    (
-        "pr.resolved",
-        "#11301: produced by fleet.state, which was retired; see loom-ui ui#4380",
-    ),
-    // Training-critical ETA fact, derived from `fleet.state`; the #11301
-    // casualty this guard exists to prevent recurring.
-    (
-        "eta.stage_outcome",
-        "#11301: produced by fleet.state, which was retired; see loom-ui ui#4380",
-    ),
-    // Produced by the `loom:blocked` release pass, also removed by #11301.
-    (
-        "pass.summary",
-        "#11301: produced by the loom:blocked release pass, which was removed",
-    ),
     // The daemon-side producer (collector presence derivation) is not present;
     // the OTLP export path and schema remain registered.
     (
