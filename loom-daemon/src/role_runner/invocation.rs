@@ -5,6 +5,11 @@ use crate::observability::lifecycle::pre_launch;
 impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let trace_root = self.workspace_root.clone();
+        // #13502: the session's output is whatever lands in its role log from
+        // here on; remember where the log ended before launch.
+        let log_path = role_log_path(&self.logs_dir(), role);
+        let log_start = std::fs::metadata(&log_path).map_or(0, |m| m.len());
+        self.last_output = None;
         let (outcome, context, unlaunched) =
             crate::observability::lifecycle::role_invocation_classified(&trace_root, role, || {
                 let script = match self.resolve_spawn_bin() {
@@ -225,7 +230,12 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             });
         self.trace_context = context;
         self.unlaunched_failure = unlaunched;
+        self.last_output = read_log_since(&log_path, log_start);
         outcome
+    }
+
+    fn last_output(&self) -> Option<String> {
+        self.last_output.clone()
     }
 
     fn resolved_launch(&self) -> Option<crate::role_tick_telemetry::ResolvedLaunch> {
@@ -239,4 +249,18 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
         self.unlaunched_failure.clone()
     }
+}
+
+/// The log bytes appended after `start`, lossily decoded; `None` when the log
+/// is unreadable, shrank (rotated), or nothing was appended.
+fn read_log_since(path: &Path, start: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() <= start {
+        return None;
+    }
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }

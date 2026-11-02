@@ -253,13 +253,35 @@ impl Key {
 /// [`keys_marked`] parses), then a visible `reviewer=` line. `head_sha` is the
 /// head captured at selection time, never re-read.
 ///
-/// `RoleTickOutcome` carries no verdict text, so none is included.
+/// `verdict` is the tail of the session's output (#13502), appended after the
+/// marker line. It is bounded to [`MAX_VERDICT_CHARS`] (keeping the end, with
+/// an explicit truncation notice) and its `<!--` / `-->` are escaped so it can
+/// never form or alter a marker that [`keys_marked`] would parse.
 #[must_use]
-pub fn marker_body(key: Key, head_sha: &str, reviewer: &str) -> String {
-    format!(
+pub fn marker_body(key: Key, head_sha: &str, reviewer: &str, verdict: Option<&str>) -> String {
+    let mut body = format!(
         "<!-- ratify:key={} sha={head_sha} -->\nreviewer={reviewer}\nReviewed head: {head_sha}\n",
         key.wire()
-    )
+    );
+    if let Some(text) = verdict.map(str::trim).filter(|t| !t.is_empty()) {
+        body.push_str("\nVerdict:\n\n");
+        body.push_str(&bound_verdict(text));
+        body.push('\n');
+    }
+    body
+}
+
+/// Longest verdict text posted, in characters.
+pub const MAX_VERDICT_CHARS: usize = 4000;
+
+fn bound_verdict(text: &str) -> String {
+    let escaped = text.replace("<!--", "&lt;!--").replace("-->", "--&gt;");
+    let total = escaped.chars().count();
+    if total <= MAX_VERDICT_CHARS {
+        return escaped;
+    }
+    let tail: String = escaped.chars().skip(total - MAX_VERDICT_CHARS).collect();
+    format!("[truncated: first {} characters omitted]\n{tail}", total - MAX_VERDICT_CHARS)
 }
 
 /// What the lane did for one key of one PR.
@@ -287,7 +309,7 @@ pub fn post_markers(
         .map(|key| {
             let result = match dispatched.get(key) {
                 KeyOutcome::Ran(RoleTickOutcome::Success) => sink
-                    .post(pr, &marker_body(key, head_sha, role_name(key)))
+                    .post(pr, &marker_body(key, head_sha, role_name(key), dispatched.output(key)))
                     .map(|()| KeyPost::Posted)
                     .unwrap_or_else(|e| KeyPost::Withheld(format!("marker post failed: {e}"))),
                 KeyOutcome::Ran(other) => {
@@ -366,8 +388,13 @@ impl<'a> GhPrSource<'a> {
     }
 
     fn get(&self, endpoint: &str) -> Option<Value> {
-        let out = crate::script_helpers::run_gh(&["api", endpoint], self.root, false);
-        serde_json::from_slice(&out.ok_output()?.stdout).ok()
+        // `--paginate` reads every page (#13502); `parse_listing` flattens the
+        // concatenated arrays. Any failed or unparseable read is `None`.
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        let inv = crate::claim_reconciliation::gh_call::read("ratification.pr_get", &gh, self.root)
+            .args(["api", endpoint, "--paginate"]);
+        let stdout = crate::claim_reconciliation::gh_call::ok_stdout(inv)?;
+        crate::comment_trust::parse_listing(&stdout).map(Value::Array)
     }
 
     fn raw(&self, path: &str, git_ref: &str) -> Option<String> {
@@ -382,7 +409,7 @@ impl<'a> GhPrSource<'a> {
 }
 
 impl PrSource for GhPrSource<'_> {
-    /// First page (100) of open PRs; an unreadable list is "no candidates".
+    /// Every open PR; an unreadable list is "no candidates".
     fn open_prs(&self) -> Vec<OpenPr> {
         let Some(Value::Array(list)) =
             self.get(&format!("repos/{}/pulls?state=open&per_page=100", self.nwo))
@@ -485,6 +512,9 @@ struct RunnerRef<'r, R: super::RoleInvocationRunner + ?Sized>(&'r mut R);
 impl<R: super::RoleInvocationRunner + ?Sized> super::RoleInvocationRunner for RunnerRef<'_, R> {
     fn invoke(&mut self, role: &str, prompt: &str) -> super::RoleTickOutcome {
         self.0.invoke(role, prompt)
+    }
+    fn last_output(&self) -> Option<String> {
+        self.0.last_output()
     }
 }
 

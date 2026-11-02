@@ -50,6 +50,9 @@ pub enum KeyOutcome {
 pub struct Dispatched {
     pub ee: KeyOutcome,
     pub market: KeyOutcome,
+    /// The EE session's output, when it ran and the runner exposes it (#13502).
+    pub ee_output: Option<String>,
+    pub market_output: Option<String>,
 }
 
 impl Dispatched {
@@ -58,6 +61,17 @@ impl Dispatched {
         match key {
             Key::Ee => &self.ee,
             Key::Market => &self.market,
+        }
+    }
+}
+
+impl Dispatched {
+    /// The session output captured for `key`, if any.
+    #[must_use]
+    pub fn output(&self, key: Key) -> Option<&str> {
+        match key {
+            Key::Ee => self.ee_output.as_deref(),
+            Key::Market => self.market_output.as_deref(),
         }
     }
 }
@@ -110,19 +124,24 @@ pub fn dispatch(
     runner: &mut dyn RoleInvocationRunner,
 ) -> Dispatched {
     let is_public = src.repo_is_private(target_repo) != Some(true);
-    let mut run = |key: Key, pin: &Pin| -> KeyOutcome {
+    let mut run = |key: Key, pin: &Pin| -> (KeyOutcome, Option<String>) {
         match fetch_pinned(src, pin) {
-            Err(reason) => KeyOutcome::FailedClosed(reason),
+            Err(reason) => (KeyOutcome::FailedClosed(reason), None),
             Ok(text) => {
                 let public_only = key == Key::Market && is_public;
                 let prompt = build_prompt(&text, pr_ref, public_only);
-                KeyOutcome::Ran(runner.invoke(role_name(key), &prompt))
+                let outcome = runner.invoke(role_name(key), &prompt);
+                (KeyOutcome::Ran(outcome), runner.last_output())
             }
         }
     };
+    let (ee, ee_output) = run(Key::Ee, ee);
+    let (market, market_output) = run(Key::Market, market);
     Dispatched {
-        ee: run(Key::Ee, ee),
-        market: run(Key::Market, market),
+        ee,
+        market,
+        ee_output,
+        market_output,
     }
 }
 

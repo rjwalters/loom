@@ -885,6 +885,14 @@ pub trait RoleInvocationRunner {
     fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
         None
     }
+
+    /// What the most recent [`invoke`](Self::invoke) wrote to the session's
+    /// output (its role log, from just before launch), or `None` when that is
+    /// unavailable. Defaulted so a test double is unaffected. The ratification
+    /// lane (#13502) posts a bounded tail of it as the verdict text.
+    fn last_output(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The concrete [`RoleInvocationRunner`]: shells out to
@@ -926,6 +934,8 @@ pub struct ScriptRoleInvocationRunner {
     /// Set by [`roll_resume`] when this runner relaunches a session a daemon
     /// roll paused (#10832), instead of starting a fresh tick.
     roll_resume: Option<roll_resume::RoleRollResume>,
+    /// Output the most recent invocation appended to its role log (#13502).
+    last_output: Option<String>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -943,6 +953,7 @@ impl ScriptRoleInvocationRunner {
             trace_context: None,
             unlaunched_failure: None,
             roll_resume: None,
+            last_output: None,
         }
     }
 
