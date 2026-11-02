@@ -202,8 +202,10 @@ impl OutcomeClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepOutcome {
     pub class: OutcomeClass,
-    /// The reason token (`snake_case`). Champion's outcomes keep their own
-    /// word, with `-` read as `_` (`head-moved` → `head_moved`).
+    /// The reason token (`snake_case`), with `-` read as `_` on both line
+    /// shapes: Champion's outcome word (`head-moved` → `head_moved`) and a
+    /// `LOOM_STEP_OUTCOME` reason (`ci-pending` → `ci_pending`, #13500), so
+    /// the [`EXTERNAL_WAIT_NOOPS`] match holds however the role spells it.
     pub reason: String,
 }
 
@@ -267,7 +269,13 @@ pub fn parse_outcome_line(output: &str, step: StepRole, target: u32) -> Option<S
                 return None;
             }
             let class = OutcomeClass::parse(f.get("class")?)?;
-            Some(StepOutcome::new(class, f.get("reason").copied().unwrap_or(UNCLASSIFIED)))
+            Some(StepOutcome::new(
+                class,
+                &f.get("reason")
+                    .copied()
+                    .unwrap_or(UNCLASSIFIED)
+                    .replace('-', "_"),
+            ))
         }
     })
 }

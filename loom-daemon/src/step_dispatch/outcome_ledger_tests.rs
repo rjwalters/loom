@@ -321,6 +321,23 @@ fn a_verdict_clears_the_items_history_and_cooldowns() {
 /// short refusal window, not the no-op hour, so a PR whose CI concludes in
 /// minutes gets its Judge back in minutes.
 #[test]
+/// #13500: the Judge spells the reason `ci-pending` on its line; the parser
+/// folds it to `ci_pending`, so it is an external wait (the short window,
+/// not a run) however the role spells it.
+#[test]
+fn a_hyphenated_ci_pending_line_parses_to_the_external_wait_token() {
+    let parsed = parse_outcome_line(
+        "LOOM_STEP_OUTCOME role=judge target=5 class=noop reason=ci-pending",
+        StepRole::Judge,
+        5,
+    )
+    .unwrap();
+    assert_eq!(parsed, out(OutcomeClass::Noop, "ci_pending"));
+    assert!(!counts_as_run(&parsed));
+    assert!(EXTERNAL_WAIT_NOOPS.contains(&parsed.reason.as_str()));
+}
+
+#[test]
 fn a_ci_pending_noop_takes_the_short_window() {
     let cfg = LedgerConfig::default();
     let noop = out(OutcomeClass::Noop, "ci_pending");
