@@ -317,7 +317,8 @@ worktree-contains open -
 pr-state open -
 merge-route open -
 workflow-scope open -
-post-merge-cleanup open -"
+post-merge-cleanup open -
+release-hold open -"
 
 # Shared comparison, so the controls below exercise the SAME logic the real
 # assertion does rather than a paraphrase of it. `sort -V` over a here-string

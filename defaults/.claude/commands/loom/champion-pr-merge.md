@@ -1944,7 +1944,7 @@ auto-merging:
 $CONCERN_BULLET
 
 **Next steps** — this hold stays in force until one of these happens; Champion re-reading the same diff will **not** clear it:
-- A human releases it: \`gh pr edit $PR_NUMBER --remove-label \"loom:blocked\"\`. Champion merges on its next tick unless it finds a concern this notice does not name; or run \`./.loom/scripts/merge-pr.sh $PR_NUMBER\` yourself after removing it (\`merge-pr.sh\` refuses \`loom:pr\` + \`loom:blocked\` together, #8112)
+- A human releases it and merges in one audited step: \`./.loom/scripts/merge-pr.sh $PR_NUMBER --release-hold\` (#13517). It refuses if the head moved since this hold or the Judge approval, and posts a comment naming you and the approved head. Bare \`merge-pr.sh\` still refuses \`loom:pr\` + \`loom:blocked\` together (#8112)
 - Or applies \`loom:auto-merge-ok\` to override the hold; Champion merges on the next tick
 - Or comments here to clear it explicitly — **start the comment with the instruction**: \`clear the hold — <why>\`, \`cleared: <why>\`, \`override: <why>\`, \`merge anyway, <why>\`, \`ok to merge — <why>\`. Phrasing that only mentions those words later in a sentence, negates them (\`do not merge anyway\`), or asks about them (\`is it ok to merge?\`) deliberately does **not** release the hold, and neither does a bare 'looks fine'
 - Or the situation actually changes: a new push that narrows the concern, or a deeper Judge re-review

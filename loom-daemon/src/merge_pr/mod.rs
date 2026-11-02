@@ -266,6 +266,7 @@ pub mod closed_by_merge;
 pub mod consolidate;
 pub mod dirty_guard;
 pub mod discovered_worktree;
+pub mod hold_release;
 pub mod hold_state;
 pub mod issue_close_gate;
 pub mod labels;
