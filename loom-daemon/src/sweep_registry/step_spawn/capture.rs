@@ -64,6 +64,10 @@ pub struct StepOutcomeLine {
     pub role: String,
     pub target: u32,
     pub class: StepOutcomeClass,
+    /// The reason token, `snake_case`: a `-` on the line is read as `_`
+    /// (#13500), the same fold the Champion outcome word gets, so a Judge
+    /// that writes `reason=ci-pending` (the spelling of its own
+    /// `lease pr release --skip-reason`) is the contract's `ci_pending`.
     pub reason: String,
 }
 
@@ -83,7 +87,7 @@ pub fn parse_outcome_line(line: &str) -> Option<StepOutcomeLine> {
         role: field("role")?.to_string(),
         target: field("target")?.parse().ok()?,
         class: StepOutcomeClass::parse(field("class")?)?,
-        reason: field("reason").unwrap_or("").to_string(),
+        reason: field("reason").unwrap_or("").replace('-', "_"),
     })
 }
 
@@ -98,7 +102,8 @@ pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> 
     text[start..].lines().rev().find_map(parse_outcome_line)
 }
 
-/// The `reason`s held as `ci_wait`: Judge's `ci_pending`, and the Champion
+/// The `reason`s held as `ci_wait`: Judge's `ci_pending` (written
+/// `ci-pending` on the line; the parser folds it, #13500), and the Champion
 /// `requeued` outcome word. The captain is fed the outcome line's own reason,
 /// not the telemetry projection, so a Champion `requeued` holds for any gate
 /// (`ci_pending`, `merge_rc<N>`, `pin_missing`): not merged, still approved,

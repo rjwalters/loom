@@ -110,6 +110,7 @@ mod hold;
 mod host;
 mod loom_ui;
 mod memory;
+mod supersede;
 mod w2;
 
 use std::cell::OnceCell;

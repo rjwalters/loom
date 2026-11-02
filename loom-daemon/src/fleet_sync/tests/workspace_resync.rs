@@ -1330,5 +1330,7 @@ mod head_check;
 mod hold_pass;
 #[path = "workspace_resync_online.rs"]
 mod online;
+#[path = "workspace_resync_supersede.rs"]
+mod supersede;
 #[path = "workspace_resync_surfaces.rs"]
 mod surfaces;

@@ -53,16 +53,6 @@ pub const QUEUE_PATH_ENV: &str = "LOOM_OBSERVABILITY_QUEUE_PATH";
 /// Default filename under `<workspace_root>/.loom/logs/`.
 pub const QUEUE_FILENAME: &str = "observability-queue.jsonl";
 
-/// Per-exporter queue filename under `<workspace_root>/.loom/logs/` when more
-/// than one exporter is configured (Issue #8756) — `observability-queue.<name>
-/// .jsonl` for the exporter named `name` ("https", "otlp"). A **sole**
-/// exporter keeps [`QUEUE_FILENAME`] unchanged so a pre-fan-out backlog stays
-/// discoverable without migration.
-#[must_use]
-pub fn named_queue_filename(name: &str) -> String {
-    format!("observability-queue.{name}.jsonl")
-}
-
 /// Resolve the default queue path: [`QUEUE_PATH_ENV`] override (non-empty),
 /// else `<workspace_root>/.loom/logs/observability-queue.jsonl`.
 #[must_use]

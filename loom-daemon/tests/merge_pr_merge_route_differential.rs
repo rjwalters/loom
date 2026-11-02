@@ -6,7 +6,7 @@
 //! This compares the CALL SHAPE, not just the Rust function: both loops run
 //! under bash with the same recording stubs for every side effect
 //! (`forge_merge_pr`, `forge_get_pr_nocache`, `forge_update_branch`, `sleep`,
-//! `_refresh_precondition_sha`, `_head_moved_or_resync`, the narration
+//! `_refresh_precondition_sha`, `error_head_moved`, the narration
 //! helpers and `error`), driven by the same scripted forge, with the real
 //! binary (behind a recording wrapper for `record-rework`) answering
 //! `classify-response` and `merge-route`. Every scenario's trace — each merge
@@ -53,7 +53,7 @@ forge_merge_pr() { local n; n="$(_next merge)"; printf 'MERGE %s %s\n' "$n" "$3"
 forge_get_pr_nocache() { local n; n="$(_next get)"; if [[ -f "$D/get.$n" ]]; then echo '{"merged":true}'; else echo '{}'; fi; }
 forge_update_branch() { echo UPDATE >>"$T"; [[ ! -f "$D/update-fails" ]] || { echo "boom: HTTP 422"; return 1; }; }
 _refresh_precondition_sha() { echo REFRESH >>"$T"; MERGE_PRECONDITION_SHA="synced$MERGE_ATTEMPT"; }
-_head_moved_or_resync() { echo HEAD-MISMATCH >>"$T"; exit 3; }
+error_head_moved() { echo HEAD-MISMATCH >>"$T"; exit 3; }
 _mp_daemon_roll_hint() { :; }
 eval "$(grep '^_classify_merge_response()' "$mp")"
 eval "$(grep '^_mr_say()' "$mp")"
@@ -270,7 +270,7 @@ fn live_loop_and_retired_loop_agree_byte_for_byte() {
         assert_eq!(t_old, t_new, "scenario {i}: traces differ in raw bytes");
         let t = String::from_utf8_lossy(&t_new);
         let mut m = 0;
-        if t.contains("UPDATE") {
+        if t.contains("Branch is behind base branch") {
             m |= SYNC;
         }
         if t.contains("HTTP 405), waiting") {

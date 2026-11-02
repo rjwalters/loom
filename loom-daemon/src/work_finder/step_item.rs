@@ -68,9 +68,10 @@
 //! | any other blocked issue | pass `blocked` |
 //! | landed: a merged **closing** PR (or one built on the issue's `feature/issue-N` branch into the default branch, #12251), issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
+//! | `loom:triage`, whatever other stage label it carries (#12713) | Curator |
 //! | `loom:issue` | Builder |
 //! | `loom:curated` | Champion promote |
-//! | `loom:triage`, or no stage label | Curator |
+//! | no stage label | Curator |
 //!
 //! The design's "cooling down" row is not here: cooldowns are local draw
 //! state (the outcome ledger), applied by the draw (#11896), not by this
@@ -861,12 +862,21 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     }
     if has(labels, DECISION_MALFORMED) {
         step(ItemState::DecisionMalformed, Step::Curator)
+    } else if has(labels, TRIAGE) {
+        // `loom:triage` beside `loom:curated` or `loom:issue` is still
+        // Curator's turn (#12713): every writer of the label (intake, the
+        // landed router, a Champion send-back, the past-intake demotion)
+        // means exactly that, `check-claim` already refuses a Builder on it
+        // (`LabelLeg::AwaitingCurator`), and the landed guard reads its
+        // removal as Curator's keep. Ranking the stage labels above it sent
+        // a routed issue to Champion promote (`loom:issue` back on, `loom:
+        // triage` never off) and froze it: refused `already_landed` at every
+        // Builder spawn, invisible to the Curator's queue.
+        step(ItemState::Triage, Step::Curator)
     } else if has(labels, READY) {
         step(ItemState::Ready, Step::Builder)
     } else if has(labels, CURATED) {
         step(ItemState::Curated, Step::ChampionPromote)
-    } else if has(labels, TRIAGE) {
-        step(ItemState::Triage, Step::Curator)
     } else {
         step(ItemState::Unlabeled, Step::Curator)
     }

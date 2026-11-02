@@ -4,9 +4,9 @@
 //! These used to be the live inputs of the #8248 required-check freshness
 //! guard, which #12063 slice 1 deleted along with the re-date remedy (#8508)
 //! and the CI-run conclusion gate (#10444): required checks at the head are
-//! GitHub's to enforce. What stays is what `required-checks`,
-//! `checks-failure`, `zero-checks-settle`, `check-runs-rollup` and
-//! `forge wait-checks` still read, and it goes with them in slice 2.
+//! GitHub's to enforce. What stays is what `required-checks` and
+//! `forge wait-checks` still read (the other `merge-pr` verbs that shared
+//! these reads went in slice 2).
 //!
 //! 1. **required contexts** — the TWO-source union
 //!    `forge_get_required_status_check_contexts` builds (#8103): rulesets

@@ -263,6 +263,57 @@
       ]
     },
     {
+      "name": "loom:triage + loom:curated (a landed route or a Champion send-back): Curator, not Champion promote (#12713)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 21,
+            "labels": [
+              "loom:triage",
+              "loom:curated"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 21,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:triage + loom:issue (a claim release put the ready label back on a routed issue): Curator, not Builder (#12713)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 22,
+            "labels": [
+              "loom:triage",
+              "loom:issue",
+              "loom:curated"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 22,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
       "name": "a proposal label (loom:architect) stays on Champion's non-item run: pass",
       "inputs": {
         "issues": [

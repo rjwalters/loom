@@ -685,66 +685,6 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
     resolved
 }
 
-/// Resolve the durable-queue path for the exporter named `name` (Issue
-/// #8756). A **sole** configured exporter keeps the pre-fan-out
-/// [`queue::default_queue_path`] unchanged — byte-compat with every existing
-/// deployment's backlog file. With N ≥ 2 exporters each gets
-/// `observability-queue.<name>.jsonl` under the same directory; a
-/// [`queue::QUEUE_PATH_ENV`] override gains `.<name>` before its extension
-/// so a test-pinned directory still isolates per-exporter files.
-fn queue_path_for(workspace_root: &Path, name: &str, sole: bool) -> PathBuf {
-    if sole {
-        return queue::default_queue_path(workspace_root);
-    }
-    if let Ok(path) = std::env::var(queue::QUEUE_PATH_ENV) {
-        if !path.is_empty() {
-            let mut path = PathBuf::from(path);
-            if let Some(stem) = path.file_stem() {
-                // "<stem>.<name>.<original-ext>" — built as one filename so
-                // the appended name is never mistaken for (and replaced as)
-                // the extension.
-                let mut named = stem.to_os_string();
-                named.push(".");
-                named.push(name);
-                if let Some(extension) = path.extension() {
-                    named.push(".");
-                    named.push(extension);
-                }
-                path.set_file_name(named);
-                return path;
-            }
-            return path;
-        }
-    }
-    workspace_root
-        .join(".loom")
-        .join("logs")
-        .join(queue::named_queue_filename(name))
-}
-
-/// One-time upgrade step for the multi-exporter fan-out (Issue #8756): when
-/// per-name queue files come into use, move a pre-fan-out backlog
-/// (`observability-queue.jsonl`) into the **first** configured exporter's
-/// per-name file so records queued by an older daemon are still drained.
-/// Best-effort and deliberately non-merging: skipped when the per-name file
-/// already exists (adoption happens exactly once, on the boot that first
-/// sees the fan-out config).
-fn adopt_legacy_queue_file(workspace_root: &Path, per_name: &Path) {
-    if per_name.exists() {
-        return;
-    }
-    let legacy = queue::default_queue_path(workspace_root);
-    if legacy.exists() {
-        if let Err(error) = std::fs::rename(&legacy, per_name) {
-            log::warn!(
-                "observability: could not adopt legacy queue {}: {error} — it will be \
-                 adopted on a later boot",
-                legacy.display()
-            );
-        }
-    }
-}
-
 /// The per-exporter policy pass [`spawn_task`] runs before the ingest key is
 /// read (Issue #7815): the endpoint `entry` exports to, or the
 /// `(endpoint, detail)` its `Misconfigured` status reports. Shared with the
@@ -888,7 +828,6 @@ pub fn spawn_task(
         register_global_export_status(primary_status_for(&entries, &statuses));
         return None;
     }
-    let sole = entries.len() == 1;
     let shared_endpoint = resolve_endpoint(config);
 
     // Policy pass, per entry, BEFORE the ingest key is read (Issue #7815's
@@ -978,7 +917,7 @@ pub fn spawn_task(
     );
 
     // Per-exporter construction (Issue #8756): each planned entry opens its
-    // own durable queue at [`queue_path_for`]'s path, gets its own status
+    // own durable queue at [`queue::default_queue_path`], gets its own status
     // cell, and spawns its own sender. The `match` below constructs different
     // concrete `E: Exporter` types and each calls `sender::spawn_task` with
     // their own — no dyn/boxing needed, since every call returns the same
@@ -993,12 +932,9 @@ pub fn spawn_task(
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The OTLP sinks whose senders started, for the agent relay (#10964).
     let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
-    for (index, (entry, endpoint)) in planned.iter().enumerate() {
+    for (entry, endpoint) in &planned {
         let name = entry.kind.name();
-        let queue_path = queue_path_for(&workspace_root, name, sole);
-        if !sole && index == 0 {
-            adopt_legacy_queue_file(&workspace_root, &queue_path);
-        }
+        let queue_path = queue::default_queue_path(&workspace_root);
         let queue = Arc::new(DurableQueue::open(queue_path, capacity));
         let export_status =
             Arc::new(ExportStatus::started(&host_id, endpoint, name, flush_interval.as_secs()));
