@@ -6,7 +6,7 @@
 //!
 //! `queue.snapshot` and `eta.snapshot` are native-HTTPS only (dashboard state
 //! keys), and neither has an entered-at, host or slot field. This kind is the
-//! slim state record a replay reader (`defaults/docs/telemetry-replay.md`)
+//! slim state record a replay reader
 //! needs: one row per `(repo, issue)` this host can see (the sweeps it holds,
 //! the PRs under a Loom review label, its ready queue with each item's planner
 //! rank and ranking inputs) plus a per-repo open-PR census.
@@ -15,7 +15,7 @@
 //!
 //! Nothing is elected. Each daemon reports what it holds and what it sees;
 //! two hosts reporting the same PR in review are two true views, and readers
-//! reconcile (`telemetry-replay.md`). The record does not depend on the ETA
+//! reconcile. The record does not depend on the ETA
 //! subsystem: it is emitted whenever an OTLP exporter exists.
 //!
 //! # Anchors, deltas and chunks
