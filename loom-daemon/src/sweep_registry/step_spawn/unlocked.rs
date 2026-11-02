@@ -177,6 +177,11 @@ impl SweepRegistry {
             }
         };
         let sweep_id = generate_sweep_id(&kind);
+        // Every forge call below (lock, claim, pre-claim) is made for this
+        // sweep: stamp its `invoke github` spans (#13171). `blocking` stays
+        // on this thread, so the thread-local holds across it.
+        let _sweep =
+            crate::gh_invocation::telemetry::enter_sweep(&sweep_id, Some(role.role_name()));
         let claim_cmd = {
             let reg = locked(registry);
             let held = if role.acts_on_pr() {
