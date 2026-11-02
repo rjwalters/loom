@@ -147,6 +147,14 @@ pub struct PoolExhaustionHold {
     /// spawn cannot select an account, which is stronger evidence than this
     /// daemon's own read of the same directory.
     pub wrapper_observed: bool,
+    /// `true` once the `Armed` edge for this hold has been handed to the
+    /// caller for broadcast (#13508). A pre-flight hold arms *locally* on its
+    /// first tick but only advertises to peers once it has survived a later
+    /// tick, so an arm that clears within the same tick (two roots sharing
+    /// one pool with different preference lists) never reaches peers — and
+    /// its `Cleared` is suppressed too, rather than orphaning a clear ad for
+    /// an arm ad that was never sent.
+    pub published: bool,
 }
 
 /// A transition in this host's hold set worth telling peers about (Issue
@@ -326,22 +334,29 @@ impl PoolHoldState {
                     let hold = existing.get_mut();
                     hold.total = pool.total;
                     hold.next_clear_at = next_clear_at;
+                    // #13508: the hold survived past its arming tick, so it is
+                    // no longer a same-tick flap — advertise it now, once.
+                    if !hold.published {
+                        hold.published = true;
+                        edge = Some(PoolHoldEdge::Armed {
+                            remaining: remaining_until(next_clear_at, now),
+                        });
+                    }
                 }
                 Entry::Vacant(slot) => {
-                    // #8001: the arming edge — the one tick per outage that
-                    // both logs and broadcasts. Every later tick refreshes
-                    // the Occupied arm above and stays silent on both.
-                    edge = Some(PoolHoldEdge::Armed {
-                        remaining: remaining_until(next_clear_at, now),
-                    });
+                    // #8001: the arming tick — logs here. The broadcast is
+                    // deferred to the next tick that still sees the hold
+                    // (#13508, the Occupied arm above); later ticks stay
+                    // silent on both.
                     if let Some(diagnostic) = &preference_diagnostic {
                         log::warn!(
                             "work_finder: every runtime in the sweep-lifecycle preference list \
                              is UNAVAILABLE. Holding ALL sweep dispatch for every workspace \
                              resolving to this pool until at least one tap recovers (~{}); no \
                              claim label will be flipped and no lease comment posted while held \
-                             (#7708/#8554).\n{diagnostic}",
-                            next_clear_at.to_rfc3339()
+                             (#7708/#8554). Armed by workspace {}.\n{diagnostic}",
+                            next_clear_at.to_rfc3339(),
+                            root.display()
                         );
                     } else {
                         log::warn!(
@@ -363,6 +378,7 @@ impl PoolHoldState {
                         since: now,
                         next_clear_at,
                         wrapper_observed: false,
+                        published: false,
                     });
                 }
             }
@@ -398,11 +414,13 @@ impl PoolHoldState {
                     hold.wrapper_observed,
                     hold.total,
                 );
-                holds.remove(&pool.dir);
                 // #8001: the clearing edge. Broadcast so peers release this
                 // host's advertised hold NOW rather than sitting out the rest
-                // of a TTL this host has already stopped honouring.
-                (false, Some(PoolHoldEdge::Cleared))
+                // of a TTL this host has already stopped honouring. A hold
+                // that was never advertised (#13508) has nothing to release.
+                let edge = hold.published.then_some(PoolHoldEdge::Cleared);
+                holds.remove(&pool.dir);
+                (false, edge)
             }
             None => (false, None),
         };
@@ -448,12 +466,13 @@ impl PoolHoldState {
                 // since expired) the original arm ad gets a fresh, longer
                 // window out of the strongest evidence available. Re-arming
                 // an already-post-mortem hold is a no-op edge.
-                if !hold.wrapper_observed {
+                if !hold.wrapper_observed || !hold.published {
                     edge = Some(PoolHoldEdge::Armed {
                         remaining: remaining_until(next_clear_at, now),
                     });
                 }
                 hold.wrapper_observed = true;
+                hold.published = true;
             }
             Entry::Vacant(slot) => {
                 edge = Some(PoolHoldEdge::Armed {
@@ -476,6 +495,7 @@ impl PoolHoldState {
                     since: now,
                     next_clear_at,
                     wrapper_observed: true,
+                    published: true,
                 });
             }
         }
