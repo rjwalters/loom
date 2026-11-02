@@ -390,8 +390,11 @@ impl<'a> GhPrSource<'a> {
     fn get(&self, endpoint: &str) -> Option<Value> {
         // `--paginate` reads every page (#13502); `parse_listing` flattens the
         // concatenated arrays. Any failed or unparseable read is `None`.
-        let out = crate::script_helpers::run_gh(&["api", "--paginate", endpoint], self.root, false);
-        crate::comment_trust::parse_listing(&out.ok_output()?.stdout).map(Value::Array)
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        let inv = crate::claim_reconciliation::gh_call::read("ratification.pr_get", &gh, self.root)
+            .args(["api", endpoint, "--paginate"]);
+        let stdout = crate::claim_reconciliation::gh_call::ok_stdout(inv)?;
+        crate::comment_trust::parse_listing(&stdout).map(Value::Array)
     }
 
     fn raw(&self, path: &str, git_ref: &str) -> Option<String> {
