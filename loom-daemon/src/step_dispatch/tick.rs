@@ -246,6 +246,9 @@ pub struct StepWorkspace {
     /// `champion.mergeConcurrencyPerRepo` as resolved for the tick, for the
     /// span (`loom.champion.merge_concurrency`).
     pub merge_concurrency: usize,
+    /// The repo's eligible `champion_merge` steps in the tick's pool (#13367),
+    /// for the span (`loom.champion.merge_eligible`).
+    pub merge_eligible: usize,
     /// Merges in flight in the repo before the tick drew (this host's and
     /// the peers'), for the span.
     pub merges_in_flight: usize,
@@ -330,6 +333,9 @@ pub struct StepTick {
     /// The largest `champion.mergeConcurrencyPerRepo` among the tick's
     /// repos (#13026): the span's `loom.champion.merge_concurrency`.
     pub merge_concurrency: usize,
+    /// Eligible `champion_merge` steps across the tick's repos (#13367): the
+    /// span's `loom.champion.merge_eligible`.
+    pub merge_eligible: usize,
     /// Champion merges in flight across the tick's repos once it ended: those
     /// running before it plus those it spawned (#13026).
     pub merges_in_flight: usize,
@@ -491,7 +497,10 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
             E::BuildBackoff => &mut report.deferred_build_backoff,
             E::CoolingDown
             | E::Pass(
-                PassReason::CiPending | PassReason::HeldAtHead | PassReason::AuthorGateHeld,
+                PassReason::CiPending
+                | PassReason::HeldAtHead
+                | PassReason::AuthorGateHeld
+                | PassReason::Conflicting,
             ) => &mut report.skipped_noop_cooldown,
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
@@ -1099,6 +1108,7 @@ pub fn run_with_offers(
         .map(|w| w.merge_concurrency)
         .max()
         .unwrap_or(0);
+    let merge_eligible = workspaces.iter().map(|w| w.merge_eligible).sum::<usize>();
     let merges_in_flight = workspaces.iter().map(|w| w.merges_in_flight).sum::<usize>()
         + merging.values().sum::<usize>();
     StepTick {
@@ -1109,6 +1119,7 @@ pub fn run_with_offers(
         stop,
         merge_deferred,
         merge_concurrency,
+        merge_eligible,
         merges_in_flight,
         draws_unspawned,
     }

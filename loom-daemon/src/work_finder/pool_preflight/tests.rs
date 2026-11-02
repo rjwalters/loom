@@ -523,6 +523,91 @@ fn an_operator_pin_disables_fall_through_at_the_hold() {
 }
 
 // ---------------------------------------------------------------------------
+// Tap-less preference resolution is config, not exhaustion (#13428)
+// ---------------------------------------------------------------------------
+
+/// A `roleDraw` table for `sweep-lifecycle` whose only provider is excluded:
+/// the walk runs over ZERO taps, so `resolve_runtime` returns a
+/// `Decision::Preference` whose resolution `is_empty_list()`.
+fn tapless_config() -> serde_json::Value {
+    serde_json::json!({"runtimes": {
+        "excludeProviders": ["codex"],
+        "roleDraw": {"sweep-lifecycle": [{"attempt": 1, "draw": {"codex": 100}}]},
+    }})
+}
+
+/// AC1: a tap-less root over a healthy pool must not hold or arm anything.
+/// Reverting the `is_empty_list()` guard in `observe_root_edge` makes this
+/// fail: the empty resolution has `chosen == None`, so it reads as exhausted.
+#[test]
+#[serial]
+fn a_tapless_root_with_a_healthy_pool_does_not_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(&["a", "b"], &tapless_config());
+
+    let host = PoolHoldState::new();
+    assert!(!host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// AC4: a tap-less root over a genuinely exhausted pool still holds — the
+/// pool-state branch decides, exactly as with no preference configured.
+#[test]
+#[serial]
+fn a_tapless_root_with_a_really_exhausted_pool_still_arms_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(&["a"], &tapless_config());
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 1);
+}
+
+/// AC3: two roots sharing one HEALTHY pool, one tap-less and one with a
+/// preference list. Neither may hold, and no arm/clear edge may appear across
+/// repeated ticks. Before the fix the tap-less root read as exhausted and armed
+/// the shared key, which the other root then cleared: the per-tick WARN /
+/// recovered pair.
+#[test]
+#[serial]
+fn a_tapless_root_does_not_flap_the_hold_shared_with_a_spawnable_root() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+
+    // Neither root has a repo-local pool, so both resolve to the shared one.
+    let shared = tempfile::tempdir().unwrap();
+    fs::write(shared.path().join("a.token"), "sk-ant-oat01-fake").unwrap();
+    let prior = std::env::var_os("LOOM_SHARED_TOKENS_DIR");
+    std::env::set_var("LOOM_SHARED_TOKENS_DIR", shared.path());
+
+    let tapless = workspace_with_pool_and_preference(&[], &tapless_config());
+    let spawnable = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    let mut edges = Vec::new();
+    for _ in 0..3 {
+        for root in [tapless.path(), spawnable.path()] {
+            let obs = host.observe_root_edge(root, chrono::Utc::now());
+            edges.push((root == tapless.path(), obs.held, obs.edge));
+        }
+    }
+    match prior {
+        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+    }
+
+    assert!(edges.iter().all(|(_, held, edge)| !held && edge.is_none()), "{edges:?}");
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Fleet broadcast of the hold (Issue #8001)
 // ---------------------------------------------------------------------------
 //

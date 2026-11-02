@@ -192,9 +192,10 @@ pub mod dep_recheck;
 /// from the mirror's worklist or per-repo listings.
 pub mod discovery;
 pub mod disk_headroom;
-pub mod dispatch_tap;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
+/// Doctor hand-back as a conditional, verified label transition (#9388).
+pub mod doctor_handback;
 pub mod eager_reclaim;
 #[cfg(test)]
 pub(crate) mod env_test_support;
@@ -301,7 +302,6 @@ mod live_gh_guard;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;
-pub mod merge_policy;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
@@ -446,6 +446,9 @@ pub mod telemetry_join;
 pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
+/// Test-only hermetic git helpers shared by the orphan-stack test modules.
+#[cfg(test)]
+pub mod test_git_helpers;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's
 /// one-per-process `log::set_boxed_logger` installation is shared by every test
 /// module that asserts on log severity.

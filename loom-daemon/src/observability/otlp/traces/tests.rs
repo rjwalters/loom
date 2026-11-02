@@ -159,6 +159,9 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
         .map(|kv| kv["key"].as_str().unwrap().to_string())
         .collect();
     for key in SPAN_ATTRIBUTE_KEYS {
+        if crate::gh_invocation::telemetry::OPTIONAL_SPAN_ATTRIBUTE_KEYS.contains(key) {
+            continue;
+        }
         assert!(keys.iter().any(|k| k == key), "exported span lacks {key}");
     }
 }

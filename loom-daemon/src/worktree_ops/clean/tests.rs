@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_git_helpers::run as git;
 
 // --- select_pr_status / rows_to_status / classify_pr_row (#6746) ------
 //
@@ -1826,17 +1827,6 @@ fn log_retention_dry_run_lists_without_deleting() {
 }
 
 // --- actionable error reporting (#4877) ------------------------------
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?} failed in {}", dir.display());
-}
 
 /// A recorded error must name the target, the operation, and the cause —
 /// the three things `Errors: 1` on its own withholds.

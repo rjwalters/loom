@@ -294,6 +294,7 @@ fn sample_repo_status(root_missing: bool) -> RepoStatus {
         health_gate_enabled: Some(true),
         health_gate_verdict_at: None,
         root_missing,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,

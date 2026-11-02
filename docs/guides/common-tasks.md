@@ -117,9 +117,6 @@ cat > .loom/roles/documenter.json <<'EOF'
 {
   "name": "Documenter",
   "description": "Documentation maintenance specialist",
-  "defaultInterval": 0,
-  "defaultIntervalPrompt": "",
-  "autonomousRecommended": false,
   "suggestedWorkerType": "claude"
 }
 EOF

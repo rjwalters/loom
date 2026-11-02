@@ -15,7 +15,6 @@ use super::common::{query_daemon_bounded, resolve_dispatch_ack_timeout, resolve_
 /// (`--workspace`/`--model`/`--effort`/`--depends-on`) is unit-testable without
 /// a socket. Mirrors the field mapping the `mcp__loom__dispatch_sweep` tool uses
 /// so both operator surfaces enqueue byte-for-byte-equivalent requests.
-#[cfg(test)]
 fn build_dispatch_request(
     issue: u32,
     workspace: Option<String>,
@@ -23,22 +22,6 @@ fn build_dispatch_request(
     effort: Option<String>,
     depends_on: Option<u32>,
     force: bool,
-) -> Request {
-    build_dispatch_request_with_tap(issue, workspace, model, effort, depends_on, force, None, None)
-}
-
-/// [`build_dispatch_request`] plus the optional per-dispatch `runtime` /
-/// `modelProfile` tap for the Builder and Doctor phases (#11284).
-#[allow(clippy::too_many_arguments)]
-fn build_dispatch_request_with_tap(
-    issue: u32,
-    workspace: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-    depends_on: Option<u32>,
-    force: bool,
-    runtime: Option<String>,
-    model_profile: Option<String>,
 ) -> Request {
     Request::DispatchSweep {
         kind: SweepKind::Issue(issue),
@@ -52,8 +35,6 @@ fn build_dispatch_request_with_tap(
         // Host-distress circuit-breaker override (#4235): default false, so a
         // tripped breaker refuses the dispatch unless the operator passes --force.
         force,
-        runtime,
-        model_profile,
         // #11444: a human ran `loom-daemon dispatch`. The daemon records an
         // absent origin as `unknown`, so the CLI must say so explicitly.
         dispatch_origin: Some(crate::telemetry::DispatchOrigin::Operator),
@@ -165,21 +146,6 @@ fn host_constraint_refusal(
     ))
 }
 
-/// Per-dispatch runtime tap flags for `loom-daemon dispatch` (#11284), kept here
-/// (flattened into `Commands::Dispatch`) so `main.rs` does not grow.
-#[derive(clap::Args, Debug, Clone, Default)]
-pub struct DispatchTapArgs {
-    /// Run the sweep's Builder and Doctor phases on this runtime (#11284),
-    /// e.g. `opencode`. An unavailable or unadmitted runtime is refused,
-    /// never silently replaced. Curator/Judge keep their role policy.
-    #[arg(long, value_name = "RUNTIME")]
-    pub runtime: Option<String>,
-
-    /// Model profile for `--runtime` (e.g. `zai-flash`). Requires `--runtime`.
-    #[arg(long, value_name = "PROFILE", requires = "runtime")]
-    pub model_profile: Option<String>,
-}
-
 /// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
 /// daemon over its Unix socket and enqueues a sweep via the same `DispatchSweep`
 /// request the MCP `dispatch_sweep` tool uses — but with a bounded client-side
@@ -201,9 +167,6 @@ pub struct DispatchTapArgs {
 /// happens entirely client-side, before the socket round-trip: the CLI
 /// process and the daemon it talks to over a Unix socket always share one
 /// host identity, so there is no protocol change to make here.
-#[allow(clippy::too_many_arguments)] // one flag per independent CLI override
-                                     // (`--force`, `--ignore-host-constraint`, `--runtime`,
-                                     // `--model-profile`)
 pub async fn handle_dispatch_command(
     issue: u32,
     workspace: Option<String>,
@@ -212,17 +175,7 @@ pub async fn handle_dispatch_command(
     depends_on: Option<u32>,
     force: bool,
     ignore_host_constraint: bool,
-    runtime: Option<String>,
-    model_profile: Option<String>,
 ) -> Result<()> {
-    // Fail fast, client-side, on a malformed runtime/modelProfile (#11284).
-    if let Err(message) = crate::runtime_preference::explicit_tap::parse_explicit_tap(
-        runtime.as_deref(),
-        model_profile.as_deref(),
-    ) {
-        eprintln!("loom-daemon dispatch: {message}");
-        std::process::exit(2);
-    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
@@ -248,16 +201,7 @@ pub async fn handle_dispatch_command(
     }
 
     let socket_path = resolve_socket_path()?;
-    let request = build_dispatch_request_with_tap(
-        issue,
-        workspace,
-        model,
-        effort,
-        depends_on,
-        force,
-        runtime,
-        model_profile,
-    );
+    let request = build_dispatch_request(issue, workspace, model, effort, depends_on, force);
     let ack_timeout = resolve_dispatch_ack_timeout();
 
     match query_daemon_bounded(&socket_path, &request, ack_timeout).await {
@@ -325,10 +269,7 @@ mod dispatch_tests {
     //! plumbing into the `DispatchSweep` IPC request, a successful round-trip
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
-    use super::{
-        build_dispatch_request, build_dispatch_request_with_tap, host_constraint_refusal,
-        resolve_cli_dispatch_workspace,
-    };
+    use super::{build_dispatch_request, host_constraint_refusal, resolve_cli_dispatch_workspace};
     use crate::cli::common::{
         query_daemon_bounded, resolve_dispatch_ack_timeout, DAEMON_IPC_TIMEOUT_ENV,
         DISPATCH_ACK_TIMEOUT,
@@ -338,32 +279,6 @@ mod dispatch_tests {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
-
-    /// #11284: `--runtime` / `--model-profile` reach the request.
-    #[test]
-    fn build_dispatch_request_plumbs_runtime_and_profile() {
-        let request = build_dispatch_request_with_tap(
-            7,
-            None,
-            None,
-            None,
-            None,
-            false,
-            Some("opencode".into()),
-            Some("zai-flash".into()),
-        );
-        match request {
-            Request::DispatchSweep {
-                runtime,
-                model_profile,
-                ..
-            } => {
-                assert_eq!(runtime.as_deref(), Some("opencode"));
-                assert_eq!(model_profile.as_deref(), Some("zai-flash"));
-            }
-            other => panic!("expected DispatchSweep, got {other:?}"),
-        }
-    }
 
     /// `build_dispatch_request` maps every flag into the right `DispatchSweep`
     /// field — the core plumbing acceptance criterion.
@@ -386,8 +301,6 @@ mod dispatch_tests {
                 depends_on,
                 workspace_root,
                 force,
-                runtime: _,
-                model_profile: _,
                 dispatch_origin,
             } => {
                 assert_eq!(kind, SweepKind::Issue(3952));

@@ -73,7 +73,7 @@ fn actual_propagation_hook_handles_enabled_disabled_and_invalid_configuration() 
                 .env(CONTEXT_FILE_ENV, "stale-file");
             // Same execution name ⇒ the second call loads the context the
             // first persisted, so the two spawns observe one identity.
-            prepare_child(&mut command, dir.path(), "child-boundary", None);
+            prepare_child(&mut command, dir.path(), "child-boundary", &StepKeys::default());
             command
         };
         let mut command = prepared(TRACEPARENT_ENV);

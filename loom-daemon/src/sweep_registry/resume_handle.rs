@@ -266,7 +266,6 @@ impl DispatchSession {
 }
 
 /// One in-flight agent, as the H4 classifier (PR 2) sees it.
-#[allow(dead_code)] // consumed by the H4 pause (#10831); exercised by tests here
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InFlightAgent {
     pub(crate) issue: u32,
@@ -354,7 +353,6 @@ impl SweepRegistry {
     /// Every live claim lock of this registry as an in-flight agent, with its
     /// resume handle (and any live-captured Codex session id) merged in. The
     /// H4 classifier's input (PR 2); read-only.
-    #[allow(dead_code)] // consumed by the H4 pause (#10831)
     pub(crate) fn in_flight_snapshot(&self) -> Vec<InFlightAgent> {
         let pause_root = roll_pause::default_pause_root(&self.config.workspace_root);
         let Ok(entries) = std::fs::read_dir(self.config.locks_dir()) else {

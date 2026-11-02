@@ -22,7 +22,15 @@
 #   or empty. A non-integer or negative value is an error, never "always bump".
 #   0 is accepted and means "no rate limit" (the pre-#11174 behaviour).
 #   --force (workflow_dispatch only) skips the interval check, never the
-#   "is there anything unreleased under defaults/" check; it needs a --reason.
+#   "is there anything unreleased" check; it needs a --reason.
+#
+# "Unreleased" = a change since the last bump under any RELEASE_PATHS entry:
+# defaults/ (what an install copies) and the two workspace crates that compile
+# into the release assets, the loom-daemon-* binaries (#13452: a Rust-only
+# stretch of daemon fixes used to be unreleasable on every path, force
+# included, so a loom_min_version floor could not ship them). Cargo.toml and
+# Cargo.lock are deliberately NOT in the set: the bump commit rewrites them,
+# and the push trigger's path filter must never match a bump commit.
 #
 # Output (stdout, key=value): decision=bump|deferred|nothing|error,
 #   last_bump_sha=, last_bump_at=, eligible_at=, forced=, reason=
@@ -110,19 +118,21 @@ if [[ "$subject" != "chore: bump version to "* ]]; then
 fi
 eligible_ct=$((last_ct + interval))
 
-# Anything unreleased? Same filter as the push trigger's `paths: defaults/**`,
-# which a scheduled or dispatched run does not get. diff-tree compares tree
-# ids only, so a blob:none partial clone answers it without fetching blobs.
+# Anything unreleased? Same filter as the push trigger's `paths:` list, which
+# a scheduled or dispatched run does not get (keep the two in step: the
+# workflow identity test pins both). diff-tree compares tree ids only, so a
+# blob:none partial clone answers it without fetching blobs.
+RELEASE_PATHS=(defaults/ loom-daemon/ loom-api/)
 rc=0
-git diff-tree --quiet -r "$last_sha" "$ref" -- defaults/ || rc=$?
+git diff-tree --quiet -r "$last_sha" "$ref" -- "${RELEASE_PATHS[@]}" || rc=$?
 case "$rc" in
   0)
     eligible_ct=""
-    emit nothing "nothing to release: no defaults/ change on ${ref} since the last bump ${last_sha:0:12}"
+    emit nothing "nothing to release: no change under ${RELEASE_PATHS[*]} on ${ref} since the last bump ${last_sha:0:12}"
     exit 0
     ;;
   1) ;;
-  *) die "git diff-tree ${last_sha:0:12} ${ref} -- defaults/ failed (rc=${rc})" ;;
+  *) die "git diff-tree ${last_sha:0:12} ${ref} -- ${RELEASE_PATHS[*]} failed (rc=${rc})" ;;
 esac
 
 if [[ "$force" == "true" ]]; then
@@ -131,7 +141,7 @@ if [[ "$force" == "true" ]]; then
 fi
 
 if ((now - last_ct >= interval)); then
-  emit bump "${interval}s elapsed since the last bump ${last_sha:0:12} and defaults/ changed since it"
+  emit bump "${interval}s elapsed since the last bump ${last_sha:0:12} and a release path changed since it"
   exit 0
 fi
 

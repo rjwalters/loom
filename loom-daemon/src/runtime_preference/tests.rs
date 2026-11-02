@@ -230,6 +230,27 @@ fn an_entirely_unavailable_list_yields_no_choice_and_names_every_reason() {
     assert!(diagnostic.contains("codex -> unavailable"), "{diagnostic}");
 }
 
+/// #13428: a walk over zero taps is a configuration outcome, distinct from
+/// "every tap skipped" — pool pre-flight keys off this to avoid a bogus hold.
+#[test]
+fn an_empty_walk_is_an_empty_list_but_an_all_skipped_walk_is_not() {
+    let empty = resolve(
+        &taps(&[]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    assert!(empty.chosen.is_none());
+    assert!(empty.is_empty_list());
+
+    let all_skipped = resolve(
+        &taps(&["claude"]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, tap, _| Err(unavailable(&format!("{}_pool", tap.runtime))),
+    );
+    assert!(all_skipped.chosen.is_none());
+    assert!(!all_skipped.is_empty_list());
+}
+
 /// The telemetry criterion: the chosen tier AND every higher tier's skip
 /// reason are in the launch record.
 #[test]

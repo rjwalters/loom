@@ -97,30 +97,8 @@ fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection
         assert!(credential_username(false, Some(invalid)).is_err());
     }
 }
-use std::process::Command;
 
-fn git(path: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args([
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "Git fixture failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
+use crate::test_git_helpers::{configure, run as git};
 
 struct RepoFixture {
     _temp: tempfile::TempDir,
@@ -137,6 +115,7 @@ impl RepoFixture {
         std::fs::create_dir(&remote).unwrap();
         std::fs::create_dir(&root).unwrap();
         git(&remote, &["init", "-b", "main"]);
+        configure(&remote);
         std::fs::write(remote.join("fixture"), "base").unwrap();
         git(&remote, &["add", "."]);
         git(&remote, &["commit", "-m", "fixture"]);
@@ -543,6 +522,7 @@ impl RepoFixture {
         let remote = self._temp.path().join(name);
         std::fs::create_dir(&remote).unwrap();
         git(&remote, &["init", "-b", "main"]);
+        configure(&remote);
         std::fs::write(remote.join("fixture"), name).unwrap();
         git(&remote, &["add", "."]);
         git(&remote, &["commit", "-m", name]);

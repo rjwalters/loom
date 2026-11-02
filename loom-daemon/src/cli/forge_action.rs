@@ -872,6 +872,11 @@ pub(crate) enum ForgeAction {
         /// sha256 of the body without trailing newlines (#12614).
         #[arg(long = "issue-body-sha")]
         issue_body_sha: Vec<String>,
+        /// Comment id (repeatable) the Judge re-read and confirmed is
+        /// spec-neutral: excluded from the stale-read comment check (#13134).
+        /// Never excuses a body edit, a body-hash mismatch or another comment.
+        #[arg(long = "acknowledged-comment")]
+        acknowledged_comment: Vec<u64>,
     },
 
     /// `forge verdict-labels <pr> --repo R --verdict V` (#10581) — apply the
@@ -890,6 +895,27 @@ pub(crate) enum ForgeAction {
         /// `approved` or `changes-requested`.
         #[arg(long)]
         verdict: String,
+    },
+
+    /// `forge doctor-handback <pr> --expected-head-sha S [--repo R]` (#9388) —
+    /// the Doctor's completion write. Re-reads labels and head itself, then:
+    /// `loom:treating` on, head == S, no `loom:review-requested`/`reviewing`/
+    /// `pr` -> add `loom:review-requested`, then drop `loom:changes-requested`
+    /// and `loom:treating`, re-read, and withdraw the add if a verdict/review
+    /// label landed meanwhile. Prints `LOOM-DOCTOR-HANDBACK <OUTCOME>`; exits
+    /// 0 HANDED-BACK, 10 ALREADY-ADVANCED (success: claim released only),
+    /// 11 CLAIM-LOST (nothing written), 12 HEAD-MOVED (claim released only),
+    /// 13 RACED (own add withdrawn), 1 FAILED (unread, or did not hold).
+    #[command(name = "doctor-handback")]
+    DoctorHandback {
+        /// The PR number.
+        pr: u64,
+        /// The head SHA the Doctor pushed (`git rev-parse HEAD`).
+        #[arg(long)]
+        expected_head_sha: String,
+        /// `owner/name` (default: this checkout's vetted origin).
+        #[arg(long)]
+        repo: Option<String>,
     },
 
     /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
@@ -1152,6 +1178,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             window_secs,
             review_started,
             issue_body_sha,
+            acknowledged_comment,
         } => {
             return super::forge_verdict_cmd::verdict_gate(
                 pr,
@@ -1162,6 +1189,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 window_secs,
                 review_started.as_deref(),
                 &issue_body_sha,
+                &acknowledged_comment,
             );
         }
         ForgeAction::VerdictLock { action, pr, repo } => {
@@ -1200,6 +1228,17 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &label,
                 &claimed_at,
                 repo.as_deref(),
+            );
+        }
+        ForgeAction::DoctorHandback {
+            pr,
+            expected_head_sha,
+            repo,
+        } => {
+            return super::forge_verdict_cmd::doctor_handback(
+                pr,
+                repo.as_deref(),
+                &expected_head_sha,
             );
         }
         ForgeAction::VerdictStaleNotice {
@@ -1406,6 +1445,9 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // `--repo`, so a direct call (the repair command the script prints)
         // is vetted like every other write verb. `verdict-gate` only reads.
         ForgeAction::VerdictLabels { repo, .. } => Some(Some(repo.clone())),
+        // #9388: `doctor-handback` POSTs and DELETEs labels; with no `--repo`
+        // the checkout's own gh target is vetted, as for `pr edit`.
+        ForgeAction::DoctorHandback { repo, .. } => Some(repo.clone()),
         // #10581: `verdict-reconcile` DELETEs the caller's duplicate verdict
         // comment on the supplied `--repo`, so a direct call is vetted too.
         ForgeAction::VerdictReconcile { repo, .. } => Some(Some(repo.clone())),
@@ -1561,8 +1603,27 @@ mod write_target_tests {
             window_secs: 600,
             review_started: None,
             issue_body_sha: Vec::new(),
+            acknowledged_comment: Vec::new(),
         };
         assert_eq!(write_target(&gate), None);
+    }
+
+    /// #9388: `doctor-handback` writes labels, so it is vetted like
+    /// `verdict-labels` (its own `--repo`, else the checkout's target).
+    #[test]
+    fn doctor_handback_is_vetted() {
+        let explicit = ForgeAction::DoctorHandback {
+            pr: 7,
+            expected_head_sha: "a".repeat(40),
+            repo: Some("unmanaged/repo".into()),
+        };
+        assert_eq!(write_target(&explicit), Some(Some("unmanaged/repo".into())));
+        let implicit = ForgeAction::DoctorHandback {
+            pr: 7,
+            expected_head_sha: "a".repeat(40),
+            repo: None,
+        };
+        assert_eq!(write_target(&implicit), Some(None));
     }
 
     /// #10581: `verdict-reconcile` can DELETE a comment, so a direct call

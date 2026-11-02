@@ -591,7 +591,10 @@ pub(crate) enum ScriptPortCommand {
     /// cites one of them as a blocker and now classifies stale. Reuses
     /// `check-stale-blocked`'s enumeration and the `dep_recheck` parsers.
     /// Called from `merge-pr.sh`'s post-merge path. Unlike
-    /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
+    /// `CheckStaleBlocked` it WRITES: a comment, plus the #13331 carve-out
+    /// that swaps `loom:blocked` for `loom:curated` on a fully-resolved
+    /// Curator park. `--resweep` applies that carve-out to every open
+    /// `loom:blocked` issue regardless of prior markers; `--dry-run`
     /// previews. Always exits 0.
     NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
     /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a

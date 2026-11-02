@@ -368,3 +368,23 @@ fn a_tracker_marker_passes_whatever_the_labels() {
     });
     assert_eq!(plain_ready[0].target(), Some(5));
 }
+
+/// #13367: an approved PR flagged `loom:merge-conflict` is a pass, not a
+/// `champion_merge` step; the same PR without the flag is still merged.
+#[test]
+fn an_approved_conflicting_pr_is_not_a_merge_step() {
+    let pr = |labels: &[&str]| Inputs {
+        pulls: vec![PullInput {
+            number: 70,
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    let conflicting = classify(&pr(&["loom:pr", "loom:merge-conflict"]));
+    assert_eq!(conflicting[0].step(), None);
+    assert_eq!(conflicting[0].verdict, Verdict::Pass(PassReason::Conflicting));
+    assert_eq!(PassReason::Conflicting.as_str(), "conflicting");
+    let clean = classify(&pr(&["loom:pr"]));
+    assert_eq!(clean[0].step(), Some(Step::ChampionMerge));
+}

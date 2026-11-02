@@ -11,6 +11,7 @@ use tempfile::TempDir;
 
 use super::super::{watch_reflog, CheckoutPass, Env, Memory, MoveHold};
 use super::*;
+use crate::test_git_helpers::run as git;
 use crate::workspace_hold::{HeldCopy, HoldKind, WorkspaceHold};
 
 /// A synthetic stand-in for the reflog of the checkout reset at 00:44:39,
@@ -20,21 +21,6 @@ use crate::workspace_hold::{HeldCopy, HoldKind, WorkspaceHold};
 /// fast-forwards around them, and a no-op `reset: moving to HEAD`) but the
 /// shas and messages are invented.
 const FIXTURE: &str = include_str!("../../../tests/fixtures/reflog-2am-2026-10-12.txt");
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_REFLOG_ACTION")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
 
 fn commit(dir: &Path, name: &str) {
     fs::write(dir.join(name), name).unwrap();

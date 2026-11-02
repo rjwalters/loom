@@ -1,10 +1,10 @@
-//! `worktree-return.sh`'s in-worktree predicate vs. `loom-daemon
+//! `worktree.sh --check`'s in-worktree predicate vs. `loom-daemon
 //! worktree-check` (#9425) — and vs. the string comparison it retired.
 //!
 //! # What was wrong
 //!
-//! `defaults/scripts/worktree-return.sh` carried a verbatim copy of the
-//! predicate #8195 slice 11 (PR #9424) retired from
+//! `worktree.sh --check` (and, until #13118, the retired `worktree-return.sh`)
+//! carried a copy of the predicate #8195 slice 11 (PR #9424) retired from
 //! `defaults/scripts/worktree.sh` as constant-true:
 //!
 //! ```text
@@ -17,39 +17,31 @@
 //! to the current directory** whenever it can be. So in the primary clone the
 //! comparison read `.git` != `/repo/.git` — true — and it answered *"in a
 //! worktree"* there, in every subdirectory of it, and inside a real linked
-//! worktree alike. It had **no reachable false branch**, so
-//! `worktree-return.sh`'s *"Not currently in a worktree"* arm was dead code —
-//! in the very script that tells operators to run `pnpm worktree --check`,
-//! which slice 11 had just made answer correctly.
+//! worktree alike. It had **no reachable false branch**, so the *"Not currently
+//! in a worktree"* arm was dead code.
 //!
 //! # What this file pins
 //!
 //! Three things, each of which fails if the string comparison comes back:
 //!
-//! 1. **The live script, run as a script**, answers correctly from all four
-//!    positions a caller can stand in, and its previously-dead arm is reached
-//!    from two of them — [`the_previously_dead_arm_is_reachable_from_the_primary_clone`],
+//! 1. **The live `worktree.sh --check`, run as a script**, answers correctly
+//!    from all four positions a caller can stand in, and its previously-dead
+//!    arm is reached from two of them —
+//!    [`the_previously_dead_arm_is_reachable_from_the_primary_clone`],
 //!    [`the_live_script_agrees_with_the_port_from_every_position`].
 //! 2. **The retired comparison is constant-true**, extracted *live* from the
 //!    one frozen copy in the tree (`tests/fixtures/worktree-check-retired.sh`,
-//!    slice 11's fixture) rather than re-typed here — so the disagreement is
-//!    asserted in the documented direction and a regression to the shell's old
-//!    answer fails rather than quietly re-agreeing:
+//!    slice 11's fixture) rather than re-typed here:
 //!    [`the_retired_comparison_is_constant_true_which_is_the_disagreement`].
-//! 3. **Neither remaining call site carries it any more** — a source-level
-//!    guard over the live script, plus the retirement of the legacy
-//!    `scripts/worktree.sh` fork that held the third copy:
+//! 3. **The live script does not carry it**, and the legacy `scripts/worktree.sh`
+//!    fork that held another copy stays retired:
 //!    [`no_live_script_carries_the_retired_comparison`],
 //!    [`the_legacy_root_fork_is_retired_and_pnpm_worktree_points_at_the_canonical_script`].
 //!
-//! The live script is run **as a script** rather than having an expression
-//! extracted from it, because after this change there is no shell expression
-//! left to extract: the predicate is a hard delegation to `loom-daemon
-//! worktree-check`, the shape `worktree.sh --check` took. That makes the
-//! strongest possible pinning available — the thing under test is the artifact
-//! operators invoke, not a re-hosted fragment of it — and it is why the
-//! `LOOM_DAEMON_SELF_BIN` seam matters: every run here is pinned to the binary
-//! built from *this* tree, never to whatever the host has installed.
+//! The script is run **as a script** because the predicate is a hard
+//! delegation to `loom-daemon worktree-check`; the `LOOM_DAEMON_SELF_BIN` seam
+//! pins every run to the binary built from *this* tree, never to whatever the
+//! host has installed.
 
 mod common;
 
@@ -67,9 +59,9 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// The live script under test — the one `pnpm worktree:return` runs.
-fn live_worktree_return_sh() -> PathBuf {
-    repo_root().join("defaults/scripts/worktree-return.sh")
+/// The live script under test — the one `pnpm worktree --check` runs.
+fn live_worktree_sh() -> PathBuf {
+    repo_root().join("defaults/scripts/worktree.sh")
 }
 
 /// Slice 11's frozen copy of the retired shell. The *only* copy of the defect
@@ -90,8 +82,7 @@ enum Position {
     /// A subdirectory of the primary clone; git answers `--git-common-dir` as
     /// `../.git` here.
     PrimarySubdir,
-    /// Inside a linked worktree — the only position `worktree-return.sh` is
-    /// meant to work from.
+    /// Inside a linked worktree.
     Worktree,
     /// A subdirectory of a linked worktree.
     WorktreeSubdir,
@@ -161,9 +152,9 @@ fn build_fixture(tag: &str) -> Fixture {
 /// readable as *neither* answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
-    /// Got past the predicate — it is inside a linked worktree.
+    /// Exit 0 — it is inside a linked worktree.
     InWorktree,
-    /// Reached the previously-dead arm: the main working directory.
+    /// Exit 1 — the main working directory (the previously-dead arm).
     MainWorkingDirectory,
     /// Exit 2: `loom-daemon worktree-check` could not be run at all.
     CouldNotRun,
@@ -174,63 +165,42 @@ struct Run {
     stdout: String,
 }
 
-/// Run the live script in `cwd`, pinned to THIS tree's binary.
+/// Run the live script's `--check` verb in `cwd`, pinned to THIS tree's binary.
 ///
 /// `LOOM_DAEMON_SELF_BIN` is `lib/script-helper.sh`'s documented harness seam
 /// ("which binary IMPLEMENTS this stub", checked before the normal resolution
 /// chain), so the answer under test can never come from a stale machine
 /// install. `LOOM_DAEMON_BIN` is cleared alongside it so a leaked ambient value
 /// cannot reach the resolver either.
-fn run_live(cwd: &Path, args: &[&str]) -> Run {
+fn run_live(cwd: &Path) -> Run {
     let mut cmd = Command::new("bash");
     hermetic(&mut cmd);
     let out = cmd
-        .arg(live_worktree_return_sh())
-        .args(args)
+        .arg(live_worktree_sh())
+        .arg("--check")
         .current_dir(cwd)
         .env("LOOM_DAEMON_SELF_BIN", bin())
         .env_remove("LOOM_DAEMON_BIN")
         .output()
-        .expect("run worktree-return.sh");
+        .expect("run worktree.sh --check");
     Run {
         code: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
     }
 }
 
-/// The script's answer, read off its `--json` document — the machine-readable
-/// contract, so this harness does not depend on human message text.
+/// The script's answer, read off its exit code (0 in a worktree, 1 the main
+/// working directory, 2 could not run). 1 and 2 are the two refusal codes, and
+/// reading a 2 as a 1 is exactly the confusion LOOM_SCRIPT_HELPER_MISSING_RC=2
+/// exists to prevent.
 fn live_answer(cwd: &Path) -> Answer {
-    let run = run_live(cwd, &["--json"]);
-    let answer = if run.stdout.contains(r#""inWorktree": false"#) {
-        Answer::MainWorkingDirectory
-    } else if run.stdout.contains(r#""inWorktree": null"#) {
-        Answer::CouldNotRun
-    } else {
-        // Past the predicate: the document is one of the downstream arms
-        // (`hasReturnPath`, `success`, …), all of which are only reachable
-        // from inside a linked worktree.
-        assert!(
-            run.stdout.contains(r#""hasReturnPath""#) || run.stdout.contains(r#""success""#),
-            "unrecognised --json document (exit {}): {:?}",
-            run.code,
-            run.stdout
-        );
-        Answer::InWorktree
-    };
-    // The exit code and the document must never disagree: 1 and 2 are the two
-    // refusal codes, and reading a 2 as a 1 is exactly the confusion
-    // LOOM_SCRIPT_HELPER_MISSING_RC=2 exists to prevent.
-    match answer {
-        Answer::MainWorkingDirectory => {
-            assert_eq!(run.code, 1, "the main-working-directory arm exits 1")
-        }
-        Answer::CouldNotRun => {
-            assert_eq!(run.code, 2, "a could-not-run must not be readable as either answer")
-        }
-        Answer::InWorktree => assert_ne!(run.code, 2, "exit 2 means the predicate never answered"),
+    let run = run_live(cwd);
+    match run.code {
+        0 => Answer::InWorktree,
+        1 => Answer::MainWorkingDirectory,
+        2 => Answer::CouldNotRun,
+        other => panic!("unexpected exit {other}: {:?}", run.stdout),
     }
-    answer
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +268,7 @@ fn the_live_script_agrees_with_the_port_from_every_position() {
         assert_eq!(
             live_answer(&cwd),
             expected,
-            "worktree-return.sh and worktree-check disagree about {pos:?}"
+            "worktree.sh --check and worktree-check disagree about {pos:?}"
         );
     }
 }
@@ -311,43 +281,11 @@ fn the_previously_dead_arm_is_reachable_from_the_primary_clone() {
     let fx = build_fixture("dead-arm");
     for pos in [Position::PrimaryRoot, Position::PrimarySubdir] {
         let cwd = fx.cwd(pos);
-        let run = run_live(&cwd, &[]);
+        let run = run_live(&cwd);
         assert_eq!(run.code, 1, "{pos:?} must exit 1");
         assert!(
-            run.stdout
-                .contains("This command must be run from within an issue worktree"),
+            run.stdout.contains("Not currently in a worktree"),
             "{pos:?} must reach the not-in-a-worktree arm; got: {:?}",
-            run.stdout
-        );
-        assert!(
-            run.stdout.contains("pnpm worktree --check"),
-            "the arm still points at the verb `worktree.sh --check` now answers correctly"
-        );
-    }
-}
-
-#[test]
-fn inside_a_linked_worktree_the_script_gets_past_the_predicate_and_still_returns() {
-    // The arm that always worked must keep working, byte-compatibly: the
-    // predicate is the only thing that changed. `--check` reports the stored
-    // path; the bare verb performs the return.
-    let fx = build_fixture("return-path");
-    fs::write(fx.worktree.join(".loom-return-to"), format!("{}\n", fx.repo.display()))
-        .expect("write .loom-return-to");
-    for pos in [Position::Worktree, Position::WorktreeSubdir] {
-        let cwd = fx.cwd(pos);
-        let run = run_live(&cwd, &["--json", "--check"]);
-        assert_eq!(run.code, 0, "{pos:?}: --check must succeed");
-        assert!(
-            run.stdout.contains(r#""hasReturnPath": true"#),
-            "{pos:?}: expected the stored-path document; got {:?}",
-            run.stdout
-        );
-        let run = run_live(&cwd, &["--json"]);
-        assert_eq!(run.code, 0, "{pos:?}: the return must succeed");
-        assert!(
-            run.stdout.contains(r#""success": true"#),
-            "{pos:?}: expected the success document; got {:?}",
             run.stdout
         );
     }
@@ -385,13 +323,10 @@ fn no_live_script_carries_the_retired_comparison() {
     // *different* call site than the ones the behavioural tests drive. The
     // frozen fixture is deliberately exempt — it exists to hold the defect.
     //
-    // Comment-only lines are stripped first: both scripts *quote* the retired
+    // Comment-only lines are stripped first: the script *quotes* the retired
     // comparison in the comment explaining why it is gone, and a guard that
     // could not tell code from prose would forbid documenting the defect.
-    let scripts = [
-        "defaults/scripts/worktree-return.sh",
-        "defaults/scripts/worktree.sh",
-    ];
+    let scripts = ["defaults/scripts/worktree.sh"];
     for rel in scripts {
         let path = repo_root().join(rel);
         let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
@@ -494,11 +429,14 @@ fn an_unresolvable_daemon_is_neither_answer() {
     let mut cmd = Command::new("bash");
     hermetic(&mut cmd);
     let out = cmd
-        .arg(live_worktree_return_sh())
-        .arg("--json")
+        .arg(live_worktree_sh())
+        .arg("--check")
         .current_dir(fx.cwd(Position::Worktree))
         .env_remove("LOOM_DAEMON_SELF_BIN")
         .env_remove("LOOM_DAEMON_BIN")
+        // The repo-local-build tier probes $CARGO_TARGET_DIR, which a builder
+        // session exports; leaving it set would resolve a real daemon.
+        .env_remove("CARGO_TARGET_DIR")
         // Starve every resolver tier: the machine-level install directory, then
         // $PATH (bash's own interpreter is already running, so a PATH with no
         // loom-daemon on it is enough), then $HOME, which the installed-binary
@@ -507,17 +445,12 @@ fn an_unresolvable_daemon_is_neither_answer() {
         .env("HOME", &empty)
         .env("PATH", format!("{}:/usr/bin:/bin", empty.display()))
         .output()
-        .expect("run worktree-return.sh");
+        .expect("run worktree.sh --check");
     assert_eq!(
         out.status.code(),
         Some(2),
         "a host that cannot run the verb must exit 2, not 0 or 1; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains(r#""inWorktree": null"#),
-        "the --json document must say it could not tell, not that the answer was false; got {:?}",
-        String::from_utf8_lossy(&out.stdout)
     );
 }
 

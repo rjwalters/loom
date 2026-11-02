@@ -1423,6 +1423,8 @@ impl TerminalManager {
     /// normal state immediately after a reboot. See #4378.
     fn is_expected_empty_restore(stderr: &str) -> bool {
         stderr.contains("no server running")
+            || (stderr.contains("error connecting to")
+                && stderr.contains("No such file or directory"))
     }
 
     /// Handle tmux command errors with consistent logging
@@ -2513,6 +2515,16 @@ mod tests {
         // "no sessions" is a distinct condition already handled separately by
         // `handle_tmux_error` (debug, not error) — it must not be reclassified here.
         assert!(!TerminalManager::is_expected_empty_restore("no sessions"));
+    }
+
+    #[test]
+    fn test_is_expected_empty_restore_socket_missing() {
+        assert!(TerminalManager::is_expected_empty_restore(
+            "error connecting to /tmp/tmux-1000/loom (No such file or directory)"
+        ));
+        assert!(!TerminalManager::is_expected_empty_restore(
+            "error connecting to /tmp/tmux-1000/loom (Permission denied)"
+        ));
     }
 
     #[test]

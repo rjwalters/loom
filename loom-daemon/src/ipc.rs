@@ -602,6 +602,7 @@ impl IpcServer {
                     let drain = self.drain_state.clone();
                     let flights = self.status_flights.clone();
                     tokio::spawn(async move {
+                        let connected_at = Instant::now();
                         if let Err(e) = handle_client(
                             stream,
                             tm,
@@ -617,7 +618,7 @@ impl IpcServer {
                         )
                         .await
                         {
-                            log::error!("Client error: {e}");
+                            log_client_error(&e, connected_at.elapsed());
                         }
                     });
                 }
@@ -626,6 +627,48 @@ impl IpcServer {
                 }
             }
         }
+    }
+}
+
+/// Longest a status build waits for one root's sweep-registry mutex before
+/// reporting that root `lock_busy` and moving on (#13443).
+const REGISTRY_LOCK_DEADLINE: Duration = Duration::from_secs(2);
+/// Poll interval while waiting on a contended registry mutex.
+const REGISTRY_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// Snapshot `registry` waiting at most `deadline` for its mutex; `None` means
+/// the mutex stayed held past the deadline. A poisoned mutex is recovered, as
+/// before.
+fn snapshot_registry_bounded(
+    registry: &Mutex<SweepRegistry>,
+    deadline: Duration,
+) -> Option<crate::sweep_registry::RegistrySnapshot> {
+    let start = Instant::now();
+    loop {
+        match registry.try_lock() {
+            Ok(sr) => return Some(sr.snapshot()),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner().snapshot()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if start.elapsed() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(REGISTRY_LOCK_POLL);
+            }
+        }
+    }
+}
+
+/// Log a `handle_client` failure. A peer that hung up (`BrokenPipe` /
+/// `ConnectionReset`) is a `WARN` carrying how long the connection lived; the
+/// request name is not threaded to this arm (#13443).
+fn log_client_error(e: &anyhow::Error, elapsed: Duration) {
+    let disconnected = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        matches!(io.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+    });
+    if disconnected {
+        log::warn!("Client disconnected: {e} (connection open {elapsed:.1?})");
+    } else {
+        log::error!("Client error: {e}");
     }
 }
 
@@ -774,8 +817,6 @@ async fn handle_client(
             depends_on,
             workspace_root,
             force,
-            runtime,
-            model_profile,
             dispatch_origin,
         } = request
         {
@@ -790,8 +831,6 @@ async fn handle_client(
                 depends_on,
                 workspace_root,
                 force,
-                runtime,
-                model_profile,
                 // #11444: absent on the wire records `unknown`, never `operator`.
                 crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             )
@@ -1384,30 +1423,47 @@ pub fn build_daemon_status_for(
         // the same lock every dispatch/reap/status call on this root
         // contends for. See `SweepRegistry::snapshot`'s doc comment for the
         // full rationale and the live fleet measurement that motivated it.
-        let snapshot = {
-            let sr = registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sr.snapshot()
-        };
+        // #13443: the acquire is bounded. A root whose mutex is held past
+        // `REGISTRY_LOCK_DEADLINE` (e.g. a reaper backup push) is reported
+        // `lock_busy` with empty registry-derived fields instead of stalling
+        // the whole reply; the wait is still counted in `registry_lock`.
+        let snapshot = snapshot_registry_bounded(&registry, REGISTRY_LOCK_DEADLINE);
+        let lock_busy = snapshot.is_none();
+        if lock_busy {
+            log::warn!(
+                "build_daemon_status: registry lock for {} busy past {:?}; reporting lock_busy",
+                root.display(),
+                REGISTRY_LOCK_DEADLINE
+            );
+        }
         // In-flight = sweeps still live (Pending / Running). Terminal sweeps
         // (Exited / Crashed) linger in the registry but are not "in flight".
         let live: Vec<crate::types::SweepInfo> = snapshot
-            .list(None)
+            .as_ref()
+            .map(|snap| snap.list(None))
+            .unwrap_or_default()
             .into_iter()
             .filter(|info| !info.state.is_terminal())
             .collect();
         // Insta-crash quarantine (#3939): surface which issues this repo is
         // currently refusing to re-dispatch, so a repo with a visible backlog
         // that is dispatching nothing is explained.
-        let root_stale: Vec<crate::sweep_registry::StaleSweepFinding> =
-            if crate::sweep_registry::resolve_stale_sweep_enabled(&stale_sweep_config) {
-                snapshot.stale_sweep_findings(stale_sweep_min_age, stale_sweep_log_silence)
-            } else {
-                Vec::new()
-            };
-        let quarantined_issues = snapshot.quarantined_issues_sorted();
-        let locked_unregistered = snapshot.unregistered_locked_issues();
+        let root_stale: Vec<crate::sweep_registry::StaleSweepFinding> = match &snapshot {
+            Some(snap)
+                if crate::sweep_registry::resolve_stale_sweep_enabled(&stale_sweep_config) =>
+            {
+                snap.stale_sweep_findings(stale_sweep_min_age, stale_sweep_log_silence)
+            }
+            _ => Vec::new(),
+        };
+        let quarantined_issues = snapshot
+            .as_ref()
+            .map(|snap| snap.quarantined_issues_sorted())
+            .unwrap_or_default();
+        let locked_unregistered = snapshot
+            .as_ref()
+            .map(|snap| snap.unregistered_locked_issues())
+            .unwrap_or_default();
         stale_sweeps.extend(
             root_stale
                 .into_iter()
@@ -1565,6 +1621,7 @@ pub fn build_daemon_status_for(
             // without `workspace remove`) so `status` — not just the
             // work-finder log — points the operator at it.
             root_missing: !root.is_dir(),
+            lock_busy,
             // Load-aware deferral + tier label (#4259).
             health_gate_deferred: health_states.is_deferred(root),
             health_gate_deferred_reason: health_states.deferred_summary(root),
@@ -2960,8 +3017,6 @@ fn handle_request(
             depends_on,
             workspace_root,
             force,
-            runtime,
-            model_profile,
             dispatch_origin,
         } => {
             // GitHub rate-limit circuit breaker (#4429/#4440, gap closed by
@@ -3006,19 +3061,6 @@ fn handle_request(
             // daemon-dispatched child is pinned to an explicit model.
             let repo_root = sr.config().workspace_root.clone();
 
-            // Per-dispatch runtime/modelProfile (#11284): validate (refusing an
-            // unavailable or unadmitted tap, no silent fallback) with no side
-            // effects; the record is saved only after the dispatch is accepted.
-            let tap_plan = match crate::dispatch_tap::validate_request(
-                &repo_root,
-                &kind,
-                runtime.as_deref(),
-                model_profile.as_deref(),
-            ) {
-                Ok(plan) => plan,
-                Err(response) => return *response,
-            };
-
             // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
             // the same dynamic concurrency cap the autonomous work finder
             // applies to its own dispatches, and advise — never gate — an
@@ -3053,21 +3095,12 @@ fn handle_request(
                 depends_on,
                 crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             ) {
-                Ok(outcome) => {
-                    // Accepted and spawned. An idempotency hit is the
-                    // in-flight sweep itself: leave its record alone.
-                    if outcome.was_new {
-                        if let Err(response) = tap_plan.commit(&repo_root) {
-                            return *response;
-                        }
-                    }
-                    Response::SweepDispatched {
-                        sweep_id: outcome.sweep_id,
-                        pid: outcome.pid,
-                        token_name: outcome.token_name,
-                        log_path: outcome.log_path,
-                    }
-                }
+                Ok(outcome) => Response::SweepDispatched {
+                    sweep_id: outcome.sweep_id,
+                    pid: outcome.pid,
+                    token_name: outcome.token_name,
+                    log_path: outcome.log_path,
+                },
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
                     Err(e) => {

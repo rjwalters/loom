@@ -351,3 +351,19 @@ fn unavailable_roster_widens_nothing_and_is_reported() {
     assert!(s.contains("unavailable: no file") && s.contains("fleet/admins.json"), "{s}");
     assert!(policy(&[]).sources_consulted().contains("not consulted"));
 }
+
+#[test]
+fn the_actions_bot_stays_untrusted_for_comments_and_markers() {
+    // #13378: the ci-daily tracker exception lives in the promotion author
+    // gate only; the bot's comments and markers are never trusted.
+    let p = policy(&[]);
+    let marker = "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->";
+    for v in [
+        rest("github-actions[bot]", "Bot", "NONE"),
+        graphql("github-actions[bot]", "NONE"),
+        json!({"user": {"login": "github-actions[bot]", "type": "Bot"},
+               "author_association": "NONE", "title": "[ci-daily] x", "body": marker}),
+    ] {
+        assert!(!p.trusts_json(&v), "{v}");
+    }
+}

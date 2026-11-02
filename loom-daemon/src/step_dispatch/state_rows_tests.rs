@@ -57,6 +57,7 @@ fn workspace(idx: usize, inputs: &[DrawInput], cooldowns: StepCooldowns) -> Step
         created_at: Default::default(),
         merge_slots: 1,
         merge_concurrency: 1,
+        merge_eligible: 0,
         merges_in_flight: 0,
     }
 }

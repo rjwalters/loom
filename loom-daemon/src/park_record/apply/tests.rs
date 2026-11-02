@@ -16,6 +16,7 @@ struct Fake {
     blockers: HashMap<(Option<String>, u64), &'static str>,
     calls: Vec<String>,
     fail_body: bool,
+    fail_label: bool,
 }
 
 impl Fake {
@@ -68,6 +69,9 @@ impl ParkForge for Fake {
     fn add_labels(&mut self, number: u64, labels: &[String]) -> Result<(), String> {
         self.calls
             .push(format!("add_labels {number} {}", labels.join(",")));
+        if self.fail_label {
+            return Err("'loom:blocked' not found".into());
+        }
         self.state.labels.extend(labels.iter().cloned());
         Ok(())
     }
@@ -152,6 +156,17 @@ fn a_failed_body_write_applies_no_label() {
     assert_eq!(code, exit::FORGE);
     assert_eq!(f.mutations(), vec!["set_body 10"]);
     assert!(err.contains("no label applied"), "{err}");
+}
+
+#[test]
+fn a_failed_label_add_exits_nonzero_after_the_body_with_a_sync_labels_hint() {
+    let mut f = Fake::new("b", &["loom:building"]).blocker(11, "open");
+    f.fail_label = true;
+    let (code, _, err) = run(&mut f, &req(&[11], None));
+    assert_eq!(code, exit::FORGE);
+    assert_eq!(f.mutations(), vec!["set_body 10", "add_labels 10 loom:blocked"]);
+    assert!(f.state.body.contains("loom:park"), "body already written: {}", f.state.body);
+    assert!(err.contains("sync-labels.sh"), "{err}");
 }
 
 #[test]

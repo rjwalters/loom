@@ -23,6 +23,7 @@ use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
 use crate::init::payload::{resync_workspace_with, ResyncOutcome, Stamp};
 use crate::install_compat::INSTALL_METADATA_PATH;
+use crate::test_git_helpers::run as git;
 
 const RUNNING: &str = "0.19.880";
 const REPO: &str = "acme/app";
@@ -34,22 +35,6 @@ fn t0() -> DateTime<Utc> {
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, contents: &str) {
@@ -916,7 +901,15 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
     let host = Host::new(&fx, "host-a");
     let before = fx.origin_head();
 
-    let pass = host.pass();
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // No PR was opened, so this stays an ERROR (#13465).
+    assert!(
+        logs.iter()
+            .any(|l| l.0 == log::Level::Error && l.1.contains("branch rule")),
+        "{logs:?}"
+    );
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     let until = t0() + ChronoDuration::hours(6);
@@ -994,7 +987,13 @@ fn a_refused_default_branch_gets_a_resync_pull_request_once() {
     let before = fx.origin_head();
     let branch = format!("chore/loom-resync-v{RUNNING}");
 
-    let pass = host.pass();
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // The refused push ended in an open PR: expected path, so never ERROR (#13465).
+    let line = |l: &&(log::Level, String)| l.1.contains("resync pull request open");
+    assert!(logs.iter().filter(line).all(|l| l.0 == log::Level::Warn), "{logs:?}");
+    assert!(logs.iter().any(|l| line(&l) && l.0 == log::Level::Warn), "{logs:?}");
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     assert!(reason(report).contains("resync pull request open: #1 "), "{report:?}");
@@ -1331,5 +1330,7 @@ mod head_check;
 mod hold_pass;
 #[path = "workspace_resync_online.rs"]
 mod online;
+#[path = "workspace_resync_supersede.rs"]
+mod supersede;
 #[path = "workspace_resync_surfaces.rs"]
 mod surfaces;

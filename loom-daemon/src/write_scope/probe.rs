@@ -199,13 +199,19 @@ pub(crate) fn classify_repo_permissions(json: &str) -> Option<Permission> {
     Some(Permission::Insufficient(format!("repository role `{role}`")))
 }
 
+use crate::forge_repo_facts::installation;
+
 impl PermissionProbe for GhProbe {
     fn permission(&self, repo: &str) -> Permission {
         // W8: the writer's own installation snapshot answers the installation
         // leg; leg 1 runs only for a user token or when it cannot answer.
-        let cred =
-            crate::forge_repo_facts::installation::Credential::writer(self.config_dir.clone());
-        let snapshot = crate::forge_repo_facts::installation::lookup(&self.gh, &cred, repo);
+        let cred = installation::Credential::writer(self.config_dir.clone());
+        let mut snapshot = installation::lookup(&self.gh, &cred, repo);
+        if matches!(snapshot, installation::Answer::Listed(None))
+            && remint_writer_token(repo, &cred)
+        {
+            snapshot = installation::lookup(&self.gh, &cred, repo);
+        }
         if let Some(p) = super::probe_snapshot::from_snapshot(&snapshot, || self.repo_leg(repo)) {
             return p;
         }
@@ -215,6 +221,53 @@ impl PermissionProbe for GhProbe {
     fn cache_scope(&self) -> CacheScope {
         CacheScope::GitHub
     }
+}
+
+/// A writer token's repository set is fixed when it is minted (#9247), so a
+/// repo created after the mint is absent from its `installation/repositories`
+/// listing no matter how often the snapshot is refreshed (#13306: a 16-repo
+/// view of a 119-repo installation). When a miss refresh still lists the repo
+/// absent, force one re-mint for the owner (debounced) and drop the stale
+/// snapshot so the caller re-reads under the new token. `true` when a fresh
+/// token is published and the lookup should be repeated.
+fn remint_writer_token(repo: &str, cred: &installation::Credential) -> bool {
+    static DEBOUNCE: std::sync::OnceLock<crate::stale_token_retry::Debounce> =
+        std::sync::OnceLock::new();
+    let owner = crate::credential_preflight::owner_of_nwo(repo);
+    if !DEBOUNCE
+        .get_or_init(Default::default)
+        .admit(owner, std::time::Instant::now())
+    {
+        return false;
+    }
+    if force_remint(repo).is_none() {
+        return false;
+    }
+    log::warn!(
+        "write_scope: {repo} absent from the writer installation listing after a miss refresh; \
+         re-minted the {owner} installation token (#13306)"
+    );
+    installation::forget(cred);
+    true
+}
+
+#[cfg(not(test))]
+fn force_remint(repo: &str) -> Option<PathBuf> {
+    crate::credential_preflight::force_refresh_owner_credential_for_repo(repo)
+}
+
+#[cfg(test)]
+fn force_remint(repo: &str) -> Option<PathBuf> {
+    TEST_REMINT.with(|slot| slot.borrow().as_ref().and_then(|f| f(repo)))
+}
+
+#[cfg(test)]
+pub(super) type TestRemint = Box<dyn Fn(&str) -> Option<PathBuf>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_REMINT: std::cell::RefCell<Option<TestRemint>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl GhProbe {

@@ -533,12 +533,6 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
     if has_label_flag && (command.contains("gh issue edit") || command.contains("gh pr edit")) {
         actions.issues_labeled = actions.issues_labeled.saturating_add(1);
     }
-    if command.contains("merge-pr.sh")
-        || command.contains("gh pr merge")
-        || (command.contains("gh api") && command.contains("/merge"))
-    {
-        actions.prs_merged = actions.prs_merged.saturating_add(1);
-    }
     if command.contains("gh issue comment")
         || command.contains("gh pr comment")
         || (command.contains("gh api") && command.contains("/comments"))
@@ -547,13 +541,80 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
     }
 }
 
+/// Whether `command` attempts a PR merge. An attempt is not a merge: it is
+/// counted into `prs_merged` only once its `tool_result` confirms success
+/// (see [`merge_result_confirms`]).
+fn is_merge_command(command: &str) -> bool {
+    command.contains("merge-pr.sh")
+        || command.contains("gh pr merge")
+        || (command.contains("gh api") && command.contains("/merge"))
+}
+
+/// Whether a merge command's `tool_result` shows a completed merge.
+///
+/// Keyed on a stable success line, never on exit status alone: `merge-pr.sh`
+/// exits 0 for `--dry-run` and for "already merged" paths too. The lines are
+/// `merge-pr.sh`'s terminal `success "PR #N merged successfully"`, `gh pr
+/// merge`'s `Merged pull request`, and the merge API's `"merged": true`.
+fn merge_result_confirms(block: &Value) -> bool {
+    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    let text = match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return false,
+    };
+    let text = text.to_ascii_lowercase();
+    text.contains("merged successfully")
+        || text.contains("merged pull request")
+        || text.replace(' ', "").contains("\"merged\":true")
+}
+
+/// Whether a record's top-level `timestamp` falls in `[start, end)`. A record
+/// with no parseable timestamp is **outside** (excluded: counting it would
+/// re-count it in every later tick).
+fn in_window(obj: &Value, window: (DateTime<Utc>, DateTime<Utc>)) -> bool {
+    obj.get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| {
+            let t = t.with_timezone(&Utc);
+            t >= window.0 && t < window.1
+        })
+}
+
 /// Fold one transcript record's `tool_use` blocks into `actions`.
-fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
+///
+/// A merge `tool_use` only registers its id in `pending_merges` (regardless of
+/// window, since its result may land in a later one); `prs_merged` is
+/// incremented when the matching `tool_result` confirms success, and only if
+/// that result record is in the window (`in_win`).
+fn tally_record_actions(
+    obj: &Value,
+    in_win: bool,
+    pending_merges: &mut std::collections::HashSet<String>,
+    actions: &mut RoleTickActions,
+) {
     let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(obj);
     let Some(content) = container.get("content").and_then(Value::as_array) else {
         return;
     };
     for block in content {
+        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            let id = block.get("tool_use_id").and_then(Value::as_str);
+            if id.is_some_and(|id| pending_merges.remove(id))
+                && in_win
+                && merge_result_confirms(block)
+            {
+                actions.prs_merged = actions.prs_merged.saturating_add(1);
+            }
+            continue;
+        }
         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
             continue;
         }
@@ -564,7 +625,14 @@ fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
         else {
             continue;
         };
-        tally_command(command, actions);
+        if is_merge_command(command) {
+            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                pending_merges.insert(id.to_string());
+            }
+        }
+        if in_win {
+            tally_command(command, actions);
+        }
     }
 }
 
@@ -577,8 +645,18 @@ fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
 /// exact record decoders their single-purpose counterparts use
 /// ([`crate::script_helpers::transcript_usage::usage_from_record`]), so the
 /// token numbers here cannot drift from `sweep.outcome`'s.
+///
+/// Only records whose top-level `timestamp` lies in `[started_at, ended_at)`
+/// contribute (actions and tokens alike): a transcript still being appended to
+/// is selected by mtime in the next tick's window too, and without this filter
+/// it would be re-counted from line 1. Records with no parseable timestamp
+/// are excluded from both.
 #[must_use]
-pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
+pub fn scan_transcripts(
+    transcripts: &[PathBuf],
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+) -> Option<TranscriptScan> {
     use std::collections::BTreeMap;
 
     let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
@@ -587,6 +665,8 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
     // One fold across every transcript: deduped on `message.id` per scan, not
     // per file (#8186, #9303, #9315).
     let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
+    let window = (started_at, ended_at);
+    let mut pending_merges = std::collections::HashSet::new();
 
     for path in transcripts {
         if std::fs::metadata(path)
@@ -607,7 +687,11 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
             let Ok(obj) = serde_json::from_str::<Value>(raw) else {
                 continue;
             };
-            tally_record_actions(&obj, &mut actions);
+            let in_win = in_window(&obj, window);
+            tally_record_actions(&obj, in_win, &mut pending_merges, &mut actions);
+            if !in_win {
+                continue;
+            }
             if let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) {
                 fold.add(rec);
             }
@@ -847,7 +931,7 @@ fn emit_correlated(
             tick.started_at,
             tick.ended_at,
         );
-        scan_transcripts(&transcripts)
+        scan_transcripts(&transcripts, tick.started_at, tick.ended_at)
     });
     let scan = scan.flatten();
     // The launch record's runtime, else the resolved-runtime marker (#8594);

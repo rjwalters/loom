@@ -852,7 +852,10 @@ Re-run the "Verdict-time recheck" (above) immediately before this write; abort i
 the issue's content, not who wrote it. An issue whose author fails the comment-trust
 predicate (`comment-trust.md`) may be curated but is not approved by an automated
 verdict: a trusted maintainer adopts it (applies `loom:issue` by hand) or re-files
-it. Ask the daemon, which reuses that predicate (no second trust table):
+it. Ask the daemon, which reuses that predicate (no second trust table; the one
+exception is a `ci-daily.yml` tracker filed by `github-actions[bot]` — `[ci-daily] `
+title plus the workflow's body sentence — which passes the author gate only: the bot's
+comments and markers stay untrusted, #13378):
 
 ```bash
 GATE_OUT="$(loom-daemon forge promotion-author --number "$ISSUE_NUMBER")" || GATE_OUT="${GATE_OUT:-UNKNOWN the author check failed}"

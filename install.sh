@@ -1878,6 +1878,47 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       fi
     fi
 
+    # Issue #13356: everything that can fail without touching the target (the
+    # loom-daemon build and the pinned package manager) must fail BEFORE the
+    # destructive uninstall below, so an aborted run leaves the target intact.
+    # The same block used to run after the uninstall; it now lives only here.
+    resolve_cargo_target_dir "$LOOM_ROOT"
+    if loom_daemon_binary_stale "$LOOM_ROOT" && ! loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+      # Run from $LOOM_ROOT so corepack honors this repo's `packageManager` pin
+      # (the same cwd `pnpm daemon:build` uses).
+      pushd "$LOOM_ROOT" >/dev/null
+      pnpm_probe_ok=0
+      pnpm_probe_version || pnpm_probe_ok=1
+      popd >/dev/null
+      if [[ "$pnpm_probe_ok" -ne 0 ]]; then
+        error "The pinned package manager does not run, so loom-daemon cannot be built. Target left untouched.$(pnpm_failure_hint "$LOOM_PNPM_PROBE_ERROR" "${NODE_VERSION:-}")"
+      fi
+    fi
+
+    # Check if loom-daemon is built AND up to date with the current source
+    # tree (issue #4188 -- a bare existence check reuses a binary built from
+    # an older commit after `git pull` landed a newer one).
+    if loom_daemon_binary_stale "$LOOM_ROOT"; then
+      # Issue #4897: before paying for a `cargo build` (and its
+      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
+      # machine-level binary was already rebuilt from this exact commit --
+      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
+      # instead of rebuilding.
+      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
+      else
+        if [[ -f "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" ]]; then
+          warning "loom-daemon binary is stale (source tree updated since last build)"
+        else
+          warning "loom-daemon binary not found"
+        fi
+        info "Building loom-daemon (this may take a minute)..."
+        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon. Target left untouched."
+        echo ""
+      fi
+    fi
+
+
     # Issue #4928 (AC #3): make the half-uninstalled window explicit in output
     # AND in state. The uninstall below mutates the target's main checkout in
     # place and the fresh install only restores it several steps later, so the
@@ -1901,35 +1942,6 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
 
     info "Running fresh Quick Install..."
     echo ""
-
-    # #5922: resolve Cargo's real target directory ONCE, before anything below
-    # goes looking for the built daemon binary. Honors build.target-dir /
-    # CARGO_TARGET_DIR; falls back to $LOOM_ROOT/target (the previous
-    # assumption) when Cargo can't be consulted.
-    resolve_cargo_target_dir "$LOOM_ROOT"
-
-    # Check if loom-daemon is built AND up to date with the current source
-    # tree (issue #4188 -- a bare existence check reuses a binary built from
-    # an older commit after `git pull` landed a newer one).
-    if loom_daemon_binary_stale "$LOOM_ROOT"; then
-      # Issue #4897: before paying for a `cargo build` (and its
-      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
-      # machine-level binary was already rebuilt from this exact commit --
-      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
-      # instead of rebuilding.
-      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
-        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
-      else
-        if [[ -f "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" ]]; then
-          warning "loom-daemon binary is stale (source tree updated since last build)"
-        else
-          warning "loom-daemon binary not found"
-        fi
-        info "Building loom-daemon (this may take a minute)..."
-        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon"
-        echo ""
-      fi
-    fi
 
     # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
     # fills CLAUDE.md correctly (issue #3502).

@@ -224,12 +224,13 @@ impl SweepRegistry {
         child_env_markers::apply_issue_scoped_markers(&mut cmd, kind);
         // The issue this run's telemetry belongs to: a sweep's issue, an
         // issue step's item, a PR step's linked issue (#11898).
-        let issue = self.step_issue(kind);
+        let keys = self.step_keys(kind);
+        let issue = keys.issue;
         crate::observability::tracing::prepare_child(
             &mut cmd,
             &self.config.workspace_root,
             sweep_id,
-            issue,
+            &keys,
         );
         // #9215: opt-in, default-off — hand the child's OWN Claude Code session
         // the OTel env it needs to emit `claude_code.llm_request` /

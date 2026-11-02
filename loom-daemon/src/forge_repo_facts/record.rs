@@ -112,12 +112,67 @@ pub(super) fn mark_suspect(key: &str, why: &str) {
 }
 
 /// Why a verify read produced no record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum VerifyFailure {
     /// 404 / 410: the repo is gone or not visible to this credential.
     Gone,
-    /// Anything else: breaker, network, unparseable.
-    Failed,
+    /// Anything else (breaker, credential, network, unparseable body), with a
+    /// short redacted one-line cause for the backoff log.
+    Failed(String),
+}
+
+impl std::fmt::Display for VerifyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gone => write!(f, "gone"),
+            Self::Failed(cause) => write!(f, "Failed: {cause}"),
+        }
+    }
+}
+
+/// Longest cause carried in [`VerifyFailure::Failed`], in characters.
+const CAUSE_MAX_CHARS: usize = 200;
+
+/// Reduce forge/stderr text to one redacted line of at most
+/// [`CAUSE_MAX_CHARS`] characters (redact first, then clip, so a secret is
+/// never cut into an unrecognisable prefix).
+fn one_line_cause(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let redacted = crate::secret_scan::redact(line);
+    if redacted.chars().count() > CAUSE_MAX_CHARS {
+        let clipped: String = redacted.chars().take(CAUSE_MAX_CHARS).collect();
+        format!("{clipped}…")
+    } else {
+        redacted
+    }
+}
+
+/// Why a read that is neither a usable answer nor a 404/410 failed.
+fn failure_cause(fetched: &anyhow::Result<crate::forge_etag_store::FetchResult>) -> String {
+    match fetched {
+        Err(e) => format!("transport: {}", one_line_cause(&format!("{e:#}"))),
+        Ok((_, Some(r), _)) if r.status == 200 => "unparseable body".to_string(),
+        Ok((_, Some(r), stderr)) => {
+            let detail = one_line_cause(stderr);
+            if detail.is_empty() {
+                format!("http {}", r.status)
+            } else {
+                format!("http {}: {detail}", r.status)
+            }
+        }
+        Ok((status, None, stderr)) => {
+            let detail = one_line_cause(stderr);
+            if detail.is_empty() {
+                format!("no http response ({status}), empty stderr")
+            } else {
+                format!("no http response ({status}): {detail}")
+            }
+        }
+    }
 }
 
 /// One conditional `GET repos/<nwo>` for `base` (reader-first through
@@ -143,6 +198,7 @@ pub(super) fn verify(
     let etag = sent.and_then(|r| r.etag.as_deref());
     let site = ConditionalRead::new(caller, crate::forge_call_stats::ops::REPO_VIEW);
     let fetched = store::fetch_conditional(site, gh, Some(root), &target, &url, etag);
+    let cause = failure_cause(&fetched);
     let outcome = match fetched {
         Ok((_, Some(r), _)) if r.status == 304 && etag.is_some() => sent.map(|p| Record {
             verified_at: sent_at,
@@ -170,7 +226,7 @@ pub(super) fn verify(
             save(&key, &rec);
             Ok(rec)
         }
-        None => Err(backoff(&key, base, prior, VerifyFailure::Failed)),
+        None => Err(backoff(&key, base, prior, VerifyFailure::Failed(cause))),
     }
 }
 
@@ -198,7 +254,7 @@ fn backoff(
     rec.suspect_until = Some(until);
     save(key, &rec);
     log::info!(
-        "forge_repo_facts: reading {} failed ({why:?}); no retry for {SUSPECT_BACKOFF_SECS}s",
+        "forge_repo_facts: reading {} failed ({why}); no retry for {SUSPECT_BACKOFF_SECS}s",
         base.nwo
     );
     why
@@ -281,5 +337,35 @@ pub(crate) fn invalidate(root: &Path, why: &str) {
     keys.dedup();
     for key in keys {
         mark_suspect(&key, why);
+    }
+}
+
+#[cfg(test)]
+mod cause_tests {
+    use super::*;
+
+    #[test]
+    fn cause_is_one_redacted_clipped_line() {
+        assert_eq!(one_line_cause(""), "");
+        assert_eq!(one_line_cause("\n  first\nsecond"), "first");
+        let leaked = "Authorization: token ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let out = one_line_cause(leaked);
+        assert!(!out.contains("ghp_"), "{out}");
+        let long = "x".repeat(500);
+        assert!(one_line_cause(&long).chars().count() <= CAUSE_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn transport_error_names_its_cause() {
+        let e: anyhow::Result<crate::forge_etag_store::FetchResult> =
+            Err(anyhow::anyhow!("breaker open\nsecond line"));
+        assert_eq!(failure_cause(&e), "transport: breaker open");
+    }
+
+    #[test]
+    fn display_carries_the_cause() {
+        let f = VerifyFailure::Failed("http 401: Bad credentials".into());
+        assert_eq!(f.to_string(), "Failed: http 401: Bad credentials");
+        assert_eq!(VerifyFailure::Gone.to_string(), "gone");
     }
 }

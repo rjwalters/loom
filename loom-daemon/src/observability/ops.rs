@@ -49,6 +49,7 @@ pub mod busy_slots;
 #[cfg(test)]
 pub mod capture;
 pub mod codex_session;
+pub mod discovery_recheck;
 pub mod dispatch;
 pub mod dispatch_facts;
 pub mod dispatch_step;

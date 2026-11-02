@@ -277,7 +277,12 @@ impl PoolHoldState {
         let preference =
             crate::runtime_preference::resolve_runtime(root, "sweep-lifecycle", None, now_epoch);
         let preference_resolution = match &preference {
-            Ok(crate::runtime_preference::Decision::Preference { resolution, .. }) => {
+            // An empty list (no taps at all) is a configuration outcome, not
+            // pool exhaustion: treat it like "no preference" so the
+            // pool-state branch decides (#13428).
+            Ok(crate::runtime_preference::Decision::Preference { resolution, .. })
+                if !resolution.is_empty_list() =>
+            {
                 Some(resolution)
             }
             // No preference configured, an operator pin is in force, or the

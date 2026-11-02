@@ -100,6 +100,52 @@ pub fn infra_only(runs: &[GroupRun]) -> bool {
     failed > 0
 }
 
+/// Names of the runs that did not succeed, for the revoke comment.
+fn non_success_names(runs: &[GroupRun], pred: impl Fn(&GroupRun) -> bool) -> String {
+    runs.iter()
+        .filter(|r| pred(r))
+        .map(|r| format!("`{}`", r.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Detail line for a `dropped-infra` revoke: the cancelled/timed-out jobs.
+#[must_use]
+pub fn infra_detail(runs: &[GroupRun]) -> String {
+    let names = non_success_names(runs, |r| {
+        matches!(r.conclusion.as_deref(), Some("cancelled" | "timed_out"))
+    });
+    format!("Cancelled or timed-out group job(s): {names}.")
+}
+
+/// Why [`infra_only`] declined a group that had cancelled/timed-out runs, or
+/// `None` when no run was cancelled (a plain failure; nothing to explain).
+#[must_use]
+pub fn infra_decline_reason(runs: &[GroupRun]) -> Option<String> {
+    let is_infra =
+        |r: &GroupRun| matches!(r.conclusion.as_deref(), Some("cancelled" | "timed_out"));
+    if !runs.iter().any(is_infra) {
+        return None;
+    }
+    let cancelled = non_success_names(runs, is_infra);
+    let step_failed = non_success_names(runs, |r| is_infra(r) && r.failed_steps > 0);
+    let real = non_success_names(runs, |r| {
+        matches!(r.conclusion.as_deref(), Some(c) if !is_infra(r)
+            && !matches!(c, "success" | "neutral" | "skipped"))
+    });
+    let pending = non_success_names(runs, |r| r.conclusion.is_none());
+    let why = if !step_failed.is_empty() {
+        format!("a step of {step_failed} ended `failure`, so it is not a runner loss")
+    } else if !real.is_empty() {
+        format!("{real} ended with a real failure")
+    } else if !pending.is_empty() {
+        format!("{pending} was still running")
+    } else {
+        "the group's check runs were not infrastructure-only".to_string()
+    };
+    Some(format!("Infra refinement declined (cancelled/timed-out: {cancelled}): {why}."))
+}
+
 /// Label transition for a removal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
@@ -163,14 +209,20 @@ pub fn route(kind: RemovalKind) -> Route {
 
 /// Explanation posted with the revoke marker for a drop.
 #[must_use]
-pub fn drop_prose(kind: RemovalKind, raw: Option<&str>, removed_at: Option<&str>) -> String {
+pub fn drop_prose(
+    kind: RemovalKind,
+    raw: Option<&str>,
+    removed_at: Option<&str>,
+    detail: Option<&str>,
+) -> String {
     let said = match raw.map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => format!("GitHub's removal reason, verbatim: \"{}\".", t.replace('"', "'")),
         None => "GitHub recorded no removal reason.".to_string(),
     };
     let when = removed_at.map_or_else(String::new, |w| format!(" at {w}"));
+    let detail = detail.map_or_else(String::new, |d| format!("\n\n{d}"));
     format!(
-        "GitHub removed this PR from the merge queue{when}. {said} Classified as **{}**{}.\n\n{}",
+        "GitHub removed this PR from the merge queue{when}. {said} Classified as **{}**{}.{detail}\n\n{}",
         kind.as_str(),
         if kind == RemovalKind::Unknown {
             " (unknown: not one of the reasons Loom recognises)"

@@ -702,10 +702,6 @@ pub struct FleetHoldReleaseBurst {
 /// Observed Champion dispatch metadata, independent of approval authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChampionState {
-    /// Policy cannot be inferred from scheduling: absent means unknown.
-    pub approval: Option<String>,
-    /// Conditional merge authority is prompt-defined; absent means unknown.
-    pub merge: Option<String>,
     /// Command actually selected by the role runner.
     pub prompt_source: String,
     /// SHA-256 of the installed Champion command and its two policy companions.

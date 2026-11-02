@@ -350,6 +350,13 @@ impl SweepRegistry {
             info.and_then(|i| i.model.as_deref()),
             info.and_then(|i| i.effort.as_deref()),
             self.step_points(sweep_id),
+            // #13169: a Builder step that reported a PR names it on its close.
+            (role == StepRole::Builder
+                && line
+                    .as_ref()
+                    .is_some_and(|l| l.class == StepOutcomeClass::Verdict))
+            .then(|| self.builder_pr(item))
+            .flatten(),
         );
         self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached

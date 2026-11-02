@@ -82,7 +82,12 @@ fn failed_spawn_completes_and_retires_the_prepared_root() {
     let root = dir.path();
     let execution = "missing-executable";
     let mut cmd = Command::new(root.join("does-not-exist"));
-    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, None);
+    loom_daemon::observability::tracing::prepare_child(
+        &mut cmd,
+        root,
+        execution,
+        &Default::default(),
+    );
     assert!(TraceStore::new(root).path(root, execution).exists());
     let error = lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -113,7 +118,12 @@ fn issue_sweeps(
     let mut sweeps = Vec::new();
     for execution in executions {
         let mut cmd = Command::new(root.join("does-not-exist"));
-        loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, Some(issue));
+        loom_daemon::observability::tracing::prepare_child(
+            &mut cmd,
+            root,
+            execution,
+            &loom_daemon::observability::lifecycle::StepKeys::issue(Some(issue)),
+        );
         lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
         sweeps.extend(
             spans(root).into_iter().filter(|s| {

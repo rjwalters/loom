@@ -554,8 +554,9 @@ fn assess_with_scope(
     let base_ref = match pr_base_ref_checked(gh_bin, cwd, pr) {
         Ok(base_ref) => base_ref,
         Err(why) => {
-            unavailable
-                .push(format!("could not read PR #{pr}'s base branch from the forge: {why}"));
+            unavailable.push(format!(
+                "{BASE_UNREAD_TOKEN} — could not read PR #{pr}'s base branch from the forge: {why}"
+            ));
             return Assessment::indeterminate(unavailable);
         }
     };
@@ -602,10 +603,27 @@ fn assess_with_scope(
         // #13114: the forge never answered, even after the retries. Distinct
         // from `changed` so a re-arm caused by an outage is visible as one.
         patch_identity::Outcome::Unread => {
-            unavailable.push(format!(
-                "rebase-patch-identical: {UNREAD_TOKEN} — forge compare unreadable after retries"
-            ));
-            Assessment::indeterminate(unavailable)
+            // #13359: before giving up, compare the two patches from local git.
+            // Fail closed: only equal non-empty patches keep the release.
+            let local = match repo_dir(cwd) {
+                Some(repo) => {
+                    patch_identity::local_outcome(&repo, Some(pr), reviewed, head, &base_ref)
+                }
+                None => Err("local: no local repository to compare in".into()),
+            };
+            match local {
+                Ok(()) => Assessment::determinate(Equivalence::Equivalent(
+                    EquivalenceKind::RebasePatchIdentical,
+                )),
+                Err(why) => {
+                    unavailable.push(format!(
+                        "rebase-patch-identical: {UNREAD_TOKEN} — forge compare \
+                         {base_ref}...{reviewed} / {base_ref}...{head} unreadable after retries; \
+                         {why}"
+                    ));
+                    Assessment::indeterminate(unavailable)
+                }
+            }
         }
         patch_identity::Outcome::Inconclusive => {
             unavailable.push(
@@ -621,6 +639,10 @@ fn assess_with_scope(
 /// The token a re-arm caused by an unreadable forge compare carries in its
 /// reason line and in `hold.transition` telemetry (#13114).
 pub const UNREAD_TOKEN: &str = "equivalence=unread";
+
+/// The token a re-arm caused by an unreadable PR base branch carries, ahead of
+/// the free-text reason, so the cause is exportable without that text (#13149).
+pub const BASE_UNREAD_TOKEN: &str = "equivalence=base-unread";
 
 /// The body of the re-anchor comment the daemon pass posts when a verdict is
 /// carried forward.

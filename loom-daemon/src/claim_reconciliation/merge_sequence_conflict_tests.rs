@@ -3,7 +3,6 @@
 
 use std::cell::Cell;
 use std::path::Path;
-use std::process::Command;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -136,6 +135,7 @@ fn a_spent_deadline_launches_no_git_and_clamps_the_timeout() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     git(dir, &["init", "-q", "-b", "main"]);
+    configure(dir);
     std::fs::write(dir.join("lib.rs"), "pub mod a;\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-q", "-m", "base"]);
@@ -164,6 +164,7 @@ fn fetch_that_spends_the_deadline_launches_no_further_git() {
     std::fs::create_dir_all(&origin).unwrap();
     std::fs::create_dir_all(&clone).unwrap();
     git(&origin, &["init", "-q", "-b", "main"]);
+    configure(&origin);
     std::fs::write(origin.join("lib.rs"), "pub mod a;\n").unwrap();
     git(&origin, &["add", "."]);
     git(&origin, &["commit", "-q", "-m", "base"]);
@@ -193,17 +194,7 @@ fn fetch_that_spends_the_deadline_launches_no_further_git() {
 
 // --- Real git --------------------------------------------------------------
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
-        .args(["-c", "commit.gpgsign=false"])
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
+use crate::test_git_helpers::{configure, run as git};
 
 /// Commit `lib.rs` = `body` on a new branch `name` off `main`; its head SHA.
 fn branch(dir: &Path, name: &str, body: &str) -> String {
@@ -231,6 +222,7 @@ fn real_merge_tree_ignores_a_same_spot_changelog_conflict_only() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     git(dir, &["init", "-q", "-b", "main"]);
+    configure(dir);
     std::fs::write(dir.join("CHANGELOG.md"), "# Log\n").unwrap();
     std::fs::write(dir.join("lib.rs"), "a\n").unwrap();
     git(dir, &["add", "."]);
@@ -261,6 +253,7 @@ fn real_merge_tree_distinguishes_clean_mod_appends_from_same_line_edits() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     git(dir, &["init", "-q", "-b", "main"]);
+    configure(dir);
     std::fs::write(dir.join("lib.rs"), "pub mod a;\npub mod c;\npub mod e;\npub mod g;\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-q", "-m", "base"]);

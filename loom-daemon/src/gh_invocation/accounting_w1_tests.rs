@@ -6,8 +6,8 @@ use super::*;
 use crate::forge_bucket_book::{self, BucketKey, Resource};
 use crate::gh_invocation::test_support::stub;
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation, ParentContext};
+use crate::test_git_helpers::run as git;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
@@ -37,17 +37,6 @@ fn raw_lines_after(body: impl FnOnce()) -> Vec<serde_json::Value> {
         }
     }
     out
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
 }
 
 /// A tempdir git checkout whose `origin` is `url`.

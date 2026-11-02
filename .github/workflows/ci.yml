@@ -352,7 +352,7 @@ jobs:
     # macOS (`shell-syntax` has no Rust toolchain), so a Linux-only dependency
     # feature (#12129's tokio `taskdump`) sat red there for hours. Same package,
     # features and target as the release build; a check, not a build.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

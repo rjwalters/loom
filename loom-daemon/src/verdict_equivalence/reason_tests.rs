@@ -45,6 +45,7 @@ fn indeterminate_assessment_carries_the_underlying_reasons() {
     assert!(note.contains("tree: forge compare"), "{note}");
     assert!(note.contains("fake-gh: no route"), "{note}");
     assert!(note.contains("base branch from the forge: gh exited with status 1"), "{note}");
+    assert!(note.contains(BASE_UNREAD_TOKEN), "{note}");
 }
 
 #[test]
