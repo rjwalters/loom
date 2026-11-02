@@ -704,6 +704,8 @@ fn a_peer_holds_on_the_broadcast_without_rederiving_exhaustion_itself() {
     let host_b = FleetHost::new("host-b", ws_b.path());
 
     assert!(host_a.preflight(ws_a.path(), now), "A's own read must hold");
+    // #13508: the ad goes out once the hold survives its arming tick.
+    assert!(host_a.preflight(ws_a.path(), now), "A's own read must keep holding");
     // Before the ad arrives B is free — this is the baseline the broadcast
     // has to change, and it proves B's OWN read says "healthy".
     assert!(
@@ -780,6 +782,7 @@ fn a_recovery_broadcast_releases_the_peer_early() {
     let host_b = FleetHost::new("host-b", ws_b.path());
 
     assert!(host_a.preflight(ws_a.path(), now));
+    assert!(host_a.preflight(ws_a.path(), now), "second tick publishes the arm (#13508)");
     host_a.deliver_to(&host_b);
     assert!(host_b.preflight(ws_b.path(), now), "B holds on the arm ad");
 
@@ -895,6 +898,51 @@ fn the_arm_edge_is_broadcast_once_per_outage() {
     }
     assert_eq!(ads.len(), 1, "three recovered ticks must publish one clear ad");
     assert_eq!(ads[0].kind, ClaimKind::PoolHoldCleared);
+}
+
+/// #13508: an arm that clears within the same tick publishes neither an arm
+/// nor a clear ad — peers never act on a hold that lived for one tick.
+#[test]
+fn a_same_tick_arm_then_clear_publishes_nothing() {
+    let now = chrono::Utc::now();
+    let ws = workspace_with_pool(&["a"]);
+    bad_mark_all(ws.path(), &["a"]);
+    let mut host = FleetHost::new("host-a", ws.path());
+
+    assert!(host.preflight(ws.path(), now), "arming tick holds locally");
+    readmit_all(ws.path());
+    assert!(!host.preflight(ws.path(), now), "recovers the same tick");
+
+    assert!(host.outbound.try_recv().is_err(), "no arm and no orphan clear ad");
+    assert_eq!(host.holds.held_pool_count(), 0);
+}
+
+/// #13508: a hold that persists across ticks publishes exactly one arm, and
+/// its eventual clear exactly one clear.
+#[test]
+fn a_multi_tick_hold_publishes_one_arm_and_one_clear() {
+    let now = chrono::Utc::now();
+    let ws = workspace_with_pool(&["a"]);
+    bad_mark_all(ws.path(), &["a"]);
+    let mut host = FleetHost::new("host-a", ws.path());
+
+    assert!(host.preflight(ws.path(), now));
+    assert!(host.outbound.try_recv().is_err(), "arming tick publishes nothing");
+    for _ in 0..3 {
+        assert!(host.preflight(ws.path(), now));
+    }
+    let arm = host
+        .outbound
+        .try_recv()
+        .expect("arm published on the second tick");
+    assert_eq!(arm.kind, ClaimKind::PoolHoldArmed);
+    assert!(host.outbound.try_recv().is_err(), "exactly one arm ad");
+
+    readmit_all(ws.path());
+    assert!(!host.preflight(ws.path(), now));
+    let clear = host.outbound.try_recv().expect("clear published");
+    assert_eq!(clear.kind, ClaimKind::PoolHoldCleared);
+    assert!(host.outbound.try_recv().is_err(), "exactly one clear ad");
 }
 
 /// A wrapper-confirmed death (the post-mortem path the reaper drives) is the
