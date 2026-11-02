@@ -152,6 +152,10 @@ pub enum Outcome {
     RoutingBlocked,
     /// The managed launcher exited `69`: its adapter is down (#9987).
     AdapterUnavailable,
+    /// `gh` exited non-zero on an HTTP `304 Not Modified` — the normal answer
+    /// to an ETag'd conditional read, not a failure (#10755). Only ever
+    /// derived from the billing evidence; see [`Outcome::reconcile`].
+    NotModified,
 }
 
 /// The managed launcher's exit status for "routing blocked" (EX_CONFIG).
@@ -172,11 +176,33 @@ impl Outcome {
             Outcome::RoutingRefused => "routing_refused",
             Outcome::RoutingBlocked => "routing_blocked",
             Outcome::AdapterUnavailable => "adapter_unavailable",
+            Outcome::NotModified => "not_modified",
+        }
+    }
+
+    /// Whether this outcome is a failure: it is recorded as an error span
+    /// and leaves a local completion record.
+    #[must_use]
+    pub fn is_failure(self) -> bool {
+        !matches!(self, Outcome::Ok | Outcome::NotModified)
+    }
+
+    /// Fold the HTTP evidence into the process truth (#10755): a non-zero
+    /// exit that the ledger billed as a confirmed `304` is `NotModified`.
+    /// Anything else (including a 304 with no status evidence) is unchanged.
+    #[must_use]
+    pub fn reconcile(self, billing: &super::billing::Billing) -> Self {
+        if self == Outcome::ExitNonzero
+            && billing.class == super::billing::BillingClass::NotModified
+        {
+            Outcome::NotModified
+        } else {
+            self
         }
     }
 
     /// Every value, for vocabulary tests and docs.
-    pub const ALL: [Outcome; 9] = [
+    pub const ALL: [Outcome; 10] = [
         Outcome::Ok,
         Outcome::ExitNonzero,
         Outcome::Signaled,
@@ -186,6 +212,7 @@ impl Outcome {
         Outcome::RoutingRefused,
         Outcome::RoutingBlocked,
         Outcome::AdapterUnavailable,
+        Outcome::NotModified,
     ];
 }
 
@@ -531,6 +558,7 @@ impl InvocationSpan {
         ended_at: DateTime<Utc>,
         billing: &super::billing::Billing,
     ) -> SpanRecord {
+        let outcome = outcome.reconcile(billing);
         let mut attributes: TraceAttributes = [
             ("github.operation", inv.operation.as_str().to_string()),
             ("github.access_intent", inv.intent.as_str().to_string()),
@@ -586,10 +614,10 @@ impl InvocationSpan {
             name: SpanName::GithubInvoke,
             started_at: self.started_at,
             ended_at: ended_at.max(self.started_at),
-            status: if outcome == Outcome::Ok {
-                SpanStatus::Ok
-            } else {
+            status: if outcome.is_failure() {
                 SpanStatus::Error
+            } else {
+                SpanStatus::Ok
             },
             attributes,
             events: Vec::new(),
@@ -598,7 +626,7 @@ impl InvocationSpan {
     }
 
     /// Emit the span (with `billing`'s HTTP truth and identity, #10343) and,
-    /// for a non-`ok` outcome, the local completion record.
+    /// for a failed outcome, the local completion record.
     pub fn finish(
         self,
         inv: &GhInvocation,
@@ -608,8 +636,9 @@ impl InvocationSpan {
         billing: &super::billing::Billing,
     ) {
         let ended_at = Utc::now();
+        let outcome = outcome.reconcile(billing);
         let span = self.record(inv, launcher, outcome, exit_code, ended_at, billing);
-        if outcome != Outcome::Ok {
+        if outcome.is_failure() {
             record_failure(&FailureRecord::from_span(&span, inv, outcome, exit_code));
         }
         match &self.delivery {
