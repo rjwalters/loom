@@ -21,9 +21,14 @@
 //!    exclusively (held through the recreate). Busy: deferred, re-checked
 //!    next pass. Never killed.
 //! 3. **One attempt per (container version, host version).** A recreate that
-//!    leaves the container still skewed (the pinned tag was never published,
-//!    the registry was unreachable) is not retried until a version changes,
-//!    so a broken pull cannot churn an idle seat every pass.
+//!    leaves the container still skewed is not retried until a version
+//!    changes, so a broken recreate cannot churn an idle seat every pass.
+//!    A pull that fails **before** the teardown has churned nothing: the seat
+//!    is intact and the pinned tag is usually a release workflow that has not
+//!    finished (the session image follows the tag by ~25 minutes), so the
+//!    pull is retried with a doubling pass backoff
+//!    ([`PULL_RETRY_MAX_SKIP`] passes at most) until it succeeds or a version
+//!    changes (#13493).
 //! 4. **Private-clone sessions** and accounts whose mode cannot be ruled out
 //!    are never touched; the workspace registry must be readable.
 //!
@@ -179,6 +184,10 @@ pub fn guard_image(inputs: &PassInputs<'_>, image: Option<&str>) -> anyhow::Resu
     }
 }
 
+/// Longest run of passes skipped between two pulls of a pinned image that is
+/// not available yet: 30 passes is half an hour at the default interval.
+pub const PULL_RETRY_MAX_SKIP: u32 = 30;
+
 /// What the pass remembers about one account's version skew.
 #[derive(Debug, Default, Clone)]
 pub(super) struct SkewMemory {
@@ -188,6 +197,54 @@ pub(super) struct SkewMemory {
     /// The `(container, host)` versions a recreate was already attempted for.
     attempted: Option<(DaemonVersion, DaemonVersion)>,
     deferred: Option<DeferReason>,
+    /// A pinned image the pass could not pull for `(container, host)`: how
+    /// many pulls failed and how many passes remain to skip before the next.
+    pull: Option<PullRetry>,
+}
+
+/// Backoff state for a pinned image that is not available yet (rule 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PullRetry {
+    versions: (DaemonVersion, DaemonVersion),
+    failures: u32,
+    skip: u32,
+}
+
+impl PullRetry {
+    /// The run of passes to skip after `failures` failed pulls: 1, 2, 4, …
+    /// capped at [`PULL_RETRY_MAX_SKIP`].
+    pub(super) fn skip_after(failures: u32) -> u32 {
+        1u32.checked_shl(failures.saturating_sub(1))
+            .unwrap_or(PULL_RETRY_MAX_SKIP)
+            .min(PULL_RETRY_MAX_SKIP)
+    }
+}
+
+/// Whether this pass should pull the pinned image for `versions` or sit out
+/// the backoff. Counts the pass down when it sits out.
+fn pull_due(mem: &mut SkewMemory, versions: &(DaemonVersion, DaemonVersion)) -> bool {
+    match &mut mem.pull {
+        Some(retry) if retry.versions == *versions && retry.skip > 0 => {
+            retry.skip -= 1;
+            false
+        }
+        _ => true,
+    }
+}
+
+/// A pull of the pinned image for `versions` failed: schedule the next one.
+fn note_pull_failure(mem: &mut SkewMemory, versions: (DaemonVersion, DaemonVersion)) -> u32 {
+    let failures = match &mem.pull {
+        Some(retry) if retry.versions == versions => retry.failures + 1,
+        _ => 1,
+    };
+    let skip = PullRetry::skip_after(failures);
+    mem.pull = Some(PullRetry {
+        versions,
+        failures,
+        skip,
+    });
+    skip
 }
 
 fn probe<R: ContainerRunner>(
@@ -272,6 +329,12 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
         log::debug!("session_reconcile: {container}: skew unchanged since the last recreate");
         return Ok(None);
     }
+    if !pull_due(mem, &(have.clone(), host.clone())) {
+        log::debug!(
+            "session_reconcile: {container}: pinned image still backing off after a failed pull"
+        );
+        return Ok(None);
+    }
     if !matches!((inputs.is_private_clone)(account), Ok(false)) {
         return Ok(None);
     }
@@ -326,20 +389,33 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
             return Ok(Some(defer(&container, DeferReason::LockUnknown, &detail, mem)));
         }
     };
-    // Recorded before the teardown: a failure past this point is not retried
-    // until a version changes (rule 3).
-    mem.attempted = Some((have.clone(), host.clone()));
     mem.deferred = None;
     // The pinned tag must be on hand before the teardown: `docker run` would
     // pull it implicitly, but only after the seat is already gone. A failed
-    // pull leaves the container running on its old daemon.
+    // pull leaves the container running on its old daemon, and the seat has
+    // not been touched, so it is retried after a backoff (rule 3, #13493):
+    // the tag is usually a release workflow that has not published the
+    // session image yet.
     if let Err(error) = lifecycle.runner().ensure_image(&pinned) {
-        log::warn!(
-            "session_reconcile: {container}: not recreating for skew: {pinned} is not \
-             available ({error:#}); left running"
-        );
+        let skip = note_pull_failure(mem, (have, host.clone()));
+        let failures = mem.pull.as_ref().map_or(1, |r| r.failures);
+        if failures == 1 {
+            log::warn!(
+                "session_reconcile: {container}: not recreating for skew: {pinned} is not \
+                 available ({error:#}); left running, pull retried after {skip} pass(es)"
+            );
+        } else {
+            log::debug!(
+                "session_reconcile: {container}: {pinned} still not available (pull {failures} \
+                 failed: {error:#}); next pull after {skip} pass(es)"
+            );
+        }
         return Ok(None);
     }
+    // Recorded before the teardown: a failure past this point is not retried
+    // until a version changes (rule 3).
+    mem.attempted = Some((have.clone(), host.clone()));
+    mem.pull = None;
     lifecycle.runner().stop_and_remove(&container, STOP_GRACE)?;
     let undo = UndoLock::HeldByCaller;
     recreate_container(lifecycle, name, &workspace, Some(pinned.clone()), &is_held, undo)?;
