@@ -40,8 +40,11 @@ reviewer=<ratification-ee|ratification-market>
 The first line is the wire format `keys_marked` parses; `reviewer=` is a visible
 line beside it and is not part of the regex. The `sha` is the head captured at
 selection, not re-read at post time: a push mid-review leaves the new head
-without markers, so the PR is selected again. The session's verdict text is not
-included (the tick outcome does not carry it).
+without markers, so the PR is selected again. After the marker the comment carries a
+`Verdict:` section: the tail of the session's output (its role log from launch),
+at most 4000 characters, with an explicit truncation notice when cut. `<!--` and
+`-->` in it are escaped, so it cannot form or alter a marker. It is posted only
+for a session that succeeded.
 
 ## Trust model
 
