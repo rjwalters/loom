@@ -3,9 +3,10 @@
 //!
 //! Finds open PRs that need key reviews: a PR that adds or edits
 //! `ratification/requests/*.md`, or flips a `Status:` line to ratified under
-//! `spec/**`, `decisions/**` or `docs/decisions/**`. It dispatches nothing:
-//! sessions, instruction fetching and verdict posting are separate steps. The
-//! forge is injected ([`PrSource`]) so every rule is unit-testable offline.
+//! `spec/**`, `decisions/**` or `docs/decisions/**`. Selection is
+//! [`find_candidates`]; [`run_lane`] (step 3, #13345) ties selection, the
+//! step-2 dispatch and marker posting together. The forge is injected
+//! ([`PrSource`], [`CommentSink`]) so every rule is unit-testable offline.
 //!
 //! # Fail closed
 //!
@@ -13,7 +14,7 @@
 //! [`Config::disabled`]; [`find_candidates`] on a disabled config returns
 //! nothing and never touches the source.
 //!
-//! # Key marker (wire format, emitted by step 3)
+//! # Key marker (wire format, emitted by [`post_markers`])
 //!
 //! `<!-- ratify:key=<ee|market> sha=<40-hex head> -->`. A PR is skipped only
 //! when **both** keys carry a marker for its current head, from a trusted
@@ -38,7 +39,6 @@ pub struct Config {
     pub enabled: bool,
     pub ee: Option<Pin>,
     pub market: Option<Pin>,
-    pub broker_endpoint: Option<String>,
 }
 
 impl Config {
@@ -49,7 +49,6 @@ impl Config {
             enabled: false,
             ee: None,
             market: None,
-            broker_endpoint: None,
         }
     }
 
@@ -80,11 +79,6 @@ impl Config {
             })
         };
         let (ee, market) = (pin("ee"), pin("market"));
-        let broker_endpoint = block
-            .get("brokerEndpoint")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
         // Both instruction pins are required; a half-configured lane is off.
         if ee.is_none() || market.is_none() {
             return Self::disabled();
@@ -93,7 +87,6 @@ impl Config {
             enabled: true,
             ee,
             market,
-            broker_endpoint,
         }
     }
 }
@@ -233,6 +226,294 @@ pub fn find_candidates(cfg: &Config, identity: &str, src: &dyn PrSource) -> Vec<
     out
 }
 
+// ---------------------------------------------------------------------------
+// Marker posting and the lane tick (#13345, step 3 of 3 of #13186)
+// ---------------------------------------------------------------------------
+
+/// Posts one comment on a PR. Injected so posting is testable offline.
+pub trait CommentSink {
+    /// # Errors
+    ///
+    /// The forge refused or could not be reached; the text is logged.
+    fn post(&self, pr: u64, body: &str) -> Result<(), String>;
+}
+
+impl Key {
+    /// The wire name used in the marker.
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Key::Ee => "ee",
+            Key::Market => "market",
+        }
+    }
+}
+
+/// The comment body for one key: the wire marker (exactly the shape
+/// [`keys_marked`] parses), then a visible `reviewer=` line. `head_sha` is the
+/// head captured at selection time, never re-read.
+///
+/// `RoleTickOutcome` carries no verdict text, so none is included.
+#[must_use]
+pub fn marker_body(key: Key, head_sha: &str, reviewer: &str) -> String {
+    format!(
+        "<!-- ratify:key={} sha={head_sha} -->\nreviewer={reviewer}\nReviewed head: {head_sha}\n",
+        key.wire()
+    )
+}
+
+/// What the lane did for one key of one PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPost {
+    Posted,
+    /// No marker posted; the reason is logged.
+    Withheld(String),
+}
+
+/// Post a marker for each key whose session ended in
+/// `KeyOutcome::Ran(RoleTickOutcome::Success)`. Anything else (not launched,
+/// or a session that ran but did not succeed) posts nothing: fail closed. One
+/// key's outcome never affects the other.
+pub fn post_markers(
+    pr: u64,
+    head_sha: &str,
+    dispatched: &super::ratification_dispatch::Dispatched,
+    sink: &dyn CommentSink,
+) -> Vec<(Key, KeyPost)> {
+    use super::ratification_dispatch::{role_name, KeyOutcome};
+    use super::RoleTickOutcome;
+    [Key::Ee, Key::Market]
+        .into_iter()
+        .map(|key| {
+            let result = match dispatched.get(key) {
+                KeyOutcome::Ran(RoleTickOutcome::Success) => sink
+                    .post(pr, &marker_body(key, head_sha, role_name(key)))
+                    .map(|()| KeyPost::Posted)
+                    .unwrap_or_else(|e| KeyPost::Withheld(format!("marker post failed: {e}"))),
+                KeyOutcome::Ran(other) => {
+                    KeyPost::Withheld(format!("session did not succeed: {other:?}"))
+                }
+                KeyOutcome::FailedClosed(reason) => KeyPost::Withheld(reason.clone()),
+            };
+            if let KeyPost::Withheld(reason) = &result {
+                log::warn!("ratification_lane: PR #{pr} key {} withheld: {reason}", key.wire());
+            }
+            (key, result)
+        })
+        .collect()
+}
+
+/// One lane pass: select, dispatch both key sessions per candidate, post
+/// markers for the keys that succeeded. A disabled `cfg` returns at once
+/// without touching any source. Returns the per-PR key results.
+pub fn run_lane(
+    cfg: &Config,
+    identity: &str,
+    target_repo: &str,
+    prs: &dyn PrSource,
+    instructions: &dyn super::ratification_dispatch::InstructionSource,
+    sink: &dyn CommentSink,
+    runner: &mut dyn super::RoleInvocationRunner,
+) -> Vec<(u64, Vec<(Key, KeyPost)>)> {
+    let (true, Some(ee), Some(market)) = (cfg.enabled, cfg.ee.as_ref(), cfg.market.as_ref()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for sel in find_candidates(cfg, identity, prs) {
+        match sel {
+            Selection::Refused { pr, reason } => {
+                log::info!("ratification_lane: PR #{pr} refused: {reason}");
+            }
+            Selection::Candidate { pr, head_sha } => {
+                let pr_ref = format!("{target_repo}#{pr}@{head_sha}");
+                let dispatched = super::ratification_dispatch::dispatch(
+                    ee,
+                    market,
+                    target_repo,
+                    &pr_ref,
+                    instructions,
+                    runner,
+                );
+                out.push((pr, post_markers(pr, &head_sha, &dispatched, sink)));
+            }
+        }
+    }
+    out
+}
+
+/// The real forge for [`PrSource`]: `gh api` against `nwo`, trusting only
+/// comments `policy` believes.
+pub struct GhPrSource<'a> {
+    pub root: &'a std::path::Path,
+    pub nwo: &'a str,
+    pub policy: &'a crate::comment_trust::TrustPolicy,
+    refs: std::cell::RefCell<std::collections::HashMap<u64, (String, String)>>,
+}
+
+impl<'a> GhPrSource<'a> {
+    #[must_use]
+    pub fn new(
+        root: &'a std::path::Path,
+        nwo: &'a str,
+        policy: &'a crate::comment_trust::TrustPolicy,
+    ) -> Self {
+        Self {
+            root,
+            nwo,
+            policy,
+            refs: std::cell::RefCell::default(),
+        }
+    }
+
+    fn get(&self, endpoint: &str) -> Option<Value> {
+        let out = crate::script_helpers::run_gh(&["api", endpoint], self.root, false);
+        serde_json::from_slice(&out.ok_output()?.stdout).ok()
+    }
+
+    fn raw(&self, path: &str, git_ref: &str) -> Option<String> {
+        let endpoint = format!("repos/{}/contents/{path}?ref={git_ref}", self.nwo);
+        let out = crate::script_helpers::run_gh(
+            &["api", "-H", "Accept: application/vnd.github.raw", &endpoint],
+            self.root,
+            false,
+        );
+        Some(String::from_utf8_lossy(&out.ok_output()?.stdout).into_owned())
+    }
+}
+
+impl PrSource for GhPrSource<'_> {
+    /// First page (100) of open PRs; an unreadable list is "no candidates".
+    fn open_prs(&self) -> Vec<OpenPr> {
+        let Some(Value::Array(list)) =
+            self.get(&format!("repos/{}/pulls?state=open&per_page=100", self.nwo))
+        else {
+            return Vec::new();
+        };
+        let mut prs = Vec::new();
+        for p in &list {
+            let (Some(number), Some(author), Some(head), Some(base)) = (
+                p.get("number").and_then(Value::as_u64),
+                p.pointer("/user/login").and_then(Value::as_str),
+                p.pointer("/head/sha").and_then(Value::as_str),
+                p.pointer("/base/sha").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            self.refs
+                .borrow_mut()
+                .insert(number, (head.to_string(), base.to_string()));
+            prs.push(OpenPr {
+                number,
+                author: author.to_string(),
+                head_sha: head.to_string(),
+            });
+        }
+        prs
+    }
+
+    /// Content is read only for paths a status flip could apply to.
+    fn files(&self, pr: u64) -> Vec<LaneFile> {
+        let Some(Value::Array(list)) =
+            self.get(&format!("repos/{}/pulls/{pr}/files?per_page=100", self.nwo))
+        else {
+            return Vec::new();
+        };
+        let (head, base) = self.refs.borrow().get(&pr).cloned().unwrap_or_default();
+        list.iter()
+            .filter_map(|f| {
+                let filename = f.get("filename").and_then(Value::as_str)?.to_string();
+                let status = f.get("status").and_then(Value::as_str)?.to_string();
+                let flip =
+                    status != "removed" && STATUS_FLIP_GLOBS.iter().any(|g| glob(g, &filename));
+                let (head_content, base_content) = if flip && !head.is_empty() {
+                    (self.raw(&filename, &head), self.raw(&filename, &base))
+                } else {
+                    (None, None)
+                };
+                Some(LaneFile {
+                    file: ChangedFile {
+                        filename,
+                        previous_filename: f
+                            .get("previous_filename")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        status,
+                        head_content,
+                    },
+                    base_content,
+                })
+            })
+            .collect()
+    }
+
+    fn trusted_comments(&self, pr: u64) -> Vec<Comment> {
+        let Some(Value::Array(list)) =
+            self.get(&format!("repos/{}/issues/{pr}/comments?per_page=100", self.nwo))
+        else {
+            return Vec::new();
+        };
+        list.iter()
+            .filter(|c| self.policy.trusts_json(c))
+            .filter_map(Comment::from_record)
+            .collect()
+    }
+}
+
+/// The real [`CommentSink`]: `forge_comment::post_comment` as the fleet identity.
+pub struct GhCommentSink<'a> {
+    pub root: &'a std::path::Path,
+    pub nwo: &'a str,
+}
+
+impl CommentSink for GhCommentSink<'_> {
+    fn post(&self, pr: u64, body: &str) -> Result<(), String> {
+        crate::forge_comment::post_comment(
+            crate::gh_invocation::gh_bin(),
+            Some(self.root),
+            self.nwo,
+            pr,
+            true,
+            body,
+        )
+        .map(|_| ())
+    }
+}
+
+/// Adapts a (possibly unsized) runner reference to the sized `dyn` the lane takes.
+struct RunnerRef<'r, R: super::RoleInvocationRunner + ?Sized>(&'r mut R);
+
+impl<R: super::RoleInvocationRunner + ?Sized> super::RoleInvocationRunner for RunnerRef<'_, R> {
+    fn invoke(&mut self, role: &str, prompt: &str) -> super::RoleTickOutcome {
+        self.0.invoke(role, prompt)
+    }
+}
+
+/// The role-tick entry point: does nothing unless `ratificationLane.enabled`
+/// is set for `root`, and fails closed when the repo or the daemon's own
+/// identity cannot be resolved (the self-author refusal needs it).
+pub fn tick_for_root<R: super::RoleInvocationRunner + ?Sized>(
+    root: &std::path::Path,
+    runner: &mut R,
+) {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    let cfg = Config::from_effective(&effective);
+    if !cfg.enabled {
+        return;
+    }
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    let (Some(nwo), Some(identity)) = (
+        crate::credential_preflight::nwo_from_git_remote(root),
+        policy.self_login().map(str::to_string),
+    ) else {
+        log::warn!("ratification_lane: repo or dispatching identity unresolved; skipping");
+        return;
+    };
+    let prs = GhPrSource::new(root, &nwo, &policy);
+    let instructions = super::ratification_dispatch::GhInstructionSource { root };
+    let sink = GhCommentSink { root, nwo: &nwo };
+    run_lane(&cfg, &identity, &nwo, &prs, &instructions, &sink, &mut RunnerRef(runner));
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -277,8 +558,7 @@ mod tests {
         Config::from_effective(&json!({"ratificationLane": {
             "enabled": true,
             "ee": {"repo": "o/ee", "path": "i.md", "commit": "abc"},
-            "market": {"repo": "o/mk", "path": "i.md", "commit": "def"},
-            "brokerEndpoint": "https://broker.example"
+            "market": {"repo": "o/mk", "path": "i.md", "commit": "def"}
         }}))
     }
 
@@ -317,12 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn config_parses_pins_and_endpoint() {
+    fn config_parses_pins() {
         let c = enabled();
         assert!(c.enabled);
         assert_eq!(c.ee.unwrap().repo, "o/ee");
         assert_eq!(c.market.unwrap().commit, "def");
-        assert_eq!(c.broker_endpoint.as_deref(), Some("https://broker.example"));
     }
 
     #[test]
