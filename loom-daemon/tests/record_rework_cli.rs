@@ -7,22 +7,18 @@
 //! `.loom/logs/sweep-rework-events.jsonl`. So the field was permanently
 //! absent and every query over it answered "this fleet re-does no work" from a
 //! fleet that does. Nothing failed; the number was just always zero. That is
-//! the failure mode this suite exists to keep closed, which is why it checks
-//! two different things:
+//! the failure mode this suite exists to keep closed, so it checks the
+//! command's own contract — it writes a marker the reader accepts,
+//! and it never fails the operation it describes (always exit 0, whatever
+//! goes wrong), because its callers are merge and doctor paths where a
+//! telemetry refusal must not become an operational one. The one exception
+//! is deliberate: an unknown `--kind`/`--classification` is a clap argument
+//! error (exit 2), since a typo that widens a low-cardinality vocabulary
+//! poisons every downstream rollup silently.
 //!
-//! 1. **The command's own contract** — it writes a marker the reader accepts,
-//!    and it never fails the operation it describes (always exit 0, whatever
-//!    goes wrong), because its callers are merge and doctor paths where a
-//!    telemetry refusal must not become an operational one. The one exception
-//!    is deliberate: an unknown `--kind`/`--classification` is a clap argument
-//!    error (exit 2), since a typo that widens a low-cardinality vocabulary
-//!    poisons every downstream rollup silently.
-//!
-//! 2. **That `merge-pr.sh` actually calls it.** A writer nothing invokes is
-//!    the same always-zero as no writer at all, and the wiring is two appended
-//!    fragments on pre-existing lines (the script is frozen by the file-size
-//!    ratchet), which is exactly the shape a later edit removes without
-//!    noticing. These assertions read the committed script.
+//! `merge-pr.sh` no longer calls it (#12063 slice 2 deleted both emission
+//! sites with the base-sync and mergeable pre-read they described), so the
+//! wiring assertions that used to live here are gone.
 //!
 //! No forge, network, Docker or credential: the marker file is a local append
 //! under a temp directory.
@@ -31,8 +27,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
-
-const MERGE_PR: &str = include_str!("../../defaults/scripts/merge-pr.sh");
 
 /// A directory that [`loom_daemon::repo_root::find_repo_root`] accepts as a
 /// workspace root: `.git` plus `.loom`.
@@ -269,74 +263,6 @@ fn an_explicit_classification_overrides_the_table() {
     );
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(markers(dir.path())[0]["classification"], "substantive");
-}
-
-// ---------------------------------------------------------------------------
-// merge-pr.sh wiring. A writer nothing calls measures nothing.
-// ---------------------------------------------------------------------------
-
-/// Both emission sites exist, with the kinds they are supposed to carry.
-#[test]
-fn merge_pr_emits_a_rebase_marker_when_it_syncs_a_moved_base() {
-    let site = MERGE_PR
-        .lines()
-        .find(|line| line.contains("record-rework") && line.contains("--kind rebase"))
-        .expect("merge-pr.sh no longer marks the base-sync rebase (#9444)");
-    assert!(
-        site.contains("_refresh_precondition_sha"),
-        "the rebase marker moved off the base-modified retry arm: {site}"
-    );
-    assert!(
-        site.contains("--branch \"$PR_BRANCH\"") && site.contains("--repo-root \"$REPO_ROOT\""),
-        "the marker must name the issue's branch and the shared workspace root: {site}"
-    );
-}
-
-#[test]
-fn merge_pr_emits_a_merge_conflict_marker_only_on_a_corroborated_conflict() {
-    let site = MERGE_PR
-        .lines()
-        .find(|line| line.contains("record-rework") && line.contains("--kind merge_conflict"))
-        .expect("merge-pr.sh no longer marks the corroborated conflict (#9444)");
-    assert!(
-        site.contains("refuse-conflict)"),
-        "the conflict marker must stay on the CORROBORATED arm — the stale/unknown \
-         arm is 'nobody could tell', not 'this branch conflicts': {site}"
-    );
-    // The `*` fallback arm must not gain one.
-    assert_eq!(
-        MERGE_PR.matches("--kind merge_conflict").count(),
-        1,
-        "exactly one conflict emission site is wired"
-    );
-}
-
-/// Every call is isolated. A marker may never fail a merge, and a daemon
-/// predating the verb must be indistinguishable from one that recorded
-/// nothing.
-#[test]
-fn every_emission_site_is_failure_isolated_and_declared() {
-    let sites: Vec<&str> = MERGE_PR
-        .lines()
-        .filter(|line| line.contains("record-rework") && !line.trim_start().starts_with('#'))
-        .collect();
-    assert_eq!(sites.len(), 2, "expected exactly the two wired sites: {sites:?}");
-    for site in &sites {
-        assert!(
-            site.contains(">/dev/null 2>&1 || true"),
-            "a rework marker must never fail the merge it describes: {site}"
-        );
-        assert!(
-            site.contains("${LOOM_DAEMON_BIN:-loom-daemon}"),
-            "the call must honour LOOM_DAEMON_BIN like every other daemon call \
-             in this script: {site}"
-        );
-    }
-    assert!(
-        MERGE_PR.contains("# requires-daemon: record-rework optional"),
-        "#8285: a new daemon dependency declares its floor, and this one \
-         degrades rather than refusing"
-    );
 }
 
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
