@@ -308,6 +308,11 @@ mod tests {
         let cross = dir.path().join("cross");
         let same = dir.path().join("same");
         let owner_dir = dir.path().join("gh-config-by-owner/2AMLogic");
+        // The registry key canonicalizes an existing root (macOS `/var` ->
+        // `/private/var`) but falls back to the raw path for a missing one, so
+        // create the roots first to keep the registered and looked-up keys equal.
+        std::fs::create_dir_all(&cross).unwrap();
+        std::fs::create_dir_all(&same).unwrap();
         crate::credential_preflight::register_root_gh_config_dir(&cross, &owner_dir);
 
         assert_eq!(gh_config_dir_seen_by_refresh(&cross), owner_dir.display().to_string());
