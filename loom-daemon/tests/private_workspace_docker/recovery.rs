@@ -157,6 +157,10 @@ fn a_missing_container_is_recreated_on_the_surviving_volume_without_losing_work(
     assert!(status.running && running(a));
     assert_ne!(container_id(a).unwrap(), before, "a missing container is replaced");
     assert_survived(&f, a);
+    // Job admission refuses any dirty clone by design (unpublished work must not
+    // be reused over), and `seed` left uncommitted files in every clone. Survival
+    // is already proven above, so clear them before checking admission.
+    f.exec(a, "rm -f /workspace/repo/keep /workspace/work/*/mine");
     // The ordinary job path still admits the recovered account.
     checked(f.job(a, "role", "true").output().unwrap());
 }
