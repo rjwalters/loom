@@ -4364,6 +4364,7 @@ mod llm_gateway;
 mod model_resolution;
 mod prompt_cache_prefix;
 mod ratification_dispatch;
+mod ratification_markers;
 mod residue_teardown;
 mod roster_fence;
 mod run_target_dir;
