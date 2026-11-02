@@ -910,17 +910,18 @@ assert_doc_contains "$CRITICAL_HOLD_MD" \
     'CF_ACTION=rearm' \
     "the tick re-arms the hold when the head moved past the released one"
 
-# The operator-facing procedure has to be the one that actually works: remove
-# the label, then run merge-pr.sh, with an explicit promise that Champion will
-# not put the label back at this head. The pre-#9016 wording promised a
-# `merge-pr.sh` run the #8112 guard refused.
+# The operator-facing procedure has to be the one that actually works: since
+# #13517 it is one audited command, `merge-pr.sh <N> --release-hold`, which
+# verifies the hold and Judge-approved heads and removes loom:blocked itself
+# (the pre-#13517 hand `gh pr edit --remove-label` recorded nothing), with an
+# explicit promise that Champion will not put the label back at this head.
 assert_doc_contains "$CRITICAL_HOLD_MD" \
-    'gh pr edit $PR_NUMBER --remove-label \"loom:blocked\"' \
-    "the hold notice's Next steps tell the operator to remove loom:blocked first"
+    './.loom/scripts/merge-pr.sh $PR_NUMBER --release-hold' \
+    "the hold notice's Next steps name the one audited release-and-merge command (#13517)"
 
-assert_doc_contains "$CRITICAL_HOLD_MD" \
-    './.loom/scripts/merge-pr.sh $PR_NUMBER' \
-    "the hold notice's Next steps name the merge command that follows the removal"
+assert_doc_lacks "$CRITICAL_HOLD_MD" \
+    'gh pr edit $PR_NUMBER --remove-label \"loom:blocked\"' \
+    "the hold notice no longer tells the operator to hand-remove loom:blocked (#13517)"
 
 # One line, not a two-line needle: `grep -F` splits a needle on newlines and
 # ORs the parts, so a multi-line pin silently degrades to "either line".
