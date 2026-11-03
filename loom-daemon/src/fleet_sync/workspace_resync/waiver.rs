@@ -376,6 +376,17 @@ fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
         if !is_test && (matches_any(GATE, &f.filename) || matches_any(GATE, prev)) {
             return no(format!("{} is a merge-gate path", f.filename));
         }
+        // Every version-bumping resync rewrites the install metadata, which
+        // has no `defaults/` counterpart. It is data, not code, and the proof
+        // already requires it at the head to name the title's version, so
+        // strict mode accepts it when added/modified in place (not renamed).
+        if strict
+            && f.filename == kind.meta_path()
+            && prev == f.filename
+            && (f.status == "added" || f.status == "modified")
+        {
+            continue;
+        }
         if !strict && !(matches_any(KEPT_SET, &f.filename) || matches_any(KEPT_SET, prev)) {
             continue;
         }

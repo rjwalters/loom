@@ -396,6 +396,44 @@ fn an_ordinary_file_with_no_upstream_counterpart_takes_the_lane() {
     assert!(fx.merged.take().is_none());
 }
 
+/// A resync's file list has the shape of a real one (2AMLogic/fasterhenry#253):
+/// the install metadata rewritten alongside hooks/scripts/docs/commands.
+#[test]
+fn a_realistic_resync_with_rewritten_install_metadata_lands() {
+    let mut f = Fake::ok();
+    f.files = Ok(vec![
+        file(".loom/install-metadata.json", "m1", "modified"),
+        file(".loom/hooks/guard-x.sh", "b1", "modified"),
+        file(".loom/scripts/tests/test-x.sh", "t1", "added"),
+        file(".loom/docs/readme.md", "b2", "modified"),
+        file(".claude/commands/loom/sweep.md", "c1", "modified"),
+    ]);
+    f.changed = 5;
+    f.upstream
+        .push(("defaults/scripts/tests/test-x.sh".to_string(), "t1".to_string()));
+    f.upstream
+        .push(("defaults/.claude/commands/loom/sweep.md".to_string(), "c1".to_string()));
+    let fx = Fx::new(Checks::Green, Ok(()));
+    let out = land(&f, &fx, 1);
+    assert_eq!(out.word(), "landed-by-daemon", "{out:?}");
+    assert_eq!(fx.merged.take().as_deref(), Some(HEAD));
+}
+
+#[test]
+fn a_renamed_or_removed_install_metadata_is_not_exempt() {
+    for status in ["removed", "renamed"] {
+        let mut f = Fake::ok();
+        f.files = Ok(vec![
+            file(".loom/install-metadata.json", "m1", status),
+            file(".loom/hooks/guard-x.sh", "b1", "modified"),
+        ]);
+        let fx = Fx::new(Checks::Green, Ok(()));
+        let out = land(&f, &fx, 1);
+        assert_eq!(out.word(), "handed-to-lane", "{status}: {out:?}");
+        assert!(fx.merged.take().is_none());
+    }
+}
+
 #[test]
 fn red_or_pending_checks_take_the_lane_without_a_comment_or_label() {
     for why in [
