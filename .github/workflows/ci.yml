@@ -1734,6 +1734,9 @@ jobs:
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
+      - name: merge-pr --release-hold (#13517)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-merge-pr-release-hold.sh
       # #9657 (#9548 slice): this suite pins the working-tree binary for the
       # real `forge trusted-comments` filter, so it needs this job's shared
       # build.

@@ -169,7 +169,6 @@ test-merge-admission-telemetry.sh
 test-merge-pr-app-permission-fallback.sh
 test-merge-pr-expected-head.sh
 test-merge-pr-pr-state.sh
-test-merge-pr-release-hold.sh
 test-merge-pr-daemon-version-floor.sh
 test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
