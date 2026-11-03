@@ -396,8 +396,10 @@ fn an_ordinary_file_with_no_upstream_counterpart_takes_the_lane() {
     assert!(fx.merged.take().is_none());
 }
 
-/// A resync's file list has the shape of a real one (2AMLogic/fasterhenry#253):
-/// the install metadata rewritten alongside hooks/scripts/docs/commands.
+/// A resync that touches only files the proof can map (install metadata,
+/// hooks, scripts, docs, commands). This is NOT the shape of a typical real
+/// resync: real ones usually also carry roles, generated skill copies, or
+/// merge-gate paths, which the strict proof refuses (next test).
 #[test]
 fn a_realistic_resync_with_rewritten_install_metadata_lands() {
     let mut f = Fake::ok();
@@ -417,6 +419,66 @@ fn a_realistic_resync_with_rewritten_install_metadata_lands() {
     let out = land(&f, &fx, 1);
     assert_eq!(out.word(), "landed-by-daemon", "{out:?}");
     assert_eq!(fx.merged.take().as_deref(), Some(HEAD));
+}
+
+/// The exact file list of 2AMLogic/fasterhenry#253 (a real
+/// `chore(loom): resync installed Loom` PR), every mappable file byte-identical
+/// to the tag. It must NOT land: it carries `.agents/skills/*` (outside the
+/// install set), `.loom/roles/*` (no `defaults/` counterpart, #13313) and
+/// merge-gate paths (`*judge*`, `*champion*`, `merge-pr.sh`), so it takes the
+/// Judge lane. Pins the deliberate limit of the strict proof.
+#[test]
+fn the_real_fasterhenry_253_file_list_takes_the_lane() {
+    const REAL: &[(&str, &str)] = &[
+        ("modified", ".agents/skills/loom-doctor/SKILL.md"),
+        ("modified", ".agents/skills/loom-judge/SKILL.md"),
+        ("modified", ".claude/commands/loom/champion-critical-file-hold.md"),
+        ("modified", ".claude/commands/loom/champion-pr-merge.md"),
+        ("modified", ".claude/commands/loom/champion-ratification-hold.md"),
+        ("modified", ".claude/commands/loom/champion-reference.md"),
+        ("modified", ".claude/commands/loom/doctor.md"),
+        ("modified", ".claude/commands/loom/judge.md"),
+        ("modified", ".loom/docs/ci-observability.md"),
+        ("modified", ".loom/docs/critical-file-hold.md"),
+        ("modified", ".loom/docs/ratification-hold.md"),
+        ("added", ".loom/docs/ratification-lane.md"),
+        ("modified", ".loom/docs/release-cadence.md"),
+        ("modified", ".loom/docs/targeted-role-invocation.md"),
+        ("modified", ".loom/docs/telemetry-schema.md"),
+        ("modified", ".loom/docs/tracing.md"),
+        ("modified", ".loom/install-metadata.json"),
+        ("modified", ".loom/roles/doctor.md"),
+        ("modified", ".loom/roles/judge.md"),
+        ("modified", ".loom/scripts/merge-pr.sh"),
+        ("modified", ".loom/scripts/tests/ci-wired.txt"),
+        ("modified", ".loom/scripts/tests/test-champion-critical-file-check.sh"),
+        ("modified", ".loom/scripts/tests/test-champion-resync-waiver.sh"),
+        ("added", ".loom/scripts/tests/test-doctor-champion-hold-conflict.sh"),
+        ("modified", ".loom/scripts/tests/test-guide-operator-attention-fold.sh"),
+        ("modified", ".loom/scripts/tests/test-merge-pr-stacked-child-branch-delete.sh"),
+        ("modified", ".loom/scripts/tests/test-version-bump-workflow-identity.sh"),
+    ];
+    let mut f = Fake::ok();
+    let mut files = Vec::new();
+    let mut upstream = Vec::new();
+    for (i, (status, name)) in REAL.iter().enumerate() {
+        let sha = format!("s{i}");
+        if let Some(up) = upstream_path(name) {
+            upstream.push((up, sha.clone()));
+        }
+        files.push(file(name, &sha, status));
+    }
+    f.changed = files.len();
+    f.files = Ok(files);
+    f.upstream = upstream;
+    let fx = Fx::new(Checks::Green, Ok(()));
+    let out = land(&f, &fx, 1);
+    assert_eq!(out.word(), "handed-to-lane", "{out:?}");
+    assert!(
+        out.reason().contains("outside the install set"),
+        "first refusal is the generated skill copy: {out:?}"
+    );
+    assert!(fx.merged.take().is_none() && fx.comments.borrow().is_empty());
 }
 
 #[test]
