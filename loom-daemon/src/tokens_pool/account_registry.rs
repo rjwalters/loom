@@ -4,6 +4,7 @@
 //! logical names bound to directories below a machine-level profile root; this
 //! module never reads `auth.json`.
 
+use crate::script_helpers::now_epoch_secs;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -803,7 +804,7 @@ pub fn select_codex_account_where(
         .into_iter()
         .filter(|account| keep(account))
         .collect();
-    let now = epoch_now();
+    let now = now_epoch_secs();
     // Proactive in-container auth probe (issue #6927): a session-managed
     // account whose refresh chain has died is marked `reauth_required` *here*,
     // so the exclusion below sees it, instead of being selected and failing a
@@ -836,13 +837,6 @@ pub fn select_codex_account_where(
         // manifest to source an upstream id from (D9).
         upstream_id: None,
     })
-}
-
-fn epoch_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

@@ -11,10 +11,10 @@
 //! Reaching the threshold (default 5) is checked `>= 5` — idempotent
 //! at-or-above, matching the Python semantics exactly.
 
+use crate::script_helpers::now_iso;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::allowlist::atomic_write;
@@ -93,10 +93,6 @@ fn write_state(path: &Path, state: &State) -> Result<(), String> {
     let mut body = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
     body.push('\n');
     atomic_write(path, &body)
-}
-
-fn now_iso() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Increment the failure counter for `name`, capped at
