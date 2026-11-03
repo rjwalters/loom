@@ -73,6 +73,31 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
 /// older readers skip it as a corrupt line.
 const HEADER_KEY: &str = "loom_queue_header";
 
+/// Minimum gap between overflow log lines.
+const OVERFLOW_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `kind=count` pairs for `items`, most frequent first (spans by name), capped
+/// at the top eight.
+fn kind_histogram(items: &VecDeque<TelemetryEnvelope>) -> String {
+    use crate::telemetry::TelemetryRecord;
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for item in items {
+        let key = match &item.record {
+            TelemetryRecord::Span(span) => format!("trace.span:{}", span.name.as_str()),
+            other => other.kind().to_string(),
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    let mut pairs: Vec<_> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs
+        .iter()
+        .take(8)
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
     /// Envelope lines currently in the file, stale (evicted) prefix included.
@@ -82,6 +107,9 @@ struct QueueState {
     /// Bulk-backfill offers refused at the backfill limit (#11115).
     deferred_total: u64,
     head_sequence: u128,
+    /// When the last overflow line (with its per-kind histogram) was logged
+    /// (#13538), so a burst logs once rather than once per dropped record.
+    last_overflow_log: Option<std::time::Instant>,
 }
 
 /// Outcome of a bounded bulk-backfill offer (#11115).
@@ -199,6 +227,7 @@ impl DurableQueue {
                 file_ready,
                 deferred_total: 0,
                 head_sequence: 0,
+                last_overflow_log: None,
             }),
         }
     }
@@ -235,12 +264,21 @@ impl DurableQueue {
             state.items.pop_front();
             state.head_sequence += 1;
             self.ledger.record(REASON_QUEUE_OVERFLOW, 1);
-            log::warn!(
-                "observability: queue at capacity ({}); dropped oldest record \
-                 (queue_overflow, dropped_total={})",
-                self.capacity,
-                self.ledger.total()
-            );
+            // One line per burst, naming what fills the queue (#13538): the
+            // ledger counts every drop, so per-record lines add only noise.
+            let quiet = state
+                .last_overflow_log
+                .is_some_and(|at| at.elapsed() < OVERFLOW_LOG_INTERVAL);
+            if !quiet {
+                state.last_overflow_log = Some(std::time::Instant::now());
+                log::warn!(
+                    "observability: queue at capacity ({}); dropped oldest record \
+                     (queue_overflow, dropped_total={}); queued by kind: {}",
+                    self.capacity,
+                    self.ledger.total(),
+                    kind_histogram(&state.items)
+                );
+            }
         }
     }
 
@@ -980,6 +1018,13 @@ mod tests {
         queue.push(envelope(1));
         queue.ack(100); // must not panic
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn kind_histogram_names_what_fills_the_queue() {
+        let items: VecDeque<TelemetryEnvelope> = (1..=3).map(envelope).collect();
+        assert_eq!(kind_histogram(&items), "sweep.started=3");
+        assert_eq!(kind_histogram(&VecDeque::new()), "");
     }
 
     #[test]
