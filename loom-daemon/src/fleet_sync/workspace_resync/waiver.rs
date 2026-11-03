@@ -315,9 +315,19 @@ fn classify(title: &str) -> Option<(Kind, &str)> {
         .or_else(|| repo_skills_title_version(title).map(|v| (Kind::RepoSkills, v)))
 }
 
-/// The proof, for PR `number`. Fails closed on every read error.
+/// The proof, for PR `number`. Fails closed on every read error. Only the
+/// kept-set files are byte-checked: Champion's waiver lifts just that hold and
+/// leaves the rest to Judge and the other merge-risk axes.
 #[must_use]
 pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
+    prove(src, number, false)
+}
+
+/// The proof the daemon merges on alone (no Judge, no Champion): with `strict`
+/// set every changed file must be an added/modified byte-copy of its upstream
+/// counterpart at the tag, not only the kept-set files. A file with no upstream
+/// mapping fails it.
+fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
     let pr = match src.pr(number) {
         Ok(p) => p,
         Err(_) => return no("PR unreadable"),
@@ -366,7 +376,7 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
         if !is_test && (matches_any(GATE, &f.filename) || matches_any(GATE, prev)) {
             return no(format!("{} is a merge-gate path", f.filename));
         }
-        if !(matches_any(KEPT_SET, &f.filename) || matches_any(KEPT_SET, prev)) {
+        if !strict && !(matches_any(KEPT_SET, &f.filename) || matches_any(KEPT_SET, prev)) {
             continue;
         }
         if f.status != "added" && f.status != "modified" {
@@ -382,7 +392,12 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
             _ => return no(format!("{} differs from {tag}:{up}", f.filename)),
         }
     }
-    if record.is_empty() {
+    if record.is_empty()
+        || !files.iter().any(|f| {
+            let prev = f.previous_filename.as_deref().unwrap_or(&f.filename);
+            matches_any(KEPT_SET, &f.filename) || matches_any(KEPT_SET, prev)
+        })
+    {
         return no("no kept-set file to waive");
     }
     match src.pr(number) {
@@ -455,7 +470,7 @@ pub trait Landing {
 pub fn record_comment(tag: &str, head: &str, record: &[(String, String)]) -> String {
     format!(
         "**Resync waiver (daemon): ELIGIBLE** against `{tag}` at head `{head}`.\n\n\
-         Every changed kept-set file is byte-identical to its `defaults/` counterpart at the tag \
+         Every changed file is byte-identical to its `defaults/` counterpart at the tag \
          (blob SHA), and checks are green on this head. The daemon merges this resync PR itself \
          through `merge-pr.sh`; no Judge or Champion decision applies to a byte-copy of a tag.\n\n\
          ```\n{}```\n",
@@ -463,10 +478,11 @@ pub fn record_comment(tag: &str, head: &str, record: &[(String, String)]) -> Str
     )
 }
 
-/// Run the proof and, if it holds with green checks on the same head, merge.
+/// Run the strict proof (every changed file, not only the kept set) and, if it
+/// holds with green checks on the same head, merge.
 /// The caller labels `loom:review-requested` on anything but [`Waived::Landed`].
 pub fn land(src: &dyn Source, landing: &dyn Landing, number: u32) -> Waived {
-    let (tag, head, record) = match evaluate(src, number) {
+    let (tag, head, record) = match prove(src, number, true) {
         Verdict::Eligible { tag, head, record } => (tag, head, record),
         Verdict::NotEligible(why) => return Waived::Lane(format!("waiver proof failed: {why}")),
     };

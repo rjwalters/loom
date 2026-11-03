@@ -43,7 +43,10 @@ impl Fake {
                 file(".loom/docs/readme.md", "b2", "modified"),
             ]),
             changed: 2,
-            upstream: vec![("defaults/hooks/guard-x.sh".to_string(), "b1".to_string())],
+            upstream: vec![
+                ("defaults/hooks/guard-x.sh".to_string(), "b1".to_string()),
+                ("defaults/docs/readme.md".to_string(), "b2".to_string()),
+            ],
         }
     }
 }
@@ -357,6 +360,40 @@ fn an_ineligible_resync_merges_nothing_and_takes_the_lane() {
             && fx.comments.borrow().is_empty()
             && fx.labels.borrow().is_empty()
     );
+}
+
+/// The daemon merges on the proof alone, so a non-kept-set file must be a
+/// byte-copy too (Champion's `evaluate` leaves those to Judge).
+#[test]
+fn an_ordinary_file_that_differs_by_one_byte_takes_the_lane() {
+    let mut f = Fake::ok();
+    f.upstream[1].1 = "b2-different".to_string();
+    // The kept-set-only proof (Champion's) still passes ...
+    assert!(matches!(evaluate(&f, 1), Verdict::Eligible { .. }));
+    // ... the daemon's landing does not.
+    let fx = Fx::new(Checks::Green, Ok(()));
+    let out = land(&f, &fx, 1);
+    assert_eq!(out.word(), "handed-to-lane", "{out:?}");
+    assert!(
+        out.reason()
+            .contains("differs from v1.2.3:defaults/docs/readme.md"),
+        "{out:?}"
+    );
+    assert!(fx.merged.take().is_none() && fx.comments.borrow().is_empty());
+}
+
+#[test]
+fn an_ordinary_file_with_no_upstream_counterpart_takes_the_lane() {
+    let mut f = Fake::ok();
+    f.files = Ok(vec![
+        file(".loom/hooks/guard-x.sh", "b1", "modified"),
+        file(".loom/roles/builder.md", "b3", "modified"),
+    ]);
+    assert!(matches!(evaluate(&f, 1), Verdict::Eligible { .. }));
+    let fx = Fx::new(Checks::Green, Ok(()));
+    let out = land(&f, &fx, 1);
+    assert_eq!(out.word(), "handed-to-lane", "{out:?}");
+    assert!(fx.merged.take().is_none());
 }
 
 #[test]
