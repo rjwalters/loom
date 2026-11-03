@@ -16,35 +16,15 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use super::*;
+use crate::worktree_cli::test_support;
+use crate::worktree_cli::test_support::git;
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-branch-conflict-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmpdir");
-    fs::canonicalize(&base).expect("canonicalize tmpdir")
-}
-
-fn git(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out
+    test_support::tmpdir("loom-branch-conflict", tag)
 }
 
 /// A one-commit repo at `<dir>/<name>`, on branch `on_branch`. `name` may

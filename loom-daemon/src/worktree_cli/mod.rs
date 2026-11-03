@@ -211,3 +211,6 @@ pub mod stale_ref;
 pub mod submodules;
 pub mod upstream;
 pub mod wip;
+
+#[cfg(test)]
+mod test_support;

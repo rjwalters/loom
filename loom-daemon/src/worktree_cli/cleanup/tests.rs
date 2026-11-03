@@ -23,16 +23,10 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::worktree_cli::test_support;
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-cleanup-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmpdir");
-    fs::canonicalize(&base).expect("canonicalize tmpdir")
+    test_support::tmpdir("loom-cleanup", tag)
 }
 
 fn quiet() -> Reporter {
