@@ -607,6 +607,68 @@ fn a_tapless_root_does_not_flap_the_hold_shared_with_a_spawnable_root() {
     assert_eq!(host.held_pool_count(), 0);
 }
 
+/// #13539: two roots on ONE pool — A lists only `codex` and no Codex seat
+/// exists, B lists `claude` with a spawnable account. Across repeated ticks A
+/// stays held and B stays free, the hold never disappears between A's ticks
+/// (it used to be cleared by B's, flapping the arm WARN / clear INFO per
+/// tick), and nothing is ever offered for broadcast. When a Codex seat
+/// appears A releases exactly once.
+#[test]
+#[serial]
+fn a_per_workspace_preference_hold_survives_a_sibling_root_on_the_same_pool() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+
+    let shared = tempfile::tempdir().unwrap();
+    fs::write(shared.path().join("a.token"), "sk-ant-oat01-fake").unwrap();
+    let prior = std::env::var_os("LOOM_SHARED_TOKENS_DIR");
+    std::env::set_var("LOOM_SHARED_TOKENS_DIR", shared.path());
+
+    let codex_only = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["codex"]}}),
+    );
+    let claude = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    let mut observed = Vec::new();
+    for _ in 0..4 {
+        for root in [codex_only.path(), claude.path()] {
+            let obs = host.observe_root_edge(root, chrono::Utc::now());
+            observed.push((root == codex_only.path(), obs.held, obs.edge));
+            if root == codex_only.path() {
+                assert_eq!(
+                    host.held_pool_count(),
+                    1,
+                    "the sibling root's tick must not clear the codex-only hold"
+                );
+            }
+        }
+    }
+    assert!(
+        observed
+            .iter()
+            .all(|(is_codex_only, held, edge)| *is_codex_only == *held && edge.is_none()),
+        "{observed:?}"
+    );
+    assert_eq!(host.active_holds().len(), 1);
+
+    // A Codex seat logs in: the codex-only root releases, once.
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let obs = host.observe_root_edge(codex_only.path(), chrono::Utc::now());
+    assert!(!obs.held && obs.edge.is_none());
+    assert_eq!(host.held_pool_count(), 0);
+    assert!(!host.observe_root(codex_only.path(), chrono::Utc::now()));
+
+    match prior {
+        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fleet broadcast of the hold (Issue #8001)
 // ---------------------------------------------------------------------------
