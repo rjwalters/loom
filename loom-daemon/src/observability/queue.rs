@@ -742,6 +742,39 @@ mod tests {
             .collect()
     }
 
+    /// #12094: `fleet.state`, `pr.resolved`, `eta.stage_outcome` and
+    /// `pass.summary` left the registry. An older daemon's spool can still hold
+    /// them; they are skipped on load (never a decode error that loses the
+    /// neighbouring records) and rewritten away on the next open.
+    #[test]
+    fn a_retired_kind_in_an_old_spool_is_skipped_not_fatal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let valid = |n| serde_json::to_string(&envelope(n)).unwrap();
+        let mut retired = serde_json::to_value(envelope(2)).unwrap();
+        for kind in [
+            "fleet.state",
+            "pr.resolved",
+            "eta.stage_outcome",
+            "pass.summary",
+        ] {
+            retired["record"] = serde_json::json!({ "kind": kind, "repo": "o/r" });
+            assert!(
+                serde_json::from_value::<TelemetryEnvelope>(retired.clone()).is_err(),
+                "{kind} must no longer decode as a registered kind"
+            );
+        }
+        let retired_line = serde_json::to_string(&retired).unwrap();
+        std::fs::write(&path, format!("{}\n{retired_line}\n{}\n", valid(1), valid(3))).unwrap();
+
+        let queue = DurableQueue::open(path.clone(), 8);
+        assert_eq!(issues(&queue), vec![1, 3]);
+        queue.push(envelope(4));
+        assert_eq!(issues(&queue), vec![1, 3, 4]);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("eta.stage_outcome"), "{rewritten}");
+    }
+
     #[test]
     fn bounded_check_and_enqueue_share_one_lock_hold() {
         let dir = tempdir().unwrap();

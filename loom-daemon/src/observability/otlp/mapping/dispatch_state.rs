@@ -186,7 +186,10 @@ mod tests {
         }
         let log_keep = CONFIG
             .lines()
-            .find(|l| l.contains("keep_keys(attributes, [") && l.contains("loom.eta.pr.state"))
+            .find(|l| {
+                l.contains("keep_keys(attributes, [")
+                    && l.contains("loom.eta.dispatch_state.artifact")
+            })
             .expect("the transform/privacy log keep_keys line");
         for key in DISPATCH_STATE_LOG_ATTRIBUTE_KEYS {
             assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
