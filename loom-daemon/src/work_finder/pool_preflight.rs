@@ -203,6 +203,14 @@ pub struct PoolObservation {
 #[derive(Debug, Default)]
 pub struct PoolHoldState {
     holds: Mutex<HashMap<PathBuf, PoolExhaustionHold>>,
+    /// Holds produced by ONE workspace's preference list being wholly
+    /// unavailable (#13539), keyed by the arming **root**, not the pool
+    /// directory. A shared pool-dir key let another root on the same pool
+    /// (different list, spawnable tap) take the clear path and remove this
+    /// hold every tick, so the arm WARN / clear INFO flapped per tick. Never
+    /// advertised to peers: the hold describes one workspace's list, not the
+    /// pool.
+    pref_holds: Mutex<HashMap<PathBuf, PoolExhaustionHold>>,
     /// Pool keys currently held **by a peer** and already edge-logged by this
     /// host (Issue #8001). Purely a log-deduplication set: the authoritative
     /// peer state lives in [`crate::peer_claims::PeerClaimView`], which has
@@ -225,6 +233,12 @@ impl PoolHoldState {
     pub fn global() -> &'static Self {
         static GLOBAL: OnceLock<PoolHoldState> = OnceLock::new();
         GLOBAL.get_or_init(PoolHoldState::new)
+    }
+
+    fn lock_pref(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, PoolExhaustionHold>> {
+        self.pref_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, PoolExhaustionHold>> {
@@ -262,12 +276,11 @@ impl PoolHoldState {
     ///   bounded TTL. The wrapper proved *that pool* cannot select an
     ///   account; re-deciding that verdict per tap is not something this
     ///   pre-flight can do from a pool-keyed hold.
-    /// - The hold set stays keyed by **pool directory**, not by (root, list).
-    ///   Two roots resolving to one pool with *different* preference lists
-    ///   therefore share one hold key, so one root's list recovering clears
-    ///   (and the other's re-arms) the shared key. Only the per-root return
-    ///   value gates dispatch, so this affects the edge-logging, never
-    ///   whether a root with a spawnable tap is dispatched.
+    /// - Real token-pool exhaustion stays keyed by **pool directory**. A
+    ///   preference-list exhaustion (#13539) is keyed by the arming **root**
+    ///   instead, since the list belongs to one workspace: another root on
+    ///   the same pool cannot clear it, so it edge-logs once per condition
+    ///   change, and it is never advertised to peers.
     pub fn observe_root(&self, root: &Path, now: DateTime<Utc>) -> bool {
         self.observe_root_edge(root, now).held
     }
@@ -324,6 +337,56 @@ impl PoolHoldState {
             // not keep a pre-flight hold alive under a stale key.
             None => (pool.total > 0 && pool.usable == 0, None),
         };
+        if exhausted && preference_diagnostic.is_some() {
+            let next_clear_at = pool_clear_estimate(&pool.dir);
+            let mut pref = self.lock_pref();
+            match pref.entry(root.to_path_buf()) {
+                Entry::Occupied(mut existing) => {
+                    let hold = existing.get_mut();
+                    hold.total = pool.total;
+                    hold.next_clear_at = next_clear_at;
+                }
+                Entry::Vacant(slot) => {
+                    if let Some(diagnostic) = &preference_diagnostic {
+                        log::warn!(
+                            "work_finder: every runtime in the sweep-lifecycle preference list \
+                             of workspace {} is UNAVAILABLE. Holding sweep dispatch for this \
+                             workspace only (other workspaces on pool {} are not held) until at \
+                             least one tap recovers (~{}); no claim label will be flipped and no \
+                             lease comment posted while held (#7708/#8554/#13539).\n{diagnostic}",
+                            root.display(),
+                            pool.dir.display(),
+                            next_clear_at.to_rfc3339()
+                        );
+                    }
+                    slot.insert(PoolExhaustionHold {
+                        dir: pool.dir.clone(),
+                        total: pool.total,
+                        since: now,
+                        next_clear_at,
+                        wrapper_observed: false,
+                        published: false,
+                    });
+                }
+            }
+            return PoolObservation {
+                held: true,
+                pool_key,
+                edge: None,
+            };
+        }
+
+        // Not preference-exhausted: release this root's own preference hold
+        // (once), regardless of what any other root on the pool is doing.
+        if let Some(hold) = self.lock_pref().remove(root) {
+            log::info!(
+                "work_finder: sweep-lifecycle preference list of workspace {} recovered after {} \
+                 held; sweep dispatch resuming (#13539)",
+                root.display(),
+                format_held_for(now - hold.since)
+            );
+        }
+
         let mut holds = self.lock();
 
         if exhausted {
@@ -348,30 +411,18 @@ impl PoolHoldState {
                     // deferred to the next tick that still sees the hold
                     // (#13508, the Occupied arm above); later ticks stay
                     // silent on both.
-                    if let Some(diagnostic) = &preference_diagnostic {
-                        log::warn!(
-                            "work_finder: every runtime in the sweep-lifecycle preference list \
-                             is UNAVAILABLE. Holding ALL sweep dispatch for every workspace \
-                             resolving to this pool until at least one tap recovers (~{}); no \
-                             claim label will be flipped and no lease comment posted while held \
-                             (#7708/#8554). Armed by workspace {}.\n{diagnostic}",
-                            next_clear_at.to_rfc3339(),
-                            root.display()
-                        );
-                    } else {
-                        log::warn!(
-                            "work_finder: token pool {} is EXHAUSTED — 0/{} accounts spawnable \
-                             (every account bad-marked in .bad_tokens or hard-excluded by \
-                             .ranking). Holding ALL sweep dispatch for every workspace resolving \
-                             to this pool until at least one account returns (~{}); no claim \
-                             label will be flipped and no lease comment posted while held. Run \
-                             `loom-daemon tokens check --ranking` or `loom-daemon tokens unblock \
-                             <name>` (#7708)",
-                            pool.dir.display(),
-                            pool.total,
-                            next_clear_at.to_rfc3339()
-                        );
-                    }
+                    log::warn!(
+                        "work_finder: token pool {} is EXHAUSTED — 0/{} accounts spawnable \
+                         (every account bad-marked in .bad_tokens or hard-excluded by \
+                         .ranking). Holding ALL sweep dispatch for every workspace resolving \
+                         to this pool until at least one account returns (~{}); no claim \
+                         label will be flipped and no lease comment posted while held. Run \
+                         `loom-daemon tokens check --ranking` or `loom-daemon tokens unblock \
+                         <name>` (#7708)",
+                        pool.dir.display(),
+                        pool.total,
+                        next_clear_at.to_rfc3339()
+                    );
                     slot.insert(PoolExhaustionHold {
                         dir: pool.dir.clone(),
                         total: pool.total,
@@ -532,6 +583,7 @@ impl PoolHoldState {
     #[must_use]
     pub fn active_holds(&self) -> Vec<PoolExhaustionHold> {
         let mut out: Vec<PoolExhaustionHold> = self.lock().values().cloned().collect();
+        out.extend(self.lock_pref().values().cloned());
         out.sort_by(|a, b| a.dir.cmp(&b.dir));
         out
     }
@@ -540,7 +592,7 @@ impl PoolHoldState {
     /// steady state.
     #[must_use]
     pub fn held_pool_count(&self) -> usize {
-        self.lock().len()
+        self.lock().len() + self.lock_pref().len()
     }
 
     /// Drop every hold. Test-only reset for the process-global instance; never
@@ -548,6 +600,7 @@ impl PoolHoldState {
     #[cfg(test)]
     pub fn clear_all(&self) {
         self.lock().clear();
+        self.lock_pref().clear();
         self.peer_held_logged
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
