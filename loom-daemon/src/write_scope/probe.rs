@@ -58,6 +58,7 @@
 //! has no key at all: it is never looked up, never stored, and never upgraded
 //! by the stale-WRITE grace, so "no Gitea credential" always refuses.
 
+use crate::script_helpers::now_epoch_secs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -533,12 +534,6 @@ struct DiskEntry {
     cred: String,
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 pub(crate) fn cache_dir() -> PathBuf {
     match std::env::var("LOOM_WRITE_SCOPE_CACHE_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
@@ -761,7 +756,7 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
                 &DiskEntry {
                     write,
                     detail,
-                    at: now_secs(),
+                    at: now_epoch_secs(),
                     cred,
                 },
             );
@@ -779,7 +774,7 @@ fn write_entry(path: &Path, entry: &DiskEntry) {
     let Ok(body) = serde_json::to_string(entry) else {
         return;
     };
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now_secs()));
+    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now_epoch_secs()));
     let Ok(mut f) = crate::forge_etag_store::create_private_file(&tmp) else {
         return;
     };

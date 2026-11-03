@@ -99,6 +99,7 @@
 //! `loom-daemon/tests/worktree_branch_reuse_differential.rs` builds both sides
 //! of its fixture under a directory named `re po` for exactly that reason.
 
+use crate::script_helpers::now_epoch_secs;
 use std::path::{Path, PathBuf};
 
 use super::branch_landed::{self, Verdict};
@@ -271,12 +272,6 @@ fn staleness(repo: &Path, opts: &Options) -> Staleness {
     classify(ahead, behind, merge_base_secs)
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Whole days between a merge-base commit time and `now`.
 #[must_use]
 pub fn age_days(now: u64, merge_base_secs: u64) -> u64 {
@@ -292,7 +287,7 @@ pub fn divergence_warning(
     behind: u64,
     merge_base_secs: Option<u64>,
 ) -> String {
-    let age = merge_base_secs.map(|t| age_days(now_secs(), t));
+    let age = merge_base_secs.map(|t| age_days(now_epoch_secs(), t));
     let base_note = age.map_or_else(String::new, |d| format!(", merge-base is {d} day(s) old"));
     let loud = age.filter(|d| *d > STALE_AGE_DAYS).map_or_else(String::new, |d| {
         format!(

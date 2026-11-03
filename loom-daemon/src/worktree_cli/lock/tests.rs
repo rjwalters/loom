@@ -119,7 +119,7 @@ fn a_lock_owned_by_a_dead_pid_is_broken_once() {
         owner_pid: 0x7fff_fffe,
         token: "someone-elses".to_string(),
         script: "worktree.sh".to_string(),
-        acquired_at: iso_now(),
+        acquired_at: crate::script_helpers::now_iso(),
     };
     std::fs::write(lock_path(d.path()).join("owner.json"), serde_json::to_string(&dead).unwrap())
         .unwrap();

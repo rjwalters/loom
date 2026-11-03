@@ -57,6 +57,7 @@
 //! on the security-relevant details (atomic write-then-rename, `0600`/`0700`
 //! modes, fingerprint-based drift detection).
 
+use crate::script_helpers::now_iso;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -431,10 +432,6 @@ pub fn fingerprint(secret: &str) -> String {
     hasher.update(secret.as_bytes());
     let full = hex::encode(hasher.finalize());
     full[..8].to_string()
-}
-
-fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Strip the trailing `.token` suffix to derive a logical account name.

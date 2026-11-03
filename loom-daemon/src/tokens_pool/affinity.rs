@@ -50,6 +50,7 @@
 //!   carry a different issue number in every prompt anyway — on plain rotation
 //!   (the second phase #8146 describes).
 
+use crate::script_helpers::now_iso;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -195,10 +196,6 @@ fn state_path(tokens_dir: &Path) -> PathBuf {
 
 fn lock_path(tokens_dir: &Path) -> PathBuf {
     tokens_dir.join(format!("{STATE_FILE}.lock"))
-}
-
-fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn parse_stamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
