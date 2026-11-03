@@ -214,6 +214,19 @@ pub fn tick_outcome(
     }
 }
 
+/// A `step-no-outcome-line` failure of a step that did open a PR (#13521)
+/// becomes `step-no-outcome-line-pr-opened`; any other failure is unchanged.
+/// The tick outcome stays a `Failure`: only the dashboard class splits.
+#[must_use]
+pub(crate) fn no_outcome_line_with_pr(failure: RoleFailure) -> RoleFailure {
+    use crate::observability::lifecycle::step;
+    if failure.class() == step::NO_OUTCOME_LINE.class {
+        step::NO_OUTCOME_LINE_PR_OPENED.failure(failure.exit_code())
+    } else {
+        failure
+    }
+}
+
 /// The closed-vocabulary failure behind a failed [`tick_outcome`] (#12480):
 /// `Some` exactly when `tick_outcome` is a `Failure`, one class per branch.
 /// The exit code rides `exit_code`, never the class. Pure.
@@ -334,13 +347,28 @@ impl SweepRegistry {
                 },
             );
         }
+        // #13169: a Builder step that reported a PR names it on its close.
+        // #13521: so does a clean-exit Builder step that wrote no line, to
+        // tell "PR opened, no line" from "no PR, no line". An unreadable PR
+        // stays unknown, so that case keeps the `no-outcome-line` class.
+        let pr_number = (role == StepRole::Builder
+            && match line.as_ref() {
+                Some(l) => l.class == StepOutcomeClass::Verdict,
+                None => matches!(end, StepEnd::Exited(Some(0))),
+            })
+        .then(|| self.builder_pr(item))
+        .flatten();
+        let mut failure = step_failure(role, end, line.as_ref());
+        if pr_number.is_some() {
+            failure = failure.map(no_outcome_line_with_pr);
+        }
         let capture = StepCapture {
             root: self.config.workspace_root.clone(),
             role,
             sweep_id: sweep_id.to_string(),
             started_at,
             outcome: tick_outcome(role, end, line.as_ref()),
-            failure: step_failure(role, end, line.as_ref()),
+            failure,
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
         };
@@ -355,13 +383,7 @@ impl SweepRegistry {
             info.and_then(|i| i.model.as_deref()),
             info.and_then(|i| i.effort.as_deref()),
             self.step_points(sweep_id),
-            // #13169: a Builder step that reported a PR names it on its close.
-            (role == StepRole::Builder
-                && line
-                    .as_ref()
-                    .is_some_and(|l| l.class == StepOutcomeClass::Verdict))
-            .then(|| self.builder_pr(item))
-            .flatten(),
+            pr_number,
         );
         self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached
