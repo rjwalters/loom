@@ -1824,7 +1824,37 @@ CONCERN_BULLET="- **<AXIS>**: <SPECIFIC_CONCERN — name the file/function and w
 BLOCKER_NUMBERS=""   # #10937: open issue/PR numbers the concern names (e.g. "pending verification in #N"); empty if none
 PRIOR_CONCERN_BULLET=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:')
 
-if [ "$MANUAL_RELEASE_SINCE_HOLD" = true ] && [ "$CONCERN_BULLET" = "$PRIOR_CONCERN_BULLET" ]; then
+# Live, uncached re-read of the PR's state immediately before anything is posted
+# (#13534): `$PR_JSON` was read earlier in the pass and the assessment can outlast
+# a concurrent merge (human `merge-pr.sh`, a second Champion pass), which left
+# merged PRs carrying a hold notice + `loom:blocked`. Plain `gh api` (REST), not
+# `$GH_READ`: a cached read is exactly the stale read being fixed.
+LIVE_STATE=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '"\(.merged) \(any(.labels[]; .name == "loom:blocked"))"' 2>/dev/null)
+LIVE_MERGED=${LIVE_STATE%% *}; LIVE_BLOCKED=${LIVE_STATE##* }
+MERGED_NOTE_MARKER="<!-- champion:merged-before-hold -->"
+
+if [ "$LIVE_MERGED" = true ]; then
+  # Merged before the hold could apply: no hold notice, no park record, and a
+  # hold that already landed on the merged PR is removed in this same pass.
+  echo "PR #$PR_NUMBER merged before the merge-risk hold could apply — no hold"
+  if [ "$LIVE_BLOCKED" = true ]; then
+    gh api -X DELETE "repos/{owner}/{repo}/issues/$PR_NUMBER/labels/loom%3Ablocked" >/dev/null 2>&1 || true
+  fi
+  if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$MERGED_NOTE_MARKER\"))")" != "true" ]; then
+    ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$MERGED_NOTE_MARKER
+**Champion: merged before hold could apply** — this PR merged while the merge-risk assessment was still running, so no hold was placed. The concern below was never addressed; file it as a follow-up if it still matters:
+
+$CONCERN_BULLET
+
+---
+*Automated by Champion role*"
+  fi
+  MERGE_BLOCKED_BY_HOLD=true   # nothing left to merge this pass
+elif [ "$LIVE_MERGED" != false ]; then
+  # Fail closed: an unreadable live state posts nothing; the next tick retries.
+  echo "Live state of #$PR_NUMBER unreadable — no hold notice, no label write; retry next tick"
+  MERGE_BLOCKED_BY_HOLD=true
+elif [ "$MANUAL_RELEASE_SINCE_HOLD" = true ] && [ "$CONCERN_BULLET" = "$PRIOR_CONCERN_BULLET" ]; then
   # Not a hold (#11416): a human removed the hold label for exactly this
   # concern. PASS — continue to critical-files; Step 2's reversal block is mandatory.
   echo "PASS: #$PR_NUMBER — human released this same concern ($RELEASE_REASON)"
