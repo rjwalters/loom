@@ -402,6 +402,7 @@ fn run_live(
                 pr,
             )
         },
+        waive: &super::waiver_gh::waive,
     };
     let mut pass = super::run(&env, &registered_roots(), mode, &mut guard);
     // #10719: rebuild the dispatch holds and the roll demand from this pass.

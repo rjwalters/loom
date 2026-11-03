@@ -2,6 +2,7 @@
 //! installed files, judged against real git and a synthetic payload.
 
 use super::*;
+use crate::fleet_sync::workspace_resync::waiver::Waived;
 use crate::workspace_hold::{HeldCopy, HoldKind, Holds, Observation, Verdict, ALERT_AFTER};
 
 /// A pass by `host`, then what it tells the hold, folded into `holds`.
@@ -33,6 +34,7 @@ fn hold_pass_in(
         overdue: &|| false,
         heads: &|asks| host.heads.answer(asks),
         land: &|_, _, _| Landed::Waiting("not exercised".to_string()),
+        waive: &|_, _, _| Waived::Lane("not exercised".to_string()),
     };
     let seen = observations(&env, &pass, &mut host.memory.borrow_mut());
     holds.step(&seen, v(host.version), host.now.get(), ALERT_AFTER);

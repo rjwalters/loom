@@ -1135,7 +1135,7 @@ It is eligible only when **all** hold, each read live in this pass:
   `.claude/settings.json` has no upstream counterpart, so a bump that changes it holds, which
   keeps the rjwalters/repo#733 guard-wiring PRs held;
 - every changed file is under `.loom/` or `.claude/`, and none is a merge-gate path
-  (`RESYNC_GATE_PATTERNS`: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
+  (the daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
   comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
   under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
   path sources it: it is compared byte-for-byte like any kept-set file (#13486);
@@ -1155,114 +1155,26 @@ A differing byte, a local-only file, a missing or unparsable tag, or any failed 
 `NOT ELIGIBLE` and the kept-set hold applies exactly as before. A non-resync PR never matches.
 
 ```bash
-# Merge-gate entries of the kept set (operator ruling on #12945, option a): a resync that
-# changes any of these keeps the human hold, because the gate cannot vouch for a change to
-# itself. Hardcoded, like KEPT_SET_PATTERNS; the first two blocks of that array.
-RESYNC_GATE_PATTERNS=(
-  "*champion*" "*judge*"
-  "*merge-pr.sh" "*merge_pr*" "*verdict*" "*check-review-feedback.sh"
-  "*comment_trust*" "*trusted_comments*" "*claim_reconciliation*"
-  "*version_only_diff*" "*version-only-diff*"
-  "*.loom/config.json" "*defaults/config.json"
-)
-
-# resync_upstream_path <installed-path>: the defaults/ counterpart per resync-installed.sh's
-# surface map, empty when the path has none. Roles and skills are symlinks or generated
-# upstream, so their blobs never compare equal: no mapping, hold.
-# `.loom/roles` and the generated skill copies are deliberately unmapped (operator ruling, #13313).
-resync_upstream_path() {
-  case "$1" in
-    .loom/hooks/*)            printf 'defaults/hooks/%s' "${1#.loom/hooks/}" ;;
-    .loom/scripts/*)          printf 'defaults/scripts/%s' "${1#.loom/scripts/}" ;;
-    .loom/docs/*)             printf 'defaults/docs/%s' "${1#.loom/docs/}" ;;
-    .loom/runtimes/*)         printf 'defaults/runtimes/%s' "${1#.loom/runtimes/}" ;;
-    .loom/bin/*)              printf 'defaults/.loom/bin/%s' "${1#.loom/bin/}" ;;
-    .claude/commands/loom/*)  printf 'defaults/.claude/commands/loom/%s' "${1#.claude/commands/loom/}" ;;
-    .claude/agents/*)         printf 'defaults/.claude/agents/%s' "${1#.claude/agents/}" ;;
-    *) return 0 ;;
-  esac
-}
-
-# repo_skills_upstream_path <installed-path>: the rjwalters/repo source path per install.sh's own
-# copy lines (hooks/repo/ and scripts/repo/ land under .claude/skills/repo/), empty when none.
-repo_skills_upstream_path() {
-  case "$1" in
-    .claude/skills/repo/hooks/*)    printf 'hooks/repo/%s' "${1#.claude/skills/repo/hooks/}" ;;
-    .claude/skills/repo/scripts/*)  printf 'scripts/repo/%s' "${1#.claude/skills/repo/scripts/}" ;;
-    .claude/skills/repo/SKILL.md)   printf 'skills/repo/SKILL.md' ;;
-    .claude/commands/repo/*)        printf 'commands/repo/%s' "${1#.claude/commands/repo/}" ;;
-    *) return 0 ;;
-  esac
-}
-
 # resync_waiver_eval: sets RESYNC_WAIVER_RESULT (ELIGIBLE|NOT ELIGIBLE), RESYNC_WAIVER_TAG,
 # RESYNC_WAIVER_RECORD (one "path: sha" line per kept-set file) and RESYNC_WAIVER_REASON.
-# Reads PR_NUMBER and KEPT_SET_PATTERNS. Every step fails closed.
+# Reads PR_NUMBER. The rules are NOT here: they live once, in loom-daemon
+# (`fleet_sync/workspace_resync/waiver.rs`), which also runs them when the daemon lands its own
+# resync PR (#13487). Exit 0 plus RESYNC_WAIVER=ELIGIBLE is the only eligible answer; a missing or
+# older binary, any other exit, or any other output is NOT ELIGIBLE (fail closed).
 resync_waiver_eval() {
-  local title ver tag sha1 sha2 meta_ver changed n file prev pattern is_kept is_test up enc up_sha up_type head_sha status
-  local kind=loom upstream=rjwalters/loom meta_path=.loom/install-metadata.json meta_key=loom_version
+  local out rc=0 line
   RESYNC_WAIVER_RESULT="NOT ELIGIBLE"; RESYNC_WAIVER_TAG=""; RESYNC_WAIVER_RECORD=""; RESYNC_WAIVER_REASON=""
-  [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { RESYNC_WAIVER_REASON="kept set not loaded"; return 0; }
-  title=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.title' 2>/dev/null) || { RESYNC_WAIVER_REASON="PR unreadable"; return 0; }
-  if [[ "$title" =~ ^chore\(loom\):\ resync\ installed\ Loom\ to\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-    ver="${BASH_REMATCH[1]}"; tag="v$ver"
-  elif [[ "$title" =~ ^Bump\ Repo\ Skills\ [^[:space:]]+\ -\>\ ([0-9]+\.[0-9]+\.[0-9]+)$ ||
-         "$title" =~ ^chore\(repo-skills\):\ .*\ v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-    # Repo Skills bump (#13435): same rule against the rjwalters/repo tag.
-    ver="${BASH_REMATCH[1]}"; tag="v$ver"; kind=repo-skills; upstream=rjwalters/repo
-    meta_path=.claude/skills/repo/install-metadata.json; meta_key=version
-  else
-    RESYNC_WAIVER_REASON="not a resync PR"; return 0
+  out=$("${LOOM_DAEMON_BIN:-loom-daemon}" forge resync-waiver "$PR_NUMBER" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then RESYNC_WAIVER_REASON="waiver proof did not hold (exit $rc)"; return 0; fi
+  printf '%s\n' "$out" | grep -qx 'RESYNC_WAIVER=ELIGIBLE' || { RESYNC_WAIVER_REASON="no ELIGIBLE answer"; return 0; }
+  RESYNC_WAIVER_TAG=$(printf '%s\n' "$out" | sed -n 's/^RESYNC_WAIVER_TAG=//p' | head -n1)
+  while IFS= read -r line; do RESYNC_WAIVER_RECORD="${RESYNC_WAIVER_RECORD}${line}"$'\n'; done \
+    < <(printf '%s\n' "$out" | sed -n 's/^RESYNC_WAIVER_RECORD=//p')
+  if [ -z "$RESYNC_WAIVER_TAG" ] || [ -z "$RESYNC_WAIVER_RECORD" ]; then
+    RESYNC_WAIVER_RESULT="NOT ELIGIBLE"; RESYNC_WAIVER_TAG=""; RESYNC_WAIVER_RECORD=""
+    RESYNC_WAIVER_REASON="ELIGIBLE answer without a tag or record"; return 0
   fi
-  sha1=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || sha1=""
-  [ -n "$sha1" ] || { RESYNC_WAIVER_REASON="head unreadable"; return 0; }
-  meta_ver=$(gh api -H "Accept: application/vnd.github.raw" "repos/{owner}/{repo}/contents/${meta_path}?ref=$sha1" 2>/dev/null | jq -r --arg k "$meta_key" '.[$k] // empty' 2>/dev/null) || meta_ver=""
-  [ "$meta_ver" = "$ver" ] || { RESYNC_WAIVER_REASON="install-metadata names '${meta_ver:-none}', title names $ver"; return 0; }
-  [ "$(gh api "repos/$upstream/git/ref/tags/$tag" --jq '.ref' 2>/dev/null)" = "refs/tags/$tag" ] \
-    || { RESYNC_WAIVER_REASON="tag $tag not found upstream"; return 0; }
-  standing_auth_fetch_diff || { RESYNC_WAIVER_REASON="files unreadable"; return 0; }
-  n=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.changed_files' 2>/dev/null) || n=""
-  printf '%s' "$DIFF_JSON" | jq -e --argjson n "${n:-null}" 'length == $n and length > 0' >/dev/null 2>&1 \
-    || { RESYNC_WAIVER_REASON="files read incomplete"; return 0; }
-  while IFS=$'\t' read -r file prev head_sha status; do
-    [ -z "$file" ] && continue
-    # Install set only (#12945): any file outside .loom/ and .claude/ holds the whole PR.
-    case "$kind:$file" in
-      loom:.loom/* | loom:.claude/*) ;;
-      repo-skills:.claude/skills/repo/* | repo-skills:.claude/commands/repo/* | repo-skills:.agents/skills/repo* | repo-skills:.claude/settings.json | repo-skills:.gitignore | repo-skills:CLAUDE.md) ;;
-      *) RESYNC_WAIVER_REASON="$file is outside the install set"; RESYNC_WAIVER_RECORD=""; return 0 ;;
-    esac
-    # A test under .loom/scripts/tests/ decides nothing at merge time (#13486): it is compared
-    # byte-for-byte below, not refused as a gate path. Both names must be under tests/, so a
-    # rename from a gate path into tests/ still hits the gate loop.
-    is_test=0
-    case "$file" in .loom/scripts/tests/*) case "$prev" in .loom/scripts/tests/*) is_test=1 ;; esac ;; esac
-    if [ "$is_test" -eq 0 ]; then
-      for pattern in "${RESYNC_GATE_PATTERNS[@]}"; do
-        # shellcheck disable=SC2053
-        if [[ "$file" == $pattern || "$prev" == $pattern ]]; then RESYNC_WAIVER_REASON="$file is a merge-gate path"; RESYNC_WAIVER_RECORD=""; return 0; fi
-      done
-    fi
-    is_kept=0
-    for pattern in "${KEPT_SET_PATTERNS[@]}"; do
-      # shellcheck disable=SC2053
-      if [[ "$file" == $pattern || "$prev" == $pattern ]]; then is_kept=1; break; fi
-    done
-    [ "$is_kept" -eq 1 ] || continue
-    case "$status" in added | modified) ;; *) RESYNC_WAIVER_REASON="$file is $status"; RESYNC_WAIVER_RECORD=""; return 0 ;; esac
-    if [ "$kind" = repo-skills ]; then up=$(repo_skills_upstream_path "$file"); else up=$(resync_upstream_path "$file"); fi
-    [ -n "$up" ] || { RESYNC_WAIVER_REASON="$file has no upstream counterpart"; RESYNC_WAIVER_RECORD=""; return 0; }
-    enc=$(jq -rn --arg p "$up" '$p | split("/") | map(@uri) | join("/")') || { RESYNC_WAIVER_RECORD=""; return 0; }
-    IFS=$'\t' read -r up_type up_sha < <(gh api "repos/$upstream/contents/${enc}?ref=$tag" --jq '[.type, .sha] | @tsv' 2>/dev/null)
-    if [ "$up_type" != "file" ] || [ -z "$up_sha" ] || [ "$up_sha" != "$head_sha" ]; then
-      RESYNC_WAIVER_REASON="$file differs from $upstream@$tag:$up"; RESYNC_WAIVER_RECORD=""; return 0
-    fi
-    RESYNC_WAIVER_RECORD="${RESYNC_WAIVER_RECORD}${file}: ${head_sha}"$'\n'
-  done < <(printf '%s' "$DIFF_JSON" | jq -r '.[] | [.filename, (.previous_filename // .filename), (.sha // ""), (.status // "")] | @tsv')
-  [ -n "$RESYNC_WAIVER_RECORD" ] || { RESYNC_WAIVER_REASON="no kept-set file to waive"; return 0; }
-  sha2=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || sha2=""
-  [ "$sha1" = "$sha2" ] || { RESYNC_WAIVER_REASON="head moved while reading"; RESYNC_WAIVER_RECORD=""; return 0; }
-  RESYNC_WAIVER_RESULT="ELIGIBLE"; RESYNC_WAIVER_TAG="$tag"
+  RESYNC_WAIVER_RESULT="ELIGIBLE"
 }
 ```
 

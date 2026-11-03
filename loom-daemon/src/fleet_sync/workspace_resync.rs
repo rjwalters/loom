@@ -112,6 +112,8 @@ mod loom_ui;
 mod memory;
 mod supersede;
 mod w2;
+pub mod waiver;
+pub mod waiver_gh;
 
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
@@ -415,6 +417,10 @@ pub struct Env<'a> {
     /// merge queue (#13268). The daemon owns this, so no installed hook or
     /// prompt that is itself stale can stop its own replacement.
     pub land: &'a dyn Fn(&Path, &str, u32) -> Landed,
+    /// Land the resync pull request `(root, OWNER/REPO, number)` on the
+    /// waiver proof, without a Judge (#13487). `Waived::Landed` means it is
+    /// merged (or queued); anything else leaves the ordinary lane.
+    pub waive: &'a dyn Fn(&Path, &str, u32) -> waiver::Waived,
 }
 
 /// A stale workspace this pass may resync.

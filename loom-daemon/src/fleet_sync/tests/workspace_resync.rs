@@ -21,6 +21,7 @@ use super::git::WORKTREE_PREFIX;
 use super::*;
 use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared};
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
+use crate::fleet_sync::workspace_resync::waiver::Waived;
 use crate::init::payload::{resync_workspace_with, ResyncOutcome, Stamp};
 use crate::install_compat::INSTALL_METADATA_PATH;
 use crate::test_git_helpers::run as git;
@@ -245,6 +246,9 @@ struct Host<'f> {
     /// What the daemon-owned landing answers, and every `(repo, PR)` it was
     /// asked about (#13268).
     landing: RefCell<Landed>,
+    /// What the waiver landing answers, and every `(repo, PR)` it was asked.
+    waiver: RefCell<Waived>,
+    waived: RefCell<Vec<(String, u32)>>,
     landed: RefCell<Vec<(String, u32)>>,
 }
 
@@ -279,6 +283,8 @@ impl<'f> Host<'f> {
             heads: head_check::ForgeHeads::default(),
             overdue: Cell::new(false),
             landing: RefCell::new(Landed::Waiting("no Judge approval".to_string())),
+            waiver: RefCell::new(Waived::Lane("waiver proof failed: not exercised".to_string())),
+            waived: RefCell::new(Vec::new()),
             landed: RefCell::new(Vec::new()),
         }
     }
@@ -344,6 +350,10 @@ impl<'f> Host<'f> {
             land: &|_, nwo, pr| {
                 self.landed.borrow_mut().push((nwo.to_string(), pr));
                 self.landing.borrow().clone()
+            },
+            waive: &|_, nwo, pr| {
+                self.waived.borrow_mut().push((nwo.to_string(), pr));
+                self.waiver.borrow().clone()
             },
         };
         run(&env, roots, mode, &mut self.memory.borrow_mut())
@@ -1019,6 +1029,41 @@ fn a_refused_default_branch_gets_a_resync_pull_request_once() {
     assert_eq!(fx.forge.pulls.borrow().len(), 1);
     assert_eq!(git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]), pushed);
     assert!(again.alerts.is_empty(), "alerted once per repo");
+}
+
+#[test]
+fn a_provable_resync_pull_request_lands_without_a_judge_label() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    *host.waiver.borrow_mut() = Waived::Landed("merged on the waiver proof against v1".to_string());
+
+    let pass = host.pass();
+    assert!(
+        reason(only(&pass)).contains("landed-by-daemon: merged on the waiver proof"),
+        "{pass:?}"
+    );
+    assert_eq!(*host.waived.borrow(), vec![(REPO.to_string(), 1)]);
+    // Never the review label, and the queue hand-off is not asked.
+    assert!(fx.forge.labels.borrow().is_empty(), "{:?}", fx.forge.labels);
+    assert!(host.landed.borrow().is_empty());
+}
+
+#[test]
+fn an_unprovable_resync_pull_request_takes_the_ordinary_lane_with_the_reason() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    *host.waiver.borrow_mut() =
+        Waived::Lane("waiver proof failed: x.sh differs from v1:defaults/scripts/x.sh".to_string());
+
+    let pass = host.pass();
+    assert!(
+        reason(only(&pass)).contains("handed-to-lane: waiver proof failed: x.sh differs"),
+        "{pass:?}"
+    );
+    assert_eq!(*fx.forge.labels.borrow(), vec![(1, "loom:review-requested".to_string())]);
+    assert_eq!(*host.landed.borrow(), vec![(REPO.to_string(), 1)]);
 }
 
 #[test]
