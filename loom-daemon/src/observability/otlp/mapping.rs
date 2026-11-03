@@ -15,7 +15,6 @@ mod dispatch_eligibility;
 mod dispatch_state;
 mod executing_host;
 mod fact_id;
-mod fleet_state;
 mod hold_transition;
 mod host_export;
 mod host_health;
@@ -30,7 +29,6 @@ mod merge_queue_regime;
 mod metadata;
 mod operator_presence;
 mod ops;
-mod outcome_facts;
 mod pass;
 mod pick_decision;
 mod prompt_tree;
@@ -611,9 +609,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
         | TelemetryRecord::RosterChange(_)
-        | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
-        | TelemetryRecord::FleetState(_)
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
@@ -639,7 +635,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| checkout_external_change::log_parts(r))
                 .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
-                .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
@@ -665,9 +660,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::RunStateRequest(_)
-        | TelemetryRecord::ScopeMemory(_)
-        | TelemetryRecord::PrResolved(_)
-        | TelemetryRecord::StageOutcome(_) => {
+        | TelemetryRecord::ScopeMemory(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
             // and these kinds override BOTH timestamps — the source event's
             // time and the producer's read time are separate facts here, and
@@ -677,7 +670,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // merge/close or stage exit and observed when the daemon saw it.
             let r = &envelope.record;
             let parts = session_output::log_parts(r)
-                .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))

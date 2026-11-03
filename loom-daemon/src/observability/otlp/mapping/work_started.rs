@@ -53,7 +53,7 @@ mod tests {
 
     use super::super::log_record_for;
     use super::*;
-    use crate::telemetry::kinds::fleet_state::FleetStage;
+    use crate::telemetry::kinds::work_started::FleetStage;
     use crate::telemetry::kinds::work_started::{
         WorkStartedRecord, WORK_STARTED_LOG_ATTRIBUTE_KEYS,
     };
