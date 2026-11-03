@@ -306,3 +306,29 @@ fn a_close_carries_the_pr_number_only_when_one_is_known() {
     assert_eq!(close(Some(99))["loom.pr_number"], "99");
     assert!(!close(None).contains_key("loom.pr_number"));
 }
+
+/// #13521: a clean-exit Builder step with no outcome line closes as
+/// `no-outcome-line-pr-opened` when it opened a PR, and as `no-outcome-line`
+/// when none is known (an unreadable PR fails closed to the old class).
+#[test]
+fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
+    let outcome =
+        super::super::capture::tick_outcome(StepRole::Builder, StepEnd::Exited(Some(0)), None);
+    assert!(matches!(outcome, RoleTickOutcome::Failure(_)), "tick outcome is unchanged");
+    let class = |pr| {
+        sweep_close(
+            StepEnd::Exited(Some(0)),
+            None,
+            &outcome,
+            StepRole::Builder,
+            None,
+            None,
+            None,
+            pr,
+        )
+        .1[lifecycle::FAILURE_CLASS]
+            .clone()
+    };
+    assert_eq!(class(Some(7)), "no-outcome-line-pr-opened");
+    assert_eq!(class(None), "no-outcome-line");
+}

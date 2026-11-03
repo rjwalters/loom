@@ -1173,3 +1173,14 @@ fn builders_completion_section_requires_a_parseable_outcome_line() {
     assert_eq!(parsed.reason, "pr_opened");
     assert_eq!(parsed.target, 13176);
 }
+
+/// #13521: the capture-side class splits the same way, and only for it.
+#[test]
+fn a_no_line_builder_that_opened_a_pr_has_its_own_step_class() {
+    let base = step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), None).unwrap();
+    let split = super::capture::no_outcome_line_with_pr(base);
+    assert_eq!(split.class(), "step-no-outcome-line-pr-opened");
+    assert_eq!(split.exit_code(), Some(0));
+    let other = step_failure(StepRole::Builder, StepEnd::Exited(Some(3)), None).unwrap();
+    assert_eq!(super::capture::no_outcome_line_with_pr(other).class(), "step-exit-nonzero");
+}
