@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use super::*;
+use crate::worktree_cli::test_support;
+use crate::worktree_cli::test_support::git;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -30,29 +32,7 @@ use super::*;
 /// A scratch directory. `tag` may contain a space — several cases need one
 /// (#7858's class).
 fn tmpdir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-reset-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmpdir");
-    fs::canonicalize(&base).expect("canonicalize tmpdir")
-}
-
-fn git(repo: &Path, args: &[&str]) -> std::process::Output {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out
+    test_support::tmpdir("loom-reset", tag)
 }
 
 /// A one-commit repo at `<dir>/<name>`. `name` may contain spaces.
