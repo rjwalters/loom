@@ -76,6 +76,7 @@
 //!   from [`Answer::evidence`] so `clean --aggressive` keeps its two removal
 //!   reasons.
 
+use crate::fs_util::is_executable;
 use std::path::Path;
 use std::process::Command;
 
@@ -503,17 +504,6 @@ fn on_path(program: &str) -> bool {
         let candidate = dir.join(program);
         candidate.is_file() && is_executable(&candidate)
     })
-}
-
-#[cfg(unix)]
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &Path) -> bool {
-    p.is_file()
 }
 
 /// Accept a local branch, a remote branch, a bare ref name, or any rev —

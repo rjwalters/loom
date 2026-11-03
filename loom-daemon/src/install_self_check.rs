@@ -63,6 +63,7 @@
 //!   explicitly ([`resolve_tool_path`]) rather than trusting a non-login ssh
 //!   `PATH`.
 
+use crate::fs_util::{is_executable, truncate_tail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -712,20 +713,6 @@ fn resolve_tool_path_in(tool: &str, search_path: Option<&std::ffi::OsStr>) -> Op
     None
 }
 
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
 /// Run `bin arg… [maybe_workspace]` with `cwd` as the working directory,
 /// capturing combined output to a temp file (never a pipe — avoids the
 /// pipe-buffer deadlock) and killing it after `timeout`. `Ok(())` on a zero
@@ -777,7 +764,7 @@ fn run_with_timeout(
                 break Err(format!(
                     "`{}` exited with {status}: {}",
                     bin.display(),
-                    truncate_tail(&tail)
+                    truncate_tail(&tail, MAX_OUTPUT_TAIL_BYTES)
                 ));
             }
             Ok(None) => {
@@ -797,19 +784,6 @@ fn run_with_timeout(
     };
     let _ = std::fs::remove_file(&log_path);
     result
-}
-
-/// Truncate captured output to the last [`MAX_OUTPUT_TAIL_BYTES`] bytes,
-/// trimmed, on a char boundary.
-fn truncate_tail(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_TAIL_BYTES {
-        return s.trim().to_string();
-    }
-    let start = s.len() - MAX_OUTPUT_TAIL_BYTES;
-    let start = (start..s.len())
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(s.len());
-    s[start..].trim().to_string()
 }
 
 // ============================================================================

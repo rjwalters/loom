@@ -87,17 +87,8 @@ fn first_failure_line(s: &str) -> Option<&str> {
     })
 }
 
-/// Keep only the last [`MAX_OUTPUT_TAIL_BYTES`] bytes of captured output,
-/// trimmed, on a char boundary.
 fn truncate_tail(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_TAIL_BYTES {
-        return s.trim().to_string();
-    }
-    let start = s.len() - MAX_OUTPUT_TAIL_BYTES;
-    let start = (start..s.len())
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(s.len());
-    s[start..].trim().to_string()
+    crate::fs_util::truncate_tail(s, MAX_OUTPUT_TAIL_BYTES)
 }
 
 #[cfg(test)]

@@ -45,6 +45,7 @@
 //! behind in `$TMPDIR`. Here the extracted checker is a [`tempfile::TempPath`],
 //! removed on drop however the evaluation ends. No output changes.
 
+use crate::fs_util::is_executable;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -242,12 +243,6 @@ fn strip_trailing_newlines(s: &str) -> String {
     s.trim_end_matches('\n').to_string()
 }
 
-fn is_executable_file(p: &Path) -> bool {
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
 /// Write the PR head's checker to a private executable temp file. `None`
 /// (fall back to the default branch's copy) when the blob is missing, empty,
 /// or cannot be written — the retired `git show … && [[ -s ]] && chmod +x`.
@@ -311,7 +306,7 @@ fn run_checker(checker: &Path, repo: &Path, base_sha: &str, head_sha: &str) -> (
 pub fn evaluate(inputs: &Inputs<'_>) -> Report {
     let repo = inputs.repo_root;
     let local_checker = repo.join(CHECKER_REL);
-    if !is_executable_file(&local_checker)
+    if !is_executable(&local_checker)
         || inputs.default_branch.is_empty()
         || inputs.head_sha.is_empty()
         || inputs.branch.is_empty()

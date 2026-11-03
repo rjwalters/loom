@@ -108,9 +108,68 @@ fn mtime_of(meta: &fs::Metadata) -> DateTime<Utc> {
         .map_or_else(Utc::now, DateTime::<Utc>::from)
 }
 
+/// Is `path` an existing regular file (symlinks followed) with any execute
+/// bit set? On non-unix targets, any regular file qualifies.
+#[must_use]
+pub fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// Keep only the last `max` bytes of captured output, snapped forward to a
+/// char boundary and trimmed of surrounding whitespace (the failure detail is
+/// usually last).
+#[must_use]
+pub fn truncate_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.trim().to_string();
+    }
+    let start = s.len() - max;
+    let start = (start..s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len());
+    s[start..].trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_tail_trims_short_text_and_cuts_on_char_boundary() {
+        assert_eq!(truncate_tail("  hi \n", 10), "hi");
+        let raw = "é".repeat(100);
+        let tail = truncate_tail(&raw, 11);
+        assert!(tail.len() <= 11);
+        assert!(tail.chars().all(|c| c == 'é'));
+        assert_eq!(truncate_tail("abcdef", 3), "def");
+    }
+
+    #[test]
+    fn is_executable_requires_regular_file_with_exec_bit() {
+        let td = tempfile::tempdir().unwrap();
+        assert!(!is_executable(td.path()), "directory");
+        assert!(!is_executable(&td.path().join("missing")));
+        let f = td.path().join("f");
+        fs::write(&f, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert!(!is_executable(&f), "no exec bit");
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(is_executable(&f));
+        }
+    }
 
     #[test]
     fn write_atomic_creates_parent_replaces_and_leaves_no_temp() {

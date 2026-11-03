@@ -44,6 +44,7 @@ pub mod validate_phase;
 mod validate_phase_curator;
 
 use crate::cmd_out::{decode_json, run_command, CmdOutcome, Query, DEFAULT_TIMEOUT};
+use crate::fs_util::is_executable;
 
 /// Ceiling for the `gh-cached --version` capability probe.
 ///
@@ -98,7 +99,7 @@ pub fn now_epoch_secs() -> u64 {
 #[must_use]
 pub fn gh_cmd(repo_root: &Path) -> PathBuf {
     let cached = repo_root.join(".loom").join("scripts").join("gh-cached");
-    if is_executable_file(&cached) {
+    if is_executable(&cached) {
         // #7810 PR 2: bounded. The point of this probe is to catch a wrapper
         // that is executable but broken (an unaccepted Xcode licence, a missing
         // interpreter); one that HANGS is the same class of broken, and an
@@ -111,17 +112,6 @@ pub fn gh_cmd(repo_root: &Path) -> PathBuf {
         }
     }
     PathBuf::from(crate::gh_invocation::gh_bin())
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
 }
 
 /// Run a `gh` (or `gh-cached`) command inside `repo_root`, under a deadline.

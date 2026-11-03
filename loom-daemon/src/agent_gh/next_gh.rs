@@ -10,6 +10,8 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+pub(crate) use crate::fs_util::is_executable;
+
 /// The underlying `gh`, or `None` when there is none.
 #[must_use]
 pub fn resolve() -> Option<PathBuf> {
@@ -53,19 +55,4 @@ fn search(name: &str, path: &[PathBuf], is_me: &dyn Fn(&Path) -> bool) -> Option
     path.iter()
         .map(|d| d.join(name))
         .find(|c| is_executable(c) && !is_me(c))
-}
-
-pub(crate) fn is_executable(p: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(p) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
 }
