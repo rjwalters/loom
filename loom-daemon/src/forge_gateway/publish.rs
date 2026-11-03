@@ -2,7 +2,6 @@
 //! version gate, and the profile files themselves.
 
 use std::collections::{BTreeSet, HashSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -391,33 +390,14 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 /// Write `bytes` to `path` atomically, created 0600 (never readable by
 /// others, not even for an instant).
 pub(super) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    // A leftover from a crashed run may carry any mode: never reuse it.
-    let _ = std::fs::remove_file(&tmp);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let written = opts
-        .open(&tmp)
-        .and_then(|mut f| {
-            // The umask cannot widen 0600, but make the mode explicit anyway
-            // before a byte of the key is written.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            f.write_all(bytes)
-        })
-        .and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )
 }
 
 /// The gateway profile's `config.yml`: `version: 1` skips gh's account
