@@ -13,7 +13,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use super::*;
 use crate::worktree_cli::test_support;
