@@ -52,6 +52,7 @@
 //! would fail at spawn must be passed over here, not selected and then killed.
 
 use super::resolve::{SkipReason, Tap};
+use crate::fs_util::is_executable;
 use crate::role_runner::{PoolHold, PoolStateFile};
 use crate::runtime_admission::ResolvedRuntime;
 use std::ffi::{OsStr, OsString};
@@ -255,7 +256,7 @@ fn generic(
 fn binary_resolves(bin: &str, path: Option<&OsStr>) -> Option<bool> {
     let candidate = Path::new(bin);
     if candidate.is_absolute() {
-        return Some(is_executable_file(candidate));
+        return Some(is_executable(candidate));
     }
     if candidate.components().count() != 1 {
         return None;
@@ -264,27 +265,11 @@ fn binary_resolves(bin: &str, path: Option<&OsStr>) -> Option<bool> {
     for dir in std::env::split_paths(path?) {
         if !dir.is_absolute() {
             cwd_dependent = true;
-        } else if is_executable_file(&dir.join(candidate)) {
+        } else if is_executable(&dir.join(candidate)) {
             return Some(true);
         }
     }
     (!cwd_dependent).then_some(false)
-}
-
-/// An existing regular file (symlinks followed) with any execute bit set.
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
 }
 
 fn ungated(source: CredentialSource) -> Availability {

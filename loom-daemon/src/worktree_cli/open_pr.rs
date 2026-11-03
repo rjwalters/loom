@@ -106,6 +106,7 @@
 //! creates a genuinely NEW branch, so a hard dependency would strand that
 //! path on any host running a daemon that predates this slice.
 
+use crate::fs_util::is_executable;
 use std::path::Path;
 use std::process::Command;
 
@@ -348,17 +349,6 @@ fn on_path(program: &str) -> bool {
         let candidate = dir.join(program);
         candidate.is_file() && is_executable(&candidate)
     })
-}
-
-#[cfg(unix)]
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &Path) -> bool {
-    p.is_file()
 }
 
 /// Run the query and print the `TOKEN<TAB>text` record stream

@@ -7,6 +7,7 @@
 //! pinning, OAuth token injection from the native pool, spawn verification,
 //! bypass-permissions modal auto-accept, and stuck-session detection/recovery.
 
+use crate::fs_util::is_executable;
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -806,20 +807,6 @@ pub fn spawn_agent(env: &dyn AgentEnv, opts: &SpawnOptions, repo_root: &Path) ->
     result.session = session;
     result.log = log_file.display().to_string();
     result
-}
-
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
 }
 
 // ---------------------------------------------------------------------------
