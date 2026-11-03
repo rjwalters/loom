@@ -33,8 +33,7 @@
 //! The git-version floor (`>= 2.38`, where `merge-tree --write-tree` exists)
 //! and the exit-code reading (`0` clean, `1` conflict, anything else a
 //! failure) are deliberately the same ones
-//! [`crate::overlap_replay::conflict`] and
-//! [`crate::merge_pr::mergeable_recheck`] already use — this module does not
+//! [`crate::overlap_replay::conflict`] already uses — this module does not
 //! re-derive them differently, it just answers a different question with them
 //! (verdict equivalence, not conflict prediction).
 

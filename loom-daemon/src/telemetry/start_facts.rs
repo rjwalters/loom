@@ -192,7 +192,7 @@ mod tests {
             .find(|l| {
                 l.contains("keep_keys(attributes, [")
                     && l.contains("loom.ci.chunk_index")
-                    && l.contains("loom.eta.pr.state")
+                    && l.contains("loom.eta.dispatch_state.artifact")
             })
             .expect("the transform/privacy log keep_keys line");
         for key in SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS

@@ -34,7 +34,8 @@
 //! | `step-outcome-failed` | the session's `LOOM_STEP_OUTCOME` said `class=failed` |
 //! | `exit-<code>` | the step exited non-zero |
 //! | `no-pr` | a Builder step exited 0 with `class=noop`: no PR (#12500) |
-//! | `no-outcome-line` | a Builder step exited 0 and wrote no outcome line (#12500) |
+//! | `no-outcome-line` | a Builder step exited 0, opened no PR (or none was readable) and wrote no outcome line (#12500) |
+//! | `no-outcome-line-pr-opened` | as `no-outcome-line`, but the step opened a PR (#13521) |
 //! | `exit-unobserved` | the step exited, its status is unknown, and it wrote no outcome line |
 
 use std::path::Path;
@@ -49,7 +50,11 @@ use crate::telemetry::trace::TraceAttributes;
 
 /// Why a step failed, on its `loom.sweep` close.
 #[must_use]
-pub(crate) fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> RoleFailure {
+pub(crate) fn step_failure(
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    pr_number: Option<u32>,
+) -> RoleFailure {
     let failed_line = line.filter(|l| l.class == StepOutcomeClass::Failed);
     match end {
         StepEnd::TimedOut => RoleFailure::new(
@@ -75,6 +80,12 @@ pub(crate) fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> Role
         ),
         // A clean exit that tick_outcome still fails (#12500): a Builder step
         // that opened no PR, or wrote no outcome line.
+        // #13521: with a PR known it is delivered work, so it has its own class.
+        StepEnd::Exited(code) if line.is_none() && pr_number.is_some() => RoleFailure::new(
+            "no-outcome-line-pr-opened",
+            code,
+            "step opened a PR but exited without writing a LOOM_STEP_OUTCOME line",
+        ),
         StepEnd::Exited(code) if line.is_none() => RoleFailure::new(
             "no-outcome-line",
             code,
@@ -123,7 +134,7 @@ pub(crate) fn sweep_close(
         );
     }
     if matches!(outcome, RoleTickOutcome::Failure(_)) {
-        close.extend(step_failure(end, line).attributes());
+        close.extend(step_failure(end, line, pr_number).attributes());
     } else if let StepEnd::Exited(Some(code)) = end {
         close.insert(lifecycle::EXIT_CODE.into(), code.to_string());
     }

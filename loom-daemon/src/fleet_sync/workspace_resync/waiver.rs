@@ -91,6 +91,9 @@ pub const GATE: &[&str] = &[
     "*defaults/config.json",
 ];
 
+/// Tests that no merge path sources (#13486).
+const TESTS_DIR: &str = ".loom/scripts/tests/";
+
 /// Bash-style glob where `*` matches any run of characters (`/` included)
 /// and everything else is literal.
 #[must_use]
@@ -138,6 +141,81 @@ pub fn upstream_path(installed: &str) -> Option<String> {
     })
 }
 
+/// The `rjwalters/repo` source path of an installed Repo Skills path, per that
+/// installer's own copy lines (#13435). `None` when the path has none.
+#[must_use]
+pub fn repo_skills_upstream_path(installed: &str) -> Option<String> {
+    if let Some(rest) = installed.strip_prefix(".claude/skills/repo/hooks/") {
+        return Some(format!("hooks/repo/{rest}"));
+    }
+    if let Some(rest) = installed.strip_prefix(".claude/skills/repo/scripts/") {
+        return Some(format!("scripts/repo/{rest}"));
+    }
+    if installed == ".claude/skills/repo/SKILL.md" {
+        return Some("skills/repo/SKILL.md".to_string());
+    }
+    installed
+        .strip_prefix(".claude/commands/repo/")
+        .map(|rest| format!("commands/repo/{rest}"))
+}
+
+/// Which resync the PR claims to be: Loom's own, or the Repo Skills bump
+/// (#13435), which runs the same rule against the `rjwalters/repo` tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Loom,
+    RepoSkills,
+}
+
+impl Kind {
+    /// The repo whose tag and blobs the PR must byte-match.
+    #[must_use]
+    pub fn upstream(self) -> &'static str {
+        match self {
+            Self::Loom => "rjwalters/loom",
+            Self::RepoSkills => "rjwalters/repo",
+        }
+    }
+
+    /// The install metadata file at the PR head.
+    #[must_use]
+    pub fn meta_path(self) -> &'static str {
+        match self {
+            Self::Loom => ".loom/install-metadata.json",
+            Self::RepoSkills => ".claude/skills/repo/install-metadata.json",
+        }
+    }
+
+    fn meta_key(self) -> &'static str {
+        match self {
+            Self::Loom => "loom_version",
+            Self::RepoSkills => "version",
+        }
+    }
+
+    /// Whether `file` is inside this kind's install set (#12945).
+    fn in_install_set(self, file: &str) -> bool {
+        match self {
+            Self::Loom => file.starts_with(".loom/") || file.starts_with(".claude/"),
+            Self::RepoSkills => {
+                file.starts_with(".claude/skills/repo/")
+                    || file.starts_with(".claude/commands/repo/")
+                    || file.starts_with(".agents/skills/repo")
+                    || file == ".claude/settings.json"
+                    || file == ".gitignore"
+                    || file == "CLAUDE.md"
+            }
+        }
+    }
+
+    fn upstream_path(self, installed: &str) -> Option<String> {
+        match self {
+            Self::Loom => upstream_path(installed),
+            Self::RepoSkills => repo_skills_upstream_path(installed),
+        }
+    }
+}
+
 /// A pull request as the proof reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pr {
@@ -163,13 +241,13 @@ pub trait Source {
     fn pr(&self, number: u32) -> Result<Pr, String>;
     /// Every changed file, all pages.
     fn files(&self, number: u32) -> Result<Vec<File>, String>;
-    /// `.loom/install-metadata.json` at `sha` in the PR's repo.
-    fn metadata(&self, sha: &str) -> Result<String, String>;
-    /// Whether `refs/tags/<tag>` exists in `rjwalters/loom`.
-    fn tag_exists(&self, tag: &str) -> Result<bool, String>;
-    /// The blob SHA of `path` at `tag` in `rjwalters/loom`; `None` when it is
+    /// `kind.meta_path()` at `sha` in the PR's repo.
+    fn metadata(&self, kind: Kind, sha: &str) -> Result<String, String>;
+    /// Whether `refs/tags/<tag>` exists in `kind.upstream()`.
+    fn tag_exists(&self, kind: Kind, tag: &str) -> Result<bool, String>;
+    /// The blob SHA of `path` at `tag` in `kind.upstream()`; `None` when it is
     /// not a file there.
-    fn upstream_blob(&self, path: &str, tag: &str) -> Result<Option<String>, String>;
+    fn upstream_blob(&self, kind: Kind, path: &str, tag: &str) -> Result<Option<String>, String>;
 }
 
 /// What the proof concluded.
@@ -199,9 +277,8 @@ fn no(why: impl Into<String>) -> Verdict {
     Verdict::NotEligible(why.into())
 }
 
-/// `chore(loom): resync installed Loom to v<X.Y.Z>` -> `X.Y.Z`.
-fn title_version(title: &str) -> Option<&str> {
-    let v = title.strip_prefix("chore(loom): resync installed Loom to v")?;
+/// `X.Y.Z` when `v` is exactly three dot-separated digit runs.
+fn semver(v: &str) -> Option<&str> {
     let mut parts = v.split('.');
     let ok = (0..3).all(|_| {
         parts
@@ -211,6 +288,33 @@ fn title_version(title: &str) -> Option<&str> {
     ok.then_some(v)
 }
 
+/// `chore(loom): resync installed Loom to v<X.Y.Z>` -> `X.Y.Z`.
+fn title_version(title: &str) -> Option<&str> {
+    semver(title.strip_prefix("chore(loom): resync installed Loom to v")?)
+}
+
+/// The Repo Skills bump titles (#13435): `Bump Repo Skills <from> -> <X.Y.Z>`
+/// or `chore(repo-skills): ... v<X.Y.Z>` (the `v` optional, a space before it).
+fn repo_skills_title_version(title: &str) -> Option<&str> {
+    if let Some(rest) = title.strip_prefix("Bump Repo Skills ") {
+        let (from, to) = rest.split_once(" -> ")?;
+        if from.is_empty() || from.contains(char::is_whitespace) {
+            return None;
+        }
+        return semver(to);
+    }
+    let rest = title.strip_prefix("chore(repo-skills): ")?;
+    let (_, last) = rest.rsplit_once(' ')?;
+    semver(last.strip_prefix('v').unwrap_or(last))
+}
+
+/// The kind and version a resync PR title claims, if it is one.
+fn classify(title: &str) -> Option<(Kind, &str)> {
+    title_version(title)
+        .map(|v| (Kind::Loom, v))
+        .or_else(|| repo_skills_title_version(title).map(|v| (Kind::RepoSkills, v)))
+}
+
 /// The proof, for PR `number`. Fails closed on every read error.
 #[must_use]
 pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
@@ -218,17 +322,17 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
         Ok(p) => p,
         Err(_) => return no("PR unreadable"),
     };
-    let Some(version) = title_version(&pr.title) else {
+    let Some((kind, version)) = classify(&pr.title) else {
         return no("not a resync PR");
     };
     let tag = format!("v{version}");
     if pr.head_sha.is_empty() {
         return no("head unreadable");
     }
-    let meta = src.metadata(&pr.head_sha).ok().and_then(|raw| {
+    let meta = src.metadata(kind, &pr.head_sha).ok().and_then(|raw| {
         serde_json::from_str::<serde_json::Value>(&raw)
             .ok()?
-            .get("loom_version")?
+            .get(kind.meta_key())?
             .as_str()
             .map(str::to_string)
     });
@@ -238,7 +342,7 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
             meta.as_deref().unwrap_or("none")
         ));
     }
-    match src.tag_exists(&tag) {
+    match src.tag_exists(kind, &tag) {
         Ok(true) => {}
         _ => return no(format!("tag {tag} not found upstream")),
     }
@@ -251,10 +355,15 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
     let mut record = Vec::new();
     for f in &files {
         let prev = f.previous_filename.as_deref().unwrap_or(&f.filename);
-        if !(f.filename.starts_with(".loom/") || f.filename.starts_with(".claude/")) {
+        if !kind.in_install_set(&f.filename) {
             return no(format!("{} is outside the install set", f.filename));
         }
-        if matches_any(GATE, &f.filename) || matches_any(GATE, prev) {
+        // A test under `.loom/scripts/tests/` decides nothing at merge time
+        // (#13486): it is compared byte-for-byte below, not refused as a gate
+        // path. Both names must be under `tests/`, so a rename from a gate
+        // path into `tests/` still hits the gate.
+        let is_test = f.filename.starts_with(TESTS_DIR) && prev.starts_with(TESTS_DIR);
+        if !is_test && (matches_any(GATE, &f.filename) || matches_any(GATE, prev)) {
             return no(format!("{} is a merge-gate path", f.filename));
         }
         if !(matches_any(KEPT_SET, &f.filename) || matches_any(KEPT_SET, prev)) {
@@ -263,10 +372,10 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
         if f.status != "added" && f.status != "modified" {
             return no(format!("{} is {}", f.filename, f.status));
         }
-        let Some(up) = upstream_path(&f.filename) else {
+        let Some(up) = kind.upstream_path(&f.filename) else {
             return no(format!("{} has no upstream counterpart", f.filename));
         };
-        match src.upstream_blob(&up, &tag) {
+        match src.upstream_blob(kind, &up, &tag) {
             Ok(Some(sha)) if !sha.is_empty() && sha == f.sha => {
                 record.push((f.filename.clone(), f.sha.clone()));
             }

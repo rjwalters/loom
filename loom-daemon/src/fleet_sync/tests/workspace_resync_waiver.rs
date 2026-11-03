@@ -65,13 +65,13 @@ impl Source for Fake {
     fn files(&self, _: u32) -> Result<Vec<File>, String> {
         self.files.clone()
     }
-    fn metadata(&self, _: &str) -> Result<String, String> {
+    fn metadata(&self, _: Kind, _: &str) -> Result<String, String> {
         self.meta.clone()
     }
-    fn tag_exists(&self, _: &str) -> Result<bool, String> {
+    fn tag_exists(&self, _: Kind, _: &str) -> Result<bool, String> {
         self.tag.clone()
     }
-    fn upstream_blob(&self, path: &str, _: &str) -> Result<Option<String>, String> {
+    fn upstream_blob(&self, _: Kind, path: &str, _: &str) -> Result<Option<String>, String> {
         Ok(self
             .upstream
             .iter()
@@ -161,6 +161,93 @@ fn outside_the_install_set_or_a_gate_path_holds_the_whole_pr() {
         file(".loom/hooks/guard-x.sh", "b1", "modified"),
     ]);
     assert!(why(&evaluate(&f, 1)).contains("merge-gate path"));
+}
+
+#[test]
+fn a_test_under_scripts_tests_is_compared_not_refused_as_a_gate_path() {
+    // The name holds "champion", a gate pattern, yet no merge path sources it (#13486).
+    let t = ".loom/scripts/tests/test-champion-resync-waiver.sh";
+    let mut f = Fake::ok();
+    f.files = Ok(vec![file(t, "t1", "modified")]);
+    f.changed = 1;
+    f.upstream = vec![(
+        "defaults/scripts/tests/test-champion-resync-waiver.sh".to_string(),
+        "t1".to_string(),
+    )];
+    assert_eq!(
+        evaluate(&f, 1),
+        Verdict::Eligible {
+            tag: "v1.2.3".to_string(),
+            head: HEAD.to_string(),
+            record: vec![(t.to_string(), "t1".to_string())],
+        }
+    );
+    // One byte of difference still holds.
+    f.upstream[0].1 = "t1-different".to_string();
+    assert!(why(&evaluate(&f, 1)).contains("differs from v1.2.3"));
+    // A rename from a gate path into tests/ still hits the gate.
+    let mut renamed = file(t, "t1", "renamed");
+    renamed.previous_filename = Some(".loom/scripts/merge-pr.sh".to_string());
+    f.files = Ok(vec![renamed]);
+    assert!(why(&evaluate(&f, 1)).contains("merge-gate path"));
+    // Only .loom/scripts/tests/ is exempt: a gate script elsewhere is not.
+    f.files = Ok(vec![file(".loom/scripts/test-champion.sh", "t1", "modified")]);
+    assert!(why(&evaluate(&f, 1)).contains("merge-gate path"));
+}
+
+fn repo_skills() -> Fake {
+    let mut f = Fake::ok();
+    f.title = "Bump Repo Skills 1.2.2 -> 1.2.3".to_string();
+    f.meta = Ok(r#"{"version":"1.2.3"}"#.to_string());
+    f.files = Ok(vec![file(
+        ".claude/skills/repo/hooks/guard-y.sh",
+        "r1",
+        "modified",
+    )]);
+    f.changed = 1;
+    f.upstream = vec![("hooks/repo/guard-y.sh".to_string(), "r1".to_string())];
+    f
+}
+
+#[test]
+fn a_repo_skills_bump_is_proved_against_the_repo_tag() {
+    assert_eq!(
+        evaluate(&repo_skills(), 1),
+        Verdict::Eligible {
+            tag: "v1.2.3".to_string(),
+            head: HEAD.to_string(),
+            record: vec![(".claude/skills/repo/hooks/guard-y.sh".to_string(), "r1".to_string())],
+        }
+    );
+    let mut f = repo_skills();
+    f.title = "chore(repo-skills): refresh the skills to v1.2.3".to_string();
+    assert!(matches!(evaluate(&f, 1), Verdict::Eligible { .. }));
+    // Metadata is read with the `version` key, not `loom_version`.
+    let mut f = repo_skills();
+    f.meta = Ok(r#"{"loom_version":"1.2.3"}"#.to_string());
+    assert!(why(&evaluate(&f, 1)).starts_with("install-metadata names 'none'"));
+    // settings.json has no upstream counterpart, so a bump changing it holds.
+    let mut f = repo_skills();
+    f.files = Ok(vec![file(".claude/settings.json", "r1", "modified")]);
+    assert!(why(&evaluate(&f, 1)).contains("has no upstream counterpart"));
+    // A Loom path is outside the Repo Skills install set.
+    let mut f = repo_skills();
+    f.files = Ok(vec![file(".loom/hooks/guard-x.sh", "b1", "modified")]);
+    assert!(why(&evaluate(&f, 1)).contains("outside the install set"));
+}
+
+#[test]
+fn the_repo_skills_title_shape_is_strict() {
+    for title in [
+        "Bump Repo Skills 1.2.2 -> 1.2",
+        "Bump Repo Skills 1.2.2 -> 1.2.3-rc1",
+        "Bump Repo Skills -> 1.2.3",
+        "chore(repo-skills): v1.2.3x",
+    ] {
+        let mut f = repo_skills();
+        f.title = title.to_string();
+        assert_eq!(why(&evaluate(&f, 1)), "not a resync PR", "{title}");
+    }
 }
 
 #[test]

@@ -83,11 +83,16 @@ assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval "$WORK/no-such-daemon")")" "a 
 new_fx; echo 2 >"$FX/rc"
 assert_eq "NOT ELIGIBLE" "$(result_of "$(run_eval)")" "a daemon that predates the verb (clap exit 2) holds"
 
+# The #13486 (tests/ exemption) and #13435 (Repo Skills) cases now run against the native proof:
+# see fleet_sync/tests/workspace_resync_waiver.rs.
+
 echo "--- docs ---"
 assert_doc() { assert_contains "$(cat "$1")" "$2" "$3"; }
 assert_doc "$CHAMPION_MD" "Resync waiver for the kept-set hold (#13096)" "champion-pr-merge.md documents the waiver"
 assert_doc "$CHAMPION_MD" "champion:resync-waiver tag=" "pre-merge comment carries a greppable waiver marker"
 assert_doc "$CHAMPION_MD" "KEPT_SET_PATTERNS\` stays hardcoded" "doc states the floor stays hardcoded"
+assert_doc "$CHAMPION_MD" "compared byte-for-byte like any kept-set file (#13486)" "champion-pr-merge.md documents the tests/ exemption"
+assert_doc "$CHAMPION_REF_MD" "Bump Repo Skills <from> -> <X.Y.Z>" "champion-reference.md documents the Repo Skills variant"
 assert_doc "$CHAMPION_REF_MD" "Resync waiver (#13096)" "champion-reference.md documents the waiver"
 assert_doc "$CHAMPION_MD" "Step 3b: Close Superseded Resync PRs" "champion-pr-merge.md closes superseded resyncs"
 

@@ -7,15 +7,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::waiver::{self, Checks, File, Landing, Pr, Source, Waived};
+use super::waiver::{self, Checks, File, Kind, Landing, Pr, Source, Waived};
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 /// Per-call deadline for one `gh` request.
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Upstream, where the tag and the `defaults/` blobs live.
-const UPSTREAM: &str = "rjwalters/loom";
 
 /// `gh` reads and writes for one repo's resync PR.
 pub struct Gh<'a> {
@@ -108,7 +105,7 @@ impl Source for Gh<'_> {
             .collect())
     }
 
-    fn metadata(&self, sha: &str) -> Result<String, String> {
+    fn metadata(&self, kind: Kind, sha: &str) -> Result<String, String> {
         self.gh(
             "resync_waiver.metadata",
             AccessIntent::Read,
@@ -116,20 +113,21 @@ impl Source for Gh<'_> {
                 "api",
                 "-H",
                 "Accept: application/vnd.github.raw",
-                &format!("repos/{}/contents/.loom/install-metadata.json?ref={sha}", self.nwo),
+                &format!("repos/{}/contents/{}?ref={sha}", self.nwo, kind.meta_path()),
             ],
         )
     }
 
-    fn tag_exists(&self, tag: &str) -> Result<bool, String> {
-        let v = self.json("resync_waiver.tag", &format!("repos/{UPSTREAM}/git/ref/tags/{tag}"))?;
+    fn tag_exists(&self, kind: Kind, tag: &str) -> Result<bool, String> {
+        let v = self
+            .json("resync_waiver.tag", &format!("repos/{}/git/ref/tags/{tag}", kind.upstream()))?;
         Ok(v["ref"].as_str() == Some(&format!("refs/tags/{tag}")))
     }
 
-    fn upstream_blob(&self, path: &str, tag: &str) -> Result<Option<String>, String> {
+    fn upstream_blob(&self, kind: Kind, path: &str, tag: &str) -> Result<Option<String>, String> {
         let v = self.json(
             "resync_waiver.upstream_blob",
-            &format!("repos/{UPSTREAM}/contents/{}?ref={tag}", encode_path(path)),
+            &format!("repos/{}/contents/{}?ref={tag}", kind.upstream(), encode_path(path)),
         )?;
         Ok((v["type"].as_str() == Some("file"))
             .then(|| v["sha"].as_str().map(str::to_string))

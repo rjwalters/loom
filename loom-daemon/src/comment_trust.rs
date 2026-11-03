@@ -267,6 +267,12 @@ impl TrustPolicy {
         .with_admins(crate::fleet_store::admins::resolve(root))
     }
 
+    /// This workspace's own (writer App) login, when one resolved.
+    #[must_use]
+    pub fn self_login(&self) -> Option<&str> {
+        self.self_login.as_deref()
+    }
+
     /// Replace the self identity (an explicit `--self-login`).
     #[must_use]
     pub fn with_self_login(mut self, login: Option<String>) -> Self {

@@ -62,6 +62,7 @@ test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
 test-champion-ratification-hold.sh
+test-doctor-champion-hold-conflict.sh
 test-champion-resync-waiver.sh
 test-champion-standing-authorization.sh
 test-champion-targeted-modes.sh
@@ -166,13 +167,9 @@ test-mcp-pnpm-selfrepair.sh
 test-memory-budget.sh
 test-merge-admission-telemetry.sh
 test-merge-pr-app-permission-fallback.sh
-test-merge-pr-auto-merge-disabled-fallback.sh
-test-merge-pr-auto-queued-stacked-children.sh
 test-merge-pr-expected-head.sh
 test-merge-pr-pr-state.sh
-test-merge-pr-check-runs-404-fallback.sh
 test-merge-pr-daemon-version-floor.sh
-test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
 test-merge-pr-required-checks.sh

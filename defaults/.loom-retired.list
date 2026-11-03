@@ -160,6 +160,17 @@ scripts/tests/test-merge-pr-stale-required-checks.sh
 scripts/check-dependabot-labels.sh
 scripts/tests/test-check-dependabot-labels.sh
 scripts/tests/test-check-pipefail-early-exit.sh
+# #12063 slice 2 (2026-10-15) — merge-pr no longer waits for checks, self-syncs or pre-reads
+# mergeability; the suites for that machinery leave with it.
+scripts/tests/test-merge-pr-auto-blocked-settle.sh
+scripts/tests/test-merge-pr-auto-merge-disabled-fallback.sh
+scripts/tests/test-merge-pr-auto-queued-stacked-children.sh
+scripts/tests/test-merge-pr-check-runs-404-fallback.sh
+scripts/tests/test-merge-pr-head-sync-retry.sh
+scripts/tests/test-merge-pr-rate-limit-fallback.sh
+scripts/tests/test-merge-pr-stale-mergeable.sh
+scripts/tests/test-merge-pr-unstable-fallback.sh
+scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
 
 # #12121 (2026-10-16) — the operator presence hook is retired; operator
 # activity is inferred by consumers, not emitted.
@@ -179,6 +190,10 @@ scripts/tests/test-judge-fanout-experiment.sh
 
 # #13020 (2026-10-21) — the orphaned heredoc-body-safety test lib is removed (PR #13023).
 scripts/tests/lib/heredoc-body-safety.sh
+
+# #12094 (2026-10-16) — the telemetry-replay CLI and its SigNoz replay queries
+# are deleted; the replay doc goes with them.
+docs/telemetry-replay.md
 
 # #13118 (2026-10-24) — worktree-return.sh and worktree.sh --return-to are removed (PR #13160).
 scripts/worktree-return.sh
