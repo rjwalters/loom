@@ -331,6 +331,6 @@ fn the_shipped_gemini_manifest_declares_its_binary() {
     assert_eq!(shipped, installed, "the two gemini manifests must stay identical");
     let doc: serde_json::Value = serde_json::from_str(&shipped).unwrap();
     assert_eq!(doc["launch"]["cliBin"], "gemini");
-    // spawn-gemini.sh's own default, which the manifest must not contradict.
-    assert_eq!(doc["launch"]["promptFlag"], "--prompt");
+    // The unattended pins live in the manifest now (#13559), not spawn-gemini.sh.
+    assert_eq!(doc["launch"]["extraArgs"], serde_json::json!(["--yolo", "--skip-trust"]));
 }
