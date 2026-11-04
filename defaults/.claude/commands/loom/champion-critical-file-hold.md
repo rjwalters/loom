@@ -251,12 +251,13 @@ ${CF_REARM_NOTE}This PR modifies a critical file and cannot be automatically mer
 
 - **Critical File Exclusion Check**: <FILE_PATH> matches critical-file pattern \`<PATTERN>\`${CF_SUSPECT_NOTE}
 
-**Next steps** — to merge it yourself, two commands, in either order, no race:
+**Next steps** — to merge it yourself, one audited command (#13517):
 
 \`\`\`bash
-gh pr edit $PR_NUMBER --remove-label \"loom:blocked\"
-./.loom/scripts/merge-pr.sh $PR_NUMBER
+./.loom/scripts/merge-pr.sh $PR_NUMBER --release-hold
 \`\`\`
+
+It refuses if the head moved since this hold or the Judge approval, and records who released it.
 
 On a merge-queue repo, skip \`merge-pr.sh\`: after your release Champion hands the PR to the queue itself (#13321).
 

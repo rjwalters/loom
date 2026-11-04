@@ -112,6 +112,7 @@ mod merge_pr_pr_state;
 mod merge_pr_reconcile;
 mod merge_pr_redate_report;
 mod merge_pr_refs;
+mod merge_pr_release_hold;
 mod merge_pr_remove_gate;
 mod merge_pr_required_checks;
 mod merge_pr_response;

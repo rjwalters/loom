@@ -784,6 +784,10 @@ pub(crate) enum MergePrCommand {
     /// Refuse a PR carrying `loom:pr` alongside a contradicting label.
     VerdictContradiction(super::merge_pr_labels::VerdictContradictionArgs),
 
+    /// Decide whether an operator may release Champion's human-merge hold
+    /// (`merge-pr.sh --release-hold`, #13517). Exit 0+OK = release, 1 = refuse.
+    ReleaseHold(super::merge_pr_release_hold::ReleaseHoldArgs),
+
     /// Run the repo's `merge.treeChecks` against the merge tree (base + PR
     /// head) in a temp dir (#10026). Exit 0+CLEAN = pass/none declared (or
     /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
@@ -1105,6 +1109,7 @@ impl MergePrCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
+            MergePrCommand::ReleaseHold(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),

@@ -268,6 +268,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // sole caller (`PullMarkers::from_trusted`) passes `TrustedComments::bodies()`.
         // It fetches nothing itself.
         ("champion_hold.rs", "parses already-filtered bodies"),
+        // #13517: `--release-hold` eligibility. `evaluate` takes comment bodies on
+        // stdin from `merge-pr.sh`'s `_trusted_pr_comments` (trust-filtered; Gitea
+        // reads as absent, so it refuses). It fetches nothing itself.
+        ("merge_pr/hold_release.rs", "parses already-filtered bodies"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];
