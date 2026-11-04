@@ -629,8 +629,8 @@ fn a_judge_step_with_a_verdict_write_is_verdict_with_the_observed_head() {
         assert_eq!(class_reason(&r), ("verdict", action));
         assert_eq!(r.mechanism, "step:judge");
         assert_eq!(r.artifact, "pr");
-        assert_eq!(r.step.step.as_deref(), Some("judge_pr"));
-        assert_eq!(r.step.reason_set.as_deref(), Some(judge::REASON_SET));
+        assert_eq!(r.step.step.as_deref(), Some("judge"));
+        assert_eq!(r.step.reason_set.as_deref(), Some(judge::VERDICT_REASON_SET));
         assert_eq!(r.step.head_sha.as_deref(), Some(sha));
         assert!(r.applied);
     }
@@ -649,7 +649,8 @@ fn a_judge_step_with_a_noop_line_and_no_write_is_that_noop() {
         &mut store,
     );
     let r = records.remove(0);
-    assert_eq!(class_reason(&r), ("noop", "already_judged"));
+    assert_eq!(class_reason(&r), ("noop", "no_change"));
+    assert_eq!(r.step.reason_set.as_deref(), Some(judge::REASON_SET));
     assert!(!r.applied);
     // A line for another target or role is not this step's.
     let mut records = records_for(
@@ -658,7 +659,7 @@ fn a_judge_step_with_a_noop_line_and_no_write_is_that_noop() {
         Some(&journal(vec![])),
         &mut store,
     );
-    assert_eq!(class_reason(&records.remove(0)), ("failed", "unclassified"));
+    assert_eq!(class_reason(&records.remove(0)), ("failed", "failed"));
 }
 
 #[test]
@@ -878,13 +879,47 @@ fn curator_journaled_writes_outrank_the_outcome_line() {
 }
 
 #[test]
-fn a_role_tick_projects_nothing_for_doctor_or_curator() {
+fn a_role_tick_projects_nothing_for_doctor_curator_or_judge() {
     assert!(projector("judge").is_some());
     assert!(projector("doctor").is_some() && projector("curator").is_some());
-    for role in ["doctor", "curator"] {
+    for role in ["doctor", "curator", "judge"] {
         let ctx = Context { role, ..ctx(t(5)) };
         let j = journal(vec![act(1, 5, "curated")]);
         let source = Source::Tick { started_at: t(0) };
         assert!(records_for(&ctx, &source, Some(&j), &mut RefusalStore::default()).is_empty());
+    }
+}
+
+fn ci_refusal(minute: u32, class: &str, head: &str) -> JournalEntry {
+    marker(minute, 88, true, &format!("<!-- judge:ci-refused:{class} -->"), Some(head))
+}
+
+#[test]
+fn a_judge_ci_refusal_projects_its_class_and_head() {
+    for (class, reason) in [("ci_red", "ci_red"), ("ci_incomplete", "ci_incomplete")] {
+        let j = journal(vec![ci_refusal(2, class, "abc1234")]);
+        let r =
+            one_for("judge", &role_step(StepRole::Judge, 88, Some(("refused", "ci"))), Some(&j));
+        assert_eq!(class_reason(&r), ("refused", reason));
+        assert_eq!(r.step.reason_set.as_deref(), Some(judge::REASON_SET));
+        assert_eq!(r.step.step.as_deref(), Some("judge"));
+        assert_eq!(r.step.head_sha.as_deref(), Some("abc1234"));
+        assert_eq!(r.artifact, "pr");
+    }
+}
+
+#[test]
+fn a_judge_step_without_a_refusal_passes_its_outcome_through() {
+    for (line, class, reason) in [
+        (Some(("verdict", "approved")), "verdict", "reviewed"),
+        (Some(("noop", "x")), "noop", "no_change"),
+        (Some(("refused", "x")), "refused", "declined"),
+        (Some(("failed", "x")), "failed", "failed"),
+        (None, "failed", "failed"),
+    ] {
+        let r = one_for("judge", &role_step(StepRole::Judge, 88, line), Some(&journal(vec![])));
+        assert_eq!(class_reason(&r), (class, reason), "{line:?}");
+        assert!(judge::REASONS.contains(&reason));
+        assert_eq!(r.step.head_sha, None);
     }
 }

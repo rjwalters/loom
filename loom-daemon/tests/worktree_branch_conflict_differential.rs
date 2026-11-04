@@ -37,6 +37,8 @@
 
 mod common;
 
+use common::git;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -201,20 +203,6 @@ fn scenarios() -> Vec<Scenario> {
 
 fn tmpdir(tag: &str) -> PathBuf {
     common::unique_tmpdir("loom-branch-conflict-diff", tag)
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} in {repo:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 fn init_repo(path: &Path, on_branch: &str) {

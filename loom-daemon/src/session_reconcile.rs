@@ -123,6 +123,7 @@
 //! and the busy deferral. Private-clone containers are never
 //! drift-recreated.
 
+use crate::script_helpers::now_epoch_secs;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1159,13 +1160,6 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     all
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Spawn the loop on the shared runtime. The first tick fires immediately, so
 /// the pass also runs once at daemon start.
 pub fn spawn_task(fallback_root: PathBuf, interval: Duration) -> tokio::task::JoinHandle<()> {
@@ -1178,7 +1172,7 @@ pub fn spawn_task(fallback_root: PathBuf, interval: Duration) -> tokio::task::Jo
             let root = fallback_root.clone();
             let mut carried = std::mem::take(&mut state);
             let joined = tokio::task::spawn_blocking(move || {
-                run_tick(&root, &mut carried, unix_now());
+                run_tick(&root, &mut carried, now_epoch_secs());
                 carried
             })
             .await;

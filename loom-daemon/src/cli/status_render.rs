@@ -721,6 +721,9 @@ pub(crate) fn build_status_json_value_for(
             "autonomy_mismatch": autonomy_mismatch(Some(p), report),
         })),
     });
+    // Agent-residue reap counters (#10802); added outside the literal above,
+    // which is at the macro recursion limit.
+    value["agent_residue"] = serde_json::json!(report.agent_residue);
     // Restart-survivorship seed (#6262). Inserted after the literal rather than
     // added as another `json!` key: the macro above is already at the recursion
     // limit (see the `role_agents` comment), and a post-insert costs nothing and
@@ -2390,6 +2393,11 @@ pub(crate) fn print_status_human(
             // unmounted volume, to leave it registered).
             if let Some(mark) = &r.maintain_only {
                 println!("        {}: kept current, never dispatched into (#11186)", mark.label());
+            }
+            if r.lock_busy {
+                println!(
+                    "        sweep registry lock busy — in-flight/quarantine data omitted (#13443)"
+                );
             }
             if r.root_missing {
                 println!(
@@ -4226,6 +4234,7 @@ mod stash_status_render_tests {
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -4475,6 +4484,7 @@ mod role_runner_diagnostic_source_render_tests {
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,

@@ -86,6 +86,9 @@ pub(super) fn reached(
         repo,
         pass_skipped_reason: reason.map(str::to_string),
         remote_tip_age_s: tip_age_s,
+        checkout_role: None,
+        dirty_tracked_files: None,
+        dirty_identical_to_remote: None,
         prompt,
     }
 }
@@ -101,6 +104,9 @@ pub(super) fn deferred(root: &Path, now: DateTime<Utc>) -> CheckoutFreshnessReco
         repo: origin.repo.filter(|_| !origin.foreign),
         pass_skipped_reason: Some("budget".to_string()),
         remote_tip_age_s: None,
+        checkout_role: None,
+        dirty_tracked_files: None,
+        dirty_identical_to_remote: None,
         prompt: None,
     }
 }

@@ -151,8 +151,18 @@ fn is_sha(s: &str) -> bool {
 /// decided to invalidate on — never on the common `Fresh` path.
 #[must_use]
 pub fn tree_unchanged(gh_bin: &Path, cwd: Option<&Path>, base: &str, head: &str) -> Option<bool> {
+    tree_unchanged_checked(gh_bin, cwd, base, head).ok()
+}
+
+/// [`tree_unchanged`], naming why there was no answer (#13146).
+pub fn tree_unchanged_checked(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    base: &str,
+    head: &str,
+) -> Result<bool, String> {
     // Both keys are REQUIRED: a response missing either fails to deserialize,
-    // i.e. `None`, never an assumed equality (PR #9581 review — the inherited
+    // i.e. no answer, never an assumed equality (PR #9581 review — the inherited
     // `#[serde(default)]` on `files` was the one fail-open arm).
     #[derive(Deserialize)]
     struct Compare {
@@ -160,12 +170,13 @@ pub fn tree_unchanged(gh_bin: &Path, cwd: Option<&Path>, base: &str, head: &str)
         files: Vec<serde_json::Value>,
     }
     if !is_sha(base) || !is_sha(head) {
-        return None;
+        return Err("an argument is not a bare hex SHA".to_string());
     }
     // #10089: the compare of two commit SHAs is a function of those SHAs
     // alone, so a found answer is reused for the process lifetime (a pass
     // that re-sees the same invalidated head move no longer re-spends it).
-    // Only an answered compare is stored; a failure is retried as before.
+    // Only an answered compare is stored; a failure is retried as before, so
+    // the closure always runs (and records its reason) when there is no answer.
     let cache_key = crate::claim_reconciliation::read_cache::key_of(&[
         &gh_bin.to_string_lossy(),
         &cwd.map(|d| d.to_string_lossy().into_owned())
@@ -173,12 +184,35 @@ pub fn tree_unchanged(gh_bin: &Path, cwd: Option<&Path>, base: &str, head: &str)
         base,
         head,
     ]);
-    crate::claim_reconciliation::read_cache::TREE_COMPARE.get_or(cache_key, || {
+    let why = std::cell::RefCell::new(String::new());
+    let answer = crate::claim_reconciliation::read_cache::TREE_COMPARE.get_or(cache_key, || {
         // Counted via the facade (`forge.tree_compare`).
         let path = format!("repos/{{owner}}/{{repo}}/compare/{base}...{head}");
-        let out = crate::verdict_equivalence::gh_api("forge.tree_compare", gh_bin, cwd, &path)?;
-        let parsed: Compare = serde_json::from_slice(&out).ok()?;
+        let out = match crate::verdict_equivalence::gh_api_checked(
+            "forge.tree_compare",
+            gh_bin,
+            cwd,
+            &path,
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                *why.borrow_mut() = e;
+                return None;
+            }
+        };
+        let Ok(parsed) = serde_json::from_slice::<Compare>(&out) else {
+            *why.borrow_mut() = "unparseable or incomplete compare response".to_string();
+            return None;
+        };
         Some(proves_identical_trees(&parsed.status, parsed.files.is_empty()))
+    });
+    answer.ok_or_else(|| {
+        let why = why.into_inner();
+        if why.is_empty() {
+            "no answer".to_string()
+        } else {
+            why
+        }
     })
 }
 

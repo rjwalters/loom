@@ -35,6 +35,9 @@ pub const CHECKOUT_FRESHNESS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.prompt.origin_ref_stale",
     "loom.prompt.remote_repo",
     "loom.prompt.remote_foreign",
+    "loom.checkout.role",
+    "loom.checkout.dirty_tracked_files",
+    "loom.checkout.dirty_identical_to_remote",
 ];
 
 /// The `checkout.freshness` record.
@@ -55,6 +58,19 @@ pub struct CheckoutFreshnessRecord {
     /// the daemon's cache rather than being learned this pass (#12565).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_tip_age_s: Option<u64>,
+    /// What the checkout is for, set only for the daemon's own root
+    /// (`daemon-root`, #12727): a registered workspace leaves it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_role: Option<String>,
+    /// Tracked files with a staged or unstaged change (#12727); absent when
+    /// the checkout's status could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_tracked_files: Option<u64>,
+    /// Every dirty tracked file is byte-identical to `remote_tip` (#12727), so
+    /// a fast-forward could pass through it. Absent when nothing is dirty or
+    /// the tip is not in the object store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_identical_to_remote: Option<bool>,
     /// The checkout's prompt tree; absent when it could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptTree>,

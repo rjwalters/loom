@@ -183,7 +183,8 @@ fn the_registry_row_agrees_with_the_record_it_describes() {
 
 /// The Stage 1 exported-facts contract (`defaults/docs/telemetry-schema.md`,
 /// #11098): every record external consumers rely on stays registered with its
-/// signal shape, and the retired ETA-only wire tags stay retired (never
+/// signal shape, and the retired wire tags (the ETA-only ones, plus the producer-less
+/// kinds #12094 removed) stay retired (never
 /// reused) after the ETA subsystem was deleted.
 #[test]
 fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
@@ -196,12 +197,9 @@ fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
         ("sweep.completed", true),
         ("sweep.identity", true),
         ("pick.decision", true),
-        ("fleet.state", true),
         ("host.health", true),
         ("host.export", true),
         ("operator.presence", true),
-        ("pr.resolved", true),
-        ("eta.stage_outcome", true),
     ] {
         let meta = kind(tag).unwrap_or_else(|| panic!("contract kind `{tag}` is not registered"));
         assert_eq!(
@@ -218,6 +216,11 @@ fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
         "eta.fleet_refresh",
         "eta.backtest.fold",
         "eta.backtest.summary",
+        // Retired by #12094 (no producer since #11301).
+        "fleet.state",
+        "pr.resolved",
+        "eta.stage_outcome",
+        "pass.summary",
     ] {
         assert!(kind(tag).is_none(), "retired wire tag `{tag}` was re-registered");
     }

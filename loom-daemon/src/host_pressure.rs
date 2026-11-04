@@ -329,10 +329,14 @@ pub struct MeminfoSample {
     pub swap_total_kb: Option<u64>,
     /// `SwapFree` (kB).
     pub swap_free_kb: Option<u64>,
+    /// `Shmem` (kB) — tmpfs-resident + SysV/POSIX shared-memory pages, the same
+    /// figure `free -h`'s `shared` column reports.
+    pub shmem_kb: Option<u64>,
 }
 
 /// Parse a `/proc/meminfo` snapshot. Lines are `Key: <value> kB`; the unit is
-/// always kB on Linux, and a missing key leaves its field `None`.
+/// always kB on Linux, and a missing or malformed key leaves its field `None`.
+/// The single `/proc/meminfo` parser for the daemon — callers convert units.
 #[must_use]
 pub fn parse_meminfo(text: &str) -> MeminfoSample {
     let mut out = MeminfoSample::default();
@@ -347,6 +351,7 @@ pub fn parse_meminfo(text: &str) -> MeminfoSample {
             "MemAvailable" => out.mem_available_kb = value,
             "SwapTotal" => out.swap_total_kb = value,
             "SwapFree" => out.swap_free_kb = value,
+            "Shmem" => out.shmem_kb = value,
             _ => {}
         }
     }
@@ -543,6 +548,15 @@ SwapFree:              9502720 kB
         assert_eq!(m.mem_available_kb, Some(21_431_040));
         assert_eq!(m.swap_total_kb, Some(10_485_760));
         assert_eq!(m.swap_free_kb, Some(9_502_720));
+        assert_eq!(m.shmem_kb, None);
+    }
+
+    #[test]
+    fn meminfo_reads_shmem_independently() {
+        let m = parse_meminfo("MemTotal: 16384000 kB\nShmem:  512000 kB\n");
+        assert_eq!(m.mem_total_kb, Some(16_384_000));
+        assert_eq!(m.mem_available_kb, None);
+        assert_eq!(m.shmem_kb, Some(512_000));
     }
 
     #[test]

@@ -20,6 +20,7 @@ fn policy(allow: &[&str]) -> TrustPolicy {
         readers: vec![app("acme-reader-1")],
         legacy_logins: vec!["acme-old".into()],
         writers: Vec::new(),
+        load_failed: false,
     };
     TrustPolicy::new(
         FleetLogins::of(&roster),
@@ -267,6 +268,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // sole caller (`PullMarkers::from_trusted`) passes `TrustedComments::bodies()`.
         // It fetches nothing itself.
         ("champion_hold.rs", "parses already-filtered bodies"),
+        // #13517: `--release-hold` eligibility. `evaluate` takes comment bodies on
+        // stdin from `merge-pr.sh`'s `_trusted_pr_comments` (trust-filtered; Gitea
+        // reads as absent, so it refuses). It fetches nothing itself.
+        ("merge_pr/hold_release.rs", "parses already-filtered bodies"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];
@@ -312,8 +317,48 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
 fn roster(logins: &[&str]) -> crate::fleet_store::admins::Admins {
     crate::fleet_store::admins::Admins {
         logins: logins.iter().map(|s| (*s).to_string()).collect(),
+        apps: Vec::new(),
         state: format!("loaded {}", logins.len()),
     }
+}
+
+fn roster_with_apps(apps: &[&str]) -> crate::fleet_store::admins::Admins {
+    let mut r = roster(&["turian"]);
+    r.apps = apps.iter().map(|s| (*s).to_string()).collect();
+    r
+}
+
+#[test]
+fn fleet_app_is_trusted_but_bare_user_is_not() {
+    let p = policy(&[]).with_admins(roster_with_apps(&["gateway[bot]"]));
+    assert!(p.trusts_json(&rest("gateway[bot]", "Bot", "NONE")));
+    assert!(!p.trusts_json(&rest("gateway", "User", "NONE")));
+    assert!(p.trusts_json(&rest("turian", "User", "NONE")));
+}
+
+#[test]
+fn unavailable_roster_trusts_no_apps() {
+    let p = policy(&[]).with_admins(crate::fleet_store::admins::Admins::unavailable("x"));
+    assert!(!p.trusts_json(&rest("gateway[bot]", "Bot", "NONE")));
+}
+
+#[test]
+fn apps_list_changes_digest_only_when_non_empty() {
+    let base = policy(&[]).with_admins(roster(&["turian"])).digest();
+    let empty = policy(&[]).with_admins(roster_with_apps(&[])).digest();
+    let one = policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]"]))
+        .digest();
+    let two = policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]", "b[bot]"]))
+        .digest();
+    assert_eq!(base, empty);
+    assert_ne!(base, one);
+    assert_ne!(one, two);
+    assert!(policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]"]))
+        .sources_consulted()
+        .contains("fleet trusted Apps list (1 entries"));
 }
 
 #[test]
@@ -349,4 +394,20 @@ fn unavailable_roster_widens_nothing_and_is_reported() {
     let s = p.sources_consulted();
     assert!(s.contains("unavailable: no file") && s.contains("fleet/admins.json"), "{s}");
     assert!(policy(&[]).sources_consulted().contains("not consulted"));
+}
+
+#[test]
+fn the_actions_bot_stays_untrusted_for_comments_and_markers() {
+    // #13378: the ci-daily tracker exception lives in the promotion author
+    // gate only; the bot's comments and markers are never trusted.
+    let p = policy(&[]);
+    let marker = "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->";
+    for v in [
+        rest("github-actions[bot]", "Bot", "NONE"),
+        graphql("github-actions[bot]", "NONE"),
+        json!({"user": {"login": "github-actions[bot]", "type": "Bot"},
+               "author_association": "NONE", "title": "[ci-daily] x", "body": marker}),
+    ] {
+        assert!(!p.trusts_json(&v), "{v}");
+    }
 }

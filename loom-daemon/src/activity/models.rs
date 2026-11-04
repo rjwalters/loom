@@ -185,9 +185,7 @@ pub struct LintResults {
 
 /// Quality metrics record for tracking test outcomes and code quality
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct QualityMetrics {
-    pub id: Option<i64>,
     pub input_id: Option<i64>,
     pub timestamp: DateTime<Utc>,
 
@@ -203,17 +201,6 @@ pub struct QualityMetrics {
 
     // Build status
     pub build_success: Option<bool>,
-
-    // PR review outcomes
-    pub pr_approved: Option<bool>,
-    pub pr_changes_requested: Option<bool>,
-
-    // Rework tracking (Issue #1054)
-    // Counts how many review cycles a PR goes through
-    pub rework_count: Option<i32>,
-
-    // Human rating (1-5 stars, optional)
-    pub human_rating: Option<i32>,
 }
 
 // ============================================================================

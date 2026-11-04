@@ -60,6 +60,7 @@
 //! | PR `loom:pr` | Champion merge |
 //! | PR with none of those | Champion triage; a draft passes `draft` |
 //! | issue `loom:epic` | pass `epic` |
+//! | issue whose body carries the `<!-- loom:tracker -->` marker | pass `tracker` |
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
@@ -67,9 +68,10 @@
 //! | any other blocked issue | pass `blocked` |
 //! | landed: a merged **closing** PR (or one built on the issue's `feature/issue-N` branch into the default branch, #12251), issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
+//! | `loom:triage`, whatever other stage label it carries (#12713) | Curator |
 //! | `loom:issue` | Builder |
 //! | `loom:curated` | Champion promote |
-//! | `loom:triage`, or no stage label | Curator |
+//! | no stage label | Curator |
 //!
 //! The design's "cooling down" row is not here: cooldowns are local draw
 //! state (the outcome ledger), applied by the draw (#11896), not by this
@@ -146,6 +148,7 @@ const REVIEW_REQUESTED: &str = "loom:review-requested";
 const CHANGES_REQUESTED: &str = "loom:changes-requested";
 const APPROVED: &str = "loom:pr";
 const SEQUENCED: &str = "loom:sequenced";
+const MERGE_CONFLICT: &str = "loom:merge-conflict";
 const FROZEN: &str = "loom:frozen";
 const DECISION_MALFORMED: &str = "loom:decision-malformed";
 
@@ -195,6 +198,10 @@ pub struct IssueInput {
     /// yet `loom:issue` ([`super::main_red_fix`], #10118).
     #[serde(default)]
     pub red_fix: bool,
+    /// The body carries the `<!-- loom:tracker -->` marker (#10886, #13244):
+    /// a living tracker with no finite deliverable, never drawn as work.
+    #[serde(default)]
+    pub tracker: bool,
 }
 
 /// A merged PR that references an issue.
@@ -387,6 +394,7 @@ pub enum ItemState {
     Landed,
     Blocked,
     Epic,
+    Tracker,
     Proposal,
     ReviewRequested,
     ChangesRequested,
@@ -491,6 +499,7 @@ pub enum PassReason {
     Blocked,
     CapabilityMissing,
     Epic,
+    Tracker,
     Proposal,
     NoStage,
     /// An open draft PR with no stage label (#12499): unfinished, never Judged.
@@ -512,6 +521,10 @@ pub enum PassReason {
     /// step tick's gather applies it
     /// (`step_dispatch::gather::hold_author_gated`).
     AuthorGateHeld,
+    /// An approved PR flagged `loom:merge-conflict` (#13367): it cannot be
+    /// handed to the merge queue, and Doctor's conflict queue owns the fix, so
+    /// a `champion_merge` run would spend its slot on a rejection.
+    Conflicting,
 }
 
 impl PassReason {
@@ -529,12 +542,14 @@ impl PassReason {
             Self::Blocked => "blocked",
             Self::CapabilityMissing => "capability_missing",
             Self::Epic => "epic",
+            Self::Tracker => "tracker",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
             Self::Draft => "draft",
             Self::CiPending => "ci_pending",
             Self::HeldAtHead => "held_at_head",
             Self::AuthorGateHeld => "author_gate_held",
+            Self::Conflicting => "conflicting",
         }
     }
 }
@@ -794,6 +809,9 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
     } else if has(labels, REVIEW_REQUESTED) {
         step(ItemState::ReviewRequested, Step::Judge)
     } else if has(labels, APPROVED) {
+        if has(labels, MERGE_CONFLICT) {
+            return (ItemState::Approved, Verdict::Pass(PassReason::Conflicting));
+        }
         step(ItemState::Approved, Step::ChampionMerge)
     } else if pr.draft {
         (ItemState::NoStage, Verdict::Pass(PassReason::Draft))
@@ -811,6 +829,9 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     let pass = |s: ItemState, r: PassReason| (s, Verdict::Pass(r));
     if has(labels, super::EPIC_LABEL) {
         return pass(ItemState::Epic, PassReason::Epic);
+    }
+    if issue.tracker {
+        return pass(ItemState::Tracker, PassReason::Tracker);
     }
     // A proposal that is already promoted (`loom:issue`) or curated is item
     // work; Champion's own proposal query skips those too (`champion.md`
@@ -841,12 +862,21 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     }
     if has(labels, DECISION_MALFORMED) {
         step(ItemState::DecisionMalformed, Step::Curator)
+    } else if has(labels, TRIAGE) {
+        // `loom:triage` beside `loom:curated` or `loom:issue` is still
+        // Curator's turn (#12713): every writer of the label (intake, the
+        // landed router, a Champion send-back, the past-intake demotion)
+        // means exactly that, `check-claim` already refuses a Builder on it
+        // (`LabelLeg::AwaitingCurator`), and the landed guard reads its
+        // removal as Curator's keep. Ranking the stage labels above it sent
+        // a routed issue to Champion promote (`loom:issue` back on, `loom:
+        // triage` never off) and froze it: refused `already_landed` at every
+        // Builder spawn, invisible to the Curator's queue.
+        step(ItemState::Triage, Step::Curator)
     } else if has(labels, READY) {
         step(ItemState::Ready, Step::Builder)
     } else if has(labels, CURATED) {
         step(ItemState::Curated, Step::ChampionPromote)
-    } else if has(labels, TRIAGE) {
-        step(ItemState::Triage, Step::Curator)
     } else {
         step(ItemState::Unlabeled, Step::Curator)
     }

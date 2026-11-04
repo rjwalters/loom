@@ -2777,20 +2777,6 @@ fn decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity() {
 }
 
 #[test]
-fn parse_issue_from_branch_matches_convention() {
-    assert_eq!(parse_issue_from_branch("feature/issue-42"), Some(42));
-    assert_eq!(parse_issue_from_branch("feature/issue-4367"), Some(4367));
-}
-
-#[test]
-fn parse_issue_from_branch_rejects_non_matching_shapes() {
-    assert_eq!(parse_issue_from_branch("main"), None);
-    assert_eq!(parse_issue_from_branch("fix/something"), None);
-    assert_eq!(parse_issue_from_branch("feature/issue-"), None);
-    assert_eq!(parse_issue_from_branch("feature/issue-abc"), None);
-}
-
-#[test]
 fn plan_pr_joins_branch_to_journal_entry() {
     let now = Utc::now();
     let mut journal = SweepJournal::default();

@@ -205,6 +205,7 @@ pub fn pass_attributes(
         ("loom.dispatch.draws_unspawned".into(), p.draws_unspawned.to_string()),
         ("loom.dispatch.merge_deferred".into(), p.merge_deferred.to_string()),
         ("loom.champion.merge_concurrency".into(), p.merge_concurrency.to_string()),
+        ("loom.champion.merge_eligible".into(), p.merge_eligible.to_string()),
         ("loom.champion.merges_in_flight".into(), p.merges_in_flight.to_string()),
         ("loom.dispatch.budget".into(), p.budget.to_string()),
     ];
@@ -419,6 +420,7 @@ mod tests {
                 draws_unspawned: 2,
                 merge_deferred: 7,
                 merge_concurrency: 2,
+                merge_eligible: 4,
                 merges_in_flight: 1,
                 by_reason: [
                     ("backstop_hold".to_string(), 2),
@@ -437,6 +439,7 @@ mod tests {
         assert_eq!(get("loom.dispatch.draws_unspawned"), Some("2"));
         assert_eq!(get("loom.dispatch.merge_deferred"), Some("7"));
         assert_eq!(get("loom.champion.merge_concurrency"), Some("2"));
+        assert_eq!(get("loom.champion.merge_eligible"), Some("4"));
         assert_eq!(get("loom.champion.merges_in_flight"), Some("1"));
         assert_eq!(get("loom.dispatch.passes"), Some("backstop_hold=2,claim_lost=3"));
         assert_eq!(get("loom.dispatch.budget"), Some("30"));

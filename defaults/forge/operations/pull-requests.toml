@@ -332,6 +332,9 @@ unknowns = [
 kind = "rust"
 path = "loom-daemon/src/forge_tree_unchanged.rs"
 [[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/verdict_equivalence/mod.rs"
+[[operation.callers]]
 kind = "script"
 path = "defaults/scripts/blame-issue.sh"
 [[operation.callers]]

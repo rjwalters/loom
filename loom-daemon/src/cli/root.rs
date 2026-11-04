@@ -342,9 +342,6 @@ pub enum Commands {
         /// bail-out on a host that was never meant to run it.
         #[arg(long)]
         ignore_host_constraint: bool,
-
-        #[command(flatten)]
-        tap: super::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`

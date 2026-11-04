@@ -110,7 +110,10 @@ mod hold;
 mod host;
 mod loom_ui;
 mod memory;
+mod supersede;
 mod w2;
+pub mod waiver;
+pub mod waiver_gh;
 
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
@@ -122,6 +125,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Mode;
 use crate::fleet_store::resync_claim::ClaimForge;
+use crate::forge_merge_queue::gh_lifecycle::Landed;
 use crate::init::payload::{gate_metadata, materialize_with, Payload, ResyncRefusal};
 use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS_INSTALLED};
 
@@ -409,6 +413,14 @@ pub struct Env<'a> {
     /// requests as that takes ([`heads::live`]). Called at most once per
     /// pass, and never by a host that may not write.
     pub heads: &'a dyn Fn(&[HeadAsk]) -> Heads,
+    /// Hand the resync pull request `(root, OWNER/REPO, number)` to the
+    /// merge queue (#13268). The daemon owns this, so no installed hook or
+    /// prompt that is itself stale can stop its own replacement.
+    pub land: &'a dyn Fn(&Path, &str, u32) -> Landed,
+    /// Land the resync pull request `(root, OWNER/REPO, number)` on the
+    /// waiver proof, without a Judge (#13487). `Waived::Landed` means it is
+    /// merged (or queued); anything else leaves the ordinary lane.
+    pub waive: &'a dyn Fn(&Path, &str, u32) -> waiver::Waived,
 }
 
 /// A stale workspace this pass may resync.
@@ -674,10 +686,27 @@ fn record_failure(
     memory: &mut Memory,
     alerts: &mut Vec<Alert>,
 ) {
+    record_failure_at(env, report, kind, detail, memory, alerts, log::Level::Error);
+}
+
+/// [`record_failure`] with the level of the alert line chosen by the caller.
+/// A refused push that still ended in an open resync PR is the expected first
+/// step of a path that succeeded (#13465), so it logs at WARN; the alert and
+/// backoff are identical.
+fn record_failure_at(
+    env: &Env<'_>,
+    report: &mut WorkspaceReport,
+    kind: FailureKind,
+    detail: &str,
+    memory: &mut Memory,
+    alerts: &mut Vec<Alert>,
+    level: log::Level,
+) {
     let (until, alert) = memory.fail(report, kind, detail, env.interval, (env.clock)());
     report.reason = Some(format!("backoff until {}: {detail}", stamp(until)));
     if let Some(alert) = alert {
-        log::error!(
+        log::log!(
+            level,
             "workspace_resync: {} ({}): {} failure(s): {detail}; next attempt {}",
             report.repo.as_deref().unwrap_or("unknown repo"),
             report.root.display(),

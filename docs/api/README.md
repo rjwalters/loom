@@ -337,9 +337,6 @@ Optional metadata for role files.
 {
   "name": "Worker Bot",
   "description": "General development worker",
-  "defaultInterval": 0,
-  "defaultIntervalPrompt": "Continue working on open tasks",
-  "autonomousRecommended": false,
   "suggestedWorkerType": "claude"
 }
 ```

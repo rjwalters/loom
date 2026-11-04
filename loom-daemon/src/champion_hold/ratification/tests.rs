@@ -73,6 +73,18 @@ fn a_pr_that_only_cites_a_spec_is_not_held() {
 }
 
 #[test]
+fn a_ratification_request_file_is_held_like_a_spec_file() {
+    let req = "ratification/requests/x.md";
+    assert!(held(&[file(req, "added", Some("Ratified on merge."))]));
+    // Path alone does not hold: the phrase test still applies.
+    assert!(!held(&[file(req, "added", Some("Please review this request."))]));
+    // Renamed out of ratification/**: still matched by its previous name.
+    let mut moved = file("docs/overview.md", "renamed", Some("Ratified on merge."));
+    moved.previous_filename = Some(req.into());
+    assert!(held(&[moved]));
+}
+
+#[test]
 fn edge_cases_follow_the_head_not_the_diff() {
     let declares = "Ratified on merge.";
     // Deleted: nothing at the head to ratify.

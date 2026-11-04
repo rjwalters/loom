@@ -367,7 +367,7 @@ pub fn authorize_and_enqueue(
         let _ = store.revoke(pr);
         return Err(HandoffError::HeadStatus(e));
     }
-    let out = match ops::enqueue(api, pr, approved_sha) {
+    let out = match enqueue_with_retry(api, pr, approved_sha) {
         Ok(o) => o,
         Err(e) => {
             // Roll the grant back; a failed rollback is surfaced by the next
@@ -388,6 +388,35 @@ pub fn authorize_and_enqueue(
         return Err(HandoffError::RevokedDuringEnqueue { why, revocation });
     }
     Ok(out)
+}
+
+/// Backoff before the single `QueueUnavailable` retry. Zero under test so the
+/// fake-forge suite never sleeps.
+#[cfg(not(test))]
+const ENQUEUE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(test)]
+const ENQUEUE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::ZERO;
+
+/// Enqueue, retrying once after a short backoff when the forge answers
+/// `QueueUnavailable` right after the head-status post (a GitHub-side lag
+/// between the status write and the merge requirements being re-evaluated,
+/// #13357). Any other error class, and a second `QueueUnavailable`, are
+/// returned unchanged for the caller's rollback.
+fn enqueue_with_retry(
+    api: &dyn QueueApi,
+    pr: u32,
+    approved_sha: &str,
+) -> Result<EnqueueOutcome, QueueError> {
+    match ops::enqueue(api, pr, approved_sha) {
+        Err(QueueError::QueueUnavailable { detail }) => {
+            log::warn!(
+                "merge-queue: enqueue of #{pr} refused as QueueUnavailable ({detail}); retrying (attempt 2 of 2)"
+            );
+            std::thread::sleep(ENQUEUE_RETRY_BACKOFF);
+            ops::enqueue(api, pr, approved_sha)
+        }
+        other => other,
+    }
 }
 
 /// The PR is open, queued at `approved_sha`, and a live grant covers that same

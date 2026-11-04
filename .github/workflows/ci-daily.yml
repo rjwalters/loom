@@ -178,18 +178,6 @@ jobs:
         # #11198: host-export-queries.sql queries 1-3 and the host-export-silent
         # alert, run verbatim (roster substituted) over a fixture.
         run: cargo test --package loom-daemon --features otlp --test signoz_host_export_queries -- --ignored --nocapture
-      - name: "Ignored: SigNoz replay reconstruction against a real pinned ClickHouse"
-        if: ${{ !cancelled() }}
-        # #11125: replay-queries.sql queries 1-3. Only this run shows an issue
-        # removed, re-added and removed again stays deleted, and that a lost delta or
-        # missing anchor/chunk makes that host unknown instead of rebuilding wrong state.
-        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
-      - name: "Ignored: telemetry-replay against the replay fixture store"
-        if: ${{ !cancelled() }}
-        # #11127: `telemetry-replay --as-of` runs the same committed queries with its
-        # own parameter binding and reader; only this run shows an uncovered host is
-        # reported `unknown`, not empty.
-        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
       - name: "Ignored: SigNoz CI failed-run log join against a real pinned ClickHouse"
         if: ${{ !cancelled() }}
         # #8528 / #8826: section 5 of ci-queries.sql ("Failed run -> logs"). Only
@@ -227,7 +215,7 @@ jobs:
         # up here days before release day instead of on it.
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
@@ -306,7 +294,7 @@ jobs:
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # cargo-audit
         with:
           tool: cargo-audit
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
       # deny.toml has existed since the repo's early days and NO job has ever
@@ -554,6 +542,27 @@ jobs:
           git config --global user.name "Loom CI"
       - name: Assert the wired/excluded manifest invariant (#4455)
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
+      - name: Fetch pinned Repo Skills guard (#13324)
+        # tests/hooks/test-guard-cross-tool-champion.sh exits 3 (INCOMPLETE, by
+        # design) without LOOM_GUARD_CANONICAL. Same pinned tag + sha256 as the
+        # "Fetch pinned Repo Skills guard (#13269)" step in ci.yml -- bump both
+        # together. A fetch failure or hash mismatch fails the job (never a
+        # skip). sha256sum is absent on stock macOS, hence the shasum fallback.
+        env:
+          REPO_SKILLS_TAG: v0.24.9
+          REPO_SKILLS_GUARD_SHA256: d2108860006844a4fb4dddf6aadfe68af10d84eb346a1ffc214bcbcd40d11f3b
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/repo-skills-guard/guard-destructive.sh"
+          mkdir -p "$(dirname "$dest")"
+          curl -fsSL --retry 3 -o "$dest" \
+            "https://raw.githubusercontent.com/rjwalters/repo/${REPO_SKILLS_TAG}/hooks/repo/guard-destructive.sh"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${REPO_SKILLS_GUARD_SHA256}  ${dest}" | sha256sum -c -
+          else
+            echo "${REPO_SKILLS_GUARD_SHA256}  ${dest}" | shasum -a 256 -c -
+          fi
+          echo "LOOM_GUARD_CANONICAL=${dest}" >> "$GITHUB_ENV"
       - name: Ensure a per-suite timeout wrapper (#11964)
         # run-ci-suites.sh bounds each suite only through `timeout`/`gtimeout`
         # and, in CI, now refuses to run without one: with neither, one hung
@@ -574,7 +583,7 @@ jobs:
         run: bash defaults/scripts/tests/run-ci-suites.sh
       - name: Upload the per-suite retry log (#7791)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # #7789's flake data should come from RUNS, not from reading issue
           # titles. ci.yml uploads this too, but only for a sharded 4-wide run;

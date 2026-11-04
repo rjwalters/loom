@@ -8,11 +8,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::authz::HandoffError;
 use super::events::FileEventSink;
 use super::forge::{GroupRun, LifecycleForge, PrSnapshot, RemovalEvent};
 use super::github::{safe_detail, GhQueueApi};
 use super::group_github::{group_transition_line, revoke_for_transition_groups};
-use super::lifecycle::{sweep, Ctx, Reconciled};
+use super::lifecycle::{handoff, reconcile_pr, sweep, Ctx, HandoffFailure, Reconciled};
 use super::mode::{resolve_merge_mode, MergeMode};
 use super::ops::PrState;
 use super::status_command::{self, StatusCommand};
@@ -487,5 +488,72 @@ pub fn revoke_for_root(gh: &Path, root: &Path, pr: u32, reason: &str) -> Option<
         Live::Direct => None,
         Live::Unresolved(why) => Some(unresolved_line(&why)),
         Live::Ran(line) => line,
+    }
+}
+
+/// Where a daemon-owned landing of one PR stands (#13268).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landed {
+    /// The repository is in `direct` mode (or its mode is unresolved): the
+    /// queue has nothing to hand off to.
+    NotQueueMode(String),
+    /// Not authorized yet (no Judge approval at the current head, a hold, a
+    /// claim): nothing was written. Retried on the next pass.
+    Waiting(String),
+    /// Queued at the approved head, or already queued.
+    Queued,
+    /// GitHub reports the PR merged.
+    Merged,
+    /// Refused, dropped or undetermined; the PR is left unauthorized.
+    Failed(String),
+}
+
+/// Hand `pr` in `root` to the merge queue from the daemon itself: the same
+/// guarded [`handoff`] the Champion's `merge-pr.sh` reaches, but with no
+/// installed hook or prompt in the path. The approved head is the PR's
+/// current head; [`handoff`] denies unless a trusted Judge verdict marker and
+/// `loom:pr` cover exactly that head, and the queue's required checks gate
+/// the merge itself.
+#[must_use]
+pub fn land_for_root(gh: &Path, root: &Path, pr: u32) -> Landed {
+    let gh_s = gh.to_string_lossy().to_string();
+    match with_live(gh, root, |ctx, forge| land(ctx, forge, &gh_s, pr)) {
+        Live::Direct => Landed::NotQueueMode("champion.mergeMode is direct".to_string()),
+        Live::Unresolved(why) => Landed::NotQueueMode(why),
+        Live::Ran(landed) => landed,
+    }
+}
+
+fn land(ctx: &Ctx<'_>, forge: &GhLifecycleForge, gh: &str, pr: u32) -> Landed {
+    match reconcile_pr(ctx, pr) {
+        Reconciled::Merged { .. } => return Landed::Merged,
+        Reconciled::StillQueued { .. } => return Landed::Queued,
+        Reconciled::Undetermined(why) => return Landed::Failed(why),
+        Reconciled::Dropped { kind, .. } => {
+            return Landed::Failed(format!("dropped from the queue: {}", kind.as_str()))
+        }
+        Reconciled::Direct => return Landed::NotQueueMode("direct".to_string()),
+        Reconciled::Continue(_) => {}
+    }
+    let head = match forge.snapshot(pr) {
+        Ok(s) if s.state == PrState::Open => s.head_sha,
+        Ok(s) => return Landed::Failed(format!("PR #{pr} is {}", s.state.as_str())),
+        Err(e) => return Landed::Failed(e),
+    };
+    let nwo = forge.nwo();
+    let required = || {
+        super::preflight::github_preflight(gh, &nwo, None)
+            .map(|c| c.required_checks)
+            .map_err(|e| format!("[{}] {e}", e.code()))
+    };
+    match handoff(ctx, pr, &head, &required) {
+        Ok(_) => Landed::Queued,
+        Err(HandoffFailure::Authz(HandoffError::Denied(why))) => Landed::Waiting(
+            why.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        Err(e) => Landed::Failed(e.to_string()),
     }
 }

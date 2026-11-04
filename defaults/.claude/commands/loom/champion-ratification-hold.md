@@ -18,7 +18,7 @@ Rationale: `.loom/docs/ratification-hold.md`.
   `loom-daemon champion-hold ratification --pr N`. Never re-derive it, and never
   replace it with merge-risk judgment (that is the observed miss: it would have
   merged a private design repo's spec PR). It holds when a file the PR adds, modifies
-  or renames under `spec/**`, `decisions/**`, `docs/decisions/**`,
+  or renames under `spec/**`, `ratification/**`, `decisions/**`, `docs/decisions/**`,
   `*decision*.md` (or a `champion.ratificationPaths` glob) carries a
   ratification phrase at the head. A repo extends the phrases with
   `champion.ratificationPhrases`; it can never remove a built-in. A PR that only
@@ -39,6 +39,8 @@ Rationale: `.loom/docs/ratification-hold.md`.
 - Fail closed: a candidate file whose head content cannot be read is never
   `clear`. With no hold standing the tick defers (no merge, no marker); with one
   standing it stays.
+
+A held PR that goes CONFLICTING is served by Doctor, hold intact (#13505): Doctor resolves and pushes, leaves `loom:blocked` and `loom:pr` on, and Judge re-reviews the new head; the operator then ratifies a clean head.
 
 ## The state machine
 

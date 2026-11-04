@@ -130,6 +130,10 @@ pub enum CoverageRefusal {
     /// repo: the reader is blind to it. Withdraw it for the repo (the
     /// coverage scope) and try the next reader.
     Withdraw,
+    /// A plain `404` from a reader with no evidence at all (typically a
+    /// restart emptied the served map): withdraw it for the repo only for
+    /// [`crate::forge_read_pool::DEFAULT_WITHDRAWAL`] ([`super::Failure::CoverageUnproven`]).
+    WithdrawUnproven,
 }
 
 /// Judge a reader's coverage refusal of `owner_repo` (see
@@ -164,7 +168,7 @@ pub fn judge_coverage(
     if reader_recently_served_repo(app_id, owner_repo, now) {
         CoverageRefusal::Shed
     } else {
-        CoverageRefusal::Withdraw
+        CoverageRefusal::WithdrawUnproven
     }
 }
 
@@ -215,14 +219,14 @@ mod tests {
 
     #[test]
     fn only_a_covered_item_scoped_404_is_an_answer() {
-        use CoverageRefusal::{Answer, Shed, Withdraw};
+        use CoverageRefusal::{Answer, Shed, Withdraw, WithdrawUnproven};
         let now = SystemTime::now();
         let (app, repo) = ("w6-answer-1", "acme/app-answer");
         let j = |family: &str, item: bool, status: Option<u16>, stderr: &str| {
             judge_coverage(app, repo, family, item, status, stderr, now)
         };
-        // No evidence at all: the reader is blind to the repo.
-        assert_eq!(j("pulls", true, Some(404), ""), Withdraw);
+        // No evidence at all: withdrawn, but only briefly (#12511).
+        assert_eq!(j("pulls", true, Some(404), ""), WithdrawUnproven);
         note_reader_served(app, repo, "pulls", now);
         assert_eq!(j("pulls", true, Some(404), ""), Answer);
         // A plain 404 from a reader that sees the repo, but no proof for
@@ -238,13 +242,19 @@ mod tests {
         let gql = "GraphQL: Could not resolve to a Repository with the name 'acme/app-answer'.";
         assert_eq!(j("pulls", true, Some(404), gql), Withdraw);
         // Another repo, another app, stale evidence: none.
-        assert_eq!(judge_coverage(app, "acme/other", "pulls", true, Some(404), "", now), Withdraw);
+        assert_eq!(
+            judge_coverage(app, "acme/other", "pulls", true, Some(404), "", now),
+            WithdrawUnproven
+        );
         assert_eq!(
             judge_coverage("w6-answer-2", repo, "pulls", true, Some(404), "", now),
-            Withdraw
+            WithdrawUnproven
         );
         let later = now + ITEM_SCOPED_EVIDENCE + Duration::from_secs(1);
-        assert_eq!(judge_coverage(app, repo, "pulls", true, Some(404), "", later), Withdraw);
+        assert_eq!(
+            judge_coverage(app, repo, "pulls", true, Some(404), "", later),
+            WithdrawUnproven
+        );
     }
 
     #[test]

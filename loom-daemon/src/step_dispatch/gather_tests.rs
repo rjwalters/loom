@@ -524,3 +524,15 @@ mod author_gate_held {
         assert_eq!(hold_author_gated(&mut items, &gates, &revs, Some(TRUST)), 0);
     }
 }
+
+/// #13244: the tracker marker counts alone on a line, outside a code fence.
+#[test]
+fn the_tracker_marker_must_be_its_own_line_outside_a_fence() {
+    assert!(has_tracker_marker(Some("hub\n<!-- loom:tracker -->\n- [ ] #1")));
+    assert!(has_tracker_marker(Some("  <!-- loom:tracker -->  ")));
+    assert!(!has_tracker_marker(Some("see <!-- loom:tracker --> inline")));
+    assert!(!has_tracker_marker(Some("> <!-- loom:tracker -->")));
+    assert!(!has_tracker_marker(Some("```\n<!-- loom:tracker -->\n```")));
+    assert!(!has_tracker_marker(Some("no marker here")));
+    assert!(!has_tracker_marker(None));
+}

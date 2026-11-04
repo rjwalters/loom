@@ -50,7 +50,6 @@ fn edge_2_after_1(follower_head: &str) -> SequenceEdge {
         pred_head: sha(1),
         follower_head: follower_head.to_string(),
         plan: "seq-bbbb1111".to_string(),
-        reason: super::super::EdgeReason::SharedFiles,
     }
 }
 
@@ -368,6 +367,7 @@ fn setup(
             .created("2026-10-02T00:00:01Z")
             .updated(&now),
         row(2, labels2)
+            .base("feature/issue-1")
             .sha(head2)
             .created("2026-10-02T00:00:02Z")
             .updated(&now),
@@ -385,10 +385,7 @@ fn setup(
         .map(|i| serde_json::json!({"filename": format!("f{i}.rs")}))
         .collect();
     write(d, "compare.json", &serde_json::json!({"status": "ahead", "files": files}));
-    let apply = super::super::apply_comment_body(
-        &marker_2_after_1(),
-        super::super::EdgeReason::SharedFiles,
-    );
+    let apply = super::super::apply_comment_body(&marker_2_after_1());
     write(d, "comments-2.json", &comments(&[apply]));
     crate::forge_pull_listing::parse_rest_pulls(&listing(&rows)).unwrap()
 }
@@ -428,31 +425,6 @@ fn operator_removed(d: &std::path::Path, actor: &str) {
 /// loom:sequenced` event, then re-dated with a tree-identical commit, is
 /// not re-sequenced on the next pass — and stays released after that.
 #[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn an_operator_release_survives_a_tree_identical_re_date() {
-    let dir = tempfile::tempdir().unwrap();
-    let d = dir.path();
-    let listing = setup(d, &redated(), &["loom:pr"], 0);
-    operator_removed(d, "rjwalters");
-
-    let (stats, calls) = tick(d, &listing);
-    assert_eq!(stats.applied, 0, "{calls}");
-    assert!(!calls.contains("--add-label"), "not re-sequenced:\n{calls}");
-    assert!(!calls.contains("Landing order recorded"), "{calls}");
-    assert!(calls.contains(&record_text(1, &sha(2))), "the release is recorded:\n{calls}");
-
-    // Next tick, with the record on the thread: no history read, no writes.
-    let apply = super::super::apply_comment_body(
-        &marker_2_after_1(),
-        super::super::EdgeReason::SharedFiles,
-    );
-    write(d, "comments-2.json", &comments(&[apply, record_comment_body(1, &sha(2))]));
-    let (stats, calls) = tick(d, &listing);
-    assert_eq!(stats.applied, 0, "{calls}");
-    assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
-    assert!(!calls.contains("issues/2/timeline"), "the record answers:\n{calls}");
-}
 
 /// The controls for acceptance 1: a fleet removal, a changed tree, and an
 /// unreadable label history all keep today's behavior (re-sequenced).

@@ -2386,3 +2386,35 @@ pub(crate) fn write_local_cfg(dir: &Path, body: &str) {
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
 }
+
+/// A registry whose `gh` is `script` and whose forge probes are NOT skipped
+/// (the fixture registries set `skip_label_flip`, which suppresses every real
+/// forge read on the outcome-journal path by design). Journals are confined to
+/// `ws`. Shared by the `outcome_journal` sibling test files.
+pub(crate) fn forge_probing_registry(ws: &Path, script: &str) -> SweepRegistry {
+    let fake_gh = ws.join("fake-gh-forge-probing.sh");
+    std::fs::write(&fake_gh, script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    config.outcomes_journal_path = Some(ws.join("test-sweep-outcomes.jsonl"));
+    config.outcome_telemetry_path = Some(ws.join("test-sweep-outcome-telemetry.jsonl"));
+    SweepRegistry::new(config)
+}

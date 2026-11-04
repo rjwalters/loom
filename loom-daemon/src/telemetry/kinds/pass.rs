@@ -1,38 +1,25 @@
-//! `pass.summary` and `pass.verdict` (#10752): what a pass over forge
-//! artifacts did, once per pass and once per artifact it decided.
+//! `pass.verdict` (#10752): one artifact's verdict in a pass over forge
+//! artifacts: repo#n, the verdict and its reason, the blockers with the state
+//! the pass read, and the labels it changed. `role` is empty for a daemon
+//! pass. A role's verdicts (Guide's unblock outcomes, Champion's promotion
+//! verdicts) fit the same record with `role` set and their own `mechanism`,
+//! `verdict` and `reason` vocabulary. `pass.summary` (the per-pass rollup) was
+//! retired in #12094: nothing emitted it after the `loom:blocked` release pass
+//! went (#12108).
 //!
-//! Before these kinds, the `loom:blocked` release pass (#10556) left one local
-//! `log::info!` line per pass and nothing in SigNoz, so "how often did it run,
-//! what did it release, what did it skip and why" had no answer. The two
-//! records are shaped for any pass that decides per artifact, not only that
-//! one:
-//!
-//! - **`pass.summary`**, one per pass per workspace: the `mechanism`, repo,
-//!   host, deciding build, mode, outcome, counts by verdict and by skip reason,
-//!   whether the write cap was hit, the duration and the GitHub calls the pass
-//!   made.
-//! - **`pass.verdict`**, one per artifact: repo#n, the verdict and its reason,
-//!   the blockers with the state the pass read, and the labels it changed.
-//!   `role` is empty for a daemon pass. A role's verdicts (Guide's unblock
-//!   outcomes, Champion's promotion verdicts) fit the same record with `role`
-//!   set and their own `mechanism`, `verdict` and `reason` vocabulary.
-//!
-//! `mechanism` is the pass's `forge_call_stats` caller, so a
-//! pass, its verdicts and its forge cost join on one string.
+//! `mechanism` is the pass's `forge_call_stats` caller.
 //!
 //! **OTLP only**, like the other post-#8921 log kinds. The body is the
 //! record's JSON; the scalars ride as `loom.pass.*` attributes plus the shared
 //! `loom.repo` / `loom.role` ([`PASS_LOG_ATTRIBUTE_KEYS`], which the
 //! collector's log `keep_keys` must list; contract-tested).
 
-use std::collections::BTreeMap;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::telemetry::provenance::Provenance;
 
-/// Every `loom.pass.*` log attribute key the two kinds export. The
+/// Every `loom.pass.*` log attribute key the kind exports. The
 /// collector's `transform/privacy` log `keep_keys` must list each one
 /// (`defaults/observability/collector/config.yaml`, contract-tested).
 /// `loom.repo` and `loom.role` are shared keys already on that list.
@@ -40,18 +27,6 @@ pub const PASS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pass.id",
     "loom.pass.mechanism",
     "loom.pass.mode",
-    "loom.pass.outcome",
-    "loom.pass.examined",
-    "loom.pass.verdicts",
-    "loom.pass.skip_reasons",
-    "loom.pass.skipped",
-    "loom.pass.write_cap_hit",
-    "loom.pass.duration_ms",
-    "loom.pass.github_calls",
-    "loom.pass.github_writes",
-    "loom.pass.github_not_modified",
-    "loom.pass.verdicts_emitted",
-    "loom.pass.verdicts_unchanged",
     "loom.pass.version",
     "loom.pass.revision",
     "loom.pass.number",
@@ -77,16 +52,9 @@ pub const PASS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     // #12715: the step's raw reason token.
     "loom.pass.reason_detail",
     "loom.pass.unevaluated_reason",
-    "loom.pass.unevaluated_reasons",
     "loom.pass.budget.bucket",
     "loom.pass.budget.remaining",
     "loom.pass.budget.floor",
-    "loom.pass.budget.core_start",
-    "loom.pass.budget.core_end",
-    "loom.pass.budget.graphql_start",
-    "loom.pass.budget.graphql_end",
-    "loom.pass.budget.core_floor",
-    "loom.pass.budget.graphql_floor",
 ];
 
 /// `repo` value when no forge slug is known. Never a local path (#9442).
@@ -113,60 +81,6 @@ impl PassMode {
     }
 }
 
-/// How the pass as a whole ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PassOutcome {
-    /// It listed the artifacts and decided each one.
-    Completed,
-    /// The repository is archived; nothing was evaluated.
-    Archived,
-    /// Something refused the pass before any artifact was decided (the
-    /// listing failed, the rate-limit breaker, the forge-write scope);
-    /// `refusal` says what.
-    Refused,
-}
-
-impl PassOutcome {
-    /// The wire spelling.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Archived => "archived",
-            Self::Refused => "refused",
-        }
-    }
-}
-
-/// The GitHub executions made inside the pass's caller scope.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GithubSpend {
-    /// `gh` executions (each one an `invoke github` span).
-    pub calls: u64,
-    /// Of those, writes.
-    pub writes: u64,
-    /// Of those, free `304 Not Modified` answers.
-    pub not_modified: u64,
-}
-
-/// The budget readings of one pass (#12036). Start is the probe the pass
-/// already makes; end is the latest reading the forge sent back with an
-/// answer the pass already received, never a fresh probe.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PassBudget {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub core_start: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub core_end: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graphql_start: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graphql_end: Option<u64>,
-    pub core_floor: u64,
-    pub graphql_floor: u64,
-}
-
 /// The budget reading that stopped one artifact (#12036).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassBudgetReading {
@@ -174,53 +88,6 @@ pub struct PassBudgetReading {
     pub bucket: String,
     pub remaining: u64,
     pub floor: u64,
-}
-
-/// One pass over one workspace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PassSummaryRecord {
-    /// Derived, never random: `derived_hex(["loom.pass", mechanism, host,
-    /// repo, started_at])`. Every `pass.verdict` of the pass carries it.
-    pub pass_id: String,
-    /// The pass: its `forge_call_stats` caller (`stale_blocked_release`).
-    pub mechanism: String,
-    /// `owner/repo`, or [`REPO_UNRESOLVED`].
-    pub repo: String,
-    /// The host that ran it.
-    pub host: String,
-    pub mode: PassMode,
-    pub outcome: PassOutcome,
-    /// Why the pass was refused, truncated (only for [`PassOutcome::Refused`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refusal: Option<String>,
-    pub started_at: DateTime<Utc>,
-    /// When it finished; the record's time.
-    pub ended_at: DateTime<Utc>,
-    pub duration_ms: u64,
-    /// Artifacts listed.
-    pub examined: u64,
-    /// Artifacts per verdict, every verdict of the mechanism's vocabulary
-    /// present (zeros included).
-    pub verdicts: BTreeMap<String, u64>,
-    /// Skipped artifacts per reason.
-    pub skipped: BTreeMap<String, u64>,
-    /// Unevaluated artifacts per `unevaluated_reason`, every reason present
-    /// (zeros included) (#12036).
-    #[serde(default)]
-    pub unevaluated_reasons: BTreeMap<String, u64>,
-    /// The budget readings the pass took; a reading it never took is `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<PassBudget>,
-    /// The per-pass write cap left work for the next pass.
-    pub write_cap_hit: bool,
-    pub github: GithubSpend,
-    /// `pass.verdict` records emitted for this pass.
-    pub verdicts_emitted: u64,
-    /// Artifacts whose verdict was unchanged since one already emitted
-    /// within the heartbeat, so no `pass.verdict` was emitted this pass.
-    pub verdicts_unchanged: u64,
-    /// The deciding build.
-    pub loom: Provenance,
 }
 
 /// One blocker of an artifact, with the state the pass read.
@@ -238,9 +105,9 @@ pub struct BlockerState {
 /// One artifact's verdict in one pass (or one role run).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassVerdictRecord {
-    /// The [`PassSummaryRecord::pass_id`] of the pass that decided it.
+    /// The `pass_id` of the pass that decided it.
     pub pass_id: String,
-    /// See [`PassSummaryRecord::mechanism`].
+    /// The pass: its `forge_call_stats` caller.
     pub mechanism: String,
     /// The role that decided it; `None` for a daemon pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]

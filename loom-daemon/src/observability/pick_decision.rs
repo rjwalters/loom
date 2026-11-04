@@ -36,13 +36,11 @@ use crate::step_dispatch::item_draw::{
     pool_weights, DrawRecord, Exclusion, ItemDraw, PoolRow, ITEM_DRAW_SEED_SCHEME,
 };
 use crate::telemetry::kinds::pick_decision::{
-    source, PickAction, PickCandidate, PickDecisionRecord, PickDraw, PickDrawCandidate,
-    PickItemClosure, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickItemPoolEntry,
-    PickItemRepo, PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict,
-    PickViDemotion, PickWorkspaceDraw, WORK_FINDER_ROLE,
+    source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
+    PickDrawCandidate, PickItemClosure, PickItemDraw, PickItemDrawStep, PickItemExclusion,
+    PickItemPoolEntry, PickItemRepo, PickLane, PickQueueSkip, PickSkipReason, PickSortKey,
+    PickTick, PickVerdict, PickViDemotion, PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
-#[cfg(test)]
-use crate::telemetry::kinds::pick_decision::{split_into_chunks, CHUNK_BYTES};
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
 use crate::work_finder::halt_cause::HaltCause;
@@ -161,24 +159,12 @@ fn emit(record: PickDecisionRecord) {
 /// record carries the tick's trace id.
 fn emit_in(record: PickDecisionRecord, context: Option<&crate::telemetry::trace::TraceContext>) {
     if let Some(sink) = super::ops::global_ops_sink() {
-        let sink_dir = super::pick_payload_archive::LocalDirSink::from_env();
-        export_summary(sink, &sink_dir, record, context);
+        // A record over the byte budget is split, never truncated (#11567):
+        // the chunks share `tick_id` and their union is the original.
+        for chunk in split_into_chunks(record, CHUNK_BYTES) {
+            sink.emit_record_in(TelemetryRecord::PickDecision(chunk), context.cloned());
+        }
     }
-}
-
-/// Archive the full `record`, then export only its bounded summary (#12974):
-/// the log stays under the ingest cap and the complete record (the former
-/// chunk union) is fetched by `payload_ref`. The archive is best-effort: on a
-/// failure the summary still exports.
-pub(super) fn export_summary(
-    ops: &super::ops::OpsSink,
-    archive: &dyn super::pick_payload_archive::PickPayloadSink,
-    record: PickDecisionRecord,
-    context: Option<&crate::telemetry::trace::TraceContext>,
-) {
-    let payload_ref = super::pick_payload_archive::archive_record(archive, &record);
-    let summary = record.summarize(&payload_ref);
-    ops.emit_record_in(TelemetryRecord::PickDecision(summary), context.cloned());
 }
 
 /// Always drains the stash (it must not leak into the next tick on this

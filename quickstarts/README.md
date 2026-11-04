@@ -82,8 +82,6 @@ template/
 │   │   ├── builder.md  # Customized for this stack
 │   │   └── judge.md    # Review guidelines
 │   └── scripts/        # Helper scripts
-├── .github/
-│   └── labels.yml      # Loom workflow labels
 ├── README.md           # Template documentation
 └── ...                 # Stack-specific files
 ```
@@ -92,7 +90,7 @@ template/
 
 1. Start with an existing template or create from scratch
 2. Add `.loom/roles/` with customized role definitions
-3. Add `.github/labels.yml` with Loom labels
+3. Let the Loom installer provide `.github/labels.yml` (the canonical labels; don't hand-copy it)
 4. Include comprehensive README with setup instructions
 5. Test the complete workflow (create issue → build → PR → review)
 

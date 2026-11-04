@@ -392,3 +392,28 @@ fn overflowing_weights_saturate_and_are_not_reported_empty() {
     assert!(!drawn.record.diagnostic_suffix().contains("EMPTY"));
     assert_eq!(drawn.order.len(), 2);
 }
+
+#[test]
+fn an_empty_table_is_reported_once_per_root_and_again_when_it_changes() {
+    let empty = |exclude: &[&str]| {
+        let config = layers(&[(
+            Layer::RepoConfig,
+            json!({"runtimes": {"excludeProviders": exclude,
+                "roleDraw": {"judge": [{"attempt": 1, "draw": {"codex": 100, "claude": 0}}]}}}),
+        )]);
+        config.effective(config.table_for("judge", 1).unwrap())
+    };
+    let root_a = Path::new("/tmp/role-draw-dedup-a-13463");
+    let root_b = Path::new("/tmp/role-draw-dedup-b-13463");
+    let table = empty(&["codex"]);
+    assert!(table.active.is_empty());
+    assert!(empty_table_first_sighting(root_a, "judge", 1, &table));
+    assert!(!empty_table_first_sighting(root_a, "judge", 1, &table));
+    // A different root with the identical table logs separately.
+    assert!(empty_table_first_sighting(root_b, "judge", 1, &table));
+    // A changed exclusion set changes the table hash and re-logs once.
+    let changed = empty(&["codex", "claude"]);
+    assert!(changed.active.is_empty());
+    assert!(empty_table_first_sighting(root_a, "judge", 1, &changed));
+    assert!(!empty_table_first_sighting(root_a, "judge", 1, &changed));
+}

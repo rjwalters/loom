@@ -139,7 +139,7 @@ fn group_by_parses_the_six_documented_dimensions() {
 /// the only one that can tell a flat-rate coding plan from a metered endpoint
 /// reached through the same runtime.
 #[test]
-fn an_explicit_tap_stamp_is_used_verbatim() {
+fn a_recorded_tap_stamp_is_used_verbatim() {
     let mut stamped = record("s1", "o/r", None, SweepResult::Success, 100);
     stamped
         .config

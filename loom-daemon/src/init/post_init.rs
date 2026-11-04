@@ -218,7 +218,6 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/locks/",
     ".loom/signals/",
     // #11284: per-dispatch runtime/modelProfile tap records (daemon-written).
-    ".loom/sweep-dispatch-tap/",
     ".loom/status/",
     ".loom/retry-state/",
     ".loom/exit-codes/",
@@ -377,7 +376,12 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // `defaults/scripts/check-main-clean.sh` lists it for the same reason —
     // the two defenses are independent, since this one only reaches a consumer
     // repo after a resync while that one holds immediately.
-    ".loom-local/",
+    //
+    // Root-anchored on purpose: an unanchored `.loom-local/` matches at any
+    // depth and would also ignore Loom's own tracked test fixtures under
+    // `.loom/scripts/tests/fixtures/config_resolver/.loom-local/` (#13549).
+    // `config_resolver.rs` only reads the overlay at `<repo_root>/.loom-local/`.
+    "/.loom-local/",
 ];
 
 /// The credential-bearing subset of [`EPHEMERAL_PATTERNS`] (#8005) — paths that
@@ -951,7 +955,7 @@ mod tests {
         // #8075: the host-local config overlay must be ignored in consumer
         // repos, else `check-main-clean.sh --quarantine` can stash it away
         // mid-sweep and silently revert a per-repo model override.
-        assert!(contents.contains(".loom-local/"));
+        assert!(contents.contains("\n/.loom-local/\n"));
 
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
@@ -1189,6 +1193,7 @@ mod tests {
         assert_eq!(contents.matches(".loom/gh-config-by-owner/").count(), 1);
         // #8075: the host-local config overlay must not duplicate across runs.
         assert_eq!(contents.matches(".loom-local/").count(), 1);
+        assert_eq!(contents.matches("\n/.loom-local/\n").count(), 1);
     }
 
     #[test]
@@ -1277,7 +1282,7 @@ mod tests {
             // Ignored in loom's own source .gitignore long before it reached
             // this list, which is exactly the drift that left every consumer
             // repo's overlay eligible for a quarantine stash.
-            ".loom-local/",
+            "/.loom-local/",
         ];
 
         for pattern in &expected {
@@ -1716,6 +1721,32 @@ mod tests {
         update_gitignore(tmp.path()).unwrap();
         let again = fs::read_to_string(&gitignore).unwrap();
         assert_eq!(contents, again, "second refresh must be a byte-identical no-op");
+    }
+
+    #[test]
+    fn refresh_replaces_unanchored_loom_local_with_anchored_rule() {
+        // #13549: a block written by an older binary carries the unanchored
+        // `.loom-local/`, which also ignores Loom's tracked test fixtures.
+        // A refresh must replace it with `/.loom-local/` — no duplicate, no
+        // leftover unanchored line.
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+        let old_block = format!(
+            "{begin}\n{header}\n.loom-in-use\n.loom-local/\n{end}",
+            begin = GITIGNORE_BEGIN_MARKER,
+            header = GITIGNORE_BLOCK_HEADER,
+            end = GITIGNORE_END_MARKER,
+        );
+        fs::write(&gitignore, format!("node_modules/\n{old_block}\n")).unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        assert_eq!(contents.lines().filter(|l| *l == "/.loom-local/").count(), 1);
+        assert_eq!(contents.lines().filter(|l| *l == ".loom-local/").count(), 0);
+
+        update_gitignore(tmp.path()).unwrap();
+        assert_eq!(contents, fs::read_to_string(&gitignore).unwrap());
     }
 
     #[test]

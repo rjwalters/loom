@@ -14,19 +14,7 @@ use super::*;
 use crate::worktree_cli::branch_landed::{ForgeProbe, ForgeStatus};
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    crate::worktree_cli::test_support::git(dir, args);
 }
 
 fn rev(dir: &Path, r: &str) -> String {
@@ -197,13 +185,14 @@ fn age_is_whole_days_and_never_underflows() {
 #[test]
 fn warning_names_ahead_behind_age_and_goes_loud_past_the_threshold() {
     let o = opts(Path::new("/x"), false);
-    let old = now_secs() - 30 * 86_400;
+    let old = crate::script_helpers::now_epoch_secs() - 30 * 86_400;
     let msg = divergence_warning(&o, 2, 40, Some(old));
     assert!(msg.contains("has diverged from main"), "{msg}");
     assert!(msg.contains("2 commit(s) ahead, 40 behind"), "{msg}");
     assert!(msg.contains("30 day(s) old"), "{msg}");
     assert!(msg.contains("WARNING"), "{msg}");
-    let fresh = divergence_warning(&o, 2, 1, Some(now_secs() - 86_400));
+    let fresh =
+        divergence_warning(&o, 2, 1, Some(crate::script_helpers::now_epoch_secs() - 86_400));
     assert!(!fresh.contains("WARNING"), "{fresh}");
 }
 

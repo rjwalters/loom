@@ -12,39 +12,7 @@
 use super::*;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
-
-/// A registry whose `gh` is `script` and whose forge probes are NOT skipped
-/// (the fixture registries set `skip_label_flip`, which suppresses every real
-/// forge read on this path by design). Journals are confined to `ws`.
-fn timeline_registry(ws: &Path, script: &str) -> SweepRegistry {
-    let fake_gh = ws.join("fake-gh-timeline.sh");
-    std::fs::write(&fake_gh, script).unwrap();
-    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fake_gh, perms).unwrap();
-    if let Ok(f) = std::fs::File::open(&fake_gh) {
-        let _ = f.sync_all();
-    }
-
-    let scripts_dir = ws.join(".loom").join("scripts");
-    std::fs::create_dir_all(&scripts_dir).unwrap();
-    let spawn = scripts_dir.join("spawn-claude.sh");
-    std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
-    sperms.set_mode(0o755);
-    std::fs::set_permissions(&spawn, sperms).unwrap();
-
-    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
-    config.spawn_bin = Some(spawn);
-    config.gh_bin = Some(fake_gh);
-    config.skip_label_flip = false;
-    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
-    config.outcomes_journal_path = Some(ws.join("test-sweep-outcomes.jsonl"));
-    config.outcome_telemetry_path = Some(ws.join("test-sweep-outcome-telemetry.jsonl"));
-    SweepRegistry::new(config)
-}
 
 /// A fake `gh` whose timeline endpoint answers with `rows` (already in the
 /// `<rfc3339>\t<label>` shape the module's own `--jq` projects). `repo view`
@@ -155,7 +123,7 @@ fn records_judge_verdicts_and_doctor_cycles_from_the_label_timeline() {
                 2026-09-18T12:30:00Z\tloom:changes-requested\n\
                 2026-09-18T13:00:00Z\tloom:review-requested\n\
                 2026-09-18T13:30:00Z\tloom:pr\n";
-    let mut registry = timeline_registry(dir.path(), &gh_timeline_ok(rows));
+    let mut registry = forge_probing_registry(dir.path(), &gh_timeline_ok(rows));
     let issue = 8222;
     let sweep_id = insert_sweep_with_pr(&mut registry, issue, 8299);
 
@@ -204,7 +172,7 @@ fn a_daemon_base_conflict_flag_is_not_recorded_as_a_judge_rejection() {
                 2026-09-18T12:10:02Z\tloom:merge-conflict\n\
                 2026-09-18T12:40:00Z\tloom:review-requested\n\
                 2026-09-18T13:00:00Z\tloom:pr\n";
-    let mut registry = timeline_registry(dir.path(), &gh_timeline_ok(rows));
+    let mut registry = forge_probing_registry(dir.path(), &gh_timeline_ok(rows));
     let issue = 9062;
     let sweep_id = insert_sweep_with_pr(&mut registry, issue, 9061);
 
@@ -239,7 +207,7 @@ fn a_first_pass_approval_is_readable_off_the_record_alone() {
     let dir = tempdir().unwrap();
     let rows = "2026-09-18T12:00:00Z\tloom:review-requested\n\
                 2026-09-18T12:30:00Z\tloom:pr\n";
-    let mut registry = timeline_registry(dir.path(), &gh_timeline_ok(rows));
+    let mut registry = forge_probing_registry(dir.path(), &gh_timeline_ok(rows));
     let issue = 8223;
     let sweep_id = insert_sweep_with_pr(&mut registry, issue, 8300);
 
@@ -269,7 +237,7 @@ fn a_first_pass_approval_is_readable_off_the_record_alone() {
 #[serial]
 fn a_failing_timeline_fetch_omits_both_fields_and_still_writes_the_record() {
     let dir = tempdir().unwrap();
-    let mut registry = timeline_registry(dir.path(), &gh_timeline_failing());
+    let mut registry = forge_probing_registry(dir.path(), &gh_timeline_failing());
     let issue = 8224;
     let sweep_id = insert_sweep_with_pr(&mut registry, issue, 8301);
 
@@ -309,7 +277,7 @@ fn a_failing_timeline_fetch_omits_both_fields_and_still_writes_the_record() {
 #[serial]
 fn a_sweep_with_no_pr_omits_both_fields() {
     let dir = tempdir().unwrap();
-    let mut registry = timeline_registry(dir.path(), &gh_timeline_ok(""));
+    let mut registry = forge_probing_registry(dir.path(), &gh_timeline_ok(""));
     let issue = 8225;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-2", "log\n");
 
@@ -337,7 +305,7 @@ fn a_sweep_with_no_pr_omits_both_fields() {
 fn an_observed_timeline_with_no_verdict_reports_empty_not_absent() {
     let dir = tempdir().unwrap();
     let rows = "2026-09-18T12:00:00Z\tloom:review-requested\n";
-    let mut registry = timeline_registry(dir.path(), &gh_timeline_ok(rows));
+    let mut registry = forge_probing_registry(dir.path(), &gh_timeline_ok(rows));
     let issue = 8226;
     let sweep_id = insert_sweep_with_pr(&mut registry, issue, 8302);
 
@@ -375,8 +343,10 @@ fn a_loom_repo_override_is_passed_as_the_gh_repo_env_var() {
     let dir = tempdir().unwrap();
     let rows = "2026-09-18T12:00:00Z\tloom:review-requested\n\
                 2026-09-18T12:30:00Z\tloom:pr\n";
-    let mut registry =
-        timeline_registry(dir.path(), &gh_timeline_requiring_gh_repo_env(rows, "rjwalters/loom"));
+    let mut registry = forge_probing_registry(
+        dir.path(),
+        &gh_timeline_requiring_gh_repo_env(rows, "rjwalters/loom"),
+    );
     let issue = 8228;
     let sweep_id = insert_sweep_with_pr(&mut registry, issue, 8304);
 

@@ -134,6 +134,7 @@ fn an_unchanged_hold_reads_its_marker_and_predecessor_once() {
                 .created("2026-10-01T00:00:00Z")
                 .updated(at),
             row(2, &[SEQUENCE_LABEL])
+                .base("feature/issue-1")
                 .created("2026-10-02T00:00:00Z")
                 .updated(at),
             row(3, &[]).created("2026-10-03T00:00:00Z").updated(at),
@@ -192,8 +193,11 @@ fn a_predecessor_outside_the_listing_is_never_served_from_cache() {
     std::fs::create_dir_all(&root).unwrap();
     let sha = |n: u32| format!("{n:040x}");
     let day = |n: u32| format!("2026-10-0{n}T00:00:00Z");
+    // PR 2 is stacked on PR 1: only stacked pairs are ordered (#12775).
     let r = |n: u32, labels: &[&str]| {
+        let base = if n == 2 { "feature/issue-1" } else { "main" };
         row(n, labels)
+            .base(base)
             .created(&day(n))
             .updated("2026-10-04T00:00:00Z")
     };

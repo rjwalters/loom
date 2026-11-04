@@ -19,6 +19,7 @@ fn split_roster() -> Roster {
         ],
         legacy_logins: vec!["loom-fleet-dispatch-0".to_string()],
         writers: Vec::new(),
+        load_failed: false,
     }
 }
 
@@ -206,6 +207,7 @@ fn a_fresh_reader_dir_is_used_and_a_near_expiry_one_is_not() {
         readers: vec![ident("fresh-1", Some("r1"))],
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     };
     let reader = &r.readers[0];
     let now = SystemTime::now();
@@ -244,6 +246,7 @@ fn a_withdrawn_reader_sends_reads_elsewhere() {
         readers: vec![ident("wd-only", None)],
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     };
     assert!(reader_for(&r, "o/r").is_some());
     withdraw_reader("wd-only", "test");
@@ -284,6 +287,7 @@ fn refresh_publishes_each_reader_for_each_owner_and_withdraws_failures() {
         readers: vec![ident("rf-ok", Some("ok")), ident("rf-bad", Some("bad"))],
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     };
     let expires = (chrono::Utc::now() + chrono::Duration::minutes(55)).to_rfc3339();
     let exp2 = expires.clone();
@@ -438,6 +442,7 @@ fn a_coverage_withdrawal_affects_only_that_repo() {
         readers: vec![ident("cov-a", None), ident("cov-b", None)],
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     };
     // Find two repos that hash to the same reader.
     let first = reader_for(&r, "owner/repo-0").unwrap().app_id.clone();
@@ -532,6 +537,7 @@ fn a_stale_reader_token_yields_to_the_next_reader_not_the_writer() {
         readers: vec![ident("nx-a", None), ident("nx-b", None)],
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     };
     let repo = "Acme/app";
     let first = reader_for(&r, repo).unwrap().clone();

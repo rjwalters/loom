@@ -13,41 +13,8 @@
 use super::*;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use tempfile::tempdir;
-
-/// A registry whose `gh` is `script` and whose forge probes are NOT skipped.
-/// Journals are confined to `ws`. Same shape as `complexity_tests`'
-/// `complexity_registry`, duplicated here rather than shared so each sibling
-/// test file stays self-contained (this crate's existing convention).
-fn disposition_registry(ws: &Path, script: &str) -> SweepRegistry {
-    let fake_gh = ws.join("fake-gh-disposition.sh");
-    std::fs::write(&fake_gh, script).unwrap();
-    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fake_gh, perms).unwrap();
-    if let Ok(f) = std::fs::File::open(&fake_gh) {
-        let _ = f.sync_all();
-    }
-
-    let scripts_dir = ws.join(".loom").join("scripts");
-    std::fs::create_dir_all(&scripts_dir).unwrap();
-    let spawn = scripts_dir.join("spawn-claude.sh");
-    std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
-    sperms.set_mode(0o755);
-    std::fs::set_permissions(&spawn, sperms).unwrap();
-
-    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
-    config.spawn_bin = Some(spawn);
-    config.gh_bin = Some(fake_gh);
-    config.skip_label_flip = false;
-    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
-    config.outcomes_journal_path = Some(ws.join("test-sweep-outcomes.jsonl"));
-    config.outcome_telemetry_path = Some(ws.join("test-sweep-outcome-telemetry.jsonl"));
-    SweepRegistry::new(config)
-}
 
 /// A fake `gh` answering the `{body, state, closed_at, labels}` projection
 /// `complexity_signal` requests. Everything else (the PR timeline, `repo
@@ -113,7 +80,7 @@ fn emit(
 #[serial]
 fn landed_holds_exactly_when_the_record_names_a_pr() {
     let dir = tempdir().unwrap();
-    let mut registry = disposition_registry(dir.path(), &gh_issue_state("open", None, &[]));
+    let mut registry = forge_probing_registry(dir.path(), &gh_issue_state("open", None, &[]));
 
     // --- With a PR: the checkpoint the sweep sampled names one. ---
     let issue = 94_411;
@@ -169,7 +136,7 @@ fn landed_holds_exactly_when_the_record_names_a_pr() {
 #[serial]
 fn a_short_clean_redispatch_is_reported_as_a_noop_not_a_success_landing() {
     let dir = tempdir().unwrap();
-    let mut registry = disposition_registry(dir.path(), &gh_issue_state("open", None, &[]));
+    let mut registry = forge_probing_registry(dir.path(), &gh_issue_state("open", None, &[]));
     let record = emit(&mut registry, 94_430, 41, telemetry::SweepResult::Success, None);
 
     assert_eq!(record.disposition, telemetry::SweepDisposition::NoopAlreadyDone);
@@ -191,7 +158,7 @@ fn an_issue_closed_before_dispatch_is_a_noop_even_after_a_long_run() {
     let dir = tempdir().unwrap();
     let closed_at = (Utc::now() - Duration::from_secs(86_400)).to_rfc3339();
     let mut registry =
-        disposition_registry(dir.path(), &gh_issue_state("closed", Some(&closed_at), &[]));
+        forge_probing_registry(dir.path(), &gh_issue_state("closed", Some(&closed_at), &[]));
     let issue = 94_440;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-1", "log\n");
     registry.entries.get_mut(&sweep_id).unwrap().started_at = Utc::now() - Duration::from_secs(60);
@@ -219,7 +186,7 @@ fn curator_close_and_rescope_reach_the_record() {
     let dir = tempdir().unwrap();
     let closed_at = Utc::now().to_rfc3339();
     let mut closed_registry =
-        disposition_registry(dir.path(), &gh_issue_state("closed", Some(&closed_at), &[]));
+        forge_probing_registry(dir.path(), &gh_issue_state("closed", Some(&closed_at), &[]));
     let issue = 94_450;
     let sweep_id = insert_dead_running_with_log(&mut closed_registry, issue, 0, "agent-1", "log\n");
     closed_registry
@@ -242,8 +209,10 @@ fn curator_close_and_rescope_reach_the_record() {
     );
 
     let rescope_dir = tempdir().unwrap();
-    let mut rescope_registry =
-        disposition_registry(rescope_dir.path(), &gh_issue_state("open", None, &["loom:curated"]));
+    let mut rescope_registry = forge_probing_registry(
+        rescope_dir.path(),
+        &gh_issue_state("open", None, &["loom:curated"]),
+    );
     let issue = 94_451;
     let record = emit(&mut rescope_registry, issue, 600, telemetry::SweepResult::Failure, None);
     assert_eq!(record.disposition, telemetry::SweepDisposition::CuratorRescoped);
@@ -258,7 +227,7 @@ fn curator_close_and_rescope_reach_the_record() {
 fn the_restored_ready_label_is_not_mistaken_for_a_rescope() {
     let dir = tempdir().unwrap();
     let mut registry =
-        disposition_registry(dir.path(), &gh_issue_state("open", None, &["loom:issue"]));
+        forge_probing_registry(dir.path(), &gh_issue_state("open", None, &["loom:issue"]));
     let record =
         emit(&mut registry, 94_460, 1_800, telemetry::SweepResult::Failure, Some("exit-1"));
     assert_ne!(record.disposition, telemetry::SweepDisposition::CuratorRescoped);
@@ -287,7 +256,8 @@ fn a_stale_curated_milestone_never_masks_an_environmental_death() {
         (94_482, vec!["loom:curated", "loom:triage"]),
     ] {
         let dir = tempdir().unwrap();
-        let mut registry = disposition_registry(dir.path(), &gh_issue_state("open", None, &labels));
+        let mut registry =
+            forge_probing_registry(dir.path(), &gh_issue_state("open", None, &labels));
         let record = emit(
             &mut registry,
             issue,
@@ -317,7 +287,7 @@ fn a_stale_curated_milestone_never_masks_an_environmental_death() {
 #[serial]
 fn a_stale_curated_milestone_on_a_claimed_issue_is_not_a_rescope() {
     let dir = tempdir().unwrap();
-    let mut registry = disposition_registry(
+    let mut registry = forge_probing_registry(
         dir.path(),
         &gh_issue_state("open", None, &["loom:curated", "loom:building"]),
     );
@@ -334,7 +304,7 @@ fn a_stale_curated_milestone_on_a_claimed_issue_is_not_a_rescope() {
 #[serial]
 fn an_exhausted_account_is_an_env_failure_carrying_its_own_class() {
     let dir = tempdir().unwrap();
-    let mut registry = disposition_registry(dir.path(), &gh_issue_state("open", None, &[]));
+    let mut registry = forge_probing_registry(dir.path(), &gh_issue_state("open", None, &[]));
     let record = emit(
         &mut registry,
         94_470,
@@ -357,7 +327,7 @@ fn an_exhausted_account_is_an_env_failure_carrying_its_own_class() {
 #[serial]
 fn every_emitted_record_satisfies_both_invariants() {
     let dir = tempdir().unwrap();
-    let mut registry = disposition_registry(dir.path(), &gh_issue_state("open", None, &[]));
+    let mut registry = forge_probing_registry(dir.path(), &gh_issue_state("open", None, &[]));
     let mut issue = 94_500;
     let mut fault_records = 0_usize;
     for result in [
@@ -407,7 +377,7 @@ fn a_pre_9441_journal_line_still_decodes_as_unknown() {
 #[serial]
 fn disposition_is_always_serialized() {
     let dir = tempdir().unwrap();
-    let mut registry = disposition_registry(dir.path(), &gh_issue_state("open", None, &[]));
+    let mut registry = forge_probing_registry(dir.path(), &gh_issue_state("open", None, &[]));
     emit(&mut registry, 94_600, 30, telemetry::SweepResult::Success, None);
 
     let path = registry.config().resolve_outcome_telemetry_path();

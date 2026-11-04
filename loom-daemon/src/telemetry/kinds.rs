@@ -178,6 +178,8 @@ pub mod stage_occupancy;
 
 /// `champion.run` (#13029) — what a Champion merge / hold-reevaluate run decided.
 pub mod champion_run;
+/// `completion.narrated` (#13287) — a public-feed completion the narration sink built.
+pub mod completion_narrated;
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `hold.transition` (#12665) — a hold label applied to or removed from a PR.
@@ -229,21 +231,9 @@ pub mod pass;
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
 
-/// `pick.decision` bounded summary (#12974) — the exported form; the full record is archived.
-pub mod pick_summary;
-
-/// `pr.resolved` (#10519) — a PR's merge or close instant, from `fleet.state`.
-pub mod pr_resolved;
-
-/// `eta.stage_outcome` (#10929) — one stage an item left, from `fleet.state`.
-pub mod stage_outcome;
-
+pub mod issue_estimate;
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
-
-/// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
-pub mod fleet_state;
-pub mod issue_estimate;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
 
@@ -437,36 +427,10 @@ macro_rules! telemetry_kind_table {
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
-            /// One host's in-flight items (stage, entered-at, PR, host, slot)
-            /// and per-repo open-PR census (Issue #10196). OTLP-only: the
-            /// replay contract's state record. A full anchor goes out hourly,
-            /// with deltas in between only when something changed. See
-            /// [`fleet_state`].
-            FleetState = "fleet.state" => $crate::telemetry::kinds::fleet_state::FleetStateRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
-
             /// One role tick's (or work-finder tick's) pick decision (Issue #10212):
             /// the ranked candidates it considered, what it acted on, and a
             /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
             PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
-
-            /// A PR that left the review listings, with its forge merge or
-            /// close instant (Issue #10519; produced by `fleet.state` since
-            /// #11126). OTLP-only. See [`pr_resolved`].
-            PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
-
-            /// One stage an item left, with its entry and exit instants (Issue
-            /// #10929; produced by `fleet.state` since #11126). The wire tag
-            /// keeps its `eta.` prefix. OTLP-only. See [`stage_outcome`].
-            StageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::stage_outcome::StageOutcomeRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
-
-            /// One pass over a workspace's artifacts (Issue #10752): mechanism,
-            /// mode, outcome, counts by verdict and skip reason, write cap,
-            /// duration and GitHub calls. OTLP-only. See [`pass`].
-            PassSummary = "pass.summary" => $crate::telemetry::kinds::pass::PassSummaryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One artifact's verdict in a pass (Issue #10752): repo#n, verdict,
@@ -517,6 +481,12 @@ macro_rules! telemetry_kind_table {
             /// A role agent began working an item in a stage (#11641): the
             /// work-start that splits a stay into queue wait and work time.
             WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
+
+            /// One public-feed completion the narration sink built (#13287):
+            /// repo, issue, trigger path and whether tokens rode along.
+            /// OTLP-only. See [`completion_narrated`].
+            CompletionNarrated = "completion.narrated" => $crate::telemetry::kinds::completion_narrated::CompletionNarratedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
             /// One daemon-pass write the #9548 credential-scope gate refused

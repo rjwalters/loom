@@ -6,6 +6,7 @@
 //! connection needs the daemon's own socket, which `loom-daemon status` covers.
 //! `print_calibrate_hint` is bounded and silent on every error.
 
+use crate::fs_util::is_executable;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -271,18 +272,6 @@ pub fn run_host_sleep_check(repo_root: &Path) {
         return;
     }
     let _ = Command::new(&script).status();
-}
-
-fn is_executable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
-    }
 }
 
 /// `loom_host_prevent_sleep_enabled <repo_root>` (#6311).

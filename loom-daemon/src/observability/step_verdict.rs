@@ -18,8 +18,8 @@
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
 //! item to a closed, versioned `(class, reason)`. Registered: `champion`
-//! ([`champion`]), `judge` ([`judge`], #12362), `doctor` ([`doctor`]) and
-//! `curator` ([`curator`], #12921); other roles add theirs (#12029).
+//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921) and `judge` ([`judge`], #13274, #12362);
+//! other roles add theirs (#12029).
 //!
 //! # The ledger's view, record-only
 //!
@@ -158,9 +158,9 @@ pub struct Projector {
 pub fn projector(role: &str) -> Option<Projector> {
     match role {
         "champion" => Some(champion::PROJECTOR),
-        "judge" => Some(judge::PROJECTOR),
         "doctor" => Some(doctor::PROJECTOR),
         "curator" => Some(curator::PROJECTOR),
+        "judge" => Some(judge::PROJECTOR),
         _ => None,
     }
 }

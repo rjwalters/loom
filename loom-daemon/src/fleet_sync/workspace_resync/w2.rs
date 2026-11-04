@@ -8,11 +8,13 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
 use super::memory::FailureKind;
+use super::waiver::Waived;
 use super::{
-    daemon, git, record_failure, refused, stamp, Alert, Candidate, Env, Memory, Scan, WState,
-    WorkspaceReport,
+    daemon, git, record_failure, record_failure_at, refused, stamp, Alert, Candidate, Env, Memory,
+    Scan, WState, WorkspaceReport,
 };
 use crate::fleet_store::resync_claim::{stale_after, Acquire, Claimant, ForgeUnreachable, Held};
+use crate::forge_merge_queue::gh_lifecycle::Landed;
 use crate::init::payload::{gate_metadata, resync_workspace_with, Payload, ResyncOutcome};
 
 // ============================================================================
@@ -253,6 +255,7 @@ pub(super) fn attempt(
             report.state = WState::W0;
             report.reason = None;
             settle_current(env, &root, &candidate.branch, &commit, report, memory);
+            super::supersede::close_superseded(&claimant, env.running, None);
             report.reason = Some("already current once the claim was held; no commit".to_string());
         }
         Ok(Done::NoWrite(state, reason)) => {
@@ -278,9 +281,23 @@ pub(super) fn attempt(
             // so the alert stays raised and the 6 h backoff paces the next
             // look. W0 clears both.
             let pr = number.map_or(url.clone(), |n| format!("#{n} {url}"));
-            let detail =
-                format!("push refused by a branch rule: {rule}; resync pull request open: {pr}");
-            record_failure(env, report, FailureKind::Protected, &detail, memory, &mut scan.alerts);
+            let installed = report.installed.as_deref().unwrap_or("unknown");
+            let detail = format!(
+                "push refused by a branch rule: {rule}; resync pull request open: {pr} \
+                 (installed v{installed}, target v{})",
+                env.running
+            );
+            record_failure_at(
+                env,
+                report,
+                FailureKind::Protected,
+                &detail,
+                memory,
+                &mut scan.alerts,
+                log::Level::Warn,
+            );
+            memory.mark_pr_open(&report.root);
+            super::supersede::close_superseded(&claimant, env.running, number);
         }
         Err(e) => fail_attempt(env, &candidate.nwo, report, &e, memory, scan),
     }
@@ -463,6 +480,7 @@ impl Step<'_, '_> {
         };
         let existing: serde_json::Value = serde_json::from_str(&listed.body).unwrap_or_default();
         if let Some(pr) = existing.as_array().and_then(|a| a.first()) {
+            let rule = self.land_pr(pr_number(pr), rule, false);
             return Ok(Done::PrOpen(pr_number(pr), pr_url(pr), rule));
         }
         match git::push(self.worktree, self.root, &branch) {
@@ -495,7 +513,35 @@ impl Step<'_, '_> {
             Err(e) => return Ok(failed(format!("opening the PR: {e:#}"))),
         };
         let number = pr_number(&pr);
-        if let Some(n) = number {
+        log::info!("workspace_resync: {nwo}: opened resync PR for {new}: {}", pr_url(&pr));
+        let rule = self.land_pr(number, rule, true);
+        Ok(Done::PrOpen(number, pr_url(&pr), rule))
+    }
+
+    /// Land the resync PR on the waiver proof (#13487), or leave it to the
+    /// ordinary lane: `loom:review-requested` (only on a PR this pass opened,
+    /// `label_lane`), then the merge-queue hand-off (#13268). The proof is
+    /// the daemon's own; the host gate is read again first, so a pause or a
+    /// roll that began since the push holds it.
+    fn land_pr(&self, number: Option<u64>, rule: String, label_lane: bool) -> String {
+        let nwo = &self.candidate.nwo;
+        let waived = match number.and_then(|n| u32::try_from(n).ok()) {
+            None => Waived::Lane("no PR number in the reply".to_string()),
+            Some(n) => match (self.env.gate)() {
+                Err(why) => Waived::Held(format!("{} before landing", why.host_note())),
+                Ok(()) => (self.env.waive)(self.root, nwo, n),
+            },
+        };
+        log::info!(
+            "workspace_resync: {nwo}: resync PR {number:?}: {}: {}",
+            waived.word(),
+            waived.reason()
+        );
+        let note = format!("{}: {}", waived.word(), waived.reason());
+        if matches!(waived, Waived::Landed(_)) {
+            return format!("{rule}; {note}");
+        }
+        if let (Some(n), true) = (number, label_lane) {
             // The label Judge and then Champion work from. A failure leaves a
             // PR a person can label; it is not worth abandoning the route.
             let labelled = self.claimant.write.write(
@@ -507,8 +553,31 @@ impl Step<'_, '_> {
                 log::warn!("workspace_resync: {nwo}: could not label resync PR #{n}");
             }
         }
-        log::info!("workspace_resync: {nwo}: opened resync PR for {new}: {}", pr_url(&pr));
-        Ok(Done::PrOpen(number, pr_url(&pr), rule))
+        format!("{}; {note}", self.land(number, rule))
+    }
+
+    /// Hand the open resync PR to the merge queue from the daemon (#13268),
+    /// and say how that stands after `rule`. Never an error: a PR that cannot
+    /// land yet (no Judge approval, a red check) is retried on the next pass,
+    /// and the Champion's installed path stays as the other way in.
+    fn land(&self, number: Option<u64>, rule: String) -> String {
+        let Some(n) = number.and_then(|n| u32::try_from(n).ok()) else {
+            return rule;
+        };
+        let nwo = &self.candidate.nwo;
+        let landed = (self.env.land)(self.root, nwo, n);
+        log::info!("workspace_resync: {nwo}: resync PR #{n}: landing {landed:?}");
+        format!("{rule}; landing: {}", landed_note(&landed))
+    }
+}
+
+fn landed_note(landed: &Landed) -> String {
+    match landed {
+        Landed::NotQueueMode(why) => format!("not handed to a merge queue ({why})"),
+        Landed::Waiting(why) => format!("waiting ({why})"),
+        Landed::Queued => "queued".to_string(),
+        Landed::Merged => "merged".to_string(),
+        Landed::Failed(why) => format!("failed ({why})"),
     }
 }
 

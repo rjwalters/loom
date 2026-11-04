@@ -15,6 +15,7 @@
 //!   under a `MINIMAL_PATH` with stubbed `launchctl`/`systemctl`/`cargo`/
 //!   `gh`/`crontab` in front of it.
 
+pub use crate::fs_util::is_executable;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -75,12 +76,6 @@ pub fn have(name: &str) -> bool {
 #[must_use]
 pub fn uname_s() -> String {
     uname_flag("-s")
-}
-
-/// `uname -m`, or `unknown`.
-#[must_use]
-pub fn uname_m() -> String {
-    uname_flag("-m")
 }
 
 fn uname_flag(flag: &str) -> String {
@@ -212,20 +207,6 @@ pub fn version_output(bin: &Path) -> String {
                 .to_string()
         })
         .unwrap_or_default()
-}
-
-/// `[[ -x "$path" ]]` — exists, is not a directory, and has an execute bit.
-#[must_use]
-pub fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
 }
 
 /// `kill -0 <pid> 2>/dev/null` — is this pid alive and signalable by us?

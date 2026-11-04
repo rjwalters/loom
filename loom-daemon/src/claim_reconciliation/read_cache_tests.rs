@@ -189,8 +189,10 @@ fn unchanged_open_prs_read_their_changed_files_once() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
+    // A stacked chain 1 <- 2 <- 3: only stacked PRs have their files read (#12775).
     let seq_row = |n: u32| {
         row(n, &[])
+            .base(&format!("feature/issue-{}", n - 1))
             .sha(SHA)
             .created(&format!("2026-10-0{n}T00:00:00Z"))
             .updated("2026-10-03T00:00:00Z")

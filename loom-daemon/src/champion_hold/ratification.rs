@@ -40,8 +40,9 @@ pub const HOLD_REASON: &str = "champion ratification hold";
 /// Path globs of the files that can declare ratification. A pattern with a `/`
 /// matches the whole path; one without matches the basename
 /// ([`crate::main_health_gate::glob_matches`]).
-pub const DEFAULT_PATHS: [&str; 4] = [
+pub const DEFAULT_PATHS: [&str; 5] = [
     "spec/**",
+    "ratification/**",
     "decisions/**",
     "docs/decisions/**",
     "*decision*.md",

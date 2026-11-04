@@ -32,6 +32,10 @@ pub enum RemovalKind {
     /// An operator's own dequeue (GitHub's `manual` token); no human decision
     /// is pending, so it is not routed to `loom:operator`.
     Manual,
+    /// GitHub cleared the whole queue (`queue_cleared`): a queue-wide event,
+    /// not a verdict on this PR (e.g. an org-wide plan downgrade making the
+    /// rules unreadable).
+    QueueCleared,
     Unknown,
 }
 
@@ -46,6 +50,7 @@ impl RemovalKind {
             RemovalKind::Timeout => "timeout",
             RemovalKind::HeadChanged => "head-changed",
             RemovalKind::Manual => "manual",
+            RemovalKind::QueueCleared => "queue-cleared",
             RemovalKind::Unknown => "unknown",
         }
     }
@@ -63,6 +68,8 @@ pub fn classify(reason: Option<&str>) -> RemovalKind {
     let any = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
     if t == "manual" {
         RemovalKind::Manual
+    } else if t == "queue cleared" {
+        RemovalKind::QueueCleared
     } else if any(&["merge conflict", "conflicts with", "conflicting"]) {
         RemovalKind::Conflict
     } else if any(&["timed out", "timeout", "time limit"]) {
@@ -91,6 +98,52 @@ pub fn infra_only(runs: &[GroupRun]) -> bool {
         }
     }
     failed > 0
+}
+
+/// Names of the runs that did not succeed, for the revoke comment.
+fn non_success_names(runs: &[GroupRun], pred: impl Fn(&GroupRun) -> bool) -> String {
+    runs.iter()
+        .filter(|r| pred(r))
+        .map(|r| format!("`{}`", r.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Detail line for a `dropped-infra` revoke: the cancelled/timed-out jobs.
+#[must_use]
+pub fn infra_detail(runs: &[GroupRun]) -> String {
+    let names = non_success_names(runs, |r| {
+        matches!(r.conclusion.as_deref(), Some("cancelled" | "timed_out"))
+    });
+    format!("Cancelled or timed-out group job(s): {names}.")
+}
+
+/// Why [`infra_only`] declined a group that had cancelled/timed-out runs, or
+/// `None` when no run was cancelled (a plain failure; nothing to explain).
+#[must_use]
+pub fn infra_decline_reason(runs: &[GroupRun]) -> Option<String> {
+    let is_infra =
+        |r: &GroupRun| matches!(r.conclusion.as_deref(), Some("cancelled" | "timed_out"));
+    if !runs.iter().any(is_infra) {
+        return None;
+    }
+    let cancelled = non_success_names(runs, is_infra);
+    let step_failed = non_success_names(runs, |r| is_infra(r) && r.failed_steps > 0);
+    let real = non_success_names(runs, |r| {
+        matches!(r.conclusion.as_deref(), Some(c) if !is_infra(r)
+            && !matches!(c, "success" | "neutral" | "skipped"))
+    });
+    let pending = non_success_names(runs, |r| r.conclusion.is_none());
+    let why = if !step_failed.is_empty() {
+        format!("a step of {step_failed} ended `failure`, so it is not a runner loss")
+    } else if !real.is_empty() {
+        format!("{real} ended with a real failure")
+    } else if !pending.is_empty() {
+        format!("{pending} was still running")
+    } else {
+        "the group's check runs were not infrastructure-only".to_string()
+    };
+    Some(format!("Infra refinement declined (cancelled/timed-out: {cancelled}): {why}."))
 }
 
 /// Label transition for a removal.
@@ -132,6 +185,13 @@ pub fn route(kind: RemovalKind) -> Route {
             handler: "Labels unchanged: the PR was dequeued manually, so no human decision is \
                       pending; the next Champion pass decides whether to re-enqueue.",
         },
+        RemovalKind::QueueCleared => Route {
+            add: Vec::new(),
+            remove: Vec::new(),
+            handler: "Not a verdict on this PR: GitHub cleared the whole merge queue, so \
+                      `loom:pr` is kept and the next Champion pass re-checks the current head \
+                      and re-enqueues it as usual.",
+        },
         RemovalKind::HeadChanged => Route {
             add: Vec::new(),
             remove: Vec::new(),
@@ -149,14 +209,20 @@ pub fn route(kind: RemovalKind) -> Route {
 
 /// Explanation posted with the revoke marker for a drop.
 #[must_use]
-pub fn drop_prose(kind: RemovalKind, raw: Option<&str>, removed_at: Option<&str>) -> String {
+pub fn drop_prose(
+    kind: RemovalKind,
+    raw: Option<&str>,
+    removed_at: Option<&str>,
+    detail: Option<&str>,
+) -> String {
     let said = match raw.map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => format!("GitHub's removal reason, verbatim: \"{}\".", t.replace('"', "'")),
         None => "GitHub recorded no removal reason.".to_string(),
     };
     let when = removed_at.map_or_else(String::new, |w| format!(" at {w}"));
+    let detail = detail.map_or_else(String::new, |d| format!("\n\n{d}"));
     format!(
-        "GitHub removed this PR from the merge queue{when}. {said} Classified as **{}**{}.\n\n{}",
+        "GitHub removed this PR from the merge queue{when}. {said} Classified as **{}**{}.{detail}\n\n{}",
         kind.as_str(),
         if kind == RemovalKind::Unknown {
             " (unknown: not one of the reasons Loom recognises)"

@@ -171,7 +171,7 @@ pub enum ConflictAction {
     /// A conflicting `loom:pr` PR that is operator-held or sequenced: add
     /// `loom:merge-conflict` only (#12041) — no comment, no state change.
     LabelOnly,
-    /// A mergeable held/sequenced `loom:pr` PR still carrying the label-only
+    /// A mergeable `loom:pr` PR still carrying a label-only or stale
     /// `loom:merge-conflict`: remove that label and change nothing else.
     LabelClear,
     /// Mergeable again and carrying `loom:merge-conflict`: return it to review
@@ -223,14 +223,12 @@ pub fn decide_review_conflict(pr: &ConflictPr) -> ConflictAction {
             _ => ConflictAction::Keep(ConflictKeepReason::NoHeadSha),
         },
         // The label-only path writes no flag comment, so `ClearIfOurs` could
-        // never recognise its label: drop it directly. `loom:pr` +
-        // `loom:merge-conflict` only arises from that path (the Flag path
-        // removes `loom:pr`).
-        Mergeable::Mergeable
-            if pr.has(APPROVED)
-                && pr.has(MERGE_CONFLICT)
-                && (operator_only || pr.has(super::merge_sequence::SEQUENCE_LABEL)) =>
-        {
+        // never recognise its label: drop it directly. The Flag path removes
+        // `loom:pr`, so a mergeable `loom:pr` + `loom:merge-conflict` PR is
+        // never our flag - whether label-only or a stale label a Doctor left
+        // behind before the Judge approved. Leaving it would strand the PR:
+        // `decide_pr` skips approved PRs carrying the label.
+        Mergeable::Mergeable if pr.has(APPROVED) && pr.has(MERGE_CONFLICT) => {
             ConflictAction::LabelClear
         }
         // A held PR is never cleared otherwise.

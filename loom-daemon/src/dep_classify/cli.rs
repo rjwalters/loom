@@ -730,6 +730,7 @@ fn detect_cycle(cwd: &Path, opts: &CycleOpts) -> Result<i32, i32> {
             nodes.sort();
             nodes.dedup();
             let nodes = nodes.join(" ");
+            let edges = walk.edge_lines(&path);
             let fp = super::fingerprint::fingerprint(&nodes);
 
             println!("CYCLE_DETECTED");
@@ -740,7 +741,7 @@ fn detect_cycle(cwd: &Path, opts: &CycleOpts) -> Result<i32, i32> {
                 println!("UNREADABLE: {}", unreadable.join(" "));
             }
             if opts.report {
-                report_cycle(cwd, &root, &pretty, &nodes, &fp);
+                report_cycle(cwd, &root, &pretty, &nodes, &edges, &fp);
             }
             Ok(1)
         }
@@ -766,7 +767,14 @@ fn detect_cycle(cwd: &Path, opts: &CycleOpts) -> Result<i32, i32> {
 /// not re-comment. Unlike an un-escalation, the comment goes **first** here —
 /// the label is what an operator acts on, and a label with no explanation is
 /// the worse half to be left holding.
-fn report_cycle(cwd: &Path, root: &str, pretty: &str, nodes: &str, fingerprint: &str) {
+fn report_cycle(
+    cwd: &Path,
+    root: &str,
+    pretty: &str,
+    nodes: &str,
+    edges: &[(String, String, String)],
+    fingerprint: &str,
+) {
     let Some((repo, num)) = root.rsplit_once('#') else {
         return;
     };
@@ -780,7 +788,7 @@ fn report_cycle(cwd: &Path, root: &str, pretty: &str, nodes: &str, fingerprint: 
         }
     }
 
-    let body = cycle_report_body(pretty, nodes, &marker);
+    let body = cycle_report_body(pretty, nodes, edges, &marker);
     let mut writer = forge::GhWriter {
         issue: num.parse().unwrap_or(0),
         repo,
@@ -801,10 +809,32 @@ fn report_cycle(cwd: &Path, root: &str, pretty: &str, nodes: &str, fingerprint: 
 /// on live issues, and an operator reads it to decide which declared edge is
 /// the wrong one.
 #[must_use]
-pub fn cycle_report_body(pretty: &str, nodes: &str, marker: &str) -> String {
+pub fn cycle_report_body(
+    pretty: &str,
+    nodes: &str,
+    edges: &[(String, String, String)],
+    marker: &str,
+) -> String {
+    let edges = edge_section(edges);
     format!(
-        "**Dependency cycle detected** - this issue cannot be unblocked by waiting.\n\nThe declared `Blocked by` / `Depends on` / `Requires` references form a closed loop:\n\n```\n{pretty}\n```\n\nEvery issue on that path is OPEN, and the progress of each node is declared to depend\non the next, so the loop can never resolve itself: each side re-derives \"still\nblocked\" on every pass, indefinitely. This is the deadlock shape that previously had\nto be found by hand.\n\nBreaking a cycle is a human decision - which declared dependency edge is wrong, or\nwhich side ships a partial increment first - so Champion is routing this to\n`loom:operator` (a judgement call, not a self-clearing wait) instead of\nre-deriving the same conclusion forever.\n\n**Cycle members** (machine-readable, #5671): Blocked by {nodes}\n\n---\n*Automated by Champion role (detect-dependency-cycle.sh)*\n{marker}\n"
+        "**Dependency cycle detected** - this issue cannot be unblocked by waiting.\n\nThe declared `Blocked by` / `Depends on` / `Requires` references form a closed loop:\n\n```\n{pretty}\n```\n\nEvery issue on that path is OPEN, and the progress of each node is declared to depend\non the next, so the loop can never resolve itself: each side re-derives \"still\nblocked\" on every pass, indefinitely. This is the deadlock shape that previously had\nto be found by hand.\n\nBreaking a cycle is a human decision - which declared dependency edge is wrong, or\nwhich side ships a partial increment first - so Champion is routing this to\n`loom:operator` (a judgement call, not a self-clearing wait) instead of\nre-deriving the same conclusion forever.\n\n**Cycle members** (machine-readable, #5671): Blocked by {nodes}\n\n{edges}---\n*Automated by Champion role (detect-dependency-cycle.sh)*\n{marker}\n"
     )
+}
+
+/// The "declared by" section of the cycle report (#13303): the body line that
+/// produced each edge, so an operator can spot a misparse at once. Empty when
+/// no line was recoverable, leaving the report text as it was.
+fn edge_section(edges: &[(String, String, String)]) -> String {
+    if edges.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("**Declared by** (the line each edge was read from):\n\n");
+    for (from, to, line) in edges {
+        let line = line.trim().replace('`', "'");
+        out.push_str(&format!("- `{from} -> {to}`: `{line}`\n"));
+    }
+    out.push('\n');
+    out
 }
 
 // ===========================================================================

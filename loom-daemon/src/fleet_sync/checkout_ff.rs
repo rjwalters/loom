@@ -198,6 +198,8 @@ use crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRec
 
 #[cfg(test)]
 pub(in crate::fleet_sync) use host::note_remote_head_at;
+#[cfg(test)]
+pub(in crate::fleet_sync) use host::with_daemon_root;
 pub use host::BUSY_NOTE;
 pub(super) use host::{after_resync, announce, note_remote_head, startup};
 #[cfg(test)]

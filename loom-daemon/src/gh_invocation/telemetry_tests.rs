@@ -286,6 +286,9 @@ fn every_span_attribute_survives_export_bounding() {
     let bounded = span.clone().bounded();
     for key in SPAN_ATTRIBUTE_KEYS {
         assert_eq!(bounded.attributes.get(*key), span.attributes.get(*key), "{key}");
+        if OPTIONAL_SPAN_ATTRIBUTE_KEYS.contains(key) {
+            continue;
+        }
         assert!(span.attributes.contains_key(*key), "record() never sets {key}");
     }
 }
@@ -315,8 +318,8 @@ fn spans_carry_github_api_kind() {
 }
 
 /// #10343: every span carries the nine billing keys; a `--include` 304 (gh
-/// exits non-zero on it) is billed `not_modified` while `github.outcome`
-/// keeps its process truth.
+/// exits non-zero on it) is billed `not_modified`; `github.exit_code` keeps
+/// the process truth while `github.outcome` is `not_modified` (#10755).
 #[test]
 fn a_304_span_is_billed_not_modified_with_process_truth_unchanged() {
     let inv = read_op().args(["api", "--include", "repos/acme/widgets/issues"]);
@@ -324,7 +327,8 @@ fn a_304_span_is_billed_not_modified_with_process_truth_unchanged() {
         "printf 'HTTP/2.0 304 Not Modified\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n'; exit 1";
     let (_, spans, _) = run(inv, body);
     let span = &spans[0];
-    assert_eq!(attr(span, "github.outcome"), Some("exit_nonzero"));
+    assert_eq!(attr(span, "github.outcome"), Some("not_modified"));
+    assert_eq!(attr(span, "github.exit_code"), Some("1"));
     assert_eq!(attr(span, "github.billing"), Some("not_modified"));
     assert_eq!(attr(span, "github.http.status"), Some("304"));
     assert_eq!(attr(span, "github.http.not_modified"), Some("true"));
@@ -449,6 +453,38 @@ fn a_thread_parent_is_the_ambient_parent_until_its_guard_drops() {
     assert_eq!(ParentContext::ambient(), ParentContext::Missing);
 }
 
+fn sweep_span_attrs() -> SpanRecord {
+    let (_, mut spans, _) = run(read_op(), "true");
+    spans.remove(0)
+}
+
+#[test]
+fn a_thread_sweep_stamps_sweep_id_and_role_until_its_guard_drops() {
+    set_test_ambient(None, None);
+    {
+        let _g = enter_sweep("step-builder-1-2", Some("builder"));
+        let rec = sweep_span_attrs();
+        assert_eq!(attr(&rec, "loom.sweep_id"), Some("step-builder-1-2"));
+        assert_eq!(attr(&rec, "loom.role"), Some("builder"));
+        std::thread::spawn(|| assert_eq!(ambient_sweep(), (None, None)))
+            .join()
+            .unwrap();
+    }
+    let rec = sweep_span_attrs();
+    assert_eq!(attr(&rec, "loom.sweep_id"), None);
+    assert_eq!(attr(&rec, "loom.role"), None);
+}
+
+#[test]
+fn env_sourced_sweep_identity_omits_absent_and_blank_values() {
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(sweep_identity(s("sw-1"), s("judge")), (s("sw-1"), s("judge")));
+    assert_eq!(sweep_identity(s("sw-1"), None), (s("sw-1"), None));
+    assert_eq!(sweep_identity(s("sw-1"), s("  ")), (s("sw-1"), None));
+    assert_eq!(sweep_identity(s(""), s("judge")), (None, None));
+    assert_eq!(sweep_identity(None, s("judge")), (None, None));
+}
+
 fn api_op(intent: AccessIntent) -> GhInvocation {
     GhInvocation::new(
         Operation::new("api.rest"),
@@ -547,4 +583,26 @@ fn a_reserve_refusal_is_its_own_outcome_and_leaves_the_breaker_alone() {
     let (gate, _, _) = run(api_op(AccessIntent::Read), "echo sent");
     assert_eq!(stdout_of(gate).trim(), "sent");
     crate::gh_invocation::purpose::reopen_discovery();
+}
+
+/// #10755: a 304 is the normal answer to a conditional read — an OK span, no
+/// failure line — while a real HTTP error still fails loudly.
+#[test]
+fn a_304_is_an_ok_span_with_no_failure_record_but_a_404_is_an_error() {
+    let inv = || read_op().args(["api", "--include", "repos/acme/widgets/issues"]);
+    let (_, spans, records) = run(inv(), "printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 1");
+    assert_eq!(attr(&spans[0], "github.outcome"), Some("not_modified"));
+    assert_eq!(spans[0].status, SpanStatus::Ok);
+    assert!(records.is_empty(), "{records:?}");
+
+    let (_, spans, records) = run(inv(), "printf 'HTTP/2.0 404 Not Found\\r\\n\\r\\n'; exit 1");
+    assert_eq!(attr(&spans[0], "github.outcome"), Some("exit_nonzero"));
+    assert_eq!(spans[0].status, SpanStatus::Error);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].outcome, Outcome::ExitNonzero);
+
+    // No status evidence: never guessed into a success.
+    let (_, spans, records) = run(read_op().args(["issue", "list"]), "exit 1");
+    assert_eq!(spans[0].status, SpanStatus::Error);
+    assert_eq!(records.len(), 1);
 }

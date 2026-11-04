@@ -33,7 +33,9 @@ use super::grants::{marker_re, reason_token, CommentGrantStore, GrantRecord};
 use super::group_authz::StatusApi;
 use super::mode::MergeMode;
 use super::ops::{self, DequeueOutcome, EnqueueOutcome, PrState, QueueApi, QueueError};
-use super::removal::{classify, drop_prose, infra_only, route, RemovalKind};
+use super::removal::{
+    classify, drop_prose, infra_decline_reason, infra_detail, infra_only, route, RemovalKind,
+};
 
 /// Everything a lifecycle step needs.
 pub struct Ctx<'a> {
@@ -295,8 +297,8 @@ fn reconcile_drop(
             Err(e) => Reconciled::Undetermined(format!("revoke stale grant: {e}")),
         };
     };
-    let kind = refine_infra(ctx, pr, rec, ev, classify(ev.reason.as_deref()));
-    let prose = drop_prose(kind, ev.reason.as_deref(), Some(&ev.created_at));
+    let (kind, detail) = refine_infra(ctx, pr, rec, ev, classify(ev.reason.as_deref()));
+    let prose = drop_prose(kind, ev.reason.as_deref(), Some(&ev.created_at), detail.as_deref());
     // Revoke (with the verified reason) BEFORE any label transition. The
     // revoke marker is also the dedup point: a later pass sees `Revoked` and
     // never re-routes or re-comments this drop.
@@ -334,24 +336,41 @@ fn refine_infra(
     rec: &GrantRecord,
     ev: &RemovalEvent,
     kind: RemovalKind,
-) -> RemovalKind {
+) -> (RemovalKind, Option<String>) {
     let (RemovalKind::CheckFailure, GrantRecord::Live { sha, .. }) = (kind, rec) else {
-        return kind;
+        return (kind, None);
     };
     let Some(commit) = ev.before_commit.as_deref().filter(|c| !c.is_empty()) else {
-        return kind;
+        return (kind, Some("Infra refinement skipped: GitHub gave no group commit.".into()));
     };
-    match ctx.forge.group_check_runs(commit) {
-        Ok(runs) if infra_only(&runs) => {}
-        Ok(_) => return kind,
+    let runs = match ctx.forge.group_check_runs(commit) {
+        Ok(runs) => runs,
         Err(e) => {
             log::warn!("merge-queue: PR #{pr}: group check runs unreadable ({e}); not infra");
-            return kind;
+            return (
+                kind,
+                Some("Infra refinement skipped: the group's check runs were unreadable.".into()),
+            );
         }
+    };
+    if !infra_only(&runs) {
+        return (kind, infra_decline_reason(&runs));
     }
     match ctx.forge.trusted_comments(pr) {
-        Ok(bodies) if !infra_retry_spent(&bodies, pr, sha) => RemovalKind::DroppedInfra,
-        _ => kind,
+        Ok(bodies) if !infra_retry_spent(&bodies, pr, sha) => {
+            (RemovalKind::DroppedInfra, Some(infra_detail(&runs)))
+        }
+        Ok(_) => (
+            kind,
+            Some(format!(
+                "Infra refinement declined: this head already had its one infra retry. {}",
+                infra_detail(&runs)
+            )),
+        ),
+        Err(_) => (
+            kind,
+            Some("Infra refinement skipped: earlier revoke comments were unreadable.".into()),
+        ),
     }
 }
 

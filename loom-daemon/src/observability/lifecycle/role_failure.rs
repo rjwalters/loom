@@ -296,6 +296,11 @@ pub mod step {
         class: "step-no-outcome-line",
         message: "step exited cleanly but wrote no outcome line",
     };
+    /// #13521: the same clean exit with no line, but the step opened a PR.
+    pub const NO_OUTCOME_LINE_PR_OPENED: StepSite = StepSite {
+        class: "step-no-outcome-line-pr-opened",
+        message: "step exited cleanly and opened a PR but wrote no outcome line",
+    };
 
     /// Every step class, for the contract tests.
     pub const ALL: &[StepSite] = &[
@@ -306,6 +311,7 @@ pub mod step {
         STATUS_UNKNOWN,
         NO_PR,
         NO_OUTCOME_LINE,
+        NO_OUTCOME_LINE_PR_OPENED,
     ];
 
     impl StepSite {

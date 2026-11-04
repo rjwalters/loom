@@ -2147,10 +2147,16 @@ fn write_fake_forge_gh_with_repo_view(
         arm(pr_list_json),
         arm(repo_view_json),
     );
-    std::fs::write(&script_path, body).unwrap();
-    let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+    // Write to a sibling temp file, chmod, then rename over `script_path`. Some
+    // tests rewrite this script while the code under test may be mid-exec of
+    // the previous copy; `open(O_WRONLY)` on a busy executable fails with
+    // ETXTBSY, whereas a rename leaves the running copy on its old inode.
+    let tmp_path = dir.join("fake-forge-gh.sh.tmp");
+    std::fs::write(&tmp_path, body).unwrap();
+    let mut perms = std::fs::metadata(&tmp_path).unwrap().permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&script_path, perms).unwrap();
+    std::fs::set_permissions(&tmp_path, perms).unwrap();
+    std::fs::rename(&tmp_path, &script_path).unwrap();
     (script_path, log)
 }
 

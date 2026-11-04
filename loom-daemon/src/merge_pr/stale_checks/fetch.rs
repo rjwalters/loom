@@ -4,9 +4,9 @@
 //! These used to be the live inputs of the #8248 required-check freshness
 //! guard, which #12063 slice 1 deleted along with the re-date remedy (#8508)
 //! and the CI-run conclusion gate (#10444): required checks at the head are
-//! GitHub's to enforce. What stays is what `required-checks`,
-//! `checks-failure`, `zero-checks-settle`, `check-runs-rollup` and
-//! `forge wait-checks` still read, and it goes with them in slice 2.
+//! GitHub's to enforce. What stays is what `required-checks` and
+//! `forge wait-checks` still read (the other `merge-pr` verbs that shared
+//! these reads went in slice 2).
 //!
 //! 1. **required contexts** — the TWO-source union
 //!    `forge_get_required_status_check_contexts` builds (#8103): rulesets
@@ -410,21 +410,6 @@ pub(crate) fn fetch_check_runs(
     let rollup = conditional(gh, nwo, store.as_deref(), |r| r.check_runs(head_sha))
         .map_err(|e| format!("check-runs read for {head_sha} failed: {e}"))?;
     project_check_runs(&rollup, head_sha)
-}
-
-/// The workflow runs on `head_sha` (one page), through the same paced,
-/// conditional read as [`fetch_check_runs`] — for `merge-pr
-/// check-runs-rollup`'s superseded-twin drop (#11097).
-///
-/// # Errors
-///
-/// When the read fails; the caller then drops nothing.
-pub fn fetch_workflow_runs(
-    gh: &str,
-    nwo: &str,
-    head_sha: &str,
-) -> Result<serde_json::Value, String> {
-    conditional(gh, nwo, default_store().as_deref(), |r| r.workflow_runs(head_sha))
 }
 
 /// The guard's [`CheckRun`]s from a `{total_count, check_runs}` rollup.

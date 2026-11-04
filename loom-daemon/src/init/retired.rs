@@ -38,6 +38,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::init::InitReport;
+use crate::tokens_pool::profile_ledger::sha256_hex;
 
 /// Frozen retired-file allowlist: `(relative path, sha256 hex digest)`.
 ///
@@ -125,16 +126,6 @@ pub const RETIRED_FILES: &[(&str, &str)] = &[
         "8cfc89428135cb55c91a6ae768bbd3373dbe2a1d22eb088694bc158ce0091d34",
     ),
 ];
-
-/// Compute the lowercase-hex sha256 of `bytes`.
-///
-/// Mirrors the `Sha256` usage pattern at `loom-daemon/src/terminal.rs:76`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
 
 /// Remove retired Loom strays whose on-disk content matches a shipped digest.
 ///

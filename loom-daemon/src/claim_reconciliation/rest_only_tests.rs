@@ -69,8 +69,11 @@ fn the_merge_sequence_plan_reads_changed_files_over_rest_only() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
+    // PR 2 is stacked on PR 1; PR 3 is independent (#12775).
     let seq_row = |n: u32| {
+        let base = if n == 2 { "feature/issue-1" } else { "main" };
         row(n, &[])
+            .base(base)
             .sha(SHA)
             .created(&format!("2026-10-0{n}T00:00:00Z"))
             .updated("2026-10-03T00:00:00Z")
@@ -81,10 +84,11 @@ fn the_merge_sequence_plan_reads_changed_files_over_rest_only() {
     let log = calls(&log);
     assert!(!log.contains("FORBIDDEN"), "a GraphQL read was attempted: {log}");
     assert_eq!(report.open_prs, 3);
-    for n in 1..=3 {
+    for n in 1..=2 {
         assert!(log.contains(&format!("pulls/{n}/files?per_page=100&page=1")), "{log}");
     }
-    // Unchanged decision: only the two PRs sharing a file form a group.
+    assert!(!log.contains("pulls/3/files"), "an unstacked PR's files are never read: {log}");
+    // Only the stacked pair sharing a file forms a group.
     let groups: Vec<Vec<u32>> = report.groups.iter().map(|g| g.order.clone()).collect();
     assert_eq!(groups, vec![vec![1, 2]], "{report:?}");
 }
@@ -113,7 +117,10 @@ fn the_plan_counts_each_suppressed_edge_once() {
         std::fs::create_dir_all(&root).unwrap();
         // PR 1 is approved: only a ready predecessor is ever sequenced behind.
         let seq_row = |n: u32, labels: &[&str]| {
+            // PR 2 is stacked on PR 1 (#12775).
+            let base = if n == 2 { "feature/issue-1" } else { "main" };
             row(n, labels)
+                .base(base)
                 .sha(SHA)
                 .created(&format!("2026-10-0{n}T00:00:00Z"))
                 .updated("2026-10-03T00:00:00Z")
@@ -205,4 +212,63 @@ fn a_failed_by_head_read_never_fast_reclaims() {
     let (reclaimed, log) = claim_pass("echo 'gh: HTTP 502' >&2; exit 1");
     assert_eq!(reclaimed, 0, "a fresh label falls through to the age gate: {log}");
     assert!(log.contains("pulls?head="), "{log}");
+}
+
+/// #12315: the open-PR listing's transport is the discovery snapshot in
+/// mirror mode (zero `gh` calls) and the ETag'd REST listing in direct mode,
+/// and the callers' candidate sets are the same either way: every label view
+/// (`list_with_label`, the claim, verdict and hold selectors) and the full
+/// listing (merge-sequence, review-conflict, orphan-stack, open-pr-hold).
+#[test]
+#[serial]
+fn the_listing_is_a_snapshot_in_mirror_mode_and_rest_in_direct_mode() {
+    use super::open_pr_listing::{list_open_prs, list_with_label};
+    use crate::discovery::published::test_support::{repo, set, MirrorRoot};
+
+    let rows = [
+        row(3, &["loom:reviewing"]),
+        row(2, &["loom:pr", "loom:treating"]),
+        row(1, &["loom:changes-requested"]),
+    ];
+    let labels = [
+        "loom:reviewing",
+        "loom:treating",
+        "loom:pr",
+        "loom:changes-requested",
+        "none",
+    ];
+
+    // Direct mode: no mirror config, so the REST listing serves.
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let (gh, log) = fake_gh(dir.path(), &pulls_arm(&rows), "exit 1");
+    let direct = list_open_prs(&gh, &root).unwrap();
+    assert!(calls(&log).contains("pulls?state=open"), "direct mode must list over REST");
+    let direct_by_label: Vec<_> = labels
+        .iter()
+        .map(|l| list_with_label(&gh, &root, l).unwrap())
+        .collect();
+
+    // Mirror mode: the same PRs as the tick's snapshot; nothing is listed.
+    let fixture = MirrorRoot::new("acme/widgets");
+    let mut snapshot = repo("acme/widgets");
+    snapshot.pulls = Some(
+        crate::forge_pull_listing::parse_rest_pulls(
+            &super::open_pr_listing::test_support::listing(&rows),
+        )
+        .unwrap(),
+    );
+    set(vec![snapshot]);
+    let mirror = list_open_prs(&fixture.gh, fixture.path()).unwrap();
+    let mirror_by_label: Vec<_> = labels
+        .iter()
+        .map(|l| list_with_label(&fixture.gh, fixture.path(), l).unwrap())
+        .collect();
+    assert_eq!(fixture.gh_calls(), "", "mirror mode made a listing call");
+    set(Vec::new());
+
+    assert_eq!(mirror, direct);
+    assert_eq!(mirror_by_label, direct_by_label);
+    assert_eq!(mirror_by_label[4].len(), 0);
 }

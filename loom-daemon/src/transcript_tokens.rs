@@ -145,6 +145,44 @@ pub fn head_names_sweep_issue(head: &str, issue: u32) -> bool {
         == Some(issue)
 }
 
+/// Whether `head` shows a session launched for `issue` by either the legacy
+/// `/loom:sweep <issue>` orchestrator or a dispatched **step** (#11898), which runs
+/// a bare role command instead: `/loom:builder <issue>`, `/loom:curator <issue>`
+/// or `/loom:champion --issue <issue>`.
+///
+/// Measured on a fleet host (#13287): recent transcript heads are all role
+/// commands, none `/loom:sweep`, so the sweep-only match attributed no tokens
+/// to step-narrated completions. Judge / Doctor / `champion --pr` carry a PR
+/// number, which cannot be mapped to an issue here, so they stay unattributed.
+/// The first-argument rule is unchanged (`470` never matches `4705`).
+#[must_use]
+pub fn head_names_issue_session(head: &str, issue: u32) -> bool {
+    if head_names_sweep_issue(head, issue) {
+        return true;
+    }
+    const NAME_OPEN: &str = "<command-name>/loom:";
+    const ARGS_OPEN: &str = "<command-args>";
+    let Some(at) = head.find(NAME_OPEN) else {
+        return false;
+    };
+    let rest = &head[at + NAME_OPEN.len()..];
+    let Some((role, after)) = rest.split_once("</command-name>") else {
+        return false;
+    };
+    let Some(args) = after.split_once(ARGS_OPEN).map(|(_, a)| a) else {
+        return false;
+    };
+    let args = args.split("</command-args>").next().unwrap_or(args);
+    let mut toks = args.split_whitespace();
+    let first = toks.next();
+    let subject = match role {
+        "builder" | "curator" => first,
+        "champion" if first == Some("--issue") => toks.next(),
+        _ => None,
+    };
+    subject.and_then(|t| t.parse::<u32>().ok()) == Some(issue)
+}
+
 /// Read at most [`HEAD_SCAN_BYTES`] from `path`, lossily decoded.
 ///
 /// `pub(crate)` since #8056: the role-tick journal attributes transcripts by
@@ -241,7 +279,7 @@ fn sweep_transcript_files(
         let Some(head) = read_head(&path) else {
             continue;
         };
-        if !head_names_sweep_issue(&head, issue) {
+        if !head_names_issue_session(&head, issue) {
             continue;
         }
         for transcript in session_transcripts(&path) {
@@ -595,6 +633,40 @@ mod tests {
              <command-args>4705</command-args>\"}}";
         assert!(!head_names_sweep_issue(other, 4705));
         assert!(!head_names_sweep_issue("no markup here at all", 4705));
+    }
+
+    #[test]
+    fn step_role_sessions_are_attributed_to_their_issue() {
+        let role = |name: &str, args: &str| {
+            format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\
+                 \"<command-name>/loom:{name}</command-name>\\n\
+                 <command-args>{args}</command-args>\"}}}}"
+            )
+        };
+        assert!(head_names_issue_session(&role("builder", "4705"), 4705));
+        assert!(!head_names_issue_session(&role("builder", "4705"), 470));
+        assert!(head_names_issue_session(&role("curator", "4705"), 4705));
+        assert!(head_names_issue_session(&role("champion", "--issue 4705"), 4705));
+        // PR-numbered roles are not attributable to an issue.
+        assert!(!head_names_issue_session(&role("judge", "4705"), 4705));
+        assert!(!head_names_issue_session(&role("champion", "--pr 4705"), 4705));
+        assert!(head_names_issue_session(&sweep_head("4705"), 4705));
+    }
+
+    #[test]
+    fn step_builder_session_tokens_are_summed_for_its_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let project = dir.path().join(project_slug(workspace));
+        fs::create_dir_all(&project).unwrap();
+        let head = "{\"type\":\"user\",\"message\":{\"content\":\
+            \"<command-name>/loom:builder</command-name>\\n\
+            <command-args>4699</command-args>\"}}\n";
+        fs::write(project.join("uuid-s.jsonl"), format!("{head}{}", usage_line(1, 2, 3, 4)))
+            .unwrap();
+        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(10));
+        assert!(sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None).is_some());
     }
 
     #[test]

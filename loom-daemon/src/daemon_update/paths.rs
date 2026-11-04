@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::util;
 use crate::daemon_start::paths::logical_cwd;
+use crate::repo_root::main_checkout_from_gitdir_file;
 
 /// `find_repo_root [dir]` — walk up from `dir` (default `$PWD`) to the nearest
 /// ancestor holding both `.git` and `.loom/`, following a linked worktree's
@@ -37,23 +38,9 @@ pub fn find_repo_root(start: Option<&Path>) -> Option<PathBuf> {
         }
         let dot_git = dir.join(".git");
         if dot_git.is_file() {
-            if let Ok(text) = std::fs::read_to_string(&dot_git) {
-                // `sed 's/^gitdir: //'` is per-line and unanchored at the end;
-                // `$( )` then strips the trailing newline.
-                let gitdir = text
-                    .lines()
-                    .map(|l| l.strip_prefix("gitdir: ").unwrap_or(l))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let main_repo = PathBuf::from(&gitdir)
-                    .parent()
-                    .and_then(Path::parent)
-                    .and_then(Path::parent)
-                    .map(Path::to_path_buf);
-                if let Some(main_repo) = main_repo {
-                    if main_repo.join(".loom").is_dir() {
-                        return Some(main_repo);
-                    }
+            if let Some(main_repo) = main_checkout_from_gitdir_file(&dot_git) {
+                if main_repo.join(".loom").is_dir() {
+                    return Some(main_repo);
                 }
             }
         }

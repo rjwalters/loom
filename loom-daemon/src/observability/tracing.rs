@@ -1,4 +1,5 @@
 //! Owned process-boundary trace propagation. Export remains independently opt-in.
+use super::lifecycle::StepKeys;
 use crate::telemetry::trace::store::{
     TraceStore, CONTEXT_FILE_ENV, TRACEPARENT_ENV, W3C_TRACEPARENT_ENV,
 };
@@ -29,7 +30,7 @@ fn valid_endpoint(endpoint: &str) -> bool {
 /// Persist before spawn. A corrupt/busy/full store disables this execution's
 /// tracing with a diagnostic; it cannot fail the actual issue dispatch.
 ///
-/// Every execution is its own root trace; `issue` is a plain span attribute.
+/// Every execution is its own root trace; the `keys` are plain span attributes.
 ///
 /// The context is exported under **both** [`TRACEPARENT_ENV`] (Loom's own
 /// namespaced variable) and [`W3C_TRACEPARENT_ENV`] (the standard `TRACEPARENT`,
@@ -39,7 +40,7 @@ fn valid_endpoint(endpoint: &str) -> bool {
 /// parents its own spans inside this execution's trace instead of emitting
 /// orphan roots. Both are `env_remove`d on the disabled and error paths, so a
 /// stale ambient value can never be mistaken for this execution's context.
-pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue: Option<u32>) {
+pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, keys: &StepKeys) {
     command
         .env_remove(TRACEPARENT_ENV)
         .env_remove(W3C_TRACEPARENT_ENV)
@@ -53,7 +54,7 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
             command.env(W3C_TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
-            super::lifecycle::prepare_execution(command, root, execution, issue);
+            super::lifecycle::prepare_execution(command, root, execution, keys);
         }
         Err(error) => {
             log::warn!("observability: trace context unavailable; child is untraced: {error}")

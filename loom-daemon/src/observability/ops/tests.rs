@@ -296,6 +296,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::AgentScopeOomKills,
         MetricName::ForgeMirrorReads,
         MetricName::ForgeMirrorChanges,
+        MetricName::DiscoveryRecheck,
         MetricName::ForgeMirrorWakeLatency,
         MetricName::StageEntryLookups,
         MetricName::FeedCompletions,

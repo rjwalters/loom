@@ -478,3 +478,28 @@ fn the_open_pr_listing_is_shed_not_sent_to_the_writer_when_readers_are_out_of_bu
     assert!(pulls.is_err(), "a shed listing is no listing");
     assert!(log_lines(&log).is_empty(), "the writer was not asked");
 }
+
+/// #12315: `pull_state_cached_as` and `pull_files_cached_as` are the write
+/// gates of the claim-reconciliation passes (every decision re-reads the PR it
+/// acts on through them), so they must stay [`ReadClass::Gate`] — never shed
+/// when the readers are out of budget. Neither sets a class: they ride the
+/// [`store::ConditionalRead`] default, so pin both the default and that no
+/// site in these two functions downgrades it with `.deferrable(..)`.
+#[test]
+fn the_per_pr_write_gate_reads_are_gate_class() {
+    use crate::forge_identity::ReadClass;
+    let site = store::ConditionalRead::new("test", ops::PR_VIEW_STATE);
+    assert_eq!(site.class, ReadClass::Gate, "the conditional-read default must stay Gate");
+
+    let src = include_str!("forge_pull_listing.rs");
+    for name in ["pub fn pull_state_cached_as", "pub fn pull_files_cached_as"] {
+        let start = src.find(name).unwrap_or_else(|| panic!("{name} moved"));
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("ConditionalRead::new("), "{name} no longer builds a read site");
+        assert!(
+            !body.contains(".deferrable("),
+            "{name} is a write gate and must stay ReadClass::Gate"
+        );
+    }
+}

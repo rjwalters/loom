@@ -9,41 +9,7 @@
 use super::*;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
-
-/// A registry whose `gh` is `script` and whose forge probes are NOT skipped.
-/// Journals are confined to `ws`. Identical shape to `timeline_tests`'
-/// `timeline_registry`, duplicated here rather than shared so each sibling
-/// test file stays self-contained (matches this crate's existing convention
-/// of `timeline_tests` vs. `credential_tests`).
-fn complexity_registry(ws: &Path, script: &str) -> SweepRegistry {
-    let fake_gh = ws.join("fake-gh-complexity.sh");
-    std::fs::write(&fake_gh, script).unwrap();
-    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fake_gh, perms).unwrap();
-    if let Ok(f) = std::fs::File::open(&fake_gh) {
-        let _ = f.sync_all();
-    }
-
-    let scripts_dir = ws.join(".loom").join("scripts");
-    std::fs::create_dir_all(&scripts_dir).unwrap();
-    let spawn = scripts_dir.join("spawn-claude.sh");
-    std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
-    sperms.set_mode(0o755);
-    std::fs::set_permissions(&spawn, sperms).unwrap();
-
-    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
-    config.spawn_bin = Some(spawn);
-    config.gh_bin = Some(fake_gh);
-    config.skip_label_flip = false;
-    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
-    config.outcomes_journal_path = Some(ws.join("test-sweep-outcomes.jsonl"));
-    config.outcome_telemetry_path = Some(ws.join("test-sweep-outcome-telemetry.jsonl"));
-    SweepRegistry::new(config)
-}
 
 /// A fake `gh` whose issue endpoint answers with the `{state, closed_at,
 /// labels}` projection `complexity_signal` asks for — one call, both the
@@ -109,7 +75,7 @@ fn raw_record(registry: &SweepRegistry, issue: u32) -> serde_json::Value {
 fn a_sized_issue_carries_story_points_and_no_complexity() {
     let dir = tempdir().unwrap();
     let mut registry =
-        complexity_registry(dir.path(), &gh_issue_ok(&["loom:building", "points:5"]));
+        forge_probing_registry(dir.path(), &gh_issue_ok(&["loom:building", "points:5"]));
     let issue = 8542;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-1", "log\n");
 
@@ -136,7 +102,7 @@ fn a_sized_issue_carries_story_points_and_no_complexity() {
 #[serial]
 fn an_unsized_issue_omits_story_points() {
     let dir = tempdir().unwrap();
-    let mut registry = complexity_registry(dir.path(), &gh_issue_ok(&["loom:building"]));
+    let mut registry = forge_probing_registry(dir.path(), &gh_issue_ok(&["loom:building"]));
     let issue = 8543;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-2", "log\n");
 
@@ -161,7 +127,7 @@ fn an_unsized_issue_omits_story_points() {
 #[serial]
 fn a_failing_fetch_omits_story_points_and_still_writes_the_record() {
     let dir = tempdir().unwrap();
-    let mut registry = complexity_registry(dir.path(), &gh_issue_failing());
+    let mut registry = forge_probing_registry(dir.path(), &gh_issue_failing());
     let issue = 8545;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-4", "log\n");
 

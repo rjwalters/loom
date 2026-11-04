@@ -130,6 +130,19 @@ fn mergeable_held_or_sequenced_approved_pr_loses_the_label_only() {
 }
 
 #[test]
+fn mergeable_plain_approved_pr_loses_a_stale_conflict_label() {
+    assert_eq!(
+        decide_review_conflict(&pr(Mergeable::Mergeable, &[APPROVED, MERGE_CONFLICT])),
+        ConflictAction::LabelClear
+    );
+    // Unknown mergeability: no information, leave the label.
+    assert_eq!(
+        decide_review_conflict(&pr(Mergeable::Unknown, &[APPROVED, MERGE_CONFLICT])),
+        ConflictAction::Keep(ConflictKeepReason::Unknown)
+    );
+}
+
+#[test]
 fn mergeable_blocked_or_frozen_approved_pr_is_never_cleared() {
     for hold in ["loom:blocked", "loom:frozen"] {
         for extra in ["loom:operator", "loom:sequenced"] {
@@ -354,6 +367,17 @@ fn end_to_end_mergeable_held_and_sequenced_prs_lose_only_the_conflict_label() {
         assert!(!calls.contains("pr comment"), "{extra}: {calls}");
         assert!(!calls.contains("/comments"), "{extra}: {calls}");
     }
+}
+
+#[test]
+#[serial]
+fn end_to_end_mergeable_plain_approved_pr_loses_a_stale_conflict_label() {
+    // A Judge verdict is the newest marker, so `ClearIfOurs` would keep it.
+    let (stats, calls) = run(&open(12041, "MERGEABLE", &["loom:pr", "loom:merge-conflict"]), "[]");
+    assert_eq!((stats.label_cleared, stats.cleared, stats.flagged), (1, 0, 0));
+    assert!(calls.contains("pr edit 12041 --remove-label loom:merge-conflict"), "{calls}");
+    assert!(!calls.contains("--add-label"), "{calls}");
+    assert!(!calls.contains("pr comment"), "{calls}");
 }
 
 #[test]

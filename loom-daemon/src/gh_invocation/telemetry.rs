@@ -89,7 +89,13 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.route",
     "github.command",
     "http.request.method",
+    // #13170: the pushed branch head on a `pr.create` write span of the agent
+    // `gh` front. Optional: omitted, never guessed, when unknown.
+    "loom.head_sha",
 ];
+
+/// The keys of [`SPAN_ATTRIBUTE_KEYS`] only some spans carry.
+pub const OPTIONAL_SPAN_ATTRIBUTE_KEYS: &[&str] = &["loom.head_sha"];
 
 /// At most this many numbers in a write span's `github.number`.
 const MAX_WRITE_NUMBERS: usize = 5;
@@ -146,6 +152,10 @@ pub enum Outcome {
     RoutingBlocked,
     /// The managed launcher exited `69`: its adapter is down (#9987).
     AdapterUnavailable,
+    /// `gh` exited non-zero on an HTTP `304 Not Modified` — the normal answer
+    /// to an ETag'd conditional read, not a failure (#10755). Only ever
+    /// derived from the billing evidence; see [`Outcome::reconcile`].
+    NotModified,
 }
 
 /// The managed launcher's exit status for "routing blocked" (EX_CONFIG).
@@ -166,11 +176,33 @@ impl Outcome {
             Outcome::RoutingRefused => "routing_refused",
             Outcome::RoutingBlocked => "routing_blocked",
             Outcome::AdapterUnavailable => "adapter_unavailable",
+            Outcome::NotModified => "not_modified",
+        }
+    }
+
+    /// Whether this outcome is a failure: it is recorded as an error span
+    /// and leaves a local completion record.
+    #[must_use]
+    pub fn is_failure(self) -> bool {
+        !matches!(self, Outcome::Ok | Outcome::NotModified)
+    }
+
+    /// Fold the HTTP evidence into the process truth (#10755): a non-zero
+    /// exit that the ledger billed as a confirmed `304` is `NotModified`.
+    /// Anything else (including a 304 with no status evidence) is unchanged.
+    #[must_use]
+    pub fn reconcile(self, billing: &super::billing::Billing) -> Self {
+        if self == Outcome::ExitNonzero
+            && billing.class == super::billing::BillingClass::NotModified
+        {
+            Outcome::NotModified
+        } else {
+            self
         }
     }
 
     /// Every value, for vocabulary tests and docs.
-    pub const ALL: [Outcome; 9] = [
+    pub const ALL: [Outcome; 10] = [
         Outcome::Ok,
         Outcome::ExitNonzero,
         Outcome::Signaled,
@@ -180,6 +212,7 @@ impl Outcome {
         Outcome::RoutingRefused,
         Outcome::RoutingBlocked,
         Outcome::AdapterUnavailable,
+        Outcome::NotModified,
     ];
 }
 
@@ -317,6 +350,75 @@ pub fn enter_parent(parent: Option<TraceContext>) -> ParentGuard {
     }
 }
 
+thread_local! {
+    static THREAD_SWEEP: std::cell::RefCell<Option<(String, Option<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous thread sweep identity when dropped. `!Send`.
+#[must_use = "the sweep identity ends when the guard is dropped"]
+pub struct SweepGuard {
+    previous: Option<(String, Option<String>)>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        THREAD_SWEEP.with(|p| *p.borrow_mut() = previous);
+    }
+}
+
+/// Stamp every `invoke github` span this thread opens with `loom.sweep_id`
+/// (and `loom.role`) until the guard drops (#13171) — for daemon-side forge
+/// calls made on behalf of a known sweep/step.
+pub fn enter_sweep(sweep_id: &str, role: Option<&str>) -> SweepGuard {
+    let value = Some((sweep_id.to_string(), role.map(str::to_string)));
+    let previous = THREAD_SWEEP.with(|p| p.replace(value));
+    SweepGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// A raw `(sweep id, role)` pair: no (or blank) sweep id means no identity at
+/// all — never an empty-string attribute, never a role without a sweep.
+#[must_use]
+pub fn sweep_identity(
+    id: Option<String>,
+    role: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match non_empty(id) {
+        Some(id) => (Some(id), non_empty(role)),
+        None => (None, None),
+    }
+}
+
+/// `(sweep_id, role)` for this call: the thread identity ([`enter_sweep`]),
+/// else `LOOM_SWEEP_ID` / `LOOM_ROLE` (CLI-side calls; not read in test
+/// builds). Empty values are absent.
+#[must_use]
+pub fn ambient_sweep() -> (Option<String>, Option<String>) {
+    if let Some((id, role)) = THREAD_SWEEP.with(|p| p.borrow().clone()) {
+        let found = sweep_identity(Some(id), role);
+        if found.0.is_some() {
+            return found;
+        }
+    }
+    #[cfg(not(test))]
+    {
+        sweep_identity(std::env::var("LOOM_SWEEP_ID").ok(), std::env::var("LOOM_ROLE").ok())
+    }
+    #[cfg(test)]
+    {
+        (None, None)
+    }
+}
+
 /// The ambient execution's `(parent, trace journal)` — what a short-lived CLI
 /// span delivers through when no ops sink is registered (#11690). Test builds
 /// read the per-thread [`set_test_ambient`] value, never the real environment.
@@ -382,6 +484,8 @@ pub struct InvocationSpan {
     pub started_at: DateTime<Utc>,
     pub invocation: String,
     delivery: Delivery,
+    /// `loom.head_sha` (#13170); set only by [`Self::with_head_sha`].
+    head_sha: Option<String>,
 }
 
 impl InvocationSpan {
@@ -414,7 +518,19 @@ impl InvocationSpan {
             started_at,
             invocation,
             delivery: delivery(&inv.parent),
+            head_sha: None,
         }
+    }
+
+    /// Record the commit a `pr.create` call published as `loom.head_sha`
+    /// (#13170). Anything but a full 40-hex SHA is dropped, never exported.
+    #[must_use]
+    pub fn with_head_sha(mut self, sha: Option<&str>) -> Self {
+        self.head_sha = sha
+            .map(str::trim)
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase);
+        self
     }
 
     /// The context to hand the child as its `traceparent`: this span's own
@@ -442,6 +558,7 @@ impl InvocationSpan {
         ended_at: DateTime<Utc>,
         billing: &super::billing::Billing,
     ) -> SpanRecord {
+        let outcome = outcome.reconcile(billing);
         let mut attributes: TraceAttributes = [
             ("github.operation", inv.operation.as_str().to_string()),
             ("github.access_intent", inv.intent.as_str().to_string()),
@@ -480,6 +597,16 @@ impl InvocationSpan {
                 attributes.insert("github.number".into(), numbers);
             }
         }
+        if let Some(sha) = &self.head_sha {
+            attributes.insert("loom.head_sha".into(), sha.clone());
+        }
+        let (sweep_id, role) = ambient_sweep();
+        if let Some(id) = sweep_id {
+            attributes.insert("loom.sweep_id".into(), id);
+            if let Some(role) = role {
+                attributes.insert("loom.role".into(), role);
+            }
+        }
         crate::telemetry::trace::provenance::stamp(&mut attributes);
         SpanRecord {
             context: self.context.clone(),
@@ -487,10 +614,10 @@ impl InvocationSpan {
             name: SpanName::GithubInvoke,
             started_at: self.started_at,
             ended_at: ended_at.max(self.started_at),
-            status: if outcome == Outcome::Ok {
-                SpanStatus::Ok
-            } else {
+            status: if outcome.is_failure() {
                 SpanStatus::Error
+            } else {
+                SpanStatus::Ok
             },
             attributes,
             events: Vec::new(),
@@ -499,7 +626,7 @@ impl InvocationSpan {
     }
 
     /// Emit the span (with `billing`'s HTTP truth and identity, #10343) and,
-    /// for a non-`ok` outcome, the local completion record.
+    /// for a failed outcome, the local completion record.
     pub fn finish(
         self,
         inv: &GhInvocation,
@@ -509,8 +636,9 @@ impl InvocationSpan {
         billing: &super::billing::Billing,
     ) {
         let ended_at = Utc::now();
+        let outcome = outcome.reconcile(billing);
         let span = self.record(inv, launcher, outcome, exit_code, ended_at, billing);
-        if outcome != Outcome::Ok {
+        if outcome.is_failure() {
             record_failure(&FailureRecord::from_span(&span, inv, outcome, exit_code));
         }
         match &self.delivery {

@@ -49,6 +49,7 @@ pub mod busy_slots;
 #[cfg(test)]
 pub mod capture;
 pub mod codex_session;
+pub mod discovery_recheck;
 pub mod dispatch;
 pub mod dispatch_facts;
 pub mod dispatch_step;
@@ -71,6 +72,7 @@ pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod reaper;
 pub mod redate_chain;
+pub mod safehouse_forge_lookup;
 pub mod scope_memory;
 pub mod stage_entry;
 pub mod stage_events;

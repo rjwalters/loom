@@ -53,7 +53,7 @@ fn config_repo_enables_with_defaults() {
     assert_eq!(cfg.location.repo, "acme/fleet");
     assert_eq!(cfg.location.reference, "main");
     assert_eq!(cfg.interval.as_secs(), DEFAULT_SYNC_INTERVAL_SECS);
-    assert!(!cfg.auto_apply, "autoApply must default off (roster --apply deregisters)");
+    assert!(!cfg.auto_apply.any(), "autoApply must default off (roster --apply deregisters)");
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn env_overrides_config_for_interval_and_auto_apply() {
         .expect("resolve")
         .expect("enabled");
     assert_eq!(cfg.interval.as_secs(), 120);
-    assert!(cfg.auto_apply);
+    assert!(cfg.auto_apply.any());
 }
 
 #[test]
@@ -85,7 +85,45 @@ fn non_truthy_auto_apply_env_reads_as_off() {
     let cfg = resolve_config(&config, &env)
         .expect("resolve")
         .expect("enabled");
-    assert!(!cfg.auto_apply, "an explicit env 0 must disarm the write path");
+    assert!(!cfg.auto_apply.any(), "an explicit env 0 must disarm the write path");
+}
+
+#[test]
+fn per_write_flags_resolve_over_the_umbrella() {
+    let writes = |fleet: serde_json::Value, env: &[(&str, &str)]| {
+        resolve_auto_apply_writes(&json!({ "fleet": fleet }), &env_from(env))
+    };
+    let only = |roster, config, resync, checkout| AutoApply {
+        roster,
+        config,
+        resync,
+        checkout,
+    };
+    // Nothing set: all off.
+    assert_eq!(writes(json!({}), &[]), AutoApply::default());
+    // Umbrella only: all four, as before.
+    assert_eq!(writes(json!({"autoApply": true}), &[]), AutoApply::ALL);
+    // Per-key only (the roster-only fleet shape).
+    assert_eq!(writes(json!({"autoApplyRoster": true}), &[]), only(true, false, false, false));
+    // An explicit false beats the umbrella.
+    assert_eq!(
+        writes(json!({"autoApply": true, "autoApplyResync": false}), &[]),
+        only(true, true, false, true)
+    );
+    // Env beats config, per key.
+    assert_eq!(
+        writes(json!({"autoApplyCheckout": true}), &[(AUTO_APPLY_CHECKOUT_ENV, "0")]),
+        AutoApply::default()
+    );
+    assert_eq!(
+        writes(json!({"autoApplyConfig": false}), &[(AUTO_APPLY_CONFIG_ENV, "1")]),
+        only(false, true, false, false)
+    );
+    // A non-boolean config value falls back to the umbrella.
+    assert_eq!(
+        writes(json!({"autoApply": true, "autoApplyRoster": "yes"}), &[]),
+        AutoApply::ALL
+    );
 }
 
 #[test]
@@ -543,6 +581,7 @@ pub(crate) fn sample_status() -> FleetSyncStatus {
         at: Utc::now(),
         interval_secs: 300,
         auto_apply: false,
+        auto_apply_writes: AutoApply::default(),
         config: ConfigPass::default(),
         roster: RosterPass::default(),
         state: StatePass::default(),

@@ -40,8 +40,6 @@ mod telemetry_join;
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
 mod telemetry_overhead;
-#[path = "telemetry_replay.rs"]
-mod telemetry_replay;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
@@ -60,8 +58,6 @@ pub(crate) enum TelemetryCommand {
     /// file, send one `host.export` probe, and read it back requiring
     /// `host.id == harness.ingest.principal == <host>`.
     TelemetryJoin(telemetry_join::JoinArgs),
-    /// Print fleet state at an instant from SigNoz, as a daemon then could have known it.
-    TelemetryReplay(telemetry_replay::ReplayArgs),
     /// Report transport capabilities of this installed binary without reading configuration.
     TelemetryCapabilities {
         /// Fail when this artifact cannot export OTLP.
@@ -177,7 +173,6 @@ impl TelemetryCommand {
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryJoin(args) => args.run().await,
-            TelemetryCommand::TelemetryReplay(args) => args.run(),
             // The OTLP exporter is compiled unconditionally (#10700), so
             // `otlp` is always `true` and `--require-otlp` always passes. The
             // flag stays so build/roll probes (`daemon-build.sh`,

@@ -30,7 +30,10 @@
 //!    ([`crate::fleet_store::admins`], user accounts only). It is **unioned**
 //!    with rule 4: neither can remove the other. Fails closed: an unreadable
 //!    roster widens nothing and is reported by
-//!    [`TrustPolicy::sources_consulted`] (#10303).
+//!    [`TrustPolicy::sources_consulted`] (#10303);
+//! 6. a fleet-trusted App from the optional `apps` list in the same file
+//!    (`name[bot]` spelled, same account-kind rule as rule 4). Unioned, only
+//!    ever adds trust, same fail-closed behavior (#13545).
 //!
 //! # The GraphQL shape cannot name an App
 //!
@@ -188,6 +191,8 @@ pub struct TrustPolicy {
     allowlist: Vec<String>,
     /// Fleet admin roster logins (rule 5), empty when unavailable.
     admins: Vec<String>,
+    /// Fleet-trusted App logins from the same file (rule 6).
+    apps: Vec<String>,
     /// How the roster resolved (`None`: not consulted, e.g. explicit rules).
     admins_state: Option<String>,
 }
@@ -201,6 +206,7 @@ impl TrustPolicy {
             self_login,
             allowlist,
             admins: Vec::new(),
+            apps: Vec::new(),
             admins_state: None,
         }
     }
@@ -209,6 +215,7 @@ impl TrustPolicy {
     #[must_use]
     pub fn with_admins(mut self, admins: crate::fleet_store::admins::Admins) -> Self {
         self.admins = admins.logins;
+        self.apps = admins.apps;
         self.admins_state = Some(admins.state);
         self
     }
@@ -219,9 +226,11 @@ impl TrustPolicy {
     pub fn sources_consulted(&self) -> String {
         format!(
             "author_association (OWNER/MEMBER/COLLABORATOR), fleet Apps, self identity, \
-             forge.trustedCommenters ({} entries), fleet admin roster {ADMINS_PATH} ({})",
+             forge.trustedCommenters ({} entries), fleet admin roster {ADMINS_PATH} ({}), fleet trusted Apps list \
+             ({} entries, `apps` in the same file)",
             self.allowlist.len(),
             self.admins_state.as_deref().unwrap_or("not consulted"),
+            self.apps.len(),
         )
     }
 
@@ -237,12 +246,16 @@ impl TrustPolicy {
             v.sort();
             v
         };
-        let canon = serde_json::json!({
+        let mut canon = serde_json::json!({
             "fleet": self.fleet.names(),
             "self": self.self_login,
             "allow": sorted(&self.allowlist),
             "admins": sorted(&self.admins),
         });
+        // Only when non-empty, so a fleet without the list keeps its digest.
+        if !self.apps.is_empty() {
+            canon["apps"] = serde_json::json!(sorted(&self.apps));
+        }
         hex::encode(Sha256::digest(canon.to_string().as_bytes()))[..16].to_string()
     }
 
@@ -262,9 +275,16 @@ impl TrustPolicy {
             self_login,
             allowlist: allowlist_from_config(&effective),
             admins: Vec::new(),
+            apps: Vec::new(),
             admins_state: None,
         }
         .with_admins(crate::fleet_store::admins::resolve(root))
+    }
+
+    /// This workspace's own (writer App) login, when one resolved.
+    #[must_use]
+    pub fn self_login(&self) -> Option<&str> {
+        self.self_login.as_deref()
     }
 
     /// Replace the self identity (an explicit `--self-login`).
@@ -298,7 +318,13 @@ impl TrustPolicy {
     /// Whether `author` is believed.
     #[must_use]
     pub fn trusts(&self, author: &Author) -> bool {
-        let allow: Vec<String> = self.allowlist.iter().chain(&self.admins).cloned().collect();
+        let allow: Vec<String> = self
+            .allowlist
+            .iter()
+            .chain(&self.admins)
+            .chain(&self.apps)
+            .cloned()
+            .collect();
         trusted_by(author, |norm| self.fleet.contains(norm), self.self_login.as_deref(), &allow)
     }
 

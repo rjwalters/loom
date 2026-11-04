@@ -232,6 +232,7 @@ fn a_managed_checkout_resolves_its_readers_at_the_daemon_workspace_root() {
             }],
             legacy_logins: vec![],
             writers: Vec::new(),
+            load_failed: false,
         }
     }
     let daemon = tempfile::tempdir().unwrap();

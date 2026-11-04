@@ -328,3 +328,63 @@ fn items_carry_their_story_points_from_the_labels_in_hand() {
     assert_eq!(second.issue, None);
     assert_eq!(second.story_points, Some(2));
 }
+
+/// #13244: a body-marked tracker passes `tracker` for every audited label
+/// shape, and the same labels without the marker keep their normal step.
+#[test]
+fn a_tracker_marker_passes_whatever_the_labels() {
+    let shapes: [&[&str]; 3] = [
+        &["loom:issue", "loom:curated", "loom:blocked"],
+        &["loom:issue"],
+        &["loom:triage"],
+    ];
+    for l in shapes {
+        let issue = |tracker: bool| IssueInput {
+            number: 4,
+            labels: labels(l),
+            tracker,
+            ..IssueInput::default()
+        };
+        let marked = classify(&Inputs {
+            issues: vec![issue(true)],
+            ..Inputs::default()
+        });
+        assert_eq!(marked[0].step(), None, "{l:?}");
+        assert_eq!(marked[0].verdict, Verdict::Pass(PassReason::Tracker), "{l:?}");
+        assert_eq!(PassReason::Tracker.as_str(), "tracker");
+        let plain = classify(&Inputs {
+            issues: vec![issue(false)],
+            ..Inputs::default()
+        });
+        assert_ne!(plain[0].verdict, Verdict::Pass(PassReason::Tracker), "{l:?}");
+    }
+    let plain_ready = classify(&Inputs {
+        issues: vec![IssueInput {
+            number: 5,
+            labels: labels(&["loom:issue"]),
+            ..IssueInput::default()
+        }],
+        ..Inputs::default()
+    });
+    assert_eq!(plain_ready[0].target(), Some(5));
+}
+
+/// #13367: an approved PR flagged `loom:merge-conflict` is a pass, not a
+/// `champion_merge` step; the same PR without the flag is still merged.
+#[test]
+fn an_approved_conflicting_pr_is_not_a_merge_step() {
+    let pr = |labels: &[&str]| Inputs {
+        pulls: vec![PullInput {
+            number: 70,
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    let conflicting = classify(&pr(&["loom:pr", "loom:merge-conflict"]));
+    assert_eq!(conflicting[0].step(), None);
+    assert_eq!(conflicting[0].verdict, Verdict::Pass(PassReason::Conflicting));
+    assert_eq!(PassReason::Conflicting.as_str(), "conflicting");
+    let clean = classify(&pr(&["loom:pr"]));
+    assert_eq!(clean[0].step(), Some(Step::ChampionMerge));
+}

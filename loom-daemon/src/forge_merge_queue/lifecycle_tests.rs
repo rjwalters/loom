@@ -923,11 +923,39 @@ fn classify_matches_github_snake_case_tokens() {
 }
 
 #[test]
+fn classify_recognises_queue_cleared() {
+    for t in ["queue_cleared", "Queue cleared", "  QUEUE_CLEARED\n"] {
+        assert_eq!(classify(Some(t)), RemovalKind::QueueCleared, "{t:?}");
+    }
+    assert_eq!(classify(Some("queue_cleared_by_octocat")), RemovalKind::Unknown);
+    assert_eq!(RemovalKind::QueueCleared.as_str(), "queue-cleared");
+}
+
+#[test]
+fn queue_cleared_drop_keeps_loom_pr_and_does_not_page_the_operator() {
+    let (gh, _, r) = drop_with(Some("queue_cleared"));
+    assert!(matches!(
+        r,
+        Reconciled::Dropped {
+            kind: RemovalKind::QueueCleared,
+            route_error: None,
+            ..
+        }
+    ));
+    assert!(gh.has_label("loom:pr"), "loom:pr is kept");
+    assert!(!gh.has_label("loom:operator"), "no operator hold");
+    assert!(!gh.has_label("loom:changes-requested"));
+    // Unrelated unknown text still pages the operator.
+    let (gh, _, _) = drop_with(Some("some_new_token"));
+    assert!(gh.has_label("loom:operator"));
+}
+
+#[test]
 fn manual_removal_does_not_page_the_operator() {
     let r = super::removal::route(RemovalKind::Manual);
     assert!(r.add.is_empty() && r.remove.is_empty());
     assert_eq!(RemovalKind::Manual.as_str(), "manual");
-    assert!(super::removal::drop_prose(RemovalKind::Manual, Some("manual"), None)
+    assert!(super::removal::drop_prose(RemovalKind::Manual, Some("manual"), None, None)
         .contains("**manual**"));
 }
 
@@ -1244,4 +1272,31 @@ fn group_revoke_reports_a_failed_head_write() {
     let rev = revoke_for_transition_groups(&c, &groups, PR, "stale-verdict").unwrap();
     assert!(rev.head_failed.is_err());
     assert!(group_transition_line(&rev).contains("PR head status failure NOT confirmed"));
+}
+
+#[test]
+fn the_dropped_infra_revoke_names_the_cancelled_jobs() {
+    let (gh, _, _) = infra_drop(Ok(vec![run("ci", "success", 0), run("shard-3", "cancelled", 0)]));
+    assert_eq!(gh.count("Cancelled or timed-out group job(s): `shard-3`."), 1);
+}
+
+#[test]
+fn a_declined_infra_refinement_says_which_guard_declined() {
+    let (gh, _, _) = infra_drop(Ok(vec![run("shard-3", "cancelled", 1)]));
+    assert_eq!(gh.count("a step of `shard-3` ended `failure`"), 1);
+    let (gh, _, _) = infra_drop(Ok(vec![run("a", "cancelled", 0), run("lint", "failure", 2)]));
+    assert_eq!(gh.count("`lint` ended with a real failure"), 1);
+    let (gh, _, _) = infra_drop(Err("HTTP 403".to_string()));
+    assert_eq!(gh.count("check runs were unreadable"), 1);
+}
+
+#[test]
+fn a_retry_spent_drop_says_so() {
+    let (gh, ev, _) = infra_drop(Ok(vec![run("t", "cancelled", 0)]));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(10));
+    assert!(handoff(&c, PR, SHA1, &required_ok).is_ok());
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(13));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(14));
+    let _ = reconcile_pr(&c, PR);
+    assert_eq!(gh.count("already had its one infra retry"), 1);
 }

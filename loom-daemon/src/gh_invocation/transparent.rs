@@ -75,3 +75,24 @@ pub fn run_captured<A: AsRef<OsStr>>(
     }
     cmd.output()
 }
+
+/// Run `program args…` as a child with stdin, stdout and stderr inherited and
+/// wait for it (#13170): the streams are the caller's own, byte for byte, so
+/// the only difference from [`exec`] is that this process survives to see the
+/// exit status. Only `env` is added.
+///
+/// # Errors
+///
+/// When the child cannot be spawned or waited for.
+pub fn run_inherited<A: AsRef<OsStr>>(
+    program: &Path,
+    args: &[A],
+    env: &[(&str, OsString)],
+) -> io::Result<std::process::ExitStatus> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.status()
+}

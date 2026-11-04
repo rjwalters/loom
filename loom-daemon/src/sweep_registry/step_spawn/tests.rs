@@ -1129,6 +1129,25 @@ fn a_ci_pending_noop_line_releases_as_ci_wait() {
     assert_eq!(rel(&line("failed", "ci_pending")), "failed");
 }
 
+/// #13500: the Judge writes `reason=ci-pending`, the spelling of its own
+/// `lease pr release --skip-reason`. The parser folds `-` to `_`, so the
+/// line is the contract's `ci_pending` and releases as `ci_wait`, not as a
+/// `noop` that climbs the captain's 30 m / 2 h / 6 h / 24 h ladder.
+#[test]
+fn a_hyphenated_ci_pending_line_is_the_same_token_and_releases_as_ci_wait() {
+    let parsed =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=7 class=noop reason=ci-pending")
+            .unwrap();
+    assert_eq!(parsed.reason, "ci_pending");
+    assert_eq!(release_class_of_line(&parsed), "ci_wait");
+    let other = parse_outcome_line(
+        "LOOM_STEP_OUTCOME role=curator target=7 class=refused reason=not-a-work-item-hold-digest",
+    )
+    .unwrap();
+    assert_eq!(other.reason, "not_a_work_item_hold_digest");
+    assert_eq!(release_class_of_line(&other), "refused");
+}
+
 /// #12729: a Champion `requeued` holds as `ci_wait` whatever gate requeued it;
 /// a `skipped` stop stays on the no-progress ladder.
 #[test]
@@ -1139,4 +1158,34 @@ fn a_champion_requeued_noop_line_releases_as_ci_wait_for_any_gate() {
     };
     assert_eq!(rel(&line("requeued")), "ci_wait");
     assert_eq!(rel(&line("skipped")), "noop");
+}
+
+/// #13176: a Builder that opens a PR ends on the prompt's `## Completion`
+/// section. If that section does not tell it to write the outcome line, the
+/// step exits 0 with no line and is recorded `no-outcome-line`.
+#[test]
+fn builders_completion_section_requires_a_parseable_outcome_line() {
+    let prompt = include_str!("../../../../defaults/.claude/commands/loom/builder.md");
+    let completion = &prompt[prompt.rfind("\n## Completion").expect("Completion section")..];
+    let line = completion
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix('`').and_then(|l| l.strip_suffix('`')))
+        .find(|l| l.starts_with("LOOM_STEP_OUTCOME role=builder"))
+        .expect("Completion names the builder outcome line");
+    let concrete = line.replace("<n>", "13176");
+    let parsed = parse_outcome_line(&concrete).expect("the template parses once <n> is filled");
+    assert_eq!(parsed.class, StepOutcomeClass::Verdict);
+    assert_eq!(parsed.reason, "pr_opened");
+    assert_eq!(parsed.target, 13176);
+}
+
+/// #13521: the capture-side class splits the same way, and only for it.
+#[test]
+fn a_no_line_builder_that_opened_a_pr_has_its_own_step_class() {
+    let base = step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), None).unwrap();
+    let split = super::capture::no_outcome_line_with_pr(base);
+    assert_eq!(split.class(), "step-no-outcome-line-pr-opened");
+    assert_eq!(split.exit_code(), Some(0));
+    let other = step_failure(StepRole::Builder, StepEnd::Exited(Some(3)), None).unwrap();
+    assert_eq!(super::capture::no_outcome_line_with_pr(other).class(), "step-exit-nonzero");
 }

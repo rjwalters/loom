@@ -159,7 +159,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
                 ignore_host_constraint,
-                tap,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -169,8 +168,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     depends_on,
                     force,
                     ignore_host_constraint,
-                    tap.runtime,
-                    tap.model_profile,
                 )
                 .await
             }
@@ -393,6 +390,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // from sweep children, plus consumer for `SubscribeEvents` streams).
     let event_bus = Arc::new(EventBus::new());
     log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
+    loom_daemon::agent_residue_reaper::install_event_bus(event_bus.clone());
 
     // #10832: a live pause manifest must hold restart recovery off its paused
     // agents BEFORE the first registry is reconstructed (design §7 H5).
@@ -1543,6 +1541,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
     let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone());
+    // #12727: measure (never move) the daemon-root checkout's lag and dirt.
+    let _daemon_root_freshness =
+        loom_daemon::daemon_root_freshness::spawn_task(sweep_workspace.clone());
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);

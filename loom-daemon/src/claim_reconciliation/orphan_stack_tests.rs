@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::*;
 
@@ -224,41 +223,7 @@ fn head_owner_admits_only_loom_branches_in_this_repository() {
 
 // --- the pass, on real repositories -----------------------------------------
 
-fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "loom@example.com")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "loom@example.com")
-        .output()
-        .expect("git must spawn")
-}
-
-fn run(dir: &Path, args: &[&str]) -> String {
-    let out = git_out(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-fn commit_file(dir: &Path, name: &str, body: &str, msg: &str) -> String {
-    std::fs::write(dir.join(name), body).unwrap();
-    run(dir, &["add", "-A"]);
-    run(dir, &["commit", "-q", "-m", msg]);
-    run(dir, &["rev-parse", "HEAD"])
-}
-
-fn configure(dir: &Path) {
-    run(dir, &["config", "user.email", "loom@example.com"]);
-    run(dir, &["config", "user.name", "Loom Test"]);
-    run(dir, &["config", "commit.gpgsign", "false"]);
-}
+use crate::test_git_helpers::{commit_file, configure, run};
 
 const A: &str = "feature/issue-901";
 const B: &str = "feature/issue-902";

@@ -27,9 +27,37 @@ pub fn worktree_name(issue: u32) -> String {
     format!("{WORKTREE_PREFIX}{issue}")
 }
 
+/// A non-empty run of ASCII digits and nothing else — `[0-9]+` under an
+/// anchored ERE. Rejects a sign (`u32::parse` would accept a leading `+`),
+/// an empty string, a trailing newline and non-ASCII decimal digits, any of
+/// which would otherwise address a nonexistent issue.
+#[must_use]
+pub fn is_issue_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse a digits-only issue number ([`is_issue_digits`]); `None` on any other
+/// shape or on `u32` overflow.
+#[must_use]
+pub fn parse_issue_digits(s: &str) -> Option<u32> {
+    if is_issue_digits(s) {
+        s.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// The digit text of a `feature/issue-<digits>` branch, verbatim (leading
+/// zeros and over-`u32` runs intact), for callers that interpolate it as text.
+#[must_use]
+pub fn issue_digits_from_branch(branch: &str) -> Option<&str> {
+    let digits = branch.strip_prefix(BRANCH_PREFIX)?;
+    is_issue_digits(digits).then_some(digits)
+}
+
 #[must_use]
 pub fn issue_from_branch(branch: &str) -> Option<u32> {
-    branch.strip_prefix(BRANCH_PREFIX)?.parse().ok()
+    parse_issue_digits(branch.strip_prefix(BRANCH_PREFIX)?)
 }
 
 #[must_use]
@@ -54,6 +82,32 @@ mod tests {
     fn round_trips_branch_name() {
         assert_eq!(branch_name(42), "feature/issue-42");
         assert_eq!(issue_from_branch("feature/issue-42"), Some(42));
+    }
+
+    #[test]
+    fn issue_from_branch_accepts_digits_only() {
+        for (branch, want) in [
+            ("feature/issue-5", Some(5)),
+            ("feature/issue-007", Some(7)),
+            ("feature/issue-+5", None),
+            ("feature/issue--5", None),
+            ("feature/issue-", None),
+            ("feature/issue-12a", None),
+            ("feature/issue-12\n", None),
+            ("feature/issue-5-slug", None),
+            ("feature/issue-99999999999", None),
+            ("feature/issue-١٢", None),
+            ("main", None),
+        ] {
+            assert_eq!(issue_from_branch(branch), want, "branch {branch:?}");
+        }
+    }
+
+    #[test]
+    fn issue_digits_from_branch_keeps_text_verbatim() {
+        assert_eq!(issue_digits_from_branch("feature/issue-007"), Some("007"));
+        assert_eq!(issue_digits_from_branch("feature/issue-+5"), None);
+        assert_eq!(issue_digits_from_branch("feature/issue-"), None);
     }
 
     #[test]

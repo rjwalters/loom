@@ -149,3 +149,43 @@ fn a_user_credential_probe_falls_back_to_leg_one() {
     assert_eq!(probe.permission("acme/other"), Permission::Write);
     assert_eq!(fake.listing_calls(), 1, "the refusal is remembered: {:?}", fake.calls());
 }
+
+/// #13306: through the full cached probe (not just `lookup`), a repo created
+/// after the snapshot was taken is answered WRITE once the miss has aged past
+/// the one-minute windows of both layers.
+#[test]
+#[serial_test::serial(write_scope_cache)]
+fn a_repo_created_after_the_snapshot_is_admitted_through_the_cached_probe() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "acme/old", true)]));
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", env.tmp.path().join("c"));
+    crate::write_scope::probe::clear_memory();
+    let cfg = env.tmp.path().join("cfg-writer");
+    let cached = crate::write_scope::probe::Cached {
+        inner: GhProbe::new(fake.gh.clone(), Some(cfg.clone())),
+        key_dir: Some(cfg.clone()),
+    };
+    assert_eq!(cached.permission("acme/old"), Permission::Write);
+    assert!(matches!(cached.permission("acme/new"), Permission::Insufficient(_)));
+    // The forge now lists the new repo. Both layers' windows lapse.
+    fake.set("page1", &page(2, &[(1, "acme/old", true), (2, "acme/new", true)]));
+    crate::forge_repo_facts::test_support::advance_clock(120);
+    crate::write_scope::probe::clear_memory();
+    let key = crate::write_scope::probe::cache_key(Some(&cfg), &cached.cache_scope(), "acme/new")
+        .unwrap();
+    let path = crate::write_scope::probe::cache_dir().join(format!("{key}.json"));
+    let aged = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 120;
+    let body = serde_json::json!({
+        "write": false, "detail": crate::write_scope::probe::NOT_IN_INSTALLATION, "at": aged,
+        "cred": ""
+    });
+    std::fs::write(&path, body.to_string()).unwrap();
+    assert_eq!(cached.permission("acme/new"), Permission::Write, "{:?}", fake.calls());
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+}

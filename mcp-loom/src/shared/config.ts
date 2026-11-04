@@ -15,9 +15,6 @@ import { resolveEffectiveConfig } from "./config-resolver.js";
 /** Global Loom directory in user's home */
 export const LOOM_DIR = join(homedir(), ".loom");
 
-/** Browser console log file path */
-export const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
-
 /** Global state file path */
 export const STATE_FILE = join(LOOM_DIR, "state.json");
 

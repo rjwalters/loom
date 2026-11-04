@@ -236,12 +236,11 @@ fn host_total_mb() -> u64 {
     MEM_TOTAL_FALLBACK_MB
 }
 
+/// `MemTotal` (kB) from the shared meminfo parser; a zero total is unusable
+/// for budget arithmetic, so it is treated as absent.
 fn parse_meminfo_total_kb(contents: &str) -> Option<u64> {
-    contents
-        .lines()
-        .find_map(|l| l.strip_prefix("MemTotal:"))
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|kb| kb.parse::<u64>().ok())
+    crate::host_pressure::parse_meminfo(contents)
+        .mem_total_kb
         .filter(|kb| *kb > 0)
 }
 

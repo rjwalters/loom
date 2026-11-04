@@ -44,6 +44,7 @@ pub fn spawn_task(
         "daemon.work_finder",
         "daemon.capacity.advisory",
         "daemon.preflight.advisory",
+        "daemon.agent_residue",
         "epic.issue",
     ]);
     tokio::spawn(run(subscription, queue, host_id))
@@ -107,6 +108,7 @@ pub(crate) fn map_event_to_daemon_event_record(event: &Event) -> Option<Telemetr
         // already the bare, tag-free shape.
         Event::Generic { payload, .. }
             if topic.starts_with("daemon.drain.")
+                || topic.starts_with("daemon.agent_residue.")
                 || topic == crate::work_finder::startup_gate::FIRST_TICK_TOPIC =>
         {
             payload.clone()

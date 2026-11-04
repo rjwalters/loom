@@ -187,8 +187,9 @@ impl Ctx {
                 .to_string(),
         };
         self.say(&format!(
-            "BACKSTOP: {why}; held until {} — stand down, next PR (a push or label change \
-             releases it; {}=0 disables)",
+            "BACKSTOP: {why}; held until {} — stand down, next PR (a push or a change to the \
+             PR's `loom:*` label set releases it — removing and re-adding the same label does \
+             not; {}=0 disables)",
             until.to_rfc3339(),
             backstop::DISABLE_ENV
         ));

@@ -254,11 +254,12 @@ fn claim_label_is_live_foreign_ignores_this_dispatchers_own_flip() {
     );
 }
 
-/// [`is_sole_claimant`] is about FOREIGN records: several of this dispatcher's
-/// own (e.g. a re-published lease) still leave it the sole claimant, and a
-/// single foreign record — whatever its comment order — does not.
+/// [`issue_claim_state`] is about FOREIGN records: several of this dispatcher's
+/// own (e.g. a re-published lease) still leave it holding the claim, a single
+/// foreign record — whatever its comment order — does not, and an unreadable
+/// lease list is `Unknown`, never `Free`.
 #[test]
-fn is_sole_claimant_counts_foreign_records_only() {
+fn issue_claim_state_counts_foreign_records_only() {
     let lease = |host: &str, sweep: &str, id: u64| LeaseComment {
         id,
         created_at: None,
@@ -269,18 +270,27 @@ fn is_sole_claimant_counts_foreign_records_only() {
     let mine_a = lease("host-me", "sweep-mine", 1);
     let mine_b = lease("host-me", "sweep-mine", 3);
     let peer = lease("host-peer", "sweep-peer", 2);
+    let state = |rows: Option<&[&LeaseComment]>| issue_claim_state(rows, "host-me", "sweep-mine");
+    let held_by_peer = |h: &str, s: &str| IssueClaimState::HeldByPeer {
+        host: h.to_string(),
+        sweep_id: s.to_string(),
+    };
 
-    assert!(is_sole_claimant(&[], "host-me", "sweep-mine"));
-    assert!(is_sole_claimant(&[&mine_a, &mine_b], "host-me", "sweep-mine"));
-    assert!(!is_sole_claimant(&[&mine_a, &peer], "host-me", "sweep-mine"));
-    assert!(
-        !is_sole_claimant(&[&peer], "host-me", "sweep-mine"),
-        "a record from another sweep on another host is foreign"
-    );
-    assert!(
-        !is_sole_claimant(&[&lease("host-me", "sweep-other", 1)], "host-me", "sweep-mine"),
+    assert_eq!(state(Some(&[])), IssueClaimState::Free);
+    assert_eq!(state(Some(&[&mine_a, &mine_b])), IssueClaimState::HeldBySelf);
+    assert_eq!(state(Some(&[&mine_a, &peer])), held_by_peer("host-peer", "sweep-peer"));
+    assert_eq!(state(Some(&[&peer])), held_by_peer("host-peer", "sweep-peer"));
+    assert_eq!(
+        state(Some(&[&lease("host-me", "sweep-other", 1)])),
+        held_by_peer("host-me", "sweep-other"),
         "a different sweep on THIS host is still not this dispatcher's own record"
     );
+    assert_eq!(state(None), IssueClaimState::Unknown, "an unreadable list is never Free");
+
+    assert!(IssueClaimState::Free.permits_leaseless_leg());
+    assert!(IssueClaimState::HeldBySelf.permits_leaseless_leg());
+    assert!(IssueClaimState::Unknown.permits_leaseless_leg());
+    assert!(!held_by_peer("h", "s").permits_leaseless_leg());
 }
 
 /// `yield_identity` is the one shape the dispatch path consumes: `Proceed`

@@ -31,6 +31,7 @@ pub(super) async fn reconcile_merges_since(
     already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
+    seeded: bool,
 ) -> Option<ReconcilePass> {
     let (rows, saturated) = fetch_merged_prs_since(Path::new(workspace_root), since).await?;
     let mut pass = ReconcilePass {
@@ -51,6 +52,10 @@ pub(super) async fn reconcile_merges_since(
             already_narrated,
             activity_db,
             peer_completions,
+            super::completion_runtime::Narration::new(
+                crate::observability::ops::feed::Trigger::Reconcile,
+                seeded,
+            ),
         )
         .await
         {
@@ -183,6 +188,10 @@ impl ReconcileState {
         // suppresses one tick per workspace.
         let since = self.watermarks.since(&workspace_root);
         let started = Utc::now();
+        // Whether this pass seeds without posting (#4649); the dedup slot is
+        // still only spent below, once the forge has answered.
+        let seeding =
+            self.dedup_state_was_fresh && !self.seeded_fresh_workspaces.contains(&workspace_root);
         let Some(pass) = reconcile_merges_since(
             persona,
             &workspace_root,
@@ -191,6 +200,7 @@ impl ReconcileState {
             completed,
             activity_db,
             peer_completions,
+            seeding,
         )
         .await
         else {

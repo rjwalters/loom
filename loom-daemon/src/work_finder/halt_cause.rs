@@ -119,31 +119,6 @@ impl HaltCause {
             Self::WeightZero => "weight_zero",
         }
     }
-
-    /// The short phrase naming this cause in a `workspace_halted` row's
-    /// human-readable `reason` (#11417).
-    #[must_use]
-    pub fn phrase(self) -> &'static str {
-        match self {
-            Self::MainRed => "main red",
-            Self::GatePending => "build gate running",
-            Self::TokenPool => "token pool exhausted",
-            Self::PreflightAdvisory => "pre-flight advisory tripped",
-            Self::Drain => "scheduled drain",
-            Self::WriteScope => "no write access to this repo",
-            Self::CiBilling => "CI billing failure",
-            Self::InstallIncompatible => "installed Loom incompatible",
-            Self::DaemonTooOld => "daemon too old for installed Loom",
-            Self::MaintainOnly => "maintain-only workspace",
-            Self::WeightZero => "draw weight 0",
-        }
-    }
-
-    /// The `reason` sentence for a `workspace_halted` row held by `self`.
-    #[must_use]
-    pub fn halted_reason(self) -> String {
-        format!("blocked: repo dispatch held — {}", self.phrase())
-    }
 }
 
 /// `2 token_pool, 1 daemon_too_old`: how many roots each cause holds, in

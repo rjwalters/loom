@@ -520,7 +520,7 @@ pub fn snapshot_stamp() -> String {
 /// UTC timestamp in the pending marker's format.
 #[must_use]
 pub fn iso_stamp() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    crate::script_helpers::now_iso()
 }
 
 /// Render a path into a JSON string value.

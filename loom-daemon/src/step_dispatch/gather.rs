@@ -196,6 +196,21 @@ pub fn has_red_fix_marker(body: Option<&str>) -> bool {
     })
 }
 
+/// The tracker marker (#10886): a living tracker, never drawn as work.
+const TRACKER_MARKER: &str = "<!-- loom:tracker -->";
+
+/// A body carries the tracker marker alone on a line, outside a code fence
+/// (`label-state-machine.md` § "Tracker marker"); a quoted or inline mention
+/// does not count.
+#[must_use]
+pub fn has_tracker_marker(body: Option<&str>) -> bool {
+    body.is_some_and(|b| {
+        crate::merge_pr::refs::strip_fenced_code_blocks(b)
+            .lines()
+            .any(|l| l.trim() == TRACKER_MARKER)
+    })
+}
+
 /// A PR as the classifier reads it, from an issue-listing row alone: its
 /// body links it, its branch cannot (head unknown).
 #[must_use]
@@ -248,6 +263,7 @@ pub fn build_inputs(
                     .unwrap_or_default(),
                 markers: IssueMarkers::default(),
                 red_fix: facts.red_fix.contains(&r.number),
+                tracker: has_tracker_marker(r.body.as_deref()),
             }
         })
         .collect();

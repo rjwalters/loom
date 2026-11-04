@@ -299,3 +299,42 @@ fn parse_dependency_refs_itself_still_ignores_the_checklist() {
 // `defaults/scripts/tests/test-classify-dependency-block.sh`, whose assertions
 // were written against the shell and now drive this implementation unchanged
 // through the same CLI.
+
+// #13303: quoted / code spans describe other issues and declare nothing.
+
+#[test]
+fn a_quoted_phrase_on_a_blocks_line_declares_nothing() {
+    let body = "Blocks #28 (macro layout generator, which \"Depends on #27 and #24\")";
+    assert!(parse_dependency_refs(body, REPO).is_empty());
+}
+
+#[test]
+fn blocks_and_blocking_lines_declare_nothing() {
+    assert!(parse_dependency_refs("Blocks #28\nBlocking #29", REPO).is_empty());
+}
+
+#[test]
+fn an_inline_code_span_is_not_a_declaration() {
+    assert!(parse_dependency_refs("Write `Depends on #5` in the body", REPO).is_empty());
+}
+
+#[test]
+fn a_real_declaration_survives_a_quoted_span_on_the_same_line() {
+    let body = "Blocked by #3, unlike \"Depends on #9\"";
+    assert_eq!(parse_dependency_refs(body, REPO), vec!["o/r#3"]);
+}
+
+#[test]
+fn an_unbalanced_quote_does_not_mask_the_rest_of_the_line() {
+    assert_eq!(parse_dependency_refs("a \" stray\nBlocked by #3 \" x", REPO), vec!["o/r#3"]);
+    assert_eq!(parse_dependency_refs("Don't care. Blocked by #3", REPO), vec!["o/r#3"]);
+}
+
+#[test]
+fn bold_and_park_record_declarations_still_parse() {
+    assert_eq!(parse_dependency_refs("**Depends on:** #3", REPO), vec!["o/r#3"]);
+    assert_eq!(
+        parse_dependency_refs("<!-- loom:park Blocked by: #4 by=builder -->", REPO),
+        vec!["o/r#4"]
+    );
+}

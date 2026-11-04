@@ -68,9 +68,6 @@ const TABLE: &[(&str, Reloadability)] = &[
     // inside the tick loop body (`loom-daemon/src/role_runner.rs`), and
     // `loom-daemon status` already reports the live per-root value.
     ("autonomous.roleRunner", Reloadability::Live),
-    // Per-repo approval/merge policy (#11674): `merge_policy::declared` is
-    // read from the effective config on every `fleet.state` export.
-    ("repos", Reloadability::Live),
     // Re-read every multi-workspace work-finder tick since #9060 (the cap,
     // and since #12406 the only cap) — `ConfiguredMaxReloader::refresh()` in
     // `loom-daemon/src/work_finder/configured_max.rs`, consumed from
@@ -127,7 +124,7 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Resolved once before the ingestion thread is spawned, then frozen for
     // that thread's lifetime (`try_init_transcript_ingest`).
     ("autonomous.transcriptIngest", Reloadability::RestartRequired),
-    // `fleet.repo` / `fleet.ref` / `fleet.syncIntervalSecs` / `fleet.autoApply`
+    // `fleet.repo` / `fleet.ref` / `fleet.syncIntervalSecs` / `fleet.autoApply*`
     // are captured once into `PassInputs` in `fleet_sync::start()`, before
     // the timer task is spawned — including the very config this `render`
     // itself is driven by.

@@ -98,7 +98,7 @@
 //! differences driven by the weaker evidence available on the PR side:
 //!
 //! - **The join is heuristic, not authoritative.** A PR has no `loom:building`
-//!   issue number of its own — [`parse_issue_from_branch`] recovers one only
+//!   issue number of its own — [`naming::issue_from_branch`](crate::worktree_ops::naming::issue_from_branch) recovers one only
 //!   when `headRefName` matches `feature/issue-<N>` (the convention
 //!   `worktree.sh` establishes); any other branch name has no evidence to
 //!   join, and [`decide_pr`] falls straight through to the age rule below.
@@ -1054,7 +1054,7 @@ pub struct ClaimedPr {
     /// failure or no such push.
     pub most_recent_head_push_at: Option<DateTime<Utc>>,
     /// The PR's head branch name, when available — the only join key to an
-    /// issue number this pass has (see [`parse_issue_from_branch`]).
+    /// issue number this pass has (see [`crate::worktree_ops::naming::issue_from_branch`]).
     pub head_ref_name: Option<String>,
 }
 
@@ -1104,18 +1104,6 @@ pub struct PrClaimOutcome {
     /// call failed (already logged at `warn` by
     /// [`forge::reconcile_pr_claims_report`]).
     pub reclaimed: bool,
-}
-
-/// Recover the `loom:building` issue number a PR's head branch encodes, when
-/// it follows the `feature/issue-<N>` convention `worktree.sh` establishes.
-/// `None` for any other branch shape — the caller then has no join key at
-/// all and [`decide_pr`] falls straight through to the age rule.
-#[must_use]
-pub fn parse_issue_from_branch(head_ref_name: &str) -> Option<u32> {
-    head_ref_name
-        .strip_prefix("feature/issue-")?
-        .parse::<u32>()
-        .ok()
 }
 
 /// Pure decision function for one PR-side claim label — no I/O, fully
@@ -1256,7 +1244,7 @@ pub fn plan_pr(
             let issue_number = pr
                 .head_ref_name
                 .as_deref()
-                .and_then(parse_issue_from_branch);
+                .and_then(crate::worktree_ops::naming::issue_from_branch);
             let (entry, run_registry_pid) = match issue_number {
                 Some(n) => {
                     let entry = sweep_journal::find(journal, repo, n);

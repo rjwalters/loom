@@ -87,7 +87,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::telemetry::kinds::fleet_state::FleetStage;
+    use crate::telemetry::kinds::work_started::FleetStage;
 
     fn act(minute: u32, number: u32, action: &str) -> JournalEntry {
         JournalEntry::Act {
