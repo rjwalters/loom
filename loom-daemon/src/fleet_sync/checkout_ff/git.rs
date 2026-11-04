@@ -44,7 +44,8 @@ const NAMED_PATHS: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Refusal {
     /// A local file sits where an incoming commit writes one. Nothing changed.
-    WouldOverwrite(String),
+    /// The short list for a detail line, and every path git named.
+    WouldOverwrite(String, Vec<String>),
     /// Anything else git said, or a command that did not finish.
     Other(String),
 }
@@ -382,7 +383,7 @@ pub(super) fn classify_refusal(stderr: &str) -> Refusal {
         .filter_map(|l| l.strip_prefix('\t'))
         .map(|p| p.trim().to_string())
         .collect();
-    Refusal::WouldOverwrite(summarize(&paths))
+    Refusal::WouldOverwrite(summarize(&paths), paths)
 }
 
 /// A short list of `paths` for a one-line detail.
