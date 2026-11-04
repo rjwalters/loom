@@ -126,9 +126,11 @@ fn the_tracker_exception_needs_login_prefix_and_body_sentence() {
 
 #[test]
 fn a_fleet_listed_app_author_passes_but_its_bare_user_does_not() {
-    let mut roster = crate::fleet_store::admins::Admins::default();
-    roster.apps = vec!["gateway[bot]".to_string()];
-    roster.state = "loaded 0".to_string();
+    let roster = crate::fleet_store::admins::Admins {
+        apps: vec!["gateway[bot]".to_string()],
+        state: "loaded 0".to_string(),
+        ..Default::default()
+    };
     let p = policy().with_admins(roster);
     assert_eq!(classify(&p, Some(&issue("gateway[bot]", "Bot", "NONE"))), Gate::Trusted);
     assert_ne!(classify(&p, Some(&issue("gateway", "User", "NONE"))), Gate::Trusted);
