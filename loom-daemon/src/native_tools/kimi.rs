@@ -29,6 +29,8 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+use crate::shell_quote::shell_quote;
 use std::path::Path;
 
 /// Kimi 2.0.2's own builtin tool names that write, execute or delegate.
@@ -59,10 +61,6 @@ fn toml_string(value: &str) -> String {
     // everything serde_json emits, so this is an exact, injection-free
     // encoding of an arbitrary path or command line.
     serde_json::Value::String(value.to_owned()).to_string()
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// The generated `config.toml`. Byte-for-byte deterministic given the same
