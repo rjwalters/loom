@@ -317,8 +317,48 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
 fn roster(logins: &[&str]) -> crate::fleet_store::admins::Admins {
     crate::fleet_store::admins::Admins {
         logins: logins.iter().map(|s| (*s).to_string()).collect(),
+        apps: Vec::new(),
         state: format!("loaded {}", logins.len()),
     }
+}
+
+fn roster_with_apps(apps: &[&str]) -> crate::fleet_store::admins::Admins {
+    let mut r = roster(&["turian"]);
+    r.apps = apps.iter().map(|s| (*s).to_string()).collect();
+    r
+}
+
+#[test]
+fn fleet_app_is_trusted_but_bare_user_is_not() {
+    let p = policy(&[]).with_admins(roster_with_apps(&["gateway[bot]"]));
+    assert!(p.trusts_json(&rest("gateway[bot]", "Bot", "NONE")));
+    assert!(!p.trusts_json(&rest("gateway", "User", "NONE")));
+    assert!(p.trusts_json(&rest("turian", "User", "NONE")));
+}
+
+#[test]
+fn unavailable_roster_trusts_no_apps() {
+    let p = policy(&[]).with_admins(crate::fleet_store::admins::Admins::unavailable("x"));
+    assert!(!p.trusts_json(&rest("gateway[bot]", "Bot", "NONE")));
+}
+
+#[test]
+fn apps_list_changes_digest_only_when_non_empty() {
+    let base = policy(&[]).with_admins(roster(&["turian"])).digest();
+    let empty = policy(&[]).with_admins(roster_with_apps(&[])).digest();
+    let one = policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]"]))
+        .digest();
+    let two = policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]", "b[bot]"]))
+        .digest();
+    assert_eq!(base, empty);
+    assert_ne!(base, one);
+    assert_ne!(one, two);
+    assert!(policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]"]))
+        .sources_consulted()
+        .contains("fleet trusted Apps list (1 entries"));
 }
 
 #[test]

@@ -123,3 +123,15 @@ fn the_tracker_exception_needs_login_prefix_and_body_sentence() {
     no_fields["body"] = json!(TRACKER_BODY);
     assert!(matches!(classify(&p, Some(&no_fields)), Gate::Unknown(_)), "a PR stays unknown");
 }
+
+#[test]
+fn a_fleet_listed_app_author_passes_but_its_bare_user_does_not() {
+    let roster = crate::fleet_store::admins::Admins {
+        apps: vec!["gateway[bot]".to_string()],
+        state: "loaded 0".to_string(),
+        ..Default::default()
+    };
+    let p = policy().with_admins(roster);
+    assert_eq!(classify(&p, Some(&issue("gateway[bot]", "Bot", "NONE"))), Gate::Trusted);
+    assert_ne!(classify(&p, Some(&issue("gateway", "User", "NONE"))), Gate::Trusted);
+}
