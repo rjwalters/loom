@@ -1077,6 +1077,7 @@ assert_contains "$OUT" "WARN: champion.extraCriticalPaths is not an array" "malf
 EXTRA_CRITICAL_PATHS=("infra/bot/**")
 assert_eq "FAIL: .github/workflows/ci.yml" "$(printf '.github/workflows/ci.yml\n' | champion_critical_file_check)" "a built-in path still holds with the key set"
 assert_eq "PASS" "$(printf 'infra/bot/a\n' | champion_critical_file_check)" "declared paths are not in CRITICAL_PATTERNS (a criticalFilesOnly class never sees them)"
+# shellcheck disable=SC2034 # read by champion_critical_file_check
 EXTRA_CRITICAL_PATHS=()
 
 # Ordering and wiring pinned against the shipped block.
