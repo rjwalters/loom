@@ -77,6 +77,10 @@ impl SweepRegistry {
         started_at: DateTime<Utc>,
         end: StepEnd,
     ) -> bool {
+        // The label-time read, lease check and claim restore below are all
+        // made for this step's sweep: stamp their `invoke github` spans
+        // (#13171). The guard is thread-local and this fn is synchronous.
+        let _sweep = crate::gh_invocation::telemetry::enter_sweep(sweep_id, Some(role.role_name()));
         let retained = if role.acts_on_pr() {
             self.release_pr_lock_owned(item, sweep_id).retained()
         } else {
