@@ -117,7 +117,7 @@ Thumbs.db
 .loom/gh-config-by-owner/
 .loom/gh-config-by-owner.*/
 .loom/gh-config-by-owner-*/
-.loom-local/
+/.loom-local/
 # <<< loom-managed <<<
 .loom-test-failure-context.json
 .loom/.daemon.flags
