@@ -4,7 +4,7 @@ use super::*;
 use crate::champion_hold::ratification::{ChangedFile, Comment};
 use crate::role_runner::ratification_dispatch::InstructionSource;
 use crate::role_runner::ratification_lane::{
-    keys_marked, run_lane, CommentSink, Config, Key, LaneFile, OpenPr, PrSource,
+    keys_marked, run_lane, CommentSink, Config, Key, OpenPr, PrSource,
 };
 use serde_json::json;
 use std::cell::RefCell;
@@ -36,15 +36,16 @@ impl PrSource for Prs {
             head_sha: HEAD.into(),
         }]
     }
-    fn files(&self, _pr: u64) -> Vec<LaneFile> {
-        vec![LaneFile {
-            file: ChangedFile {
-                filename: "ratification/requests/a.md".into(),
-                previous_filename: None,
-                status: "added".into(),
-                head_content: Some("x".into()),
-            },
-            base_content: None,
+    fn files(
+        &self,
+        _pr: u64,
+        _hold: &crate::champion_hold::ratification::Config,
+    ) -> Vec<ChangedFile> {
+        vec![ChangedFile {
+            filename: "ratification/requests/a.md".into(),
+            previous_filename: None,
+            status: "added".into(),
+            head_content: Some("Ratified only on operator merge.".into()),
         }]
     }
     fn trusted_comments(&self, _pr: u64) -> Vec<Comment> {
@@ -118,7 +119,7 @@ fn one_candidate_posts_one_marker_per_key_with_selected_head() {
         Sink::default(),
         ok_runner(),
     );
-    run_lane(&cfg(), "bot[bot]", "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
     let posted = sink.posted.borrow();
     assert_eq!(posted.len(), 2);
     assert!(posted[0].1.contains("reviewer=ratification-ee"));
@@ -138,7 +139,7 @@ fn failed_closed_key_posts_nothing_and_other_key_is_unaffected() {
         Sink::default(),
         ok_runner(),
     );
-    run_lane(&cfg(), "bot[bot]", "o/r", &prs, &Instr { fail_market: true }, &sink, &mut r);
+    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: true }, &sink, &mut r);
     assert_eq!(keys_marked(&comments(&sink), HEAD), vec![Key::Ee]);
     assert_eq!(sink.posted.borrow().len(), 1);
 }
@@ -156,7 +157,7 @@ fn non_success_session_fails_closed_without_marker() {
         outcome: RoleTickOutcome::Failure("boom".into()),
         calls: 0,
     };
-    run_lane(&cfg(), "bot[bot]", "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
     assert_eq!(r.calls, 2);
     assert!(sink.posted.borrow().is_empty());
 }
@@ -173,7 +174,7 @@ fn marker_carries_selected_head_so_a_push_mid_review_is_reselected() {
         Sink::default(),
         ok_runner(),
     );
-    run_lane(&cfg(), "bot[bot]", "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
     let new_head = "f".repeat(40);
     assert!(keys_marked(&comments(&sink), &new_head).is_empty());
     assert_eq!(keys_marked(&comments(&sink), HEAD).len(), 2);
@@ -191,7 +192,7 @@ fn disabled_lane_dispatches_and_posts_nothing() {
     );
     run_lane(
         &Config::disabled(),
-        "bot[bot]",
+        None,
         "o/r",
         &prs,
         &Instr { fail_market: false },
@@ -202,7 +203,8 @@ fn disabled_lane_dispatches_and_posts_nothing() {
 }
 
 #[test]
-fn self_authored_pr_is_refused_before_any_dispatch_or_post() {
+fn fleet_authored_held_pr_gets_both_markers_for_the_head() {
+    // Author == the dispatching identity; the hold's predicate selects it.
     let (prs, sink, mut r) = (
         Prs {
             author: "Bot[bot]",
@@ -211,8 +213,18 @@ fn self_authored_pr_is_refused_before_any_dispatch_or_post() {
         Sink::default(),
         ok_runner(),
     );
-    run_lane(&cfg(), "bot[bot]", "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
-    assert_eq!((r.calls, sink.posted.borrow().len()), (0, 0));
+    run_lane(
+        &cfg(),
+        Some("lane-session"),
+        "o/r",
+        &prs,
+        &Instr { fail_market: false },
+        &sink,
+        &mut r,
+    );
+    assert_eq!(r.calls, 2);
+    let keys = keys_marked(&comments(&sink), HEAD);
+    assert!(keys.contains(&Key::Ee) && keys.contains(&Key::Market));
 }
 
 // ---- #13502: verdict text and pagination -----------------------------------
@@ -270,7 +282,7 @@ fn posted_marker_carries_the_session_output() {
     );
     run_lane(
         &cfg(),
-        "bot",
+        None,
         "o/r",
         &prs,
         &Instr { fail_market: false },
