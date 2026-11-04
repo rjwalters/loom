@@ -133,6 +133,38 @@ pub fn classify(policy: &TrustPolicy, issue: Option<&Value>) -> Gate {
     }
 }
 
+/// The login of the first trusted actor who applied `loom:issue` to the issue,
+/// read from its REST timeline (`events`), or `None` (#13578).
+///
+/// An operator's hand adoption is recorded by the forge with an unforgeable
+/// actor and survives later re-curation, so it is read back rather than
+/// marked. Timeline actors carry no `author_association`, so
+/// `association_of(login)` supplies one (`None`: unknown, which no rule
+/// trusts); the verdict is still [`TrustPolicy::trusts`], with no second trust
+/// table. An event by an untrusted actor does not count.
+#[must_use]
+pub fn adopted_by(
+    policy: &TrustPolicy,
+    events: &[Value],
+    association_of: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    events.iter().find_map(|e| {
+        if e.get("event").and_then(Value::as_str) != Some("labeled")
+            || e.pointer("/label/name").and_then(Value::as_str) != Some("loom:issue")
+        {
+            return None;
+        }
+        let actor = e.get("actor").filter(|a| a.is_object())?;
+        let login = actor.get("login").and_then(Value::as_str)?;
+        let mut author = Author::new(Some(login), None);
+        author.app = author.app || actor.get("type").and_then(Value::as_str) == Some("Bot");
+        if !policy.trusts(&author) {
+            author.association = association_of(login);
+        }
+        policy.trusts(&author).then(|| login.to_string())
+    })
+}
+
 /// The one-time comment body explaining the hold, marker first. `stamp`
 /// (`None`: the legacy marker) is what the verdict was reached from.
 #[must_use]

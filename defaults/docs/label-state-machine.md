@@ -361,7 +361,14 @@ comments and markers stay untrusted everywhere (`forge trusted-comments`, verdic
 hold markers, PRs and non-tracker issues).
 
 Adoption is a trusted maintainer applying `loom:issue` by hand, or re-filing the
-issue; an automated Champion verdict alone is not adoption. Trusted authors see no
+issue; an automated Champion verdict alone is not adoption. **A trusted adoption
+persists (#13578):** for an `UNTRUSTED` author, `promotion-author` also reads the
+issue timeline and returns `TRUSTED` (detail on stderr) when a trusted actor ever
+applied `loom:issue`, so landed-route re-curation does not re-arm the gate. The actor
+is judged by the same predicate (timeline actors carry no association, so write
+access or better counts as one); an unreadable timeline keeps `UNTRUSTED`
+(fail closed). It does not look at body revisions: a later body edit by the untrusted
+author does not undo an adoption. Trusted authors see no
 change. This is admission control for external submissions, not protection against
 a compromised trusted agent, and it adds no signed decisions or keys.
 

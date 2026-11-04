@@ -368,7 +368,15 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     let issue =
         crate::comment_trust::records::fetch_issue_object(repo, &number.to_string(), &root, false);
     let policy = crate::comment_trust::TrustPolicy::for_root(&root);
-    let gate = classify(&policy, issue.as_ref());
+    let mut gate = classify(&policy, issue.as_ref());
+    if matches!(gate, crate::promotion_author::Gate::Untrusted(_)) {
+        // #13578: a trusted actor's earlier `loom:issue` is a durable adoption.
+        // Any read failure keeps the verdict above (fail closed).
+        if let Some(who) = adopter(&policy, repo, number, &root) {
+            eprintln!("promotion-author: adopted by {who} (trusted `labeled loom:issue`)");
+            gate = crate::promotion_author::Gate::Trusted;
+        }
+    }
     println!("{}", gate.token());
     let text = |key: &str| {
         issue
@@ -390,6 +398,28 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
         std::process::exit(1)
     }
     Ok(())
+}
+
+/// The trusted actor who applied `loom:issue` to issue `number`, if the whole
+/// timeline could be read and shows one (#13578).
+fn adopter(
+    policy: &crate::comment_trust::TrustPolicy,
+    repo: &str,
+    number: u64,
+    root: &Path,
+) -> Option<String> {
+    let path = format!("repos/{repo}/issues/{number}/timeline");
+    let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+    let events = crate::comment_trust::parse_listing(&out.ok_output()?.stdout)?;
+    crate::promotion_author::adopted_by(policy, &events, |login| {
+        // Timeline actors have no association: map write access or better to one.
+        let path = format!("repos/{repo}/collaborators/{login}/permission");
+        let out =
+            crate::script_helpers::run_gh(&["api", &path, "--jq", ".permission"], root, false);
+        let out = out.ok_output()?;
+        matches!(String::from_utf8_lossy(&out.stdout).trim(), "admin" | "maintain" | "write")
+            .then(|| "COLLABORATOR".to_string())
+    })
 }
 
 #[cfg(test)]

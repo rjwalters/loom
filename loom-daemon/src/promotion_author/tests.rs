@@ -135,3 +135,39 @@ fn a_fleet_listed_app_author_passes_but_its_bare_user_does_not() {
     assert_eq!(classify(&p, Some(&issue("gateway[bot]", "Bot", "NONE"))), Gate::Trusted);
     assert_ne!(classify(&p, Some(&issue("gateway", "User", "NONE"))), Gate::Trusted);
 }
+
+fn labeled(actor: &str, kind: &str, label: &str) -> Value {
+    json!({"event": "labeled", "label": {"name": label}, "actor": {"login": actor, "type": kind}})
+}
+
+fn maintainer(login: &str) -> Option<String> {
+    (login == "rjwalters").then(|| "OWNER".to_string())
+}
+
+/// #13578: adopt -> partial merge -> re-curate -> promote. The adoption event
+/// stays on the timeline through the later triage/curated label churn.
+#[test]
+fn a_trusted_adoption_survives_recuration() {
+    let events = vec![
+        labeled("rjwalters", "User", "loom:issue"),
+        labeled("loom-bot[bot]", "Bot", "loom:triage"),
+        labeled("loom-bot[bot]", "Bot", "loom:curated"),
+    ];
+    assert_eq!(adopted_by(&policy(), &events, maintainer), Some("rjwalters".to_string()));
+}
+
+#[test]
+fn never_adopted_or_adopted_by_an_untrusted_actor_is_not_adoption() {
+    let p = policy();
+    let curated = vec![labeled("loom-bot[bot]", "Bot", "loom:curated")];
+    assert_eq!(adopted_by(&p, &curated, maintainer), None);
+    let outsider = vec![labeled("drive-by", "User", "loom:issue")];
+    assert_eq!(adopted_by(&p, &outsider, maintainer), None);
+    assert_eq!(adopted_by(&p, &[], maintainer), None);
+}
+
+#[test]
+fn an_allowlisted_actor_needs_no_association_lookup() {
+    let events = vec![labeled("partner", "User", "loom:issue")];
+    assert_eq!(adopted_by(&policy(), &events, |_| None), Some("partner".to_string()));
+}
