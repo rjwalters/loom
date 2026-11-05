@@ -19,6 +19,7 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
     [[ -f "$f" ]] || { fail "$copy exists"; continue; }
     LINE="$(grep -m1 '^[[:space:]]*first_at=\$(jq' "$f")"
     [[ -n "$LINE" ]] || { fail "extract first_at line from $copy"; continue; }
+    # shellcheck disable=SC2034  # recs/cause are read by the eval'd first_at line, invisible to shellcheck
     run() { local recs="$1" cause="$2" first_at; eval "$LINE"; echo "$first_at"; }
 
     got=$(run "{\"records\":[$(rec 2026-10-01T00:00:00Z c 1),$(rec 2026-10-02T00:00:00Z c 2),$(rec 2026-11-04T00:00:00Z c 1),$(rec 2026-11-05T00:00:00Z c 2)]}" c)
