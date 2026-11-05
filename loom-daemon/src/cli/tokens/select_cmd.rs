@@ -8,7 +8,8 @@
 
 use anyhow::{anyhow, Result};
 
-use super::{resolve_tokens_workspace, shell_single_quote};
+use super::resolve_tokens_workspace;
+use crate::shell_quote::shell_quote;
 
 /// Parsed `tokens select` arguments. A struct rather than six positional
 /// parameters so the call site stays readable and a future flag cannot be
@@ -71,11 +72,11 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
             _ => unreachable!("Codex selection returned a non-Codex binding"),
         };
         if export {
-            println!("export CODEX_HOME={}", shell_single_quote(&directory.display().to_string()));
+            println!("export CODEX_HOME={}", shell_quote(&directory.display().to_string()));
             println!(
                 "export LOOM_ACCOUNT_PROVIDER='{}'\nexport LOOM_ACCOUNT_NAME={}",
                 selected.id.provider,
-                shell_single_quote(&selected.id.name)
+                shell_quote(&selected.id.name)
             );
             // #5609 AC 6: alongside the existing PROVIDER/NAME pair,
             // so a dispatched sweep can be correlated back to the
@@ -84,7 +85,7 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
             // doc comment), so this is a no-op today and becomes live
             // the day a Codex-backed `ProviderAdapter` gains one.
             if let Some(upstream_id) = &selected.upstream_id {
-                println!("export LOOM_ACCOUNT_UPSTREAM_ID={}", shell_single_quote(upstream_id));
+                println!("export LOOM_ACCOUNT_UPSTREAM_ID={}", shell_quote(upstream_id));
             }
             println!("LOOM_TOKEN_MODE='{}'", selected.mode);
         } else {
