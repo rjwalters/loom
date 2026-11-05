@@ -90,6 +90,22 @@ pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
     attrs
 }
 
+/// `loom.tokens.{input,output,cache_read,cache_write}` (#13563): the sums of
+/// the same rows [`usage`] emits, so they equal `burn.rs`'s fold by
+/// construction. Empty when there are no rows.
+pub(super) fn token_totals(rows: Option<&[ModelUsageTotals]>) -> Vec<KeyValue> {
+    let Some(rows) = rows.filter(|rows| !rows.is_empty()) else {
+        return Vec::new();
+    };
+    let sum = |f: fn(&ModelUsageTotals) -> i64| rows.iter().map(f).sum::<i64>();
+    vec![
+        kv_int("loom.tokens.input", sum(|r| r.input)),
+        kv_int("loom.tokens.output", sum(|r| r.output)),
+        kv_int("loom.tokens.cache_read", sum(|r| r.cache_read)),
+        kv_int("loom.tokens.cache_write", sum(|r| r.cache_write_5m + r.cache_write_1h)),
+    ]
+}
+
 pub(super) fn usage(rows: Option<&[ModelUsageTotals]>) -> Option<KeyValue> {
     let rows = rows.filter(|rows| !rows.is_empty())?;
     if rows.len() > MAX_GROUPS

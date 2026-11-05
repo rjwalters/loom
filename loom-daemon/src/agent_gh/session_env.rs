@@ -79,7 +79,7 @@ fn try_run() -> Result<(), String> {
 /// skips the prepend when `PATH` already starts with `prefix`.
 #[must_use]
 pub fn env_line(prefix: &OsStr) -> Option<String> {
-    let q = format!("'{}'", prefix.to_str()?.replace('\'', r"'\''"));
+    let q = crate::shell_quote::shell_quote(prefix.to_str()?);
     Some(format!(
         "case \":$PATH:\" in :{q}:*) ;; *) PATH={q}${{PATH:+:$PATH}}; export PATH ;; esac {MARKER}\n"
     ))
