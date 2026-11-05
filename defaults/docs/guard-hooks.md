@@ -2094,6 +2094,33 @@ LOOM_FORCE_SCOPE=protected git push --force origin feature/x   # allowed
 LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
 ```
 
+### Primary-Checkout Mutation Guard (`guards.primaryCheckoutMutation` / `LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION`)
+
+**An agent step never commits or switches branches in a workspace's primary
+checkout (#13589).** A stray `git commit` / `git checkout <branch>` there parks
+the primary clone off the default branch (observed on loom-worker-4,
+2026-11-04) and holds fleet sync with a `wrong-branch` hold (self-heal: #13588).
+Builder and Doctor work in `.loom/worktrees/issue-<N>`.
+
+- **Agent step** = `LOOM_SWEEP_ID` or `LOOM_WORKTREE_PATH` is exported (set by
+  the dispatcher). An operator's interactive session has neither and is untouched.
+- **Denied** (tier: deny, since headless runs cannot answer an ask) when the
+  resolved cwd — honouring `cd X &&` and `git -C X` — is a primary checkout:
+  `git commit`, `git switch <x>`/`-c`, `git checkout -b|-B <x>`, `--detach`,
+  and `git checkout <branch|sha>`. The message names
+  `./.loom/scripts/worktree.sh <issue-number>` and this toggle.
+- **Allowed**: everything inside a linked worktree; checkout/switch whose target
+  is `main`/`master` (the Auditor's `git checkout -B main origin/main`);
+  `git checkout -- <path>` and `git checkout <path>` file restores; `-h/--help`;
+  read-only git. `worktree.sh`, `check-main-clean.sh --quarantine`,
+  `resync-installed.sh`, `merge-pr.sh` and `scripts/version.sh` are unaffected:
+  the hook only sees the top-level command text, not their internal git calls.
+- **Decision-log tag**: `primary-checkout-mutation:<commit|switch|checkout>`.
+- **Toggle**: `LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0` (env, agent's own
+  environment) or `"guards": {"primaryCheckoutMutation": false}` in
+  `.loom/config.json`. Default on.
+- Tests: `tests/hooks/test-guard-destructive-primary-checkout.sh`.
+
 ### Stash-Stack Scope Guard (`guards.stashScope` / `LOOM_GUARD_STASH_SCOPE`)
 
 **The main checkout's stash stack is operator-owned, not scratch space.**
