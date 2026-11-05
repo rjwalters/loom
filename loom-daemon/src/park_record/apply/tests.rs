@@ -508,6 +508,59 @@ mod transient {
         assert_eq!(last(&body).attempt, 1);
     }
 
+    fn body_with_attempt5() -> String {
+        render(&ParkRecord {
+            blocker: None,
+            by: None,
+            at: Some("2026-11-05T00:00:00Z".into()),
+            reason: None,
+            transient: Some(Transient {
+                cause: "capacity:batch".into(),
+                attempt: 5,
+                until: Some("2026-11-05T12:00:00Z".into()),
+            }),
+        })
+    }
+
+    #[test]
+    fn stale_chain_resets_attempt() {
+        let out = compose_transient_body(
+            &body_with_attempt5(),
+            "capacity:batch",
+            None,
+            "2026-11-07T00:00:00Z",
+            None,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(last(&out).attempt, 1);
+    }
+
+    #[test]
+    fn live_chain_and_boundary_increment_attempt() {
+        for at in ["2026-11-05T12:00:01Z", "2026-11-06T12:00:00Z"] {
+            let out = compose_transient_body(
+                &body_with_attempt5(),
+                "capacity:batch",
+                None,
+                at,
+                None,
+                0.0,
+            )
+            .unwrap();
+            assert_eq!(last(&out).attempt, 6, "{at}");
+        }
+    }
+
+    #[test]
+    fn missing_until_keeps_incrementing() {
+        let b = body_with_attempt5().replace(" until=2026-11-05T12:00:00Z", "");
+        let out =
+            compose_transient_body(&b, "capacity:batch", None, "2026-12-25T00:00:00Z", None, 0.0)
+                .unwrap();
+        assert_eq!(last(&out).attempt, 6);
+    }
+
     #[test]
     fn transient_excludes_blockers_and_needs_a_cause() {
         let both = ApplyRequest {
