@@ -20,8 +20,10 @@ struct Fake {
 
 impl Fake {
     fn healthy() -> Self {
-        let mut f = Fake::default();
-        f.ignored = Some(String::new());
+        let mut f = Fake {
+            ignored: Some(String::new()),
+            ..Fake::default()
+        };
         f.dirs.insert(WT.to_string());
         f.sentinels.insert(WT.to_string());
         f.porcelain = format!(
