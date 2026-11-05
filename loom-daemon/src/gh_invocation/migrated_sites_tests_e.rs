@@ -54,9 +54,10 @@ const UNCOUNTED: &[(&str, usize, &str)] = &[
     ),
     (
         "cli/forge_identity_cmd.rs",
-        1,
-        "`forge verdict` CLI through the raw `script_helpers::run_gh` spawn: not a facade row; \
-         the choke-point ratchet owns its migration",
+        2,
+        "`forge verdict` and `forge promotion-author` (issue timeline read) CLIs through the raw \
+         `script_helpers::run_gh` spawn: not facade rows, so their pages cannot be counted; \
+         the choke-point ratchet owns their migration",
     ),
     (
         "cli/champion_hold_cmd.rs",
