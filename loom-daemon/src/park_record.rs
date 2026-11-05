@@ -186,6 +186,55 @@ pub struct ParkRecord {
     pub at: Option<String>,
     /// `reason="…"` — free text, already unescaped.
     pub reason: Option<String>,
+    /// `transient=`/`attempt=`/`until=` — a self-expiring park (#13606).
+    pub transient: Option<Transient>,
+}
+
+/// The backoff schedule of a transient park (#13606): a park whose cause (for
+/// example `capacity:batch`) clears by itself, so it carries a retry time
+/// instead of waiting for a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transient {
+    /// What is transiently unavailable, e.g. `capacity:batch`.
+    pub cause: String,
+    /// 1 for the first park for this cause, then +1 per re-park.
+    pub attempt: u32,
+    /// RFC 3339 time after which the park may be released. `None` (missing or
+    /// unparseable on a hand-edited record) is treated as already due.
+    pub until: Option<String>,
+}
+
+/// First transient delay, in seconds (30 min); doubles per attempt.
+pub const TRANSIENT_BASE_SECS: i64 = 30 * 60;
+/// Longest transient delay (24 h).
+pub const TRANSIENT_CAP_SECS: i64 = 24 * 60 * 60;
+/// Jitter is at most this fraction of the delay, either way (±10%).
+pub const TRANSIENT_JITTER_FRACTION: f64 = 0.10;
+/// From this attempt on the release pass escalates once (comment only).
+pub const TRANSIENT_ESCALATE_ATTEMPT: u32 = 6;
+
+/// Delay in seconds before attempt `attempt` (1-based) may be retried:
+/// `30min * 2^(attempt-1)`, with `jitter` (clamped to `-1.0..=1.0`) scaling a
+/// ±[`TRANSIENT_JITTER_FRACTION`] adjustment, then capped at 24 h.
+#[must_use]
+pub fn transient_delay_secs(attempt: u32, jitter: f64) -> i64 {
+    let exp = attempt.saturating_sub(1).min(16);
+    let base = (TRANSIENT_BASE_SECS << exp).min(TRANSIENT_CAP_SECS);
+    let j = jitter.clamp(-1.0, 1.0) * TRANSIENT_JITTER_FRACTION;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let adjusted = (base as f64 * (1.0 + j)).round() as i64;
+    adjusted.min(TRANSIENT_CAP_SECS)
+}
+
+/// Whether a transient park may be released at `now` (RFC 3339): `until` has
+/// passed, or is missing/unparseable (treated as due).
+#[must_use]
+pub fn transient_due(t: &Transient, now: &str) -> bool {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match (t.until.as_deref().and_then(parse), parse(now)) {
+        (Some(u), Some(n)) => n >= u,
+        _ => true,
+    }
 }
 
 /// `<!-- loom:park …( -->)` spans, captured lazily.
@@ -211,7 +260,9 @@ fn reason_re() -> &'static Regex {
 /// `key=value` for the unquoted provenance attributes.
 fn attr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\b(by|at)=([^\s]+)").expect("static park-attr pattern"))
+    RE.get_or_init(|| {
+        Regex::new(r"\b(by|at|transient|attempt|until)=([^\s]+)").expect("static park-attr pattern")
+    })
 }
 
 /// Every `#N`, optionally qualified as `OWNER/REPO#N` (#10443). A bare `#N`
@@ -265,6 +316,7 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
 
     let mut by = None;
     let mut at = None;
+    let (mut cause, mut attempt, mut until) = (None, None, None);
     for c in attr_re().captures_iter(&without_reason) {
         let (Some(k), Some(v)) = (c.get(1), c.get(2)) else {
             continue;
@@ -272,6 +324,9 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
         match k.as_str() {
             "by" => by = Some(v.as_str().to_string()),
             "at" => at = Some(v.as_str().to_string()),
+            "transient" => cause = Some(v.as_str().to_string()),
+            "attempt" => attempt = v.as_str().parse::<u32>().ok(),
+            "until" => until = Some(v.as_str().to_string()),
             _ => {}
         }
     }
@@ -291,6 +346,11 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
         by,
         at,
         reason,
+        transient: cause.map(|cause| Transient {
+            cause,
+            attempt: attempt.unwrap_or(1),
+            until,
+        }),
     };
 
     if refs.is_empty() {
@@ -352,6 +412,12 @@ pub fn render(record: &ParkRecord) -> String {
     if let Some(at) = &record.at {
         out.push_str(&format!(" at={}", sanitize_attr(at)));
     }
+    if let Some(t) = &record.transient {
+        out.push_str(&format!(" transient={} attempt={}", sanitize_attr(&t.cause), t.attempt));
+        if let Some(u) = &t.until {
+            out.push_str(&format!(" until={}", sanitize_attr(u)));
+        }
+    }
     if let Some(reason) = &record.reason {
         let clean = sanitize_reason(reason);
         if !clean.is_empty() {
@@ -376,6 +442,7 @@ pub fn render_park(
         by: by.map(str::to_string),
         at: at.map(str::to_string),
         reason: reason.map(str::to_string),
+        transient: None,
     };
     if blockers.is_empty() {
         return render(&template);

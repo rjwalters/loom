@@ -418,3 +418,25 @@ nothing to the forge. Champion calls it after removing a merge-risk hold's
 ([`telemetry-schema.md`](telemetry-schema.md#holdtransition--a-hold-label-applied-to-or-removed-from-a-pr)).
 A Champion `park-record apply` journals the matching `add` itself, only when
 the label was not already on the PR.
+
+## Transient parks — `park-record apply --transient <cause>` (#13606)
+
+A park whose cause clears by itself (for example `batch_no_capacity` from the
+Spot batch fleet) carries a retry time instead of waiting for a person:
+
+```text
+<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z transient=capacity:batch attempt=1 until=2026-11-05T12:30:00Z -->
+```
+
+- `--transient` is mutually exclusive with `--blocked-by`; it counts as the
+  written choice, so no `--reason` is needed.
+- `attempt` is the previous record for the same cause plus one (else 1).
+- Delay: 30 min, 1 h, 2 h, 4 h, … capped at 24 h, with up to ±10% jitter
+  (`TRANSIENT_*` constants in `park_record.rs`).
+- Re-running while `until` is in the future is a no-op; after it passes, a
+  re-park appends the next attempt.
+- A record without these attributes parses exactly as before. A transient
+  record with a missing or unparseable `until` is treated as already due.
+
+Release (Guide's unblock sweep) and the Builder prompt change are follow-up
+work under #13606.

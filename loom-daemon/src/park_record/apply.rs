@@ -29,7 +29,9 @@
 
 use std::io::Write;
 
-use super::{blockers, parse, render_park, BlockerRef};
+use super::{
+    blockers, parse, render, render_park, transient_delay_secs, BlockerRef, ParkRecord, Transient,
+};
 use crate::operator_decision::cli::{Forge as DecisionForge, GhForge, IssueState};
 
 /// The label this command exists to apply.
@@ -100,13 +102,33 @@ pub struct ApplyRequest {
     /// The target is a PR (not an issue). Only a PR park is a merge hold, so
     /// only it journals a `hold.transition` (#12665).
     pub is_pr: bool,
+    /// A self-expiring park for this cause, e.g. `capacity:batch` (#13606).
+    /// Mutually exclusive with [`Self::blocked_by`].
+    pub transient: Option<String>,
+    /// Backoff jitter in `-1.0..=1.0` (see [`transient_delay_secs`]); injected
+    /// so the schedule is deterministic under test.
+    pub jitter: f64,
 }
 
 /// Why a request is refused before any forge call, or `None` when it may run.
 #[must_use]
 pub fn precheck(req: &ApplyRequest) -> Option<String> {
     let has_reason = req.reason.as_deref().is_some_and(|r| !r.trim().is_empty());
-    if req.blocked_by.is_empty() && !has_reason {
+    let has_transient = req
+        .transient
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty());
+    if req.transient.is_some() && !has_transient {
+        return Some("--transient needs a cause (e.g. capacity:batch)".to_string());
+    }
+    if has_transient && !req.blocked_by.is_empty() {
+        return Some(
+            "--transient and --blocked-by are mutually exclusive: a transient park has no \
+             blocker, it expires on its own (#13606)"
+                .to_string(),
+        );
+    }
+    if req.blocked_by.is_empty() && !has_reason && !has_transient {
         return Some(
             "no blocker named: pass --blocked-by N, or state why there is none with \
              --reason (e.g. --reason operator). A park with no named blocker reads as \
@@ -171,6 +193,56 @@ pub fn compose_body(
     })
 }
 
+/// `body` with a transient park record appended, or `None` when the body's
+/// latest record for `cause` has not yet expired at `at` (idempotent re-run).
+///
+/// `attempt` is the previous record for the same cause plus one, else 1; the
+/// retry time is `at` plus [`transient_delay_secs`].
+#[must_use]
+pub fn compose_transient_body(
+    body: &str,
+    cause: &str,
+    by: Option<&str>,
+    at: &str,
+    reason: Option<&str>,
+    jitter: f64,
+) -> Option<String> {
+    let want = cause.trim();
+    let prior = parse(body)
+        .into_iter()
+        .filter_map(|r| r.transient)
+        .rfind(|t| t.cause == want);
+    let now = chrono::DateTime::parse_from_rfc3339(at).ok();
+    if let Some(t) = &prior {
+        if !super::transient_due(t, at) {
+            return None;
+        }
+    }
+    let attempt = prior.map_or(1, |t| t.attempt.saturating_add(1));
+    let until = now.map(|n| {
+        (n + chrono::Duration::seconds(transient_delay_secs(attempt, jitter)))
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    });
+    let line = render(&ParkRecord {
+        blocker: None,
+        by: by.map(str::to_string),
+        at: Some(at.to_string()),
+        reason: reason.map(str::to_string),
+        transient: Some(Transient {
+            cause: want.to_string(),
+            attempt,
+            until,
+        }),
+    });
+    let head = body.trim_end();
+    Some(if head.is_empty() {
+        format!("{line}\n")
+    } else {
+        format!("{head}\n\n{line}\n")
+    })
+}
+
 /// Apply the park: refuse, or write the body record(s), then `loom:blocked`,
 /// then drop `remove_labels`.
 pub fn apply(
@@ -216,13 +288,23 @@ pub fn apply(
         return exit::REFUSED;
     }
 
-    let new_body = compose_body(
-        &state.body,
-        &req.blocked_by,
-        req.by.as_deref(),
-        &req.at,
-        req.reason.as_deref(),
-    );
+    let new_body = match req.transient.as_deref() {
+        Some(cause) => compose_transient_body(
+            &state.body,
+            cause,
+            req.by.as_deref(),
+            &req.at,
+            req.reason.as_deref(),
+            req.jitter,
+        ),
+        None => compose_body(
+            &state.body,
+            &req.blocked_by,
+            req.by.as_deref(),
+            &req.at,
+            req.reason.as_deref(),
+        ),
+    };
     let has = |l: &str| state.labels.iter().any(|x| x == l);
     let add: Vec<String> = if has(BLOCKED_LABEL) {
         Vec::new()
