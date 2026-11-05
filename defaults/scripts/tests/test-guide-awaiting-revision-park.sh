@@ -32,7 +32,7 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
     check "revision reason + open blocker named => left alone" 1 \
         '<!-- loom:park Blocked by: #123 by=builder at=2026-11-01T10:00:00Z reason="awaiting Architect revision" -->'
     check "cross-repo blocker named => left alone" 1 \
-        '<!-- loom:park Blocked by: org/repo#9 by=builder at=2026-11-01T10:00:00Z reason="awaiting a design epic" -->'
+        '<!-- loom:park Blocked by: owner/repo#9 by=builder at=2026-11-01T10:00:00Z reason="awaiting a design epic" -->'
     check "park fresh vs latest loom:blocked label => convertible" 0 \
         "$(printf "$P" 'awaiting Architect revision')" "2026-11-01T10:00:30Z"
     check "block re-applied >5min after record => stale, left alone" 1 \
