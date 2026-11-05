@@ -337,6 +337,7 @@ fn a_pass_over_the_root_reports_the_change() {
             budget: None,
             elapsed: &|| Duration::ZERO,
             clock: &Utc::now,
+            pr_merged: &|_, _| None,
         };
         super::super::run(&env, &roots, memory)
     };

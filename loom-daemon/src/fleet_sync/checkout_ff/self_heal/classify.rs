@@ -309,6 +309,87 @@ fn untracked_in_the_way(
         .map(str::to_string))
 }
 
+/// A HEAD that is off the default branch with nothing of its own to lose
+/// (#13588): the repair puts the checkout back on the branch.
+#[derive(Debug)]
+pub(super) struct Strand {
+    /// The branch HEAD is on, `None` when detached.
+    pub from: Option<String>,
+    /// HEAD, for the rescue ref and the log.
+    pub head: String,
+    /// Commits on HEAD that are not on `origin/<branch>` (all of them a merged
+    /// pull request's).
+    pub unique: usize,
+}
+
+/// Is `root` stranded off `branch` with everything on its HEAD safe elsewhere?
+/// `Ok(None)`: HEAD is on `branch`. `Err(why)`: stranded, but not provably
+/// safe, or in doubt; the hold stays. Every doubt, including a failed forge
+/// lookup, is an `Err`.
+pub(super) fn stranded(
+    env: &Env<'_>,
+    root: &Path,
+    branch: &str,
+    gd: &Path,
+) -> Result<Option<Strand>, String> {
+    let current = git::current_branch(root, local(env))?;
+    if current.as_deref() == Some(branch) {
+        return Ok(None);
+    }
+    if operation(gd)
+        .map_err(|()| "an operation is in progress")?
+        .is_some()
+    {
+        return Err("an operation is in progress".to_string());
+    }
+    if gd.join("index.lock").exists() {
+        return Err("index.lock exists".to_string());
+    }
+    if !dirty_paths(env, root)?.is_empty() {
+        return Err("the working tree has a tracked change".to_string());
+    }
+    let tracking = git::tracking(branch);
+    read(env, root, &["rev-parse", "--verify", "--quiet", &tracking])
+        .map_err(|_| format!("no {tracking} to compare with"))?;
+    let head = read(env, root, &["rev-parse", "HEAD"])?;
+    let unique = read(env, root, &["rev-list", "HEAD", "--not", &tracking])?
+        .lines()
+        .count();
+    if unique > MAX_COMMITS {
+        return Err(format!("{unique} commits are more than are read"));
+    }
+    if unique > 0 && (env.pr_merged)(root, &head) != Some(true) {
+        return Err(format!(
+            "{unique} commit(s) are not on {tracking} and HEAD is not a merged pull request's head"
+        ));
+    }
+    if current.is_none() {
+        let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
+            .unwrap_or_default();
+        if keep.trim().eq_ignore_ascii_case("keep") {
+            return Err("HEAD is detached on purpose (loom.checkoutFf.detached=keep)".to_string());
+        }
+    }
+    let moved = managed::head_moved_at(gd);
+    let old_enough = moved.is_some_and(|at| {
+        (env.clock)()
+            .signed_duration_since(at)
+            .to_std()
+            .is_ok_and(|age| age >= managed::detached_after())
+    });
+    if !old_enough {
+        return Err("HEAD moved recently".to_string());
+    }
+    if live_git(root) {
+        return Err("a git process is running in the repository".to_string());
+    }
+    Ok(Some(Strand {
+        from: current,
+        head,
+        unique,
+    }))
+}
+
 /// Classify what blocks `root`'s fast-forward to `origin/<branch>`.
 pub(super) fn classify(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Verdict {
     match classify_inner(env, root, branch, gd) {

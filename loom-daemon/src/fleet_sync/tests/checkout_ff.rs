@@ -176,6 +176,8 @@ struct Knobs {
     breaker: Rc<Cell<bool>>,
     budget: Option<Duration>,
     elapsed: Box<dyn Fn() -> Duration>,
+    /// The forge's answer to "is this sha a merged PR's head" (#13588).
+    merged: Option<bool>,
 }
 
 impl Default for Knobs {
@@ -191,6 +193,7 @@ impl Default for Knobs {
             breaker: Rc::new(Cell::new(false)),
             budget: None,
             elapsed: Box::new(|| Duration::ZERO),
+            merged: None,
         }
     }
 }
@@ -208,6 +211,7 @@ fn pass_over(roots: &[PathBuf], knobs: &Knobs, memory: &mut Memory) -> CheckoutP
         budget: knobs.budget,
         elapsed: &*knobs.elapsed,
         clock: &t0,
+        pr_merged: &|_, _| knobs.merged,
     };
     run(&env, roots, memory)
 }
