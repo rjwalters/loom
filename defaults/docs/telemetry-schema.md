@@ -1701,7 +1701,7 @@ subscribed). Published once per reap by the agent residue reaper
 **`daemon.start` (#11197)** — the one topic in this kind that is not a
 mirrored bus event. Exactly one record per daemon process, enqueued by
 `observability::spawn_task` when the exporters come up (never when telemetry
-is disabled), so a fleet-gitops roll is visible in the backend the moment a
+is disabled), so the fleet state store roll is visible in the backend the moment a
 host's daemon restarts onto new config. Its payload is
 `{"version", "revision", "tree_state", "supervisor", "config_sha", "pid",
 "start_time_unix_ms", "instance", "previous_version", "start_reason"}` —

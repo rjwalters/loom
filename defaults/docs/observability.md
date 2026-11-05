@@ -194,7 +194,7 @@ host-shape attributes in the next table:
 | `host.name` | the envelope's `host_id` (#10977) |
 | `service.version` | the reporting daemon's version (a `host.health` record's `daemon_version`, else the exporting build's) |
 | `loom.daemon.revision` | the exporting build's full git SHA (`unknown` for a tarball build) — the same value every span carries (#11197) |
-| `loom.fleet.config_sha` | the fleet-gitops commit whose rendered config tiers are **on disk on this host right now**: a 40-hex SHA, `unknown` (a fleet host where no applied commit is established yet, e.g. during a startup-pass timeout), or `none` (no fleet store, `fleet.repo` unset). Never empty, never omitted (#11197) |
+| `loom.fleet.config_sha` | the fleet state store commit whose rendered config tiers are **on disk on this host right now**: a 40-hex SHA, `unknown` (a fleet host where no applied commit is established yet, e.g. during a startup-pass timeout), or `none` (no fleet store, `fleet.repo` unset). Never empty, never omitted (#11197) |
 
 **Host shape (#12874).** The emitting host's static shape, so a sweep or phase
 span resolves to its host's size with no join against the
@@ -1362,7 +1362,7 @@ go out once the exporters are up. llm-monitor's quota step-change alert is not
 in `ranking.json` yet, so it is not sent.
 
 `fleet_alert` only runs when `autonomous.fleetAlert.enabled` is on (off by
-default here); the fleet defaults (fleet-gitops) are where to enable it.
+default here); the fleet defaults (the fleet state store) are where to enable it.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 
