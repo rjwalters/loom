@@ -568,7 +568,9 @@ pub fn stale_read(
             if !body_sha_matches(expected, body) {
                 why.push(format!(
                     "issue #{n}'s body changed since this review started (it no longer matches \
-                     the body you reviewed)"
+                     the body you reviewed). The gate compares the sha256 of the issue body with \
+                     trailing newlines trimmed; recompute yours with: printf %s \"$(gh api \
+                     repos/OWNER/REPO/issues/{n} --jq .body)\" | sha256sum | cut -d' ' -f1"
                 ));
             }
         }
