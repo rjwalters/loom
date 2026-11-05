@@ -127,6 +127,12 @@ pub(crate) struct ApplyArgs {
     #[arg(long = "by", value_name = "ROLE")]
     pub by: Option<String>,
 
+    /// Park transiently for a cause that clears by itself, e.g. `capacity:batch`
+    /// (#13606). Writes `attempt` and an exponential-backoff `until`; the unblock
+    /// sweep releases it once `until` passes. Excludes `--blocked-by`.
+    #[arg(long, value_name = "CAUSE")]
+    pub transient: Option<String>,
+
     /// Label to remove once parked (repeatable), e.g. loom:building.
     #[arg(long = "remove-label", value_name = "LABEL")]
     pub remove_label: Vec<String>,
@@ -283,12 +289,23 @@ impl ApplyArgs {
             remove_labels: self.remove_label,
             dry_run: self.dry_run,
             is_pr,
+            transient: self.transient,
+            jitter: random_unit(),
         };
         let mut forge = GhForge::new(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
         crate::park_record::apply::journal_applied(&req, is_pr, code);
         std::process::exit(code)
     }
+}
+
+/// A value in `-1.0..=1.0` from the clock's sub-second nanos: backoff jitter
+/// needs spread across hosts, not cryptographic randomness.
+fn random_unit() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    f64::from(nanos % 2001) / 1000.0 - 1.0
 }
 
 impl ParseArgs {
