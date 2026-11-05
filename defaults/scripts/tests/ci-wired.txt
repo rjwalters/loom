@@ -126,6 +126,7 @@ test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
+test-guide-awaiting-revision-park.sh
 test-guide-blocked-unblock-limit.sh
 test-guide-operator-hold-exclude.sh
 test-guide-plan-body-stable-sort.sh
