@@ -2889,7 +2889,7 @@ fn log_transition(transition: HealthTransition, outcome: &GateOutcome, halted: b
 
 /// Whether the main-health gate loop is enabled, per
 /// [`MAIN_HEALTH_GATE_ENABLE_ENV`]. Off by default (opt-in); parsing mirrors
-/// [`crate::work_finder::enabled`]. This is the **env-only** primitive; the
+/// [`crate::epic_supervisor::supervisor_enabled`]. This is the **env-only** primitive; the
 /// config-aware entry point the daemon uses is [`resolve_enabled`] (precedence
 /// env > config > default).
 #[must_use]

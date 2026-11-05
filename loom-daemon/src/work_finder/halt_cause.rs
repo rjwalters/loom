@@ -138,14 +138,12 @@ pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
     parts.join(", ")
 }
 
-/// The per-root cause fold — the named-cause counterpart of
-/// [`super::dispatch_held_per_root_with_preflight`] plus the daemon-global
-/// `draining` term the production loop OR's on top (#9017).
+/// The per-root cause fold — [`super::dispatch_held_per_root`]'s holds plus the
+/// pre-flight causes and the daemon-global `draining` term (#9017).
 ///
 /// `preflight_causes` is parallel to `roots`, as computed by
 /// [`crate::work_finder::pool_preflight::preflight_held_causes_per_root`];
-/// a missing entry defaults to *not held*, mirroring the bool fold's
-/// `preflight_held.get(i).unwrap_or(false)`.
+/// a missing entry defaults to *not held*.
 ///
 /// **Precedence** — when several causes are true at once for the same root,
 /// the first of these wins, so the row always names one cause:

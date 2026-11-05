@@ -2734,33 +2734,6 @@ fn test_recheck_interval_independent_of_noop_cooldown() {
 
 #[test]
 #[serial]
-fn test_enabled_off_by_default() {
-    std::env::remove_var(WORK_FINDER_ENABLE_ENV);
-    assert!(!enabled(), "unset ⇒ disabled (zero behavior change)");
-}
-
-#[test]
-#[serial]
-fn test_enabled_truthy_values() {
-    for v in ["1", "true", "yes", "on", "TRUE", "On", " Yes "] {
-        std::env::set_var(WORK_FINDER_ENABLE_ENV, v);
-        assert!(enabled(), "{v:?} should enable");
-    }
-    std::env::remove_var(WORK_FINDER_ENABLE_ENV);
-}
-
-#[test]
-#[serial]
-fn test_enabled_falsy_values() {
-    for v in ["0", "false", "no", "off", "", "maybe"] {
-        std::env::set_var(WORK_FINDER_ENABLE_ENV, v);
-        assert!(!enabled(), "{v:?} should not enable");
-    }
-    std::env::remove_var(WORK_FINDER_ENABLE_ENV);
-}
-
-#[test]
-#[serial]
 fn test_resolve_interval_default_and_override() {
     std::env::remove_var(WORK_FINDER_INTERVAL_ENV);
     assert_eq!(resolve_interval(), Duration::from_secs(DEFAULT_WORK_FINDER_INTERVAL_SECS));
@@ -2774,23 +2747,6 @@ fn test_resolve_interval_default_and_override() {
     std::env::set_var(WORK_FINDER_INTERVAL_ENV, "garbage");
     assert_eq!(resolve_interval(), Duration::from_secs(DEFAULT_WORK_FINDER_INTERVAL_SECS));
     std::env::remove_var(WORK_FINDER_INTERVAL_ENV);
-}
-
-#[test]
-#[serial]
-fn test_resolve_max_concurrent_default_and_override() {
-    std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
-    assert_eq!(resolve_max_concurrent(), DEFAULT_WORK_FINDER_MAX_CONCURRENT);
-
-    std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "7");
-    assert_eq!(resolve_max_concurrent(), 7);
-
-    // Zero and unparseable fall back to the default.
-    std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "0");
-    assert_eq!(resolve_max_concurrent(), DEFAULT_WORK_FINDER_MAX_CONCURRENT);
-    std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "nope");
-    assert_eq!(resolve_max_concurrent(), DEFAULT_WORK_FINDER_MAX_CONCURRENT);
-    std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
 }
 
 // ===================================================================
@@ -3431,84 +3387,6 @@ fn test_dispatch_held_per_root_suppressor_disabled_is_is_halted_only() {
     assert_eq!(held_on, vec![true, true]);
 }
 
-#[test]
-fn test_dispatch_held_per_root_with_drain_holds_every_root() {
-    // A daemon-global scheduled drain (#4090) holds EVERY root at once,
-    // regardless of each root's gate state — the merge with #4084 must not
-    // let the per-root gate term shadow the global drain term.
-    let states = WorkspaceHealthStates::new();
-    let root_a = std::path::PathBuf::from("/tmp/repo-a");
-    let root_b = std::path::PathBuf::from("/tmp/repo-b");
-    // Neither root is verified-red nor has a gate in flight.
-    let held = dispatch_held_per_root_with_drain(
-        &states,
-        &[root_a, root_b],
-        true, // suppressor on
-        true, // draining
-    );
-    assert_eq!(
-        held,
-        vec![true, true],
-        "a scheduled drain holds every root regardless of gate state"
-    );
-}
-
-#[test]
-fn test_dispatch_held_per_root_with_drain_gate_still_per_root_when_not_draining() {
-    // With no drain in progress the gate-in-flight term stays strictly
-    // per-root: only the root whose gate run is in flight is held, its
-    // sibling keeps dispatching (#3930 isolation contract survives #4090).
-    let states = WorkspaceHealthStates::new();
-    let root_a = std::path::PathBuf::from("/tmp/repo-a");
-    let root_b = std::path::PathBuf::from("/tmp/repo-b");
-    states.get_or_create(&root_a).set_gate_in_flight(true);
-    let held = dispatch_held_per_root_with_drain(
-        &states,
-        &[root_a, root_b],
-        true,  // suppressor on
-        false, // not draining
-    );
-    assert_eq!(
-        held,
-        vec![true, false],
-        "gate-in-flight holds only its own root when not draining"
-    );
-}
-
-#[test]
-fn test_dispatch_held_per_root_with_drain_terms_are_independent() {
-    // Both terms compose additively: a drain holds a healthy root, and a
-    // gate in flight holds its own root — with the drain on, every root is
-    // held whether or not its gate is in flight.
-    let states = WorkspaceHealthStates::new();
-    let root_a = std::path::PathBuf::from("/tmp/repo-a"); // gate in flight
-    let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
-    states.get_or_create(&root_a).set_gate_in_flight(true);
-    let held = dispatch_held_per_root_with_drain(
-        &states,
-        &[root_a, root_b],
-        true, // suppressor on
-        true, // draining
-    );
-    assert_eq!(held, vec![true, true], "drain OR gate-in-flight: both roots held");
-}
-
-#[test]
-fn test_dispatch_held_per_root_with_drain_no_drain_matches_per_root() {
-    // With `draining = false` the result is byte-for-byte the plain
-    // per-root vector — the drain fold is a pure superset, never a
-    // regression of the #4084 / #3930 semantics.
-    let states = WorkspaceHealthStates::new();
-    let root_a = std::path::PathBuf::from("/tmp/repo-a");
-    let root_b = std::path::PathBuf::from("/tmp/repo-b");
-    states.get_or_create(&root_a).set_gate_in_flight(true);
-    states.get_or_create(&root_b).set_halted(true);
-    let roots = [root_a, root_b];
-    let plain = dispatch_held_per_root(&states, &roots, true);
-    let with_drain = dispatch_held_per_root_with_drain(&states, &roots, true, false);
-    assert_eq!(plain, with_drain, "draining=false ⇒ identical to dispatch_held_per_root");
-}
-
 /// The admission side of a roll (#6007's test, restated for #10831). The work
 /// finder reads exactly one bit (`DrainState::flag`, surfaced here as
 /// `draining`). A pause roll holds it for the whole pause, so no new sweep is
@@ -3528,14 +3406,20 @@ fn test_admission_stays_held_for_a_pause_roll_and_resumes_when_it_ends_without_a
     let _ =
         drain.begin_as(std::time::Duration::from_secs(120), false, false, DrainOrigin::PauseRoll);
     assert_eq!(
-        dispatch_held_per_root_with_drain(&states, &roots, true, drain.is_draining()),
+        halt_cause::causes_per_root(&states, &roots, true, &[], drain.is_draining())
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>(),
         vec![true, true],
         "a pause roll holds every root"
     );
 
     assert!(drain.abort_pause_roll());
     assert_eq!(
-        dispatch_held_per_root_with_drain(&states, &roots, true, drain.is_draining()),
+        halt_cause::causes_per_root(&states, &roots, true, &[], drain.is_draining())
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>(),
         vec![false, false],
         "a roll that ended without a restart returns the admission window to the work finder"
     );
@@ -3575,59 +3459,6 @@ fn test_gate_in_flight_root_dispatches_zero_new_sweeps() {
 // ===================================================================
 
 #[test]
-fn test_dispatch_held_per_root_with_preflight_holds_only_the_tripped_root() {
-    // A workspace whose pre-flight breaker is holding (broken .mcp.json)
-    // holds only its own root; a healthy sibling keeps dispatching — the
-    // #3930 per-repo isolation contract must survive the #5030 fold.
-    let states = WorkspaceHealthStates::new();
-    let root_a = std::path::PathBuf::from("/tmp/repo-a"); // pre-flight held
-    let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
-    let preflight_held = [true, false];
-    let held =
-        dispatch_held_per_root_with_preflight(&states, &[root_a, root_b], true, &preflight_held);
-    assert_eq!(
-        held,
-        vec![true, false],
-        "only the tripped root is held; its healthy sibling keeps dispatching"
-    );
-}
-
-#[test]
-fn test_dispatch_held_per_root_with_preflight_empty_slice_matches_per_root() {
-    // An all-false / missing pre-flight slice is byte-for-byte the plain
-    // per-root vector — the fold is a pure superset, never a regression of
-    // the #4084 / #3930 semantics.
-    let states = WorkspaceHealthStates::new();
-    let root_a = std::path::PathBuf::from("/tmp/repo-a");
-    let root_b = std::path::PathBuf::from("/tmp/repo-b");
-    states.get_or_create(&root_a).set_gate_in_flight(true);
-    states.get_or_create(&root_b).set_halted(true);
-    let roots = [root_a, root_b];
-    let plain = dispatch_held_per_root(&states, &roots, true);
-    let folded = dispatch_held_per_root_with_preflight(&states, &roots, true, &[]);
-    assert_eq!(plain, folded, "empty pre-flight slice ⇒ identical to dispatch_held_per_root");
-}
-
-#[test]
-fn test_dispatch_held_per_root_with_preflight_composes_with_verified_red() {
-    // The pre-flight hold and the #3930 verified-red hold compose
-    // additively per root: root_a is held by pre-flight, root_b by a red
-    // main, root_c is healthy on both axes.
-    let states = WorkspaceHealthStates::new();
-    let root_a = std::path::PathBuf::from("/tmp/repo-a");
-    let root_b = std::path::PathBuf::from("/tmp/repo-b");
-    let root_c = std::path::PathBuf::from("/tmp/repo-c");
-    states.get_or_create(&root_b).set_halted(true);
-    let held = dispatch_held_per_root_with_preflight(
-        &states,
-        &[root_a, root_b, root_c],
-        true,
-        &[true, false, false],
-    );
-    assert_eq!(held, vec![true, true, false]);
-}
-
-#[test]
 fn test_preflight_held_root_dispatches_zero_new_sweeps() {
     // Regression (#5030): end-to-end through `tick_multi`, a workspace whose
     // pre-flight advisory has tripped (its breaker is holding) dispatches
@@ -3637,8 +3468,16 @@ fn test_preflight_held_root_dispatches_zero_new_sweeps() {
     let states = WorkspaceHealthStates::new();
     let root_a = std::path::PathBuf::from("/tmp/repo-a"); // pre-flight held
     let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
-    let halted =
-        dispatch_held_per_root_with_preflight(&states, &[root_a, root_b], true, &[true, false]);
+    let halted: Vec<bool> = halt_cause::causes_per_root(
+        &states,
+        &[root_a, root_b],
+        true,
+        &[Some(halt_cause::HaltCause::PreflightAdvisory), None],
+        false,
+    )
+    .iter()
+    .map(Option::is_some)
+    .collect();
 
     let mut multi = vec![
         (FakeSource::once((1..=5).map(issue).collect()), RecordingDispatcher::default()),
@@ -3669,8 +3508,11 @@ fn test_preflight_probe_tick_resumes_dispatch_to_recovering_root() {
     let root_a = std::path::PathBuf::from("/tmp/repo-a"); // probing this tick
     let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
                                                           // A probe tick maps `PreflightDispatchGate::Probe` → not held.
-    let halted =
-        dispatch_held_per_root_with_preflight(&states, &[root_a, root_b], true, &[false, false]);
+    let halted: Vec<bool> =
+        halt_cause::causes_per_root(&states, &[root_a, root_b], true, &[None, None], false)
+            .iter()
+            .map(Option::is_some)
+            .collect();
 
     let mut multi = vec![
         (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
