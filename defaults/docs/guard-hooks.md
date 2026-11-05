@@ -2023,7 +2023,7 @@ The decision log sized that gap. **Which log matters**: the hook writes to
 `<its own checkout>/.loom/logs/guard-decisions.log`, so every worktree keeps a
 separate one and no single file is authoritative for the host. The figure below
 is from the **primary clone's** log
-(`/Users/joseph/dev/loom/.loom/logs/guard-decisions.log`) over
+(`.loom/logs/guard-decisions.log`) over
 2026-09-16T03:12Z–2026-09-17T05:12Z: **17 of 18 ASKs were `force-op:all`**,
 every one an own-branch force op. (The 18th is a `force-op:detached` ask —
 which `"protected"` still raises, by design.) A reviewer on another checkout
