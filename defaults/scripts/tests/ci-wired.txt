@@ -200,6 +200,7 @@ test-resync-installed-retired-dry-run.sh
 test-resync-installed-retired-migrate.sh
 test-resync-installed-dogfood-symlink.sh
 test-resync-installed-stamp.sh
+test-resync-installed-agents-md-create.sh
 test-resync-installed-output-staging.sh
 test-resync-installed.sh
 test-resync-installed-payload-fallback.sh
