@@ -624,10 +624,6 @@ fn print_monitor_import(result: &crate::tokens_pool::monitor_db::MonitorImportRe
 /// file-based — does not require a running daemon. See
 /// `loom-daemon/src/tokens_pool/mod.rs` for the ported subset and what is
 /// deliberately deferred.
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
     use crate::tokens_pool::{allowlist, bad_tokens, failure_counts};
 

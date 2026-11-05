@@ -449,4 +449,33 @@ mod tests {
         let skills = generate_all(defaults).unwrap();
         assert!(skills.is_empty());
     }
+
+    /// The committed `defaults/.agents/skills/` copies must equal what the
+    /// generator renders from the role docs. When they lag, a fresh install
+    /// (which regenerates) looks "edited in place" to the resync local-fix
+    /// guard. Fails on a stale file and on a missing one.
+    #[test]
+    fn committed_agent_skills_match_generator_output() {
+        let defaults = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("defaults");
+        let skills = generate_all(&defaults).unwrap();
+        assert!(!skills.is_empty(), "generator produced no skills from {}", defaults.display());
+
+        let mut problems = Vec::new();
+        for skill in &skills {
+            match fs::read_to_string(&skill.out_path) {
+                Ok(on_disk) if on_disk == skill.content => {}
+                Ok(_) => problems.push(format!("STALE:   {}", skill.out_path.display())),
+                Err(_) => problems.push(format!("MISSING: {}", skill.out_path.display())),
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "committed defaults/.agents/skills are out of sync with defaults/roles:\n{}\n\
+             Regenerate with: loom-daemon generate-agent-skills --defaults defaults",
+            problems.join("\n")
+        );
+    }
 }

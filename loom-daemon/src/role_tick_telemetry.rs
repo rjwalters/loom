@@ -127,6 +127,9 @@ pub struct RoleTickTelemetry {
     /// The step's sweep id when a step-engine step, not a role tick, ran
     /// (#11906); the record then carries `source = "step"`.
     pub step_sweep_id: Option<String>,
+    /// The step's work item as `(number, is_pr)` (#13563); `None` for a role
+    /// tick, which has no single item.
+    pub step_item: Option<(u32, bool)>,
     /// The host limit that deferred this repo's tick (#12084); `Some` exactly
     /// when `result` is [`RoleTickResult::SkippedDeferred`].
     pub deferred_by: Option<String>,
@@ -337,7 +340,7 @@ pub fn emit_for_tick_correlated(
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
 ) {
-    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None, None);
+    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None, None, None);
 }
 
 /// The step-specific inputs of [`emit_for_step`], bundled so the emit stays
@@ -349,6 +352,8 @@ pub struct StepTelemetry<'a> {
     pub sweep_id: &'a str,
     /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362).
     pub step_outcome: Option<(String, String)>,
+    /// The step's work item and whether it is a PR (#13563).
+    pub item: (u32, bool),
 }
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
@@ -371,6 +376,7 @@ pub fn emit_for_step(
         None,
         step.failure,
         Some(step.sweep_id.to_string()),
+        Some(step.item),
         step.step_outcome,
     );
 }
@@ -414,6 +420,7 @@ fn emit_tick(
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
     step_sweep_id: Option<String>,
+    step_item: Option<(u32, bool)>,
     step_outcome: Option<(String, String)>,
 ) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
@@ -463,6 +470,7 @@ fn emit_tick(
             role_draw,
             prompt,
             step_sweep_id,
+            step_item,
             deferred_by: None,
             shard_owner: None,
             extras: TickExtras::of(trace.as_ref(), step_outcome),
@@ -849,6 +857,8 @@ pub fn build_record(
             .as_ref()
             .map(|_| crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string()),
         sweep_id: tick.step_sweep_id.clone(),
+        issue: tick.step_item.filter(|(_, is_pr)| !is_pr).map(|(n, _)| n),
+        pr_number: tick.step_item.filter(|(_, is_pr)| *is_pr).map(|(n, _)| n),
         deferred_by: tick.deferred_by.clone().filter(|d| !d.is_empty()),
         shard_owner: tick.shard_owner.clone().filter(|s| !s.is_empty()),
         found_work: tick.extras.found_work,

@@ -406,11 +406,20 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(reason) = &r.step_reason {
                 attributes.push(kv_string("loom.role_tick.step_reason", reason.clone()));
             }
+            // #13563: the step's work item, so its tokens attribute to it.
+            if let Some(issue) = r.issue {
+                attributes.push(kv_int("loom.issue", i64::from(issue)));
+            }
+            if let Some(pr) = r.pr_number {
+                attributes.push(kv_int("loom.pr_number", i64::from(pr)));
+            }
             if let Some(models) = metadata::models(r.models_used.as_deref()) {
                 attributes.push(models);
             }
             if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
                 attributes.push(usage);
+                // #13563: flat per-step totals; absent (never zero) without usage.
+                attributes.extend(metadata::token_totals(r.tokens_by_model.as_deref()));
             }
             if let Some(actions) = &r.actions {
                 attributes

@@ -1039,6 +1039,8 @@ fn role_tick_outcome_envelope(
             actions: None,
             source: None,
             sweep_id: None,
+            issue: None,
+            pr_number: None,
             deferred_by: None,
             shard_owner: None,
             found_work: None,
@@ -1121,6 +1123,51 @@ fn role_tick_outcome_maps_the_judge_found_work_split_only_when_observed() {
     ] {
         assert_eq!(attr(&records[1], key), None, "{key}");
     }
+}
+
+/// #13563: a step's record names its item and flat token totals that equal the
+/// sum of its per-model rows; without usage the totals are absent, never zero.
+#[test]
+fn a_steps_role_tick_outcome_carries_its_item_and_token_totals() {
+    use crate::script_helpers::sweep_experiment::ModelUsageTotals;
+    let row = |model: &str, i, cr, w5, w1, o| ModelUsageTotals {
+        model: model.to_string(),
+        speed: String::new(),
+        service_tier: String::new(),
+        input: i,
+        cache_read: cr,
+        cache_write_5m: w5,
+        cache_write_1h: w1,
+        output: o,
+    };
+    let mut step = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut step.record {
+        r.pr_number = Some(42);
+        r.tokens_by_model = Some(vec![
+            row("claude-opus-5", 10, 100, 5, 1, 20),
+            row("claude-sonnet-5", 1, 2, 3, 4, 5),
+        ]);
+    }
+    let bare = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[step, bare]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let n = |v: i64| Some(any_value::Value::IntValue(v));
+    assert_eq!(attr(&records[0], "loom.pr_number"), n(42));
+    assert_eq!(attr(&records[0], "loom.issue"), None);
+    assert_eq!(attr(&records[0], "loom.tokens.input"), n(11));
+    assert_eq!(attr(&records[0], "loom.tokens.output"), n(25));
+    assert_eq!(attr(&records[0], "loom.tokens.cache_read"), n(102));
+    assert_eq!(attr(&records[0], "loom.tokens.cache_write"), n(13));
+    assert_eq!(attr(&records[1], "loom.tokens.input"), None);
+    assert_eq!(attr(&records[1], "loom.pr_number"), None);
 }
 
 /// Issue #8408 shipped `loom.gated_pool` with no assertion behind it (#8444):

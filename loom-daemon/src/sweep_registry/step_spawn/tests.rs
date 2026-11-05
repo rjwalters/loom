@@ -529,6 +529,7 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     emit_step_capture(&StepCapture {
         root: dir.path().to_path_buf(),
         role: StepRole::ChampionMerge,
+        item: 8,
         sweep_id: "step-champion_merge-8-1".into(),
         started_at: Utc::now() - chrono::Duration::seconds(30),
         outcome: RoleTickOutcome::Success,
