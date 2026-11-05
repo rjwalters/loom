@@ -517,6 +517,12 @@ pub fn worker_attempt(root: &Path, role: &str) -> Option<Span> {
         ("loom.phase", role),
         ("loom.timing_source", "owned_boundary"),
     ]);
+    // The role attempt joins its repo/issue/PR like every other attempt span.
+    metadata.extend(execution_scope(
+        &journal.active().ok()?,
+        &root_context,
+        &TraceStore::repo_attribute(root),
+    ));
     // `spawn-worker` runs before `spawn-claude.sh` computes the CPU budget, so
     // any `LOOM_SWEEP_CPU_*` here is the parent's; only host state is stamped.
     metadata.extend(open_host_attributes());
@@ -564,6 +570,7 @@ pub fn checkpoint_completed(
         model,
         pr,
         "checkpoint_write_observed",
+        &TraceStore::repo_attribute(root),
     );
 }
 
@@ -603,9 +610,11 @@ pub fn checkpoint_begun(
         role,
         attempt,
         model,
+        &TraceStore::repo_attribute(root),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checkpoint_begin_observation(
     journal: &Journal,
     root: &TraceContext,
@@ -614,6 +623,7 @@ fn checkpoint_begin_observation(
     role: &str,
     attempt: Option<u32>,
     model: Option<&str>,
+    repo: &str,
 ) -> Option<ActiveSpan> {
     if !CHECKPOINT_ROLES.contains(&role) {
         return None;
@@ -636,7 +646,7 @@ fn checkpoint_begin_observation(
     metadata.extend(spawn_budget_attributes());
     let at = Utc::now();
     let active = journal.active().ok()?;
-    metadata.extend(execution_scope(&active, root));
+    metadata.extend(execution_scope(&active, root, repo));
     // A re-dispatch of the same phase (the earlier subagent died without its
     // checkpoint) supersedes the begun attempt it replaces. Its outcome is
     // unknown, so `worked` stays absent.
@@ -719,18 +729,30 @@ pub(crate) fn checkpoint_workspace(root: &Path) -> PathBuf {
 }
 
 /// The execution's own scope (#10637): `loom.repo` and `loom.sweep_id` as its
-/// root span carries them. `prepare_execution` stamps both on every sweep
-/// root, so a checkpoint span that names only an issue also names the
-/// repository and sweep it belongs to, with values that join that root's
-/// exactly. A key the root lacks, or a root no longer open, stays absent.
-fn execution_scope(active: &[ActiveSpan], root: &TraceContext) -> TraceAttributes {
-    let Some(span) = active.iter().find(|span| span.record.context == *root) else {
-        return TraceAttributes::new();
-    };
-    ["loom.repo", "loom.sweep_id"]
-        .into_iter()
-        .filter_map(|key| Some((key.to_owned(), span.record.attributes.get(key)?.clone())))
-        .collect()
+/// root span carries them, plus the root's `loom.issue` / `loom.pr_number` when
+/// it names them (a step root does, #13169). `prepare_execution` stamps the
+/// repo and sweep on every sweep root, so a span that names only an issue also
+/// names the repository and sweep it belongs to, with values that join that
+/// root's exactly. A root that is missing or no longer open, or that lacks
+/// `loom.repo`, falls back to `repo` (the workspace's own spelling, #13562) so
+/// no role attempt is ever repo-less; the other keys stay absent.
+fn execution_scope(active: &[ActiveSpan], root: &TraceContext, repo: &str) -> TraceAttributes {
+    let mut scope: TraceAttributes = active
+        .iter()
+        .find(|span| span.record.context == *root)
+        .map(|span| {
+            ["loom.repo", "loom.sweep_id", "loom.issue", "loom.pr_number"]
+                .into_iter()
+                .filter_map(|key| Some((key.to_owned(), span.record.attributes.get(key)?.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !repo.is_empty() {
+        scope
+            .entry("loom.repo".into())
+            .or_insert_with(|| repo.to_owned());
+    }
+    scope
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -744,6 +766,7 @@ fn checkpoint_observation(
     model: Option<&str>,
     pr: Option<u32>,
     source: &str,
+    repo: &str,
 ) {
     let role = phase
         .strip_suffix("-done")
@@ -798,9 +821,14 @@ fn checkpoint_observation(
     }
     let at = Utc::now();
     let active = journal.active();
+    // The explicit `issue` / `pr` of this call win over the root's.
+    let own = metadata.clone();
     if let Ok(active) = &active {
-        metadata.extend(execution_scope(active, root));
+        metadata.extend(execution_scope(active, root, repo));
+    } else {
+        metadata.insert("loom.repo".into(), repo.to_owned());
     }
+    metadata.extend(own);
     // An explicitly launched role already has an authoritative start. Its
     // checkpoint completes that same attempt; never fabricate a second one.
     // A begun attempt names its issue (#9935): parallel builders in one wave
@@ -890,6 +918,7 @@ pub fn phase_transition(root: &Path, execution: &str, phase: &str, issue: u32, p
         None,
         pr,
         "checkpoint_poll_observed",
+        &TraceStore::repo_attribute(root),
     );
 }
 
