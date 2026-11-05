@@ -123,7 +123,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/verdict-staleness-guard.sh"
-calls = 7
+calls = 9
 owner = "role-scripts"
 removal_issue = 9799
 
