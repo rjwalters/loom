@@ -357,11 +357,70 @@ impl ParseArgs {
 }
 
 fn record_json(r: &ParkRecord) -> serde_json::Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    // `null` for a legacy park; `due` reuses `transient_due` so a shell caller
+    // (Guide's unblock sweep, #13606) never re-implements the missing/garbled
+    // `until` rule.
+    let transient = r.transient.as_ref().map(|t| {
+        serde_json::json!({
+            "cause": t.cause,
+            "attempt": t.attempt,
+            "until": t.until,
+            "due": park_record::transient_due(t, &now),
+            "escalate": t.attempt >= park_record::TRANSIENT_ESCALATE_ATTEMPT,
+        })
+    });
     serde_json::json!({
         "blocker": r.blocker.as_ref().map(|b| b.number),
         "blocker_repo": r.blocker.as_ref().and_then(|b| b.repo.clone()),
         "by": r.by,
         "at": r.at,
         "reason": r.reason,
+        "transient": transient,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_record_json(body: &str) -> serde_json::Value {
+        record_json(&park_record::parse(body)[0])
+    }
+
+    #[test]
+    fn legacy_park_has_null_transient() {
+        let v = first_record_json(
+            "<!-- loom:park Blocked by: #5 by=builder at=2026-11-05T12:00:00Z -->",
+        );
+        assert!(v["transient"].is_null());
+    }
+
+    #[test]
+    fn expired_transient_is_due_and_future_is_not() {
+        let past = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=2 until=2026-11-05T12:30:00Z -->",
+        );
+        assert_eq!(past["transient"]["cause"], "capacity:batch");
+        assert_eq!(past["transient"]["attempt"], 2);
+        assert_eq!(past["transient"]["due"], true);
+        assert_eq!(past["transient"]["escalate"], false);
+
+        let future = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=6 until=2999-01-01T00:00:00Z -->",
+        );
+        assert_eq!(future["transient"]["due"], false);
+        assert_eq!(future["transient"]["escalate"], true);
+    }
+
+    #[test]
+    fn missing_until_is_due() {
+        let v = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=1 -->",
+        );
+        assert_eq!(v["transient"]["due"], true);
+    }
 }

@@ -438,5 +438,12 @@ Spot batch fleet) carries a retry time instead of waiting for a person:
 - A record without these attributes parses exactly as before. A transient
   record with a missing or unparseable `until` is treated as already due.
 
-Release (Guide's unblock sweep) and the Builder prompt change are follow-up
-work under #13606.
+Release: Guide's unblock sweep (`release_due_transient_parks`) reads
+`park-record parse --json` (`records[].transient` = `cause`, `attempt`, `until`,
+`due`, `escalate`; `null` for a legacy park) and removes `loom:blocked` once
+`due`. Only the last record counts, so a later blocker or reason park wins. At
+`attempt >= 6` or park age >= 7 days it posts one escalation comment
+(`<!-- loom:transient-escalated cause=… -->`) and keeps retrying at the 24 h cap;
+it never adds a hold. The record stays in the body so the next re-park
+increments `attempt`. Release has no `hold.transition` span: `park-record
+released` is PR-only, so cause and attempt are in the release comment.
