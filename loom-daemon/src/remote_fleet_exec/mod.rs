@@ -901,10 +901,16 @@ fn describe_target(t: &Target) -> String {
     match t {
         Target::Host(h) => format!("fleet host `{h}`"),
         Target::Dynamic(d) => {
-            format!("`{d}` (a host this guard cannot resolve, so treated as a fleet host)")
+            format!("`{d}` (a host this guard cannot resolve, so treated as a fleet host; if it is outside the \
+                 fleet, spell the host literally and list it under `guards.remoteUnmanagedHosts`)")
         }
         Target::Instances(ids) => format!("fleet instance(s) {}", ids.join(", ")),
-        Target::TagTargets => "tag-selected instances (`--targets`, treated as fleet hosts)".into(),
+        Target::TagTargets => {
+            "tag-selected instances (`--targets`, unresolved so treated as fleet hosts; for hosts \
+             outside the fleet, spell them literally and list them under \
+             `guards.remoteUnmanagedHosts`)"
+                .into()
+        }
     }
 }
 

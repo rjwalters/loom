@@ -489,3 +489,37 @@ fn ssh_options_after_the_destination_are_skipped() {
     assert!(f.ask("ssh loom-worker-1 -t bash -s < s.sh").is_some());
     assert_eq!(f.ask("ssh loom-worker-1 -t -- uptime"), None);
 }
+
+#[test]
+fn unmanaged_list_matches_names_and_cidrs() {
+    use super::roster::unmanaged_matches;
+    let e = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let list = e(&[
+        "100.100.0.0/16",
+        "fd7a:115c:a1e0:ab::/64",
+        "lab.ts.net",
+        "bad/cidr",
+        "100.64.0.0/99",
+    ]);
+    assert!(unmanaged_matches(&list, "100.100.1.2"));
+    assert!(!unmanaged_matches(&list, "100.101.1.2"));
+    assert!(unmanaged_matches(&list, "fd7a:115c:a1e0:ab::5"));
+    assert!(!unmanaged_matches(&list, "fd7a:115c:a1e0:cd::5"));
+    assert!(unmanaged_matches(&list, "LAB.ts.net."));
+    // malformed entries never match everything
+    assert!(!unmanaged_matches(&list, "100.64.0.1"));
+    assert!(!unmanaged_matches(&e(&["0.0.0.0/0"]), "fd7a::1"));
+    assert!(unmanaged_matches(&e(&["0.0.0.0/0"]), "1.2.3.4"));
+}
+
+#[test]
+fn unresolved_ask_text_names_the_scoping_option_but_protected_does_not() {
+    let fx = Fx::new();
+    let dynamic = fx.ask("ssh ubuntu@$IP 'git reset --hard'").expect("asks");
+    assert!(dynamic.contains("guards.remoteUnmanagedHosts"), "{dynamic}");
+    let protected = fx
+        .ask("ssh ubuntu@loom-worker-1 'git reset --hard'")
+        .expect("asks");
+    assert!(!protected.contains("remoteUnmanagedHosts"), "{protected}");
+    assert!(protected.contains("break-glass"));
+}

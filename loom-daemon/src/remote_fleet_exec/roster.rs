@@ -28,6 +28,11 @@ use serde_json::Value;
 pub const TAILSCALE_STATUS_FILE_ENV: &str = "LOOM_GUARD_TAILSCALE_STATUS_FILE";
 /// The extend-only config array of extra fleet host names.
 pub const HOSTS_KEY: &str = "guards.remoteFleetHosts";
+/// Repo-local list of hosts (exact names/addresses and CIDRs) that are outside
+/// the guard's scope. It removes only the range-based tailnet classification;
+/// a host on a roster (registry, tailscale peers, [`HOSTS_KEY`]) stays a fleet
+/// host even when listed here.
+pub const UNMANAGED_KEY: &str = "guards.remoteUnmanagedHosts";
 
 /// Answers "is this a fleet host?".
 pub trait Roster {
@@ -60,6 +65,46 @@ pub fn is_tailnet_literal(host: &str) -> bool {
     }
 }
 
+fn parse_host_ip(host: &str) -> Option<IpAddr> {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+/// Does `ip` fall inside `net/prefix`? Mixed address families never match.
+fn cidr_contains(net: IpAddr, prefix: u32, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) if prefix <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+            u32::from(n) & mask == u32::from(i) & mask
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) if prefix <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+            u128::from(n) & mask == u128::from(i) & mask
+        }
+        _ => false,
+    }
+}
+
+/// Is `host` named by an `entries` item: an exact name/address, or a CIDR
+/// containing it? A malformed CIDR entry matches nothing (never fail-open).
+#[must_use]
+pub fn unmanaged_matches(entries: &[String], host: &str) -> bool {
+    let ip = parse_host_ip(host);
+    entries.iter().any(|e| {
+        let e = e.trim();
+        if let Some((net, prefix)) = e.split_once('/') {
+            return match (parse_host_ip(net), prefix.trim().parse::<u32>(), ip) {
+                (Some(n), Ok(p), Some(i)) => cidr_contains(n, p, i),
+                _ => false,
+            };
+        }
+        names_match(e, host)
+    })
+}
+
 /// Names compare case-insensitively, and a dotless name matches the first
 /// label of a dotted one (`loom-worker-1` ≡ `loom-worker-1.tail1234.ts.net`).
 #[must_use]
@@ -86,6 +131,7 @@ pub struct ProcessRoster {
     workspace: PathBuf,
     names: OnceCell<Vec<String>>,
     instances: OnceCell<Vec<String>>,
+    unmanaged: OnceCell<Vec<String>>,
 }
 
 impl ProcessRoster {
@@ -95,6 +141,7 @@ impl ProcessRoster {
             workspace: workspace.to_path_buf(),
             names: OnceCell::new(),
             instances: OnceCell::new(),
+            unmanaged: OnceCell::new(),
         }
     }
 
@@ -120,20 +167,45 @@ impl ProcessRoster {
         })
     }
 
-    fn on_roster(&self, host: &str) -> bool {
-        is_tailnet_literal(host) || self.names().iter().any(|n| names_match(n, host))
+    fn unmanaged(&self) -> &[String] {
+        self.unmanaged.get_or_init(|| {
+            let config = crate::config_resolver::resolve_effective_config(&self.workspace);
+            match crate::config_resolver::get_path(&config, UNMANAGED_KEY) {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|n| !n.trim().is_empty())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+    }
+
+    fn named(&self, host: &str) -> bool {
+        self.names().iter().any(|n| names_match(n, host))
     }
 }
 
 impl Roster for ProcessRoster {
     fn is_fleet_host(&self, host: &str) -> bool {
-        if self.on_roster(host) {
+        // Named rosters always win: the unmanaged list can never un-protect
+        // a host the fleet actually knows.
+        if self.named(host) {
             return true;
         }
-        match ssh_resolved_hostname(host) {
-            Some(resolved) if !resolved.eq_ignore_ascii_case(host) => self.on_roster(&resolved),
-            _ => false,
+        let scoped = |h: &str| unmanaged_matches(self.unmanaged(), h);
+        if is_tailnet_literal(host) && self.unmanaged().is_empty() {
+            return true; // no scoping configured: no `ssh -G` needed
         }
+        let resolved = ssh_resolved_hostname(host).filter(|r| !r.eq_ignore_ascii_case(host));
+        if resolved.as_deref().is_some_and(|r| self.named(r)) {
+            return true;
+        }
+        if scoped(host) || resolved.as_deref().is_some_and(scoped) {
+            return false;
+        }
+        is_tailnet_literal(host) || resolved.as_deref().is_some_and(is_tailnet_literal)
     }
 
     fn is_fleet_instance(&self, instance_id: &str) -> bool {
