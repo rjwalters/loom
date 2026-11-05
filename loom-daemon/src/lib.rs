@@ -388,6 +388,7 @@ pub mod self_update;
 pub mod serve;
 pub mod session_reconcile;
 pub mod session_status;
+pub mod shell_quote;
 pub mod short_hash;
 pub mod signoz_read;
 /// `stack-parent`: the open PR a Builder's conflicting work stacks on (#12759).

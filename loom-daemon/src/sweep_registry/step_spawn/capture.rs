@@ -259,6 +259,7 @@ pub fn step_failure(
 pub(crate) struct StepCapture {
     pub(crate) root: PathBuf,
     pub(crate) role: StepRole,
+    pub(crate) item: u32,
     pub(crate) sweep_id: SweepId,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) outcome: RoleTickOutcome,
@@ -282,6 +283,7 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
         capture.failure.clone(),
         &capture.sweep_id,
+        (capture.item, capture.role.acts_on_pr()),
     );
 }
 
@@ -365,6 +367,7 @@ impl SweepRegistry {
         let capture = StepCapture {
             root: self.config.workspace_root.clone(),
             role,
+            item,
             sweep_id: sweep_id.to_string(),
             started_at,
             outcome: tick_outcome(role, end, line.as_ref()),

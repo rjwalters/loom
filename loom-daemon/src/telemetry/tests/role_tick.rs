@@ -47,6 +47,8 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
         }),
         source: None,
         sweep_id: None,
+        issue: None,
+        pr_number: None,
         deferred_by: None,
         shard_owner: None,
     })
@@ -119,6 +121,8 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         actions: None,
         source: None,
         sweep_id: None,
+        issue: None,
+        pr_number: None,
         deferred_by: None,
         shard_owner: None,
     };

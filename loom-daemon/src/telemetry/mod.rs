@@ -1280,6 +1280,13 @@ pub struct RoleTickOutcomeRecord {
     /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_id: Option<String>,
+    /// The issue a step worked (#13563); set only on a step whose item is an
+    /// issue, so its token totals attribute to that issue. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    /// The PR a step worked (#13563); set only on a step whose item is a PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u32>,
     /// Which host limit deferred this repo's tick (#12084): `ceiling`,
     /// `role_budget`, `demand_width` or `reservation`. Present exactly on
     /// [`RoleTickResult::SkippedDeferred`]. Additive, no `schema_version`
