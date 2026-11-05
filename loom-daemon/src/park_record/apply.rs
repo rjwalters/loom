@@ -31,6 +31,7 @@ use std::io::Write;
 
 use super::{
     blockers, parse, render, render_park, transient_delay_secs, BlockerRef, ParkRecord, Transient,
+    TRANSIENT_CHAIN_RESET_SECS,
 };
 use crate::operator_decision::cli::{Forge as DecisionForge, GhForge, IssueState};
 
@@ -193,10 +194,23 @@ pub fn compose_body(
     })
 }
 
+/// True when `t.until` is more than [`TRANSIENT_CHAIN_RESET_SECS`] before `now`.
+fn chain_expired(t: &Transient, now: Option<chrono::DateTime<chrono::FixedOffset>>) -> bool {
+    let until = t
+        .until
+        .as_deref()
+        .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok());
+    match (until, now) {
+        (Some(u), Some(n)) => (n - u).num_seconds() > TRANSIENT_CHAIN_RESET_SECS,
+        _ => false,
+    }
+}
+
 /// `body` with a transient park record appended, or `None` when the body's
 /// latest record for `cause` has not yet expired at `at` (idempotent re-run).
 ///
-/// `attempt` is the previous record for the same cause plus one, else 1; the
+/// `attempt` is the previous record for the same cause plus one (else 1, also
+/// when that record is older than [`TRANSIENT_CHAIN_RESET_SECS`]); the
 /// retry time is `at` plus [`transient_delay_secs`].
 #[must_use]
 pub fn compose_transient_body(
@@ -218,7 +232,12 @@ pub fn compose_transient_body(
             return None;
         }
     }
-    let attempt = prior.map_or(1, |t| t.attempt.saturating_add(1));
+    // A chain whose last retry time is more than `TRANSIENT_CHAIN_RESET_SECS`
+    // old has gone quiet (a success in between): start over at attempt 1.
+    // Missing/unparseable `until` or `at` keeps the chain (as `transient_due`).
+    let attempt = prior
+        .filter(|t| !chain_expired(t, now))
+        .map_or(1, |t| t.attempt.saturating_add(1));
     let until = now.map(|n| {
         (n + chrono::Duration::seconds(transient_delay_secs(attempt, jitter)))
             .with_timezone(&chrono::Utc)

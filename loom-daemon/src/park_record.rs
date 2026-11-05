@@ -208,6 +208,9 @@ pub struct Transient {
 pub const TRANSIENT_BASE_SECS: i64 = 30 * 60;
 /// Longest transient delay (24 h).
 pub const TRANSIENT_CAP_SECS: i64 = 24 * 60 * 60;
+/// A prior transient record whose `until` is older than this no longer counts
+/// toward `attempt`; the backoff chain restarts at 1.
+pub const TRANSIENT_CHAIN_RESET_SECS: i64 = TRANSIENT_CAP_SECS;
 /// Jitter is at most this fraction of the delay, either way (±10%).
 pub const TRANSIENT_JITTER_FRACTION: f64 = 0.10;
 /// From this attempt on the release pass escalates once (comment only).
