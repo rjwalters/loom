@@ -827,7 +827,10 @@ release_due_transient_parks() {
     [ "$(has_restore_note "$number")" = "true" ] && continue
 
     # Escalate once at attempt >= 6 or park age >= 7 days: a comment, never a hold.
-    first_at=$(jq -r --arg c "$cause" '[.records[] | select(.transient.cause == $c) | .at] | first // empty' <<<"$recs")
+    # Age runs from the start of the TRAILING chain (last attempt==1 record for the
+    # cause): apply.rs resets the chain after TRANSIENT_CHAIN_RESET_SECS, so older
+    # records from a prior chain must not count (#13615).
+    first_at=$(jq -r --arg c "$cause" '[.records[] | select(.transient.cause == $c)] | (map(.transient.attempt == 1) | rindex(true) // 0) as $i | .[$i].at // empty' <<<"$recs")
     age_days=0
     if [ -n "$first_at" ]; then
       local fe; fe=$(date -u -d "$first_at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$first_at" +%s 2>/dev/null) \
