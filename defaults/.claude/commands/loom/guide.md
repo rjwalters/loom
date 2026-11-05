@@ -812,7 +812,7 @@ release_due_transient_parks() {
     [ "$(has_restore_note "$number")" = "true" ] && continue
 
     # Escalate once at attempt >= 6 or park age >= 7 days: a comment, never a hold.
-    first_at=$(jq -r '[.records[] | select(.transient.cause == "'"$cause"'") | .at] | first // empty' <<<"$recs")
+    first_at=$(jq -r --arg c "$cause" '[.records[] | select(.transient.cause == $c) | .at] | first // empty' <<<"$recs")
     age_days=0
     if [ -n "$first_at" ]; then
       local fe; fe=$(date -u -d "$first_at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$first_at" +%s 2>/dev/null) \
