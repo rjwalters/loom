@@ -1027,7 +1027,7 @@ fn export(envelope: &TelemetryEnvelope) {
 /// path reaches the wire (#9442).
 fn exportable(mut record: TelemetryRecord) -> TelemetryRecord {
     if let TelemetryRecord::RoleTickOutcome(r) = &mut record {
-        if !crate::agent_gh::classify::is_slug(&r.repo) {
+        if !crate::forge_slug::valid_slug(&r.repo) {
             r.repo = crate::observability::pick_decision::REPO_UNRESOLVED.to_string();
         }
     }

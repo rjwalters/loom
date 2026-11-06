@@ -888,22 +888,6 @@ impl CompletionMeta {
     }
 }
 
-/// Whether `slug` is a forge `owner/repo` slug: exactly one `/`, both halves
-/// non-empty and made of forge-legal name characters.
-fn valid_repo_slug(slug: &str) -> bool {
-    let mut parts = slug.split('/');
-    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    let legal = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 100
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    legal(owner) && legal(name)
-}
-
 /// Validate a `completion-v1` `meta` object **before** it can reach the wire
 /// (#4426). safehoused silently degrades a malformed `meta` to a `chat` — the
 /// event then vanishes from the public feed with no error anywhere — so this
@@ -935,7 +919,7 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
     if !valid_persona(get("agent")) {
         bail!("completion `meta.agent` {:?} is not a valid persona", get("agent"));
     }
-    if !valid_repo_slug(get("repo")) {
+    if !crate::forge_slug::valid_slug(get("repo")) {
         bail!("completion `meta.repo` {:?} is not a forge owner/repo slug", get("repo"));
     }
     let pr_ref = get("ref");
@@ -1924,7 +1908,7 @@ async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
     log_gh_recovery_once("repo view", workspace_root);
     let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
     let slug = parsed.get("nameWithOwner")?.as_str()?.trim().to_owned();
-    if !valid_repo_slug(&slug) {
+    if !crate::forge_slug::valid_slug(&slug) {
         return None;
     }
     // Absent/wrongly-typed ⇒ unknown, never "assume public": the whole point of
