@@ -2,21 +2,11 @@
 //! label write, stamped at the write. The body is the record's JSON; the
 //! scalars ride as `loom.hold.*` attributes.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::session_output::LogParts;
-use super::{kv, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
     let TelemetryRecord::HoldTransition(r) = record else {
@@ -27,12 +17,7 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
     }
     let mut attributes = vec![
         kv_string("loom.repo", &r.repo),
-        kv(
-            "loom.pr_number",
-            AnyValue {
-                value: Some(any_value::Value::IntValue(i64::from(r.pr))),
-            },
-        ),
+        kv_int("loom.pr_number", i64::from(r.pr)),
         kv_string("loom.hold.transition", &r.transition),
         kv_string("loom.hold.reason_code", &r.reason_code),
         kv_string("loom.hold.trigger", &r.trigger),
@@ -46,12 +31,7 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
         attributes.push(kv_string("loom.hold.episode_id", id));
     }
     if let Some(c) = r.confidence_pct {
-        attributes.push(kv(
-            "loom.hold.confidence_pct",
-            AnyValue {
-                value: Some(any_value::Value::IntValue(i64::from(c))),
-            },
-        ));
+        attributes.push(kv_int("loom.hold.confidence_pct", i64::from(c)));
     }
     if let Some(at) = r.entered_at {
         attributes.push(kv_string("loom.hold.entered_at", at.to_rfc3339()));
