@@ -5,7 +5,9 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::tests::{stub_server, SafehouseTestPaths};
+use super::tests::{
+    fetch_merged_prs_unwatermarked, reconcile_merges_unwatermarked, stub_server, SafehouseTestPaths,
+};
 use super::*;
 use crate::rate_limit_breaker::evidence::ResetEvidence;
 use crate::rate_limit_breaker::report::{BreakerHandle, BudgetProbe, FailureContext, ProbeMode};
@@ -117,7 +119,7 @@ async fn cooling_breaker_makes_zero_forge_calls_for_every_lookup() {
         assert!(fetch_issue_title(&ws, 8997).await.is_none());
         assert!(fetch_merged_pr(&ws, 8997).await.is_none());
         assert!(fetch_repo_identity(&ws).await.is_none());
-        assert!(fetch_recent_merged_prs(&ws).await.is_empty());
+        assert!(fetch_merged_prs_unwatermarked(&ws).await.is_empty());
     })
     .await;
     // Control: the same lookups with no breaker in scope reach `gh`.
@@ -142,9 +144,9 @@ async fn a_trip_in_workspace_a_stops_workspace_b_in_the_same_pass() {
     let probe = Arc::new(CountingProbe::default());
     let b = breaker();
     forge_gate::scoped(gate(&b, &probe), async {
-        assert!(fetch_recent_merged_prs(&ws_a).await.is_empty());
+        assert!(fetch_merged_prs_unwatermarked(&ws_a).await.is_empty());
         assert!(b.is_suppressed(Utc::now()), "first rate-limited lookup trips");
-        assert!(fetch_recent_merged_prs(&ws_b).await.is_empty());
+        assert!(fetch_merged_prs_unwatermarked(&ws_b).await.is_empty());
         assert!(fetch_issue_title(&ws_b, 1).await.is_none());
         assert!(fetch_merged_pr(&ws_b, 1).await.is_none());
     })
@@ -226,7 +228,7 @@ async fn suppressed_completion_stays_discoverable_and_narrates_once_after_releas
         )
         .await;
         assert!(exit.is_none());
-        let during = reconcile_recent_merges(
+        let during = reconcile_merges_unwatermarked(
             "loom_daemon",
             &root,
             &mut slug_cache,
@@ -241,7 +243,7 @@ async fn suppressed_completion_stays_discoverable_and_narrates_once_after_releas
         tokio::time::sleep(Duration::from_millis(3300)).await;
         assert!(!b.is_suppressed(Utc::now()), "window released");
 
-        let after = reconcile_recent_merges(
+        let after = reconcile_merges_unwatermarked(
             "loom_daemon",
             &root,
             &mut slug_cache,
@@ -252,7 +254,7 @@ async fn suppressed_completion_stays_discoverable_and_narrates_once_after_releas
         .await;
         assert_eq!(after.len(), 1, "the unseen completion is discovered after release");
         assert!(completed.contains(&(root.clone(), 8997, 8997)));
-        let again = reconcile_recent_merges(
+        let again = reconcile_merges_unwatermarked(
             "loom_daemon",
             &root,
             &mut slug_cache,

@@ -1,3 +1,4 @@
+use super::reconcile_tick::reconcile_merges_since;
 use super::*;
 use crate::types::{SweepId, SweepKind};
 use crate::workspace_registry::normalize_path;
@@ -6,6 +7,42 @@ use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
+
+/// Test-only: `fetch_merged_prs_since` with no watermark (the first-pass
+/// shape), flattened to a `Vec`. Production always passes a watermark.
+pub(super) async fn fetch_merged_prs_unwatermarked(
+    workspace_root: &Path,
+) -> Vec<ReconciledMergedPr> {
+    fetch_merged_prs_since(workspace_root, None)
+        .await
+        .map(|(rows, _)| rows)
+        .unwrap_or_default()
+}
+
+/// Test-only: `reconcile_merges_since` with no watermark and no saturation
+/// probe, returning just the envelopes.
+pub(super) async fn reconcile_merges_unwatermarked(
+    persona: &str,
+    workspace_root: &str,
+    slug_cache: &mut HashMap<String, RepoIdentity>,
+    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    peer_completions: Option<&PeerCompletionHandle>,
+) -> Vec<Envelope> {
+    reconcile_merges_since(
+        persona,
+        workspace_root,
+        None,
+        slug_cache,
+        already_narrated,
+        activity_db,
+        peer_completions,
+        false,
+    )
+    .await
+    .map(|pass| pass.envelopes)
+    .unwrap_or_default()
+}
 
 /// Test isolation guard (issue #4583). `run_sink` now reads/writes two
 /// machine-level paths by default: the persisted merge-reconciliation
@@ -2509,7 +2546,7 @@ fn write_env_probing_gh(dir: &std::path::Path) -> (PathBuf, PathBuf) {
 async fn probe_gh_config_dirs(probe_log: &Path, root: &Path) -> Vec<(String, String)> {
     let _ = fetch_merged_pr(root, 6596).await;
     let _ = fetch_repo_identity(root).await;
-    let _ = fetch_recent_merged_prs(root).await;
+    let _ = fetch_merged_prs_unwatermarked(root).await;
     let _ = fetch_issue_title(root, 6596).await;
     let text = std::fs::read_to_string(probe_log).unwrap_or_default();
     text.lines()
@@ -3103,9 +3140,15 @@ async fn reconcile_recent_merges_emits_completion_for_a_champion_driven_merge() 
     let root = dir.path().to_string_lossy().into_owned();
     let mut slug_cache = HashMap::new();
     let mut completed = std::collections::HashSet::new();
-    let envelopes =
-        reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None, None)
-            .await;
+    let envelopes = reconcile_merges_unwatermarked(
+        "loom_daemon",
+        &root,
+        &mut slug_cache,
+        &mut completed,
+        None,
+        None,
+    )
+    .await;
 
     std::env::remove_var(GH_BIN_ENV);
     assert_eq!(envelopes.len(), 1, "exactly one completion for the champion merge");
@@ -3152,9 +3195,15 @@ async fn reconcile_recent_merges_skips_a_merge_already_narrated_in_sweep() {
     .await;
     assert!(in_sweep.is_some(), "the in-sweep SweepExited path must narrate first");
 
-    let reconciled =
-        reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None, None)
-            .await;
+    let reconciled = reconcile_merges_unwatermarked(
+        "loom_daemon",
+        &root,
+        &mut slug_cache,
+        &mut completed,
+        None,
+        None,
+    )
+    .await;
 
     std::env::remove_var(GH_BIN_ENV);
     assert!(
@@ -3349,7 +3398,7 @@ async fn two_hosts_build_on_a_merge_on_b_produce_exactly_one_completion_envelope
         v.observe_completion_at(&ad, Instant::now());
     }
     let mut completed_b = std::collections::HashSet::new();
-    let reconciled_b = reconcile_recent_merges(
+    let reconciled_b = reconcile_merges_unwatermarked(
         "loom_daemon",
         &root,
         &mut HashMap::new(),
@@ -3446,9 +3495,15 @@ async fn reconcile_recent_merges_narrates_distinct_issues_independently() {
     // tick ever ran.
     completed.insert((root.clone(), 4610, 4610));
 
-    let envelopes =
-        reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None, None)
-            .await;
+    let envelopes = reconcile_merges_unwatermarked(
+        "loom_daemon",
+        &root,
+        &mut slug_cache,
+        &mut completed,
+        None,
+        None,
+    )
+    .await;
 
     std::env::remove_var(GH_BIN_ENV);
     assert_eq!(envelopes.len(), 1, "only the not-yet-narrated issue produces a completion");
@@ -3480,9 +3535,15 @@ async fn reconcile_recent_merges_ignores_merges_older_than_the_lookback_window()
     let root = dir.path().to_string_lossy().into_owned();
     let mut slug_cache = HashMap::new();
     let mut completed = std::collections::HashSet::new();
-    let envelopes =
-        reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None, None)
-            .await;
+    let envelopes = reconcile_merges_unwatermarked(
+        "loom_daemon",
+        &root,
+        &mut slug_cache,
+        &mut completed,
+        None,
+        None,
+    )
+    .await;
 
     std::env::remove_var(GH_BIN_ENV);
     std::env::remove_var(RECONCILE_MAX_AGE_ENV);
@@ -3845,9 +3906,15 @@ async fn reconcile_recent_merges_does_not_repost_a_merge_loaded_from_a_persisted
     // Simulate the fresh process's startup load.
     let mut completed = load_persisted_completed(Some(&completions_path));
     let mut slug_cache = HashMap::new();
-    let envelopes =
-        reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None, None)
-            .await;
+    let envelopes = reconcile_merges_unwatermarked(
+        "loom_daemon",
+        &root,
+        &mut slug_cache,
+        &mut completed,
+        None,
+        None,
+    )
+    .await;
 
     std::env::remove_var(GH_BIN_ENV);
     assert!(
