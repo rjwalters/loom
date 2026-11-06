@@ -65,9 +65,9 @@ mod completion_runtime;
 mod forge_gate;
 mod reconcile_tick;
 mod status_reaction;
+use reconcile_tick::ReconcileState;
 #[cfg(test)]
 use reconcile_tick::ReconcileWatermarks;
-use reconcile_tick::{reconcile_merges_since, ReconcileState};
 pub mod loom_ui_watch;
 
 // ============================================================================
@@ -2270,7 +2270,7 @@ async fn completion_for_exit(
 /// ([`completion_for_exit`]), a Champion merge step's end
 /// ([`completion_for_merged_step`], #12152: a step emits no `SweepExited`),
 /// and the periodic merge-reconciliation pass below
-/// ([`reconcile_recent_merges`]), which exists precisely because a
+/// ([`reconcile_tick::reconcile_merges_since`]), which exists precisely because a
 /// champion-tick merge — landing well after the sweep process (and its one
 /// `SweepExited`) already exited — is never observed by the first path alone.
 ///
@@ -2281,7 +2281,7 @@ async fn completion_for_exit(
 /// here because the two callers have different clocks available: a live
 /// sweep's reaper clock for [`completion_for_exit`], the forge's
 /// `createdAt`/`mergedAt` pair (no sweep clock exists) for
-/// [`reconcile_recent_merges`].
+/// [`reconcile_tick::reconcile_merges_since`].
 ///
 /// The dedup key is `(workspace, issue, merged.number)` (Issue #6062), not
 /// `(workspace, issue)` alone — see [`completion_for_exit`]'s doc comment for
@@ -2463,15 +2463,6 @@ fn reconcile_max_age() -> chrono::Duration {
 /// network, unauthenticated, timeout, malformed JSON, an unparsable row —
 /// degrades that row (or the whole call) to being silently skipped; a
 /// best-effort reconciliation pass must never panic or block the sink.
-// The unwatermarked form; production goes through the watermarked one (#12152).
-#[cfg_attr(not(test), allow(dead_code))]
-async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
-    fetch_merged_prs_since(workspace_root, None)
-        .await
-        .map(|(rows, _)| rows)
-        .unwrap_or_default()
-}
-
 /// How far before a workspace's watermark a catch-up query starts (#12152).
 /// GitHub's search index trails a merge by seconds to minutes, so a query
 /// cut exactly at the last pass could miss a merge that landed just before
@@ -2745,31 +2736,6 @@ async fn completion_for_merged_step(
 /// the daemon itself was down, **provided** the dedup set survives the
 /// restart; see [`load_persisted_completed`] / [`persist_completed_best_effort`]
 /// for that half of the story (the in-memory set alone does not survive one).
-// The unwatermarked form; production goes through the watermarked one (#12152).
-#[cfg_attr(not(test), allow(dead_code))]
-async fn reconcile_recent_merges(
-    persona: &str,
-    workspace_root: &str,
-    slug_cache: &mut HashMap<String, RepoIdentity>,
-    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
-    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
-    peer_completions: Option<&PeerCompletionHandle>,
-) -> Vec<Envelope> {
-    reconcile_merges_since(
-        persona,
-        workspace_root,
-        None,
-        slug_cache,
-        already_narrated,
-        activity_db,
-        peer_completions,
-        false,
-    )
-    .await
-    .map(|pass| pass.envelopes)
-    .unwrap_or_default()
-}
-
 /// Reconciliation-pass cadence (issue #4583). Test/operator override mirrors
 /// the existing `GH_BIN_ENV` seam: milliseconds, so a test can drive a whole
 /// reconciliation cycle without a real wall-clock wait. Unset/unparsable falls
