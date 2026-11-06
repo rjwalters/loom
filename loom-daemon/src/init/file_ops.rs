@@ -25,59 +25,9 @@ pub struct TemplateContext {
     pub loom_metadata: LoomMetadata,
 }
 
-/// Copy directory recursively
-///
-/// Creates the destination directory and copies all files and subdirectories.
-#[cfg(test)]
-pub fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            fs::copy(&src_path, &dst_path)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Merge directory recursively
-///
-/// Copies files from src to dst, but only if they don't already exist in dst.
-/// This allows merging new files from defaults while preserving existing customizations.
-#[cfg(test)]
-pub fn merge_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if file_type.is_dir() {
-            // Recursively merge subdirectories
-            merge_dir_recursive(&src_path, &dst_path)?;
-        } else if !dst_path.exists() {
-            // Only copy if destination file doesn't exist
-            fs::copy(&src_path, &dst_path)?;
-        }
-        // If dst_path exists, skip (preserve existing file)
-    }
-
-    Ok(())
-}
-
 /// Copy directory recursively with reporting
 ///
-/// Like `copy_dir_recursive` but tracks which files were added.
+/// Copies all files and subdirectories, tracking which files were added or updated.
 pub fn copy_dir_with_report(
     src: &Path,
     dst: &Path,
@@ -140,7 +90,8 @@ pub fn copy_dir_with_report_filtered(
 
 /// Merge directory recursively with reporting
 ///
-/// Like `merge_dir_recursive` but tracks which files were added vs preserved.
+/// Copies files only if they don't already exist in `dst`, tracking which files were
+/// added vs preserved.
 pub fn merge_dir_with_report(
     src: &Path,
     dst: &Path,
@@ -441,76 +392,6 @@ pub fn verify_copied_files(
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[test]
-    fn test_copy_dir_recursive() {
-        let temp_dir = TempDir::new().unwrap();
-        let src = temp_dir.path().join("src");
-        let dst = temp_dir.path().join("dst");
-
-        // Create source structure
-        fs::create_dir(&src).unwrap();
-        fs::write(src.join("file1.txt"), "content1").unwrap();
-        fs::create_dir(src.join("subdir")).unwrap();
-        fs::write(src.join("subdir").join("file2.txt"), "content2").unwrap();
-
-        // Copy recursively
-        copy_dir_recursive(&src, &dst).unwrap();
-
-        // Verify destination
-        assert!(dst.exists());
-        assert!(dst.join("file1.txt").exists());
-        assert!(dst.join("subdir").exists());
-        assert!(dst.join("subdir").join("file2.txt").exists());
-
-        let content1 = fs::read_to_string(dst.join("file1.txt")).unwrap();
-        assert_eq!(content1, "content1");
-
-        let content2 = fs::read_to_string(dst.join("subdir").join("file2.txt")).unwrap();
-        assert_eq!(content2, "content2");
-    }
-
-    #[test]
-    fn test_merge_dir_recursive() {
-        let temp_dir = TempDir::new().unwrap();
-        let src = temp_dir.path().join("src");
-        let dst = temp_dir.path().join("dst");
-
-        // Create source structure
-        fs::create_dir(&src).unwrap();
-        fs::write(src.join("file1.txt"), "new content 1").unwrap();
-        fs::write(src.join("file2.txt"), "new content 2").unwrap();
-        fs::create_dir(src.join("subdir")).unwrap();
-        fs::write(src.join("subdir").join("file3.txt"), "new content 3").unwrap();
-
-        // Create destination with existing file
-        fs::create_dir(&dst).unwrap();
-        fs::write(dst.join("file1.txt"), "existing content").unwrap();
-        fs::write(dst.join("existing.txt"), "preserve me").unwrap();
-
-        // Merge directories
-        merge_dir_recursive(&src, &dst).unwrap();
-
-        // Verify: file1.txt should be preserved (not overwritten)
-        let content1 = fs::read_to_string(dst.join("file1.txt")).unwrap();
-        assert_eq!(content1, "existing content");
-
-        // Verify: file2.txt should be copied (new file)
-        assert!(dst.join("file2.txt").exists());
-        let content2 = fs::read_to_string(dst.join("file2.txt")).unwrap();
-        assert_eq!(content2, "new content 2");
-
-        // Verify: subdir and file3.txt should be created
-        assert!(dst.join("subdir").exists());
-        assert!(dst.join("subdir").join("file3.txt").exists());
-        let content3 = fs::read_to_string(dst.join("subdir").join("file3.txt")).unwrap();
-        assert_eq!(content3, "new content 3");
-
-        // Verify: existing.txt should still exist
-        assert!(dst.join("existing.txt").exists());
-        let existing = fs::read_to_string(dst.join("existing.txt")).unwrap();
-        assert_eq!(existing, "preserve me");
-    }
 
     #[test]
     fn test_force_merge_preserves_custom_files() {

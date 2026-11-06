@@ -10,6 +10,9 @@ struct Fake {
     sentinels: HashSet<String>,
     porcelain: String,
     status: String,
+    /// `None` = the ignored listing read fails.
+    ignored: Option<String>,
+    links: Vec<String>,
     cwd: Option<String>,
     teardown_fails: bool,
     calls: RefCell<Vec<String>>,
@@ -17,7 +20,10 @@ struct Fake {
 
 impl Fake {
     fn healthy() -> Self {
-        let mut f = Fake::default();
+        let mut f = Fake {
+            ignored: Some(String::new()),
+            ..Fake::default()
+        };
         f.dirs.insert(WT.to_string());
         f.sentinels.insert(WT.to_string());
         f.porcelain = format!(
@@ -42,6 +48,16 @@ impl Host for Fake {
     }
     fn git_status(&self, _: &str) -> String {
         self.status.clone()
+    }
+    fn git_ignored(&self, _: &str) -> Option<String> {
+        self.calls.borrow_mut().push("git-ignored".into());
+        self.ignored.clone()
+    }
+    fn link_paths(&self, _: &str) -> Vec<String> {
+        self.links.clone()
+    }
+    fn size_kib(&self, _: &str, entries: &[String]) -> u64 {
+        entries.len() as u64 * 10
     }
     fn sentinel_present(&self, p: &str) -> bool {
         self.sentinels.contains(p)
@@ -104,6 +120,7 @@ fn inputs() -> Inputs {
         cleanup_primary: true,
         preserve_env: false,
         worktree_path_override: String::new(),
+        remove_ignored: false,
     }
 }
 
@@ -392,6 +409,15 @@ fn an_unframeable_worktree_root_removes_nothing_but_still_runs_the_branch_step()
         fn git_status(&self, p: &str) -> String {
             self.0.git_status(p)
         }
+        fn git_ignored(&self, p: &str) -> Option<String> {
+            self.0.git_ignored(p)
+        }
+        fn link_paths(&self, r: &str) -> Vec<String> {
+            self.0.link_paths(r)
+        }
+        fn size_kib(&self, p: &str, e: &[String]) -> u64 {
+            self.0.size_kib(p, e)
+        }
         fn sentinel_present(&self, p: &str) -> bool {
             self.0.sentinel_present(p)
         }
@@ -428,4 +454,73 @@ fn an_unframeable_worktree_root_removes_nothing_but_still_runs_the_branch_step()
     assert!(!host.0.called("teardown"));
     assert!(host.0.called("delete-branch"));
     assert!(texts(&r)[0].starts_with("WARNING:Post-merge worktree cleanup for PR #99 did not run"));
+}
+
+// --- #13599: ignored-data guard on the --worktree-path override ------------
+
+fn override_inputs() -> Inputs {
+    let mut i = inputs();
+    i.worktree_path_override = WT.into();
+    i
+}
+
+#[test]
+fn override_keeps_worktree_with_ignored_user_data() {
+    let mut host = Fake::healthy();
+    host.sentinels.clear();
+    host.ignored = Some("!! wip/results/out.json\n!! node_modules/\n".into());
+    let (r, _) = done(run(&override_inputs(), &Facts::default(), &host));
+    let t = texts(&r);
+    assert!(!host.called("teardown"), "{t:?}");
+    assert!(t.iter().any(|l| l.contains("ignored-data guard, #13599")), "{t:?}");
+    assert!(t.iter().any(|l| l == "WARNING:  wip/results/out.json"), "{t:?}");
+    assert!(!t.iter().any(|l| l.contains("node_modules")), "{t:?}");
+    assert!(
+        t.iter()
+            .any(|l| l.contains("Total size of the above: 10 KiB")),
+        "{t:?}"
+    );
+    assert!(t.iter().any(|l| l.contains("--remove-ignored")), "{t:?}");
+}
+
+#[test]
+fn override_with_force_flag_removes_despite_ignored_data() {
+    let mut host = Fake::healthy();
+    host.sentinels.clear();
+    host.ignored = Some("!! wip/results/out.json\n".into());
+    let mut i = override_inputs();
+    i.remove_ignored = true;
+    done(run(&i, &Facts::default(), &host));
+    assert!(host.called("teardown"));
+    assert!(!host.called("git-ignored"));
+}
+
+#[test]
+fn override_removes_when_only_artifacts_are_ignored() {
+    let mut host = Fake::healthy();
+    host.sentinels.clear();
+    host.ignored =
+        Some("!! node_modules/\n!! target/\n!! .venv/\n!! .loom-managed\n!! linked/dir/\n".into());
+    host.links = vec!["linked/dir".into()];
+    done(run(&override_inputs(), &Facts::default(), &host));
+    assert!(host.called("teardown"));
+}
+
+#[test]
+fn override_fails_closed_when_ignored_listing_unreadable() {
+    let mut host = Fake::healthy();
+    host.sentinels.clear();
+    host.ignored = None;
+    let (r, _) = done(run(&override_inputs(), &Facts::default(), &host));
+    assert!(!host.called("teardown"));
+    assert!(texts(&r).iter().any(|l| l.contains("could not be read")));
+}
+
+#[test]
+fn managed_default_path_never_reads_ignored_files() {
+    let mut host = Fake::healthy();
+    host.ignored = None; // would refuse if consulted
+    done(run(&inputs(), &closes_42(), &host));
+    assert!(host.called("teardown"));
+    assert!(!host.called("git-ignored"));
 }

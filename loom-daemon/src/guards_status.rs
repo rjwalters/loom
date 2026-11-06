@@ -159,6 +159,13 @@ const CATEGORIES: &[Category] = &[
         tags: &["stash-scope:"],
     },
     Category {
+        key: "primaryCheckoutMutation",
+        env: "LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["primary-checkout-mutation:"],
+    },
+    Category {
         key: "backgroundSubagents",
         env: "LOOM_GUARD_BACKGROUND_SUBAGENTS",
         kind: Kind::Bool {

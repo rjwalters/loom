@@ -769,6 +769,10 @@ impl SweepRegistry {
         started_at: DateTime<Utc>,
         exited_within_grace: bool,
     ) -> CancelOutcome {
+        // The lock release, cross-host claim check and label restore below are
+        // made for this sweep: stamp their `invoke github` spans (#13171). A
+        // step's own release re-enters with its role. Thread-local, synchronous.
+        let _sweep = crate::gh_invocation::telemetry::enter_sweep(sweep_id, None);
         // SIGKILL the group if still alive.
         let sigkill_sent = if exited_within_grace {
             false
@@ -1055,6 +1059,10 @@ impl SweepRegistry {
                 self.watch_in_run_exhaustion(&sweep_id);
             }
             if is_dead {
+                // The claim check and label restore below act for this sweep:
+                // stamp their `invoke github` spans (#13171). Dropped per tick
+                // iteration; a step's release re-enters with its role.
+                let _sweep = crate::gh_invocation::telemetry::enter_sweep(&sweep_id, None);
                 // Issue #4980 crash-path reap: the tracked leader is gone, but
                 // its process group may still hold a live `claude` agent and
                 // whatever that agent spawned — the zombie-agent shape of the
@@ -2336,3 +2344,8 @@ mod tests;
     unused_imports
 )]
 mod claim_restore_tests;
+
+// #13171: span-attribute coverage for the legacy issue-sweep cancel path.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+mod sweep_stamp_tests;

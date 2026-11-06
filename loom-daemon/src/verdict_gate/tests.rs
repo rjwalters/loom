@@ -470,6 +470,13 @@ fn trailing_newline_hash_is_accepted_but_edited_body_still_refuses() {
     iss[0].body = Some("edited".into());
     let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
     assert!(matches!(&d, Decision::Refuse(m) if m.contains("body changed")), "{d:?}");
+    // The refusal says what was hashed and shows the recipe (#13600).
+    assert!(
+        matches!(&d, Decision::Refuse(m) if m.contains("trailing newlines trimmed")
+            && m.contains("sha256sum")
+            && m.contains("issues/12509")),
+        "{d:?}"
+    );
 
     // Empty body: "" and "\n" both hash-match; two newlines do not.
     iss[0].body = Some(String::new());

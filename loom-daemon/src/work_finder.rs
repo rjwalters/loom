@@ -1197,58 +1197,6 @@ pub fn dispatch_held_per_root(
         .collect()
 }
 
-/// Fold the daemon-global scheduled-drain flag (#4090) on top of the per-root
-/// dispatch holds computed by [`dispatch_held_per_root`] (#3930 verified-red +
-/// #4084 gate-in-flight).
-///
-/// A scheduled drain is daemon-global: it pauses new dispatch in EVERY repo at
-/// once, so `draining` is OR'd onto every root's per-root hold. The two terms
-/// are fully independent: a drain holds every root regardless of its gate
-/// state, and a gate in flight holds its own root regardless of drain state.
-/// With `draining = false` the result is byte-for-byte `dispatch_held_per_root`.
-#[must_use]
-pub fn dispatch_held_per_root_with_drain(
-    health_states: &WorkspaceHealthStates,
-    roots: &[std::path::PathBuf],
-    suppress_dispatch_during_gate: bool,
-    draining: bool,
-) -> Vec<bool> {
-    dispatch_held_per_root(health_states, roots, suppress_dispatch_during_gate)
-        .into_iter()
-        .map(|h| h || draining)
-        .collect()
-}
-
-/// Fold a per-root claude-wrapper pre-flight-advisory hold (#5030) on top of the
-/// #3930 verified-red + #4084 gate-in-flight per-root holds.
-///
-/// `preflight_held` is a slice **parallel to `roots`**: `preflight_held[i] ==
-/// true` means root `i`'s pre-flight advisory is tripped AND its half-open
-/// breaker is currently in the "held" window (not a probe tick), so no new
-/// dispatch should go to that root this tick. The caller computes it from each
-/// root's own [`SweepRegistry::preflight_dispatch_gate`](crate::sweep_registry::SweepRegistry::preflight_dispatch_gate)
-/// — a broken workspace burns at most one ~1s pre-flight death per probe
-/// cooldown instead of one every tick.
-///
-/// The hold is strictly **per root**, matching the #3930 per-repo isolation
-/// contract: a workspace with a broken `.mcp.json` never halts dispatch to a
-/// healthy sibling repo. A missing entry (`preflight_held.len() < roots.len()`)
-/// defaults to *not held*. With an all-`false` slice the result is byte-for-byte
-/// [`dispatch_held_per_root`].
-#[must_use]
-pub fn dispatch_held_per_root_with_preflight(
-    health_states: &WorkspaceHealthStates,
-    roots: &[std::path::PathBuf],
-    suppress_dispatch_during_gate: bool,
-    preflight_held: &[bool],
-) -> Vec<bool> {
-    dispatch_held_per_root(health_states, roots, suppress_dispatch_during_gate)
-        .into_iter()
-        .enumerate()
-        .map(|(i, h)| h || preflight_held.get(i).copied().unwrap_or(false))
-        .collect()
-}
-
 /// The plain multi-workspace tick: no halt causes, lanes or build back-off.
 /// See [`tick_multi_with_build_backoff`].
 pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
@@ -1715,19 +1663,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 // Env-var configuration helpers
 // ============================================================================
 
-/// Whether the work-finder loop is enabled, per [`WORK_FINDER_ENABLE_ENV`].
-///
-/// Off by default (opt-in) — parsing mirrors
-/// [`crate::epic_supervisor::supervisor_enabled`]. This is the **env-only**
-/// primitive; the config-aware entry point the daemon actually uses is
-/// [`resolve_enabled`] (precedence env > config > default).
-#[must_use]
-pub fn enabled() -> bool {
-    std::env::var(WORK_FINDER_ENABLE_ENV).is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
-}
-
 /// Env override for the tick interval — `None` when unset, zero, or
 /// unparseable (a zero-interval busy loop is never useful).
 fn env_interval_secs() -> Option<u64> {
@@ -1753,15 +1688,6 @@ fn env_max_concurrent() -> Option<usize> {
 pub fn resolve_interval() -> Duration {
     env_interval_secs()
         .map_or_else(|| Duration::from_secs(DEFAULT_WORK_FINDER_INTERVAL_SECS), Duration::from_secs)
-}
-
-/// Resolve the fixed max-concurrency cap from
-/// [`WORK_FINDER_MAX_CONCURRENT_ENV`], falling back to
-/// [`DEFAULT_WORK_FINDER_MAX_CONCURRENT`]. A zero or unparseable value falls
-/// back to the default (a zero cap would dispatch nothing, defeating the loop).
-#[must_use]
-pub fn resolve_max_concurrent() -> usize {
-    env_max_concurrent().unwrap_or(DEFAULT_WORK_FINDER_MAX_CONCURRENT)
 }
 
 // ============================================================================
@@ -2196,8 +2122,8 @@ pub fn spawn_multi_work_finder_task(
             // bool from it, so the slice the tick routes on and the causes
             // its rows record are one fold and can never disagree — the same
             // terms, same inputs, same instant as the pre-#9017 inline bool
-            // fold (`dispatch_held_per_root_with_preflight` + drain, which
-            // `causes_per_root` mirrors cause-for-cause).
+            // fold (a bool fold of `dispatch_held_per_root`, pre-flight and drain,
+            // which `causes_per_root` mirrors cause-for-cause).
             let halt_causes = halt_cause::causes_per_root(
                 &health_states,
                 &roots,

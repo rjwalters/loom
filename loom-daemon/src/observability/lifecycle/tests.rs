@@ -23,6 +23,7 @@ fn completion_markers_preserve_each_repair_attempt_without_invented_duration() {
             Some("glm-5.3-flash"),
             Some(42),
             "checkpoint_write_observed",
+            "o/r",
         );
     }
     assert!(journal.has_checkpoint_observations().unwrap());
@@ -88,6 +89,7 @@ fn checkpoint_completes_existing_started_attempt_without_double_counting() {
         None,
         Some(42),
         "checkpoint_write_observed",
+        "o/r",
     );
     let mut spans = Vec::new();
     assert_eq!(
@@ -504,6 +506,7 @@ fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
             None,
             None,
             source,
+            "o/r",
         );
         let mut spans = Vec::new();
         journal
@@ -550,6 +553,7 @@ fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
         None,
         None,
         "checkpoint_write_observed",
+        "o/r",
     );
     let mut spans = Vec::new();
     journal
@@ -599,7 +603,18 @@ fn checkpoint_spans_carry_their_executions_repo_and_sweep_id() {
                 )
                 .unwrap();
         }
-        checkpoint_observation(&journal, &root, None, 18, "builder-done", None, None, None, source);
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            18,
+            "builder-done",
+            None,
+            None,
+            None,
+            source,
+            "o/r",
+        );
         let mut spans = Vec::new();
         journal
             .drain(|s| {
@@ -630,9 +645,10 @@ fn checkpoint_spans_carry_their_executions_repo_and_sweep_id() {
         }
     }
     for span in observed("bare-root", TraceAttributes::new(), false, SYNTHETIC_TIMING_SOURCES[0]) {
-        for key in scope.keys() {
-            assert!(!span.attributes.contains_key(key), "{key} must stay absent, never guessed");
-        }
+        // #13562: the repo falls back to the workspace's own spelling; the
+        // sweep id has no such source and stays absent, never guessed.
+        assert_eq!(span.attributes["loom.repo"], "o/r");
+        assert!(!span.attributes.contains_key("loom.sweep_id"), "sweep id must stay absent");
     }
 }
 
@@ -903,9 +919,17 @@ fn a_begun_phase_completes_with_its_real_duration() {
         .start(root.clone(), None, SpanName::Sweep, Utc::now(), scope)
         .unwrap();
     for role in ["curator", "builder", "judge", "doctor"] {
-        let begun =
-            checkpoint_begin_observation(&journal, &root, None, 9935, role, Some(1), Some("opus"))
-                .unwrap();
+        let begun = checkpoint_begin_observation(
+            &journal,
+            &root,
+            None,
+            9935,
+            role,
+            Some(1),
+            Some("opus"),
+            "o/r",
+        )
+        .unwrap();
         assert_eq!(begun.record.attributes["loom.timing_source"], CHECKPOINT_BEGIN_SOURCE);
         assert!(!begun.record.attributes.contains_key(ATTEMPT_WORKED));
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -924,6 +948,7 @@ fn a_begun_phase_completes_with_its_real_duration() {
             None,
             Some(7),
             "checkpoint_write_observed",
+            "o/r",
         );
     }
     let spans = drained_spans(&journal);
@@ -951,8 +976,17 @@ fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
     )
     .unwrap();
     let span = begin(root_dir, "sweep-9935", SpanName::Sweep, TraceAttributes::new()).unwrap();
-    checkpoint_begin_observation(&span.journal, span.context(), None, 9935, "builder", None, None)
-        .unwrap();
+    checkpoint_begin_observation(
+        &span.journal,
+        span.context(),
+        None,
+        9935,
+        "builder",
+        None,
+        None,
+        "o/r",
+    )
+    .unwrap();
     assert_eq!(span.journal.active().unwrap().len(), 3, "root, phase, attempt all open");
     finish_execution(root_dir, "sweep-9935", "failure", TraceAttributes::new()).unwrap();
     let spans = drained_spans(&span.journal);
@@ -974,10 +1008,13 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
     let journal = Journal::for_context(&dir.path().join("root.json"));
     let root = TraceContext::root(true);
     let first_a =
-        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
-    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None).unwrap();
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None, "o/r")
+            .unwrap();
+    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None, "o/r")
+        .unwrap();
     let second_a =
-        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None).unwrap();
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None, "o/r")
+            .unwrap();
     for issue in [1, 2] {
         checkpoint_observation(
             &journal,
@@ -989,6 +1026,7 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
             None,
             None,
             "checkpoint_write_observed",
+            "o/r",
         );
     }
     // No begin for issue 3: the synthetic zero-duration completion is unchanged.
@@ -1002,6 +1040,7 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
         None,
         None,
         "checkpoint_write_observed",
+        "o/r",
     );
     let spans = drained_spans(&journal);
     let attempt = |context: &TraceContext| spans.iter().find(|s| s.context == *context).unwrap();
@@ -1021,7 +1060,10 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
     assert_eq!(synthetic.started_at, synthetic.ended_at);
     assert_eq!(synthetic.attributes["loom.timing_source"], "checkpoint_write_observed");
     assert_eq!(synthetic.attributes[ATTEMPT_WORKED], "false");
-    assert!(checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None).is_none());
+    assert!(
+        checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None, "o/r")
+            .is_none()
+    );
 }
 
 /// #9510: the value `insert_nonempty_bounded` would stamp for `value`.
@@ -1274,8 +1316,17 @@ fn drained_sweep_and_phase_spans_keep_the_open_load_beside_the_close_load() {
     let journal = Journal::for_context(&store.path(root_dir, "sweep-12884"));
     publish_load(0.5);
     prepare_execution(&mut Command::new("true"), root_dir, "sweep-12884", &StepKeys::default());
-    checkpoint_begin_observation(&journal, &saved.context, None, 12884, "builder", None, None)
-        .unwrap();
+    checkpoint_begin_observation(
+        &journal,
+        &saved.context,
+        None,
+        12884,
+        "builder",
+        None,
+        None,
+        "o/r",
+    )
+    .unwrap();
     publish_load(3.25);
     finish_execution(root_dir, "sweep-12884", "success", TraceAttributes::new()).unwrap();
     crate::host_status::clear_latest();
@@ -1295,7 +1346,7 @@ fn a_checkpoint_completion_keeps_the_begin_load_and_a_synthetic_one_its_only_sam
     let journal = Journal::for_context(&dir.path().join("root.json"));
     let root = TraceContext::root(true);
     publish_load(0.5);
-    checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
+    checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None, "o/r").unwrap();
     publish_load(3.25);
     checkpoint_observation(
         &journal,
@@ -1307,6 +1358,7 @@ fn a_checkpoint_completion_keeps_the_begin_load_and_a_synthetic_one_its_only_sam
         None,
         None,
         "checkpoint_write_observed",
+        "o/r",
     );
     // No begin for issue 2: the synthetic phase opens and closes on one sample.
     checkpoint_observation(
@@ -1319,6 +1371,7 @@ fn a_checkpoint_completion_keeps_the_begin_load_and_a_synthetic_one_its_only_sam
         None,
         None,
         "checkpoint_write_observed",
+        "o/r",
     );
     crate::host_status::clear_latest();
     let spans = drained_spans(&journal);
@@ -1435,4 +1488,89 @@ fn a_step_root_carries_its_item_keys_at_open() {
     assert_eq!(attrs["loom.role"], "judge");
     assert_eq!(attrs["loom.head_sha"], head);
     assert!(!attrs.contains_key("loom.issue"), "an unlinked PR names no issue");
+}
+
+/// #13562: every role's attempt names its repo even when the root span carries
+/// no scope (or is gone), and its issue or PR only where the step has one.
+#[test]
+fn role_attempts_carry_a_repo_whatever_the_root_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let bare = TraceContext::root(true);
+    journal
+        .start(bare.clone(), None, SpanName::Sweep, Utc::now(), TraceAttributes::new())
+        .unwrap();
+    for (role, issue, pr) in [
+        ("curator", 7, None),
+        ("builder", 7, None),
+        ("judge", 8, Some(70)),
+        ("doctor", 9, Some(90)),
+    ] {
+        let begun =
+            checkpoint_begin_observation(&journal, &bare, None, issue, role, None, None, "o/r")
+                .unwrap();
+        assert_eq!(begun.record.attributes["loom.repo"], "o/r", "{role} begin");
+        assert_eq!(begun.record.attributes["loom.issue"], issue.to_string());
+        checkpoint_observation(
+            &journal,
+            &bare,
+            None,
+            issue,
+            &format!("{role}-done"),
+            None,
+            None,
+            pr,
+            "checkpoint_write_observed",
+            "o/r",
+        );
+    }
+    // A synthetic completion on a root that is no longer open.
+    let gone = TraceContext::root(true);
+    checkpoint_observation(
+        &journal,
+        &gone,
+        None,
+        5,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+        "o/r",
+    );
+    let spans = drained_spans(&journal);
+    let attempts: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == SpanName::RoleAttempt)
+        .collect();
+    assert_eq!(attempts.len(), 5);
+    for span in &attempts {
+        assert_eq!(span.attributes["loom.repo"], "o/r");
+        assert!(span.attributes.contains_key("loom.issue"));
+    }
+    let role_pr = |role: &str| {
+        attempts
+            .iter()
+            .find(|s| s.attributes["loom.role"] == role)
+            .and_then(|s| s.attributes.get("loom.pr_number").cloned())
+    };
+    assert_eq!(role_pr("judge").as_deref(), Some("70"));
+    assert_eq!(role_pr("doctor").as_deref(), Some("90"));
+    assert_eq!(role_pr("curator"), None, "no PR means no loom.pr_number, not an empty one");
+}
+
+/// A step root's own scope wins over the fallback, and supplies its PR.
+#[test]
+fn a_step_roots_scope_wins_over_the_workspace_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let scope = attributes(&[("loom.repo", "Org/Repo"), ("loom.pr_number", "31")]);
+    journal
+        .start(root.clone(), None, SpanName::Sweep, Utc::now(), scope)
+        .unwrap();
+    let begun =
+        checkpoint_begin_observation(&journal, &root, None, 4, "judge", None, None, "o/r").unwrap();
+    assert_eq!(begun.record.attributes["loom.repo"], "Org/Repo");
+    assert_eq!(begun.record.attributes["loom.pr_number"], "31");
 }

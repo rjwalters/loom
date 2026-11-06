@@ -93,6 +93,8 @@ fn req(blocked_by: &[u64], reason: Option<&str>) -> ApplyRequest {
         remove_labels: vec!["loom:building".to_string()],
         dry_run: false,
         is_pr: false,
+        transient: None,
+        jitter: 0.0,
     }
 }
 
@@ -440,5 +442,159 @@ mod hold_journal {
             ..champion("champion merge-risk hold")
         };
         assert!(holds(&mut f, &dry).is_empty());
+    }
+}
+
+mod transient {
+    use super::*;
+    use crate::park_record::{transient_delay_secs, transient_due, Transient, TRANSIENT_CAP_SECS};
+
+    fn treq(at: &str) -> ApplyRequest {
+        ApplyRequest {
+            transient: Some("capacity:batch".to_string()),
+            by: Some("builder".to_string()),
+            at: at.to_string(),
+            ..req(&[], None)
+        }
+    }
+
+    fn last(body: &str) -> Transient {
+        parse(body)
+            .into_iter()
+            .filter_map(|r| r.transient)
+            .next_back()
+            .unwrap()
+    }
+
+    #[test]
+    fn schedule_doubles_from_30_minutes_and_caps_at_24_hours() {
+        let got: Vec<i64> = (1..=8).map(|a| transient_delay_secs(a, 0.0) / 60).collect();
+        assert_eq!(got, vec![30, 60, 120, 240, 480, 960, 1440, 1440]);
+        assert_eq!(transient_delay_secs(40, 1.0), TRANSIENT_CAP_SECS);
+    }
+
+    #[test]
+    fn jitter_stays_within_ten_percent() {
+        assert_eq!(transient_delay_secs(1, 1.0), 1980);
+        assert_eq!(transient_delay_secs(1, -1.0), 1620);
+        assert_eq!(transient_delay_secs(1, 50.0), 1980, "out-of-range jitter is clamped");
+    }
+
+    #[test]
+    fn apply_writes_attempt_and_until_then_increments_after_expiry() {
+        let mut f = Fake::new("Body.", &["loom:building"]);
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        assert_eq!(apply(&mut f, &treq("2026-11-05T12:00:00Z"), &mut o, &mut e), exit::OK);
+        let t = last(&f.state.body);
+        assert_eq!((t.attempt, t.until.as_deref()), (1, Some("2026-11-05T12:30:00Z")));
+        // Re-run while unexpired: body unchanged (idempotent).
+        let before = f.state.body.clone();
+        apply(&mut f, &treq("2026-11-05T12:10:00Z"), &mut o, &mut e);
+        assert_eq!(f.state.body, before);
+        // Re-park after expiry: attempt 2, one hour out.
+        apply(&mut f, &treq("2026-11-05T13:00:00Z"), &mut o, &mut e);
+        let t = last(&f.state.body);
+        assert_eq!((t.attempt, t.until.as_deref()), (2, Some("2026-11-05T14:00:00Z")));
+    }
+
+    #[test]
+    fn another_cause_starts_at_attempt_one() {
+        let body =
+            compose_transient_body("", "capacity:batch", None, "2026-11-05T12:00:00Z", None, 0.0)
+                .unwrap();
+        let body =
+            compose_transient_body(&body, "quota:api", None, "2026-11-05T12:00:00Z", None, 0.0)
+                .unwrap();
+        assert_eq!(last(&body).attempt, 1);
+    }
+
+    fn body_with_attempt5() -> String {
+        render(&ParkRecord {
+            blocker: None,
+            by: None,
+            at: Some("2026-11-05T00:00:00Z".into()),
+            reason: None,
+            transient: Some(Transient {
+                cause: "capacity:batch".into(),
+                attempt: 5,
+                until: Some("2026-11-05T12:00:00Z".into()),
+            }),
+        })
+    }
+
+    #[test]
+    fn stale_chain_resets_attempt() {
+        let out = compose_transient_body(
+            &body_with_attempt5(),
+            "capacity:batch",
+            None,
+            "2026-11-07T00:00:00Z",
+            None,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(last(&out).attempt, 1);
+    }
+
+    #[test]
+    fn live_chain_and_boundary_increment_attempt() {
+        for at in ["2026-11-05T12:00:01Z", "2026-11-06T12:00:00Z"] {
+            let out = compose_transient_body(
+                &body_with_attempt5(),
+                "capacity:batch",
+                None,
+                at,
+                None,
+                0.0,
+            )
+            .unwrap();
+            assert_eq!(last(&out).attempt, 6, "{at}");
+        }
+    }
+
+    #[test]
+    fn missing_until_keeps_incrementing() {
+        let b = body_with_attempt5().replace(" until=2026-11-05T12:00:00Z", "");
+        let out =
+            compose_transient_body(&b, "capacity:batch", None, "2026-12-25T00:00:00Z", None, 0.0)
+                .unwrap();
+        assert_eq!(last(&out).attempt, 6);
+    }
+
+    #[test]
+    fn transient_excludes_blockers_and_needs_a_cause() {
+        let both = ApplyRequest {
+            blocked_by: vec![BlockerRef::local(5)],
+            ..treq(AT)
+        };
+        assert!(precheck(&both).is_some());
+        let empty = ApplyRequest {
+            transient: Some(" ".into()),
+            ..treq(AT)
+        };
+        assert!(precheck(&empty).is_some());
+        assert!(precheck(&treq(AT)).is_none(), "a transient park needs no --reason");
+    }
+
+    #[test]
+    fn due_when_until_passed_missing_or_garbled() {
+        let t = |u: Option<&str>| Transient {
+            cause: "c".into(),
+            attempt: 1,
+            until: u.map(Into::into),
+        };
+        let now = "2026-11-05T12:00:00Z";
+        assert!(transient_due(&t(Some("2026-11-05T11:59:59Z")), now));
+        assert!(!transient_due(&t(Some("2026-11-05T12:00:01Z")), now));
+        assert!(transient_due(&t(None), now));
+        assert!(transient_due(&t(Some("garbage")), now));
+    }
+
+    #[test]
+    fn legacy_parks_parse_without_transient_and_round_trip() {
+        let legacy = "<!-- loom:park Blocked by: #7 by=doctor at=2026-09-19T12:09:00Z -->";
+        assert!(parse(legacy).iter().all(|r| r.transient.is_none()));
+        let body = compose_transient_body("", "capacity:batch", None, AT, None, 0.0).unwrap();
+        assert_eq!(render(&parse(&body)[0]), body.trim());
     }
 }

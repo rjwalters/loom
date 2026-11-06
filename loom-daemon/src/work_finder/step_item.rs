@@ -835,8 +835,15 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     }
     // A proposal that is already promoted (`loom:issue`) or curated is item
     // work; Champion's own proposal query skips those too (`champion.md`
-    // Priority 3 excludes `loom:issue` / `loom:building`).
-    if is_proposal(labels) && !has(labels, CURATED) && !has(labels, READY) {
+    // Priority 3 excludes `loom:issue` / `loom:building`). A proposal carrying
+    // `loom:triage` or `loom:decision-malformed` is a Champion send-back and
+    // is Curator's turn (#13623): fall through to the Curator rows below.
+    if is_proposal(labels)
+        && !has(labels, CURATED)
+        && !has(labels, READY)
+        && !has(labels, TRIAGE)
+        && !has(labels, DECISION_MALFORMED)
+    {
         return pass(ItemState::Proposal, PassReason::Proposal);
     }
     if super::is_blocked_hold(labels) {

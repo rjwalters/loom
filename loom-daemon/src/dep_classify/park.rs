@@ -85,6 +85,8 @@ pub fn apply(
         remove_labels: remove_labels.to_vec(),
         dry_run: false,
         is_pr: false,
+        transient: None,
+        jitter: 0.0,
     };
     let mut forge = crate::operator_decision::cli::GhForge::new(
         repo_root.to_path_buf(),

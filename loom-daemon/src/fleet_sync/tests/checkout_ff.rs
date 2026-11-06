@@ -398,6 +398,58 @@ fn an_ignored_untracked_file_in_the_way_is_not_overwritten() {
 }
 
 #[test]
+fn an_ignored_file_identical_to_the_incoming_blob_is_replaced() {
+    // #13580: nothing can be lost, so this is not a hold.
+    let fx = Fixture::new();
+    write(&fx.host.join(".git/info/exclude"), ".loom-local/\n");
+    write(&fx.host.join("a/.loom-local/f.json"), "{}\n");
+    write(&fx.host.join("empty.txt"), "");
+    let tip = {
+        write(&fx.seed.join("empty.txt"), "");
+        fx.push("a/.loom-local/f.json", "{}\n")
+    };
+    let found = pass(&fx, &Knobs::default());
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert!(git(&fx.host, &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
+fn an_untracked_file_identical_to_the_incoming_blob_is_replaced() {
+    let fx = Fixture::new();
+    write(&fx.host.join("notes.txt"), "from upstream\n");
+    let tip = fx.push("notes.txt", "from upstream\n");
+    let found = pass(&fx, &Knobs::default());
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+}
+
+#[test]
+fn one_differing_byte_keeps_the_hold_and_removes_nothing() {
+    let fx = Fixture::new();
+    write(&fx.host.join("same.txt"), "same\n");
+    write(&fx.host.join("diff.txt"), "mine\n");
+    write(&fx.seed.join("same.txt"), "same\n");
+    fx.push("diff.txt", "theirs\n");
+    let report = assert_skipped(&fx, &Knobs::default(), CheckoutState::WouldOverwrite);
+    assert!(report.detail.as_deref().unwrap().contains("diff.txt"), "{report:?}");
+    assert_eq!(fs::read_to_string(fx.host.join("same.txt")).unwrap(), "same\n");
+    assert_eq!(fs::read_to_string(fx.host.join("diff.txt")).unwrap(), "mine\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_the_way_keeps_the_hold() {
+    let fx = Fixture::new();
+    std::os::unix::fs::symlink("README.md", fx.host.join("link.txt")).unwrap();
+    fx.push("link.txt", "one\n");
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::WouldOverwrite);
+    assert!(fs::symlink_metadata(fx.host.join("link.txt"))
+        .unwrap()
+        .is_symlink());
+}
+
+#[test]
 fn unpushed_commits_are_ahead_or_diverged_and_left_alone() {
     // Ahead only.
     let fx = Fixture::new();
@@ -1065,7 +1117,10 @@ fn a_refused_merge_is_read_as_a_file_in_the_way_or_as_a_failure() {
                      merge.\nAborting";
     assert_eq!(
         classify_refusal(untracked),
-        Refusal::WouldOverwrite("notes.txt, docs/x.md".to_string())
+        Refusal::WouldOverwrite(
+            "notes.txt, docs/x.md".to_string(),
+            vec!["notes.txt".to_string(), "docs/x.md".to_string()]
+        )
     );
     let other = "fatal: Not possible to fast-forward, aborting.";
     assert!(matches!(classify_refusal(other), Refusal::Other(e) if e.contains("fast-forward")));

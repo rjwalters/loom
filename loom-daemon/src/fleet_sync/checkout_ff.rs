@@ -185,6 +185,7 @@ pub(crate) mod external_change;
 mod freshness;
 pub(crate) mod git;
 mod host;
+mod identical;
 mod self_heal;
 
 use std::collections::HashMap;
@@ -960,7 +961,17 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
         }
     }
     let old = found.head.clone().unwrap_or_else(|| "unknown".to_string());
-    match git::fast_forward(root, &branch) {
+    let mut attempt = git::fast_forward(root, &branch);
+    // #13580: a file in the way that is byte-identical to what the merge would
+    // write holds nothing. Remove it and retry once; any doubt keeps the hold.
+    let mut removed = Vec::new();
+    if let Err(git::Refusal::WouldOverwrite(_, named)) = &attempt {
+        if let Some(paths) = identical::remove_identical_collisions(root, &branch, named, local()) {
+            removed = paths;
+            attempt = git::fast_forward(root, &branch);
+        }
+    }
+    match attempt {
         Ok(()) => {
             found.head = git::head(root, local());
             let new = found.head.clone().unwrap_or_else(|| "unknown".to_string());
@@ -971,9 +982,13 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
                 detail.push_str("; discarded local edits identical to origin: ");
                 detail.push_str(&git::summarize(&identical));
             }
+            if !removed.is_empty() {
+                detail.push_str("; removed untracked files identical to origin: ");
+                detail.push_str(&git::summarize(&removed));
+            }
             found.end(S::FastForwarded, detail)
         }
-        Err(git::Refusal::WouldOverwrite(paths)) => {
+        Err(git::Refusal::WouldOverwrite(paths, _)) => {
             found.end(S::WouldOverwrite, format!("a local file is in the way: {paths}"))
         }
         Err(git::Refusal::Other(e)) => found.end(S::GitFailure, e),

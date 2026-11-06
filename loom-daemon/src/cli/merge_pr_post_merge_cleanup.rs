@@ -64,6 +64,11 @@ pub(crate) struct PostMergeCleanupArgs {
     #[arg(long, value_name = "PATH", default_value = "")]
     worktree_path: String,
 
+    /// `--remove-ignored` (#13599): skip the ignored-data guard on the
+    /// `--worktree-path` override path.
+    #[arg(long)]
+    remove_ignored: bool,
+
     /// `forge_pr_close_targets`' output. Pass it (empty included) once fetched.
     #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
     close_targets: Option<String>,
@@ -105,6 +110,7 @@ impl PostMergeCleanupArgs {
             cleanup_primary: !self.no_cleanup_primary,
             preserve_env: self.preserve_env,
             worktree_path_override: self.worktree_path,
+            remove_ignored: self.remove_ignored,
         };
         let facts = Facts {
             close_targets: self.close_targets,
