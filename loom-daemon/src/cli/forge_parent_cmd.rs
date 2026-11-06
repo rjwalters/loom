@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use crate::parent_link::{child_body, fetch_parent_body, link_created};
+use crate::parent_link::{child_body, fetch_parent_body, link_created, split_state, SplitState};
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 
@@ -29,6 +29,19 @@ pub enum ParentAction {
         /// The created child: its URL, `owner/repo#N`, or number.
         #[arg(long, value_name = "URL|N")]
         child: String,
+        /// Target `owner/repo`; omitted resolves from the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// Is `--parent` a split tracker whose children are all closed? Prints
+    /// `SPLIT_ALL_CLOSED #a #b` and exits 0 when so (do NOT build it, do NOT
+    /// promote it to `loom:issue`); exits 1 with `NOT_SPLIT` when there are no
+    /// children or one is still open; exits 2 when the children could not be
+    /// read (unanswered, never an all-clear for promotion). #13635.
+    SplitState {
+        /// The parent issue number.
+        #[arg(long)]
+        parent: u32,
         /// Target `owner/repo`; omitted resolves from the origin remote.
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
@@ -86,6 +99,24 @@ pub fn handle(action: ParentAction) -> Result<()> {
             let (root, slug) = target(repo)?;
             let number = child_number(&child, &slug)?;
             link_created(&root, &slug, parent, number)
+        }
+        ParentAction::SplitState { parent, repo } => {
+            let (root, slug) = target(repo)?;
+            match split_state(&root, &slug, parent) {
+                Ok(SplitState::AllClosed(kids)) => {
+                    let list: Vec<String> = kids.iter().map(|n| format!("#{n}")).collect();
+                    println!("SPLIT_ALL_CLOSED {}", list.join(" "));
+                    Ok(())
+                }
+                Ok(_) => {
+                    println!("NOT_SPLIT");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("loom-daemon forge parent split-state: {e}");
+                    std::process::exit(2);
+                }
+            }
         }
     }
 }
