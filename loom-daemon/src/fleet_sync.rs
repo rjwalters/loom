@@ -61,7 +61,7 @@
 //!   [`Policy::FailClosed`]: the snapshot must have been confirmed current by
 //!   the forge in this pass (a `304` counts), there is no cached fallback, and
 //!   a both-flags (`fleet: true` + `firewall: true`) record is a hard error for
-//!   the whole roster — [`crate::fleet_store::roster::parse`]'s behaviour,
+//!   the whole roster — [`crate::fleet_store::roster::from_snapshot`]'s behaviour,
 //!   reused verbatim rather than re-implemented.
 //! - **Writes are opt-in on the timer.** The startup pass renders (that is what
 //!   "the process that starts is the one the store configured" means). Every
