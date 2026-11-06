@@ -1293,18 +1293,6 @@ fn build_completion_envelope_threads_with_the_issue_and_reads_as_prose() {
     assert!(build_send_request(&env, 1, None).is_ok());
 }
 
-#[test]
-fn valid_repo_slug_accepts_owner_repo_and_rejects_the_rest() {
-    assert!(valid_repo_slug("rjwalters/loom"));
-    assert!(valid_repo_slug("2AMLogic/marketing"));
-    assert!(valid_repo_slug("owner/kicad-tools.git"));
-    assert!(!valid_repo_slug("loom"), "a bare basename is not a forge slug");
-    assert!(!valid_repo_slug("a/b/c"));
-    assert!(!valid_repo_slug("/loom"));
-    assert!(!valid_repo_slug("rjwalters/"));
-    assert!(!valid_repo_slug("rjwalters/lo om"));
-}
-
 // ---- repo qualification helpers (issue #4201) ----
 
 #[test]

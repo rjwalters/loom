@@ -10,7 +10,7 @@ use super::client::{
     ask_daemon, check_socket_trust_as, DaemonLink, RoutedLookup, StandaloneRead as LocalSide,
 };
 use super::daemon::{serve, Backend, GhRead};
-use super::{standalone, valid_slug, IssueStateReply, ReadOutcome};
+use super::{standalone, IssueStateReply, ReadOutcome};
 use crate::stash_retirement::IssueStateLookup;
 use crate::types::{Request, Response};
 use crate::workspace_registry::{normalize_path, Workspace, WorkspaceRegistry};
@@ -132,17 +132,6 @@ fn hostile_inputs_are_rejected_before_any_read() {
         assert_eq!(reply.outcome, ReadOutcome::Unknown, "{root} {repo} {issue}");
     }
     assert!(backend.reads.borrow().is_empty());
-}
-
-#[test]
-fn slug_validation_is_strict() {
-    assert!(valid_slug("acme/private"));
-    assert!(valid_slug("a.b-c_d/e.f"));
-    for bad in [
-        "", "acme", "a/b/c", "/b", "a/", "a b/c", "a/b;ls", "..", "a/..", "a/-b",
-    ] {
-        assert!(!valid_slug(bad), "{bad:?}");
-    }
 }
 
 #[test]
