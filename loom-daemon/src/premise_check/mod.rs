@@ -61,7 +61,7 @@ pub mod evidence;
 pub mod record;
 pub mod scope;
 
-pub use record::{Outcome, Record};
+pub use record::{Outcome, Record, ReversalPolicy};
 pub use scope::Trigger;
 
 /// Exit codes. These are contract: `defaults/scripts/premise-check.sh` is a
@@ -122,6 +122,23 @@ pub struct Decision {
 /// [`crate::repo_root::find_worktree_root`].
 #[must_use]
 pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
+    decide_with(inputs, content_root, ReversalPolicy::Always)
+}
+
+/// [`decide`] under `hermit.reversalNeedsOperator`. The policy only applies to
+/// Hermit-filed issues (`loom:hermit`): the operator ruling behind it covers
+/// Hermit removals, so Architect/Auditor records keep today's rule.
+#[must_use]
+pub fn decide_with(
+    inputs: &Inputs,
+    content_root: &std::path::Path,
+    policy: ReversalPolicy,
+) -> Decision {
+    let policy = if inputs.labels.iter().any(|l| l == "loom:hermit") {
+        policy
+    } else {
+        ReversalPolicy::Always
+    };
     let Some(trigger) = scope::trigger(&inputs.title, &inputs.body, &inputs.labels) else {
         return Decision {
             trigger: None,
@@ -155,7 +172,7 @@ pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
             exit_code: exit::RECORD_MALFORMED,
         },
         Ok(rec) => {
-            let outcome = record::check(&rec, content_root);
+            let outcome = record::check_with(&rec, content_root, policy);
             let exit_code = match outcome {
                 Outcome::Proceed => exit::PROCEED,
                 Outcome::RouteOperator => exit::ROUTE_OPERATOR,
@@ -173,5 +190,37 @@ pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
                 exit_code,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_scope_tests {
+    use super::*;
+
+    fn inputs(labels: &[&str]) -> Inputs {
+        Inputs {
+            title: "hermit: remove dead helper".into(),
+            body:
+                "<!-- loom:premise-check exists=yes deliberate=yes reversal=yes verdict=clear -->\n\
+                   premise-evidence: Cargo.toml:1 — kept for later\npremise-protected: none\n"
+                    .into(),
+            labels: labels.iter().map(ToString::to_string).collect(),
+            comments: vec![],
+        }
+    }
+
+    /// The knob is a Hermit-removal ruling: it must not widen to other roles.
+    #[test]
+    fn policy_applies_only_to_hermit_issues() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let hermit =
+            decide_with(&inputs(&["loom:hermit"]), dir.path(), ReversalPolicy::ProtectedOnly);
+        let other =
+            decide_with(&inputs(&["loom:architect"]), dir.path(), ReversalPolicy::ProtectedOnly);
+        if hermit.trigger.is_some() {
+            assert_eq!(hermit.outcome, Outcome::Proceed);
+        }
+        assert_ne!(other.outcome, Outcome::Proceed);
     }
 }
