@@ -11,6 +11,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
+- **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
 
 ## Very Important
 
@@ -59,6 +60,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
+- **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
 
 ## Proposed
 
@@ -142,13 +144,13 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 3 |
 | Very important | 0 |
 | Important | 3 |
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 3 |
+| Approved PRs awaiting merge | 4 |
 | Curated | 48 |
 | Architect / Hermit proposals | 11 |
 | Active epics | 8 |
