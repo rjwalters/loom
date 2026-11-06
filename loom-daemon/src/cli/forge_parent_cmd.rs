@@ -101,7 +101,15 @@ pub fn handle(action: ParentAction) -> Result<()> {
             link_created(&root, &slug, parent, number)
         }
         ParentAction::SplitState { parent, repo } => {
-            let (root, slug) = target(repo)?;
+            // Fail closed: any failure (incl. an unresolvable repo) is exit 2,
+            // never the startup-failure exit 1 that callers read as NOT_SPLIT.
+            let (root, slug) = match target(repo) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("loom-daemon forge parent split-state: {e}");
+                    std::process::exit(2);
+                }
+            };
             match split_state(&root, &slug, parent) {
                 Ok(SplitState::AllClosed(kids)) => {
                     let list: Vec<String> = kids.iter().map(|n| format!("#{n}")).collect();
