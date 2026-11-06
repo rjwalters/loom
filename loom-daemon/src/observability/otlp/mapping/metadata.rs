@@ -1,7 +1,8 @@
 //! Allowlisted observed outcome metadata. No prompts, errors, account contents,
 //! token-price estimates, or provider billing guesses enter this mapping.
 use super::{
-    any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
+    any_string, any_value, kv, kv_bool, kv_int, kv_string, AnyValue, ArrayValue, KeyValue,
+    KeyValueList,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::{
@@ -413,12 +414,7 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     // 2AMLogic/2am#4393: the weighted agent draw's pick (#11726).
     if let Some(draw) = &record.role_draw {
         attrs.push(kv_string("loom.role_draw.pick", draw.pick.clone()));
-        attrs.push(kv(
-            "loom.role_draw.model_pinned",
-            AnyValue {
-                value: Some(any_value::Value::BoolValue(draw.model_pinned)),
-            },
-        ));
+        attrs.push(kv_bool("loom.role_draw.model_pinned", draw.model_pinned));
     }
     if let Some(numbers) = &record.pr_numbers {
         if !numbers.is_empty() && numbers.len() <= MAX_GROUPS {
