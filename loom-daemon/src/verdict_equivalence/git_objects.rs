@@ -43,14 +43,7 @@ use std::process::{Command, Stdio};
 /// Run `git -C <repo> <args>` and return its trimmed stdout, or `None` on any
 /// failure (absent binary, non-zero exit, non-UTF-8 output).
 pub(super) fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
+    let out = crate::git_utils::git_run(repo, args).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -264,5 +257,47 @@ pub(super) fn merge_tree(repo: &Path, a: &str, b: &str) -> MergeTree {
         }
         Some(1) => MergeTree::Conflict,
         _ => MergeTree::Failed,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        dir
+    }
+
+    #[test]
+    fn git_returns_trimmed_stdout_on_success() {
+        let dir = init_repo();
+        let out = git(dir.path(), &["rev-parse", "--git-dir"]).unwrap();
+        assert_eq!(out, ".git");
+    }
+
+    #[test]
+    fn git_returns_none_on_nonzero_exit() {
+        let dir = init_repo();
+        assert_eq!(git(dir.path(), &["rev-parse", "--verify", "nope"]), None);
+    }
+
+    #[test]
+    fn git_returns_none_on_non_utf8_stdout() {
+        let dir = init_repo();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, [0xff, 0xfe, 0xfd]).unwrap();
+        // `cat-file`-free way to emit raw bytes: `git hash-object` is ASCII, so
+        // use `git show-index`-style raw output via `git cat-file blob`.
+        let sha = git(dir.path(), &["hash-object", "-w", "blob"]).unwrap();
+        assert_eq!(git(dir.path(), &["cat-file", "blob", &sha]), None);
     }
 }
