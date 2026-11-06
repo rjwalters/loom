@@ -196,3 +196,44 @@ fn legacy_missing_and_corrupt_cursors_stay_safe() {
     std::fs::write(&file, "{not json").unwrap();
     assert_eq!(export::load_cursor(dir.path()), ExportCursor::default());
 }
+
+/// #13636: a crash between the two renames of a tail-carrying rotation leaves
+/// no journal, but every line is still in `.1`, which recovery replay scans.
+#[test]
+fn tail_carry_crash_between_renames_loses_no_line() {
+    let dir = TempDir::new().unwrap();
+    let (text, _) = exported_generation(dir.path());
+    let path = journal_path(dir.path());
+    let lines = valid_lines(&text);
+    // Pretend the bulk cursor trails EOF by stopping at the first line.
+    let first_end = text.find('\n').unwrap() as u64 + 1;
+    let staged = rotation::carry_tail(&path, first_end).unwrap();
+    assert_eq!(std::fs::read_to_string(&staged).unwrap(), text[first_end as usize..]);
+    // Crash point: the journal was renamed to `.1`, the tail not yet in place.
+    rotation::rotate(&path, 1).unwrap();
+    assert!(!path.exists() && staged.exists());
+    assert_eq!(std::fs::read_to_string(rotated_path(&path, 1)).unwrap(), text);
+    let recovered = Journal::reader(path.clone())
+        .missing(&Journal::reader(rotated_path(&path, 1)).read_all().unwrap())
+        .unwrap();
+    assert!(recovered.is_empty(), "{lines} lines all covered by the rotation");
+}
+
+/// #13636: a rotation that carries a tail leaves cursor 0 and the tail first.
+#[test]
+fn tail_carry_rotation_resets_the_cursor_and_puts_the_tail_first() {
+    let dir = TempDir::new().unwrap();
+    let (text, _) = exported_generation(dir.path());
+    let path = journal_path(dir.path());
+    let first_end = text.find('\n').unwrap() as u64 + 1;
+    let mut cursor = ExportCursor {
+        byte_offset: first_end,
+        fast_offset: Some(first_end + 1),
+        exported: 1,
+    };
+    assert!(export::rotate_if_due(dir.path(), &path, &mut cursor, policy(1)).unwrap());
+    assert_eq!(cursor.byte_offset, 0);
+    assert_eq!(cursor.fast_offset, None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text[first_end as usize..]);
+    assert_eq!(std::fs::read_to_string(rotated_path(&path, 1)).unwrap(), text);
+}
