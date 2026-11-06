@@ -20,8 +20,8 @@
 //!   roster record (`fleet: true` or `maintain`, never `firewall`) whose clone
 //!   exists, written verbatim to that repo's `.loom-local/fleet-repo.json`
 //!   ([`crate::config_resolver::FLEET_REPO_CONFIG_REL`]) by [`repo_targets`].
-//!   Compiled-store only: the legacy `repos.yml` has no per-repo config, so a
-//!   store without `fleet.json` yields no per-repo targets at all. Unlike the
+//!   Compiled-store only: per-repo config lives only in `fleet.json`, so a
+//!   store without it yields no per-repo targets at all. Unlike the
 //!   host-local tier, a record with **no** `config` means the file must not
 //!   exist ([`RepoTarget::value`] is `None`, removed by [`remove`]): the file
 //!   is owned by the fleet sync, so taking a value out of the fleet config has
@@ -169,7 +169,7 @@ impl RepoTarget {
 /// (#11738), in roster order.
 ///
 /// Only `fleet.json` carries per-repo config, so a store without it yields an
-/// empty list (the legacy `repos.yml` path does nothing here). The repo set is
+/// empty list. The repo set is
 /// [`super::roster::Roster::desired`] — so a `firewall: true` record, or one
 /// the roster does not manage, never gets a target — narrowed to the repos
 /// `is_cloned` (a seam: production checks `<path>/.git`). A repo that is not

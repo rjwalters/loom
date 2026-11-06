@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::fleet_store::fetch::{Reply, Transport};
@@ -199,4 +200,54 @@ pub(crate) fn snapshot_of(files: &BTreeMap<String, String>) -> crate::fleet_stor
             .map(|(p, c)| (p, c.into_bytes()))
             .collect(),
     }
+}
+
+/// The compiled form of [`sample_files`]: the same roster, state and tiers in
+/// the shape fleet-gitops' `scripts/render.py` writes.
+pub(crate) fn sample_compiled() -> Value {
+    json!({
+        "_generated": {
+            "generator": "scripts/render.py",
+            "note": "Generated from fleet.yml by scripts/render.py; do not edit.",
+            "schema": "schema/fleet.schema.json",
+            "schema_version": 1,
+            "source": "fleet.yml"
+        },
+        "config": {
+            "defaults": {
+                "autonomous": {
+                    "autoUpdate": {"settleSecs": 3600},
+                    "roleRunner": {"enabled": true, "roles": ["judge"]}
+                },
+                "forge": {"githubApp": {"appId": "1"}}
+            },
+            "hosts": {
+                "build-1": {
+                    "defaults": {
+                        "autonomous": {
+                            "roleRunner": {"roles": ["judge", "doctor"]},
+                            "workFinder": {"maxConcurrent": 8}
+                        },
+                        "forge": {"githubApp": {"privateKeyPath": "/k.pem"}}
+                    },
+                    "local": {"observability": {"enabled": true}}
+                },
+                "build-2": {
+                    "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 2}}}
+                }
+            }
+        },
+        "dispatch": {},
+        "hosts": [{"name": "build-1"}, {"name": "build-2"}],
+        "repos": [
+            {"dir": "app", "fleet": true, "name": "app", "weight": 5}
+        ],
+        "root": "/srv/src",
+        "state": {
+            "fleet": {"state": "running"},
+            "hosts": {"build-2": {"state": "paused"}}
+        },
+        "topology": {},
+        "versions": {}
+    })
 }
