@@ -365,8 +365,17 @@ fn record_outcome(
             let skipped_owners = report.owners.iter().filter(|o| o.error.is_some()).count();
             if report.repo_errors.len() <= skipped_owners {
                 status.last_ok_at = Some(ctx.now);
-                status.consecutive_failures = 0;
                 status.backoff_until = None;
+                if skipped_owners == 0 {
+                    status.consecutive_failures = 0;
+                } else {
+                    // #13640: a skipped owner is a failure `health` must see —
+                    // a dead main org went unnoticed for 20+ days with the
+                    // counter pinned at 0. `last_error_at` stays unset so
+                    // `classify` still reads `degraded`, not `failing`.
+                    status.consecutive_failures += 1;
+                    status.last_error = report.repo_errors.first().cloned();
+                }
             } else {
                 status.last_error = Some(format!(
                     "{} repo(s) failed; first: {}",
