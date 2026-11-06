@@ -122,8 +122,6 @@ fn samples() -> Vec<TelemetryRecord> {
                     "consecutive_failures": 0, "duration_ms": 0, "loom": p})),
         wire(json!({"kind": "host.export", "captured_at": AT, "host": "host-a",
                     "exporters": []})),
-        wire(json!({"kind": "operator.presence", "captured_at": AT, "host": "host-a",
-                    "session_id": "s1", "last_activity_at": AT, "driving": []})),
         wire(json!({"kind": "checkout.freshness", "captured_at": AT,
                     "prompt": {"commit": "a"}})),
         wire(json!({"kind": "checkout.external_change", "change_id": "c", "root": "/r",

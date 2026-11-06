@@ -363,9 +363,6 @@ processors:
           # host.lease_id (#11530, the opaque lease-comment host id)
           # (HOST_EXPORT_LOG_ATTRIBUTE_KEYS in
           # loom-daemon/src/telemetry/kinds/host_export.rs, contract-tested).
-          # operator.presence (#11563) adds the loom.presence.* scalars
-          # (OPERATOR_PRESENCE_LOG_ATTRIBUTE_KEYS in
-          # loom-daemon/src/telemetry/kinds/operator_presence.rs, contract-tested).
           # stage.work_started (#11641) adds the loom.work_started.* keys
           # (WORK_STARTED_LOG_ATTRIBUTE_KEYS in
           # loom-daemon/src/telemetry/kinds/work_started.rs, contract-tested).

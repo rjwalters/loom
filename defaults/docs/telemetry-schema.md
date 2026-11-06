@@ -189,7 +189,6 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
-| [`operator.presence`](#operatorpresence) | log, OTLP only | none (#12121): no producer exists; the kind and its mapping remain for old rows → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.freshness`](#checkoutfreshness) | log, OTLP only | `fleet_sync/checkout_ff` pass → `observability/otlp/mapping/checkout_freshness.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
@@ -3433,20 +3432,6 @@ only git children are local reads (`rev-parse`, `rev-list`, `remote get-url`,
 SigNoz: `attributes_string['loom.kind'] = 'checkout.freshness'`, grouped by
 `host.name` and `loom.repo`, with `max(loom.prompt.commits_behind_remote)` and
 `countIf(loom.prompt.origin_ref_stale)`.
-
-### `operator.presence`
-
-**No longer emitted (#12121).** The daemon records telemetry for its own work
-and nothing else: it does not read interactive session transcripts, and
-outside sessions do not send telemetry through it. The `presence-beat.sh` hook
-and the `loom-daemon presence …` subcommands that used to emit this record are
-removed, and nothing replaces them. The kind, its OTLP mapping and the
-`loom.presence.*` attribute allowlist stay so rows already in a backend still
-decode.
-
-Operator activity is **inferred by consumers**, not emitted: an item (issue or
-PR) that advanced with no daemon span covering it was moved by an operator
-session. See [`operator-presence.md`](operator-presence.md).
 
 ### `checkout.external_change`
 
