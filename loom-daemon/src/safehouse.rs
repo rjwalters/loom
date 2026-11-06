@@ -2453,16 +2453,6 @@ fn reconcile_max_age() -> chrono::Duration {
     chrono::Duration::seconds(secs)
 }
 
-/// Best-effort bulk `gh pr list --state merged` lookup across **all** recently
-/// merged PRs in `workspace_root` (issue #4583) — unlike [`fetch_merged_pr`]
-/// this is not filtered to one issue's branch, which is exactly what lets it
-/// discover a merge the branch-scoped, `SweepExited`-triggered lookup never
-/// ran for (no sweep, no trigger). Rows merged longer than
-/// [`reconcile_max_age`] ago are dropped here, so a first-ever pass cannot
-/// backfill stale history onto the feed. Every failure — missing `gh`, no
-/// network, unauthenticated, timeout, malformed JSON, an unparsable row —
-/// degrades that row (or the whole call) to being silently skipped; a
-/// best-effort reconciliation pass must never panic or block the sink.
 /// How far before a workspace's watermark a catch-up query starts (#12152).
 /// GitHub's search index trails a merge by seconds to minutes, so a query
 /// cut exactly at the last pass could miss a merge that landed just before
@@ -2718,24 +2708,6 @@ async fn completion_for_merged_step(
     .await
 }
 
-/// The periodic reconciliation pass itself (issue #4583): bulk-lists recently
-/// merged PRs for `workspace_root` and narrates a completion for any
-/// `(workspace, issue, merged-PR-number)` not already in `already_narrated` —
-/// sharing that exact dedup set with [`completion_for_exit`]'s `SweepExited`
-/// path is what keeps the two trigger paths from ever double-posting the same
-/// merge, in either direction (whichever path observes the merge first wins;
-/// the other becomes a no-op `contains` check). Keying on the PR number
-/// (Issue #6062) rather than the issue alone also means a *different* merged
-/// PR against the same still-open issue (a partial increment) is narrated
-/// independently instead of being silently swallowed by the first merge's key.
-///
-/// This is the option the issue's curation explicitly favors over a new event
-/// topic/IPC verb: it needs no change to the frozen v0.10.0 event taxonomy,
-/// and — because it queries forge truth directly rather than depending on any
-/// daemon-emitted event — it also naturally covers a merge that happened while
-/// the daemon itself was down, **provided** the dedup set survives the
-/// restart; see [`load_persisted_completed`] / [`persist_completed_best_effort`]
-/// for that half of the story (the in-memory set alone does not survive one).
 /// Reconciliation-pass cadence (issue #4583). Test/operator override mirrors
 /// the existing `GH_BIN_ENV` seam: milliseconds, so a test can drive a whole
 /// reconciliation cycle without a real wall-clock wait. Unset/unparsable falls
