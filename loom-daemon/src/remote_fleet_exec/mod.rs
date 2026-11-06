@@ -34,7 +34,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use lex::{Pipeline, Simple, Stdin, Word};
-use roster::Roster;
+use roster::{FleetMatch, Roster};
 
 /// The first bytes of every ask; the hook asks only on this prefix.
 pub const ASK_PREFIX: &str = "ASK [remote-fleet-exec]";
@@ -80,6 +80,9 @@ pub struct Finding {
     pub transport: &'static str,
     pub target: Target,
     pub payload: Payload,
+    /// The invocation's literal `-F <file>` ssh config, used to resolve an
+    /// alias defined only there. `None` when absent or spelled dynamically.
+    pub ssh_config: Option<PathBuf>,
 }
 
 /// Inputs the classifier needs from the environment.
@@ -402,11 +405,49 @@ impl Scan<'_> {
     }
 
     fn push(&mut self, transport: &'static str, target: Target, payload: Payload) {
+        self.push_with(transport, target, payload, None);
+    }
+
+    fn push_with(
+        &mut self,
+        transport: &'static str,
+        target: Target,
+        payload: Payload,
+        ssh_config: Option<PathBuf>,
+    ) {
         self.findings.push(Finding {
             transport,
             target,
             payload,
+            ssh_config,
         });
+    }
+
+    /// The literal `-F <file>` among `opts` (resolved against the cwd/home).
+    /// A variable path is `None`: the lookup then ignores it (fail closed).
+    fn ssh_config_of(&self, opts: &[Word]) -> Option<PathBuf> {
+        let mut cfg = None;
+        let mut i = 0;
+        while let Some(w) = opts.get(i) {
+            i += 1;
+            let value = if w.text == "-F" {
+                let v = opts.get(i);
+                i += 1;
+                v.cloned()
+            } else {
+                w.text
+                    .strip_prefix("-F")
+                    .filter(|v| !v.is_empty())
+                    .map(|v| Word {
+                        text: v.to_string(),
+                        dynamic: w.dynamic,
+                    })
+            };
+            if let Some(v) = value {
+                cfg = (!v.dynamic).then(|| self.resolve(&v.text));
+            }
+        }
+        cfg
     }
 
     fn ssh(
@@ -429,6 +470,7 @@ impl Scan<'_> {
             skip_ssh_options(args, i + 1).0
         };
         let target = host_target(dest, true);
+        let cfg = self.ssh_config_of(args.get(..start).unwrap_or_default());
         let local: Vec<&Word> = args.get(start..).unwrap_or_default().iter().collect();
         let remote: Vec<&str> = local.iter().map(|w| w.text.as_str()).collect();
         let remote = remote.join(" ");
@@ -450,18 +492,18 @@ impl Scan<'_> {
         }
         if let Some(pattern) = destructive_pattern(&remote) {
             let source = "the inline remote command".to_string();
-            self.push(transport, target, Payload::Destructive { pattern, source });
+            self.push_with(transport, target, Payload::Destructive { pattern, source }, cfg);
             return;
         }
         if remote.trim().is_empty() || text_runs_stdin_shell(&remote) {
             if let Some(payload) = fed {
-                self.push(transport, target, payload);
+                self.push_with(transport, target, payload, cfg);
                 return;
             }
         }
         if let Some(why) = dynamic::undeterminable(&remote, &local) {
             let src = format!("the inline remote command ({why})");
-            self.push(transport, target, Payload::Unresolvable(src));
+            self.push_with(transport, target, Payload::Unresolvable(src), cfg);
         }
     }
 
@@ -645,10 +687,19 @@ impl Scan<'_> {
     /// `scp` / `rsync`: a remote destination is a push onto that host.
     fn copy(&mut self, transport: &'static str, args: &[Word], takes: &[&str]) {
         let mut positional = Vec::new();
+        let mut options = Vec::new();
         let mut i = 0;
         while let Some(a) = args.get(i) {
             let t = a.text.as_str();
             i += 1;
+            if t.starts_with('-') && t.len() > 1 && !t.starts_with("--") {
+                options.push(a.clone());
+                if t == "-F"
+                    || takes.contains(&format!("-{}", t.chars().last().unwrap_or('-')).as_str())
+                {
+                    options.extend(args.get(i).cloned());
+                }
+            }
             if t.starts_with("--") {
                 if !t.contains('=') && takes.contains(&t) {
                     i += 1;
@@ -666,7 +717,12 @@ impl Scan<'_> {
             return;
         }
         if let Some(dest) = positional.last().and_then(|w| remote_spec(w)) {
-            self.push(transport, dest, Payload::Push);
+            let cfg = if transport == "scp" {
+                self.ssh_config_of(&options)
+            } else {
+                None
+            };
+            self.push_with(transport, dest, Payload::Push, cfg);
         }
     }
 
@@ -889,17 +945,31 @@ fn remote_spec(w: &Word) -> Option<Target> {
 // The verb
 // ===========================================================================
 
-fn on_fleet(target: &Target, roster: &dyn Roster) -> bool {
-    match target {
-        Target::Host(h) => roster.is_fleet_host(h),
-        Target::Dynamic(_) | Target::TagTargets => true,
-        Target::Instances(ids) => ids.iter().any(|i| roster.is_fleet_instance(i)),
+fn fleet_match(f: &Finding, roster: &dyn Roster) -> Option<Option<FleetMatch>> {
+    // `Some(None)`: a fleet target with no host rule to name (dynamic, tags,
+    // instances). `None`: not a fleet target.
+    match &f.target {
+        Target::Host(h) => roster.fleet_match(h, f.ssh_config.as_deref()).map(Some),
+        Target::Dynamic(_) | Target::TagTargets => Some(None),
+        Target::Instances(ids) => ids
+            .iter()
+            .any(|i| roster.is_fleet_instance(i))
+            .then_some(None),
     }
 }
 
-fn describe_target(t: &Target) -> String {
+fn describe_target(t: &Target, why: Option<&FleetMatch>) -> String {
     match t {
-        Target::Host(h) => format!("fleet host `{h}`"),
+        Target::Host(h) => match why {
+            Some(m) => {
+                let via = m
+                    .resolved
+                    .as_ref()
+                    .map_or(String::new(), |r| format!(", resolved by `ssh -G` to `{r}`"));
+                format!("fleet host `{h}` (classified by {}{via})", m.rule.describe())
+            }
+            None => format!("fleet host `{h}`"),
+        },
         Target::Dynamic(d) => {
             format!("`{d}` (a host this guard cannot resolve, so treated as a fleet host; if it is outside the \
                  fleet, spell the host literally and list it under `guards.remoteUnmanagedHosts`)")
@@ -940,7 +1010,12 @@ fn slug(t: &Target) -> String {
 
 /// The ask text: what, where, the approval rule, and the break-glass record.
 #[must_use]
-pub fn ask_reason(f: &Finding, fleet_repo: Option<&str>, date: &str) -> String {
+pub fn ask_reason(
+    f: &Finding,
+    why: Option<&FleetMatch>,
+    fleet_repo: Option<&str>,
+    date: &str,
+) -> String {
     let what = match &f.payload {
         Payload::Destructive { pattern, source } => format!("runs `{pattern}` (in {source})"),
         Payload::Unresolvable(src) => {
@@ -958,7 +1033,7 @@ pub fn ask_reason(f: &Finding, fleet_repo: Option<&str>, date: &str) -> String {
          what ran, on which hosts, why, and who approved it. Opt-out: guards.remoteFleetExec=false \
          or LOOM_GUARD_REMOTE_FLEET_EXEC=0 (#11568).",
         f.transport,
-        describe_target(&f.target),
+        describe_target(&f.target, why),
         slug(&f.target),
     )
 }
@@ -973,10 +1048,10 @@ pub fn check(
     fleet_repo: impl FnOnce() -> Option<String>,
     date: &str,
 ) -> Option<String> {
-    let found = findings(command, ctx)
+    let (found, why) = findings(command, ctx)
         .into_iter()
-        .find(|f| on_fleet(&f.target, roster))?;
-    toggle().then(|| ask_reason(&found, fleet_repo().as_deref(), date))
+        .find_map(|f| fleet_match(&f, roster).map(|why| (f, why)))?;
+    toggle().then(|| ask_reason(&found, why.as_ref(), fleet_repo().as_deref(), date))
 }
 
 /// [`check`] against the process's own environment, config and roster.
