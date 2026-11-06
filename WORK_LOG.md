@@ -16,6 +16,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-06
 
+- **PR #13645**: refactor: drop always-zero drain refusals from telemetry and status
+- **Issue #13643** (closed): Extract hyperparameter resolution from run_daemon into daemon_service/ sibling module
+- **Issue #13492** (closed): Remove always-zero drain `refusals` field from status and auto_update.tick telemetry
 - **PR #13631**: chore(harness): track latest CLIs — codex 0.166.0→0.167.0
 - **Issue #13622** (closed): Dedupe OTLP kv_bool/kv_int helpers in mapping/ (hold_transition, merge_authorization)
 - **PR #13630**: refactor: use shared OTLP kv_bool/kv_int helpers in mapping modules
