@@ -16,6 +16,32 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-06
 
+- **Issue #13639** (closed): worktree.root committed as a host path breaks Judge on every other host — fall back or validate
+- **PR #13652**: fix: fall back to default worktree root when configured root is missing or unwritable
+- **Issue #13663** (closed): New skill /loom:accelerate: session-only '/loom:sweep all' loop sized to localhost, to push one project faster alongside the fleet
+- **PR #13664**: feat: add /loom:accelerate session-only sweep loop with localhost sizing
+- **Issue #13487** (closed): workspace_resync: land a mechanically verified resync PR without Judge (daemon runs the resync-waiver proof and merges via merge-pr.sh)
+- **Issue #13017** (closed): Split run_daemon (~1960-line fn) in daemon_service.rs into startup-phase modules
+- **PR #13648**: refactor: extract startup credential preflight from run_daemon
+- **Issue #13662** (closed): resync-waiver: .agents/skills/loom-* counted as outside the install set → every resync PR held for human merge
+- **Issue #13636** (closed): ci_telemetry: journal never rotates on a continuously-polling host — rotation waits for bulk cursor at EOF
+- **PR #13657**: fix: rotate the CI telemetry journal past the threshold, carrying the unexported tail
+- **Issue #13525** (closed): Remove test-only reconcile wrappers in safehouse.rs and unconsumed forge_repo_facts::disagreement
+- **PR #13658**: refactor: drop test-only unwatermarked safehouse wrappers
+- **Issue #13400** (closed): Remove write-only role-runner skip-counter totals and unused *_count() wrappers
+- **PR #13649**: refactor: remove write-only role-runner skip-count totals
+- **Issue #13637** (closed): Port loom-daemon stats dashboard onto *_rows queries (slice 1 of #12752)
+- **PR #13655**: refactor: render loom-daemon stats from the *_rows query stack
+- **Issue #13362** (closed): Drop the fleet.json-absent legacy fallback and retire fleet_store/yaml.rs (#10705 follow-up)
+- **PR #13656**: refactor: remove repos.yml/state.yml fallback and the fleet_store YAML reader
+- **PR #13654**: fix(ci_telemetry): orgs/ fallback on kind-probe transport errors; count skipped owners as failures
+- **Issue #13628** (closed): Remove deprecated tmux loom-scale.sh (the 'loom scale' verb, ~450 LOC)
+- **PR #13647**: refactor: remove deprecated tmux loom-scale verb
+- **Issue #13567** (closed): Consolidate four divergent owner/repo slug validators in loom-daemon
+- **PR #13650**: refactor: consolidate owner/repo slug validators into forge_slug
+- **Issue #13660** (closed): Add per-module env-truthy pinning tests for Group A migrated callers (follow-up to #13376)
+- **Issue #13376** (closed): Consolidate ~14 duplicated env-truthy helpers in loom-daemon into one
+- **PR #13653**: refactor: share one env-truthy parser across seven identical copies
 - **PR #13645**: refactor: drop always-zero drain refusals from telemetry and status
 - **Issue #13643** (closed): Extract hyperparameter resolution from run_daemon into daemon_service/ sibling module
 - **Issue #13492** (closed): Remove always-zero drain `refusals` field from status and auto_update.tick telemetry
