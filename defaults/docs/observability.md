@@ -1396,10 +1396,9 @@ Guards: `kind_producer.rs` fails when a kind loses its last producer; `kind_expo
 | `pass.verdict` | observability/step_verdict.rs | daemon | logs |  |
 | `token_ranking.refresh` | token_ranking_refresh/telemetry.rs | daemon | logs |  |
 | `host.export` | observability/collector.rs | daemon | logs |  |
-| `operator.presence` | none (`PRODUCER_LESS_KINDS`, #11563) | CLI | logs | No daemon-side producer; schema and OTLP mapping retained. |
 | `checkout.external_change` | fleet_sync/checkout_ff/external_change.rs | daemon | logs |  |
 | `roster.change` | fleet_sync/roster_clone.rs | daemon | logs |  |
-| `issue.estimate` | telemetry/kinds/issue_estimate/completion.rs (`loom-daemon curation-complete`) | CLI | logs | Written by the `curation-complete` CLI, not observed by the daemon. |
+| `issue.estimate` | telemetry/kinds/issue_estimate/observe.rs | daemon | logs | Observed from curated issues by the intake pass (#12118). |
 | `stage.work_started` | observability/work_started.rs | daemon | logs |  |
 | `completion.narrated` | safehouse/completion_runtime.rs | daemon | logs |  |
 | `write_scope.refused` | write_scope.rs | daemon | logs |  |

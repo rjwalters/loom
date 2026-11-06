@@ -223,9 +223,6 @@ pub mod kind_producer;
 /// `scope.memory` (#12241) — one agent scope's memory limit, peak and OOM kills.
 pub mod scope_memory;
 
-/// `operator.presence` (#11563) — an operator session's keyboard presence.
-pub mod operator_presence;
-
 /// `checkout.freshness` (#12509) — one managed checkout, measured against GitHub's tip.
 pub mod checkout_freshness;
 
@@ -457,15 +454,6 @@ macro_rules! telemetry_kind_table {
             HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
 
-            /// An operator session's presence beat (Issue #11563): who is at the
-            /// keyboard (`last_input_at`), when the session last did anything,
-            /// and which issues and PRs it is driving. No prompt or transcript
-            /// content exists in the record. Exported over OTLP (the `loom.presence.*`
-            /// scalars ride as attributes; the body is the record's JSON) now that
-            /// #11525 settled the transport — the same path as every other fact.
-            /// See [`operator_presence`].
-            OperatorPresence = "operator.presence" => $crate::telemetry::kinds::operator_presence::OperatorPresenceRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs;
             /// A managed checkout's history was moved by something other than
             /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
