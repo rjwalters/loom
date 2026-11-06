@@ -197,6 +197,7 @@ pub mod doctor_escalation;
 /// Doctor hand-back as a conditional, verified label transition (#9388).
 pub mod doctor_handback;
 pub mod eager_reclaim;
+pub(crate) mod env_flag;
 #[cfg(test)]
 pub(crate) mod env_test_support;
 pub mod epic_state;
