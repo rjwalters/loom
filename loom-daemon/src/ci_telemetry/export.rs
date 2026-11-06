@@ -11,8 +11,8 @@
 //! line at a time; nothing here reads the journal whole (a 5.4 GB journal
 //! read whole OOM-killed the fleet captain). A pass holds the per-host cycle
 //! lock, so it never overlaps a poll cycle, and it is the one place the
-//! journal is rotated ([`super::rotation`]) — only once every line is
-//! exported.
+//! journal is rotated ([`super::rotation`]) — once the bulk cursor passes the
+//! threshold, carrying any unexported tail into the new generation (#13636).
 //!
 //! Delivery to the exporter is at-least-once across a crash between the
 //! queue offer and the cursor save (the same posture as every other
@@ -27,8 +27,9 @@
 //! run/job-class lines ([`is_priority`]) past it, then — only once the fast
 //! lane has reached the end of the journal — continues the bulk cursor, which
 //! skips the priority lines the fast lane already offered. Nothing is dropped
-//! or sampled; the journal rotates only when the bulk cursor (and so the fast
-//! one) is at EOF.
+//! or sampled; rotation does not wait for EOF (a live writer keeps the bulk
+//! cursor trailing it): the unexported tail is carried forward and the fast
+//! offset resets, so priority lines in the tail may be re-offered once.
 //!
 //! **Bounded admission (#11115).** Records are offered through
 //! [`QueueSink::offer_backfill`], which never evicts: when any exporter queue
@@ -225,9 +226,10 @@ pub fn pending_count(root: &Path) -> usize {
 /// a time.
 pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
     let path = journal_path(root);
-    if !path.exists() {
+    if !path.exists() && !rotation::carry_path(&path).exists() {
         // Nothing to export — and no lock file is created in a workspace
-        // that has never run the poller.
+        // that has never run the poller. (A lone staging file is an
+        // interrupted tail-carrying rotation: recovered below.)
         return 0;
     }
     let lock = match CycleLock::try_acquire(&state_dir(root)) {
@@ -241,6 +243,19 @@ pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
             return 0;
         }
     };
+    // Finish an interrupted tail-carrying rotation before reading the journal
+    // (#13636): otherwise the carried tail never reaches the exporter.
+    match rotation::recover_carry(&path) {
+        Ok(true) => log::info!("ci_telemetry: recovered an interrupted rotation's carried tail"),
+        Ok(false) => {}
+        Err(error) => {
+            log::warn!("ci_telemetry: could not recover the carried tail, will retry: {error}");
+            return 0;
+        }
+    }
+    if !path.exists() {
+        return 0;
+    }
     let (offered, mut cursor) = export_locked(root, &path, queue);
     let policy = if cursor.byte_offset > 0 {
         RotationPolicy::resolve(&read_config(root))
@@ -389,9 +404,10 @@ fn persist(root: &Path, cursor: ExportCursor, advanced: ExportCursor) -> ExportC
     }
 }
 
-/// Rotate the journal when the cursor has passed `policy`'s threshold **and**
-/// sits exactly at the end of the file, so every line is already exported.
-/// Then reset the cursor's byte offset. The caller holds the cycle lock.
+/// Rotate the journal when the bulk cursor has passed `policy`'s threshold.
+/// Any unexported tail `[byte_offset, EOF)` is copied into the new generation
+/// first (#13636), so a live writer cannot postpone rotation forever. Then
+/// reset the cursor's byte offset. The caller holds the cycle lock.
 /// Returns whether it rotated.
 pub fn rotate_if_due(
     root: &Path,
@@ -410,29 +426,51 @@ pub(crate) fn rotate_if_due_with(
     policy: RotationPolicy,
     save_hook: &dyn Fn(SaveStep) -> io::Result<()>,
 ) -> io::Result<bool> {
-    if cursor.byte_offset < policy.threshold_bytes {
+    if cursor.byte_offset == 0 || cursor.byte_offset < policy.threshold_bytes {
+        // Nothing consumed yet (e.g. the fast lane is still pushed back):
+        // rotating would just copy the whole journal.
         return Ok(false);
     }
     let len = std::fs::metadata(path)?.len();
-    if cursor.byte_offset != len {
-        // Unexported lines (or a torn tail a writer has yet to repair)
-        // remain; a later pass rotates once they are gone.
+    let tail_len = len.saturating_sub(cursor.byte_offset);
+    if tail_len > 0 && policy.keep == 0 {
+        // No retained rotation to replay the tail from after a crash: wait
+        // for it to drain.
         return Ok(false);
     }
+    // Stage the unexported tail (fsynced) before anything is changed.
+    let staged = if tail_len > 0 {
+        Some(rotation::carry_tail(path, cursor.byte_offset)?)
+    } else {
+        None
+    };
     // Durably reset the cursor to 0 BEFORE the journal is renamed/deleted, so
     // a crash anywhere afterwards can never leave the old offset trusted for a
-    // new generation. A crash before the rotation merely replays the old,
-    // already-offered generation (at-least-once). If the reset cannot be made
-    // durable, do not rotate.
+    // new generation. A crash before the rotation merely replays the old
+    // generation (at-least-once); one between the renames leaves the tail in
+    // `.1`, which recovery replay scans. If the reset cannot be made durable,
+    // do not rotate.
     let reset = ExportCursor {
         byte_offset: 0,
         fast_offset: None,
         exported: cursor.exported,
     };
-    save_cursor_with(root, &reset, save_hook)?;
-    rotation::rotate(path, policy.keep)?;
+    let rotated = save_cursor_with(root, &reset, save_hook).and_then(|()| match &staged {
+        Some(tail) => rotation::rotate_carrying(path, policy.keep, tail),
+        None => rotation::rotate(path, policy.keep),
+    });
+    if let Err(error) = rotated {
+        if let Some(tail) = &staged {
+            // Only drop the staging file if the journal still exists; after a
+            // partial rotate it may be the sole copy of the new generation.
+            if path.exists() {
+                let _ = std::fs::remove_file(tail);
+            }
+        }
+        return Err(error);
+    }
     log::info!(
-        "ci_telemetry: rotated the {len}-byte journal (threshold {} bytes, keeping {} rotation(s))",
+        "ci_telemetry: rotated the {len}-byte journal carrying {tail_len} unexported byte(s) (threshold {} bytes, keeping {} rotation(s))",
         policy.threshold_bytes,
         policy.keep
     );
