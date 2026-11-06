@@ -994,6 +994,15 @@ allow (the rule is inert). `cargo --config build.target-dir=…` and an inline
 
 `guard-worktree-paths.sh` (issue #4007) denies Edit/Write tool calls whose target resolves into the **main** repository checkout while a Loom-managed worktree exists (path-derived — see the guard inventory bullet above for the mechanism). This is the mechanical enforcement behind "never work on main branch": a builder that used a repo-relative path after a cwd reset, or that otherwise escaped its issue worktree, is denied instead of silently corrupting the main checkout.
 
+**One rule across tools (#13569).** Edit/Write and Bash are confined by the
+same rule, and **gitignored status does not exempt a path**: a write into the
+main checkout (an ignored `.notes/` journal included) is denied from either
+tool while a managed worktree exists, and allowed from both when none does.
+Repo-local scratch, notes, or journal files belong under your issue worktree or
+under `/tmp` (session scratch); both deny messages say so.
+`tests/hooks/test-guard-worktree-edit-bash-parity.sh` feeds identical targets to
+both hooks and fails on any verdict divergence.
+
 **Bash-tool write confinement (issue #4178).** The same toggle *also* gates a
 second, independent check inside `guard-destructive-generic.sh` (the `Bash`
 matcher): it denies the common Bash write idioms — `>`/`>>` redirection,
