@@ -212,6 +212,10 @@ pub mod host_status;
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
 
+/// OTLP-export coverage guard: every registered kind routes over OTLP with a
+/// mapping arm, or is on an explicit not-exported allowlist (#12117).
+pub mod kind_export;
+
 /// Producer-liveness guard: every registered kind has a producer or is on an
 /// explicit producer-less allowlist (#12947, #11301 post-mortem).
 pub mod kind_producer;
