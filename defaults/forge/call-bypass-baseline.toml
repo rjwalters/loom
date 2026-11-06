@@ -212,7 +212,7 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/daemon_service.rs"
+path = "loom-daemon/src/daemon_service/credential_startup.rs"
 calls = 1
 owner = "daemon-other"
 removal_issue = 9799
