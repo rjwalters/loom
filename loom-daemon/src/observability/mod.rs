@@ -371,12 +371,6 @@ fn parse_raw_exporters(value: &serde_json::Value) -> Option<Vec<RawExporterEntry
     Some(parsed)
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|value| {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
-}
-
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -387,7 +381,9 @@ fn env_nonempty(name: &str) -> Option<String> {
 /// **env > config > default** (`false`).
 #[must_use]
 pub fn resolve_enabled(config: &ObservabilityConfig) -> bool {
-    env_bool(ENABLED_ENV).or(config.enabled).unwrap_or(false)
+    crate::env_flag::env_flag(ENABLED_ENV)
+        .or(config.enabled)
+        .unwrap_or(false)
 }
 
 /// **env > config**, no built-in default — a missing endpoint means "not

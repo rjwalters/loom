@@ -60,11 +60,6 @@ pub fn is_unrendered_key(key: &str) -> bool {
     UNRENDERED_KEYS.contains(&key)
 }
 
-/// The daemon's own truthiness test for a loop's env value.
-fn truthy(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
 /// `<unit path>.d` — the user drop-in directory systemd reads for the unit.
 #[must_use]
 pub fn dropin_dir(unit_path: &Path) -> PathBuf {
@@ -202,7 +197,7 @@ impl Layer {
             return false;
         };
         match &self.dropin[i] {
-            Some(v) => truthy(v),
+            Some(v) => crate::env_flag::parse_truthy(v),
             None => self.config[i] == Some(true),
         }
     }
@@ -242,7 +237,8 @@ fn asked_on(want: Want, pre_exported: &str, flag: &str, key: &str) -> Option<Str
     if want == Want::On {
         return Some(flag.to_string());
     }
-    (want == Want::Unset && truthy(pre_exported)).then(|| format!("exported {key}={pre_exported}"))
+    (want == Want::Unset && crate::env_flag::parse_truthy(pre_exported))
+        .then(|| format!("exported {key}={pre_exported}"))
 }
 
 /// A loop this invocation asked to be on that the re-rendered unit cannot turn
