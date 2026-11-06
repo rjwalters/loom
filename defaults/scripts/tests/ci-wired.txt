@@ -357,3 +357,4 @@ test-repo-root-alias.sh
 test-create-issue-curated.sh
 # #13414: guide unblock sweep honors a park record over AC checkboxes. Hermetic.
 test-guide-park-record-precedence.sh
+test-guide-transient-first-at.sh
