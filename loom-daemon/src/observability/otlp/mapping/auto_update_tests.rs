@@ -26,7 +26,6 @@ fn record() -> AutoUpdateTickRecord {
         drain: DrainSnapshot {
             armed: true,
             pending: true,
-            refusals: 1,
             target: Some("artifact:0.19.731:feedface".to_string()),
         },
         floor_stall: None,
