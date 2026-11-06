@@ -196,10 +196,10 @@ fn more_than_256_rows_are_all_emitted() {
 #[test]
 fn loom_repo_is_the_resolved_slug_never_the_local_path() {
     let mut repos = HashMap::new();
-    repos.insert("/Users/joseph/dev/loom".to_string(), repo_ref("rjwalters/loom"));
+    repos.insert("/Users/alice/dev/loom".to_string(), repo_ref("rjwalters/loom"));
     let summary = WorkFinderTickSummary {
         queue: vec![summary_row(
-            "/Users/joseph/dev/loom",
+            "/Users/alice/dev/loom",
             42,
             1,
             Qd::DeferredCapacity,

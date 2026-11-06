@@ -18,6 +18,12 @@ Options:
                          for removing non-Loom worktrees). Also deletes
                          the matching local branch via 'git branch -d'
                          (Git refuses on unmerged commits).
+  --remove-ignored       With --worktree-path: also remove the worktree when it
+                         holds gitignored files that are not regenerable build
+                         artifacts (#13599). Without it such a worktree is kept
+                         and the files are listed with their total size.
+                         node_modules, target, .venv, __pycache__ and Loom's own
+                         markers never count.
   --dry-run              Show what would happen without merging
   --auto                 No-op (#12063): merge-pr no longer waits for checks;
                          GitHub's required checks gate the merge call itself.

@@ -405,7 +405,7 @@ exporters. Authoritative journal recovery remains separate incident work (#11639
 Query 3 (#11198) finds roster hosts silent by absence, which queries 1-2
 cannot (they anchor on logs a host sent). The roster sits between
 `/* loom:roster:begin */` and `/* loom:roster:end */`: one `(host, telemetry)`
-row per fleet-gitops `hosts.yml` host with `services.loom-daemon.expected:
+row per the fleet state store `hosts.yml` host with `services.loom-daemon.expected:
 running`, `telemetry` being `always` (silent after 900 s) or `when_awake`
 (86400 s). Render it by pasting those rows between the markers, in both
 `host-export-queries.sql` and `alerts/host-export-silent.json`; re-render on

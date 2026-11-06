@@ -28,7 +28,7 @@
   },
   "annotations": {
     "summary": "Loom host export silent",
-    "description": "Roster host {{$labels.host}} has sent no host.export log for {{$value}} s past its limit (900 s for telemetry: always, 86400 s for when_awake). The state label splits the cause: exporter_silent means the host still sends other Loom logs (the exporter or pipeline stopped, the host is up); host_silent means it sends nothing (the host or daemon is down, or it never exported over OTLP). The roster inside the query is rendered from fleet-gitops hosts.yml (services.loom-daemon.expected: running); the COMMITTED roster holds example-* placeholders so an unrendered import fires loudly rather than staying silently healthy. Re-render on every hosts.yml change. A host that never exported in the 48 h window counts as silent for the whole window. Issue #11198."
+    "description": "Roster host {{$labels.host}} has sent no host.export log for {{$value}} s past its limit (900 s for telemetry: always, 86400 s for when_awake). The state label splits the cause: exporter_silent means the host still sends other Loom logs (the exporter or pipeline stopped, the host is up); host_silent means it sends nothing (the host or daemon is down, or it never exported over OTLP). The roster inside the query is rendered from the fleet state store hosts.yml (services.loom-daemon.expected: running); the COMMITTED roster holds example-* placeholders so an unrendered import fires loudly rather than staying silently healthy. Re-render on every hosts.yml change. A host that never exported in the 48 h window counts as silent for the whole window. Issue #11198."
   },
   "disabled": false
 }

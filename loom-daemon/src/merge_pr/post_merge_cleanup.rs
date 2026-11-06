@@ -129,6 +129,9 @@ pub struct Inputs {
     pub preserve_env: bool,
     /// `--worktree-path`, already validated by the shell; empty when absent.
     pub worktree_path_override: String,
+    /// `--remove-ignored` (#13599): skip the ignored-data guard on the
+    /// `--worktree-path` override path.
+    pub remove_ignored: bool,
 }
 
 /// The world the orchestrator touches. A trait so the sequencing is tested
@@ -142,6 +145,14 @@ pub trait Host {
     /// `git -C <path> status --porcelain`, empty on failure — `git status`
     /// failing has always meant "no dirt, proceed" here (#5177).
     fn git_status(&self, path: &str) -> String;
+    /// `git -C <path> status --porcelain --ignored` (#13599). `None` when the
+    /// read fails (the caller fails closed); an empty string when `path` is not
+    /// a git directory at all (the #5177 orphan, which proceeds as it always did).
+    fn git_ignored(&self, path: &str) -> Option<String>;
+    /// `worktree.linkPaths` for the repo (symlinked in, never the tree's own data).
+    fn link_paths(&self, repo_root: &str) -> Vec<String>;
+    /// Best-effort `du -sk` sum, in KiB, over `entries` under `path`.
+    fn size_kib(&self, path: &str, entries: &[String]) -> u64;
     fn sentinel_present(&self, path: &str) -> bool;
     /// `cd <path> && pwd -P`.
     fn canonical(&self, path: &str) -> Option<String>;
@@ -494,6 +505,34 @@ impl Run<'_> {
             return;
         }
 
+        // #13599: ignored files are invisible to the porcelain above. Only the
+        // caller-asserted (non-Loom) override path is checked.
+        if allow_unmanaged && !i.remove_ignored {
+            match self.host.git_ignored(path) {
+                None => {
+                    for (level, text) in dirty_guard::ignored_unreadable(&dirty_ctx) {
+                        self.push(level.token(), text);
+                    }
+                    return;
+                }
+                Some(listing) => {
+                    let links = self.host.link_paths(&i.repo_root);
+                    let paths = dirty_guard::ignored_user_paths(&listing, &links);
+                    let kib = if paths.is_empty() {
+                        0
+                    } else {
+                        self.host.size_kib(path, &paths)
+                    };
+                    if let Some(refusal) = dirty_guard::assess_ignored(&dirty_ctx, &paths, kib) {
+                        for (level, text) in refusal {
+                            self.push(level.token(), text);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         // Resolved BEFORE removal: `cargo metadata` needs the manifest.
         let resolved = self.host.resolve_cargo_target(path);
         self.info(format!("Removing worktree: {path}"));
@@ -551,6 +590,58 @@ impl Host for SystemHost {
 
     fn git_status(&self, path: &str) -> String {
         git_stdout(&["-C", path, "status", "--porcelain"])
+    }
+
+    fn git_ignored(&self, path: &str) -> Option<String> {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+        };
+        // Not a git directory at all: the #5177 orphan, handled as before.
+        if !run(&["-C", path, "rev-parse", "--git-dir"]).is_some_and(|o| o.status.success()) {
+            return Some(String::new());
+        }
+        let o = run(&[
+            "-C",
+            path,
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=normal",
+        ])?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    }
+
+    fn link_paths(&self, repo_root: &str) -> Vec<String> {
+        crate::worktree_cli::link::configured_link_paths(std::path::Path::new(repo_root))
+    }
+
+    fn size_kib(&self, path: &str, entries: &[String]) -> u64 {
+        entries
+            .iter()
+            .filter_map(|e| {
+                let full = std::path::Path::new(path).join(e.trim_matches('"'));
+                let o = std::process::Command::new("du")
+                    .arg("-sk")
+                    .arg("--")
+                    .arg(full)
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()?;
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .sum()
     }
 
     fn sentinel_present(&self, path: &str) -> bool {

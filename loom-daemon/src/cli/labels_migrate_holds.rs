@@ -611,6 +611,8 @@ impl GhHoldsForge {
             remove_labels: Vec::new(),
             dry_run: false,
             is_pr: false,
+            transient: None,
+            jitter: 0.0,
         };
         let mut forge =
             crate::operator_decision::cli::GhForge::new(self.root.clone(), Some(self.repo.clone()));
