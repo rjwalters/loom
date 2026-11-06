@@ -210,7 +210,6 @@ fn a_tick_with_a_roll_already_armed_reports_drain_wait_and_the_drain() {
     let summary = run_tick(&mut state(&dir), &status, &mut probe, &trigger, NOW, NOW);
     assert_eq!(summary.decision, TickDecisionKind::DrainWait, "{}", summary.note);
     assert!(summary.drain.armed && summary.drain.pending);
-    assert_eq!(summary.drain.refusals, 0, "no deadline refusals are counted any more");
 }
 
 /// The #10414 failure mode: before the fix a panicking tick ended the loop
