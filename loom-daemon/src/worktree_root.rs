@@ -125,6 +125,14 @@ fn read_config_worktree_root(repo_root: &Path) -> Option<String> {
 pub fn worktree_root_readable(repo_root: &Path) -> PathBuf {
     let resolved = worktree_root(repo_root);
     let default = repo_root.join(".loom").join("worktrees");
+    if resolved != default && unusable(&resolved) {
+        log::warn!(
+            "worktree root target is missing or not writable on this host: '{}'; \
+             falling back to default",
+            resolved.display()
+        );
+        return default;
+    }
     if resolved != default && unreadable(&resolved) {
         log::warn!(
             "worktree root target exists but is unreadable (readdir failed, e.g. macOS TCC \
@@ -134,6 +142,30 @@ pub fn worktree_root_readable(repo_root: &Path) -> PathBuf {
         return default;
     }
     resolved
+}
+
+/// `_loom_root_unusable <target>` (#13639): the target exists but is not
+/// writable, or it does not exist and its nearest existing ancestor is not a
+/// writable directory. Never creates anything.
+fn unusable(target: &Path) -> bool {
+    let mut p = target;
+    while !p.exists() {
+        match p.parent() {
+            Some(parent) if parent != p => p = parent,
+            _ => return true,
+        }
+    }
+    !(p.is_dir() && access_wx(p))
+}
+
+/// Real access(2) check (honours uid/ACLs/read-only mounts); creates nothing.
+fn access_wx(dir: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(dir.as_os_str().as_bytes())
+        // SAFETY: valid NUL-terminated path; access(2) has no side effects.
+        .map(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0)
+        .unwrap_or(false)
 }
 
 /// `_loom_root_unreadable <dir>`: the path exists as a directory (so `stat`
@@ -486,5 +518,31 @@ mod tests {
         // Cleared key -> falls through to the default, exactly like an
         // absent key.
         assert_eq!(got, repo_root.join(".loom").join("worktrees"));
+    }
+
+    // #13639: a committed host-specific root (e.g. /Volumes/Stripe) that is
+    // missing under an unwritable ancestor falls back to the default; a
+    // missing leaf under a writable parent is kept.
+    #[test]
+    #[serial]
+    fn readable_falls_back_when_root_missing_under_unwritable_ancestor() {
+        let repo = Path::new("/tmp/loom-13639-repo/reporoot");
+        let default = repo.join(".loom").join("worktrees");
+        let got =
+            with_env(Some("/nonexistent-loom-vol-13639/Stripe"), || worktree_root_readable(repo));
+        // Skip the assertion's premise only if running as root (can write anywhere).
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(got, default);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn readable_keeps_missing_leaf_under_writable_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("not-yet-created");
+        let repo = Path::new("/tmp/loom-13639-repo/reporoot");
+        let got = with_env(Some(base.to_str().unwrap()), || worktree_root_readable(repo));
+        assert_eq!(got, base.join("reporoot"));
     }
 }
