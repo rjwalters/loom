@@ -38,7 +38,6 @@ pub const AUTO_UPDATE_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.auto_update.in_flight",
     "loom.auto_update.drain_armed",
     "loom.auto_update.drain_pending",
-    "loom.auto_update.drain_refusals",
     "loom.auto_update.drain_target",
     "loom.auto_update.target_source",
     "loom.auto_update.config_restart_paths",
@@ -159,8 +158,6 @@ pub struct DrainSnapshot {
     /// is an operator drain. (Before #10831: it had survived a deadline
     /// refusal.)
     pub pending: bool,
-    /// Always `0` since #10831: a roll no longer refuses deadlines.
-    pub refusals: u32,
     /// The artifact identity it rolls to, when the auto-updater armed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -274,5 +271,20 @@ impl AutoUpdateTickRecord {
     #[must_use]
     pub fn has_provenance(&self) -> bool {
         self.loom.is_valid()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DrainSnapshot;
+
+    /// #13492: records written before `refusals` was dropped still parse.
+    #[test]
+    fn a_stored_drain_snapshot_with_refusals_still_deserializes() {
+        let old = r#"{"armed":true,"pending":false,"refusals":3,"target":"artifact:1"}"#;
+        let d: DrainSnapshot = serde_json::from_str(old).unwrap();
+        assert!(d.armed && !d.pending);
+        assert_eq!(d.target.as_deref(), Some("artifact:1"));
+        assert!(!serde_json::to_string(&d).unwrap().contains("refusals"));
     }
 }
