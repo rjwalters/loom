@@ -371,7 +371,8 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     let mut gate = classify(&policy, issue.as_ref());
     if matches!(gate, crate::promotion_author::Gate::Untrusted(_)) {
         // #13578: a trusted actor's earlier `loom:issue` is a durable adoption.
-        // Any read failure keeps the verdict above (fail closed).
+        // Any read failure keeps the verdict above (fail closed). An edit of
+        // the body by a non-trusted editor since the adoption ends it.
         if let Some(who) = adopter(&policy, repo, number, &root) {
             eprintln!("promotion-author: adopted by {who} (trusted `labeled loom:issue`)");
             gate = crate::promotion_author::Gate::Trusted;
@@ -400,8 +401,9 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The trusted actor who applied `loom:issue` to issue `number`, if the whole
-/// timeline could be read and shows one (#13578).
+/// The trusted actor whose `loom:issue` adoption of issue `number` still
+/// stands, if the whole timeline and the body's edit history could be read
+/// (#13578). Either read failing yields `None`.
 fn adopter(
     policy: &crate::comment_trust::TrustPolicy,
     repo: &str,
@@ -411,8 +413,9 @@ fn adopter(
     let path = format!("repos/{repo}/issues/{number}/timeline");
     let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
     let events = crate::comment_trust::parse_listing(&out.ok_output()?.stdout)?;
-    crate::promotion_author::adopted_by(policy, &events, |login| {
-        // Timeline actors have no association: map write access or better to one.
+    let edits = body_edits(repo, number, root)?;
+    // Timeline actors and editors have no association: map write access or better to one.
+    crate::promotion_author::standing_adoption(policy, &events, &edits, |login| {
         let path = format!("repos/{repo}/collaborators/{login}/permission");
         let out =
             crate::script_helpers::run_gh(&["api", &path, "--jq", ".permission"], root, false);
@@ -420,6 +423,45 @@ fn adopter(
         matches!(String::from_utf8_lossy(&out.stdout).trim(), "admin" | "maintain" | "write")
             .then(|| "COLLABORATOR".to_string())
     })
+}
+
+/// The `userContentEdits` nodes of issue `number`'s body (`createdAt`,
+/// `editedAt`, `editor`): the timeline carries no body edits. `None` on any
+/// failure, a GraphQL error, or more edits than one page (not fully read).
+fn body_edits(repo: &str, number: u64, root: &Path) -> Option<Vec<serde_json::Value>> {
+    const QUERY: &str = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
+        issue(number:$i){userContentEdits(first:100){pageInfo{hasNextPage} \
+        nodes{createdAt editedAt editor{login __typename}}}}}}";
+    let (owner, name) = repo.split_once('/')?;
+    let out = crate::script_helpers::run_gh(
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={QUERY}"),
+            "-f",
+            &format!("o={owner}"),
+            "-f",
+            &format!("n={name}"),
+            "-F",
+            &format!("i={number}"),
+        ],
+        root,
+        false,
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.ok_output()?.stdout).ok()?;
+    if json.get("errors").is_some() {
+        return None;
+    }
+    let edits = json.pointer("/data/repository/issue/userContentEdits")?;
+    if edits
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return None;
+    }
+    edits.get("nodes")?.as_array().cloned()
 }
 
 #[cfg(test)]
