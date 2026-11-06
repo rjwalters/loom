@@ -200,3 +200,6 @@ scripts/worktree-return.sh
 
 # #13148 (2026-10-27) — the forked installer sync-labels test is removed with the fork (PR #13213).
 scripts/tests/test-install-sync-labels.sh
+
+# #13628 (2026-11-06) — deprecated tmux `loom scale` verb removed.
+scripts/cli/loom-scale.sh
