@@ -226,9 +226,10 @@ pub fn pending_count(root: &Path) -> usize {
 /// a time.
 pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
     let path = journal_path(root);
-    if !path.exists() {
+    if !path.exists() && !rotation::carry_path(&path).exists() {
         // Nothing to export — and no lock file is created in a workspace
-        // that has never run the poller.
+        // that has never run the poller. (A lone staging file is an
+        // interrupted tail-carrying rotation: recovered below.)
         return 0;
     }
     let lock = match CycleLock::try_acquire(&state_dir(root)) {
@@ -242,6 +243,19 @@ pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
             return 0;
         }
     };
+    // Finish an interrupted tail-carrying rotation before reading the journal
+    // (#13636): otherwise the carried tail never reaches the exporter.
+    match rotation::recover_carry(&path) {
+        Ok(true) => log::info!("ci_telemetry: recovered an interrupted rotation's carried tail"),
+        Ok(false) => {}
+        Err(error) => {
+            log::warn!("ci_telemetry: could not recover the carried tail, will retry: {error}");
+            return 0;
+        }
+    }
+    if !path.exists() {
+        return 0;
+    }
     let (offered, mut cursor) = export_locked(root, &path, queue);
     let policy = if cursor.byte_offset > 0 {
         RotationPolicy::resolve(&read_config(root))

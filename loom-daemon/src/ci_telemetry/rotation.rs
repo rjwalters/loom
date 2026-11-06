@@ -145,8 +145,10 @@ pub fn carry_tail(journal: &Path, from: u64) -> io::Result<PathBuf> {
 }
 
 /// [`rotate`], then move the staged `tail` (from [`carry_tail`]) into place as
-/// the new journal. Between the two renames there is no journal file; the tail
-/// is still in `.1`, which the crash-recovery replay scans. Needs `keep >= 1`.
+/// the new journal. Between the two renames there is no journal file and the
+/// tail lives only in `<journal>.carry` (and in `.1`, which the exporter never
+/// reads): [`recover_carry`] puts it back on the next export pass. Needs
+/// `keep >= 1`.
 pub fn rotate_carrying(journal: &Path, keep: usize, tail: &Path) -> io::Result<()> {
     rotate(journal, keep)?;
     std::fs::rename(tail, journal)?;
@@ -154,6 +156,68 @@ pub fn rotate_carrying(journal: &Path, keep: usize, tail: &Path) -> io::Result<(
         File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+/// Finish a tail-carrying rotation that was interrupted (a crash between the
+/// two renames, or a failed second rename). Returns whether a staged tail was
+/// consumed. The caller holds the cycle lock.
+///
+/// - Journal absent: the staged tail becomes the journal.
+/// - Journal present and already ending with the staged bytes: the crash came
+///   before the rotation, the tail is still in the old generation; just drop
+///   the staging file.
+/// - Otherwise the poller recreated the journal first: stream the staged tail
+///   onto its end, fsync, then drop the staging file. A crash mid-append at
+///   worst leaves the staging file to be appended again (at-least-once; the
+///   ledger dedups emission).
+pub fn recover_carry(journal: &Path) -> io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let staged = carry_path(journal);
+    if !staged.exists() {
+        return Ok(false);
+    }
+    let sync_dir = || -> io::Result<()> {
+        if let Some(dir) = journal.parent() {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    };
+    if !journal.exists() {
+        std::fs::rename(&staged, journal)?;
+        sync_dir()?;
+        return Ok(true);
+    }
+    let staged_len = std::fs::metadata(&staged)?.len();
+    let mut live = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(journal)?;
+    let live_len = live.metadata()?.len();
+    if staged_len <= live_len {
+        // Compare the journal's suffix with the staged bytes, streaming.
+        live.seek(SeekFrom::Start(live_len - staged_len))?;
+        let mut a = io::BufReader::new(File::open(&staged)?).bytes();
+        let mut b = io::BufReader::new(&mut live).bytes();
+        let mut same = true;
+        for _ in 0..staged_len {
+            if a.next().transpose()? != b.next().transpose()? {
+                same = false;
+                break;
+            }
+        }
+        drop(b);
+        if same {
+            remove_if_present(&staged)?;
+            sync_dir()?;
+            return Ok(true);
+        }
+    }
+    let mut src = File::open(&staged)?;
+    io::copy(&mut src, &mut live)?;
+    live.sync_all()?;
+    remove_if_present(&staged)?;
+    sync_dir()?;
+    Ok(true)
 }
 
 /// Rotate `journal` keeping at most `keep` rotations. This only moves files:
