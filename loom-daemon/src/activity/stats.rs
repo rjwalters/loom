@@ -298,6 +298,17 @@ pub struct SummaryMetrics {
     pub issues_count: i64,
     pub prs_count: i64,
     pub success_rate: f64,
+    /// At least one `resource_usage` row falls in scope. Gates the cost/token
+    /// fields in the `loom-daemon stats` dashboard (`n/a` instead of `0`,
+    /// #6128). `serde(skip)`: not part of the `agent-metrics` JSON contract.
+    #[serde(skip)]
+    pub cost_data_available: bool,
+    /// At least one `prompt_github` row falls in scope (gates issues/PRs).
+    #[serde(skip)]
+    pub github_data_available: bool,
+    /// At least one `quality_metrics` row falls in scope (gates success rate).
+    #[serde(skip)]
+    pub quality_data_available: bool,
 }
 
 /// Effectiveness row for the `agent-metrics effectiveness` command,
@@ -316,6 +327,14 @@ pub struct EffectivenessRow {
     /// JSON shape for existing consumers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// At least one `resource_usage` row backs this group (gates
+    /// `avg_cost`/`avg_duration_sec`, #6128). `serde(skip)`: dashboard only.
+    #[serde(skip)]
+    pub cost_data_available: bool,
+    /// At least one `quality_metrics` row backs this group (gates
+    /// `success_rate`, #6128). `serde(skip)`: dashboard only.
+    #[serde(skip)]
+    pub quality_data_available: bool,
 }
 
 /// Cost row for the `agent-metrics costs` command, optionally grouped by
@@ -328,6 +347,13 @@ pub struct CostRow {
     pub total_tokens: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Earliest prompt timestamp for the issue (raw DB text). `serde(skip)`:
+    /// used only by the `loom-daemon stats --issue` breakdown.
+    #[serde(skip)]
+    pub started: Option<String>,
+    /// Latest prompt timestamp for the issue (raw DB text). `serde(skip)`.
+    #[serde(skip)]
+    pub completed: Option<String>,
 }
 
 /// Weekly velocity row for the `agent-metrics velocity` command (last 8
@@ -374,20 +400,24 @@ pub fn query_summary_metrics(
     let role_filter = role_sql_filter(role);
     let period_filter = period_sql_filter(period);
 
-    let (total_prompts, total_tokens, total_cost, issues_count, prs_count): (
-        i64,
-        i64,
-        f64,
-        i64,
-        i64,
-    ) = conn.query_row(
+    let (
+        total_prompts,
+        total_tokens,
+        total_cost,
+        issues_count,
+        prs_count,
+        resource_rows,
+        github_rows,
+    ): (i64, i64, f64, i64, i64, i64, i64) = conn.query_row(
         &format!(
             r"SELECT
                 COUNT(*),
                 COALESCE(SUM(r.tokens_input + r.tokens_output), 0),
                 ROUND(COALESCE(SUM(r.cost_usd), 0), 4),
                 COUNT(DISTINCT pg.issue_number),
-                COUNT(DISTINCT pg.pr_number)
+                COUNT(DISTINCT pg.pr_number),
+                COUNT(r.input_id),
+                COUNT(pg.input_id)
               FROM agent_inputs i
               LEFT JOIN resource_usage r ON i.id = r.input_id
               LEFT JOIN prompt_github pg ON i.id = pg.input_id
@@ -401,14 +431,15 @@ pub fn query_summary_metrics(
                 row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
 
-    let success_rate: f64 = conn
-        .query_row(
-            &format!(
-                r"SELECT
+    let (success_rate, quality_rows): (f64, i64) = conn.query_row(
+        &format!(
+            r"SELECT
                     ROUND(
                         100.0 * SUM(
                             CASE WHEN q.tests_passed > 0
@@ -416,15 +447,15 @@ pub fn query_summary_metrics(
                             THEN 1 ELSE 0 END
                         ) / NULLIF(COUNT(*), 0),
                         1
-                    )
+                    ),
+                    COUNT(q.input_id)
                   FROM agent_inputs i
                   LEFT JOIN quality_metrics q ON i.id = q.input_id
                   WHERE 1=1 {role_filter} {period_filter}"
-            ),
-            [],
-            |row| row.get::<_, Option<f64>>(0),
-        )?
-        .unwrap_or(0.0);
+        ),
+        [],
+        |row| Ok((row.get::<_, Option<f64>>(0)?.unwrap_or(0.0), row.get::<_, i64>(1)?)),
+    )?;
 
     Ok(SummaryMetrics {
         total_prompts,
@@ -433,6 +464,9 @@ pub fn query_summary_metrics(
         issues_count,
         prs_count,
         success_rate,
+        cost_data_available: resource_rows > 0,
+        github_data_available: github_rows > 0,
+        quality_data_available: quality_rows > 0,
     })
 }
 
@@ -464,7 +498,9 @@ pub fn query_effectiveness_rows(
             SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) as successful_prompts,
             ROUND(100.0 * SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as success_rate,
             ROUND(COALESCE(AVG(r.cost_usd), 0), 4) as avg_cost,
-            ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0), 1) as avg_duration_sec
+            ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0), 1) as avg_duration_sec,
+            COUNT(r.input_id) as resource_rows,
+            COUNT(q.input_id) as quality_rows
           FROM agent_inputs i
           LEFT JOIN quality_metrics q ON i.id = q.input_id
           LEFT JOIN resource_usage r ON i.id = r.input_id
@@ -494,6 +530,8 @@ pub fn query_effectiveness_rows(
             } else {
                 None
             },
+            cost_data_available: row.get::<_, i64>("resource_rows")? > 0,
+            quality_data_available: row.get::<_, i64>("quality_rows")? > 0,
         })
     })?;
 
@@ -527,7 +565,9 @@ pub fn query_cost_rows(
             {model_select}
             COUNT(DISTINCT i.id) as prompt_count,
             ROUND(COALESCE(SUM(r.cost_usd), 0), 4) as total_cost,
-            COALESCE(SUM(r.tokens_input + r.tokens_output), 0) as total_tokens
+            COALESCE(SUM(r.tokens_input + r.tokens_output), 0) as total_tokens,
+            MIN(i.timestamp) as started,
+            MAX(i.timestamp) as completed
           FROM prompt_github pg
           JOIN agent_inputs i ON pg.input_id = i.id
           LEFT JOIN resource_usage r ON i.id = r.input_id
@@ -555,6 +595,8 @@ pub fn query_cost_rows(
                 } else {
                     None
                 },
+                started: row.get("started")?,
+                completed: row.get("completed")?,
             },
         ))
     })?;
