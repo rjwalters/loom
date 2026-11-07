@@ -12,6 +12,10 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
+- **#13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
+- **#13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
+- **#13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
+- **#13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
 
 ## Very Important
 
@@ -26,6 +30,7 @@ _None._
 - **#10420**: loom-daemon on Linux: ~2.2 GB RSS baseline (Macs ~200 MB); ci_telemetry adds ~2.2 GB and its spans overflow the 2000-record export queue
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
+- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
 
 ## Ready
 
@@ -43,6 +48,8 @@ Issues currently being built (`loom:building`).
 
 - **#13578**: Promotion author gate re-holds an issue the operator already adopted, after landed-route re-curation
 - **#13619**: remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work
+- **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33)
+- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
 
 ## PRs Awaiting Review
 
@@ -61,6 +68,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
+- **#13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
+- **#13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
+- **#13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
+- **#13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
 
 ## Proposed
 
@@ -70,7 +81,6 @@ Issues carrying `loom:curated`.
 - **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles *(curated)*
 - **#8698**: Live end-to-end verification of the credential egress proxy (AC5 of #8674) *(curated)*
 - **#9136**: main ruleset: bypass_actors 'RepositoryRole:always' makes pull_request and required_status_checks advisory *(curated)*
-- **#9978**: feat(champion): optional per-repo merge-queue mode — enqueue Judge-approved PRs to GitHub's merge queue instead of merge-pr.sh's freshness/re-date loop *(curated)*
 - **#10332**: Epic: cut GitHub API usage ~10x — per-consumer quotas, fix chatty loops, then push-not-poll via a loom-ui read mirror (baseline 105k gh calls/day) *(curated)*
 - **#10420**: loom-daemon on Linux: ~2.2 GB RSS baseline (Macs ~200 MB); ci_telemetry adds ~2.2 GB and its spans overflow the 2000-record export queue *(curated)*
 - **#10512**: Fleet reader-App pool near exhaustion: cut top billable pollers (visibility.repo cache, issue_state ETag, cross-host dedupe) — ~8k REST/h *(curated)*
@@ -101,11 +111,12 @@ Issues carrying `loom:curated`.
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR) *(curated)*
 - **#12703**: Add a per-repo setting to turn off Champion's out-of-band acceptance-criteria hold (#6883) *(curated)*
 - **#12713**: Part-of merges re-queue the issue to Builders: landed-route marker is read as a Curator 'kept' decision *(curated)*
+- **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(curated)*
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures) *(curated)*
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
 - **#12978**: Codex shared-seat dispatch: live receipts and startup measurements (split from #10796) *(curated)*
 - **#13155**: [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1) *(curated)*
-- **#13308**: Re-evaluate #13280 (daemon lands its own resync PRs through the merge queue) after one week: on or after 2026-11-05 *(curated)*
+- **#13261**: Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon *(curated)*
 - **#13317**: Audit Champion merge-risk self-releases two weeks after #12960 is live *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
 - **#13486**: Champion resync waiver: a byte-identical test under .loom/scripts/tests/ is not a merge-gate path — every release shipping test-champion-resync-waiver.sh holds all resync PRs *(curated)*
@@ -114,25 +125,19 @@ Issues carrying `loom:curated`.
 - **#13588**: checkout_ff: primary checkout moved off main by an agent step stays wrong-branch forever (no guard, no self-heal) *(curated)*
 - **#13590**: Observe convert_awaiting_revision_parks on a live Guide tick (#10936 follow-up) *(curated)*
 - **#13619**: remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work *(curated)*
+- **#13640**: ci_telemetry: owner-kind probe users/2amlogic hangs 120s every cycle in the daemon (0.3s by hand) and a timeout never fails over — 2AMLogic CI dropped 20+ days *(curated)*
+- **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33) *(curated)*
+- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35) *(curated)*
+- **#13680**: resync-installed.sh: false 'pin had no effect' for guard-destructive-generic.sh when the canonical Repo Skills guard is present *(curated)*
 
 ## Proposed (Architect / Hermit)
 
 - **#13071**: Peer claims: move machine coordination off rendered room messages (custom event type / state events) *(architect)*
 - **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(hermit)*
-- **#13017**: Split run_daemon (~1960-line fn) in daemon_service.rs into startup-phase modules *(hermit)*
-- **#13261**: Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon *(hermit)*
-- **#13362**: Drop the fleet.json-absent legacy fallback and retire fleet_store/yaml.rs (#10705 follow-up) *(hermit)*
-- **#13376**: Consolidate ~14 duplicated env-truthy helpers in loom-daemon into one *(hermit)*
-- **#13400**: Remove write-only role-runner skip-counter totals and unused *_count() wrappers *(hermit)*
-- **#13492**: Remove always-zero drain `refusals` field from status and auto_update.tick telemetry *(hermit)*
-- **#13525**: Remove test-only reconcile wrappers in safehouse.rs and unconsumed forge_repo_facts::disagreement *(hermit)*
-- **#13567**: Consolidate four divergent owner/repo slug validators in loom-daemon *(hermit)*
-- **#13628**: Remove deprecated tmux loom-scale.sh (the 'loom scale' verb, ~450 LOC) *(hermit)*
 
 ## Epics
 
 - **#4489**: [Epic #4167 Phase 4] Routinely deploy Codex through loom-daemon with provider-aware account management
-- **#9978**: feat(champion): optional per-repo merge-queue mode — enqueue Judge-approved PRs to GitHub's merge queue instead of merge-pr.sh's freshness/re-date loop
 - **#10332**: Epic: cut GitHub API usage ~10x — per-consumer quotas, fix chatty loops, then push-not-poll via a loom-ui read mirror (baseline 105k gh calls/day)
 - **#10420**: loom-daemon on Linux: ~2.2 GB RSS baseline (Macs ~200 MB); ci_telemetry adds ~2.2 GB and its spans overflow the 2000-record export queue
 - **#10698**: Fleet version floor: the daemon enforces `loom_min_version` from the fleet store, rolls itself forward, and brings each repo's installed Loom up to its own version
@@ -144,14 +149,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
+| Operator merge-risk holds | 7 |
 | Very important | 0 |
-| Important | 3 |
+| Important | 4 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 4 |
 | PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 48 |
-| Architect / Hermit proposals | 11 |
-| Active epics | 8 |
+| Approved PRs awaiting merge | 8 |
+| Curated | 52 |
+| Architect / Hermit proposals | 2 |
+| Active epics | 7 |
 <!-- guide:plan-body:end -->
