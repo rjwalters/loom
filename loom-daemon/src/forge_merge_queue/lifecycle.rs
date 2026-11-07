@@ -297,7 +297,10 @@ fn reconcile_drop(
             Err(e) => Reconciled::Undetermined(format!("revoke stale grant: {e}")),
         };
     };
-    let (kind, detail) = refine_infra(ctx, pr, rec, ev, classify(ev.reason.as_deref()));
+    let (kind, detail) = match refine_hold(ctx, pr, classify(ev.reason.as_deref())) {
+        Some(held) => held,
+        None => refine_infra(ctx, pr, rec, ev, classify(ev.reason.as_deref())),
+    };
     let prose = drop_prose(kind, ev.reason.as_deref(), Some(&ev.created_at), detail.as_deref());
     // Revoke (with the verified reason) BEFORE any label transition. The
     // revoke marker is also the dedup point: a later pass sees `Revoked` and
@@ -322,6 +325,25 @@ fn reconcile_drop(
         raw: ev.reason.clone(),
         route_error,
     }
+}
+
+/// Reclassify a `check-failure` drop as `human-hold` while a Champion hold
+/// stands on the PR (r7-q35): the group check fails because the hold revoked
+/// the authorization, which is not a CI failure for Doctor. An unreadable
+/// comment list keeps the original kind.
+fn refine_hold(ctx: &Ctx<'_>, pr: u32, kind: RemovalKind) -> Option<(RemovalKind, Option<String>)> {
+    if kind != RemovalKind::CheckFailure {
+        return None;
+    }
+    let bodies = ctx.forge.trusted_comments(pr).ok()?;
+    crate::champion_hold::standing_hold(&bodies).map(|_| {
+        (
+            RemovalKind::HumanHold,
+            Some(
+                "A Champion hold stands on this PR; the group failure is the hold, not CI.".into(),
+            ),
+        )
+    })
 }
 
 /// Downgrade a `check-failure` drop to `dropped-infra` (#12573) only when the

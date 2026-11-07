@@ -36,6 +36,9 @@ pub enum RemovalKind {
     /// not a verdict on this PR (e.g. an org-wide plan downgrade making the
     /// rules unreadable).
     QueueCleared,
+    /// A group failure caused by a standing Champion/human hold (r7-q35); never
+    /// produced by [`classify`]. The hold stays; no Doctor routing.
+    HumanHold,
     Unknown,
 }
 
@@ -51,6 +54,7 @@ impl RemovalKind {
             RemovalKind::HeadChanged => "head-changed",
             RemovalKind::Manual => "manual",
             RemovalKind::QueueCleared => "queue-cleared",
+            RemovalKind::HumanHold => "human-hold",
             RemovalKind::Unknown => "unknown",
         }
     }
@@ -191,6 +195,13 @@ pub fn route(kind: RemovalKind) -> Route {
             handler: "Not a verdict on this PR: GitHub cleared the whole merge queue, so \
                       `loom:pr` is kept and the next Champion pass re-checks the current head \
                       and re-enqueues it as usual.",
+        },
+        RemovalKind::HumanHold => Route {
+            add: Vec::new(),
+            remove: Vec::new(),
+            handler: "Labels unchanged: the group failed because a Champion/human hold stands \
+                      on this PR. That is a hold, not a CI failure, so it is not routed to \
+                      Doctor; the hold keeps the PR until a release.",
         },
         RemovalKind::HeadChanged => Route {
             add: Vec::new(),
