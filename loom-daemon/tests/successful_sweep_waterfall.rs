@@ -229,7 +229,9 @@ fn every_span_in_a_successful_sweep_resolves_to_its_issue_and_pr() {
     let roles: Vec<_> = observed.iter().map(|s| attribute(s, "loom.role")).collect();
     assert_eq!(roles, ["curator", "builder", "judge", "merge"], "{observed:?}");
     let judge = observed[2];
-    assert_eq!(attribute(judge, "loom.judge_verdict"), "approved");
+    // The checkpoint write no longer invents a verdict: the real Judge write
+    // records it, so the sweep-checkpoint span must not carry one.
+    assert_eq!(attribute(judge, "loom.judge_verdict"), "<absent>");
     assert_eq!(
         attribute(judge, "loom.timing_source"),
         "checkpoint_write_observed",
