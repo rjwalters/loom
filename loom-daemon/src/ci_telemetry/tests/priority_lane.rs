@@ -169,3 +169,51 @@ fn a_pre_priority_lane_cursor_file_starts_the_fast_lane_at_the_bulk_cursor() {
     );
     assert_eq!(export::pending_count(dir.path()), priority + bulk - skip);
 }
+
+/// Refuses every priority (run/job) record forever, accepts the rest: the
+/// fast lane can never pass its first priority line (#13685).
+struct PriorityRefusingSink {
+    taken: std::sync::Mutex<Vec<TelemetryEnvelope>>,
+}
+
+impl crate::observability::queue::QueueSink for PriorityRefusingSink {
+    fn offer(&self, envelope: TelemetryEnvelope) {
+        self.taken.lock().unwrap().push(envelope);
+    }
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        if is_priority_envelope(&envelope) {
+            return Err(std::io::Error::other("refused"));
+        }
+        self.offer(envelope);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_stuck_fast_lane_cannot_starve_the_bulk_lane_or_rotation() {
+    let dir = TempDir::new().unwrap();
+    let (_, bulk) = seeded_reordered(dir.path()); // bulk lines first, priority last
+    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+    std::fs::write(
+        dir.path().join(".loom/config.json"),
+        r#"{"autonomous":{"ciTelemetry":{"journalRotateBytes":1,"journalRotateKeep":2}}}"#,
+    )
+    .unwrap();
+    let path = journal_path(dir.path());
+    let sink = PriorityRefusingSink {
+        taken: std::sync::Mutex::new(Vec::new()),
+    };
+
+    // One pass: the fast lane stops at the first (refused) priority line, yet
+    // the bulk lane still consumes every bulk line before it.
+    export::backfill(dir.path(), &sink);
+    assert_eq!(sink.taken.lock().unwrap().len(), bulk, "all bulk lines offered");
+    // Past the threshold, so the pass rotated, carrying the unexported tail.
+    assert!(
+        super::super::rotation::rotated_path(&path, 1).exists(),
+        "rotation fired although the fast lane never reached EOF"
+    );
+    let cursor = export::load_cursor(dir.path());
+    assert_eq!(cursor.byte_offset, 0, "cursor reset for the new generation");
+    assert_eq!(cursor.exported, bulk as u64);
+}

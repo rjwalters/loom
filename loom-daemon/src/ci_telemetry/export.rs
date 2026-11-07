@@ -24,9 +24,10 @@
 //! `ci.job` facts (what ETA consumes) queued behind millions of older spans
 //! whenever the backfill drain is capped. [`ExportCursor::fast_offset`] is a
 //! second persisted cursor over the *same* journal: each pass first offers the
-//! run/job-class lines ([`is_priority`]) past it, then — only once the fast
-//! lane has reached the end of the journal — continues the bulk cursor, which
-//! skips the priority lines the fast lane already offered. Nothing is dropped
+//! run/job-class lines ([`is_priority`]) past it, then continues the bulk
+//! cursor, which skips the priority lines the fast lane already offered. A
+//! fast lane that stops early (scan budget, queue push-back) bounds the bulk
+//! lane to the span it already covered instead of starving it (#13685). Nothing is dropped
 //! or sampled; rotation does not wait for EOF (a live writer keeps the bulk
 //! cursor trailing it): the unexported tail is carried forward and the fast
 //! offset resets, so priority lines in the tail may be re-offered once.
@@ -275,7 +276,28 @@ enum Offer {
     /// Unparseable: logged and passed over.
     Skipped,
     /// The queue deferred or refused it: the lane stops at this line.
-    Stop,
+    Stop(StopReason),
+}
+
+/// Why an export lane stopped before the end of the journal (#13685).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// The per-pass scan budget ([`FAST_LANE_SCAN_BYTES`]) ran out.
+    Budget,
+    /// An exporter queue is at its backfill limit (#11115).
+    Deferred,
+    /// An exporter queue refused the record.
+    Refused,
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Budget => "scan budget exhausted",
+            Self::Deferred => "exporter queue deferred (backfill limit)",
+            Self::Refused => "exporter queue refused a record",
+        }
+    }
 }
 
 fn offer_line(queue: &dyn QueueSink, line: &[u8]) -> Offer {
@@ -293,21 +315,24 @@ fn offer_line(queue: &dyn QueueSink, line: &[u8]) -> Offer {
             // #11115: stop at the first unadmitted record; it stays behind
             // the cursor and no work is spent on the rest of the journal.
             log::debug!("ci_telemetry: export deferred — exporter queue at its backfill limit");
-            Offer::Stop
+            Offer::Stop(StopReason::Deferred)
         }
         Err(error) => {
             log::warn!("ci_telemetry: export queue refused a record, will retry: {error}");
-            Offer::Stop
+            Offer::Stop(StopReason::Refused)
         }
     }
 }
 
 /// The export pass proper. The caller holds the cycle lock.
 ///
-/// Fast lane first (priority lines past `fast_offset`, byte-bounded), then —
-/// only if the fast lane reached the end of the journal without the queue
-/// pushing back — the bulk lane over everything past `byte_offset`, skipping
-/// priority lines the fast lane already offered.
+/// Fast lane first (priority lines past `fast_offset`, byte-bounded), then the
+/// bulk lane over everything past `byte_offset`, skipping priority lines the
+/// fast lane already offered. If the fast lane reached the end of the journal
+/// the bulk lane runs to the end too; if the fast lane stopped early (scan
+/// budget, queue push-back) the bulk lane is bounded to the span the fast lane
+/// already covered, so it still advances rather than starving behind a fast
+/// lane that cannot finish (#13685) — rotation keys off the bulk cursor.
 fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, ExportCursor) {
     let cursor = load_cursor(root);
     let Some((bulk_start, fast_start)) = start_offsets(path, &cursor) else {
@@ -317,10 +342,10 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
 
     // Fast lane.
     let mut read = 0_u64;
-    let mut pushed_back = false;
+    let mut pushed_back: Option<StopReason> = None;
     let fast_scan = scan_lines_at(path, fast_start, MAX_LINE_BYTES, |_, line| {
         if read >= FAST_LANE_SCAN_BYTES {
-            pushed_back = true; // out of budget, not at the end yet
+            pushed_back = Some(StopReason::Budget); // not at the end yet
             return false;
         }
         read += line.len() as u64 + 1;
@@ -333,8 +358,8 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
                 true
             }
             Offer::Skipped => true,
-            Offer::Stop => {
-                pushed_back = true;
+            Offer::Stop(reason) => {
+                pushed_back = Some(reason);
                 false
             }
         }
@@ -346,19 +371,23 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
             return (0, cursor);
         }
     };
-    if pushed_back {
-        // Persist what the fast lane did and leave the bulk lane for later.
-        let advanced = ExportCursor {
-            byte_offset: bulk_start,
-            fast_offset: normalized_fast(bulk_start, fast_end),
-            exported: cursor.exported + offered as u64,
-        };
-        return (offered, persist(root, cursor, advanced));
+    if let Some(reason) = pushed_back {
+        log::info!(
+            "ci_telemetry: export fast lane stopped at offset {fast_end} of {}: {} (bulk cursor {bulk_start})",
+            path.display(),
+            reason.as_str()
+        );
     }
 
-    // Bulk lane. The fast lane is at EOF, so every priority line before
-    // `fast_end` is already offered.
+    // Bulk lane. Every priority line before `fast_end` is already offered. When
+    // the fast lane stopped early the bulk lane may not pass `fast_end`: lines
+    // beyond it are the fast lane's to classify.
+    let bulk_limit = pushed_back.map(|_| fast_end);
+    let mut bulk_stop = None;
     let bulk_scan = scan_lines_at(path, bulk_start, MAX_LINE_BYTES, |offset, line| {
+        if bulk_limit.is_some_and(|limit| offset >= limit) {
+            return false;
+        }
         if line.trim_ascii().is_empty() || (offset < fast_end && is_priority(line)) {
             return true;
         }
@@ -368,7 +397,10 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
                 true
             }
             Offer::Skipped => true,
-            Offer::Stop => false,
+            Offer::Stop(reason) => {
+                bulk_stop = Some(reason);
+                false
+            }
         }
     });
     let bulk_end = match bulk_scan {
@@ -380,6 +412,12 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
             return (0, cursor);
         }
     };
+    if let Some(reason) = bulk_stop {
+        log::info!(
+            "ci_telemetry: export bulk lane stopped at offset {bulk_end}: {}",
+            reason.as_str()
+        );
+    }
     let advanced = ExportCursor {
         byte_offset: bulk_end,
         fast_offset: normalized_fast(bulk_end, fast_end.max(bulk_end)),
