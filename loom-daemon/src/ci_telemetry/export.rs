@@ -288,6 +288,9 @@ enum StopReason {
     Deferred,
     /// An exporter queue refused the record.
     Refused,
+    /// The fast lane spent its share of this pass's backfill headroom, which
+    /// is held back for the bulk lane (#13688).
+    FastShare,
 }
 
 impl StopReason {
@@ -296,6 +299,7 @@ impl StopReason {
             Self::Budget => "scan budget exhausted",
             Self::Deferred => "exporter queue deferred (backfill limit)",
             Self::Refused => "exporter queue refused a record",
+            Self::FastShare => "fast-lane share of backfill headroom spent",
         }
     }
 }
@@ -324,6 +328,55 @@ fn offer_line(queue: &dyn QueueSink, line: &[u8]) -> Offer {
     }
 }
 
+/// Fast lane: offer priority lines from `start` until the end of the journal,
+/// the scan budget, queue push-back, or `budget` admitted offers. Returns the
+/// offset reached and why it stopped early (`None`: end of journal).
+fn fast_lane(
+    path: &Path,
+    queue: &dyn QueueSink,
+    start: u64,
+    budget: Option<usize>,
+    read: &mut u64,
+    offered: &mut usize,
+) -> std::io::Result<(u64, Option<StopReason>)> {
+    let mut admitted = 0_usize;
+    let mut pushed_back: Option<StopReason> = None;
+    let end = scan_lines_at(path, start, MAX_LINE_BYTES, |_, line| {
+        if *read >= FAST_LANE_SCAN_BYTES {
+            pushed_back = Some(StopReason::Budget); // not at the end yet
+            return false;
+        }
+        *read += line.len() as u64 + 1;
+        if line.trim_ascii().is_empty() || !is_priority(line) {
+            return true;
+        }
+        if budget.is_some_and(|budget| admitted >= budget) {
+            pushed_back = Some(StopReason::FastShare);
+            return false;
+        }
+        match offer_line(queue, line) {
+            Offer::Admitted => {
+                *offered += 1;
+                admitted += 1;
+                true
+            }
+            Offer::Skipped => true,
+            Offer::Stop(reason) => {
+                pushed_back = Some(reason);
+                false
+            }
+        }
+    })?;
+    Ok((end, pushed_back))
+}
+
+/// The fast lane's share of `headroom` backfill offers: the larger half, so it
+/// always progresses when there is any room; the bulk lane gets the rest
+/// (#13688).
+fn fast_lane_share(headroom: usize) -> usize {
+    headroom.div_ceil(2)
+}
+
 /// The export pass proper. The caller holds the cycle lock.
 ///
 /// Fast lane first (priority lines past `fast_offset`, byte-bounded), then the
@@ -340,37 +393,20 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
     };
     let mut offered = 0;
 
-    // Fast lane.
+    // Fast lane. It may spend only its share of this pass's backfill headroom:
+    // otherwise a sustained fast-lane backlog fills the queue to its backfill
+    // limit every pass and the bulk lane (whose cursor drives rotation) is
+    // never admitted (#13688).
+    let fast_budget = queue.backfill_headroom().map(fast_lane_share);
     let mut read = 0_u64;
-    let mut pushed_back: Option<StopReason> = None;
-    let fast_scan = scan_lines_at(path, fast_start, MAX_LINE_BYTES, |_, line| {
-        if read >= FAST_LANE_SCAN_BYTES {
-            pushed_back = Some(StopReason::Budget); // not at the end yet
-            return false;
-        }
-        read += line.len() as u64 + 1;
-        if line.trim_ascii().is_empty() || !is_priority(line) {
-            return true;
-        }
-        match offer_line(queue, line) {
-            Offer::Admitted => {
-                offered += 1;
-                true
+    let (mut fast_end, pushed_back) =
+        match fast_lane(path, queue, fast_start, fast_budget, &mut read, &mut offered) {
+            Ok(result) => result,
+            Err(error) => {
+                log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
+                return (0, cursor);
             }
-            Offer::Skipped => true,
-            Offer::Stop(reason) => {
-                pushed_back = Some(reason);
-                false
-            }
-        }
-    });
-    let fast_end = match fast_scan {
-        Ok(offset) => offset,
-        Err(error) => {
-            log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
-            return (0, cursor);
-        }
-    };
+        };
     if let Some(reason) = pushed_back {
         log::info!(
             "ci_telemetry: export fast lane stopped at offset {fast_end} of {}: {} (bulk cursor {bulk_start})",
@@ -412,6 +448,18 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
             return (0, cursor);
         }
     };
+    // The share only reserves room for the bulk lane: headroom the bulk lane
+    // left unspent (little to offer before `fast_end`) goes back to the fast
+    // lane, so a capped pass never wastes admission (#13688).
+    if pushed_back == Some(StopReason::FastShare) && bulk_stop.is_none() {
+        match fast_lane(path, queue, fast_end, None, &mut read, &mut offered) {
+            Ok((end, _)) => fast_end = end,
+            Err(error) => {
+                log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
+                return (0, cursor);
+            }
+        }
+    }
     if let Some(reason) = bulk_stop {
         log::info!(
             "ci_telemetry: export bulk lane stopped at offset {bulk_end}: {}",
