@@ -106,6 +106,9 @@ const MAX_WRITE_NUMBERS: usize = 5;
 /// whose loose `gh issue|pr` parse can also pick up a numeric flag value).
 /// `None` when the argv names none (GraphQL, a comment edited by id).
 fn write_numbers(inv: &GhInvocation) -> Option<String> {
+    if let Some(n) = inv.number {
+        return Some(n.to_string());
+    }
     let mut numbers: Vec<u32> = Vec::new();
     for (_, n) in super::own_writes::written_targets(&inv.args, inv.target.slug().as_deref()) {
         if !numbers.contains(&n) {
