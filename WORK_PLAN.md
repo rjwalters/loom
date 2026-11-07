@@ -50,6 +50,8 @@ Issues currently being built (`loom:building`).
 - **#13619**: remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work
 - **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33)
 - **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
+- **#13692**: auto-update relaunch bakes the daemon's runtime LOOM_PID_FILE/LOOM_WORKSPACE/LOOM_HOST_ID into the base systemd unit
+- **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files
 
 ## PRs Awaiting Review
 
@@ -59,6 +61,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
 - **#13593**: fix: put a clean stranded primary checkout back on the default branch
+- **#13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
 
 ## Approved (Awaiting Merge)
 
@@ -129,6 +132,8 @@ Issues carrying `loom:curated`.
 - **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33) *(curated)*
 - **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35) *(curated)*
 - **#13680**: resync-installed.sh: false 'pin had no effect' for guard-destructive-generic.sh when the canonical Repo Skills guard is present *(curated)*
+- **#13692**: auto-update relaunch bakes the daemon's runtime LOOM_PID_FILE/LOOM_WORKSPACE/LOOM_HOST_ID into the base systemd unit *(curated)*
+- **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -153,10 +158,10 @@ Issues carrying `loom:curated`.
 | Very important | 0 |
 | Important | 4 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 4 |
-| PRs awaiting review | 4 |
+| In Progress (`loom:building`) | 6 |
+| PRs awaiting review | 5 |
 | Approved PRs awaiting merge | 8 |
-| Curated | 52 |
+| Curated | 54 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
