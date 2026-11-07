@@ -195,9 +195,14 @@ fn is_patch_header(re: &Regex, line: &str) -> bool {
 fn check_manifest(file: &str, patch: &str) -> Result<(), Reason> {
     #[allow(clippy::unwrap_used)] // constant patterns
     let (re_build, re_src, re_path, re_patch, re_patch_key) = (
-        Regex::new(r"^\s*(build|links)\s*=").unwrap(),
-        Regex::new(r"(^|[{,])\s*(git|registry)\s*=").unwrap(),
-        Regex::new(r#"(?:^|[{,])\s*path\s*=\s*(?:"([^"]*)"|'([^']*)')?"#).unwrap(),
+        // Keys may be dotted (`package.build = ..`, `foo.git = ..`) and quoted (`"foo".git`): allow
+        // any dotted prefix before the key, and optional quotes around it.
+        Regex::new(r#"^\s*(?:["'\w-]+\s*\.\s*)*["']?(build|links)["']?\s*="#).unwrap(),
+        Regex::new(r#"(?:^|[{,])\s*(?:["'\w-]+\s*\.\s*)*["']?(git|registry)["']?\s*="#).unwrap(),
+        Regex::new(
+            r#"(?:^|[{,])\s*(?:["'\w-]+\s*\.\s*)*["']?path["']?\s*=\s*(?:"([^"]*)"|'([^']*)')?"#,
+        )
+        .unwrap(),
         Regex::new(r"^\s*\[\[?\s*(patch|replace)\b").unwrap(),
         Regex::new(r#"^\s*["']?(patch|replace)["']?\s*[.=]"#).unwrap(),
     );
@@ -460,6 +465,11 @@ mod tests {
             "[patch.crates-io]",
             "[replace]",
             "patch.crates-io.foo = { path = \"x\" }",
+            "foo.git = \"https://x/y\"",
+            "foo.registry = \"alt\"",
+            "package.build = \"evil.rs\"",
+            "package.links = \"z\"",
+            "\"foo\".git = \"u\"",
         ] {
             let toml = format!("@@ -0,0 +1 @@\n+{line}\n");
             let f = [
@@ -477,6 +487,8 @@ mod tests {
             "a = { path = \"../../../x\" }",
             "a = { path = \"~/x\" }",
             "a = { path = SOMETHING }",
+            "foo.path = \"../../../etc\"",
+            "\"foo\".path = \"/etc\"",
         ] {
             let toml = format!("@@ -0,0 +1 @@\n+{line}\n");
             let f = [
