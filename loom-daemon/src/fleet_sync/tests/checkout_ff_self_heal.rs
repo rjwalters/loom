@@ -40,6 +40,7 @@ fn pass_at(fx: &Fixture, knobs: &Knobs, memory: &mut Memory, now: DateTime<Utc>)
         budget: None,
         elapsed: &|| Duration::ZERO,
         clock: &clock,
+        pr_merged: &|_, _| knobs.merged,
     };
     run(&env, std::slice::from_ref(&fx.host), memory)
 }
@@ -632,7 +633,9 @@ fn a_detached_head_left_behind_for_hours_is_put_back_on_the_branch() {
         "origin/main",
         "the branch tracks origin again"
     );
-    assert!(kinds(&found).contains(&"reattached"), "{:?}", kinds(&found));
+    // Everything on that HEAD is on origin, so #13588's rule puts it back
+    // before the Loom-owned repair is asked.
+    assert!(kinds(&found).contains(&"rehomed"), "{:?}", kinds(&found));
 }
 
 #[test]
@@ -661,15 +664,6 @@ fn a_recently_detached_head_is_not_touched() {
 }
 
 #[test]
-fn a_detached_head_at_origins_tip_is_not_touched() {
-    let fx = loom_fixture();
-    fx.push("README.md", "two\n");
-    git(&fx.host, &["fetch", "--quiet", "origin"]);
-    git(&fx.host, &["checkout", "--quiet", "--detach", "origin/main"]);
-    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
-}
-
-#[test]
 fn a_detached_head_with_a_non_loom_commit_is_not_touched() {
     let fx = loom_fixture();
     git(&fx.host, &["checkout", "--quiet", "--detach", "HEAD"]);
@@ -680,9 +674,10 @@ fn a_detached_head_with_a_non_loom_commit_is_not_touched() {
 }
 
 #[test]
-fn a_checkout_on_another_branch_is_not_this_repair() {
+fn a_checkout_on_another_branch_with_its_own_commit_is_not_this_repair() {
     let fx = loom_fixture();
     git(&fx.host, &["checkout", "--quiet", "-b", "pr6597"]);
+    fx.commit_locally("src/feature.rs");
     fx.push("README.md", "two\n");
     git(&fx.host, &["fetch", "--quiet", "origin"]);
     assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
@@ -749,4 +744,126 @@ fn a_detached_head_pinned_to_keep_is_not_put_back() {
     detached_behind(&fx);
     git(&fx.host, &["config", "--local", "loom.checkoutFf.detached", "keep"]);
     assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+// ----------------------------------------------------------------------------
+// A checkout stranded off the default branch (#13588)
+// ----------------------------------------------------------------------------
+
+fn knobs_merged(merged: Option<bool>) -> Knobs {
+    Knobs {
+        merged,
+        ..Knobs::default()
+    }
+}
+
+#[test]
+fn a_branch_whose_commits_are_all_on_origin_is_put_back_and_fast_forwarded() {
+    let fx = loom_fixture();
+    let old = fx.head();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+    let refs = rescue_refs(&fx);
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    assert!(refs[0].ends_with(&old), "the rescue ref is at the old HEAD: {refs:?}");
+    assert!(kinds(&found).contains(&"rehomed"), "{:?}", kinds(&found));
+}
+
+#[test]
+fn a_branch_whose_commits_are_a_merged_prs_is_put_back() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.commit_locally("src/feature.rs");
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = pass_at(&fx, &knobs_merged(Some(true)), &mut Memory::default(), much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(rescue_refs(&fx).len(), 1);
+    // The branch and its commit are still there.
+    assert!(git(&fx.host, &["branch", "--list", "feature/issue-756"]).contains("feature"));
+}
+
+#[test]
+fn a_failed_or_negative_merged_pr_lookup_keeps_the_hold() {
+    for answer in [None, Some(false)] {
+        let fx = loom_fixture();
+        git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+        fx.commit_locally("src/feature.rs");
+        fx.push("README.md", "two\n");
+        git(&fx.host, &["fetch", "--quiet", "origin"]);
+        let knobs = knobs_merged(answer);
+        assert_eq!(
+            assert_untouched_with(&fx, &knobs, much_later()),
+            CheckoutState::WrongBranch,
+            "lookup answer {answer:?}"
+        );
+    }
+}
+
+#[test]
+fn a_head_detached_at_a_commit_on_origin_is_put_back() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "--detach", "origin/main"]);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+}
+
+#[test]
+fn a_stranded_checkout_with_a_tracked_change_stays_held() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    write(&fx.host.join("README.md"), "edited\n");
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_stranded_checkout_is_not_moved_when_nothing_may_be_written() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    let knobs = Knobs {
+        write: false,
+        ..Knobs::default()
+    };
+    assert_eq!(assert_untouched_with(&fx, &knobs, much_later()), CheckoutState::WrongBranch);
+    let held = Knobs {
+        held: Some("paused"),
+        ..Knobs::default()
+    };
+    assert_eq!(assert_untouched_with(&fx, &held, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_standing_wrong_branch_hold_is_said_again_each_interval() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.commit_locally("src/feature.rs");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+    let still = |pass: &CheckoutPass| kinds(pass).iter().filter(|k| **k == "still-held").count();
+
+    assert_eq!(
+        still(&pass_at(&fx, &knobs, &mut memory, at(0))),
+        0,
+        "the first sight is the transition"
+    );
+    assert_eq!(still(&pass_at(&fx, &knobs, &mut memory, at(30))), 0);
+    let hourly = pass_at(&fx, &knobs, &mut memory, at(61));
+    assert_eq!(still(&hourly), 1, "{:?}", kinds(&hourly));
+    assert_eq!(still(&pass_at(&fx, &knobs, &mut memory, at(90))), 0);
+    assert_eq!(still(&pass_at(&fx, &knobs, &mut memory, at(125))), 1);
 }
