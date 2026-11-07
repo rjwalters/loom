@@ -61,9 +61,12 @@ pub fn waiver_outcome(waived: &Waived) -> (&'static str, String) {
 
 /// Attribute values are bounded (256 bytes): keep the reason within it.
 fn bounded(reason: &str) -> String {
-    let mut out: String = reason.chars().take(200).collect();
-    if out.len() > 240 {
-        out.truncate(240);
+    let mut out = String::new();
+    for c in reason.chars().take(200) {
+        if out.len() + c.len_utf8() > 240 {
+            break;
+        }
+        out.push(c);
     }
     out
 }
@@ -197,5 +200,19 @@ mod tests {
         let long = "é".repeat(500);
         let s = landing_span("o/r", Some(1), "x", LandingPath::Waiver, "Waiting", &long, at());
         assert!(s.attributes["reason"].len() <= 240);
+    }
+
+    #[test]
+    fn mixed_width_reason_does_not_panic() {
+        // 1 + 3*100 = 301 bytes in 101 chars: byte 240 falls inside a char.
+        let three = format!("a{}", "€".repeat(100));
+        let out = bounded(&three);
+        assert!(out.len() <= 240);
+        assert!(out.starts_with('a'));
+        // 4-byte chars: 200 chars would be 800 bytes.
+        let four = format!("ab{}", "😀".repeat(150));
+        let out = bounded(&four);
+        assert!(out.len() <= 240);
+        assert!(out.chars().all(|c| c == 'a' || c == 'b' || c == '😀'));
     }
 }
