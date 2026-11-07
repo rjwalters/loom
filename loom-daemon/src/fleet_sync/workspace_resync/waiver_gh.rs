@@ -124,6 +124,38 @@ impl Source for Gh<'_> {
         Ok(v["ref"].as_str() == Some(&format!("refs/tags/{tag}")))
     }
 
+    fn release_published(&self, kind: Kind, tag: &str) -> Result<bool, String> {
+        let v = self.json(
+            "resync_waiver.release",
+            &format!("repos/{}/releases/tags/{tag}", kind.upstream()),
+        )?;
+        Ok(v["tag_name"].as_str() == Some(tag) && v["draft"].as_bool() == Some(false))
+    }
+
+    fn resync_ignore(&self, sha: &str) -> Result<Vec<String>, String> {
+        let got = self.gh(
+            "resync_waiver.resync_ignore",
+            AccessIntent::Read,
+            &[
+                "api",
+                "-H",
+                "Accept: application/vnd.github.raw",
+                &format!("repos/{}/contents/.loom/resync-ignore?ref={sha}", self.nwo),
+            ],
+        );
+        match got {
+            Ok(raw) => Ok(raw
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()),
+            // No pin file is the common case; anything else is unreadable.
+            Err(e) if e.contains("404") || e.contains("Not Found") => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     fn upstream_blob(&self, kind: Kind, path: &str, tag: &str) -> Result<Option<String>, String> {
         let v = self.json(
             "resync_waiver.upstream_blob",
@@ -300,9 +332,15 @@ pub fn cli(pr: u32, repo: Option<&str>) -> i32 {
         nwo: &nwo,
     };
     match waiver::evaluate(&gh, pr) {
-        waiver::Verdict::Eligible { tag, record, .. } => {
+        waiver::Verdict::Eligible {
+            tag,
+            record,
+            gate_paths_included,
+            ..
+        } => {
             println!("RESYNC_WAIVER=ELIGIBLE");
             println!("RESYNC_WAIVER_TAG={tag}");
+            println!("RESYNC_WAIVER_GATE_PATHS_INCLUDED={gate_paths_included}");
             for (path, sha) in record {
                 println!("RESYNC_WAIVER_RECORD={path}: {sha}");
             }
