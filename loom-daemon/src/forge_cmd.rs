@@ -811,6 +811,8 @@ pub enum ForgeCmd {
     VersionOnlyDiff(crate::forge_version_only_diff::Args),
     /// `forge additive-migrations` (#13102): see [`crate::forge_additive_migrations`].
     AdditiveMigrations(crate::forge_additive_migrations::Args),
+    /// `forge locked-deps-only` (2am#6942): see [`crate::forge_locked_deps_only`].
+    LockedDepsOnly(crate::forge_locked_deps_only::Args),
     /// `forge resync-waiver` (#13487): the resync waiver proof, shared with the daemon's landing.
     ResyncWaiver { pr: u32, repo: Option<String> },
     /// `forge suspect-critical-diff` (#12999): see [`crate::forge_suspect_critical_diff`].
@@ -899,6 +901,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ),
         ForgeCmd::VersionOnlyDiff(args) => crate::forge_version_only_diff::handle(&args),
         ForgeCmd::AdditiveMigrations(args) => crate::forge_additive_migrations::handle(&args),
+        ForgeCmd::LockedDepsOnly(args) => crate::forge_locked_deps_only::handle(&args),
         ForgeCmd::ResyncWaiver { pr, repo } => std::process::exit(
             crate::fleet_sync::workspace_resync::waiver_gh::cli(pr, repo.as_deref()),
         ),

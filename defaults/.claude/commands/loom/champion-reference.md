@@ -613,6 +613,19 @@ changed file. It waives the `critical-files` criterion only and is never eligibl
 | `ci.yml` plus `defaults/scripts/install-loom.sh` | kept set: `critical-files` **FAIL**, hold |
 | `src/ci.yml` renamed to `.github/workflows/ci.yml` | the previous name is outside the class: `critical-files` **FAIL**, hold |
 | `docs/guide.md` alone | no critical-file hit: the class does not apply, `critical-files` passes on its own |
+
+**Opt-in critical-file verbs.** Two class keys make a `criticalFilesOnly`-shaped class conditional on a
+daemon verb that fails closed (any non-zero exit, forge error or older daemon keeps the hold). Neither is
+on by default and neither is eligible for `merge-risk`:
+
+- `"additiveMigrations": true` (#13102) lifts the `*migrations/*` kept-set entry when
+  `loom-daemon forge additive-migrations <pr>` exits 0 (only newly added additive `.sql` files).
+- `"lockedDepsOnly": true` (2am#6942) covers `Cargo.toml` hits when `loom-daemon forge locked-deps-only <pr>`
+  exits 0: no `Cargo.lock` hunk adds a `source =`/`checksum =` line or changes an existing package, no
+  changed manifest line names `git =`, `registry =`, `build =`, `links =`, `[patch.*]`, `[replace]` or an
+  out-of-repo `path =`, and a manifest change comes with a lock change. Every hit the class covers must be a
+  `Cargo.toml`. Example: a new `infra/<crate>/Cargo.toml` using `reqwest`/`serde` already locked passes; the
+  same crate adding a new registry dependency, or bumping a locked crate, holds.
 | `ci.yml` plus `package.json` scripts, classes `workflow-critical-only` and `package-scripts` (#13042) | each hit is covered by its own class: `critical-files` **PASS** naming both; a forbidden line in either hunk, or a third critical file neither covers, **FAIL**s |
 
 **Dependabot bumps merge by default (#12948)**: operator direction 2026-10-20,
