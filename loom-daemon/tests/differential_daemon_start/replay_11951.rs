@@ -4,14 +4,16 @@
 
 use super::Answer;
 
-/// The keys #11951 removed from the unit, written out literally rather than
-/// imported from the renderer, so a later change cannot ride in under this
-/// class.
-const UNIT_AUTONOMY_KEYS_11951: [&str; 4] = [
+/// The keys #11951 (and, for the last two, #13692) removed from the unit,
+/// written out literally rather than imported from the renderer, so a later
+/// change cannot ride in under this class.
+const UNIT_AUTONOMY_KEYS_11951: [&str; 6] = [
     "LOOM_WORK_FINDER",
     "LOOM_MAIN_HEALTH_GATE",
     "LOOM_FORCE_SCOPE",
     "LOOM_GUARD_DECISION_LOG",
+    "LOOM_WORKSPACE",
+    "LOOM_HOST_ID",
 ];
 
 /// The shell's answer with exactly the #11951 edit applied: a unit document

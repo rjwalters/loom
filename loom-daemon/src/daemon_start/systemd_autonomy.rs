@@ -1,6 +1,6 @@
 //! The systemd unit no longer carries the dispatcher's autonomy env (#11951),
-//! nor its runtime path/identity env (`LOOM_PID_FILE`, `LOOM_WORKSPACE`,
-//! `LOOM_HOST_ID`, #13692).
+//! nor its runtime workspace/identity env (`LOOM_WORKSPACE`, `LOOM_HOST_ID`,
+//! #13692).
 //!
 //! # The ruling
 //!
@@ -43,19 +43,20 @@ use super::out;
 
 /// The keys a rendered systemd unit never carries (#11951).
 ///
-/// The last three are the daemon's own runtime path/identity env, not
+/// The last two are the daemon's own runtime workspace/identity env, not
 /// autonomy settings (#13692): an auto-update relaunch renders from the running
-/// daemon's env, which would freeze `LOOM_PID_FILE` / `LOOM_WORKSPACE` /
-/// `LOOM_HOST_ID` into the unit, where they outrank the config tiers. The unit
-/// already gets `WorkingDirectory=`/`ExecStart=` from the render context; the
-/// daemon resolves its pid file, workspace and host id from its fallbacks
-/// (`daemon_pidfile` tiers 2-4, `fleet.hostId`, the hostname) when unset.
-pub const UNRENDERED_KEYS: [&str; 7] = [
+/// daemon's env, which would freeze `LOOM_WORKSPACE` / `LOOM_HOST_ID` into the
+/// unit, where they outrank the config tiers. The daemon resolves its workspace
+/// and host id from its fallbacks (`fleet.hostId`, the hostname) when unset.
+///
+/// `LOOM_PID_FILE` is deliberately NOT here: `daemon_start/mod.rs` derives it
+/// (derived-only, #6420, an inbound value never survives) and both supervisors
+/// render that derived value.
+pub const UNRENDERED_KEYS: [&str; 6] = [
     "LOOM_WORK_FINDER",
     "LOOM_MAIN_HEALTH_GATE",
     "LOOM_FORCE_SCOPE",
     "LOOM_GUARD_DECISION_LOG",
-    "LOOM_PID_FILE",
     "LOOM_WORKSPACE",
     "LOOM_HOST_ID",
 ];

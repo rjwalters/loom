@@ -440,10 +440,13 @@ enum Divergence {
     /// The systemd unit stopped carrying the dispatcher's autonomy env on
     /// purpose (#11951): the host's supervisor env (a drop-in) or its config
     /// owns `LOOM_WORK_FINDER`, `LOOM_MAIN_HEALTH_GATE`, `LOOM_FORCE_SCOPE` and
-    /// `LOOM_GUARD_DECISION_LOG` on Linux. The plist is untouched.
+    /// `LOOM_GUARD_DECISION_LOG` on Linux. #13692 extends the same unit-only
+    /// edit to the daemon's own `LOOM_WORKSPACE` and `LOOM_HOST_ID`, which an
+    /// auto-update relaunch would otherwise freeze into the unit. The plist is
+    /// untouched, and the derived `LOOM_PID_FILE` is still rendered by both.
     ///
     /// Recognised only on a unit document, by replaying that exact edit over
-    /// the SHELL's answer ([`replay_11951`]): its four `Environment=` lines are
+    /// the SHELL's answer ([`replay_11951`]): its `Environment=` lines for those keys are
     /// removed (rendered or carried forward alike), and its carry-forward
     /// warning no longer lists them, since the port purges them instead. The
     /// port's own `(#11951)` advisory blocks are removed by their fixed grammar
