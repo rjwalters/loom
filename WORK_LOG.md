@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-07
 
+- **PR #13689**: fix: reserve a bulk-lane share of backfill headroom in CI telemetry export
+- **Issue #13688** (closed): ci_telemetry: bulk lane starved by the fast lane at the exporter backfill limit after a tail-carry rotation
 - **PR #13686**: fix: keep the CI export bulk lane advancing when the fast lane stops early
 - **Issue #13685** (closed): ci_telemetry: bulk export cursor stuck at 0 after the first tail-carry rotation (captain, v0.19.1272), so no further rotation and the 7.48 GB .1 stays
 - **Issue #13682** (closed): role_runner: round-robin cursor resets on every daemon restart, so the newest workspaces never get a guide tick
