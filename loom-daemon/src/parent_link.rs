@@ -175,6 +175,30 @@ fn parse_child_lines(text: &str) -> Option<Vec<(u32, bool)>> {
 /// than what was read, which is treated as unreadable (fail closed).
 const CHILD_PAGE: usize = 100;
 
+/// `--limit` of the marker search. Like `CHILD_PAGE`, a raw result that
+/// reaches it may be truncated (#13670).
+const MARKER_LIMIT: usize = CHILD_PAGE * 2;
+
+/// Parse the marker search output: a leading `RAW <n>` line carrying the
+/// **unfiltered** search count, then `"<number> <STATE>"` rows that survived
+/// the jq marker filter. Fails closed when the raw count reaches
+/// [`MARKER_LIMIT`], even if the filter dropped rows (the dropped rows may
+/// have hidden an unread child).
+fn parse_marker_output(text: &str, parent: u32) -> Result<Vec<(u32, bool)>> {
+    let malformed = || anyhow::anyhow!("malformed marker-child list for #{parent}");
+    let trimmed = text.trim_start();
+    let (head, rest) = trimmed.split_once('\n').unwrap_or((trimmed, ""));
+    let raw: usize = head
+        .trim()
+        .strip_prefix("RAW ")
+        .and_then(|n| n.trim().parse().ok())
+        .ok_or_else(malformed)?;
+    if raw >= MARKER_LIMIT {
+        anyhow::bail!("marker-child search of #{parent} may be truncated");
+    }
+    parse_child_lines(rest).ok_or_else(malformed)
+}
+
 /// Enumerate `parent`'s children from the native sub-issue list and from
 /// `<!-- loom:parent #N -->` markers, and classify them.
 ///
@@ -205,10 +229,10 @@ pub fn split_state(root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
     // marker so #12 never matches #123.
     let query = format!("\"loom:parent #{parent}\" in:body");
     let jq = format!(
-        r#".[] | select(.body | contains("{}")) | "\(.number) \(.state)""#,
+        r#"length as $n | "RAW \($n)", (.[] | select(.body | contains("{}")) | "\(.number) \(.state)")"#,
         parent_marker(parent)
     );
-    let limit = (CHILD_PAGE * 2).to_string();
+    let limit = MARKER_LIMIT.to_string();
     let marker = gh_call::read("parent_link.marker_children", &gh, root).args([
         "issue",
         "list",
@@ -227,8 +251,7 @@ pub fn split_state(root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
     ]);
     let out = gh_call::ok_stdout(marker)
         .ok_or_else(|| anyhow::anyhow!("could not search marker children of #{parent}"))?;
-    let rows = parse_child_lines(&String::from_utf8_lossy(&out))
-        .ok_or_else(|| anyhow::anyhow!("malformed marker-child list for #{parent}"))?;
+    let rows = parse_marker_output(&String::from_utf8_lossy(&out), parent)?;
     all.extend(rows.into_iter().filter(|&(n, _)| n != parent));
     Ok(classify_children(&all))
 }
@@ -267,6 +290,28 @@ mod tests {
         assert_eq!(parse_child_lines(""), Some(vec![]));
         assert_eq!(parse_child_lines("7 WEIRD"), None);
         assert_eq!(parse_child_lines("x CLOSED"), None);
+    }
+
+    #[test]
+    fn marker_output_below_limit_succeeds() {
+        let text = format!("RAW {}\n7 CLOSED\n8 OPEN\n", MARKER_LIMIT - 1);
+        assert_eq!(parse_marker_output(&text, 1).unwrap(), vec![(7, true), (8, false)]);
+    }
+
+    #[test]
+    fn marker_output_at_limit_bails_even_when_filter_dropped_rows() {
+        // Raw count at the limit, zero rows survived the filter.
+        let text = format!("RAW {MARKER_LIMIT}\n");
+        assert!(parse_marker_output(&text, 1).is_err());
+        let text = format!("RAW {MARKER_LIMIT}\n7 CLOSED\n");
+        assert!(parse_marker_output(&text, 1).is_err());
+    }
+
+    #[test]
+    fn marker_output_without_raw_count_is_malformed() {
+        assert!(parse_marker_output("7 CLOSED\n", 1).is_err());
+        assert!(parse_marker_output("", 1).is_err());
+        assert!(parse_marker_output("RAW x\n", 1).is_err());
     }
 
     #[test]
