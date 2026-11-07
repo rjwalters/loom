@@ -16,6 +16,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-07
 
+- **PR #13686**: fix: keep the CI export bulk lane advancing when the fast lane stops early
+- **Issue #13685** (closed): ci_telemetry: bulk export cursor stuck at 0 after the first tail-carry rotation (captain, v0.19.1272), so no further rotation and the 7.48 GB .1 stays
+- **Issue #13682** (closed): role_runner: round-robin cursor resets on every daemon restart, so the newest workspaces never get a guide tick
 - **PR #13683**: fix: persist role-runner round-robin cursor across restarts
 - **PR #13677**: feat: emit workspace_resync.landing span and github.number on merge-queue spans
 - **Issue #13679** (closed): Export workspace_resync landing log lines to the logs store (follow-up to #13674)
