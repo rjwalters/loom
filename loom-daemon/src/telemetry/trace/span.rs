@@ -134,6 +134,14 @@ pub enum SpanName {
     /// span, its own root, naming the kind, the host and the sweeps it ended.
     #[serde(rename = "loom.host.interruption_notice")]
     HostInterruptionNotice,
+    /// One workspace-resync landing attempt (#13674): an instant span, its own
+    /// root, naming the repo, PR, head, path and outcome.
+    #[serde(rename = "workspace_resync.landing")]
+    WorkspaceResyncLanding,
+    /// One ratification-lane tick (#13707): an instant span, its own root,
+    /// with the tick's reason and selected / skipped / ran / posted counts.
+    #[serde(rename = "ratification_lane.tick")]
+    RatificationLaneTick,
 }
 
 impl SpanName {
@@ -170,6 +178,8 @@ impl SpanName {
             Self::FleetDispatchCall => "loom.fleet_dispatch.call",
             Self::ReaperPass => "reaper.pass",
             Self::HostInterruptionNotice => "loom.host.interruption_notice",
+            Self::WorkspaceResyncLanding => "workspace_resync.landing",
+            Self::RatificationLaneTick => "ratification_lane.tick",
         }
     }
 }

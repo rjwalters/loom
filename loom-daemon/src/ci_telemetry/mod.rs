@@ -296,9 +296,7 @@ pub fn process_env(name: &str) -> Option<String> {
 }
 
 fn env_bool(env: EnvLookup<'_>, name: &str) -> Option<bool> {
-    env(name).map(|value| {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
+    env(name).map(|value| crate::env_flag::parse_truthy(&value))
 }
 
 fn env_nonempty(env: EnvLookup<'_>, name: &str) -> Option<String> {

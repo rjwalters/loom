@@ -14,8 +14,83 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-08
+
+- **PR #13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
+- **Issue #13702** (closed): land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record
+- **PR #13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
+- **PR #13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
+- **PR #13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
+- **Issue #13680** (closed): resync-installed.sh: false 'pin had no effect' for guard-destructive-generic.sh when the canonical Repo Skills guard is present
+- **Issue #13619** (closed): remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work
+- **Issue #13261** (closed): Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon
+- **PR #13708**: feat: tick ratification lane from step dispatch and record every tick
+- **PR #13705**: feat: add --strict read-only replay to forge resync-waiver
+- **Issue #13707** (closed): Ratification lane never runs on the fleet: tick_for_root is only called from the champion role tick, not step-dispatched Champion
+- **PR #13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
+- **Issue #13673** (closed): Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
+- **PR #13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
+- **Issue #13665** (closed): Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33)
+- **PR #13693**: fix: stop rendering daemon runtime path env into the systemd unit
+- **Issue #13692** (closed): auto-update relaunch bakes the daemon's runtime LOOM_PID_FILE/LOOM_WORKSPACE/LOOM_HOST_ID into the base systemd unit
+- **PR #13698**: test: gate cursor_tick runs until the dispatch walk returns
+- **Issue #13697** (closed): test flake: concurrent_dispatch cursor_persisted_across_restart_admits_tail_before_head_repeats fails on Rust Unit Tests (3/5)
+
+### 2026-11-07
+
+- **PR #13689**: fix: reserve a bulk-lane share of backfill headroom in CI telemetry export
+- **Issue #13688** (closed): ci_telemetry: bulk lane starved by the fast lane at the exporter backfill limit after a tail-carry rotation
+- **PR #13686**: fix: keep the CI export bulk lane advancing when the fast lane stops early
+- **Issue #13685** (closed): ci_telemetry: bulk export cursor stuck at 0 after the first tail-carry rotation (captain, v0.19.1272), so no further rotation and the 7.48 GB .1 stays
+- **Issue #13682** (closed): role_runner: round-robin cursor resets on every daemon restart, so the newest workspaces never get a guide tick
+- **PR #13683**: fix: persist role-runner round-robin cursor across restarts
+- **PR #13677**: feat: emit workspace_resync.landing span and github.number on merge-queue spans
+- **Issue #13679** (closed): Export workspace_resync landing log lines to the logs store (follow-up to #13674)
+- **Issue #13674** (closed): Telemetry: workspace_resync.landing span per attempt; github.number on merge_queue enqueue/dequeue (r7-q35)
+- **Issue #13670** (closed): split-state: marker-child search has no truncation guard (limit 200)
+- **PR #13675**: fix: fail closed when marker-child search reaches its raw limit
+- **Issue #13638** (closed): Delete legacy stats query stack in activity/stats.rs (slice 2 of #12752)
+- **PR #13672**: refactor: delete legacy stats query stack from activity/stats.rs
+
 ### 2026-11-06
 
+- **Issue #13642** (closed): Extract sweep-registry / reaper wiring from run_daemon into daemon_service/ sibling module
+- **PR #13671**: refactor: extract sweep-registry knob and reaper wiring from run_daemon
+- **Issue #13641** (closed): Extract GitHub App refresh-tick tasks from run_daemon into daemon_service/ sibling module
+- **PR #13669**: refactor: extract GitHub App token refresh ticks from run_daemon
+- **Issue #9978** (closed): feat(champion): optional per-repo merge-queue mode — enqueue Judge-approved PRs to GitHub's merge queue instead of merge-pr.sh's freshness/re-date loop
+- **Issue #13308** (closed): Re-evaluate #13280 (daemon lands its own resync PRs through the merge queue) after one week: on or after 2026-11-05
+- **Issue #13635** (closed): Unblocking a split tracker promotes it to loom:issue and dispatches builders on it
+- **PR #13651**: fix: don't promote or build a split tracker whose children are all closed
+- **Issue #13639** (closed): worktree.root committed as a host path breaks Judge on every other host — fall back or validate
+- **PR #13652**: fix: fall back to default worktree root when configured root is missing or unwritable
+- **Issue #13663** (closed): New skill /loom:accelerate: session-only '/loom:sweep all' loop sized to localhost, to push one project faster alongside the fleet
+- **PR #13664**: feat: add /loom:accelerate session-only sweep loop with localhost sizing
+- **Issue #13487** (closed): workspace_resync: land a mechanically verified resync PR without Judge (daemon runs the resync-waiver proof and merges via merge-pr.sh)
+- **Issue #13017** (closed): Split run_daemon (~1960-line fn) in daemon_service.rs into startup-phase modules
+- **PR #13648**: refactor: extract startup credential preflight from run_daemon
+- **Issue #13662** (closed): resync-waiver: .agents/skills/loom-* counted as outside the install set → every resync PR held for human merge
+- **Issue #13636** (closed): ci_telemetry: journal never rotates on a continuously-polling host — rotation waits for bulk cursor at EOF
+- **PR #13657**: fix: rotate the CI telemetry journal past the threshold, carrying the unexported tail
+- **Issue #13525** (closed): Remove test-only reconcile wrappers in safehouse.rs and unconsumed forge_repo_facts::disagreement
+- **PR #13658**: refactor: drop test-only unwatermarked safehouse wrappers
+- **Issue #13400** (closed): Remove write-only role-runner skip-counter totals and unused *_count() wrappers
+- **PR #13649**: refactor: remove write-only role-runner skip-count totals
+- **Issue #13637** (closed): Port loom-daemon stats dashboard onto *_rows queries (slice 1 of #12752)
+- **PR #13655**: refactor: render loom-daemon stats from the *_rows query stack
+- **Issue #13362** (closed): Drop the fleet.json-absent legacy fallback and retire fleet_store/yaml.rs (#10705 follow-up)
+- **PR #13656**: refactor: remove repos.yml/state.yml fallback and the fleet_store YAML reader
+- **PR #13654**: fix(ci_telemetry): orgs/ fallback on kind-probe transport errors; count skipped owners as failures
+- **Issue #13628** (closed): Remove deprecated tmux loom-scale.sh (the 'loom scale' verb, ~450 LOC)
+- **PR #13647**: refactor: remove deprecated tmux loom-scale verb
+- **Issue #13567** (closed): Consolidate four divergent owner/repo slug validators in loom-daemon
+- **PR #13650**: refactor: consolidate owner/repo slug validators into forge_slug
+- **Issue #13660** (closed): Add per-module env-truthy pinning tests for Group A migrated callers (follow-up to #13376)
+- **Issue #13376** (closed): Consolidate ~14 duplicated env-truthy helpers in loom-daemon into one
+- **PR #13653**: refactor: share one env-truthy parser across seven identical copies
+- **PR #13645**: refactor: drop always-zero drain refusals from telemetry and status
+- **Issue #13643** (closed): Extract hyperparameter resolution from run_daemon into daemon_service/ sibling module
+- **Issue #13492** (closed): Remove always-zero drain `refusals` field from status and auto_update.tick telemetry
 - **PR #13631**: chore(harness): track latest CLIs — codex 0.166.0→0.167.0
 - **Issue #13622** (closed): Dedupe OTLP kv_bool/kv_int helpers in mapping/ (hold_transition, merge_authorization)
 - **PR #13630**: refactor: use shared OTLP kv_bool/kv_int helpers in mapping modules
@@ -5824,194 +5899,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **Issue #6320** (closed): In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
 - **PR #6333**: feat(lease): publish a lease record from the in-session sweep path
-
-### 2026-09-08
-- **Issue #6855** (closed): Port 2AMLogic/2am#448's forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation to defaults/
-- **PR #6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **Issue #6169** (closed): CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **PR #6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
-- **Issue #7018** (closed): Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation)
-- **PR #7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
-- **Issue #7388** (closed): [Epic #6896] Phase 2: multi-arch (linux/arm64) loom-worker + loom-worker-session images
-- **PR #7392**: feat(docker): multi-arch (linux/arm64) loom-worker + loom-worker-session images
-- **Issue #6927** (closed): [Epic #6896] Phase 2: Codex auth-state health probe + re-auth runbook
-- **PR #7397**: feat(daemon): in-container Codex auth-state probe + proactive reauth exclusion (#6927)
-- **Issue #6925** (closed): [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
-- **PR #7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
-- **Issue #6805** (closed): Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
-- **PR #6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix (#6805)
-- **PR #7384**: fix: suggest_commit_if_resync_only_dirt() excludes retired pure-copy-surface paths
-- **Issue #7336** (closed): resync-installed.sh: suggest_commit_if_resync_only_dirt() still suggests committing retired-but-unlisted pure-copy-surface paths
-- **Issue #6568** (closed): loom-daemon-start.sh from a sweep session overwrote BOTH production Mac LaunchAgents with test env (issue-6388 sweep, undetected 2 days)
-- **PR #7380**: fix: isolate loom-daemon-start.sh from agent-session env (#6568)
-- **Issue #6612** (closed): resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
-- **PR #6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **Issue #6619** (closed): safehouse: sink-side gh failures are fully silent — warn once per (workspace, failure kind) so a #6596-class gap is a log line, not a half-day ps hunt
-- **PR #7376**: safehouse: warn-once recovery log + reconcile row-count debug line (#6619)
-- **Issue #6613** (closed): resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
-- **PR #6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
-- **Issue #6515** (closed): resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **PR #6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
-- **Issue #6389** (closed): merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
-- **PR #6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
-- **Issue #6472** (closed): guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
-- **PR #6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **PR #7368**: fix: gate claim_reconciliation's issue reclaim on a fresh closed-state check
-- **Issue #7367** (closed): Issue #7363 was closed by loom-fleet-dispatch[bot] before its closing PR (#7366) merged, with no rationale comment
-- **PR #7366**: fix: mask grep/awk quoted-pattern args in stash-scope detection
-- **Issue #7363** (closed): Guard false positive: stash-scope:worktree-collision fires on grep/awk searching for the literal string "git stash pop"
-- **PR #7364**: fix: narrow dep-recheck fingerprint's label component to stop review-cycle label spam
-- **Issue #7362** (closed): dep-recheck CONCLUSION_HASH churns on every incidental PR label flip, producing continuous re-check comment spam
-- **PR #7361**: fix: mask printenv ask-pattern false positives from heredoc vars and jq/grep args
-- **Issue #7355** (closed): Guard ask-pattern false positive: printenv.*SECRET fires on data mentioning the words, not live invocations
-- **PR #7360**: fix: Guide docs-PR recheck uses --search, which lags the Pulls List API
-- **Issue #7354** (closed): Duplicate docs-maintenance PRs (#7352, #7353) recur despite cross-host recheck — byte-identical WORK_PLAN.md diffs
-- **PR #7358**: test: add real-rebase regression coverage for the merge=ours install-metadata drop (#7351)
-- **Issue #7351** (closed): Judge's automated DIRTY-PR rebase can silently drop a commit via 3-way-merge adjacent-line collision
-- **PR #7350**: Fix Guide's Fill-free-slots tie-break for tied loom:issue candidates
-- **Issue #7349** (closed): Guide's 'Fill free slots' step has no tie-break for multiple tied loom:issue candidates — same flap PR #7325 fixed for eviction, unfixed for promotion
-
-### 2026-09-07
-- **PR #7344**: fix: gate every rebase-then-force-push path with version-check-gate.sh
-- **Issue #7341** (closed): Hand-rolled 'post-rebase VERSION bump' commits bypass version.sh set, drift install-metadata.json (2nd occurrence after #7168)
-- **PR #7340**: fix(champion): adopt pre-marker digest issues instead of orphaning them
-- **Issue #7338** (closed): Champion digest-issue lookup orphans pre-marker digest issues without the startswith() marker
-- **PR #7334**: feat(daemon): add host-wide Docker image retention pass (#7332)
-- **Issue #7332** (closed): Session-container smoke/audit flows leave ~2-4GB of tagged images per day on the executing host — no retention, invisible to workspace disk accounting
-- **PR #7325**: docs(guide): deterministic tie-break for multiple tied incumbents
-- **Issue #7323** (closed): Guide urgency_rank tie-break: incumbency rule has no rule for choosing among multiple tied incumbents
-
-### 2026-09-06
-- **PR #7316**: feat(dep-recheck): add named-dependency subcommand for non-closing Dependencies checklist items
-- **Issue #7314** (closed): dep-recheck-fingerprint.sh has no path for a named, non-closing Dependencies-section prerequisite — silently returns VERDICT=clear or forces error-prone hand-computed hashing
-- **Issue #6335** (closed): Reclaim path lacks a cross-host regression test: a live peer claim visible only via its lease
-- **Issue #7294** (closed): Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes
-- **PR #7309**: fix(guard): propagate same-command cd cwd resolution into write-confinement
-- **Issue #7307** (closed): flake: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst recurs after #7030
-- **PR #7312**: fix: hoist ActivityDb construction out of ListSweeps timing window
-- **Issue #7302** (closed): check-defaults-version-bump.sh gate can pass with a net-zero version bump on concurrent PRs
-- **PR #7308**: fix(merge-pr): guard against a net-zero defaults/ VERSION bump on concurrent PRs
-- **Issue #7304** (closed): dep-recheck-fingerprint.sh dep-recheck crashes on any live PR with labels: jq startswith() requires string inputs
-- **PR #7306**: fix(dep-recheck): normalize gh pr view label objects to plain strings
-- **Issue #7299** (closed): check-promotion-landed.sh escalated a MISMATCH on #7287 despite loom:issue having already legitimately progressed to loom:building
-- **PR #7300**: fix: check-promotion-landed.sh self-comment shadowing a genuine APPROVED verdict
-- **Issue #7281** (closed): Curator dep-recheck fingerprint has no shared script — hash churn defeats idempotency guard, spams duplicate comments
-- **PR #7291**: fix(curator): extract dep-recheck fingerprint into a shared, tested script
-- **Issue #7287** (closed): Flaky: "Shell Test Suites (hermetic)" intermittently fails unrelated suites in CI (test-loom-daemon-start.sh DEK6b, test-install-stash-scope.sh)
-- **PR #7298**: fix(tests): make DEK6a/DEK6b and DEK7 daemon teardown deterministic
-- **Issue #7161** (closed): Add uninstall-loom.sh test coverage for .claude/settings.json permissions.deny removal
-- **PR #7296**: test(install): add uninstall-loom.sh coverage for settings.json permissions.deny removal
-- **Issue #7285** (closed): CI flake: test-install-stash-scope.sh fails with 'Broken pipe' / false manifest-drift error on GitHub Actions
-- **PR #7290**: fix: eliminate printf|grep -q broken-pipe race in test-install-stash-scope.sh
-- **Issue #7288** (closed): Guard false positive: for-loop-wordlist search var still hard-denied post-#6070, contradicts fix's own claim
-- **PR #7292**: fix(guard): widen escaped-quote --search/--arg/--argjson trusted-consumer shape in for-loop wordlist masking
-- **Issue #6516** (closed): Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
-- **PR #6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
-- **Issue #6261** (closed): Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
-- **PR #6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
-- **Issue #6382** (closed): The loom:verdict-sha marker is easy to omit and only caught by self-inspection
-- **PR #6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
-- **Issue #6366** (closed): macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
-- **PR #6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
-- **Issue #7275** (closed): forge_cached_list's disk-persistent ETag cache key doesn't scope by repo — cross-repo collision on shared label conventions
-- **PR #7280**: fix: scope forge_cached_list's disk-persistent ETag cache key by resolved repo
-- **Issue #7279** (closed): Guard: cargo_target's shallow-path refusal is bypassed for macOS symlinked roots (/tmp, /var), letting plan_reclaim attempt a real removal
-- **PR #7283**: fix(daemon): cargo_target's shallow-path guard now catches symlinked shallow roots
-- **Issue #7270** (closed): WORK_PLAN.md 'Approved (Awaiting Merge)' / 'Operator Attention' sections list loom:review-requested PRs, not loom:pr — stale for 7+ docs-maintenance cycles
-- **PR #7276**: test(guide): add regression guard for WORK_PLAN approved/review label fidelity
-- **Issue #7272** (closed): Guide: concurrent-tick urgent-set refill race exceeds 3-cap, and reversal-within-cooldown blocks the correction
-- **PR #7274**: fix(guide): urgent-flip-guard cannot leave/strand an over-cap urgent set
-- **Issue #7267** (closed): guide.md's has_superseding_block() misses PR merge-state/operator-hold, causing an unblock/reblock livelock (found while curating #6925)
-- **PR #7269**: fix(guide): has_superseding_block() misses PR merge-state/operator-hold
-- **Issue #7256** (closed): Flaky test: emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch races on MockSink's push-after-response ordering
-- **PR #7264**: test(otlp): record MockSink requests before writing the HTTP response
-- **Issue #7258** (closed): Peer-claim coordination watchdog alert flaps hourly on ip-198-51-100-23, driving issue-tracker and WORK_LOG churn
-- **PR #7262**: fix(watchdog): cooldown for peer-coordination escalation to stop flap-filing
-- **Issue #7252** (closed): find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
-- **PR #7259**: fix(worktree): check lsof FD field, not TYPE field, for cwd matches
-- **PR #7255**: chore(deps): bump the all-dependencies group with 2 updates
-- **Issue #7239** (closed): worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees
-- **PR #7251**: fix(worktree): reclaim a redirected cargo target dir when its worktree is removed
-
-### 2026-09-05
-- **Issue #7247** (closed): Guard worktree-write-confinement: unquoted heredoc body prose containing a literal '>' misparsed as a write redirect
-- **PR #7248**: fix(guard): mask unquoted heredoc BODY from the write-target > scan
-- **Issue #7242** (closed): test_invoke_times_out_on_hung_script fails on any host with load-per-core >= 1.0 (unpinned load_per_core)
-- **PR #7243**: fix(role_runner): pin load_per_core in hung-script timeout test
-- **Issue #7238** (closed): health: role_liveness flags healthy roles SILENT when the role runner is configured to a slower cadence than the per-role default interval
-- **PR #7241**: fix(health): compare role_liveness against the resolved role-runner interval
-- **Issue #6898** (closed): [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
-- **PR #6904**: docs(docker): normative container mount contract + worktree-correctness test
-- **Issue #7235** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7234** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7232** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7230** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7227** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7226** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7224** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7222** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7220** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7218** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7216** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-
-### 2026-09-04
-- **Issue #7201** (closed): test-loom-daemon-update.sh: '--help documents --check/--dry-run/--no-restart' flaked on PR #6405 CI, unrelated to the PR's diff
-- **PR #7207**: fix(daemon): harden loom-daemon-update.sh --help against a same-path-rewrite race
-- **Issue #7209** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7205** (closed): No test coverage for uninstall-loom.sh's permissions.allow/deny cleanup logic
-- **Issue #7203** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7199** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7197** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7195** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7192** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7188** (closed): champion-epic.md: Phase Progression has no idempotency guard — near-duplicate 'Phase progress update' comments accumulate indefinitely
-- **PR #7191**: fix(champion): add idempotency guard to phase-progression status comments
-- **Issue #7189** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7186** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7184** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7182** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7179** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-
-### 2026-09-03
-- **Issue #7178** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7176** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7173** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7170** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7168** (closed): version-bump tooling silently skips .loom/install-metadata.json sync, breaking Installer Integration Tests on every open PR
-- **PR #7171**: fix: gate Doctor's rebase-conflict push on version.sh sync
-- **Issue #7158** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7156** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7153** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7151** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7149** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7147** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-
-### 2026-09-02
-- **Issue #7140** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7144** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7143** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7135** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7132** (closed): Flaky: test-loom-daemon-start.sh AD8 'refusal names the explicit-flag escape hatch' fails intermittently in CI
-- **PR #7136**: fix(tests): close AD8 decoy-kill reap race in test-loom-daemon-start.sh
-- **PR #7130**: fix: update stale FROZEN/future-tense peer-coordination wording
-- **Issue #7117** (closed): loom-daemon-watchdog.sh's peer-coordination DEGRADED issue template asserts stale FROZEN reclamation behavior
-- **Issue #7133** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7128** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7126** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7124** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7122** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7120** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7119** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7116** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7114** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7113** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7111** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7108** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7107** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7105** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7102** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7100** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
-- **Issue #7099** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 

@@ -7,7 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{parse_state, valid_slug, IssueStateReply, ReadOutcome};
+use super::{parse_state, IssueStateReply, ReadOutcome};
+use crate::forge_slug::valid_slug;
 use crate::workspace_registry::{normalize_path, WorkspaceRegistry};
 
 /// Route label for a read the daemon answered itself.

@@ -241,10 +241,10 @@ fn planned_dir_is_none_when_the_feature_is_off() {
 #[test]
 fn the_env_override_accepts_the_documented_truthy_spellings() {
     for v in ["1", "true", "TRUE", "yes", "on"] {
-        assert!(truthy(v), "{v} must be truthy");
+        assert!(crate::env_flag::parse_truthy(v), "{v} must be truthy");
     }
     for v in ["0", "false", "no", "off", "", "maybe"] {
-        assert!(!truthy(v), "{v} must not be truthy");
+        assert!(!crate::env_flag::parse_truthy(v), "{v} must not be truthy");
     }
 }
 

@@ -156,23 +156,14 @@ fn repos_are_slugs(args: &[String]) -> bool {
         } else {
             a.strip_prefix("--repo=").or_else(|| a.strip_prefix("-R="))
         };
-        if (a == "-R" || a == "--repo" || value.is_some()) && !value.is_some_and(is_slug) {
+        if (a == "-R" || a == "--repo" || value.is_some())
+            && !value.is_some_and(crate::forge_slug::valid_slug)
+        {
             return false;
         }
         i += 1;
     }
     true
-}
-
-/// `owner/name`: exactly one `/`, both halves non-empty and URL-safe.
-#[must_use]
-pub fn is_slug(s: &str) -> bool {
-    let ok = |p: &str| {
-        !p.is_empty()
-            && p.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
-    matches!(s.split_once('/'), Some((o, n)) if ok(o) && ok(n))
 }
 
 #[cfg(test)]

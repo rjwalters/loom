@@ -7,6 +7,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
+use super::landing_span::{self, LandingPath};
 use super::memory::FailureKind;
 use super::waiver::Waived;
 use super::{
@@ -480,7 +481,7 @@ impl Step<'_, '_> {
         };
         let existing: serde_json::Value = serde_json::from_str(&listed.body).unwrap_or_default();
         if let Some(pr) = existing.as_array().and_then(|a| a.first()) {
-            let rule = self.land_pr(pr_number(pr), rule, false);
+            let rule = self.land_pr(pr_number(pr), new, rule, false);
             return Ok(Done::PrOpen(pr_number(pr), pr_url(pr), rule));
         }
         match git::push(self.worktree, self.root, &branch) {
@@ -514,7 +515,7 @@ impl Step<'_, '_> {
         };
         let number = pr_number(&pr);
         log::info!("workspace_resync: {nwo}: opened resync PR for {new}: {}", pr_url(&pr));
-        let rule = self.land_pr(number, rule, true);
+        let rule = self.land_pr(number, new, rule, true);
         Ok(Done::PrOpen(number, pr_url(&pr), rule))
     }
 
@@ -523,7 +524,7 @@ impl Step<'_, '_> {
     /// `label_lane`), then the merge-queue hand-off (#13268). The proof is
     /// the daemon's own; the host gate is read again first, so a pause or a
     /// roll that began since the push holds it.
-    fn land_pr(&self, number: Option<u64>, rule: String, label_lane: bool) -> String {
+    fn land_pr(&self, number: Option<u64>, head: &str, rule: String, label_lane: bool) -> String {
         let nwo = &self.candidate.nwo;
         let waived = match number.and_then(|n| u32::try_from(n).ok()) {
             None => Waived::Lane("no PR number in the reply".to_string()),
@@ -538,6 +539,13 @@ impl Step<'_, '_> {
             waived.reason()
         );
         let note = format!("{}: {}", waived.word(), waived.reason());
+        landing_span::emit(
+            nwo,
+            number,
+            head,
+            LandingPath::Waiver,
+            landing_span::waiver_outcome(&waived),
+        );
         if matches!(waived, Waived::Landed(_)) {
             return format!("{rule}; {note}");
         }
@@ -553,20 +561,27 @@ impl Step<'_, '_> {
                 log::warn!("workspace_resync: {nwo}: could not label resync PR #{n}");
             }
         }
-        format!("{}; {note}", self.land(number, rule))
+        format!("{}; {note}", self.land(number, head, rule))
     }
 
     /// Hand the open resync PR to the merge queue from the daemon (#13268),
     /// and say how that stands after `rule`. Never an error: a PR that cannot
     /// land yet (no Judge approval, a red check) is retried on the next pass,
     /// and the Champion's installed path stays as the other way in.
-    fn land(&self, number: Option<u64>, rule: String) -> String {
+    fn land(&self, number: Option<u64>, head: &str, rule: String) -> String {
         let Some(n) = number.and_then(|n| u32::try_from(n).ok()) else {
             return rule;
         };
         let nwo = &self.candidate.nwo;
         let landed = (self.env.land)(self.root, nwo, n);
         log::info!("workspace_resync: {nwo}: resync PR #{n}: landing {landed:?}");
+        landing_span::emit(
+            nwo,
+            number,
+            head,
+            LandingPath::QueueHandoff,
+            landing_span::queue_outcome(&landed),
+        );
         format!("{rule}; landing: {}", landed_note(&landed))
     }
 }

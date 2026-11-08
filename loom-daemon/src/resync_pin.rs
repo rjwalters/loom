@@ -29,7 +29,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Pin list, read by `resync-installed.sh` and `init::repo_owned`.
 pub const IGNORE_FILE: &str = ".loom/resync-ignore";
@@ -248,12 +247,7 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = crate::git_utils::git_run(dir, args).ok()?;
     out.status.success().then_some(out.stdout)
 }
 

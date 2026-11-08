@@ -83,10 +83,12 @@ fn fresh_run_job_lines_are_offered_before_any_older_span() {
     let q = queue(dir.path(), 8); // backfill limit 6
     assert_eq!(export::backfill(dir.path(), q.as_ref()), 6);
     let first = drain(&q);
-    assert!(first.iter().all(is_priority_envelope), "only priority lines go first");
-    // The bulk cursor has not moved: the span backlog is untouched.
+    // The fast lane takes the larger half of the headroom (#13688) and goes
+    // first; the rest of the pass is the bulk lane's reserved share.
+    assert!(first.iter().take(3).all(is_priority_envelope), "priority lines go first");
+    assert_eq!(first.iter().filter(|env| is_priority_envelope(env)).count(), 3);
     let cursor = export::load_cursor(dir.path());
-    assert_eq!(cursor.byte_offset, 0);
+    assert!(cursor.byte_offset > 0, "the bulk lane got its share");
     assert!(cursor.fast_offset.is_some_and(|offset| offset > 0));
     assert_eq!(cursor.exported, 6);
     assert_eq!(export::pending_count(dir.path()), priority + bulk - 6);
@@ -130,9 +132,10 @@ fn rotation_waits_for_the_fast_lane_and_the_bulk_lane() {
     let path = journal_path(dir.path());
     export::backfill(dir.path(), q.as_ref());
     let mut cursor = export::load_cursor(dir.path());
-    assert!(!export::rotate_if_due(dir.path(), &path, &mut cursor, policy).unwrap());
-    assert!(path.exists());
-    // Drain to completion; only then does a pass rotate.
+    // The bulk cursor has moved (#13688), so the pass may rotate and carry the
+    // unexported tail; nothing is lost either way.
+    export::rotate_if_due(dir.path(), &path, &mut cursor, policy).unwrap();
+    // Drain to completion.
     for _ in 0..1000 {
         drain(&q);
         export::backfill(dir.path(), q.as_ref());
@@ -168,4 +171,71 @@ fn a_pre_priority_lane_cursor_file_starts_the_fast_lane_at_the_bulk_cursor() {
         }
     );
     assert_eq!(export::pending_count(dir.path()), priority + bulk - skip);
+}
+
+/// Refuses every priority (run/job) record forever, accepts the rest: the
+/// fast lane can never pass its first priority line (#13685).
+struct PriorityRefusingSink {
+    taken: std::sync::Mutex<Vec<TelemetryEnvelope>>,
+}
+
+impl crate::observability::queue::QueueSink for PriorityRefusingSink {
+    fn offer(&self, envelope: TelemetryEnvelope) {
+        self.taken.lock().unwrap().push(envelope);
+    }
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        if is_priority_envelope(&envelope) {
+            return Err(std::io::Error::other("refused"));
+        }
+        self.offer(envelope);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_stuck_fast_lane_cannot_starve_the_bulk_lane_or_rotation() {
+    let dir = TempDir::new().unwrap();
+    let (_, bulk) = seeded_reordered(dir.path()); // bulk lines first, priority last
+    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+    std::fs::write(
+        dir.path().join(".loom/config.json"),
+        r#"{"autonomous":{"ciTelemetry":{"journalRotateBytes":1,"journalRotateKeep":2}}}"#,
+    )
+    .unwrap();
+    let path = journal_path(dir.path());
+    let sink = PriorityRefusingSink {
+        taken: std::sync::Mutex::new(Vec::new()),
+    };
+
+    // One pass: the fast lane stops at the first (refused) priority line, yet
+    // the bulk lane still consumes every bulk line before it.
+    export::backfill(dir.path(), &sink);
+    assert_eq!(sink.taken.lock().unwrap().len(), bulk, "all bulk lines offered");
+    // Past the threshold, so the pass rotated, carrying the unexported tail.
+    assert!(
+        super::super::rotation::rotated_path(&path, 1).exists(),
+        "rotation fired although the fast lane never reached EOF"
+    );
+    let cursor = export::load_cursor(dir.path());
+    assert_eq!(cursor.byte_offset, 0, "cursor reset for the new generation");
+    assert_eq!(cursor.exported, bulk as u64);
+}
+
+#[test]
+fn a_sustained_fast_lane_backlog_still_lets_the_bulk_lane_advance_each_pass() {
+    // #13688: priority backlog alone exceeds the backfill limit, and the queue
+    // drains between passes (as the exporter does). Previously the fast lane
+    // refilled the queue to its limit each pass and the bulk cursor stayed 0.
+    let dir = TempDir::new().unwrap();
+    let (priority, bulk) = seeded_reordered(dir.path());
+    assert!(priority > 6 && bulk > 6, "fixture must exceed the small queue");
+    let q = queue(dir.path(), 8); // backfill limit 6, headroom 6 per pass
+    let mut last = 0;
+    for pass in 0..2 {
+        export::backfill(dir.path(), q.as_ref());
+        let cursor = export::load_cursor(dir.path());
+        assert!(cursor.byte_offset > last, "pass {pass}: bulk cursor must advance");
+        last = cursor.byte_offset;
+        drain(&q);
+    }
 }

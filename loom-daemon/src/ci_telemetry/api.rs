@@ -403,8 +403,8 @@ impl GhCliApi {
     /// #9537: a `repos/<owner>/<repo>/…` path is a repo-scoped read, so it
     /// runs under that repo's reader App when one is usable (readers carry
     /// `actions: read`). A rate limit or an auth/coverage refusal withdraws
-    /// the reader (until the reported reset, when there is one) and the same
-    /// call is retried once on the writer's credential.
+    /// the reader (until the reported reset, when there is one); the read is
+    /// never retried on the writer (#12394).
     fn run(&self, path: &str, extra: &[&str]) -> Result<ApiResponse, ApiError> {
         self.run_for(repo_of_path(path), path, extra)
     }
@@ -420,7 +420,7 @@ impl GhCliApi {
     ) -> Result<ApiResponse, ApiError> {
         let (route, nwo) = route_and_repo(nwo, path);
         let reader = route.as_deref().and_then(|r| (self.reader_for)(r));
-        // The shared reader → writer retry (#9872, `reader_then_writer`).
+        // One reader attempt (#12394: a read never falls through to the writer).
         let attempt = crate::forge_identity::read_via_reader(
             reader.as_ref().map(|(dir, _)| dir.as_path()),
             |dir, role| {

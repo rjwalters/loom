@@ -526,6 +526,13 @@ pub trait QueueSink: Send + Sync {
     fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
         self.offer_durable(envelope).map(|()| Admission::Admitted)
     }
+
+    /// How many more backfill offers the sink would admit right now (#13688),
+    /// or `None` for a sink with no capacity notion. The export pass uses it
+    /// to split one pass's admission between its fast and bulk lanes.
+    fn backfill_headroom(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl QueueSink for DurableQueue {
@@ -539,6 +546,10 @@ impl QueueSink for DurableQueue {
 
     fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
         self.push_bounded(envelope)
+    }
+
+    fn backfill_headroom(&self) -> Option<usize> {
+        Some(backfill_limit(self.capacity).saturating_sub(self.lock().items.len()))
     }
 }
 
@@ -580,6 +591,14 @@ impl QueueSink for FanoutQueue {
             queue.push_durable(envelope.clone())?;
         }
         Ok(())
+    }
+
+    /// The tightest member queue's headroom (an offer needs room in all).
+    fn backfill_headroom(&self) -> Option<usize> {
+        self.queues
+            .iter()
+            .filter_map(|queue| queue.backfill_headroom())
+            .min()
     }
 
     /// All-or-defer across unequal queues (#11115). Every queue's lock is

@@ -124,6 +124,38 @@ impl Source for Gh<'_> {
         Ok(v["ref"].as_str() == Some(&format!("refs/tags/{tag}")))
     }
 
+    fn release_published(&self, kind: Kind, tag: &str) -> Result<bool, String> {
+        let v = self.json(
+            "resync_waiver.release",
+            &format!("repos/{}/releases/tags/{tag}", kind.upstream()),
+        )?;
+        Ok(v["tag_name"].as_str() == Some(tag) && v["draft"].as_bool() == Some(false))
+    }
+
+    fn resync_ignore(&self, sha: &str) -> Result<Vec<String>, String> {
+        let got = self.gh(
+            "resync_waiver.resync_ignore",
+            AccessIntent::Read,
+            &[
+                "api",
+                "-H",
+                "Accept: application/vnd.github.raw",
+                &format!("repos/{}/contents/.loom/resync-ignore?ref={sha}", self.nwo),
+            ],
+        );
+        match got {
+            Ok(raw) => Ok(raw
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()),
+            // No pin file is the common case; anything else is unreadable.
+            Err(e) if e.contains("404") || e.contains("Not Found") => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     fn upstream_blob(&self, kind: Kind, path: &str, tag: &str) -> Result<Option<String>, String> {
         let v = self.json(
             "resync_waiver.upstream_blob",
@@ -264,8 +296,10 @@ pub fn waive(root: &Path, nwo: &str, number: u32) -> Waived {
 /// `RESYNC_WAIVER=ELIGIBLE`, `RESYNC_WAIVER_TAG=<tag>` and one
 /// `RESYNC_WAIVER_RECORD=<path>: <sha>` line per kept-set file; any other
 /// outcome exits 1 with `RESYNC_WAIVER=NOT_ELIGIBLE` and the reason on
-/// stderr. Callers treat any non-zero exit as `NOT ELIGIBLE`.
-pub fn cli(pr: u32, repo: Option<&str>) -> i32 {
+/// stderr. Callers treat any non-zero exit as `NOT ELIGIBLE`. With `strict`
+/// (#13668) it runs the daemon's landing proof instead, read-only: no label,
+/// comment or merge is written.
+pub fn cli(pr: u32, repo: Option<&str>, strict: bool) -> i32 {
     let root = std::env::current_dir().unwrap_or_default();
     let nwo = match repo {
         Some(r) => r.to_string(),
@@ -299,10 +333,21 @@ pub fn cli(pr: u32, repo: Option<&str>) -> i32 {
         root: &root,
         nwo: &nwo,
     };
-    match waiver::evaluate(&gh, pr) {
-        waiver::Verdict::Eligible { tag, record, .. } => {
+    let verdict = if strict {
+        waiver::evaluate_strict(&gh, pr)
+    } else {
+        waiver::evaluate(&gh, pr)
+    };
+    match verdict {
+        waiver::Verdict::Eligible {
+            tag,
+            record,
+            gate_paths_included,
+            ..
+        } => {
             println!("RESYNC_WAIVER=ELIGIBLE");
             println!("RESYNC_WAIVER_TAG={tag}");
+            println!("RESYNC_WAIVER_GATE_PATHS_INCLUDED={gate_paths_included}");
             for (path, sha) in record {
                 println!("RESYNC_WAIVER_RECORD={path}: {sha}");
             }

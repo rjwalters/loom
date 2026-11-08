@@ -301,7 +301,7 @@ pub fn published_cap() -> Option<CapView> {
 #[must_use]
 pub fn fallback_repo_ref(root: &Path) -> Option<QueueRepoRef> {
     let (host, repo) = crate::forge_etag_store::remote_identity(root)?;
-    if host != "github.com" || !crate::agent_gh::classify::is_slug(&repo) {
+    if host != "github.com" || !crate::forge_slug::valid_slug(&repo) {
         return None;
     }
     let visibility =

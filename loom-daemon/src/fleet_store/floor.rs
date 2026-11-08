@@ -9,20 +9,13 @@
 //! loom_min_version: "0.19.830"
 //! ```
 //!
-//! In `fleet.json` it is always a JSON string. In `repos.yml` quote it; an
-//! unquoted `X.Y.Z` is also read (YAML parses it as a string), while an
-//! unquoted `X.Y` is a number and is refused.
+//! It is always a JSON string in `fleet.json`.
 //!
 //! Read from the top level of the store's compiled `fleet.json`
-//! ([`super::FLEET_JSON_PATH`], via [`super::compiled`]) when that file is
-//! present, and otherwise from the top level of `repos.yml`
-//! ([`super::ROSTER_PATH`]). A `fleet.json` that is present is the only
-//! source: without the key the result is **Absent**, and `repos.yml` is not
-//! consulted. One that is present but not a valid compiled document is
-//! **Malformed**, again with no fallback. The `repos.yml` fallback lives
-//! entirely in [`from_repos_yml`] so the legacy-fallback removal (#10705
-//! follow-up) can delete it in one place; [`super::roster::parse`] is
-//! deliberately not widened to know about the key.
+//! ([`super::FLEET_JSON_PATH`], via [`super::compiled`]). Without the key, or
+//! without a `fleet.json`, the result is **Absent**; a legacy `repos.yml` is no
+//! longer read. A `fleet.json` that is present but not a valid compiled
+//! document is **Malformed**.
 //!
 //! # Outcomes
 //!
@@ -42,13 +35,13 @@ use serde_json::Value;
 
 use super::{compiled, fetch::Snapshot};
 
-/// The key, in both sources.
+/// The key.
 pub const KEY: &str = "loom_min_version";
 
 /// What one snapshot says about the floor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloorRead {
-    /// Neither source carries the key.
+    /// No `fleet.json`, or it lacks the key.
     Absent,
     /// A well-formed floor.
     Valid {
@@ -66,60 +59,22 @@ pub enum FloorRead {
     },
 }
 
-/// Read the floor from `snapshot`: the compiled `fleet.json` when present,
-/// else the top level of `repos.yml`.
+/// Read the floor from `snapshot`'s compiled `fleet.json`.
 #[must_use]
 pub fn read(snapshot: &Snapshot) -> FloorRead {
     match compiled::from_snapshot(snapshot) {
         // `roster()` is the whole top-level document, so this is the top-level
         // `loom_min_version` key of `fleet.json`.
-        Ok(Some(c)) => {
-            return c
-                .roster()
-                .get(KEY)
-                .map_or(FloorRead::Absent, |value| classify(value, super::FLEET_JSON_PATH))
-        }
-        Ok(None) => {}
-        Err(e) => {
-            return FloorRead::Malformed {
-                source: super::FLEET_JSON_PATH,
-                detail: format!("{e:#}"),
-            }
-        }
-    }
-    match source_text(snapshot, super::ROSTER_PATH) {
-        Err(read) => read,
+        Ok(Some(c)) => c
+            .roster()
+            .get(KEY)
+            .map_or(FloorRead::Absent, |value| classify(value, super::FLEET_JSON_PATH)),
         Ok(None) => FloorRead::Absent,
-        Ok(Some(text)) => match from_repos_yml(&text) {
-            Ok(Some(value)) => classify(&value, super::ROSTER_PATH),
-            Ok(None) => FloorRead::Absent,
-            Err(detail) => FloorRead::Malformed {
-                source: super::ROSTER_PATH,
-                detail,
-            },
+        Err(e) => FloorRead::Malformed {
+            source: super::FLEET_JSON_PATH,
+            detail: format!("{e:#}"),
         },
     }
-}
-
-fn source_text(snapshot: &Snapshot, path: &'static str) -> Result<Option<String>, FloorRead> {
-    snapshot.text(path).map_err(|e| FloorRead::Malformed {
-        source: path,
-        detail: format!("{e:#}"),
-    })
-}
-
-/// The raw `loom_min_version` value at the top level of `repos.yml`, `None`
-/// when the key is absent. `Err` when the file is not a YAML mapping.
-///
-/// The legacy source, used only when the store has no `fleet.json`; the
-/// legacy-fallback removal (#10705 follow-up) deletes this function together
-/// with its call in [`read`].
-fn from_repos_yml(text: &str) -> Result<Option<Value>, String> {
-    let doc = super::yaml::parse(text).map_err(|e| format!("not valid YAML ({e:#})"))?;
-    let top = doc
-        .as_object()
-        .ok_or_else(|| "top level must be a mapping".to_string())?;
-    Ok(top.get(KEY).cloned())
 }
 
 fn classify(value: &Value, source: &'static str) -> FloorRead {

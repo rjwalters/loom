@@ -812,7 +812,11 @@ pub enum ForgeCmd {
     /// `forge additive-migrations` (#13102): see [`crate::forge_additive_migrations`].
     AdditiveMigrations(crate::forge_additive_migrations::Args),
     /// `forge resync-waiver` (#13487): the resync waiver proof, shared with the daemon's landing.
-    ResyncWaiver { pr: u32, repo: Option<String> },
+    ResyncWaiver {
+        pr: u32,
+        repo: Option<String>,
+        strict: bool,
+    },
     /// `forge suspect-critical-diff` (#12999): see [`crate::forge_suspect_critical_diff`].
     SuspectCriticalDiff(crate::forge_suspect_critical_diff::Args),
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
@@ -899,8 +903,8 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ),
         ForgeCmd::VersionOnlyDiff(args) => crate::forge_version_only_diff::handle(&args),
         ForgeCmd::AdditiveMigrations(args) => crate::forge_additive_migrations::handle(&args),
-        ForgeCmd::ResyncWaiver { pr, repo } => std::process::exit(
-            crate::fleet_sync::workspace_resync::waiver_gh::cli(pr, repo.as_deref()),
+        ForgeCmd::ResyncWaiver { pr, repo, strict } => std::process::exit(
+            crate::fleet_sync::workspace_resync::waiver_gh::cli(pr, repo.as_deref(), strict),
         ),
         ForgeCmd::SuspectCriticalDiff(args) => crate::forge_suspect_critical_diff::handle(&args),
         ForgeCmd::MergeMethod { repo, requested } => {

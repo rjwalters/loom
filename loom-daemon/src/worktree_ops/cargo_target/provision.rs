@@ -109,19 +109,15 @@ impl Provision {
 pub fn enabled(repo_root: &Path) -> bool {
     if let Ok(raw) = std::env::var(ENABLE_ENV) {
         if !raw.trim().is_empty() {
-            return truthy(raw.trim());
+            return crate::env_flag::parse_truthy(raw.trim());
         }
     }
     let config = crate::config_resolver::resolve_effective_config(repo_root);
     match crate::config_resolver::get_path(&config, CONFIG_KEY) {
         Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::String(s)) => truthy(s.trim()),
+        Some(serde_json::Value::String(s)) => crate::env_flag::parse_truthy(s.trim()),
         _ => false,
     }
-}
-
-fn truthy(value: &str) -> bool {
-    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 /// Decide and act: give `worktree_path` its own Cargo target dir and record it,

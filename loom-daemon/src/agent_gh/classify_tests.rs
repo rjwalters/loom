@@ -6,7 +6,7 @@
 //! mutation, every `api` call and every unrecognised shape must be
 //! Passthrough.
 
-use super::{classify, is_slug, Entity, Route};
+use super::{classify, Entity, Route};
 
 /// Minimal quote-aware split, enough for the table below.
 fn argv(s: &str) -> Vec<String> {
@@ -260,23 +260,5 @@ fn every_issue_and_pr_verb_but_view_and_list_passes_through() {
             let cmd = argv(&format!("{entity} {verb} 42 --json state"));
             assert_eq!(classify(&cmd), Route::Passthrough, "gh {cmd:?}");
         }
-    }
-}
-
-#[test]
-fn slugs() {
-    for ok in ["o/r", "rjwalters/loom", "2AMLogic/2am", "a-b/c.d_e"] {
-        assert!(is_slug(ok), "{ok}");
-    }
-    for bad in [
-        "",
-        "o",
-        "o/",
-        "/r",
-        "github.com/o/r",
-        "https://github.com/o/r",
-        "o/r?x",
-    ] {
-        assert!(!is_slug(bad), "{bad}");
     }
 }

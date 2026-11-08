@@ -94,25 +94,6 @@ pub fn parse_state(stdout: &[u8]) -> ReadOutcome {
     }
 }
 
-/// Strict `owner/repo` shape: two non-empty segments of `[A-Za-z0-9._-]`,
-/// neither starting with `-` or `.`, each at most 100 characters. Rejects
-/// anything that could smuggle a flag, a path or a host into `gh`.
-#[must_use]
-pub fn valid_slug(slug: &str) -> bool {
-    let mut parts = slug.split('/');
-    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    [owner, repo].iter().all(|seg| {
-        !seg.is_empty()
-            && seg.len() <= 100
-            && !seg.starts_with(['-', '.'])
-            && seg
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    })
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
