@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-08
 
+- **PR #13693**: fix: stop rendering daemon runtime path env into the systemd unit
+- **Issue #13692** (closed): auto-update relaunch bakes the daemon's runtime LOOM_PID_FILE/LOOM_WORKSPACE/LOOM_HOST_ID into the base systemd unit
 - **PR #13698**: test: gate cursor_tick runs until the dispatch walk returns
 - **Issue #13697** (closed): test flake: concurrent_dispatch cursor_persisted_across_restart_admits_tail_before_head_repeats fails on Rust Unit Tests (3/5)
 
