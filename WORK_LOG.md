@@ -16,6 +16,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-08
 
+- **PR #13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
+- **PR #13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
+- **PR #13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
+- **Issue #13680** (closed): resync-installed.sh: false 'pin had no effect' for guard-destructive-generic.sh when the canonical Repo Skills guard is present
+- **Issue #13619** (closed): remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work
+- **Issue #13261** (closed): Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon
 - **PR #13708**: feat: tick ratification lane from step dispatch and record every tick
 - **PR #13705**: feat: add --strict read-only replay to forge resync-waiver
 - **Issue #13707** (closed): Ratification lane never runs on the fleet: tick_for_root is only called from the champion role tick, not step-dispatched Champion
