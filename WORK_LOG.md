@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-08
 
+- **PR #13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
+- **Issue #13702** (closed): land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record
 - **PR #13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
 - **PR #13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
 - **PR #13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
