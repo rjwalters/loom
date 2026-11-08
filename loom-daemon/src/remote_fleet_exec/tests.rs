@@ -523,3 +523,91 @@ fn unresolved_ask_text_names_the_scoping_option_but_protected_does_not() {
     assert!(!protected.contains("remoteUnmanagedHosts"), "{protected}");
     assert!(protected.contains("break-glass"));
 }
+
+// ---- `-F <config>` resolution and rule names in the ask text (#13619) ----
+
+/// A workspace with `.loom/config.json` and an ssh config mapping `vm-a` to
+/// `100.100.1.5`, checked through the real roster (`ssh -G`).
+struct CfgFx {
+    dir: tempfile::TempDir,
+}
+
+impl CfgFx {
+    fn new(guards: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(".loom/config.json"), format!("{{\"guards\":{guards}}}"))
+            .unwrap();
+        std::fs::write(dir.path().join("run.cfg"), "Host vm-a\n  HostName 100.100.1.5\n").unwrap();
+        Self { dir }
+    }
+
+    fn ask(&self, command: &str) -> Option<String> {
+        let ctx = Context {
+            cwd: self.dir.path(),
+            home: Some(self.dir.path().to_path_buf()),
+        };
+        let roster = super::roster::ProcessRoster::new(self.dir.path());
+        check(command, &ctx, &roster, || true, || None, "2026-11-06")
+    }
+}
+
+const DESTRUCTIVE: &str = "'git reset --hard'";
+
+#[test]
+fn ssh_config_alias_is_resolved_against_the_dash_f_file() {
+    let listed = CfgFx::new(r#"{"remoteUnmanagedHosts":["100.100.0.0/16"]}"#);
+    assert_eq!(listed.ask(&format!("ssh -F run.cfg vm-a {DESTRUCTIVE}")), None);
+    assert_eq!(listed.ask(&format!("ssh -Frun.cfg vm-a {DESTRUCTIVE}")), None);
+
+    // Not listed: the resolved tailnet address makes it a fleet host.
+    let unlisted = CfgFx::new("{}");
+    let r = unlisted
+        .ask(&format!("ssh -F run.cfg vm-a {DESTRUCTIVE}"))
+        .expect("asks");
+    assert!(r.contains("the tailnet address range"), "{r}");
+    assert!(r.contains("`ssh -G` to `100.100.1.5`"), "{r}");
+
+    // Without `-F` the alias is unresolvable here: behaviour is unchanged.
+    assert_eq!(listed.ask(&format!("ssh vm-a {DESTRUCTIVE}")), None);
+}
+
+#[test]
+fn scp_dash_f_config_is_honored() {
+    let listed = CfgFx::new(r#"{"remoteUnmanagedHosts":["100.100.0.0/16"]}"#);
+    assert_eq!(listed.ask("scp -F run.cfg x vm-a:/srv/"), None);
+    let unlisted = CfgFx::new("{}");
+    assert!(unlisted.ask("scp -F run.cfg x vm-a:/srv/").is_some());
+}
+
+#[test]
+fn missing_dash_f_file_adds_no_allow() {
+    // The listed range does not cover this literal address, and a bad `-F`
+    // cannot resolve anything that would.
+    let fx = CfgFx::new(r#"{"remoteUnmanagedHosts":["100.100.0.0/16"]}"#);
+    assert!(fx
+        .ask(&format!("ssh -F nope.cfg ubuntu@100.64.1.2 {DESTRUCTIVE}"))
+        .is_some());
+}
+
+#[test]
+fn roster_host_stays_protected_even_if_listed_and_names_its_rule() {
+    let fx =
+        CfgFx::new(r#"{"remoteUnmanagedHosts":["100.100.0.0/16"],"remoteFleetHosts":["vm-a"]}"#);
+    let r = fx
+        .ask(&format!("ssh -F run.cfg vm-a {DESTRUCTIVE}"))
+        .expect("asks");
+    assert!(r.contains("`guards.remoteFleetHosts`"), "{r}");
+}
+
+#[test]
+fn literal_tailnet_host_ask_names_the_range_rule() {
+    let fx = CfgFx::new("{}");
+    let r = fx
+        .ask(&format!("ssh ubuntu@100.64.1.2 {DESTRUCTIVE}"))
+        .expect("asks");
+    assert!(
+        r.contains("fleet host `100.64.1.2` (classified by the tailnet address range)"),
+        "{r}"
+    );
+}
