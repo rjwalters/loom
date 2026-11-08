@@ -96,3 +96,45 @@ fn an_applied_write_journals_one_entry() {
             if action == "blocked" && by == "park_record"
     ));
 }
+
+/// #12362: `head_sha` is additive on an `Applied` line.
+#[test]
+fn an_applied_line_without_a_head_still_parses_and_one_with_it_round_trips() {
+    let old = r#"{"kind":"applied","at":"2026-10-15T03:00:00Z","number":7,"is_pr":true,"action":"approved","by":"verdict-labels"}"#;
+    assert!(matches!(
+        parse(old).as_slice(),
+        [JournalEntry::Applied {
+            number: 7,
+            head_sha: None,
+            ..
+        }]
+    ));
+    let ((), entries) =
+        with_journal(|| record_applied_at(7, true, "approved", "verdict-labels", Some("abc123")));
+    assert!(matches!(
+        entries.as_slice(),
+        [JournalEntry::Applied { head_sha: Some(sha), .. }] if sha == "abc123"
+    ));
+    let line = serde_json::to_string(&entries[0]).unwrap();
+    assert_eq!(parse(&line), entries);
+    let ((), none) = with_journal(|| record_applied(7, true, "approved", "x"));
+    assert!(!serde_json::to_string(&none[0])
+        .unwrap()
+        .contains("head_sha"));
+}
+
+/// #12362: `forge verdict-labels` journals through `record_verdict`; a run
+/// without a journal makes no write, and the helper makes no forge call.
+#[test]
+fn a_verdict_write_journals_one_applied_entry_with_the_head() {
+    let ((), entries) = with_journal(|| record_verdict(31, "changes_requested", Some("abc123")));
+    assert!(matches!(
+        entries.as_slice(),
+        [JournalEntry::Applied { number: 31, is_pr: true, action, by, head_sha: Some(sha), .. }]
+            if action == "changes_requested" && by == "verdict-labels" && sha == "abc123"
+    ));
+    set_test_journal(None);
+    if std::env::var_os(PICK_JOURNAL_ENV).is_none() {
+        record_verdict(31, "approved", None);
+    }
+}

@@ -64,7 +64,7 @@ fn project(e: &Evidence) -> Option<Projection> {
     };
     // A journaled hand-off to a human is the step's own write: it wins.
     let handed_off = e.events.iter().rev().find_map(|event| match event {
-        Event::Applied { at, action, by }
+        Event::Applied { at, action, by, .. }
             if matches!(
                 (action.as_str(), by.as_str()),
                 ("escalated", "operator_decision") | ("blocked", "park_record")
