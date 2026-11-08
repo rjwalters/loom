@@ -16,6 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-08
 
+- **PR #13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
+- **Issue #13673** (closed): Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
+- **PR #13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
+- **Issue #13665** (closed): Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33)
 - **PR #13693**: fix: stop rendering daemon runtime path env into the systemd unit
 - **Issue #13692** (closed): auto-update relaunch bakes the daemon's runtime LOOM_PID_FILE/LOOM_WORKSPACE/LOOM_HOST_ID into the base systemd unit
 - **PR #13698**: test: gate cursor_tick runs until the dispatch walk returns
