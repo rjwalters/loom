@@ -376,6 +376,13 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
     prove(src, number, false)
 }
 
+/// The strict proof (what the daemon's `land()` runs), read-only, for
+/// `forge resync-waiver --strict` (#13668).
+#[must_use]
+pub fn evaluate_strict(src: &dyn Source, number: u32) -> Verdict {
+    prove(src, number, true)
+}
+
 /// The proof the daemon merges on alone (no Judge, no Champion): with `strict`
 /// set every changed file must be an added/modified byte-copy of its upstream
 /// counterpart at the tag, not only the kept-set files. A file with no upstream

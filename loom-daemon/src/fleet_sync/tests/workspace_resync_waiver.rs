@@ -527,6 +527,19 @@ fn byte_identical_gate_role_and_skill_files_land_under_the_strict_proof_only() {
 }
 
 #[test]
+fn strict_evaluation_refuses_what_the_non_strict_proof_passes() {
+    // A kept-set file plus a file with no upstream mapping: non-strict only
+    // byte-checks the kept set, strict refuses the unmapped file (#13668).
+    let mut f = Fake::ok();
+    let mut files = f.files.clone().expect("files");
+    files.push(file(".loom/docs/other.md", "zz", "modified"));
+    f.files = Ok(files);
+    f.changed += 1;
+    assert!(matches!(evaluate(&f, 1), Verdict::Eligible { .. }));
+    assert!(matches!(evaluate_strict(&f, 1), Verdict::NotEligible(_)));
+}
+
+#[test]
 fn a_gate_file_one_byte_off_the_tag_takes_the_lane() {
     for i in 0..3 {
         let mut f = gate_pr();

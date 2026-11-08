@@ -2308,7 +2308,8 @@ other outcome keeps the `loom:review-requested` lane: a differing byte, a
 rename or removal, an unmapped file or one outside the install set, or a path
 pinned in `.loom/resync-ignore` at the PR head (or an unreadable pin file). The
 Repo Skills kind still refuses gate paths, and Champion's own (non-strict)
-`forge resync-waiver` proof is unchanged. The merge comment and the
+`forge resync-waiver` proof is unchanged; `forge resync-waiver <PR> --strict` replays the
+daemon's strict proof read-only (#13668). The merge comment and the
 `landed-by-daemon` status line record the tag, the file count and
 `gate_paths_included`; the daemon log line `resync_waiver: PR #N landed:` carries
 the same fields.

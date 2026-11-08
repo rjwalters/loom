@@ -296,8 +296,10 @@ pub fn waive(root: &Path, nwo: &str, number: u32) -> Waived {
 /// `RESYNC_WAIVER=ELIGIBLE`, `RESYNC_WAIVER_TAG=<tag>` and one
 /// `RESYNC_WAIVER_RECORD=<path>: <sha>` line per kept-set file; any other
 /// outcome exits 1 with `RESYNC_WAIVER=NOT_ELIGIBLE` and the reason on
-/// stderr. Callers treat any non-zero exit as `NOT ELIGIBLE`.
-pub fn cli(pr: u32, repo: Option<&str>) -> i32 {
+/// stderr. Callers treat any non-zero exit as `NOT ELIGIBLE`. With `strict`
+/// (#13668) it runs the daemon's landing proof instead, read-only: no label,
+/// comment or merge is written.
+pub fn cli(pr: u32, repo: Option<&str>, strict: bool) -> i32 {
     let root = std::env::current_dir().unwrap_or_default();
     let nwo = match repo {
         Some(r) => r.to_string(),
@@ -331,7 +333,12 @@ pub fn cli(pr: u32, repo: Option<&str>) -> i32 {
         root: &root,
         nwo: &nwo,
     };
-    match waiver::evaluate(&gh, pr) {
+    let verdict = if strict {
+        waiver::evaluate_strict(&gh, pr)
+    } else {
+        waiver::evaluate(&gh, pr)
+    };
+    match verdict {
         waiver::Verdict::Eligible {
             tag,
             record,
