@@ -23,18 +23,54 @@ fn is_clear(body: &str) -> bool {
 /// `trusted` is the PR's trusted comment bodies, oldest first (an untrusted
 /// quote of a marker is prose, not state). A clear is head-bound only through
 /// the hold-state record it follows: with no record at `head` it is not one.
+///
+/// A record written in the *same* comment as the clear carries the head at
+/// Champion's tick, not the head the human cleared (the head may have moved in
+/// between). Such a clear covers `head` only when the hold it released was
+/// itself recorded at `head`: the previous record must equal `head` too.
 #[must_use]
 pub fn champion_clear_at<C: AsRef<str>>(trusted: &[C], head: &str) -> bool {
+    clear_verdict(trusted, head) == ClearVerdict::Covers
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClearVerdict {
+    Covers,
+    /// No record, or no clear after it: nothing ties a clear to any head.
+    NoClear,
+    /// A record exists but the clear is not provably for the live head.
+    HeadMismatch,
+}
+
+fn clear_verdict<C: AsRef<str>>(trusted: &[C], head: &str) -> ClearVerdict {
     let Some(rec) = trusted
         .iter()
         .rposition(|c| recorded_head(c.as_ref()).is_some())
     else {
-        return false;
+        return ClearVerdict::NoClear;
     };
     if recorded_head(trusted[rec].as_ref()).as_deref() != Some(head) {
-        return false;
+        return ClearVerdict::HeadMismatch;
     }
-    trusted[rec..].iter().any(|c| is_clear(c.as_ref())) && standing_hold(trusted).is_none()
+    if standing_hold(trusted).is_some() {
+        return ClearVerdict::NoClear;
+    }
+    if trusted[rec + 1..].iter().any(|c| is_clear(c.as_ref())) {
+        return ClearVerdict::Covers;
+    }
+    if !is_clear(trusted[rec].as_ref()) {
+        return ClearVerdict::NoClear;
+    }
+    // Clear shares the record's comment: the released hold must be at `head`.
+    let prior = trusted[..rec]
+        .iter()
+        .rev()
+        .find_map(|c| recorded_head(c.as_ref()));
+    if prior.as_deref() == Some(head) {
+        ClearVerdict::Covers
+    } else {
+        ClearVerdict::HeadMismatch
+    }
 }
 
 /// `None` to proceed; `Some(reason)` to wait.
@@ -44,8 +80,15 @@ pub fn decide(proven: bool, comments: Result<Vec<String>, String>, head: &str) -
         return None;
     }
     match comments {
-        Ok(c) if champion_clear_at(&c, head) => None,
-        Ok(_) => Some(format!("no byte-identity proof and no Champion clear at {head}")),
+        Ok(c) => match clear_verdict(&c, head) {
+            ClearVerdict::Covers => None,
+            ClearVerdict::NoClear => {
+                Some(format!("no byte-identity proof and no Champion clear at {head}"))
+            }
+            ClearVerdict::HeadMismatch => Some(format!(
+                "clear-head-mismatch: Champion clear is not provably for live head {head}"
+            )),
+        },
         Err(e) => Some(format!("Champion clear unreadable at {head} ({e}); not enqueued")),
     }
 }
@@ -94,6 +137,40 @@ mod tests {
     #[test]
     fn clear_at_older_head_waits() {
         assert!(decide(false, Ok(vec![hold(H1), cleared()]), H2).is_some());
+    }
+
+    fn release(h: &str) -> String {
+        format!("{MERGE_RISK_CLEARED_MARKER}\nreleased\n<!-- champion:hold-state head={h} -->")
+    }
+
+    #[test]
+    fn same_comment_clear_and_record_at_moved_head_waits_with_token() {
+        // Hold at A, human clears at A, head pushes to B, Champion writes a
+        // release+record at B: the clear never covered B.
+        let r = decide(false, Ok(vec![hold(H1), release(H2)]), H2);
+        assert!(r.unwrap().contains("clear-head-mismatch"));
+    }
+
+    #[test]
+    fn same_comment_clear_and_record_after_hold_at_same_head_enqueues() {
+        assert!(decide(false, Ok(vec![hold(H1), release(H1)]), H1).is_none());
+    }
+
+    #[test]
+    fn same_comment_clear_without_prior_record_waits() {
+        assert!(decide(false, Ok(vec![release(H1)]), H1).is_some());
+    }
+
+    #[test]
+    fn older_head_record_reports_mismatch_token() {
+        let r = decide(false, Ok(vec![hold(H1), cleared()]), H2);
+        assert!(r.unwrap().contains("clear-head-mismatch"));
+    }
+
+    #[test]
+    fn no_record_keeps_legacy_reason() {
+        let r = decide(false, Ok(vec![cleared()]), H1).unwrap();
+        assert!(r.contains("no byte-identity proof") && !r.contains("clear-head-mismatch"));
     }
 
     #[test]
