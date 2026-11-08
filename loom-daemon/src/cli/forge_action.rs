@@ -606,6 +606,26 @@ pub(crate) enum ForgeAction {
         repo: Option<String>,
     },
 
+    /// `forge locked-deps-only <pr> [--repo OWNER/REPO]` (2am#6942 ruling, 2026-11-07) — does
+    /// PR `<pr>` add no third-party package? Every `Cargo.lock` patch adds no `source =` /
+    /// `checksum =` line and changes no existing package, no `Cargo.toml` line names `git =`,
+    /// `registry =`, `build =`, `links =`, `[patch]`, `[replace]` or an out-of-repo `path =`,
+    /// and a manifest change comes with a lock change. Backs Champion's opt-in
+    /// `lockedDepsOnly` class key.
+    ///
+    /// Exits 0 (`LOCKED_DEPS_ONLY=1`) ONLY when all of that was read and held. Any other
+    /// outcome exits 1 with the reason on stderr. Callers treat any non-zero exit as "hold".
+    #[command(name = "locked-deps-only")]
+    LockedDepsOnly {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge resync-waiver <pr> [--repo OWNER/REPO]` (#13487) — the resync waiver proof
     /// (#13096): is PR `<pr>` a `chore(loom): resync installed Loom to vX` whose changed
     /// kept-set files are byte-identical to the tag? Exit 0 prints `RESYNC_WAIVER=ELIGIBLE`,
@@ -1406,6 +1426,12 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         }),
         ForgeAction::AdditiveMigrations { pr_number, repo } => {
             ForgeCmd::AdditiveMigrations(crate::forge_additive_migrations::Args {
+                pr: pr_number,
+                repo,
+            })
+        }
+        ForgeAction::LockedDepsOnly { pr_number, repo } => {
+            ForgeCmd::LockedDepsOnly(crate::forge_locked_deps_only::Args {
                 pr: pr_number,
                 repo,
             })

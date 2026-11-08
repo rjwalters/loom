@@ -234,6 +234,7 @@ pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;
 pub mod forge_listing;
+pub mod forge_locked_deps_only;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_merge_queue;

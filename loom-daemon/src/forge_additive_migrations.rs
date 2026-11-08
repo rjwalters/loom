@@ -332,7 +332,7 @@ where
 }
 
 /// Reject file names that could address a different API endpoint.
-fn safe_path(file: &str) -> bool {
+pub(crate) fn safe_path(file: &str) -> bool {
     !file.is_empty()
         && !file.starts_with('/')
         && !file
@@ -344,7 +344,7 @@ fn safe_path(file: &str) -> bool {
 }
 
 /// Decode a `repos/<r>/contents/<f>?ref=<sha>` JSON body to text.
-fn decode_contents(body: &[u8]) -> Result<String, String> {
+pub(crate) fn decode_contents(body: &[u8]) -> Result<String, String> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
@@ -366,7 +366,7 @@ fn gh_read(gh_bin: &Path, path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// The PR head SHA.
-fn gh_head_sha(gh_bin: &Path, repo: &str, pr: u32) -> Result<String, String> {
+pub(crate) fn gh_head_sha(gh_bin: &Path, repo: &str, pr: u32) -> Result<String, String> {
     let body = gh_read(gh_bin, &format!("repos/{repo}/pulls/{pr}"))?;
     let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
     v.pointer("/head/sha")
