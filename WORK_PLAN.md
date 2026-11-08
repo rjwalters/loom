@@ -13,8 +13,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
 - **#13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
-- **#13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
-- **#13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
 - **#13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
 - **#13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
 
@@ -31,7 +29,6 @@ _None._
 - **#10420**: loom-daemon on Linux: ~2.2 GB RSS baseline (Macs ~200 MB); ci_telemetry adds ~2.2 GB and its spans overflow the 2000-record export queue
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
-- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
 
 ## Ready
 
@@ -49,9 +46,9 @@ Issues currently being built (`loom:building`).
 
 - **#13578**: Promotion author gate re-holds an issue the operator already adopted, after landed-route re-curation
 - **#13619**: remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work
-- **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33)
-- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
+- **#13668**: Replay strict resync waiver on recent fasterhenry resync PRs (follow-up to #13665)
 - **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files
+- **#13702**: land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record
 
 ## PRs Awaiting Review
 
@@ -61,6 +58,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
 - **#13593**: fix: put a clean stranded primary checkout back on the default branch
+- **#13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
 
 ## Approved (Awaiting Merge)
 
@@ -71,8 +69,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
 - **#13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
-- **#13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
-- **#13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
 - **#13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
 - **#13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
 
@@ -129,10 +125,10 @@ Issues carrying `loom:curated`.
 - **#13590**: Observe convert_awaiting_revision_parks on a live Guide tick (#10936 follow-up) *(curated)*
 - **#13619**: remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work *(curated)*
 - **#13640**: ci_telemetry: owner-kind probe users/2amlogic hangs 120s every cycle in the daemon (0.3s by hand) and a timeout never fails over — 2AMLogic CI dropped 20+ days *(curated)*
-- **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33) *(curated)*
-- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35) *(curated)*
+- **#13668**: Replay strict resync waiver on recent fasterhenry resync PRs (follow-up to #13665) *(curated)*
 - **#13680**: resync-installed.sh: false 'pin had no effect' for guard-destructive-generic.sh when the canonical Repo Skills guard is present *(curated)*
 - **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files *(curated)*
+- **#13702**: land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -153,13 +149,13 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 8 |
+| Operator merge-risk holds | 6 |
 | Very important | 0 |
-| Important | 4 |
+| Important | 3 |
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 9 |
+| PRs awaiting review | 5 |
+| Approved PRs awaiting merge | 7 |
 | Curated | 53 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 7 |
