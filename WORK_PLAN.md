@@ -11,11 +11,8 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
-- **#13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
-- **#13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
-- **#13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
-- **#13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
+- **#13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
+- **#13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
 
 ## Very Important
 
@@ -30,7 +27,6 @@ _None._
 - **#10420**: loom-daemon on Linux: ~2.2 GB RSS baseline (Macs ~200 MB); ci_telemetry adds ~2.2 GB and its spans overflow the 2000-record export queue
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
-- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
 
 ## Ready
 
@@ -47,9 +43,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#13578**: Promotion author gate re-holds an issue the operator already adopted, after landed-route re-curation
-- **#13619**: remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work
-- **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33)
-- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
+- **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files
+- **#13702**: land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record
 
 ## PRs Awaiting Review
 
@@ -67,11 +62,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
-- **#13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
-- **#13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
-- **#13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
-- **#13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
+- **#13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
+- **#13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
 
 ## Proposed
 
@@ -116,7 +108,6 @@ Issues carrying `loom:curated`.
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
 - **#12978**: Codex shared-seat dispatch: live receipts and startup measurements (split from #10796) *(curated)*
 - **#13155**: [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1) *(curated)*
-- **#13261**: Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon *(curated)*
 - **#13317**: Audit Champion merge-risk self-releases two weeks after #12960 is live *(curated)*
 - **#13378**: Scope trust for github-actions[bot] to ci-daily tracker authorship instead of repo-wide trustedCommenters (alternative to #13340) *(curated)*
 - **#13486**: Champion resync waiver: a byte-identical test under .loom/scripts/tests/ is not a merge-gate path — every release shipping test-champion-resync-waiver.sh holds all resync PRs *(curated)*
@@ -124,11 +115,10 @@ Issues carrying `loom:curated`.
 - **#13578**: Promotion author gate re-holds an issue the operator already adopted, after landed-route re-curation *(curated)*
 - **#13588**: checkout_ff: primary checkout moved off main by an agent step stays wrong-branch forever (no guard, no self-heal) *(curated)*
 - **#13590**: Observe convert_awaiting_revision_parks on a live Guide tick (#10936 follow-up) *(curated)*
-- **#13619**: remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work *(curated)*
 - **#13640**: ci_telemetry: owner-kind probe users/2amlogic hangs 120s every cycle in the daemon (0.3s by hand) and a timeout never fails over — 2AMLogic CI dropped 20+ days *(curated)*
-- **#13665**: Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33) *(curated)*
-- **#13673**: Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35) *(curated)*
-- **#13680**: resync-installed.sh: false 'pin had no effect' for guard-destructive-generic.sh when the canonical Repo Skills guard is present *(curated)*
+- **#13668**: Replay strict resync waiver on recent fasterhenry resync PRs (follow-up to #13665) *(curated)*
+- **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files *(curated)*
+- **#13702**: land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -149,14 +139,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 7 |
+| Operator merge-risk holds | 4 |
 | Very important | 0 |
-| Important | 4 |
+| Important | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 4 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 8 |
-| Curated | 52 |
+| Approved PRs awaiting merge | 5 |
+| Curated | 50 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->

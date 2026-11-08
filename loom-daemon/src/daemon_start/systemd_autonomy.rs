@@ -1,4 +1,6 @@
-//! The systemd unit no longer carries the dispatcher's autonomy env (#11951).
+//! The systemd unit no longer carries the dispatcher's autonomy env (#11951),
+//! nor its runtime path/identity env (`LOOM_PID_FILE`, `LOOM_WORKSPACE`,
+//! `LOOM_HOST_ID`, #13692).
 //!
 //! # The ruling
 //!
@@ -40,11 +42,24 @@ use super::args::Want;
 use super::out;
 
 /// The keys a rendered systemd unit never carries (#11951).
-pub const UNRENDERED_KEYS: [&str; 4] = [
+///
+/// The last three are the daemon's own runtime path/identity env, not
+/// autonomy settings (#13692): an auto-update relaunch renders from the running
+/// daemon's env, which would freeze them into the unit, where they outrank the
+/// config tiers (and the worker spec's `UNIT_AUTONOMY_KEYS` drift check flags
+/// them). The daemon resolves its pid file (`daemon_pidfile` machine/repo/
+/// `<loom_dir>` tiers), workspace and host id (`fleet.hostId`, the hostname)
+/// from its fallbacks when unset. `daemon_start/mod.rs` still exports the
+/// derived `LOOM_PID_FILE` to the stop/update/watchdog ends; only the unit's
+/// copy goes.
+pub const UNRENDERED_KEYS: [&str; 7] = [
     "LOOM_WORK_FINDER",
     "LOOM_MAIN_HEALTH_GATE",
     "LOOM_FORCE_SCOPE",
     "LOOM_GUARD_DECISION_LOG",
+    "LOOM_PID_FILE",
+    "LOOM_WORKSPACE",
+    "LOOM_HOST_ID",
 ];
 
 /// The two dispatch loops, with the flag that asks for each and the config key

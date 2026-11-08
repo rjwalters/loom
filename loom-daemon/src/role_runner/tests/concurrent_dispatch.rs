@@ -1164,27 +1164,38 @@ fn a_capped_pr_with_no_hold_record_skips_the_doctor_queue_read() {
     );
 }
 
-fn cursor_dispatcher(role: &'static str, state: &Path) -> RoleDispatcher {
-    dispatcher(role, ok_factory_for_cursor(), admit_only(role)).with_cursor_dir(Some(state))
+thread_local! {
+    /// The cursor tests' per-tick gate (each test runs on its own thread).
+    /// Dispatchers capture it at construction, on the test thread.
+    static CURSOR_TICK: TickGate = TickGate::default();
 }
 
-fn ok_factory_for_cursor() -> RunnerFactory {
-    let count = Arc::new(AtomicUsize::new(0));
-    Arc::new(move |_| Box::new(FixedRunner(RoleTickOutcome::Success, count.clone())))
+fn cursor_dispatcher(role: &'static str, state: &Path) -> RoleDispatcher {
+    let factory = CURSOR_TICK.with(TickGate::factory);
+    dispatcher(role, factory, admit_only(role)).with_cursor_dir(Some(state))
 }
 
 /// Run one tick of `d` and return the roots it spawned, reaping the runs.
+///
+/// Every run is held on the tick's gate until `dispatch_tick` has returned, so
+/// no budget slot frees mid-walk and admits a second root (same race as
+/// #12325; `roleMaxConcurrent` is 1 in [`CURSOR_CFG`]). The gate opens on
+/// drop too, so a failed assertion cannot leave runs blocked.
 fn cursor_tick(
     rt: &tokio::runtime::Runtime,
     d: &mut RoleDispatcher,
     p: &[PathBuf],
 ) -> Vec<PathBuf> {
+    let gate = CURSOR_TICK.with(TickGate::current);
+    let _open = OpenOnDrop(gate.clone());
     let spawned = d
         .dispatch_tick(p.to_vec(), &new_in_progress_guard())
         .spawned;
+    gate.open();
     for _ in 0..spawned.len() {
         let _ = join_one(rt, d);
     }
+    CURSOR_TICK.with(TickGate::next);
     spawned
 }
 

@@ -321,6 +321,9 @@ pub fn post_markers(
         .collect()
 }
 
+/// Per-PR key results of one lane pass.
+pub type LaneResults = Vec<(u64, Vec<(Key, KeyPost)>)>;
+
 /// One lane pass: select, dispatch both key sessions per candidate, post
 /// markers for the keys that succeeded. A disabled `cfg` returns at once
 /// without touching any source. Returns the per-PR key results.
@@ -332,14 +335,29 @@ pub fn run_lane(
     instructions: &dyn super::ratification_dispatch::InstructionSource,
     sink: &dyn CommentSink,
     runner: &mut dyn super::RoleInvocationRunner,
-) -> Vec<(u64, Vec<(Key, KeyPost)>)> {
+) -> LaneResults {
+    run_lane_counted(cfg, lane_session, target_repo, prs, instructions, sink, runner).0
+}
+
+/// [`run_lane`] plus the number of PRs selection refused (the tick's `skipped`).
+pub fn run_lane_counted(
+    cfg: &Config,
+    lane_session: Option<&str>,
+    target_repo: &str,
+    prs: &dyn PrSource,
+    instructions: &dyn super::ratification_dispatch::InstructionSource,
+    sink: &dyn CommentSink,
+    runner: &mut dyn super::RoleInvocationRunner,
+) -> (LaneResults, usize) {
     let (true, Some(ee), Some(market)) = (cfg.enabled, cfg.ee.as_ref(), cfg.market.as_ref()) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut out = Vec::new();
+    let mut refused = 0;
     for sel in find_candidates(cfg, lane_session, prs) {
         match sel {
             Selection::Refused { pr, reason } => {
+                refused += 1;
                 log::info!("ratification_lane: PR #{pr} refused: {reason}");
             }
             Selection::Candidate { pr, head_sha } => {
@@ -356,7 +374,110 @@ pub fn run_lane(
             }
         }
     }
-    out
+    (out, refused)
+}
+
+/// What one lane tick did: a distinct `reason` for every way a tick can end,
+/// so "never ran" and "nothing to do" are different records (#13707).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// `disabled` | `repo_unresolved` | `in_flight` | `nothing_to_do` | `ran`.
+    pub reason: &'static str,
+    /// Candidates selected for key review.
+    pub selected: usize,
+    /// PRs selection refused.
+    pub skipped: usize,
+    /// Candidates whose key sessions were dispatched.
+    pub ran: usize,
+    /// Key markers posted.
+    pub posted: usize,
+}
+
+impl TickOutcome {
+    fn bare(reason: &'static str) -> Self {
+        Self {
+            reason,
+            selected: 0,
+            skipped: 0,
+            ran: 0,
+            posted: 0,
+        }
+    }
+
+    /// Summarize a [`run_lane_counted`] result.
+    #[must_use]
+    pub fn from_run(results: &[(u64, Vec<(Key, KeyPost)>)], skipped: usize) -> Self {
+        let posted = results
+            .iter()
+            .flat_map(|(_, keys)| keys)
+            .filter(|(_, p)| *p == KeyPost::Posted)
+            .count();
+        Self {
+            reason: if results.is_empty() {
+                "nothing_to_do"
+            } else {
+                "ran"
+            },
+            selected: results.len(),
+            skipped,
+            ran: results.len(),
+            posted,
+        }
+    }
+}
+
+/// Log the tick and emit its span (when spans are exported on this host).
+fn record_tick(root: &std::path::Path, source: &str, o: &TickOutcome) {
+    log::info!(
+        "ratification_lane: tick root={} source={source} reason={} selected={} skipped={} ran={} posted={}",
+        root.display(),
+        o.reason,
+        o.selected,
+        o.skipped,
+        o.ran,
+        o.posted
+    );
+    if crate::observability::ops::spans_exported() {
+        crate::observability::ops::emit_span(tick_span(root, source, o, chrono::Utc::now()));
+    }
+}
+
+/// The `ratification_lane.tick` span: an instant, its own root.
+#[must_use]
+pub fn tick_span(
+    root: &std::path::Path,
+    source: &str,
+    o: &TickOutcome,
+    at: chrono::DateTime<chrono::Utc>,
+) -> crate::telemetry::trace::SpanRecord {
+    use crate::telemetry::trace::{
+        instant, SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext,
+    };
+    let name = SpanName::RatificationLaneTick;
+    let root_s = root.display().to_string();
+    let context = TraceContext::derived(name.as_str(), &[&root_s, source, &instant(at)]);
+    let mut attributes = TraceAttributes::new();
+    let mut put = |k: &str, v: String| {
+        attributes.insert(k.to_string(), v);
+    };
+    put("reason", o.reason.to_string());
+    put("source", source.to_string());
+    put("selected", o.selected.to_string());
+    put("skipped", o.skipped.to_string());
+    put("ran", o.ran.to_string());
+    put("posted", o.posted.to_string());
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
+    SpanRecord {
+        context,
+        parent_span_id: None,
+        name,
+        started_at: at,
+        ended_at: at,
+        status: SpanStatus::Ok,
+        attributes,
+        events: Vec::new(),
+        links: Vec::new(),
+    }
 }
 
 /// The real forge for [`PrSource`]: `gh api` against `nwo`, trusting only
@@ -509,22 +630,74 @@ impl<R: super::RoleInvocationRunner + ?Sized> super::RoleInvocationRunner for Ru
     }
 }
 
+/// Roots with a lane tick in flight, process-wide: the role-tick and
+/// step-dispatch entry points share it, so a root is ticked by at most one
+/// path at a time (#13707).
+fn in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static SET: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+struct InFlight(std::path::PathBuf);
+
+impl InFlight {
+    fn acquire(root: &std::path::Path) -> Option<Self> {
+        let mut set = in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.insert(root.to_path_buf())
+            .then(|| Self(root.to_path_buf()))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
 /// The role-tick entry point: does nothing unless `ratificationLane.enabled`
 /// is set for `root`, and fails closed when the repo cannot be resolved. The
 /// lane's own session id (`LOOM_SWEEP_ID`) feeds the builder-session check.
+/// Every tick, including a no-op one, logs and emits its outcome (#13707).
 pub fn tick_for_root<R: super::RoleInvocationRunner + ?Sized>(
     root: &std::path::Path,
     runner: &mut R,
-) {
+) -> TickOutcome {
+    tick_for_root_from(root, runner, "role_tick")
+}
+
+fn tick_for_root_from<R: super::RoleInvocationRunner + ?Sized>(
+    root: &std::path::Path,
+    runner: &mut R,
+    source: &str,
+) -> TickOutcome {
+    let outcome = tick_inner(root, runner);
+    record_tick(root, source, &outcome);
+    outcome
+}
+
+fn tick_inner<R: super::RoleInvocationRunner + ?Sized>(
+    root: &std::path::Path,
+    runner: &mut R,
+) -> TickOutcome {
     let effective = crate::config_resolver::resolve_effective_config(root);
     let cfg = Config::from_effective(&effective);
     if !cfg.enabled {
-        return;
+        return TickOutcome::bare("disabled");
     }
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
     let Some(nwo) = crate::credential_preflight::nwo_from_git_remote(root) else {
         log::warn!("ratification_lane: repo unresolved; skipping");
-        return;
+        return TickOutcome::bare("repo_unresolved");
+    };
+    let Some(_guard) = InFlight::acquire(root) else {
+        return TickOutcome::bare("in_flight");
     };
     let lane_session = std::env::var("LOOM_SWEEP_ID")
         .ok()
@@ -532,7 +705,7 @@ pub fn tick_for_root<R: super::RoleInvocationRunner + ?Sized>(
     let prs = GhPrSource::new(root, &nwo, &policy);
     let instructions = super::ratification_dispatch::GhInstructionSource { root };
     let sink = GhCommentSink { root, nwo: &nwo };
-    run_lane(
+    let (results, skipped) = run_lane_counted(
         &cfg,
         lane_session.as_deref(),
         &nwo,
@@ -541,6 +714,69 @@ pub fn tick_for_root<R: super::RoleInvocationRunner + ?Sized>(
         &sink,
         &mut RunnerRef(runner),
     );
+    TickOutcome::from_run(&results, skipped)
+}
+
+/// How often the step-dispatch driver ticks the lane for a root.
+pub const STEP_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether `root` is due a step-dispatch tick at `now`, recording it as ticked
+/// when so. Pure over `last` so the cadence is testable.
+fn step_tick_due(
+    last: &mut std::collections::HashMap<std::path::PathBuf, std::time::Instant>,
+    root: &std::path::Path,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match last.get(root) {
+        Some(t) if now.duration_since(*t) < interval => false,
+        _ => {
+            last.insert(root.to_path_buf(), now);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn step_tick_due_for_test(
+    last: &mut std::collections::HashMap<std::path::PathBuf, std::time::Instant>,
+    root: &std::path::Path,
+    now: std::time::Instant,
+) -> bool {
+    step_tick_due(last, root, now, STEP_TICK_INTERVAL)
+}
+
+/// The step-dispatch entry point (#13707): a fleet host that dispatches by
+/// steps never reaches the champion role tick, so the driver calls this each
+/// tick. Per root, at most once per [`STEP_TICK_INTERVAL`], on its own thread
+/// (the lane shells out and runs reviewer sessions, which must not stall the
+/// driver tick). The shared in-flight guard stops it overlapping a role tick.
+pub fn spawn_step_ticks(roots: &[std::path::PathBuf]) {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let last = LAST.get_or_init(Default::default);
+    for root in roots {
+        let due = {
+            let mut m = last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            step_tick_due(&mut m, root, std::time::Instant::now(), STEP_TICK_INTERVAL)
+        };
+        if !due {
+            continue;
+        }
+        let root = root.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ratification-lane".into())
+            .spawn(move || {
+                let mut runner = super::ScriptRoleInvocationRunner::new(root.clone());
+                tick_for_root_from(&root, &mut runner, "step_dispatch");
+            });
+        if let Err(e) = spawned {
+            log::warn!("ratification_lane: could not spawn step tick: {e}");
+        }
+    }
 }
 
 #[cfg(test)]

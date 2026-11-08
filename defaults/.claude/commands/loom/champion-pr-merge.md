@@ -1183,6 +1183,9 @@ It is eligible only when **all** hold, each read live in this pass:
   comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
   under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
   path sources it: it is compared byte-for-byte like any kept-set file (#13486);
+  (This is Champion's proof. The daemon's own strict landing of its resync PR instead lets
+  byte-identical gate files land without a Judge when the tag is a published release, per
+  operator ruling r7-q33, #13665; a PR the daemon left for the lane still takes this rule.)
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a

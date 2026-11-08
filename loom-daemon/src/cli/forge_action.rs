@@ -640,6 +640,12 @@ pub(crate) enum ForgeAction {
         /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
+
+        /// Run the daemon's strict landing proof (every changed file must be a
+        /// byte-copy of its upstream counterpart) instead of Champion's
+        /// kept-set proof. Read-only (#13668).
+        #[arg(long)]
+        strict: bool,
     },
 
     /// `forge suspect-critical-diff <pr> <file> [--repo OWNER/REPO]` (#12999) —
@@ -1421,9 +1427,14 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 repo,
             })
         }
-        ForgeAction::ResyncWaiver { pr_number, repo } => ForgeCmd::ResyncWaiver {
+        ForgeAction::ResyncWaiver {
+            pr_number,
+            repo,
+            strict,
+        } => ForgeCmd::ResyncWaiver {
             pr: pr_number,
             repo,
+            strict,
         },
         ForgeAction::SuspectCriticalDiff {
             pr_number,

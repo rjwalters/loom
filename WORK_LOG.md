@@ -14,6 +14,26 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-08
+
+- **PR #13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
+- **PR #13646**: refactor: add shared git_run and migrate four no-timeout git wrappers
+- **PR #13633**: fix: resolve ssh -F configs in remote-fleet-exec and name the classifying rule
+- **Issue #13680** (closed): resync-installed.sh: false 'pin had no effect' for guard-destructive-generic.sh when the canonical Repo Skills guard is present
+- **Issue #13619** (closed): remote-fleet-exec guard: no allowlist for disposable non-fleet hosts, and a blocking ASK stalls time-boxed work
+- **Issue #13261** (closed): Consolidate ~23 duplicated private git subprocess wrappers in loom-daemon
+- **PR #13708**: feat: tick ratification lane from step dispatch and record every tick
+- **PR #13705**: feat: add --strict read-only replay to forge resync-waiver
+- **Issue #13707** (closed): Ratification lane never runs on the fleet: tick_for_root is only called from the champion role tick, not step-dispatched Champion
+- **PR #13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
+- **Issue #13673** (closed): Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
+- **PR #13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
+- **Issue #13665** (closed): Resync auto-land: allow merge-gate files when byte-identical to the tag's defaults/, plus roles/skills mapping (r7-q33)
+- **PR #13693**: fix: stop rendering daemon runtime path env into the systemd unit
+- **Issue #13692** (closed): auto-update relaunch bakes the daemon's runtime LOOM_PID_FILE/LOOM_WORKSPACE/LOOM_HOST_ID into the base systemd unit
+- **PR #13698**: test: gate cursor_tick runs until the dispatch walk returns
+- **Issue #13697** (closed): test flake: concurrent_dispatch cursor_persisted_across_restart_admits_tail_before_head_repeats fails on Rust Unit Tests (3/5)
+
 ### 2026-11-07
 
 - **PR #13689**: fix: reserve a bulk-lane share of backfill headroom in CI telemetry export
@@ -5877,52 +5897,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **Issue #6320** (closed): In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
 - **PR #6333**: feat(lease): publish a lease record from the in-session sweep path
-
-### 2026-09-08
-- **Issue #6855** (closed): Port 2AMLogic/2am#448's forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation to defaults/
-- **PR #6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **Issue #6169** (closed): CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **PR #6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
-- **Issue #7018** (closed): Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation)
-- **PR #7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
-- **Issue #7388** (closed): [Epic #6896] Phase 2: multi-arch (linux/arm64) loom-worker + loom-worker-session images
-- **PR #7392**: feat(docker): multi-arch (linux/arm64) loom-worker + loom-worker-session images
-- **Issue #6927** (closed): [Epic #6896] Phase 2: Codex auth-state health probe + re-auth runbook
-- **PR #7397**: feat(daemon): in-container Codex auth-state probe + proactive reauth exclusion (#6927)
-- **Issue #6925** (closed): [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
-- **PR #7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
-- **Issue #6805** (closed): Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
-- **PR #6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix (#6805)
-- **PR #7384**: fix: suggest_commit_if_resync_only_dirt() excludes retired pure-copy-surface paths
-- **Issue #7336** (closed): resync-installed.sh: suggest_commit_if_resync_only_dirt() still suggests committing retired-but-unlisted pure-copy-surface paths
-- **Issue #6568** (closed): loom-daemon-start.sh from a sweep session overwrote BOTH production Mac LaunchAgents with test env (issue-6388 sweep, undetected 2 days)
-- **PR #7380**: fix: isolate loom-daemon-start.sh from agent-session env (#6568)
-- **Issue #6612** (closed): resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
-- **PR #6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **Issue #6619** (closed): safehouse: sink-side gh failures are fully silent — warn once per (workspace, failure kind) so a #6596-class gap is a log line, not a half-day ps hunt
-- **PR #7376**: safehouse: warn-once recovery log + reconcile row-count debug line (#6619)
-- **Issue #6613** (closed): resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
-- **PR #6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
-- **Issue #6515** (closed): resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **PR #6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
-- **Issue #6389** (closed): merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
-- **PR #6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
-- **Issue #6472** (closed): guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
-- **PR #6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **PR #7368**: fix: gate claim_reconciliation's issue reclaim on a fresh closed-state check
-- **Issue #7367** (closed): Issue #7363 was closed by loom-fleet-dispatch[bot] before its closing PR (#7366) merged, with no rationale comment
-- **PR #7366**: fix: mask grep/awk quoted-pattern args in stash-scope detection
-- **Issue #7363** (closed): Guard false positive: stash-scope:worktree-collision fires on grep/awk searching for the literal string "git stash pop"
-- **PR #7364**: fix: narrow dep-recheck fingerprint's label component to stop review-cycle label spam
-- **Issue #7362** (closed): dep-recheck CONCLUSION_HASH churns on every incidental PR label flip, producing continuous re-check comment spam
-- **PR #7361**: fix: mask printenv ask-pattern false positives from heredoc vars and jq/grep args
-- **Issue #7355** (closed): Guard ask-pattern false positive: printenv.*SECRET fires on data mentioning the words, not live invocations
-- **PR #7360**: fix: Guide docs-PR recheck uses --search, which lags the Pulls List API
-- **Issue #7354** (closed): Duplicate docs-maintenance PRs (#7352, #7353) recur despite cross-host recheck — byte-identical WORK_PLAN.md diffs
-- **PR #7358**: test: add real-rebase regression coverage for the merge=ours install-metadata drop (#7351)
-- **Issue #7351** (closed): Judge's automated DIRTY-PR rebase can silently drop a commit via 3-way-merge adjacent-line collision
-- **PR #7350**: Fix Guide's Fill-free-slots tie-break for tied loom:issue candidates
-- **Issue #7349** (closed): Guide's 'Fill free slots' step has no tie-break for multiple tied loom:issue candidates — same flap PR #7325 fixed for eviction, unfixed for promotion
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 
