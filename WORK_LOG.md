@@ -16,6 +16,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-08
 
+- **PR #13708**: feat: tick ratification lane from step dispatch and record every tick
+- **PR #13705**: feat: add --strict read-only replay to forge resync-waiver
+- **Issue #13707** (closed): Ratification lane never runs on the fleet: tick_for_root is only called from the champion role tick, not step-dispatched Champion
 - **PR #13678**: fix: queue a resync PR only on the byte-identity proof or a Champion clear at head
 - **Issue #13673** (closed): Narrow land_for_root: queue a resync PR only on the byte-identity proof or a Champion clear at head (r7-q35)
 - **PR #13666**: feat: land byte-identical gate, role and skill files in the strict resync proof
