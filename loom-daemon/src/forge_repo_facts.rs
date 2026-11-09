@@ -288,7 +288,6 @@ pub(crate) struct Disagreement {
 /// the recorded canonical repo are not all the same. Local only: no forge
 /// call. For read routing that keys on `origin` to see when gh would act on
 /// a different repo.
-#[allow(dead_code)] // the read-routing consumer lands separately; tested here
 pub(crate) fn disagreement(root: &Path) -> Option<Disagreement> {
     let base = base_repo(root, GhRepoEnv::Honour)?;
     let canonical = record::load(&record::record_key(&base.host, &base.nwo))
