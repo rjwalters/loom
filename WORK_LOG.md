@@ -14,6 +14,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-09
+
+- **PR #13716**: build(deps): Bump the cargo-minor-patch group across 1 directory with 4 updates
+- **PR #13715**: build(deps): Bump @modelcontextprotocol/sdk from 1.32.1 to 1.32.2 in /mcp-loom in the npm-minor-patch group across 1 directory
+- **Issue #13644** (closed): Decision: keep or delete unconsumed forge_repo_facts::disagreement (split from #13525)
+- **Issue #12752** (closed): Consolidate duplicate stats query stacks in activity/stats.rs
+- **Issue #11926** (closed): peer-claim coordination is DEGRADED on a fleet worker (#6157 Layer 3)
+- **Issue #10512** (closed): Fleet reader-App pool near exhaustion: cut top billable pollers (visibility.repo cache, issue_state ETag, cross-host dedupe) — ~8k REST/h
+
 ### 2026-11-08
 
 - **PR #13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
