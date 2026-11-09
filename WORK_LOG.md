@@ -16,6 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-09
 
+- **PR #13730**: test: reuse shared worker_cli fixture in four integration tests
+- **Issue #13729** (closed): Dedupe fake-harness fixture() helper: 4 inline copies of support/worker_cli.rs
+- **PR #13728**: fix: count a live renewed PR lease as liveness in the stale-claim reaper
+- **Issue #13727** (closed): Stale-claim reaper strips loom:reviewing from a Judge whose lease is still being renewed
 - **PR #13724**: feat: route reads to the recorded canonical slug after a repo rename
 - **Issue #13723** (closed): [ci-daily] Docker Image Smokes (unfiltered)
 - **Issue #13719** (closed): forge_repo_facts: wire disagreement() into read routing (the consumer #13644 kept it for)
