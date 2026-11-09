@@ -25,11 +25,16 @@ use loom_daemon::{
 };
 use serde_json::json;
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     sync::atomic::{AtomicU32, Ordering},
-    sync::OnceLock,
 };
+
+/// The `spawn-worker` preflight resolves a runtime binary before it can judge
+/// capability, so the rejection arm needs a real executable to point at.
+#[cfg(unix)]
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
 
 /// A workspace whose resolved observability config actually enables tracing.
 fn traced_root() -> tempfile::TempDir {
@@ -156,24 +161,6 @@ fn crashed_without_a_terminal_record(root: &Path) -> Vec<SpanRecord> {
     exported(root)
 }
 
-/// The `spawn-worker` preflight resolves a runtime binary before it can judge
-/// capability, so the rejection arm needs a real executable to point at.
-#[cfg(unix)]
-fn runtime_fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let bin = tempfile::tempdir().unwrap().keep().join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
-
 /// Arm 4 — the runtime refused the work. No model ran, so no `loom.runtime.run`
 /// span may exist, and the rejection must be legible on the boundary that
 /// refused rather than inferred from the absence of anything.
@@ -201,7 +188,7 @@ fn rejected_preflight(root: &Path) -> Vec<SpanRecord> {
         .env("LOOM_OBSERVABILITY_ENABLED", "true")
         .env("LOOM_OBSERVABILITY_EXPORTER", "otlp")
         .env("LOOM_OBSERVABILITY_ENDPOINT", "http://127.0.0.1:4318")
-        .env("LOOM_PI_BIN", runtime_fixture())
+        .env("LOOM_PI_BIN", worker_cli::fixture())
         .env("FIXTURE_VERSION", "1.18.31")
         .env(
             "LOOM_NATIVE_GUARD_DIR",
