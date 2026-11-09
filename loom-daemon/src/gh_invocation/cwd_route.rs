@@ -536,7 +536,15 @@ pub(crate) fn checkout_answer(cwd: &Path, gh_env: GhRepoEnv) -> CwdAnswer {
         Some((host, nwo))
             if host.eq_ignore_ascii_case("github.com") && nwo.eq_ignore_ascii_case(&base.nwo) =>
         {
-            CwdAnswer::Sole(base.nwo)
+            // origin = base here. A renamed/transferred repo is not a
+            // disagreement about which repo gh acts on (gh follows the
+            // redirect), only a stale slug: route to the recorded canonical
+            // one instead of shedding the read. Only trust a record computed
+            // against the same base this answer used.
+            let canonical = crate::forge_repo_facts::disagreement(cwd)
+                .filter(|d| d.gh_base_nwo.eq_ignore_ascii_case(&base.nwo))
+                .and_then(|d| d.canonical_nwo);
+            CwdAnswer::Sole(canonical.unwrap_or(base.nwo))
         }
         _ => CwdAnswer::Disagree,
     }
