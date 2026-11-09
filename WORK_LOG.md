@@ -16,6 +16,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-08
 
+- **PR #13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
+- **PR #12368**: feat(telemetry): record Judge verdicts and found-work from the real write
+- **Issue #13694** (closed): Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files
+- **Issue #12362** (closed): Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes)
+- **Issue #13713** (closed): Champion claims tracker-marker issues until a verdict marker exists
 - **PR #13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
 - **Issue #13702** (closed): land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record
 - **PR #13681**: fix: count resync-ignore pin on generic guard as a hit when canonical guard present
