@@ -16,6 +16,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-09
 
+- **PR #13724**: feat: route reads to the recorded canonical slug after a repo rename
+- **Issue #13723** (closed): [ci-daily] Docker Image Smokes (unfiltered)
+- **Issue #13719** (closed): forge_repo_facts: wire disagreement() into read routing (the consumer #13644 kept it for)
 - **PR #13716**: build(deps): Bump the cargo-minor-patch group across 1 directory with 4 updates
 - **PR #13715**: build(deps): Bump @modelcontextprotocol/sdk from 1.32.1 to 1.32.2 in /mcp-loom in the npm-minor-patch group across 1 directory
 - **Issue #13644** (closed): Decision: keep or delete unconsumed forge_repo_facts::disagreement (split from #13525)
