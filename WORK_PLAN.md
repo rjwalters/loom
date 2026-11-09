@@ -11,8 +11,8 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
-- **#13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
+- **#13717**: build(deps): Bump rusqlite from 0.40.2 to 0.41.0
+- **#13718**: build(deps): Bump the github-actions group across 1 directory with 4 updates
 
 ## Very Important
 
@@ -43,8 +43,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#13578**: Promotion author gate re-holds an issue the operator already adopted, after landed-route re-curation
-- **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files
-- **#13702**: land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record
 
 ## PRs Awaiting Review
 
@@ -59,11 +57,10 @@ PRs waiting on Judge (`loom:review-requested`).
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13695**: feat: add lockedDepsOnly Champion class and locked-deps-only verb
-- **#13704**: fix: bind same-comment Champion clear to the head its hold was recorded at
+- **#13717**: build(deps): Bump rusqlite from 0.40.2 to 0.41.0
+- **#13718**: build(deps): Bump the github-actions group across 1 directory with 4 updates
 
 ## Proposed
 
@@ -75,7 +72,6 @@ Issues carrying `loom:curated`.
 - **#9136**: main ruleset: bypass_actors 'RepositoryRole:always' makes pull_request and required_status_checks advisory *(curated)*
 - **#10332**: Epic: cut GitHub API usage ~10x — per-consumer quotas, fix chatty loops, then push-not-poll via a loom-ui read mirror (baseline 105k gh calls/day) *(curated)*
 - **#10420**: loom-daemon on Linux: ~2.2 GB RSS baseline (Macs ~200 MB); ci_telemetry adds ~2.2 GB and its spans overflow the 2000-record export queue *(curated)*
-- **#10512**: Fleet reader-App pool near exhaustion: cut top billable pollers (visibility.repo cache, issue_state ETag, cross-host dedupe) — ~8k REST/h *(curated)*
 - **#10698**: Fleet version floor: the daemon enforces `loom_min_version` from the fleet store, rolls itself forward, and brings each repo's installed Loom up to its own version *(curated)*
 - **#10838**: merge_pr_reconcile_differential: claim-gate differential disagrees on case-variant duplicate label (loom:buildinG) *(curated)*
 - **#10941**: No-PR retry hold fires when the only remaining work is a live check or a cross-repo PR *(curated)*
@@ -88,14 +84,12 @@ Issues carrying `loom:curated`.
 - **#11595**: Pause-and-roll budget path can still kill an in-flight merge-pr.sh (follow-up to #11263) *(curated)*
 - **#11703**: Config precedence: fleet-gitops values must override repo-committed .loom/config.json (general rule + enforcement) *(curated)*
 - **#11911**: Finish retiring daemon-spawned /loom:sweep and merge the two concurrency budgets *(curated)*
-- **#11926**: peer-claim coordination is DEGRADED on loom-worker-4 (#6157 Layer 3) *(curated)*
 - **#12029**: Telemetry: merge runs record PR number and observed result (merge-pr chokepoint) — Judge parts moved to #12362; held behind #12063 *(curated)*
 - **#12063**: Umbrella: refactor merge-pr to a minimal contract (deletion-first slices; merge queue after the 2AMLogic move) *(curated)*
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301 *(curated)*
 - **#12248**: Retired hold labels: remove core registry/work_finder readers (1/3 of #11843) *(curated)*
 - **#12304**: Epic: fleet discovery from one mirror read per tick — zero forge reads for discovery; delete per-host listing paths *(curated)*
 - **#12320**: Cleanup once every worker reads the worklist: delete the per-call `forge_mirror` discovery path, `maxStalenessSecs` and `per_call`; docs and ADR-0024; direct backend preserved *(curated)*
-- **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes) *(curated)*
 - **#12408**: Live-verify epic child discovery against sky130-sar-adc#23 (follow-up to #12388) *(curated)*
 - **#12418**: Verify epic #10698 acceptance: completed-vs-not-planned dispositions and live fleet receipts *(curated)*
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out *(curated)*
@@ -103,7 +97,6 @@ Issues carrying `loom:curated`.
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR) *(curated)*
 - **#12703**: Add a per-repo setting to turn off Champion's out-of-band acceptance-criteria hold (#6883) *(curated)*
 - **#12713**: Part-of merges re-queue the issue to Builders: landed-route marker is read as a Curator 'kept' decision *(curated)*
-- **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(curated)*
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures) *(curated)*
 - **#12966**: Bound Codex session/thread history inside live profiles (the real codex-profiles growth) + uv cache *(curated)*
 - **#12978**: Codex shared-seat dispatch: live receipts and startup measurements (split from #10796) *(curated)*
@@ -117,13 +110,11 @@ Issues carrying `loom:curated`.
 - **#13590**: Observe convert_awaiting_revision_parks on a live Guide tick (#10936 follow-up) *(curated)*
 - **#13640**: ci_telemetry: owner-kind probe users/2amlogic hangs 120s every cycle in the daemon (0.3s by hand) and a timeout never fails over — 2AMLogic CI dropped 20+ days *(curated)*
 - **#13668**: Replay strict resync waiver on recent fasterhenry resync PRs (follow-up to #13665) *(curated)*
-- **#13694**: Champion: opt-in lockedDepsOnly class condition so a new workspace crate with only already-locked deps clears critical-files *(curated)*
-- **#13702**: land_for_root clear gate: detect a head that moved after a Champion clear with no new hold-state record *(curated)*
+- **#13720**: worktree.issue_state_rest reads spike every 4 h (synchronized cache expiry?) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
 - **#13071**: Peer claims: move machine coordination off rendered room messages (custom event type / state events) *(architect)*
-- **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(hermit)*
 
 ## Epics
 
@@ -143,10 +134,10 @@ Issues carrying `loom:curated`.
 | Very important | 0 |
 | Important | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 3 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 5 |
-| Curated | 50 |
-| Architect / Hermit proposals | 2 |
+| Approved PRs awaiting merge | 4 |
+| Curated | 45 |
+| Architect / Hermit proposals | 1 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
