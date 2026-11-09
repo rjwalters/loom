@@ -194,6 +194,10 @@ pub enum LivenessSignal {
     JudgeComment,
     /// A force-push of the head by the claimant ([`most_recent_head_push_at`]).
     HeadPush,
+    /// A live, recently renewed `loom:pr-lease` of the claim's role
+    /// ([`live_pr_lease_at`], #13727): the renewer only keeps it fresh while
+    /// the watched PID is alive.
+    PrLease,
     /// Only the PR's aggregate `updatedAt` (fail-open fallback).
     UpdatedAt,
     /// No age evidence at all.
@@ -213,6 +217,7 @@ pub fn pr_liveness(pr: &ClaimedPr) -> (Option<DateTime<Utc>>, LivenessSignal) {
         (pr.most_recent_claim_activity_at, LivenessSignal::ClaimActivityMarker),
         (pr.most_recent_judge_activity_at, LivenessSignal::JudgeComment),
         (pr.most_recent_head_push_at, LivenessSignal::HeadPush),
+        (pr.most_recent_pr_lease_at, LivenessSignal::PrLease),
     ] {
         if let Some(t) = at {
             // A signal only beats a `UpdatedAt` fallback / `None` or a strictly older anchor.
@@ -222,6 +227,62 @@ pub fn pr_liveness(pr: &ClaimedPr) -> (Option<DateTime<Utc>>, LivenessSignal) {
         }
     }
     best
+}
+
+/// The `updated_at` of the freshest **live** `loom:pr-lease` of `role` among
+/// `rows` (#13727), or `None`. Pure. The newest record of the role decides: a
+/// `-released` / `-yield` record, or a lease whose forge `updated_at` is
+/// outside `ttl` (its renewer stopped, i.e. the watched PID is gone), is not
+/// liveness.
+#[must_use]
+pub fn live_pr_lease_at(
+    rows: &[crate::sweep_registry::step_lease_owner::RoleLeaseRow],
+    role: &str,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+) -> Option<DateTime<Utc>> {
+    use crate::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
+    rows.iter()
+        .filter_map(|r| Some((r, parse_role_lease(&r.body)?)))
+        .filter(|(_, rec)| rec.role == role)
+        .max_by_key(|(r, _)| r.updated_at)
+        .filter(|(r, rec)| rec.kind == RoleLeaseKind::Lease && now - r.updated_at < ttl)
+        .map(|(r, _)| r.updated_at)
+}
+
+/// Best-effort fetch of the live PR-phase lease time for a claim label
+/// (`loom:reviewing` -> judge, `loom:treating` -> doctor), #13727. `None` on
+/// any read failure (fail-open to the old rule), an untrusted author, or no
+/// live lease.
+pub(crate) fn fetch_live_pr_lease_at(
+    gh_bin: &Path,
+    root: &Path,
+    pr_number: u32,
+    label: &str,
+    repo: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    let role = if label == "loom:reviewing" {
+        "judge"
+    } else {
+        "doctor"
+    };
+    let base = repo_base(repo);
+    let path = format!("{base}/issues/{pr_number}/comments?per_page=100");
+    let jq = format!(
+        r#".[] | select(.body | startswith("<!-- loom:pr-lease")) | {{id: .id, updated_at: .updated_at, body: .body, {}}}"#,
+        crate::comment_trust::records::AUTHOR_JQ
+    );
+    let out = gh_call::ok_stdout(gh_call::read("claim.pr_lease_comments", gh_bin, root).args([
+        "api",
+        &path,
+        "--paginate",
+        "--jq",
+        &jq,
+    ]))?;
+    let trusted = crate::comment_trust::TrustPolicy::for_root(root).trusted_ndjson(&out);
+    let rows = crate::sweep_registry::step_lease_owner::parse_role_lease_rows(&trusted);
+    let ttl = chrono::Duration::seconds((super::resolve_lease_ttl_minutes() * 60.0) as i64);
+    live_pr_lease_at(&rows, role, Utc::now(), ttl)
 }
 
 /// Best-effort fetch of the most recent **claimant activity** comment
