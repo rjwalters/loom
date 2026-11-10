@@ -391,13 +391,15 @@ fn tick_span_carries_reason_and_counts() {
     let o = TickOutcome::from_run(&[], 3);
     let span = tick_span(std::path::Path::new("/r"), "step_dispatch", &o, chrono::Utc::now());
     assert_eq!(span.name.as_str(), "ratification_lane.tick");
+    // Assert through `.bounded()`: the export allowlist drops unregistered keys.
+    let span = span.bounded();
     for (k, v) in [
-        ("reason", "nothing_to_do"),
-        ("source", "step_dispatch"),
-        ("selected", "0"),
-        ("skipped", "3"),
-        ("ran", "0"),
-        ("posted", "0"),
+        ("loom.ratification.reason", "nothing_to_do"),
+        ("loom.ratification.source", "step_dispatch"),
+        ("loom.ratification.selected", "0"),
+        ("loom.ratification.skipped", "3"),
+        ("loom.ratification.ran", "0"),
+        ("loom.ratification.posted", "0"),
     ] {
         assert_eq!(span.attributes.get(k).map(String::as_str), Some(v), "{k}");
     }
