@@ -112,6 +112,47 @@ pub trait PrSource {
     fn files(&self, pr: u64, hold: &ratification::Config) -> Vec<ChangedFile>;
     /// Comments by trusted authors only.
     fn trusted_comments(&self, pr: u64) -> Vec<Comment>;
+    /// Why the head content of `path` on `pr` could not be read (the `gh`
+    /// exit status and bounded stderr), when the last [`PrSource::files`] call
+    /// recorded one.
+    fn read_failure(&self, _pr: u64, _path: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Log-once-per-change gate. A failure repeats on every tick; the WARN is
+/// emitted once per `(pr, head_sha, kind)` and again only when its reason text
+/// changes. In-memory: resets with the daemon.
+#[derive(Debug, Default)]
+pub struct WarnDedup {
+    seen: std::collections::HashMap<(u64, String, &'static str), String>,
+}
+
+impl WarnDedup {
+    /// True when this `(pr, head_sha, kind, reason)` has not been logged yet.
+    pub fn should_log(
+        &mut self,
+        pr: u64,
+        head_sha: &str,
+        kind: &'static str,
+        reason: &str,
+    ) -> bool {
+        let key = (pr, head_sha.to_string(), kind);
+        if self.seen.get(&key).is_some_and(|r| r == reason) {
+            return false;
+        }
+        self.seen.insert(key, reason.to_string());
+        true
+    }
+}
+
+/// The process-wide gate the real lane logs through.
+fn warn_once(pr: u64, head_sha: &str, kind: &'static str, reason: &str) -> bool {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<WarnDedup>> = std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .should_log(pr, head_sha, kind, reason)
 }
 
 /// The two review keys.
@@ -135,12 +176,45 @@ pub enum Selection {
 /// and is logged.
 #[must_use]
 pub fn matches_pr(pr: u64, files: &[ChangedFile], hold: &ratification::Config) -> bool {
+    !matches!(
+        match_state(pr, "", files, hold, &|_| None),
+        MatchState::Clear | MatchState::Unreadable
+    )
+}
+
+/// Selection's view of one PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchState {
+    Hold,
+    Clear,
+    Unreadable,
+}
+
+/// [`ratification::scan`] plus the unreadable WARN, with each path's read
+/// failure (`detail`) in the reason and the WARN deduplicated per head.
+fn match_state(
+    pr: u64,
+    head_sha: &str,
+    files: &[ChangedFile],
+    hold: &ratification::Config,
+    detail: &dyn Fn(&str) -> Option<String>,
+) -> MatchState {
     match ratification::scan(files, hold) {
-        Verdict::Hold(_) => true,
-        Verdict::Clear => false,
+        Verdict::Hold(_) => MatchState::Hold,
+        Verdict::Clear => MatchState::Clear,
         Verdict::Unreadable(paths) => {
-            log::warn!("ratification_lane: PR #{pr} not selected; unreadable: {paths:?}");
-            false
+            let reason = paths
+                .iter()
+                .map(|p| match detail(p) {
+                    Some(d) => format!("{p} ({d})"),
+                    None => p.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if warn_once(pr, head_sha, "unreadable", &reason) {
+                log::warn!("ratification_lane: PR #{pr} not selected; unreadable: [{reason}]");
+            }
+            MatchState::Unreadable
         }
     }
 }
@@ -192,13 +266,32 @@ pub fn find_candidates(
     lane_session: Option<&str>,
     src: &dyn PrSource,
 ) -> Vec<Selection> {
+    find_candidates_counted(cfg, lane_session, src).0
+}
+
+/// [`find_candidates`] plus the number of PRs not selected because a candidate
+/// file was unreadable.
+#[must_use]
+pub fn find_candidates_counted(
+    cfg: &Config,
+    lane_session: Option<&str>,
+    src: &dyn PrSource,
+) -> (Vec<Selection>, usize) {
     if !cfg.enabled {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let mut out = Vec::new();
+    let mut unreadable = 0;
     for pr in src.open_prs() {
-        if !matches_pr(pr.number, &src.files(pr.number, &cfg.hold), &cfg.hold) {
-            continue;
+        let files = src.files(pr.number, &cfg.hold);
+        let detail = |path: &str| src.read_failure(pr.number, path);
+        match match_state(pr.number, &pr.head_sha, &files, &cfg.hold, &detail) {
+            MatchState::Hold => {}
+            MatchState::Clear => continue,
+            MatchState::Unreadable => {
+                unreadable += 1;
+                continue;
+            }
         }
         let comments = src.trusted_comments(pr.number);
         if let Some(sid) =
@@ -219,7 +312,7 @@ pub fn find_candidates(
             head_sha: pr.head_sha,
         });
     }
-    out
+    (out, unreadable)
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +407,13 @@ pub fn post_markers(
                 KeyOutcome::FailedClosed(reason) => KeyPost::Withheld(reason.clone()),
             };
             if let KeyPost::Withheld(reason) = &result {
-                log::warn!("ratification_lane: PR #{pr} key {} withheld: {reason}", key.wire());
+                let kind = match key {
+                    Key::Ee => "withheld:ee",
+                    Key::Market => "withheld:market",
+                };
+                if warn_once(pr, head_sha, kind, reason) {
+                    log::warn!("ratification_lane: PR #{pr} key {} withheld: {reason}", key.wire());
+                }
             }
             (key, result)
         })
@@ -349,12 +448,29 @@ pub fn run_lane_counted(
     sink: &dyn CommentSink,
     runner: &mut dyn super::RoleInvocationRunner,
 ) -> (LaneResults, usize) {
+    let (results, refused, _unreadable) =
+        run_lane_stats(cfg, lane_session, target_repo, prs, instructions, sink, runner);
+    (results, refused)
+}
+
+/// [`run_lane_counted`] plus the number of PRs left unselected because a
+/// candidate file was unreadable.
+pub fn run_lane_stats(
+    cfg: &Config,
+    lane_session: Option<&str>,
+    target_repo: &str,
+    prs: &dyn PrSource,
+    instructions: &dyn super::ratification_dispatch::InstructionSource,
+    sink: &dyn CommentSink,
+    runner: &mut dyn super::RoleInvocationRunner,
+) -> (LaneResults, usize, usize) {
     let (true, Some(ee), Some(market)) = (cfg.enabled, cfg.ee.as_ref(), cfg.market.as_ref()) else {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 0);
     };
     let mut out = Vec::new();
     let mut refused = 0;
-    for sel in find_candidates(cfg, lane_session, prs) {
+    let (selections, unreadable) = find_candidates_counted(cfg, lane_session, prs);
+    for sel in selections {
         match sel {
             Selection::Refused { pr, reason } => {
                 refused += 1;
@@ -374,14 +490,16 @@ pub fn run_lane_counted(
             }
         }
     }
-    (out, refused)
+    (out, refused, unreadable)
 }
 
 /// What one lane tick did: a distinct `reason` for every way a tick can end,
 /// so "never ran" and "nothing to do" are different records (#13707).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TickOutcome {
-    /// `disabled` | `repo_unresolved` | `in_flight` | `nothing_to_do` | `ran`.
+    /// `disabled` | `repo_unresolved` | `in_flight` | `nothing_to_do` | `degraded`
+    /// | `ran`. `degraded`: nothing was selected but some PRs were unreadable
+    /// or had keys withheld, so "no ratification PRs here" would be false.
     pub reason: &'static str,
     /// Candidates selected for key review.
     pub selected: usize,
@@ -391,6 +509,10 @@ pub struct TickOutcome {
     pub ran: usize,
     /// Key markers posted.
     pub posted: usize,
+    /// PRs not selected because a candidate file's head content was unreadable.
+    pub unreadable: usize,
+    /// Keys not posted (pin unresolved, session failed, post failed).
+    pub withheld: usize,
 }
 
 impl TickOutcome {
@@ -401,27 +523,48 @@ impl TickOutcome {
             skipped: 0,
             ran: 0,
             posted: 0,
+            unreadable: 0,
+            withheld: 0,
         }
     }
 
     /// Summarize a [`run_lane_counted`] result.
     #[must_use]
     pub fn from_run(results: &[(u64, Vec<(Key, KeyPost)>)], skipped: usize) -> Self {
+        Self::from_run_stats(results, skipped, 0)
+    }
+
+    /// [`TickOutcome::from_run`] with the unreadable-PR count.
+    #[must_use]
+    pub fn from_run_stats(
+        results: &[(u64, Vec<(Key, KeyPost)>)],
+        skipped: usize,
+        unreadable: usize,
+    ) -> Self {
+        let withheld = results
+            .iter()
+            .flat_map(|(_, keys)| keys)
+            .filter(|(_, p)| matches!(p, KeyPost::Withheld(_)))
+            .count();
         let posted = results
             .iter()
             .flat_map(|(_, keys)| keys)
             .filter(|(_, p)| *p == KeyPost::Posted)
             .count();
         Self {
-            reason: if results.is_empty() {
-                "nothing_to_do"
-            } else {
+            reason: if !results.is_empty() {
                 "ran"
+            } else if unreadable > 0 {
+                "degraded"
+            } else {
+                "nothing_to_do"
             },
             selected: results.len(),
             skipped,
             ran: results.len(),
             posted,
+            unreadable,
+            withheld,
         }
     }
 }
@@ -429,13 +572,15 @@ impl TickOutcome {
 /// Log the tick and emit its span (when spans are exported on this host).
 fn record_tick(root: &std::path::Path, source: &str, o: &TickOutcome) {
     log::info!(
-        "ratification_lane: tick root={} source={source} reason={} selected={} skipped={} ran={} posted={}",
+        "ratification_lane: tick root={} source={source} reason={} selected={} skipped={} ran={} posted={} unreadable={} withheld={}",
         root.display(),
         o.reason,
         o.selected,
         o.skipped,
         o.ran,
-        o.posted
+        o.posted,
+        o.unreadable,
+        o.withheld
     );
     if crate::observability::ops::spans_exported() {
         crate::observability::ops::emit_span(tick_span(root, source, o, chrono::Utc::now()));
@@ -450,13 +595,17 @@ pub const KEY_SELECTED: &str = "loom.ratification.selected";
 pub const KEY_SKIPPED: &str = "loom.ratification.skipped";
 pub const KEY_RAN: &str = "loom.ratification.ran";
 pub const KEY_POSTED: &str = "loom.ratification.posted";
-pub const KEYS: [&str; 6] = [
+pub const KEY_UNREADABLE: &str = "loom.ratification.unreadable";
+pub const KEY_WITHHELD: &str = "loom.ratification.withheld";
+pub const KEYS: [&str; 8] = [
     KEY_REASON,
     KEY_SOURCE,
     KEY_SELECTED,
     KEY_SKIPPED,
     KEY_RAN,
     KEY_POSTED,
+    KEY_UNREADABLE,
+    KEY_WITHHELD,
 ];
 
 /// The `ratification_lane.tick` span: an instant, its own root.
@@ -483,6 +632,8 @@ pub fn tick_span(
     put(KEY_SKIPPED, o.skipped.to_string());
     put(KEY_RAN, o.ran.to_string());
     put(KEY_POSTED, o.posted.to_string());
+    put(KEY_UNREADABLE, o.unreadable.to_string());
+    put(KEY_WITHHELD, o.withheld.to_string());
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -504,6 +655,8 @@ pub struct GhPrSource<'a> {
     pub nwo: &'a str,
     pub policy: &'a crate::comment_trust::TrustPolicy,
     refs: std::cell::RefCell<std::collections::HashMap<u64, (String, String)>>,
+    /// `(pr, path)` -> why the head content could not be read, this pass.
+    failures: std::cell::RefCell<std::collections::HashMap<(u64, String), String>>,
 }
 
 impl<'a> GhPrSource<'a> {
@@ -518,6 +671,7 @@ impl<'a> GhPrSource<'a> {
             nwo,
             policy,
             refs: std::cell::RefCell::default(),
+            failures: std::cell::RefCell::default(),
         }
     }
 
@@ -531,14 +685,9 @@ impl<'a> GhPrSource<'a> {
         crate::comment_trust::parse_listing(&stdout).map(Value::Array)
     }
 
-    fn raw(&self, path: &str, git_ref: &str) -> Option<String> {
+    fn raw(&self, path: &str, git_ref: &str) -> Result<String, String> {
         let endpoint = format!("repos/{}/contents/{path}?ref={git_ref}", self.nwo);
-        let out = crate::script_helpers::run_gh(
-            &["api", "-H", "Accept: application/vnd.github.raw", &endpoint],
-            self.root,
-            false,
-        );
-        Some(String::from_utf8_lossy(&out.ok_output()?.stdout).into_owned())
+        super::ratification_dispatch::read_raw(self.root, &endpoint)
     }
 }
 
@@ -595,11 +744,22 @@ impl PrSource for GhPrSource<'_> {
                     && !head.is_empty()
                     && ratification::is_candidate(&file, hold)
                 {
-                    file.head_content = self.raw(&file.filename, &head);
+                    match self.raw(&file.filename, &head) {
+                        Ok(text) => file.head_content = Some(text),
+                        Err(why) => {
+                            self.failures
+                                .borrow_mut()
+                                .insert((pr, file.filename.clone()), why);
+                        }
+                    }
                 }
                 Some(file)
             })
             .collect()
+    }
+
+    fn read_failure(&self, pr: u64, path: &str) -> Option<String> {
+        self.failures.borrow().get(&(pr, path.to_string())).cloned()
     }
 
     fn trusted_comments(&self, pr: u64) -> Vec<Comment> {
@@ -722,7 +882,7 @@ fn tick_inner<R: super::RoleInvocationRunner + ?Sized>(
     let prs = GhPrSource::new(root, &nwo, &policy);
     let instructions = super::ratification_dispatch::GhInstructionSource { root };
     let sink = GhCommentSink { root, nwo: &nwo };
-    let (results, skipped) = run_lane_counted(
+    let (results, skipped, unreadable) = run_lane_stats(
         &cfg,
         lane_session.as_deref(),
         &nwo,
@@ -731,7 +891,7 @@ fn tick_inner<R: super::RoleInvocationRunner + ?Sized>(
         &sink,
         &mut RunnerRef(runner),
     );
-    TickOutcome::from_run(&results, skipped)
+    TickOutcome::from_run_stats(&results, skipped, unreadable)
 }
 
 /// How often the step-dispatch driver ticks the lane for a root.
@@ -932,6 +1092,44 @@ mod tests {
         let mut f = file("spec/fft.md", "");
         f.head_content = None;
         assert!(!matches_pr(1, &[f], &ratification::Config::default()));
+    }
+
+    /// Fake whose one PR has an unreadable file with a recorded failure.
+    struct Broken(Fake);
+
+    impl PrSource for Broken {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.0.open_prs()
+        }
+        fn files(&self, pr: u64, hold: &ratification::Config) -> Vec<ChangedFile> {
+            self.0.files(pr, hold)
+        }
+        fn trusted_comments(&self, pr: u64) -> Vec<Comment> {
+            self.0.trusted_comments(pr)
+        }
+        fn read_failure(&self, _pr: u64, path: &str) -> Option<String> {
+            Some(format!("exit 1: HTTP 404 for {path}"))
+        }
+    }
+
+    #[test]
+    fn unreadable_pr_is_counted_not_silently_dropped() {
+        let mut f = file("spec/fft.md", "");
+        f.head_content = None;
+        let src = Broken(one_pr("alice", vec![f], vec![]));
+        let (sel, unreadable) = find_candidates_counted(&enabled(), None, &src);
+        assert!(sel.is_empty());
+        assert_eq!(unreadable, 1);
+    }
+
+    #[test]
+    fn warn_dedup_logs_once_per_head_and_again_on_a_new_reason() {
+        let mut d = WarnDedup::default();
+        assert!(d.should_log(7, "aaa", "unreadable", "x (exit 1)"));
+        assert!(!d.should_log(7, "aaa", "unreadable", "x (exit 1)"), "same tick repeat");
+        assert!(d.should_log(7, "bbb", "unreadable", "x (exit 1)"), "new head");
+        assert!(d.should_log(7, "aaa", "withheld:ee", "x (exit 1)"), "other kind");
+        assert!(d.should_log(7, "aaa", "unreadable", "x (exit 4)"), "reason changed");
     }
 
     #[test]
