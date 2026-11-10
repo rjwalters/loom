@@ -11,8 +11,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13717**: build(deps): Bump rusqlite from 0.40.2 to 0.41.0
-- **#13718**: build(deps): Bump the github-actions group across 1 directory with 4 updates
 
 ## Very Important
 
@@ -59,8 +57,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13717**: build(deps): Bump rusqlite from 0.40.2 to 0.41.0
-- **#13718**: build(deps): Bump the github-actions group across 1 directory with 4 updates
 
 ## Proposed
 
@@ -130,13 +126,13 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 4 |
+| Operator merge-risk holds | 2 |
 | Very important | 0 |
 | Important | 3 |
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 4 |
+| Approved PRs awaiting merge | 2 |
 | Curated | 45 |
 | Architect / Hermit proposals | 1 |
 | Active epics | 7 |
