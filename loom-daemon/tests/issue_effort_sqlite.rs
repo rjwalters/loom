@@ -447,7 +447,6 @@ fn effort_row(conn: &Connection, issue: u32) -> std::collections::BTreeMap<Strin
         .prepare(statement)
         .unwrap()
         .column_names()
-        .into_iter()
         .map(str::to_owned)
         .collect();
     let rows = query_with(conn, statement, &[(":issue", &issue.to_string())]);

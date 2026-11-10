@@ -396,11 +396,7 @@ fn run_calibration(populated: bool) -> BTreeMap<String, CalResult> {
                 .map(|(_, id)| id.clone())
                 .expect("query statement without a CAL marker");
             let mut prepared = conn.prepare(statement).expect("prepare CAL query");
-            let headers: Vec<String> = prepared
-                .column_names()
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect();
+            let headers: Vec<String> = prepared.column_names().map(str::to_owned).collect();
             let mut rows = Vec::new();
             let mut query = prepared.query([]).expect("run CAL query");
             while let Some(row) = query.next().expect("CAL query row") {
