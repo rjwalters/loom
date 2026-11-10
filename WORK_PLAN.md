@@ -11,6 +11,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
+- **#13738**: fix: pass approved PRs stacked on a Loom stack branch instead of drawing champion_merge
 
 ## Very Important
 
@@ -25,6 +26,7 @@ _None._
 - **#10420**: loom-daemon on Linux: ~2.2 GB RSS baseline (Macs ~200 MB); ci_telemetry adds ~2.2 GB and its spans overflow the 2000-record export queue
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
+- **#13734**: ratification_lane.tick: outcome attributes never reach the store, and no keys posted on 0.19.1283 after 2 h
 
 ## Ready
 
@@ -40,7 +42,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#13578**: Promotion author gate re-holds an issue the operator already adopted, after landed-route re-curation
+- **#13737**: Champion: stacked PR on a blocked parent is skipped daily as janitor_rc3 with nothing on the PR (15 skips on one head)
 
 ## PRs Awaiting Review
 
@@ -57,6 +59,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
+- **#13738**: fix: pass approved PRs stacked on a Loom stack branch instead of drawing champion_merge
 
 ## Proposed
 
@@ -107,6 +110,9 @@ Issues carrying `loom:curated`.
 - **#13640**: ci_telemetry: owner-kind probe users/2amlogic hangs 120s every cycle in the daemon (0.3s by hand) and a timeout never fails over — 2AMLogic CI dropped 20+ days *(curated)*
 - **#13668**: Replay strict resync waiver on recent fasterhenry resync PRs (follow-up to #13665) *(curated)*
 - **#13720**: worktree.issue_state_rest reads spike every 4 h (synchronized cache expiry?) *(curated)*
+- **#13734**: ratification_lane.tick: outcome attributes never reach the store, and no keys posted on 0.19.1283 after 2 h *(curated)*
+- **#13736**: ratification_lane on 0.19.1283: every key withheld (pin 'could not resolve' under the daemon) and 60 PRs unreadable; ~390 WARN/h per host, no keys posted *(curated)*
+- **#13737**: Champion: stacked PR on a blocked parent is skipped daily as janitor_rc3 with nothing on the PR (15 skips on one head) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -126,14 +132,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 3 |
 | Very important | 0 |
-| Important | 3 |
+| Important | 4 |
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 45 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 48 |
 | Architect / Hermit proposals | 1 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
