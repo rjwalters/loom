@@ -14,6 +14,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-10
+
+- **PR #13718**: build(deps): Bump the github-actions group across 1 directory with 4 updates
+- **PR #13717**: build(deps): Bump rusqlite from 0.40.2 to 0.41.0
+
 ### 2026-11-09
 
 - **PR #13730**: test: reuse shared worker_cli fixture in four integration tests
