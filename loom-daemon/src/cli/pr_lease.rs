@@ -612,8 +612,31 @@ pub(crate) fn write_target(root: &Path) -> Result<String, String> {
 }
 
 impl Gh {
+    /// The `owner/repo` a read names explicitly (#13743): the vetted write
+    /// target if there is one, else this checkout's `origin`. An untargeted
+    /// read (`GhTarget::None` plus a `{owner}/{repo}` placeholder) is shed by
+    /// the cwd router whenever it cannot derive the repository, and a shed
+    /// read never reaches the forge. `None` only when no slug is derivable.
+    fn read_slug(&self) -> Option<String> {
+        if let Ok(nwo) = &self.write_repo {
+            return Some(nwo.clone());
+        }
+        let remotes = crate::write_scope::target::read_remotes(&self.root);
+        crate::write_scope::target::origin_nwo(&remotes)
+    }
+
     fn inv(&self, op: &'static str, intent: AccessIntent, fop: ForgeOp) -> GhInvocation {
-        GhInvocation::new(Operation::new(op), intent, GhTarget::None, GH_TIMEOUT)
+        self.inv_at(op, intent, fop, GhTarget::None)
+    }
+
+    fn inv_at(
+        &self,
+        op: &'static str,
+        intent: AccessIntent,
+        fop: ForgeOp,
+        target: GhTarget,
+    ) -> GhInvocation {
+        GhInvocation::new(Operation::new(op), intent, target, GH_TIMEOUT)
             .forge_op(fop)
             .program(&self.bin)
             .current_dir(&self.root)
@@ -628,33 +651,58 @@ impl Gh {
 
     /// Every trusted `loom:pr-lease*` comment on `pr`; `None` on any failure.
     pub(crate) fn read_rows(&self, pr: u64, policy: &TrustPolicy) -> Option<Vec<Row>> {
+        self.read_rows_why(pr, policy).ok()
+    }
+
+    /// [`read_rows`](Self::read_rows), naming why a failed read failed (a
+    /// shed, a timeout, or the exit status) so a stand-down is diagnosable.
+    pub(crate) fn read_rows_why(&self, pr: u64, policy: &TrustPolicy) -> Result<Vec<Row>, String> {
         let jq = format!(
             r#".[] | select(.body != null and (.body | startswith("{FAMILY_PREFIX}"))) | {{id: .id, updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
         );
+        let slug = self.read_slug();
+        let target = slug
+            .as_deref()
+            .and_then(|s| GhTarget::repo(s).ok())
+            .unwrap_or(GhTarget::None);
+        let repo_path = slug.unwrap_or_else(|| "{owner}/{repo}".to_string());
         let out = self
-            .inv("pr_lease.comments", AccessIntent::Read, ops::COMMENT_LIST)
+            .inv_at("pr_lease.comments", AccessIntent::Read, ops::COMMENT_LIST, target)
             .args([
                 "api",
-                &format!("repos/{{owner}}/{{repo}}/issues/{pr}/comments"),
+                &format!("repos/{repo_path}/issues/{pr}/comments"),
                 "--paginate",
                 "--jq",
                 &jq,
             ])
             .run();
-        let out = out.ok_output()?;
+        let out = match out.into_result() {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let line = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                return Err(format!("gh exited {}: {}", o.status, line.trim()));
+            }
+            Err(u) => return Err(u.to_string()),
+        };
         // #9548/#9631: an untrusted author's marker is prose.
         let trusted = policy.trusted_ndjson(&out.stdout);
-        Some(parse_rows(&String::from_utf8_lossy(&trusted)))
+        Ok(parse_rows(&String::from_utf8_lossy(&trusted)))
     }
 
     /// [`read_rows`](Self::read_rows) with the bounded retry.
     pub(crate) fn read_rows_retrying(&self, pr: u64, policy: &TrustPolicy) -> Option<Vec<Row>> {
         for attempt in 1..=READ_ATTEMPTS {
-            if let Some(rows) = self.read_rows(pr, policy) {
-                return Some(rows);
-            }
-            if attempt < READ_ATTEMPTS {
-                std::thread::sleep(READ_RETRY_DELAY);
+            match self.read_rows_why(pr, policy) {
+                Ok(rows) => return Some(rows),
+                Err(why) if attempt == READ_ATTEMPTS => {
+                    eprintln!("lease pr #{pr}: lease read failed after {attempt} attempts: {why}");
+                }
+                Err(_) => std::thread::sleep(READ_RETRY_DELAY),
             }
         }
         None
