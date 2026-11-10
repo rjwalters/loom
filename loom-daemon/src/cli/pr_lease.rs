@@ -611,6 +611,35 @@ pub(crate) fn write_target(root: &Path) -> Result<String, String> {
     }
 }
 
+/// Longest failure reason echoed to stderr (#13743).
+const REASON_MAX_CHARS: usize = 200;
+
+/// `s` trimmed, control characters replaced by spaces, capped at
+/// [`REASON_MAX_CHARS`] (#13743: bounded, redacted diagnostic output).
+fn bounded_reason(s: &str) -> String {
+    let cleaned: String = s
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() > REASON_MAX_CHARS {
+        let head: String = cleaned.chars().take(REASON_MAX_CHARS).collect();
+        format!("{head}…")
+    } else {
+        cleaned
+    }
+}
+
+/// The `claim` stand-down line; the cause, when known, is on this same line.
+fn unreadable_claim_line(why: Option<&str>) -> String {
+    match why {
+        Some(why) => {
+            format!("could not read this PR's lease records; nothing written — stand down: {why}")
+        }
+        None => "could not read this PR's lease records; nothing written — stand down".to_string(),
+    }
+}
+
 impl Gh {
     /// The `owner/repo` a read names explicitly (#13743): the vetted write
     /// target if there is one, else this checkout's `origin`. An untargeted
@@ -685,9 +714,9 @@ impl Gh {
                     .rev()
                     .find(|l| !l.trim().is_empty())
                     .unwrap_or("");
-                return Err(format!("gh exited {}: {}", o.status, line.trim()));
+                return Err(format!("gh exited {}: {}", o.status, bounded_reason(line)));
             }
-            Err(u) => return Err(u.to_string()),
+            Err(u) => return Err(bounded_reason(&u.to_string())),
         };
         // #9548/#9631: an untrusted author's marker is prose.
         let trusted = policy.trusted_ndjson(&out.stdout);
@@ -696,16 +725,28 @@ impl Gh {
 
     /// [`read_rows`](Self::read_rows) with the bounded retry.
     pub(crate) fn read_rows_retrying(&self, pr: u64, policy: &TrustPolicy) -> Option<Vec<Row>> {
+        self.read_rows_retrying_why(pr, policy).ok()
+    }
+
+    /// The bounded retry, returning the last attempt's reason on failure so a
+    /// caller can put the cause on its own (last) stderr line (#13743):
+    /// telemetry keeps only the final non-empty stderr line.
+    pub(crate) fn read_rows_retrying_why(
+        &self,
+        pr: u64,
+        policy: &TrustPolicy,
+    ) -> Result<Vec<Row>, String> {
+        let mut last = String::new();
         for attempt in 1..=READ_ATTEMPTS {
             match self.read_rows_why(pr, policy) {
-                Ok(rows) => return Some(rows),
-                Err(why) if attempt == READ_ATTEMPTS => {
-                    eprintln!("lease pr #{pr}: lease read failed after {attempt} attempts: {why}");
-                }
-                Err(_) => std::thread::sleep(READ_RETRY_DELAY),
+                Ok(rows) => return Ok(rows),
+                Err(why) => last = why,
+            }
+            if attempt < READ_ATTEMPTS {
+                std::thread::sleep(READ_RETRY_DELAY);
             }
         }
-        None
+        Err(last)
     }
 
     /// Post a comment; its forge `id` on success.
@@ -1100,10 +1141,13 @@ impl Ctx {
             self.say(&format!("refusing to write here (#9548): {why} — stand down"));
             return EXIT_UNVERIFIED;
         }
-        let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
+        let (rows, why) = match self.gh.read_rows_retrying_why(self.pr(), &self.policy) {
+            Ok(rows) => (Some(rows), None),
+            Err(why) => (None, Some(why)),
+        };
         match self.state_of(rows.as_deref()) {
             ClaimState::Unknown => {
-                self.say("could not read this PR's lease records; nothing written — stand down");
+                self.say(&unreadable_claim_line(why.as_deref()));
                 return EXIT_UNVERIFIED;
             }
             ClaimState::HeldByPeer { holder, .. } => {
@@ -1436,9 +1480,14 @@ impl Ctx {
             // A renewer killed mid-PATCH could still land its write; let it.
             std::thread::sleep(Duration::from_secs(2));
         }
-        let Some(rows) = self.gh.read_rows_retrying(self.pr(), &self.policy) else {
-            self.say("could not read lease records; the lease will age out at the TTL");
-            return (EXIT_HELD, 0);
+        let rows = match self.gh.read_rows_retrying_why(self.pr(), &self.policy) {
+            Ok(rows) => rows,
+            Err(why) => {
+                self.say(&format!(
+                    "could not read lease records; the lease will age out at the TTL: {why}"
+                ));
+                return (EXIT_HELD, 0);
+            }
         };
         let mut released = 0;
         // #11855: a Judge leaving the PR still waiting for review records it.
