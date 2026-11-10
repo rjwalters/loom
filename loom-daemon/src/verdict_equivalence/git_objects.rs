@@ -37,6 +37,7 @@
 //! re-derive them differently, it just answers a different question with them
 //! (verdict equivalence, not conflict prediction).
 
+use crate::git_merge_tree::supports_merge_tree;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -185,29 +186,6 @@ pub(super) fn parents(repo: &Path, sha: &str) -> Option<Vec<String>> {
     Some(fields.map(str::to_string).collect())
 }
 
-/// git >= 2.38, where `git merge-tree --write-tree` exists. Same floor and
-/// same probe shape as [`crate::overlap_replay::conflict`].
-pub(super) fn supports_merge_tree(repo: &Path) -> bool {
-    let Some(out) = git(repo, &["--version"]) else {
-        return false;
-    };
-    out.split_whitespace()
-        .nth(2)
-        .is_some_and(merge_tree_in_version)
-}
-
-pub(super) fn merge_tree_in_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let Some(Ok(major)) = parts.next().map(str::parse::<u32>) else {
-        return false;
-    };
-    let minor = parts
-        .next()
-        .and_then(|m| m.parse::<u32>().ok())
-        .unwrap_or(0);
-    major > 2 || (major == 2 && minor >= 38)
-}
-
 /// What a `git merge-tree --write-tree` run produced.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum MergeTree {
@@ -230,7 +208,7 @@ pub(super) enum MergeTree {
 /// but this function, and ordinary gc reclaims it — the index and working tree
 /// are untouched (`merge-tree` is plumbing).
 pub(super) fn merge_tree(repo: &Path, a: &str, b: &str) -> MergeTree {
-    if !supports_merge_tree(repo) {
+    if !supports_merge_tree(Some(repo)) {
         return MergeTree::Failed;
     }
     let Ok(out) = Command::new("git")
