@@ -442,6 +442,23 @@ fn record_tick(root: &std::path::Path, source: &str, o: &TickOutcome) {
     }
 }
 
+/// Span attribute keys on `ratification_lane.tick`. They must be namespaced
+/// and registered in `bounded_attributes()`; bare keys are dropped at export.
+pub const KEY_REASON: &str = "loom.ratification.reason";
+pub const KEY_SOURCE: &str = "loom.ratification.source";
+pub const KEY_SELECTED: &str = "loom.ratification.selected";
+pub const KEY_SKIPPED: &str = "loom.ratification.skipped";
+pub const KEY_RAN: &str = "loom.ratification.ran";
+pub const KEY_POSTED: &str = "loom.ratification.posted";
+pub const KEYS: [&str; 6] = [
+    KEY_REASON,
+    KEY_SOURCE,
+    KEY_SELECTED,
+    KEY_SKIPPED,
+    KEY_RAN,
+    KEY_POSTED,
+];
+
 /// The `ratification_lane.tick` span: an instant, its own root.
 #[must_use]
 pub fn tick_span(
@@ -460,12 +477,12 @@ pub fn tick_span(
     let mut put = |k: &str, v: String| {
         attributes.insert(k.to_string(), v);
     };
-    put("reason", o.reason.to_string());
-    put("source", source.to_string());
-    put("selected", o.selected.to_string());
-    put("skipped", o.skipped.to_string());
-    put("ran", o.ran.to_string());
-    put("posted", o.posted.to_string());
+    put(KEY_REASON, o.reason.to_string());
+    put(KEY_SOURCE, source.to_string());
+    put(KEY_SELECTED, o.selected.to_string());
+    put(KEY_SKIPPED, o.skipped.to_string());
+    put(KEY_RAN, o.ran.to_string());
+    put(KEY_POSTED, o.posted.to_string());
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,

@@ -300,6 +300,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 || crate::host_loss::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_runtime::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_draw::KEYS.contains(&key.as_str())
+                || crate::role_runner::ratification_lane::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)
