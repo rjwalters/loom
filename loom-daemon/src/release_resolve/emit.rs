@@ -21,7 +21,11 @@ use serde_json::{json, Value};
 pub fn to_json(resolution: &Resolution) -> Value {
     match resolution {
         Resolution::Resolved(r) => object(true, "", r),
-        Resolution::Unresolved(reason) => object(false, reason, &Resolved::default()),
+        // `Unavailable` shares the `ok:false` shape: the published contract has
+        // no field for it, and the reason text says the releases were unread.
+        Resolution::Unresolved(reason) | Resolution::Unavailable(reason) => {
+            object(false, reason, &Resolved::default())
+        }
     }
 }
 
