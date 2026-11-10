@@ -16,6 +16,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-10
 
+- **PR #13739**: fix: report gh failure detail and dedupe ratification lane warnings
 - **PR #13735**: fix: namespace ratification_lane.tick span keys so export keeps them
 - **PR #13718**: build(deps): Bump the github-actions group across 1 directory with 4 updates
 - **PR #13717**: build(deps): Bump rusqlite from 0.40.2 to 0.41.0
