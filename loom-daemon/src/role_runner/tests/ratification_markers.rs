@@ -400,6 +400,8 @@ fn tick_span_carries_reason_and_counts() {
         ("loom.ratification.skipped", "3"),
         ("loom.ratification.ran", "0"),
         ("loom.ratification.posted", "0"),
+        ("loom.ratification.unreadable", "0"),
+        ("loom.ratification.withheld", "0"),
     ] {
         assert_eq!(span.attributes.get(k).map(String::as_str), Some(v), "{k}");
     }
@@ -434,4 +436,82 @@ fn step_cadence_ticks_once_per_interval_per_root() {
         a,
         t0 + STEP_TICK_INTERVAL
     ));
+}
+
+#[test]
+fn tick_with_unreadable_prs_is_degraded_not_nothing_to_do() {
+    let o = TickOutcome::from_run_stats(&[], 0, 2);
+    assert_eq!((o.reason, o.selected, o.unreadable), ("degraded", 0, 2));
+    let span =
+        tick_span(std::path::Path::new("/r"), "step_dispatch", &o, chrono::Utc::now()).bounded();
+    assert_eq!(
+        span.attributes
+            .get("loom.ratification.unreadable")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        span.attributes
+            .get("loom.ratification.reason")
+            .map(String::as_str),
+        Some("degraded")
+    );
+}
+
+#[test]
+fn withheld_keys_are_counted() {
+    let results = vec![(
+        5,
+        vec![
+            (Key::Ee, KeyPost::Withheld("could not resolve".into())),
+            (Key::Market, KeyPost::Posted),
+        ],
+    )];
+    let o = TickOutcome::from_run_stats(&results, 0, 0);
+    assert_eq!((o.reason, o.posted, o.withheld), ("ran", 1, 1));
+}
+
+#[cfg(unix)]
+mod gh_failure {
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use crate::role_runner::ratification_dispatch::gh_failure_detail;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::Duration;
+
+    fn ran(code: i32, stderr: &str) -> CmdOutcome {
+        CmdOutcome::Ran(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn nonzero_exit_carries_status_and_stderr() {
+        let d = gh_failure_detail(&ran(1, "gh: Not Found (HTTP 404)\n"));
+        assert_eq!(d, "exit 1: gh: Not Found (HTTP 404)");
+        assert_eq!(gh_failure_detail(&ran(4, "")), "exit 4, no stderr");
+    }
+
+    #[test]
+    fn stderr_is_bounded_and_token_shaped_words_redacted() {
+        let d = gh_failure_detail(&ran(1, &format!("bad ghp_SECRET123 {}", "x".repeat(500))));
+        assert!(!d.contains("SECRET123"));
+        assert!(d.contains("[redacted]"));
+        assert!(d.ends_with("..."));
+        assert!(d.chars().count() < 230);
+    }
+
+    #[test]
+    fn spawn_failure_and_timeout_are_distinct_from_a_nonzero_exit() {
+        let spawn = gh_failure_detail(&CmdOutcome::Unavailable(Unavailable::Spawn("no gh".into())));
+        let timeout = gh_failure_detail(&CmdOutcome::Unavailable(Unavailable::TimedOut {
+            after: Duration::from_secs(120),
+            partial_stdout: Vec::new(),
+        }));
+        assert!(spawn.starts_with("could not start"));
+        assert!(timeout.starts_with("timed out"));
+        assert_ne!(spawn, timeout);
+        assert!(!spawn.starts_with("exit"));
+    }
 }
