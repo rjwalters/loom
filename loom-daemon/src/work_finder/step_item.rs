@@ -275,6 +275,9 @@ pub struct PullInput {
     /// The head branch name.
     #[serde(default)]
     pub head_ref: Option<String>,
+    /// The base branch name (#13737): a Loom stack branch marks a stacked child.
+    #[serde(default)]
+    pub base_ref: Option<String>,
     /// The head lives in this repository (not a fork).
     #[serde(default)]
     pub same_repo: bool,
@@ -525,6 +528,10 @@ pub enum PassReason {
     /// handed to the merge queue, and Doctor's conflict queue owns the fix, so
     /// a `champion_merge` run would spend its slot on a rejection.
     Conflicting,
+    /// An approved, unheld PR whose base is a Loom stack branch (#13737): the
+    /// Champion janitor skips it (`stacked-on-loom-branch`, #12761) until the
+    /// base is retargeted, so a `champion_merge` run would only be skipped.
+    Stacked,
 }
 
 impl PassReason {
@@ -550,6 +557,7 @@ impl PassReason {
             Self::HeldAtHead => "held_at_head",
             Self::AuthorGateHeld => "author_gate_held",
             Self::Conflicting => "conflicting",
+            Self::Stacked => "stacked",
         }
     }
 }
@@ -811,6 +819,14 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
     } else if has(labels, APPROVED) {
         if has(labels, MERGE_CONFLICT) {
             return (ItemState::Approved, Verdict::Pass(PassReason::Conflicting));
+        }
+        // Same predicate the janitor's classifier uses, so they cannot disagree.
+        if pr
+            .base_ref
+            .as_deref()
+            .is_some_and(crate::merge_pr::stacked_children::is_stackable_parent_branch)
+        {
+            return (ItemState::Approved, Verdict::Pass(PassReason::Stacked));
         }
         step(ItemState::Approved, Step::ChampionMerge)
     } else if pr.draft {
@@ -1103,6 +1119,7 @@ impl PullInput {
             labels: row.labels.clone(),
             body: row.body.clone(),
             head_ref: row.head_ref.clone(),
+            base_ref: row.base_ref.clone(),
             same_repo,
             author_untrusted,
             queued,
