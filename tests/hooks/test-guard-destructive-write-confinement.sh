@@ -2507,6 +2507,11 @@ assert_allow "write-confinement (#12285): unquoted target -> allow" \
     'cd /tmp/probe && for name in a b; do echo x > $name.gds; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): absolute loop value stays denied" \
     "cd /tmp/probe && for n in $WT_REPO/x; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+# #13773: absolute loop value resolving OUTSIDE the checkout, used as a write target
+assert_deny "write-confinement (#13773): absolute loop value outside checkout stays denied" \
+    'cd /tmp/p && for n in /abs; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#13773): absolute /tmp/outside loop value stays denied" \
+    'cd /tmp/p && for n in /tmp/outside/a; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with .. stays denied" \
     'cd /tmp/probe && for n in ../x; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with / stays denied" \
