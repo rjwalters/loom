@@ -126,6 +126,23 @@ impl std::fmt::Display for Refusal {
 /// The retired failing filter's terminal non-success conclusions.
 const FAILING_CONCLUSIONS: [&str; 4] = ["failure", "timed_out", "cancelled", "action_required"];
 
+/// Whether a check-run object is terminal (#13758). `status == "completed"`
+/// is the normal signal, but GitHub sometimes leaves a finished run at
+/// `status: in_progress` with a string `conclusion` and a `completed_at`;
+/// that is settled too. Both fields are required so a half-written row still
+/// reads as pending. Shared by every CI classifier.
+#[must_use]
+pub fn is_settled(run: &Value) -> bool {
+    run.as_object().is_some_and(is_settled_obj)
+}
+
+/// [`is_settled`] on an already-unwrapped object.
+fn is_settled_obj(run: &Map<String, Value>) -> bool {
+    run.get("status").and_then(Value::as_str) == Some("completed")
+        || (run.get("conclusion").is_some_and(Value::is_string)
+            && run.get("completed_at").is_some_and(|v| !v.is_null()))
+}
+
 /// Classify one `forge_get_check_runs` payload. See the module docs.
 ///
 /// # Errors
@@ -159,7 +176,7 @@ pub fn classify(raw: &str) -> Result<Rollup, Refusal> {
         {
             failing.push(name);
         }
-        if run.get("status").and_then(Value::as_str) != Some("completed") {
+        if !is_settled_obj(run) {
             pending.push(name);
         }
     }

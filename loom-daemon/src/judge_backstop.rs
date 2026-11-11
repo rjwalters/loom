@@ -161,7 +161,7 @@ pub fn pending_check_runs(page: &Value) -> Vec<String> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|r| r.get("status").and_then(Value::as_str) != Some("completed"))
+        .filter(|r| !crate::merge_pr::check_runs_rollup::is_settled(r))
         .map(|r| stamp(r, "started_at"))
         .collect()
 }
