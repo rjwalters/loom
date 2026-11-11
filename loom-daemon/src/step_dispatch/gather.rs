@@ -220,6 +220,7 @@ pub fn pull_from_row(row: &RestIssue, markers: PullMarkers) -> PullInput {
         labels: row.labels.clone(),
         body: row.body.clone(),
         head_ref: None,
+        base_ref: None,
         same_repo: false,
         author_untrusted: false,
         queued: false,

@@ -112,6 +112,7 @@ fn pull_input(slug: &str, p: &RestPull) -> step_item::PullInput {
         labels: p.labels.clone(),
         body: p.body.clone(),
         head_ref: p.head_ref.clone(),
+        base_ref: p.base_ref.clone(),
         same_repo: p
             .head_repo
             .as_deref()
