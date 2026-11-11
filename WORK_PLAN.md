@@ -27,6 +27,7 @@ _None._
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures)
 - **#12993**: Shadow evaluation of the new Champion (2026-10-20): 1/95 holds cleared — ranked remaining causes + fixtures
 - **#13734**: ratification_lane.tick: outcome attributes never reach the store, and no keys posted on 0.19.1283 after 2 h
+- **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
 
 ## Ready
 
@@ -37,12 +38,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
 - **#13588**: checkout_ff: primary checkout moved off main by an agent step stays wrong-branch forever (no guard, no self-heal)
+- **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
+- **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#13737**: Champion: stacked PR on a blocked parent is skipped daily as janitor_rc3 with nothing on the PR (15 skips on one head)
+_None._
 
 ## PRs Awaiting Review
 
@@ -134,9 +137,9 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 3 |
 | Very important | 0 |
-| Important | 4 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
+| Important | 5 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 4 |
 | Approved PRs awaiting merge | 3 |
 | Curated | 48 |

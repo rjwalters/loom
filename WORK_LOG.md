@@ -14,8 +14,22 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-11
+
+- **PR #13756**: fix: confirm retired-label usage per item before keeping it in labels migrate
+- **PR #13753**: refactor: share one git merge-tree version gate across three callers
+- **Issue #13755** (closed): worktree-isolation guard treats a read-only input heredoc (python3 - <<'EOF') as a write
+- **Issue #13754** (closed): labels migrate --apply keeps a retired label it cleared in the same pass; needs a second run
+- **Issue #13752** (closed): Consolidate three duplicate git merge-tree version gates
+
 ### 2026-11-10
 
+- **PR #13751**: fix: report unreadable release reads as unavailable, not missing or floor-unsatisfiable
+- **PR #13750**: fix: admit ratification reviewer sessions as Judge aliases
+- **PR #13748**: fix: name the repo on PR lease reads and report why a read failed
+- **Issue #13749** (closed): ratification lane: every reviewer session is rejected at admission
+- **Issue #13745** (closed): auto_update: release reads depend on the writer budget, and a rate limit is reported as FLEET FLOOR UNSATISFIABLE
+- **Issue #13743** (closed): lease pr claim: 'could not read this PR's lease records' refuses 1 in 3 PR steps
 - **PR #13739**: fix: report gh failure detail and dedupe ratification lane warnings
 - **PR #13735**: fix: namespace ratification_lane.tick span keys so export keeps them
 - **PR #13718**: build(deps): Bump the github-actions group across 1 directory with 4 updates
