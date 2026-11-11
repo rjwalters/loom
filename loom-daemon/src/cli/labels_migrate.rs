@@ -90,6 +90,10 @@ pub(crate) trait MigrateForge {
     /// Page `page` (1-based, [`PER_PAGE`] per page) of the OPEN issues and
     /// PRs carrying `label`.
     fn open_page(&self, label: &str, page: u32) -> Result<Vec<Item>, ForgeError>;
+    /// Labels on one item, read directly (not through the list endpoint,
+    /// which can lag a removal just made). [`ForgeError::NotFound`] means
+    /// the item is gone.
+    fn item_labels(&self, number: u64) -> Result<Vec<String>, ForgeError>;
     fn add_label(&self, number: u64, label: &str) -> Result<(), ForgeError>;
     /// Remove `label` from one item. [`ForgeError::NotFound`] means it was
     /// not there.
@@ -511,8 +515,27 @@ fn relabel_item(
 }
 
 /// Re-read open usage after the relabels; delete only on a definite "none".
+/// The listed items that really still carry `label`. The list endpoint can
+/// lag a removal this run just made, so each listed item is confirmed with a
+/// direct read; a read failure is an error (fail closed: the label is kept).
+fn still_carrying(
+    forge: &dyn MigrateForge,
+    label: &str,
+    listed: Vec<Item>,
+) -> Result<Vec<Item>, ForgeError> {
+    let mut real = Vec::new();
+    for it in listed {
+        match forge.item_labels(it.number) {
+            Ok(labels) if labels.iter().any(|l| l == label) => real.push(it),
+            Ok(_) | Err(ForgeError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(real)
+}
+
 fn prune(forge: &dyn MigrateForge, name: &str, r: &mut Report) -> Result<(), Stop> {
-    let why = match list_open(forge, name) {
+    let why = match list_open(forge, name).and_then(|open| still_carrying(forge, name, open)) {
         Err(e) => {
             stop_on_limit(r, &e)?;
             format!("usage re-check failed: {e}")
@@ -730,6 +753,17 @@ impl MigrateForge for GhMigrateForge {
         let jq = ".[] | [.number, [.labels[].name]] | @json";
         let out = self.gh(AccessIntent::Read, &["api", &path, "--jq", jq])?;
         parse_items(&String::from_utf8_lossy(&out))
+    }
+
+    fn item_labels(&self, number: u64) -> Result<Vec<String>, ForgeError> {
+        let path = format!("repos/{}/issues/{number}/labels?per_page=100", self.repo);
+        let out = self.gh(AccessIntent::Read, &["api", &path, "--jq", ".[].name"])?;
+        Ok(String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     fn add_label(&self, number: u64, label: &str) -> Result<(), ForgeError> {
