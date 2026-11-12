@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-11
 
+- **PR #13738**: fix: pass approved PRs stacked on a Loom stack branch instead of drawing champion_merge
+- **Issue #13737** (closed): Champion: stacked PR on a blocked parent is skipped daily as janitor_rc3 with nothing on the PR (15 skips on one head)
 - **PR #13756**: fix: confirm retired-label usage per item before keeping it in labels migrate
 - **PR #13753**: refactor: share one git merge-tree version gate across three callers
 - **Issue #13755** (closed): worktree-isolation guard treats a read-only input heredoc (python3 - <<'EOF') as a write
