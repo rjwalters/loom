@@ -357,6 +357,17 @@ install_hooks_and_cli() {
   local loom_root="$1"
   local target="$2"
   local force="${3:-false}"
+  # Issue #13801: newline-separated hook names that existed BEFORE this run's
+  # `loom-daemon init` (which itself syncs .loom/hooks/). Only those get the
+  # "Preserving" warning; a hook written earlier in the same run is silent.
+  # When the 4th arg is not passed at all, every existing hook is treated as
+  # pre-existing (the original behavior).
+  local have_snapshot=false
+  local preexisting_hooks=""
+  if [[ $# -ge 4 ]]; then
+    have_snapshot=true
+    preexisting_hooks="$4"
+  fi
 
   local canonical_present=false
   if canonical_guard_present "$target"; then
@@ -380,7 +391,9 @@ install_hooks_and_cli() {
         continue
       fi
       if [[ -f "$target/.loom/hooks/$hook_name" ]] && [[ "$force" != "true" ]]; then
-        warning "Preserving existing hook: $hook_name (use --clean to overwrite)"
+        if [[ "$have_snapshot" != "true" ]] || grep -qxF -- "$hook_name" <<<"$preexisting_hooks"; then
+          warning "Preserving existing hook: $hook_name (use --confirm-reinstall to overwrite)"
+        fi
       else
         cp "$hook_file" "$target/.loom/hooks/$hook_name"
         chmod +x "$target/.loom/hooks/$hook_name"
@@ -2451,6 +2464,11 @@ case "$METHOD" in
         error "Installation failed"
     else
       set_install_lock_phase "installing"
+      # Snapshot hooks present before init (#13801) so only those warn below.
+      _PREEXISTING_HOOKS=""
+      if [[ -d "$TARGET_PATH/.loom/hooks" ]]; then
+        _PREEXISTING_HOOKS="$(cd "$TARGET_PATH/.loom/hooks" && ls -1 -- *.sh 2>/dev/null || true)"
+      fi
       # Run loom-daemon init
       "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init $FORCE_FLAG ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
@@ -2460,8 +2478,9 @@ case "$METHOD" in
     # Force-overwrite existing hooks only under --clean (a deliberate fresh
     # install); otherwise preserve a downstream-tuned hook (#3625).
     _HOOK_FORCE=false
+    _PREEXISTING_HOOKS="${_PREEXISTING_HOOKS-}"
     [[ "$FORCE_FLAG" == "--clean" ]] && _HOOK_FORCE=true
-    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH" "$_HOOK_FORCE"
+    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH" "$_HOOK_FORCE" "${_PREEXISTING_HOOKS-}"
     # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
