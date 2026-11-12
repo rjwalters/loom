@@ -11,9 +11,9 @@ use tempfile::tempdir;
 
 fn flags(squash: bool, merge: bool, rebase: bool) -> RepoMergeFlags {
     RepoMergeFlags {
-        allow_squash_merge: squash,
-        allow_merge_commit: merge,
-        allow_rebase_merge: rebase,
+        allow_squash_merge: Some(squash),
+        allow_merge_commit: Some(merge),
+        allow_rebase_merge: Some(rebase),
     }
 }
 

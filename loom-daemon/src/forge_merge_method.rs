@@ -35,16 +35,18 @@ use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 /// Which of a repo's three merge strategies are actually enabled — the
 /// GitHub/Gitea `allow_squash_merge` / `allow_merge_commit(s)` /
 /// `allow_rebase_merge` triad, decoded once and passed around as plain
-/// `bool`s so [`resolve_merge_method`] never has to know which forge or
-/// transport it came from.
+/// tri-state `Option<bool>`s (#13779): `None` means the credential could not
+/// see the flag (a reader/fleet App returns `allow_*` as null or omits it),
+/// which is *unknown*, not *disabled*. [`resolve_merge_method`] never has to
+/// know which forge or transport it came from.
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
 pub(crate) struct RepoMergeFlags {
     #[serde(default)]
-    pub(crate) allow_squash_merge: bool,
+    pub(crate) allow_squash_merge: Option<bool>,
     #[serde(default, alias = "allow_merge_commits")]
-    pub(crate) allow_merge_commit: bool,
+    pub(crate) allow_merge_commit: Option<bool>,
     #[serde(default)]
-    pub(crate) allow_rebase_merge: bool,
+    pub(crate) allow_rebase_merge: Option<bool>,
 }
 
 /// The pure decision behind `loom-daemon forge merge-method` (#8845): given
@@ -52,6 +54,9 @@ pub(crate) struct RepoMergeFlags {
 /// method (validated) or today's auto-detect preference order.
 ///
 /// - `requested` present and allowed -> `Ok(requested)`.
+/// - `requested` present and its own flag unknown (`None`, #13779) ->
+///   `Ok(requested)`: the credential cannot see the setting, so the forge's
+///   own merge call is the authority rather than a local all-false guess.
 /// - `requested` present and NOT allowed -> `Err` naming every method the
 ///   repo actually allows — never a silent fallback to a different method,
 ///   which would reproduce the bug this subcommand exists to fix (#8845's
@@ -76,17 +81,17 @@ pub(crate) fn resolve_merge_method(
                 ))
             }
         };
-        if allowed {
+        if allowed != Some(false) {
             return Ok(req.to_string());
         }
         let mut names = Vec::new();
-        if flags.allow_squash_merge {
+        if flags.allow_squash_merge == Some(true) {
             names.push("squash");
         }
-        if flags.allow_merge_commit {
+        if flags.allow_merge_commit == Some(true) {
             names.push("merge");
         }
-        if flags.allow_rebase_merge {
+        if flags.allow_rebase_merge == Some(true) {
             names.push("rebase");
         }
         let allowed_desc = if names.is_empty() {
@@ -98,11 +103,11 @@ pub(crate) fn resolve_merge_method(
             "requested merge method '{req}' is not allowed by this repository; allowed method(s): {allowed_desc}"
         ));
     }
-    Ok(if flags.allow_merge_commit {
+    Ok(if flags.allow_merge_commit == Some(true) {
         "merge"
-    } else if flags.allow_rebase_merge {
+    } else if flags.allow_rebase_merge == Some(true) {
         "rebase"
-    } else if flags.allow_squash_merge {
+    } else if flags.allow_squash_merge == Some(true) {
         "squash"
     } else {
         // Degenerate: every strategy reports disabled (a state neither forge's
@@ -210,9 +215,9 @@ mod tests {
 
     fn flags(squash: bool, merge: bool, rebase: bool) -> RepoMergeFlags {
         RepoMergeFlags {
-            allow_squash_merge: squash,
-            allow_merge_commit: merge,
-            allow_rebase_merge: rebase,
+            allow_squash_merge: Some(squash),
+            allow_merge_commit: Some(merge),
+            allow_rebase_merge: Some(rebase),
         }
     }
 
@@ -262,6 +267,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_merge_method_unknown_flags_accept_an_explicit_request() {
+        // #13779: a credential that reads allow_* as null must not have an
+        // explicit request refused against all-false decoded flags.
+        let unknown = RepoMergeFlags::default();
+        for m in ["merge", "squash", "rebase"] {
+            assert_eq!(resolve_merge_method(Some(m), unknown).unwrap(), m);
+        }
+        // Auto-detect is unchanged: unknown behaves as not-enabled -> merge.
+        assert_eq!(resolve_merge_method(None, unknown).unwrap(), "merge");
+    }
+
+    #[test]
+    fn resolve_merge_method_partially_known_flags_still_validate() {
+        let partial = RepoMergeFlags {
+            allow_squash_merge: Some(false),
+            allow_merge_commit: None,
+            allow_rebase_merge: Some(true),
+        };
+        // Known-false still refuses; the unknown flag's method is accepted.
+        let err = resolve_merge_method(Some("squash"), partial).unwrap_err();
+        assert!(err.contains("rebase"), "should name what is known allowed: {err}");
+        assert_eq!(resolve_merge_method(Some("merge"), partial).unwrap(), "merge");
+        assert_eq!(resolve_merge_method(Some("rebase"), partial).unwrap(), "rebase");
+    }
+
+    #[test]
     fn resolve_merge_method_rejects_unrecognized_vocabulary() {
         let err = resolve_merge_method(Some("fast-forward"), flags(true, true, true)).unwrap_err();
         assert!(err.contains("fast-forward"));
@@ -298,6 +329,21 @@ mod tests {
         );
         let rc = github_merge_method(gh.to_str().unwrap(), "acme/widgets", Some("merge"));
         assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn github_merge_method_null_flags_accept_explicit_request() {
+        // #13779: the fleet App reads allow_* as null (or omits them).
+        let dir = tempdir().unwrap();
+        let gh = write_mock_gh_repo(
+            dir.path(),
+            Some(
+                r#"{"allow_squash_merge":null,"allow_merge_commit":null,"allow_rebase_merge":null}"#,
+            ),
+        );
+        assert_eq!(github_merge_method(gh.to_str().unwrap(), "acme/widgets", Some("merge")), 0);
+        let gh = write_mock_gh_repo(dir.path(), Some("{}"));
+        assert_eq!(github_merge_method(gh.to_str().unwrap(), "acme/widgets", Some("merge")), 0);
     }
 
     #[test]

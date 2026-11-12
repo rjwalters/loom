@@ -119,13 +119,13 @@ fn method_name(raw: &str) -> Option<&'static str> {
 
 fn repo_allowed(flags: RepoMergeFlags) -> MethodSet {
     let mut set = MethodSet::new();
-    if flags.allow_merge_commit {
+    if flags.allow_merge_commit == Some(true) {
         set.insert("merge");
     }
-    if flags.allow_squash_merge {
+    if flags.allow_squash_merge == Some(true) {
         set.insert("squash");
     }
-    if flags.allow_rebase_merge {
+    if flags.allow_rebase_merge == Some(true) {
         set.insert("rebase");
     }
     set
@@ -335,9 +335,9 @@ pub(crate) fn github_merge_config(
         );
     };
     let flags = RepoMergeFlags {
-        allow_squash_merge: allow_squash,
-        allow_merge_commit: allow_merge,
-        allow_rebase_merge: allow_rebase,
+        allow_squash_merge: Some(allow_squash),
+        allow_merge_commit: Some(allow_merge),
+        allow_rebase_merge: Some(allow_rebase),
     };
     let admin = settings.permissions.as_ref().is_some_and(|p| p.admin);
     let Some(branch) = branch
