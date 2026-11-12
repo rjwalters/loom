@@ -57,6 +57,7 @@ loom_test_require_daemon_bin --self-only --path "$SCRIPTS_DIR" spawn-worker sess
 # shellcheck source=lib/assert.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
+# Local assert_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_contains() {
     local needle="$1" haystack="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -71,6 +72,7 @@ assert_contains() {
     fi
 }
 
+# Local assert_not_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_not_contains() {
     local needle="$1" haystack="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
