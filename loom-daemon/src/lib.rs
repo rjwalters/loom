@@ -287,6 +287,7 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
+pub mod shell_out;
 // #11855: bound Judge re-runs on a PR whose passes end without a verdict.
 pub(crate) mod git_merge_tree;
 pub mod judge_backstop;
