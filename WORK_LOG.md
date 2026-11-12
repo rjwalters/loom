@@ -14,8 +14,30 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-12
+
+- **PR #13783**: chore(harness): track latest CLIs — codex 0.167.1→0.167.2
+- **PR #13782**: refactor(tests): share the ClickHouse pin and runner across SigNoz replay tests
+- **Issue #13781** (closed): Consolidate duplicated ClickHouse image pin and clickhouse() runner across SigNoz replay tests
+- **PR #13780**: fix(merge-method): treat null allow_* merge flags as unknown, not disabled
+- **Issue #13779** (closed): merge-pr: explicit --merge-method refused as 'allowed: none' when the App reads allow_* as null (#13178 never fixed here)
+
 ### 2026-11-11
 
+- **PR #13778**: docs: record guard-confinement evidence outcomes and pin E/F/C2/C4 cases
+- **Issue #13777** (closed): Give the guard-confinement and sweep evidence kept in gf180-opamp (and gf180-rcosc) an upstream home
+- **PR #13775**: fix(merge-queue): treat settled in-progress check runs as terminal in states_from
+- **PR #13774**: test(hooks): deny absolute loop value outside checkout as write target
+- **Issue #13773** (closed): guard test: no deny case for an absolute loop value outside the checkout used as a write target
+- **PR #13772**: docs: document that merge-group-check must not wait for CI
+- **Issue #13771** (closed): merge-group-check: the authorization job holds a runner for the length of the required checks
+- **PR #13770**: fix(deps): bump rustix to 1.1.6 to clear RUSTSEC-2026-0486
+- **Issue #13768** (closed): [ci-daily] Release Build (aarch64-unknown-linux-gnu)
+- **Issue #13767** (closed): [ci-daily] Supply Chain
+- **PR #13765**: chore(harness): track latest CLIs — codex 0.167.0→0.167.1
+- **Issue #13764** (closed): Merge-queue group_run check-run classifier still reads status alone
+- **PR #13761**: fix: treat check runs with a conclusion and completed_at as settled
+- **Issue #13758** (closed): Judge: a check run stuck at status=in_progress with conclusion=success reads as pending forever; PR is backstop-held indefinitely
 - **PR #13738**: fix: pass approved PRs stacked on a Loom stack branch instead of drawing champion_merge
 - **Issue #13737** (closed): Champion: stacked PR on a blocked parent is skipped daily as janitor_rc3 with nothing on the PR (15 skips on one head)
 - **PR #13756**: fix: confirm retired-label usage per item before keeping it in labels migrate
