@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-12
 
+- **Issue #13769** (closed): [ci-daily] Docker Image Smokes (unfiltered)
+- **Issue #13766** (closed): [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
 - **PR #13786**: refactor(daemon): share one shell-output helper module between daemon_start and daemon_update
 - **Issue #13784** (closed): Consolidate duplicated out.rs output helpers in daemon_start and daemon_update
 - **PR #13783**: chore(harness): track latest CLIs — codex 0.167.1→0.167.2
