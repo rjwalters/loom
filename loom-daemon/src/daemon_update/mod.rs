@@ -45,7 +45,7 @@ pub mod artifact;
 pub mod entry_points;
 pub mod floor_guard;
 pub mod notice;
-pub mod out;
+pub use crate::shell_out as out;
 pub mod paths;
 pub mod preflight;
 pub mod provision;
