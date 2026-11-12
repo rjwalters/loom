@@ -11,7 +11,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13738**: fix: pass approved PRs stacked on a Loom stack branch instead of drawing champion_merge
 
 ## Very Important
 
@@ -40,12 +39,15 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#13588**: checkout_ff: primary checkout moved off main by an agent step stays wrong-branch forever (no guard, no self-heal)
 - **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
 - **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
+- **#13760**: Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it
+- **#13769**: [ci-daily] Docker Image Smokes (unfiltered)
+- **#13787**: Install/resync leaves .loom/hooks/guard-destructive.sh unwired when another PreToolUse Bash guard is present (frenkel, 2am)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#13784**: Consolidate duplicated out.rs output helpers in daemon_start and daemon_update
 
 ## PRs Awaiting Review
 
@@ -55,6 +57,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
 - **#13593**: fix: put a clean stranded primary checkout back on the default branch
+- **#13786**: refactor(daemon): share one shell-output helper module between daemon_start and daemon_update
 
 ## Approved (Awaiting Merge)
 
@@ -62,7 +65,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13738**: fix: pass approved PRs stacked on a Loom stack branch instead of drawing champion_merge
 
 ## Proposed
 
@@ -115,11 +117,14 @@ Issues carrying `loom:curated`.
 - **#13720**: worktree.issue_state_rest reads spike every 4 h (synchronized cache expiry?) *(curated)*
 - **#13734**: ratification_lane.tick: outcome attributes never reach the store, and no keys posted on 0.19.1283 after 2 h *(curated)*
 - **#13736**: ratification_lane on 0.19.1283: every key withheld (pin 'could not resolve' under the daemon) and 60 PRs unreadable; ~390 WARN/h per host, no keys posted *(curated)*
-- **#13737**: Champion: stacked PR on a blocked parent is skipped daily as janitor_rc3 with nothing on the PR (15 skips on one head) *(curated)*
+- **#13762**: Ratification lane posts ratify:key markers with no verdict, as the PR author, with wrapper logs as the body *(curated)*
+- **#13769**: [ci-daily] Docker Image Smokes (unfiltered) *(curated)*
+- **#13787**: Install/resync leaves .loom/hooks/guard-destructive.sh unwired when another PreToolUse Bash guard is present (frenkel, 2am) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
 - **#13071**: Peer claims: move machine coordination off rendered room messages (custom event type / state events) *(architect)*
+- **#13776**: Remove write-only prompt_changes pipeline (git_parser, CaptureGitChanges): no reader, uncorrelatable rows *(hermit)*
 
 ## Epics
 
@@ -135,14 +140,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
+| Operator merge-risk holds | 2 |
 | Very important | 0 |
 | Important | 5 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 3 |
-| Curated | 48 |
-| Architect / Hermit proposals | 1 |
+| Ready (`loom:issue`) | 10 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 5 |
+| Approved PRs awaiting merge | 2 |
+| Curated | 50 |
+| Architect / Hermit proposals | 2 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
