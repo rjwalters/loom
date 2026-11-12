@@ -45,6 +45,7 @@ export LOOM_SWEEP_INFLIGHT_SWEEPS=1
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 
+# Local assert_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_contains() {
     local needle="$1"
     local haystack="$2"
@@ -61,6 +62,7 @@ assert_contains() {
     fi
 }
 
+# Local assert_not_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_not_contains() {
     local needle="$1"
     local haystack="$2"
