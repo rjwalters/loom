@@ -40,14 +40,12 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
 - **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
 - **#13760**: Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it
-- **#13769**: [ci-daily] Docker Image Smokes (unfiltered)
-- **#13787**: Install/resync leaves .loom/hooks/guard-destructive.sh unwired when another PreToolUse Bash guard is present (frenkel, 2am)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#13784**: Consolidate duplicated out.rs output helpers in daemon_start and daemon_update
+- **#13793**: Daemon floor-roll resync never wires Loom hooks into .claude/settings.json (#13789 only fixed the script path)
 
 ## PRs Awaiting Review
 
@@ -57,7 +55,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
 - **#13593**: fix: put a clean stranded primary checkout back on the default branch
-- **#13786**: refactor(daemon): share one shell-output helper module between daemon_start and daemon_update
+- **#13794**: feat: wire missing project hook entries in daemon workspace resync
 
 ## Approved (Awaiting Merge)
 
@@ -118,13 +116,13 @@ Issues carrying `loom:curated`.
 - **#13734**: ratification_lane.tick: outcome attributes never reach the store, and no keys posted on 0.19.1283 after 2 h *(curated)*
 - **#13736**: ratification_lane on 0.19.1283: every key withheld (pin 'could not resolve' under the daemon) and 60 PRs unreadable; ~390 WARN/h per host, no keys posted *(curated)*
 - **#13762**: Ratification lane posts ratify:key markers with no verdict, as the PR author, with wrapper logs as the body *(curated)*
-- **#13769**: [ci-daily] Docker Image Smokes (unfiltered) *(curated)*
-- **#13787**: Install/resync leaves .loom/hooks/guard-destructive.sh unwired when another PreToolUse Bash guard is present (frenkel, 2am) *(curated)*
+- **#13793**: Daemon floor-roll resync never wires Loom hooks into .claude/settings.json (#13789 only fixed the script path) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
 - **#13071**: Peer claims: move machine coordination off rendered room messages (custom event type / state events) *(architect)*
 - **#13776**: Remove write-only prompt_changes pipeline (git_parser, CaptureGitChanges): no reader, uncorrelatable rows *(hermit)*
+- **#13795**: Remove shadowing assert_* copies in test suites; share assert_doc_* via lib/assert.sh *(hermit)*
 
 ## Epics
 
@@ -143,11 +141,11 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 2 |
 | Very important | 0 |
 | Important | 5 |
-| Ready (`loom:issue`) | 10 |
+| Ready (`loom:issue`) | 8 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 5 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 50 |
-| Architect / Hermit proposals | 2 |
+| Curated | 49 |
+| Architect / Hermit proposals | 3 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
