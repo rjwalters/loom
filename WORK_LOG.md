@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-12
 
+- **PR #13789**: fix: wire Loom hooks additively on resync and match the Loom path
+- **Issue #13787** (closed): Install/resync leaves .loom/hooks/guard-destructive.sh unwired when another PreToolUse Bash guard is present
 - **Issue #13769** (closed): [ci-daily] Docker Image Smokes (unfiltered)
 - **Issue #13766** (closed): [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
 - **PR #13786**: refactor(daemon): share one shell-output helper module between daemon_start and daemon_update
