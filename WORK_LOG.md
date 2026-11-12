@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-12
 
+- **PR #13786**: refactor(daemon): share one shell-output helper module between daemon_start and daemon_update
+- **Issue #13784** (closed): Consolidate duplicated out.rs output helpers in daemon_start and daemon_update
 - **PR #13783**: chore(harness): track latest CLIs — codex 0.167.1→0.167.2
 - **PR #13782**: refactor(tests): share the ClickHouse pin and runner across SigNoz replay tests
 - **Issue #13781** (closed): Consolidate duplicated ClickHouse image pin and clickhouse() runner across SigNoz replay tests
