@@ -52,17 +52,17 @@
 //!   reached into `attributes_number` would silently get 0.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 /// Same pin as the SigNoz trial's telemetry store (`signoz/casting.yaml`) and
 /// as `signoz_usage_queries.rs` / `signoz_cycle_time.rs`, so no proof in this
 /// repo can drift from the deployment on ClickHouse version.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::{clickhouse, CLICKHOUSE_IMAGE};
 
 const QUEUE_DWELL: &str = include_str!("../../defaults/observability/signoz/queue-dwell.sql");
 const QUOTA: &str = include_str!("../../defaults/observability/signoz/quota-utilization.sql");
@@ -70,46 +70,6 @@ const FIXTURE: &str = include_str!("fixtures/signoz_queue_quota/fixture.sql");
 
 /// One result row: column name -> JSON value, as `JSONEachRow` renders it.
 type Row = BTreeMap<String, serde_json::Value>;
-
-/// Runs `script` through `clickhouse local` in the pinned image and returns
-/// stdout. Panics with the engine's own stderr on failure — a query that does
-/// not parse must fail this test, not be silently skipped.
-///
-/// Neither committed file takes a bound parameter: both are windowed on
-/// `now()`, which is why the fixture anchors its rows to computed points
-/// instead of fixed timestamps.
-fn clickhouse(script: &str, format: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            &format!("--format={format}"),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 /// The committed file's statements. Line comments are stripped **before** the
 /// split on `;`, mirroring `signoz_usage_queries.rs` / `signoz_cycle_time.rs`:
