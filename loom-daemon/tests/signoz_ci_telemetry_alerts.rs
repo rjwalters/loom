@@ -19,14 +19,14 @@
 //! for five days while `host.export` stays healthy.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::CLICKHOUSE_IMAGE;
 
 const LAGGING: &str =
     include_str!("../../defaults/observability/signoz/alerts/ci-telemetry-export-lagging.json");
@@ -146,39 +146,6 @@ fn thresholds_are_the_filed_values() {
 }
 
 // ---------------------------------------------------------------- replay ----
-
-fn clickhouse(script: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            "--format=JSONEachRow",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 const SCHEMA: &str = "CREATE DATABASE signoz_metrics;\n\
 CREATE DATABASE signoz_logs;\n\
@@ -346,7 +313,7 @@ fn firing(raw: &str, fixture: &str, end_sec: i64) -> Vec<String> {
         .replace("{{.end_timestamp_nano}}", &(end * 1_000_000_000).to_string())
         .replace("{{.start_timestamp_ms}}", &(start * 1000).to_string())
         .replace("{{.end_timestamp_ms}}", &(end * 1000).to_string());
-    let out = clickhouse(&format!("{fixture}\n{q};"));
+    let out = clickhouse_local::clickhouse_json(&format!("{fixture}\n{q};"));
     let mut by_host: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for line in out.lines().filter(|l| !l.trim().is_empty()) {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();

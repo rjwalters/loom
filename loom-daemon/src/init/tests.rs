@@ -1038,97 +1038,43 @@ fn test_hooks_preserved_on_reinstall() {
     assert_eq!(content, "#!/bin/bash\n# updated guard hook v2");
 }
 
-#[test]
-fn test_scripts_lib_subdirectory_copied_on_fresh_install() {
-    // Verifies that scripts/lib/ subdirectory (containing loom-tools.sh,
-    // repo-root.sh and pipe-pane-cmd.sh) is correctly copied during initialization.
-    // This is the specific scenario reported in issue #2392.
+/// Build a temp workspace (with `.git`) plus a minimal `defaults/` tree
+/// (`config.json` + `roles/builder.md`) and any extra `(relative path,
+/// content)` files, creating parent directories as needed.
+fn defaults_with(files: &[(&str, &str)]) -> (TempDir, std::path::PathBuf) {
     let temp_dir = TempDir::new().unwrap();
-    let workspace = temp_dir.path();
     let defaults = temp_dir.path().join("defaults");
-
-    fs::create_dir(workspace.join(".git")).unwrap();
-
-    // Create defaults mirroring real structure with scripts/lib/
+    fs::create_dir(temp_dir.path().join(".git")).unwrap();
     fs::create_dir_all(defaults.join("roles")).unwrap();
-    fs::create_dir_all(defaults.join("scripts").join("lib")).unwrap();
     fs::write(defaults.join("config.json"), "{}").unwrap();
     fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
-    fs::write(
-        defaults.join("scripts").join("agent-spawn.sh"),
-        "#!/bin/bash\nsource \"$SCRIPT_DIR/lib/loom-tools.sh\"",
-    )
-    .unwrap();
-    fs::write(
-        defaults.join("scripts").join("lib").join("loom-tools.sh"),
-        "#!/bin/bash\n# shared helper library",
-    )
-    .unwrap();
-    fs::write(
-        defaults.join("scripts").join("lib").join("repo-root.sh"),
-        "#!/bin/bash\n# repo-root helper",
-    )
-    .unwrap();
-    fs::write(
-        defaults
-            .join("scripts")
-            .join("lib")
-            .join("pipe-pane-cmd.sh"),
-        "#!/bin/bash\n# pipe pane command",
-    )
-    .unwrap();
+    write_files(&defaults, files);
+    (temp_dir, defaults)
+}
 
-    let result =
-        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+/// Write `(relative path, content)` files under `root`, creating parents.
+fn write_files(root: &Path, files: &[(&str, &str)]) {
+    for (rel, content) in files {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+}
 
-    assert!(result.is_ok());
-    let report = result.unwrap();
-
-    // Verify scripts/lib/ subdirectory exists
-    let lib_dir = workspace.join(".loom").join("scripts").join("lib");
-    assert!(lib_dir.exists(), "scripts/lib/ directory should exist");
-    assert!(lib_dir.is_dir(), "scripts/lib/ should be a directory");
-
-    // Verify both lib files were copied
-    let loom_tools = lib_dir.join("loom-tools.sh");
-    assert!(loom_tools.exists(), "lib/loom-tools.sh should exist");
-    let content = fs::read_to_string(&loom_tools).unwrap();
-    assert_eq!(content, "#!/bin/bash\n# shared helper library");
-
-    let pipe_pane = lib_dir.join("pipe-pane-cmd.sh");
-    assert!(pipe_pane.exists(), "lib/pipe-pane-cmd.sh should exist");
-
-    // Verify the parent script was also copied
-    let agent_spawn = workspace
-        .join(".loom")
-        .join("scripts")
-        .join("agent-spawn.sh");
-    assert!(agent_spawn.exists(), "agent-spawn.sh should exist");
-
-    // Verify report includes subdirectory files
-    assert!(
-        report
-            .added
-            .contains(&".loom/scripts/lib/loom-tools.sh".to_string()),
-        "Report should include lib/loom-tools.sh, got: {:?}",
-        report.added
-    );
-    assert!(
-        report
-            .added
-            .contains(&".loom/scripts/lib/repo-root.sh".to_string()),
-        "Report should include lib/repo-root.sh, got: {:?}",
-        report.added
-    );
-    assert!(
-        report
-            .added
-            .contains(&".loom/scripts/lib/pipe-pane-cmd.sh".to_string()),
-        "Report should include lib/pipe-pane-cmd.sh, got: {:?}",
-        report.added
-    );
-
-    // Verify no verification failures
+/// Assert each `(path relative to .loom/, expected content)` file exists with
+/// that content, is listed in `report.added` as `.loom/<path>`, and that init
+/// reported no verification failures.
+fn assert_subdir_installed(report: &InitReport, workspace: &Path, files: &[(&str, &str)]) {
+    for (rel, expected) in files {
+        let path = workspace.join(".loom").join(rel);
+        assert!(path.exists(), ".loom/{rel} should exist");
+        assert_eq!(fs::read_to_string(&path).unwrap(), *expected, ".loom/{rel} content");
+        assert!(
+            report.added.contains(&format!(".loom/{rel}")),
+            "Report should include {rel}, got: {:?}",
+            report.added
+        );
+    }
     assert!(
         report.verification_failures.is_empty(),
         "Expected no verification failures, got: {:?}",
@@ -1137,74 +1083,66 @@ fn test_scripts_lib_subdirectory_copied_on_fresh_install() {
 }
 
 #[test]
+fn test_scripts_lib_subdirectory_copied_on_fresh_install() {
+    // Verifies that scripts/lib/ subdirectory (containing loom-tools.sh,
+    // repo-root.sh and pipe-pane-cmd.sh) is correctly copied during initialization.
+    // This is the specific scenario reported in issue #2392.
+    let files = [
+        (
+            "scripts/agent-spawn.sh",
+            "#!/bin/bash\nsource \"$SCRIPT_DIR/lib/loom-tools.sh\"",
+        ),
+        ("scripts/lib/loom-tools.sh", "#!/bin/bash\n# shared helper library"),
+        ("scripts/lib/repo-root.sh", "#!/bin/bash\n# repo-root helper"),
+        ("scripts/lib/pipe-pane-cmd.sh", "#!/bin/bash\n# pipe pane command"),
+    ];
+    let (temp_dir, defaults) = defaults_with(&files);
+    let workspace = temp_dir.path();
+
+    let report =
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+            .unwrap();
+
+    assert!(
+        workspace.join(".loom/scripts/lib").is_dir(),
+        "scripts/lib/ should be a directory"
+    );
+    assert_subdir_installed(&report, workspace, &files);
+}
+
+#[test]
 fn test_scripts_lib_subdirectory_restored_on_reinstall() {
     // On reinstall, scripts/lib/ should be cleaned and re-copied.
     // This tests the case where lib/ existed but with stale content.
-    let temp_dir = TempDir::new().unwrap();
+    let (temp_dir, defaults) =
+        defaults_with(&[("scripts/lib/loom-tools.sh", "#!/bin/bash\n# v2 helper")]);
     let workspace = temp_dir.path();
-    let defaults = temp_dir.path().join("defaults");
-
-    fs::create_dir(workspace.join(".git")).unwrap();
-
-    // Create defaults with scripts/lib/
-    fs::create_dir_all(defaults.join("roles")).unwrap();
-    fs::create_dir_all(defaults.join("scripts").join("lib")).unwrap();
-    fs::write(defaults.join("config.json"), "{}").unwrap();
-    fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
-    fs::write(
-        defaults.join("scripts").join("lib").join("loom-tools.sh"),
-        "#!/bin/bash\n# v2 helper",
-    )
-    .unwrap();
 
     // Simulate existing installation with old lib/ content and a stale file
-    fs::create_dir_all(workspace.join(".loom").join("scripts").join("lib")).unwrap();
-    fs::write(
-        workspace
-            .join(".loom")
-            .join("scripts")
-            .join("lib")
-            .join("loom-tools.sh"),
-        "#!/bin/bash\n# v1 helper (old)",
-    )
-    .unwrap();
-    fs::write(
-        workspace
-            .join(".loom")
-            .join("scripts")
-            .join("lib")
-            .join("obsolete.sh"),
-        "#!/bin/bash\n# should be removed",
-    )
-    .unwrap();
+    write_files(
+        &workspace.join(".loom"),
+        &[
+            ("scripts/lib/loom-tools.sh", "#!/bin/bash\n# v1 helper (old)"),
+            ("scripts/lib/obsolete.sh", "#!/bin/bash\n# should be removed"),
+        ],
+    );
     // #5971: the sweep retires a file only when something attributes it to
     // Loom — here, the previous install's own record.
     write_prev_manifest(workspace, &[".loom/scripts/lib/obsolete.sh"]);
 
-    let result =
-        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
-
-    assert!(result.is_ok());
-    let report = result.unwrap();
+    let report =
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+            .unwrap();
 
     // lib/loom-tools.sh should have new content
-    let loom_tools = workspace
-        .join(".loom")
-        .join("scripts")
-        .join("lib")
-        .join("loom-tools.sh");
-    let content = fs::read_to_string(&loom_tools).unwrap();
+    let content = fs::read_to_string(workspace.join(".loom/scripts/lib/loom-tools.sh")).unwrap();
     assert_eq!(content, "#!/bin/bash\n# v2 helper");
 
-    // Stale file should be removed
-    let obsolete = workspace
-        .join(".loom")
-        .join("scripts")
-        .join("lib")
-        .join("obsolete.sh");
-    assert!(!obsolete.exists(), "Stale file in lib/ should be removed on reinstall");
-
-    // Report should track the removal
+    // Stale file should be removed and tracked in the report
+    assert!(
+        !workspace.join(".loom/scripts/lib/obsolete.sh").exists(),
+        "Stale file in lib/ should be removed on reinstall"
+    );
     assert!(
         report
             .removed
@@ -1225,85 +1163,30 @@ fn test_docs_subdirectory_copied_on_fresh_install() {
     // would re-introduce the v0.10 field failure where consumers got
     // `MISSING: .loom/docs/ci-integration.md` from the post-install
     // metadata verification (the #3287 safety net).
-    let temp_dir = TempDir::new().unwrap();
-    let workspace = temp_dir.path();
-    let defaults = temp_dir.path().join("defaults");
-
-    fs::create_dir(workspace.join(".git")).unwrap();
-
-    // Create defaults mirroring the real shipped shape: docs live at
-    // `defaults/docs/` alongside `defaults/roles/` (issue #3476 moved
-    // them there from `defaults/.loom/docs/`, which `sync_managed_dir`
-    // never looked at). The companion test
-    // `test_real_defaults_tree_ships_docs_at_top_level` pins the actual
-    // shipped tree to this layout so the two can't silently diverge.
-    fs::create_dir_all(defaults.join("roles")).unwrap();
-    fs::create_dir_all(defaults.join("docs")).unwrap();
-    fs::write(defaults.join("config.json"), "{}").unwrap();
-    fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
-    fs::write(
-        defaults.join("docs").join("ci-integration.md"),
-        "# CI Integration\n\nStatic reference documentation.",
-    )
-    .unwrap();
-    // A second doc, to confirm we copy the whole directory and not
+    //
+    // Defaults mirror the real shipped shape: docs live at `defaults/docs/`
+    // alongside `defaults/roles/` (issue #3476 moved them there from
+    // `defaults/.loom/docs/`, which `sync_managed_dir` never looked at). The
+    // companion test `test_real_defaults_tree_ships_docs_at_top_level` pins
+    // the actual shipped tree to this layout so the two can't silently
+    // diverge. A second doc confirms we copy the whole directory and not
     // just one named file.
-    fs::write(
-        defaults.join("docs").join("troubleshooting.md"),
-        "# Troubleshooting\n\nMore docs.",
-    )
-    .unwrap();
+    let files = [
+        ("docs/ci-integration.md", "# CI Integration\n\nStatic reference documentation."),
+        ("docs/troubleshooting.md", "# Troubleshooting\n\nMore docs."),
+    ];
+    let (temp_dir, defaults) = defaults_with(&files);
+    let workspace = temp_dir.path();
 
     let result =
         initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
-
-    assert!(result.is_ok(), "init failed: {:?}", result.err());
+    assert!(result.is_ok(), "init failed: {:?}", result.as_ref().err());
     let report = result.unwrap();
 
-    // The `.loom/docs/` directory must exist on disk post-init.
-    let docs_dir = workspace.join(".loom").join("docs");
-    assert!(docs_dir.exists(), ".loom/docs/ directory should exist");
-    assert!(docs_dir.is_dir(), ".loom/docs/ should be a directory");
-
-    // The specific file the field failure flagged must be present.
-    let ci_md = docs_dir.join("ci-integration.md");
-    assert!(
-        ci_md.exists(),
-        ".loom/docs/ci-integration.md should exist (this is the file the \
-             v0.10 install regression reported as MISSING in issue #3470)"
-    );
-    let content = fs::read_to_string(&ci_md).unwrap();
-    assert_eq!(content, "# CI Integration\n\nStatic reference documentation.");
-
-    // The sibling doc must also be present (whole-directory copy).
-    let troubleshooting = docs_dir.join("troubleshooting.md");
-    assert!(troubleshooting.exists(), ".loom/docs/troubleshooting.md should exist");
-
-    // Report bookkeeping: both docs files should be tracked as added.
-    assert!(
-        report
-            .added
-            .contains(&".loom/docs/ci-integration.md".to_string()),
-        "Report should include docs/ci-integration.md, got: {:?}",
-        report.added
-    );
-    assert!(
-        report
-            .added
-            .contains(&".loom/docs/troubleshooting.md".to_string()),
-        "Report should include docs/troubleshooting.md, got: {:?}",
-        report.added
-    );
-
-    // No verification failures: the fail-fast assertion inside
-    // sync_managed_dir (the #3220/#3287 safety net) should be quiet,
-    // and the post-copy `verify_all_copied_files` walk over the docs
-    // dir should not produce any content mismatches.
-    assert!(
-        report.verification_failures.is_empty(),
-        "Expected no verification failures, got: {:?}",
-        report.verification_failures
-    );
+    assert!(workspace.join(".loom/docs").is_dir(), ".loom/docs/ should be a directory");
+    // Includes the file the field failure flagged as MISSING (#3470), and
+    // asserts no verification failures from the #3220/#3287 safety net.
+    assert_subdir_installed(&report, workspace, &files);
 }
 
 #[test]
@@ -1313,51 +1196,35 @@ fn test_docs_subdirectory_restored_on_reinstall() {
     // removed and updated content lands. This pins the #3470 fix on
     // the reinstall path (which is the path the field failure
     // exercised — Studio was upgrading v0.9 -> v0.10).
-    let temp_dir = TempDir::new().unwrap();
+    let (temp_dir, defaults) = defaults_with(&[("docs/ci-integration.md", "# CI Integration v2")]);
     let workspace = temp_dir.path();
-    let defaults = temp_dir.path().join("defaults");
-
-    fs::create_dir(workspace.join(".git")).unwrap();
-
-    // Defaults with updated docs.
-    fs::create_dir_all(defaults.join("roles")).unwrap();
-    fs::create_dir_all(defaults.join("docs")).unwrap();
-    fs::write(defaults.join("config.json"), "{}").unwrap();
-    fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
-    fs::write(defaults.join("docs").join("ci-integration.md"), "# CI Integration v2").unwrap();
 
     // Pre-existing install with stale content + a stale file.
-    fs::create_dir_all(workspace.join(".loom").join("docs")).unwrap();
-    fs::write(
-        workspace
-            .join(".loom")
-            .join("docs")
-            .join("ci-integration.md"),
-        "# CI Integration v1 (old)",
-    )
-    .unwrap();
-    fs::write(workspace.join(".loom").join("docs").join("obsolete-doc.md"), "stale").unwrap();
+    write_files(
+        &workspace.join(".loom"),
+        &[
+            ("docs/ci-integration.md", "# CI Integration v1 (old)"),
+            ("docs/obsolete-doc.md", "stale"),
+        ],
+    );
     // #5971: the sweep retires a file only when something attributes it to
     // Loom — here, the previous install's own record.
     write_prev_manifest(workspace, &[".loom/docs/obsolete-doc.md"]);
 
     let result =
         initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
-
-    assert!(result.is_ok(), "reinstall failed: {:?}", result.err());
+    assert!(result.is_ok(), "reinstall failed: {:?}", result.as_ref().err());
     let report = result.unwrap();
 
     // Updated file has new content.
-    let ci_md = workspace
-        .join(".loom")
-        .join("docs")
-        .join("ci-integration.md");
-    let content = fs::read_to_string(&ci_md).unwrap();
+    let content = fs::read_to_string(workspace.join(".loom/docs/ci-integration.md")).unwrap();
     assert_eq!(content, "# CI Integration v2");
 
     // Stale file removed.
-    let obsolete = workspace.join(".loom").join("docs").join("obsolete-doc.md");
-    assert!(!obsolete.exists(), "Stale docs file should be removed on reinstall");
+    assert!(
+        !workspace.join(".loom/docs/obsolete-doc.md").exists(),
+        "Stale docs file should be removed on reinstall"
+    );
     assert!(
         report
             .removed
@@ -1377,60 +1244,24 @@ fn test_runtimes_subdirectory_copied_on_fresh_install() {
     // left `.loom/runtimes/` unpopulated and the admission gate fell
     // through to a nonexistent `defaults/runtimes/...` on every
     // dispatch.
-    let temp_dir = TempDir::new().unwrap();
+    let files = [
+        ("runtimes/claude.json", r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#),
+        ("runtimes/codex.json", r#"{"runtime":"codex","capabilities":{"mcp":"yes"}}"#),
+    ];
+    let (temp_dir, defaults) = defaults_with(&files);
     let workspace = temp_dir.path();
-    let defaults = temp_dir.path().join("defaults");
-
-    fs::create_dir(workspace.join(".git")).unwrap();
-
-    fs::create_dir_all(defaults.join("roles")).unwrap();
-    fs::create_dir_all(defaults.join("runtimes")).unwrap();
-    fs::write(defaults.join("config.json"), "{}").unwrap();
-    fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
-    fs::write(
-        defaults.join("runtimes").join("claude.json"),
-        r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#,
-    )
-    .unwrap();
-    fs::write(
-        defaults.join("runtimes").join("codex.json"),
-        r#"{"runtime":"codex","capabilities":{"mcp":"yes"}}"#,
-    )
-    .unwrap();
 
     let result =
         initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
-
-    assert!(result.is_ok(), "init failed: {:?}", result.err());
+    assert!(result.is_ok(), "init failed: {:?}", result.as_ref().err());
     let report = result.unwrap();
 
-    let runtimes_dir = workspace.join(".loom").join("runtimes");
-    assert!(runtimes_dir.exists(), ".loom/runtimes/ directory should exist");
-    assert!(runtimes_dir.is_dir(), ".loom/runtimes/ should be a directory");
-
-    let claude_json = runtimes_dir.join("claude.json");
-    assert!(claude_json.exists(), ".loom/runtimes/claude.json should exist");
-    assert_eq!(
-        fs::read_to_string(&claude_json).unwrap(),
-        r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#
-    );
     assert!(
-        runtimes_dir.join("codex.json").exists(),
-        ".loom/runtimes/codex.json should exist (whole-directory copy)"
+        workspace.join(".loom/runtimes").is_dir(),
+        ".loom/runtimes/ should be a directory"
     );
-
-    assert!(
-        report
-            .added
-            .contains(&".loom/runtimes/claude.json".to_string()),
-        "Report should include runtimes/claude.json, got: {:?}",
-        report.added
-    );
-    assert!(
-        report.verification_failures.is_empty(),
-        "Expected no verification failures, got: {:?}",
-        report.verification_failures
-    );
+    // Both manifests: whole-directory copy, not just one named file.
+    assert_subdir_installed(&report, workspace, &files);
 }
 
 #[test]
@@ -1440,21 +1271,9 @@ fn test_runtimes_subdirectory_restored_on_reinstall() {
     // fresh, and — critically — a workspace that NEVER had
     // `.loom/runtimes/` at all (the exact #4688 incident layout) must
     // have it backfilled by a reinstall, not silently skipped.
-    let temp_dir = TempDir::new().unwrap();
+    let manifest = r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#;
+    let (temp_dir, defaults) = defaults_with(&[("runtimes/claude.json", manifest)]);
     let workspace = temp_dir.path();
-    let defaults = temp_dir.path().join("defaults");
-
-    fs::create_dir(workspace.join(".git")).unwrap();
-
-    fs::create_dir_all(defaults.join("roles")).unwrap();
-    fs::create_dir_all(defaults.join("runtimes")).unwrap();
-    fs::write(defaults.join("config.json"), "{}").unwrap();
-    fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
-    fs::write(
-        defaults.join("runtimes").join("claude.json"),
-        r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#,
-    )
-    .unwrap();
 
     // Pre-existing install that predates #4688: `.loom/roles/` exists
     // but `.loom/runtimes/` was never provisioned at all.
@@ -1463,7 +1282,6 @@ fn test_runtimes_subdirectory_restored_on_reinstall() {
 
     let result =
         initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
-
     assert!(result.is_ok(), "reinstall failed: {:?}", result.err());
 
     let claude_json = workspace.join(".loom").join("runtimes").join("claude.json");
@@ -1472,10 +1290,7 @@ fn test_runtimes_subdirectory_restored_on_reinstall() {
         ".loom/runtimes/claude.json should be backfilled by reinstall even though \
              .loom/runtimes/ never existed before"
     );
-    assert_eq!(
-        fs::read_to_string(&claude_json).unwrap(),
-        r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#
-    );
+    assert_eq!(fs::read_to_string(&claude_json).unwrap(), manifest);
 }
 
 #[test]

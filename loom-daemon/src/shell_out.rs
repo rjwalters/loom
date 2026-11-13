@@ -1,8 +1,9 @@
-//! The script's four output helpers, reproduced exactly — plus the one
-//! stream-routing rule `--resolve-json` imposes on all of them.
+//! The shell scripts' output helpers, reproduced exactly — shared by
+//! `daemon_start` and `daemon_update` (both re-export this as `out`) — plus the
+//! one stream-routing rule `--resolve-json` imposes on all of them.
 //!
 //! ```sh
-//! if [[ -t 1 ]]; then RED=…; GREEN=…; YELLOW=…; NC=…; else …=''; fi
+//! if [[ -t 1 ]]; then RED=…; GREEN=…; YELLOW=…; BOLD=…; NC=…; else …=''; fi
 //! err()  { echo -e "${RED}$*${NC}" >&2; }
 //! warn() { echo -e "${YELLOW}$*${NC}" >&2; }
 //! ok()   { echo -e "${GREEN}$*${NC}"; }
@@ -25,7 +26,8 @@
 //!   a process-global flag that [`ok`] and [`say`] consult. The effect is the
 //!   same — stdout carries the single JSON object and nothing else — without
 //!   needing a spare file descriptor to survive into the exec'd child, which
-//!   inherits the real stdout untouched.
+//!   inherits the real stdout untouched. The flag is process-global, so it
+//!   applies to `daemon_start` output too; that path never sets it.
 
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +38,7 @@ pub struct Palette {
     pub red: &'static str,
     pub green: &'static str,
     pub yellow: &'static str,
+    pub bold: &'static str,
     pub nc: &'static str,
 }
 
@@ -53,6 +56,7 @@ pub fn palette() -> &'static Palette {
                 red: "\x1b[0;31m",
                 green: "\x1b[0;32m",
                 yellow: "\x1b[1;33m",
+                bold: "\x1b[1m",
                 nc: "\x1b[0m",
             }
         } else {
@@ -60,6 +64,7 @@ pub fn palette() -> &'static Palette {
                 red: "",
                 green: "",
                 yellow: "",
+                bold: "",
                 nc: "",
             }
         }

@@ -344,3 +344,23 @@ fn a_download_without_a_reader_is_the_pre_reader_invocation() {
     assert_eq!(stub.calls(), vec![false]);
     assert_eq!(roles(&rows), vec!["writer"]);
 }
+
+/// #13640 / #12394: a reader whose `gh` produces no HTTP response on the
+/// owner-kind probe yields a transport error, and the writer is never run.
+#[test]
+fn a_failed_owner_kind_probe_on_the_reader_never_runs_the_writer() {
+    let stub = Stub::new("exit 1", "echo 'HTTP/2.0 200 OK'; echo; echo '{}'");
+    let withdrawn: Withdrawals = Arc::default();
+    let reader = stub.reader.clone();
+    let api = GhCliApi::with_reader_seams(
+        stub.gh.clone(),
+        Box::new(move |route| (route == "acme/*").then(|| (reader.clone(), APP.to_string()))),
+        Box::new(|_, _, _, _| {}),
+    );
+    drop(withdrawn);
+    let err = api.get("users/acme", None).unwrap_err();
+    assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+    let log = std::fs::read_to_string(&stub.log).unwrap();
+    assert_eq!(log.lines().count(), 1, "only the reader ran: {log}");
+    assert_eq!(log.trim(), stub.reader.display().to_string());
+}

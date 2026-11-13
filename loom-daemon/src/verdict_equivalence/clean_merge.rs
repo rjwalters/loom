@@ -114,7 +114,7 @@ pub fn assess(
     }
     // Checked before the fetch, so a host that could never compute the answer
     // does not pay for the network round trip.
-    if !git_objects::supports_merge_tree(repo) {
+    if !crate::git_merge_tree::supports_merge_tree(Some(repo)) {
         return unavailable("git predates 2.38 (no `merge-tree --write-tree`)".into());
     }
 

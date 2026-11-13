@@ -45,7 +45,7 @@ pub mod artifact;
 pub mod entry_points;
 pub mod floor_guard;
 pub mod notice;
-pub mod out;
+pub use crate::shell_out as out;
 pub mod paths;
 pub mod preflight;
 pub mod provision;
@@ -634,7 +634,7 @@ fn resolve_json_and_exit(a: &Args, repo_root: &Path, installed_bin: Option<&Path
     println!("{}", emit::to_json(&resolution));
     exit(match resolution {
         Resolution::Resolved(_) => 0,
-        Resolution::Unresolved(_) => 1,
+        Resolution::Unresolved(_) | Resolution::Unavailable(_) => 1,
     })
 }
 

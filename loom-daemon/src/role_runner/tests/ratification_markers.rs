@@ -315,3 +315,203 @@ fn unreadable_second_page_fails_closed() {
     assert!(parse_listing(torn.as_bytes()).is_none());
     assert!(parse_listing(b"").is_none());
 }
+
+// ---- tick outcome + shared entry points (#13707) ----
+
+use crate::role_runner::ratification_lane::{
+    run_lane_counted, tick_span, KeyPost, TickOutcome, STEP_TICK_INTERVAL,
+};
+
+/// A forge whose trusted comments are whatever the sink has posted so far.
+struct Live<'a> {
+    inner: Prs,
+    sink: &'a Sink,
+}
+
+impl PrSource for Live<'_> {
+    fn open_prs(&self) -> Vec<OpenPr> {
+        self.inner.open_prs()
+    }
+    fn files(
+        &self,
+        pr: u64,
+        hold: &crate::champion_hold::ratification::Config,
+    ) -> Vec<ChangedFile> {
+        self.inner.files(pr, hold)
+    }
+    fn trusted_comments(&self, _pr: u64) -> Vec<Comment> {
+        comments(self.sink)
+    }
+}
+
+#[test]
+fn outcome_counts_selected_ran_posted() {
+    let (prs, sink, mut r) = (
+        Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        Sink::default(),
+        ok_runner(),
+    );
+    let (results, skipped) =
+        run_lane_counted(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    let o = TickOutcome::from_run(&results, skipped);
+    assert_eq!((o.reason, o.selected, o.skipped, o.ran, o.posted), ("ran", 1, 0, 1, 2));
+    assert!(results[0].1.iter().all(|(_, p)| *p == KeyPost::Posted));
+}
+
+#[test]
+fn nothing_to_do_is_a_distinct_outcome() {
+    let o = TickOutcome::from_run(&[], 0);
+    assert_eq!((o.reason, o.selected, o.ran, o.posted), ("nothing_to_do", 0, 0, 0));
+}
+
+#[test]
+fn second_pass_over_a_marked_head_posts_nothing() {
+    let sink = Sink::default();
+    let live = Live {
+        inner: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        sink: &sink,
+    };
+    let mut r = ok_runner();
+    let instr = Instr { fail_market: false };
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(sink.posted.borrow().len(), 2);
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(sink.posted.borrow().len(), 2, "no double-posting of keys");
+    assert_eq!(r.calls, 2, "no second reviewer dispatch");
+}
+
+#[test]
+fn tick_span_carries_reason_and_counts() {
+    let o = TickOutcome::from_run(&[], 3);
+    let span = tick_span(std::path::Path::new("/r"), "step_dispatch", &o, chrono::Utc::now());
+    assert_eq!(span.name.as_str(), "ratification_lane.tick");
+    // Assert through `.bounded()`: the export allowlist drops unregistered keys.
+    let span = span.bounded();
+    for (k, v) in [
+        ("loom.ratification.reason", "nothing_to_do"),
+        ("loom.ratification.source", "step_dispatch"),
+        ("loom.ratification.selected", "0"),
+        ("loom.ratification.skipped", "3"),
+        ("loom.ratification.ran", "0"),
+        ("loom.ratification.posted", "0"),
+        ("loom.ratification.unreadable", "0"),
+        ("loom.ratification.withheld", "0"),
+    ] {
+        assert_eq!(span.attributes.get(k).map(String::as_str), Some(v), "{k}");
+    }
+}
+
+#[test]
+fn disabled_tick_is_recorded_with_its_reason() {
+    // The temp root has no config: the lane is disabled and says so.
+    let dir = std::env::temp_dir().join(format!("ratif-tick-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut r = ok_runner();
+    let o = crate::role_runner::ratification_lane::tick_for_root(&dir, &mut r);
+    assert_eq!((o.reason, r.calls), ("disabled", 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn step_cadence_ticks_once_per_interval_per_root() {
+    use std::time::{Duration, Instant};
+    let mut last = std::collections::HashMap::new();
+    let (a, b) = (std::path::Path::new("/a"), std::path::Path::new("/b"));
+    let t0 = Instant::now();
+    assert!(crate::role_runner::ratification_lane::step_tick_due_for_test(&mut last, a, t0));
+    assert!(!crate::role_runner::ratification_lane::step_tick_due_for_test(
+        &mut last,
+        a,
+        t0 + Duration::from_secs(1)
+    ));
+    assert!(crate::role_runner::ratification_lane::step_tick_due_for_test(&mut last, b, t0));
+    assert!(crate::role_runner::ratification_lane::step_tick_due_for_test(
+        &mut last,
+        a,
+        t0 + STEP_TICK_INTERVAL
+    ));
+}
+
+#[test]
+fn tick_with_unreadable_prs_is_degraded_not_nothing_to_do() {
+    let o = TickOutcome::from_run_stats(&[], 0, 2);
+    assert_eq!((o.reason, o.selected, o.unreadable), ("degraded", 0, 2));
+    let span =
+        tick_span(std::path::Path::new("/r"), "step_dispatch", &o, chrono::Utc::now()).bounded();
+    assert_eq!(
+        span.attributes
+            .get("loom.ratification.unreadable")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        span.attributes
+            .get("loom.ratification.reason")
+            .map(String::as_str),
+        Some("degraded")
+    );
+}
+
+#[test]
+fn withheld_keys_are_counted() {
+    let results = vec![(
+        5,
+        vec![
+            (Key::Ee, KeyPost::Withheld("could not resolve".into())),
+            (Key::Market, KeyPost::Posted),
+        ],
+    )];
+    let o = TickOutcome::from_run_stats(&results, 0, 0);
+    assert_eq!((o.reason, o.posted, o.withheld), ("ran", 1, 1));
+}
+
+#[cfg(unix)]
+mod gh_failure {
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use crate::role_runner::ratification_dispatch::gh_failure_detail;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::Duration;
+
+    fn ran(code: i32, stderr: &str) -> CmdOutcome {
+        CmdOutcome::Ran(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn nonzero_exit_carries_status_and_stderr() {
+        let d = gh_failure_detail(&ran(1, "gh: Not Found (HTTP 404)\n"));
+        assert_eq!(d, "exit 1: gh: Not Found (HTTP 404)");
+        assert_eq!(gh_failure_detail(&ran(4, "")), "exit 4, no stderr");
+    }
+
+    #[test]
+    fn stderr_is_bounded_and_token_shaped_words_redacted() {
+        let d = gh_failure_detail(&ran(1, &format!("bad ghp_SECRET123 {}", "x".repeat(500))));
+        assert!(!d.contains("SECRET123"));
+        assert!(d.contains("[redacted]"));
+        assert!(d.ends_with("..."));
+        assert!(d.chars().count() < 230);
+    }
+
+    #[test]
+    fn spawn_failure_and_timeout_are_distinct_from_a_nonzero_exit() {
+        let spawn = gh_failure_detail(&CmdOutcome::Unavailable(Unavailable::Spawn("no gh".into())));
+        let timeout = gh_failure_detail(&CmdOutcome::Unavailable(Unavailable::TimedOut {
+            after: Duration::from_secs(120),
+            partial_stdout: Vec::new(),
+        }));
+        assert!(spawn.starts_with("could not start"));
+        assert!(timeout.starts_with("timed out"));
+        assert_ne!(spawn, timeout);
+        assert!(!spawn.starts_with("exit"));
+    }
+}

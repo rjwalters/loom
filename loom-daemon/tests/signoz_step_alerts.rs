@@ -122,50 +122,16 @@ fn the_thresholds_are_the_ruled_ones() {
 
 // ---------------------------------------------------------------- replay ----
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-
 /// The image the other alert replays pin.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::CLICKHOUSE_IMAGE;
 
 /// 2026-10-14T14:00:00Z.
 const T0: i64 = 1_791_986_400;
-
-fn clickhouse(script: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            "--format=JSONEachRow",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 const SCHEMA: &str = "CREATE DATABASE signoz_metrics;\n\
 CREATE TABLE signoz_metrics.samples_v4 (metric_name LowCardinality(String), fingerprint UInt64, \
@@ -255,7 +221,7 @@ fn firing_repos(raw: &str, store: &Store, end: i64) -> Vec<String> {
     let q = query(&rule)
         .replace("{{.start_timestamp_ms}}", &((end - window) * 1000).to_string())
         .replace("{{.end_timestamp_ms}}", &(end * 1000).to_string());
-    let out = clickhouse(&format!("{}\n{q};", store.script()));
+    let out = clickhouse_local::clickhouse_json(&format!("{}\n{q};", store.script()));
     let target = rule["condition"]["target"].as_f64().unwrap();
     let above = rule["condition"]["op"] == "1";
     let mut repos: Vec<String> = out

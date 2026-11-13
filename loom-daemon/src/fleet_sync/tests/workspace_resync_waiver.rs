@@ -18,6 +18,8 @@ struct Fake {
     files: Result<Vec<File>, String>,
     changed: usize,
     upstream: Vec<(String, String)>,
+    release: Result<bool, String>,
+    ignore: Result<Vec<String>, String>,
 }
 
 fn file(name: &str, sha: &str, status: &str) -> File {
@@ -43,6 +45,8 @@ impl Fake {
                 file(".loom/docs/readme.md", "b2", "modified"),
             ]),
             changed: 2,
+            release: Ok(true),
+            ignore: Ok(Vec::new()),
             upstream: vec![
                 ("defaults/hooks/guard-x.sh".to_string(), "b1".to_string()),
                 ("defaults/docs/readme.md".to_string(), "b2".to_string()),
@@ -74,6 +78,12 @@ impl Source for Fake {
     fn tag_exists(&self, _: Kind, _: &str) -> Result<bool, String> {
         self.tag.clone()
     }
+    fn release_published(&self, _: Kind, _: &str) -> Result<bool, String> {
+        self.release.clone()
+    }
+    fn resync_ignore(&self, _: &str) -> Result<Vec<String>, String> {
+        self.ignore.clone()
+    }
     fn upstream_blob(&self, _: Kind, path: &str, _: &str) -> Result<Option<String>, String> {
         Ok(self
             .upstream
@@ -99,6 +109,7 @@ fn a_byte_identical_resync_is_eligible_and_records_the_kept_set_file() {
             tag: "v1.2.3".to_string(),
             head: HEAD.to_string(),
             record: vec![(".loom/hooks/guard-x.sh".to_string(), "b1".to_string())],
+            gate_paths_included: false,
         }
     );
 }
@@ -183,6 +194,7 @@ fn a_test_under_scripts_tests_is_compared_not_refused_as_a_gate_path() {
             tag: "v1.2.3".to_string(),
             head: HEAD.to_string(),
             record: vec![(t.to_string(), "t1".to_string())],
+            gate_paths_included: false,
         }
     );
     // One byte of difference still holds.
@@ -220,6 +232,7 @@ fn a_repo_skills_bump_is_proved_against_the_repo_tag() {
             tag: "v1.2.3".to_string(),
             head: HEAD.to_string(),
             record: vec![(".claude/skills/repo/hooks/guard-y.sh".to_string(), "r1".to_string())],
+            gate_paths_included: false,
         }
     );
     let mut f = repo_skills();
@@ -422,13 +435,13 @@ fn a_realistic_resync_with_rewritten_install_metadata_lands() {
 }
 
 /// The exact file list of 2AMLogic/fasterhenry#253 (a real
-/// `chore(loom): resync installed Loom` PR), every mappable file byte-identical
-/// to the tag. It must NOT land: it carries `.agents/skills/*` (outside the
-/// install set), `.loom/roles/*` (no `defaults/` counterpart, #13313) and
-/// merge-gate paths (`*judge*`, `*champion*`, `merge-pr.sh`), so it takes the
-/// Judge lane. Pins the deliberate limit of the strict proof.
+/// `chore(loom): resync installed Loom` PR), every file byte-identical to the
+/// tag. It carries `.agents/skills/*`, `.loom/roles/*` and merge-gate paths
+/// (`*judge*`, `*champion*`, `merge-pr.sh`); under operator ruling r7-q33
+/// (#13665) the release tag is the review point, so it now lands and says it
+/// included gate paths. Before #13665 it took the Judge lane.
 #[test]
-fn the_real_fasterhenry_253_file_list_takes_the_lane() {
+fn the_real_fasterhenry_253_file_list_lands_with_gate_paths_flagged() {
     const REAL: &[(&str, &str)] = &[
         ("modified", ".agents/skills/loom-doctor/SKILL.md"),
         ("modified", ".agents/skills/loom-judge/SKILL.md"),
@@ -463,7 +476,7 @@ fn the_real_fasterhenry_253_file_list_takes_the_lane() {
     let mut upstream = Vec::new();
     for (i, (status, name)) in REAL.iter().enumerate() {
         let sha = format!("s{i}");
-        if let Some(up) = upstream_path(name) {
+        if let Some(up) = strict_upstream_path(name) {
             upstream.push((up, sha.clone()));
         }
         files.push(file(name, &sha, status));
@@ -473,12 +486,136 @@ fn the_real_fasterhenry_253_file_list_takes_the_lane() {
     f.upstream = upstream;
     let fx = Fx::new(Checks::Green, Ok(()));
     let out = land(&f, &fx, 1);
+    assert_eq!(out.word(), "landed-by-daemon", "{out:?}");
+    assert!(out.reason().contains("gate_paths_included=true"), "{out:?}");
+    assert_eq!(fx.merged.take().as_deref(), Some(HEAD));
+    let comments = fx.comments.borrow();
+    assert!(comments[0].contains("gate_paths_included=true") && comments[0].contains("v1.2.3"));
+}
+
+fn gate_pr() -> Fake {
+    let mut f = Fake::ok();
+    f.files = Ok(vec![
+        file(".loom/scripts/merge-pr.sh", "g1", "modified"),
+        file(".loom/roles/judge.md", "g2", "modified"),
+        file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
+    ]);
+    f.changed = 3;
+    f.upstream = vec![
+        ("defaults/scripts/merge-pr.sh".to_string(), "g1".to_string()),
+        ("defaults/roles/judge.md".to_string(), "g2".to_string()),
+        ("defaults/.agents/skills/loom-judge/SKILL.md".to_string(), "g3".to_string()),
+    ];
+    f
+}
+
+fn lane_reason(f: &Fake) -> String {
+    let fx = Fx::new(Checks::Green, Ok(()));
+    let out = land(f, &fx, 1);
     assert_eq!(out.word(), "handed-to-lane", "{out:?}");
-    assert!(
-        out.reason().contains("outside the install set"),
-        "first refusal is the generated skill copy: {out:?}"
-    );
     assert!(fx.merged.take().is_none() && fx.comments.borrow().is_empty());
+    out.reason().to_string()
+}
+
+#[test]
+fn byte_identical_gate_role_and_skill_files_land_under_the_strict_proof_only() {
+    let fx = Fx::new(Checks::Green, Ok(()));
+    let out = land(&gate_pr(), &fx, 1);
+    assert_eq!(out.word(), "landed-by-daemon", "{out:?}");
+    // Champion's non-strict proof still refuses a gate path.
+    assert!(why(&evaluate(&gate_pr(), 1)).contains("merge-gate path"));
+}
+
+#[test]
+fn strict_evaluation_refuses_what_the_non_strict_proof_passes() {
+    // A kept-set file plus a file with no upstream mapping: non-strict only
+    // byte-checks the kept set, strict refuses the unmapped file (#13668).
+    let mut f = Fake::ok();
+    let mut files = f.files.clone().expect("files");
+    files.push(file(".loom/docs/other.md", "zz", "modified"));
+    f.files = Ok(files);
+    f.changed += 1;
+    assert!(matches!(evaluate(&f, 1), Verdict::Eligible { .. }));
+    assert!(matches!(evaluate_strict(&f, 1), Verdict::NotEligible(_)));
+}
+
+#[test]
+fn a_gate_file_one_byte_off_the_tag_takes_the_lane() {
+    for i in 0..3 {
+        let mut f = gate_pr();
+        f.upstream[i].1.push_str("-different");
+        assert!(lane_reason(&f).contains("differs from v1.2.3"), "{i}");
+    }
+}
+
+#[test]
+fn gate_files_need_a_published_release_not_just_a_tag_ref() {
+    let mut f = gate_pr();
+    f.release = Ok(false); // a branch-like or draft/unreleased tag
+    assert!(lane_reason(&f).contains("not a published release"));
+    f.release = Err("HTTP 404".to_string());
+    assert!(lane_reason(&f).contains("not a published release"));
+    // A ref that is not under refs/tags/ never gets here.
+    f.release = Ok(true);
+    f.tag = Ok(false);
+    assert!(lane_reason(&f).contains("not found upstream"));
+}
+
+#[test]
+fn a_resync_ignore_pin_or_an_unreadable_pin_file_takes_the_lane() {
+    for pin in [
+        "roles/judge.md",
+        "scripts/merge-pr.sh",
+        "./.loom/roles/judge.md",
+        "agents/skills/loom-judge/SKILL.md",
+    ] {
+        let mut f = gate_pr();
+        f.ignore = Ok(vec![pin.to_string()]);
+        assert!(lane_reason(&f).contains("pinned in .loom/resync-ignore"), "{pin}");
+    }
+    let mut f = gate_pr();
+    f.ignore = Err("HTTP 502".to_string());
+    assert!(lane_reason(&f).contains("resync-ignore unreadable"));
+    // An unrelated pin does not block.
+    let mut f = gate_pr();
+    f.ignore = Ok(vec!["hooks/post-worktree.sh".to_string()]);
+    let fx = Fx::new(Checks::Green, Ok(()));
+    assert_eq!(land(&f, &fx, 1).word(), "landed-by-daemon");
+}
+
+#[test]
+fn gate_renames_unmapped_and_outside_files_still_take_the_lane() {
+    let mut f = gate_pr();
+    let mut renamed = file(".loom/roles/judge.md", "g2", "renamed");
+    renamed.previous_filename = Some(".loom/roles/old-judge.md".to_string());
+    f.files = Ok(vec![
+        renamed,
+        file(".loom/scripts/merge-pr.sh", "g1", "modified"),
+        file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
+    ]);
+    assert!(lane_reason(&f).contains("is renamed"));
+    let mut f = gate_pr();
+    f.files = Ok(vec![
+        file(".loom/scripts/merge-pr.sh", "g1", "modified"),
+        file(".loom/roles/judge.md", "g2", "removed"),
+        file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
+    ]);
+    assert!(lane_reason(&f).contains("is removed"));
+    let mut f = gate_pr();
+    f.files = Ok(vec![
+        file(".loom/scripts/merge-pr.sh", "g1", "modified"),
+        file(".agents/other/x.md", "g2", "modified"),
+        file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
+    ]);
+    assert!(lane_reason(&f).contains("outside the install set"));
+    // The Repo Skills kind keeps refusing gate paths.
+    let mut f = repo_skills();
+    f.files = Ok(vec![file(
+        ".claude/skills/repo/hooks/judge-y.sh",
+        "r1",
+        "modified",
+    )]);
+    assert!(lane_reason(&f).contains("merge-gate path"));
 }
 
 #[test]

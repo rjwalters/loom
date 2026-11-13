@@ -4,9 +4,25 @@
 //! agent prompts, enabling correlation of prompts with code changes.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use crate::activity::PromptChanges;
+
+/// Run `git -C <dir> <args>` and return the raw [`Output`].
+///
+/// Shared runner for the private `git(dir, args)` wrappers: stdin is null,
+/// stdout and stderr are piped, and there is no timeout or env tweaking.
+/// Callers keep a thin adapter for their own return shape (decode/trim).
+pub fn git_run(dir: &Path, args: &[&str]) -> std::io::Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+}
 
 /// Capture the current HEAD commit hash
 pub fn get_current_commit(working_dir: &Path) -> Option<String> {

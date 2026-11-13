@@ -63,24 +63,6 @@ assert_line() {
 
 assert_true() { if "$@"; then pass "${!#}"; else fail "${!#}"; fi; }
 
-assert_doc_contains() {
-    local file="$1" needle="$2" msg="$3"
-    if grep -qF -- "$needle" "$file"; then
-        pass "$msg"
-    else
-        fail "$msg (missing literal in $file: $needle)"
-    fi
-}
-
-assert_doc_lacks() {
-    local file="$1" needle="$2" msg="$3"
-    if grep -qF -- "$needle" "$file"; then
-        fail "$msg (unexpected literal in $file: $needle)"
-    else
-        pass "$msg"
-    fi
-}
-
 # =====================================================================
 # Fixture comment bodies (the real shapes champion-issue-promo.md posts)
 # =====================================================================

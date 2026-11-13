@@ -4,30 +4,11 @@
 //! `loom.merge_authorization.*` attributes, with `loom.pr_number` for the
 //! entry the group was built for.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::session_output::LogParts;
-use super::{kv, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
-
-fn kv_int(key: &str, value: i64) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::IntValue(value)),
-        },
-    )
-}
 
 pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
     let TelemetryRecord::MergeAuthorization(r) = record else {

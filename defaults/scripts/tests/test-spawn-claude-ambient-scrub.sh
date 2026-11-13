@@ -69,12 +69,11 @@ export LOOM_SWEEP_CPU_QUOTA=0
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-assert_eq() {
-    if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3"; echo "    Expected: '$1'"; echo "    Actual:   '$2'"; fi
-}
+# Local assert_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_contains() {
     if [[ "$2" == *"$1"* ]]; then pass "$3"; else fail "$3"; echo "    Expected to contain: '$1'"; echo "    In: '$2'"; fi
 }
+# Local assert_not_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_not_contains() {
     if [[ "$2" != *"$1"* ]]; then pass "$3"; else fail "$3"; echo "    Expected NOT to contain: '$1'"; fi
 }

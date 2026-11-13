@@ -18,7 +18,6 @@
 //! affected.
 
 use std::path::Path;
-use std::process::Command;
 
 /// Exit code from `preflight --check`: a commit carries a skip-CI marker.
 pub const EXIT_SKIP_CI: i32 = 8;
@@ -159,11 +158,7 @@ pub fn allowed_by_env() -> bool {
 }
 
 fn git(worktree: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(worktree)
-        .output()
-        .ok()?;
+    let out = crate::git_utils::git_run(worktree, args).ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -173,6 +168,7 @@ fn git(worktree: &Path, args: &[&str]) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     const SPELLINGS: [&str; 5] = [
         "[skip ci]",

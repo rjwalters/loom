@@ -845,8 +845,6 @@ tick is refused as `RoleTickOutcome::ModelRuntimeMismatch` before any spawn:
 - A distinct outcome, deliberately never folded into the generic `Failure`
   tally — same argument as `NoTokenPool` (#4642): this is a permanent config
   conflict detected pre-spawn, not a transient invocation failure.
-- Its own `MODEL_RUNTIME_MISMATCH_SKIP_COUNT` counter
-  (`model_runtime_mismatch_skip_count()`).
 - A one-line operator-facing `detail()` — `"model/runtime mismatch: … (model
   source=…); set autonomous.roleRunner.roleModels.<role> …"` — that
   `record_role_tick` stores on the health ring, which `assess_roles` in
@@ -1349,7 +1347,7 @@ profile declares a provider for that harness. `loom-daemon validate` rejects an
 `excludedRoles` entry that is not a known role name.
 
 **GLM-first Builder and Doctor (fleet policy, tier 1).** The routing comes
-from fleet-gitops `config.defaults`, rendered into each host's machine tier
+from the fleet state store `config.defaults`, rendered into each host's machine tier
 (`~/.local/share/loom/config/defaults.json`), not from this repo's
 `.loom/config.json`, which carries no fleet keys (#11450, #11441). It sets
 `defaultModelProfile: "zai-flash"`, `rolePreference.builder` to

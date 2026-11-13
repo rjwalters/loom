@@ -1,5 +1,5 @@
-//! `fleet.json` (#10705): golden equality with the legacy files, the absent →
-//! legacy fallback, and fail-closed on a present-but-invalid document.
+//! `fleet.json` (#10705): the compiled roster, state and tiers, no roster/state
+//! fallback to the legacy files, and fail-closed on a present-but-invalid document.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -10,58 +10,8 @@ use super::*;
 use crate::fleet_store::render::{render, Target};
 use crate::fleet_store::roster::{self, Roster};
 use crate::fleet_store::state::{self, HostState};
-use crate::fleet_store::test_support::{sample_files, snapshot_of};
+use crate::fleet_store::test_support::{sample_compiled, sample_files, snapshot_of};
 use crate::fleet_store::{fetch::Snapshot, FLEET_JSON_PATH};
-
-/// The compiled form of [`sample_files`]: the same roster, state and tiers in
-/// the shape fleet-gitops' `scripts/render.py` writes.
-fn sample_compiled() -> Value {
-    json!({
-        "_generated": {
-            "generator": "scripts/render.py",
-            "note": "Generated from fleet.yml by scripts/render.py; do not edit.",
-            "schema": "schema/fleet.schema.json",
-            "schema_version": 1,
-            "source": "fleet.yml"
-        },
-        "config": {
-            "defaults": {
-                "autonomous": {
-                    "autoUpdate": {"settleSecs": 3600},
-                    "roleRunner": {"enabled": true, "roles": ["judge"]}
-                },
-                "forge": {"githubApp": {"appId": "1"}}
-            },
-            "hosts": {
-                "build-1": {
-                    "defaults": {
-                        "autonomous": {
-                            "roleRunner": {"roles": ["judge", "doctor"]},
-                            "workFinder": {"maxConcurrent": 8}
-                        },
-                        "forge": {"githubApp": {"privateKeyPath": "/k.pem"}}
-                    },
-                    "local": {"observability": {"enabled": true}}
-                },
-                "build-2": {
-                    "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 2}}}
-                }
-            }
-        },
-        "dispatch": {},
-        "hosts": [{"name": "build-1"}, {"name": "build-2"}],
-        "repos": [
-            {"dir": "app", "fleet": true, "name": "app", "weight": 5}
-        ],
-        "root": "/srv/src",
-        "state": {
-            "fleet": {"state": "running"},
-            "hosts": {"build-2": {"state": "paused"}}
-        },
-        "topology": {},
-        "versions": {}
-    })
-}
 
 fn legacy_only() -> Snapshot {
     snapshot_of(&sample_files())
@@ -98,40 +48,41 @@ fn read_tiers(s: &Snapshot, host: &str) -> anyhow::Result<Vec<Target>> {
 }
 
 #[test]
-fn golden_roster_state_and_tiers_equal_the_legacy_files() {
-    let legacy = legacy_only();
+fn compiled_roster_state_and_tiers_are_read() {
     let compiled = compiled_only(&sample_compiled());
 
-    let want = read_roster(&legacy).unwrap().expect("legacy roster");
-    assert_eq!(read_roster(&compiled).unwrap().expect("compiled roster"), want);
+    let roster = read_roster(&compiled).unwrap().expect("compiled roster");
+    assert_eq!(roster.records[0].name, "app");
+    assert_eq!(roster.records[0].weight, Some(5));
 
-    for host in ["build-1", "build-2", "build-3"] {
-        assert_eq!(
-            read_state(&compiled, host).unwrap(),
-            read_state(&legacy, host).unwrap(),
-            "state for {host}"
-        );
-    }
+    assert_eq!(
+        read_state(&compiled, "build-1").unwrap().unwrap().state,
+        state::RunState::Running
+    );
+    assert_eq!(
+        read_state(&compiled, "build-2").unwrap().unwrap().state,
+        state::RunState::Paused
+    );
+    // The compiled tiers equal the legacy files' render of the same store.
     for host in ["build-1", "build-2"] {
         assert_eq!(
             read_tiers(&compiled, host).unwrap(),
-            read_tiers(&legacy, host).unwrap(),
+            read_tiers(&legacy_only(), host).unwrap(),
             "tiers for {host}"
         );
     }
-    // build-1 has both tiers, build-2 only the machine tier — in both forms.
+    // build-1 has both tiers, build-2 only the machine tier.
     assert_eq!(read_tiers(&compiled, "build-1").unwrap().len(), 2);
     assert_eq!(read_tiers(&compiled, "build-2").unwrap().len(), 1);
 }
 
 #[test]
-fn unknown_host_is_refused_from_fleet_json_as_from_the_legacy_files() {
+fn unknown_host_is_refused_from_fleet_json_() {
     let err = read_tiers(&compiled_only(&sample_compiled()), "build-9")
         .unwrap_err()
         .to_string();
     assert!(err.contains("host `build-9` is not in the store"), "{err}");
     assert!(err.contains("config.hosts.build-9.defaults"), "{err}");
-    assert!(read_tiers(&legacy_only(), "build-9").is_err());
 }
 
 #[test]
@@ -150,11 +101,20 @@ fn present_fleet_json_wins_and_the_legacy_files_are_not_read() {
 }
 
 #[test]
-fn absent_fleet_json_falls_back_to_the_legacy_files() {
+fn a_store_with_only_legacy_roster_and_state_files_reads_as_absent() {
     let s = legacy_only();
     assert!(from_snapshot(&s).unwrap().is_none());
-    assert_eq!(read_roster(&s).unwrap().unwrap().records[0].name, "app");
-    assert_eq!(read_state(&s, "build-2").unwrap().unwrap().state, state::RunState::Paused);
+    assert!(read_roster(&s).unwrap().is_none(), "repos.yml is no longer read");
+    assert!(
+        read_state(&s, "build-2").unwrap().is_none(),
+        "fleet/state.yml is no longer read"
+    );
+    let msg = roster::missing_message(&s);
+    assert!(
+        msg.contains("no fleet.json") && msg.contains("repos.yml is no longer read"),
+        "{msg}"
+    );
+    // The config tiers are outside this change and still read their files.
     assert_eq!(read_tiers(&s, "build-1").unwrap().len(), 2);
 }
 
@@ -163,8 +123,12 @@ fn a_store_with_neither_form_reads_as_absent() {
     let s = snapshot_of(&BTreeMap::new());
     assert!(read_roster(&s).unwrap().is_none());
     assert!(read_state(&s, "build-1").unwrap().is_none());
-    assert!(roster::missing_message(&s).contains("neither fleet.json nor repos.yml"));
-    assert!(state::missing_message(&s).contains("neither fleet.json nor fleet/state.yml"));
+    assert!(roster::missing_message(&s).contains("no fleet.json"));
+    let msg = state::missing_message(&s);
+    assert!(
+        msg.contains("no fleet.json") && msg.contains("fleet/state.yml is no longer read"),
+        "{msg}"
+    );
 }
 
 /// Every reader refuses `text` as `fleet.json`, even though valid legacy

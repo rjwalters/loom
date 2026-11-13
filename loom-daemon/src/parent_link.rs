@@ -122,9 +122,197 @@ pub fn link_created(root: &Path, slug: &str, parent: u32, child: u32) -> Result<
     anyhow::bail!("sub-issue link: {err}")
 }
 
+/// What a parent's children say about whether the parent is still work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitState {
+    /// No child is known: not a split parent (or undecomposed). Never a
+    /// completion signal.
+    NoChildren,
+    /// At least one child is still open: the parent legitimately waits.
+    OpenChildren(usize),
+    /// Children exist and every one is closed: the children carry the code,
+    /// so the parent must not be built or promoted to `loom:issue` (#13635).
+    AllClosed(Vec<u32>),
+}
+
+/// Classify `(number, is_closed)` pairs. Duplicates (the same child found by
+/// both the marker search and the sub-issue list) collapse by number.
+#[must_use]
+pub fn classify_children(children: &[(u32, bool)]) -> SplitState {
+    let mut seen: std::collections::BTreeMap<u32, bool> = std::collections::BTreeMap::new();
+    for &(n, closed) in children {
+        // A child seen open anywhere is open.
+        let e = seen.entry(n).or_insert(closed);
+        *e = *e && closed;
+    }
+    if seen.is_empty() {
+        return SplitState::NoChildren;
+    }
+    let open = seen.values().filter(|c| !**c).count();
+    if open > 0 {
+        SplitState::OpenChildren(open)
+    } else {
+        SplitState::AllClosed(seen.keys().copied().collect())
+    }
+}
+
+/// Parse `"<number> <STATE>"` lines (as emitted by the `--jq` filters below).
+fn parse_child_lines(text: &str) -> Option<Vec<(u32, bool)>> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (n, state) = line.split_once(' ')?;
+        let closed = match state.to_ascii_uppercase().as_str() {
+            "CLOSED" | "MERGED" => true,
+            "OPEN" => false,
+            _ => return None,
+        };
+        out.push((n.parse().ok()?, closed));
+    }
+    Some(out)
+}
+
+/// Page size of both child reads: a full page means the list may be longer
+/// than what was read, which is treated as unreadable (fail closed).
+const CHILD_PAGE: usize = 100;
+
+/// `--limit` of the marker search. Like `CHILD_PAGE`, a raw result that
+/// reaches it may be truncated (#13670).
+const MARKER_LIMIT: usize = CHILD_PAGE * 2;
+
+/// Parse the marker search output: a leading `RAW <n>` line carrying the
+/// **unfiltered** search count, then `"<number> <STATE>"` rows that survived
+/// the jq marker filter. Fails closed when the raw count reaches
+/// [`MARKER_LIMIT`], even if the filter dropped rows (the dropped rows may
+/// have hidden an unread child).
+fn parse_marker_output(text: &str, parent: u32) -> Result<Vec<(u32, bool)>> {
+    let malformed = || anyhow::anyhow!("malformed marker-child list for #{parent}");
+    let trimmed = text.trim_start();
+    let (head, rest) = trimmed.split_once('\n').unwrap_or((trimmed, ""));
+    let raw: usize = head
+        .trim()
+        .strip_prefix("RAW ")
+        .and_then(|n| n.trim().parse().ok())
+        .ok_or_else(malformed)?;
+    if raw >= MARKER_LIMIT {
+        anyhow::bail!("marker-child search of #{parent} may be truncated");
+    }
+    parse_child_lines(rest).ok_or_else(malformed)
+}
+
+/// Enumerate `parent`'s children from the native sub-issue list and from
+/// `<!-- loom:parent #N -->` markers, and classify them.
+///
+/// # Errors
+/// Either read failed, was malformed, or filled a whole page. An unreadable
+/// list is never evidence that the parent is split and finished.
+pub fn split_state(root: &Path, slug: &str, parent: u32) -> Result<SplitState> {
+    let gh = gh_program();
+    let mut all: Vec<(u32, bool)> = Vec::new();
+
+    let path = format!("repos/{slug}/issues/{parent}/sub_issues?per_page={CHILD_PAGE}&state=all");
+    let sub = gh_call::read("parent_link.sub_issues", &gh, root).args([
+        "api",
+        &path,
+        "--jq",
+        r#".[] | "\(.number) \(.state | ascii_upcase)""#,
+    ]);
+    let out = gh_call::ok_stdout(sub)
+        .ok_or_else(|| anyhow::anyhow!("could not read sub-issues of #{parent}"))?;
+    let rows = parse_child_lines(&String::from_utf8_lossy(&out))
+        .ok_or_else(|| anyhow::anyhow!("malformed sub-issue list for #{parent}"))?;
+    if rows.len() >= CHILD_PAGE {
+        anyhow::bail!("sub-issue list of #{parent} may be truncated");
+    }
+    all.extend(rows);
+
+    // The search is a loose text match; the jq select re-checks the exact
+    // marker so #12 never matches #123.
+    let query = format!("\"loom:parent #{parent}\" in:body");
+    let jq = format!(
+        r#"length as $n | "RAW \($n)", (.[] | select(.body | contains("{}")) | "\(.number) \(.state)")"#,
+        parent_marker(parent)
+    );
+    let limit = MARKER_LIMIT.to_string();
+    let marker = gh_call::read("parent_link.marker_children", &gh, root).args([
+        "issue",
+        "list",
+        "--repo",
+        slug,
+        "--state",
+        "all",
+        "--limit",
+        &limit,
+        "--search",
+        &query,
+        "--json",
+        "number,state,body",
+        "--jq",
+        &jq,
+    ]);
+    let out = gh_call::ok_stdout(marker)
+        .ok_or_else(|| anyhow::anyhow!("could not search marker children of #{parent}"))?;
+    let rows = parse_marker_output(&String::from_utf8_lossy(&out), parent)?;
+    all.extend(rows.into_iter().filter(|&(n, _)| n != parent));
+    Ok(classify_children(&all))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_no_children_is_not_a_split_parent() {
+        assert_eq!(classify_children(&[]), SplitState::NoChildren);
+    }
+
+    #[test]
+    fn classify_all_closed_dedups_and_sorts() {
+        assert_eq!(
+            classify_children(&[(9, true), (7, true), (9, true)]),
+            SplitState::AllClosed(vec![7, 9])
+        );
+    }
+
+    #[test]
+    fn classify_any_open_child_wins_even_if_seen_closed_elsewhere() {
+        assert_eq!(
+            classify_children(&[(7, true), (8, false), (8, true)]),
+            SplitState::OpenChildren(1)
+        );
+    }
+
+    #[test]
+    fn child_lines_parse_and_reject_garbage() {
+        assert_eq!(
+            parse_child_lines("7 CLOSED\n8 OPEN\n\n9 MERGED\n"),
+            Some(vec![(7, true), (8, false), (9, true)])
+        );
+        assert_eq!(parse_child_lines(""), Some(vec![]));
+        assert_eq!(parse_child_lines("7 WEIRD"), None);
+        assert_eq!(parse_child_lines("x CLOSED"), None);
+    }
+
+    #[test]
+    fn marker_output_below_limit_succeeds() {
+        let text = format!("RAW {}\n7 CLOSED\n8 OPEN\n", MARKER_LIMIT - 1);
+        assert_eq!(parse_marker_output(&text, 1).unwrap(), vec![(7, true), (8, false)]);
+    }
+
+    #[test]
+    fn marker_output_at_limit_bails_even_when_filter_dropped_rows() {
+        // Raw count at the limit, zero rows survived the filter.
+        let text = format!("RAW {MARKER_LIMIT}\n");
+        assert!(parse_marker_output(&text, 1).is_err());
+        let text = format!("RAW {MARKER_LIMIT}\n7 CLOSED\n");
+        assert!(parse_marker_output(&text, 1).is_err());
+    }
+
+    #[test]
+    fn marker_output_without_raw_count_is_malformed() {
+        assert!(parse_marker_output("7 CLOSED\n", 1).is_err());
+        assert!(parse_marker_output("", 1).is_err());
+        assert!(parse_marker_output("RAW x\n", 1).is_err());
+    }
 
     #[test]
     fn body_gets_the_parent_marker() {

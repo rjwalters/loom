@@ -31,7 +31,6 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             "started_at": r.started_at,
             "paused_secs": r.paused_secs,
             "budget_secs": r.budget_secs,
-            "refusals": r.refusals,
             "in_flight": r.in_flight,
             "target": r.target,
             "then_exit": r.then_exit,
@@ -126,10 +125,9 @@ fn roll_line_at(report: &DaemonStatusReport, now: chrono::DateTime<chrono::Utc>)
         format!(" [origin: {}]", roll.origin)
     };
     Some(format!(
-        "       roll {state} {since} — dispatch paused {}{budget}, {} in flight, {} refusal(s){target}{origin}",
+        "       roll {state} {since} — dispatch paused {}{budget}, {} in flight{target}{origin}",
         human_secs(roll.paused_secs),
         roll.in_flight,
-        roll.refusals,
     ))
 }
 
@@ -333,7 +331,6 @@ mod tests {
     fn a_pause_roll_reports_its_step_budget_and_per_reason_counts() {
         let mut roll = pending_roll();
         roll.roll_pending = false;
-        roll.refusals = 0;
         roll.budget_secs = 120;
         roll.paused_secs = 40;
         roll.origin = "pause-roll".to_string();
@@ -350,7 +347,7 @@ mod tests {
         });
         let value = drain_json(&report_with(Some(roll.clone())));
         assert_eq!(value["roll"]["roll_pending"], serde_json::json!(false));
-        assert_eq!(value["roll"]["refusals"], serde_json::json!(0));
+        assert!(value["roll"].get("refusals").is_none());
         assert_eq!(value["roll"]["pause"]["step"], serde_json::json!(5));
         assert_eq!(value["roll"]["pause"]["budget_secs"], serde_json::json!(120));
         assert_eq!(
@@ -371,7 +368,7 @@ mod tests {
         assert_eq!(roll["roll_pending"], serde_json::json!(true));
         assert_eq!(roll["paused_secs"], serde_json::json!(3720));
         assert_eq!(roll["budget_secs"], serde_json::json!(7200));
-        assert_eq!(roll["refusals"], serde_json::json!(2));
+        assert!(roll.get("refusals").is_none());
         assert_eq!(roll["in_flight"], serde_json::json!(3));
         assert_eq!(roll["target"], serde_json::json!("v0.19.24@abcd"));
         assert_eq!(roll["then_exit"], serde_json::json!(false));
@@ -401,7 +398,7 @@ mod tests {
         assert!(line.contains("since 2026-09-22 12:00:00"), "{line}");
         assert!(line.contains("dispatch paused 1h2m of a 2h0m budget"), "{line}");
         assert!(line.contains("3 in flight"), "{line}");
-        assert!(line.contains("2 refusal(s)"), "{line}");
+        assert!(!line.contains("refusal"), "{line}");
         assert!(line.contains("target v0.19.24@abcd"), "{line}");
     }
 
@@ -409,7 +406,6 @@ mod tests {
     fn a_first_attempt_roll_does_not_claim_to_be_pending() {
         let mut roll = pending_roll();
         roll.roll_pending = false;
-        roll.refusals = 0;
         roll.paused_secs = 45;
         roll.target = None;
         let line = roll_line(&report_with(Some(roll))).unwrap();

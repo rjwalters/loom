@@ -55,8 +55,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use super::classify::is_slug;
 use crate::forge_call_stats::{self, CallAttribution, CallIdentity, Outcome, Pool};
+use crate::forge_slug::valid_slug;
 use crate::gh_invocation::accounting::{self, CredAttr};
 
 /// The role label of a session with no `LOOM_ROLE`.
@@ -153,7 +153,7 @@ fn repo_in_api_path(words: &[String]) -> Option<String> {
         let rest = a.trim_start_matches('/').strip_prefix("repos/")?;
         let mut parts = rest.split(['/', '?']);
         let slug = format!("{}/{}", parts.next()?, parts.next()?);
-        is_slug(&slug).then_some(slug)
+        valid_slug(&slug).then_some(slug)
     })
 }
 
@@ -204,12 +204,12 @@ pub fn plan(
     // a repo this row cannot: it is left unattributed, never guessed from
     // the checkout.
     let (repo, origin) = if let Some(flag) = repo_flag(&words) {
-        match Some(flag).filter(|r| is_slug(r)) {
+        match Some(flag).filter(|r| valid_slug(r)) {
             Some(repo) => (Some(repo), "target"),
             None => (None, "none"),
         }
     } else if let Some(repo) =
-        repo_in_api_path(&words).or_else(|| session.gh_repo.clone().filter(|r| is_slug(r)))
+        repo_in_api_path(&words).or_else(|| session.gh_repo.clone().filter(|r| valid_slug(r)))
     {
         (Some(repo), "target")
     } else if let Some(repo) = remote() {

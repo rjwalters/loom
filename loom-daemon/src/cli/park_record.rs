@@ -127,6 +127,12 @@ pub(crate) struct ApplyArgs {
     #[arg(long = "by", value_name = "ROLE")]
     pub by: Option<String>,
 
+    /// Park transiently for a cause that clears by itself, e.g. `capacity:batch`
+    /// (#13606). Writes `attempt` and an exponential-backoff `until`; the unblock
+    /// sweep releases it once `until` passes. Excludes `--blocked-by`.
+    #[arg(long, value_name = "CAUSE")]
+    pub transient: Option<String>,
+
     /// Label to remove once parked (repeatable), e.g. loom:building.
     #[arg(long = "remove-label", value_name = "LABEL")]
     pub remove_label: Vec<String>,
@@ -283,12 +289,23 @@ impl ApplyArgs {
             remove_labels: self.remove_label,
             dry_run: self.dry_run,
             is_pr,
+            transient: self.transient,
+            jitter: random_unit(),
         };
         let mut forge = GhForge::new(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
         crate::park_record::apply::journal_applied(&req, is_pr, code);
         std::process::exit(code)
     }
+}
+
+/// A value in `-1.0..=1.0` from the clock's sub-second nanos: backoff jitter
+/// needs spread across hosts, not cryptographic randomness.
+fn random_unit() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    f64::from(nanos % 2001) / 1000.0 - 1.0
 }
 
 impl ParseArgs {
@@ -340,11 +357,70 @@ impl ParseArgs {
 }
 
 fn record_json(r: &ParkRecord) -> serde_json::Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    // `null` for a legacy park; `due` reuses `transient_due` so a shell caller
+    // (Guide's unblock sweep, #13606) never re-implements the missing/garbled
+    // `until` rule.
+    let transient = r.transient.as_ref().map(|t| {
+        serde_json::json!({
+            "cause": t.cause,
+            "attempt": t.attempt,
+            "until": t.until,
+            "due": park_record::transient_due(t, &now),
+            "escalate": t.attempt >= park_record::TRANSIENT_ESCALATE_ATTEMPT,
+        })
+    });
     serde_json::json!({
         "blocker": r.blocker.as_ref().map(|b| b.number),
         "blocker_repo": r.blocker.as_ref().and_then(|b| b.repo.clone()),
         "by": r.by,
         "at": r.at,
         "reason": r.reason,
+        "transient": transient,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_record_json(body: &str) -> serde_json::Value {
+        record_json(&park_record::parse(body)[0])
+    }
+
+    #[test]
+    fn legacy_park_has_null_transient() {
+        let v = first_record_json(
+            "<!-- loom:park Blocked by: #5 by=builder at=2026-11-05T12:00:00Z -->",
+        );
+        assert!(v["transient"].is_null());
+    }
+
+    #[test]
+    fn expired_transient_is_due_and_future_is_not() {
+        let past = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=2 until=2026-11-05T12:30:00Z -->",
+        );
+        assert_eq!(past["transient"]["cause"], "capacity:batch");
+        assert_eq!(past["transient"]["attempt"], 2);
+        assert_eq!(past["transient"]["due"], true);
+        assert_eq!(past["transient"]["escalate"], false);
+
+        let future = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=6 until=2999-01-01T00:00:00Z -->",
+        );
+        assert_eq!(future["transient"]["due"], false);
+        assert_eq!(future["transient"]["escalate"], true);
+    }
+
+    #[test]
+    fn missing_until_is_due() {
+        let v = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=1 -->",
+        );
+        assert_eq!(v["transient"]["due"], true);
+    }
 }

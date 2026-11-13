@@ -3,6 +3,14 @@ name: Merge-queue group check
 # Posts the `loom/merge-authorization` commit status on a merge-group commit
 # (Phase C of #9978; #12323). Install it only in a repo whose default branch has
 # a merge queue and `champion.mergeMode: queue`. See defaults/optional/README.md.
+#
+# This job must NOT wait for CI. `checks_requested` posts `pending` while the
+# required checks run, and the `workflow_run` trigger below posts the final status
+# when CI completes, so no runner is held for the length of your checks.
+# Migrating a copy that has a wait/poll step: delete the step, add the
+# `workflow_run` trigger with `workflows:` set to your CI workflow's name, and keep
+# the `concurrency` group. A missing, pending, failed or cancelled required check
+# still yields no authorization (fail-closed).
 
 on:
   merge_group:

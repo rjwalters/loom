@@ -78,7 +78,7 @@ ORDER BY h.host;
 -- 3. Roster hosts that are silent by absence (Issue #11198). Queries 1 and 2
 --    anchor on logs a host did send, so a host that sends nothing never
 --    appears. Only a declared roster turns absence into a finding. The roster
---    is the fleet-gitops hosts.yml entries with
+--    is the fleet state store hosts.yml entries with
 --    `services.loom-daemon.expected: running`, with their `telemetry:` class,
 --    pasted between the markers (the committed rows are placeholders: an
 --    unrendered rule fires loudly for them, by design). Each host is judged

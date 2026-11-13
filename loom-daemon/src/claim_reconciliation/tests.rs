@@ -2306,6 +2306,7 @@ fn claimed_pr(
         most_recent_claim_activity_at: None,
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: head_ref_name.map(ToString::to_string),
     }
 }
@@ -2445,6 +2446,7 @@ fn decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at
         most_recent_claim_activity_at: None,
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: Some("some-doctor-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2479,6 +2481,7 @@ fn decide_pr_keeps_when_claim_labeled_at_is_fresh_even_if_updated_at_is_old() {
         most_recent_claim_activity_at: None,
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: None,
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2528,6 +2531,7 @@ fn decide_pr_keeps_when_old_claim_labeled_at_but_recent_genuine_comment() {
         most_recent_claim_activity_at: Some(recent_genuine_comment),
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: Some("pr-worktree-review-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2556,6 +2560,7 @@ fn decide_pr_reclaims_when_old_claim_labeled_at_and_only_standdown_comments_sinc
         most_recent_claim_activity_at: None,
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: Some("some-doctor-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2607,6 +2612,7 @@ fn decide_pr_reclaims_when_only_unrelated_comments_since_the_claim() {
         most_recent_claim_activity_at: scanned,
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: Some("some-judge-branch".to_string()),
     };
     match decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_REVIEWING_MINUTES, now) {
@@ -2642,6 +2648,7 @@ fn decide_pr_keeps_when_a_marked_claimant_heartbeat_is_recent() {
         most_recent_claim_activity_at: scanned,
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: Some("some-judge-branch".to_string()),
     };
     assert_eq!(
@@ -2671,6 +2678,7 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
         most_recent_claim_activity_at: scanned,
         most_recent_judge_activity_at: None,
         most_recent_head_push_at: None,
+        most_recent_pr_lease_at: None,
         head_ref_name: None,
     };
 
@@ -2743,6 +2751,7 @@ fn decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity() {
             most_recent_claim_activity_at: None,
             most_recent_judge_activity_at: None,
             most_recent_head_push_at: None,
+            most_recent_pr_lease_at: None,
             head_ref_name: Some("feature/issue-6523".to_string()),
         };
         assert_eq!(

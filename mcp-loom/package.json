@@ -1,6 +1,6 @@
 {
   "name": "@loom/mcp",
-  "version": "0.19.1265",
+  "version": "0.19.1296",
   "description": "Unified MCP server for Loom - combines logs, UI, and terminal tools",
   "type": "module",
   "engines": {
@@ -18,7 +18,7 @@
     "watch": "tsc --watch --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "strip-ansi": "^7.2.0"
   },
   "devDependencies": {

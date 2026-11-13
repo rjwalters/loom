@@ -2507,6 +2507,11 @@ assert_allow "write-confinement (#12285): unquoted target -> allow" \
     'cd /tmp/probe && for name in a b; do echo x > $name.gds; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): absolute loop value stays denied" \
     "cd /tmp/probe && for n in $WT_REPO/x; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+# #13773: absolute loop value resolving OUTSIDE the checkout, used as a write target
+assert_deny "write-confinement (#13773): absolute loop value outside checkout stays denied" \
+    'cd /tmp/p && for n in /abs; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#13773): absolute /tmp/outside loop value stays denied" \
+    'cd /tmp/p && for n in /tmp/outside/a; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with .. stays denied" \
     'cd /tmp/probe && for n in ../x; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with / stays denied" \
@@ -2601,6 +2606,36 @@ assert_allow "write-confinement (#13200): rm of the pin under the temp dir allow
     "$_C13200_DEF; rm -f \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED"
 assert_allow "write-confinement (#13200): same, from inside the linked worktree" \
     "$_C13200_DEF; printf 'sha 1\\n' > \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED/.loom/worktrees/issue-1"
+
+# --- #13608: sky130-temp-por#191 downstream reproducer cases ----------------
+# Six cases from 2AMLogic/sky130-temp-por docs/guard-repro/
+# test-tmp-cwd-relative-writes.sh, pinned here so that script can be retired.
+# Each runs from the linked-worktree cwd and the main-checkout cwd. Verdicts
+# were probed on origin/main @ 25e302039. Names map 1:1 to the downstream cases.
+for _c13608 in "linked:$WT_REPO_LINKED" "main:$WT_REPO"; do
+    _l13608="${_c13608%%:*}"; _d13608="${_c13608#*:}"
+    # unknown-arg-var: deny (unexpanded $1 in the filename root).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 unknown-arg-var, cwd=$_l13608): unexpanded \$1.gds denies" \
+        'cd /tmp/p && echo x > "$1.gds"' "$_d13608"
+    # traversal-literal: deny (unexpanded /$n/../a).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 traversal-literal, cwd=$_l13608): '/\$n/../a' denies" \
+        'cd /tmp/p && for n in a; do echo x > "/$n/../a"; done' "$_d13608"
+    # fn-unknown-arg: deny (function arg $1 is unresolvable).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 fn-unknown-arg, cwd=$_l13608): function \$1 target denies" \
+        'cd /tmp/p && g(){ echo x > "$1.gds"; }; g a' "$_d13608"
+    # no-cwd-var-root: deny (loop var as the target with no known cwd).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 no-cwd-var-root, cwd=$_l13608): loop \$n.gds without a cd denies" \
+        'for n in a; do echo x > "$n.gds"; done' "$_d13608"
+    # unset-cwd-var: deny (unexpanded variable as first real path component).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 unset-cwd-var, cwd=$_l13608): 'cd \$D && echo x > a' denies" \
+        'cd $D && echo x > a' "$_d13608"
+    # loop-literal-tmp-cwd: ALLOW today. This is a characterization of current
+    # behaviour, not an endorsement: both writes land under the literal
+    # /tmp/klt_probe cwd and $name is only a loop variable in the filename.
+    # If a guard change flips this, the test must fail and force a decision.
+    assert_allow "write-confinement (#13608, sky130-temp-por#191 loop-literal-tmp-cwd, cwd=$_l13608): literal /tmp cwd + loop-var filenames allows (characterization)" \
+        'mkdir -p /tmp/klt_probe && cd /tmp/klt_probe && for name in a b; do echo x > "$name.gds"; echo y > "$name.json"; done' "$_d13608"
+done
 
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"

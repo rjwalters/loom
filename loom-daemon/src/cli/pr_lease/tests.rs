@@ -654,6 +654,45 @@ fn claim_refuses_without_writing_when_the_list_is_unreadable() {
     assert!(posted(dir.path()).is_empty());
 }
 
+// ---- the cause of an unreadable list is named (#13743) ---------------------
+
+#[test]
+fn a_nonzero_gh_exit_and_an_unrunnable_gh_give_distinct_reasons() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    let mut c = ctx(dir.path(), who(Role::Judge, "s"));
+    let exited = c.gh.read_rows_why(77, &c.policy).unwrap_err();
+    assert!(exited.starts_with("gh exited "), "{exited}");
+    assert!(exited.ends_with("HTTP 502"), "{exited}");
+    c.gh.bin = dir.path().join("no-such-gh");
+    let unrunnable = c.gh.read_rows_why(77, &c.policy).unwrap_err();
+    assert_ne!(exited, unrunnable);
+    assert!(!unrunnable.starts_with("gh exited "), "{unrunnable}");
+}
+
+#[test]
+fn the_claim_stand_down_line_carries_the_cause_last() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    let c = ctx(dir.path(), who(Role::Judge, "s"));
+    let why = c.gh.read_rows_retrying_why(77, &c.policy).unwrap_err();
+    let line = unreadable_claim_line(Some(&why));
+    assert!(line.contains("nothing written — stand down: gh exited "), "{line}");
+    assert!(line.ends_with("HTTP 502"), "{line}");
+    assert!(unreadable_claim_line(None).ends_with("stand down"));
+}
+
+#[test]
+fn a_failure_reason_is_bounded_and_free_of_control_characters() {
+    let r = bounded_reason(&format!("  a\x1b[31m\tb{}\n", "x".repeat(500)));
+    assert!(!r.chars().any(char::is_control), "{r:?}");
+    assert_eq!(r.chars().count(), REASON_MAX_CHARS + 1, "capped plus the ellipsis");
+    assert!(r.ends_with('…'));
+    assert_eq!(bounded_reason("HTTP 502\n"), "HTTP 502");
+}
+
 // ---- a read-back failure after the claim write (#12252) -------------------
 
 /// The step engine's Judge pre-claim identity (`--step judge`).

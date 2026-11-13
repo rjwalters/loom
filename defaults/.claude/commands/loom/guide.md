@@ -725,7 +725,22 @@ check_and_unblock() {
       # was blocked. An issue blocked pre-approval (e.g. Curator-blocked) must
       # NOT be promoted into the Builder queue — just clear loom:blocked and let
       # it re-enter the curation/approval flow.
-      if [ "$(was_previously_approved "$number")" = "true" ]; then
+      # Split-parent gate (#13635): a tracker whose children are all closed is
+      # not work. `loom:issue` in its history can be an operator's accidental
+      # add/remove, so approval archaeology alone would promote it to a Builder.
+      # Exit 0 = split + all closed; 1 = not split; anything else = unreadable,
+      # which fails closed (no promotion).
+      split_out=$(loom-daemon forge parent split-state --parent "$number" 2>/dev/null); split_rc=$?
+      if [ "$split_rc" != "1" ]; then
+        gh issue edit "$number" --remove-label "loom:blocked"
+        if [ "$split_rc" = "0" ]; then
+          ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: Dependencies resolved ($resolved_deps), and this is a split tracker whose children are all closed (${split_out#SPLIT_ALL_CLOSED }). Not restoring \`loom:issue\`: the children carry the code, so a Builder has nothing to build. It re-enters intake/curation, where Curator can close it as already covered."
+          echo "Unblocked #$number (split parent, children all closed; no loom:issue): $title"
+        else
+          ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: Dependencies resolved ($resolved_deps). Could not read this issue's children, so \`loom:issue\` was not restored (fail closed); it re-enters intake/curation."
+          echo "Unblocked #$number (children unreadable; no loom:issue): $title"
+        fi
+      elif [ "$(was_previously_approved "$number")" = "true" ]; then
         gh issue edit "$number" --remove-label "loom:blocked" --add-label "loom:issue"
         ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: Dependencies resolved ($resolved_deps). Restored \`loom:issue\` (previously approved). Ready for implementation."
         echo "Unblocked #$number (restored loom:issue): $title"
@@ -741,6 +756,7 @@ check_and_unblock() {
   # surfaces a PR) — see "Problem: Stuck Blocked Issues".
   check_and_unblock_prs
   convert_awaiting_revision_parks  # #10936: unnamed awaiting-revision parks -> revise path
+  release_due_transient_parks      # #13606: expired `--transient` parks release by `until`
 }
 ```
 
@@ -786,6 +802,56 @@ awaiting_revision_park() {  # $1=body [$2=ISO time of latest loom:blocked label]
     [ "$a" -ge $((b - 300)) ] || return 1  # stale record: block re-applied since
   fi
   return 0
+}
+
+release_due_transient_parks() {
+  # #13606: a park written with `park-record apply --transient <cause>` carries
+  # its own retry time. Releasing it needs no dependency and no person.
+  # Preventing: capacity refusals (batch_no_capacity) parked as a plain reason
+  # never released, stranding seven issues on 2026-11-05.
+  # Only the LAST park record counts (a later blocker/reason park supersedes it);
+  # a legacy park (`transient` null) is never touched here.
+  "$GH_READ" issue list --label "loom:blocked" --state open --limit 1000 --json number,body,labels \
+    | jq -c '.[] | select(any(.labels[]?.name; IN("loom:operator","loom:frozen","loom:building","loom:curating")) | not)' \
+    | while read -r issue; do
+    local number body recs t cause attempt first_at age_days
+    number=$(jq -r '.number' <<<"$issue"); body=$(jq -r '.body // ""' <<<"$issue")
+    grep -q 'transient=' <<<"$body" || continue   # cheap body check before any API call
+    recs=$(loom-daemon park-record parse --json <<<"$body") || continue
+    t=$(jq -c '.records | last | .transient // empty' <<<"$recs")
+    [ -n "$t" ] || continue                                  # last record is not transient
+    cause=$(jq -r '.cause' <<<"$t"); attempt=$(jq -r '.attempt' <<<"$t")
+    # `due` is computed by the daemon (transient_due): a missing/garbled `until` is due.
+    [ "$(jq -r '.due' <<<"$t")" = "true" ] || continue       # unexpired: leave alone
+    [ "$(has_permanent_block "$number")" = "true" ] && continue
+    [ "$(has_restore_note "$number")" = "true" ] && continue
+
+    # Escalate once at attempt >= 6 or park age >= 7 days: a comment, never a hold.
+    # Age runs from the start of the TRAILING chain (last attempt==1 record for the
+    # cause): apply.rs resets the chain after TRANSIENT_CHAIN_RESET_SECS, so older
+    # records from a prior chain must not count (#13615).
+    first_at=$(jq -r --arg c "$cause" '[.records[] | select(.transient.cause == $c)] | (map(.transient.attempt == 1) | rindex(true) // 0) as $i | .[$i].at // empty' <<<"$recs")
+    age_days=0
+    if [ -n "$first_at" ]; then
+      local fe; fe=$(date -u -d "$first_at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$first_at" +%s 2>/dev/null) \
+        && age_days=$(( ($(date -u +%s) - fe) / 86400 ))
+    fi
+    if [ "$(jq -r '.escalate' <<<"$t")" = "true" ] || [ "$age_days" -ge 7 ]; then
+      local esc="<!-- loom:transient-escalated cause=$cause -->"   # one per issue+cause
+      if [ "$(loom-daemon forge trusted-comments --fetch "$number" --with-body 2>/dev/null | jq -r --arg m "$esc" 'any(.[]; (.body // "") | contains($m))')" != "true" ]; then
+        ./.loom/scripts/post-comment.sh "$number" --body "**Guide: transient park not clearing** — \`$cause\` has refused $attempt time(s) over ~${age_days}d. Retrying continues at the 24 h cap; no hold is added. A person may want to look at the cause itself.
+$esc"
+      fi
+    fi
+
+    if [ "$(was_previously_approved "$number")" = "true" ]; then
+      gh issue edit "$number" --remove-label "loom:blocked" --add-label "loom:issue" || continue
+    else
+      gh issue edit "$number" --remove-label "loom:blocked" || continue
+    fi
+    ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: transient park \`$cause\` (attempt $attempt) reached its retry time. The park record stays in the body so a re-park counts attempt $((attempt + 1))."
+    echo "Released transient park #$number cause=$cause attempt=$attempt"
+  done
 }
 
 convert_awaiting_revision_parks() {

@@ -123,7 +123,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/verdict-staleness-guard.sh"
-calls = 7
+calls = 9
 owner = "role-scripts"
 removal_issue = 9799
 
@@ -212,7 +212,7 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/daemon_service.rs"
+path = "loom-daemon/src/daemon_service/credential_startup.rs"
 calls = 1
 owner = "daemon-other"
 removal_issue = 9799

@@ -189,7 +189,6 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
-| [`operator.presence`](#operatorpresence) | log, OTLP only | none (#12121): no producer exists; the kind and its mapping remain for old rows → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.freshness`](#checkoutfreshness) | log, OTLP only | `fleet_sync/checkout_ff` pass → `observability/otlp/mapping/checkout_freshness.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
@@ -1360,6 +1359,10 @@ gradeable by a model or prompt experiment.
 | `prompt` | object | no | The checkout the session read its `/loom:<role>` prompt from, as it stood immediately before the spawn (#11989): `commit` (HEAD, full SHA), `loom_version` (the working tree's `.loom/install-metadata.json`), `commits_behind` (HEAD's distance behind the clone's `origin/<default>`), `on_branch` (`false` for a detached HEAD) and the remote fields of [`checkout.freshness`](#checkoutfreshness) (`remote_tip`, `commits_behind_remote`, `origin_ref_stale`, `remote_repo`, `remote_foreign`); each inner key is absent when it cannot be read. Absent on a tick that never resolved a launch. OTLP: `loom.prompt.commit`, `loom.prompt.loom_version`, `loom.prompt.commits_behind`, `loom.prompt.on_branch` and the remote fields' `loom.prompt.*` keys, so a role running stale prompts is `loom.prompt.commits_behind > 0`. Here `commits_behind` is against the local `origin/<default>` ref; `commits_behind_remote` measures against GitHub's tip from the head the daemon last heard (#12509). Additive, no `schema_version` bump. |
 | `source` | string | no | `step` when a step-engine step ran, not a role-runner tick (#11906). Mapped to `loom.role_tick.source`; absent on a role tick. Additive. |
 | `sweep_id` | string | no | The step's sweep id (`step-<role>-<item>-<ts>`), with `source`. Mapped to `loom.sweep_id`. |
+| `found_work` | bool | no | A **launched Judge** role-runner tick won a PR claim (or its prompt named a PR) or wrote a verdict (#12362). `false` is an observation (an idle, spawned tick), never a default; absent for any other role and for a tick that never launched. Mapped to `loom.found_work`. Additive. |
+| `noop_reason` | string | no | Set exactly when `found_work` is `false`: the session's own `LOOM_STEP_OUTCOME role=judge … reason=` (advisory, read from the role log after the tick's last `# LOOM_RUNTIME_RESOLVED` marker), else the daemon-observed `no_claim_no_verdict`. Mapped to `loom.noop_reason`. |
+| `verdicts` | array | no | One `{pr_number, head_sha?, verdict}` per PR a Judge tick wrote a verdict on, from the `forge verdict-labels` write via the pick journal (`verdict` is `approved` or `changes_requested`; `head_sha` is the `--sha` `post-verdict.sh` passed). Omitted when none. Mapped to `loom.role_tick.verdicts` (JSON). |
+| `step_class` / `step_reason` | string | no | On a step-sourced record: the step's `LOOM_STEP_OUTCOME` class and reason, which `result` collapses (`verdict`/`noop`/`refused` all read `success`). Mapped to `loom.role_tick.step_class` / `loom.role_tick.step_reason`. `result` itself is unchanged. |
 
 #### `result` — seven values, and why a skip is not a failure
 
@@ -1701,7 +1704,7 @@ subscribed). Published once per reap by the agent residue reaper
 **`daemon.start` (#11197)** — the one topic in this kind that is not a
 mirrored bus event. Exactly one record per daemon process, enqueued by
 `observability::spawn_task` when the exporters come up (never when telemetry
-is disabled), so a fleet-gitops roll is visible in the backend the moment a
+is disabled), so the fleet state store roll is visible in the backend the moment a
 host's daemon restarts onto new config. Its payload is
 `{"version", "revision", "tree_state", "supervisor", "config_sha", "pid",
 "start_time_unix_ms", "instance", "previous_version", "start_reason"}` —
@@ -2507,7 +2510,7 @@ roll it reported; no record carries it any more.)
 | `target_version` / `target_published_at` | string? | the newest release artifact resolved for this host |
 | `commits_behind` / `hours_behind` | integer? | source-checkout staleness, when the tick read it |
 | `in_flight` | integer? | in-flight sweeps, when the tick read them |
-| `drain` | object | `{armed, pending, refusals, target?}`: the roll or drain armed at tick start. Since #10831 `pending` means it can no longer be superseded (its pause has stopped an agent, or it is an operator drain) and `refusals` is always `0` |
+| `drain` | object | `{armed, pending, target?}`: the roll or drain armed at tick start. Since #10831 `pending` means it can no longer be superseded (its pause has stopped an agent, or it is an operator drain) (#13492 dropped the always-zero `refusals`; stored records that carry it still parse) |
 | `floor_stall` | string? | the unsatisfiable-floor alert text (#10712), or an unsatisfiable repo-ahead demand (#10719); absent otherwise |
 | `roll_held` | object? | #10880: a release roll this tick left held, raised on every such tick: `{floor?, running, target, cause, attempts, last_failure?, next_retry?}`. `cause` is `failed_roll` (an armed roll did not take; the failed-roll guard holds it), `fetch_backoff` (three or more consecutive fetch failures) or `fetch_terminal`. `floor` is set when the host is below its fleet floor. `next_retry` is absent only for a terminal failure on a target that is not the floor's |
 | `consecutive_failures` | integer | retryable failures for the tracked target |
@@ -2807,7 +2810,7 @@ Severity is `WARN` for a `failed` verdict and `INFO` otherwise.
 #### Role step verdicts: `step:<role>` (#12027)
 
 A role step also emits `pass.verdict`, with `mechanism=step:<role>` (today
-`step:champion`, `step:doctor` and `step:curator`; the judge row is #12029). The daemon builds the records from
+`step:champion`, `step:judge` (#12362), `step:doctor` and `step:curator`; the judge row is #12029). The daemon builds the records from
 facts the run already produced, so there is no new GitHub call and no prompt
 change: a `Marker` entry that `loom-daemon forge comment` appends to the pick
 journal (the body's first-line `<!-- ns:kind[:…] -->`), the agent gh front's
@@ -2829,7 +2832,7 @@ projected reason, so `passVerdictQuery` still parses both):
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
 | `step` | `champion_pr`, `champion_issue`, `doctor`, `curator` or `judge` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1`, `curator_step_v1` or `judge_step_v1` |
+| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1`, `curator_step_v1`, `judge_step_v1` or `judge_v1` |
 | `loom.sweep_id` | the step's sweep id, to join a verdict to its session (#12715) |
 | `reason_detail` | the raw `reason=` token of a `skipped` / `requeued` step (body `detail`), bounded to token characters (#12715) |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
@@ -2844,7 +2847,7 @@ projected reason, so `passVerdictQuery` still parses both):
 `merged` is `verdict`. `refused` carries `ci_failing`, `conflict`, `label`,
 `size`, `critical_file`, `stale`, `head_moved`, `not_eligible` or `unknown`
 (an unnamed criterion). `noop` carries `held`, or, for a `skipped` / `requeued`
-step, the gate it names with `reason=` (#12715): `facts_unread`, `janitor_rc3`,
+step, the gate it names with `reason=` (#12715): `facts_unread`, `janitor_rc3` (a foreign park, a failed read, or a PR stacked on a Loom `feature/issue-<N>` base),
 `verdict_rc11`, `ci_pending`, `mergeable_unknown`, `pin_missing`, `guard_refused`, `merge_rc<N>`,
 or `unspecified` when it named none or an unknown one. `ci_pending` is never
 inferred from the word `requeued`. A `skipped` / `requeued` step is never
@@ -2868,6 +2871,18 @@ peer held a fresh `loom:evaluating`) or `not_eligible`. `failed` carries
 `failed` or `unclassified`. There is no `duplicate`: Champion has no duplicate
 close.
 
+**Judge verdict (`judge_v1`, `step=judge`, `artifact=pr`, #12362).** One record per
+PR a verdict was written on, from a step or a role-runner tick. The evidence is the `Applied` entry
+`loom-daemon forge verdict-labels` appends to the pick journal once the label
+transition held (`post-verdict.sh` passes `--sha "$SHA"`, on the main and the
+superseded path; a refused approval, a duplicate loser and a failed transition
+journal nothing). `verdict` carries `approved` or `changes_requested`, with
+`head_sha` from the write. It wins over the step projection below unless a
+CI refusal was journaled after it. A role-runner tick that wrote no verdict
+projects nothing; spawned-but-idle ticks are counted by
+`role_tick.outcome.found_work=false`. Telemetry only: no label, claim, retry,
+exit code or ledger effect changes.
+
 **Doctor step (`doctor_step_v1`, `step=doctor`, `artifact=pr`, #12921).**
 One record per Doctor step end, no-op included, read from the journal and the
 step's `LOOM_STEP_OUTCOME role=doctor` line (no forge call). `head_sha` is the
@@ -2882,7 +2897,7 @@ has no journaled signal and is not emitted.
 | `failed` | `failed` (`class=failed`, or no outcome line) |
 
 **Judge step (`judge_step_v1`, `step=judge`, `artifact=pr`, #13274).**
-One record per Judge step end. When `post-verdict.sh` refuses an approval at
+One record per Judge step end that wrote no verdict (a written verdict is the `judge_v1` record above). When `post-verdict.sh` refuses an approval at
 the exact-head CI gate (#10486; it posts nothing), it journals the refusal
 through `loom-daemon forge journal-ci-refusal` (best-effort; an older daemon
 changes nothing) and the step's record carries it, with `head_sha` set. Without
@@ -3433,20 +3448,6 @@ only git children are local reads (`rev-parse`, `rev-list`, `remote get-url`,
 SigNoz: `attributes_string['loom.kind'] = 'checkout.freshness'`, grouped by
 `host.name` and `loom.repo`, with `max(loom.prompt.commits_behind_remote)` and
 `countIf(loom.prompt.origin_ref_stale)`.
-
-### `operator.presence`
-
-**No longer emitted (#12121).** The daemon records telemetry for its own work
-and nothing else: it does not read interactive session transcripts, and
-outside sessions do not send telemetry through it. The `presence-beat.sh` hook
-and the `loom-daemon presence …` subcommands that used to emit this record are
-removed, and nothing replaces them. The kind, its OTLP mapping and the
-`loom.presence.*` attribute allowlist stay so rows already in a backend still
-decode.
-
-Operator activity is **inferred by consumers**, not emitted: an item (issue or
-PR) that advanced with no daemon span covering it was moved by an operator
-session. See [`operator-presence.md`](operator-presence.md).
 
 ### `checkout.external_change`
 

@@ -163,6 +163,25 @@ fn shipped_safe_codex_roles_are_admitted() {
     );
 }
 
+/// Issue #13749: the ratification lane invokes `ratification-ee` /
+/// `ratification-market`; both must be admitted as Judge aliases (not new
+/// canonical roles, so no `runtimes.roles` key), while other unknown names
+/// still reject.
+#[test]
+fn ratification_reviewer_sessions_are_judge_aliases() {
+    let _env = ClearedLoomRuntimeEnv::new();
+    let d = fixture();
+    for name in ["ratification-ee", "ratification-market"] {
+        assert_eq!(canonical_role(name), Some("judge"), "{name}");
+        let admitted = resolve_and_admit(d.path(), name, None).unwrap();
+        assert_eq!(admitted.role, "judge", "{name}");
+        assert_eq!(admitted.runtime, "claude", "{name}");
+        assert!(!KNOWN_ROLE_KEYS.contains(&name), "{name} must not be a role key");
+    }
+    assert_eq!(canonical_role("ratification-other"), None);
+    assert!(resolve_and_admit(d.path(), "ratification-other", None).is_err());
+}
+
 /// Issue #8561: `defaults/runtimes/kimi.json` declares every capability
 /// `"no"` (no on-disk copy is written by [`fixture`], so this exercises
 /// the compiled-in [`BUNDLED_RUNTIME_MANIFESTS`] fallback). Curator

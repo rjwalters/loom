@@ -168,8 +168,17 @@ fn drift_line_only_when_below_floor() {
     let snap = |floor: &str| {
         let mut files = std::collections::BTreeMap::new();
         files.insert(
-            store::ROSTER_PATH.to_string(),
-            format!("loom_min_version: \"{floor}\"\nrepos: []\n").into_bytes(),
+            store::FLEET_JSON_PATH.to_string(),
+            serde_json::json!({
+                "_generated": {"schema_version": 1},
+                "root": "/srv/src",
+                "repos": [],
+                "state": {},
+                "config": {"defaults": {}},
+                "loom_min_version": floor
+            })
+            .to_string()
+            .into_bytes(),
         );
         Snapshot {
             manifest: fetch::Manifest {

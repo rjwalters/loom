@@ -136,6 +136,37 @@ pub struct RoleTickTelemetry {
     /// `<index>/<count>` of the shard that owns this repo (#12084), when the
     /// host is sharded.
     pub shard_owner: Option<String>,
+    /// What a Judge tick or a step observed about its own work (#12362).
+    pub extras: TickExtras,
+}
+
+/// The #12362 additions to a `role_tick.outcome` record, all optional and
+/// additive: a Judge tick's found-work split and verdicts, and a step's
+/// `LOOM_STEP_OUTCOME` class and reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickExtras {
+    pub found_work: Option<bool>,
+    pub noop_reason: Option<String>,
+    pub verdicts: Option<Vec<crate::telemetry::JudgeVerdictRecord>>,
+    pub step_class: Option<String>,
+    pub step_reason: Option<String>,
+}
+
+impl TickExtras {
+    fn of(
+        trace: Option<&crate::observability::lifecycle::RoleTrace>,
+        step: Option<(String, String)>,
+    ) -> Self {
+        let judge = trace.and_then(|t| t.judge.as_ref());
+        let (step_class, step_reason) = step.unzip();
+        Self {
+            found_work: judge.map(|j| j.found_work),
+            noop_reason: judge.and_then(|j| j.noop_reason.clone()),
+            verdicts: judge.map(|j| j.verdicts.clone()).filter(|v| !v.is_empty()),
+            step_class,
+            step_reason,
+        }
+    }
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -309,23 +340,32 @@ pub fn emit_for_tick_correlated(
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
 ) {
-    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None, None);
+    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None, None, None);
+}
+
+/// The step-specific inputs of [`emit_for_step`], bundled so the emit stays
+/// under clippy's argument limit.
+pub struct StepTelemetry<'a> {
+    /// The class the step's end derived (#12480); `None` on a failure falls
+    /// back to `unclassified:step`.
+    pub failure: Option<crate::observability::lifecycle::RoleFailure>,
+    pub sweep_id: &'a str,
+    /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362).
+    pub step_outcome: Option<(String, String)>,
+    /// The step's work item and whether it is a PR (#13563).
+    pub item: (u32, bool),
 }
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
 /// record marked `source = "step"` with the step's sweep id, so it is never
-/// counted as a role-runner tick. `failure` is the class the step's end
-/// derived (#12480); `None` on a failure falls back to `unclassified:step`.
-#[allow(clippy::too_many_arguments)]
+/// counted as a role-runner tick.
 pub fn emit_for_step(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
-    failure: Option<crate::observability::lifecycle::RoleFailure>,
-    sweep_id: &str,
-    item: (u32, bool),
+    step: StepTelemetry<'_>,
 ) {
     emit_tick(
         root,
@@ -334,9 +374,10 @@ pub fn emit_for_step(
         outcome,
         resolved,
         None,
-        failure,
-        Some(sweep_id.to_string()),
-        Some(item),
+        step.failure,
+        Some(step.sweep_id.to_string()),
+        Some(step.item),
+        step.step_outcome,
     );
 }
 
@@ -380,6 +421,7 @@ fn emit_tick(
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
     step_sweep_id: Option<String>,
     step_item: Option<(u32, bool)>,
+    step_outcome: Option<(String, String)>,
 ) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
     crate::observability::pick_decision::emit_role_tick(
@@ -431,6 +473,7 @@ fn emit_tick(
             step_item,
             deferred_by: None,
             shard_owner: None,
+            extras: TickExtras::of(trace.as_ref(), step_outcome),
         },
         trace,
     );
@@ -818,6 +861,11 @@ pub fn build_record(
         pr_number: tick.step_item.filter(|(_, is_pr)| *is_pr).map(|(n, _)| n),
         deferred_by: tick.deferred_by.clone().filter(|d| !d.is_empty()),
         shard_owner: tick.shard_owner.clone().filter(|s| !s.is_empty()),
+        found_work: tick.extras.found_work,
+        noop_reason: tick.extras.noop_reason.clone().filter(|s| !s.is_empty()),
+        verdicts: tick.extras.verdicts.clone(),
+        step_class: tick.extras.step_class.clone().filter(|s| !s.is_empty()),
+        step_reason: tick.extras.step_reason.clone().filter(|s| !s.is_empty()),
     }
 }
 
@@ -1027,7 +1075,7 @@ fn export(envelope: &TelemetryEnvelope) {
 /// path reaches the wire (#9442).
 fn exportable(mut record: TelemetryRecord) -> TelemetryRecord {
     if let TelemetryRecord::RoleTickOutcome(r) = &mut record {
-        if !crate::agent_gh::classify::is_slug(&r.repo) {
+        if !crate::forge_slug::valid_slug(&r.repo) {
             r.repo = crate::observability::pick_decision::REPO_UNRESOLVED.to_string();
         }
     }

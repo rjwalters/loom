@@ -180,16 +180,25 @@ impl GhQueueApi {
         }
     }
 
-    fn graphql(&self, op: &'static str, intent: AccessIntent, args: &[String]) -> CmdOutcome {
+    fn graphql(
+        &self,
+        op: &'static str,
+        intent: AccessIntent,
+        args: &[String],
+        number: Option<u32>,
+    ) -> CmdOutcome {
         let target = GhTarget::Repo {
             owner: self.owner.clone(),
             repo: self.name.clone(),
         };
-        GhInvocation::new(Operation::new(op), intent, target, QUEUE_CALL_TIMEOUT)
+        let mut inv = GhInvocation::new(Operation::new(op), intent, target, QUEUE_CALL_TIMEOUT)
             .program(&self.gh)
             .args(["api", "graphql"])
-            .args(args)
-            .run()
+            .args(args);
+        if let Some(n) = number {
+            inv = inv.number(n);
+        }
+        inv.run()
     }
 
     /// Run a GraphQL call to a parsed `data` value, or the failure text.
@@ -198,8 +207,9 @@ impl GhQueueApi {
         op: &'static str,
         intent: AccessIntent,
         args: &[String],
+        pr: u32,
     ) -> Result<serde_json::Value, String> {
-        let out = self.graphql(op, intent, args);
+        let out = self.graphql(op, intent, args, Some(pr));
         let combined = format!("{}\n{}", out.stderr_trimmed(), out.stdout_trimmed());
         if !out.succeeded() {
             return Err(combined);
@@ -287,7 +297,7 @@ impl QueueApi for GhQueueApi {
             "-F".to_string(),
             format!("number={pr}"),
         ];
-        match self.run("merge_queue.status", AccessIntent::Read, &args) {
+        match self.run("merge_queue.status", AccessIntent::Read, &args, pr) {
             Ok(data) => parse_status(pr, &data),
             Err(text) => Err(error_for(classify_failure(&text), &text, pr, None)),
         }
@@ -307,7 +317,7 @@ impl QueueApi for GhQueueApi {
             "-f".to_string(),
             format!("expectedHeadOid={expected_head_oid}"),
         ];
-        match self.run("merge_queue.enqueue", AccessIntent::Write, &args) {
+        match self.run("merge_queue.enqueue", AccessIntent::Write, &args, pr) {
             Ok(data) => Ok(EnqueueAck::Enqueued {
                 position: data
                     .pointer("/enqueuePullRequest/mergeQueueEntry/position")
@@ -328,7 +338,7 @@ impl QueueApi for GhQueueApi {
             "-f".to_string(),
             format!("id={node_id}"),
         ];
-        match self.run("merge_queue.dequeue", AccessIntent::Write, &args) {
+        match self.run("merge_queue.dequeue", AccessIntent::Write, &args, pr) {
             Ok(_) => Ok(DequeueAck::Dequeued),
             Err(text) => match classify_failure(&text) {
                 FailureClass::NotQueued => Ok(DequeueAck::NotQueued),

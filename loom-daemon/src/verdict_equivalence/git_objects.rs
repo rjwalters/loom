@@ -37,20 +37,14 @@
 //! re-derive them differently, it just answers a different question with them
 //! (verdict equivalence, not conflict prediction).
 
+use crate::git_merge_tree::supports_merge_tree;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Run `git -C <repo> <args>` and return its trimmed stdout, or `None` on any
 /// failure (absent binary, non-zero exit, non-UTF-8 output).
 pub(super) fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
+    let out = crate::git_utils::git_run(repo, args).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -192,29 +186,6 @@ pub(super) fn parents(repo: &Path, sha: &str) -> Option<Vec<String>> {
     Some(fields.map(str::to_string).collect())
 }
 
-/// git >= 2.38, where `git merge-tree --write-tree` exists. Same floor and
-/// same probe shape as [`crate::overlap_replay::conflict`].
-pub(super) fn supports_merge_tree(repo: &Path) -> bool {
-    let Some(out) = git(repo, &["--version"]) else {
-        return false;
-    };
-    out.split_whitespace()
-        .nth(2)
-        .is_some_and(merge_tree_in_version)
-}
-
-pub(super) fn merge_tree_in_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let Some(Ok(major)) = parts.next().map(str::parse::<u32>) else {
-        return false;
-    };
-    let minor = parts
-        .next()
-        .and_then(|m| m.parse::<u32>().ok())
-        .unwrap_or(0);
-    major > 2 || (major == 2 && minor >= 38)
-}
-
 /// What a `git merge-tree --write-tree` run produced.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum MergeTree {
@@ -237,7 +208,7 @@ pub(super) enum MergeTree {
 /// but this function, and ordinary gc reclaims it — the index and working tree
 /// are untouched (`merge-tree` is plumbing).
 pub(super) fn merge_tree(repo: &Path, a: &str, b: &str) -> MergeTree {
-    if !supports_merge_tree(repo) {
+    if !supports_merge_tree(Some(repo)) {
         return MergeTree::Failed;
     }
     let Ok(out) = Command::new("git")
@@ -264,5 +235,47 @@ pub(super) fn merge_tree(repo: &Path, a: &str, b: &str) -> MergeTree {
         }
         Some(1) => MergeTree::Conflict,
         _ => MergeTree::Failed,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        dir
+    }
+
+    #[test]
+    fn git_returns_trimmed_stdout_on_success() {
+        let dir = init_repo();
+        let out = git(dir.path(), &["rev-parse", "--git-dir"]).unwrap();
+        assert_eq!(out, ".git");
+    }
+
+    #[test]
+    fn git_returns_none_on_nonzero_exit() {
+        let dir = init_repo();
+        assert_eq!(git(dir.path(), &["rev-parse", "--verify", "nope"]), None);
+    }
+
+    #[test]
+    fn git_returns_none_on_non_utf8_stdout() {
+        let dir = init_repo();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, [0xff, 0xfe, 0xfd]).unwrap();
+        // `cat-file`-free way to emit raw bytes: `git hash-object` is ASCII, so
+        // use `git show-index`-style raw output via `git cat-file blob`.
+        let sha = git(dir.path(), &["hash-object", "-w", "blob"]).unwrap();
+        assert_eq!(git(dir.path(), &["cat-file", "blob", &sha]), None);
     }
 }

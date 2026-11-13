@@ -104,17 +104,6 @@ fn one_file(patch: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn merge_tree_version_floor_is_2_38() {
-    use super::git_objects::merge_tree_in_version;
-    assert!(merge_tree_in_version("2.38.0"));
-    assert!(merge_tree_in_version("2.51.1"));
-    assert!(merge_tree_in_version("3.0.0"));
-    assert!(!merge_tree_in_version("2.37.3"));
-    assert!(!merge_tree_in_version("1.9"));
-    assert!(!merge_tree_in_version("not-a-version"));
-}
-
-#[test]
 fn ref_names_that_could_address_another_endpoint_are_refused() {
     assert!(is_safe_ref("main"));
     assert!(is_safe_ref("release/v1.2"));
@@ -571,7 +560,7 @@ fn fixture(pr_file: &str, pr_content: &str) -> (TempDir, String, String) {
 /// Skip rather than fail on a git with no `merge-tree --write-tree`, the same
 /// floor the two existing callers use.
 pub(super) fn merge_tree_available(repo: &Path) -> bool {
-    if super::git_objects::supports_merge_tree(repo) {
+    if crate::git_merge_tree::supports_merge_tree(Some(repo)) {
         return true;
     }
     eprintln!("SKIP: git < 2.38 has no `merge-tree --write-tree`");

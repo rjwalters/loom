@@ -197,6 +197,7 @@ pub mod doctor_escalation;
 /// Doctor hand-back as a conditional, verified label transition (#9388).
 pub mod doctor_handback;
 pub mod eager_reclaim;
+pub(crate) mod env_flag;
 #[cfg(test)]
 pub(crate) mod env_test_support;
 pub mod epic_state;
@@ -233,6 +234,7 @@ pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;
 pub mod forge_listing;
+pub mod forge_locked_deps_only;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_merge_queue;
@@ -245,6 +247,7 @@ pub mod forge_pull_listing;
 pub mod forge_read_pool;
 pub(crate) mod forge_repo_facts;
 pub mod forge_rerun;
+pub mod forge_slug;
 pub mod forge_suspect_critical_diff;
 pub mod forge_tree_unchanged;
 pub mod forge_version_only_diff;
@@ -284,7 +287,9 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
+pub mod shell_out;
 // #11855: bound Judge re-runs on a PR whose passes end without a verdict.
+pub(crate) mod git_merge_tree;
 pub mod judge_backstop;
 pub mod key_ref;
 pub mod kimi_usage;

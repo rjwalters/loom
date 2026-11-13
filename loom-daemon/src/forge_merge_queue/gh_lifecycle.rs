@@ -514,17 +514,23 @@ pub enum Landed {
 /// current head; [`handoff`] denies unless a trusted Judge verdict marker and
 /// `loom:pr` cover exactly that head, and the queue's required checks gate
 /// the merge itself.
+///
+/// Narrowed by operator ruling r7-q35: a Judge verdict alone never enqueues.
+/// The landing needs (a) `proven`, the byte-identity proof held at this head,
+/// or (b) a Champion clear recorded at the live head
+/// ([`super::clear_gate::champion_clear_at`]); otherwise [`Landed::Waiting`].
+/// Any read failure is `Waiting` too.
 #[must_use]
-pub fn land_for_root(gh: &Path, root: &Path, pr: u32) -> Landed {
+pub fn land_for_root(gh: &Path, root: &Path, pr: u32, proven: bool) -> Landed {
     let gh_s = gh.to_string_lossy().to_string();
-    match with_live(gh, root, |ctx, forge| land(ctx, forge, &gh_s, pr)) {
+    match with_live(gh, root, |ctx, forge| land(ctx, forge, &gh_s, pr, proven)) {
         Live::Direct => Landed::NotQueueMode("champion.mergeMode is direct".to_string()),
         Live::Unresolved(why) => Landed::NotQueueMode(why),
         Live::Ran(landed) => landed,
     }
 }
 
-fn land(ctx: &Ctx<'_>, forge: &GhLifecycleForge, gh: &str, pr: u32) -> Landed {
+fn land(ctx: &Ctx<'_>, forge: &GhLifecycleForge, gh: &str, pr: u32, proven: bool) -> Landed {
     match reconcile_pr(ctx, pr) {
         Reconciled::Merged { .. } => return Landed::Merged,
         Reconciled::StillQueued { .. } => return Landed::Queued,
@@ -540,6 +546,9 @@ fn land(ctx: &Ctx<'_>, forge: &GhLifecycleForge, gh: &str, pr: u32) -> Landed {
         Ok(s) => return Landed::Failed(format!("PR #{pr} is {}", s.state.as_str())),
         Err(e) => return Landed::Failed(e),
     };
+    if let Some(why) = super::clear_gate::gate(forge, pr, &head, proven) {
+        return Landed::Waiting(why);
+    }
     let nwo = forge.nwo();
     let required = || {
         super::preflight::github_preflight(gh, &nwo, None)

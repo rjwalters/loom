@@ -26,11 +26,11 @@
 //! - [`admins`] — the fleet admin roster (`fleet/admins.json`) that comment
 //!   trust consults (#10303). Fails closed.
 //! - [`render`] — the host's machine tier and host-local tier, and drift.
-//! - [`roster`] — `repos.yml` → desired workspace set, diffed against the
+//! - [`roster`] — `fleet.json` roster → desired workspace set, diffed against the
 //!   daemon's workspace registry. Fails closed.
-//! - [`state`] — this host's desired run state from `fleet/state.yml`.
+//! - [`state`] — this host's desired run state from `fleet.json`.
 //! - [`floor`] — the fleet-wide minimum Loom version, `loom_min_version`
-//!   (#10711), from `fleet.json` or else the top level of `repos.yml`.
+//!   (#10711), from `fleet.json`.
 //! - [`propose`] — the one *write* path: open a PR against the store instead
 //!   of hand-editing it (#9599).
 //! - [`reload`] — classify a changed config path as live-reloadable or
@@ -54,7 +54,6 @@ pub mod render;
 pub mod resync_claim;
 pub mod roster;
 pub mod state;
-pub mod yaml;
 
 use std::path::{Path, PathBuf};
 
@@ -88,8 +87,8 @@ pub const ADMINS_PATH: &str = "fleet/admins.json";
 /// the store has it; when present it is the only source of the roster, run
 /// state and config tiers ([`compiled`]), and the legacy files above are the
 /// fallback only while it is absent. [`floor`] also reads it through
-/// [`compiled`] (`loom_min_version`, #10711); it falls back to `repos.yml`
-/// only when this file is absent.
+/// [`compiled`] (`loom_min_version`, #10711). It is the only roster, run-state
+/// and floor source; a legacy `repos.yml` / `fleet/state.yml` is no longer read.
 pub const FLEET_JSON_PATH: &str = "fleet.json";
 
 /// Store-relative path of `host`'s machine-tier overlay.
