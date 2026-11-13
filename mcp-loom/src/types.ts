@@ -22,26 +22,6 @@ export interface Terminal {
   working_dir?: string;
   tmux_session: string;
   created_at: number;
-  isPrimary?: boolean;
-}
-
-/**
- * State file structure
- */
-export interface StateFile {
-  daemonPid?: number;
-  nextAgentNumber: number;
-  terminals: Array<{
-    id: string;
-    status: string;
-    isPrimary: boolean;
-    worktreePath?: string;
-    agentPid?: number;
-    agentStatus?: string;
-    lastIntervalRun?: number;
-  }>;
-  selectedTerminalId: string | null;
-  lastUpdated: string;
 }
 
 /**

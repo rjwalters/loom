@@ -13,13 +13,7 @@
 import { readFile } from "node:fs/promises";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import stripAnsi from "strip-ansi";
-import {
-  getWorkspacePath,
-  readConfigFile,
-  readStateFile,
-  writeConfigFile,
-  writeStateFile,
-} from "../shared/config.js";
+import { getWorkspacePath, readConfigFile, writeConfigFile } from "../shared/config.js";
 import {
   LOCAL_CONFIG_REL,
   PROJECT_CONFIG_REL,
@@ -57,82 +51,33 @@ function extractDaemonErrorMessage(response: {
 }
 
 /**
- * Where a `listTerminalsWithSource()` result came from (Issue #4794).
+ * List all active terminals from the live `loom-daemon` registry.
  *
- * - `"daemon"`: the live `loom-daemon`'s registry, which the daemon itself
- *   garbage-collects against actual tmux session liveness on every
- *   `ListTerminals` request (see `TerminalManager::prune_dead_terminals` in
- *   `loom-daemon/src/terminal.rs`) — entries here are verified live.
- * - `"state-fallback"`: the daemon was unreachable, so this is the
- *   last-written `.loom/state.json` snapshot with NO tmux verification —
- *   it can include terminals whose sessions have since died.
- */
-export type TerminalListSource = "daemon" | "state-fallback";
-
-export interface TerminalListResult {
-  terminals: Terminal[];
-  source: TerminalListSource;
-}
-
-/**
- * List all active terminals from the daemon, reporting which source served
- * the result (Issue #4794) so callers can flag an unverified fallback list.
- */
-async function listTerminalsWithSource(): Promise<TerminalListResult> {
-  try {
-    const response = (await sendDaemonRequest({
-      type: "ListTerminals",
-    })) as { type: string; payload?: { terminals: Terminal[] } };
-
-    if (response.type === "TerminalList" && response.payload?.terminals) {
-      return { terminals: response.payload.terminals, source: "daemon" };
-    }
-
-    return { terminals: [], source: "daemon" };
-  } catch (_error) {
-    // If daemon is not running, fall back to state file. Unlike the daemon
-    // path, this is NOT cross-checked against live tmux sessions — the
-    // caller must treat it as unverified (Issue #4794).
-    const state = await readStateFile();
-    if (!state) return { terminals: [], source: "state-fallback" };
-
-    // Map state file format to Terminal format
-    return {
-      terminals: state.terminals.map((t) => ({
-        id: t.id,
-        name: t.id, // State file doesn't have name
-        role: undefined,
-        working_dir: t.worktreePath,
-        tmux_session: `loom-${t.id}`,
-        created_at: 0,
-        isPrimary: t.isPrimary,
-      })),
-      source: "state-fallback",
-    };
-  }
-}
-
-/**
- * List all active terminals from the daemon
+ * The daemon garbage-collects registry entries whose backing tmux session no
+ * longer exists on every `ListTerminals` request (see
+ * `TerminalManager::prune_dead_terminals` in `loom-daemon/src/terminal.rs`),
+ * so every terminal returned here is tmux-verified.
+ *
+ * There is deliberately NO fallback source (Issue #13821). The previous
+ * `.loom/state.json` fallback was written only by the Tauri desktop app
+ * removed in #3353, so on a daemon-unreachable call it could only ever
+ * return a stale snapshot or nothing at all — the unverified list #4794 had
+ * to warn about. An unreachable daemon now rejects: the connection error
+ * propagates to `handleTerminalTool`'s caller in `index.ts`, which reports it
+ * as a tool error. That is the fail-closed answer — "the daemon did not
+ * answer" must not be rendered as the indistinguishable "there are no
+ * terminals".
  */
 async function listTerminals(): Promise<Terminal[]> {
-  return (await listTerminalsWithSource()).terminals;
-}
+  const response = (await sendDaemonRequest({
+    type: "ListTerminals",
+  })) as { type: string; payload?: { terminals: Terminal[] } };
 
-/**
- * Build the operator-facing note appended to `list_terminals` output when
- * the result did not come from the live, tmux-verified daemon path
- * (Issue #4794). Returns `""` for the verified `"daemon"` source.
- */
-export function buildTerminalListFallbackNote(source: TerminalListSource): string {
-  if (source !== "state-fallback") {
-    return "";
+  if (response.type === "TerminalList" && response.payload?.terminals) {
+    return response.payload.terminals;
   }
-  return (
-    "\n\nNote: loom-daemon did not respond, so this list was read from the last-written " +
-    "local state file (.loom/state.json) and is UNVERIFIED against live tmux sessions — " +
-    "it may include terminals whose sessions have since ended."
-  );
+
+  return [];
 }
 
 /**
@@ -456,57 +401,14 @@ async function configureTerminal(
 }
 
 /**
- * Set the primary terminal
- */
-async function setPrimaryTerminal(terminalId: string): Promise<{
-  success: boolean;
-  error?: string;
-}> {
-  try {
-    const terminals = await listTerminals();
-    const terminal = terminals.find((t) => t.id === terminalId);
-
-    if (!terminal) {
-      return {
-        success: false,
-        error: `Terminal ${terminalId} not found`,
-      };
-    }
-
-    let state = await readStateFile();
-    if (!state) {
-      state = {
-        terminals: terminals.map((t) => ({
-          id: t.id,
-          status: "idle",
-          isPrimary: t.id === terminalId,
-          worktreePath: t.working_dir,
-          lastIntervalRun: undefined,
-        })),
-        selectedTerminalId: terminalId,
-        lastUpdated: new Date().toISOString(),
-        nextAgentNumber: terminals.length + 1,
-      };
-    } else {
-      for (const t of state.terminals) {
-        t.isPrimary = t.id === terminalId;
-      }
-      state.selectedTerminalId = terminalId;
-    }
-
-    await writeStateFile(state);
-
-    return { success: true };
-  } catch (error) {
-    return {
-      success: false,
-      error: `Error setting primary terminal: ${error}`,
-    };
-  }
-}
-
-/**
  * Terminal tool definitions
+ *
+ * Removed tools (Issue #13821): `set_primary_terminal` and
+ * `get_selected_terminal` are gone. Both operated on a home-directory
+ * `~/.loom/state.json` whose only writer was `set_primary_terminal` itself —
+ * a closed loop left behind when #3353 removed the Tauri desktop app that
+ * owned the "primary terminal" concept. No daemon-era equivalent exists:
+ * the daemon registry has no notion of a primary or selected terminal.
  */
 export const terminalTools: Tool[] = [
   {
@@ -536,21 +438,6 @@ export const terminalTools: Tool[] = [
         },
       },
       required: ["terminal_id"],
-    },
-  },
-  {
-    name: "get_selected_terminal",
-    description:
-      "Get information about the currently selected (primary) terminal in Loom. Returns the terminal's ID, name, role, and recent output.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        lines: {
-          type: "number",
-          description: "Number of output lines to include (default: 20)",
-          default: 20,
-        },
-      },
     },
   },
   {
@@ -692,21 +579,6 @@ export const terminalTools: Tool[] = [
     },
   },
   {
-    name: "set_primary_terminal",
-    description:
-      "Set the primary (selected) terminal in the Loom UI. This updates the UI state to focus on the specified terminal. The terminal must exist.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        terminal_id: {
-          type: "string",
-          description: "Terminal ID to set as primary (e.g., 'terminal-1')",
-        },
-      },
-      required: ["terminal_id"],
-    },
-  },
-  {
     // The `enum`s below are advertised to the client; they are NOT enforced by
     // the MCP SDK. The server-side allow-lists in `agent-metrics.ts` are what
     // actually gate these values (Issue #9107) — keep the two in sync.
@@ -768,20 +640,16 @@ export async function handleTerminalTool(
 ): Promise<{ type: "text"; text: string }[]> {
   switch (name) {
     case "list_terminals": {
-      const { terminals, source } = await listTerminalsWithSource();
-
-      // Issue #4794: the daemon path is verified live (the daemon
-      // garbage-collects registry entries whose tmux session no longer
-      // exists on every `ListTerminals` request); the state-file fallback
-      // (daemon unreachable) is NOT — flag it explicitly rather than
-      // presenting a possibly-stale snapshot as if it were confirmed live.
-      const fallbackNote = buildTerminalListFallbackNote(source);
+      // Daemon-only, and deliberately throwing when the daemon is unreachable
+      // (Issue #13821): an empty list here means the daemon answered and the
+      // registry is empty, never that nobody answered.
+      const terminals = await listTerminals();
 
       if (terminals.length === 0) {
         return [
           {
             type: "text",
-            text: `No active terminals found. Either Loom hasn't been started yet, or all terminals have been closed.${fallbackNote}`,
+            text: "No active terminals found. Either Loom hasn't been started yet, or all terminals have been closed.",
           },
         ];
       }
@@ -804,7 +672,7 @@ export async function handleTerminalTool(
       return [
         {
           type: "text",
-          text: `=== Active Loom Terminals (${terminals.length}) ===\n\n${terminalList}${fallbackNote}`,
+          text: `=== Active Loom Terminals (${terminals.length}) ===\n\n${terminalList}`,
         },
       ];
     }
@@ -819,45 +687,6 @@ export async function handleTerminalTool(
 
       const result = await getTerminalOutput(terminalId, lines);
       return [{ type: "text", text: formatTerminalOutput(result, terminalId) }];
-    }
-
-    case "get_selected_terminal": {
-      const lines = (args?.lines as number) || 20;
-      const state = await readStateFile();
-
-      if (!state || !state.selectedTerminalId) {
-        return [{ type: "text", text: "No terminal is currently selected in Loom." }];
-      }
-
-      const terminals = await listTerminals();
-      const terminal = terminals.find((t) => t.id === state.selectedTerminalId);
-
-      if (!terminal) {
-        return [
-          {
-            type: "text",
-            text: `Selected terminal ${state.selectedTerminalId} not found.`,
-          },
-        ];
-      }
-
-      const result = await getTerminalOutput(terminal.id, lines);
-      const info = [
-        `ID: ${terminal.id}`,
-        `Name: ${terminal.name}`,
-        terminal.role ? `Role: ${terminal.role}` : null,
-        terminal.working_dir ? `Working Dir: ${terminal.working_dir}` : null,
-        `Session: ${terminal.tmux_session}`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      return [
-        {
-          type: "text",
-          text: `=== Currently Selected Terminal ===\n\n${info}\n\n${formatTerminalOutput(result, terminal.id)}`,
-        },
-      ];
     }
 
     case "send_terminal_input": {
@@ -1033,32 +862,6 @@ export async function handleTerminalTool(
         {
           type: "text",
           text: `=== Configure Terminal ===\n\nSuccess\n\nTerminal ${terminalId} configuration updated.\n\nUpdated fields: ${changedFields}\n\nNote: Changes are saved to the config file. The terminal may need to be restarted for some changes to take effect, or the UI will hot-reload the configuration.`,
-        },
-      ];
-    }
-
-    case "set_primary_terminal": {
-      const terminalId = args?.terminal_id as string;
-
-      if (!terminalId) {
-        return [{ type: "text", text: "Error: terminal_id is required" }];
-      }
-
-      const result = await setPrimaryTerminal(terminalId);
-
-      if (!result.success) {
-        return [
-          {
-            type: "text",
-            text: `=== Set Primary Terminal ===\n\nFailed\n\n${result.error}`,
-          },
-        ];
-      }
-
-      return [
-        {
-          type: "text",
-          text: `=== Set Primary Terminal ===\n\nSuccess\n\nTerminal ${terminalId} is now the primary (selected) terminal.\n\nThe UI will focus on this terminal.`,
         },
       ];
     }
