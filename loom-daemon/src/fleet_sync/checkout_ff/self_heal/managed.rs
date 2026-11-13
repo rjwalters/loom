@@ -113,10 +113,9 @@ pub(super) fn has_marker(content: &str) -> bool {
 ///
 /// Long on purpose. A role session that checks out a PR head or `origin/main`
 /// in the main checkout is done with it in minutes; a tool installer that
-/// keeps a workspace detached at a pinned commit (2am's `provision.sh` does
-/// this for geode-fem) moves it at least hourly, and a checkout it keeps
-/// current is never behind for long. Days-old detached checkouts are the
-/// ones this is for.
+/// keeps a registered workspace detached at a pinned commit moves it at least
+/// hourly, and a checkout it keeps current is never behind for long. Days-old
+/// detached checkouts are the ones this is for.
 pub(super) fn detached_after() -> Duration {
     let minutes = std::env::var(DETACHED_ENV)
         .ok()

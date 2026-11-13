@@ -518,10 +518,11 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     // Re-attached only when the repair resets anyway, or the HEAD is behind.
     let reattach = stray && (stray_behind || !commits.is_empty() || blocking_dirt);
     if reattach {
-        // A tool that pins a checkout to a commit on purpose (2am's
-        // `provision.sh` keeps geode-fem at the newest green one) says so here;
-        // while main is red such a HEAD is detached, behind and unmoved, which
-        // is exactly the shape this repair puts back.
+        // A tool that pins a registered workspace to a commit on purpose
+        // says so here; while the default branch is red such a HEAD is
+        // detached, behind and unmoved, which is exactly the shape this repair
+        // puts back. A tool clone kept outside the registered workspaces is
+        // never reached by a pass and needs no opt-out.
         let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
             .unwrap_or_default();
         if keep.trim().eq_ignore_ascii_case("keep") {
