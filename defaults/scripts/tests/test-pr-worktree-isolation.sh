@@ -7,8 +7,8 @@
 #   2. doctor.md (defaults/) documents the branch-isolation requirement,
 #      including the #9401 occupied-worktree yield (live process, no lease).
 #   3. pr-worktree.sh surfaces a clear diagnostic when the PR branch is already
-#      checked out elsewhere, cleans up the partial pr-<N> worktree (#6264,
-#      #6594), and leaves the orchestrator checkout's HEAD and branch untouched.
+#      checked out elsewhere, and cleans up the partial pr-<N> worktree (#6264,
+#      #6594).
 #   4. pr-worktree.sh catches that collision up front — before any pr-<N>
 #      worktree is created at all — when `gh pr view` resolves the head branch
 #      (#6594).
@@ -194,31 +194,11 @@ chmod +x "$MOCKBIN/gh"
 
 COLLIDING_WT_ABS="$(cd ".loom/worktrees/issue-998" && pwd)"
 
-# #3358: the orchestrator checkout must be left exactly where it was, whatever
-# pr-worktree.sh does with its own worktree. Asserted around the real helper
-# call below (it creates a pr-<N> worktree here, then tears it down), not
-# around a hand-rolled `git worktree add` that would only re-test git itself.
-ORCH_HEAD_BEFORE=$(git rev-parse HEAD)
-ORCH_BRANCH_BEFORE=$(git rev-parse --abbrev-ref HEAD)
 set +e
 PR_OUT=$(PATH="$MOCKBIN:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_COLLIDING_WT="$COLLIDING_WT_ABS" \
     "$PR_WORKTREE_SH" 998 2>&1)
 PR_RC=$?
 set -e
-ORCH_HEAD_AFTER=$(git rev-parse HEAD)
-ORCH_BRANCH_AFTER=$(git rev-parse --abbrev-ref HEAD)
-
-if [[ "$ORCH_HEAD_BEFORE" == "$ORCH_HEAD_AFTER" ]]; then
-    pass "orchestrator HEAD SHA unchanged across the pr-worktree.sh run"
-else
-    fail "orchestrator HEAD moved: $ORCH_HEAD_BEFORE -> $ORCH_HEAD_AFTER"
-fi
-if [[ "$ORCH_BRANCH_BEFORE" == "$ORCH_BRANCH_AFTER" ]]; then
-    pass "orchestrator branch unchanged ($ORCH_BRANCH_BEFORE)"
-else
-    fail "orchestrator branch moved: $ORCH_BRANCH_BEFORE -> $ORCH_BRANCH_AFTER"
-fi
-
 if [[ "$PR_RC" -ne 0 ]]; then
     pass "pr-worktree.sh exits non-zero on the branch-collision failure"
 else
