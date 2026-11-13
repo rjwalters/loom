@@ -100,33 +100,48 @@ pub(super) fn handle_invalidate(
             );
         }
         if let Equivalence::Equivalent(kind) = assessment.equivalence {
-            match reanchor_equivalent_verdict(gh_bin, root, pr, marker_sha, head_sha, kind) {
-                Ok(()) => {
-                    stats.tree_identical_reanchors += 1;
-                    log::info!(
-                        "claim_reconciliation: PR #{} in {} carries {} with head moved from \
-                         {marker_sha} to {head_sha}, but the reviewed change is unchanged \
-                         (equivalence kind: {}) — re-anchored instead of invalidating (#9124, \
-                         #9416)",
-                        pr.number,
-                        root.display(),
-                        pr.kind.label(),
-                        kind.token(),
-                    );
+            // #13822: equivalence answers "is this the same change?", which is
+            // the wrong question for a verdict that reviewed no change at all.
+            // A CI-gate-only rejection is never re-anchored.
+            if let Some(why) = ci_only_reanchor_refusal(gh_bin, root, pr) {
+                log::info!(
+                    "claim_reconciliation: PR #{} in {} carries {} with head moved from \
+                     {marker_sha} to {head_sha} and the change is {}-equivalent, but the \
+                     verdict is not re-anchorable — clearing it instead (#13822). Why: {why}",
+                    pr.number,
+                    root.display(),
+                    pr.kind.label(),
+                    kind.token(),
+                );
+            } else {
+                match reanchor_equivalent_verdict(gh_bin, root, pr, marker_sha, head_sha, kind) {
+                    Ok(()) => {
+                        stats.tree_identical_reanchors += 1;
+                        log::info!(
+                            "claim_reconciliation: PR #{} in {} carries {} with head moved from \
+                             {marker_sha} to {head_sha}, but the reviewed change is unchanged \
+                             (equivalence kind: {}) — re-anchored instead of invalidating \
+                             (#9124, #9416)",
+                            pr.number,
+                            root.display(),
+                            pr.kind.label(),
+                            kind.token(),
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "claim_reconciliation: failed to re-anchor PR #{}'s {}-equivalent {} \
+                             verdict in {}: {e} — it stays stale (recorded for {marker_sha}) \
+                             until the next tick re-evaluates it",
+                            pr.number,
+                            kind.token(),
+                            pr.kind.label(),
+                            root.display()
+                        );
+                    }
                 }
-                Err(e) => {
-                    log::warn!(
-                        "claim_reconciliation: failed to re-anchor PR #{}'s {}-equivalent {} \
-                         verdict in {}: {e} — it stays stale (recorded for {marker_sha}) until \
-                         the next tick re-evaluates it",
-                        pr.number,
-                        kind.token(),
-                        pr.kind.label(),
-                        root.display()
-                    );
-                }
+                return;
             }
-            return;
         }
     }
     let note = unavailable_note.as_deref();
@@ -152,6 +167,76 @@ pub(super) fn handle_invalidate(
                 root.display()
             );
         }
+    }
+}
+
+/// Why the `changes-requested` verdict on `pr` must not be carried forward
+/// across an otherwise-equivalent head move (Issue #13822); `None` when
+/// re-anchoring it is fine.
+///
+/// # The livelock this closes
+///
+/// Judge's CI-failing verdict (`judge-ci-red.md` step 5) states in its own
+/// template that no code review was performed; its one requested change *is*
+/// the head move that gets CI green. Re-anchoring it onto the fixed head
+/// therefore preserves a rejection whose remedy has already been applied, and
+/// the re-anchor rationale ("only the *review* carries over") is vacuous when
+/// there was no review. Worse, it strands the PR for good, because both passes
+/// that could release it read the re-anchor comment instead of the verdict:
+/// [`super::ci_gate_recovery::verdict_gate`] sees a newest verdict with no
+/// CI-only marker (`Skip::VerdictNotCiOnly`), and `forge doctor-handback`
+/// reads the same-head marker as a *fresh* rejection and withdraws its own
+/// `loom:review-requested` (exit 13 `RACED`). Observed on PR #13593, which sat
+/// on `loom:changes-requested` alone with green CI and no queued Judge.
+///
+/// Falling through to [`invalidate_verdict`] is the whole fix: the ordinary
+/// stale-verdict clear takes `loom:changes-requested` + `loom:ci-failure` off
+/// and re-queues `loom:review-requested`, which is where a PR whose only
+/// finding was a red CI belongs once its head has moved.
+///
+/// # Scope and cost
+///
+/// Only [`VerdictKind::ChangesRequested`] is asked about — an approval is
+/// never a CI gate, so an approved verdict pays nothing and behaves exactly as
+/// it did before. The comment fetch is deliberately made here rather than
+/// carried on [`VerdictPr`]: `claim_reconciliation.rs` is frozen by the
+/// file-size ratchet, and this way the call happens only on the rare
+/// equivalent-head-move path instead of once per listed PR.
+///
+/// # Fail closed
+///
+/// An unreadable comment listing, or a listing with no `changes-requested`
+/// verdict marker left in it at all, is a refusal too: "could not tell" takes
+/// the clear, the same direction [`Equivalence::Indeterminate`] already fails
+/// (#10134). Clearing costs a Judge pass; re-anchoring a CI-only verdict costs
+/// the PR its whole remaining lifetime.
+fn ci_only_reanchor_refusal(gh_bin: &Path, root: &Path, pr: &VerdictPr) -> Option<String> {
+    if pr.kind != VerdictKind::ChangesRequested {
+        return None;
+    }
+    let Some(bodies) = super::forge::fetch_comment_bodies(gh_bin, root, pr.number) else {
+        return Some(
+            "the PR's comments could not be read, so whether the verdict is a CI-only gate is \
+             unknown (failing closed)"
+                .to_string(),
+        );
+    };
+    let newest = bodies.iter().rev().find(|b| {
+        super::extract_latest_verdict_sha(std::slice::from_ref(*b), VerdictKind::ChangesRequested)
+            .is_some()
+    });
+    match newest {
+        Some(body) if super::ci_gate_recovery::is_ci_only_verdict(body) => Some(
+            "the verdict is a CI-gate-only rejection, which records no review and whose one \
+             requested change is the head move itself"
+                .to_string(),
+        ),
+        Some(_) => None,
+        None => Some(
+            "no trusted changes-requested verdict marker is on the PR any more, so there is no \
+             verdict to carry forward (failing closed)"
+                .to_string(),
+        ),
     }
 }
 
