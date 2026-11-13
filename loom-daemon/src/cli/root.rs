@@ -2041,6 +2041,29 @@ pub enum TokensAction {
         json: bool,
     },
 
+    /// Print the fraction of pool accounts that are NOT available (`0`-`1`,
+    /// four decimals) and exit 0 — the pool-pressure signal Guide's Step 4b
+    /// backs off on (#6135), exposed as a verb so no caller has to read
+    /// inside the token pool itself (#13839).
+    ///
+    /// Filesystem-only: it parses the `.ranking` file the daemon already
+    /// refreshes on its own loop (`autonomous.tokenRankingRefresh`) via
+    /// `capacity::read_ranking`, so it never probes an account and never
+    /// touches token material. It prints one number and nothing else — no
+    /// account names, statuses, or per-account rows — which is what lets a
+    /// role without the `credential-store` capability consume it.
+    ///
+    /// Absent, unreadable, or unparseable ranking data prints `0` and exits
+    /// 0, preserving Step 4b's fail-open posture: a missing telemetry file is
+    /// not evidence of pressure.
+    Pressure {
+        /// Repo root whose pool is resolved (the same per-repo-then-shared
+        /// resolution every other `tokens` verb uses — on a shared-pool host
+        /// this reads `~/.loom/tokens/.ranking`, not a repo-local path).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+    },
+
     /// Remove auth-reason entries for the given accounts from `.bad_tokens`
     /// (e.g. after re-authenticating).
     Unblock {
