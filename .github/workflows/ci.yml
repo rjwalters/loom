@@ -123,6 +123,7 @@ jobs:
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
+      quickstarts: ${{ steps.filter.outputs.quickstarts }}
       scripts: ${{ steps.filter.outputs.scripts }}
       docker: ${{ steps.images.outputs.docker }}
     steps:
@@ -213,6 +214,16 @@ jobs:
               - '.github/workflows/ci.yml'
             mcp:
               - 'mcp-loom/**'
+              - '.github/workflows/ci.yml'
+            # `quickstarts/webapp` is the only template with a test suite
+            # (#13851). Before this filter existed no workflow referenced
+            # `quickstarts/` at all, so a PR confined to that tree went green
+            # with its 8 vitest files unrun -- and the template had drifted
+            # unnoticed five times (#5925, #5926, #5927, #13834, #13850).
+            # `desktop` and `api` stay out: neither has test files and `api`
+            # does not typecheck today (#13850).
+            quickstarts:
+              - 'quickstarts/webapp/**'
               - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
@@ -387,9 +398,16 @@ jobs:
   node-packages:
     name: Node Packages (MCP server, dashboard)
     needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.mcp == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.mcp == 'true' || needs.changes.outputs.quickstarts == 'true')
     # The dashboard half moved to `2AMLogic/loom-ui` (#9104); the display
-    # name below is kept as-is so a required-check context is not renamed.
+    # name below is kept as-is so a required-check context is not renamed --
+    # which is also why the quickstart gates below are steps of this job
+    # rather than a job of their own (#13851): grouping Node gates by
+    # component is ci-principles.md rule 8, and a new job would need a new
+    # `CI Result` `needs:` entry for three steps.
+    #
+    # Each half keeps its OWN gate, so a quickstart-only PR does not rebuild
+    # `mcp-loom` and an MCP-only PR does not install the webapp.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -407,6 +425,20 @@ jobs:
       - name: Verify build output
         if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.mcp == 'true') }}
         run: test -f mcp-loom/dist/index.js
+      # --- quickstarts/webapp (#13851) ---
+      # `npm ci`, not `npm install`: the template's dependencies are all `^`
+      # ranges, and without the committed lockfile an upstream release could
+      # redden an unfiltered `main` run that no commit here caused.
+      # `!cancelled()` so an MCP failure above does not hide a template one.
+      - name: Install quickstart webapp dependencies
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.quickstarts == 'true') }}
+        run: cd quickstarts/webapp && npm ci
+      - name: Run quickstart webapp test suite
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.quickstarts == 'true') }}
+        run: cd quickstarts/webapp && npm test
+      - name: Typecheck quickstart webapp
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.quickstarts == 'true') }}
+        run: cd quickstarts/webapp && npx tsc --noEmit
 
   backend-lint-and-check:
     name: Rust Linting & Build Check
