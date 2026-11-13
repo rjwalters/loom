@@ -135,3 +135,99 @@ fn a_fleet_listed_app_author_passes_but_its_bare_user_does_not() {
     assert_eq!(classify(&p, Some(&issue("gateway[bot]", "Bot", "NONE"))), Gate::Trusted);
     assert_ne!(classify(&p, Some(&issue("gateway", "User", "NONE"))), Gate::Trusted);
 }
+
+fn labeled(actor: &str, kind: &str, label: &str, at: &str) -> Value {
+    json!({"event": "labeled", "created_at": at, "label": {"name": label},
+           "actor": {"login": actor, "type": kind}})
+}
+
+fn edit(editor: &str, kind: &str, at: &str) -> Value {
+    json!({"createdAt": at, "editedAt": at, "editor": {"login": editor, "__typename": kind}})
+}
+
+fn maintainer(login: &str) -> Option<String> {
+    (login == "rjwalters").then(|| "OWNER".to_string())
+}
+
+const T1: &str = "2026-11-01T10:00:00Z";
+const T2: &str = "2026-11-01T11:00:00Z";
+const T3: &str = "2026-11-01T12:00:00Z";
+const T4: &str = "2026-11-01T13:00:00Z";
+
+fn stands(events: &[Value], edits: &[Value]) -> Option<String> {
+    standing_adoption(&policy(), events, edits, maintainer)
+}
+
+/// #13578: adopt -> partial merge -> re-curate -> promote. The adoption event
+/// stays on the timeline through the later triage/curated label churn.
+#[test]
+fn a_trusted_adoption_survives_recuration() {
+    let events = vec![
+        labeled("rjwalters", "User", "loom:issue", T1),
+        labeled("loom-bot[bot]", "Bot", "loom:triage", T2),
+        labeled("loom-bot[bot]", "Bot", "loom:curated", T3),
+    ];
+    assert_eq!(stands(&events, &[]), Some("rjwalters".to_string()));
+}
+
+#[test]
+fn never_adopted_or_adopted_by_an_untrusted_actor_is_not_adoption() {
+    let curated = vec![labeled("loom-bot[bot]", "Bot", "loom:curated", T1)];
+    assert_eq!(stands(&curated, &[]), None);
+    let outsider = vec![labeled("drive-by", "User", "loom:issue", T1)];
+    assert_eq!(stands(&outsider, &[]), None);
+    assert_eq!(stands(&[], &[]), None);
+}
+
+#[test]
+fn an_allowlisted_actor_needs_no_association_lookup() {
+    let events = vec![labeled("partner", "User", "loom:issue", T1)];
+    assert_eq!(
+        standing_adoption(&policy(), &events, &[], |_| None),
+        Some("partner".to_string())
+    );
+}
+
+#[test]
+fn adopted_then_edited_by_the_untrusted_author_is_untrusted() {
+    let events = vec![labeled("rjwalters", "User", "loom:issue", T1)];
+    assert_eq!(stands(&events, &[edit("drive-by", "User", T2)]), None);
+}
+
+#[test]
+fn an_edit_before_the_adoption_does_not_end_it() {
+    let events = vec![labeled("rjwalters", "User", "loom:issue", T2)];
+    assert_eq!(stands(&events, &[edit("drive-by", "User", T1)]), Some("rjwalters".to_string()));
+}
+
+#[test]
+fn adopted_edited_and_readopted_is_trusted() {
+    let events = vec![
+        labeled("rjwalters", "User", "loom:issue", T1),
+        labeled("rjwalters", "User", "loom:issue", T3),
+    ];
+    assert_eq!(stands(&events, &[edit("drive-by", "User", T2)]), Some("rjwalters".to_string()));
+    // ... and an edit after the re-adoption ends it again.
+    assert_eq!(
+        stands(&events, &[edit("drive-by", "User", T2), edit("drive-by", "User", T4)]),
+        None
+    );
+}
+
+#[test]
+fn an_edit_by_a_trusted_actor_after_adoption_stays_trusted() {
+    let events = vec![labeled("rjwalters", "User", "loom:issue", T1)];
+    let edits = [edit("rjwalters", "User", T2), edit("partner", "User", T3)];
+    assert_eq!(stands(&events, &edits), Some("rjwalters".to_string()));
+}
+
+#[test]
+fn an_unreadable_edit_fails_closed() {
+    let events = vec![labeled("rjwalters", "User", "loom:issue", T1)];
+    // No editor (a deleted account), and no readable time.
+    assert_eq!(
+        stands(&events, &[json!({"createdAt": T2, "editedAt": null, "editor": null})]),
+        None
+    );
+    assert_eq!(stands(&events, &[json!({"editor": {"login": "rjwalters"}})]), None);
+}

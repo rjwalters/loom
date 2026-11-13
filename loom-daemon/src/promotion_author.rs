@@ -133,6 +133,105 @@ pub fn classify(policy: &TrustPolicy, issue: Option<&Value>) -> Gate {
     }
 }
 
+/// Whether the forge actor `actor` (a timeline `actor` or an edit `editor`
+/// object) is trusted: the verdict is [`TrustPolicy::trusts`], with the
+/// association `association_of(login)` supplies when the login alone is not
+/// enough (`None`: unknown, which no rule trusts). A bot-typed actor is an App.
+fn actor_trusted(
+    policy: &TrustPolicy,
+    actor: &Value,
+    association_of: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let login = actor.get("login").and_then(Value::as_str)?;
+    let mut author = Author::new(Some(login), None);
+    let kind = actor.get("type").or_else(|| actor.get("__typename"));
+    author.app = author.app || kind.and_then(Value::as_str) == Some("Bot");
+    if !policy.trusts(&author) {
+        author.association = association_of(login);
+    }
+    policy.trusts(&author).then(|| login.to_string())
+}
+
+fn instant(v: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(v?.as_str()?)
+        .ok()
+        .map(|t| t.to_utc())
+}
+
+/// The login of the trusted actor who most recently applied `loom:issue` to
+/// the issue, with the time they did, read from its REST timeline (`events`)
+/// (#13578). `None`: no trusted adoption (an event whose time cannot be read
+/// does not count).
+///
+/// An operator's hand adoption is recorded by the forge with an unforgeable
+/// actor and survives later re-curation, so it is read back rather than
+/// marked. Timeline actors carry no `author_association`, so
+/// `association_of(login)` supplies one; there is no second trust table. An
+/// event by an untrusted actor does not count.
+#[must_use]
+pub fn adopted_by(
+    policy: &TrustPolicy,
+    events: &[Value],
+    association_of: impl Fn(&str) -> Option<String>,
+) -> Option<(String, chrono::DateTime<chrono::Utc>)> {
+    events
+        .iter()
+        .filter(|e| {
+            e.get("event").and_then(Value::as_str) == Some("labeled")
+                && e.pointer("/label/name").and_then(Value::as_str) == Some("loom:issue")
+        })
+        .filter_map(|e| {
+            let at = instant(e.get("created_at"))?;
+            let who =
+                actor_trusted(policy, e.get("actor").filter(|a| a.is_object())?, &association_of)?;
+            Some((who, at))
+        })
+        .max_by_key(|(_, at)| *at)
+}
+
+/// Whether the adoption at `adopted_at` still covers the issue body (#13578,
+/// operator ruling r7-q6): no edit at or after it was made by an editor
+/// outside the trust policy. `edits` are the issue's `userContentEdits` nodes
+/// (`createdAt`, `editedAt`, `editor`). An edit whose time or editor cannot be
+/// read counts as an untrusted one (fail closed); a later trusted adoption is
+/// a later `adopted_at`, so it restores trust.
+#[must_use]
+pub fn body_unchanged_since(
+    policy: &TrustPolicy,
+    edits: &[Value],
+    adopted_at: chrono::DateTime<chrono::Utc>,
+    association_of: impl Fn(&str) -> Option<String>,
+) -> bool {
+    edits.iter().all(|edit| {
+        let Some(at) = instant(
+            edit.get("editedAt")
+                .filter(|v| !v.is_null())
+                .or(edit.get("createdAt")),
+        ) else {
+            return false;
+        };
+        at < adopted_at
+            || edit
+                .get("editor")
+                .filter(|a| a.is_object())
+                .and_then(|a| actor_trusted(policy, a, &association_of))
+                .is_some()
+    })
+}
+
+/// The adopter, when a trusted adoption exists and no untrusted editor has
+/// changed the body since the latest one.
+#[must_use]
+pub fn standing_adoption(
+    policy: &TrustPolicy,
+    events: &[Value],
+    edits: &[Value],
+    association_of: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let (who, at) = adopted_by(policy, events, &association_of)?;
+    body_unchanged_since(policy, edits, at, &association_of).then_some(who)
+}
+
 /// The one-time comment body explaining the hold, marker first. `stamp`
 /// (`None`: the legacy marker) is what the verdict was reached from.
 #[must_use]
