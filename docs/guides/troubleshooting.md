@@ -253,7 +253,6 @@ Loom provides a unified MCP server (`mcp-loom`) for AI-powered debugging:
 
 #### Terminal Tools
 - `mcp__loom__list_terminals` - List all terminals
-- `mcp__loom__get_selected_terminal` - Get primary terminal info
 - `mcp__loom__get_terminal_output` - Read terminal output
 - `mcp__loom__send_terminal_input` - Send input to terminal
 

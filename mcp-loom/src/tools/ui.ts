@@ -11,8 +11,6 @@
  * For reading state/config files, use get_ui_state which provides comprehensive info.
  */
 
-import { access, readFile } from "node:fs/promises";
-import { join } from "node:path";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { getWorkspacePath, readConfigFile } from "../shared/config.js";
 import { sendDaemonRequest } from "../shared/daemon.js";
@@ -100,8 +98,62 @@ async function getHeartbeat(): Promise<string> {
   return JSON.stringify(classifyHeartbeat(await probeDaemon()), null, 2);
 }
 
+/** Effective-config shape {@link getUIState} reports on. */
+export interface UIStateConfig {
+  version: string;
+  terminals: unknown[];
+  offlineMode?: boolean;
+}
+
 /**
- * Get comprehensive UI state including workspace, terminals, and engine status
+ * Assemble the `get_ui_state` payload from already-gathered inputs.
+ *
+ * Pure (and exported) so the engine-liveness contract below is testable
+ * without a workspace on disk or a live daemon.
+ *
+ * Liveness comes from {@link probeDaemon} — the running `loom-daemon` itself
+ * (Issue #13821). It used to be derived from a `.loom/state.json` under the
+ * workspace, written only by the Tauri desktop app that #3353 removed. With
+ * no writer left, that file never existed, so this tool reported the engine
+ * stopped on every call whether or not the daemon was running. The removed
+ * `state` / `hasState` blocks echoed the same dead file.
+ */
+export function buildUIState(
+  workspacePath: string,
+  config: UIStateConfig | null,
+  daemon: DaemonProbeResult
+): {
+  workspace: { path: string; hasConfig: boolean };
+  engine: { isRunning: boolean; inFlightSweeps: number | null };
+  config: {
+    version: string;
+    terminalCount: number;
+    offlineMode: boolean;
+    terminals: unknown[];
+  } | null;
+} {
+  return {
+    workspace: {
+      path: workspacePath,
+      hasConfig: config !== null,
+    },
+    engine: {
+      isRunning: daemon.alive,
+      inFlightSweeps: daemon.inFlightSweeps,
+    },
+    config: config
+      ? {
+          version: config.version,
+          terminalCount: config.terminals?.length ?? 0,
+          offlineMode: config.offlineMode ?? false,
+          terminals: config.terminals,
+        }
+      : null,
+  };
+}
+
+/**
+ * Get comprehensive UI state including workspace, config, and engine liveness
  */
 async function getUIState(): Promise<string> {
   try {
@@ -110,69 +162,9 @@ async function getUIState(): Promise<string> {
     // Read the effective config across all tiers (issue #4064) so get_ui_state
     // agrees with the daemon / Python / Bash surfaces about the config, rather
     // than reading only the legacy `.loom/config.json`.
-    const config: { version: string; terminals: unknown[]; offlineMode?: boolean } | null =
-      await readConfigFile();
+    const config: UIStateConfig | null = await readConfigFile();
 
-    // Read state file
-    const statePath = join(workspacePath, ".loom", "state.json");
-    let state: {
-      daemonPid?: number;
-      nextAgentNumber: number;
-      terminals: Array<{
-        id: string;
-        status: string;
-        isPrimary: boolean;
-        worktreePath?: string;
-        agentPid?: number;
-        agentStatus?: string;
-        lastIntervalRun?: number;
-      }>;
-    } | null = null;
-    try {
-      await access(statePath);
-      const stateContent = await readFile(statePath, "utf-8");
-      state = JSON.parse(stateContent);
-    } catch {
-      // State doesn't exist or can't be read
-    }
-
-    // Build comprehensive UI state response
-    const uiState = {
-      workspace: {
-        path: workspacePath,
-        hasConfig: config !== null,
-        hasState: state !== null,
-      },
-      engine: {
-        isRunning: state !== null && (state.terminals?.length ?? 0) > 0,
-        daemonPid: state?.daemonPid ?? null,
-        terminalCount: state?.terminals?.length ?? 0,
-      },
-      config: config
-        ? {
-            version: config.version,
-            terminalCount: config.terminals?.length ?? 0,
-            offlineMode: config.offlineMode ?? false,
-            terminals: config.terminals,
-          }
-        : null,
-      state: state
-        ? {
-            nextAgentNumber: state.nextAgentNumber,
-            terminals: state.terminals?.map((t) => ({
-              id: t.id,
-              status: t.status,
-              isPrimary: t.isPrimary,
-              worktreePath: t.worktreePath,
-              agentPid: t.agentPid,
-              agentStatus: t.agentStatus,
-              lastIntervalRun: t.lastIntervalRun ? new Date(t.lastIntervalRun).toISOString() : null,
-            })),
-          }
-        : null,
-    };
-
-    return JSON.stringify(uiState, null, 2);
+    return JSON.stringify(buildUIState(workspacePath, config, await probeDaemon()), null, 2);
   } catch (error) {
     return JSON.stringify(
       {
@@ -189,7 +181,7 @@ async function getUIState(): Promise<string> {
  *
  * Removed tools (use alternatives):
  * - read_console_log: Use `tail ~/.loom/console.log` for debugging
- * - read_state_file: Use get_ui_state instead (provides state + more context)
+ * - read_state_file: Use get_ui_state instead (provides config + more context)
  * - read_config_file: Use get_ui_state instead (provides config + more context)
  * - trigger_start, trigger_force_start, trigger_force_factory_reset, stop_engine: removed; they
  *   relied on a file IPC nothing consumed (the daemon is driven via dispatch_sweep etc.)
@@ -197,6 +189,10 @@ async function getUIState(): Promise<string> {
  * - trigger_restart_terminal: Use restart_terminal from terminals module
  * - trigger_run_now: Removed (launch_interval was removed too)
  * - get_random_file: Use .loom/scripts/random-file.sh instead
+ * - set_primary_terminal, get_selected_terminal: removed (Issue #13821); they
+ *   read and wrote a ~/.loom/state.json the retired desktop app owned, so the
+ *   only writer was set_primary_terminal itself. The daemon registry has no
+ *   primary/selected terminal — use list_terminals and address a terminal by id.
  */
 export const uiTools: Tool[] = [
   {
@@ -211,7 +207,7 @@ export const uiTools: Tool[] = [
   {
     name: "get_ui_state",
     description:
-      "Get comprehensive UI state including workspace info, engine status, terminal configurations, and runtime state. Returns a JSON object with workspace path, engine running status, terminal count, and detailed terminal states. Also includes full config and state file contents. Use this instead of separate read_state_file and read_config_file calls.",
+      "Get comprehensive UI state: workspace path, whether a config was resolved, engine liveness (whether loom-daemon answers on its Unix socket, plus its in-flight sweep count), and the effective tiered config including every configured terminal. Use this instead of separate read_state_file and read_config_file calls.",
     inputSchema: {
       type: "object",
       properties: {},

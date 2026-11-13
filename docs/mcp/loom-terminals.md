@@ -15,7 +15,6 @@ This MCP server enables AI agents to:
 - List active terminal sessions with metadata
 - Read terminal output in real-time
 - Send input to terminals (commands, text)
-- Query the currently selected terminal
 - Interact with the Loom daemon via IPC
 
 This server communicates directly with the Loom daemon via Unix socket.
@@ -65,14 +64,19 @@ No active terminals found. Either Loom hasn't been started yet, or all terminals
 ```
 
 **Data Source:**
-- Primary: Daemon IPC (`ListTerminals` request)
-- Fallback: State file (`~/.loom/state.json`) if daemon is not running
+- Daemon IPC (`ListTerminals` request) — the only source. The daemon prunes
+  registry entries whose tmux session has died on every request, so every
+  terminal listed is verified live.
 
 **Error Conditions:**
 
-- **Daemon Not Running**: Falls back to reading state file
-- **State File Missing**: Returns empty list
-- **IPC Error**: Returns empty list with fallback attempt
+- **Daemon Not Running**: Returns a tool error (`isError`) carrying the
+  connection failure. There is deliberately no fallback source since #13821:
+  the `~/.loom/state.json` snapshot this used to fall back to was written only
+  by the desktop app removed in #3353, so an empty list would have been
+  indistinguishable from "the daemon never answered".
+- **IPC Error**: Same — the error propagates rather than degrading to an
+  empty list.
 
 **Example:**
 ```typescript
@@ -145,72 +149,6 @@ mcp__loom__get_terminal_output({
 - Reading agent responses
 
 **Note:** This reads from `/tmp/loom-{terminal_id}.out` files, which are the same files accessed by the log tools.
-
----
-
-### `get_selected_terminal`
-
-Get information about the currently selected (primary) terminal in Loom. Returns the terminal's ID, name, role, and recent output.
-
-**Parameters:**
-
-| Name | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `lines` | number | No | 50 | Number of output lines to include |
-
-**Returns:**
-
-Plain text with terminal information and recent output.
-
-**Output Format:**
-```
-=== Currently Selected Terminal ===
-
-ID: terminal-1
-Name: Architect
-Role: claude-code-worker
-Working Dir: /Users/user/GitHub/loom
-Session: loom-terminal-1
-
-=== Output (last 50 lines) ===
-
-claude --dangerously-skip-permissions
-Claude Code v1.2.3
-Ready to assist!
-
-> _
-```
-
-**Empty Case:**
-```
-No terminal is currently selected in Loom.
-```
-
-**Data Source:**
-- Reads `~/.loom/state.json` to find `selectedTerminalId`
-- Reads terminal output from `/tmp/loom-{terminal_id}.out`
-
-**Error Conditions:**
-
-- **No Selection**: Returns message if no terminal is selected
-- **State File Missing**: Returns error message
-- **Terminal Not Found**: Returns error if selected terminal ID not in state
-- **Output Read Error**: Shows terminal info but reports error for output
-
-**Example:**
-```typescript
-// Get selected terminal with default 50 lines of output
-mcp__loom__get_selected_terminal()
-
-// Get selected terminal with 100 lines of output
-mcp__loom__get_selected_terminal({ lines: 100 })
-```
-
-**Use Cases:**
-- Checking which terminal user is viewing
-- Reading output from primary terminal
-- Monitoring user's active context
-- Quick access to main terminal info
 
 ---
 
@@ -300,7 +238,6 @@ mcp__loom__send_terminal_input({
 | File | Path | Purpose |
 |------|------|---------|
 | Daemon Socket | `/tmp/loom-daemon.sock` | Unix socket for IPC |
-| State File | `~/.loom/state.json` | Terminal state and selection |
 | Terminal Logs | `/tmp/loom-{terminal_id}.out` | Terminal output capture |
 
 ---
@@ -333,14 +270,14 @@ const output = await mcp__loom__get_terminal_output({
 ### Monitoring Agent Activity
 
 ```typescript
-// 1. Get currently selected terminal
-const selected = await mcp__loom__get_selected_terminal();
+// 1. Find the terminal to watch
+const terminals = await mcp__loom__list_terminals();
 // Parse to find terminal ID
 
 // 2. Periodically check output
 setInterval(async () => {
   const output = await mcp__loom__get_terminal_output({
-    terminal_id: selectedId,
+    terminal_id: watchedId,
     lines: 20
   });
 
