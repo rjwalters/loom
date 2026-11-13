@@ -14,8 +14,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-13
+
+- **PR #13803**: fix(install): warn about preserved hooks only when they predate the run
+- **Issue #13801** (closed): Fresh quick install warns "Preserving existing hook" for its own hooks
+
 ### 2026-11-12
 
+- **PR #13799**: test: drop shadowing assert_* copies from 12 more suites, annotate kept helpers
+- **PR #13798**: build(deps): Bump @hono/node-server from 2.1.5 to 2.1.8 in /mcp-loom
+- **PR #13797**: test: share assert_doc_* helpers, drop shadowing copies from 13 suites
+- **PR #13794**: feat: wire missing project hook entries in daemon workspace resync
+- **Issue #13795** (closed): Remove shadowing assert_* copies in test suites; share assert_doc_* via lib/assert.sh
+- **Issue #13793** (closed): Daemon floor-roll resync never wires Loom hooks into .claude/settings.json (#13789 only fixed the script path)
 - **PR #13789**: fix: wire Loom hooks additively on resync and match the Loom path
 - **Issue #13787** (closed): Install/resync leaves .loom/hooks/guard-destructive.sh unwired when another PreToolUse Bash guard is present
 - **Issue #13769** (closed): [ci-daily] Docker Image Smokes (unfiltered)
