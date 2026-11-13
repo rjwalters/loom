@@ -33,7 +33,7 @@
 //!
 //! # Trigger: the free-disk floor, plus a cooldown of this pass's own
 //!
-//! [`EagerTrigger`] (in `level_trigger.rs`) asks for a pass on every tick
+//! [`pass_due`] (in `level_trigger.rs`) asks for a pass on every tick
 //! while free space is below the floor (`diskWarnFreeGb`). Since #12406 that
 //! is the only trigger: the disk term it used to watch ("the disk axis binds
 //! the dispatch cap down") is gone from admission. [`run_pass`] enforces a
@@ -119,7 +119,7 @@ pub use idle_schedule::{
     idle_pass_due, reset_idle_state_for_test, run_idle_targets_if_due, scheduled_idle_pass_with,
     scheduled_pressure_tier,
 };
-pub use level_trigger::{EagerTrigger, TickReading, TriggerReason};
+pub use level_trigger::{pass_due, tick, TickReading};
 
 #[cfg(test)]
 mod level_tests;
@@ -147,6 +147,12 @@ pub const DEFAULT_EAGER_MIN_INTERVAL_SECS: u64 = 600;
 /// spaced at most `cooldown * 2^3` (80 minutes at the default) apart while
 /// passes keep reclaiming nothing (#11192).
 pub const MAX_EMPTY_BACKOFF_SHIFT: u32 = 3;
+
+/// The log-line fragment naming the trigger. Since #12406 the floor is the
+/// only trigger, so this is a constant rather than a per-pass value (#13837).
+/// Operators and 2am's DISK-HEADROOM instrument read these lines: the phrase
+/// must stay byte-identical.
+const TRIGGER_PHRASE: &str = "free space is below the floor";
 
 // ============================================================================
 // Config (.loom/config.json → autonomous.worktreeReaper.eagerReclaim)
@@ -222,8 +228,6 @@ pub struct EagerReclaimReport {
     /// The repo root this pass reclaimed from (the same root the dispatch
     /// loop's disk term was probed against).
     pub repo_root: PathBuf,
-    /// Why the pass was asked for (#11192).
-    pub reason: TriggerReason,
     /// `Some(reason)` when **no sub-pass ran at all** (disabled, or this
     /// pass's own cooldown had not elapsed). `None` on a pass that ran.
     pub skipped: Option<String>,
@@ -299,9 +303,8 @@ impl EagerReclaimReport {
     pub fn log_line(&self) -> String {
         if let Some(reason) = &self.skipped {
             return format!(
-                "eager_reclaim: {} {} but no pass ran: {reason} (#7512)",
-                self.repo_root.display(),
-                self.reason.describe()
+                "eager_reclaim: {} {TRIGGER_PHRASE} but no pass ran: {reason} (#7512)",
+                self.repo_root.display()
             );
         }
         let not_reached = |tier: u8| {
@@ -352,7 +355,7 @@ impl EagerReclaimReport {
              {target_orphans}, idle worktree targets {idle}, deep-clean {deep}, docker {docker} \
              — now {} free vs. floor {}G (#7512, #11192)",
             self.repo_root.display(),
-            self.reason.describe(),
+            TRIGGER_PHRASE,
             gb_or_unknown(self.free_gb_before),
             self.tiers_run,
             gb_or_unknown(self.free_gb_after),
@@ -375,7 +378,7 @@ impl EagerReclaimReport {
              --dry-run` and `du` on the volume (#11192)",
             self.repo_root.display(),
             empty_streak,
-            self.reason.describe(),
+            TRIGGER_PHRASE,
             gb_or_unknown(self.free_gb_before),
             gb_or_unknown(self.free_gb_after),
             self.floor_gb,
@@ -478,8 +481,6 @@ pub struct EagerReclaimInputs {
     /// reported in the log line and handed to the deep-clean sub-pass by
     /// [`run_for`].
     pub floor_gb: u64,
-    /// Why the pass was asked for.
-    pub reason: TriggerReason,
     /// Evaluation timestamp.
     pub now: DateTime<Utc>,
 }
@@ -524,7 +525,6 @@ pub fn run_pass(
 ) -> EagerReclaimReport {
     let mut report = EagerReclaimReport {
         repo_root: repo_root.to_path_buf(),
-        reason: inputs.reason,
         skipped: None,
         floor_gb: inputs.floor_gb,
         free_gb_before: None,
@@ -643,8 +643,8 @@ pub fn reset_state_for_test() {
 /// **Blocking** — it shells to `df`/`git`/`docker` and may probe the forge over
 /// REST, so callers must be on the blocking pool, exactly like the reaper's own
 /// `spawn_blocking(move || reap_repo(..))`. The dispatch loop `await`s it
-/// through [`EagerTrigger::tick`].
-pub fn run_for(repo_root: &Path, reason: TriggerReason) -> EagerReclaimReport {
+/// through [`tick`].
+pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let config = read_eager_reclaim_config(repo_root);
     let reaper_config = crate::worktree_reaper::read_worktree_reaper_config(repo_root);
     let floor_gb = crate::worktree_reaper::resolve_disk_warn_free_gb(&reaper_config);
@@ -654,7 +654,6 @@ pub fn run_for(repo_root: &Path, reason: TriggerReason) -> EagerReclaimReport {
         min_interval_secs,
         ledger: ledger_for(repo_root),
         floor_gb,
-        reason,
         now: Utc::now(),
     };
 
@@ -845,7 +844,6 @@ mod tests {
             min_interval_secs: 600,
             ledger: PassLedger::default(),
             floor_gb: 20,
-            reason: TriggerReason::BelowFloor,
             now,
         }
     }
@@ -1006,7 +1004,7 @@ mod tests {
         reset_state_for_test();
         std::env::set_var(EAGER_RECLAIM_ENABLE_ENV, "0");
         let tmp = tempfile::tempdir().unwrap();
-        let report = run_for(tmp.path(), TriggerReason::BelowFloor);
+        let report = run_for(tmp.path());
         std::env::remove_var(EAGER_RECLAIM_ENABLE_ENV);
         assert!(report.skipped.as_deref().unwrap().contains("disabled"));
         assert!(

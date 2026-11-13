@@ -89,14 +89,13 @@ fn orphan_report(root: &Path) -> TargetOrphanReport {
 
 // ===================================================================
 // A whole dispatch loop, simulated: trigger -> run_pass -> ledger ->
-// on an injected clock, mirroring `EagerTrigger::tick`.
+// on an injected clock, mirroring `level_trigger::tick`.
 // ===================================================================
 
 struct Sim {
-    trigger: EagerTrigger,
     ledger: PassLedger,
-    /// Passes that ran (not cooldown-skipped): (seconds, reason, report).
-    ran: Vec<(i64, TriggerReason, EagerReclaimReport)>,
+    /// Passes that ran (not cooldown-skipped): (seconds, report).
+    ran: Vec<(i64, EagerReclaimReport)>,
     worktree_reaps: Cell<usize>,
     idle_runs: Cell<usize>,
     /// Whether the scratch sub-pass finds something to remove.
@@ -104,9 +103,8 @@ struct Sim {
 }
 
 impl Sim {
-    fn new(trigger: EagerTrigger) -> Self {
+    fn new() -> Self {
         Self {
-            trigger,
             ledger: PassLedger::default(),
             ran: Vec::new(),
             worktree_reaps: Cell::new(0),
@@ -118,13 +116,12 @@ impl Sim {
     fn tick(&mut self, secs: i64, free: Option<u64>) {
         let now = t(secs);
         let r = reading(free);
-        if let Some(reason) = self.trigger.evaluate(&r) {
+        if pass_due(&r) {
             let inputs = EagerReclaimInputs {
                 enabled: true,
                 min_interval_secs: COOLDOWN,
                 ledger: self.ledger,
                 floor_gb: FLOOR,
-                reason,
                 now,
             };
             let removed = usize::from(self.reclaimable);
@@ -157,7 +154,7 @@ impl Sim {
             let report = run_pass(Path::new("/repo"), &inputs, &passes);
             self.ledger.record(&report);
             if report.skipped.is_none() {
-                self.ran.push((secs, reason, report));
+                self.ran.push((secs, report));
             }
         }
     }
@@ -169,15 +166,14 @@ impl Sim {
 
 #[test]
 fn test_fires_below_the_floor_only() {
-    let trigger = EagerTrigger;
-    assert_eq!(trigger.evaluate(&reading(Some(19))), Some(TriggerReason::BelowFloor));
-    assert_eq!(trigger.evaluate(&reading(Some(20))), None, "at the floor is not below it");
-    assert_eq!(trigger.evaluate(&reading(Some(500))), None);
+    assert!(pass_due(&reading(Some(19))));
+    assert!(!pass_due(&reading(Some(20))), "at the floor is not below it");
+    assert!(!pass_due(&reading(Some(500))));
 }
 
 #[test]
 fn test_unmeasurable_disk_never_fires() {
-    assert_eq!(EagerTrigger.evaluate(&reading(None)), None);
+    assert!(!pass_due(&reading(None)));
 }
 
 // ===================================================================
@@ -188,12 +184,12 @@ fn test_unmeasurable_disk_never_fires() {
 #[serial]
 fn test_pinned_below_floor_runs_at_most_one_pass_per_cooldown_window() {
     reset_idle_state_for_test();
-    let mut sim = Sim::new(EagerTrigger);
+    let mut sim = Sim::new();
     sim.reclaimable = true; // keep the backoff out of this test
     for tick in 0..60 {
         sim.tick(tick * 60, Some(15));
     }
-    let at: Vec<i64> = sim.ran.iter().map(|(s, _, _)| *s).collect();
+    let at: Vec<i64> = sim.ran.iter().map(|(s, _)| *s).collect();
     assert_eq!(at, vec![0, 600, 1200, 1800, 2400, 3000], "one pass per 600s window");
     for pair in at.windows(2) {
         assert!(pair[1] - pair[0] >= 600);
@@ -262,7 +258,6 @@ fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>)
         min_interval_secs: COOLDOWN,
         ledger: PassLedger::default(),
         floor_gb: FLOOR,
-        reason: TriggerReason::BelowFloor,
         now,
     };
     let report = run_pass(Path::new("/repo"), &inputs, &passes);
@@ -406,7 +401,7 @@ fn test_idle_pass_due() {
 fn test_no_thrash_when_nothing_is_reclaimable() {
     // Four hours pinned below the floor with nothing the daemon can remove.
     reset_idle_state_for_test();
-    let mut sim = Sim::new(EagerTrigger);
+    let mut sim = Sim::new();
     for tick in 0..240 {
         sim.tick(tick * 60, Some(12));
     }
@@ -418,7 +413,7 @@ fn test_no_thrash_when_nothing_is_reclaimable() {
     // the cooldown (8x = 80 min is the cap) — at 0, 4800 and 9600s.
     assert_eq!(sim.worktree_reaps.get(), 3);
     // Every pass that came back empty raised its own alert.
-    for (i, (_, _, report)) in sim.ran.iter().enumerate() {
+    for (i, (_, report)) in sim.ran.iter().enumerate() {
         let streak = u32::try_from(i + 1).unwrap();
         let alert = report.empty_pass_alert(streak).unwrap();
         assert!(alert.starts_with("eager_reclaim: ALERT"), "{alert}");
