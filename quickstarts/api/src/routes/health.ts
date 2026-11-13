@@ -41,12 +41,15 @@ healthRoutes.openapi(healthRoute, async (c) => {
     // Quick database health check
     await c.env.DB.prepare("SELECT 1").first();
 
-    return c.json({
-      status: "healthy",
-      app: c.env.APP_NAME,
-      timestamp: new Date().toISOString(),
-      database: "connected",
-    });
+    return c.json(
+      {
+        status: "healthy",
+        app: c.env.APP_NAME,
+        timestamp: new Date().toISOString(),
+        database: "connected",
+      },
+      200,
+    );
   } catch {
     return c.json(
       {
