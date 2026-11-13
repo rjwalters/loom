@@ -358,11 +358,6 @@ pub(super) fn stranded(
     if unique > MAX_COMMITS {
         return Err(format!("{unique} commits are more than are read"));
     }
-    if unique > 0 && (env.pr_merged)(root, &head) != Some(true) {
-        return Err(format!(
-            "{unique} commit(s) are not on {tracking} and HEAD is not a merged pull request's head"
-        ));
-    }
     if current.is_none() {
         let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
             .unwrap_or_default();
@@ -382,6 +377,16 @@ pub(super) fn stranded(
     }
     if live_git(root) {
         return Err("a git process is running in the repository".to_string());
+    }
+    // Last, because it is the only forge read on this path (#13835): every
+    // cheaper local check above has already agreed, so this lookup is the one
+    // answer that can still change the outcome. Before the reorder a checkout
+    // parked on an unmerged branch spent one `commits/<sha>/pulls` read per
+    // pass that a local refusal then threw away.
+    if unique > 0 && (env.pr_merged)(root, &head) != Some(true) {
+        return Err(format!(
+            "{unique} commit(s) are not on {tracking} and HEAD is not a merged pull request's head"
+        ));
     }
     Ok(Some(Strand {
         from: current,

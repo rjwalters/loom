@@ -160,14 +160,25 @@ fn rehome(env: &Env<'_>, root: &Path, branch: &str, gd: &Path, net: &mut Net) {
         return;
     };
     let result = (|| -> Result<(), String> {
-        let rescue = rescue_ref(root, &stamp((env.clock)()), "", &strand.head)?;
-        say(
-            net,
-            root,
-            "rescue-ref",
-            Level::Info,
-            format!("rescue ref {rescue} -> {}", strand.head),
-        );
+        // A rescue ref already at this HEAD is the same way back, so reuse it
+        // rather than making one per pass (#13835): the checkout below can
+        // fail for a reason that holds pass after pass (the default branch is
+        // checked out in another worktree, an untracked file is in the way),
+        // and each new ref then sat until it was pruned 14 days later.
+        let rescue = match existing_rescue_ref(root, &strand.head) {
+            Some(found) => found,
+            None => {
+                let made = rescue_ref(root, &stamp((env.clock)()), "", &strand.head)?;
+                say(
+                    net,
+                    root,
+                    "rescue-ref",
+                    Level::Info,
+                    format!("rescue ref {made} -> {}", strand.head),
+                );
+                made
+            }
+        };
         let own = format!("refs/heads/{branch}");
         let exists =
             git::ok(root, &["rev-parse", "--verify", "--quiet", &own], git::LOCAL_TIMEOUT).is_ok();
@@ -185,15 +196,19 @@ fn rehome(env: &Env<'_>, root: &Path, branch: &str, gd: &Path, net: &mut Net) {
             .from
             .as_deref()
             .map_or_else(|| "a detached HEAD".to_string(), |b| format!("`{b}`"));
+        // Nothing was carried when every commit on HEAD was already on
+        // `origin/<branch>`; the clause would read "(0 commit(s) ...)" (#13835).
+        let carried = if strand.unique == 0 {
+            String::new()
+        } else {
+            format!(" ({} commit(s) only on a merged PR)", strand.unique)
+        };
         say(
             net,
             root,
             "rehomed",
             Level::Warn,
-            format!(
-                "put back on `{branch}` from {was} ({} commit(s) only on a merged PR), recoverable from {rescue}",
-                strand.unique
-            ),
+            format!("put back on `{branch}` from {was}{carried}, recoverable from {rescue}"),
         );
         Ok(())
     })();
@@ -210,6 +225,23 @@ fn rehome(env: &Env<'_>, root: &Path, branch: &str, gd: &Path, net: &mut Net) {
 
 fn stamp(at: DateTime<Utc>) -> String {
     at.format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// An existing rescue ref already pointing at `sha`, if there is one (#13835).
+/// Any of them is an equally good way back to that commit, so the first by
+/// refname (`for-each-ref`'s own order, so the answer is stable across passes)
+/// is taken. `None` on a failed read: the caller then makes a new ref, which is
+/// the behaviour from before this reuse existed.
+fn existing_rescue_ref(root: &Path, sha: &str) -> Option<String> {
+    let args = [
+        "for-each-ref",
+        "--format=%(refname)",
+        "--points-at",
+        sha,
+        RESCUE_PREFIX,
+    ];
+    let listed = git::ok(root, &args, git::LOCAL_TIMEOUT).ok()?;
+    listed.lines().next().map(str::to_string)
 }
 
 /// A rescue ref at `sha` named `refs/loom/rescue/<ts><suffix>`, never over an
