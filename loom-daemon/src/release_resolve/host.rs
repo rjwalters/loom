@@ -69,12 +69,7 @@ pub fn slug_from_remote_url(url: &str) -> Option<String> {
 #[must_use]
 pub fn sha256_file(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    Some(
-        Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
-    )
+    Some(hex::encode(Sha256::digest(&bytes)))
 }
 
 #[cfg(test)]
