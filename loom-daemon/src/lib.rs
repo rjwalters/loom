@@ -164,6 +164,7 @@ pub mod ci_telemetry;
 pub mod claim_liveness;
 pub mod claim_reconciliation;
 pub mod classify_error;
+pub mod claude_config;
 pub mod cli;
 pub mod cmd_out;
 pub mod codex_sandbox_noop;
