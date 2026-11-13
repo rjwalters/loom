@@ -951,8 +951,8 @@ assert_classify "TOKEN_EXPIRED" \
     1 codex "invalid_api_key is TOKEN_EXPIRED"
 
 # --- TOKEN_EXHAUSTED: plan/quota exhaustion ---
-# Kept on one line each (rather than the usual continuations) so the #8539
-# capture below could be added without growing this over-ratchet file.
+# Kept on one line each (rather than the usual continuations), matching the
+# #8539 capture below.
 assert_classify "TOKEN_EXHAUSTED" "You've hit your usage limit. Upgrade to Pro to continue using Codex" 1 codex "\"hit your usage limit\" is TOKEN_EXHAUSTED"
 # The wording captured verbatim on the #8539 host (a headless `codex exec`
 # inside an account's session container, every registered account walled). The

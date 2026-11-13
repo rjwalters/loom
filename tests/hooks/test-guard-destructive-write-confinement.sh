@@ -1159,8 +1159,7 @@ echo x > \"\$tmp/out.txt\"" "$WT_REPO"
 # The ONE chained exception to that ambiguity rule — a second assignment of
 # the exact `NAME=$(cd "$NAME" && pwd -P)` / `NAME=$(realpath "$NAME")`
 # canonicalization form (#7986) — is covered in its own suite alongside the
-# identical rm-scope half (this file is frozen at its
-# scripts/file-size-baseline.txt size, so new cases go to a sibling):
+# identical rm-scope half:
 # tests/hooks/test-guard-destructive-mktemp-canon.sh.
 
 # A '..' traversal in the suffix after a proven-safe mktemp var fails closed

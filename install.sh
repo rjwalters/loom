@@ -1184,9 +1184,7 @@ SOURCE_OVERRIDE_FLAGS=()
 MODE_FLAGS=()
 # NOTE (#8884): the arms below are deliberately written in the compact
 # single-line form (`--flag) cmd; shift ;;`) already used elsewhere in this repo
-# (e.g. scripts/check-doc-tocs.sh). install.sh sits at its file-size ratchet
-# ceiling (.loom/docs/file-size-policy.md), so adding a flag means paying for it
-# from the same case block -- option (2) of that policy's "Hitting the gate".
+# (e.g. scripts/check-doc-tocs.sh).
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
     -y|--yes) NON_INTERACTIVE=true; shift ;;
