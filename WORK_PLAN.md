@@ -13,6 +13,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **#13802**: fix: list user-level writes in the install preview
 - **#13816**: fix(hooks): treat >(cmd) process substitution as non-target in vendored guard
+- **#13830**: fix: never re-anchor a CI-gate-only verdict across a head move
 
 ## Very Important
 
@@ -38,7 +39,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#12167**: telemetry: export peer_coordination verdict and degraded duration on host.health
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
 - **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
-- **#13588**: checkout_ff: primary checkout moved off main by an agent step stays wrong-branch forever (no guard, no self-heal)
 - **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
 - **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
 - **#13760**: Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it
@@ -49,6 +49,7 @@ Issues currently being built (`loom:building`).
 
 - **#13800**: install.sh --dry-run omits the writes made outside the target repo
 - **#13814**: guard-destructive-generic.sh (vendored fallback): >(cmd) process substitution still misread as a worktree write
+- **#13822**: CI-gate-only verdict re-anchor defeats ci_gate_recovery, stranding green PRs in the Doctor queue
 
 ## PRs Awaiting Review
 
@@ -57,7 +58,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#13593**: fix: put a clean stranded primary checkout back on the default branch
 
 ## Approved (Awaiting Merge)
 
@@ -65,8 +65,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
+- **#13593**: fix: put a clean stranded primary checkout back on the default branch
 - **#13802**: fix: list user-level writes in the install preview
 - **#13816**: fix(hooks): treat >(cmd) process substitution as non-target in vendored guard
+- **#13830**: fix: never re-anchor a CI-gate-only verdict across a head move
 
 ## Proposed
 
@@ -122,11 +124,21 @@ Issues carrying `loom:curated`.
 - **#13762**: Ratification lane posts ratify:key markers with no verdict, as the PR author, with wrapper logs as the body *(curated)*
 - **#13800**: install.sh --dry-run omits the writes made outside the target repo *(curated)*
 - **#13814**: guard-destructive-generic.sh (vendored fallback): >(cmd) process substitution still misread as a worktree write *(curated)*
+- **#13822**: CI-gate-only verdict re-anchor defeats ci_gate_recovery, stranding green PRs in the Doctor queue *(curated)*
 
 ## Proposed (Architect / Hermit)
 
 - **#13071**: Peer claims: move machine coordination off rendered room messages (custom event type / state events) *(architect)*
 - **#13776**: Remove write-only prompt_changes pipeline (git_parser, CaptureGitChanges): no reader, uncorrelatable rows *(hermit)*
+- **#13818**: Remove dead spawn-loop-state.json reader: loom-clean deletes live claim locks because its only liveness source is never present *(hermit)*
+- **#13820**: Remove the loom-api crate: reads a database the daemon does not write, 3 of 5 endpoints query tables nothing creates *(hermit)*
+- **#13826**: Remove hollow assertions from test-pr-worktree-isolation.sh: they test comments, a local regex copy, and git itself *(hermit)*
+- **#13827**: Remove stale file-size ratchet comments: 242 files cite a gate #12099 deleted, and new code still obeys it *(hermit)*
+- **#13829**: Remove the inert per-host overflow slot: nothing can set the flag since #11508, but its write, restart and report paths remain *(hermit)*
+- **#13831**: Remove SweepState::Pending: a lifecycle state nothing constructs, matched at 25 production sites *(hermit)*
+- **#13832**: Remove the single-workspace role and main-health cadence loops: production runs only the multi-workspace ones, and 7 tests exercise the stale copy *(hermit)*
+- **#13833**: Consolidate eight copies of the loom-dir resolution rule (LOOM_SOCKET_PATH parent, else ~/.loom) into one helper *(hermit)*
+- **#13834**: Fix quickstart Toaster mount: useToast() throws because the provider wraps nothing *(hermit)*
 
 ## Epics
 
@@ -142,14 +154,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 4 |
+| Operator merge-risk holds | 5 |
 | Very important | 0 |
 | Important | 5 |
-| Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 50 |
-| Architect / Hermit proposals | 2 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 3 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 6 |
+| Curated | 51 |
+| Architect / Hermit proposals | 11 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->

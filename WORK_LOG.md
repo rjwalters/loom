@@ -16,6 +16,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-13
 
+- **PR #13828**: docs: regenerate stale TOC in lease-record.md
+- **PR #13823**: refactor(mcp-loom): drop dead state.json readers; source engine liveness from the daemon
+- **PR #13825**: docs: reframe fleet unit WorkingDirectory pin as primary-workspace, not a #4292 workaround
+- **Issue #13824** (closed): check-doc-tocs fails on main: stale TOC in defaults/docs/lease-record.md
+- **Issue #13821** (closed): Remove dead state.json paths from mcp-loom: get_ui_state always reports engine stopped, set_primary/get_selected_terminal are a closed loop
+- **Issue #13819** (closed): Remove stale #4292 WorkingDirectory workaround from fleet daemon-unit: #4292 closed, marker and docs still say pending
 - **PR #13813**: chore(harness): track latest CLIs — codex 0.167.2→0.168.0
 - **Issue #13627** (closed): Telemetry: settle fleet hosts (host ids and exemptions)
 - **Issue #13809** (closed): Five status clients disconnect together every 10 min: reply takes 12 s on registry-lock contention after a champion tick admits 5 agents
