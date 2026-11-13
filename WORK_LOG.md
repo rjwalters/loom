@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-13
 
+- **PR #13813**: chore(harness): track latest CLIs — codex 0.167.2→0.168.0
+- **Issue #13627** (closed): Telemetry: settle fleet hosts (host ids and exemptions)
 - **Issue #13809** (closed): Five status clients disconnect together every 10 min: reply takes 12 s on registry-lock contention after a champion tick admits 5 agents
 - **PR #13810**: fix: scope spawn CPU probe to needed status sections and align its bound
 - **PR #13807**: test: share fixture scaffolding across managed-subdirectory init tests
