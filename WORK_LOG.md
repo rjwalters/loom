@@ -16,6 +16,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-13
 
+- **PR #13853**: feat(tokens): add `tokens pressure` verb and route Guide Step 4b through it
+- **Issue #13839** (closed): guide.md Step 4b reads .loom/tokens/.ranking, which the guide role's own tool policy denies
+- **PR #13849**: fix(quickstarts): make desktop + api biome.json standalone-safe so npm run lint passes
+- **Issue #13840** (closed): quickstarts/desktop: biome.json sets "root": false with no root config, so `npm run lint` fails on every source file
+- **PR #13846**: fix(quickstarts): mount Toaster as provider around App so useToast() resolves
+- **Issue #13834** (closed): Fix quickstart Toaster mount: useToast() throws because the provider wraps nothing
+- **PR #13844**: docs: drop the false provision.sh geode-fem example from the self-heal opt-out
+- **Issue #13838** (closed): Follow-on from PR #13593: daemon-reference.md says provision.sh sets loom.checkoutFf.detached=keep; it does not
+- **PR #13593**: fix: put a clean stranded primary checkout back on the default branch
+- **Issue #13588** (closed): checkout_ff: primary checkout moved off main by an agent step stays wrong-branch forever (no guard, no self-heal)
 - **PR #13828**: docs: regenerate stale TOC in lease-record.md
 - **PR #13823**: refactor(mcp-loom): drop dead state.json readers; source engine liveness from the daemon
 - **PR #13825**: docs: reframe fleet unit WorkingDirectory pin as primary-workspace, not a #4292 workaround

@@ -14,6 +14,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#13802**: fix: list user-level writes in the install preview
 - **#13816**: fix(hooks): treat >(cmd) process substitution as non-target in vendored guard
 - **#13830**: fix: never re-anchor a CI-gate-only verdict across a head move
+- **#13847**: chore(deps): drop the criterion dev-dependency and its no-op bench
 
 ## Very Important
 
@@ -42,6 +43,9 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
 - **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
 - **#13760**: Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it
+- **#13857**: Split claude_config out of terminal.rs: 1190 of its 2748 lines are non-terminal code reached through six forwarding wrappers
+- **#13859**: Replace 47 inline env-truthy copies in loom-daemon with env_flag::parse_truthy (follow-up to #13376)
+- **#13860**: Remove has_unnegated_closing_ref_in_repo: its only caller was deleted by #11301
 
 ## In Progress
 
@@ -50,6 +54,14 @@ Issues currently being built (`loom:building`).
 - **#13800**: install.sh --dry-run omits the writes made outside the target repo
 - **#13814**: guard-destructive-generic.sh (vendored fallback): >(cmd) process substitution still misread as a worktree write
 - **#13822**: CI-gate-only verdict re-anchor defeats ci_gate_recovery, stranding green PRs in the Doctor queue
+- **#13826**: Remove hollow assertions from test-pr-worktree-isolation.sh: they test comments, a local regex copy, and git itself
+- **#13827**: Remove stale file-size ratchet comments: 242 files cite a gate #12099 deleted, and new code still obeys it
+- **#13835**: checkout_ff stranded self-heal: forge lookup on every pass, rescue ref per failed checkout, doc kinds
+- **#13837**: Remove EagerTrigger unit struct and one-variant TriggerReason: stateless residue of #12406
+- **#13841**: Remove the vestigial criterion bench: it measures no Loom code and nothing runs it
+- **#13848**: Simplify dep_classify/fingerprint.rs: reuse short_hash::short_sha16 and hex::encode instead of hand-rolled SHA-256 hex loops
+- **#13850**: quickstarts/api: tsc --noEmit fails with 14 errors in src/routes/users.ts on a pristine checkout
+- **#13851**: CI never runs the quickstart template test suites (quickstarts/webapp vitest)
 
 ## PRs Awaiting Review
 
@@ -58,6 +70,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
+- **#13856**: fix(checkout_ff): ask the merged-PR lookup last and reuse a stranded HEAD's rescue ref
 
 ## Approved (Awaiting Merge)
 
@@ -65,10 +78,15 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
-- **#13593**: fix: put a clean stranded primary checkout back on the default branch
 - **#13802**: fix: list user-level writes in the install preview
 - **#13816**: fix(hooks): treat >(cmd) process substitution as non-target in vendored guard
 - **#13830**: fix: never re-anchor a CI-gate-only verdict across a head move
+- **#13842**: docs: drop stale file-size ratchet comments from defaults, tests, install.sh, mcp-loom
+- **#13843**: test: drop hollow assertions from test-pr-worktree-isolation.sh
+- **#13847**: chore(deps): drop the criterion dev-dependency and its no-op bench
+- **#13852**: refactor: replace eager-reclaim EagerTrigger/TriggerReason with free functions
+- **#13855**: fix(quickstarts/api): register admin middleware via route config, not the handler slot
+- **#13858**: ci: run the quickstarts/webapp suite and typecheck in Node Packages
 
 ## Proposed
 
@@ -114,7 +132,6 @@ Issues carrying `loom:curated`.
 - **#13486**: Champion resync waiver: a byte-identical test under .loom/scripts/tests/ is not a merge-gate path — every release shipping test-champion-resync-waiver.sh holds all resync PRs *(curated)*
 - **#13521**: Builder: ~11% of fleet sweeps still end without an outcome line after #13447 (worker-3 29%, worker-4 0%) *(curated)*
 - **#13578**: Promotion author gate re-holds an issue the operator already adopted, after landed-route re-curation *(curated)*
-- **#13588**: checkout_ff: primary checkout moved off main by an agent step stays wrong-branch forever (no guard, no self-heal) *(curated)*
 - **#13590**: Observe convert_awaiting_revision_parks on a live Guide tick (#10936 follow-up) *(curated)*
 - **#13640**: ci_telemetry: owner-kind probe users/2amlogic hangs 120s every cycle in the daemon (0.3s by hand) and a timeout never fails over — 2AMLogic CI dropped 20+ days *(curated)*
 - **#13668**: Replay strict resync waiver on recent fasterhenry resync PRs (follow-up to #13665) *(curated)*
@@ -125,6 +142,9 @@ Issues carrying `loom:curated`.
 - **#13800**: install.sh --dry-run omits the writes made outside the target repo *(curated)*
 - **#13814**: guard-destructive-generic.sh (vendored fallback): >(cmd) process substitution still misread as a worktree write *(curated)*
 - **#13822**: CI-gate-only verdict re-anchor defeats ci_gate_recovery, stranding green PRs in the Doctor queue *(curated)*
+- **#13835**: checkout_ff stranded self-heal: forge lookup on every pass, rescue ref per failed checkout, doc kinds *(curated)*
+- **#13850**: quickstarts/api: tsc --noEmit fails with 14 errors in src/routes/users.ts on a pristine checkout *(curated)*
+- **#13851**: CI never runs the quickstart template test suites (quickstarts/webapp vitest) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -132,13 +152,12 @@ Issues carrying `loom:curated`.
 - **#13776**: Remove write-only prompt_changes pipeline (git_parser, CaptureGitChanges): no reader, uncorrelatable rows *(hermit)*
 - **#13818**: Remove dead spawn-loop-state.json reader: loom-clean deletes live claim locks because its only liveness source is never present *(hermit)*
 - **#13820**: Remove the loom-api crate: reads a database the daemon does not write, 3 of 5 endpoints query tables nothing creates *(hermit)*
-- **#13826**: Remove hollow assertions from test-pr-worktree-isolation.sh: they test comments, a local regex copy, and git itself *(hermit)*
-- **#13827**: Remove stale file-size ratchet comments: 242 files cite a gate #12099 deleted, and new code still obeys it *(hermit)*
 - **#13829**: Remove the inert per-host overflow slot: nothing can set the flag since #11508, but its write, restart and report paths remain *(hermit)*
 - **#13831**: Remove SweepState::Pending: a lifecycle state nothing constructs, matched at 25 production sites *(hermit)*
 - **#13832**: Remove the single-workspace role and main-health cadence loops: production runs only the multi-workspace ones, and 7 tests exercise the stale copy *(hermit)*
 - **#13833**: Consolidate eight copies of the loom-dir resolution rule (LOOM_SOCKET_PATH parent, else ~/.loom) into one helper *(hermit)*
-- **#13834**: Fix quickstart Toaster mount: useToast() throws because the provider wraps nothing *(hermit)*
+- **#13861**: Remove NoopCooldownState::consecutive: a second no-op streak counter nothing acts on, whose documented reset does not exist *(hermit)*
+- **#13862**: Consolidate seven private kill(pid, 0) liveness probes in loom-daemon onto the shared is_pid_alive (copies disagree on EPERM) *(hermit)*
 
 ## Epics
 
@@ -154,14 +173,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 5 |
+| Operator merge-risk holds | 6 |
 | Very important | 0 |
 | Important | 5 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 51 |
-| Architect / Hermit proposals | 11 |
+| Ready (`loom:issue`) | 10 |
+| In Progress (`loom:building`) | 11 |
+| PRs awaiting review | 4 |
+| Approved PRs awaiting merge | 11 |
+| Curated | 53 |
+| Architect / Hermit proposals | 10 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
