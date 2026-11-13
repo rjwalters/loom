@@ -12,6 +12,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **#13802**: fix: list user-level writes in the install preview
+- **#13816**: fix(hooks): treat >(cmd) process substitution as non-target in vendored guard
 
 ## Very Important
 
@@ -47,7 +48,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#13800**: install.sh --dry-run omits the writes made outside the target repo
-- **#13809**: Five status clients disconnect together every 10 min: reply takes 12 s on registry-lock contention after a champion tick admits 5 agents
+- **#13814**: guard-destructive-generic.sh (vendored fallback): >(cmd) process substitution still misread as a worktree write
 
 ## PRs Awaiting Review
 
@@ -57,7 +58,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
 - **#13593**: fix: put a clean stranded primary checkout back on the default branch
-- **#13810**: fix: scope spawn CPU probe to needed status sections and align its bound
 
 ## Approved (Awaiting Merge)
 
@@ -66,6 +66,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12969**: feat: age-bound Codex rollout history in live profiles
 - **#13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **#13802**: fix: list user-level writes in the install preview
+- **#13816**: fix(hooks): treat >(cmd) process substitution as non-target in vendored guard
 
 ## Proposed
 
@@ -120,7 +121,7 @@ Issues carrying `loom:curated`.
 - **#13736**: ratification_lane on 0.19.1283: every key withheld (pin 'could not resolve' under the daemon) and 60 PRs unreadable; ~390 WARN/h per host, no keys posted *(curated)*
 - **#13762**: Ratification lane posts ratify:key markers with no verdict, as the PR author, with wrapper logs as the body *(curated)*
 - **#13800**: install.sh --dry-run omits the writes made outside the target repo *(curated)*
-- **#13809**: Five status clients disconnect together every 10 min: reply takes 12 s on registry-lock contention after a champion tick admits 5 agents *(curated)*
+- **#13814**: guard-destructive-generic.sh (vendored fallback): >(cmd) process substitution still misread as a worktree write *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -141,13 +142,13 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
+| Operator merge-risk holds | 4 |
 | Very important | 0 |
 | Important | 5 |
 | Ready (`loom:issue`) | 8 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 3 |
+| PRs awaiting review | 4 |
+| Approved PRs awaiting merge | 4 |
 | Curated | 50 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 7 |
