@@ -160,11 +160,19 @@ authRoutes.openapi(loginRoute, async (c) => {
     Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN),
   ).toISOString();
 
-  return c.json({
-    user: { id: user.id, email: user.email, name: user.name, role: user.role },
-    accessToken,
-    expiresAt,
-  });
+  return c.json(
+    {
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+      },
+      accessToken,
+      expiresAt,
+    },
+    200,
+  );
 });
 
 // POST /auth/refresh
@@ -219,16 +227,19 @@ authRoutes.openapi(refreshRoute, async (c) => {
       Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN),
     ).toISOString();
 
-    return c.json({
-      user: {
-        id: payload.sub,
-        email: payload.email,
-        name: "", // Would fetch from DB in production
-        role: payload.role,
+    return c.json(
+      {
+        user: {
+          id: payload.sub,
+          email: payload.email,
+          name: "", // Would fetch from DB in production
+          role: payload.role,
+        },
+        accessToken,
+        expiresAt,
       },
-      accessToken,
-      expiresAt,
-    });
+      200,
+    );
   } catch {
     throw new HTTPException(401, { message: "Invalid or expired token" });
   }
