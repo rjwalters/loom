@@ -2543,12 +2543,13 @@ blocker is Loom-owned:
   hours (`LOOM_CHECKOUT_DETACHED_AFTER_MINUTES`, from the newest line of the
   HEAD reflog) and every commit on it is Loom-owned. One at origin's tip is
   not handled by this repair (see the next section for the stranded rule that
-  does put it back; 2am's `provision.sh` pins geode-fem detached at its newest
-  green commit with `loom.checkoutFf.detached=keep`). The branch tip gets
-  its `-branch` rescue ref, then `checkout -B <default> --track
-  origin/<default>`. A pinned checkout that must stay detached while behind
-  (geode-fem while main is red) opts out with `git config --local
-  loom.checkoutFf.detached keep`.
+  does put it back). The branch tip gets its `-branch` rescue ref, then
+  `checkout -B <default> --track origin/<default>`. A pass only ever visits
+  the registered workspaces (plus the daemon's own checkout), so a tool clone
+  kept outside them is never visited at all and needs no opt-out: that is how
+  2am holds its pinned geode-fem clone, under `~/.local/share/loom-worker/`
+  since 2am#5228. A checkout that must stay detached *inside* a workspace opts
+  out with `git config --local loom.checkoutFf.detached keep`.
 - **A checkout stranded off the default branch (#13588).** A HEAD on another
   branch, or detached, whose tree is clean (no tracked change, no operation,
   no `index.lock`, no live `git`) and that has not moved for 6 hours is put
