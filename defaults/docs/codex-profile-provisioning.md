@@ -40,6 +40,16 @@ Each surface of the profile gets exactly one mechanism, chosen for a reason:
 | `hooks.json` | installed by `provision-codex-hooks.sh` | the managed `pre_tool_use` bridge already owns this file and preserves every operator entry; a second writer with its own idempotency record would fight it |
 | `auth.json`, identity keys, per-project trust state | **never shared** | |
 
+**Retention bound (#12966).** Codex never expires its rollout files, so the
+daemon's reaper tick (`loom-daemon/src/codex_session_reaper.rs`) deletes
+`rollout-*.jsonl` older than `autonomous.codexSessionReaper.retentionDays`
+(default 30; `LOOM_CODEX_SESSION_RETENTION_DAYS`, off via
+`LOOM_CODEX_SESSION_REAPER=0`) under each real `sessions/` and
+`archived_sessions/` tree, once per symlink target. It never touches
+`auth.json`, `config.toml`, `hooks.json`, the session markers, the
+thread-history db or dot-dirs, and skips a target outside the profile root and
+default Codex home.
+
 The TOML merge goes through a format-preserving document model
 (`toml_edit`), so every key Loom does not own — comments, ordering and
 whitespace included — survives byte-for-byte.
