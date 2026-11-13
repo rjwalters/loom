@@ -2428,7 +2428,7 @@ For each workspace the first rule that matches ends the attempt:
 | # | Check | State when it fails |
 |---|---|---|
 | 1 | the clone's `origin/HEAD` names the default branch (no remote is asked, `main` is never guessed) | `no-default-branch` |
-| 2 | HEAD is on it, not on another branch and not detached | `wrong-branch` |
+| 2 | HEAD is on it, not on another branch and not detached (a clean stranded one is first put back, see "A checkout stranded off the default branch" below) | `wrong-branch` |
 | 3 | no rebase, merge, cherry-pick, bisect or revert is in progress | `mid-operation` |
 | 4 | no main-health gate run is building in the checkout | `gate-in-flight` |
 | 4 | the daemon's self-update is not running in the checkout | `self-update-in-flight` |
@@ -2542,12 +2542,28 @@ blocker is Loom-owned:
   default branch when it is behind `origin/<default>`, has not moved for 6
   hours (`LOOM_CHECKOUT_DETACHED_AFTER_MINUTES`, from the newest line of the
   HEAD reflog) and every commit on it is Loom-owned. One at origin's tip is
-  left alone: it already serves current files (2am's `provision.sh` keeps
-  geode-fem detached at its newest green commit this way). The branch tip gets
+  not handled by this repair (see the next section for the stranded rule that
+  does put it back; 2am's `provision.sh` pins geode-fem detached at its newest
+  green commit with `loom.checkoutFf.detached=keep`). The branch tip gets
   its `-branch` rescue ref, then `checkout -B <default> --track
   origin/<default>`. A pinned checkout that must stay detached while behind
   (geode-fem while main is red) opts out with `git config --local
   loom.checkoutFf.detached keep`.
+- **A checkout stranded off the default branch (#13588).** A HEAD on another
+  branch, or detached, whose tree is clean (no tracked change, no operation,
+  no `index.lock`, no live `git`) and that has not moved for 6 hours is put
+  back on the default branch (`checkout`, with a `refs/loom/rescue/<ts>` ref at
+  the old HEAD, kind `rehomed`); the ordinary rules then fast-forward it. It
+  qualifies only when every commit on HEAD is on `origin/<default>`, or HEAD
+  is the head of a pull request the forge reports as merged. The lookup is
+  `gh api repos/{owner}/{repo}/commits/<sha>/pulls`; no network, an open
+  breaker or any failure means "not merged" and the hold stays (fail closed).
+  `loom.checkoutFf.detached=keep` still pins a detached HEAD. The same
+  `fleet.autoApply`, host-hold and gate-in-flight rules as every write apply.
+  A stranded checkout that is not repaired stays `wrong-branch`, and is said
+  again as a `still-held` transition (log line plus an event on the checkout
+  topic) every hour (`LOOM_CHECKOUT_REREPORT_AFTER_MINUTES`) so it can be
+  counted, instead of once.
 - **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
   at the branch tip when an operation moved HEAD); the lock; `stash push` of
   the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort

@@ -45,6 +45,8 @@ use super::{git, CheckoutReport, CheckoutState, Env, Level, Memory, Net, Transit
 pub(super) const RESCUE_PREFIX: &str = "refs/loom/rescue/";
 
 const ESCALATE_ENV: &str = "LOOM_CHECKOUT_ESCALATE_AFTER_MINUTES";
+const REREPORT_ENV: &str = "LOOM_CHECKOUT_REREPORT_AFTER_MINUTES";
+const DEFAULT_REREPORT_MINUTES: u64 = 60;
 const RETAIN_ENV: &str = "LOOM_RESCUE_REF_RETAIN_DAYS";
 const DEFAULT_ESCALATE_MINUTES: u64 = 120;
 const DEFAULT_RETAIN_DAYS: u64 = 14;
@@ -60,6 +62,11 @@ fn env_number(name: &str, default: u64) -> u64 {
 /// How long a hold may stand before it is escalated.
 pub(super) fn escalate_after() -> Duration {
     Duration::from_secs(env_number(ESCALATE_ENV, DEFAULT_ESCALATE_MINUTES) * 60)
+}
+
+/// How often a standing `wrong-branch` hold is said again (#13588).
+pub(super) fn rereport_after() -> Duration {
+    Duration::from_secs(env_number(REREPORT_ENV, DEFAULT_REREPORT_MINUTES) * 60)
 }
 
 /// How long a rescue ref is kept.
@@ -100,6 +107,7 @@ pub(super) fn heal(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) {
     let Some(gd) = classify::git_dir(env, root) else {
         return;
     };
+    rehome(env, root, branch, &gd, net);
     let plan = match classify::classify(env, root, branch, &gd) {
         Verdict::Clean => None,
         Verdict::Leave(why) => {
@@ -132,6 +140,71 @@ pub(super) fn heal(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) {
                 format!("stopped, checkout left as is: {e}"),
             );
         }
+    }
+}
+
+/// A checkout left on another branch, or detached, whose HEAD holds nothing
+/// that is not on `origin/<branch>` or a merged pull request's head (#13588)
+/// goes back on `branch`; the rules after this fast-forward it. Anything in
+/// doubt is left, and reported as `wrong-branch` as before.
+fn rehome(env: &Env<'_>, root: &Path, branch: &str, gd: &Path, net: &mut Net) {
+    let strand = match classify::stranded(env, root, branch, gd) {
+        Ok(Some(strand)) => strand,
+        Ok(None) => return,
+        Err(why) => {
+            log::debug!("checkout_ff: {}: self-heal: stays off `{branch}`: {why}", root.display());
+            return;
+        }
+    };
+    let Some(_hold) = writable(env, root) else {
+        return;
+    };
+    let result = (|| -> Result<(), String> {
+        let rescue = rescue_ref(root, &stamp((env.clock)()), "", &strand.head)?;
+        say(
+            net,
+            root,
+            "rescue-ref",
+            Level::Info,
+            format!("rescue ref {rescue} -> {}", strand.head),
+        );
+        let own = format!("refs/heads/{branch}");
+        let exists =
+            git::ok(root, &["rev-parse", "--verify", "--quiet", &own], git::LOCAL_TIMEOUT).is_ok();
+        let tracking = git::tracking(branch);
+        let args: Vec<&str> = if exists {
+            vec!["checkout", "--quiet", branch]
+        } else {
+            vec!["checkout", "--quiet", "-B", branch, "--track", &tracking]
+        };
+        let out = git::run(root, &["core.hooksPath=/dev/null"], &args, git::MERGE_TIMEOUT)?;
+        if !out.status.success() {
+            return Err(format!("git {} failed: {}", args.join(" "), git::stderr(&out)));
+        }
+        let was = strand
+            .from
+            .as_deref()
+            .map_or_else(|| "a detached HEAD".to_string(), |b| format!("`{b}`"));
+        say(
+            net,
+            root,
+            "rehomed",
+            Level::Warn,
+            format!(
+                "put back on `{branch}` from {was} ({} commit(s) only on a merged PR), recoverable from {rescue}",
+                strand.unique
+            ),
+        );
+        Ok(())
+    })();
+    if let Err(e) = result {
+        say(
+            net,
+            root,
+            "repair-failed",
+            Level::Warn,
+            format!("stopped, checkout left as is: {e}"),
+        );
     }
 }
 
@@ -317,6 +390,9 @@ pub(super) fn expired_rescue_refs(
 pub struct Ledger {
     /// Root -> the `since` of the hold that was escalated.
     asked: HashMap<PathBuf, DateTime<Utc>>,
+    /// Root -> (the `since` of a standing `wrong-branch` hold, when it was
+    /// last said).
+    said: HashMap<PathBuf, (DateTime<Utc>, DateTime<Utc>)>,
 }
 
 /// The holds the self-heal does not clear: a person's or an agent's work.
@@ -390,6 +466,47 @@ pub(super) fn escalate(
     });
 }
 
+/// Say a standing `wrong-branch` hold again every `every` (#13588): the
+/// ordinary transition is logged once, and a checkout left off its default
+/// branch goes stale silently. One `still-held` transition (a log line and an
+/// event on the checkout topic) per interval, so the hold can be counted.
+pub(super) fn rereport(
+    ledger: &mut Ledger,
+    report: &CheckoutReport,
+    now: DateTime<Utc>,
+    every: Duration,
+    out: &mut Vec<Transition>,
+) {
+    if report.state != CheckoutState::WrongBranch {
+        ledger.said.remove(&report.root);
+        return;
+    }
+    let last = match ledger.said.get(&report.root) {
+        Some((since, last)) if *since == report.since => *last,
+        _ => report.since,
+    };
+    if now.signed_duration_since(last).to_std().unwrap_or_default() < every {
+        return;
+    }
+    ledger.said.insert(report.root.clone(), (report.since, now));
+    let stood = now
+        .signed_duration_since(report.since)
+        .to_std()
+        .unwrap_or_default();
+    out.push(Transition {
+        kind: "still-held",
+        level: Level::Warn,
+        previous: None,
+        line: format!(
+            "{}: still `wrong-branch` after {} min, not repaired: {}",
+            report.root.display(),
+            stood.as_secs() / 60,
+            report.detail.as_deref().unwrap_or("off the default branch"),
+        ),
+        report: report.clone(),
+    });
+}
+
 /// Turn a checkout's repair steps into transitions, and escalate its hold.
 pub(super) fn after(
     env: &Env<'_>,
@@ -406,4 +523,5 @@ pub(super) fn after(
         report: report.clone(),
     }));
     escalate(&mut memory.escalated, report, (env.clock)(), escalate_after(), out);
+    rereport(&mut memory.escalated, report, (env.clock)(), rereport_after(), out);
 }

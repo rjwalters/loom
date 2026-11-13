@@ -251,8 +251,40 @@ fn run_live(live: &Live<'_>, roots: &[PathBuf], memory: &mut Memory) -> Checkout
         budget: Some(live.budget),
         elapsed: &|| started.elapsed(),
         clock: &Utc::now,
+        pr_merged: &|root, sha| {
+            if !live.network || crate::rate_limit_breaker::global_skip_pass(CALLER) {
+                return None;
+            }
+            pr_head_merged(root, sha)
+        },
     };
     super::run(&env, roots, memory)
+}
+
+/// Does the forge report `sha` as the head of a merged pull request (#13588)?
+/// `None` when the lookup fails for any reason: a caller must not read that as
+/// "not merged" and act on it, only as "unknown".
+fn pr_head_merged(root: &Path, sha: &str) -> Option<bool> {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    if sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let path = format!("repos/{{owner}}/{{repo}}/commits/{sha}/pulls");
+    let jq = format!("any(.[]; .merged_at != null and .head.sha == \"{sha}\")");
+    let out = GhInvocation::new(
+        Operation::new("checkout_ff.pr_merged"),
+        AccessIntent::Read,
+        GhTarget::None,
+        Duration::from_secs(20),
+    )
+    .current_dir(root)
+    .args(["api", path.as_str(), "--jq", jq.as_str()])
+    .run();
+    match out.ok_stdout_trimmed()?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// The roots a checkout pass visits: the registered workspaces plus the
