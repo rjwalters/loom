@@ -963,9 +963,11 @@ the plan/ordering/checklist; the per-phase shell is rendered in
    rendered from the SAME supervision block as the canonical unit
    (`systemd_supervision_block()`, #11058; see "Supervisor exit-code contract"
    below) so `restart --drain` (#4090) works on fleet
-   workers (#4640). `WorkingDirectory=` is pinned to a workspace clone as the
-   **#4292** token-pool-cwd workaround — the rendered unit carries a `#4292`
-   marker so it is removed when that lands.
+   workers (#4640). `WorkingDirectory=` is pinned to the first registered
+   workspace clone: the fleet unit sets no `LOOM_WORKSPACE`, so the daemon's
+   cwd seeds its primary workspace, and the pin keeps that a real repo root
+   rather than an incidental cwd (the same property the canonical unit
+   maintains — see "systemd note" below).
 9. **idle-shutdown** (optional, `--idle-shutdown-minutes N`) — a cron guard that
    powers the host off after N idle minutes. This is stage 2:
    `autonomous.idleExit` is stage 1. On daemon-managed hosts use a short guard

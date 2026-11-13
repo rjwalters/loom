@@ -1,22 +1,18 @@
 /**
  * Shared configuration utilities for Loom MCP server
  *
- * Handles workspace path resolution, state file reading/writing,
- * and config file operations.
+ * Handles workspace path resolution and config file operations.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { ConfigFile, StateFile } from "../types.js";
+import type { ConfigFile } from "../types.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 
 /** Global Loom directory in user's home */
 export const LOOM_DIR = join(homedir(), ".loom");
-
-/** Global state file path */
-export const STATE_FILE = join(LOOM_DIR, "state.json");
 
 /** Daemon socket path (can be overridden via LOOM_SOCKET_PATH env var) */
 export const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(LOOM_DIR, "loom-daemon.sock");
@@ -132,34 +128,6 @@ export function getWorkspacePath(): string {
     `(No silent ~/GitHub/loom fallback — see issue #4230.)`;
   process.stderr.write(`${message}\n`);
   throw new Error(message);
-}
-
-/**
- * Read the global state file
- */
-export async function readStateFile(): Promise<StateFile | null> {
-  try {
-    const fileStats = await stat(STATE_FILE);
-    if (!fileStats.isFile()) {
-      return null;
-    }
-
-    const content = await readFile(STATE_FILE, "utf-8");
-    return JSON.parse(content) as StateFile;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
-/**
- * Write the global state file
- */
-export async function writeStateFile(state: StateFile): Promise<void> {
-  state.lastUpdated = new Date().toISOString();
-  await writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
 }
 
 /**
