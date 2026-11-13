@@ -2558,6 +2558,21 @@ blocker is Loom-owned:
   is the head of a pull request the forge reports as merged. The lookup is
   `gh api repos/{owner}/{repo}/commits/<sha>/pulls`; no network, an open
   breaker or any failure means "not merged" and the hold stays (fail closed).
+  It is the **last** question the rule asks (#13835), after the clean-tree,
+  `detached=keep`, six-hour and live-`git` checks, so a checkout any of those
+  refuses costs no forge read at all; only one they all pass pays for it.
+  **A squash- or rebase-merged PR's head qualifies too**, measured 2026-11-13
+  against the production query on three squash-merged rjwalters/loom PRs
+  (#9216 head `3e0393d7`, #9240 head `5f35ef2e`, #9212 head `07af0cb5`, none
+  of them an ancestor of `origin/main`):
+  `gh api repos/rjwalters/loom/commits/<sha>/pulls --jq 'any(.[]; .merged_at != null and .head.sha == "<sha>")'`
+  answered `true` for each. So the endpoint does list a merged PR for a head
+  commit that is not on the default branch, and a checkout left on a squashed
+  branch is put back rather than held.
+  An existing rescue ref already at that HEAD is reused instead of a new one
+  being made (#13835), so a `checkout` that fails the same way pass after pass
+  (the default branch checked out in another worktree, an untracked file in the
+  way) leaves one ref behind rather than one per pass.
   `loom.checkoutFf.detached=keep` still pins a detached HEAD. The same
   `fleet.autoApply`, host-hold and gate-in-flight rules as every write apply.
   A stranded checkout that is not repaired stays `wrong-branch`, and is said
@@ -2582,7 +2597,8 @@ blocker is Loom-owned:
   restart asks once more.
 - **Telemetry.** Each step is an event on `fleet_sync.checkout` with kind
   `rescue-ref`, `lock-removed`, `stash`, `abort`, `reattached`, `repaired`,
-  `repair-failed`, `rescue-pruned` or `escalated`, and a log line naming the repo path. Carrying
+  `rehomed`, `still-held`, `repair-failed`, `rescue-pruned` or `escalated`, and
+  a log line naming the repo path. Carrying
   these to SigNoz is #11386.
 
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
