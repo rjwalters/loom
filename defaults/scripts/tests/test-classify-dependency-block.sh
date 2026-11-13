@@ -400,8 +400,7 @@ assert_eq "1" "$RC" "one merits finding disqualifies the whole set"
 assert_contains "$OUT" "REASON: merits-finding" "mixed set reports merits-finding"
 
 # Premise-false interaction with --check-defer (#7904) is covered in the
-# sibling module test-classify-dependency-block-premise-false.sh -- extracted
-# to keep this file under the file-size-policy.md threshold.
+# sibling module test-classify-dependency-block-premise-false.sh.
 
 echo
 echo "--- REGRESSION GUARD: a real dependency CYCLE still escalates ---"

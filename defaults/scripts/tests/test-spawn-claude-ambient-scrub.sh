@@ -28,9 +28,8 @@
 # environment" asserted below is exactly the environment the real CLI
 # would have been started with.
 #
-# Split out from the parent suite for the same reason the #8697 suite was:
-# test-spawn-claude.sh is over scripts/check-file-size-budget.sh's threshold
-# and therefore frozen.
+# Split out from test-spawn-claude.sh as its own suite, like the #8697 suite
+# (test-spawn-claude-credential-proxy.sh).
 #
 # Style matches test-spawn-claude.sh — plain bash, hand-rolled assertions.
 #

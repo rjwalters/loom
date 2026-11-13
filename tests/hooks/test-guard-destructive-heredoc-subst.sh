@@ -4,9 +4,7 @@
 # (#8035).
 #
 # Sibling of test-guard-destructive-write-confinement.sh, which owns the rest
-# of the #4178 Bash-tool write-confinement surface; this one is split out per
-# .loom/docs/file-size-policy.md (that suite is over the size threshold and is
-# frozen, so new coverage goes in a new sibling module rather than growing it).
+# of the #4178 Bash-tool write-confinement surface.
 # Shared fixtures, assertions and the GUARD path live in
 # tests/hooks/lib/guard-destructive-harness.sh exactly as they do there.
 #

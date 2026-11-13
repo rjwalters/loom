@@ -2,8 +2,7 @@
 # test-spawn-claude-credential-proxy.sh — spawn-claude.sh's contained dispatch
 # routed through the credential egress proxy (issue #8697, follow-up to #8674).
 #
-# Split out of test-spawn-claude.sh rather than appended to it: that file is
-# over scripts/check-file-size-budget.sh's threshold and therefore frozen.
+# Split out of test-spawn-claude.sh rather than appended to it.
 #
 # What is real here: spawn-claude.sh itself, host-side token selection against
 # a real `loom-daemon tokens select`, and `loom-daemon worker proxy-exec` with

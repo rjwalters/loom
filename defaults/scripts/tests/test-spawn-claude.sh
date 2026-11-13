@@ -1976,8 +1976,7 @@ assert_contains "--memory" "$docker_log" "containerized dispatch: --memory is ap
 # sccache cannot cache an incrementally-compiled crate, and cargo keys
 # incremental session state by absolute source path, so on a
 # shared-target-dir host it is orphaned disk (213 GB / 6,402 session dirs on
-# one fleet host). The --memory assert above and this one are single-line so
-# the frozen-at-1822-code-lines file stays within the file-size ratchet.
+# one fleet host).
 # Issue #11190: the debuginfo cap the host-side seam chose (or an operator's
 # own value, here `full`) is forwarded BY NAME — `-e VAR` with no `=value` in
 # argv — so the in-container cargo builds with the value the worker log
@@ -1988,8 +1987,7 @@ assert_contains "--memory" "$docker_log" "containerized dispatch: --memory is ap
 # forwarded: cargo fails every build on an empty value (`invalid value:
 # string ""`) instead of reading it as unset, so the passthrough drops it.
 # (Both names share one `case` arm; the Rust containment tests cover the
-# two-names-forwarded shape.) Folded into the same single assert line for
-# the same ratchet reason.
+# two-names-forwarded shape.) Folded into the same single assert line.
 # Issue #11237: the run above also sets LOOM_NONUTF8_PROBE to a value with a
 # non-UTF-8 byte (0xE9) under LC_ALL=C.UTF-8. GNU grep in a UTF-8 locale
 # suppresses such a line unless given `-a`, which silently dropped the
