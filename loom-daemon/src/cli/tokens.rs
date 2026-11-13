@@ -619,6 +619,26 @@ fn print_monitor_import(result: &crate::tokens_pool::monitor_db::MonitorImportRe
     }
 }
 
+/// Render a ranking snapshot as the `tokens pressure` fraction (#13839).
+///
+/// `unhealthy / total` to four decimals, or the literal `0` when there is no
+/// ranking data at all ([`crate::capacity::read_ranking`] returns `None` for
+/// an absent, unreadable, or row-less file). The `0` branch is load-bearing:
+/// Guide's Step 4b fails **open** on missing telemetry, so "no data" must be
+/// indistinguishable from "no pressure" to the caller.
+///
+/// `total == 0` cannot reach here through `read_ranking` (it returns `None`
+/// instead), but it is matched explicitly anyway so this function can never
+/// divide by zero regardless of who constructs the snapshot.
+fn format_pressure(snapshot: Option<crate::capacity::RankingSnapshot>) -> String {
+    match snapshot {
+        Some(s) if s.total > 0 => {
+            format!("{:.4}", s.unhealthy() as f64 / s.total as f64)
+        }
+        _ => "0".to_string(),
+    }
+}
+
 /// Handle `loom-daemon tokens <select|pin|unpin|unblock|mark-bad>` (Issue
 /// #4082, Phase 1 of epic #4081; `mark-bad` added in #4228, Phase 2). Purely
 /// file-based — does not require a running daemon. See
@@ -935,6 +955,12 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             } else {
                 println!("No allowlist was active.");
             }
+            Ok(())
+        }
+
+        TokensAction::Pressure { workspace } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            println!("{}", format_pressure(crate::capacity::read_ranking(&ws)));
             Ok(())
         }
 
