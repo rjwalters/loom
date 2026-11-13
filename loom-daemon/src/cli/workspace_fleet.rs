@@ -398,7 +398,7 @@ pub(crate) fn handle_workspace_command_by(
             // and is idempotent on an already-registered workspace so a
             // pre-existing registry entry self-heals on the next `workspace
             // add` of the same path.
-            let claude_state_path = crate::terminal::claude_config_state_path();
+            let claude_state_path = crate::claude_config::default_state_file();
             match registry.add_and_trust(
                 std::path::Path::new(&repo_path),
                 overrides,

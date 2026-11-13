@@ -1,7 +1,8 @@
 //! `security -i` keychain write for the per-config-dir credential clone (#11850).
 //!
-//! Split out of `terminal.rs` (a file-size-ratchet file) so the credential
-//! never rides in argv and the parent file does not grow.
+//! Split out of its parent file (then `terminal.rs`, now
+//! [`crate::claude_config`] — see #13857) so the credential never rides in
+//! argv and the parent file does not grow.
 
 /// Upper bound on one `security -i` command line.
 ///
