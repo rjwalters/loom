@@ -2637,6 +2637,34 @@ for _c13608 in "linked:$WT_REPO_LINKED" "main:$WT_REPO"; do
         'mkdir -p /tmp/klt_probe && cd /tmp/klt_probe && for name in a b; do echo x > "$name.gds"; echo y > "$name.json"; done' "$_d13608"
 done
 
+# --- Process substitution `>(cmd)` is not an attached redirect (#13814) ---
+# The attached-redirect extraction treated `>(cmd` as `>` + a file named
+# `(cmd`, resolving a phantom `<repo>/(cmd` write target (ported fix from
+# rjwalters/repo#786). The substitution BODY must still be judged, so a nested
+# write into the main checkout keeps denying.
+assert_allow "write-confinement (#13814): ls >(echo) is not a phantom write target" \
+    "ls >(echo)" "$WT_REPO"
+assert_allow "write-confinement (#13814): ls >(true) is not a phantom write target" \
+    "ls >(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): nested write inside >(...) into the managed worktree allows" \
+    "ls >(echo x > $WT_DIR/f)" "$WT_REPO"
+assert_allow "write-confinement (#13814): 2>(cmd) is not a phantom write target" \
+    "ls 2>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): &>(cmd) is not a phantom write target" \
+    "ls &>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): >>(cmd) is not a phantom write target" \
+    "ls >>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): ls >(true) >/dev/null allows" \
+    "ls >(true) >/dev/null" "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#13814): nested >(tee MAIN/x) still denies (body stays scanned)" \
+    "echo x >(tee $WT_REPO/evil.sh)" 'worktree-isolation bypass' "$WT_REPO"
+assert_deny "write-confinement (#13814): nested >(echo > MAIN/x) still denies" \
+    "ls >(echo x > $WT_REPO/evil.sh)" "$WT_REPO"
+assert_deny "write-confinement (#13814 control): plain > MAIN path still denies" \
+    "echo x > $WT_REPO/blocked.txt" "$WT_REPO"
+assert_allow "write-confinement (#13814 control): read-only <(cmd) allows" \
+    "cat <(printf x)" "$WT_REPO"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
