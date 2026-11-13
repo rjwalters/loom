@@ -9272,7 +9272,7 @@ _extract_write_targets_scan() {
                     if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
                         numfd_redir[j+1] = 1
                     }
-                } else if (mtoks[j] ~ /^[0-9]+>>?[^ \t&]/) {
+                } else if (mtoks[j] ~ /^[0-9]+>>?[^ \t&(>]/) {
                     numfd_redir[j] = 1
                 }
             }
@@ -9490,8 +9490,23 @@ _extract_write_targets_scan() {
                     }
                     continue
                 }
-                if (mt ~ /^[0-9]*>>?[^ \t&]/) {
-                    # Attached form (`>file`, `2>file`, `>>file`).
+                if (mt ~ /^[0-9]*>>?\(tee$/) {
+                    # Output process substitution into tee (`>(tee F ...)`,
+                    # #13814): not a file named `(tee`, but its operands ARE
+                    # write targets, so emit them to keep nested writes judged.
+                    for (k = j + 1; k <= m; k++) {
+                        if (toks[k] == "") continue
+                        op = toks[k]
+                        closed = (op ~ /\)$/)
+                        sub(/\)+$/, "", op)
+                        if (op != "" && op !~ /^-/) print curcwd SEP resolve_var_q(op)
+                        if (closed) break
+                    }
+                    continue
+                }
+                if (mt ~ /^[0-9]*>>?[^ \t&(>]/) {
+                    # Attached form (`>file`, `2>file`, `>>file`). `>(` is
+                    # process substitution, not an attached target (#13814).
                     op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
                     if (op != "") print curcwd SEP resolve_var_q(op)
