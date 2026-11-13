@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-13
 
+- **Issue #13809** (closed): Five status clients disconnect together every 10 min: reply takes 12 s on registry-lock contention after a champion tick admits 5 agents
+- **PR #13810**: fix: scope spawn CPU probe to needed status sections and align its bound
 - **PR #13807**: test: share fixture scaffolding across managed-subdirectory init tests
 - **PR #13804**: build(deps): Bump hono from 4.13.13 to 4.13.18 in /mcp-loom
 - **Issue #13806** (closed): Dedupe init tests: six managed-subdirectory tests share copy-pasted scaffolding
