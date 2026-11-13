@@ -354,10 +354,7 @@ fn api_key(path: &str) -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 const BIN: &str = "loom-daemon-x86_64-unknown-linux-gnu";

@@ -270,11 +270,7 @@ pub fn plan_id(members: &[(u32, &str)]) -> String {
         hasher.update(line.as_bytes());
         hasher.update(b"\n");
     }
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let digest = hex::encode(hasher.finalize());
     format!("seq-{}", &digest[..8])
 }
 
