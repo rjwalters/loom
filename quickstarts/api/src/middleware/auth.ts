@@ -18,7 +18,7 @@ export const requireAuth: MiddlewareHandler<{ Bindings: Env }> = async (
 ) => {
   const authHeader = c.req.header("Authorization");
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  if (!authHeader?.startsWith("Bearer ")) {
     throw new HTTPException(401, {
       message: "Missing or invalid authorization header",
     });
