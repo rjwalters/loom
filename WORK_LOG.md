@@ -16,6 +16,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-13
 
+- **PR #13807**: test: share fixture scaffolding across managed-subdirectory init tests
+- **PR #13804**: build(deps): Bump hono from 4.13.13 to 4.13.18 in /mcp-loom
+- **Issue #13806** (closed): Dedupe init tests: six managed-subdirectory tests share copy-pasted scaffolding
 - **PR #13803**: fix(install): warn about preserved hooks only when they predate the run
 - **Issue #13801** (closed): Fresh quick install warns "Preserving existing hook" for its own hooks
 
