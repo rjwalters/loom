@@ -59,6 +59,22 @@ pub const CI_ONLY_MARKER: &str = "<!-- loom:ci-gate-only -->";
 /// The header of that template, which verdicts posted before the marker carry.
 const CI_ONLY_HEADER: &str = "Changes Requested - CI Failing";
 
+/// Does `body` declare itself a CI-only gate — Judge's [`CI_ONLY_MARKER`], or
+/// the [`CI_ONLY_HEADER`] that verdicts posted before the marker carry?
+///
+/// Shared with [`super::verdict_invalidation`] (#13822) so the two passes
+/// cannot drift apart on what "CI-only" means. They need the same answer for
+/// opposite reasons: this pass recovers such a verdict once the head is green,
+/// and that one refuses to carry it across an equivalent head move — because
+/// a CI-only verdict records no review, and the head move IS the change it
+/// asked for. If one recognised a verdict the other did not, a PR would land
+/// back in exactly the #13822 livelock: a rejection re-anchored onto the
+/// head that fixed it, with no pass willing to clear it.
+#[must_use]
+pub fn is_ci_only_verdict(body: &str) -> bool {
+    body.contains(CI_ONLY_MARKER) || body.contains(CI_ONLY_HEADER)
+}
+
 /// Written by this pass into its audit comment; names the head it cleared for.
 pub const RECOVERY_MARKER_PREFIX: &str = "<!-- loom:ci-gate-recovery sha=";
 
@@ -170,11 +186,7 @@ pub fn verdict_gate(trusted: &[String]) -> Result<(), Skip> {
             .map(|k| (k, b))
     });
     match newest {
-        Some((VerdictKind::ChangesRequested, b))
-            if b.contains(CI_ONLY_MARKER) || b.contains(CI_ONLY_HEADER) =>
-        {
-            Ok(())
-        }
+        Some((VerdictKind::ChangesRequested, b)) if is_ci_only_verdict(b) => Ok(()),
         _ => Err(Skip::VerdictNotCiOnly),
     }
 }
