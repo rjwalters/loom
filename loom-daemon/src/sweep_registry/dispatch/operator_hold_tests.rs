@@ -2,10 +2,9 @@
 //! park since #11795), the `loom:epic` tracking container (a skip, not a
 //! park, #11399) and `loom:frozen` (#11743).
 //!
-//! Split out as a sibling file rather than appended to `dispatch/tests.rs`:
-//! that module is over the 1000-line ratchet threshold and frozen at its
-//! current size (see `.loom/docs/file-size-policy.md`). Registered from its
-//! foot via `#[path]`, the shape `guards.rs` already uses for
+//! Split out as a sibling file rather than appended to the already-large
+//! `dispatch/tests.rs`. Registered from its foot via `#[path]`, the shape
+//! `guards.rs` already uses for
 //! `guards_union_tests.rs` / `guards_preflip_tests.rs`.
 
 use super::*;

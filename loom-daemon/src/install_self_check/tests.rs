@@ -1,5 +1,4 @@
-//! Unit tests for `install_self_check` — a sibling file so the frozen parent
-//! stays under its file-size ratchet.
+//! Unit tests for `install_self_check`, kept in a sibling file beside the parent module.
 
 #![allow(clippy::unwrap_used)]
 
@@ -300,9 +299,7 @@ fn test_ranking_ok_when_fresh() {
 fn test_ranking_violation_when_stale() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
-    // `bootstrap_pool`'s return is joined inline rather than bound: this
-    // file is at its `scripts/check-file-size-budget.sh` ratchet ceiling,
-    // so the `#[serial(...)]` line added above had to be paid for here.
+    // `bootstrap_pool`'s return is joined inline rather than bound.
     let ranking = bootstrap_pool(tmp.path()).join(".ranking");
     fs::write(&ranking, "agent-1\n").unwrap();
     // Backdate mtime by two hours.

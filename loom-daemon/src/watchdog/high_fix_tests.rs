@@ -1,7 +1,7 @@
 //! Regression tests for the four HIGH findings on the watchdog port (#8086).
 //!
-//! In a sibling file because `mod.rs` is at the file-size threshold and these
-//! are the newest addition (`.loom/docs/file-size-policy.md`).
+//! In a sibling file rather than in `mod.rs`, since these are the newest
+//! addition.
 //!
 //! Each of these covers a fix the RETAINED SUITE could not reach:
 //! sibling-script resolution (the suite always pins

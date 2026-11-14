@@ -8,8 +8,7 @@
 //! `loom-daemon status`. Both halves are asserted here, at the `decide()` level
 //! and end to end through `run_tick`.
 //!
-//! A sibling module rather than more lines in `tests.rs`, per
-//! `.loom/docs/file-size-policy.md` (that file is over the ratchet threshold).
+//! A sibling module of `tests.rs` holding the in-flight-gate tests.
 
 use super::*;
 

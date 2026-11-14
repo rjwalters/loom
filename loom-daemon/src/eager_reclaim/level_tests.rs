@@ -1,7 +1,6 @@
 //! #11192: the floor trigger (re-keyed by #12406), tier escalation, the empty-pass alert and
 //! backoff, and the cross-root idle-target pass on the scheduled path. A
-//! sibling of `eager_reclaim.rs`'s own `tests` module so that file stays
-//! under the file-size threshold.
+//! sibling of `eager_reclaim.rs`'s own `tests` module.
 
 #![allow(clippy::unwrap_used)]
 

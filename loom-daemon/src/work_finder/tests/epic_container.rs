@@ -8,9 +8,8 @@
 //! bound (#7972) parked the epic under a `loom:blocked` that described
 //! nothing real.
 //!
-//! A sibling file, not appended to `tests.rs`: that module is over the
-//! 1000-line ratchet threshold and frozen at its current size
-//! (`.loom/docs/file-size-policy.md`).
+//! A sibling file, not appended to `tests.rs`, which holds the shared
+//! work-finder tests.
 
 use super::*;
 

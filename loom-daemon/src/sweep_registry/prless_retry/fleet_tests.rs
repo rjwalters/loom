@@ -21,8 +21,7 @@
 //! real peer view back.
 //!
 //! Lives in its own file rather than in `prless_retry.rs` because the harness
-//! is most of its bulk and `.loom/docs/file-size-policy.md` prefers a sibling
-//! to a growing parent.
+//! is most of its bulk and a sibling beats a growing parent.
 
 use super::*;
 use crate::peer_claims::{observe_brake_ad, ClaimAd, PeerClaimView};

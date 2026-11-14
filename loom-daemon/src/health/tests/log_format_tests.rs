@@ -1,10 +1,8 @@
 //! Issue #8504: `daemon.log`'s line-prefix timestamp must always be UTC with
 //! a trailing `Z` designator, never host-local time.
 //!
-//! Split out of `health/tests.rs` rather than appended to it: that file is
-//! over the `.loom/docs/file-size-policy.md` threshold and therefore frozen
-//! at its current size, so new cases go in a sibling module instead (mirrors
-//! `model_class_tests`'s own doc comment for the same reason).
+//! A sibling module of `health/tests.rs` (like `model_class_tests`) holding
+//! the log-format cases.
 //!
 //! Declared as a child module of `health` (not of `tests`, despite living
 //! under `health/tests/` on disk — see the `#[path]` declaration in

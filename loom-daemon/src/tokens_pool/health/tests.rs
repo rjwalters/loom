@@ -1,10 +1,8 @@
 //! Unit tests for [`super`] — the provider-scoped account-health surface.
 //!
 //! Extracted to a sibling file (#8058 Phase 2) when the class-scoped
-//! `MODEL_CREDITS_EXHAUSTED` work pushed `health.rs` over the 1000-line
-//! ratchet: `.loom/docs/file-size-policy.md` names test-module extraction as
-//! the intended split, and it is a pure move — every test below is unchanged
-//! by the extraction itself.
+//! `MODEL_CREDITS_EXHAUSTED` work grew `health.rs`; it is a pure move — every
+//! test below is unchanged by the extraction itself.
 
 use super::*;
 use crate::tokens_pool::account_registry::{CredentialKind, InventoryProvenance};

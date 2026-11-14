@@ -1,7 +1,7 @@
 //! #9548: the daemon's verdict backstop reads `loom:verdict-sha` markers only
 //! from trusted authors. End-to-end through `forge::reconcile_pr_verdicts`
-//! with a fake `gh`, in its own sibling file because neither this module nor
-//! `tests.rs` has ratchet headroom (scripts/file-size-baseline.txt).
+//! with a fake `gh`, in its own sibling file of
+//! `tests.rs`.
 
 use super::*;
 use serial_test::serial;

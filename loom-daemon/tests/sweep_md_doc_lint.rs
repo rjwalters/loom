@@ -68,9 +68,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 // Extract-and-execute helpers + the bodies of the heavier migrated checks
-// live in a sibling module, not inline here, purely to keep this file under
-// the file-size ratchet (`.loom/docs/file-size-policy.md`) — see that
-// module's own doc comment.
+// live in a sibling module, not inline here — see that module's own doc
+// comment.
 mod doc_lint_support;
 
 use std::fs;

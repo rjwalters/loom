@@ -1,5 +1,4 @@
-//! Extracted from `transcript_ingest.rs`'s inline test module (file-size
-//! ratchet: the parent stays under the 1000-code-line threshold, #8757).
+//! Extracted from `transcript_ingest.rs`'s inline test module (#8757).
 
 use super::*;
 use crate::transcript_tokens::project_slug;

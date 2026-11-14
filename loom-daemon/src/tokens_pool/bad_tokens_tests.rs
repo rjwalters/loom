@@ -1,9 +1,7 @@
 //! Unit tests for [`super`] — `tokens_pool::bad_tokens`.
 //!
-//! Extracted verbatim from `bad_tokens.rs` (issue #8058) for the reason
-//! `scripts/check-file-size-budget.sh` names: an over-threshold file that needs
-//! to grow puts the new lines in a sibling instead, and a test module is the
-//! cleanest thing to move. `bad_tokens.rs` declares it with
+//! Extracted verbatim from `bad_tokens.rs` (issue #8058) so that file need not
+//! grow; a test module is the cleanest thing to move. `bad_tokens.rs` declares it with
 //! `#[cfg(test)] #[path = "bad_tokens_tests.rs"] mod tests;`, so `super::*`
 //! below still resolves to `bad_tokens` exactly as before.
 

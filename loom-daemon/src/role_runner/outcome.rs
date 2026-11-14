@@ -2,12 +2,8 @@
 //! from `role_runner.rs`).
 //!
 //! A pure data type with no behaviour beyond one predicate, split into its own
-//! module because `role_runner.rs` is at its
-//! `scripts/file-size-baseline.txt` ceiling and every addition there has to be
-//! paid for by a removal — exactly the "put new code in a NEW sibling module"
-//! rule `scripts/check-file-size-budget.sh` documents. Re-exported from
-//! `role_runner`, so `crate::role_runner::RoleTickOutcome` is unchanged for
-//! every caller.
+//! module. Re-exported from `role_runner`, so
+//! `crate::role_runner::RoleTickOutcome` is unchanged for every caller.
 
 use super::ModelRuntimeMismatch;
 
@@ -338,7 +334,7 @@ impl RoleTickOutcome {
     }
 
     /// Test fixture: a Claude-pool [`Self::PoolExhausted`]. Lives here rather
-    /// than in `role_runner/tests.rs`, which is at its file-size ceiling.
+    /// than in `role_runner/tests.rs`.
     #[cfg(test)]
     pub(crate) fn claude_pool_exhausted(
         total: usize,

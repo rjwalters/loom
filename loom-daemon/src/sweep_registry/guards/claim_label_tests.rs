@@ -18,8 +18,8 @@
 //! only.
 //!
 //! Sibling file rather than an inline `mod`, for the same reason
-//! `repo_env_tests.rs` is one: `guards.rs` is over the file-size ratchet
-//! threshold (`scripts/file-size-baseline.txt`).
+//! `repo_env_tests.rs` is one: it keeps test modules out of the already-large
+//! `guards.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

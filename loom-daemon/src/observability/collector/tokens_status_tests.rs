@@ -10,7 +10,7 @@
 //! asserted here.
 //!
 //! In their own sibling module so `collector.rs`'s existing test file does not
-//! grow (`scripts/check-file-size-budget.sh`).
+//! grow.
 
 use super::*;
 use serial_test::serial;

@@ -6,10 +6,9 @@
 //! and caching a transient `gh` outage would turn one bad call into a
 //! permanent one.
 //!
-//! Sibling file rather than an inline `mod`: `guards.rs` is over the
-//! file-size ratchet threshold (`scripts/file-size-baseline.txt`), and
-//! keeping test modules out of it is that policy's own preferred remedy
-//! (see `repo_env_tests.rs`, the existing precedent this file follows).
+//! Sibling file rather than an inline `mod`: it keeps test modules out of the
+//! already-large `guards.rs` (see `repo_env_tests.rs`, the existing precedent
+//! this file follows).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

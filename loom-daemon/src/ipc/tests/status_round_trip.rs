@@ -2,8 +2,7 @@
 //! split out of `ipc/tests.rs` (#7990) so its deliberately exhaustive
 //! [`crate::types::DaemonStatusReport`] literal — every field named, so a
 //! schema change fails here rather than skewing the wire silently — can keep
-//! growing with the schema without pushing its parent past the
-//! `.loom/docs/file-size-policy.md` ratchet.
+//! growing with the schema without bloating its parent.
 
 use super::*;
 

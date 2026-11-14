@@ -1,8 +1,7 @@
 //! Wire-payload unit tests for [`super`] — extracted from `types.rs`'s
-//! inline `mod tests` (#8514) so that file, already over
-//! `.loom/docs/file-size-policy.md`'s threshold, has room for the
-//! live drain-roll status field. A pure move: every test below is
-//! byte-identical to its inline original, only dedented.
+//! inline `mod tests` (#8514) to make room for the live drain-roll status
+//! field. A pure move: every test below is byte-identical to its inline
+//! original, only dedented.
 
 use super::*;
 

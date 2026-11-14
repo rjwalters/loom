@@ -1,9 +1,7 @@
 //! Per-model-class token counts in the `health` report's `tokens` section
 //! (#8058 Phase 3).
 //!
-//! Split out of the parent `health/tests.rs` rather than appended to it: that
-//! file is over the `.loom/docs/file-size-policy.md` threshold and therefore
-//! frozen at its current size, so new cases go in a sibling module.
+//! A sibling module of the parent `health/tests.rs`.
 //!
 //! A child module of `tests`, not of `health`, so it inherits the parent's
 //! `healthy_inputs()` fixture and reads the same `assess_tokens` the rest of

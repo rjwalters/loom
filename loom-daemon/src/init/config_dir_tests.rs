@@ -8,8 +8,7 @@
 //! reason it is not part of the payload step: a daemon resync must never
 //! create, overwrite or remove these files.
 //!
-//! A sibling of `tests.rs` for the same reason as `loom_payload_tree_tests.rs`:
-//! that file is frozen by `scripts/check-file-size-budget.sh`.
+//! A sibling of `tests.rs`, like `loom_payload_tree_tests.rs`.
 
 use super::loom_payload_tree_tests::{installed_files_manifest, repo_root_for_tests};
 use super::payload::{apply, materialize_with, Payload, ResyncOutcome};

@@ -2,8 +2,8 @@
 //! binary already running.
 //!
 //! Driven through `guarded_tick`, so the feed, the loop-mode gate and the
-//! `auto_update.tick` record are all in the path. A sibling module rather than
-//! more lines in `tests.rs`, per `.loom/docs/file-size-policy.md`.
+//! `auto_update.tick` record are all in the path. A sibling module of
+//! `tests.rs` holding the config-restart tests.
 
 use super::*;
 use crate::auto_update::runner::{guarded_tick, FloorFeed};

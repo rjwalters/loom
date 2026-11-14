@@ -1,8 +1,7 @@
 //! Prompt-cache prefix stability for scheduled role ticks (#8066) — the
 //! property that a role tick's resolved prompt carries no per-invocation
 //! volatile content, so the injected prefix stays shareable across sessions.
-//! Split out of `role_runner/tests.rs` so the over-threshold parent shrinks
-//! rather than grows (`.loom/docs/file-size-policy.md`).
+//! Split out of `role_runner/tests.rs`.
 
 use super::*;
 

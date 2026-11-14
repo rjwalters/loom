@@ -41,8 +41,7 @@ const INCIDENT_RENEWED_SECS_AGO: i64 = 8;
 /// The harness's own `&[&str]` seeding form always stamps both timestamps
 /// at "now", which cannot express the one shape these tests need: a record
 /// created long ago and renewed **in place** moments ago. Writing the store
-/// directly keeps `test_support.rs` untouched (it is over the file-size
-/// ratchet) while modeling exactly what the forge returned during the
+/// directly keeps `test_support.rs` untouched while modeling exactly what the forge returned during the
 /// incident.
 ///
 /// `id` is 1, so this dispatcher's own lease write — which the fake `gh`
@@ -264,8 +263,8 @@ fn a_yield_annotation_is_never_read_back_as_a_lease_record() {
 /// Rewrite the harness's fake `gh` so its `issue view --json labels` arm
 /// reports `labels`, instead of the empty set it hardcodes.
 ///
-/// Patching the generated script in place keeps `test_support.rs` — which is
-/// over the file-size ratchet — untouched, and keeps every other arm
+/// Patching the generated script in place keeps `test_support.rs` untouched,
+/// and keeps every other arm
 /// (comment write, comment read-back, edit, repo view) byte-for-byte the
 /// shared harness's.
 fn set_preflip_labels(ws: &Path, labels: &[&str]) {
@@ -297,7 +296,7 @@ fn set_preflip_labels(ws: &Path, labels: &[&str]) {
 /// the timeline path also matches that glob, and that arm prints an empty line
 /// (the "no label event" fail-open shape every other test in this file relies
 /// on). Patched in place for the same reason `set_preflip_labels` is — keeping
-/// `test_support.rs`, which is over the file-size ratchet, untouched.
+/// `test_support.rs` untouched.
 fn set_claim_labeled_at(ws: &Path, secs_ago: i64) {
     let fake_gh = ws.join("fake-gh.sh");
     let script = std::fs::read_to_string(&fake_gh).unwrap();

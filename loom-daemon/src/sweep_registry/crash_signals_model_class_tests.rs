@@ -2,10 +2,8 @@
 //! field (#8277) — the producer side of #8058 Phase 2's class-scoped health
 //! marks.
 //!
-//! In its own sibling module rather than `crash_signals.rs`'s `mod tests`:
-//! that file sits just under the file-size ratchet's 1000-line threshold and
-//! adding these cases inline would push it over (see
-//! `.loom/docs/file-size-policy.md`). Mirrors the existing
+//! In its own sibling module rather than `crash_signals.rs`'s `mod tests`.
+//! Mirrors the existing
 //! `crash_signals_empty_pool_tests.rs` precedent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;

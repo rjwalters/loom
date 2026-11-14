@@ -1,6 +1,5 @@
 //! #10660: the pre-spawn gate reads session-container liveness from the
-//! shared snapshot (`tokens_pool::session_state`) — split from `tests.rs`
-//! (file-size ratchet).
+//! shared snapshot (`tokens_pool::session_state`) — split from `tests.rs`.
 
 use super::*;
 use crate::tokens_pool::session_hold;

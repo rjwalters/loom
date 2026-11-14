@@ -246,11 +246,10 @@ fn undeterminable_worktree_is_never_reaped_even_with_force() {
 // ---------------------------------------------------------------------------
 // Decision-tree cases for the three-way answer.
 //
-// These live here rather than in `aggressive.rs`'s own `#[cfg(test)]` block
-// only because that file sits at its file-size-ratchet baseline
-// (scripts/file-size-baseline.txt) and may not grow; the decision function is
-// `pub`, so testing it from here is equivalent. The pre-existing in-file cases
-// were rewritten in place to pass `Landed::{Reachable,Rewritten,NotLanded}`.
+// These live here rather than in `aggressive.rs`'s own `#[cfg(test)]` block;
+// the decision function is `pub`, so testing it from here is equivalent. The
+// pre-existing in-file cases were rewritten in place to pass
+// `Landed::{Reachable,Rewritten,NotLanded}`.
 // ---------------------------------------------------------------------------
 
 /// A canonical managed worktree on `feature/issue-42`, matching the in-file

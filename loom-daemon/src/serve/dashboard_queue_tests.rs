@@ -1,5 +1,4 @@
-//! Dashboard queue-panel source-contract test, split out of `serve.rs` (frozen
-//! by the file-size ratchet).
+//! Dashboard queue-panel source-contract test, split out of `serve.rs`.
 
 const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
 

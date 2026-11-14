@@ -1,6 +1,6 @@
 //! Coverage for the per-issue ready queue (Issue #8852). Its own file with
-//! its own minimal fakes, for the file-size-ratchet reason
-//! `prless_retry_tests.rs` gives: `work_finder/tests.rs` is frozen.
+//! its own minimal fakes, for the reason `prless_retry_tests.rs` gives: it
+//! stays independent of the shared `work_finder/tests.rs` harness.
 
 #![allow(clippy::unwrap_used)]
 

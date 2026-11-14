@@ -1,8 +1,7 @@
 //! Issue #8413: the mid-build watchdog's destructive path, from the point of
 //! view of a worker the daemon has **no registry record for**.
 //!
-//! Kept beside (not inside) `watchdog/tests.rs` because that file is at its
-//! file-size ratchet baseline — see `.loom/docs/file-size-policy.md`. The
+//! Kept beside (not inside) `watchdog/tests.rs`, which is already large. The
 //! hazards documented at the top of `tests.rs` (shared-process env mutation,
 //! real `git` children — run under `cargo nextest run`) apply here verbatim,
 //! and more so: these tests set `LOOM_INFLIGHT_DIR`, so they are `#[serial]`.

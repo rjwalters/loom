@@ -3,8 +3,7 @@
 //! (#6653) whose preconditions that veto changed.
 //!
 //! A sibling of `worktree_reaper.rs`'s own `mod tests` (whose helpers it
-//! inherits through `use super::*`) because that file is at its file-size
-//! ratchet baseline — see `.loom/docs/file-size-policy.md`.
+//! inherits through `use super::*`).
 //!
 //! # Why these tests pin the activity window
 //!

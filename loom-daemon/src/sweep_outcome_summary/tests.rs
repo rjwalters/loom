@@ -1,9 +1,7 @@
 //! Unit tests for [`crate::sweep_outcome_summary`] (Issue #8057).
 //!
 //! Extracted to a sibling file rather than left as an inline `#[cfg(test)]`
-//! module: `scripts/check-file-size-budget.sh` counts the whole file
-//! including its tests, on the argument that an agent editing the production
-//! half still pays for the test half sitting in the same buffer.
+//! module.
 
 use super::*;
 

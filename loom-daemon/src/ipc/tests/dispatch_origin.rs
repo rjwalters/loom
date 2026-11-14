@@ -2,8 +2,7 @@
 //! Operator surfaces (the `loom-daemon dispatch` CLI, the `dispatch_sweep`
 //! MCP tool, Safehouse ChatOps) send `operator`; a request without the field
 //! (a legacy client, or any IPC client that does not say) records `unknown`,
-//! never `operator`. In its own sibling module because `ipc/tests.rs` is over
-//! the file-size ratchet (`.loom/docs/file-size-policy.md`).
+//! never `operator`. In its own sibling module rather than in `ipc/tests.rs`.
 
 use super::*;
 use crate::telemetry::DispatchOrigin;

@@ -15,9 +15,7 @@
 //! answer unless `GH_REPO` names the expected repo. A regression therefore
 //! shows up as the fail-open result, which is exactly the production symptom.
 //!
-//! Sibling file rather than an inline `mod`: `claim_reconciliation.rs` is over
-//! the file-size ratchet threshold (`scripts/file-size-baseline.txt`), and
-//! keeping test modules out of it is that policy's own preferred remedy.
+//! Sibling file rather than an inline `mod` in `claim_reconciliation.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

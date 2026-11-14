@@ -10,8 +10,7 @@
 //! `select_target` and the verdict themselves are unit-tested in
 //! `auto_update/floor_roll.rs`.
 //!
-//! A sibling module rather than more lines in `tests.rs`, per
-//! `.loom/docs/file-size-policy.md`.
+//! A sibling module of `tests.rs` holding the fleet-floor tests.
 
 use super::*;
 use crate::auto_update::supersede::ArmedRoll;

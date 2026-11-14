@@ -7,8 +7,7 @@
 //! suite's [`super::strip_created`] deliberately ignores it, which is exactly
 //! what hid this gap.
 //!
-//! A sibling module of `super` rather than more lines in it: `tests.rs` is near
-//! the file-size ratchet, and the created-filter-honouring harness is a
+//! A sibling module of `super`: the created-filter-honouring harness is a
 //! self-contained concern (the same split #8825's [`super::job_logs`] made).
 
 use super::*;

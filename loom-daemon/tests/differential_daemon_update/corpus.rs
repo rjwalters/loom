@@ -1,5 +1,5 @@
 //! Corpus construction + oracle generation for [`super`]'s differential
-//! suite, split out under `file-size-policy.md`'s 1000-code-line ratchet.
+//! suite, split out of the parent module.
 //!
 //! Everything here builds the CASES (`build_corpus`) or regenerates the
 //! frozen fixture from them (`regenerate_oracle`, ignored by default); the

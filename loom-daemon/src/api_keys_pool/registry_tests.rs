@@ -1,5 +1,4 @@
-//! Registry tests (issue #8401). Split out of `registry.rs` so the module
-//! stays well under the file-size ratchet.
+//! Registry tests (issue #8401). Split out of `registry.rs`.
 
 use super::*;
 

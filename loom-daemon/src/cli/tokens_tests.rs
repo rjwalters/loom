@@ -1,9 +1,6 @@
 //! Unit tests for the workspace / pool-dir resolvers in `cli::tokens`.
 //!
-//! Extracted verbatim from `cli/tokens.rs` (issue #8058) for the reason
-//! `scripts/check-file-size-budget.sh` names: an over-threshold file that
-//! needs to grow puts the new lines in a sibling instead, and a test module
-//! is the cleanest thing to move. Included from `cli/tokens.rs` with a
+//! Extracted verbatim from `cli/tokens.rs` (issue #8058). Included from `cli/tokens.rs` with a
 //! `#[path]` module declaration, so the `super::` paths these tests use
 //! still resolve to `cli::tokens` exactly as before.
 

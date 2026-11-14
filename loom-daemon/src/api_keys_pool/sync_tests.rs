@@ -1,5 +1,4 @@
-//! `api-keys sync` tests (issue #8511). Split out of `sync.rs` so the module
-//! stays well under the file-size ratchet.
+//! `api-keys sync` tests (issue #8511). Split out of `sync.rs`.
 //!
 //! Every test that touches key material uses a value that is unmistakable in a
 //! failure message, because half of what is under test here is that the value

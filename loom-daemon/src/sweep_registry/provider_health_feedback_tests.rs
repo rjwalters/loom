@@ -4,7 +4,7 @@
 //!
 //! Kept in a sibling file rather than an inline `mod tests`, matching the
 //! `*_empty_pool_tests.rs` precedent, so the production module stays small
-//! enough to hold in view (see `.loom/docs/file-size-policy.md`).
+//! enough to hold in view.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use crate::sweep_registry::test_support::fixture_registry;

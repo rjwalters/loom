@@ -2,8 +2,7 @@
 //! anchored at the current head and is re-queued instead; a rejection with no
 //! marker still anchors (#6319). Pure `decide_anchor` cases plus one
 //! end-to-end pass through `forge::reconcile_pr_verdicts` with a fake `gh`, in
-//! a sibling file because neither this module nor `tests.rs` has ratchet
-//! headroom (scripts/file-size-baseline.txt).
+//! a sibling file of `tests.rs`.
 
 use super::unanchored_verdict::{requeue_body, UNANCHORED_APPROVAL_MARKER_PREFIX};
 use super::*;

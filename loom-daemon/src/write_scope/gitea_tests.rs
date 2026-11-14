@@ -1,6 +1,5 @@
-//! Gitea write-scope tests (#9699), split out of `tests.rs` to keep that file
-//! under the file-size budget. Shared fixtures (`FakeProbe`, `seed_disk`,
-//! `seed_disk_for`) stay in `tests.rs`.
+//! Gitea write-scope tests (#9699), split out of `tests.rs`. Shared
+//! fixtures (`FakeProbe`, `seed_disk`, `seed_disk_for`) stay in `tests.rs`.
 
 use super::probe::{Permission, PermissionProbe};
 use super::tests::{seed_disk, seed_disk_for, FakeProbe};

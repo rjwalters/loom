@@ -1,7 +1,7 @@
 //! #10331: a dispatched worker gets the agent `gh` front's shim directory
 //! first on `PATH` (so plain `gh` reads are ETag-revalidated), and
-//! `LOOM_GH_SHIM=0` leaves `PATH` untouched. Split from `worker_spawn.rs`,
-//! which sits at the file-size threshold; same native-seam fixture.
+//! `LOOM_GH_SHIM=0` leaves `PATH` untouched. Split from `worker_spawn.rs`;
+//! same native-seam fixture.
 
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]

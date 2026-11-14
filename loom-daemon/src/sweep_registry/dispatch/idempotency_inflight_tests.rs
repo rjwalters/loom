@@ -5,10 +5,9 @@
 //! doc comment in `sweep_registry/mod.rs` and step 3.05 in
 //! `begin_prepared_issue_dispatch` for the full design.
 //!
-//! Sibling file rather than an inline `mod` on `dispatch/tests.rs`: that file
-//! is over the file-size ratchet threshold (`scripts/file-size-baseline.txt`)
-//! and already grew from this issue's own test rename, so new coverage is
-//! declared directly from `dispatch.rs` instead of adding to it further.
+//! Sibling file rather than an inline `mod` on `dispatch/tests.rs`: that
+//! file is already large, so new coverage is declared directly from `dispatch.rs`
+//! instead of adding to it further.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
