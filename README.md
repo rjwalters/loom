@@ -347,6 +347,7 @@ gh pr create --label "loom:review-requested"
 | Document | Description |
 |----------|-------------|
 | [ADR Index](docs/adr/README.md) | Architecture decision records |
+| [Roadmap](docs/ROADMAP.md) | Where the project stands and what comes next |
 | [MCP Tools](docs/mcp/README.md) | Programmatic control interface |
 
 ### Repository Layout
