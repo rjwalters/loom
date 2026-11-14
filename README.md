@@ -250,6 +250,12 @@ your-repo/
 └── CLAUDE.md            # AI context document
 ```
 
+The installer also makes user-level changes outside your repo (`--dry-run` lists them):
+
+- the `loom-daemon` binary in `~/.local/bin` (override with `LOOM_DAEMON_BIN_DIR`), keeping the previous one as `loom-daemon.previous`
+- a mirror of the defaults payload in `~/.local/share/loom-daemon/defaults` (override with `LOOM_DAEMON_DEFAULTS_DIR`)
+- user-scope guard hooks in `~/.claude/settings.json`, after a `settings.json.loom-backup-<timestamp>` backup
+
 ## Usage
 
 ### Single-Issue Mode

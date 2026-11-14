@@ -108,6 +108,15 @@ done
 assert_contains "fresh-target preview lists .gitignore as a modification" "$OUT1" ".gitignore"
 assert_contains "fresh-target preview lists .claude/settings.json as a modification" "$OUT1" "project-level guard-hook entries wired in"
 
+assert_contains "preview has the user-level block" "$OUT1" "Outside the target repository"
+assert_contains "preview names the default daemon path" "$OUT1" "$HOME/.local/bin/loom-daemon"
+assert_contains "preview names the .previous binary" "$OUT1" "loom-daemon.previous"
+assert_contains "preview names the default defaults mirror" "$OUT1" "$HOME/.local/share/loom-daemon/defaults"
+assert_contains "preview names the user settings backup" "$OUT1" "settings.json.loom-backup-"
+OUT1B="$(LOOM_DAEMON_BIN_DIR=/tmp/x-bin LOOM_DAEMON_DEFAULTS_DIR=/tmp/x-defaults TARGET_PATH="$TARGET1" print_what_will_be_installed)"
+assert_contains "preview honours LOOM_DAEMON_BIN_DIR" "$OUT1B" "/tmp/x-bin/loom-daemon"
+assert_contains "preview honours LOOM_DAEMON_DEFAULTS_DIR" "$OUT1B" "/tmp/x-defaults/"
+
 rm -rf "$TARGET1"
 
 # ============================================================================
@@ -189,6 +198,7 @@ OUT4="$(TARGET_PATH="$REPO_ROOT" print_what_will_be_installed)"
 PREVIEW_CLAUDE_COUNT_DOGFOOD="$(printf '%s\n' "$OUT4" | grep -oE '\.claude/, committed to git, [0-9]+ files' | grep -oE '[0-9]+')"
 assert_eq "preview .claude/ count matches dogfood-mode manifest" "$LIVE_CLAUDE_COUNT_DOGFOOD" "$PREVIEW_CLAUDE_COUNT_DOGFOOD"
 assert_contains "preview notes the dogfood-mode symlink instead of a plain copy" "$OUT4" "Symlinked (not copied)"
+assert_contains "dogfood preview still has the user-level block" "$OUT4" "Outside the target repository"
 
 # ============================================================================
 # Summary
