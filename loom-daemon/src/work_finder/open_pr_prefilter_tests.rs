@@ -1,6 +1,6 @@
 //! The batched open-PR pre-filter at the tick seam (Issue #8865), with a fake
-//! dispatcher. Its own file with its own fakes because `work_finder/tests.rs`
-//! is over the file-size ratchet. The production dispatcher and a fake `gh`
+//! dispatcher. Its own file with its own fakes, independent of
+//! `work_finder/tests.rs`. The production dispatcher and a fake `gh`
 //! are driven in `open_pr_prefilter_forge_tests.rs`.
 
 use std::cell::{Cell, RefCell};

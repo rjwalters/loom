@@ -4,8 +4,7 @@
 //!
 //! A sibling of `worker_spawn.rs` rather than a section of it, for the same
 //! reason `worker_spawn_api_keys.rs` and `worker_spawn_preference_marker.rs`
-//! are: that file sits at the 1000-line file-size ratchet and these tests
-//! would carry it over. `worker` and `profile_check` below are deliberate
+//! are: these tests get their own file. `worker` and `profile_check` below are deliberate
 //! copies of its own.
 use std::process::Command;
 

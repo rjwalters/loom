@@ -1,9 +1,9 @@
 //! `host.health` → `is_captain` / `armed_singleton_jobs` wire-schema tests
 //! (Issue #8848).
 //!
-//! A sibling module rather than more lines in `telemetry/tests.rs`, which is
-//! at the `scripts/check-file-size-budget.sh` threshold — the same shape
-//! `admission_brake.rs` next door already uses.
+//! A sibling module rather than more lines in the already-large
+//! `telemetry/tests.rs` — the same shape `admission_brake.rs` next door
+//! already uses.
 //!
 //! What is asserted here is the *contract* a fleet consumer depends on, not
 //! the sampling (that lives in `observability/collector.rs`) and not the gate

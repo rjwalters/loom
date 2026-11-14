@@ -1595,8 +1595,8 @@ fn the_oracle_is_host_portable() {
 // Corpus construction + oracle generation (ignored by default)
 // ---------------------------------------------------------------------------
 //
-// Split into `differential_daemon_update/corpus.rs` under file-size-policy's
-// 1000-code-line ratchet (#8088's own port pushed this file over threshold).
+// Split into `differential_daemon_update/corpus.rs` (#8088's own port made
+// this file large).
 //
 // An integration-test file is its own crate root, so plain `mod corpus;`
 // would resolve beside it (`tests/corpus.rs`) — which Cargo's own test

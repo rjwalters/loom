@@ -1,8 +1,7 @@
 //! Observability **export liveness** health-section coverage (#5083 config
 //! errors #5337, first-hop scope #9015).
 //!
-//! A child module of `health::tests` rather than more lines in `tests.rs`,
-//! which is over `.loom/docs/file-size-policy.md`'s threshold and frozen —
+//! A child module of `health::tests` rather than more lines in `tests.rs` —
 //! same split as `section_inventory` and `auto_update_stale_repo`. Pure move
 //! apart from the #9015 test at the end; `use super::*` keeps every fixture
 //! (`now`, `healthy_inputs`) shared with the parent so the

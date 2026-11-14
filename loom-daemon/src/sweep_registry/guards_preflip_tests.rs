@@ -2,9 +2,7 @@
 //! `gh issue view --json labels` probe plus the [`preflip_labels`] verdict it
 //! delegates to (Issues #4085, #5789, #7873).
 //!
-//! Sibling file rather than an inline `mod` in `guards.rs`: that file is over
-//! the file-size ratchet threshold (`scripts/file-size-baseline.txt`), and
-//! extracting a test module is the policy's own preferred remedy.
+//! Sibling file rather than an inline `mod` in the already-large `guards.rs`.
 //!
 //! The predicate's exhaustive label matrix lives in `preflip_labels.rs`'s own
 //! unit tests (pure, no fixture). These tests are the wiring: that the probe

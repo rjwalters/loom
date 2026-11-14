@@ -4,9 +4,8 @@ use serial_test::serial;
 // crate-private there, so name it explicitly rather than re-exporting it.
 use super::artifact_verdict::compare_versions;
 
-// Wrong-repo-resolution coverage (Issue #8513) lives in its own child module
-// so this file, already over `.loom/docs/file-size-policy.md`'s threshold,
-// does not grow to hold it. It reuses the fixtures below via `use super::*`.
+// Wrong-repo-resolution coverage (Issue #8513) lives in its own child module.
+// It reuses the fixtures below via `use super::*`.
 mod stale_repo;
 // The production trigger's test needs these directly since #8514 moved the
 // trigger itself (and with it the parent's `EventBus`/`DrainState` imports) to
@@ -1102,12 +1101,11 @@ fn test_global_status_defaults_when_unset() {
 // ===================================================================
 
 /// Issue #8252 — the in-flight/build-stampede gate applies to the rebuild path
-/// only. A sibling file (this one is over the file-size ratchet threshold); it
-/// reuses the fixtures below via `use super::*`.
+/// only. A sibling file; it reuses the fixtures below via
+/// `use super::*`.
 mod in_flight_gate;
-// Supersede-not-stack coverage (#8514) — its own child module so this file,
-// already over `.loom/docs/file-size-policy.md`'s threshold, does not grow to
-// hold it. Reuses the fixtures above via `use super::*`.
+// Supersede-not-stack coverage (#8514) — its own child module. Reuses the
+// fixtures above via `use super::*`.
 mod supersede_tick;
 // Running-version roll basis (#10710).
 mod running_basis;

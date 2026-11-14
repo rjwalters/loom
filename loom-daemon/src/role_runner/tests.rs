@@ -101,8 +101,7 @@ fn truncate_tail_falls_back_to_byte_cut_for_a_single_giant_token() {
 
 // `find_failure_sentinel` / `describe_role_failure` (#6757 AC1/AC2, #8123)
 // tests live with their implementation in `role_runner/failure_sentinel.rs`
-// (`.loom/docs/file-size-policy.md` — new code for an over-threshold parent
-// goes to a new sibling module, not inline here).
+// rather than inline here.
 
 // -- had_ever_succeeded / failure_history_note (#6757 AC4) --------------
 

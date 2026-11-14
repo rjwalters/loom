@@ -66,9 +66,8 @@
 //! transitions that DO still get invalidated, which this carve-out narrows
 //! but does not eliminate.
 //!
-//! Sibling file rather than an inline `mod`: `claim_reconciliation.rs` and its
-//! `tests.rs` both sit at the file-size ratchet (`scripts/file-size-baseline.txt`),
-//! and keeping test modules out of them is that policy's own preferred remedy.
+//! Sibling file of `claim_reconciliation.rs`'s `tests.rs`, rather than an inline
+//! `mod`.
 
 #![allow(clippy::unwrap_used)]
 

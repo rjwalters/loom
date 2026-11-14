@@ -3943,10 +3943,8 @@ fn dispatch_refuses_operator_only_issue() {
 }
 
 // The vibesql#6664 operator-hold park-guard test lives in its own sibling
-// file rather than being appended here: this module is over the 1000-line
-// ratchet threshold and frozen at its current size
-// (`.loom/docs/file-size-policy.md` — "put the new code in a NEW sibling
-// module"). Registered from here, the same shape `guards.rs` uses for
+// file rather than being appended here, to keep this module from growing
+// further. Registered from here, the same shape `guards.rs` uses for
 // `guards_union_tests.rs` / `guards_preflip_tests.rs`.
 #[path = "operator_hold_tests.rs"]
 mod operator_hold_tests;
@@ -4724,9 +4722,8 @@ fn a_slow_lease_renew_start_never_holds_the_registry_lock() {
 }
 
 // The #8065 prompt-shape invariant lives in its own sibling file rather than
-// being appended here: this module is over the 1000-line ratchet threshold and
-// frozen at its current size (`.loom/docs/file-size-policy.md` — "put the new
-// code in a NEW sibling module"). Registered from here, the same shape
+// being appended here, to keep this module from growing further. Registered
+// from here, the same shape
 // `guards.rs` uses for `guards_union_tests.rs` / `guards_preflip_tests.rs`.
 #[path = "prompt_shape_tests.rs"]
 mod prompt_shape_tests;

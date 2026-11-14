@@ -1524,10 +1524,9 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
 }
 
 // The vibesql#6664 operator-hold skip-not-park test lives in its own
-// sibling file rather than being appended here: this module is over the
-// 1000-line ratchet threshold and frozen at its current size
-// (`.loom/docs/file-size-policy.md`), the same pattern `roster_fence`
-// already uses in this file. `epic_container` (#11399) follows it.
+// sibling file rather than being appended here, the same pattern
+// `roster_fence` already uses in this file. `epic_container` (#11399)
+// follows it.
 mod epic_container;
 mod operator_hold;
 mod restore_veto;

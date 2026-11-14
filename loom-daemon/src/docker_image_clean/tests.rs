@@ -1,5 +1,5 @@
-//! Unit tests for [`super`] (`docker_image_clean`). A sibling file so the
-//! parent stays under the file-size threshold (#11195).
+//! Unit tests for [`super`] (`docker_image_clean`). A sibling file of the
+//! parent module (#11195).
 
 #![allow(clippy::unwrap_used)]
 

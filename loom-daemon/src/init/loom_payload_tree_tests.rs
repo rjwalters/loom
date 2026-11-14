@@ -9,10 +9,8 @@
 //! cover the post-condition that makes [`LOOM_TREE_SCAFFOLDED_FILES`] an
 //! alternate-handler list rather than an exclusion list.
 //!
-//! Lives beside `tests.rs` rather than inside it because `init/tests.rs` is
-//! over the `scripts/check-file-size-budget.sh` threshold and frozen at its
-//! current size; new test modules go in sibling files (same pattern as
-//! `credential_class_tests.rs`).
+//! Lives beside `tests.rs` rather than inside it, in a sibling file (same
+//! pattern as `credential_class_tests.rs`).
 
 use super::*;
 use tempfile::TempDir;

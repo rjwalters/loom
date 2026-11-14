@@ -12,8 +12,7 @@
 //! whose artifact has been overtaken — supersedes instead. It also pins that
 //! each roll decision reaches `trigger_pause_roll` with its `target_source`.
 //!
-//! A sibling module rather than more lines in `tests.rs`, per
-//! `.loom/docs/file-size-policy.md` (that file is over the ratchet threshold).
+//! A sibling module of `tests.rs` holding the supersede-tick tests.
 
 use super::*;
 use crate::auto_update::supersede::ArmedRoll;

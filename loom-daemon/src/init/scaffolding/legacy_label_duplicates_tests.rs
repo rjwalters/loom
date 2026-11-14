@@ -1,7 +1,5 @@
 //! Tests for `merge_labels_block`'s pre-#4187 legacy duplicate absorption
-//! (issue #8875) — split into its own sibling file per
-//! `.loom/docs/file-size-policy.md` rather than growing `tests.rs`, which is
-//! already over the frozen threshold.
+//! (issue #8875) — in its own sibling file rather than in `tests.rs`.
 
 use super::*;
 

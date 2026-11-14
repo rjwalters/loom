@@ -4,10 +4,8 @@
 //! whether a reap whose sweep DID produce a PR seeds the #4123 dispatch
 //! guard's open-PR memo.
 //!
-//! Moved verbatim out of the sibling `tests.rs` — that file is over the
-//! file-size ratchet's 1000-line threshold and therefore frozen at its current
-//! size (`.loom/docs/file-size-policy.md`), so new tests in this family land
-//! here instead of growing it.
+//! Moved verbatim out of the sibling `tests.rs`, so new tests in this family
+//! land here instead of growing it.
 
 use super::*;
 use crate::sweep_registry::test_support::*;

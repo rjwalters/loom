@@ -2,7 +2,7 @@
 //! independently of `entry_points.rs` so
 //! [`super::Divergence::StaleAdvisoryNoRmForUnprunableEntries`] verifies the
 //! EXACT intended text rather than "whatever the port prints". A sibling of
-//! the main file, which is at the file-size ratchet's threshold.
+//! the main file.
 
 use super::{classify, Answer, Divergence};
 

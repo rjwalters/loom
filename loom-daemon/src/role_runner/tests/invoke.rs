@@ -3,8 +3,7 @@
 //! and timeout outcomes, model/effort resolution into argv, and the per-role
 //! log. Split out of `role_runner/tests.rs` when #9548 registered these
 //! launches' roots as writable checkouts (the real write-scope gate now runs
-//! in front of every tick), so the over-threshold parent shrinks rather than
-//! grows (`.loom/docs/file-size-policy.md`).
+//! in front of every tick).
 
 use super::*;
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.

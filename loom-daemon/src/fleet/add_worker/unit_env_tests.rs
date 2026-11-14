@@ -8,8 +8,7 @@
 //! run both rendered scripts against a stubbed `$HOME` with a polluted
 //! environment and assert on the unit file they leave behind.
 //!
-//! A sibling of `tests.rs`, which is over the file-size ratchet's threshold
-//! (`.loom/docs/file-size-policy.md`).
+//! A sibling of `tests.rs`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

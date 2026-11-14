@@ -1,6 +1,5 @@
 //! Unit tests for [`super`] — extracted from the parent module's inline
-//! `#[cfg(test)] mod tests` (Issue #8056) so the parent stays inside the
-//! file-size ratchet (`scripts/check-file-size-budget.sh`). Content is
+//! `#[cfg(test)] mod tests` (Issue #8056) so the parent stays small. Content is
 //! unchanged apart from dedenting and the new-module additions.
 
 use super::*;

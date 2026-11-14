@@ -1,7 +1,6 @@
 //! [`PeerClaimSink`]'s `ClaimKind::Heartbeat` routing (Issue #8736), kept out
-//! of `tests.rs` because that file is at `scripts/file-size-baseline.txt`'s
-//! ratchet — same reason `coordination_tests.rs` lives beside `peer_claims.rs`
-//! rather than inside it.
+//! of `tests.rs` — same pattern as `coordination_tests.rs` beside
+//! `peer_claims.rs`.
 
 use super::*;
 use serde_json::json;

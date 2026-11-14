@@ -4,8 +4,7 @@
 //! calls and serves only their REST replacements, so a regression back to
 //! either GraphQL call fails here — and the passes' decisions are unchanged.
 //!
-//! A sibling file: `claim_reconciliation.rs` and `tests.rs` are frozen by the
-//! file-size ratchet (`scripts/file-size-baseline.txt`).
+//! A sibling file of `claim_reconciliation.rs`'s `tests.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

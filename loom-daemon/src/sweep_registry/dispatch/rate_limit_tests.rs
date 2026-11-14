@@ -3,8 +3,8 @@
 //! attempt keeps its pre-#8997 semantics (dispatch continues, no lease
 //! comment for a claim that was never flipped).
 //!
-//! Sibling file (declared from `dispatch.rs`) because `dispatch/tests.rs` is
-//! over the file-size ratchet threshold.
+//! Sibling file (declared from `dispatch.rs`) rather than additions to the
+//! already-large `dispatch/tests.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

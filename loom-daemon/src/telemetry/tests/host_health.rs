@@ -3,10 +3,9 @@
 //! state (#5352), plus their back-compat decode tests.
 //!
 //! Extracted from `telemetry/tests.rs` rather than grown in place: the merge
-//! of #11488's `phase_tap_usage` fixture lines pushed `tests.rs` across
-//! `scripts/check-file-size-budget.sh`'s 1000-code-line threshold, and the
-//! policy's prescribed remedy is a new sibling module (as for
-//! `host_health_omissions.rs`). Test bodies are unchanged.
+//! of #11488's `phase_tap_usage` fixture lines made `tests.rs` too large, so
+//! these live in a sibling module (as for `host_health_omissions.rs`). Test
+//! bodies are unchanged.
 
 use super::super::*;
 use super::{host_health, ts};

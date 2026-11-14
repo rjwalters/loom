@@ -4,10 +4,9 @@
 //!
 //! Extracted from `telemetry/tests.rs` (Issue #8848) rather than grown in
 //! place: adding `is_captain`/`armed_singleton_jobs` to `HostHealthRecord`
-//! forced two new lines into every one of these struct literals, which pushed
-//! `tests.rs` across `scripts/check-file-size-budget.sh`'s 1000-code-line
-//! threshold. The policy's prescribed remedy is a new sibling module, and
-//! these tests are one coherent family that already had two topical siblings
+//! forced two new lines into every one of these struct literals, which made
+//! `tests.rs` too large. These tests are one coherent family that already
+//! had two topical siblings
 //! (`admission_brake.rs`, `fleet_captain.rs`). Test bodies are unchanged apart
 //! from the two new struct fields.
 

@@ -2,9 +2,8 @@
 //! model-profile binding (config-alias and Moonshot-API-key routes) and the
 //! honest fail-closed manifest, driven through the real `spawn-worker` path.
 //!
-//! A sibling of `worker_spawn.rs` rather than a section of it: that file sits
-//! at the 1000-line file-size ratchet, and these tests would carry it over.
-//! `worker` / `config` / `profile_check` below are therefore deliberate copies
+//! A sibling of `worker_spawn.rs` rather than a section of it: these tests
+//! get their own file. `worker` / `config` / `profile_check` below are therefore deliberate copies
 //! of that file's helpers, the same pattern `worker_spawn_api_keys.rs` already
 //! uses; `fixture` comes from the shared `support/worker_cli.rs`.
 use std::process::Command;

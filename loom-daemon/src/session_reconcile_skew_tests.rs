@@ -8,7 +8,7 @@ use super::*;
 use skew::{pinned_image, refuse_downgrade, DaemonVersion, PullRetry, PULL_RETRY_MAX_SKIP};
 
 /// The fake runner's version-skew behaviour (kept here so the shared fake in
-/// `session_reconcile_tests.rs` stays under the file-size threshold).
+/// `session_reconcile_tests.rs` stays smaller).
 impl FakeState {
     /// `docker exec <c> loom-daemon --version`: what the container's daemon
     /// prints; a missing entry fails like an image without the binary.

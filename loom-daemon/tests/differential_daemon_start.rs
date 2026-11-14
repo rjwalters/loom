@@ -458,8 +458,8 @@ enum Divergence {
     SystemdAutonomyEnv11951,
 }
 
-// The #11951 replay lives in a sibling: this file is over the size ratchet's
-// threshold. The explicit `#[path]` keeps it out of Cargo's test-crate scan.
+// The #11951 replay lives in a sibling file. The explicit
+// `#[path]` keeps it out of Cargo's test-crate scan.
 #[path = "differential_daemon_start/replay_11951.rs"]
 mod replay_11951;
 use replay_11951::{replay_11951, strip_11951_blocks};

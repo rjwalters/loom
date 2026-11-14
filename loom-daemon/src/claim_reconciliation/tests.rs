@@ -3431,8 +3431,7 @@ fn verdict_reconcile_stats_report_the_residual_unanchored_exposure() {
         ..VerdictReconcileStats::default()
     };
     assert_eq!(stats.residual_unverifiable(), 1);
-    // Zero-valued fields come from `..default()` -- `claim_reconciliation.rs`
-    // and this file are both at the file-size ratchet (#9124).
+    // Zero-valued fields come from `..default()`.
     stats.merge(VerdictReconcileStats {
         checked: 2,
         unverifiable: 1,

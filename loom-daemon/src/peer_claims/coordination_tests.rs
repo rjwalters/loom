@@ -1,7 +1,5 @@
 //! [`super::PeerClaimView::evaluate_coordination`] coverage (Issue #6157, idle
-//! gate #8026), kept out of `peer_claims.rs` because that file is frozen at its
-//! current size by `scripts/file-size-baseline.txt`, whose own preferred remedy
-//! is a sibling module.
+//! gate #8026), kept in a sibling module rather than in `peer_claims.rs`.
 //!
 //! Issue #8276 raised `DEFAULT_COORDINATION_DEGRADE_GRACE` from 600s to 1200s.
 //! That value is a pragmatic compromise, not one derived from a clean
