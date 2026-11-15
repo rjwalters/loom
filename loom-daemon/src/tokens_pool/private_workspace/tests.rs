@@ -756,12 +756,11 @@ fn prepare_exec_carries_a_resolved_token_on_the_child_never_in_argv() {
         *seen.borrow_mut() = args.iter().map(|a| (*a).to_owned()).collect();
         Ok(serde_json::json!({"protocol": PROTOCOL, "revision": "abc"}).to_string())
     }));
-    let resolved = forge_auth::ExecAuth::resolve_with(
-        Path::new("/nonexistent"),
-        &config.repository,
-        &|_| None,
-        &|_| Some(SECRET.into()),
-    );
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| {
+            Some(SECRET.into())
+        });
     let revision =
         docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &resolved).unwrap();
     assert_eq!(revision, "abc");

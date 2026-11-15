@@ -347,12 +347,11 @@ mod tests {
             control: "c".repeat(64),
             repository: String::new(),
         };
-        let auth = forge_auth::ExecAuth::resolve_with(
-            Path::new("/nonexistent"),
-            &config.repository,
-            &|_| None,
-            &|_| Some(SECRET.into()),
-        );
+        let ws = forge_auth::published_owner_workspace("acme");
+        let auth =
+            forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| {
+                Some(SECRET.into())
+            });
         let env = child_env(&[], &config, &job, &config.primary(), &auth).unwrap();
         assert!(env.contains(&"GH_TOKEN".to_string()), "{env:?}");
         assert!(!env.iter().any(|v| v.contains(SECRET)));

@@ -51,7 +51,7 @@ impl ExecAuth {
         workspace: &Path,
         repository: &str,
         env: &dyn Fn(&str) -> Option<OsString>,
-        read: &dyn Fn(Option<&Path>) -> Option<String>,
+        read: &dyn Fn(&Path) -> Option<String>,
     ) -> Self {
         let mut names: Vec<&'static str> = FORGE_ENV
             .iter()
@@ -77,8 +77,11 @@ impl ExecAuth {
                 secret: None,
             };
         };
-        let dir = config_dir_for(workspace, &slug, env);
-        let secret = read(dir.as_deref());
+        // No directory proven to hold THIS owner's installation token: read
+        // nothing. The process `GH_CONFIG_DIR` is the workspace-root owner's
+        // credential on a daemon host, and handing it to another owner's
+        // repository would forward the wrong installation's token.
+        let secret = config_dir_for(workspace, &slug, &gh_host).and_then(|dir| read(&dir));
         if secret.is_some() && !names.contains(&TOKEN_ENV) {
             names.push(TOKEN_ENV);
         }
@@ -105,6 +108,18 @@ impl ExecAuth {
     }
 }
 
+/// A workspace whose `.loom/gh-config-by-owner/<owner>` holds a published
+/// `hosts.yml`, so [`ExecAuth::resolve_with`] has a directory matched to
+/// `owner` (tests).
+#[cfg(test)]
+pub(super) fn published_owner_workspace(owner: &str) -> tempfile::TempDir {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(ws.path(), owner);
+    std::fs::create_dir_all(&dir).expect("owner dir");
+    std::fs::write(dir.join("hosts.yml"), "github.com: {}\n").expect("hosts.yml");
+    ws
+}
+
 /// The `owner/repo` of a GitHub repository URL, or `None` for any other forge
 /// (a Gitea under a sub-path, a different host).
 pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
@@ -123,21 +138,19 @@ pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
-/// Which `GH_CONFIG_DIR` holds the installation token for `slug`'s owner: the
-/// daemon's per-owner registry, else the owner's App directory under this
-/// workspace's (then the daemon's primary root's) `.loom/`, else — when the
-/// owner IS that root's own owner — the root's `.loom/gh-config` (the
-/// root owner is deliberately absent from `gh-config-by-owner`), else the
-/// process-global `GH_CONFIG_DIR`. `None` leaves `gh` on its own default.
+/// The `GH_CONFIG_DIR` proven to hold the installation token for `slug`'s
+/// owner: the daemon's per-owner registry, else the owner's App directory
+/// under this workspace's (then the daemon's primary root's) `.loom/`, else,
+/// when the owner IS that root's own owner (read from an `origin` on the same
+/// GitHub host), the root's `.loom/gh-config` — the root owner is
+/// deliberately absent from `gh-config-by-owner`. `None` when no directory is
+/// matched to the owner. There is deliberately no process-`GH_CONFIG_DIR`
+/// fallback: on a daemon host that is the root owner's credential.
 ///
 /// The root-owner step is what a hand-run `accounts session job` from an SSH
 /// shell needs: that shell has no `GH_CONFIG_DIR`, and the daemon's own
 /// registry is not in its process.
-fn config_dir_for(
-    workspace: &Path,
-    slug: &str,
-    env: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<PathBuf> {
+fn config_dir_for(workspace: &Path, slug: &str, gh_host: &str) -> Option<PathBuf> {
     use crate::credential_preflight as creds;
     let owner = creds::owner_of_nwo(slug);
     if let Some(dir) = creds::gh_config_dir_for_owner_slug(slug) {
@@ -152,8 +165,7 @@ fn config_dir_for(
         if !dir.join("hosts.yml").is_file() {
             return None;
         }
-        let root_nwo = creds::nwo_from_git_remote(root)?;
-        creds::owner_of_nwo(&root_nwo)
+        root_github_owner(root, gh_host)?
             .eq_ignore_ascii_case(owner)
             .then_some(dir)
     };
@@ -162,13 +174,38 @@ fn config_dir_for(
         .or_else(|| primary.as_deref().and_then(published))
         .or_else(|| root_owned(workspace))
         .or_else(|| primary.as_deref().and_then(root_owned))
-        .or_else(|| env("GH_CONFIG_DIR").map(PathBuf::from))
+}
+
+/// The owner of `root`'s `origin`, only when that remote is on `gh_host`
+/// (HTTPS, `ssh://` or scp-style `git@host:owner/repo`). A root cloned from
+/// any other forge owns no GitHub installation, whatever its owner is named.
+fn root_github_owner(root: &Path, gh_host: &str) -> Option<String> {
+    let url = crate::forge_cmd::get_remote_url(root)?;
+    remote_github_owner(url.trim(), gh_host)
+}
+
+fn remote_github_owner(url: &str, gh_host: &str) -> Option<String> {
+    let path = if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        (host == gh_host).then_some(path)?
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        (host == gh_host).then_some(path)?
+    } else {
+        let slug = github_slug(url, gh_host)?;
+        return Some(crate::credential_preflight::owner_of_nwo(&slug).to_owned());
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then(|| owner.to_owned())
 }
 
 /// `gh auth token` under `dir`, through the `gh` choke point. stdout is held
 /// privately and returned only when it is a single printable token; it is
 /// never logged, and a failure says nothing about its content.
-pub(super) fn read_token(dir: Option<&Path>, program: Option<&Path>) -> Option<String> {
+pub(super) fn read_token(dir: &Path, program: Option<&Path>) -> Option<String> {
     use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
     use crate::proc_exec::Completion;
     let mut invocation = GhInvocation::new(
@@ -178,7 +215,7 @@ pub(super) fn read_token(dir: Option<&Path>, program: Option<&Path>) -> Option<S
         TOKEN_READ_TIMEOUT,
     )
     .args(["auth", "token"])
-    .gh_config_dir(dir)
+    .gh_config_dir(Some(dir))
     // A local answer about THIS credential: never routed to a reader App.
     .writer_identity();
     if let Some(program) = program {
@@ -218,7 +255,7 @@ mod tests {
 
     #[test]
     fn an_app_only_host_resolves_a_token_for_the_child_and_names_it_bare() {
-        let ws = tempfile::tempdir().unwrap();
+        let ws = published_owner_workspace("acme");
         let env = env_of(&[]);
         let auth =
             ExecAuth::resolve_with(ws.path(), "https://github.com/acme/widget", &env, &|_| {
@@ -234,7 +271,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
             let env = env_of(&[(var, "from-process")]);
-            let read = |_: Option<&Path>| -> Option<String> {
+            let read = |_: &Path| -> Option<String> {
                 panic!("must not read a token when the process has one")
             };
             let auth =
@@ -249,14 +286,14 @@ mod tests {
     fn a_non_github_forge_never_reads_a_github_token() {
         let ws = tempfile::tempdir().unwrap();
         let env = env_of(&[("GITEA_TOKEN", "x")]);
-        let read = |_: Option<&Path>| -> Option<String> { panic!("not a GitHub repository") };
+        let read = |_: &Path| -> Option<String> { panic!("not a GitHub repository") };
         let auth = ExecAuth::resolve_with(ws.path(), "https://forge.example/o/r", &env, &read);
         assert!(!auth.resolved());
         assert_eq!(auth.names(), &["GITEA_TOKEN"]);
     }
 
     #[test]
-    fn the_owner_app_dir_under_the_workspace_wins_over_the_process_dir() {
+    fn the_owner_app_dir_is_read_and_an_unmatched_owner_reads_nothing() {
         let ws = tempfile::tempdir().unwrap();
         let owner_dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(
             ws.path(),
@@ -266,8 +303,8 @@ mod tests {
         std::fs::write(owner_dir.join("hosts.yml"), "github.com: {}\n").unwrap();
         let env = env_of(&[("GH_CONFIG_DIR", "/process/gh")]);
         let seen = std::cell::RefCell::new(None);
-        let read = |dir: Option<&Path>| {
-            *seen.borrow_mut() = dir.map(Path::to_path_buf);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
             Some(SECRET.to_owned())
         };
         ExecAuth::resolve_with(
@@ -277,21 +314,27 @@ mod tests {
             &read,
         );
         assert_eq!(seen.borrow().as_deref(), Some(owner_dir.as_path()));
-        // No published owner dir: the process-global one.
-        ExecAuth::resolve_with(
+        // No directory matched to this owner: nothing is read, nothing is
+        // forwarded. The process `GH_CONFIG_DIR` (the root owner's credential
+        // on a daemon host) is never a fallback.
+        let never = |_: &Path| -> Option<String> { panic!("read a token for an unmatched owner") };
+        let auth = ExecAuth::resolve_with(
             ws.path(),
             "https://github.com/other-unregistered-13916/widget",
             &env,
-            &read,
+            &never,
         );
-        assert_eq!(seen.borrow().as_deref(), Some(Path::new("/process/gh")));
+        assert!(!auth.resolved());
+        assert!(auth.names().is_empty());
+        assert!(auth.child_env().is_empty());
     }
 
     /// The workspace-root owner has no `gh-config-by-owner` entry: its token
-    /// lives in the root's `.loom/gh-config`, which must win over the process
-    /// `GH_CONFIG_DIR` (a hand-run `accounts session job` from an SSH shell).
+    /// lives in the root's `.loom/gh-config` (a hand-run `accounts session
+    /// job` from an SSH shell). Another owner, or a root whose origin is on a
+    /// different host, never borrows it.
     #[test]
-    fn the_root_owner_reads_the_root_app_dir_before_the_process_dir() {
+    fn the_root_owner_reads_the_root_app_dir_and_no_one_else_does() {
         let ws = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let ok = std::process::Command::new("git")
@@ -316,8 +359,8 @@ mod tests {
         std::fs::write(root_dir.join("hosts.yml"), "github.com: {}\n").unwrap();
         let env = env_of(&[("GH_CONFIG_DIR", "/process/gh")]);
         let seen = std::cell::RefCell::new(None);
-        let read = |dir: Option<&Path>| {
-            *seen.borrow_mut() = dir.map(Path::to_path_buf);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
             Some(SECRET.to_owned())
         };
         let auth = ExecAuth::resolve_with(
@@ -329,13 +372,49 @@ mod tests {
         assert!(auth.resolved());
         assert_eq!(seen.borrow().as_deref(), Some(root_dir.as_path()));
         // Another owner never borrows the root owner's installation token.
-        ExecAuth::resolve_with(
+        let never = |_: &Path| -> Option<String> { panic!("borrowed the root owner's token") };
+        let other = ExecAuth::resolve_with(
             ws.path(),
             "https://github.com/someone-else-13916/repo",
             &env,
-            &read,
+            &never,
         );
-        assert_eq!(seen.borrow().as_deref(), Some(Path::new("/process/gh")));
+        assert!(!other.resolved());
+        assert!(other.names().is_empty());
+        assert!(other.child_env().is_empty());
+        // Same owner name, but the root was cloned from another host.
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://ghe.example/RootOwner13916/primary.git",
+        ]);
+        let elsewhere = ExecAuth::resolve_with(
+            ws.path(),
+            "https://github.com/rootowner13916/second",
+            &env,
+            &never,
+        );
+        assert!(!elsewhere.resolved());
+    }
+
+    #[test]
+    fn remote_github_owner_requires_the_github_host() {
+        for url in [
+            "https://github.com/Own/repo.git",
+            "git@github.com:Own/repo.git",
+            "ssh://git@github.com/Own/repo",
+        ] {
+            assert_eq!(remote_github_owner(url, "github.com").as_deref(), Some("Own"), "{url}");
+        }
+        for url in [
+            "https://ghe.example/Own/repo",
+            "git@ghe.example:Own/repo.git",
+            "ssh://git@ghe.example/Own/repo",
+            "git@github.com:Own/a/b",
+        ] {
+            assert_eq!(remote_github_owner(url, "github.com"), None, "{url}");
+        }
     }
 
     #[test]
@@ -363,7 +442,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(read_token(Some(dir.path()), Some(&stub)).as_deref(), Some(SECRET));
-        assert_eq!(read_token(Some(Path::new("/elsewhere")), Some(&stub)), None);
+        assert_eq!(read_token(dir.path(), Some(&stub)).as_deref(), Some(SECRET));
+        assert_eq!(read_token(Path::new("/elsewhere"), Some(&stub)), None);
     }
 }
