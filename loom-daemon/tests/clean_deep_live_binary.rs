@@ -42,26 +42,44 @@ fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir.join(".loom")).unwrap();
 }
 
-/// A long-lived system binary to stand in for a service executable. Copying a
-/// real one (rather than compiling a fixture) keeps the test fast and makes the
-/// spawned process indistinguishable, to the detector, from a real service.
-fn host_sleep_binary() -> PathBuf {
-    for candidate in ["/bin/sleep", "/usr/bin/sleep"] {
+/// A long-lived system binary to stand in for a service executable, and the
+/// arguments that keep it alive. Copying a real one (rather than compiling a
+/// fixture) keeps the test fast and makes the spawned process
+/// indistinguishable, to the detector, from a real service.
+fn host_stand_in() -> (PathBuf, &'static [&'static str]) {
+    // The stand-in image and its arguments. On Linux it is a copy of the host
+    // shell run as `-c 'read _'`, blocked reading a stdin pipe the returned
+    // `Child` holds open. Not `sleep`: on Ubuntu 26.04 (`ubuntu-latest` since
+    // 2026-11-14) `sleep` is uutils' multicall coreutils, and a copy run under
+    // another file name exits at once with status 1, even with argv[0] set to
+    // "sleep" (#13924). `read` is a shell builtin, so the process stays the
+    // copied shell (no fork, no exec) and `/proc/<pid>/exe` names the copy.
+    // macOS keeps the `sleep` copy its `ps -o comm` detection path was built
+    // and verified against.
+    #[cfg(target_os = "linux")]
+    let (candidates, args): (&[&str], &'static [&'static str]) =
+        (&["/bin/sh", "/usr/bin/sh"], &["-c", "read _"]);
+    #[cfg(not(target_os = "linux"))]
+    let (candidates, args): (&[&str], &'static [&'static str]) =
+        (&["/bin/sleep", "/usr/bin/sleep"], &["300"]);
+    for candidate in candidates {
         let path = PathBuf::from(candidate);
         if path.is_file() {
-            return path;
+            return (path, args);
         }
     }
-    panic!("no `sleep` binary found — this test needs one to stand in for a service");
+    panic!("no stand-in binary found — this test needs one to play a service");
 }
 
-/// Copy `sleep` into `<repo>/target/release/<name>` and run it, so a live
-/// process's executable image lives inside the directory `--deep` deletes.
+/// Copy the stand-in binary into `<repo>/target/release/<name>` and run it, so
+/// a live process's executable image lives inside the directory `--deep`
+/// deletes.
 fn spawn_service_from_target(repo: &Path, name: &str) -> (Child, PathBuf) {
     let release = repo.join("target").join("release");
     std::fs::create_dir_all(&release).unwrap();
     let program = release.join(name);
-    std::fs::copy(host_sleep_binary(), &program).unwrap();
+    let (source, args) = host_stand_in();
+    std::fs::copy(source, &program).unwrap();
     // Re-sign the relocated copy on macOS: a plain `fs::copy` of a system binary
     // carries over the original embedded code signature (bound to the source
     // path's identity), so Gatekeeper SIGKILLs the exec'd copy asynchronously —
@@ -90,23 +108,9 @@ fn spawn_service_from_target(repo: &Path, name: &str) -> (Child, PathBuf) {
     // was briefly open leaves the child holding it, and Linux then refuses to
     // exec the file. A harness race, not a property of the code under test.
     for _ in 0..100 {
-        let mut command = Command::new(&program);
-        // `arg0("sleep")`: on a multicall coreutils (uutils on Ubuntu 26.04,
-        // the `ubuntu-latest` image since 2026-11-14; busybox elsewhere) the
-        // copied `sleep` is the whole multicall binary and dispatches on
-        // argv[0]. Run under the fixture's own name it finds no such utility,
-        // exits at once, and the "live" service is dead before the detector
-        // looks (#13924). Linux only: the detector reads `/proc/<pid>/exe`
-        // there, which names the copied file whatever argv[0] says, while
-        // macOS `ps -o comm` reports argv[0] itself.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-            command.arg0("sleep");
-        }
-        match command
-            .arg("300")
-            .stdin(Stdio::null())
+        match Command::new(&program)
+            .args(args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

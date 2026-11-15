@@ -1098,19 +1098,33 @@ mod tests {
     // build-artifact sweep from unlinking a running program's binary.
     // ------------------------------------------------------------------
 
-    /// Copy the host's `sleep` into `dir/<name>` and run it, so a live process
-    /// is executing an image inside `dir`.
+    /// Copy a host binary (`sh` on Linux, `sleep` elsewhere) into `dir/<name>`
+    /// and run it, so a live process is executing an image inside `dir`.
     ///
     /// The spawn is retried on `ETXTBSY`: a *concurrent* test thread forking
     /// while our write fd is briefly open leaves the child holding that fd, and
     /// Linux then refuses to exec the file. Nothing to do with the code under
     /// test — just the standard fork/exec race in a multi-threaded harness.
     fn spawn_from(dir: &Path, name: &str) -> std::process::Child {
-        let source = ["/bin/sleep", "/usr/bin/sleep"]
+        // The stand-in image and its arguments. On Linux it is a copy of the host
+        // shell run as `-c 'read _'`, blocked reading a stdin pipe the returned
+        // `Child` holds open. Not `sleep`: on Ubuntu 26.04 (`ubuntu-latest` since
+        // 2026-11-14) `sleep` is uutils' multicall coreutils, and a copy run under
+        // another file name exits at once with status 1, even with argv[0] set to
+        // "sleep" (#13924). `read` is a shell builtin, so the process stays the
+        // copied shell (no fork, no exec) and `/proc/<pid>/exe` names the copy.
+        // macOS keeps the `sleep` copy its `ps -o comm` detection path was built
+        // and verified against.
+        #[cfg(target_os = "linux")]
+        let (candidates, args): (&[&str], &[&str]) =
+            (&["/bin/sh", "/usr/bin/sh"], &["-c", "read _"]);
+        #[cfg(not(target_os = "linux"))]
+        let (candidates, args): (&[&str], &[&str]) = (&["/bin/sleep", "/usr/bin/sleep"], &["300"]);
+        let source = candidates
             .iter()
             .map(Path::new)
             .find(|p| p.is_file())
-            .expect("a `sleep` binary is needed to stand in for a service");
+            .expect("a stand-in binary is needed to play a service");
         let program = dir.join(name);
         std::fs::copy(source, &program).unwrap();
         // Re-sign the relocated copy on macOS: a plain `fs::copy` of a system binary
@@ -1135,23 +1149,9 @@ mod tests {
         }
         let mut last_err = None;
         for _ in 0..100 {
-            let mut command = Command::new(&program);
-            // `arg0("sleep")`: on a multicall coreutils (uutils on Ubuntu 26.04,
-            // the `ubuntu-latest` image since 2026-11-14; busybox elsewhere) the
-            // copied `sleep` is the whole multicall binary and dispatches on
-            // argv[0]. Run under the fixture's own name it finds no such utility,
-            // exits at once, and the "live" service is dead before the detector
-            // looks (#13924). Linux only: the detector reads `/proc/<pid>/exe`
-            // there, which names the copied file whatever argv[0] says, while
-            // macOS `ps -o comm` reports argv[0] itself.
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::process::CommandExt;
-                command.arg0("sleep");
-            }
-            match command
-                .arg("300")
-                .stdin(std::process::Stdio::null())
+            match Command::new(&program)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
