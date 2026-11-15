@@ -85,3 +85,34 @@ fn a_fact_fingerprint_is_prefixed_and_keyed_on_both_inputs() {
 // `defaults/scripts/tests/test-classify-dependency-block.sh`, whose assertions
 // were written against the shell and now drive this implementation unchanged
 // through the same CLI.
+
+// ---------------------------------------------------------------------------
+// Literal pins (#13848)
+// ---------------------------------------------------------------------------
+//
+// The tests above assert only length, prefix, and equal/not-equal relations —
+// all of which a *different* digest would still satisfy. These two pin the
+// bytes. They were captured from the pre-refactor implementation and
+// independently re-derived with `sha256sum`, so they fail loudly if the
+// derivation ever drifts:
+//
+//   printf '%s' 'o/r#3 o/r#9'            | sha256sum | cut -c1-16
+//   printf '%s\n%s' 'escalation text' 'abc1234' | sha256sum | cut -c1-16
+//
+// Fingerprints are persisted into live issue comments, so these values are a
+// compatibility contract, not an implementation detail: changing them silently
+// makes Champion re-fight decisions it already made.
+
+#[test]
+fn a_fingerprint_matches_its_pinned_value() {
+    assert_eq!(fingerprint("o/r#3 o/r#9"), "7290af79532f4687");
+    // Order and duplicates normalise onto the same pinned value.
+    assert_eq!(fingerprint("o/r#9  o/r#3\no/r#9"), "7290af79532f4687");
+    // The empty set is the SHA-256 of the empty string.
+    assert_eq!(fingerprint(""), "e3b0c44298fc1c14");
+}
+
+#[test]
+fn a_fact_fingerprint_matches_its_pinned_value() {
+    assert_eq!(fact_fingerprint("escalation text", "abc1234"), "fact-b27369d8d65d4d2f");
+}

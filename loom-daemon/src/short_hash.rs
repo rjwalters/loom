@@ -26,13 +26,9 @@ const SHORT_LEN: usize = 16;
 /// SHA-256 of `text`, truncated to the first 16 hex characters.
 #[must_use]
 pub fn short_sha16(text: &str) -> String {
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>()
-        .chars()
-        .take(SHORT_LEN)
-        .collect()
+    let mut hex = hex::encode(Sha256::digest(text.as_bytes()));
+    hex.truncate(SHORT_LEN);
+    hex
 }
 
 #[cfg(test)]
