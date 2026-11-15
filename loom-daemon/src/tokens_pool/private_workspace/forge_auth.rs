@@ -125,8 +125,14 @@ pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
 
 /// Which `GH_CONFIG_DIR` holds the installation token for `slug`'s owner: the
 /// daemon's per-owner registry, else the owner's App directory under this
-/// workspace's (then the daemon's primary root's) `.loom/`, else the
+/// workspace's (then the daemon's primary root's) `.loom/`, else — when the
+/// owner IS that root's own owner — the root's `.loom/gh-config` (the
+/// root owner is deliberately absent from `gh-config-by-owner`), else the
 /// process-global `GH_CONFIG_DIR`. `None` leaves `gh` on its own default.
+///
+/// The root-owner step is what a hand-run `accounts session job` from an SSH
+/// shell needs: that shell has no `GH_CONFIG_DIR`, and the daemon's own
+/// registry is not in its process.
 fn config_dir_for(
     workspace: &Path,
     slug: &str,
@@ -141,8 +147,21 @@ fn config_dir_for(
         let dir = creds::github_app_gh_config_dir_for_owner(root, owner);
         dir.join("hosts.yml").is_file().then_some(dir)
     };
+    let root_owned = |root: &Path| {
+        let dir = creds::github_app_gh_config_dir(root);
+        if !dir.join("hosts.yml").is_file() {
+            return None;
+        }
+        let root_nwo = creds::nwo_from_git_remote(root)?;
+        creds::owner_of_nwo(&root_nwo)
+            .eq_ignore_ascii_case(owner)
+            .then_some(dir)
+    };
+    let primary = creds::primary_workspace_root();
     published(workspace)
-        .or_else(|| creds::primary_workspace_root().and_then(|root| published(&root)))
+        .or_else(|| primary.as_deref().and_then(published))
+        .or_else(|| root_owned(workspace))
+        .or_else(|| primary.as_deref().and_then(root_owned))
         .or_else(|| env("GH_CONFIG_DIR").map(PathBuf::from))
 }
 
@@ -262,6 +281,57 @@ mod tests {
         ExecAuth::resolve_with(
             ws.path(),
             "https://github.com/other-unregistered-13916/widget",
+            &env,
+            &read,
+        );
+        assert_eq!(seen.borrow().as_deref(), Some(Path::new("/process/gh")));
+    }
+
+    /// The workspace-root owner has no `gh-config-by-owner` entry: its token
+    /// lives in the root's `.loom/gh-config`, which must win over the process
+    /// `GH_CONFIG_DIR` (a hand-run `accounts session job` from an SSH shell).
+    #[test]
+    fn the_root_owner_reads_the_root_app_dir_before_the_process_dir() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(ws.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/RootOwner13916/primary.git",
+        ]);
+        let root_dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+        std::fs::create_dir_all(&root_dir).unwrap();
+        std::fs::write(root_dir.join("hosts.yml"), "github.com: {}\n").unwrap();
+        let env = env_of(&[("GH_CONFIG_DIR", "/process/gh")]);
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: Option<&Path>| {
+            *seen.borrow_mut() = dir.map(Path::to_path_buf);
+            Some(SECRET.to_owned())
+        };
+        let auth = ExecAuth::resolve_with(
+            ws.path(),
+            "https://github.com/rootowner13916/second",
+            &env,
+            &read,
+        );
+        assert!(auth.resolved());
+        assert_eq!(seen.borrow().as_deref(), Some(root_dir.as_path()));
+        // Another owner never borrows the root owner's installation token.
+        ExecAuth::resolve_with(
+            ws.path(),
+            "https://github.com/someone-else-13916/repo",
             &env,
             &read,
         );
