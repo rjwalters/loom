@@ -741,3 +741,50 @@ fn repository_bound_job_keeps_the_account_wide_exclusive_lease() {
     std::fs::write(root.path().join("job.json"), serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(lease::read(root.path()).unwrap().unwrap().repository, "");
 }
+
+/// #13916: on an App-only host the prepare exec names `GH_TOKEN` as a bare
+/// `--env` and the resolved value rides on the `docker` child alone — never
+/// in argv. A token already in the process env adds nothing to the child.
+#[test]
+fn prepare_exec_carries_a_resolved_token_on_the_child_never_in_argv() {
+    const SECRET: &str = "ghs_prepareTESTONLY13916";
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let argv = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = argv.clone();
+    let _fake = docker::fake::install(Box::new(move |args| {
+        *seen.borrow_mut() = args.iter().map(|a| (*a).to_owned()).collect();
+        Ok(serde_json::json!({"protocol": PROTOCOL, "revision": "abc"}).to_string())
+    }));
+    let resolved = forge_auth::ExecAuth::resolve_with(
+        Path::new("/nonexistent"),
+        &config.repository,
+        &|_| None,
+        &|_| Some(SECRET.into()),
+    );
+    let revision =
+        docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &resolved).unwrap();
+    assert_eq!(revision, "abc");
+    let args = argv.borrow().clone();
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains(SECRET)), "token leaked into argv");
+    assert_eq!(docker::fake::seen_env(), vec![vec![("GH_TOKEN".to_owned(), SECRET.to_owned())]]);
+
+    // The process already holds a token: forwarded by name, nothing added.
+    let ambient = forge_auth::ExecAuth::resolve_with(
+        Path::new("/nonexistent"),
+        &config.repository,
+        &|name| (name == "GH_TOKEN").then(|| "from-process".into()),
+        &|_| panic!("must not read a token the process already has"),
+    );
+    docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &ambient).unwrap();
+    let args = argv.borrow().clone();
+    assert!(args
+        .windows(2)
+        .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"));
+    assert_eq!(docker::fake::seen_env().last().unwrap(), &Vec::new());
+}

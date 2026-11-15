@@ -89,7 +89,10 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     docker::recheck_control(&config, &job.container_id, &job.control)?;
     args.container = job.container_id.clone();
     args.workdir = target.path.clone();
-    args.env = child_env(&args.env, &config, &job, &target)?;
+    // The job exec's forge credential, resolved for THIS exec (#13916).
+    let auth = forge_auth::ExecAuth::resolve(&root, &target.repository);
+    args.env = child_env(&args.env, &config, &job, &target, &auth)?;
+    args.child_env = auth.child_env();
     // Resolve hooks on the worker, using its private installed bridge. Never
     // bless hook trust or enable a capability that the manifest rejects.
     args.command.splice(
@@ -147,6 +150,7 @@ fn child_env(
     config: &Config,
     job: &lease::Job,
     target: &Target,
+    auth: &forge_auth::ExecAuth,
 ) -> Result<Vec<String>> {
     let clone = &target.path;
     let mut env = vec![
@@ -197,17 +201,24 @@ fn child_env(
     // identity record, so a stale or replaced workspace cannot answer for the
     // bound job.
     env.push(format!("LOOM_PRIVATE_BASE_REVISION={}", job.base_revision));
-    for name in FORGE_ENV {
-        if std::env::var_os(name).is_some() {
-            env.push(name.into());
-        }
-    }
+    // Bare names only: `docker` copies each value from its own environment,
+    // where a host-resolved token was set on that child alone (#13916).
+    env.extend(auth.names().iter().map(|name| (*name).to_owned()));
     Ok(env)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_auth() -> forge_auth::ExecAuth {
+        forge_auth::ExecAuth::resolve_with(
+            Path::new("/nonexistent"),
+            "https://example.invalid/o/r",
+            &|_| None,
+            &|_| None,
+        )
+    }
     #[test]
     fn child_paths_and_control_environment_cannot_escape_private_clone() {
         let config = Config {
@@ -246,6 +257,7 @@ mod tests {
             &config,
             &job,
             &config.primary(),
+            &no_auth(),
         )
         .unwrap();
         assert!(env.contains(&"LOOM_WORKSPACE=/workspace/repo".into()));
@@ -299,11 +311,51 @@ mod tests {
             control: "c".repeat(64),
             repository: id.url.clone(),
         };
-        let env = child_env(&[], &config, &job, &target).unwrap();
+        let env = child_env(&[], &config, &job, &target, &no_auth()).unwrap();
         let clone = format!("{WORK_ROOT}/{}", id.slug);
         assert!(env.contains(&format!("LOOM_WORKSPACE={clone}")));
         assert!(env.contains(&format!("LOOM_PRIVATE_CLONE={clone}")));
         assert!(env.contains(&format!("LOOM_PRIVATE_REPOSITORY={}", id.url)));
         assert!(!env.iter().any(|v| v.contains("/workspace/repo")), "{env:?}");
+    }
+    /// #13916: the job exec on an App-only host names `GH_TOKEN` bare and the
+    /// value rides only on the `docker` child; the argv never carries it.
+    #[test]
+    fn job_exec_names_a_resolved_token_bare_and_never_carries_its_value() {
+        const SECRET: &str = "ghs_transportTESTONLY13916";
+        let config = Config {
+            schema_version: 1,
+            account: "test".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://github.com/acme/widget".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: "/host/profile".into(),
+            gh_config: None,
+        };
+        let job = lease::Job {
+            owner: "o".into(),
+            kind: JobKind::Role,
+            issue: None,
+            branch: None,
+            container_id: "a".repeat(64),
+            base_revision: "b".repeat(40),
+            host_pid: 1,
+            control: "c".repeat(64),
+            repository: String::new(),
+        };
+        let auth = forge_auth::ExecAuth::resolve_with(
+            Path::new("/nonexistent"),
+            &config.repository,
+            &|_| None,
+            &|_| Some(SECRET.into()),
+        );
+        let env = child_env(&[], &config, &job, &config.primary(), &auth).unwrap();
+        assert!(env.contains(&"GH_TOKEN".to_string()), "{env:?}");
+        assert!(!env.iter().any(|v| v.contains(SECRET)));
+        assert_eq!(auth.child_env(), vec![("GH_TOKEN".into(), SECRET.into())]);
     }
 }

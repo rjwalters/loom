@@ -293,6 +293,9 @@ pub fn run(args: HostArgs) -> Result<i32> {
     for env in args.env {
         command.args(["--env", &env]);
     }
+    // Values the bare `--env NAME` entries above copy (#13916): on this child
+    // only, never in argv.
+    command.envs(args.child_env.iter().map(|(k, v)| (k, v)));
     // Docker's client must survive the caller's process-group TERM so it can
     // deliver cancellation and collect the container cleanup acknowledgement.
     let mut child = command

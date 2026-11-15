@@ -1519,6 +1519,13 @@ pub fn register_primary_workspace_root(root: &Path) {
     PRIMARY_WORKSPACE_ROOT.get_or_init(|| root.to_path_buf());
 }
 
+/// The daemon's primary workspace root, when [`register_primary_workspace_root`]
+/// has run in this process (`None` in a CLI process).
+#[must_use]
+pub fn primary_workspace_root() -> Option<PathBuf> {
+    PRIMARY_WORKSPACE_ROOT.get().cloned()
+}
+
 /// Process-global registry of every per-owner credential the periodic refresh
 /// tick should keep fresh (#6171): owner -> (representative `owner/repo` to
 /// mint from, its `GH_CONFIG_DIR`). Distinct from
