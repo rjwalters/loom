@@ -152,8 +152,9 @@ fn an_unsignalable_pid_is_treated_as_alive() {
     // `kill(pid, 0)` failing with EPERM means the process EXISTS and is not
     // ours. Reading that as "dead" would break a live lock owned by another
     // user — the unsafe direction.
-    assert!(pid_alive(1), "pid 1 exists and is typically not signalable by us");
-    assert!(!pid_alive(0x7fff_fffe), "a genuinely absent pid is dead");
+    use crate::sweep_registry::is_pid_alive;
+    assert!(is_pid_alive(1), "pid 1 exists and is typically not signalable by us");
+    assert!(!is_pid_alive(0x7fff_fffe), "a genuinely absent pid is dead");
 }
 
 #[test]
