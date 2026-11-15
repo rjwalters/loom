@@ -386,15 +386,34 @@ fn spawn_service_in(dir: &Path, name: &str) -> std::process::Child {
     // exec. A harness race, not a property of the code under test.
     let mut last_err = None;
     for _ in 0..100 {
-        match std::process::Command::new(&program)
+        let mut command = std::process::Command::new(&program);
+        // `arg0("sleep")`: on a multicall coreutils (uutils on Ubuntu 26.04,
+        // the `ubuntu-latest` image since 2026-11-14; busybox elsewhere) the
+        // copied `sleep` is the whole multicall binary and dispatches on
+        // argv[0]. Run under the fixture's own name it finds no such utility,
+        // exits at once, and the "live" service is dead before the detector
+        // looks (#13924). Linux only: the detector reads `/proc/<pid>/exe`
+        // there, which names the copied file whatever argv[0] says, while
+        // macOS `ps -o comm` reports argv[0] itself.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            command.arg0("sleep");
+        }
+        match command
             .arg("300")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            Ok(child) => {
+            Ok(mut child) => {
                 std::thread::sleep(std::time::Duration::from_millis(250));
+                // A stand-in that already exited would fail every detection
+                // assertion for a reason unrelated to the detector.
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("the stand-in service exited before the test ran: {status}");
+                }
                 return child;
             }
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
