@@ -25,26 +25,39 @@
 //!
 //! A credential failure never gets a horizon at all (see [`super::classify`]).
 //!
-//! # Honest limits: the shapes are not live captures
+//! # What is live and what is still inference
 //!
-//! **No real Z.ai exhausted/rate-limited output has been captured** (the same
-//! gap [`super::classify`] records). The shapes recognised here are generic
-//! and provider-neutral — RFC 3339 instants, epoch seconds/milliseconds,
-//! `retry-after` seconds, and a timezone-less `YYYY-MM-DD HH:MM:SS` — chosen
-//! because they are what HTTP APIs conventionally emit, not because any was
-//! observed coming out of a Z.ai seat. Every test fixture for this module is
-//! therefore **synthetic** and says so. Fold real captures in as they are
-//! observed.
+//! Real Z.ai output was captured on 2026-11-16 (#12395; the constants are in
+//! [`super::classify`]). It showed two things the synthetic fixtures had not:
+//!
+//! * The reset instant arrives **inside JSON string values** (`error.data.
+//!   message`, and again in the escaped `responseBody`), never as a reset
+//!   field. Reading the raw line as prose left the time glued to the JSON
+//!   that follows it (`01:52:07","statusCode":429,…`), nothing parsed, and
+//!   every mark took the default cooldown. String values are now read as
+//!   prose themselves, and a stamp token is cut at its first non-stamp byte.
+//! * The stamp has no timezone and is in the provider's wall clock, **UTC+8**.
+//!   The response says so itself: its `x-log-id` opens with the request time
+//!   in that clock while its `date` header gives the same instant in GMT.
+//!   When an event carries both, the difference is the offset applied to a
+//!   timezone-less stamp ([`wall_clock_offset_secs`]). Nothing is assumed
+//!   about a provider by name.
+//!
+//! The other shapes (RFC 3339 instants, epoch seconds/milliseconds,
+//! `retry-after` seconds, reset fields) remain generic and unobserved; their
+//! fixtures are synthetic and say so.
 //!
 //! # Fail-safe direction
 //!
 //! A parsed horizon is used only when it is in the future and no further than
 //! [`MAX_RESET_HORIZON_SECS`] out (a weekly cap plus a day of slack);
 //! anything else falls through to the configured or default window rather
-//! than inventing a hold. A timezone-less timestamp is read as **UTC**: the
-//! providers in scope are east of UTC (Z.ai/Zhipu), so a UTC reading is never
-//! *earlier* than the true instant — the error, if any, holds a seat a little
-//! long rather than re-selecting it before it has recovered.
+//! than inventing a hold. A timezone-less timestamp with no offset evidence
+//! beside it is read as **UTC**: the providers in scope are east of UTC
+//! (Z.ai/Zhipu), so a UTC reading is never *earlier* than the true instant —
+//! the error, if any, holds a seat a little long rather than re-selecting it
+//! before it has recovered. The offset evidence is used only when it is a
+//! whole number of quarter hours within fourteen hours of UTC.
 //!
 //! Last match wins, as in [`crate::tokens_pool::codex_reset`]: the provider's
 //! fatal refusal is the last thing written before the harness gives up.
@@ -159,21 +172,65 @@ fn line_reset_at(line: &str, now: u64) -> Option<u64> {
     let trimmed = line.trim();
     if trimmed.starts_with('{') {
         if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            if let Some(at) = json_reset_at(&value, now) {
+            let offset = wall_clock_offset_secs(&value).unwrap_or(0);
+            if let Some(at) = json_reset_at(&value, now, offset) {
                 return Some(at);
             }
         }
     }
-    prose_reset_at(line, now)
+    prose_reset_at(line, now, 0)
 }
 
-/// Depth-first, last-key-wins search of a JSON value for a reset field.
-fn json_reset_at(value: &Value, now: u64) -> Option<u64> {
+/// Largest wall-clock offset from UTC accepted as evidence, either side.
+const MAX_WALL_CLOCK_OFFSET_SECS: i64 = 14 * 3600;
+
+/// Seconds **east of UTC** of the provider's wall clock, when one JSON event
+/// proves it: an object holding both an HTTP `date` header and an `x-log-id`
+/// that opens with a `YYYYMMDDHHMMSS` stamp of the same request (the live Z.ai
+/// shape, [`super::classify::CAPTURED_ZAI_WEEKLY_LIMIT_EVENT`]). `None` when
+/// the pair is absent, unparseable, or not a quarter-hour offset inside
+/// [`MAX_WALL_CLOCK_OFFSET_SECS`] — the caller then reads the stamp as UTC.
+fn wall_clock_offset_secs(value: &Value) -> Option<i64> {
+    match value {
+        Value::Object(map) => {
+            let header = |wanted: &str| {
+                map.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
+                    .and_then(|(_, inner)| inner.as_str())
+            };
+            let here = header("date")
+                .zip(header("x-log-id"))
+                .and_then(|(date, log_id)| {
+                    let utc = DateTime::parse_from_rfc2822(date.trim()).ok()?.timestamp();
+                    let local = NaiveDateTime::parse_from_str(log_id.get(..14)?, "%Y%m%d%H%M%S")
+                        .ok()?
+                        .and_utc()
+                        .timestamp();
+                    let raw = local - utc;
+                    let quarter_hours = (raw + raw.signum() * 450) / 900;
+                    let offset = quarter_hours * 900;
+                    ((raw - offset).abs() <= 120 && offset.abs() <= MAX_WALL_CLOCK_OFFSET_SECS)
+                        .then_some(offset)
+                });
+            here.or_else(|| map.values().find_map(wall_clock_offset_secs))
+        }
+        Value::Array(items) => items.iter().find_map(wall_clock_offset_secs),
+        _ => None,
+    }
+}
+
+/// Depth-first, last-key-wins search of a JSON value for a reset field, or for
+/// a string value that states a reset in prose (the live Z.ai shape: the
+/// instant is in `error.data.message`). `naive_offset` is the wall-clock
+/// offset a timezone-less stamp is read in ([`wall_clock_offset_secs`]).
+fn json_reset_at(value: &Value, now: u64, naive_offset: i64) -> Option<u64> {
     match value {
         Value::Object(map) => map.iter().rev().find_map(|(key, inner)| {
             let key = key.to_ascii_lowercase();
             if ABSOLUTE_KEYS.contains(&key.as_str()) {
-                if let Some(at) = absolute_value(inner).filter(|at| plausible(*at, now)) {
+                if let Some(at) =
+                    absolute_value(inner, naive_offset).filter(|at| plausible(*at, now))
+                {
                     return Some(at);
                 }
             }
@@ -182,17 +239,23 @@ fn json_reset_at(value: &Value, now: u64) -> Option<u64> {
                     return Some(at);
                 }
             }
-            json_reset_at(inner, now)
+            json_reset_at(inner, now, naive_offset)
         }),
-        Value::Array(items) => items.iter().rev().find_map(|item| json_reset_at(item, now)),
+        Value::Array(items) => items
+            .iter()
+            .rev()
+            .find_map(|item| json_reset_at(item, now, naive_offset)),
+        Value::String(text) => {
+            prose_reset_at(text, now, naive_offset).filter(|at| plausible(*at, now))
+        }
         _ => None,
     }
 }
 
-fn absolute_value(value: &Value) -> Option<u64> {
+fn absolute_value(value: &Value, naive_offset: i64) -> Option<u64> {
     match value {
         Value::Number(n) => n.as_u64().and_then(epoch_from_number),
-        Value::String(s) => parse_instant(s),
+        Value::String(s) => parse_instant(s, naive_offset),
         _ => None,
     }
 }
@@ -219,9 +282,10 @@ fn epoch_from_number(n: u64) -> Option<u64> {
 }
 
 /// An absolute instant in text: RFC 3339, a timezone-less
-/// `YYYY-MM-DD[ T]HH:MM[:SS]` (read as UTC — see the module docs), or an
-/// epoch number.
-fn parse_instant(raw: &str) -> Option<u64> {
+/// `YYYY-MM-DD[ T]HH:MM[:SS]`, or an epoch number. A timezone-less stamp is
+/// read in the wall clock `naive_offset` seconds east of UTC — `0`, i.e. UTC,
+/// unless the event proved another (see the module docs).
+fn parse_instant(raw: &str, naive_offset: i64) -> Option<u64> {
     let candidate = raw
         .trim()
         .trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | ',' | ';'))
@@ -239,23 +303,36 @@ fn parse_instant(raw: &str) -> Option<u64> {
         "%Y-%m-%dT%H:%M",
     ] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(candidate, format) {
-            return u64::try_from(naive.and_utc().timestamp()).ok();
+            return u64::try_from(naive.and_utc().timestamp() - naive_offset).ok();
         }
     }
     None
 }
 
-fn prose_reset_at(line: &str, now: u64) -> Option<u64> {
+/// The leading run of `token` that can belong to a timestamp. A stamp quoted
+/// inside JSON arrives glued to what follows it (`01:52:07","statusCode":…`,
+/// or `01:52:07\"}}` in an escaped body); everything from the first byte no
+/// timestamp uses is dropped.
+fn stamp_prefix(token: &str) -> &str {
+    let end = token
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | ':' | 'T' | 'Z' | '+' | '.')))
+        .unwrap_or(token.len());
+    &token[..end]
+}
+
+fn prose_reset_at(line: &str, now: u64, naive_offset: i64) -> Option<u64> {
     // `to_ascii_lowercase` is length-preserving, so offsets found in the
     // lowered copy index the original line.
     let lowered = line.to_ascii_lowercase();
     for phrase in ABSOLUTE_PHRASES {
         if let Some(at) = lowered.rfind(phrase) {
             let rest = line.get(at + phrase.len()..)?;
-            let tokens: Vec<&str> = rest.split_whitespace().take(2).collect();
+            let tokens: Vec<&str> = rest.split_whitespace().take(2).map(stamp_prefix).collect();
             // A date and a time as two tokens first, then one token alone.
             let joined = tokens.join(" ");
-            if let Some(found) = parse_instant(&joined).or_else(|| parse_instant(tokens.first()?)) {
+            if let Some(found) = parse_instant(&joined, naive_offset)
+                .or_else(|| parse_instant(tokens.first()?, naive_offset))
+            {
                 return Some(found);
             }
         }
