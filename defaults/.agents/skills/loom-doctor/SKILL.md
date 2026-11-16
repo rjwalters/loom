@@ -1478,9 +1478,9 @@ When you **only** resolve merge conflicts without making substantive code change
 **ID-only renumber (append-only file) qualifies ONLY when ALL four hold** — any failed condition means it is NOT conflict-only (full review path, no marker):
 
 1. Exactly **one** path conflicts.
-2. The only differing hunk in that path is a row-ID change to the **next free ID** (monotonic: one past the highest ID now on `main`). Row content is untouched, and the row stays inside the table.
+2. The only differing hunk in that path — other than what the merge brought in from `main` — is a row-ID change to the **next free ID** (monotonic: one past the highest ID now on `main`). Row content is untouched, and the row stays inside the table.
 3. The only other edits in that path are references to that same ID in the PR's **own added lines** of the same file.
-4. **No other file** changes in your resolution commit.
+4. **No other file** changes in your resolution edits — other than what the merge brought in from `main` (a merge commit legitimately changes many files relative to the prior head; only files *you* edited while resolving count).
 
 Before marking it, grep the PR body and sibling files for citations of the **old** ID (`gh pr view <N> --json body --jq .body`, `git grep -n '<OLD_ID>'`). A citation outside the one file means fixing it is an edit outside the file, so the PR is **not** conflict-only; fix or report it and take the full path. A PR body citation is fixed with `gh pr edit` and reported in the comment.
 
