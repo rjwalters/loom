@@ -53,11 +53,11 @@ Can start today. Claimed items (`loom:building`: #13800, #13814, #13822,
 | Export peer-coordination verdict and degraded duration on `host.health` | both attributes appear on the emitted record, asserted by a unit test | #12167 |
 | One env-truthy parser | the 47 inline copies call `env_flag::parse_truthy`; `git grep` for the inline pattern in `loom-daemon/src` returns none | #13859 |
 | One PID liveness probe | the seven private `kill(pid, 0)` probes call the shared `is_pid_alive`; a test pins the `EPERM` answer | #13862 |
-| Finish removing file-size ratchet comments | `git grep -i 'file-size ratchet'` returns no stale citation of the gate #12099 deleted (181 matching lines remain after #13842) | #13827 |
+| Finish removing file-size ratchet comments | `git grep -i 'file-size ratchet'` returns no stale citation of the gate #12099 deleted (166 matching lines at `96f505398` after #13842) | #13827 |
 | Success-path run for orchestrator branch isolation | `test-pr-worktree-isolation.sh` runs a real success path and asserts the branch | #13854 (unlabelled) |
 | Champion Step 0.5 reads children from a markdown table | a tracking epic whose children are table rows stands down; fixture test added | #13874 (unlabelled) |
-| `loom-tools resolve-model` | `loom-tools resolve-model` matches `loom-daemon resolve-model` on output and exit codes 0, 2 and 3, with no daemon installed | none (seed 1); part of #12708 Phase 3 |
-| Bring `docs/README.md` up to date | its tables list every directory and top-level file under `docs/`, and the ADR range matches `docs/adr/` | none (seed 2) |
+| `loom-tools resolve-model` | `loom-tools resolve-model` matches `loom-daemon resolve-model` on output and exit codes 0, 2 and 3, with no daemon installed | #13878 (seed 1); part of #12708 Phase 3 |
+| Bring `docs/README.md` up to date | its tables list every directory and top-level file under `docs/`, and the ADR range matches `docs/adr/` | #13879 (seed 2) |
 
 ## Next
 
