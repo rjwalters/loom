@@ -1123,6 +1123,19 @@ in — and write there:
 # and BEFORE any of Steps 2-5. Idempotent: one stable slot, reused every tick.
 DOCS_WT="$(./.loom/scripts/docs-worktree.sh | tail -1)"
 echo "$DOCS_WT"   # e.g. <repo>/.loom/worktrees/docs-guide
+
+# #13923: derive the repo ONCE, from the docs worktree itself (never the cwd's
+# remote), and pin EVERY forge query in Steps 2-5 to it by exporting `GH_REPO`
+# (which `gh issue|pr list` honours — one mechanism, no per-call flag to forget;
+# `repo:` in search queries uses `$GUIDE_REPO` directly). On a shared host the cwd can belong to a
+# sibling repo; an unpinned `gh ... list` then renders that repo's state into
+# this repo's WORK_PLAN.md (2AMLogic/gf180-comparator#411).
+GUIDE_REPO="$(git -C "$DOCS_WT" remote get-url origin 2>/dev/null \
+  | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')"
+[ -n "$GUIDE_REPO" ] || { echo "docs maintenance: cannot derive repo from $DOCS_WT — skipping (fail closed)" >&2; return 1 2>/dev/null || exit 1; }
+# GH_CACHE_REPO_ID scopes the `$GH_READ` cache to the pinned repo, so pinned
+# reads never share cache entries with the cwd repo's unpinned ones (#5224).
+export GH_REPO="$GUIDE_REPO" GH_CACHE_REPO_ID="$GUIDE_REPO"
 ```
 
 `docs-worktree.sh` creates (or resets) `<worktree-root>/docs-guide` on a fresh
@@ -1486,9 +1499,9 @@ _work_log_search_total_count() {
   # only a different predicate string.
   local search_range="$1"
   local predicate="${2:-is:issue is:closed}"
-  local repo_nwo
-  repo_nwo=$(git remote get-url origin 2>/dev/null \
-    | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')
+  # #13923: the repo is the one derived from the docs worktree (`GUIDE_REPO`),
+  # never the cwd's remote — see the pin note in Step 1.
+  local repo_nwo="${GUIDE_REPO:-}"
   if [ -z "$repo_nwo" ]; then
     echo "-1"
     return
@@ -2202,12 +2215,67 @@ update_work_plan() {
     return 1
   fi
 
+  # #13923 PROVENANCE GATE, DO NOT REMOVE: the header claims this file is
+  # "generated from the repository's current GitHub label state"; discharge it.
+  # Refuse (non-zero, NO file change) unless every rendered `#N` carries the
+  # title the pinned repo gives it. Checks the OUTPUT, so it bites whatever the
+  # cause (guard denial, wrong cwd, stale scratch, unfaithful execution).
+  if ! verify_plan_provenance "$new_body"; then
+    echo "WORK_PLAN.md NOT written: provenance check failed (fail closed)." >&2
+    return 1
+  fi
+
   # Replace ONLY the text between the markers in "$DOCS_WT/WORK_PLAN.md" with
   # $new_body (keep both marker lines, and everything outside them, untouched).
   # Both sides above are `$(...)`-captured, so trailing newlines are stripped on
   # both — only the internal structure has to match.
+  #
+  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body "$new_body"`, which
+  # uses a per-tick `mktemp -d` dir. NEVER stage the body or the spliced file at
+  # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
+  # repos' ticks share /tmp, and a tick whose own write was denied then consumes
+  # another repo's stale file. Never read a scratch file this tick did not write.
+  splice_plan_body "$new_body" || return 1
 
   return 0
+}
+
+# #13923: every `- **#N**: title` bullet in $1 must match the title the pinned
+# repo reports for #N (issues and PRs share the `issues/N` endpoint). Existence
+# is NOT enough — a foreign render's numbers can all exist, closed, under
+# unrelated titles. Zero bullets passes; a failed lookup fails closed.
+verify_plan_provenance() {
+  local body="$1" line num want got bad=0
+  while IFS= read -r line; do
+    num="${line#- **#}"; num="${num%%\**}"
+    want="${line#*\*\*: }"
+    want="${want% \*(curated)\*}"; want="${want% \*(architect)\*}"; want="${want% \*(hermit)\*}"
+    got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '.title' 2>/dev/null)" || got=""
+    if [ -z "$got" ]; then
+      echo "provenance: cannot fetch title of #$num from $GUIDE_REPO" >&2; bad=1
+    elif [ "$got" != "$want" ]; then
+      echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$want', forge '$got')" >&2; bad=1
+    fi
+  done < <(printf '%s\n' "$body" | grep -E '^- \*\*#[0-9]+\*\*: ')
+  return "$bad"
+}
+
+# #13923: write $1 between the plan-body markers of "$DOCS_WT/WORK_PLAN.md"
+# through a per-tick scratch dir that is removed on exit. Fails (file untouched)
+# if the markers are missing.
+splice_plan_body() {
+  local plan="$DOCS_WT/WORK_PLAN.md" scratch
+  grep -q '<!-- guide:plan-body:start -->' "$plan" 2>/dev/null \
+    && grep -q '<!-- guide:plan-body:end -->' "$plan" 2>/dev/null || return 1
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/guide-plan.XXXXXX")" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$scratch'" RETURN
+  printf '%s\n' "$1" > "$scratch/body.md" || return 1
+  awk -v body="$scratch/body.md" '
+    /<!-- guide:plan-body:start -->/ { print; while ((getline l < body) > 0) print l; skip=1; next }
+    /<!-- guide:plan-body:end -->/   { skip=0 }
+    !skip { print }' "$plan" > "$scratch/plan.new" || return 1
+  cat "$scratch/plan.new" > "$plan"
 }
 ```
 
