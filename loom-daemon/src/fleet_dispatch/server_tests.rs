@@ -942,3 +942,44 @@ async fn next_over_http_rejects_a_body_naming_another_host() {
     let (status, _) = post(addr, "/v1/next", &json!({"host_id": A})).await;
     assert_eq!(status, 400);
 }
+
+/// Claim `item` for `host` at `clock`, release it with `outcome`; the answer.
+fn claim_release(
+    s: &Server<StaticIdentity>,
+    clock: &ManualClock,
+    at: u64,
+    host: &str,
+    outcome: &str,
+) -> Value {
+    clock.set(at);
+    let hb = hb_body(host, json!([]), 4);
+    s.handle(host, "/v1/heartbeat", hb.to_string().as_bytes());
+    let (reply, _) =
+        s.handle(host, "/v1/claim", claim_body(host, 11, "builder").to_string().as_bytes());
+    let id = serde_json::from_str::<Value>(&reply.body).unwrap()["assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rel = json!({"host_id": host, "assignment_id": id, "outcome": outcome});
+    let (reply, _) = s.handle(host, "/v1/release", rel.to_string().as_bytes());
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+#[tokio::test]
+async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
+    // The #11930 sequence: one item fast-failing across hosts, each draw past
+    // the previous no-progress hold.
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    let first = claim_release(&s, &clock, 100, A, "fast_fail");
+    assert!(first.get("park").is_none(), "no order on the first: {first}");
+    let second = claim_release(&s, &clock, 2_000, B, "fast_fail");
+    assert!(second.get("park").is_none());
+    let third = claim_release(&s, &clock, 9_300, A, "fast_fail");
+    assert_eq!(third["park"], json!(true));
+    assert_eq!(third["known"], json!(true));
+    // Refused afterwards, whoever asks.
+    clock.set(9_400);
+    let (reply, _) = s.handle(B, "/v1/claim", claim_body(B, 11, "builder").to_string().as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("held"));
+}

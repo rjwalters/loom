@@ -403,6 +403,31 @@ accepted.
    stale statements. This is the successor of the deletions #11717 attempted,
    replayed on a fresh branch; #11717 itself stays blocked.
 
+## Amendment: fast-fail lane cut over to the captain (#13919, 2026-11-16)
+
+The fleet fast-fail streak lane (#11854, #11930, #11952) is **cut over**. The
+peer channel that carried its tally has been silent since about 2026-11-14, so
+there was no shadow phase to compare: the incident sequences are replayed in
+`fleet_dispatch/table_tests.rs` and `server_tests.rs` instead.
+
+- A Builder step that fails inside the fast-fail window with a non-environmental
+  reason releases with the outcome `fast_fail` (still a non-progress outcome, so
+  it climbs the no-progress ladder like any other).
+- The captain counts consecutive `fast_fail` releases per `(repo, item)` across
+  hosts. A progressing release, or any other non-progress outcome, resets the
+  count; `ci_wait` and `host_lost` leave it alone. The streak and a park order
+  age out after 24 h.
+- The release that makes the third answers `park: true`, to that worker only,
+  once. The worker makes the park (a forge write, section 8) on its next reaper
+  tick through the existing quarantine path. Claims for the item are refused
+  `held` until the park takes effect or the order ages out.
+- **Restart persistence: accepted gap, no snapshot.** The no-progress holds are
+  already soft, each host's local streak stays as the floor (section 4), and a
+  captain restart costs at most a few extra fast failures before the tally
+  rebuilds. Neither the holds nor the tally are written to disk.
+- No-op streak lane: still on the peer channel; the no-progress hold (#12541)
+  covers the fleet-wide delay but not its park. Unchanged here.
+
 ## Relationship to ADR-0025
 
 ADR-0025 decision 2 keeps the #7477 *no-op cooldown window* per host and

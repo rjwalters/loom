@@ -352,6 +352,13 @@ pub struct AckResponse {
     /// restart lost it, or for another host's id; never an error.
     #[serde(default)]
     pub known: bool,
+    /// Set on a `release` answer only (#13919): this release was the item's
+    /// third consecutive attributable fast failure across the fleet, so the
+    /// releasing worker makes the park (forge write, ADR-0027 §8). Sent to
+    /// exactly one worker per streak; absent otherwise, and ignored by an
+    /// older worker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub park: bool,
 }
 
 /// The body of every non-200 response.

@@ -170,6 +170,21 @@ pub const CI_WAIT_OUTCOME: &str = "ci_wait";
 /// either: the row ends and nothing is held, so the next draw may take it.
 pub const HOST_LOST_OUTCOME: &str = "host_lost";
 
+/// The `release` outcome of a Builder step that failed fast for a reason that
+/// is the item's own (#13919): inside the fast-fail window, not an
+/// environmental class. A non-progress outcome like any other (it climbs the
+/// no-progress ladder), and in addition counted per `(repo, item)` across hosts
+/// toward the fast-fail park ([`FAST_FAIL_PARK_THRESHOLD`]).
+pub const FAST_FAIL_OUTCOME: &str = "fast_fail";
+
+/// Consecutive attributable fast-failure releases of one item, across hosts,
+/// at which the captain orders the park (the #11854 threshold).
+pub const FAST_FAIL_PARK_THRESHOLD: u32 = 3;
+
+/// How long a fast-fail streak, and a park order, stand without a new
+/// attributable release (`MAX_PEER_FAST_FAIL_STREAK_AGE`, 24 h).
+pub const FAST_FAIL_STREAK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
 /// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
 /// the item every ~90 s while CI runs, short enough that its next step is
 /// drawn within minutes of CI finishing.
@@ -440,6 +455,28 @@ pub struct Cooldown {
     pub set_by_assignment_id: String,
 }
 
+/// One item's fleet-wide fast-fail streak (#13919).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FastFailTally {
+    /// Consecutive attributable fast-failure releases, across hosts.
+    count: u32,
+    /// When the latest one arrived.
+    last: Mono,
+    /// The park was ordered (to the releasing worker of the threshold
+    /// release); no second order is made while this stands.
+    ordered: bool,
+}
+
+/// What a `release` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Released {
+    /// The row was this host's and is now gone.
+    pub known: bool,
+    /// This release crossed the fast-fail threshold: the releasing worker is
+    /// to park the item. Set on exactly one release per streak.
+    pub park: bool,
+}
+
 /// The assignment table. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -452,6 +489,8 @@ pub struct Table {
     by_id: BTreeMap<String, (String, u64)>,
     hosts: BTreeMap<String, HostState>,
     cooldowns: BTreeMap<(String, u64, String), Cooldown>,
+    /// Fleet-wide fast-fail streaks by `(repo, item)` (#13919).
+    fast_fails: BTreeMap<(String, u64), FastFailTally>,
     lineage: BTreeMap<(String, u64, String), LineageRecord>,
     /// Assignment ids that ended here (released, refused or expired), with
     /// when. A heartbeat built before the end can still list the step; it
@@ -482,6 +521,7 @@ impl Table {
             by_id: BTreeMap::new(),
             hosts: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
+            fast_fails: BTreeMap::new(),
             lineage: BTreeMap::new(),
             ended_ids: BTreeMap::new(),
             expired_rows: Vec::new(),
@@ -638,6 +678,8 @@ impl Table {
         // ladder's last rung (module docs), which also bounds the map.
         let forget = self.policy.no_progress[self.policy.no_progress.len() - 1];
         self.cooldowns.retain(|_, c| c.until.plus(forget) > now);
+        self.fast_fails
+            .retain(|_, t| t.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now);
         expired
     }
 
@@ -837,6 +879,17 @@ impl Table {
             }
             replaces_own = true;
         }
+        // A park was ordered for this item (#13919): no host draws it until the
+        // park takes effect on the forge (which makes it ineligible) or the
+        // order ages out.
+        if let Some(t) = self
+            .fast_fails
+            .get(&(repo.to_string(), item))
+            .filter(|t| t.ordered && t.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now)
+        {
+            let retry = now.secs_until(t.last.plus(FAST_FAIL_STREAK_MAX_AGE), 1);
+            return refused(RefusalReason::Held, None, retry);
+        }
         // The fleet-wide no-progress hold (#12541): whoever asks.
         if let Some(c) = self.cooldown(now, repo, item, step) {
             let retry = now.secs_until(c.until, 1);
@@ -958,12 +1011,77 @@ impl Table {
         assignment_id: &str,
         outcome: &str,
     ) -> bool {
+        self.release_ordered(now, host, assignment_id, outcome)
+            .known
+    }
+
+    /// [`Self::release_outcome`], also saying whether this release makes the
+    /// releasing worker park the item (#13919). An attributable fast-failure
+    /// release ([`FAST_FAIL_OUTCOME`]) adds to the item's fleet-wide streak,
+    /// whichever host sent it; the [`FAST_FAIL_PARK_THRESHOLD`]-th orders the
+    /// park, once. A progressing release, or any other non-progress outcome
+    /// (not `ci_wait` or `host_lost`, which are neither), ends the streak.
+    pub fn release_ordered(
+        &mut self,
+        now: Mono,
+        host: &str,
+        assignment_id: &str,
+        outcome: &str,
+    ) -> Released {
+        let none = Released {
+            known: false,
+            park: false,
+        };
         let Some(key) = self.own_key(host, assignment_id) else {
-            return false;
+            return none;
         };
         let Some(row) = self.remove(&key) else {
-            return false;
+            return none;
         };
+        let park = self.note_fast_fail(&key, now, outcome);
+        Released {
+            known: self.finish_release(now, key, row, assignment_id, outcome),
+            park,
+        }
+    }
+
+    /// Fold `outcome` into `key`'s fast-fail streak; whether it orders the park.
+    fn note_fast_fail(&mut self, key: &(String, u64), now: Mono, outcome: &str) -> bool {
+        let outcome = outcome.trim();
+        if outcome == HOST_LOST_OUTCOME || outcome == CI_WAIT_OUTCOME {
+            return false;
+        }
+        if outcome != FAST_FAIL_OUTCOME {
+            self.fast_fails.remove(key);
+            return false;
+        }
+        let prior = self
+            .fast_fails
+            .get(key)
+            .copied()
+            .filter(|t| t.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now);
+        let count = prior.map_or(0, |t| t.count).saturating_add(1);
+        let was_ordered = prior.is_some_and(|t| t.ordered);
+        let park = !was_ordered && count >= FAST_FAIL_PARK_THRESHOLD;
+        self.fast_fails.insert(
+            key.clone(),
+            FastFailTally {
+                count,
+                last: now,
+                ordered: was_ordered || park,
+            },
+        );
+        park
+    }
+
+    fn finish_release(
+        &mut self,
+        now: Mono,
+        key: (String, u64),
+        row: Row,
+        assignment_id: &str,
+        outcome: &str,
+    ) -> bool {
         let host_lost = outcome.trim() == HOST_LOST_OUTCOME;
         let end = if host_lost {
             PrevEnd::HostLost

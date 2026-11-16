@@ -122,6 +122,30 @@ fn release_token(class: &'static str, reason: &str) -> &'static str {
     }
 }
 
+/// The captain release outcome of a step: `failed` becomes
+/// [`crate::fleet_dispatch::table::FAST_FAIL_OUTCOME`] for a Builder step that
+/// ran under the fast-fail window with a reason that is not environmental
+/// (#13919). Anything else passes through. Pure.
+pub(crate) fn fast_fail_release_class(
+    role: StepRole,
+    class: &'static str,
+    reason: Option<&str>,
+    ran_for: std::time::Duration,
+) -> &'static str {
+    let window = std::time::Duration::from_secs(
+        u64::try_from(crate::sweep_registry::FAST_FAIL_WINDOW_SECS).unwrap_or(120),
+    );
+    if role == StepRole::Builder
+        && class == "failed"
+        && ran_for < window
+        && !reason.is_some_and(crate::telemetry::disposition::is_environmental_failure_class)
+    {
+        crate::fleet_dispatch::table::FAST_FAIL_OUTCOME
+    } else {
+        class
+    }
+}
+
 /// The captain release outcome of a step that wrote an outcome line.
 pub(crate) fn release_class_of_line(line: &StepOutcomeLine) -> &'static str {
     release_token(line.class.as_str(), &line.reason)
@@ -332,6 +356,17 @@ impl SweepRegistry {
         let release_class = line.as_ref().map_or_else(
             || release_class_fallback(&log_path, sweep_id, role, item),
             release_class_of_line,
+        );
+        // #13919: an issue-attributable fast failure of a Builder step is told
+        // to the captain apart from a plain `failed`, so it counts the fleet-wide
+        // streak. Same window and carve-outs as the ladder's (`effect_of`,
+        // `is_environmental_failure_class`); a progressing release never is.
+        let ran_for = (Utc::now() - started_at).to_std().unwrap_or_default();
+        let release_class = fast_fail_release_class(
+            role,
+            release_class,
+            line.as_ref().map(|l| l.reason.as_str()),
+            ran_for,
         );
         crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {

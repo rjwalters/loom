@@ -183,6 +183,24 @@ impl SweepRegistry {
         if !fast_fail_parks(consecutive, threshold, class) {
             return false;
         }
+        self.park_fast_failure_now(issue, consecutive, class)
+    }
+
+    /// Park `issue` for the fast-failure streak the captain counted (Issue
+    /// #13919): the captain ordered this host's worker to, on the release that
+    /// made the third attributable fast failure across the fleet. Same park as
+    /// [`Self::park_fast_failure`], without its local streak check.
+    pub(crate) fn park_ordered_fast_failure(&mut self, issue: u32) -> bool {
+        if !self.dispatch_backoff_config.enabled || !self.quarantine_config.enabled {
+            return false;
+        }
+        let count = crate::fleet_dispatch::table::FAST_FAIL_PARK_THRESHOLD;
+        self.park_fast_failure_now(issue, count, UNCLASSIFIED_CLASS)
+    }
+
+    /// The tail both parks share: skip an issue already parked, else enter the
+    /// quarantine and write the forge park.
+    fn park_fast_failure_now(&mut self, issue: u32, consecutive: u32, class: &str) -> bool {
         if self.is_quarantined(issue)
             || self.prless_retry_held(issue)
             || self.noop_hold_applied(issue)

@@ -997,6 +997,10 @@ impl SweepRegistry {
         // early-return when nothing is quarantined.
         // #11930: first adopt any park the startup reconciliation kept.
         self.adopt_restored_parks();
+        // #13919: parks the captain ordered on this host's releases.
+        for issue in crate::fleet_dispatch::worker::take_park_orders(&self.config.workspace_root) {
+            self.park_ordered_fast_failure(issue);
+        }
         self.expire_quarantine();
         // Retry any previously-failed quarantine label restores (Issue #4110)
         // and release no-op holds whose inputs changed (Issue #10156). Cheap

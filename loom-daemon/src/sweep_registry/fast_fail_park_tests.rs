@@ -399,3 +399,30 @@ fn a_failure_is_never_unclassified_by_omission() {
     assert_eq!(ensure_failure_class(SweepResult::Success, None), None);
     assert_eq!(ensure_failure_class(SweepResult::Cancelled, None), None);
 }
+
+/// #13919: the captain's order parks without any local streak, and once.
+#[test]
+fn a_captain_ordered_park_parks_with_no_local_streak_and_only_once() {
+    let dir = tempdir().unwrap();
+    let mut reg = registry(dir.path());
+    assert!(!reg.is_quarantined(91));
+    assert!(reg.park_ordered_fast_failure(91));
+    assert!(reg.is_quarantined(91));
+    assert!(!reg.park_ordered_fast_failure(91), "already parked: no second park");
+}
+
+/// #13919: only an in-window, non-environmental Builder failure is told to
+/// the captain as `fast_fail`.
+#[test]
+fn the_release_class_marks_only_an_attributable_fast_builder_failure() {
+    use super::step_spawn::capture::fast_fail_release_class as f;
+    use crate::step_role::StepRole;
+    use std::time::Duration;
+    let fast = Duration::from_secs(60);
+    assert_eq!(f(StepRole::Builder, "failed", Some("exit_1"), fast), "fast_fail");
+    assert_eq!(f(StepRole::Builder, "failed", None, fast), "fast_fail");
+    assert_eq!(f(StepRole::Builder, "failed", Some("preflight-x"), fast), "failed");
+    assert_eq!(f(StepRole::Builder, "failed", None, Duration::from_secs(300)), "failed");
+    assert_eq!(f(StepRole::Builder, "verdict", None, fast), "verdict");
+    assert_eq!(f(StepRole::Judge, "failed", None, fast), "failed");
+}

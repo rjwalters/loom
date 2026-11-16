@@ -551,6 +551,7 @@ impl<I: Identity> Server<I> {
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),
             known: outcome != RefuseOutcome::Unknown,
+            park: false,
         }))
     }
 
@@ -558,21 +559,22 @@ impl<I: Identity> Server<I> {
         let req: ReleaseRequest = self.parse(host, body)?;
         call.assignment_id = Some(req.assignment_id.clone());
         call.reason = Some(req.outcome.clone());
-        let known = self.with_table(|t, now, _| {
+        let released = self.with_table(|t, now, _| {
             if let Some(((repo, item), row)) = t.row_by_id(&req.assignment_id) {
                 call.item = Some((repo.clone(), *item, row.step.clone()));
             }
-            let known = t.release_outcome(now, host, &req.assignment_id, &req.outcome);
+            let released = t.release_ordered(now, host, &req.assignment_id, &req.outcome);
             if let Some((repo, _, step)) = &call.item {
                 if step_is_merge(step) {
                     call.merge_slot_holder = Some(slot_holder(t, repo));
                 }
             }
-            known
+            released
         });
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),
-            known,
+            known: released.known,
+            park: released.park,
         }))
     }
 

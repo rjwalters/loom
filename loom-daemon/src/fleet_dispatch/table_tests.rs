@@ -1025,3 +1025,114 @@ fn ended_ids_are_forgotten_after_their_age_and_bounded() {
     }
     assert!(t.ended_ids.len() <= LINEAGE_MAX);
 }
+
+// ---- #13919: the fleet-wide fast-fail streak and its park order ----
+
+/// Claim `item` as `step` on `host` at `now` (past any hold), release it with
+/// `outcome`; the release's answer.
+fn run_release(t: &mut Table, now: u64, host: &str, item: u64, outcome: &str) -> Released {
+    t.heartbeat(at(now), host, &hb(host, vec![], 8));
+    let id = granted_id(&t.claim(at(now), host, "acme/w", item, "builder"));
+    t.release_ordered(at(now), host, &id, outcome)
+}
+
+#[test]
+fn an_item_fast_failing_on_three_hosts_is_ordered_parked_once_by_the_third() {
+    let mut t = three_hosts(at(100));
+    // #11930: three hosts, each one fast failure, each past the previous hold.
+    assert!(!run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME).park);
+    assert!(!run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME).park);
+    let third = run_release(&mut t, 9_300, C, 5, FAST_FAIL_OUTCOME);
+    assert_eq!(
+        third,
+        Released {
+            known: true,
+            park: true
+        }
+    );
+    // Further claims are refused until the park takes effect or ages out.
+    t.heartbeat(at(40_000), A, &hb(A, vec![], 8));
+    let d = t.claim(at(40_000), A, "acme/w", 5, "builder");
+    assert_eq!(refusal(&d).0, RefusalReason::Held);
+    let d = t.claim(at(40_000), A, "acme/w", 5, "judge");
+    assert_eq!(refusal(&d).0, RefusalReason::Held, "any step of the item");
+    // Another item is untouched.
+    granted_id(&t.claim(at(40_000), A, "acme/w", 6, "builder"));
+}
+
+#[test]
+fn a_duplicate_or_retried_release_orders_no_second_park() {
+    let mut t = three_hosts(at(100));
+    run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
+    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
+    t.heartbeat(at(9_300), C, &hb(C, vec![], 8));
+    let id = granted_id(&t.claim(at(9_300), C, "acme/w", 5, "builder"));
+    assert!(t.release_ordered(at(9_300), C, &id, FAST_FAIL_OUTCOME).park);
+    // The retry finds no row: unknown, no order.
+    assert_eq!(
+        t.release_ordered(at(9_301), C, &id, FAST_FAIL_OUTCOME),
+        Released {
+            known: false,
+            park: false
+        }
+    );
+}
+
+#[test]
+fn a_progressing_or_other_release_resets_the_streak() {
+    let mut t = three_hosts(at(100));
+    run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
+    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
+    // A progressing release (also clears the holds) restarts the count.
+    assert!(!run_release(&mut t, 9_300, C, 5, "verdict").park);
+    assert!(!run_release(&mut t, 9_400, A, 5, FAST_FAIL_OUTCOME).park);
+    // A plain (non-attributable) failure restarts it too.
+    assert!(!run_release(&mut t, 20_000, B, 5, "failed").park);
+    assert!(!run_release(&mut t, 90_000, C, 5, FAST_FAIL_OUTCOME).park);
+    assert!(!run_release(&mut t, 180_000, A, 5, FAST_FAIL_OUTCOME).park);
+}
+
+#[test]
+fn ci_wait_and_host_lost_leave_the_streak_alone() {
+    let mut t = three_hosts(at(100));
+    run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
+    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
+    assert!(!run_release(&mut t, 9_300, C, 5, HOST_LOST_OUTCOME).park);
+    assert!(run_release(&mut t, 9_400, A, 5, FAST_FAIL_OUTCOME).park);
+}
+
+#[test]
+fn a_streak_ages_out_and_so_does_the_order() {
+    let mut t = three_hosts(at(100));
+    run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
+    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
+    // Past the 24 h age bound the old two do not count.
+    let late = 2_000 + FAST_FAIL_STREAK_MAX_AGE.as_secs() + 1;
+    assert!(!run_release(&mut t, late, C, 5, FAST_FAIL_OUTCOME).park);
+    // An order stands only for the same age.
+    let mut t = three_hosts(at(100));
+    run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
+    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
+    assert!(run_release(&mut t, 9_300, C, 5, FAST_FAIL_OUTCOME).park);
+    let after = 9_300 + FAST_FAIL_STREAK_MAX_AGE.as_secs() + 1;
+    t.heartbeat(at(after), A, &hb(A, vec![], 8));
+    granted_id(&t.claim(at(after), A, "acme/w", 5, "builder"));
+}
+
+#[test]
+fn a_captain_restart_forgets_the_streak() {
+    // The accepted gap (ADR-0027): a fresh table counts from zero.
+    let mut t = three_hosts(at(100));
+    run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
+    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
+    let mut fresh = three_hosts(at(100));
+    assert!(!run_release(&mut fresh, 9_300, C, 5, FAST_FAIL_OUTCOME).park);
+}
+
+#[test]
+fn the_incident_12024_noop_sequence_climbs_the_ladder_and_never_orders_a_park() {
+    let mut t = three_hosts(at(100));
+    for (now, host) in [(100, A), (2_000, B), (9_300, C), (40_000, A)] {
+        assert!(!run_release(&mut t, now, host, 8, "noop").park);
+    }
+}
