@@ -503,6 +503,7 @@ async fn forward(
     // `response.headers()` borrows and both the error and success paths below
     // need it.
     let usage_headers = capture_usage_headers(response.headers());
+    let clock_headers = capture_clock_headers(response.headers());
     let mut header_lines = String::new();
     for (name, value) in response.headers() {
         let name = name.as_str();
@@ -530,7 +531,8 @@ async fn forward(
         };
         // #11286: the provider's own reset hint — the body plus any
         // `retry-after`/rate-limit-reset header — feeds the mark's horizon.
-        let reset_text = reset_evidence(&String::from_utf8_lossy(&error_body), &usage_headers);
+        let reset_text =
+            reset_evidence(&String::from_utf8_lossy(&error_body), &usage_headers, &clock_headers);
         record.record_usage(request_bytes, error_body.len() as u64, usage_headers);
         let classification =
             classify_response(status.as_u16(), &String::from_utf8_lossy(&error_body));
@@ -669,6 +671,19 @@ fn capture_usage_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, S
         .collect()
 }
 
+/// The response headers [`crate::api_keys_pool::reset`] reads a provider's
+/// wall-clock offset from (`date`, `x-log-id`). Kept apart from the usage
+/// headers: these are not usage and are not exported.
+fn capture_clock_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    crate::api_keys_pool::reset::CLOCK_HEADERS
+        .iter()
+        .filter_map(|name| {
+            let value = headers.get(*name)?.to_str().ok()?;
+            Some(((*name).to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 /// What an error response says about the account's quota, if anything.
 ///
 /// Reuses [`classify::classify`] — the SAME table
@@ -692,9 +707,18 @@ fn classify_response(status: u16, body: &str) -> Option<Classification> {
 /// error body, then one `<header>: <value>` line per captured usage header —
 /// so a `retry-after: 3600` is read by [`crate::api_keys_pool::reset`]'s
 /// prose rule exactly as it would be in a log.
-fn reset_evidence(body: &str, usage_headers: &[(String, String)]) -> String {
+///
+/// `clock_headers` follow in the same form. They name no reset themselves:
+/// they are the response's own evidence of the provider's wall clock, which
+/// is what a timezone-less reset stamp in the body is read in (#12395). They
+/// are used for this and never recorded.
+fn reset_evidence(
+    body: &str,
+    usage_headers: &[(String, String)],
+    clock_headers: &[(String, String)],
+) -> String {
     let mut text = body.to_string();
-    for (name, value) in usage_headers {
+    for (name, value) in usage_headers.iter().chain(clock_headers) {
         text.push('\n');
         text.push_str(&format!("{name}: {value}"));
     }
@@ -809,4 +833,35 @@ async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io:
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     stream.shutdown().await
+}
+
+#[cfg(test)]
+mod reset_evidence_tests {
+    use super::*;
+    use crate::api_keys_pool::reset::{resolve_cooldown, CooldownSource};
+
+    /// #12395: the proxy sees a Z.ai 5-hour refusal as a bare body plus the
+    /// response headers. The body and header values are the live capture's
+    /// (2026-11-16T11:07:07Z, log id suffix redacted). The mark must run to
+    /// the stated reset in the provider's clock, 2 min 51 s away, not 8 h.
+    #[test]
+    fn a_zai_limit_body_is_held_to_its_reset_in_the_providers_clock() {
+        let body = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-16 19:09:58"}}"#;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("date", "Mon, 16 Nov 2026 11:07:07 GMT".parse().unwrap());
+        headers.insert("x-log-id", "20261116190707REDACTED".parse().unwrap());
+        headers.insert("set-cookie", "REDACTED".parse().unwrap());
+        let clock = capture_clock_headers(&headers);
+        assert_eq!(clock.len(), 2, "only the two clock headers: {clock:?}");
+        assert!(capture_usage_headers(&headers).is_empty());
+
+        let classification = classify_response(429, body).unwrap();
+        assert_eq!(classification, Classification::Exhausted);
+        let seen = 1_794_827_227;
+        let text = reset_evidence(body, &[], &clock);
+        assert_eq!(
+            resolve_cooldown(classification, &text, seen, None),
+            Some((171, CooldownSource::ProviderReset))
+        );
+    }
 }

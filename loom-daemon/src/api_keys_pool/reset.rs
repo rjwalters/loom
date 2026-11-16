@@ -159,26 +159,65 @@ pub fn configured_window(root: &std::path::Path, provider: &str, account: &str) 
 /// window.
 #[must_use]
 pub fn parse_reset_at(text: &str, now: u64) -> Option<u64> {
+    // Offset evidence the text carries outside any one event: the egress proxy
+    // hands over a bare error body followed by `date:` / `x-log-id:` header
+    // lines. An event that proves its own offset uses that instead.
+    let text_offset = text_wall_clock_offset_secs(text).unwrap_or(0);
     text.lines()
         .rev()
-        .find_map(|line| line_reset_at(line, now).filter(|at| plausible(*at, now)))
+        .find_map(|line| line_reset_at(line, now, text_offset).filter(|at| plausible(*at, now)))
 }
 
 fn plausible(at: u64, now: u64) -> bool {
     at > now && at - now <= MAX_RESET_HORIZON_SECS
 }
 
-fn line_reset_at(line: &str, now: u64) -> Option<u64> {
+fn line_reset_at(line: &str, now: u64, text_offset: i64) -> Option<u64> {
     let trimmed = line.trim();
+    let mut offset = text_offset;
     if trimmed.starts_with('{') {
         if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            let offset = wall_clock_offset_secs(&value).unwrap_or(0);
+            offset = wall_clock_offset_secs(&value).unwrap_or(text_offset);
             if let Some(at) = json_reset_at(&value, now, offset) {
                 return Some(at);
             }
         }
     }
-    prose_reset_at(line, now, 0)
+    // The same offset as the structured read: a stamp the event's own clock
+    // puts in the past must not come back as a future instant read as UTC.
+    prose_reset_at(line, now, offset)
+}
+
+/// Header name of the response time in GMT, and of the provider's log id.
+pub const CLOCK_HEADERS: [&str; 2] = ["date", "x-log-id"];
+
+/// [`wall_clock_offset_secs`] for evidence written as `<header>: <value>`
+/// lines (the egress proxy's reset text). The last line of each name wins.
+fn text_wall_clock_offset_secs(text: &str) -> Option<i64> {
+    let header = |wanted: &str| {
+        text.lines().rev().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case(wanted)
+                .then(|| value.trim())
+        })
+    };
+    offset_between(header(CLOCK_HEADERS[0])?, header(CLOCK_HEADERS[1])?)
+}
+
+/// The quarter-hour offset between an RFC 2822 `date` (GMT) and a log id that
+/// opens with the same request's `YYYYMMDDHHMMSS` wall-clock stamp, or `None`
+/// when either is unreadable, they disagree by more than two minutes from a
+/// quarter hour, or the offset is outside [`MAX_WALL_CLOCK_OFFSET_SECS`].
+fn offset_between(date: &str, log_id: &str) -> Option<i64> {
+    let utc = DateTime::parse_from_rfc2822(date.trim()).ok()?.timestamp();
+    let local = NaiveDateTime::parse_from_str(log_id.trim().get(..14)?, "%Y%m%d%H%M%S")
+        .ok()?
+        .and_utc()
+        .timestamp();
+    let raw = local - utc;
+    let offset = ((raw + raw.signum() * 450) / 900) * 900;
+    ((raw - offset).abs() <= 120 && offset.abs() <= MAX_WALL_CLOCK_OFFSET_SECS).then_some(offset)
 }
 
 /// Largest wall-clock offset from UTC accepted as evidence, either side.
@@ -198,20 +237,9 @@ fn wall_clock_offset_secs(value: &Value) -> Option<i64> {
                     .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
                     .and_then(|(_, inner)| inner.as_str())
             };
-            let here = header("date")
-                .zip(header("x-log-id"))
-                .and_then(|(date, log_id)| {
-                    let utc = DateTime::parse_from_rfc2822(date.trim()).ok()?.timestamp();
-                    let local = NaiveDateTime::parse_from_str(log_id.get(..14)?, "%Y%m%d%H%M%S")
-                        .ok()?
-                        .and_utc()
-                        .timestamp();
-                    let raw = local - utc;
-                    let quarter_hours = (raw + raw.signum() * 450) / 900;
-                    let offset = quarter_hours * 900;
-                    ((raw - offset).abs() <= 120 && offset.abs() <= MAX_WALL_CLOCK_OFFSET_SECS)
-                        .then_some(offset)
-                });
+            let here = header(CLOCK_HEADERS[0])
+                .zip(header(CLOCK_HEADERS[1]))
+                .and_then(|(date, log_id)| offset_between(date, log_id));
             here.or_else(|| map.values().find_map(wall_clock_offset_secs))
         }
         Value::Array(items) => items.iter().find_map(wall_clock_offset_secs),
@@ -314,6 +342,8 @@ fn parse_instant(raw: &str, naive_offset: i64) -> Option<u64> {
 /// or `01:52:07\"}}` in an escaped body); everything from the first byte no
 /// timestamp uses is dropped.
 fn stamp_prefix(token: &str) -> &str {
+    // An opening quote or parenthesis is not part of the stamp either.
+    let token = token.trim_start_matches(['"', '\'', '(']);
     let end = token
         .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | ':' | 'T' | 'Z' | '+' | '.')))
         .unwrap_or(token.len());

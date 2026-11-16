@@ -205,3 +205,42 @@ fn a_stamp_followed_by_json_punctuation_is_still_read() {
         r#"{"message":"Your limit will reset at 2026-10-10 05:00:00","statusCode":429,"isRetr"#;
     assert_eq!(parse_reset_at(truncated, NOW), Some(NOW + 5 * 3600));
 }
+
+/// #12395, LIVE body: the egress proxy sees only the response body, with the
+/// headers as separate lines. The offset evidence there is the same two
+/// headers, so the hold is the same 2 min 51 s as the log reading, not 8 h.
+#[test]
+fn a_bare_zai_error_body_takes_its_offset_from_header_lines_beside_it() {
+    let body = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-16 19:09:58"}}"#;
+    let with_headers =
+        format!("{body}\ndate: Mon, 16 Nov 2026 11:07:07 GMT\nx-log-id: 20261116190707REDACTED");
+    assert_eq!(
+        parse_reset_at(&with_headers, ZAI_FIVE_HOUR_SEEN),
+        Some(ZAI_FIVE_HOUR_SEEN + 171)
+    );
+    // Without them the conservative UTC reading stands.
+    assert_eq!(
+        parse_reset_at(body, ZAI_FIVE_HOUR_SEEN),
+        Some(ZAI_FIVE_HOUR_SEEN + 171 + 8 * 3600)
+    );
+}
+
+/// A reset the event's own clock puts in the past is no reset at all. It
+/// must not be re-read as UTC and come back eight hours in the future.
+#[test]
+fn a_lapsed_zai_reset_is_not_reread_as_utc() {
+    let after_reset = ZAI_FIVE_HOUR_SEEN + 181;
+    assert_eq!(parse_reset_at(CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT, after_reset), None);
+}
+
+/// SYNTHETIC: a quoted or parenthesised stamp still parses, as it did before
+/// stamp tokens were cut at their first non-stamp byte.
+#[test]
+fn a_quoted_or_parenthesised_stamp_is_still_read() {
+    for line in [
+        r#"limit resets at "2026-10-10 05:00:00""#,
+        "limit resets at (2026-10-10 05:00:00)",
+    ] {
+        assert_eq!(parse_reset_at(line, NOW), Some(NOW + 5 * 3600), "{line}");
+    }
+}
