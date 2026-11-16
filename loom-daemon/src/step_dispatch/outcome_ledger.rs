@@ -153,6 +153,14 @@ pub const UNCLASSIFIED: &str = "unclassified";
 /// The reason of a step whose forge post-state could not be read.
 pub const PROBE_FAILED: &str = "probe_failed";
 
+/// The refusal reason of a step that died because its api-key seat was
+/// exhausted (#13966): the provider refused the launch, the seat is marked
+/// to its reset, and the draw falls through to the next runtime — so the
+/// pair records a **refusal**, not a run: no fast-fail ladder, no repeat-cap
+/// run, no item cooldown. Not an outcome-line token: the daemon synthesizes
+/// it, like the spawn-time `pool_gate` refusals it mirrors.
+pub const PROVIDER_EXHAUSTED: &str = "provider_exhausted";
+
 /// `noop` reasons that waited on something outside the item; they are not
 /// runs for the repeat cap, and they cool down for
 /// [`LedgerConfig::refusal_cooldown`] rather than the no-op hour (#12042):

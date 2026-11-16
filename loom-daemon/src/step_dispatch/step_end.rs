@@ -74,18 +74,31 @@ fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
     outcome_ledger::parse_outcome_line(&text[from..], step.role, step.item)
 }
 
-/// The run the ledger records for `step`, given its post-state read.
+/// The run the ledger records for `step`, given its post-state read. A step
+/// whose provider feedback said its api-key seat was exhausted
+/// (`step.provider_exhausted`, #13966) records a refusal
+/// ([`outcome_ledger::PROVIDER_EXHAUSTED`]) whatever the forge post-state:
+/// the launch died on an empty seat, so the pair arms no cooldown and the
+/// run is not counted for the repeat cap.
 #[must_use]
 pub fn run_of(
     step: &EndedStep,
     line: Option<&outcome_ledger::StepOutcome>,
     post: Option<PostState>,
 ) -> StepRun {
+    let outcome = if step.provider_exhausted {
+        outcome_ledger::StepOutcome::new(
+            outcome_ledger::OutcomeClass::Refused,
+            outcome_ledger::PROVIDER_EXHAUSTED,
+        )
+    } else {
+        outcome_ledger::classify(line, post)
+    };
     StepRun {
         item: step.item,
         step: step.role,
         sweep_id: step.sweep_id.clone(),
-        outcome: outcome_ledger::classify(line, post),
+        outcome,
         ran_for: step.ran_for,
         failure_class: step
             .timed_out
@@ -285,6 +298,41 @@ mod tests {
         assert_eq!(ledger_reason("workspace_commands_missing"), None);
     }
 
+    /// #13966: a step whose provider feedback said its api-key seat was
+    /// exhausted records a refusal, not a run — the fast-fail ladder and the
+    /// repeat cap never see it, and no item cooldown is armed.
+    #[test]
+    fn a_provider_exhausted_step_records_a_refusal_that_charges_nothing() {
+        let step = EndedStep {
+            sweep_id: "step-builder-13966-1".into(),
+            item: 13966,
+            role: StepRole::Builder,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(80),
+            timed_out: false,
+            provider_exhausted: true,
+        };
+        // The post-state of a crashed step (claim restored, item unchanged)
+        // would classify `failed`; the exhaustion override wins.
+        let post = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
+        assert!(post.claim_held, "fixture: a crashed step's shape");
+        let run = run_of(&step, None, Some(post));
+        assert_eq!(run.outcome.class, OutcomeClass::Refused);
+        assert_eq!(run.outcome.reason, outcome_ledger::PROVIDER_EXHAUSTED);
+        // And the refusal charges nothing: not a repeat-cap run, and the
+        // effect re-classifies instead of arming a window.
+        assert!(!outcome_ledger::counts_as_run(&run.outcome));
+        assert!(matches!(
+            outcome_ledger::effect_of(
+                StepRole::Builder,
+                &run.outcome,
+                run.ran_for,
+                &outcome_ledger::LedgerConfig::default(),
+            ),
+            outcome_ledger::Effect::Reclassify
+        ));
+    }
+
     #[test]
     fn a_failed_read_classifies_as_a_failed_probe() {
         let step = EndedStep {
@@ -294,6 +342,7 @@ mod tests {
             log_path: "/nonexistent".into(),
             ran_for: std::time::Duration::from_secs(60),
             timed_out: false,
+            provider_exhausted: false,
         };
         let run = run_of(&step, None, None);
         assert_eq!(run.outcome.class, OutcomeClass::Failed);
