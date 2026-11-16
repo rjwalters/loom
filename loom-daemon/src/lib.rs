@@ -186,6 +186,7 @@ pub mod daemon_start;
 /// (`.loom/docs/file-size-policy.md`).
 pub mod daemon_startup_reconciliation;
 pub mod daemon_update;
+pub mod daily_log;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
