@@ -2348,8 +2348,14 @@ produce. Never let a hold be the reason a conflict goes unreported.
 # PR: a new commit, or a TRUSTED comment (#9548) other than Champion's own.
 # Commits are always real (a bot cannot push code on your behalf).
 # Comments are filtered with the sticky-hold precheck's exclusion test
-# (`champion:|Automated by Champion role`: Champion's markers and footer), so
-# a human/Judge comment counts as activity but Champion's own notices never do.
+# (`champion:|Automated by Champion role|loom:pr-lease`): Champion's markers
+# and footer, plus Loom's own PR-lease bookkeeping (`loom:pr-lease`,
+# `-yield`, `-renewed`, `-released` — machine-written for every `role=`,
+# including judge, #13921). A human/Judge comment counts as activity but
+# Champion's own notices and lease records never do: a Champion step posts
+# (or renews) its lease record BEFORE the criteria run, so without the lease
+# exclusion the recency clock would reset on every tick and this criterion —
+# the only automated route from `loom:pr` to Doctor — could never fire.
 # `createdAt` is the floor, so a PR with no commits and no non-Champion
 # comments still ages from when it was opened rather than reading as
 # eternally fresh. The facts' comments are already the trusted set.
@@ -2359,7 +2365,7 @@ PR_DATA=$(cat "/tmp/loom-champion/$CHAMPION_KEY/facts-pr-<number>.json")
 LAST_ACTIVITY=$(jq -r '
   [
     (.commits[]?.committedDate // empty),
-    (.comments[]? | select((.body | test("champion:|Automated by Champion role")) | not) | .createdAt),
+    (.comments[]? | select((.body | test("champion:|Automated by Champion role|loom:pr-lease")) | not) | .createdAt),
     .createdAt
   ] | max' <<<"$PR_DATA")
 
@@ -4135,9 +4141,11 @@ fi
 # which is exactly what should reopen eligibility for a fresh notice if the
 # PR then goes stale again. This is safe from self-triggering: #6843/#6844
 # already made LAST_ACTIVITY exclude Champion's own comments (matched via
-# `champion:|Automated by Champion role`), and the notice posted below is
-# itself such a comment, so posting it does NOT advance LAST_ACTIVITY and
-# does not fabricate a "new" episode on the very next tick.
+# `champion:|Automated by Champion role`) and Loom's machine-written PR-lease
+# records (`loom:pr-lease`, `-yield`, `-renewed`, `-released`; #13921), and
+# the notice posted below is itself a Champion comment, so posting it does
+# NOT advance LAST_ACTIVITY and does not fabricate a "new" episode on the
+# very next tick.
 STALE_MARKER="<!-- champion:stale-pr-notice:$LAST_ACTIVITY -->"
 
 if [ "$HELD" = true ]; then

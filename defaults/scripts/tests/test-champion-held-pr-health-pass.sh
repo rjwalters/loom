@@ -1252,8 +1252,121 @@ assert_doc_contains "$CHAMPION_MD" \
     "the recency criterion reads the PR facts' commits + comments (+ createdAt floor) instead of updatedAt (#6843, #12242)"
 
 assert_doc_contains "$CHAMPION_MD" \
-    'select((.body | test("champion:|Automated by Champion role")) | not) | .createdAt)' \
-    "the recency criterion's activity computation excludes Champion's own comments, mirroring the sticky-hold precheck's exclusion test (#6843)"
+    'select((.body | test("champion:|Automated by Champion role|loom:pr-lease")) | not) | .createdAt)' \
+    "the recency criterion's activity computation excludes Champion's own comments and Loom's machine-written PR-lease records, mirroring the sticky-hold precheck's exclusion test (#6843, #13921)"
+
+# --- #13921: PR-lease records are not "real activity" ---
+# A Champion step posts (or renews) its `loom:pr-lease ...` record BEFORE the
+# safety criteria run, so if the recency jq counted it, LAST_ACTIVITY would
+# always read "minutes ago" for exactly the PRs Champion is looking at and
+# the stale route — the only automated path from `loom:pr` to Doctor — could
+# never fire. Same for a `role=judge` lease record: it is machine-written
+# bookkeeping, not evidence anyone worked the PR. This is extract-and-execute
+# (#7979 shape): the jq comment-filter line below is lifted verbatim from the
+# shipped markdown and run against a facts JSON shaped like the incident's PR
+# (2AMLogic/gf180-parasynth#798), not mirrored into this file.
+LAST_ACTIVITY_JQ_LINE="$(grep -m1 -F '| .createdAt)' "$CHAMPION_MD" || true)"
+
+assert_contains "$LAST_ACTIVITY_JQ_LINE" \
+    '(.comments[]? | select((.body | test("champion:|Automated by Champion role|loom:pr-lease")) | not) | .createdAt),' \
+    "(pre) the recency jq's comment-filter line is extractable from champion-pr-merge.md — this test RUNS the shipped line (#7979 extract-and-execute shape)"
+
+# Runs the shipped recency jq against a facts JSON, returning LAST_ACTIVITY.
+# Mirrors the shipped program's shape around the extracted line only.
+last_activity_from_facts() {
+    local facts="$1"
+    jq -r "[
+        (.commits[]?.committedDate // empty),
+$LAST_ACTIVITY_JQ_LINE
+        .createdAt
+    ] | max" <<<"$facts"
+}
+
+# The incident shape: genuine Judge approval ~36h before evaluation, then the
+# champion lease record the evaluating step posted right before reading the
+# facts. Pre-#13921 the lease record won; post-#13921 the genuine comment is
+# the newest real activity.
+GF180_FACTS='{
+  "createdAt": "2026-11-13T10:00:00Z",
+  "commits": [
+    {"committedDate": "2026-11-13T11:00:00Z"}
+  ],
+  "comments": [
+    {"createdAt": "2026-11-14T09:08:01Z", "body": "<!-- loom:pr-lease role=judge host=host-x sweep=step-judge-798 -->"},
+    {"createdAt": "2026-11-14T09:14:11Z", "body": "**Judge Review: APPROVED**\n\nAll criteria met.\n\n*Automated by Judge role*"},
+    {"createdAt": "2026-11-15T20:45:08Z", "body": "<!-- loom:pr-lease role=champion host=host-y sweep=step-champion_merge-798-abc step=champion_merge -->"}
+  ]
+}'
+
+LA=$(last_activity_from_facts "$GF180_FACTS")
+assert_eq "$LA" "2026-11-14T09:14:11Z" \
+    "#13921: a newer role=champion PR-lease record does not reset LAST_ACTIVITY — the genuine Judge approval stays the newest real activity (the criterion's own reading of the gf180-parasynth#798 shape)"
+
+HOURS_AGO=$(( ($(date -u -d "2026-11-16T20:49:00Z" +%s) - $(date -u -d "$LA" +%s)) / 3600 ))
+if [ "$HOURS_AGO" -gt 24 ]; then
+    pass "#13921: at the incident's evaluation instant the recency criterion reads FAIL (HOURS_AGO=$HOURS_AGO >= 24), not the pre-fix HOURS_AGO=0"
+else
+    fail "#13921: expected HOURS_AGO > 24 at the incident's evaluation instant, got $HOURS_AGO"
+fi
+
+# A role=judge lease record as the NEWEST comment must be excluded too — it
+# is bookkeeping, not a review (its genuine approval was the earlier comment).
+JUDGE_LEASE_FACTS='{
+  "createdAt": "2026-11-13T10:00:00Z",
+  "commits": [],
+  "comments": [
+    {"createdAt": "2026-11-14T09:14:11Z", "body": "**Judge Review: APPROVED**"},
+    {"createdAt": "2026-11-15T20:45:08Z", "body": "<!-- loom:pr-lease role=judge host=host-x sweep=step-judge-798-recheck -->"}
+  ]
+}'
+LA=$(last_activity_from_facts "$JUDGE_LEASE_FACTS")
+assert_eq "$LA" "2026-11-14T09:14:11Z" \
+    "#13921: a newer role=judge PR-lease record is machine-written bookkeeping, not review activity — excluded like the champion one"
+
+# Renewed and released lease records (the renewer touches the comment every
+# ~10 min while a step runs) are excluded for every role as well.
+RENEWED_RELEASED_FACTS='{
+  "createdAt": "2026-11-13T10:00:00Z",
+  "commits": [],
+  "comments": [
+    {"createdAt": "2026-11-14T09:14:11Z", "body": "**Judge Review: APPROVED**"},
+    {"createdAt": "2026-11-15T20:45:08Z", "body": "<!-- loom:pr-lease-renewed at=2026-11-15T20:55:00Z role=champion host=host-y sweep=step-champion_merge-798-abc -->"},
+    {"createdAt": "2026-11-15T21:02:00Z", "body": "<!-- loom:pr-lease-released role=curator host=host-z sweep=step-curator-798 -->"},
+    {"createdAt": "2026-11-15T21:10:00Z", "body": "<!-- loom:pr-lease-yield role=doctor host=host-w sweep=step-doctor-798 earliest_host=host-y earliest_sweep=step-champion_merge-798-abc -->"}
+  ]
+}'
+LA=$(last_activity_from_facts "$RENEWED_RELEASED_FACTS")
+assert_eq "$LA" "2026-11-14T09:14:11Z" \
+    "#13921: the loom:pr-lease prefix covers -renewed/-released/-yield records for every role — none of them counts as activity"
+
+# Positive control: a genuinely newer trusted comment IS activity — the lease
+# exclusion must not mask real comments (timestamp fresh at test runtime).
+RECENT=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+GENUINE_FACTS="{
+  \"createdAt\": \"2026-11-13T10:00:00Z\",
+  \"commits\": [],
+  \"comments\": [
+    {\"createdAt\": \"2026-11-14T09:14:11Z\", \"body\": \"**Judge Review: APPROVED**\"},
+    {\"createdAt\": \"$RECENT\", \"body\": \"A human answered: rebase onto main and retry.\"},
+    {\"createdAt\": \"2026-11-15T20:45:08Z\", \"body\": \"<!-- loom:pr-lease role=champion host=host-y sweep=step-champion_merge-798-abc -->\"}
+  ]
+}"
+LA=$(last_activity_from_facts "$GENUINE_FACTS")
+assert_eq "$LA" "$RECENT" \
+    "#13921: control — a genuinely newer trusted comment still counts as activity (the lease filter does not over-exclude)"
+
+# Edge: a PR whose ONLY comments are lease records ages from `createdAt`,
+# not from the lease records (the floor, exactly as the criterion states).
+ONLY_LEASES_FACTS='{
+  "createdAt": "2026-11-13T10:00:00Z",
+  "commits": [],
+  "comments": [
+    {"createdAt": "2026-11-15T20:45:08Z", "body": "<!-- loom:pr-lease role=champion host=host-y sweep=step-champion_merge-798-abc -->"}
+  ]
+}'
+LA=$(last_activity_from_facts "$ONLY_LEASES_FACTS")
+assert_eq "$LA" "2026-11-13T10:00:00Z" \
+    "#13921: with no genuine activity the createdAt floor applies — lease records alone never make a PR read fresh"
 
 # --- #6852: hold-only vs hold-plus-feedback stale routing ---
 assert_doc_contains "$CHAMPION_MD" \
