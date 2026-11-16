@@ -525,6 +525,41 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 10 (#13874): explicit `<!-- loom:tracking-epic -->` opt-out marker.
+# Runs the shipped detection snippet (extracted from the stand-down file)
+# against marked / fenced / inline / unmarked / phase-marker fixtures.
+echo ""
+echo "Test 10: explicit tracking-epic marker detection (#13874)"
+if [[ -f "$CHAMPION_EPIC_STANDDOWN" ]]; then
+    SNIPPET="$(awk '/^DECLARED_TRACKING_EPIC=/{p=1} p{print} /^esac$/{if(p) exit}' "$CHAMPION_EPIC_STANDDOWN")"
+    if [[ -z "$SNIPPET" ]]; then
+        fail "could not extract the DECLARED_TRACKING_EPIC detection snippet"
+    else
+        detect() { # $1=body $2=sources $3=strong_open
+            local EPIC_JSON EPIC_CHILD_SOURCES="$2" EPIC_CHILD_STRONG_OPEN="$3" IS_TRACKING_UMBRELLA=""
+            EPIC_JSON="$(jq -n --arg b "$1" '{body:$b}')"
+            eval "$SNIPPET"
+            echo "$IS_TRACKING_UMBRELLA"
+        }
+        NL=$'\n'
+        [[ "$(detect "intro${NL}<!-- loom:tracking-epic -->${NL}table" "prose-reference" 0)" == yes ]] \
+            && pass "marker alone on a line, zero strong children -> umbrella" || fail "marked epic not stood down"
+        [[ "$(detect "x${NL}\`\`\`${NL}<!-- loom:tracking-epic -->${NL}\`\`\`" "" 0)" == no ]] \
+            && pass "marker inside a code fence is ignored" || fail "fenced marker counted"
+        [[ "$(detect "see <!-- loom:tracking-epic --> inline" "" 0)" == no ]] \
+            && pass "marker inline within other text is ignored" || fail "inline marker counted"
+        [[ "$(detect "plain epic body" "" 0)" == no ]] \
+            && pass "unmarked epic with no children is not an umbrella" || fail "unmarked epic stood down"
+        [[ "$(detect "<!-- loom:tracking-epic -->" "phase-marker" 0)" == no ]] \
+            && pass "phase-marker source still falls through even when marked" || fail "phase-marker carve-out lost"
+        [[ "$(detect "plain" "native-sub-issue" 2)" == yes ]] \
+            && pass "strong open children still stand down without the marker" || fail "strong-children path regressed"
+    fi
+else
+    fail "stand-down body not found at $CHAMPION_EPIC_STANDDOWN"
+fi
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "================================"
 echo "Tests run:    $TESTS_RUN"

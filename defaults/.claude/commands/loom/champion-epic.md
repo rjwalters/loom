@@ -554,6 +554,9 @@ Step 0a's discovery, stands such an epic down with its own
 `champion:epic-tracking-umbrella:body-*` marker (once per body hash, no
 counter, no operator routing), and ends the pass. An epic Champion decomposed
 itself (`phase-marker` source) or an undecomposed one falls through to Step 1.
+An epic whose author put `<!-- loom:tracking-epic -->` alone on a line (outside
+a code fence) is stood down the same way even with no discoverable children
+(#13874).
 
 ### Step 1: Read the Epic
 

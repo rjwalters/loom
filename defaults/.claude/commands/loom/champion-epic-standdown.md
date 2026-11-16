@@ -29,12 +29,21 @@ operator escalation.
 # `phase-marker` in EPIC_CHILD_SOURCES means discovery source (a) contributed,
 # i.e. Champion decomposed this epic itself and "Phase Progression" owns it
 # from here — such an epic must fall through to Step 1 exactly as before.
+# An epic author may declare a tracking epic explicitly (#13874): the marker
+# `<!-- loom:tracking-epic -->` ALONE on a line, outside any ``` / ~~~ code
+# fence. Inline-in-prose or fenced mentions do not count. This covers epics whose
+# children are listed in a table (discovery reads no table cells, #10935) and so
+# discover as STRONG_OPEN=0. Mirrors `<!-- loom:tracker -->` (#10886).
+DECLARED_TRACKING_EPIC=$(printf '%s\n' "$EPIC_JSON" | jq -r '.body // ""' | awk '
+  /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+  !fence && $0 ~ /^[[:space:]]*<!-- loom:tracking-epic -->[[:space:]]*$/ { found = 1 }
+  END { print (found ? "yes" : "no") }')
 case ",$EPIC_CHILD_SOURCES," in
   *,phase-marker,*)
-    IS_TRACKING_UMBRELLA=no ;;                  # Champion's own decomposition
+    IS_TRACKING_UMBRELLA=no ;;                  # Champion's own decomposition (wins over the marker)
   *)
-    if [ "$EPIC_CHILD_STRONG_OPEN" -gt 0 ]; then
-      IS_TRACKING_UMBRELLA=yes                  # decomposed elsewhere, still in flight
+    if [ "$EPIC_CHILD_STRONG_OPEN" -gt 0 ] || [ "$DECLARED_TRACKING_EPIC" = "yes" ]; then
+      IS_TRACKING_UMBRELLA=yes                  # decomposed elsewhere, or declared by its author
     else
       IS_TRACKING_UMBRELLA=no                   # undecomposed (Step 1), or complete (Step 0 owned it)
     fi ;;
@@ -45,7 +54,8 @@ esac
 |---|---|---|
 | `EPIC_CHILD_SOURCES` contains `phase-marker` | `no` | Champion decomposed this epic; Step 2.75 + "Phase Progression" already handle it, and standing down here would freeze phase advancement |
 | `STRONG_OPEN > 0`, no `phase-marker` source | **`yes`** | Children exist by containment and are still in flight, but Step 3 did not create them — nothing to decompose, nothing to evaluate |
-| `STRONG_OPEN == 0` | `no` | Either undecomposed (all counters 0 → Step 1) or a completion candidate, which Step 0 already acted on before this step ran |
+| `<!-- loom:tracking-epic -->` alone on a line outside a code fence, no `phase-marker` source (#13874) | **`yes`** | The author declared the epic a tracker (e.g. children listed in a table, which discovery does not read); same stand-down path, even with `STRONG_OPEN == 0` |
+| `STRONG_OPEN == 0`, no marker | `no` | Either undecomposed (all counters 0 → Step 1) or a completion candidate, which Step 0 already acted on before this step ran |
 | Weak (prose) references only | `no` | Prose is never containment — Step 0's operator ask is the only thing weak evidence may reach |
 
 ## 0.5b. Stand down — once per body hash, no counter, no escalation
@@ -63,10 +73,15 @@ if [ "$IS_TRACKING_UMBRELLA" = "yes" ]; then
        '.comments[] | select(.body | contains($m))' >/dev/null; then
     echo "#$EPIC_NUMBER is a tracking umbrella already noted at body revision $BODY_HASH — standing down silently (no comment, no tally, no label change)"
   else
+    if [ "$EPIC_CHILD_STRONG_OPEN" -gt 0 ] || [ "$EPIC_CHILD_STRONG_CLOSED" -gt 0 ]; then
+      UMBRELLA_WHY="This epic's children already exist ($EPIC_CHILD_STRONG_OPEN open / $EPIC_CHILD_STRONG_CLOSED closed, discovered via: $EPIC_CHILD_SOURCES) but were not created by Champion's own phase-issue flow, so it is a **tracking umbrella**"
+    else
+      UMBRELLA_WHY="This epic was declared a tracking epic by its author (\`<!-- loom:tracking-epic -->\`), so it is a **tracking umbrella**"
+    fi
     ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "$UMBRELLA_MARKER
 **Champion: Epic Already Decomposed — Tracking Only**
 
-This epic's children already exist ($EPIC_CHILD_STRONG_OPEN open / $EPIC_CHILD_STRONG_CLOSED closed, discovered via: $EPIC_CHILD_SOURCES) but were not created by Champion's own phase-issue flow, so it is a **tracking umbrella**, not an epic awaiting decomposition. Champion is not creating phase issues for it and is not re-running the pre-decomposition structural criteria against it.
+$UMBRELLA_WHY, not an epic awaiting decomposition. Champion is not creating phase issues for it and is not re-running the pre-decomposition structural criteria against it.
 
 Nothing is required of anyone. The epic stays open and keeps \`loom:epic\`; Champion re-checks it every pass and will close it automatically once its last child is closed and every named deliverable is present on \`${DEFAULT_BRANCH:-main}\`.
 
@@ -83,6 +98,7 @@ fi
 | Epic shape | Required outcome |
 |---|---|
 | Curator-decomposed epic, children open, first pass at this body hash | **One** "Epic Already Decomposed — Tracking Only" comment, then the pass ends |
+| Epic body carries `<!-- loom:tracking-epic -->` alone on a line (not fenced, not inline), zero discovered children (#13874) | Same path: **one** note (worded "declared a tracking epic by its author"), then the pass ends — no rejection marker, no tally, no `loom:operator`. Marker in a code fence or inline prose: ignored. Marked epic with a `phase-marker` source: falls through to Step 1 |
 | Same epic, every later pass with an unchanged body | Silent skip — no comment, no label, no counter. Step 0 still runs first, so it closes on its own when the last child lands |
 | Same epic, body genuinely edited (new phases/scope) | New hash → one fresh stand-down note (still no evaluation, still no escalation) |
 | Same epic, carrying an old, superseded "Epic Needs Revision" marker | Stand-down still wins: Step 0.5 runs **before** the guard's skip/escalate branches commit, so a rejected-then-decomposed epic never escalates on a stale finding |
