@@ -81,7 +81,9 @@ impl ExecAuth {
         // nothing. The process `GH_CONFIG_DIR` is the workspace-root owner's
         // credential on a daemon host, and handing it to another owner's
         // repository would forward the wrong installation's token.
-        let secret = config_dir_for(workspace, &slug, &gh_host).and_then(|dir| read(&dir));
+        let primary = primary_root(env);
+        let secret = config_dir_for(workspace, primary.as_deref(), &slug, &gh_host)
+            .and_then(|dir| read(&dir));
         if secret.is_some() && !names.contains(&TOKEN_ENV) {
             names.push(TOKEN_ENV);
         }
@@ -138,19 +140,44 @@ pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
+/// The daemon's primary workspace root, where the refresh tick publishes every
+/// owner's App directory: `LOOM_MACHINE_CHECKOUT` when the process carries it
+/// (a worker's systemd unit sets it, so a short-lived `session-exec host` or
+/// hand-run `accounts session job` sees it too, #13937), else the root the
+/// daemon process registered at startup.
+fn primary_root(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env("LOOM_MACHINE_CHECKOUT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(crate::credential_preflight::primary_workspace_root)
+}
+
 /// The `GH_CONFIG_DIR` proven to hold the installation token for `slug`'s
 /// owner: the daemon's per-owner registry, else the owner's App directory
-/// under this workspace's (then the daemon's primary root's) `.loom/`, else,
+/// under the daemon's `primary` root's (then this workspace's) `.loom/`, else,
 /// when the owner IS that root's own owner (read from an `origin` on the same
 /// GitHub host), the root's `.loom/gh-config` — the root owner is
 /// deliberately absent from `gh-config-by-owner`. `None` when no directory is
 /// matched to the owner. There is deliberately no process-`GH_CONFIG_DIR`
 /// fallback: on a daemon host that is the root owner's credential.
 ///
+/// The primary root comes first (#13933, #13937): it is the only copy the
+/// daemon's refresh tick keeps fresh. A managed repository's own
+/// `.loom/gh-config-by-owner/<owner>` is published once and never refreshed,
+/// so preferring it handed the exec an expired installation token (`HTTP 401`)
+/// whenever the process had no daemon registry to consult — every
+/// `session-exec host` and hand-run `accounts session job`. The workspace copy
+/// remains a fallback for a host with no primary root at all.
+///
 /// The root-owner step is what a hand-run `accounts session job` from an SSH
 /// shell needs: that shell has no `GH_CONFIG_DIR`, and the daemon's own
 /// registry is not in its process.
-fn config_dir_for(workspace: &Path, slug: &str, gh_host: &str) -> Option<PathBuf> {
+fn config_dir_for(
+    workspace: &Path,
+    primary: Option<&Path>,
+    slug: &str,
+    gh_host: &str,
+) -> Option<PathBuf> {
     use crate::credential_preflight as creds;
     let owner = creds::owner_of_nwo(slug);
     if let Some(dir) = creds::gh_config_dir_for_owner_slug(slug) {
@@ -169,11 +196,11 @@ fn config_dir_for(workspace: &Path, slug: &str, gh_host: &str) -> Option<PathBuf
             .eq_ignore_ascii_case(owner)
             .then_some(dir)
     };
-    let primary = creds::primary_workspace_root();
-    published(workspace)
-        .or_else(|| primary.as_deref().and_then(published))
+    primary
+        .and_then(published)
+        .or_else(|| published(workspace))
+        .or_else(|| primary.and_then(root_owned))
         .or_else(|| root_owned(workspace))
-        .or_else(|| primary.as_deref().and_then(root_owned))
 }
 
 /// The owner of `root`'s `origin`, only when that remote is on `gh_host`
@@ -396,6 +423,61 @@ mod tests {
             &never,
         );
         assert!(!elsewhere.resolved());
+    }
+
+    /// #13933 / #13937: a process with no daemon registry (a `session-exec
+    /// host`, a hand-run job) reads the owner dir the daemon's refresh tick
+    /// keeps fresh under `LOOM_MACHINE_CHECKOUT`, never the stale copy a
+    /// managed repository's own `.loom/` holds. The workspace copy is only a
+    /// fallback when the primary root has none for this owner.
+    #[test]
+    fn the_primary_roots_refreshed_owner_dir_wins_over_a_stale_workspace_copy() {
+        let owner = "acme-precedence-13937";
+        let stale = published_owner_workspace(owner);
+        let fresh = published_owner_workspace(owner);
+        let fresh_dir =
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(fresh.path(), owner);
+        let stale_dir =
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(stale.path(), owner);
+        let checkout = fresh.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]);
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
+            Some(SECRET.to_owned())
+        };
+        let repo = format!("https://github.com/{owner}/widget");
+        let auth = ExecAuth::resolve_with(stale.path(), &repo, &env, &read);
+        assert!(auth.resolved());
+        assert_eq!(seen.borrow().as_deref(), Some(fresh_dir.as_path()));
+        // A primary root with nothing for this owner falls back to the
+        // workspace copy rather than reading nothing.
+        let empty = tempfile::tempdir().unwrap();
+        let elsewhere = empty.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &elsewhere)]);
+        ExecAuth::resolve_with(stale.path(), &repo, &env, &read);
+        assert_eq!(seen.borrow().as_deref(), Some(stale_dir.as_path()));
+    }
+
+    /// The primary root holds other owners' dirs too: an owner with no dir of
+    /// its own there (or in the workspace) still gets nothing, never a
+    /// neighbour's installation token.
+    #[test]
+    fn a_primary_root_never_forwards_another_owners_token() {
+        let primary = published_owner_workspace("acme-owner-13937");
+        let checkout = primary.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]);
+        let ws = published_owner_workspace("acme-owner-13937");
+        let never = |_: &Path| -> Option<String> { panic!("read another owner's token") };
+        let auth = ExecAuth::resolve_with(
+            ws.path(),
+            "https://github.com/other-owner-13937/widget",
+            &env,
+            &never,
+        );
+        assert!(!auth.resolved());
+        assert!(auth.names().is_empty());
+        assert!(auth.child_env().is_empty());
     }
 
     #[test]
