@@ -1559,8 +1559,12 @@ When the `<!-- loom:conflict-only -->` marker is present:
 # - Package lock regeneration
 # - Import reordering
 # - Whitespace normalization
+# - An ID-only renumber (see below), when Doctor's comment has an
+#   `ID renumber: <OLD_ID> -> <NEW_ID> in <path>` line
 gh pr diff <PR_NUMBER>
 ```
+
+**Verifying an ID-only renumber:** diff the pre-resolution head (the `Head before resolution` SHA in Doctor's comment) against the new head (`git diff <old>..<new>`). It must touch only `<path>`, and only the `<OLD_ID>` -> `<NEW_ID>` token plus same-file references to it in the PR's own added lines. `<NEW_ID>` must be the next free ID on `main`. A changed row cell, a row moved out of the table, a second file, or a citation of `<OLD_ID>` in another file or the PR body is a red flag: run the full evaluation.
 
 **2. Check for unexpected changes:**
 
@@ -1570,6 +1574,7 @@ Red flags that should trigger a full evaluation instead:
 - Changed function signatures
 - New error handling
 - Documentation updates beyond conflict resolution
+- A claimed ID renumber whose diff changes any row content, touches a second file, or leaves the old ID cited elsewhere
 
 **3. Verify CI passes — and reconcile formal reviews/inline threads:**
 
