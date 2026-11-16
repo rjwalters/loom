@@ -181,6 +181,30 @@ pub(super) fn mount_stale_line(
     )
 }
 
+/// The supervised `docker exec` for `args`. `env` entries become `--env`
+/// arguments; `child_env` values are set on this `docker` child only, never in
+/// argv, for the bare `--env NAME` entries that copy them (#13916).
+pub(super) fn exec_command(args: &HostArgs, id: &str) -> Command {
+    let mut command = Command::new("docker");
+    command.args(["exec", "-i", "--workdir", &args.workdir]);
+    for env in &args.env {
+        command.args(["--env", env]);
+    }
+    command.envs(args.child_env.iter().map(|(k, v)| (k, v)));
+    command
+        .args([
+            &args.container,
+            "loom-daemon",
+            "session-exec",
+            "worker",
+            "--id",
+            id,
+            "--",
+        ])
+        .args(&args.command);
+    command
+}
+
 pub fn run(args: HostArgs) -> Result<i32> {
     signals();
     let parent = unsafe { libc::getppid() };
@@ -287,25 +311,10 @@ pub fn run(args: HostArgs) -> Result<i32> {
         return Ok(143);
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let capture = args.stderr_file.map(File::create).transpose()?;
-    let mut command = Command::new("docker");
-    command.args(["exec", "-i", "--workdir", &args.workdir]);
-    for env in args.env {
-        command.args(["--env", &env]);
-    }
+    let capture = args.stderr_file.as_ref().map(File::create).transpose()?;
     // Docker's client must survive the caller's process-group TERM so it can
     // deliver cancellation and collect the container cleanup acknowledgement.
-    let mut child = command
-        .args([
-            &args.container,
-            "loom-daemon",
-            "session-exec",
-            "worker",
-            "--id",
-            &id,
-            "--",
-        ])
-        .args(args.command)
+    let mut child = exec_command(&args, &id)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)

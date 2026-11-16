@@ -165,7 +165,7 @@ pub fn start(
     let id = state["Id"].as_str().context("container id unavailable")?;
     // Adopt before any probe: even an image/protocol failure must not permit
     // a host-direct process to refresh this profile behind its new owner.
-    docker::prepare(&config, id, None)?;
+    docker::prepare(&config, workspace, id, None)?;
     // A session may not come up at all unless its image ships a control
     // boundary this host supports: provisioning the managed hook and then
     // discovering the bundle is missing/stale would leave an apparently ready
@@ -347,14 +347,15 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
     // Publish before clone/fetch/branch operations; a host crash cannot turn a
     // still-running preparation exec into an apparently free account.
     lease.begin(&job)?;
-    job.base_revision = docker::prepare_target(&config, &target, id, args.branch.as_deref())?;
+    job.base_revision =
+        docker::prepare_target(&config, workspace, &target, id, args.branch.as_deref())?;
     job.control = docker::control(&config, id)?;
     lease.begin(&job)?;
-    let mut env: Vec<String> = FORGE_ENV
-        .iter()
-        .filter(|name| std::env::var_os(name).is_some())
-        .map(|name| (*name).to_owned())
-        .collect();
+    // A fresh credential for the job's own exec (#13916), never the one the
+    // prepare exec carried: a long preparation must not hand the job a token
+    // that is already close to expiry.
+    let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
+    let mut env: Vec<String> = auth.names().iter().map(|name| (*name).to_owned()).collect();
     // Supervised jobs are mutable work too: carry the same forced guard policy
     // and the bound identity the adapter path carries.
     env.extend(bundle::policy_env());
@@ -366,6 +367,7 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
         container: config.container.clone(),
         workdir: target.path.clone(),
         env,
+        child_env: auth.child_env(),
         stderr_file: None,
         command: args.command,
     })?;
