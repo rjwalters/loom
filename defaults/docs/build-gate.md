@@ -12,6 +12,7 @@ See issue [#3347](https://github.com/rjwalters/loom/issues/3347) for the origina
 - [Configuration](#configuration)
 - [In-session pre-PR gate (`loom-daemon preflight`)](#in-session-pre-pr-gate-loom-daemon-preflight)
 - [Examples](#examples)
+- [Keeping the local gate equal to CI (#13904)](#keeping-the-local-gate-equal-to-ci-13904)
 - [Failure semantics](#failure-semantics)
 - [Why a receipt?](#why-a-receipt)
 <!-- toc:end -->
@@ -1021,6 +1022,76 @@ disk the cap saves.
 Not covered: a cargo workspace that is not at the repo root (for example
 `src-tauri/`). Its `[profile]` table is not read, so the cap applies over it.
 Set `cargo.debuginfo: "full"` for such a repo if its profile must win.
+
+## Keeping the local gate equal to CI (#13904)
+
+A common `command` is a hand mirror of the repo's CI workflow: the same
+interpreter pin, dependency pins and command sequence, restated as a
+`package.json` script (the `pnpm check:ci` Node example above). Nothing
+compares the two copies, so the mirror is a load-bearing correctness surface
+that drifts silently — bump a pin or add a test directory in the workflow and
+the script keeps running yesterday's gate: the local gate reports green having
+run less than CI, which is the exact divergence the gate exists to catch.
+
+**If your gate mirrors CI, add a parity check that parses both files and fails
+naming both values and both file locations**, and run it as part of the gate
+itself so drift fails pre-flight instead of surfacing in CI:
+
+```json
+{
+  "buildGate": {
+    "command": "bash scripts/check-gate-parity.sh && pnpm check:ci"
+  }
+}
+```
+
+One minimal example. It reads the facts it asserts from the workflow — the
+source of truth; never restate the pins inside the checker, or you have created
+a third copy to drift. It handles a matrix workflow by requiring the mirror's
+interpreter pin to be one of the matrix's values, and needs only `grep`, `sed`,
+`tr` and `jq` (swap the `jq` extraction for whatever your repo has if `jq` is
+absent; a `yq`/YAML parser is the upgrade path if your `run:` blocks outgrow
+line-grep):
+
+```bash
+#!/usr/bin/env bash
+# scripts/check-gate-parity.sh — the local gate equals CI, or this fails.
+# Every failure names the drifted fact, both values, and both file locations.
+set -euo pipefail
+
+wf=.github/workflows/ci.yml                        # source of truth
+gate=$(jq -r '.scripts["check:ci"]' package.json)  # the mirror
+
+drift() { # drift <what> <workflow value> <gate value>
+  printf 'parity: %s drifted\n  %s: %s\n  package.json scripts["check:ci"]: %s\n' \
+    "$1" "$wf" "$2" "$3" >&2
+  exit 1
+}
+
+# Interpreter pin (single or matrix): the mirror's pin must be one of the
+# workflow's python-version values.
+ci_pys=$(grep 'python-version:' "$wf" | grep -oE '[0-9]+(\.[0-9]+)+' | sort -u)
+gate_py=$(sed -nE 's/.*--python ([0-9.]+).*/\1/p' <<<"$gate")
+grep -qx "$gate_py" <<<"$ci_pys" \
+  || drift "python pin" "${ci_pys//$'\n'/ }" "${gate_py:-<none found>}"
+
+# Dependency pins: every pinned spec in the workflow must appear in the mirror.
+while IFS= read -r dep; do
+  grep -qF "$dep" <<<"$gate" || drift "dependency pin" "$dep" "absent from gate script"
+done < <(grep -oE '[A-Za-z0-9_-]+==[0-9][0-9.]*' "$wf" | sort -u)
+
+# Command/target list: the pytest invocation must be identical in both
+# (quote-stripped, so sh -c quoting in the mirror does not mask a match).
+ci_t=$(grep -oE 'pytest -q [^&|]+' "$wf" | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
+gate_t=$(grep -oE 'pytest -q [^&|]+' <<<"$gate" | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
+[[ "$ci_t" == "$gate_t" ]] || drift "pytest targets" "${ci_t:-<none found>}" "${gate_t:-<none found>}"
+```
+
+The shape generalizes: one assertion per mirrored fact, each naming the fact
+and both sides' values and locations on failure. The whole check is a handful
+of `grep`/`jq` invocations — cheap enough for the fast tier (`fastCommand`),
+which is where you want it: drift caught at pre-flight costs seconds, drift
+caught in CI costs a review cycle.
 
 ## Failure semantics
 
