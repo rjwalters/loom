@@ -4395,18 +4395,26 @@ LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
 # never fired and five identical verdicts landed on one rejection (#13903).
 PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 
-# Cached ("$GH_READ") — idempotency-marker grep.
-# `startswith`, not a bare substring match — a later comment quoting this
-# marker in prose must never be mistaken for the verdict's own comment and
-# wrongly suppress the real post (#5371).
-EXACT_PARKED=$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$PARK_MARKER\"))")
-
-# Key-spelling-tolerant guard (#13903): park markers are suppressed per
-# rejection EPISODE, not per key spelling. Skip if ANY comment starting with
-# `<!-- champion:capped-pr-parked:` was posted at or after the newest Judge
-# rejection's last EDIT time (REST `updated_at`: `gh pr view --json comments`
-# has no edit time, and an edited rejection with changed findings must still
-# get a fresh verdict). A rejection newer than every park marker never matches.
+# Key-spelling-tolerant guard (#13903) — this is the ONLY suppression guard.
+# Skip if ANY comment starting with `<!-- champion:capped-pr-parked:` was
+# posted at or after the newest Judge rejection's last EDIT time (REST
+# `updated_at`: `gh pr view --json comments` has no edit time, and an edited
+# rejection with changed findings must still get a fresh verdict). A rejection
+# newer than every park marker never matches. There is no separate exact-key
+# arm: an edit does not change a comment's id, so a correctly-keyed marker
+# still matched `PARK_MARKER` verbatim after a rejection edit and
+# re-suppressed the fresh verdict the episode check had correctly cleared
+# (removed in the #13968 review).
+# `startswith`, not a bare substring match — a later comment quoting the
+# marker in prose must never be mistaken for a park marker and wrongly
+# suppress the real post (#5371).
+# The read is uncached `gh api --paginate` on purpose: it needs REST
+# `updated_at` (edit time), which the cached `gh pr view` read cannot see,
+# and Champion's 10-minute cron draws on the independent REST pool, which
+# has headroom.
+# `$rejected` takes `updated_at | max` across ALL rejections, deliberately
+# NOT the key's `last`: an older rejection edited today also opens a fresh
+# episode, which errs toward posting — do not "align" the two selectors.
 PARKED_SINCE_REJECTION=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR_NUMBER/comments" --jq '.[]' \
   | jq -s '([.[]
              | select((.body | contains("champion:capped-pr")) | not)
@@ -4416,7 +4424,7 @@ PARKED_SINCE_REJECTION=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR_NUMB
              and any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
                           and .created_at >= $rejected)')
 
-if [ "$EXACT_PARKED" = "true" ] || [ "$PARKED_SINCE_REJECTION" = "true" ]; then
+if [ "$PARKED_SINCE_REJECTION" = "true" ]; then
   echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"
 else
   ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$PARK_MARKER
