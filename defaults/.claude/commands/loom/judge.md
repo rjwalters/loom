@@ -437,7 +437,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or a priority label.
 2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
-2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` / `NONE` → continue. Pending is never red.
+2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` → continue. `NONE` → continue the review, but no test ever ran — before any approving verdict, run the repo's documented test command on the PR head ("No-Checks PRs" under "How to Check CI Status"). Pending is never red.
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -1334,12 +1334,21 @@ loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # seconds
 ```
 
 Branch on the first stdout line:
-- ✅ `LOOM-CHECKS-GREEN` / `-NONE` (no checks) - Safe to approve
+- ✅ `LOOM-CHECKS-GREEN` - Safe to approve
+- ⚠️ `LOOM-CHECKS-NONE` (no checks) - Continue the review, but no test ever ran: before any approving verdict, run the repo's documented test command on the PR head and record the result in the verdict ("No-Checks PRs" below)
 - ❌ `-RED` - "When CI Fails"
 - ⏳ `-TIMEOUT` / `-HEAD-MOVED` - Pending (see "When CI is Pending")
 - `-ERROR` or no sentinel (Gitea / older binary) - run `gh pr checks <PR_NUMBER>` once
 
 **Unknown is never green.** If the required-context lookup fails (rate limit, 403/429, unreadable branch protection), `wait-checks` reports `-TIMEOUT … (required-contexts-unknown)` or `-ERROR`: the result is *unknown*, not passing. It cannot authorize approval; treat it as pending ("When CI is Pending") and never approve on a guess. The reader and its REST fallback are unchanged.
+
+**No-Checks PRs (`LOOM-CHECKS-NONE`): no test ever ran.** Zero check-runs means CI executed nothing — "no checks" is the absence of evidence, not evidence of passing. Continue the review normally, but before any approving verdict you must close that gap yourself:
+
+- **Run the repo's documented test command on the PR head**, in your review worktree (step 5's checkout), at the PR head SHA. "Documented" is whatever the repo itself names — its CLAUDE.md / README test section, or its package manifest (`scripts.test`, Makefile target); no new config key. A targeted run of what the repo documents is enough; this does not license the full suite or `buildGate.command` (#11690 still applies).
+- **The verdict must state the command and its result** — e.g. "`pnpm test` — pass" or "`make check` — 2 failures (names in the verdict)". A verdict that neither states a run nor says the repo documents no command is incomplete for a no-checks PR.
+- **No documented test command anywhere?** The verdict must say plainly "unverified by any test" — never "safe", never a silent pass.
+
+A failing local run is "When CI Fails"-grade evidence: do not approve on it.
 
 **Step 2: Verify merge state**
 
@@ -1393,7 +1402,7 @@ case "$first" in
     loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
     ;;
   LOOM-CHECKS-RED*) ;;    # "When CI Fails"
-  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # continue (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
   *) gh pr checks <PR_NUMBER> ;;   # no sentinel (older binary / Gitea): one snapshot, no loop
 esac
 ```
@@ -1412,7 +1421,7 @@ This mirrors `sweep.md`'s guardrail ("ending your turn IS the kill signal", #425
 ```bash
 err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red 2>"$err")"; first="${out%%$'\n'*}"
 case "$first" in
-  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
   LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id>; "When CI Fails"
   LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) ;;   # unsettled: conditional verdict below
   *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop

@@ -31,7 +31,6 @@ fn insert_step(reg: &mut SweepRegistry, item: u32, role: StepRole, pid: u32) -> 
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id

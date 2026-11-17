@@ -295,8 +295,6 @@ pub struct ManifestItem {
     #[serde(default)]
     pub log_path: Option<String>,
     #[serde(default)]
-    pub overflow: bool,
-    #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
     pub timeout_remaining_secs: Option<u64>,

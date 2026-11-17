@@ -1,5 +1,4 @@
-//! Side-listing filters and the inert overflow slot (#9244, re-scoped by
-//! #11508).
+//! Side-listing filters (#9244, re-scoped by #11508).
 //!
 //! Priority (`loom:important` / `loom:very-important`, #11103) changes
 //! dispatch **order only, never eligibility** (operator ruling on #11508):
@@ -11,16 +10,13 @@
 //!
 //! - [`excluded_from_side_listing`]: the filter the unpromoted red-main-fix
 //!   listing (#10118) applies to rows from outside `loom:issue`.
-//! - [`OverflowSlot`]: **inert** since #11508. Nothing is admitted over the
-//!   cap any more; the slot only reports whether an overflow sweep started
-//!   by an older daemon is still live (`plan.slots.overflow_free`).
 //! - [`warn_retired_config`]: the one startup warning for a host config
 //!   that still carries the removed `autonomous.operatorPriority` block
 //!   (#11104: the star-liveness subsystem that read it is gone).
 
 use std::path::Path;
 
-use super::{WorkDispatcher, WorkItem, BUILDING_LABEL};
+use super::{WorkItem, BUILDING_LABEL};
 
 /// The in-progress Curator claim. A side-listed row carrying it is being
 /// curated right now, so it is left alone this tick.
@@ -42,36 +38,6 @@ pub fn excluded_from_side_listing(item: &WorkItem) -> bool {
     item.labels.iter().any(|l| {
         l == BUILDING_LABEL || l == CURATING_LABEL || CHAMPION_PATH_LABELS.contains(&l.as_str())
     })
-}
-
-/// The per-host overflow slot (#9244 §5), **inert since #11508**.
-///
-/// It used to let one starred candidate run as this host's single over-limit
-/// sweep. Priority no longer changes admission (operator ruling on #11508),
-/// so nothing takes the slot; it is kept only so the tick still reports
-/// whether an overflow sweep an older daemon started is live
-/// ([`Self::is_free`], `plan.slots.overflow_free`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OverflowSlot {
-    taken: bool,
-}
-
-impl OverflowSlot {
-    /// The slot for the multi-workspace tick: taken when any workspace
-    /// already has a live overflow sweep.
-    #[must_use]
-    pub fn for_workspaces<S, D: WorkDispatcher>(workspaces: &[(S, D)]) -> Self {
-        Self {
-            taken: workspaces.iter().any(|(_, d)| d.overflow_in_flight()),
-        }
-    }
-
-    /// Whether no overflow sweep is live (Issue #9288's
-    /// `plan.slots.overflow_free`).
-    #[must_use]
-    pub fn is_free(&self) -> bool {
-        !self.taken
-    }
 }
 
 /// The `autonomous` sub-block the removed star-liveness subsystem read
