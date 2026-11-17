@@ -179,6 +179,51 @@ fn a_pool_or_runtime_gate_refuses_with_its_own_reason() {
     assert_eq!(refusal_of(&RoleTickOutcome::Failure("x".into())).reason, "admission_refused");
 }
 
+/// #14026 acceptance criterion 3, at the refusal boundary: a preference-path
+/// exhaustion longer than the marker's 160-char cap reaches the step refusal
+/// — the text `begin_step_spawn` logs after its `sweep_registry:` prefix —
+/// as ONE line carrying the full untruncated reason, never the multi-line
+/// operator diagnostic.
+#[test]
+fn a_runtime_rejected_refusal_carries_the_one_line_candidate_rendering() {
+    let obligation = "owned account lease plus durable workspace preparation for model \
+                      claude/sonnet on profile zai-metered is still outstanding (#13916)";
+    let rejection = crate::runtime_admission::RuntimeRejection {
+        role: "curator".into(),
+        runtime: String::new(),
+        source: crate::runtime_admission::RuntimeSource::Preference,
+        unmet_capabilities: vec![],
+        reason: format!(
+            "No runtime in the preference list can serve role \"curator\" right now\n  \
+             codex -> not-admitted(unmet capabilities: worktreeIsolation; {obligation})"
+        ),
+        exhausted_summary_line: Some(
+            format!(
+                "runtime_rejected role=curator: codex -> not-admitted(unmet capabilities: \
+             worktreeIsolation; {obligation})"
+            )
+            .into_boxed_str(),
+        ),
+    };
+    let refusal = refusal_of(&RoleTickOutcome::RuntimeRejected(rejection));
+    assert_eq!(refusal.reason, "runtime_rejected");
+    assert!(!refusal.detail.contains('\n'), "one line: {}", refusal.detail);
+    assert!(refusal.detail.contains(obligation), "{}", refusal.detail);
+    assert!(!refusal.detail.contains('\u{2026}'), "{}", refusal.detail);
+    // A rejection without the one-line rendering (the static path) falls back
+    // to its own reason, byte-identical to the pre-#14026 refusal text.
+    let static_rejection = crate::runtime_admission::RuntimeRejection {
+        role: "builder".into(),
+        runtime: "codex".into(),
+        source: crate::runtime_admission::RuntimeSource::RoleConfig,
+        unmet_capabilities: vec!["worktreeIsolation".into()],
+        reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
+    };
+    let refusal = refusal_of(&RoleTickOutcome::RuntimeRejected(static_rejection));
+    assert_eq!(refusal.detail, "unmet capabilities: worktreeIsolation");
+}
+
 // ---- B1: the claim --------------------------------------------------------
 
 /// The pre-claim takes the role-keyed lease with the step, under the step's
