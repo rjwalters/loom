@@ -478,7 +478,6 @@ fn a_step_sweep_exiting_on_exhaustion_notes_it_for_its_end() {
                 effort: None,
                 depends_on: None,
                 repo: None,
-                overflow: false,
             },
         );
     };
