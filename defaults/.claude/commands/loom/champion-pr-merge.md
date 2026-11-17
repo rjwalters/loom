@@ -4447,7 +4447,7 @@ A granted PR leaves the parked set at once, so this outcome is self-idempotent.
 
 ### Step 4b: Outcome — keep parked
 
-Comment the **specific** reason a human is still needed (not a generic "still blocked"), and change no labels. Because the parked PR stays in the query, guard the comment with a marker keyed to the rejection that is being ruled on, so the 10-minute cron does not re-post the same verdict every tick while a genuinely new rejection still gets a fresh decision:
+Comment the **specific** reason a human is still needed (not a generic "still blocked"), and change no labels. Because the parked PR stays in the query, the verdict is guarded per rejection **episode** — skip while a keep-parked verdict already covers the newest rejection — so the 10-minute cron does not re-post the same verdict every tick while a genuinely new rejection still gets a fresh decision:
 
 ```bash
 PR_NUMBER=<number>
@@ -4460,10 +4460,12 @@ LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
          | select((.body | contains("champion:capped-pr")) | not)
          | select(.body | test("Changes Requested"; "i"))]
         | last | .id // "none"')
-# The key is the id printed by the command above, copied VERBATIM. A head SHA,
-# an abbreviation, or any other spelling is NOT a key: on gf180-parasynth#647
-# four passes keyed on four spellings of one head SHA, so the exact-match guard
-# never fired and five identical verdicts landed on one rejection (#13903).
+# The key written into the marker is informational only — suppression never
+# matches on its spelling (#13903, #13880): on gf180-parasynth#647 four passes
+# keyed on four spellings of one head SHA, so the exact-match guard never fired
+# and five identical verdicts landed on one rejection. Prefer the rejection id
+# printed by the command above (`none` when there is no rejection) for the
+# audit trail.
 PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 
 # Key-spelling-tolerant guard (#13903) — this is the ONLY suppression guard.
@@ -4486,14 +4488,19 @@ PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 # `$rejected` takes `updated_at | max` across ALL rejections, deliberately
 # NOT the key's `last`: an older rejection edited today also opens a fresh
 # episode, which errs toward posting — do not "align" the two selectors.
+# No rejection in the thread at all ($rejected == null — a PR parked without
+# any Judge rejection, where the marker key reads `none`): no new episode can
+# start, so ANY existing park comment suppresses and none has posted yet
+# allows one. Without this arm the whole guard is false on such PRs and the
+# 10-minute cron re-posts the same verdict every tick (#13880, observed shape:
+# gf180-parasynth#534).
 PARKED_SINCE_REJECTION=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR_NUMBER/comments" --jq '.[]' \
   | jq -s '([.[]
              | select((.body | contains("champion:capped-pr")) | not)
              | select(.body | test("Changes Requested"; "i"))
              | .updated_at] | max) as $rejected
-           | $rejected != null
-             and any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
-                          and .created_at >= $rejected)')
+           | any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
+                      and (($rejected == null) or (.created_at >= $rejected)))')
 
 if [ "$PARKED_SINCE_REJECTION" = "true" ]; then
   echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"
