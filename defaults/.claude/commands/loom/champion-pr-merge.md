@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: PR Auto-Merge Context
 
 This file contains PR auto-merge instructions for the Champion role. **Read this file when Priority 1 work is found (PRs with loom:pr label).**
