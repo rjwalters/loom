@@ -220,10 +220,6 @@ struct RecordingDispatcher {
     /// never declares a host-affinity constraint in the first place
     /// (an empty `HostConstraint` matches any host id, including `""`).
     current_host_id: String,
-    /// #9244: a live overflow sweep already holds the host's slot.
-    overflow_live: bool,
-    /// #9244: issues dispatched as the overflow sweep (a subset of `dispatched`).
-    dispatched_overflow: Vec<u32>,
     /// #9244: the red-main-fix lane's CI-fallback verdict for this repo.
     ci_red: bool,
 }
@@ -265,18 +261,8 @@ impl WorkDispatcher for RecordingDispatcher {
     fn current_host_id(&self) -> String {
         self.current_host_id.clone()
     }
-    fn overflow_in_flight(&self) -> bool {
-        self.overflow_live
-    }
     fn main_red_via_ci(&self) -> bool {
         self.ci_red
-    }
-    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
-        let started = self.dispatch(issue);
-        if overflow && matches!(started, Ok(true)) {
-            self.dispatched_overflow.push(issue);
-        }
-        started
     }
     fn dispatch(&mut self, issue: u32) -> Result<bool> {
         self.dispatch_attempts.push(issue);

@@ -158,7 +158,6 @@ impl SweepRegistry {
                     effort: owner.effort.clone(),
                     depends_on: None,
                     repo: Some(self.config.workspace_root.display().to_string()),
-                    overflow: owner.overflow,
                 },
             );
             crate::observability::lifecycle::execution_adopted(

@@ -70,7 +70,6 @@ fn sampled_phase_history_exempts_a_productive_clean_exit() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 

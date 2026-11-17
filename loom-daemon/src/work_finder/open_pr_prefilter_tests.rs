@@ -49,10 +49,10 @@ struct Disp {
     in_flight: HashSet<u32>,
     /// How many times `open_pr_blocked` was asked, and with what.
     asked: RefCell<Vec<Vec<u32>>>,
-    /// Every `dispatch_with` call, in order (refused ones included).
+    /// Every `dispatch` call, in order (refused ones included).
     attempts: Vec<u32>,
     dispatched: Vec<u32>,
-    /// `dispatch_with` calls across every workspace sharing this log.
+    /// `dispatch` calls across every workspace sharing this log.
     fleet_attempts: Rc<RefCell<Vec<u32>>>,
     backoffs_armed: Cell<usize>,
     /// Issues a `Verified` listing gives no verdict for.
@@ -171,7 +171,7 @@ fn blocked_candidates_are_skipped_without_a_dispatch_attempt() {
     let report = tick_multi(&mut multi, &[1], 5, &[false]);
 
     let disp = &multi[0].1;
-    assert!(disp.attempts.is_empty(), "no dispatch_with for a blocked candidate");
+    assert!(disp.attempts.is_empty(), "no dispatch for a blocked candidate");
     assert_eq!(disp.asked.borrow().len(), 1, "one listing question for the workspace");
     let mut asked = disp.asked.borrow()[0].clone();
     asked.sort_unstable();
@@ -256,7 +256,7 @@ fn comparable(mut report: TickReport) -> TickReport {
 }
 
 /// Two workspaces of mixed blocked/unblocked candidates. Returns the report,
-/// every `dispatch_with` call in fleet order, and the dispatched issues.
+/// every `dispatch` call in fleet order, and the dispatched issues.
 fn mixed_tick(listing: Listing, seed: u64, cap: usize) -> (TickReport, Vec<u32>, Vec<u32>) {
     let blocked_a = [(11, 911), (13, 913), (14, 914), (17, 917)];
     let blocked_b = [(21, 921), (22, 922), (25, 925)];

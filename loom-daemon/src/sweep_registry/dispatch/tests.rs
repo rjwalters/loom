@@ -169,7 +169,6 @@ fn readvertise_republishes_live_issue_claims_only() {
         effort: None,
         depends_on: None,
         repo: None,
-        overflow: false,
     };
     let live_log = registry.compute_log_path(4431);
     let dead_log = registry.compute_log_path(999);

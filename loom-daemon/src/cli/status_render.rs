@@ -1353,11 +1353,7 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
                 .kind
                 .role()
                 .map_or("-", crate::step_role::StepRole::as_str);
-            let mut phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
-            if s.overflow {
-                // #9244: the host's single over-limit starred sweep.
-                phase.push_str(" [overflow]");
-            }
+            let phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
             let ctr = format_containment_column(s);
             let _ = writeln!(
                 out,
@@ -3208,7 +3204,6 @@ mod in_flight_repo_column_tests {
             effort: None,
             depends_on: None,
             repo: repo.map(str::to_string),
-            overflow: false,
         }
     }
 
@@ -3231,23 +3226,6 @@ mod in_flight_repo_column_tests {
     #[test]
     fn format_repo_column_falls_back_to_dash_when_none() {
         assert_eq!(format_repo_column(None), "-");
-    }
-
-    #[test]
-    fn overflow_sweep_is_marked_in_the_table() {
-        // #9244: an over-limit starred sweep must be visible in `status`.
-        let mut report = sample_report();
-        let mut over = mk(5, Some("/repos/loom"));
-        over.overflow = true;
-        report.in_flight = vec![mk(3, Some("/repos/loom")), over];
-        let table = render_in_flight_table(&report);
-        assert_eq!(table.matches("[overflow]").count(), 1, "{table}");
-        assert!(
-            table
-                .lines()
-                .any(|l| l.contains("#5") && l.contains("[overflow]")),
-            "{table}"
-        );
     }
 
     #[test]
@@ -3335,7 +3313,6 @@ mod containment_column_tests {
             effort: None,
             depends_on: None,
             repo: Some("/repos/loom".to_string()),
-            overflow: false,
         }
     }
 
