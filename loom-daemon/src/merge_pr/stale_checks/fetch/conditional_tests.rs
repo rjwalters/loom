@@ -5,7 +5,10 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
-use super::{branch_protection_contexts, budget, fetch_check_runs, fetch_required};
+use super::{
+    branch_protection_contexts, budget, fetch_check_runs, fetch_required, fetch_required_with,
+    ruleset_read_retryable,
+};
 use crate::forge_wait_checks::reads::GhReads;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -45,7 +48,17 @@ for a in "$@"; do
   prev="$a"
 done
 k=$(printf '%s' "$url" | tr -c 'A-Za-z0-9' '_')
-if [ -f '{d}'/"$k.raw" ]; then
+if [ -f '{d}'/"$k.failn" ]; then
+  c=0
+  [ -f '{d}'/"$k.seen" ] && c=$(cat '{d}'/"$k.seen")
+  c=$((c+1)); echo "$c" > '{d}'/"$k.seen"
+  if [ "$c" -le "$(cat '{d}'/"$k.failn")" ]; then
+    echo "RAW - $url" >> '{d}/calls.log'
+    [ -n "$inc" ] && cat '{d}'/"$k.raw"
+    cat '{d}'/"$k.err" 1>&2
+    exit 1
+  fi
+elif [ -f '{d}'/"$k.raw" ]; then
   echo "RAW - $url" >> '{d}/calls.log'
   [ -n "$inc" ] && cat '{d}'/"$k.raw"
   cat '{d}'/"$k.err" 1>&2
@@ -103,6 +116,15 @@ cat '{d}'/"$k.body"
         let msg = crate::forge_denial::body_message(body).unwrap_or_default();
         std::fs::write(self.file(url, "raw"), raw).unwrap();
         std::fs::write(self.file(url, "err"), format!("gh: {msg} (HTTP {status})\n")).unwrap();
+    }
+
+    /// Refuse `url` for its **first `n` reads** with `status`/`headers`/`body`,
+    /// then serve normally — the transient-then-healthy shape the bounded
+    /// retry (#13975) exists for. Plant a `serve`/`out` answer too for the
+    /// success the later attempts must see.
+    fn fail_first(&self, url: &str, n: u32, status: u16, headers: &str, body: &str) {
+        self.refuse(url, status, headers, body);
+        std::fs::write(self.file(url, "failn"), n.to_string()).unwrap();
     }
 
     fn calls(&self) -> Vec<String> {
@@ -229,6 +251,118 @@ fn a_plan_gated_rulesets_403_still_reads_as_no_rules() {
     let (required, notices) = fetch_required(f.gh(), "o/r", "main", Some(f.store())).unwrap();
     assert!(required.is_empty());
     assert!(notices[0].contains("#8844"), "{notices:?}");
+}
+
+// ---- the bounded in-process retry of the rulesets read (#13975) -----------
+
+/// A transient blip the retry can clear: no retryable-refusal marker, a 5xx.
+const TRANSIENT: &str = r#"{"message":"temporarily unavailable"}"#;
+
+#[test]
+fn a_transient_ruleset_read_failure_is_retried_to_success() {
+    let f = Forge::new();
+    f.fail_first("repos/o/r/rules/branches/main", 1, 503, "", TRANSIENT);
+    f.serve("repos/o/r/rules/branches/main", "[]");
+    f.out("graphql", "");
+    let (required, notices) =
+        fetch_required_with(f.gh(), "o/r", "main", Some(f.store()), |_| {}).unwrap();
+    assert!(required.is_empty());
+    assert!(notices.is_empty());
+    assert_eq!(
+        f.calls(),
+        vec![
+            "RAW - repos/o/r/rules/branches/main".to_string(),
+            "200 - repos/o/r/rules/branches/main".to_string(),
+            "OUT - graphql".to_string(),
+        ],
+        "exactly one in-process retry, not a fresh composite: {:#?}",
+        f.calls()
+    );
+}
+
+#[test]
+fn an_exhausted_ruleset_retry_fails_closed_after_max_attempts() {
+    let f = Forge::new();
+    f.refuse("repos/o/r/rules/branches/main", 503, "", TRANSIENT);
+    let err = fetch_required_with(f.gh(), "o/r", "main", Some(f.store()), |_| {}).unwrap_err();
+    assert!(
+        err.contains("ruleset lookup failed: HTTP 503 for repos/o/r/rules/branches/main"),
+        "byte-for-byte today's refusal: {err}"
+    );
+    let attempts = f
+        .calls()
+        .iter()
+        .filter(|c| c.ends_with("repos/o/r/rules/branches/main"))
+        .count();
+    assert_eq!(
+        attempts,
+        usize::try_from(crate::forge_retry::MAX_ATTEMPTS).unwrap(),
+        "exactly MAX_ATTEMPTS calls, then the single-attempt refusal: {:#?}",
+        f.calls()
+    );
+}
+
+#[test]
+fn a_plan_gated_ruleset_read_is_not_retried() {
+    let f = Forge::new();
+    f.refuse(
+        "repos/o/r/rules/branches/main",
+        403,
+        "",
+        r#"{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature."}"#,
+    );
+    f.out("graphql", "");
+    let (required, notices) =
+        fetch_required_with(f.gh(), "o/r", "main", Some(f.store()), |_| {}).unwrap();
+    assert!(required.is_empty());
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        f.calls(),
+        vec![
+            "RAW - repos/o/r/rules/branches/main".to_string(),
+            "OUT - graphql".to_string(),
+        ],
+        "the plan gate never clears, so one call only: {:#?}",
+        f.calls()
+    );
+}
+
+#[test]
+fn a_permission_refused_ruleset_read_is_not_retried() {
+    let f = Forge::new();
+    f.refuse("repos/o/r/rules/branches/main", 403, "", NOT_ACCESSIBLE);
+    f.out("graphql", "");
+    let err = fetch_required_with(f.gh(), "o/r", "main", Some(f.store()), |_| {}).unwrap_err();
+    assert!(err.contains("ruleset lookup failed"), "{err}");
+    assert_eq!(
+        f.calls().len(),
+        1,
+        "the refused read was not retried, and the lookup stops there: {:#?}",
+        f.calls()
+    );
+}
+
+#[test]
+fn the_ruleset_retry_predicate_accepts_only_what_can_clear() {
+    assert!(ruleset_read_retryable("HTTP 503 for repos/o/r/rules/branches/main"));
+    assert!(ruleset_read_retryable("repos/o/r/rules/branches/main: gh: connection refused"));
+    assert!(ruleset_read_retryable("could not exec gh api: no such file"));
+    assert!(!ruleset_read_retryable(
+        "HTTP 401 for repos/o/r/rules/branches/main: credential"
+    ));
+    assert!(!ruleset_read_retryable(
+        "HTTP 403 for repos/o/r/rules/branches/main: permission (needs Administration: read): Resource not accessible by integration"
+    ));
+    assert!(!ruleset_read_retryable(
+        "HTTP 403 for repos/o/r/rules/branches/main: Upgrade to GitHub Pro or make this repository public to enable this feature."
+    ));
+    assert!(!ruleset_read_retryable(
+        "HTTP 429 for repos/o/r/rules/branches/main: secondary-rate-limit: slow down"
+    ));
+    assert!(!ruleset_read_retryable("HTTP 404 for repos/o/r/rules/branches/main"));
+    assert!(!ruleset_read_retryable("HTTP 410 for x"), "gone does not clear");
+    assert!(!ruleset_read_retryable("HTTP 422 for x"), "unprocessable does not clear");
+    assert!(!ruleset_read_retryable("HTTP garbage for x"), "not a status we can read");
 }
 
 const NOT_ACCESSIBLE: &str = r#"{"message":"Resource not accessible by integration"}"#;

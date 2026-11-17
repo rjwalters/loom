@@ -20,6 +20,7 @@ use loom_daemon::daemon_heartbeat;
 use loom_daemon::daemon_startup_reconciliation;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
+use loom_daemon::extract_configured_terminal_ids;
 use loom_daemon::health_monitor;
 use loom_daemon::hyperparams;
 use loom_daemon::idle_exit;
@@ -42,7 +43,6 @@ use loom_daemon::watchdog_provisioning_guard;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::worktree_reaper;
-use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
 use std::fs;
@@ -1654,13 +1654,12 @@ fn setup_logging() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    // Rotate log file if it exceeds 10MB (keeps last 10 files)
-    rotate_log_file(&log_path, 10 * 1024 * 1024, 10)?;
-
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    // Issue #13917: daily-rolling writer — rolls a prior-day file at startup,
+    // then at 00:00 UTC while running; retention is by days (see `daily_log`).
+    let log_file = loom_daemon::daily_log::DailyLogWriter::open(
+        &log_path,
+        loom_daemon::daily_log::Retention::from_env(),
+    )?;
 
     // Issue #8504: every machine-readable timestamp `loom-daemon` writes is
     // UTC with an explicit `Z` designator, so it can never be mistaken for

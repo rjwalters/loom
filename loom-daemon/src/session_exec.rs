@@ -3,6 +3,8 @@
 //! setsid/double-fork descendants owned until they have all been reaped.
 
 mod host;
+#[cfg(test)]
+pub(crate) use host::exec_command;
 pub use host::run as run_host;
 mod owner;
 pub mod posture;
