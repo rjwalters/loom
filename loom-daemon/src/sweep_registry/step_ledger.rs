@@ -13,6 +13,7 @@
 //! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast. When the write fails, that rung's window is held locally (persisted, restored on restart) and broadcast, and the run counts toward the repeat cap (#12516) |
 //! | `Redraw` | counted; a second in a row on the pair arms the ledger's doubling refusal cooldown, broadcast (#11969) |
 //! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
+//! | `Uncharged` (a provider-exhausted launch, #13966) | nothing: no window, no streak, no run |
 //! | `Failed` (slow) | counted toward the repeat cap |
 //!
 //! A Builder step that arms the repeat cap also gets one marked comment on
@@ -165,6 +166,7 @@ impl SweepRegistry {
             | Effect::Cooldown(_)
             | Effect::FastFailWindow
             | Effect::Reclassify
+            | Effect::Uncharged
             | Effect::Failed => {}
         }
         // A refusal is host-local (#11909): this host's exhausted pool or its

@@ -37,6 +37,10 @@ pub struct EndedStep {
     pub ran_for: Duration,
     /// Killed at its role's timeout.
     pub timed_out: bool,
+    /// The exit-time provider feedback classified its failure `Exhausted`
+    /// (#13966): the launch died on an empty api-key seat, so the ledger
+    /// records a refusal (`provider_exhausted`), never a run or a cooldown.
+    pub provider_exhausted: bool,
 }
 
 type Queue = HashMap<PathBuf, Vec<EndedStep>>;
