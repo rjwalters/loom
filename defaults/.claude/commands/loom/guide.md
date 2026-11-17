@@ -2202,7 +2202,14 @@ render_plan_body() {
   local approved_json
   approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title,labels,closingIssuesReferences \
     --jq 'sort_by(.number) | [.[] | select(any(.labels[]?.name; . == "loom:frozen") | not)]')
-  approved=$(printf '%s' "$approved_json" | jq -r '.[] | "- **#\(.number)**: \(.title)"')
+  # #13928: surface the closes-graph this query already fetched — a
+  # merge-pending PR bullet annotates the issues it closes ("— closes #N"),
+  # the single fact that explains why those issues are absent from "Ready"
+  # below. Derived from $approved_json alone (no new forge query, the #6457
+  # discipline); a PR with empty closingIssuesReferences renders exactly as
+  # before. `held` bullets stay unchanged.
+  approved=$(printf '%s' "$approved_json" | \
+    jq -r '.[] | ([(.closingIssuesReferences // [])[].number] | sort) as $closes | "- **#\(.number)**: \(.title)" + (if ($closes | length) > 0 then " — closes " + ($closes | map("#" + tostring) | join(", ")) else "" end)')
   held=$(printf '%s' "$approved_json" | jq -r '.[] | select([(.labels // [])[].name] | index("loom:operator") or index("loom:blocked")) | "- **#\(.number)**: \(.title)"')
   # #7083: derive the set of issue numbers already closed by an open
   # `loom:pr`-labeled PR from `approved_json`'s own `closingIssuesReferences`
@@ -2235,7 +2242,7 @@ render_plan_body() {
   echo
   section "Important" "\`loom:important\`; taken before unlabelled work." "$imp"
   echo
-  section "Ready" "Human-approved issues ready for implementation (\`loom:issue\`)." "$ready"
+  section "Ready" "Human-approved issues (\`loom:issue\`) ready for implementation — excluding held (\`loom:blocked\`/\`loom:operator\`/\`loom:frozen\`), \`loom:building\`, and issues closed by an open \`loom:pr\` PR (listed under Approved)." "$ready"
   echo
   section "In Progress" "Issues currently being built (\`loom:building\`)." "$building"
   echo
@@ -2257,7 +2264,7 @@ render_plan_body() {
     "| Operator merge-risk holds | $(count "$held") |" \
     "| Very important | $(count "$vimp") |" \
     "| Important | $(count "$imp") |" \
-    "| Ready (\`loom:issue\`) | $(count "$ready") |" \
+    "| Ready (\`loom:issue\`, net of holds/building/merge-pending) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
     "| PRs awaiting review | $(count "$review") |" \
     "| Approved PRs awaiting merge | $(count "$approved") |" \

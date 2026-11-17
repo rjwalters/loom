@@ -257,7 +257,6 @@ mod tests {
                     effort: None,
                     depends_on: dep,
                     repo: None,
-                    overflow: false,
                 },
             );
         }
@@ -305,7 +304,6 @@ mod tests {
                 effort: None,
                 depends_on: dep,
                 repo: None,
-                overflow: false,
             }
         }
         registry
