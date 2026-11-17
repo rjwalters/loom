@@ -209,3 +209,70 @@ On approval, comment it on the linked issue under `<!-- loom:rollout-check-pendi
 When you receive a probe command, respond with: `AGENT:Judge:<brief-task>` — e.g. `AGENT:Judge:evaluating-PR-123`.
 
 **The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
+
+## Example Commands
+
+```bash
+# Step 0: clear any verdict that no longer describes its PR's current tree,
+# and anchor any verdict that carries no marker at all (never `|| true` — see
+# "Stale-Verdict Sweep"; exit 11 = still UNVERIFIABLE, 13 = anchored)
+for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
+    --jq '.[] | select([.labels[].name] | any(. == "loom:pr" or . == "loom:changes-requested")) | select(any(.labels[]?.name; . == "loom:frozen" or . == "loom:operator") | not) | .number'); do
+  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear --anchor
+  [ "$?" -eq 11 ] && echo "UNVERIFIABLE verdict on #$PR — do not trust it"
+done
+
+# Find PRs ready for evaluation (green badges) — cached; see "Cached Forge Reads"
+loom-daemon pr-queue --role judge
+
+# Check out the PR (worktree-aware — see "PR Branch Isolation" above; this is
+# a simplified illustration, not a bare checkout in the current directory)
+./.loom/scripts/pr-worktree.sh 42
+cd .loom/worktrees/pr-42
+REVIEW_HEAD_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
+
+# Run checks
+pnpm check:all  # or equivalent for the project
+
+# Verdict-Time CAS Recheck — one read yields both the label state and the SHA
+# this verdict is about (abort if the labels raced OR the head moved off
+# $REVIEW_HEAD_SHA; see "Verdict-Time CAS Recheck")
+CURRENT=$(gh pr view 42 --json labels,headRefOid)
+VERDICT_SHA=$(printf '%s\n' "$CURRENT" | jq -r '.headRefOid')
+
+# Request changes (green → amber - Doctor will address)
+# IMPORTANT: Chain comment AND label update with && to ensure both execute
+# post-verdict.sh takes $VERDICT_SHA as its own argument and stamps the
+# marker itself, so the heredoc below can ALWAYS be quoted (`<<'EOF'`) —
+# there is no "must be unquoted so the marker expands" footgun here anymore.
+./.loom/scripts/post-verdict.sh 42 changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
+❌ **Changes Requested**
+
+Found a few issues that need addressing:
+
+1. **src/foo.ts:15** - This function doesn't handle null inputs
+2. **tests/foo.test.ts** - Missing test case for error condition
+3. **README.md** - Docs need updating to reflect new API
+
+Please address these and I'll take another look!
+EOF
+)" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"
+# Note: PR now has loom:changes-requested (amber badge) - Doctor will address and change back to loom:review-requested
+
+# Approve PR (green → blue)
+# IMPORTANT: Chain comment AND label update with && to ensure both execute
+./.loom/scripts/post-verdict.sh 42 approved "$VERDICT_SHA" --body "$(cat <<'EOF'
+✅ **Approved!** Great work on this feature. Tests look comprehensive and the code is clean.
+
+## Test Execution
+
+**Test plan from PR description:**
+1. Run `pnpm test:unit` — ✅ Executed: All 42 tests pass
+2. Verify output contains expected format — ✅ Executed: Output matches expected format
+3. Start daemon and observe behavior — ⚠️ Skipped: requires manual observation
+EOF
+)" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"
+# Note: PR now has loom:pr (blue badge) - ready for Champion auto-merge
+```

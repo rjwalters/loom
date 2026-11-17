@@ -16,8 +16,9 @@ in every role prompt that documents a REST fallback for issue/PR writes.
 
 ## This is NOT one of the five rate-limit signatures — do not route it to REST
 
-`sweep.md`'s "GraphQL-exhaustion fallback" ladder and `doctor.md`/`judge.md`'s
-"GraphQL Rate-Limit Exhaustion — REST Fallback for Labels/Comments" sections
+`sweep.md`'s "GraphQL-exhaustion fallback" ladder and `doctor.md`'s /
+`judge-forge-api.md`'s (ex-`judge.md`) "GraphQL Rate-Limit Exhaustion — REST
+Fallback for Labels/Comments" sections
 exist for a **quota** problem: GraphQL's 5000/hr budget is temporarily
 exhausted while REST's independent budget still has headroom, so re-issuing
 the *same* mutation over REST succeeds. Those sections match failures against
@@ -110,7 +111,7 @@ reasons:
    prompt, which is worse than no guard for a rare, high-consequence case).
 2. **The actual failure mode is a reflexive fallback decision, not a command
    shape** — this page (and its references from `sweep.md`, `doctor.md`,
-   `judge.md`) fixes it at the point the decision is made (which fallback
+   `judge-forge-api.md`) fixes it at the point the decision is made (which fallback
    ladder applies to which rejection text), which is more precise than a
    blunt command guard applied after the decision was already made.
 

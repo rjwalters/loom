@@ -525,7 +525,7 @@ esac
 **On exit 12 the PR is now `loom:review-requested`, not your work.** Do not
 claim it, do not "fix" the cleared rejection, and do not re-apply
 `loom:changes-requested` — a Judge re-evaluates the current tree first. Full
-convention: `judge.md` → "Verdict SHA Marker" / "Stale-Verdict Sweep".
+convention: `judge.md` → "Stale-Verdict Sweep"; `judge-verdicts.md` → "Verdict SHA Marker".
 
 This is deliberately **not** the same thing as the Pre-Push Head-SHA Recheck
 below: that one protects *your own in-flight work* from a concurrent push;

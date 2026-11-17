@@ -2,8 +2,9 @@
 
 `gh issue create` is a **GraphQL-backed mutation**. GitHub's GraphQL quota
 (5000/hr, shared across every agent + tool) and its REST quota are
-**independent** — the same fact `judge.md`'s "GraphQL Rate-Limit
-Exhaustion — REST Fallback for Labels/Comments" section and #4856's
+**independent** — the same fact `judge-forge-api.md`'s "GraphQL Rate-Limit
+Exhaustion — REST Fallback for Labels/Comments" section (split out of
+`judge.md` in issue #13957) and #4856's
 `forge_gh_comment_rl_safe` / `forge_gh_reopen_issue_rl_safe` /
 `forge_gh_swap_label_rl_safe` already rely on for labels, comments, and
 reopen. Before #5047, issue **creation** was the one filing mutation left

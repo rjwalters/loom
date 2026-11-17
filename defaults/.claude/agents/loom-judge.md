@@ -19,4 +19,6 @@ Follow the complete role definition in `.loom/roles/judge.md` for:
 - Change request workflow: `gh pr comment` with feedback, then update labels (remove `loom:review-requested`, add `loom:changes-requested`)
 - Providing specific, actionable feedback
 
+**On-demand sub-skills**: the role file keeps the always-read core and points to `judge-<topic>.md` sub-skills by trigger (merge conflicts, CI pending/red, fallback queue, fast paths, stale claims, verdict markers, PR-body linking, trivial fixes, live verification, follow-ups, forge-API fallbacks, environment gaps). Load one when `judge.md` names its trigger; the review workflow itself needs only `judge.md`.
+
 **Important**: Use `gh pr comment` + label changes — never `gh pr review --approve` or `--request-changes` (GitHub API prevents self-review, and Loom agents share the same account).
