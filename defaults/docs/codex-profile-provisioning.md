@@ -43,9 +43,16 @@ Each surface of the profile gets exactly one mechanism, chosen for a reason:
 **Retention bound (#12966), opt-in.** Codex never expires its rollout files,
 and a deleted rollout cannot be restored, so the daemon deletes none until a
 host turns the pass on. It is **off by default**; enable it with
-`autonomous.codexSessionReaper.enabled: true` in the config (fleet tier or
-`.loom/config.json`) or `LOOM_CODEX_SESSION_REAPER=1` in the daemon's
-environment (env wins; unset means off).
+`LOOM_CODEX_SESSION_REAPER=1` in the daemon's environment, or
+`autonomous.codexSessionReaper.enabled: true` in a **host-scoped config
+tier** — the private defaults file
+(`~/.local/share/loom/config/defaults.json`), the per-repo fleet tier
+(`.loom-local/fleet-repo.json`) or the host-local override
+(`.loom-local/local.json`). A repo-committed `.loom/config.json` /
+`.loom-project/project.json` key is **not** honoured: the pass deletes on the
+machine level (one profile root per host), so a tracked repo config must not
+switch it on for every host that registers that repo. Env wins; unset means
+off. `retentionDays` (below) is read from the same host-scoped tiers.
 
 - **Off (default):** the reaper tick (`loom-daemon/src/codex_session_reaper.rs`)
   deletes nothing. At most once per tick it logs, at info level, how many

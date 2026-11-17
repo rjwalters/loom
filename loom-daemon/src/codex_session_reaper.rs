@@ -28,7 +28,13 @@
 //! logs how many rollout files are older than the floor and how many bytes
 //! they hold, so an operator can see what enabling it would remove.
 //!
-//! Config precedence **env > config > default**:
+//! Config precedence **env > config > default**, and the config tier is
+//! **host-scoped only**: the private defaults file, the per-repo fleet tier
+//! (`.loom-local/fleet-repo.json`) and the host-local override
+//! (`.loom-local/local.json`), never the repo-committed
+//! `.loom/config.json` / `.loom-project/project.json` — the pass is
+//! machine-level (one profile root shared by every registered repo), so a
+//! repo-committed key must not switch host-wide deletion on. Keys:
 //! `LOOM_CODEX_SESSION_REAPER` / `autonomous.codexSessionReaper.enabled`
 //! (default **off**) and `LOOM_CODEX_SESSION_RETENTION_DAYS` /
 //! `autonomous.codexSessionReaper.retentionDays` (default 30).
@@ -47,7 +53,8 @@ pub const DEFAULT_RETENTION_DAYS: u64 = 30;
 /// History trees inside a profile that hold rollout files.
 const HISTORY_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 
-/// The subset of `.loom/config.json → autonomous.codexSessionReaper` consumed here.
+/// The subset of the host-scoped `autonomous.codexSessionReaper` block (see
+/// [`read_config`]) consumed here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodexSessionReaperConfig {
     /// `autonomous.codexSessionReaper.enabled` (default **false**: opt-in).
@@ -56,10 +63,15 @@ pub struct CodexSessionReaperConfig {
     pub retention_days: Option<u64>,
 }
 
-/// Read the config block, soft-failing every field to `None`.
+/// Read the config block from **host-scoped tiers only**: the private
+/// defaults file, the per-repo fleet tier (`.loom-local/fleet-repo.json`)
+/// and the host-local override (`.loom-local/local.json`) — never the
+/// repo-committed `.loom/config.json` / `.loom-project/project.json`. The
+/// pass is machine-level, so a repo-committed key must not turn host-wide
+/// deletion on. Soft-fails every field to `None`.
 #[must_use]
 pub fn read_config(repo_root: &Path) -> CodexSessionReaperConfig {
-    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let effective = read_host_scoped_config(repo_root);
     let Some(block) = crate::config_resolver::get_path(&effective, "autonomous.codexSessionReaper")
     else {
         return CodexSessionReaperConfig::default();
@@ -71,6 +83,28 @@ pub fn read_config(repo_root: &Path) -> CodexSessionReaperConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&d| d > 0),
     }
+}
+
+/// The host-scoped half of
+/// [`config_resolver::resolve_effective_config`]: private defaults <
+/// per-repo fleet tier < host-local override, with the repo-committed tiers
+/// (`.loom/config.json`, `.loom-project/project.json`) deliberately absent —
+/// the delete decision this feeds is machine-level, and a tracked repo
+/// config must not make it for every host that registers the repo.
+#[must_use]
+fn read_host_scoped_config(repo_root: &Path) -> serde_json::Value {
+    use crate::config_resolver::{
+        deep_merge, private_defaults_path, soft_read_json_object, FLEET_REPO_CONFIG_REL,
+        LOCAL_CONFIG_REL,
+    };
+    let mut effective = serde_json::Value::Object(serde_json::Map::new());
+    if let Some(defaults) = private_defaults_path() {
+        effective = deep_merge(&effective, &soft_read_json_object(&defaults));
+    }
+    effective =
+        deep_merge(&effective, &soft_read_json_object(&repo_root.join(FLEET_REPO_CONFIG_REL)));
+    effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LOCAL_CONFIG_REL)));
+    effective
 }
 
 /// Resolve whether the pass deletes — env > config > default(**false**).
@@ -255,6 +289,17 @@ fn default_codex_home() -> Option<PathBuf> {
     }
 }
 
+/// Cutoff `days` in the past, or `None` when that cannot be represented:
+/// `days * 86_400` wraps for values from ~2.1e14 (release builds carry no
+/// overflow checks, wrapping the cutoff to just before **now**, which would
+/// delete recent rollouts), and from ~1.1e14 the `SystemTime` subtraction
+/// itself panics. A floor that overflows fails closed — the caller skips
+/// the pass.
+fn cutoff_from_days(now: SystemTime, days: u64) -> Option<SystemTime> {
+    let secs = days.checked_mul(86_400)?;
+    now.checked_sub(Duration::from_secs(secs))
+}
+
 /// Run one pass for the tick of `root`, gated by that repo's config. The
 /// profile root is machine-level, so the pass is idempotent across roots.
 ///
@@ -272,7 +317,14 @@ pub async fn reap_codex_sessions_for(root: &Path, reported: &mut bool) {
         return;
     };
     let days = resolve_retention_days(&config);
-    let cutoff = SystemTime::now() - Duration::from_secs(days * 86_400);
+    let Some(cutoff) = cutoff_from_days(SystemTime::now(), days) else {
+        log::warn!(
+            "codex_session_reaper: retention {days}d overflows the age floor; skipping this \
+             pass — fix {CODEX_SESSION_RETENTION_DAYS_ENV} / \
+             autonomous.codexSessionReaper.retentionDays"
+        );
+        return;
+    };
     let default_home = default_codex_home();
     let joined = tokio::task::spawn_blocking(move || {
         scan_profiles(&profile_root, default_home.as_deref(), cutoff, enabled)
@@ -293,8 +345,9 @@ pub async fn reap_codex_sessions_for(root: &Path, reported: &mut bool) {
         Ok(o) if o.files_eligible > 0 => log::info!(
             "codex_session_reaper: disabled, nothing deleted; enabling it would remove {} \
              rollout(s) ({} bytes) older than {days}d ({} history dir(s) outside the profile \
-             root would be skipped). Opt in with autonomous.codexSessionReaper.enabled=true \
-             or {CODEX_SESSION_REAPER_ENABLE_ENV}=1",
+             root would be skipped). Opt in with {CODEX_SESSION_REAPER_ENABLE_ENV}=1 or \
+             autonomous.codexSessionReaper.enabled=true in a host-scoped tier \
+             (.loom-local/local.json, .loom-local/fleet-repo.json or the private defaults)",
             o.files_eligible,
             o.bytes_eligible,
             o.skipped_outside_root
@@ -550,5 +603,63 @@ mod tests {
             };
             assert_eq!(resolve_retention_days(&cfg), 7);
         }
+    }
+
+    /// A retention floor that cannot be represented fails closed: no cutoff,
+    /// so the pass is skipped instead of wrapping to "delete everything
+    /// recent" (release builds have no overflow checks).
+    #[test]
+    fn retention_overflow_fails_closed() {
+        let now = SystemTime::now();
+        assert_eq!(cutoff_from_days(now, 30), now.checked_sub(Duration::from_secs(30 * 86_400)));
+        // `days * 86_400` overflows u64.
+        assert_eq!(cutoff_from_days(now, u64::MAX), None);
+        // The product fits u64 but lands before the UNIX epoch.
+        assert_eq!(cutoff_from_days(now, 10_u64.pow(15)), None);
+    }
+
+    /// Repo-committed tiers must not steer a machine-level delete: only the
+    /// host-scoped tiers (private defaults, fleet tier, `.loom-local`) are
+    /// consulted for this block.
+    #[test]
+    fn repo_committed_config_cannot_enable_host_wide_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        for rel in [".loom/config.json", ".loom-project/project.json"] {
+            let p = tmp.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(
+                &p,
+                serde_json::json!({"autonomous": {"codexSessionReaper": {
+                    "enabled": true, "retentionDays": 1,
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            read_config(tmp.path()),
+            CodexSessionReaperConfig::default(),
+            "repo-committed tiers are not consulted"
+        );
+
+        let fleet = tmp.path().join(".loom-local/fleet-repo.json");
+        fs::create_dir_all(fleet.parent().unwrap()).unwrap();
+        fs::write(
+            &fleet,
+            serde_json::json!({"autonomous": {"codexSessionReaper": {"retentionDays": 7}}})
+                .to_string(),
+        )
+        .unwrap();
+        let local = tmp.path().join(".loom-local/local.json");
+        fs::write(
+            &local,
+            serde_json::json!({"autonomous": {"codexSessionReaper": {"enabled": true}}})
+                .to_string(),
+        )
+        .unwrap();
+        let cfg = read_config(tmp.path());
+        assert_eq!(cfg.enabled, Some(true), "host-local override enables");
+        assert_eq!(cfg.retention_days, Some(7), "fleet tier supplies retention");
+        assert!(resolve_enabled_from(None, &cfg));
     }
 }
