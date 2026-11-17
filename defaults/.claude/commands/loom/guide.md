@@ -537,7 +537,20 @@ parse_dependencies() {
   local body="$1"
   # Park record wins (#13414): a body carrying `<!-- loom:park ... -->` names its
   # gates there; ordinary `- [ ] #N` acceptance criteria must not count.
-  if grep -qE '^[[:space:]]*<!-- loom:park ' <<<"$body"; then
+  # Read it through the daemon's code-masked parser (#13895): a marker demoted
+  # to an inline code span (`park-record retract`) declares nothing, and a body
+  # whose only park record was demoted must not fall through to the generic
+  # patterns below, which cannot see code spans. Exit 1 = no live record
+  # (e.g. every marker demoted): zero gates; exit 0 with empty output = a live
+  # record with no stated blocker. Any other daemon failure keeps the legacy
+  # grep path.
+  if grep -q 'loom:park' <<<"$body"; then
+    local park_deps prc
+    park_deps=$(loom-daemon park-record parse <<<"$body") && prc=0 || prc=$?
+    case "$prc" in
+      0) printf '%s\n' "$park_deps"; return ;;
+      1) return ;;
+    esac
     grep -E '^[[:space:]]*<!-- loom:park [*_:[:space:]]*Blocked by' <<<"$body" \
       | sed -E 's/^[[:space:]]*<!-- loom:park //; s/ by=.*//' \
       | grep -oE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' | sed 's/^#//' | sort -u
@@ -1108,6 +1121,19 @@ in — and write there:
 # and BEFORE any of Steps 2-5. Idempotent: one stable slot, reused every tick.
 DOCS_WT="$(./.loom/scripts/docs-worktree.sh | tail -1)"
 echo "$DOCS_WT"   # e.g. <repo>/.loom/worktrees/docs-guide
+
+# #13923: derive the repo ONCE, from the docs worktree itself (never the cwd's
+# remote), and pin EVERY forge query in Steps 2-5 to it by exporting `GH_REPO`
+# (which `gh issue|pr list` honours — one mechanism, no per-call flag to forget;
+# `repo:` in search queries uses `$GUIDE_REPO` directly). On a shared host the cwd can belong to a
+# sibling repo; an unpinned `gh ... list` then renders that repo's state into
+# this repo's WORK_PLAN.md (observed on a consumer repo; the incident behind #13923).
+GUIDE_REPO="$(git -C "$DOCS_WT" remote get-url origin 2>/dev/null \
+  | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')"
+[ -n "$GUIDE_REPO" ] || { echo "docs maintenance: cannot derive repo from $DOCS_WT — skipping (fail closed)" >&2; return 1 2>/dev/null || exit 1; }
+# GH_CACHE_REPO_ID scopes the `$GH_READ` cache to the pinned repo, so pinned
+# reads never share cache entries with the cwd repo's unpinned ones (#5224).
+export GH_REPO="$GUIDE_REPO" GH_CACHE_REPO_ID="$GUIDE_REPO"
 ```
 
 `docs-worktree.sh` creates (or resets) `<worktree-root>/docs-guide` on a fresh
@@ -1471,9 +1497,9 @@ _work_log_search_total_count() {
   # only a different predicate string.
   local search_range="$1"
   local predicate="${2:-is:issue is:closed}"
-  local repo_nwo
-  repo_nwo=$(git remote get-url origin 2>/dev/null \
-    | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')
+  # #13923: the repo is the one derived from the docs worktree (`GUIDE_REPO`),
+  # never the cwd's remote — see the pin note in Step 1.
+  local repo_nwo="${GUIDE_REPO:-}"
   if [ -z "$repo_nwo" ]; then
     echo "-1"
     return
@@ -2026,11 +2052,30 @@ render_plan_body() {
   # the nondeterminism at the source. It changes only the ORDER within a
   # section, never which items appear in it.
   local held vimp imp ready building review approved curated proposals epics
+  # #13908: `loom:frozen` is not the only hold. The priority, proposal and
+  # epic queries below filtered `loom:frozen` alone, so an issue carrying any
+  # other registry hold (`loom:blocked`, `loom:operator`, retired names until
+  # `labels migrate`, #11795) rendered as takeable work with no indication it
+  # is held. Held entries stay in place — a `## Blocked` section was rejected
+  # as a bigger surface that reshapes the byte-for-byte-checked region — but
+  # gain a ` *(held)*` suffix, the convention ` *(curated)*` / ` *(hermit)*`
+  # already set. The set is the registry's full hold list (`$hold_q`, hoisted
+  # above its first consumer; literal fallback only when the daemon call
+  # fails, as before), never a hardcoded label list, and `loom:frozen` stays
+  # fully excluded by each query's own select(). gh's jq flag cannot bind jq
+  # variables, so the hold set rides inline as a JSON array literal (built by
+  # jq itself, so it stays well-formed whatever the registry returns) inside
+  # a suffix expression appended to each query's jq program.
+  local ready_json hold_q hold_names held_sfx op_q
+  hold_q=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen')
+  hold_names=$(printf '%s' "$hold_q" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  held_sfx=' + (if any(.labels[]?.name; . as $n | '"$hold_names"' | index($n)) then " *(held)*" else "" end)'
+  op_q=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator)
   # #11103: the two priority levels, one section each.
   vimp=$("$GH_READ" issue list --label "loom:very-important" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
   imp=$("$GH_READ" issue list --label "loom:important" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
   # #7008/#7071: `ready` excludes every hold (registry sets, retired names
   # included until `labels migrate`, #11795) and loom:building, the same way
   # "Finding Work" does; `building` excludes the operator holds.
@@ -2041,9 +2086,6 @@ render_plan_body() {
   # merge-pending, not "ready for implementation" — but that exclusion set
   # can only be derived once `approved_json` (fetched further down) is in
   # hand, so the final bullet-formatted `ready` is assembled after it.
-  local ready_json hold_q op_q
-  hold_q=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen')
-  op_q=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator)
   ready_json=$("$GH_READ" issue list --label "loom:issue" --search "-label:loom:building $(sed 's/^/-label:/' <<<"$hold_q" | tr '\n' ' ')" --state open --limit 200 --json number,title \
     --jq 'sort_by(.number)')
   building=$("$GH_READ" issue list --label "loom:building" --search "$(sed 's/^/-label:/' <<<"$op_q" | tr '\n' ' ') -label:loom:frozen" --state open --limit 200 --json number,title \
@@ -2085,15 +2127,15 @@ render_plan_body() {
   ready=$(printf '%s' "$ready_json" | jq -r --argjson excl "$pr_linked_issues" \
     '.[] | select((.number as $n | $excl | index($n)) | not) | "- **#\(.number)**: \(.title)"')
   curated=$("$GH_READ" issue list --label "loom:curated" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(curated)*"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(curated)*"'"$held_sfx")
   local architect hermit
   architect=$("$GH_READ" issue list --label "loom:architect" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(architect)*"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(architect)*"'"$held_sfx")
   hermit=$("$GH_READ" issue list --label "loom:hermit" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(hermit)*"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(hermit)*"'"$held_sfx")
   proposals="${architect}${architect:+${hermit:+$'\n'}}${hermit}"
   epics=$("$GH_READ" issue list --label "loom:epic" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
 
   section "Operator Attention: Merge-Risk-Hold Pileup" \
     "Judge-approved PRs under a hold (\`loom:blocked\` or \`loom:operator\`) — only a human merge decision is missing." \
@@ -2187,12 +2229,85 @@ update_work_plan() {
     return 1
   fi
 
+  # #13923 PROVENANCE GATE, DO NOT REMOVE: the header claims this file is
+  # "generated from the repository's current GitHub label state"; discharge it.
+  # Refuse (non-zero, NO file change) unless every rendered `#N` carries the
+  # title the pinned repo gives it. Checks the OUTPUT, so it bites whatever the
+  # cause (guard denial, wrong cwd, stale scratch, unfaithful execution).
+  if ! verify_plan_provenance "$new_body"; then
+    echo "WORK_PLAN.md NOT written: provenance check failed (fail closed)." >&2
+    return 1
+  fi
+
   # Replace ONLY the text between the markers in "$DOCS_WT/WORK_PLAN.md" with
   # $new_body (keep both marker lines, and everything outside them, untouched).
   # Both sides above are `$(...)`-captured, so trailing newlines are stripped on
   # both — only the internal structure has to match.
+  #
+  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body "$new_body"`, which
+  # uses a per-tick `mktemp -d` dir. NEVER stage the body or the spliced file at
+  # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
+  # repos' ticks share /tmp, and a tick whose own write was denied then consumes
+  # another repo's stale file. Never read a scratch file this tick did not write.
+  splice_plan_body "$new_body" || return 1
 
   return 0
+}
+
+# #13923: every `- **#N**: title` bullet in $1 must match the title the pinned
+# repo reports for #N (issues and PRs share the `issues/N` endpoint). Existence
+# is NOT enough — a foreign render's numbers can all exist, closed, under
+# unrelated titles. Zero bullets passes; a failed lookup fails closed.
+#
+# SUFFIX LOCKSTEP, DO NOT LET THIS DRIFT: `render_plan_body()` appends at most
+# one section tag (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) and then,
+# for a held issue, ` *(held)*` (#13908) — in that order. The bullet must be the
+# forge title followed by exactly one of those combinations, so a title is
+# never guessed by stripping (a title that itself ends in ` *(held)*` still
+# matches). A new ` *(x)*` suffix in the render MUST be added here in the same
+# change: an unknown suffix fails closed and WORK_PLAN.md stops updating.
+# `test-guide-work-plan-provenance.sh` reads the render's suffix literals and
+# fails if this gate rejects any of them.
+verify_plan_provenance() {
+  local body="$1" line num rest got tag ok bad=0
+  while IFS= read -r line; do
+    num="${line#- **#}"; num="${num%%\**}"
+    rest="${line#*\*\*: }"
+    got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '.title' 2>/dev/null)" || got=""
+    if [ -z "$got" ]; then
+      echo "provenance: cannot fetch title of #$num from $GUIDE_REPO" >&2; bad=1
+      continue
+    fi
+    # Plain string equality only: a `${var% \*(x)\*}` strip is a no-op under
+    # zsh (the shell an interactive Guide may run this in), so never strip.
+    ok=0
+    for tag in '' ' *(curated)*' ' *(architect)*' ' *(hermit)*'; do
+      if [ "$rest" = "$got$tag" ] || [ "$rest" = "$got$tag *(held)*" ]; then ok=1; fi
+    done
+    if [ "$ok" -ne 1 ]; then
+      echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$rest', forge '$got')" >&2; bad=1
+    fi
+  done < <(printf '%s\n' "$body" | grep -E '^- \*\*#[0-9]+\*\*: ')
+  return "$bad"
+}
+
+# #13923: write $1 between the plan-body markers of "$DOCS_WT/WORK_PLAN.md"
+# through a per-tick scratch dir that is removed before returning (explicitly,
+# not via `trap ... RETURN`, which is bash-only and leaks the dir under zsh).
+# Fails (file untouched) if the markers are missing.
+splice_plan_body() {
+  local plan="$DOCS_WT/WORK_PLAN.md" scratch rc=0
+  grep -q '<!-- guide:plan-body:start -->' "$plan" 2>/dev/null \
+    && grep -q '<!-- guide:plan-body:end -->' "$plan" 2>/dev/null || return 1
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/guide-plan.XXXXXX")" || return 1
+  printf '%s\n' "$1" > "$scratch/body.md" \
+    && awk -v body="$scratch/body.md" '
+      /<!-- guide:plan-body:start -->/ { print; while ((getline l < body) > 0) print l; skip=1; next }
+      /<!-- guide:plan-body:end -->/   { skip=0 }
+      !skip { print }' "$plan" > "$scratch/plan.new" \
+    && cat "$scratch/plan.new" > "$plan" || rc=1
+  rm -rf "$scratch"
+  return "$rc"
 }
 ```
 
@@ -2390,6 +2505,58 @@ create_docs_pr() {
     git -C "$DOCS_WT" add -- "work_log/${archive_file##*/}"
   done
 
+  # Post-stage hook (#13892): a consuming repo can place any of the files this
+  # function stages under a CI integrity check satisfiable only by staging an
+  # additional, tool-produced file in the same PR (e.g. a freshness envelope
+  # pinning content hashes). The tick's fixed staging set cannot produce that
+  # file, so the arbitration surface is this hook: if the repo provides an
+  # executable script at `.loom/docs-post-stage.sh`, run it now — cwd is the
+  # docs worktree and `$DOCS_WT` is exported — AFTER the staging above and
+  # BEFORE the `diff --cached` snapshot below, so anything it adds lands in
+  # DOCS_CHANGED_FILES telemetry. The script prints the paths to stage, one
+  # per line, worktree-relative; EACH is staged by exact path — never
+  # `git add -A`, and nothing it modified without printing is staged, so the
+  # hook cannot silently widen the PR's file set. No script ⇒ behaviour
+  # identical to a repo without the hook. ANY failure — exists but not
+  # executable, non-zero exit, a printed path that is absolute, contains
+  # `..`, or cannot be staged — is fail-closed: discard the staged diff,
+  # release the lock, and abort the tick WITHOUT opening a PR, because the PR
+  # would just fail the repo's integrity check anyway. The repo that places a
+  # tick-staged file under an integrity check owns the recovery (regenerate +
+  # print the covered file); this tick only carries it.
+  local hook_script="$DOCS_WT/.loom/docs-post-stage.sh"
+  if [ -e "$hook_script" ]; then
+    if [ ! -f "$hook_script" ] || [ ! -x "$hook_script" ]; then
+      echo "Docs post-stage hook .loom/docs-post-stage.sh exists but is not an executable regular file — failing closed: no docs PR this tick. chmod +x it or remove it; the next tick retries." >&2
+      git -C "$DOCS_WT" reset --hard HEAD
+      ./.loom/scripts/docs-guide-lock.sh release
+      return 1
+    fi
+    local hook_output hook_rc hook_path
+    hook_output="$(cd "$DOCS_WT" && DOCS_WT="$DOCS_WT" "$hook_script")" && hook_rc=0 || hook_rc=$?
+    if [ "$hook_rc" -ne 0 ]; then
+      echo "Docs post-stage hook exited $hook_rc — failing closed: discarding this tick's staged docs diff, no docs PR. Fix .loom/docs-post-stage.sh; the next tick retries." >&2
+      git -C "$DOCS_WT" reset --hard HEAD
+      ./.loom/scripts/docs-guide-lock.sh release
+      return 1
+    fi
+    while IFS= read -r hook_path; do
+      [ -n "$hook_path" ] || continue
+      if [[ "$hook_path" = /* || "$hook_path" == *..* ]]; then
+        echo "Docs post-stage hook printed an unsafe path ('$hook_path') — only worktree-relative paths without '..' are staged. Failing closed: no docs PR this tick." >&2
+        git -C "$DOCS_WT" reset --hard HEAD
+        ./.loom/scripts/docs-guide-lock.sh release
+        return 1
+      fi
+      if ! git -C "$DOCS_WT" add -- "$hook_path"; then
+        echo "Docs post-stage hook printed '$hook_path' but it could not be staged (missing? outside the worktree?). Failing closed: no docs PR this tick." >&2
+        git -C "$DOCS_WT" reset --hard HEAD
+        ./.loom/scripts/docs-guide-lock.sh release
+        return 1
+      fi
+    done <<< "$hook_output"
+  fi
+
   # Snapshot which of the three files actually changed, for the telemetry
   # record below (issue #6136) — captured now, before the `diff --cached`
   # check below consumes the staged diff.
@@ -2483,18 +2650,23 @@ Automated document maintenance by the Guide triage agent.
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
 - **WORK_PLAN.md**: Regenerated roadmap from current GitHub label state
 - **README.md**: Updated if architectural changes were detected
+- Plus any files reported by the repo's `.loom/docs-post-stage.sh` hook, if installed (e.g. a regenerated freshness envelope)
 
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
 See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
 
-This PR only ever stages `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
-`create_docs_pr()`'s `git add` above), so it always qualifies for the
-docs-only fast path (rjwalters/loom#6134) Judge and Champion apply to any PR
-whose changed-file list matches that exact set. The `<!-- loom:docs-only-fast-path -->`
-marker above is informational only — Judge and Champion never trust it (or
-this section's prose) and always re-derive the changed-file list themselves
-from the paginated files API before taking the fast path.
+This PR normally stages only `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
+`create_docs_pr()`'s `git add` above), so it qualifies for the docs-only fast
+path (rjwalters/loom#6134) Judge and Champion apply to any PR whose
+changed-file list matches that exact set — EXCEPT when the repo's
+`.loom/docs-post-stage.sh` hook (rjwalters/loom#13892) reported additional
+files (e.g. a regenerated integrity envelope): those land in the same PR,
+which simply falls off the fast path to a full review. The
+`<!-- loom:docs-only-fast-path -->` marker above is informational only —
+Judge and Champion never trust it (or this section's prose) and always
+re-derive the changed-file list themselves from the paginated files API
+before taking the fast path.
 
 ---
 *Automated by Guide role - document maintenance phase*
@@ -2535,6 +2707,47 @@ PRBODY
 }
 ```
 
+#### Post-stage hook (optional, repo-provided) — #13892
+
+`create_docs_pr()` supports one arbitration surface for a conflict the tick
+cannot resolve on its own: a repo that places a tick-staged file (`WORK_LOG.md`,
+`WORK_PLAN.md`, `README.md`, a `work_log/` archive) under a CI integrity check
+that is only satisfiable by staging an additional, tool-produced file in the
+same PR — for example a freshness envelope pinning content hashes. The tick's
+staging set is fixed and cannot be widened or narrowed by the tick, so without
+this hook such a PR could never be made green by the tick that opened it. The
+repo that installs the integrity check **owns the recovery**; this hook is how
+it expresses it.
+
+- **Path**: `.loom/docs-post-stage.sh`, relative to the repo root (committed,
+  so it is present in the docs worktree). Deliberately NOT under
+  `.loom/scripts/` or `.loom/hooks/` — both are resync-refreshed Loom-shipped
+  surfaces; a repo-provided hook there could be overwritten or orphaned by a
+  resync.
+- **When it runs**: whenever Step 5 stages, after the fixed staging set and the
+  `work_log/` archive loop and BEFORE the `diff --cached` check — so anything
+  it adds is included in `DOCS_CHANGED_FILES` telemetry and counted by the
+  nothing-to-commit early return.
+- **Contract**: run with cwd = the docs worktree and `$DOCS_WT` exported
+  (absolute worktree path). Exit `0` = success. On stdout it prints the paths
+  to stage, one per line, worktree-relative (blank lines ignored). Each
+  printed path is staged by exact path — never `git add -A`, and nothing the
+  hook modified without printing is staged, so the hook cannot silently widen
+  the PR's file set. (A hook that stages with `git add` itself also works —
+  the `diff --cached` check sees it — but the printed-path contract above is
+  the supported interface.)
+- **Fail-closed**: any failure aborts the tick before commit/push — no PR is
+  opened, the staged diff is discarded (`reset --hard`), the docs-guide lock
+  is released, and the tick's output says so. Failure means: the file exists
+  but is not an executable regular file; a non-zero exit; a printed path that
+  is absolute or contains `..` (paths must resolve inside the worktree); or a
+  printed path that cannot be staged. Aborting beats shipping, because the PR
+  would fail the repo's integrity check anyway; the next tick retries.
+- **No script** ⇒ behaviour byte-identical to a repo without the hook.
+- **Review impact**: a PR carrying hook-produced files falls off the docs-only
+  fast path (rjwalters/loom#6134) to a full review — by design; Judge and
+  Champion re-derive eligibility from the PR's own file list.
+
 ### Document Maintenance Summary
 
 The full document maintenance flow runs at the end of each triage cycle:
@@ -2553,6 +2766,11 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
+  │    ├─ Stage the fixed set + archives, then the post-stage hook (#13892):
+  │    │    run .loom/docs-post-stage.sh if the repo provides it, stage the
+  │    │    worktree-relative paths it prints by exact path; ANY failure is
+  │    │    fail-closed (diff discarded, lock released, no PR) — see
+  │    │    "Post-stage hook" above for the full contract
   │    ├─ Token-pool pressure check (#6135): if the pool is under pressure
   │    │    AND the max-defer ceiling has not elapsed, discard the local diff,
   │    │    release the lock, and defer to a later tick instead of filing

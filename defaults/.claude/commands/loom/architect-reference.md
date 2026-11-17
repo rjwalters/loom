@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Architect Reference Documentation
 
 This file contains detailed reference documentation for the Architect role, including label workflow details, exception handling, and edge cases.

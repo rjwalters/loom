@@ -32,7 +32,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use super::lock::{locks_dir, pid_alive};
+use super::lock::locks_dir;
+use crate::sweep_registry::is_pid_alive;
 
 #[derive(Debug, Deserialize)]
 struct Owner {
@@ -96,7 +97,7 @@ pub fn check(repo: &Path, issue: u32) -> Option<LiveIssueLock> {
         .join("owner.json");
     let text = std::fs::read_to_string(&owner_path).ok()?;
     let owner: Owner = serde_json::from_str(&text).ok()?;
-    if owner.owner_pid == 0 || !pid_alive(owner.owner_pid) {
+    if owner.owner_pid == 0 || !is_pid_alive(owner.owner_pid) {
         return None;
     }
     Some(LiveIssueLock {

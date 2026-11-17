@@ -131,6 +131,9 @@ test-guide-blocked-unblock-limit.sh
 test-guide-operator-hold-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
+# #13892: Guide docs tick runs a repo-provided post-stage hook and stages its
+# printed paths by exact path; any hook failure is fail-closed. Hermetic.
+test-guide-post-stage-hook.sh
 test-guide-superseding-block-merge-state.sh
 test-guide-work-log-rotation.sh
 test-guide-unblock-merged-blocker.sh
@@ -143,7 +146,9 @@ test-guide-work-log-pr-pagination.sh
 test-guide-work-log-self-loop.sh
 test-guide-work-plan-approved-review-label-fidelity.sh
 test-guide-work-plan-debounce.sh
+test-guide-work-plan-held-issue-suffix.sh
 test-guide-work-plan-operator-hold-exclude.sh
+test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
