@@ -301,6 +301,12 @@ pub mod step {
         class: "step-no-outcome-line-pr-opened",
         message: "step exited cleanly and opened a PR but wrote no outcome line",
     };
+    /// #13966: the step died because its api-key seat was exhausted — the
+    /// provider refused the launch and the seat is marked to its reset.
+    pub const PROVIDER_EXHAUSTED: StepSite = StepSite {
+        class: "step-provider-exhausted",
+        message: "step ended on provider exhaustion; its api-key seat is marked to the reset",
+    };
 
     /// Every step class, for the contract tests.
     pub const ALL: &[StepSite] = &[
@@ -312,6 +318,7 @@ pub mod step {
         NO_PR,
         NO_OUTCOME_LINE,
         NO_OUTCOME_LINE_PR_OPENED,
+        PROVIDER_EXHAUSTED,
     ];
 
     impl StepSite {

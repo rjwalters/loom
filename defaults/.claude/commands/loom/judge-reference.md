@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge Reference
 
 Detailed reference material for the Judge role, split out of `judge.md` (the largest
