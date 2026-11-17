@@ -820,6 +820,20 @@ A CI-only gate must not add `loom:blocked`; if one is unavoidable, park with
 `loom-daemon park-record apply --issue <PR> --reason ci-gate --by judge` so the
 pass can tell it from a real hold.
 
+**A CI-only verdict is never re-anchored across a head move (#13822).** The
+head-move re-anchor carve-out (`verdict_invalidation`, #9124/#9416) carries a
+verdict forward when the new head is the same *change*; it skips a CI-only
+`changes-requested` entirely, because that verdict records no review and its one
+requested change is the head move itself. Such a PR takes the ordinary
+stale-verdict clear instead: `loom:changes-requested` + `loom:ci-failure` off,
+`loom:review-requested` on. Without that skip the rejection was copied onto the
+very head that fixed it, in a comment carrying no `<!-- loom:ci-gate-only -->`
+marker — so this pass skipped the PR as `VerdictNotCiOnly`, `forge
+doctor-handback` read the re-anchored same-head marker as a *fresh* rejection and
+withdrew its own `loom:review-requested`, and the PR sat on
+`loom:changes-requested` alone with green CI and no Judge ever queued (PR #13593).
+A verdict carrying a real review still re-anchors.
+
 ## Follow-up work
 
 - Derive `loom:blocked-unnamed` from "blocked without a park record" instead
