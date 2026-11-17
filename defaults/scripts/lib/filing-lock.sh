@@ -90,6 +90,21 @@
 #      role that wraps a whole burst does not deadlock against the per-call
 #      acquire inside create-issue.sh.
 #
+# ---------------------------------------------------------------------------
+# Captain tier (#13918)
+# ---------------------------------------------------------------------------
+# On a host in fleet mode, once the host lock is held the filer also takes the
+# captain's fleet-wide filing slot, so two hosts filing at once serialise
+# through the captain instead of a room broadcast. This file holds NO logic for
+# it (shell-language policy): `loom-daemon fleet-dispatch filing-lock
+# acquire|release` does the call, the TTL refresh id and the fail-open. Its
+# contract with this file is only its exit code and stdout:
+#   rc 0, a holder id on stdout — the slot is held; hand the id back on release
+#   rc 0, nothing on stdout     — fleet mode off, captain unreachable, or a
+#                                 binary without the subcommand: file under the
+#                                 host lock alone, exactly as before
+#   rc 75                       — the slot stayed held past the wait: DEFER
+# requires-daemon: fleet-dispatch optional   #13918 — a binary without it exits 2 and the filer files under the host lock alone.
 # Constants (env-tunable; keep in lock-step with filing_lock.rs):
 #   LOOM_FILING_LOCK                default 1    0/false/off/no disables
 #   LOOM_FILING_LOCK_WAIT_SECS      default 120  bounded wait before deferring
@@ -100,6 +115,9 @@
 
 # Resolved lock dir currently held by this shell (empty = none).
 LOOM_FILING_LOCK_PATH="${LOOM_FILING_LOCK_PATH:-}"
+
+# The holder id of the captain's fleet slot held by this shell (empty = none).
+LOOM_FILING_LOCK_CAPTAIN_HOLDER=""
 
 # The exit/return code meaning "deferred — do not file". 75 is EX_TEMPFAIL:
 # "the caller is invited to retry", which is exactly the contract.
@@ -261,6 +279,35 @@ _loom_filing_lock_advertise() {
     return 0
 }
 
+# Take the captain's fleet slot (#13918) within $2 remaining seconds.
+#   0  — file (slot held, or no captain to ask; see the header)
+#   75 — DEFER (the slot stayed held)
+_loom_filing_lock_captain_acquire() {
+    local label="$1" wait_secs="$2" bin="${LOOM_DAEMON_BIN:-loom-daemon}" holder rc=0
+    LOOM_FILING_LOCK_CAPTAIN_HOLDER=""
+    command -v "$bin" >/dev/null 2>&1 || return 0
+    holder="$("$bin" fleet-dispatch filing-lock acquire --label "$label" \
+        --wait-secs "$wait_secs" 2>/dev/null)" || rc=$?
+    if [[ "$rc" -eq "$LOOM_FILING_LOCK_DEFER_RC" ]]; then
+        return "$LOOM_FILING_LOCK_DEFER_RC"
+    fi
+    # Any other failure (an older binary, a crash) fails open to the host lock.
+    if [[ "$rc" -eq 0 && -n "$holder" ]]; then
+        LOOM_FILING_LOCK_CAPTAIN_HOLDER="$holder"
+    fi
+    return 0
+}
+
+# Give the captain's fleet slot back (best effort; its TTL frees a lost unlock).
+_loom_filing_lock_captain_release() {
+    local bin="${LOOM_DAEMON_BIN:-loom-daemon}"
+    [[ -n "${LOOM_FILING_LOCK_CAPTAIN_HOLDER:-}" ]] || return 0
+    "$bin" fleet-dispatch filing-lock release --holder "$LOOM_FILING_LOCK_CAPTAIN_HOLDER" \
+        >/dev/null 2>&1 || true
+    LOOM_FILING_LOCK_CAPTAIN_HOLDER=""
+    return 0
+}
+
 # Acquire the machine-wide filing lock.
 #   0  — safe to file
 #   75 — DEFER (caller must not file)
@@ -300,9 +347,21 @@ loom_filing_lock_acquire() {
             if mkdir "$holder" 2>/dev/null; then
                 printf '{"host":"%s","pid":%s,"label":"%s","acquired_at":%s}\n' \
                     "$self_host" "$$" "$label" "$(date +%s)" > "$holder/owner.json" 2>/dev/null || true
+                now="$(date +%s)"
+                # Captain tier (#13918): the fleet slot, within what is left of
+                # the bounded wait. A slot still held means defer, and the host
+                # lock goes back so a local peer is not stuck behind us.
+                local captain_rc=0 remaining=$(( wait_secs - (now - start) ))
+                (( remaining >= 0 )) || remaining=0
+                _loom_filing_lock_captain_acquire "$label" "$remaining" || captain_rc=$?
+                if [[ "$captain_rc" -eq "$LOOM_FILING_LOCK_DEFER_RC" ]]; then
+                    rm -f "$holder/owner.json" 2>/dev/null || true
+                    rmdir "$holder" 2>/dev/null || true
+                    echo "[filing-lock] DEFERRING '${label}': the captain's fleet filing lock stayed held for ${wait_secs}s. No issue was filed — retry on the next tick." >&2
+                    return "$LOOM_FILING_LOCK_DEFER_RC"
+                fi
                 LOOM_FILING_LOCK_PATH="$holder"
                 export LOOM_FILING_LOCK_HELD=1
-                now="$(date +%s)"
                 echo "[filing-lock] acquired for '${label}' after $(( now - start ))s wait (${holder})" >&2
                 _loom_filing_lock_advertise filing_lock "$label"
                 return 0
@@ -341,6 +400,8 @@ loom_filing_lock_acquire() {
 # Release the lock held by this shell. Idempotent; safe to call from a trap.
 loom_filing_lock_release() {
     if [[ -n "${LOOM_FILING_LOCK_PATH:-}" ]]; then
+        # Reverse of acquire: the captain's fleet slot first, then the host lock.
+        _loom_filing_lock_captain_release
         rm -f "$LOOM_FILING_LOCK_PATH/owner.json" 2>/dev/null || true
         rmdir "$LOOM_FILING_LOCK_PATH" 2>/dev/null || true
         echo "[filing-lock] released ${LOOM_FILING_LOCK_PATH}" >&2

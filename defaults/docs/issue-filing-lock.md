@@ -90,7 +90,35 @@ shared `LOOM_FILING_LOCK_DIR` if you run several worker containers per host and
 want them to serialize; otherwise they fall back to the fleet tier, exactly like
 two separate machines.
 
-**This tier is soft on purpose, and that is not a shortcut.** `peer_claims.rs`'s
+**The captain tier (#13918).** On a host in fleet mode (`fleetDispatch.enabled`),
+the fleet tier is also a real lock. After the host lock is taken, the filer asks
+the fleet-dispatch captain for its one filing slot (`POST /v1/filing-lock`) and
+gives it back with `POST /v1/filing-unlock`; two hosts filing at once serialise
+through the captain. In shell the call is `loom-daemon fleet-dispatch
+filing-lock acquire|release`, made by `lib/filing-lock.sh` after the host lock
+(it holds no logic of its own); in Rust it is `filing_lock::with_captain_tier`.
+
+- **Same identity and expiry as claims.** The caller is the tailnet `whois`
+  host, as for an assignment. The grant lives 60 s; the same holder id asking
+  again refreshes it, and only the same host *and* holder id may release it, so
+  a stale unlock never frees someone else's hold.
+- **Bounded, fail-safe.** A slot still held at the end of
+  `LOOM_FILING_LOCK_WAIT_SECS` defers like the host lock (rc 75 for
+  `create-issue.sh`), and the host lock is handed back.
+- **Fail open, counted.** Captain unreachable, a non-2xx answer, or this host in
+  fleet-dispatch fallback: the burst files under the host lock and its existing
+  pacing. Each is a `loom.fleet_dispatch.call` span on `/v1/filing-lock` with
+  `result=error` (`reason` the failed call's token, or `fallback`); an older
+  captain answers `404`, the same path.
+- **Soft state.** A captain restart empties the slot; a holder's next refresh
+  is granted again rather than wedging filing.
+- **Fleet mode off: unchanged.** No call is made.
+
+The room broadcast and the peer-marker mirror below remain until the
+claims-room retirement (#13945) deletes them; a host not yet in fleet mode
+still uses them.
+
+**The peer-marker tier is soft on purpose, and that is not a shortcut.** `peer_claims.rs`'s
 own module documentation states the contract: *"A room broadcast is eventually
 consistent, so this is a fast backoff, not a lock."* A true cross-host mutex
 needs an atomic authority — the peer-claims Phase 2 CAS that has never been
