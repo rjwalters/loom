@@ -1264,7 +1264,8 @@ assert_doc_contains "$CHAMPION_MD" \
 # bookkeeping, not evidence anyone worked the PR. This is extract-and-execute
 # (#7979 shape): the jq comment-filter line below is lifted verbatim from the
 # shipped markdown and run against a facts JSON shaped like the incident's PR
-# (2AMLogic/gf180-parasynth#798), not mirrored into this file.
+# (example-org/tool-repo#798, a private sibling repo's held PR), not mirrored
+# into this file.
 LAST_ACTIVITY_JQ_LINE="$(grep -m1 -F '| .createdAt)' "$CHAMPION_MD" || true)"
 
 assert_contains "$LAST_ACTIVITY_JQ_LINE" \
@@ -1286,7 +1287,7 @@ $LAST_ACTIVITY_JQ_LINE
 # champion lease record the evaluating step posted right before reading the
 # facts. Pre-#13921 the lease record won; post-#13921 the genuine comment is
 # the newest real activity.
-GF180_FACTS='{
+INCIDENT_FACTS='{
   "createdAt": "2026-11-13T10:00:00Z",
   "commits": [
     {"committedDate": "2026-11-13T11:00:00Z"}
@@ -1298,9 +1299,9 @@ GF180_FACTS='{
   ]
 }'
 
-LA=$(last_activity_from_facts "$GF180_FACTS")
+LA=$(last_activity_from_facts "$INCIDENT_FACTS")
 assert_eq "$LA" "2026-11-14T09:14:11Z" \
-    "#13921: a newer role=champion PR-lease record does not reset LAST_ACTIVITY — the genuine Judge approval stays the newest real activity (the criterion's own reading of the gf180-parasynth#798 shape)"
+    "#13921: a newer role=champion PR-lease record does not reset LAST_ACTIVITY — the genuine Judge approval stays the newest real activity (the criterion's own reading of the example-org/tool-repo#798 shape)"
 
 HOURS_AGO=$(( ($(date -u -d "2026-11-16T20:49:00Z" +%s) - $(date -u -d "$LA" +%s)) / 3600 ))
 if [ "$HOURS_AGO" -gt 24 ]; then
