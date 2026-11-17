@@ -77,6 +77,14 @@
 # resynced — so it degrades to the pre-#7647 behaviour with a loud stderr
 # warning and a `state=gate-unavailable` reconciliation marker on the comment.
 #
+# WALL-CLOCK BOUND (#13927): every forge read the gate makes runs under a hard
+# budget (LOOM_FORGE_REVIEW_READ_TIMEOUT, default 60s; 0 disables) — on a
+# loaded multi-sweep host a fraction of `gh` invocations block indefinitely
+# rather than erroring, and an unbounded read inside a command substitution
+# wedged this script (and the Judge behind it) forever. A timed-out gate is an
+# UNKNOWN that `--reviews-reconciled` CANNOT clear (nothing was read, so there
+# is nothing to disposition): retry the verdict, or park the PR.
+#
 # EXACT-HEAD ALL-CI GATE (#10485)
 #
 # Every `approved` verdict (fast paths included, same single chokepoint) also
@@ -146,7 +154,9 @@
 #   1 - the `gh pr comment` call failed
 #   2 - invalid arguments (bad PR number, verdict token, or SHA; missing body,
 #       or one forge verdict-body-check refuses: empty, -, @-, @path, too short)
-#   3 - approval refused by the formal-review reconciliation gate (#7647)
+#   3 - approval refused by the formal-review reconciliation gate (#7647),
+#       including a gate read that TIMED OUT (#13927: retry or park;
+#       --reviews-reconciled cannot clear a timeout)
 #   5 - approval refused, CI not settled or unverifiable on <sha> (#10485):
 #       pending, head moved, reader error/absent. Post nothing approving,
 #       leave loom:review-requested, retry on a later pass.
@@ -346,6 +356,7 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
   GATE_BLOCKING_IDS="$(gate_field REVIEW_BLOCKING_IDS)"
   GATE_INLINE_BLOCKING_IDS="$(gate_field INLINE_BLOCKING_IDS)"
   GATE_FINDINGS_FILE="$(gate_field REVIEW_FEEDBACK_FINDINGS_FILE)"
+  GATE_TIMED_OUT="$(gate_field REVIEW_FEEDBACK_TIMED_OUT)"
   # Formal-review ids and unresolved-inline-thread ids are both "things a
   # BLOCKING/NEEDS_RECONCILIATION disposition must cite" — an inline-thread-only
   # block must not be waved through with a citation that only ever names formal
@@ -359,6 +370,24 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
   # when nothing is blocking -- the CLEAR path -- so the unguarded form failed on
   # the common case and worked only when the PR had problems (#7783).
   GATE_ALL_BLOCKING_IDS="${_gate_all_ids[*]+${_gate_all_ids[*]}}"
+
+  # A wall-clock timeout (#13927) is an UNKNOWN with a difference: nothing was
+  # read, so there are no findings to disposition — `--reviews-reconciled`
+  # must NOT be able to wave it through the way it can a read that completed
+  # with outstanding findings. The Judge retries (a wedge is load-bound and
+  # usually transient) or parks the PR; it never asserts anything about an
+  # unread review state.
+  if [[ "$GATE_TIMED_OUT" == "1" ]]; then
+    {
+      echo "post-verdict.sh: REFUSING to post an approval — the review-feedback read TIMED OUT (#13927): the gate's forge reads did not complete within their wall-clock budget."
+      printf '%s\n' "$GATE_OUT" | sed 's/^/  /'
+      echo
+      echo "Nothing was posted. Retry the verdict once host load subsides (the wedge is transient),"
+      echo "or park the PR rather than blocking on it. --reviews-reconciled cannot disposition a read"
+      echo "that never completed. If timeouts persist, raise LOOM_FORGE_REVIEW_READ_TIMEOUT (default 60s)."
+    } >&2
+    exit 3
+  fi
 
   if [[ "$GATE_STATE" == "CLEAR" ]]; then
     RECONCILIATION_MARKER="<!-- loom:review-reconciliation state=clear reviews=${GATE_REVIEWS:-0} blocking_current=0 blocking_older=0 inline_unresolved=0 source=${GATE_SOURCE:-none} reconciled=n/a -->"

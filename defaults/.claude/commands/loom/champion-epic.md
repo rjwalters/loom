@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Epic Evaluation Context
 
 This file contains epic evaluation instructions for the Champion role. **Read this file when Priority 4 work is found (epic proposals).**
@@ -364,7 +367,7 @@ here would reproduce the #6516 blind spot.
 
 | Discovery result | Outcome |
 |---|---|
-| `STRONG_CLOSED == 0` and `WEAK_CLOSED == 0` — no children found by any source | **Not a completion candidate.** An epic that was never decomposed is exactly what the structural criteria are for → continue to Step 1 |
+| `STRONG_CLOSED == 0` and `WEAK_CLOSED == 0` — no children found by any source | **Not a completion candidate.** An epic that was never decomposed is exactly what the structural criteria are for → continue to **Step 0.5** (which declines unless the author declared a tracking epic, #13874) and on to Step 1 |
 | `STRONG_OPEN > 0` — containment children still open | Not complete → continue to **Step 0.5**, which stands the epic down if those children were created by someone other than Step 3 (#7666); an epic Champion decomposed itself falls through Step 0.5 to Step 1, and "Phase Progression" handles its next phase |
 | `EPIC_CHILD_DISCOVERY_COMPLETE=no` — a source read failed or a list was truncated (#10935) | **Never a completion candidate**, whatever the counts say (they are a lower bound: the open child that was missed is exactly the sky130-sar-adc#23 / #103 failure). End the pass for this epic with no close, no comment and no label; the next pass re-runs discovery. Do not file a verification child for a transient read failure |
 | `STRONG_OPEN == 0` and `STRONG_CLOSED > 0` (discovery complete) | **Completion candidate** → 0b |
@@ -554,6 +557,10 @@ Step 0a's discovery, stands such an epic down with its own
 `champion:epic-tracking-umbrella:body-*` marker (once per body hash, no
 counter, no operator routing), and ends the pass. An epic Champion decomposed
 itself (`phase-marker` source) or an undecomposed one falls through to Step 1.
+An epic whose author put `<!-- loom:tracking-epic -->` alone on a line (outside
+a code fence) is stood down the same way even with no discoverable children
+(#13874). Step 0 can never close that epic (it sees no children), so its note
+says the author or an operator closes it by hand.
 
 ### Step 1: Read the Epic
 

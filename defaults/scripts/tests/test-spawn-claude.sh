@@ -488,6 +488,7 @@ echo "stub-claude got token=${CLAUDE_CODE_OAUTH_TOKEN}"
 echo "stub-claude args=$*"
 echo "stub-claude ceiling=${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}"
 echo "stub-claude headless=${LOOM_HEADLESS_SESSION:-unset}"
+echo "stub-claude model-env=${LOOM_MODEL:-unset}"
 exit 0
 STUB
 chmod +x "$STUB_DIR/claude"
@@ -754,6 +755,18 @@ else
 fi
 assert_contains "spawn-claude: model=default" "$output" \
     "structured model=default log line emitted when nothing configured (#3482)"
+assert_contains "stub-claude model-env=unset" "$output" \
+    "a session-default spawn exports NO LOOM_MODEL (#13872 — an unknown model keeps the exhaustion mark class-less)"
+
+# Case 5 (#13872): an explicit --model argv — how the daemon dispatches a role
+# child (sweep_registry::dispatch) with no LOOM_MODEL in the environment — is
+# EXPORTED as LOOM_MODEL so claude-wrapper.sh's exhaustion mark can scope the
+# .bad_tokens entry to the model actually in flight. Without this, every
+# per-model ceiling on the 2026-11-13 fleet degraded to an account-wide mark.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --model fable 2>&1 || true)
+assert_contains "stub-claude model-env=fable" "$output" \
+    "an explicit --model argv is exported as LOOM_MODEL for the wrapper's model-class mark (#13872)"
 
 # Empty LOOM_MODEL is treated as unset — no --model emitted
 output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \

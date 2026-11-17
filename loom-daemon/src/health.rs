@@ -2918,20 +2918,16 @@ pub fn work_finder_log_tick_age_secs(
 
 /// Resolve the daemon log path the way the daemon itself does: `LOOM_DAEMON_LOG`
 /// (full override) when set, else `<loom dir>/daemon.log` where the loom dir is
-/// `LOOM_SOCKET_PATH`'s parent (test isolation) or `$HOME/.loom`.
-///
-/// Mirrors the binary-side `daemon_service::resolve_log_path` /
-/// `resolve_loom_dir` pair (#4010), which is private to the binary crate and so
-/// unreachable from this library module and from `cli::health`.
+/// resolved by the shared [`crate::autonomy_marker::resolve_loom_dir`] (#13833):
+/// `LOOM_SOCKET_PATH`'s parent (test isolation) or `$HOME/.loom`. The
+/// `LOOM_DAEMON_LOG` tier itself mirrors the binary-side
+/// `daemon_service::resolve_log_path` (#4010).
 #[must_use]
 pub fn resolve_daemon_log_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_DAEMON_LOG") {
         return Some(PathBuf::from(path));
     }
-    let loom_dir = match std::env::var("LOOM_SOCKET_PATH") {
-        Ok(socket) => PathBuf::from(socket).parent()?.to_path_buf(),
-        Err(_) => dirs::home_dir()?.join(".loom"),
-    };
+    let loom_dir = crate::autonomy_marker::resolve_loom_dir()?;
     Some(loom_dir.join("daemon.log"))
 }
 

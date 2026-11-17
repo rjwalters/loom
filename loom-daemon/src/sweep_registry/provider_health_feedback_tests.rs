@@ -432,6 +432,88 @@ fn a_claude_insta_crash_mark_emits_exactly_one_reason_classified_point() {
     assert!(!wire.contains("secret") && !wire.contains("usage credits"), "{wire}");
 }
 
+/// #13966: a **step** sweep whose exit-time feedback classified the launch's
+/// failure Exhausted notes that fact for its own end — so the release says
+/// `provider_exhausted` and the item is charged nothing — while an issue
+/// sweep's feedback notes nothing (an issue sweep has no step end). The
+/// provider line is SYNTHETIC (`insufficient balance`, the #8931 shape); the
+/// classifier's verbatim live captures are asserted in `classify.rs`/`ingest`
+/// tests, not here.
+#[test]
+fn a_step_sweep_exiting_on_exhaustion_notes_it_for_its_end() {
+    use crate::api_keys_pool::{ingest::LAUNCH_RECORD_PREFIX, paths, registry as keys};
+    use crate::step_role::StepRole;
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let pool = paths::per_repo_api_keys_dir(&registry.config.workspace_root);
+    keys::add(&pool, "loomtest", "exhaust-seat", "LOOM_TEST_KEY_13966", "fake-key", false).unwrap();
+    let launch = serde_json::json!({
+        "schema": 1, "runtime": "opencode", "model": "glm-5.3-flash",
+        "credentialSource": "pool", "credentialProvider": "loomtest",
+        "credentialAccount": "exhaust-seat",
+    });
+    let log_body = format!(
+        "{LAUNCH_RECORD_PREFIX}{launch}\n# LOOM_CLI_START runtime=opencode\n\
+         Error: insufficient balance for this account\n"
+    );
+    let take =
+        |id: &str| crate::sweep_registry::step_spawn::capture::take_step_provider_exhaustion(id);
+    let insert = |registry: &mut SweepRegistry, sweep_id: String, kind, log_path| {
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: sweep_id.clone(),
+                kind,
+                pid: 2_147_483_640,
+                token_name: UNKNOWN_TOKEN_NAME.to_string(),
+                runtime: "opencode".into(),
+                runtime_source: None,
+                log_path,
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+                overflow: false,
+            },
+        );
+    };
+
+    // A step sweep: the end is told the seat was exhausted.
+    let step_id = "step-builder-13966-1".to_string();
+    let step_log = registry.compute_step_log_path(13966, StepRole::Builder);
+    std::fs::create_dir_all(step_log.parent().unwrap()).unwrap();
+    std::fs::write(&step_log, format!("sweep_id={step_id} issue=13966 ====\n{log_body}")).unwrap();
+    insert(
+        &mut registry,
+        step_id.clone(),
+        SweepKind::Step {
+            item: 13966,
+            role: StepRole::Builder,
+        },
+        step_log,
+    );
+    assert!(!take(&step_id), "nothing noted before the feedback ran");
+    registry.apply_provider_health_feedback(&step_id, Some(1));
+    assert!(take(&step_id), "the step's end is told the seat was exhausted");
+    assert!(!take(&step_id), "taken once");
+
+    // An issue sweep with the same evidence notes nothing.
+    let issue_id = "sweep-issue-13967-exhaust".to_string();
+    let issue_log = registry.compute_log_path(13967);
+    std::fs::create_dir_all(issue_log.parent().unwrap()).unwrap();
+    std::fs::write(&issue_log, format!("sweep_id={issue_id} issue=13967 ====\n{log_body}"))
+        .unwrap();
+    insert(&mut registry, issue_id.clone(), SweepKind::Issue(13967), issue_log);
+    registry.apply_provider_health_feedback(&issue_id, Some(1));
+    assert!(!take(&issue_id), "an issue sweep has no step end to tell");
+}
+
 /// `IN_RUN_WATCHES` is process-global and `watch_in_run_exhaustion` prunes
 /// watchers whose sweep is not in *its* registry, so two of these tests on
 /// parallel threads would drop each other's watcher. Serialise them.

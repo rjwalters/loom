@@ -203,3 +203,11 @@ scripts/tests/test-install-sync-labels.sh
 
 # #13628 (2026-11-06) — deprecated tmux `loom scale` verb removed.
 scripts/cli/loom-scale.sh
+
+# #13960 (2026-11-17) — the deprecated two-tier-daemon tombstone commands
+# stopped shipping: both carried DEPRECATED in their own descriptions, and
+# migrate-consumer.sh has been deleting them from migrated repos since v0.10.0
+# (#3372). This entry makes the removal reach already-installed repos on their
+# next resync too.
+commands/loom/loom-iteration.md
+commands/loom/loom-parent.md

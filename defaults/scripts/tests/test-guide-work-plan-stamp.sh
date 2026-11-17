@@ -3,10 +3,10 @@
 #
 # The committed WORK_PLAN.md generated region carried no render date: a reader
 # comparing rows against live labels could not tell a fresh snapshot from a
-# days-old one without a forge query (measured instance:
-# 2AMLogic/sky130-lvds-tx#128 -- the committed region listed five closed
-# issues as open, undated). The durable fix is STAMP ON WRITE, never stamp on
-# render:
+# days-old one without a forge query (measured instance, genericized per
+# check-vendored-private-refs: example-org/tool-repo#202 -- the committed
+# region listed five closed issues as open, undated). The durable fix is
+# STAMP ON WRITE, never stamp on render:
 #
 #   1. plan_stamp_line() emits the fixed-shape stamp line. It is called ONLY
 #      by the splice step at the bottom of update_work_plan(), never by
