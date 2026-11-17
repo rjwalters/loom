@@ -139,3 +139,51 @@ fn the_fleet_author_fixture_is_trusted() {
     assert!(policy().trusts_json(&v), "{line}");
     assert_eq!(with_fleet_author("not json"), "not json");
 }
+
+// ---- the bounded in-process retry of the listing read (#13975) ------------
+
+#[test]
+fn a_failed_comment_listing_read_is_retried_to_success() {
+    let mut calls = 0;
+    let mut sleeps = Vec::new();
+    let out = fetch_comment_listing_with(
+        || {
+            calls += 1;
+            (calls > 1).then(|| b"[]".to_vec())
+        },
+        |d| sleeps.push(d),
+    );
+    assert_eq!(out.as_deref(), Some(b"[]".as_slice()));
+    assert_eq!(calls, 2, "one retry, not a fresh composite");
+    assert_eq!(sleeps, vec![crate::forge_retry::RETRY_BACKOFF_1]);
+}
+
+#[test]
+fn an_exhausted_comment_listing_read_is_none_after_max_attempts() {
+    let mut calls = 0;
+    let out = fetch_comment_listing_with(
+        || {
+            calls += 1;
+            None
+        },
+        |_| {},
+    );
+    assert!(out.is_none(), "the same None a single attempt gave");
+    assert_eq!(calls, usize::try_from(crate::forge_retry::MAX_ATTEMPTS).unwrap());
+}
+
+#[test]
+fn a_successful_comment_listing_read_is_never_retried() {
+    let mut calls = 0;
+    let mut slept = false;
+    let out = fetch_comment_listing_with(
+        || {
+            calls += 1;
+            Some(Vec::new())
+        },
+        |_| slept = true,
+    );
+    assert_eq!(out, Some(Vec::new()));
+    assert_eq!(calls, 1, "empty-but-successful is not retried");
+    assert!(!slept);
+}
