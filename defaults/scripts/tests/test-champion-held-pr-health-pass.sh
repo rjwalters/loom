@@ -1158,6 +1158,14 @@ assert_doc_contains "$CHAMPION_MD" \
     'HELD_CONFLICTING=$(printf '"'"'%s\n'"'"' "$HELD_JSON" | jq '"'"'[.[] | select(.mergeable == "CONFLICTING")] | length'"'" \
     "the census jq pipeline this test mirrors is the one shipped in the markdown"
 
+assert_doc_contains "$CHAMPION_MD" \
+    'if ! HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \' \
+    "a failed/expired at-Doctor census read raises HELD_STRUCTURAL_UNAVAILABLE instead of reporting 0 as fact (#14011)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'if ! RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \' \
+    "a failed/expired released-holds read raises HELD_STRUCTURAL_UNAVAILABLE instead of reporting none as fact (#14011)"
+
 assert_doc_contains "$CHAMPION_COMMON_MD" \
     "Merge-risk holds:" \
     "champion-common.md's Completion Report requires the merge-risk hold census line"
