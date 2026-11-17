@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Held-PR Base-Staleness Tick (#8552)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Held-PR Census"

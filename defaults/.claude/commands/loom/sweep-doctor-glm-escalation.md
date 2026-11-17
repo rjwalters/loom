@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Sweep: bounded GLM Doctor rejections (#11359)
 
 Load only when a Doctor phase is about to dispatch AND `runtimes.rolePreference.doctor`

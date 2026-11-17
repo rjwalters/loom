@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: premise-false evidence rules (#8593)
 
 Reference for the two places `champion-issue-promo.md` decides whether a

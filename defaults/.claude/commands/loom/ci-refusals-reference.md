@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # CI Refusals: Permission vs Rate Limit, and Re-runs (#10633)
 
 **Load when**: `loom-daemon forge wait-checks` printed `LOOM-CHECKS-ERROR` naming

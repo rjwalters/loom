@@ -111,3 +111,17 @@ fn an_empty_model_is_an_answer_not_a_missing_value() {
     };
     assert_eq!(run(Sub::ModelClass, &no_model, "You're out of usage credits."), 1);
 }
+
+#[test]
+fn the_incidents_hit_phrased_ceiling_scopes_at_the_cli_boundary() {
+    // #13872 end to end through the argv the wrapper builds: the category
+    // `classify_error` really yields for "hit your <Model> limit" is
+    // TOKEN_EXHAUSTED, and the marker must still be printed (exit 0) for it.
+    let opts = Opts {
+        exit_code: 1,
+        classification: Some("TOKEN_EXHAUSTED".to_string()),
+        model: "fable".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(run(Sub::ModelClass, &opts, "exhausted: hit your Fable limit"), 0);
+}
