@@ -26,8 +26,9 @@
 //! the self-update is running there.
 //!
 //! A hold that is not repaired and lasts [`escalate_after`] becomes an
-//! operator ask ([`escalate`]), once per hold. Rescue refs are pruned after
-//! [`retain`].
+//! operator ask ([`escalate`]), once per hold. Rescue refs, and the
+//! `loom-rescue-` stash entries they are paired with, are pruned after
+//! [`retain`] (#13977).
 
 mod classify;
 mod managed;
@@ -43,6 +44,11 @@ use super::{git, CheckoutReport, CheckoutState, Env, Level, Memory, Net, Transit
 
 /// The prefix every rescue ref lives under.
 pub(super) const RESCUE_PREFIX: &str = "refs/loom/rescue/";
+
+/// The stash subject the repair's step 3 writes, before its [`stamp`]: the
+/// message is exactly this prefix plus the timestamp, so a stash entry's age
+/// is readable from its own name.
+const STASH_PREFIX: &str = "loom-rescue-";
 
 const ESCALATE_ENV: &str = "LOOM_CHECKOUT_ESCALATE_AFTER_MINUTES";
 const REREPORT_ENV: &str = "LOOM_CHECKOUT_REREPORT_AFTER_MINUTES";
@@ -69,7 +75,7 @@ pub(super) fn rereport_after() -> Duration {
     Duration::from_secs(env_number(REREPORT_ENV, DEFAULT_REREPORT_MINUTES) * 60)
 }
 
-/// How long a rescue ref is kept.
+/// How long a rescue ref, and the `loom-rescue-` stash beside it, is kept.
 pub(super) fn retain() -> Duration {
     Duration::from_secs(env_number(RETAIN_ENV, DEFAULT_RETAIN_DAYS) * 86_400)
 }
@@ -117,7 +123,9 @@ pub(super) fn heal(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) {
         Verdict::Repair(plan) => Some(plan),
     };
     let expired = expired_rescue_refs(env, root, (env.clock)(), retain());
-    if plan.is_none() && expired.is_empty() {
+    let expired_stashes =
+        expired_rescue_stashes(root, (env.clock)(), retain(), env.bound(git::LOCAL_TIMEOUT));
+    if plan.is_none() && expired.is_empty() && expired_stashes.is_empty() {
         return;
     }
     let Some(_hold) = writable(env, root) else {
@@ -130,6 +138,7 @@ pub(super) fn heal(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) {
             Err(e) => log::warn!("checkout_ff: {}: could not prune {name}: {e}", root.display()),
         }
     }
+    prune_rescue_stashes(root, &expired_stashes, env.bound(git::LOCAL_TIMEOUT), net);
     if let Some(plan) = plan {
         if let Err(e) = repair(env, root, branch, &plan, net) {
             say(
@@ -330,7 +339,7 @@ fn repair(
 
     // 3. Dirty Loom paths, kept.
     if plan.op.is_none() && !plan.dirty.is_empty() {
-        let name = format!("loom-rescue-{ts}");
+        let name = format!("{STASH_PREFIX}{ts}");
         let mut args = vec!["stash", "push", "--quiet", "-m", name.as_str(), "--"];
         args.extend(plan.dirty.iter().map(String::as_str));
         write(&args)?;
@@ -411,6 +420,80 @@ pub(super) fn expired_rescue_refs(
         })
         .map(str::to_string)
         .collect()
+}
+
+/// The timestamp a `loom-rescue-<ts>` stash subject carries, read the same way
+/// [`expired_rescue_refs`] reads a ref name's: no reflog dates needed. The
+/// stash step names the entry exactly [`STASH_PREFIX`] plus the 16-character
+/// stamp, so anything else — a foreign subject, a missing, malformed or
+/// trailing-suffixed timestamp — is `None`, and the caller keeps the entry.
+fn rescue_stash_ts(subject: &str) -> Option<NaiveDateTime> {
+    let ts = subject.rsplit_once(STASH_PREFIX)?.1;
+    if ts.len() != 16 {
+        return None;
+    }
+    NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%SZ").ok()
+}
+
+/// `loom-rescue-<ts>` stash entries older than `keep` at `now`, as their
+/// `stash@{N}` selectors sorted highest index first, so the caller can drop
+/// in this order and no drop shifts an entry still to be dropped (#13977).
+/// A subject that does not carry a readable stamp is kept
+/// ([`rescue_stash_ts`]), and so is every entry outside the prefix. An empty
+/// stack, or a failed read, lists nothing.
+fn expired_rescue_stashes(
+    root: &Path,
+    now: DateTime<Utc>,
+    keep: Duration,
+    timeout: Duration,
+) -> Vec<String> {
+    let args = ["stash", "list", "--format=%gd%x00%gs"];
+    let Ok(listed) = git::ok(root, &args, timeout) else {
+        return Vec::new();
+    };
+    let mut expired: Vec<String> = listed
+        .lines()
+        .filter_map(|line| line.split_once('\x00'))
+        .filter(|(_, subject)| {
+            rescue_stash_ts(subject).is_some_and(|ts| {
+                now.signed_duration_since(ts.and_utc())
+                    .to_std()
+                    .is_ok_and(|age| age > keep)
+            })
+        })
+        .map(|(selector, _)| selector.to_string())
+        .collect();
+    // `git stash list` prints the newest entry (`stash@{0}`) first, and a
+    // drop shifts every entry above it down one, so drop highest index first.
+    expired.sort_by_key(|selector| std::cmp::Reverse(stash_index(selector)));
+    expired
+}
+
+/// The `N` of a `stash@{N}` selector.
+fn stash_index(selector: &str) -> Option<u32> {
+    selector
+        .strip_prefix("stash@{")?
+        .strip_suffix('}')?
+        .parse()
+        .ok()
+}
+
+/// Drop the listed stash entries. A failed drop only warns: the entry
+/// outlives this pass and the next pass re-lists and tries again. The rescue
+/// ref at that timestamp stays until its own expiry, so only the working-tree
+/// diff is lost — the same trade the rescue ref's expiry already makes.
+fn prune_rescue_stashes(root: &Path, expired: &[String], timeout: Duration, net: &mut Net) {
+    for selector in expired {
+        let args = ["stash", "drop", "--quiet", selector];
+        match git::ok(root, &args, timeout) {
+            Ok(_) => {
+                say(net, root, "rescue-pruned", Level::Info, format!("pruned stash {selector}"))
+            }
+            Err(e) => {
+                log::warn!("checkout_ff: {}: could not prune stash {selector}: {e}", root.display())
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -556,4 +639,129 @@ pub(super) fn after(
     }));
     escalate(&mut memory.escalated, report, (env.clock)(), escalate_after(), out);
     rereport(&mut memory.escalated, report, (env.clock)(), rereport_after(), out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// `now`, fixed, so test stamps are derived and never drift.
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0).unwrap()
+    }
+
+    fn rescue(days_ago: i64) -> String {
+        format!("loom-rescue-{}", stamp(now() - chrono::Duration::days(days_ago)))
+    }
+
+    #[test]
+    fn a_rescue_stash_subject_parses_the_stamp_it_was_named_with() {
+        let got = rescue_stash_ts("On master: loom-rescue-20200101T000000Z").unwrap();
+        assert_eq!(got.and_utc().timestamp(), 1_577_836_800);
+        // Detached HEAD spells the subject differently; the stamp is the same.
+        let parsed = rescue_stash_ts(&format!("On (no branch): {}", rescue(30))).unwrap();
+        assert_eq!(parsed.and_utc().timestamp(), (now() - chrono::Duration::days(30)).timestamp());
+    }
+
+    #[test]
+    fn a_foreign_stash_subject_has_no_rescue_stamp() {
+        assert!(rescue_stash_ts("On master: loom-quarantine: issue=1").is_none());
+        assert!(rescue_stash_ts("WIP on master: abc1234 init").is_none());
+        assert!(rescue_stash_ts("On master: stashed by hand").is_none());
+    }
+
+    #[test]
+    fn a_malformed_or_suffixed_stamp_is_kept() {
+        // No stamp at all.
+        assert!(rescue_stash_ts("On master: loom-rescue-").is_none());
+        // The stamp is the whole message: a suffix means it was not ours.
+        assert!(rescue_stash_ts("On master: loom-rescue-20200101T000000Z-1").is_none());
+        // Short and malformed stamps.
+        assert!(rescue_stash_ts("On master: loom-rescue-20200101T000000").is_none());
+        assert!(rescue_stash_ts("On master: loom-rescue-not-a-stamp").is_none());
+        assert!(rescue_stash_ts("On master: loom-rescue-20201301T000000Z").is_none());
+    }
+
+    /// A throwaway repo with one commit and one stash per message, pushed in
+    /// order — so the last message sits at `stash@{0}`.
+    fn repo_with_stashes(msgs: &[String]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let g = |args: &[&str]| git::ok(&root, args, git::LOCAL_TIMEOUT).unwrap();
+        g(&["init", "--quiet"]);
+        g(&["config", "user.email", "loom@example.invalid"]);
+        g(&["config", "user.name", "loom"]);
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "--quiet", "-m", "init"]);
+        for msg in msgs {
+            let mut body = std::fs::read_to_string(root.join("f.txt")).unwrap();
+            body.push_str("more\n");
+            std::fs::write(root.join("f.txt"), body).unwrap();
+            g(&["stash", "push", "--quiet", "-m", msg]);
+        }
+        (tmp, root)
+    }
+
+    #[test]
+    fn the_sweep_lists_only_expired_rescue_stashes() {
+        let keep = retain();
+        let (tmp, root) = repo_with_stashes(&[
+            rescue(30),
+            rescue(1),
+            "loom-quarantine: issue=1".to_string(),
+            "WIP on master: abc1234 init".to_string(),
+        ]);
+        // Pushed first, so the old rescue sits at the highest index; every
+        // other entry — young rescue, quarantine, foreign — is left.
+        assert_eq!(
+            expired_rescue_stashes(&root, now(), keep, git::LOCAL_TIMEOUT),
+            vec!["stash@{3}".to_string()],
+        );
+        drop(tmp);
+    }
+
+    #[test]
+    fn expired_stashes_drop_newest_index_first_and_the_rest_survive() {
+        let keep = retain();
+        let (tmp, root) = repo_with_stashes(&[rescue(40), rescue(30), rescue(1)]);
+        let mut net = Net::default();
+        let expired = expired_rescue_stashes(&root, now(), keep, git::LOCAL_TIMEOUT);
+        assert_eq!(expired, vec!["stash@{2}".to_string(), "stash@{1}".to_string()]);
+        prune_rescue_stashes(&root, &expired, git::LOCAL_TIMEOUT, &mut net);
+        let left = git::ok(&root, &["stash", "list", "--format=%gs"], git::LOCAL_TIMEOUT).unwrap();
+        assert_eq!(left.lines().count(), 1);
+        assert!(left.contains(&rescue(1)));
+        drop(tmp);
+    }
+
+    #[test]
+    fn each_prune_is_said_as_rescue_pruned_and_a_failed_drop_only_warns() {
+        let (tmp, root) = repo_with_stashes(&[rescue(30)]);
+        let mut net = Net::default();
+        // `stash@{9}` does not exist: a failed drop is a warning, not a step.
+        prune_rescue_stashes(
+            &root,
+            &["stash@{0}".to_string(), "stash@{9}".to_string()],
+            git::LOCAL_TIMEOUT,
+            &mut net,
+        );
+        assert_eq!(net.repairs.len(), 1);
+        assert_eq!(net.repairs[0].kind, "rescue-pruned");
+        assert_eq!(net.repairs[0].level, Level::Info);
+        assert!(net.repairs[0].line.contains("pruned stash stash@{0}"));
+        drop(tmp);
+    }
+
+    #[test]
+    fn an_empty_stash_stack_lists_and_prunes_nothing() {
+        let (tmp, root) = repo_with_stashes(&[]);
+        assert!(expired_rescue_stashes(&root, now(), Duration::from_secs(1), git::LOCAL_TIMEOUT)
+            .is_empty());
+        let mut net = Net::default();
+        prune_rescue_stashes(&root, &[], git::LOCAL_TIMEOUT, &mut net);
+        assert!(net.repairs.is_empty());
+        drop(tmp);
+    }
 }
