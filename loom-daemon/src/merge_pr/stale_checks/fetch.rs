@@ -174,6 +174,35 @@ refuses the merge."
     )
 }
 
+/// Whether a failed ruleset read is the transport kind a bounded retry can
+/// clear (#13975): no HTTP answer at all (a timeout, a `gh` that could not
+/// run), or an HTTP answer that is neither a terminal status nor a refusal.
+/// A plan-gated refusal ([`is_plan_gated`]) and a permission/credential
+/// refusal (the 401/403 shapes `forge_wait_checks`' `permission_refused`
+/// reads later) never clear by retrying; neither does a gone/unprocessable
+/// 404/410/422, nor a 429, which [`budget`] already holds and spaces rather
+/// than retrying into (#11418). Exhausted, the read returns today's error
+/// text unchanged, so every downstream gate stays byte-for-byte fail-closed.
+fn ruleset_read_retryable(err: &str) -> bool {
+    if is_plan_gated(err) {
+        return false;
+    }
+    // The `ReadError::reason` shapes that reach here: `HTTP <status> for
+    // <url>…` (a definite HTTP answer, refused or not) and anything else
+    // (no HTTP answer at all). Split on the separators the shapes use.
+    if let Some(rest) = err.strip_prefix("HTTP ") {
+        return match rest
+            .split([' ', ':'])
+            .next()
+            .and_then(|c| c.parse::<u16>().ok())
+        {
+            Some(status) => !matches!(status, 401 | 403 | 404 | 410 | 422 | 429),
+            None => false,
+        };
+    }
+    true
+}
+
 fn parse_iso(label: &str, raw: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(raw)
         .map(|d| d.with_timezone(&Utc))
@@ -311,6 +340,13 @@ pub(crate) fn branch_protection_contexts(body: &str) -> Result<Vec<String>, Stri
 /// protection (mirroring `forge_get_required_status_check_contexts`, #8103),
 /// plus any [`plan_gated_notice`] the lookup had to record.
 ///
+/// The rulesets read is retried in-process for transport/timeout failures
+/// ([`ruleset_read_retryable`]; at most
+/// [`crate::forge_retry::MAX_ATTEMPTS`] attempts, ≤[`crate::forge_retry::MAX_ADDED_WAIT`]
+/// of added wait) so one transient failure no longer fails the whole lookup
+/// (#13975); refusals are not retried, and an exhausted retry fails closed
+/// on exactly today's error.
+///
 /// The plan gate is evaluated PER SOURCE rather than "only when both are
 /// gated": a gated source provably holds no rules of its own, and a source
 /// that answered normally is still authoritative for what it does hold.
@@ -323,20 +359,34 @@ fn fetch_required(
     base_ref: &str,
     store: Option<&Path>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
+    fetch_required_with(gh, nwo, base_ref, store, crate::forge_retry::thread_sleep)
+}
+
+/// [`fetch_required`] with the retry sleeper injected (tests zero the
+/// backoff); production goes through [`fetch_required`].
+fn fetch_required_with(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+    store: Option<&Path>,
+    sleep: impl FnMut(std::time::Duration),
+) -> Result<(Vec<String>, Vec<String>), String> {
     let (owner, repo) = split_nwo(nwo)?;
     let mut notices: Vec<String> = Vec::new();
 
     let url = format!("repos/{nwo}/rules/branches/{base_ref}");
-    let ruleset = match conditional(gh, nwo, store, |r| r.read(&url, RULES_OP))
-        .and_then(|body| ruleset_contexts(&body))
-    {
-        Ok(contexts) => contexts.join("\n"),
-        Err(e) if is_plan_gated(&e) => {
-            notices.push(plan_gated_notice("ruleset", base_ref, &e));
-            String::new()
-        }
-        Err(e) => return Err(format!("ruleset lookup failed: {e}")),
-    };
+    let mut ruleset_read = || conditional(gh, nwo, store, |r| r.read(&url, RULES_OP));
+    let ruleset =
+        match crate::forge_retry::bounded(&mut ruleset_read, |e| ruleset_read_retryable(e), sleep)
+            .and_then(|body| ruleset_contexts(&body))
+        {
+            Ok(contexts) => contexts.join("\n"),
+            Err(e) if is_plan_gated(&e) => {
+                notices.push(plan_gated_notice("ruleset", base_ref, &e));
+                String::new()
+            }
+            Err(e) => return Err(format!("ruleset lookup failed: {e}")),
+        };
 
     let query = "query($owner: String!, $name: String!, $ref: String!) { repository(owner: $owner, name: $name) { ref(qualifiedName: $ref) { branchProtectionRule { requiredStatusCheckContexts } } } }";
     let classic = match gh_api(

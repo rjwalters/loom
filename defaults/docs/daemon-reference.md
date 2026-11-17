@@ -31,6 +31,7 @@
 - [Section-scoped status (`status --json --section`, #10787)](#section-scoped-status-status---json---section-10787)
 - [One-shot fleet vitals (`loom-daemon health`, #4761)](#one-shot-fleet-vitals-loom-daemon-health-4761)
 - [`.loom/state/` tracking contract (#9592)](#loomstate-tracking-contract-9592)
+- [Daily-rolling `daemon.log` (#13917)](#daily-rolling-daemonlog-13917)
 - [Reaper task](#reaper-task)
 - [Stale-claim reconciliation & the sweep journal (#3953, fixed #3975, extended to PR-side claims #4367)](#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367)
 - [Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)](#stacked-pr-dependency--3729-v1-3747-v2-item-1)
@@ -4324,6 +4325,7 @@ merges of `main`, two rebases — all six with byte-identical patches.
 | Property | Behavior |
 |----------|----------|
 | CI is never exempted | Only the **review** carries over. Every required check re-runs against the new head, whichever kind applied. Nothing in `verdict_equivalence` touches a check, a status, or an auto-merge arm. |
+| A CI-gate-only verdict is never re-anchored (#13822) | Equivalence asks "is this the same change?", which is the wrong question for a verdict that reviewed no change. A `loom:changes-requested` whose newest trusted verdict comment carries `<!-- loom:ci-gate-only -->` or the `Changes Requested - CI Failing` header is **not** carried forward across an equivalent head move — `handle_invalidate` falls through to the ordinary stale-verdict clear, so the PR returns to `loom:review-requested` (and loses `loom:ci-failure`) and a Judge is queued. Its one requested change *is* the head move, so re-anchoring preserved a rejection whose remedy had already been applied, and then stranded the PR: `ci_gate_recovery` read the marker-less re-anchor comment as `VerdictNotCiOnly` and `forge doctor-handback` read the same-head marker as a fresh rejection (exit 13 `RACED`). Observed on PR #13593. An **approved** verdict is unaffected and pays no extra read; a `changes-requested` verdict that carries a real review re-anchors as before; and "cannot classify it" (comments unreadable, no `changes-requested` marker left) clears, the same direction `Indeterminate` fails. The predicate is `ci_gate_recovery::is_ci_only_verdict`, shared with that pass so the two cannot drift. |
 | Kill switches | `LOOM_VERDICT_TREE_CARVEOUT` (`0`/`false`/`no`/`off`) disables **all three** kinds; `LOOM_VERDICT_EQUIVALENCE` is nested inside it and disables only #9416's `clean-merge` and `rebase-patch-identical`, leaving the `tree` kind in place. Both are read inside the shared module, so both paths honour them: the daemon pass (itself nested inside `LOOM_VERDICT_STALENESS_RECONCILE`) and `forge verdict-equivalent`, which with a switch off asks nothing and exits 1 with no answer, so the shell guard invalidates too. Default **ON** — each kind fires only on a positive proof and fails closed otherwise, so it can only ever *reduce* exposure. |
 | Daemon pass | `reanchor_equivalent_verdict` posts a `<!-- loom:verdict-sha … -->` marker for the new head plus a `<!-- loom:verdict-equivalence kind=… from=… to=… -->` audit line naming the kind, and leaves the verdict label untouched. Nothing is disarmed: an armed auto-merge would land the reviewed change. Counter: `VerdictReconcileStats::tree_identical_reanchors`. The equivalence marker is an audit record **only** — no code path reads it back as evidence, because a marker is prose anyone can write (#9548). |
 | Shell guard | Reports `FRESH` (exit 0) with the reason naming the kind, and writes nothing. It does **not** re-anchor — the marker write stays in the daemon — so it pays the comparison per pass until the periodic pass re-anchors. |
@@ -10110,8 +10112,34 @@ on a typical host, past the 108-byte (Linux) / 104-byte (macOS)
 anything the harness ran that bound a Unix socket under the inherited `TMPDIR`
 (`cargo test`, Python multiprocessing, Node IPC; #8693 review). `TMPDIR` is
 pinned instead at a fixed short root, `pinned_tmp_base()` (`/tmp/loom-nt` on
-Unix) joined with the launch's own uuid — constant-length regardless of
+Unix) joined with the launch's entry id — constant-length regardless of
 `$HOME`.
+
+**The pinned entry name is a 16-hex prefix of the launch uuid, not the uuid
+itself (#13935).** The bound that forces this is tighter than the socket limit
+above: yosys 0.67's `abc` pass (`yosys synth`, and any `read_verilog …; …; abc`
+flow) feeds ABC a bootstrap line `source <TMPDIR>/yosys-abc-XXXXXX/abc.script`
+over stdin, and ABC's interactive line editor echoes it back with
+terminal-width arithmetic. Once the full pinned path reaches **36 bytes**, that
+echo degrades into a `\r`-prefixed redraw fragment, the yosys↔abc output
+handshake never completes, and the run deadlocks — yosys blocked reading abc's
+stdout, `yosys-abc` idle in `poll()` at its `abc NN>` prompt with `output.blif`
+already written. Measured on a fleet worker: a pinned path of **≤35 bytes
+completes, ≥36 hangs**, and a `COLUMNS=200` environment override rescues the
+hanging case — the line-editor width is the mechanism. The old full-uuid pin
+(`/tmp/loom-nt/<36-char uuid>`, 49 bytes) sat squarely inside the dead zone, so
+no `yosys synth` could finish inside any guarded session. The 16-hex entry
+(`/tmp/loom-nt/<16 hex>`, 29 bytes) keeps a comfortable margin; the trade-off is
+that two launch uuids sharing their first 16 hex digits would share a pinned
+directory (~2⁻⁶¹ birthday risk per pair — far below anything a realistic
+concurrent-launch population on one host reaches, and benign if it ever
+happened: the extract names are deterministic and the sweep simply keeps the
+entry until *both* sessions are gone). **Escape hatch for other long-`TMPDIR`
+environments** — any harness or shell whose `TMPDIR` exceeds ~35 bytes and
+needs yosys: shorten `TMPDIR` for the run, or export `COLUMNS=200` around the
+yosys invocation. The sweep recognizes both entry shapes: current short ids
+(owner = whichever launch id derives them) and pre-#13935 full-uuid leftovers
+(owner = exact name), so a host upgrade strands nothing.
 
 **Reclaiming the pinned `TMPDIR` companion needs no age or liveness policy of
 its own.** A pinned-`TMPDIR` entry can only exist for a launch whose session
