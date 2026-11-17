@@ -537,7 +537,20 @@ parse_dependencies() {
   local body="$1"
   # Park record wins (#13414): a body carrying `<!-- loom:park ... -->` names its
   # gates there; ordinary `- [ ] #N` acceptance criteria must not count.
-  if grep -qE '^[[:space:]]*<!-- loom:park ' <<<"$body"; then
+  # Read it through the daemon's code-masked parser (#13895): a marker demoted
+  # to an inline code span (`park-record retract`) declares nothing, and a body
+  # whose only park record was demoted must not fall through to the generic
+  # patterns below, which cannot see code spans. Exit 1 = no live record
+  # (e.g. every marker demoted): zero gates; exit 0 with empty output = a live
+  # record with no stated blocker. Any other daemon failure keeps the legacy
+  # grep path.
+  if grep -q 'loom:park' <<<"$body"; then
+    local park_deps prc
+    park_deps=$(loom-daemon park-record parse <<<"$body") && prc=0 || prc=$?
+    case "$prc" in
+      0) printf '%s\n' "$park_deps"; return ;;
+      1) return ;;
+    esac
     grep -E '^[[:space:]]*<!-- loom:park [*_:[:space:]]*Blocked by' <<<"$body" \
       | sed -E 's/^[[:space:]]*<!-- loom:park //; s/ by=.*//' \
       | grep -oE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' | sed 's/^#//' | sort -u
