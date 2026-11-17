@@ -2731,11 +2731,30 @@ A sticky hold missing its label with no removal on record gets the label back
 # `--label` ANDs: loom:pr + loom:blocked is Champion's hold (#11861). A held
 # PR out at Doctor keeps loom:blocked beside loom:changes-requested; it is
 # counted with its standing marker (a Doctor-cycle-cap park has none).
-HELD_JSON=$(for H in loom:blocked loom:operator; do "$GH_READ" pr list --label "loom:pr" --label "$H" --search "-label:loom:frozen" \
-  --state open --limit 500 --json number,title,createdAt,updatedAt,mergeable,labels,mergeStateStatus,headRefOid,files; done | jq -s 'add | unique_by(.number)')
+#
+# #13930 degraded census: every "$GH_READ" call is bounded by gh-cached's
+# LOOM_GH_TIMEOUT_S — a stalled query fails fast (exit 124, diagnostic on
+# stderr) instead of hanging this pass. A failed query contributes nothing
+# and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR Digest below then marks
+# structural fields unavailable instead of silently dropping the digest.
+# Never issue a second bulk `pr list` to "recover" — the deliberate
+# single-read pin stands; a degraded digest beats a duplicated census read.
+HELD_JSON=""
+HELD_STRUCTURAL_UNAVAILABLE=0
+for H in loom:blocked loom:operator; do
+  if ! H_OUT=$("$GH_READ" pr list --label "loom:pr" --label "$H" --search "-label:loom:frozen" \
+      --state open --limit 500 --json number,title,createdAt,updatedAt,mergeable,labels,mergeStateStatus,headRefOid,files); then
+    HELD_STRUCTURAL_UNAVAILABLE=1   # census query stalled/failed (#13930) — degrade, don't hang
+    continue
+  fi
+  HELD_JSON="${HELD_JSON}${H_OUT}
+"
+done
+HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
 HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
   --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->"))
     and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->")) | not))] | length')
+HELD_AT_DOCTOR=${HELD_AT_DOCTOR:-0}   # a bounded-but-failed read degrades to 0, never breaks the arithmetic (#13930)
 
 HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
 HELD_CONFLICTING=$(printf '%s\n' "$HELD_JSON" | jq '[.[] | select(.mergeable == "CONFLICTING")] | length')
@@ -2749,7 +2768,9 @@ else
   OLDEST_DAYS=0
 fi
 
-echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d"
+HELD_NOTE=""
+[ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ] && HELD_NOTE=" — census read stalled: enumeration may be partial, structural fields unavailable (#13930)"
+echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d${HELD_NOTE}"
 RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
   --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
     or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")')
@@ -2831,7 +2852,10 @@ time. Run
 [`champion-held-pr-staleness.md`](champion-held-pr-staleness.md)'s per-PR tick
 here: from `$HELD_JSON`'s `mergeStateStatus`/`headRefOid`/`files` plus local
 read-only `git`, it sets `$BASE_STALENESS` for this row and comments only on a
-`DIRTY` PR — no label, no route, no rebase.
+`DIRTY` PR — no label, no route, no rebase. Skip Step 1b entirely when
+`$HELD_STRUCTURAL_UNAVAILABLE=1` (#13930 degraded census): its inputs are the
+census's structural fields, and the loop above already renders the Base cell
+as "structural fields unavailable: census read stalled".
 
 ```bash
 HOLD_MARKER="<!-- champion:merge-risk-hold -->"
@@ -2869,7 +2893,22 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
   fi
 
   STATUS="$PR_MERGEABLE"
-  if [ "$PR_MERGEABLE" = "CONFLICTING" ]; then
+  if [ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ]; then
+    # #13930 degraded census: the bulk read failed/expired, so this row's
+    # structural fields (mergeable, mergeStateStatus, headRefOid, files)
+    # cannot be rendered. Mark them in the digest body instead of dropping
+    # the digest — the reason column still comes from the per-PR comment
+    # read above. Carry any prior conflict-since marker forward untouched:
+    # this pass cannot re-evaluate mergeable, and forgetting the marker
+    # would reset the rot clock (#7020) once the census recovers.
+    STATUS="structural fields unavailable: census read stalled"
+    BASE_STALENESS="structural fields unavailable: census read stalled"
+    PRIOR_MARKER=$(printf '%s\n' "$OLD_DIGEST_BODY" | grep -o "${CONFLICT_SINCE_PREFIX}${PR_NUM} TS=[0-9TZ:-]* -->" | head -1)
+    if [ -n "$PRIOR_MARKER" ]; then
+      CONFLICT_SINCE_MARKERS="${CONFLICT_SINCE_MARKERS}${PRIOR_MARKER}
+"
+    fi
+  elif [ "$PR_MERGEABLE" = "CONFLICTING" ]; then
     # Reuse the prior pass's since-timestamp for THIS PR if one exists in
     # $OLD_DIGEST_BODY (Step 0); otherwise this is a fresh conflict episode
     # and the clock starts now. Never accumulates rot time across a
@@ -2912,6 +2951,13 @@ which is how the clock survives into the *next* pass) and writes it:
 ```bash
 DIGEST_TABLE="${DIGEST_ROWS:-| _none_ | _none_ | _none_ | _none_ |
 }"
+# #13930 degraded census: the digest is STILL written when the bulk read
+# failed/expired — with the banner below, so the marker lives in the digest
+# body itself rather than a missing digest.
+DIGEST_DEGRADED_NOTE=""
+if [ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ]; then
+  DIGEST_DEGRADED_NOTE="**Census degraded (#13930)**: structural fields unavailable: census read stalled — a census query failed or expired (bounded by gh-cached's \`LOOM_GH_TIMEOUT_S\`); the enumeration below may be PARTIAL."
+fi
 DIGEST_BODY="$DIGEST_MARKER
 # Merge-Risk Hold Digest
 
@@ -2920,9 +2966,11 @@ issue's body is **overwritten in place every pass** — it is never appended
 to, and it is **not a work item**: do not curate, build, or promote it.
 
 **Last updated**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-**Aggregate**: Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting ($HELD_ROTTING rotting >=${ROT_THRESHOLD_DAYS}d, $HELD_CONFLICTING_CLEAN clean), $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d
+**Aggregate**: Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting ($HELD_ROTTING rotting >=${ROT_THRESHOLD_DAYS}d, $HELD_CONFLICTING_CLEAN clean), $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d${HELD_NOTE}
 **Released, not yet merged**: ${RELEASED:-none}
-
+${DIGEST_DEGRADED_NOTE:+
+$DIGEST_DEGRADED_NOTE
+}
 | PR | Hold reason | Status | Base |
 |---|---|---|---|
 $DIGEST_TABLE
@@ -2947,7 +2995,9 @@ echo "Merge-risk hold digest updated: $DIGEST_URL"
 
 **Report it even when it is zero** — an empty `$HELD_JSON` still writes the
 digest with a single `_none_` row; a fresh "Last updated" is itself the signal
-that the census ran.
+that the census ran. That includes the #13930 degraded case: a census read
+that failed or expired still writes the digest — with the "structural fields
+unavailable: census read stalled" markers — never a silently dropped digest.
 
 **Never let this block a merge decision.** The digest is a read-only summary
 of state this pass already computed for other reasons (`$HELD_JSON`, plus one
@@ -3391,8 +3441,10 @@ items (exit `10`) and Step 4 behaves exactly as it did before this gate existed*
 
 **2. Classifying each item — a fixed phrase vocabulary, not judgment.** An item
 requires **out-of-band verification** when it contains one of these
-instruction-shaped fragments (case-insensitive substring of the joined criterion;
-the script's `OUT_OF_BAND_PHRASES` array, matched in declared order so the
+instruction-shaped fragments (case-insensitive, anchored with a leading word
+boundary inside the joined criterion — `Production run:` matches but
+`reproduction run` does not, #13900; the script's `OUT_OF_BAND_PHRASES` array,
+matched in declared order so the
 reported phrase is deterministic). Everything else is CI-checkable.
 
 | Failure shape | Phrases |
@@ -3489,6 +3541,12 @@ hold_issue_on_unverified_ac() {
     esac
     # Quote each unmet criterion VERBATIM so a human sees which is outstanding.
     quoted=$(printf '%s\n' "$report" | awk -F'\t' 'NF{printf "> - [ ] %s\n>\n>   _(matched: `%s`)_\n", $2, $1}')
+    # The notice shows the marker SHAPE with a `<head>` placeholder and names
+    # the real head in prose -- never a live `sha=$head_sha` literal. The
+    # classifier scans this very comment (issue comments are the evidence
+    # corpus) for a marker, and a rendered literal would self-satisfy the hold
+    # it just posted (#13900). The placeholder is rejected by the extractor's
+    # hex requirement, so prose-quoting stays inert.
     ./.loom/scripts/post-comment.sh "$issue" --body "$marker
 **Champion is holding this issue open.** PR #$pr merged, but this issue's own
 acceptance criteria include a step that CI structurally cannot perform, and
@@ -3505,9 +3563,11 @@ check, not a live-source, real-run, or over-time observation. See
 **To clear this**: perform the step, then post a comment on this issue (or on
 PR #$pr) saying what you ran and what you observed, ending with
 
-    <!-- loom:ac-verified sha=$head_sha -->
+    <!-- loom:ac-verified sha=<head> -->
 
-and close the issue. If the criterion was never actually out-of-band, reword it
+where \`<head>\` is the merged head \`$head_sha\` (the full 40-char SHA or a
+7+-char abbreviation of it both match), and close the issue. If the criterion
+was never actually out-of-band, reword it
 so it no longer reads as live/scheduled/over-time and close normally.
 
 *Automated by Champion role*"
