@@ -503,7 +503,7 @@ loom-daemon cancel --issue 758 --workspace ~/GitHub/anvil
 | Flag | Maps to `CancelSweep` field | Notes |
 |------|-----------------------------|-------|
 | `<sweep-id>` (positional) | `sweep_id` | required unless `--issue` is given |
-| `--issue <N>` | `sweep_id` (resolved client-side) | one extra `ListSweeps` round-trip; only **live** (`Running`/`Pending`) entries are candidates, and more than one is an error rather than a guess |
+| `--issue <N>` | `sweep_id` (resolved client-side) | one extra `ListSweeps` round-trip; only **live** (`Running`) entries are candidates, and more than one is an error rather than a guess |
 | `--grace <SECS>` | `grace_secs` | seconds between SIGTERM and SIGKILL; default 30, matching the MCP tool |
 | `--workspace <PATH>` | `workspace_root` | same cwd-default resolution `dispatch` applies (#4299) |
 
@@ -613,7 +613,7 @@ Return all tracked sweeps, optionally filtered by lifecycle state.
 Terminal entries are garbage-collected ~1h after the transition.
 
 Inputs:
-- `state_filter` (optional) — one of `Pending`, `Running`, `Exited`,
+- `state_filter` (optional) — one of `Running`, `Exited`,
   `Crashed`.
 - `workspace_root` (optional, issue #3929) — target managed-workspace root.
   Omit to list the default workspace's sweeps (unchanged). Set to a registered
@@ -728,7 +728,7 @@ The sweep registry (`loom-daemon/src/sweep_registry.rs`) holds a
   `loom-daemon cancel` process. `#[serde(default, skip_serializing_if =
   "Option::is_none")]`, so pre-#4980 wire data and clients remain compatible.
 - `idempotency_key` (optional), `started_at`.
-- `state` — one of `Pending`, `Running`, `Exited{code, at}`,
+- `state` — one of `Running`, `Exited{code, at}`,
   `Crashed{at}`.
 - `latest_phase` (optional) — most-recent phase advertised via
   checkpoint.
@@ -3950,7 +3950,7 @@ days are renamed to `daemon.log.YYYY-MM-DD`; each file holds one UTC day
 The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
 (env-overridable via `LOOM_SWEEP_REAPER_INTERVAL_SECS`). Each tick:
 
-1. Snapshots live `Running`/`Pending` entries.
+1. Snapshots live `Running` entries.
 2. Tests each PID via `kill(pid, 0)`.
 3. On dead PID:
    - If a sweep checkpoint exists at
@@ -4912,8 +4912,8 @@ Each tick:
 
 1. Queries the forge for ready work — `gh issue list --label loom:issue --state
    open --limit 200 --json number,labels` (honoring `LOOM_REPO` for `--repo`).
-2. Filters out issues that are **already in flight** (a live `Running` /
-   `Pending` entry in the sweep registry — the authoritative dedup, robust to
+2. Filters out issues that are **already in flight** (a live `Running`
+   entry in the sweep registry — the authoritative dedup, robust to
    `loom:issue → loom:building` label-flip lag) or that defensively carry any
    skip label (`loom:building` / `loom:blocked` / `loom:operator` / `loom:frozen`).
    A `loom:epic` issue is never a work-finder candidate either, even when it
@@ -5987,7 +5987,7 @@ A dispatch slot is checked out (counted as occupied) the instant
 `SweepRegistry::dispatch()` returns — i.e. at `fork/exec` success, before the
 child has proven it reached the API, created a worktree, or wrote a
 checkpoint. Before #4003 that slot stayed occupied for the sweep's entire
-`Running`/`Pending` lifetime regardless of whether the child ever showed a
+`Running` lifetime regardless of whether the child ever showed a
 sign of life, so a child wedged at startup (e.g. a hung MCP-init) held its
 slot for the full 300s startup-watchdog window
 (`sweep_registry::DEFAULT_WATCHDOG_TIMEOUT_SECS`) before anything reclaimed
@@ -8606,7 +8606,7 @@ for the full note.
   permanently starve an issue. A peer also emits a `retract` ad from its reaper on
   a terminal sweep outcome, freeing the issue before the TTL.
 - **Re-advertisement heartbeat (#4431).** The dispatch-time ad is no longer
-  one-shot: the reaper re-advertises every live (`Running`/`Pending`) Issue
+  one-shot: the reaper re-advertises every live (`Running`) Issue
   sweep's claim each tick (default 30s — ~4 refreshes per TTL window), and a
   repeat ad **restarts** the receiver's TTL clock. A live sweep's claim
   therefore never expires from peers' views mid-run, while a crashed host's
