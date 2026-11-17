@@ -36,13 +36,13 @@ pub async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> Result<
             match query_daemon(&socket_path, &request).await {
                 Ok(Response::NoopReleaseRecorded {
                     issue,
-                    consecutive,
+                    consecutive: _,
                     cooldown_secs,
                 }) => {
                     match cooldown_secs {
                         Some(secs) => println!(
-                            "Recorded no-op release for issue #{issue} — {consecutive} \
-                             consecutive, next dispatch allowed in {secs}s (#6670)."
+                            "Recorded no-op release for issue #{issue} — \
+                             next dispatch allowed in {secs}s (#6670)."
                         ),
                         None => println!(
                             "No-op re-dispatch cooldown is disabled — recorded issue #{issue}'s \

@@ -73,7 +73,7 @@ use super::client::{self, CallError, CallFacts};
 use super::fallback::{self, Hysteresis, Mode, Transition};
 use super::proto::{
     self, AckResponse, ClaimRequest, ClaimResponse, HeartbeatRequest, HeartbeatResponse, LiveStep,
-    NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
+    NextRequest, NextResponse, ParkEndedRequest, RefusalReason, RefuseRequest, ReleaseRequest,
 };
 use crate::step_role::StepRole;
 
@@ -267,6 +267,10 @@ struct State {
     /// Grants the captain offered in answer to a `next` that no claim has
     /// consumed yet (#12817).
     offered: Vec<Grant>,
+    /// Items the captain ordered this host to park (#13919), by the repo
+    /// root of the step whose release it answered. The reaper tick drains
+    /// them ([`take_park_orders`]).
+    park_orders: HashMap<PathBuf, Vec<u32>>,
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -454,10 +458,25 @@ where
     Req: serde::Serialize + Send + Sync + 'static,
     Resp: serde::de::DeserializeOwned + Send + 'static + Epoch,
 {
+    send_detached_then::<Req, Resp>(url, path, body, facts, |_| {});
+}
+
+/// [`send_detached`], also handing a good answer to `on_ok`.
+fn send_detached_then<Req, Resp>(
+    url: &str,
+    path: &str,
+    body: Req,
+    facts: CallFacts,
+    on_ok: impl FnOnce(&Resp) + Send + 'static,
+) where
+    Req: serde::Serialize + Send + Sync + 'static,
+    Resp: serde::de::DeserializeOwned + Send + 'static + Epoch,
+{
     client::post_detached::<Req, Resp>(url, path, body, move |answer, latency| {
         let mut facts = CallFacts { latency, ..facts };
         match answer {
             Ok(resp) => {
+                on_ok(&resp);
                 observe(true, None);
                 facts.status = Some(200);
                 facts.result = client::RESULT_OK;
@@ -529,7 +548,39 @@ pub fn release(sweep_id: &str, outcome: &str) {
     let Some(assigned) = state().assignments.remove(sweep_id) else {
         return;
     };
-    send_release(&assigned.grant, outcome);
+    send_release(&assigned.grant, outcome, Some(assigned.root));
+}
+
+/// The items the captain ordered this host to park for the repo at `root`
+/// (#13919), each once. The caller makes the park: a forge write that stays
+/// the worker's (ADR-0027 §8).
+pub fn take_park_orders(root: &Path) -> Vec<u32> {
+    state().park_orders.remove(root).unwrap_or_default()
+}
+
+/// The park of `item` in the repo at `root` ended on this host (its
+/// quarantine TTL ran out, or an operator cleared it), or the captain ordered
+/// one and this host made none (#13919): tell the captain, so it stops
+/// refusing claims for the item and forgets its fast-fail streak. Sent
+/// without waiting. A no-op outside fleet mode; a call that gets no answer
+/// leaves the captain's own bound on the hold
+/// ([`super::table::FAST_FAIL_PARK_HOLD`]) to end it.
+pub fn park_ended(root: &Path, item: u32) {
+    let Some(url) = host_endpoint(root) else {
+        return;
+    };
+    let body = ParkEndedRequest {
+        host_id: host_id(),
+        repo: repo_of(root),
+        item: u64::from(item),
+    };
+    let facts = CallFacts {
+        endpoint: proto::PARK_ENDED_PATH,
+        repo: Some(body.repo.clone()),
+        item: Some(body.item),
+        ..CallFacts::default()
+    };
+    send_detached::<_, AckResponse>(&url, proto::PARK_ENDED_PATH, body, facts);
 }
 
 /// This host is being lost (#12876): release every assignment it holds with
@@ -541,12 +592,12 @@ pub fn release_all(outcome: &str) -> usize {
         .map(|a| a.grant)
         .collect();
     for grant in &grants {
-        send_release(grant, outcome);
+        send_release(grant, outcome, None);
     }
     grants.len()
 }
 
-fn send_release(grant: &Grant, outcome: &str) {
+fn send_release(grant: &Grant, outcome: &str, root: Option<PathBuf>) {
     let body = ReleaseRequest {
         host_id: host_id(),
         assignment_id: grant.assignment_id.clone(),
@@ -561,7 +612,18 @@ fn send_release(grant: &Grant, outcome: &str) {
         assignment_id: Some(grant.assignment_id.clone()),
         ..CallFacts::default()
     };
-    send_detached::<_, AckResponse>(&grant.url, proto::RELEASE_PATH, body, facts);
+    let item = u32::try_from(grant.item).ok();
+    send_detached_then::<_, AckResponse>(
+        &grant.url,
+        proto::RELEASE_PATH,
+        body,
+        facts,
+        move |ack| {
+            if let (true, Some(root), Some(item)) = (ack.park, root, item) {
+                state().park_orders.entry(root).or_default().push(item);
+            }
+        },
+    );
 }
 
 /// The step tick's view of this host: its free slots and the roles whose
@@ -664,7 +726,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
         (vanished, heartbeat)
     };
     for grant in &vanished {
-        send_release(grant, "failed");
+        send_release(grant, "failed", None);
     }
     if let Some((url, request)) = heartbeat {
         let facts = CallFacts {

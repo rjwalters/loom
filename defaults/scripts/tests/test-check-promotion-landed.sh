@@ -674,6 +674,22 @@ assert_doc_contains "$CHAMPION_MD" \
     "Pass 0c's candidate search shortlists APPROVED-comment-without-loom:issue issues"
 
 assert_doc_contains "$CHAMPION_MD" \
+    'HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf '\''loom:blocked\nloom:operator\nloom:frozen'\''); export HOLDS  # Pass 0c' \
+    "Pass 0c resolves its hold list from the registry with Pass 0's HOLDS idiom and fallback (#13913)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'any(IN($h[])) or index("loom:building")' \
+    "Pass 0c's jq filter drops held and loom:building candidates before the rescan bound (#13913)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    '--limit 200 --json number,labels' \
+    "Pass 0c fetches labels so the jq filter can exclude permanent no-ops (#13913)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'The shortlist filter is a cost optimisation, not a guard' \
+    "Pass 0c states the filter is a cost optimisation and check-promotion-landed.sh keeps its checks (#13913)"
+
+assert_doc_contains "$CHAMPION_MD" \
     "#6862" \
     "champion-issue-promo.md documents the #6862 promotion-write-reliability fix"
 
