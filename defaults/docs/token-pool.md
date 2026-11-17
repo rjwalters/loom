@@ -1678,9 +1678,9 @@ text, the CLI, and this document all agree on:
 | Reason class | Blocks selection until | Pruned from `.bad_tokens` after |
 |---|---|---|
 | `auth` (401 / OAuth / expired / blocked) | `loom-daemon tokens unblock <name>` — **never expires** | 30d (`AUTH_ENTRY_MIN_RETENTION_SECS`), a garbage-collection floor, *not* an expiry |
-| non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
-| non-auth naming the **5h session limit** specifically | the earlier of: proven window reset, or `min(cooldown, 18000)` — see [Session-limit entries expire with their own window](#session-limit-entries-expire-with-their-own-window-7522) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
-| non-auth, ambiguous reason (does not name the session window) | the exhaustion cooldown (unchanged fixed TTL), **or** earlier if a re-probe proves both signals clear — see [Ambiguous exhaustion entries: two-signal early release](#ambiguous-exhaustion-entries-two-signal-early-release-7538) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) — or, on a still-`exhausted` re-probe (#13893), until that probe's recorded 7d reset instant | 8d (`DEFAULT_CLEANUP_MAX_AGE_SECS`, raised from 24h by #13893 so the on-disk clock never expires a live weekly hold) |
+| non-auth naming the **5h session limit** specifically | the earlier of: proven window reset, or `min(cooldown, 18000)` — see [Session-limit entries expire with their own window](#session-limit-entries-expire-with-their-own-window-7522) | 8d (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| non-auth, ambiguous reason (does not name the session window) | the exhaustion cooldown (unchanged fixed TTL), **earlier** if a re-probe proves both signals clear, or **later** — until the re-probe's recorded 7d reset instant when it is still `exhausted` (#13893) — see [Ambiguous exhaustion entries: two-signal early release](#ambiguous-exhaustion-entries-two-signal-early-release-7538) | 8d (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
 | unparseable timestamp | never (**fail-closed** — a malformed line never silently un-blocks a token) | never (malformed lines are always retained) |
 
 **Read time** (`bad_tokens::is_bad` / `blocking_entry`, enforced by the selector
@@ -1691,21 +1691,26 @@ TTL by design — a broken credential does not heal on a timer.
 
 **On disk** (`bad_tokens::cleanup_bad_tokens`, wired in #4643 into `tokens
 select` and `tokens check`): entries older than the max-age policy above are
-dropped. The auth floor is deliberately far longer than the routine 24h policy,
-because pruning an auth line *would* silently readmit a broken credential —
-the on-disk clock must never become a back-door expiry for the permanent class.
+dropped. The auth floor is deliberately far longer than the routine 8-day
+policy, because pruning an auth line *would* silently readmit a broken
+credential — the on-disk clock must never become a back-door expiry for the
+permanent class. The same logic is why #13893 raised the exhaustion retention
+from 24h to 8d: a weekly entry can now be held at read time until a re-probe's
+recorded 7d reset instant, and pruning the line mid-hold would readmit the
+still-exhausted account — the same back-door expiry, for the TTL class.
 Cleanup is best-effort and takes **no lock at all** when nothing is prunable, so
 a burst of concurrent spawns never serializes on `.bad_tokens`. Before #4643
 `cleanup_bad_tokens` had zero callers anywhere in the tree and pools accumulated
 entries indefinitely.
 
 **The oldest visible entry is usually not the deciding one.** Every failed spawn
-appends a *new* line, so an account with a genuinely long-lived limit (e.g.
-`hit your weekly limit`, which outlasts the 6h cooldown by days) is
-continuously re-marked: the 13h-old lines at the top of the file expired long
-ago, while a fresh line further down is what actually blocks. `blocking_entry`
-reports the deciding line, and the empty-pool error prints its timestamp — read
-that, not the head of the file.
+appends a *new* line, so `blocking_entry` reports the deciding line, and the
+empty-pool error prints its timestamp — read that, not the head of the file.
+Before #13893 a genuinely long-lived limit (e.g. `hit your weekly limit`, which
+outlasts the 6h cooldown by days) kept the account in a 6h re-mark churn (each
+expiry → retry → insta-crash → fresh line); since #13893 a still-`exhausted`
+re-probe holds the entry until the probe's recorded 7d reset instant instead,
+so the pile of re-mark lines at the head of the file is a pre-#13893 artifact.
 
 ### Session-limit entries expire with their own window (#7522)
 
@@ -1803,8 +1808,10 @@ check like `session_window_has_reset` is not safe to apply to an ambiguous
 reason — that is exactly the harm #4212 declined to risk.
 
 So an ambiguous (non-session-limit-matching) `Exhaustion` entry gets its own,
-separate, two-signal check — `bad_tokens::ambiguous_exhaustion_has_reset` —
-instead of being folded into the session-limit fast path:
+separate, evidence check — `bad_tokens::ambiguous_exhaustion_evidence`
+(renamed from #7538's `ambiguous_exhaustion_has_reset` by #13893, which also
+widened its verdicts) — instead of being folded into the session-limit fast
+path:
 
 1. Prerequisite: **freshness**. The `.ranking` file's mtime must be after the
    entry's `marked_at`, exactly like `session_window_has_reset`'s fallback
@@ -1831,10 +1838,32 @@ Never on 5h evidence alone. The session-limit-matching fast path
 (`SESSION_WINDOW_SECS` cap + `session_window_has_reset`) is completely
 unaffected — it keeps its existing single-signal behavior, unchanged.
 
-An ambiguous entry with no `.ranking` row at all (never probed, or probed
-before this change shipped) falls back to the full fixed-TTL cooldown, exactly
-as before #7538 — the two-signal check only ever narrows a hold, never widens
-one.
+**Hold to the recorded 7d reset when the re-probe says still exhausted
+(#13893).** The converse shape — a fresh row whose 7d verdict **is**
+`exhausted` — used to fall back to the fixed 6h cooldown, which just
+scheduled a retry that insta-crashed and re-marked (the 6h re-mark churn in
+the issue's evidence). Instead the entry is held until that row's recorded
+`limit_reset` — for an `exhausted` row `check::limit_reset` records the **7d**
+reset — provided the instant is **credible**: parseable
+(`%Y-%m-%dT%H:%M:%SZ`), strictly after the mark (a pre-mark instant describes
+the previous window, the same trap `session_window_has_reset` documents), and
+no more than 8 days in the future at read time
+(`MAX_WEEKLY_RESET_HORIZON_SECS` — a 7d window cannot end later, so anything
+beyond that horizon is garbage). A passed instant releases; a missing,
+unparseable, pre-mark, or beyond-horizon instant leaves the 6h behaviour
+unchanged; and `cooldown_remaining_secs` reports time to the hold instant, so
+the operator-facing countdown is never longer than the hold the code honors.
+
+One deliberate widening, one explicit cap: #7538's release only ever
+**narrowed** a hold, and #13893's hold-until-reset is the one place the fixed
+TTL is extended — only on fresh probe evidence, and an explicitly configured
+`LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS` caps the extension at the operator's
+value (the default does not cap, because holding past the default 6h is the
+whole point). An ambiguous entry with no `.ranking` row at all (never probed,
+or probed before this change shipped) falls back to the full fixed-TTL
+cooldown, exactly as before #7538. On disk, `DEFAULT_CLEANUP_MAX_AGE_SECS`
+was raised 24h → 8d in the same change so the routine prune can never expire
+a line whose hold is still live.
 
 ### Empty-pool error detail (#4643)
 
