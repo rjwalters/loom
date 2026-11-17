@@ -262,6 +262,181 @@ pub fn compose_transient_body(
     })
 }
 
+/// One blocker to withdraw from an existing park (#13895).
+#[derive(Debug, Clone)]
+pub struct RetractRequest {
+    /// The issue or PR whose body carries the park record.
+    pub number: u64,
+    /// `OWNER/REPO` of the artifact, when known.
+    pub repo: Option<String>,
+    /// The blocker being withdrawn. Every live marker naming it is demoted.
+    pub blocked_by: BlockerRef,
+    /// Why it no longer gates the artifact. Required: a withdrawal that does
+    /// not say why leaves no audit trail.
+    pub reason: String,
+    /// `by=` provenance on the audit line.
+    pub by: Option<String>,
+    /// `at=` provenance, RFC 3339.
+    pub at: String,
+    pub dry_run: bool,
+}
+
+/// Why a retraction is refused before any forge call, or `None` when it may run.
+#[must_use]
+pub fn precheck_retract(req: &RetractRequest) -> Option<String> {
+    (req.reason.trim().is_empty()).then(|| {
+        "--reason is required: a withdrawal that does not say why leaves no audit trail".to_string()
+    })
+}
+
+/// `body` with every live marker naming `target` demoted to an inline code
+/// span and one visible [`super::WITHDRAWN_PHRASE`] audit line appended, or
+/// `None` when no live marker names `target` (idempotent no-op, the same
+/// posture as [`compose_body`]).
+///
+/// A marker naming `target` and other references is refused — demoting it
+/// would silently drop the other blockers — and so is a demotion that fails to
+/// hide the blocker from [`super::parse`] (pathological backtick adjacency
+/// beside the marker); both leave the body untouched.
+pub fn compose_retract_body(
+    body: &str,
+    target: &BlockerRef,
+    by: Option<&str>,
+    at: &str,
+    reason: &str,
+) -> Result<Option<String>, String> {
+    let (demoted, count) = match super::demote_blocker(body, target) {
+        Ok(ok) => ok,
+        Err(others) => {
+            let list = others
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "a park marker names {target} and also {list}; refusing to split it — retract \
+                 each blocker through its own record, or hand-edit the body"
+            ));
+        }
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    if super::blockers(&demoted).iter().any(|b| b == target) {
+        return Err(format!(
+            "wrapping the marker for {target} in a code span did not hide it from the parser \
+             (an unmatched backtick beside it?); hand-edit it inside a fenced code block instead"
+        ));
+    }
+    let line = super::render_withdrawn(target, by, at, reason);
+    let head = demoted.trim_end();
+    Ok(Some(if head.is_empty() {
+        format!("{line}\n")
+    } else {
+        format!("{head}\n\n{line}\n")
+    }))
+}
+
+/// The offline twin of [`retract`] for `--file`: the same refusals against a
+/// body in hand, but the planned body is always only printed — a file has no
+/// forge to write back to. Exit [`exit::OK`] even on the no-op, `REFUSED` on
+/// the same conditions [`retract`] refuses.
+pub fn retract_offline(
+    req: &RetractRequest,
+    body: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    if let Some(why) = precheck_retract(req) {
+        let _ = writeln!(err, "park-record retract: REFUSED - {why}; nothing was changed");
+        return exit::REFUSED;
+    }
+    let new_body = match compose_retract_body(
+        body,
+        &req.blocked_by,
+        req.by.as_deref(),
+        &req.at,
+        &req.reason,
+    ) {
+        Ok(b) => b,
+        Err(why) => {
+            let _ = writeln!(err, "park-record retract: REFUSED - {why}; nothing was changed");
+            return exit::REFUSED;
+        }
+    };
+    let _ = writeln!(out, "DRY_RUN=true");
+    let _ = writeln!(out, "NUMBER={}", req.number);
+    let _ = writeln!(out, "BODY_CHANGED={}", new_body.is_some());
+    if let Some(b) = &new_body {
+        let _ = writeln!(out, "BODY<<EOF\n{b}EOF");
+    }
+    exit::OK
+}
+
+/// Withdraw one declared blocker: demote the marker(s) naming it, append the
+/// audit line, write the body. Never touches labels — `loom:blocked` stays on
+/// and is removed by the caller or the unblock sweep.
+pub fn retract(
+    forge: &mut dyn ParkForge,
+    req: &RetractRequest,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let n = req.number;
+    if let Some(why) = precheck_retract(req) {
+        let _ = writeln!(err, "park-record retract: REFUSED - {why}; nothing was changed");
+        return exit::REFUSED;
+    }
+
+    // Fresh read immediately before the write (concurrent body edits).
+    let state = match forge.view(n) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "park-record retract: could not read #{n}: {e}");
+            return exit::FORGE;
+        }
+    };
+
+    let new_body = match compose_retract_body(
+        &state.body,
+        &req.blocked_by,
+        req.by.as_deref(),
+        &req.at,
+        &req.reason,
+    ) {
+        Ok(b) => b,
+        Err(why) => {
+            let _ = writeln!(err, "park-record retract: REFUSED - {why}; nothing was changed");
+            return exit::REFUSED;
+        }
+    };
+    let body_changed = new_body.is_some();
+
+    let report = |out: &mut dyn Write| {
+        let _ = writeln!(out, "NUMBER={n}");
+        let _ = writeln!(out, "BODY_CHANGED={body_changed}");
+    };
+
+    if req.dry_run {
+        let _ = writeln!(out, "DRY_RUN=true");
+        report(out);
+        if let Some(b) = &new_body {
+            let _ = writeln!(out, "BODY<<EOF\n{b}EOF");
+        }
+        return exit::OK;
+    }
+
+    if let Some(b) = &new_body {
+        if let Err(e) = forge.set_body(n, b) {
+            let _ = writeln!(err, "park-record retract: body write to #{n} failed: {e}");
+            return exit::FORGE;
+        }
+    }
+    let _ = writeln!(out, "APPLIED=true");
+    report(out);
+    exit::OK
+}
+
 /// Apply the park: refuse, or write the body record(s), then `loom:blocked`,
 /// then drop `remove_labels`.
 pub fn apply(

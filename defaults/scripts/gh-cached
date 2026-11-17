@@ -26,6 +26,15 @@ Environment:
     GH_CACHE_DEBUG     Set to "1" for debug logging to stderr
     LOOM_GH_BIN        The `gh` binary to execute (default: `gh` from PATH),
                         for parity with loom-daemon's own LOOM_GH_BIN.
+    LOOM_GH_TIMEOUT_S  Per-invocation bound in seconds on the real `gh` call
+                        (default: 120; `0` disables the bound, restoring the
+                        unbounded pre-#13930 behavior; a non-numeric or
+                        negative value falls back to the default). A timed-out
+                        READ is retried once after ~2s; mutations are never
+                        retried (a timed-out write may have landed). Final
+                        expiry exits 124 (timeout(1) parity) with a
+                        distinguishable stderr diagnostic — never an
+                        unbounded hang (#13930).
     GH_CACHE_OUTCOME_LOG  Optional path; each invocation appends one JSON
                         record carrying `x-loom-cache: hit|miss|revalidated|
                         bypass` so downstream views can tell client-cache
@@ -95,6 +104,13 @@ DEFAULT_TTL = int(os.environ.get("GH_CACHE_TTL", "30"))
 MAX_CACHE_SIZE = int(os.environ.get("GH_CACHE_MAX_SIZE", "256"))
 CACHE_DISABLED = os.environ.get("GH_CACHE_DISABLE", "") == "1"
 DEBUG = os.environ.get("GH_CACHE_DEBUG", "") == "1"
+
+# Per-invocation bound on the real `gh` call (#13930): a stalled gh (network
+# black hole, credential-helper hang, host under heavy gh contention) must
+# fail fast instead of hanging the calling role step indefinitely.
+DEFAULT_GH_TIMEOUT_S = 120.0
+GH_TIMEOUT_RETRY_BACKOFF_S = 2.0   # one bounded retry, READS only
+EXIT_GH_TIMEOUT = 124              # timeout(1) parity
 
 # TTL overrides by command type (seconds).
 #
@@ -410,14 +426,74 @@ def parse_gh_args(args: list[str]) -> dict:
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+def resolve_gh_timeout_s() -> float | None:
+    """Resolve the per-invocation bound on the real `gh` call (#13930).
+
+    LOOM_GH_TIMEOUT_S overrides the 120s default; `0` disables the bound
+    entirely (the pre-#13930 unbounded behavior). A non-numeric or negative
+    value falls back to the default rather than silently disabling it."""
+    raw = os.environ.get("LOOM_GH_TIMEOUT_S", "").strip()
+    if not raw:
+        return DEFAULT_GH_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_GH_TIMEOUT_S
+    if value < 0:
+        return DEFAULT_GH_TIMEOUT_S
+    if value == 0:
+        return None
+    return value
+
+
+def is_write_invocation(args: list[str]) -> bool:
+    """True when this invocation may mutate state (#13930 retry policy):
+    a mutation subcommand (`pr edit`, `issue comment`, …) or a `gh api` call
+    with a non-GET `-X`/`--method` or form fields (`-f`/`--field` imply POST) —
+    the same shapes parse_gh_args classifies as uncacheable. A timed-out write
+    is never retried: it may already have landed, and a retry could
+    double-post."""
+    if not args:
+        return False
+    if args[0] == "api":
+        for i, arg in enumerate(args):
+            if arg in ("-X", "--method") and i + 1 < len(args) and args[i + 1].upper() != "GET":
+                return True
+            if arg in ("-f", "--field"):
+                return True
+        return False
+    return len(args) > 1 and args[1] in MUTATION_SUBCOMMANDS
+
+
 def run_gh(args: list[str]) -> tuple[str, str, int]:
-    """Execute the real gh command and return (stdout, stderr, returncode)."""
-    proc = subprocess.run(
-        [os.environ.get("LOOM_GH_BIN") or "gh"] + args,
-        capture_output=True,
-        text=True,
-    )
-    return proc.stdout, proc.stderr, proc.returncode
+    """Execute the real gh command and return (stdout, stderr, returncode).
+
+    Bounded (#13930): every attempt gets LOOM_GH_TIMEOUT_S seconds (default
+    120; `0` disables the bound). A timed-out read — not a mutation
+    subcommand, not a non-GET `gh api` — is retried once after a short
+    backoff; mutations are never retried. Final expiry surfaces a
+    distinguishable one-line diagnostic on stderr and returns rc 124
+    (timeout(1) parity) with no partial stdout, so callers' existing
+    rc != 0 handling applies unchanged (failed reads are never cached)."""
+    timeout = resolve_gh_timeout_s()
+    attempts = 1 if is_write_invocation(args) else 2
+    cmd = [os.environ.get("LOOM_GH_BIN") or "gh"] + args
+    # The diagnostic names only the identifying argv prefix — full argv can
+    # carry bodies and tokens.
+    label = " ".join(args[:2]) if len(args) > 1 else (" ".join(args) if args else "")
+    for attempt in range(1, attempts + 1):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return proc.stdout, proc.stderr, proc.returncode
+        except subprocess.TimeoutExpired:
+            if attempt < attempts:
+                debug(f"gh timed out after {timeout:g}s (attempt {attempt}/{attempts}); retrying")
+                time.sleep(GH_TIMEOUT_RETRY_BACKOFF_S)
+                continue
+            diagnostic = (f"gh-cached: gh timed out after {timeout:g}s "
+                          f"(attempts={attempts}): gh {label}")
+            return "", diagnostic, EXIT_GH_TIMEOUT
+    return "", "gh-cached: exhausted attempts", EXIT_GH_TIMEOUT  # unreachable
 
 
 # ─── ETag/REST cached listing (#5056) ────────────────────────────────────────
@@ -464,8 +540,10 @@ def try_etag_list(resource_type: str, args: list[str]) -> tuple[str, int] | None
     rest = args[2:]
     cmd = [daemon, "forge", resource_type, "list", "--cached", *rest]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-    except OSError:
+        # Same #13930 bound as the real `gh` call: a hung daemon subprocess
+        # falls through to plain `gh` instead of hanging the step.
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=resolve_gh_timeout_s())
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode == 0:
         return proc.stdout, 0
@@ -496,8 +574,9 @@ def try_etag_view(resource_type: str, args: list[str]) -> tuple[str, int] | None
     # args == [resource_type, "view", <rest…>]; forward everything after "view".
     cmd = [daemon, "forge", resource_type, "view", "--cached", *args[2:]]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-    except OSError:
+        # Same #13930 bound as the real `gh` call (see try_etag_list).
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=resolve_gh_timeout_s())
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode == 0:
         return proc.stdout, 0
@@ -523,8 +602,8 @@ def invalidate_etag_views(resource_id: str | None) -> None:
     if number:
         cmd.append(number)
     try:
-        subprocess.run(cmd, capture_output=True, text=True)
-    except OSError:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=resolve_gh_timeout_s())
+    except (OSError, subprocess.TimeoutExpired):
         pass
 
 

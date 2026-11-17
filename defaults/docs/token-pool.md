@@ -816,10 +816,14 @@ credential blocks every class whatever marker the line carries.
 **Who writes a class-scoped mark.** Only `claude-wrapper.sh`'s rotation path,
 and only when the death is provably per-class — a `MODEL_CREDITS_EXHAUSTED`
 classification (definitionally per-tier) or a #4501 per-model ceiling
-("reached your `<model>` limit") whose named words are not an account-wide
+("hit/reached your `<model>` limit" — the CLI has used both verbs, and #13872
+fixed the fleet-wide class-less marks the "reached"-only match produced) whose
+named words are not an account-wide
 qualifier (`weekly`/`monthly`/`session`/`plan`/…). The class itself comes from
 the **resolved model in flight** (`$LOOM_MODEL`, or an explicit `--model` arg
-that beat it), mapped through `script_helpers::model_tiers::task_alias_of` —
+that beat it — `spawn-claude.sh` exports the resolved value as `LOOM_MODEL`
+so the wrapper's mark sees it either way, #13872), mapped through
+`script_helpers::model_tiers::task_alias_of` —
 the same classifier the sweep orchestrator's cost ladder uses. Anything
 ambiguous, any unrecognized model, and the daemon-side reaper
 (`sweep_registry::quarantine`, which has no model in hand) all write the

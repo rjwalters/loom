@@ -33,8 +33,8 @@
 //! resolved exactly like the daemon's socket/log paths: the parent of
 //! `LOOM_SOCKET_PATH` when set (so a test daemon pointed at a tempdir socket
 //! writes its heartbeat into that tempdir, never the operator's real
-//! `~/.loom/daemon.heartbeat`), else `~/.loom`. This mirrors `resolve_loom_dir`
-//! / `resolve_log_path` in `main.rs` (#4010).
+//! `~/.loom/daemon.heartbeat`), else `~/.loom` — via the shared
+//! [`crate::autonomy_marker::resolve_loom_dir`] (#13833).
 //!
 //! # Default-on
 //!
@@ -73,23 +73,12 @@ pub const HEARTBEAT_FILENAME: &str = "daemon.heartbeat";
 // Path resolution
 // ============================================================================
 
-/// Resolve `<loom_dir>` the same way `main.rs::resolve_loom_dir` does: the
-/// parent of `LOOM_SOCKET_PATH` when set, else `~/.loom`. Kept in sync with
-/// `main.rs` deliberately (both are tiny) rather than exported from `main`,
-/// which is a binary, not a library.
-fn resolve_loom_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        return PathBuf::from(path).parent().map(Path::to_path_buf);
-    }
-    dirs::home_dir().map(|h| h.join(".loom"))
-}
-
 /// Resolve the heartbeat file path (`<loom_dir>/daemon.heartbeat`), or `None`
 /// when no loom dir can be resolved (no home directory and no
 /// `LOOM_SOCKET_PATH`).
 #[must_use]
 pub fn resolve_heartbeat_path() -> Option<PathBuf> {
-    resolve_loom_dir().map(|d| d.join(HEARTBEAT_FILENAME))
+    crate::autonomy_marker::resolve_loom_dir().map(|d| d.join(HEARTBEAT_FILENAME))
 }
 
 // ============================================================================

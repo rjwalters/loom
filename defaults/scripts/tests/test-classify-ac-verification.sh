@@ -281,6 +281,13 @@ for phrase in "${OUT_OF_BAND_PHRASES[@]}"; do
     esac
 done
 assert_eq "0" "$BARE_WORD_FOUND" "no bare single-word phrase is in the vocabulary"
+ERE_METACHAR_FOUND=0
+for phrase in "${OUT_OF_BAND_PHRASES[@]}"; do
+    case "$phrase" in
+        *[\.\[\]\(\)\*\+\?\{\}\|^\$\\]*) ERE_METACHAR_FOUND=1 ;;
+    esac
+done
+assert_eq "0" "$ERE_METACHAR_FOUND" "no vocabulary phrase contains an ERE metacharacter (-qE depends on it)"
 
 # -------- Test 21: forge evidence counts only via the trust filter (#9548) --------
 echo "Test 21: --issue evidence is read through forge trusted-comments, never raw"
@@ -309,6 +316,76 @@ assert_eq "12" "$(run21 '[]')" "no trusted marker -> 12, whatever raw comments s
 assert_eq "12" "$(run21 '')" "filter unavailable -> 12 (held open, fail safe)"
 assert_eq "11" "$(run21 "[{\"body\":\"ran it <!-- loom:ac-verified sha=$SHA21 -->\"}]")" "a trusted marker for the head -> 11"
 echo ""
+
+# -------- Test 22: phrase matching is boundary-anchored (#13900) --------
+echo "Test 22: a vocabulary phrase inside a longer word does not match"
+run_classify "## Acceptance Criteria
+
+- [ ] a reproduction run of the bug is added to the regression suite
+- [ ] the preproduction run artifacts are built by CI"
+assert_eq "0" "$CAP_RC" "'reproduction run' / 'preproduction run' contain 'production run' only mid-word -> CI-checkable"
+assert_eq "" "$CAP_OUT" "no mid-word phrase match is reported"
+run_classify "## Acceptance Criteria
+
+- [ ] production run of the nightly job confirms the export lands"
+assert_eq "12" "$CAP_RC" "'production run' at item start still matches"
+run_classify "## Acceptance Criteria
+
+- [ ] check the export on the next Production run:"
+assert_eq "12" "$CAP_RC" "'Production run:' mid-item, upper-cased, still matches"
+run_classify "## Acceptance Criteria
+
+- [ ] verify the (production run) metrics are archived"
+assert_eq "12" "$CAP_RC" "'(production run)' after punctuation still matches"
+run_classify "## Acceptance Criteria
+
+- [ ] confirm the export lands on the _next run_ of the nightly job"
+assert_eq "12" "$CAP_RC" "_next run_ underscore emphasis is a boundary (#14004)"
+
+# -------- Test 23: the shipped hold notice never embeds a live marker (#13900) --------
+echo "Test 23: the Champion hold notice renders without a live-matchable marker"
+# Sourcing re-runs the subject's own TTY-colour block (same caveat as Test 20).
+_NC_SAVE23="$NC"
+# shellcheck source=/dev/null
+source "$CLASSIFY_SCRIPT"
+NC="$_NC_SAVE23"
+# Installed (.loom/scripts -> ../../.claude) vs. source (defaults/scripts ->
+# ../.claude) layouts differ in depth; probe both (#6725).
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    CHAMPION_MD="$SCRIPTS_DIR/../../.claude/commands/loom/champion-pr-merge.md"
+else
+    CHAMPION_MD="$SCRIPTS_DIR/../.claude/commands/loom/champion-pr-merge.md"
+fi
+if [[ ! -f "$CHAMPION_MD" ]]; then
+    echo -e "${RED}FATAL${NC}: champion-pr-merge.md not found at $CHAMPION_MD" >&2
+    exit 1
+fi
+# Lift the shipped hold_issue_on_unverified_ac block (extract-and-execute,
+# #7979), anchored to the DEFINITION line -- the function name also appears in
+# an earlier fence's call site. Render it the way the template would
+# interpolate $head_sha at post time.
+T23_FENCE="$(awk '
+    /^```bash$/ { in_fence = 1; capturing = 0; next }
+    in_fence && /^```$/ { if (capturing) exit; in_fence = 0; next }
+    in_fence && !capturing && index($0, "hold_issue_on_unverified_ac() {") { capturing = 1 }
+    in_fence && capturing { print }
+' "$CHAMPION_MD")"
+T23_SHA="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+T23_RENDERED_FENCE="${T23_FENCE//'$head_sha'/$T23_SHA}"
+T23_IN_FENCE="$(_extract_ac_verified_shas "$T23_RENDERED_FENCE")"
+assert_eq "" "$T23_IN_FENCE" "the rendered hold_issue_on_unverified_ac block contains no live-matchable loom:ac-verified marker"
+# The notice body alone, as the whole evidence corpus, must NOT satisfy the
+# gate for the held head -- this is the self-satisfying-hold regression.
+T23_NOTICE="$(printf '%s\n' "$T23_FENCE" \
+    | sed -n '/--body "\$marker/,$p' \
+    | sed '1s/^.*--body "\$marker//' | sed '$s/"$//')"
+T23_RENDERED="${T23_NOTICE//'$head_sha'/$T23_SHA}"
+run_classify "## Acceptance Criteria
+
+- [ ] confirm the nightly export lands on the next real run" "$T23_RENDERED" "$T23_SHA"
+assert_eq "12" "$CAP_RC" "a corpus of only the rendered hold notice -> exit 12 (not 11)"
+assert_contains "$T23_SHA" "$T23_RENDERED" "the notice still names the exact head SHA to use"
+assert_contains "sha=<head>" "$T23_NOTICE" "the notice still shows the marker shape"
 
 # -------- Summary --------
 echo ""

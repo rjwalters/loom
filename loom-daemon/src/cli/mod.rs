@@ -88,7 +88,10 @@ pub(crate) mod lease_ensure;
 pub(crate) mod lease_release;
 pub(crate) mod lease_renewer;
 pub(crate) mod legacy_script_cmds;
-pub use legacy_script_cmds::{handle_checkpoint_command, handle_strip_ansi_command};
+pub use legacy_script_cmds::{
+    handle_checkpoint_command, handle_resolve_model_command, handle_strip_ansi_command,
+    ResolveModelArgs,
+};
 pub(crate) mod merge_group_ci_cmd;
 mod merge_pr_cleanup_paths;
 mod merge_pr_closed_building;

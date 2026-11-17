@@ -369,9 +369,11 @@ it explicitly when sizing a multi-account Codex pool):
 #    The session reconciler does NOT restart a running container because its
 #    control files changed: restart it by hand, see "Restarting or recreating
 #    session containers by hand" below.
+# (--entrypoint codex: the session entrypoint ignores a trailing command; CODEX_HOME pins trust by the hooks.json path under its runtime CODEX_HOME)
 docker run --rm -it --user 1000:1000 -w /tmp \
+  -e CODEX_HOME=/home/loom/.codex-profile --entrypoint codex \
   -v ~/.loom/codex-profiles/alice:/home/loom/.codex-profile \
-  ghcr.io/rjwalters/loom-worker-session:latest codex          # session-managed
+  ghcr.io/rjwalters/loom-worker-session:latest                # session-managed
 CODEX_HOME=~/.loom/codex-profiles/alice codex                 # bare-metal only
 
 # 3. gate the pool: exit 0 only when EVERY profile is ready

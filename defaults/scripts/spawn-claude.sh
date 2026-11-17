@@ -1037,6 +1037,21 @@ else
     log_info "spawn-claude: model=default"
 fi
 
+# Export the RESOLVED model so everything downstream sees the model actually
+# in flight (#13872). The daemon dispatch path appends an explicit `--model`
+# argv (#4501) without setting LOOM_MODEL, and claude-wrapper.sh's exhaustion
+# mark reads ONLY `LOOM_MODEL` (`retry-classify model-class --model
+# "${LOOM_MODEL:-}"`) — so without this export a role child launched with
+# `--model <m>` wrote class-less `.bad_tokens` marks and one model's limit
+# blocked the whole pool for every model (the 2026-11-13 fleet incident).
+# Exporting the resolved value keeps env and argv in agreement by construction;
+# claude-wrapper.sh's own precedence block then sees `--model` already in its
+# args and appends no duplicate. A session-default spawn (nothing resolved)
+# exports nothing, preserving the account-wide mark for an unknown model.
+if [[ -n "$_resolved_model" ]]; then
+    export LOOM_MODEL="$_resolved_model"
+fi
+
 # --- Effort selection (issue #3705) ---
 # Mirrors the model block above for the `claude --effort <level>` session knob.
 # Precedence: explicit `--effort` in the passthrough args > LOOM_EFFORT env >
