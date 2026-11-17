@@ -40,18 +40,44 @@ pub(super) struct ExecAuth {
 impl ExecAuth {
     /// The credential for an exec acting on `repository` from `workspace`.
     pub(super) fn resolve(workspace: &Path, repository: &str) -> Self {
-        Self::resolve_with(workspace, repository, &|name| std::env::var_os(name), &|dir| {
-            read_token(dir, None)
-        })
+        Self::resolve_with_root(
+            workspace,
+            repository,
+            &|name| std::env::var_os(name),
+            &|dir| read_token(dir, None),
+            crate::credential_preflight::primary_workspace_root().as_deref(),
+        )
     }
 
     /// [`Self::resolve`] over an injected process environment and token
-    /// reader (tests).
+    /// reader (tests). The daemon's registered root is read from the
+    /// process-global registry, exactly as production does.
+    #[cfg(test)]
     pub(super) fn resolve_with(
         workspace: &Path,
         repository: &str,
         env: &dyn Fn(&str) -> Option<OsString>,
         read: &dyn Fn(&Path) -> Option<String>,
+    ) -> Self {
+        Self::resolve_with_root(
+            workspace,
+            repository,
+            env,
+            read,
+            crate::credential_preflight::primary_workspace_root().as_deref(),
+        )
+    }
+
+    /// [`Self::resolve_with`] with the registered primary root injected too,
+    /// so a test can pin the pristine-dispatch state — no
+    /// `LOOM_MACHINE_CHECKOUT` in the process env, the daemon's registered
+    /// root the only source (#13965) — without touching the set-once global.
+    fn resolve_with_root(
+        workspace: &Path,
+        repository: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+        read: &dyn Fn(&Path) -> Option<String>,
+        registered: Option<&Path>,
     ) -> Self {
         let mut names: Vec<&'static str> = FORGE_ENV
             .iter()
@@ -81,7 +107,9 @@ impl ExecAuth {
         // nothing. The process `GH_CONFIG_DIR` is the workspace-root owner's
         // credential on a daemon host, and handing it to another owner's
         // repository would forward the wrong installation's token.
-        let secret = config_dir_for(workspace, &slug, &gh_host).and_then(|dir| read(&dir));
+        let primary = primary_root(env, registered);
+        let secret = config_dir_for(workspace, primary.as_deref(), &slug, &gh_host)
+            .and_then(|dir| read(&dir));
         if secret.is_some() && !names.contains(&TOKEN_ENV) {
             names.push(TOKEN_ENV);
         }
@@ -138,19 +166,52 @@ pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
+/// The daemon's primary workspace root, where the refresh tick publishes every
+/// owner's App directory: `LOOM_MACHINE_CHECKOUT` when the process carries it,
+/// else the root the daemon process registered at startup. A pristine
+/// `fleet add-worker` unit does NOT set the variable — it renders only `PATH`
+/// and `LOOM_DAEMON_SUPERVISOR` (`unit_env_tests::STRUCTURAL`) — so a
+/// short-lived `session-exec host` sees it only because the daemon pins its
+/// registered root into every dispatched child's environment
+/// (`launch_env::apply_launch_env`, #13965). A unit re-rendered by
+/// `loom-daemon-start.sh` in machine mode carries the same value directly
+/// (#13937), as does any operator export.
+fn primary_root(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    registered: Option<&Path>,
+) -> Option<PathBuf> {
+    env("LOOM_MACHINE_CHECKOUT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or(registered.map(Path::to_path_buf))
+}
+
 /// The `GH_CONFIG_DIR` proven to hold the installation token for `slug`'s
 /// owner: the daemon's per-owner registry, else the owner's App directory
-/// under this workspace's (then the daemon's primary root's) `.loom/`, else,
+/// under the daemon's `primary` root's (then this workspace's) `.loom/`, else,
 /// when the owner IS that root's own owner (read from an `origin` on the same
 /// GitHub host), the root's `.loom/gh-config` — the root owner is
 /// deliberately absent from `gh-config-by-owner`. `None` when no directory is
 /// matched to the owner. There is deliberately no process-`GH_CONFIG_DIR`
 /// fallback: on a daemon host that is the root owner's credential.
 ///
+/// The primary root comes first (#13933, #13937): it is the only copy the
+/// daemon's refresh tick keeps fresh. A managed repository's own
+/// `.loom/gh-config-by-owner/<owner>` is published once and never refreshed,
+/// so preferring it handed the exec an expired installation token (`HTTP 401`)
+/// whenever the process had no daemon registry to consult — every
+/// `session-exec host` and hand-run `accounts session job`. The workspace copy
+/// remains a fallback for a host with no primary root at all.
+///
 /// The root-owner step is what a hand-run `accounts session job` from an SSH
 /// shell needs: that shell has no `GH_CONFIG_DIR`, and the daemon's own
 /// registry is not in its process.
-fn config_dir_for(workspace: &Path, slug: &str, gh_host: &str) -> Option<PathBuf> {
+fn config_dir_for(
+    workspace: &Path,
+    primary: Option<&Path>,
+    slug: &str,
+    gh_host: &str,
+) -> Option<PathBuf> {
     use crate::credential_preflight as creds;
     let owner = creds::owner_of_nwo(slug);
     if let Some(dir) = creds::gh_config_dir_for_owner_slug(slug) {
@@ -169,11 +230,11 @@ fn config_dir_for(workspace: &Path, slug: &str, gh_host: &str) -> Option<PathBuf
             .eq_ignore_ascii_case(owner)
             .then_some(dir)
     };
-    let primary = creds::primary_workspace_root();
-    published(workspace)
-        .or_else(|| primary.as_deref().and_then(published))
+    primary
+        .and_then(published)
+        .or_else(|| published(workspace))
+        .or_else(|| primary.and_then(root_owned))
         .or_else(|| root_owned(workspace))
-        .or_else(|| primary.as_deref().and_then(root_owned))
 }
 
 /// The owner of `root`'s `origin`, only when that remote is on `gh_host`
@@ -396,6 +457,88 @@ mod tests {
             &never,
         );
         assert!(!elsewhere.resolved());
+    }
+
+    /// #13933 / #13937: a process with no daemon registry (a `session-exec
+    /// host`, a hand-run job) reads the owner dir the daemon's refresh tick
+    /// keeps fresh under `LOOM_MACHINE_CHECKOUT`, never the stale copy a
+    /// managed repository's own `.loom/` holds. The workspace copy is only a
+    /// fallback when the primary root has none for this owner.
+    #[test]
+    fn the_primary_roots_refreshed_owner_dir_wins_over_a_stale_workspace_copy() {
+        let owner = "acme-precedence-13937";
+        let stale = published_owner_workspace(owner);
+        let fresh = published_owner_workspace(owner);
+        let fresh_dir =
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(fresh.path(), owner);
+        let stale_dir =
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(stale.path(), owner);
+        let checkout = fresh.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]);
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
+            Some(SECRET.to_owned())
+        };
+        let repo = format!("https://github.com/{owner}/widget");
+        let auth = ExecAuth::resolve_with(stale.path(), &repo, &env, &read);
+        assert!(auth.resolved());
+        assert_eq!(seen.borrow().as_deref(), Some(fresh_dir.as_path()));
+        // A primary root with nothing for this owner falls back to the
+        // workspace copy rather than reading nothing.
+        let empty = tempfile::tempdir().unwrap();
+        let elsewhere = empty.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &elsewhere)]);
+        ExecAuth::resolve_with(stale.path(), &repo, &env, &read);
+        assert_eq!(seen.borrow().as_deref(), Some(stale_dir.as_path()));
+    }
+
+    /// #13965: the dispatch pin is the only source on a pristine fleet worker.
+    /// The unit carries no `LOOM_MACHINE_CHECKOUT` (`unit_env_tests::STRUCTURAL`)
+    /// and a short-lived `session-exec host` has no registered root of its
+    /// own, so the root the daemon pins into the dispatched child's env must
+    /// select the refreshed owner dir over the stale workspace copy with the
+    /// variable absent from the process env.
+    #[test]
+    fn a_dispatched_primary_root_wins_when_the_env_carries_no_checkout_var() {
+        let owner = "acme-dispatch-13965";
+        let stale = published_owner_workspace(owner);
+        let fresh = published_owner_workspace(owner);
+        let fresh_dir =
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(fresh.path(), owner);
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
+            Some(SECRET.to_owned())
+        };
+        let repo = format!("https://github.com/{owner}/widget");
+        // The pristine unit's env: no `LOOM_MACHINE_CHECKOUT` anywhere.
+        let env = env_of(&[]);
+        let auth =
+            ExecAuth::resolve_with_root(stale.path(), &repo, &env, &read, Some(fresh.path()));
+        assert!(auth.resolved());
+        assert_eq!(seen.borrow().as_deref(), Some(fresh_dir.as_path()));
+    }
+
+    /// The primary root holds other owners' dirs too: an owner with no dir of
+    /// its own there (or in the workspace) still gets nothing, never a
+    /// neighbour's installation token.
+    #[test]
+    fn a_primary_root_never_forwards_another_owners_token() {
+        let primary = published_owner_workspace("acme-owner-13937");
+        let checkout = primary.path().to_str().unwrap().to_owned();
+        let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &checkout)]);
+        let ws = published_owner_workspace("acme-owner-13937");
+        let never = |_: &Path| -> Option<String> { panic!("read another owner's token") };
+        let auth = ExecAuth::resolve_with(
+            ws.path(),
+            "https://github.com/other-owner-13937/widget",
+            &env,
+            &never,
+        );
+        assert!(!auth.resolved());
+        assert!(auth.names().is_empty());
+        assert!(auth.child_env().is_empty());
     }
 
     #[test]

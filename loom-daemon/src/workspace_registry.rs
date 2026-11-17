@@ -321,12 +321,12 @@ impl WorkspaceRegistry {
     ///
     /// Runs on **both** [`AddOutcome::Added`] and [`AddOutcome::AlreadyPresent`]
     /// — trust-marking is idempotent (see
-    /// [`claude_config_trust_at`](crate::terminal::claude_config_trust_at)) and
+    /// [`ensure_project_trusted`](crate::claude_config::ensure_project_trusted)) and
     /// self-heals a workspace that was registered before this fix existed,
     /// without re-registering it or touching its stored weight/overrides.
     ///
     /// `claude_state_path` is caller-resolved (normally
-    /// [`crate::terminal::claude_config_state_path`]) rather than resolved
+    /// [`crate::claude_config::default_state_file`]) rather than resolved
     /// here, so tests can point it at a scratch file instead of mutating the
     /// process-wide `$HOME`.
     pub fn add_and_trust(
@@ -342,7 +342,7 @@ impl WorkspaceRegistry {
                 canonical
             }
         };
-        crate::terminal::claude_config_trust_at(claude_state_path, canonical);
+        crate::claude_config::ensure_project_trusted(claude_state_path, canonical);
         Ok(outcome)
     }
 

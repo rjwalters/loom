@@ -292,6 +292,63 @@ fn a_non_loom_dirty_file_is_not_touched_even_beside_loom_ones() {
     assert_eq!(assert_untouched(&fx, late()), CheckoutState::Dirty);
 }
 
+/// The committed `opencode.json` (#13970), as the squad installer leaves it.
+const OPENCODE_COMMITTED: &str = "{\n  \"mcp\": {\n    \"squad\": {}\n  }\n}\n";
+
+#[test]
+fn an_opencode_schema_only_dirty_config_is_repaired() {
+    let fx = loom_fixture();
+    fx.push("opencode.json", OPENCODE_COMMITTED);
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    // What OpenCode adds: exactly one `$schema` entry, nothing else.
+    write(
+        &fx.host.join("opencode.json"),
+        "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+         {\n    \"squad\": {}\n  }\n}\n",
+    );
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = heal(&fx, Utc::now());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    let status = git(&fx.host, &["status", "--porcelain"]);
+    assert!(!status.contains("opencode.json"), "{status}");
+}
+
+#[test]
+fn an_opencode_config_with_any_other_change_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push("opencode.json", OPENCODE_COMMITTED);
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    // The schema entry plus one edited value: not the tool's one-liner.
+    write(
+        &fx.host.join("opencode.json"),
+        "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+         {\n    \"squad\": {\"other\": true}\n  }\n}\n",
+    );
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Dirty);
+}
+
+#[test]
+fn an_opencode_json_absent_from_head_is_not_touched() {
+    let fx = loom_fixture();
+    // Staged, so it is dirty, but `HEAD` has no `opencode.json` to compare
+    // against: fail closed to the operator.
+    write(
+        &fx.host.join("opencode.json"),
+        "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+         {\n    \"squad\": {}\n  }\n}\n",
+    );
+    git(&fx.host, &["add", "opencode.json"]);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Dirty);
+}
+
 #[test]
 fn dirt_on_a_checkout_that_is_not_behind_is_left_to_the_operator() {
     let fx = loom_fixture();
