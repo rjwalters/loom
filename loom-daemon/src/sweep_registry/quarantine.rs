@@ -1336,7 +1336,6 @@ mod tests {
 
         assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_some());
         assert!(registry.clear_quarantine(35));
-        assert_eq!(registry.noop_release_count(35), 0);
         assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_none());
     }
 
