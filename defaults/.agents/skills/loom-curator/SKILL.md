@@ -326,8 +326,10 @@ Builder reads first. Guard against this structurally, not by remembering to
 be careful:
 
 1. **The `## Verified corrections` section is append-only.** If the current
-   body already has a `## Verified corrections` heading (case-insensitive),
-   treat every entry under it as **read-only** for editing purposes — never
+   body already has a `Verified corrections` heading (case-insensitive, at
+   any heading depth ≥ 2 — `##`, `###`, … including one nested under a
+   `## Curator Enhancement` parent), treat every entry under it as
+   **read-only** for editing purposes — never
    delete or rewrite an existing entry, even to "clean it up" or fold it into
    prose elsewhere. **Only append** new entries, at the end of the section,
    in date order. If the section doesn't exist yet and you make a claim you
@@ -385,8 +387,13 @@ be careful:
    `$ENHANCED` verbatim (append-only still applies) before posting the
    rewrite. `check-verified-corrections-preserved.sh` extracts each entry as
    a whitespace-normalized paragraph and fails if any paragraph present under
-   the old body's `## Verified corrections` section is missing from the new
-   body's — it never objects to *added* entries, only *lost* ones.
+   the old body's `Verified corrections` section is missing from the new
+   body's — it never objects to *added* entries, only *lost* ones. The
+   heading is recognised at any depth ≥ 2 and the section extends to the
+   next heading of the same or shallower depth; a level-1
+   `# Verified corrections` heading is deliberately ignored but named in a
+   `WARN` on stderr — if you see that WARN, the entries under the h1 heading
+   are **not** being checked, so retitle the heading to `##` or deeper.
 
 5. **General bias: append over regenerate.** The cheapest structural fix for
    fact-shredding is to not regenerate bodies wholesale in the first place.
