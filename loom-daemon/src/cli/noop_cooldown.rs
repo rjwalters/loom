@@ -16,7 +16,7 @@ use anyhow::Result;
 
 use crate::types::{Request, Response};
 
-use super::common::{query_daemon, resolve_socket_path};
+use super::common::{exit_on_daemon_failure, query_daemon, resolve_socket_path};
 use crate::cli::NoopCooldownAction;
 
 /// Handle the `noop-cooldown` subcommand.
@@ -33,12 +33,12 @@ pub async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> Result<
                 reason,
                 workspace_root,
             };
-            match query_daemon(&socket_path, &request).await {
-                Ok(Response::NoopReleaseRecorded {
+            match exit_on_daemon_failure(&socket_path, query_daemon(&socket_path, &request).await) {
+                Response::NoopReleaseRecorded {
                     issue,
                     consecutive,
                     cooldown_secs,
-                }) => {
+                } => {
                     match cooldown_secs {
                         Some(secs) => println!(
                             "Recorded no-op release for issue #{issue} — {consecutive} \
@@ -51,19 +51,8 @@ pub async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> Result<
                     }
                     Ok(())
                 }
-                Ok(Response::Error { message }) => {
-                    eprintln!("Daemon error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => {
+                other => {
                     eprintln!("Unexpected response from daemon: {other:?}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
-                    eprintln!();
-                    eprintln!("Is the daemon running? Start it with:");
-                    eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
                     std::process::exit(1);
                 }
             }
