@@ -342,7 +342,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 
 ## Ready
 
-Human-approved issues ready for implementation (`loom:issue`).
+Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues closed by an open `loom:pr` PR (listed under Approved).
 
 *None yet.*
 
@@ -374,7 +374,7 @@ Active epics with progress tracking.
 |------|-------|
 | Very important | 0 |
 | Important | 0 |
-| Ready (`loom:issue`) | 0 |
+| Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
 
 **Note:** Initial backlog seeded from project bootstrapping. Issue numbers above are placeholders — update after GitHub issues are created.
 ```

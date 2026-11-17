@@ -3,7 +3,7 @@
 //! # Problem
 //!
 //! Every daemon-issued `gh` call (`claim_reconciliation`, `main_health_gate`,
-//! `metrics_collector`, the work finder, …) is a plain `Command::new("gh")`
+//! the work finder, …) is a plain `Command::new("gh")`
 //! with no `env_clear` — so it authenticates however `gh` itself resolves
 //! credentials in the daemon's process environment: `GH_TOKEN` /
 //! `GITHUB_TOKEN`, falling back to `gh`'s own credential store (the macOS

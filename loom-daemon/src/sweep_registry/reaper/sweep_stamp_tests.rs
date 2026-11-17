@@ -39,7 +39,6 @@ fn cancelling_an_issue_sweep_stamps_its_claim_check_with_the_sweep_id() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 
