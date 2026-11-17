@@ -66,8 +66,8 @@ fn reject_workspace_inside_pool(resolved: &Path) -> Result<()> {
 
 /// `loom-daemon claude-config` handler (issue #4415).
 pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result<()> {
-    use crate::terminal::{
-        claude_config_cleanup, claude_config_setup, claude_config_trust, claude_config_validate,
+    use crate::claude_config::{
+        cleanup_agent_config_dir, setup_agent_config_dir, trust_project, validate_agent_config_dir,
     };
 
     match action {
@@ -77,7 +77,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             json,
         } => {
             let repo_root = resolve_tokens_workspace(&workspace)?;
-            match claude_config_setup(&name, &repo_root) {
+            match setup_agent_config_dir(&name, &repo_root) {
                 Some(config_dir) => {
                     if json {
                         let mut obj = serde_json::Map::new();
@@ -104,7 +104,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             json,
         } => {
             let repo_root = resolve_tokens_workspace(&workspace)?;
-            let removed = claude_config_cleanup(&name, &repo_root);
+            let removed = cleanup_agent_config_dir(&name, &repo_root);
             if json {
                 let mut obj = serde_json::Map::new();
                 obj.insert("removed".to_string(), serde_json::Value::Bool(removed));
@@ -123,7 +123,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             json,
         } => {
             let repo_root = resolve_tokens_workspace(&workspace)?;
-            let healthy = claude_config_validate(&name, &repo_root);
+            let healthy = validate_agent_config_dir(&name, &repo_root);
             if json {
                 let mut obj = serde_json::Map::new();
                 obj.insert("healthy".to_string(), serde_json::Value::Bool(healthy));
@@ -146,7 +146,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             } else {
                 std::env::current_dir()?.join(p)
             };
-            claude_config_trust(&project_path);
+            trust_project(&project_path);
             Ok(())
         }
     }

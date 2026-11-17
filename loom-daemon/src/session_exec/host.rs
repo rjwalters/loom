@@ -184,7 +184,7 @@ pub(super) fn mount_stale_line(
 /// The supervised `docker exec` for `args`. `env` entries become `--env`
 /// arguments; `child_env` values are set on this `docker` child only, never in
 /// argv, for the bare `--env NAME` entries that copy them (#13916).
-pub(super) fn exec_command(args: &HostArgs, id: &str) -> Command {
+pub(crate) fn exec_command(args: &HostArgs, id: &str) -> Command {
     let mut command = Command::new("docker");
     command.args(["exec", "-i", "--workdir", &args.workdir]);
     for env in &args.env {

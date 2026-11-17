@@ -660,15 +660,7 @@ fn humanize_age(seconds: i64) -> String {
     if seconds < 0 {
         return "in the future — check this host's clock".to_string();
     }
-    let (days, hours, minutes) =
-        (seconds / 86_400, (seconds % 86_400) / 3_600, (seconds % 3_600) / 60);
-    if days > 0 {
-        format!("{days}d {hours}h ago")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m ago")
-    } else {
-        format!("{minutes}m ago")
-    }
+    crate::script_helpers::checkpoints::coarse_age_ago(seconds)
 }
 
 /// The pool root a verb acts on for one provider: with `shared`, the shared

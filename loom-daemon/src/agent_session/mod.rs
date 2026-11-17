@@ -16,11 +16,10 @@
 //!   ~115 pytest cases this port replaces are re-covered without touching a
 //!   live tmux server.
 //! * **`CLAUDE_CONFIG_DIR` isolation is *not* reimplemented here.**
-//!   [`SystemEnv`] delegates to the `claude_config` module already living in
-//!   `terminal.rs` (exposed via the `claude_config_*` wrappers and the
-//!   `loom-daemon claude-config` CLI surface), so there is exactly one native
-//!   implementation shared by the daemon's `create_terminal` path and the
-//!   manual-mode spawn path.
+//!   [`SystemEnv`] delegates to the crate-level [`crate::claude_config`]
+//!   module (also reached by the `loom-daemon claude-config` CLI surface), so
+//!   there is exactly one native implementation shared by the daemon's
+//!   `create_terminal` path and the manual-mode spawn path.
 //! * **OAuth token selection is the native pool selector.** [`SystemEnv`]
 //!   calls `tokens_pool::select::select_token` in-process — the same code
 //!   `loom-daemon tokens select --export` runs for `spawn-claude.sh` — rather
@@ -315,7 +314,7 @@ pub use crate::repo_root::find_repo_root;
 // ---------------------------------------------------------------------------
 
 /// The production [`AgentEnv`]: real tmux, real `pgrep`, real clock, the
-/// native token pool, and `terminal.rs`'s `claude_config` module.
+/// native token pool, and the crate-level [`crate::claude_config`] module.
 pub struct SystemEnv;
 
 impl SystemEnv {
@@ -417,19 +416,19 @@ impl AgentEnv for SystemEnv {
     }
 
     fn setup_config_dir(&self, agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
-        crate::terminal::claude_config_setup(agent_name, repo_root)
+        crate::claude_config::setup_agent_config_dir(agent_name, repo_root)
     }
 
     fn validate_config_dir(&self, agent_name: &str, repo_root: &Path) -> bool {
-        crate::terminal::claude_config_validate(agent_name, repo_root)
+        crate::claude_config::validate_agent_config_dir(agent_name, repo_root)
     }
 
     fn cleanup_config_dir(&self, agent_name: &str, repo_root: &Path) -> bool {
-        crate::terminal::claude_config_cleanup(agent_name, repo_root)
+        crate::claude_config::cleanup_agent_config_dir(agent_name, repo_root)
     }
 
     fn trust_project(&self, project_dir: &Path) {
-        crate::terminal::claude_config_trust(project_dir);
+        crate::claude_config::trust_project(project_dir);
     }
 }
 
