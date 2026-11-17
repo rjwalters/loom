@@ -68,9 +68,8 @@ fn dispatch_refused_while_a_peer_armed_noop_cooldown_is_live() {
     let (mut registry, _log) = fixture_registry(dir.path());
     attach_peer_armed_cooldown(&mut registry, 9928, 3600);
 
-    assert_eq!(
-        registry.noop_release_count(9928),
-        0,
+    assert!(
+        registry.noop_cooldown_remaining(9928, Utc::now()).is_none(),
         "no local record — the window exists only on the peer's broadcast"
     );
 
