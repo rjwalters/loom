@@ -206,7 +206,7 @@ pub fn start_launchd(ctx: &Ctx) -> ! {
     std::thread::sleep(Duration::from_secs(2));
 
     let daemon_pid = launchctl_job_pid(&service);
-    if daemon_pid.is_none_or(|p| !pid_alive(p)) {
+    if daemon_pid.is_none_or(|p| !crate::sweep_registry::pid_signalable(p)) {
         out::err(&format!("loom-daemon did not stay running under launchd ({service})."));
         dump_start_log(&ctx.start_log);
         socket_busy_hint();
@@ -371,8 +371,11 @@ pub fn start_systemd(ctx: &Ctx) -> ! {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let alive =
-        !main_pid.is_empty() && main_pid != "0" && main_pid.parse::<i32>().is_ok_and(pid_alive);
+    let alive = !main_pid.is_empty()
+        && main_pid != "0"
+        && main_pid
+            .parse::<i32>()
+            .is_ok_and(crate::sweep_registry::pid_signalable);
     if !alive {
         out::err(&format!("loom-daemon did not stay running under systemd ({unit})."));
         dump_start_log(&ctx.start_log);
@@ -621,13 +624,6 @@ fn launchctl_job_pid(service: &str) -> Option<i32> {
         return digits.parse().ok();
     }
     None
-}
-
-fn pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 fn is_eio(stderr: &str) -> bool {
