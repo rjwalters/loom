@@ -277,6 +277,10 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
   atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md).
+  **Exception — a foreign public repo the App is not installed on** (`forge create-issue` /
+  `create-issue.sh` refuse with `NOT_IN_INSTALLATION`, #9548): file with a raw
+  `gh issue create -R <repo>` (interim) rather than parking for an operator, per
+  [`gh-issue-create-rest-fallback.md`](.loom/docs/gh-issue-create-rest-fallback.md) (#13978).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does

@@ -334,6 +334,8 @@ repo's paths or lines. Full rule: `.loom/docs/citation-scope.md`.
 > same issue URL, and falls back to a single REST POST that applies labels **atomically with
 > creation**. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`.
 > (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+>
+> **Exception (#13978):** on a foreign public repo the App is not installed on, `create-issue.sh` is refused (`NOT_IN_INSTALLATION`, #9548). File with a raw `gh issue create -R <repo>` (interim) instead of parking the report for an operator: `.loom/docs/gh-issue-create-rest-fallback.md` § "Foreign public repo".
 
 ```bash
 # Check if similar issue already exists; exit 0 = clear to file (below)
