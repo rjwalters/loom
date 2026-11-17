@@ -525,6 +525,87 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 10 (#13874): explicit `<!-- loom:tracking-epic -->` opt-out marker.
+# Runs the shipped detection snippet (extracted from the stand-down file)
+# against marked / fenced / inline / unmarked / phase-marker fixtures.
+echo ""
+echo "Test 10: explicit tracking-epic marker detection (#13874)"
+if [[ -f "$CHAMPION_EPIC_STANDDOWN" ]]; then
+    SNIPPET="$(awk '/^DECLARED_TRACKING_EPIC=/{p=1} p{print} /^esac$/{if(p) exit}' "$CHAMPION_EPIC_STANDDOWN")"
+    if [[ -z "$SNIPPET" ]]; then
+        fail "could not extract the DECLARED_TRACKING_EPIC detection snippet"
+    else
+        # shellcheck disable=SC2034  # EPIC_* are read by the eval'd stand-down snippet
+        detect() { # $1=body $2=sources $3=strong_open
+            local EPIC_JSON EPIC_CHILD_SOURCES="$2" EPIC_CHILD_STRONG_OPEN="$3" IS_TRACKING_UMBRELLA=""
+            EPIC_JSON="$(jq -n --arg b "$1" '{body:$b}')"
+            eval "$SNIPPET"
+            echo "$IS_TRACKING_UMBRELLA"
+        }
+        NL=$'\n'
+        [[ "$(detect "intro${NL}<!-- loom:tracking-epic -->${NL}table" "prose-reference" 0)" == yes ]] \
+            && pass "marker alone on a line, zero strong children -> umbrella" || fail "marked epic not stood down"
+        [[ "$(detect "x${NL}\`\`\`${NL}<!-- loom:tracking-epic -->${NL}\`\`\`" "" 0)" == no ]] \
+            && pass "marker inside a code fence is ignored" || fail "fenced marker counted"
+        [[ "$(detect "see <!-- loom:tracking-epic --> inline" "" 0)" == no ]] \
+            && pass "marker inline within other text is ignored" || fail "inline marker counted"
+        [[ "$(detect "plain epic body" "" 0)" == no ]] \
+            && pass "unmarked epic with no children is not an umbrella" || fail "unmarked epic stood down"
+        [[ "$(detect "<!-- loom:tracking-epic -->" "phase-marker" 0)" == no ]] \
+            && pass "phase-marker source still falls through even when marked" || fail "phase-marker carve-out lost"
+        [[ "$(detect "plain" "native-sub-issue" 2)" == yes ]] \
+            && pass "strong open children still stand down without the marker" || fail "strong-children path regressed"
+    fi
+
+    # The note must be accurate for zero discovered children (#13874 AC 5):
+    # Step 0 can never close such an epic, so its note must not promise an
+    # automatic close, and must say who closes it. Runs the shipped wording
+    # branch (extracted from §0.5b), not a copy.
+    NOTE_SNIPPET="$(awk '/^    if \[ "\$EPIC_CHILD_STRONG_OPEN" -gt 0 \] \|\| \[ "\$EPIC_CHILD_STRONG_CLOSED" -gt 0 \]; then$/{p=1} p{print} /^    fi$/{if(p) exit}' "$CHAMPION_EPIC_STANDDOWN")"
+    if [[ -z "$NOTE_SNIPPET" ]]; then
+        fail "could not extract the §0.5b note-wording branch"
+    else
+        # shellcheck disable=SC2034  # EPIC_* / DEFAULT_BRANCH are read by the eval'd snippet
+        note_text() { # $1=strong_open $2=strong_closed
+            local EPIC_NUMBER=282 EPIC_CHILD_SOURCES="task-list" DEFAULT_BRANCH=main
+            local EPIC_CHILD_STRONG_OPEN="$1" EPIC_CHILD_STRONG_CLOSED="$2" UMBRELLA_WHY="" UMBRELLA_NEXT=""
+            eval "$NOTE_SNIPPET"
+            printf '%s\n%s\n' "$UMBRELLA_WHY" "$UMBRELLA_NEXT"
+        }
+        DECLARED_NOTE="$(note_text 0 0)"
+        DISCOVERED_NOTE="$(note_text 2 1)"
+        if [[ "$DECLARED_NOTE" == *"declared a tracking epic"* ]] \
+            && ! grep -qiE 'automatic|Nothing is required of anyone' <<<"$DECLARED_NOTE"; then
+            pass "declared epic, zero discovered children: the note promises no automatic close"
+        else
+            fail "declared-epic note still promises an automatic close Step 0 cannot perform"
+        fi
+        if grep -qF 'will **not** close this epic' <<<"$DECLARED_NOTE" \
+            && grep -qF 'its author or an operator closes it by hand' <<<"$DECLARED_NOTE"; then
+            pass "declared epic, zero discovered children: the note says who closes it"
+        else
+            fail "declared-epic note does not say Champion will not close it and who does"
+        fi
+        if grep -qF 'will close it automatically once its last child is closed' <<<"$DISCOVERED_NOTE" \
+            && grep -qF '2 open / 1 closed' <<<"$DISCOVERED_NOTE"; then
+            pass "discovered children: the note keeps the auto-close wording"
+        else
+            fail "discovered-children note lost its auto-close wording"
+        fi
+    fi
+    # The posted comment must take its closing paragraph from the branch, never
+    # carry an unconditional copy of the auto-close promise.
+    if grep -qxF '$UMBRELLA_NEXT' "$CHAMPION_EPIC_STANDDOWN" \
+        && [[ "$(grep -cF 'will close it automatically' "$CHAMPION_EPIC_STANDDOWN")" -eq 1 ]]; then
+        pass "the comment body uses the per-branch closing paragraph"
+    else
+        fail "the comment body carries an unconditional auto-close promise"
+    fi
+else
+    fail "stand-down body not found at $CHAMPION_EPIC_STANDDOWN"
+fi
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "================================"
 echo "Tests run:    $TESTS_RUN"
