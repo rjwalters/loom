@@ -74,6 +74,14 @@
 #   INLINE_BLOCKING_IDS="<thread/comment ids, space separated>"
 #   INLINE_RESOLUTION_SOURCE=graphql|rest-unknown|none
 #   REVIEW_FEEDBACK_FINDINGS_FILE=<path>
+#   REVIEW_FEEDBACK_TIMED_OUT=0|1
+#
+# Every forge read above runs under a hard wall-clock budget —
+# LOOM_FORGE_REVIEW_READ_TIMEOUT, default 60s (#13927) — because a wedged
+# `gh` under host load otherwise blocks the gate (and post-verdict.sh behind
+# it) indefinitely. A timed-out read is UNKNOWN, never CLEAR. A GraphQL
+# timeout with a complete REST fallback read keeps that fallback's semantics
+# (rest-unknown / clean-when-empty), exactly like a GraphQL error today.
 #
 # STATE semantics:
 #   CLEAR                 Complete read; no outstanding formal request and no
@@ -87,14 +95,16 @@
 #                         (GraphQL unavailable). Approval requires explicit
 #                         evidence of repair or disposition — NOT an automatic
 #                         dismissal because the head moved.
-#   UNKNOWN               The read itself did not complete. Never evidence of
+#   UNKNOWN               The read itself did not complete (failure, or a
+#                         wall-clock timeout — #13927). Never evidence of
 #                         "no blockers".
 #
 # Exit codes:
 #   0  CLEAR
 #   10 BLOCKING
 #   11 NEEDS_RECONCILIATION
-#   12 UNKNOWN (read failure / incomplete pagination / missing dependency)
+#   12 UNKNOWN (read failure / incomplete pagination / missing dependency /
+#       read timeout #13927 — with REVIEW_FEEDBACK_TIMED_OUT=1)
 #   2  usage error
 #
 # All reads are live and plain (`gh`, never gh-cached): this gates a verdict,
@@ -108,7 +118,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _usage() {
     # Keep this range in sync with the header block above ("Usage:" through
     # the exit-code table).
-    sed -n '45,100p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '45,111p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 _die() {
@@ -183,6 +193,7 @@ INLINE_UNRESOLVED_OUTDATED=0
 INLINE_BLOCKING_IDS=""
 INLINE_SOURCE="none"
 FAILURE_REASON=""
+TIMED_OUT=0
 
 _emit_and_exit() {
     local code
@@ -209,6 +220,7 @@ _emit_and_exit() {
             --arg inline_source "$INLINE_SOURCE" \
             --arg findings_file "$FINDINGS_FILE" \
             --arg failure_reason "$FAILURE_REASON" \
+            --argjson timed_out "$TIMED_OUT" \
             '{state:$state, head_sha:$head, reviews_total:$total,
               reviews_blocking_current_head:$blocking_current,
               reviews_blocking_older_head:$blocking_older,
@@ -220,6 +232,7 @@ _emit_and_exit() {
               inline_blocking_ids:($inline_blocking_ids | split(" ") | map(select(. != ""))),
               inline_resolution_source:$inline_source,
               findings_file:$findings_file,
+              timed_out:$timed_out,
               failure_reason:$failure_reason}' 2>/dev/null \
             || printf '{"state":"UNKNOWN"}\n'
     else
@@ -236,6 +249,7 @@ _emit_and_exit() {
         echo "INLINE_BLOCKING_IDS=\"$INLINE_BLOCKING_IDS\""
         echo "INLINE_RESOLUTION_SOURCE=$INLINE_SOURCE"
         echo "REVIEW_FEEDBACK_FINDINGS_FILE=$FINDINGS_FILE"
+        echo "REVIEW_FEEDBACK_TIMED_OUT=$TIMED_OUT"
     fi
 
     if [[ "$QUIET" != "true" && -s "$FINDINGS_FILE" ]]; then
@@ -251,6 +265,16 @@ _fail_unknown() {
     STATE="UNKNOWN"
     echo "UNKNOWN: $1" >> "$FINDINGS_FILE"
     _emit_and_exit
+}
+
+# A wall-clock timeout (bounded_run rc 124, #13927) reports through the same
+# UNKNOWN path as any other incomplete read, plus the machine-readable
+# REVIEW_FEEDBACK_TIMED_OUT=1 token so post-verdict.sh can refuse with
+# retry-or-park wording instead of offering a --reviews-reconciled bypass
+# (there are no findings to disposition — nothing was read).
+_fail_timeout() {
+    TIMED_OUT=1
+    _fail_unknown "$1"
 }
 
 # --- Dependencies ----------------------------------------------------------
@@ -285,7 +309,11 @@ fi
 
 # --- Resolve the head SHA --------------------------------------------------
 if [[ -z "$HEAD_SHA" ]]; then
-    HEAD_SHA=$(gh api "repos/$NWO/pulls/$NUMBER" --jq '.head.sha' 2>/dev/null) || HEAD_SHA=""
+    HEAD_SHA=$(_forge_review_read_run gh api "repos/$NWO/pulls/$NUMBER" --jq '.head.sha' 2>/dev/null)
+    HEAD_READ_RC=$?
+    if [[ "$HEAD_READ_RC" -eq 124 ]]; then
+        _fail_timeout "the PR head-SHA read (pulls/$NUMBER) timed out after ${_LOOM_FORGE_REVIEW_READ_TIMEOUT}s (LOOM_FORGE_REVIEW_READ_TIMEOUT, #13927) — cannot tell current-head findings from older-head ones"
+    fi
     if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{7,40}$ ]]; then
         HEAD_SHA=""
         _fail_unknown "could not read the PR head SHA — cannot tell current-head findings from older-head ones"
@@ -293,7 +321,12 @@ if [[ -z "$HEAD_SHA" ]]; then
 fi
 
 # --- 1. Formal reviews (fully paginated, complete records) -----------------
-if ! REVIEWS_NDJSON=$(forge_get_pr_reviews "$NWO" "$NUMBER" 2> /dev/null); then
+REVIEWS_NDJSON=$(forge_get_pr_reviews "$NWO" "$NUMBER" 2> /dev/null)
+REVIEWS_READ_RC=$?
+if [[ "$REVIEWS_READ_RC" -eq 124 ]]; then
+    _fail_timeout "the formal-review read (pulls/$NUMBER/reviews) timed out after ${_LOOM_FORGE_REVIEW_READ_TIMEOUT}s (LOOM_FORGE_REVIEW_READ_TIMEOUT, #13927) — review state could not be established"
+fi
+if [[ "$REVIEWS_READ_RC" -ne 0 ]]; then
     _fail_unknown "the formal-review read (pulls/$NUMBER/reviews) failed or paginated incompletely"
 fi
 
@@ -354,8 +387,13 @@ printf '%s' "$REVIEW_SUMMARY" | jq -r '(.current_findings + .older_findings + .u
 # that already had to cite it by id. A missing `trusted-comments` verb or a
 # partial read is UNKNOWN, never clean.
 # requires-daemon: forge optional   Without `forge trusted-comments` no author can be verified, so the gate reports UNKNOWN (exit 12) rather than reading unauthenticated verdicts.
-if ! VERDICT_COMMENTS=$(gh api "repos/$NWO/issues/$NUMBER/comments?per_page=100" --paginate 2> /dev/null \
-    | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" forge trusted-comments 2> /dev/null); then
+VERDICT_COMMENTS=$(_forge_review_read_run gh api "repos/$NWO/issues/$NUMBER/comments?per_page=100" --paginate 2> /dev/null \
+    | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" forge trusted-comments 2> /dev/null)
+VERDICT_READ_RC=$?
+if [[ "$VERDICT_READ_RC" -eq 124 ]]; then
+    _fail_timeout "the comment-verdict read (issues/$NUMBER/comments) timed out after ${_LOOM_FORGE_REVIEW_READ_TIMEOUT}s (LOOM_FORGE_REVIEW_READ_TIMEOUT, #13927) — verdict state could not be established"
+fi
+if [[ "$VERDICT_READ_RC" -ne 0 ]]; then
     _fail_unknown "the comment-verdict read (issues/$NUMBER/comments, trusted authors only) failed or paginated incompletely"
 fi
 
@@ -423,12 +461,18 @@ if [[ $THREADS_RC -eq 0 ]]; then
     INLINE_BLOCKING_IDS=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.blocking_ids | join(" ")')
     printf '%s' "$THREAD_SUMMARY" | jq -r '.findings[]' >> "$FINDINGS_FILE"
 else
-    # GraphQL is unavailable (exhausted, unsupported forge, or an error). Fall
+    # GraphQL is unavailable (exhausted, unsupported forge, or an error — a
+    # #13927 timeout behaves the same way: no resolution state was read). Fall
     # back to the REST inline-comment list — which carries NO resolution state.
     # A complete REST read with zero inline comments is genuinely clean; any
     # inline comment whose resolution we cannot establish is reported as
     # unknown-resolution, never as resolved.
-    if ! INLINE_NDJSON=$(forge_get_pr_review_comments "$NWO" "$NUMBER" 2> /dev/null); then
+    INLINE_NDJSON=$(forge_get_pr_review_comments "$NWO" "$NUMBER" 2> /dev/null)
+    INLINE_READ_RC=$?
+    if [[ "$INLINE_READ_RC" -eq 124 ]]; then
+        _fail_timeout "the inline-comment read (pulls/$NUMBER/comments; GraphQL reviewThreads had already failed) timed out after ${_LOOM_FORGE_REVIEW_READ_TIMEOUT}s (LOOM_FORGE_REVIEW_READ_TIMEOUT, #13927) — inline feedback state is unknown"
+    fi
+    if [[ "$INLINE_READ_RC" -ne 0 ]]; then
         _fail_unknown "both the review-thread (GraphQL) and inline-comment (pulls/$NUMBER/comments) reads failed — inline feedback state is unknown"
     fi
     INLINE_SOURCE="rest-unknown"
