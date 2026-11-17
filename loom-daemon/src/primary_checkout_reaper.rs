@@ -127,10 +127,9 @@ pub fn read_config(repo_root: &Path) -> PrimaryCheckoutReaperConfig {
 /// Resolve whether the pass runs — precedence **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &PrimaryCheckoutReaperConfig) -> bool {
-    if let Ok(v) = std::env::var(PRIMARY_CHECKOUT_REAPER_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(PRIMARY_CHECKOUT_REAPER_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the post-merge grace period — precedence **config > default**

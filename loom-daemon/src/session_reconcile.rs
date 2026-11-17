@@ -204,7 +204,7 @@ pub fn resolve_enabled(config: &SessionReconcileConfig) -> bool {
 
 fn resolve_enabled_from(env: Option<&str>, config: &SessionReconcileConfig) -> bool {
     match env {
-        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Some(v) => crate::env_flag::parse_truthy(v),
         None => config.enabled.unwrap_or(true),
     }
 }

@@ -346,11 +346,9 @@ pub fn read_prless_retry_file_config(repo_root: &Path) -> PrlessRetryFileConfig 
 pub fn resolve_prless_retry_config(repo_root: &Path) -> PrlessRetryConfig {
     let file = read_prless_retry_file_config(repo_root);
 
-    let enabled = if let Ok(v) = std::env::var(PRLESS_RETRY_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
+    let enabled = crate::env_flag::env_flag(PRLESS_RETRY_ENABLE_ENV)
+        .or(file.enabled)
+        .unwrap_or(true);
 
     let threshold = std::env::var(PRLESS_RETRY_THRESHOLD_ENV)
         .ok()

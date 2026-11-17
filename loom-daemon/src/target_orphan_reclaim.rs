@@ -165,10 +165,9 @@ pub fn read_config(repo_root: &Path) -> TargetOrphanConfig {
 
 #[must_use]
 pub fn resolve_enabled(config: &TargetOrphanConfig) -> bool {
-    if let Ok(v) = std::env::var(ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// A zero or unparseable value falls through: a 0-hour floor would make every

@@ -126,9 +126,7 @@ pub fn read_config(root: &Path) -> LiveOutputConfig {
 /// because something else was enabled.
 #[must_use]
 pub fn resolve_enabled(config: &LiveOutputConfig) -> bool {
-    std::env::var(ENABLED_ENV)
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    crate::env_flag::env_flag(ENABLED_ENV)
         .or(config.enabled)
         .unwrap_or(false)
 }

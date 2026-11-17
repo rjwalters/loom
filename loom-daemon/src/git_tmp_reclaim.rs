@@ -134,10 +134,9 @@ pub fn read_config(repo_root: &Path) -> GitTmpReclaimConfig {
 /// Resolve whether the pass runs — **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &GitTmpReclaimConfig) -> bool {
-    if let Ok(v) = std::env::var(GIT_TMP_RECLAIM_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(GIT_TMP_RECLAIM_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the grace period (minutes) — **env > config > default**, never

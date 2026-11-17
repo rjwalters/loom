@@ -161,10 +161,9 @@ pub fn read_tmpfs_reclaim_config(repo_root: &Path) -> TmpfsReclaimConfig {
 /// Resolve whether the pass runs — precedence **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &TmpfsReclaimConfig) -> bool {
-    if let Ok(v) = std::env::var(TMPFS_RECLAIM_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(TMPFS_RECLAIM_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the staleness window (seconds) — precedence **env > config >

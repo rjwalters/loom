@@ -229,11 +229,9 @@ pub fn read_noop_cooldown_file_config(repo_root: &Path) -> NoopCooldownFileConfi
 pub fn resolve_noop_cooldown_config(repo_root: &Path) -> NoopCooldownConfig {
     let file = read_noop_cooldown_file_config(repo_root);
 
-    let enabled = if let Ok(v) = std::env::var(NOOP_COOLDOWN_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
+    let enabled = crate::env_flag::env_flag(NOOP_COOLDOWN_ENABLE_ENV)
+        .or(file.enabled)
+        .unwrap_or(true);
 
     let cooldown_secs = std::env::var(NOOP_COOLDOWN_SECS_ENV)
         .ok()

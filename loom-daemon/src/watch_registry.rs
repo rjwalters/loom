@@ -755,10 +755,9 @@ pub fn read_watch_monitor_config(repo_root: &Path) -> WatchMonitorConfig {
 /// Resolve whether the loop is enabled: **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &WatchMonitorConfig) -> bool {
-    if let Ok(v) = std::env::var(WATCH_MONITOR_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(WATCH_MONITOR_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the poll cadence: **env > config > default**. A zero/unparseable env

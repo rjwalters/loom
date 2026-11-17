@@ -208,10 +208,9 @@ pub fn read_native_state_reclaim_config(repo_root: &Path) -> NativeStateReclaimC
 /// Resolve whether the pass runs — precedence **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &NativeStateReclaimConfig) -> bool {
-    if let Ok(v) = std::env::var(NATIVE_STATE_RECLAIM_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(NATIVE_STATE_RECLAIM_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the cooldown (seconds) — precedence **env > config > default**. A

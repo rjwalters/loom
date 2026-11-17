@@ -128,9 +128,7 @@ impl SignaturePolicy {
 
     #[must_use]
     pub fn from_values(require: Option<&str>, workflow: Option<&str>) -> Self {
-        let require_signature = require.is_some_and(|v| {
-            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-        });
+        let require_signature = require.is_some_and(crate::env_flag::parse_truthy);
         let approved_workflow = workflow
             .map(str::trim)
             .filter(|w| !w.is_empty())

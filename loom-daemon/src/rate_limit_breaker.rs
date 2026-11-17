@@ -126,12 +126,7 @@ pub fn read_rate_limit_breaker_config(repo_root: &Path) -> RateLimitBreakerConfi
 
 /// Env override for [`RATE_LIMIT_BREAKER_ENABLE_ENV`].
 fn env_enabled() -> Option<bool> {
-    match std::env::var(RATE_LIMIT_BREAKER_ENABLE_ENV) {
-        Ok(v) => {
-            Some(matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        }
-        Err(_) => None,
-    }
+    crate::env_flag::env_flag(RATE_LIMIT_BREAKER_ENABLE_ENV)
 }
 
 fn env_fallback_cooldown_secs() -> Option<u64> {

@@ -333,10 +333,9 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
 /// whatever this says; it governs only a host with no fleet store ([`loop_mode`]).
 #[must_use]
 pub fn resolve_enabled(config: &AutoUpdateConfig) -> bool {
-    if let Ok(v) = std::env::var(AUTO_UPDATE_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(false)
+    crate::env_flag::env_flag(AUTO_UPDATE_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(false)
 }
 
 /// Resolve the check cadence with precedence **env > config > default**. A zero

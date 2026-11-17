@@ -1551,8 +1551,7 @@ pub fn resolve_enabled(config: &RoleRunnerConfig) -> bool {
 /// it is.
 #[must_use]
 pub fn resolve_enabled_with_source(config: &RoleRunnerConfig) -> (bool, EnabledSource) {
-    if let Ok(v) = std::env::var(ROLE_RUNNER_ENABLE_ENV) {
-        let enabled = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    if let Some(enabled) = crate::env_flag::env_flag(ROLE_RUNNER_ENABLE_ENV) {
         return (enabled, EnabledSource::Env);
     }
     match config.enabled {
@@ -1575,8 +1574,7 @@ pub fn resolve_enabled_with_source(config: &RoleRunnerConfig) -> (bool, EnabledS
 /// WARN in this module) name the true cause instead.
 #[must_use]
 pub fn host_env_override() -> Option<bool> {
-    let v = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok()?;
-    Some(matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    crate::env_flag::env_flag(ROLE_RUNNER_ENABLE_ENV)
 }
 
 /// Compute which [`DEFAULT_ROLES`] entries are absent from an explicit

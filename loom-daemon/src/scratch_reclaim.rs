@@ -128,10 +128,9 @@ pub fn read_scratch_reclaim_config(repo_root: &Path) -> ScratchReclaimConfig {
 /// Resolve whether the pass runs — precedence **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &ScratchReclaimConfig) -> bool {
-    if let Ok(v) = std::env::var(SCRATCH_RECLAIM_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(SCRATCH_RECLAIM_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the age floor (hours) — precedence **env > config > default**.

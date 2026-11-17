@@ -136,9 +136,7 @@ pub const RELAY_CLEARED_ENV: &[&str] = &[
 /// because something else was enabled.
 #[must_use]
 pub fn enabled(root: &Path) -> bool {
-    let from_env = std::env::var(ENABLED_ENV)
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    let from_env = crate::env_flag::env_flag(ENABLED_ENV);
     from_env
         .or_else(|| {
             let config = crate::config_resolver::resolve_effective_config(root);

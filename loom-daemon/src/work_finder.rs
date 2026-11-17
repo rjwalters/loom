@@ -1714,10 +1714,9 @@ pub use config::{
 /// change).
 #[must_use]
 pub fn resolve_enabled(config: &WorkFinderConfig) -> bool {
-    if let Ok(v) = std::env::var(WORK_FINDER_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(false)
+    crate::env_flag::env_flag(WORK_FINDER_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(false)
 }
 
 /// Resolve the tick interval with precedence **env > config > default**.

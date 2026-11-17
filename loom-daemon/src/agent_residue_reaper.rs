@@ -261,10 +261,9 @@ pub struct Settings {
 /// reviewing what it logged as "would reap".
 #[must_use]
 pub fn resolve_dry_run(config: &crate::orphan_process_reaper::OrphanProcessReaperConfig) -> bool {
-    if let Ok(v) = std::env::var(crate::orphan_process_reaper::ORPHAN_PROCESS_REAPER_DRY_RUN_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.dry_run.unwrap_or(true)
+    crate::env_flag::env_flag(crate::orphan_process_reaper::ORPHAN_PROCESS_REAPER_DRY_RUN_ENV)
+        .or(config.dry_run)
+        .unwrap_or(true)
 }
 
 /// Resolve the switches across `roots` (the pass is host-wide, so: on when any

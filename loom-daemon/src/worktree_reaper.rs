@@ -220,10 +220,9 @@ pub fn read_worktree_reaper_config(repo_root: &Path) -> WorktreeReaperConfig {
 /// Resolve whether the loop runs — precedence **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &WorktreeReaperConfig) -> bool {
-    if let Ok(v) = std::env::var(WORKTREE_REAPER_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(WORKTREE_REAPER_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the reap cadence — precedence **env > config > default**. A zero or

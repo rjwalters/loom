@@ -315,11 +315,9 @@ pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
 pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
     let file = read_quarantine_file_config(repo_root);
 
-    let enabled = if let Ok(v) = std::env::var(QUARANTINE_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
+    let enabled = crate::env_flag::env_flag(QUARANTINE_ENABLE_ENV)
+        .or(file.enabled)
+        .unwrap_or(true);
 
     let threshold = std::env::var(QUARANTINE_THRESHOLD_ENV)
         .ok()

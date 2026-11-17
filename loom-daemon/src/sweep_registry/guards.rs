@@ -320,8 +320,8 @@ pub(crate) enum LeaseOrderDecision {
 /// justifies it).
 #[must_use]
 pub fn resolve_collision_detection(repo_root: &Path) -> bool {
-    if let Ok(v) = std::env::var(COLLISION_DETECT_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    if let Some(enabled) = crate::env_flag::env_flag(COLLISION_DETECT_ENV) {
+        return enabled;
     }
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
     crate::config_resolver::get_path(&effective, "autonomous")
@@ -1296,9 +1296,7 @@ impl SweepRegistry {
     /// can agree on without risking silent divergence between the writer and
     /// the sweep-side fencing reader.
     fn lease_publish_raw_hostname(&self) -> bool {
-        std::env::var(LEASE_PUBLISH_HOSTNAME_ENV)
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
+        crate::env_flag::env_flag(LEASE_PUBLISH_HOSTNAME_ENV).unwrap_or(false)
     }
 
     /// The host identity to PUBLISH in a `loom:lease`/`loom:lease-yield`

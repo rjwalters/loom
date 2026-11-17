@@ -135,11 +135,9 @@ pub fn read_sweep_outcome_writeback_file_config(
 #[must_use]
 pub fn resolve_sweep_outcome_writeback_config(repo_root: &Path) -> SweepOutcomeWritebackConfig {
     let file = read_sweep_outcome_writeback_file_config(repo_root);
-    let enabled = if let Ok(v) = std::env::var(SWEEP_OUTCOME_WRITEBACK_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(false)
-    };
+    let enabled = crate::env_flag::env_flag(SWEEP_OUTCOME_WRITEBACK_ENABLE_ENV)
+        .or(file.enabled)
+        .unwrap_or(false);
     SweepOutcomeWritebackConfig { enabled }
 }
 

@@ -164,9 +164,7 @@ pub fn is_enabled() -> bool {
 /// Whether this process is already inside a filing lock held by an ancestor.
 #[must_use]
 pub fn is_held_here() -> bool {
-    std::env::var(FILING_LOCK_HELD_ENV).is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
+    crate::env_flag::env_flag(FILING_LOCK_HELD_ENV).unwrap_or(false)
 }
 
 /// Resolve a positive-seconds env knob, falling back to `default`.

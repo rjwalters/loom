@@ -1009,28 +1009,20 @@ pub fn read_config(repo_root: &Path) -> InstallSelfCheckConfig {
     }
 }
 
-fn env_truthy(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-}
-
 /// Resolve whether the loop is enabled — **env > config > default(false)**.
 #[must_use]
 pub fn resolve_enabled(config: &InstallSelfCheckConfig) -> bool {
-    if let Some(v) = env_truthy(INSTALL_SELF_CHECK_ENABLE_ENV) {
-        return v;
-    }
-    config.enabled.unwrap_or(false)
+    crate::env_flag::env_flag(INSTALL_SELF_CHECK_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(false)
 }
 
 /// Resolve repair (act) mode — **env > config > default(false = report-only)**.
 #[must_use]
 pub fn resolve_repair(config: &InstallSelfCheckConfig) -> bool {
-    if let Some(v) = env_truthy(INSTALL_SELF_CHECK_REPAIR_ENV) {
-        return v;
-    }
-    config.repair.unwrap_or(false)
+    crate::env_flag::env_flag(INSTALL_SELF_CHECK_REPAIR_ENV)
+        .or(config.repair)
+        .unwrap_or(false)
 }
 
 /// Resolve the check cadence — **env > config > default**.

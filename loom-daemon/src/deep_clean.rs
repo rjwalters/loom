@@ -171,10 +171,9 @@ pub fn read_deep_clean_config(repo_root: &Path) -> DeepCleanConfig {
 /// Resolve whether the pass runs — precedence **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &DeepCleanConfig) -> bool {
-    if let Ok(v) = std::env::var(DEEP_CLEAN_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(DEEP_CLEAN_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the free-GB floor — precedence **env > config > `fallback_gb`**,

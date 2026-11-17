@@ -883,11 +883,9 @@ pub fn read_dispatch_backoff_file_config(repo_root: &Path) -> DispatchBackoffFil
 pub fn resolve_dispatch_backoff_config(repo_root: &Path) -> DispatchBackoffConfig {
     let file = read_dispatch_backoff_file_config(repo_root);
 
-    let enabled = if let Ok(v) = std::env::var(DISPATCH_BACKOFF_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
+    let enabled = crate::env_flag::env_flag(DISPATCH_BACKOFF_ENABLE_ENV)
+        .or(file.enabled)
+        .unwrap_or(true);
 
     let base_secs = std::env::var(DISPATCH_BACKOFF_BASE_ENV)
         .ok()

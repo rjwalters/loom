@@ -165,9 +165,7 @@ pub fn resolve_stale() -> Duration {
 /// [`BUILD_SLOT_HELD_ENV`]).
 #[must_use]
 pub fn is_held_here() -> bool {
-    std::env::var(BUILD_SLOT_HELD_ENV).is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
+    crate::env_flag::env_flag(BUILD_SLOT_HELD_ENV).unwrap_or(false)
 }
 
 /// The machine-wide slot directory: [`BUILD_SLOT_DIR_ENV`] when set, else

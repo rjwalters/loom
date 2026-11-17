@@ -176,10 +176,9 @@ pub fn read_heartbeat_config(repo_root: &Path) -> HeartbeatConfig {
 /// default(true)** — default-on (see module docs).
 #[must_use]
 pub fn resolve_enabled(config: &HeartbeatConfig) -> bool {
-    if let Ok(v) = std::env::var(HEARTBEAT_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(HEARTBEAT_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the heartbeat cadence with precedence **env > config > default**. A

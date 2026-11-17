@@ -127,9 +127,8 @@ fn resolve_this_host_serves(fallback_root: &Path) -> std::collections::BTreeSet<
 /// comment this daemon publishes).
 fn roster_host_id() -> String {
     let host = sweep_registry::lease_host_identity();
-    let raw_opt_in = std::env::var(sweep_registry::LEASE_PUBLISH_HOSTNAME_ENV)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
+    let raw_opt_in =
+        crate::env_flag::env_flag(sweep_registry::LEASE_PUBLISH_HOSTNAME_ENV).unwrap_or(false);
     if raw_opt_in {
         host
     } else {

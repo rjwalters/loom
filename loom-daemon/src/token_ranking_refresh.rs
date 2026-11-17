@@ -374,10 +374,9 @@ pub fn read_token_ranking_refresh_config(repo_root: &Path) -> TokenRankingRefres
 /// default-on decision documented at the module level.
 #[must_use]
 pub fn resolve_enabled(config: &TokenRankingRefreshConfig) -> bool {
-    if let Ok(v) = std::env::var(TOKEN_RANKING_REFRESH_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(TOKEN_RANKING_REFRESH_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the refresh cadence with precedence **env > config > default**. A

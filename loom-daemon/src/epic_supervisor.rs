@@ -1109,9 +1109,7 @@ pub async fn tick_multi<S: EpicSource, D: EpicDispatcher>(
 /// Off by default (opt-in) — see [`SUPERVISOR_ENABLE_ENV`].
 #[must_use]
 pub fn supervisor_enabled() -> bool {
-    std::env::var(SUPERVISOR_ENABLE_ENV).is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
+    crate::env_flag::env_flag(SUPERVISOR_ENABLE_ENV).unwrap_or(false)
 }
 
 /// Resolve the supervisor tick interval from [`SUPERVISOR_INTERVAL_ENV`],

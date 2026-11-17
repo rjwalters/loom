@@ -191,10 +191,9 @@ pub fn read_config(repo_root: &Path) -> OrphanProcessReaperConfig {
 /// Resolve whether the pass runs — precedence **env > config > default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &OrphanProcessReaperConfig) -> bool {
-    if let Ok(v) = std::env::var(ORPHAN_PROCESS_REAPER_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(ORPHAN_PROCESS_REAPER_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the minimum seed age — precedence **env > config > default**. A zero
@@ -212,10 +211,9 @@ pub fn resolve_min_age_secs(config: &OrphanProcessReaperConfig) -> u64 {
 /// Resolve dry-run mode — precedence **env > config > default(false)**.
 #[must_use]
 pub fn resolve_dry_run(config: &OrphanProcessReaperConfig) -> bool {
-    if let Ok(v) = std::env::var(ORPHAN_PROCESS_REAPER_DRY_RUN_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.dry_run.unwrap_or(false)
+    crate::env_flag::env_flag(ORPHAN_PROCESS_REAPER_DRY_RUN_ENV)
+        .or(config.dry_run)
+        .unwrap_or(false)
 }
 
 // ============================================================================

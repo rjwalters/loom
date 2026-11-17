@@ -580,10 +580,9 @@ pub fn resolve_dispatch_stagger(config: &StartupRaceConfig) -> Duration {
 /// but can be disabled entirely via env or config.
 #[must_use]
 pub fn resolve_watchdog_enabled(config: &StartupRaceConfig) -> bool {
-    if let Ok(v) = std::env::var(WATCHDOG_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.watchdog_enabled.unwrap_or(true)
+    crate::env_flag::env_flag(WATCHDOG_ENABLE_ENV)
+        .or(config.watchdog_enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the watchdog no-progress timeout, precedence **env > config >
@@ -619,10 +618,9 @@ pub fn resolve_watchdog_interval(config: &StartupRaceConfig) -> Duration {
 /// `autonomous.watchdog.reviewStall = false`.
 #[must_use]
 pub fn resolve_review_stall_enabled(config: &StartupRaceConfig) -> bool {
-    if let Ok(v) = std::env::var(REVIEW_STALL_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.review_stall_enabled.unwrap_or(true)
+    crate::env_flag::env_flag(REVIEW_STALL_ENABLE_ENV)
+        .or(config.review_stall_enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the review-phase stall (log-silence) timeout, precedence **env >
@@ -659,10 +657,9 @@ pub fn resolve_startup_proof_grace(config: &StartupRaceConfig) -> Duration {
 /// `LOOM_SWEEP_STALE_SWEEP=0` or `autonomous.watchdog.staleSweep = false`.
 #[must_use]
 pub fn resolve_stale_sweep_enabled(config: &StartupRaceConfig) -> bool {
-    if let Ok(v) = std::env::var(STALE_SWEEP_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.stale_sweep_enabled.unwrap_or(true)
+    crate::env_flag::env_flag(STALE_SWEEP_ENABLE_ENV)
+        .or(config.stale_sweep_enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the stale-sweep age sanity ceiling, precedence **env > config >

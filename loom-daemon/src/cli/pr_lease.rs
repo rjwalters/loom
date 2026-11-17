@@ -536,9 +536,7 @@ pub(crate) fn ordering(state: &ClaimState) -> Ordering {
 /// (`lease_host_identity`, not `host_identity`, #11530).
 pub(crate) fn published_host() -> String {
     use crate::sweep_registry::{lease_host_identity, opaque_host_id, LEASE_PUBLISH_HOSTNAME_ENV};
-    let raw = std::env::var(LEASE_PUBLISH_HOSTNAME_ENV).is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    });
+    let raw = crate::env_flag::env_flag(LEASE_PUBLISH_HOSTNAME_ENV).unwrap_or(false);
     let host = lease_host_identity();
     if raw {
         host

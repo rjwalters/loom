@@ -197,10 +197,9 @@ pub fn read_eager_reclaim_config(repo_root: &Path) -> EagerReclaimConfig {
 /// default(true)**.
 #[must_use]
 pub fn resolve_enabled(config: &EagerReclaimConfig) -> bool {
-    if let Ok(v) = std::env::var(EAGER_RECLAIM_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(true)
+    crate::env_flag::env_flag(EAGER_RECLAIM_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the cooldown (seconds) — precedence **env > config > default**. A

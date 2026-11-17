@@ -2894,9 +2894,7 @@ fn log_transition(transition: HealthTransition, outcome: &GateOutcome, halted: b
 /// env > config > default).
 #[must_use]
 pub fn enabled() -> bool {
-    std::env::var(MAIN_HEALTH_GATE_ENABLE_ENV).is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
+    crate::env_flag::env_flag(MAIN_HEALTH_GATE_ENABLE_ENV).unwrap_or(false)
 }
 
 /// The subset of `.loom/config.json → autonomous.mainHealthGate` this module
@@ -2981,10 +2979,9 @@ pub fn resolve_ci_workflow(repo_root: &Path) -> Option<String> {
 /// letting a repo enable the gate entirely from committed config.
 #[must_use]
 pub fn resolve_enabled(config: &AutonomousGateConfig) -> bool {
-    if let Ok(v) = std::env::var(MAIN_HEALTH_GATE_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.enabled.unwrap_or(false)
+    crate::env_flag::env_flag(MAIN_HEALTH_GATE_ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(false)
 }
 
 /// Resolve whether the work-finder suppresses dispatch into a root while its
@@ -2996,11 +2993,8 @@ pub fn resolve_enabled(config: &AutonomousGateConfig) -> bool {
 /// env-master-switch shape.
 #[must_use]
 pub fn resolve_suppress_dispatch_during_gate(config: &AutonomousGateConfig) -> bool {
-    if let Ok(v) = std::env::var(MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config
-        .suppress_dispatch_during_gate
+    crate::env_flag::env_flag(MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV)
+        .or(config.suppress_dispatch_during_gate)
         .unwrap_or(DEFAULT_SUPPRESS_DISPATCH_DURING_GATE)
 }
 

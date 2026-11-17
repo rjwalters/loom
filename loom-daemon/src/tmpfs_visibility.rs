@@ -322,10 +322,9 @@ pub fn read_tmpfs_visibility_config(repo_root: &Path) -> TmpfsVisibilityConfig {
 /// config > default(true)**.
 #[must_use]
 pub fn resolve_warn_enabled(config: &TmpfsVisibilityConfig) -> bool {
-    if let Ok(v) = std::env::var(WARN_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    }
-    config.warn_enabled.unwrap_or(true)
+    crate::env_flag::env_flag(WARN_ENABLE_ENV)
+        .or(config.warn_enabled)
+        .unwrap_or(true)
 }
 
 /// Resolve the warn-fraction threshold (percent) — precedence **env > config

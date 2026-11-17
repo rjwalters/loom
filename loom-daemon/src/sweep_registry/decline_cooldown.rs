@@ -185,11 +185,9 @@ pub fn read_decline_cooldown_file_config(repo_root: &Path) -> DeclineCooldownFil
 pub fn resolve_decline_cooldown_config(repo_root: &Path) -> DeclineCooldownConfig {
     let file = read_decline_cooldown_file_config(repo_root);
 
-    let enabled = if let Ok(v) = std::env::var(DECLINE_COOLDOWN_ENABLE_ENV) {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    } else {
-        file.enabled.unwrap_or(true)
-    };
+    let enabled = crate::env_flag::env_flag(DECLINE_COOLDOWN_ENABLE_ENV)
+        .or(file.enabled)
+        .unwrap_or(true);
 
     let cooldown_secs = std::env::var(DECLINE_COOLDOWN_SECS_ENV)
         .ok()
