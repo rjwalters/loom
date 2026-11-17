@@ -370,11 +370,17 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     let policy = crate::comment_trust::TrustPolicy::for_root(&root);
     let mut gate = classify(&policy, issue.as_ref());
     if matches!(gate, crate::promotion_author::Gate::Untrusted(_)) {
-        // #13578: a trusted actor's earlier `loom:issue` is a durable adoption.
-        // Any read failure keeps the verdict above (fail closed). An edit of
-        // the body by a non-trusted editor since the adoption ends it.
-        if let Some(who) = adopter(&policy, repo, number, &root) {
-            eprintln!("promotion-author: adopted by {who} (trusted `labeled loom:issue`)");
+        // #13578: a human maintainer's earlier `loom:issue` is a durable
+        // adoption. Any read failure keeps the verdict above (fail closed). A
+        // withdrawal of the label, or an edit of the body by a non-trusted
+        // editor since the adoption, ends it. The reads below need the real
+        // `owner/name`: GraphQL does not expand the `gh` placeholder.
+        let adopted = issue
+            .as_ref()
+            .and_then(|i| real_repo(repo, i))
+            .and_then(|real| adopter(&policy, &real, number, &root));
+        if let Some(who) = adopted {
+            eprintln!("promotion-author: adopted by {who} (maintainer `labeled loom:issue`)");
             gate = crate::promotion_author::Gate::Trusted;
         }
     }
@@ -401,9 +407,23 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The trusted actor whose `loom:issue` adoption of issue `number` still
-/// stands, if the whole timeline and the body's edit history could be read
-/// (#13578). Either read failing yields `None`.
+/// The real `owner/name` the issue was read from: `repo` itself when it is
+/// one, else (the `gh` placeholder `{owner}/{repo}`, which only `gh api` REST
+/// paths expand) the repository the fetched `issue` object names in its
+/// `repository_url`. `None` when neither is a valid slug, so no later call is
+/// built from a placeholder.
+fn real_repo(repo: &str, issue: &Value) -> Option<String> {
+    if crate::forge_mirror::valid_slug(repo) {
+        return Some(repo.to_string());
+    }
+    let url = issue.get("repository_url").and_then(Value::as_str)?;
+    let (_, slug) = url.rsplit_once("/repos/")?;
+    crate::forge_mirror::valid_slug(slug).then(|| slug.to_string())
+}
+
+/// The maintainer whose `loom:issue` adoption of issue `number` still stands,
+/// if the whole timeline and the body's edit history could be read (#13578).
+/// Either read failing yields `None`. `repo` is a real `owner/name`.
 fn adopter(
     policy: &crate::comment_trust::TrustPolicy,
     repo: &str,
@@ -414,41 +434,58 @@ fn adopter(
     let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
     let events = crate::comment_trust::parse_listing(&out.ok_output()?.stdout)?;
     let edits = body_edits(repo, number, root)?;
-    // Timeline actors and editors have no association: map write access or better to one.
+    // Timeline actors and editors have no association: map write access or
+    // better to one. One lookup per login; a failed lookup is no access.
+    let seen = std::cell::RefCell::new(std::collections::HashMap::<String, Option<String>>::new());
     crate::promotion_author::standing_adoption(policy, &events, &edits, |login| {
+        if let Some(known) = seen.borrow().get(login) {
+            return known.clone();
+        }
         let path = format!("repos/{repo}/collaborators/{login}/permission");
         let out =
             crate::script_helpers::run_gh(&["api", &path, "--jq", ".permission"], root, false);
-        let out = out.ok_output()?;
-        matches!(String::from_utf8_lossy(&out.stdout).trim(), "admin" | "maintain" | "write")
-            .then(|| "COLLABORATOR".to_string())
+        let access = out.ok_output().and_then(|out| {
+            matches!(String::from_utf8_lossy(&out.stdout).trim(), "admin" | "maintain" | "write")
+                .then(|| "COLLABORATOR".to_string())
+        });
+        seen.borrow_mut().insert(login.to_string(), access.clone());
+        access
     })
+}
+
+const BODY_EDITS_QUERY: &str = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
+    issue(number:$i){userContentEdits(first:100){pageInfo{hasNextPage} \
+    nodes{createdAt editedAt editor{login __typename}}}}}}";
+
+/// The `gh` arguments of the edit-history read. `None` unless `repo` is a real
+/// `owner/name`: `-f` values reach GraphQL literally, so a placeholder would
+/// name no repository.
+fn body_edits_args(repo: &str, number: u64) -> Option<Vec<String>> {
+    if !crate::forge_mirror::valid_slug(repo) {
+        return None;
+    }
+    let (owner, name) = repo.split_once('/')?;
+    Some(vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={BODY_EDITS_QUERY}"),
+        "-f".to_string(),
+        format!("o={owner}"),
+        "-f".to_string(),
+        format!("n={name}"),
+        "-F".to_string(),
+        format!("i={number}"),
+    ])
 }
 
 /// The `userContentEdits` nodes of issue `number`'s body (`createdAt`,
 /// `editedAt`, `editor`): the timeline carries no body edits. `None` on any
 /// failure, a GraphQL error, or more edits than one page (not fully read).
 fn body_edits(repo: &str, number: u64, root: &Path) -> Option<Vec<serde_json::Value>> {
-    const QUERY: &str = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
-        issue(number:$i){userContentEdits(first:100){pageInfo{hasNextPage} \
-        nodes{createdAt editedAt editor{login __typename}}}}}}";
-    let (owner, name) = repo.split_once('/')?;
-    let out = crate::script_helpers::run_gh(
-        &[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={QUERY}"),
-            "-f",
-            &format!("o={owner}"),
-            "-f",
-            &format!("n={name}"),
-            "-F",
-            &format!("i={number}"),
-        ],
-        root,
-        false,
-    );
+    let args = body_edits_args(repo, number)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = crate::script_helpers::run_gh(&args, root, false);
     let json: serde_json::Value = serde_json::from_slice(&out.ok_output()?.stdout).ok()?;
     if json.get("errors").is_some() {
         return None;
@@ -466,8 +503,42 @@ fn body_edits(repo: &str, number: u64, root: &Path) -> Option<Vec<serde_json::Va
 
 #[cfg(test)]
 mod tests {
-    use super::gh_comment;
+    use super::{body_edits_args, gh_comment, real_repo};
     use serde_json::json;
+
+    /// Finding A (20261116-r15 q48): with no `--repo` the repository is the
+    /// `gh` placeholder, and the GraphQL call must still name a real one.
+    #[test]
+    fn the_default_repo_path_builds_a_graphql_call_with_a_real_owner_and_name() {
+        let issue = json!({
+            "number": 13171,
+            "repository_url": "https://api.github.com/repos/rjwalters/loom",
+        });
+        let repo = real_repo("{owner}/{repo}", &issue).expect("resolved from the issue");
+        assert_eq!(repo, "rjwalters/loom");
+        let args = body_edits_args(&repo, 13171).expect("a real slug builds the call");
+        assert!(args.contains(&"o=rjwalters".to_string()), "{args:?}");
+        assert!(args.contains(&"n=loom".to_string()), "{args:?}");
+        assert!(args.contains(&"i=13171".to_string()), "{args:?}");
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("o={") || a.starts_with("n={")));
+        // The default path and `--repo` build the same call.
+        assert_eq!(real_repo("rjwalters/loom", &issue).as_deref(), Some("rjwalters/loom"));
+        assert_eq!(Some(args), body_edits_args("rjwalters/loom", 13171));
+    }
+
+    /// A placeholder is never sent to GraphQL, and an issue object that names
+    /// no repository resolves to nothing (the verdict stays `UNTRUSTED`).
+    #[test]
+    fn an_unresolved_placeholder_builds_no_graphql_call() {
+        assert_eq!(body_edits_args("{owner}/{repo}", 7), None);
+        assert_eq!(real_repo("{owner}/{repo}", &json!({"number": 7})), None);
+        let odd = json!({"repository_url": "https://api.github.com/repos/{owner}/{repo}"});
+        assert_eq!(real_repo("{owner}/{repo}", &odd), None);
+        let ghes = json!({"repository_url": "https://ghe.example/api/v3/repos/Org-1/my.repo"});
+        assert_eq!(real_repo("{owner}/{repo}", &ghes).as_deref(), Some("Org-1/my.repo"));
+    }
 
     /// `--gh-shape` renames the REST fields and keeps the App spelling.
     #[test]

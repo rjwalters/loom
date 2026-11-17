@@ -5,7 +5,9 @@
 //! (an outside bot, a non-collaborator) may be curated, but an automated
 //! Champion verdict alone must not approve it for building: a trusted
 //! maintainer adopts it (applies `loom:issue` by hand) or re-files it. The
-//! decision reuses [`TrustPolicy`], so there is no second trust table.
+//! decision reuses [`TrustPolicy`], so there is no second trust table. An
+//! adoption is narrower than comment trust: only a human maintainer's label
+//! counts, never an App's or a bot's ([`adopted_by`]).
 //!
 //! The caller promotes only on [`Gate::Trusted`]; [`Gate::Untrusted`] and
 //! [`Gate::Unknown`] both mean "do not promote", differing only in the
@@ -158,35 +160,140 @@ fn instant(v: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|t| t.to_utc())
 }
 
-/// The login of the trusted actor who most recently applied `loom:issue` to
-/// the issue, with the time they did, read from its REST timeline (`events`)
-/// (#13578). `None`: no trusted adoption (an event whose time cannot be read
-/// does not count).
+/// The login of a human forge account (`type` / `__typename` is exactly
+/// `User`, and the login is not App-spelled). An actor with no readable type,
+/// a `Bot`, an `Organization` or a `Mannequin` is not one (fail closed).
+fn human_login(actor: &Value) -> Option<&str> {
+    let login = actor.get("login").and_then(Value::as_str)?.trim();
+    let kind = actor
+        .get("type")
+        .or_else(|| actor.get("__typename"))
+        .and_then(Value::as_str)?;
+    (kind == "User" && !login.is_empty() && !crate::comment_trust::is_app_login(login))
+        .then_some(login)
+}
+
+/// Whether `actor` can adopt (operator ruling 20261116-r15 q48): a **human**
+/// account that is allow-listed (`forge.trustedCommenters` or the fleet admin
+/// roster) or for which `association_of(login)` reports write access or
+/// better. An App or bot never adopts, the fleet's own included, whatever
+/// [`TrustPolicy`] says about its comments.
+fn maintainer(
+    policy: &TrustPolicy,
+    actor: &Value,
+    association_of: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let login = human_login(actor)?;
+    // Built by hand, never `Author::new`: the account kind is the forge's
+    // `User` type checked above, so no App rule of the policy can match.
+    let mut author = Author {
+        login: Some(login.to_string()),
+        association: None,
+        app: false,
+    };
+    if !policy.trusts(&author) {
+        author.association = association_of(login);
+    }
+    policy.trusts(&author).then(|| login.to_string())
+}
+
+/// The labels whose arrival, next to an `unlabeled loom:issue` by the same
+/// actor, makes that removal a move of Loom's own state machine: a Builder
+/// claim (`loom:issue` → `loom:building`) and the landed-route / rescope send
+/// back to Curator (`loom:issue` → `loom:triage`).
+const SUCCESSOR_LABELS: &[&str] = &["loom:building", "loom:triage"];
+
+/// How far apart, in seconds, the removal and the successor label may be
+/// recorded and still be one transition (one `gh issue edit` is two events,
+/// observed 0-1 s apart).
+const TRANSITION_WINDOW_SECS: i64 = 30;
+
+fn is_label_event(e: &Value, event: &str, label: &str) -> bool {
+    e.get("event").and_then(Value::as_str) == Some(event)
+        && e.pointer("/label/name").and_then(Value::as_str) == Some(label)
+}
+
+fn actor_login(e: &Value) -> Option<&str> {
+    e.pointer("/actor/login").and_then(Value::as_str)
+}
+
+/// Whether the `unlabeled loom:issue` event `removal` (recorded at `at`) is a
+/// state-machine transition rather than a withdrawal: the **same actor** also
+/// applied a [`SUCCESSOR_LABELS`] label within [`TRANSITION_WINDOW_SECS`] of
+/// it, and that actor is trusted (a fleet identity or a maintainer). A bare
+/// removal, one by an actor that cannot be read or is not trusted, or one
+/// whose successor label came from someone else, is a withdrawal.
+fn is_transition(
+    policy: &TrustPolicy,
+    events: &[Value],
+    removal: &Value,
+    at: chrono::DateTime<chrono::Utc>,
+    association_of: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some(who) = actor_login(removal) else {
+        return false;
+    };
+    let moved_on = events.iter().any(|e| {
+        SUCCESSOR_LABELS
+            .iter()
+            .any(|l| is_label_event(e, "labeled", l))
+            && actor_login(e).is_some_and(|a| a.eq_ignore_ascii_case(who))
+            && instant(e.get("created_at"))
+                .is_some_and(|t| (t - at).num_seconds().abs() <= TRANSITION_WINDOW_SECS)
+    });
+    moved_on
+        && removal
+            .get("actor")
+            .and_then(|a| actor_trusted(policy, a, association_of))
+            .is_some()
+}
+
+/// The login of the maintainer whose `loom:issue` adoption of the issue
+/// stands, with the time they applied it, read from its REST timeline
+/// (`events`, oldest first) (#13578). `None`: no standing adoption.
 ///
 /// An operator's hand adoption is recorded by the forge with an unforgeable
 /// actor and survives later re-curation, so it is read back rather than
-/// marked. Timeline actors carry no `author_association`, so
-/// `association_of(login)` supplies one; there is no second trust table. An
-/// event by an untrusted actor does not count.
+/// marked. Operator ruling 20261116-r15 q48:
+///
+/// - **Who adopts.** Only a human maintainer ([`maintainer`]). Timeline actors
+///   carry no `author_association`, so `association_of(login)` supplies one.
+///   A label applied by an App or bot, or by a human without write access, is
+///   not an adoption.
+/// - **What ends it.** Any `unlabeled loom:issue` after the latest adoption
+///   that is not a state-machine transition ([`is_transition`]). A later
+///   adoption by a maintainer is a new latest adoption and restores it.
+///
+/// Fail closed: a `labeled` event whose time or actor cannot be read does not
+/// count, and an `unlabeled loom:issue` whose time cannot be read ends every
+/// adoption.
 #[must_use]
 pub fn adopted_by(
     policy: &TrustPolicy,
     events: &[Value],
     association_of: impl Fn(&str) -> Option<String>,
 ) -> Option<(String, chrono::DateTime<chrono::Utc>)> {
-    events
+    let (at, index, who) = events
         .iter()
-        .filter(|e| {
-            e.get("event").and_then(Value::as_str) == Some("labeled")
-                && e.pointer("/label/name").and_then(Value::as_str) == Some("loom:issue")
-        })
-        .filter_map(|e| {
+        .enumerate()
+        .filter(|(_, e)| is_label_event(e, "labeled", "loom:issue"))
+        .filter_map(|(i, e)| {
             let at = instant(e.get("created_at"))?;
             let who =
-                actor_trusted(policy, e.get("actor").filter(|a| a.is_object())?, &association_of)?;
-            Some((who, at))
+                maintainer(policy, e.get("actor").filter(|a| a.is_object())?, &association_of)?;
+            Some((at, i, who))
         })
-        .max_by_key(|(_, at)| *at)
+        .max_by_key(|(at, i, _)| (*at, *i))?;
+    let withdrawn = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_label_event(e, "unlabeled", "loom:issue"))
+        .any(|(i, e)| match instant(e.get("created_at")) {
+            None => true,
+            Some(t) if t < at || (t == at && i < index) => false,
+            Some(t) => !is_transition(policy, events, e, t, &association_of),
+        });
+    (!withdrawn).then_some((who, at))
 }
 
 /// Whether the adoption at `adopted_at` still covers the issue body (#13578,
@@ -219,8 +326,8 @@ pub fn body_unchanged_since(
     })
 }
 
-/// The adopter, when a trusted adoption exists and no untrusted editor has
-/// changed the body since the latest one.
+/// The adopter, when a maintainer's adoption stands ([`adopted_by`]) and no
+/// untrusted editor has changed the body since it.
 #[must_use]
 pub fn standing_adoption(
     policy: &TrustPolicy,
