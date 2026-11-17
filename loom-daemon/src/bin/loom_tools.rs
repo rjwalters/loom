@@ -2,9 +2,10 @@
 //! `docs/design/loom-tools-cli-boundary.md` §6.2 step 4, §7.3, §10).
 //!
 //! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939), plus the
-//! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940): the
+//! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940), plus
+//! `resolve-model` (#13878): the
 //! tools-only installer (`scripts/install/provision-tools.sh`) has no daemon to call. The handlers are the
-//! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config`
+//! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config|resolve-model`
 //! call), so there is no second copy. This crate links `loom_daemon` and not
 //! `daemon_service`, which is private to the `loom-daemon` bin.
 //!
@@ -19,8 +20,9 @@ use std::io::Write;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
-    config_get_dispatch, handle_checkpoint_command, handle_strip_ansi_command, CheckpointAction,
-    ConfigArgs, InstallBinaryCommand, ReleaseFetchArgs, ResyncPayloadArgs,
+    config_get_dispatch, handle_checkpoint_command, handle_resolve_model_command,
+    handle_strip_ansi_command, CheckpointAction, ConfigArgs, InstallBinaryCommand,
+    ReleaseFetchArgs, ResolveModelArgs, ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::tools_mode::{self, Route};
@@ -28,7 +30,7 @@ use loom_daemon::tools_mode::{self, Route};
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -62,6 +64,10 @@ enum ToolsCommands {
     /// Resync a workspace's installed Loom from the payload embedded in this
     /// binary (same as `loom-daemon resync-payload`).
     ResyncPayload(ResyncPayloadArgs),
+    /// Resolve a logical model tier/alias to the concrete model ID — the
+    /// same arguments, stdout and exit codes as `loom-daemon resolve-model`
+    /// (#13878), so `resolve-model.sh` works with no daemon binary installed.
+    ResolveModel(ResolveModelArgs),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -125,6 +131,8 @@ fn run() -> Result<()> {
         ToolsCommands::ReleaseFetch(args) => args.run(),
         ToolsCommands::InstallBinary(cmd) => cmd.run(),
         ToolsCommands::ResyncPayload(args) => args.run(),
+        // No forge call, so no mode gate (§10.3 gates `checkpoint read` only).
+        ToolsCommands::ResolveModel(args) => handle_resolve_model_command(&args),
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }
@@ -134,5 +142,57 @@ fn main() {
         eprintln!("Error: {err:?}");
         let _ = std::io::stderr().flush();
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{ToolsCli, ToolsCommands};
+
+    /// #13878: `loom-tools resolve-model` accepts the same argv as
+    /// `loom-daemon resolve-model`. The daemon-side mirror of this table is
+    /// `resolve_model_keeps_its_alias_surface` in `legacy_script_cmds.rs`;
+    /// both roots wrap the one `ResolveModelArgs` struct, so the surfaces
+    /// cannot drift.
+    #[test]
+    fn resolve_model_keeps_the_daemon_argv_surface() {
+        for argv in [
+            vec!["loom-tools", "resolve-model", "opus"],
+            vec![
+                "loom-tools",
+                "resolve-model",
+                "claude-opus-5",
+                "--task-alias",
+            ],
+            vec!["loom-tools", "resolve-model", "opus", "--downgrade"],
+            vec![
+                "loom-tools",
+                "resolve-model",
+                "opus",
+                "--generation",
+                "--config",
+                "x.json",
+            ],
+        ] {
+            let cli = ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(matches!(cli.command, ToolsCommands::ResolveModel(_)), "{argv:?}");
+        }
+    }
+
+    /// The rejections mirror the daemon root's
+    /// `tier_routing_and_jev_tier_entry_points_are_rejected`: removed tier-2.5
+    /// routing, an unknown runtime flag, and a missing MODEL are clap errors,
+    /// not silent aliases.
+    #[test]
+    fn resolve_model_rejects_the_daemon_rejections() {
+        for argv in [
+            vec!["loom-tools", "resolve-model", "--tier", "routine"],
+            vec!["loom-tools", "resolve-model", "opus", "--runtime", "claude"],
+            vec!["loom-tools", "resolve-model"],
+        ] {
+            assert!(ToolsCli::try_parse_from(&argv).is_err(), "{argv:?} must be rejected");
+        }
     }
 }

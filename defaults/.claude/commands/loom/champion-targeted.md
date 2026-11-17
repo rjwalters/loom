@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Targeted and Non-Item Modes (#11859)
 
 **Load when:** `$ARGUMENTS` carries `--pr N`, `--issue N` or `--non-item`

@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Builder: PR Creation and Quality
 
 This document covers PR creation, test output handling, and quality requirements for the Builder role. For the core builder workflow, see `builder.md`.

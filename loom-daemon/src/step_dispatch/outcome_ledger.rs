@@ -19,6 +19,7 @@
 //! | any other `noop` | [`Effect::Cooldown`] for [`LedgerConfig::noop_cooldown`], per `(item, step)` |
 //! | `refused`, reason `pool_gate` or `claimed` | [`Effect::Cooldown`] for [`LedgerConfig::refusal_cooldown`] |
 //! | `refused`, reason `claim_lost` | [`Effect::Redraw`], counted ([`LedgerCounters::claim_lost`]); a **second** one in a row arms a cooldown (below) |
+//! | `refused`, reason `provider_exhausted` ([`PROVIDER_EXHAUSTED`], #13966) | [`Effect::Uncharged`]: nothing, however many in a row |
 //! | any other `refused` (a state refusal) | [`Effect::Reclassify`]; a **second identical** one in a row arms a cooldown (below) |
 //! | `failed` inside the fast-fail window, Builder step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
 //! | `failed` inside the fast-fail window, any other step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
@@ -50,6 +51,16 @@
 //! peer or an attended session holding it for longer than a tick) would
 //! otherwise spawn and lose on every tick. A second consecutive `claim_lost`
 //! on the pair arms the same doubling refusal cooldown; it still redraws.
+//!
+//! [`PROVIDER_EXHAUSTED`] does **not** ride it (#13966). The streak is
+//! backpressure for a disagreement about the *item*; an exhausted api-key
+//! seat says nothing about the item, and its backpressure already exists on
+//! the seat (the exhausted mark held to the provider's reset, and the
+//! spawn-time `pool_gate` refusal once every seat is marked). During a
+//! multi-seat outage the same item is the likely discoverer of each next
+//! seat's exhaustion, so a streak here would walk it 10 min → 24 h for an
+//! outage that is not its fault. It is [`Effect::Uncharged`]: no window, no
+//! streak, no run, and no streak another outcome built is reset by it.
 //!
 //! # Fast failures of non-Builder issue steps
 //!
@@ -152,6 +163,16 @@ pub const UNCLASSIFIED: &str = "unclassified";
 
 /// The reason of a step whose forge post-state could not be read.
 pub const PROBE_FAILED: &str = "probe_failed";
+
+/// The refusal reason of a step that died because its api-key seat was
+/// exhausted (#13966): the provider refused the launch, the seat is marked
+/// to its reset, and the draw falls through to the next runtime — so the
+/// pair records a **refusal**, not a run: no fast-fail ladder, no repeat-cap
+/// run, and no item cooldown however many land in a row
+/// ([`Effect::Uncharged`], never the state-refusal streak). Not an
+/// outcome-line token: the daemon synthesizes it, like the spawn-time
+/// `pool_gate` refusals it mirrors.
+pub const PROVIDER_EXHAUSTED: &str = "provider_exhausted";
 
 /// `noop` reasons that waited on something outside the item; they are not
 /// runs for the repeat cap, and they cool down for
@@ -375,6 +396,11 @@ pub enum Effect {
     Landed,
     /// A state refusal: the listing was stale; reclassify the item.
     Reclassify,
+    /// The provider refused the launch ([`PROVIDER_EXHAUSTED`], #13966): the
+    /// pair is charged nothing, on the first or the hundredth in a row. No
+    /// window, no refusal streak, no repeat-cap run; and, since it says
+    /// nothing about the item, it resets no streak another outcome built.
+    Uncharged,
     /// A short `(item, step)` cooldown of this length.
     Cooldown(Duration),
     /// A fast failure on a Builder step: charge the #11854 fast-fail ladder.
@@ -445,6 +471,7 @@ pub fn effect_of(
         OutcomeClass::Refused => match reason {
             "pool_gate" | "claimed" => Effect::Cooldown(cfg.refusal_cooldown),
             "claim_lost" => Effect::Redraw,
+            PROVIDER_EXHAUSTED => Effect::Uncharged,
             _ => Effect::Reclassify,
         },
         OutcomeClass::Failed if ran_for < cfg.fast_fail_window && step == StepRole::Builder => {
@@ -644,7 +671,17 @@ impl OutcomeLedger {
                 self.arm(item, step, add(now, delay), CooldownCause::FastFail, now);
             }
             Effect::Reclassify => self.refusal_streak(item, step, &outcome.reason, now),
-            Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder => {}
+            Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder | Effect::Uncharged => {}
+        }
+        // An exhausted seat is not an outcome of the pair (#13966): it leaves
+        // the fast-fail and refusal streaks exactly as it found them.
+        if effect == Effect::Uncharged {
+            return Recorded {
+                effect,
+                cooling_until: self.cooling_until(item, step, now),
+                repeat_capped,
+                lifted,
+            };
         }
         if let Some(entry) = self.entries.get_mut(&(item, step)) {
             if effect != Effect::FastFailWindow {

@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Idempotency Guard for Unrevised Epics — Maintainer Notes
 
 Editor-facing notes for `champion-epic.md` → "Idempotency Guard for Unrevised
