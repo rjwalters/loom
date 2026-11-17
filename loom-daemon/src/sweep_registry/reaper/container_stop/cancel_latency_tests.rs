@@ -132,7 +132,6 @@ fn entry(sweep_id: &str, issue: u32, pid: u32, log_path: PathBuf) -> SweepInfo {
         effort: None,
         depends_on: None,
         repo: None,
-        overflow: false,
     }
 }
 

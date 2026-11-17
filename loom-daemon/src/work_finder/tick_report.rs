@@ -241,13 +241,6 @@ pub struct TickReport {
     /// result keys on [`deferred_build_backoff`](Self::deferred_build_backoff)
     /// instead, so a repo that stays held cannot mask other outcomes.
     pub build_backoff_held: bool,
-    /// The subset of [`dispatched`](Self::dispatched) admitted through the
-    /// overflow slot (#9244, inert since #11508): an operator-starred issue that
-    /// only the global cap refused, dispatched as this host's
-    /// single over-limit sweep. At most one per tick, and none while an
-    /// earlier overflow sweep is still live. See
-    /// [`operator_priority::OverflowSlot`](super::operator_priority::OverflowSlot).
-    pub dispatched_overflow: usize,
     /// Per-issue outcomes behind the counters above (Issue #8852), recorded
     /// by the multi-workspace tick only. See [`ready_queue`](super::ready_queue).
     pub queue: Vec<ready_queue::TickQueueRow>,
@@ -288,10 +281,6 @@ pub struct TickReport {
     /// gate then deferred. The published plan's `position` is read from here
     /// and never re-derived. Empty for the single-workspace tick.
     pub plan_order: Vec<(usize, u32)>,
-    /// Whether the host's single overflow slot (#9244, inert since #11508)
-    /// was still unused when the tick finished, or `None` when the
-    /// tick did not record it (Issue #9288).
-    pub overflow_free: Option<bool>,
     /// The tick's workspace draws (#11103): seed, and each draw's candidates,
     /// weights, roll and pick, in order. `None` when nothing was drawn (an
     /// idle tick, and the single-workspace tick).
@@ -401,8 +390,8 @@ impl TickReport {
     }
 
     /// This report with no occupancy reading and none of the admission
-    /// context a multi-workspace tick records for its dispatch plan (#9288:
-    /// the overflow slot), for comparing an idle
+    /// context a multi-workspace tick records for its dispatch plan (#9288),
+    /// for comparing an idle
     /// tick against [`TickReport::default`] in tests. The shaped order itself
     /// (`plan_order`) is kept: an idle tick has none.
     #[cfg(test)]
@@ -410,7 +399,6 @@ impl TickReport {
     pub fn without_occupancy(self) -> Self {
         TickReport {
             occupancy: None,
-            overflow_free: None,
             workspace_draw: None,
             ..self
         }

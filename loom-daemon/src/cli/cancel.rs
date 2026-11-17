@@ -240,7 +240,6 @@ mod cancel_tests {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         }
     }
 
