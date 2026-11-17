@@ -93,6 +93,9 @@ jobs:
   # Detect Changes: one job for every change decision a run makes.
   #   - (PR) cancel superseded queued/in_progress runs of this PR (#6683);
   #   - (PR) path groups for the filtered jobs (`backend`, `mcp`, `scripts`);
+  #     the diff-API read retries once, and if GitHub's diff API stays
+  #     unavailable the outputs fail OPEN to 'true' (full matrix, ::warning::)
+  #     instead of red-ing the run into an unverified tree (#13969);
   #   - `daemon`: whether the shared debug daemon is needed (always true);
   #   - `docker` (PR and push): whether the image jobs run (#10825), from
   #     scripts/ci-image-inputs.sh, which fails CLOSED to docker=true.
@@ -120,11 +123,85 @@ jobs:
       actions: write
       contents: read
       pull-requests: read
+    env:
+      # The PR path groups, verbatim and in one place (#13969): both filter
+      # attempts below read the same text through this variable, so they can
+      # never drift apart. (YAML anchors are not supported in Actions
+      # workflows; a local composite action would be a second mechanism.)
+      PR_PATH_FILTERS: |
+        backend:
+          - 'loom-daemon/**'
+          - 'loom-api/**'
+          # The observability artifacts are Rust-tested seams, not inert
+          # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs,
+          # signoz_topology_shape.rs (the render + gateway allowlist the
+          # Service Map conclusion rests on) and cycle_time_artifacts.rs all
+          # `include_str!` these files and
+          # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs /
+          # signoz_cycle_time.rs execute the SQL verbatim against a real ClickHouse.
+          # An artifact-only PR must
+          # re-run those, or the only tests that can catch the regression
+          # are skipped on exactly the PRs that cause one (#8665).
+          - 'defaults/observability/**'
+          # Same reason: label_registry `include_str!`s defaults/labels.json
+          # and its tests read both labels.yml copies from disk; a
+          # label-file-only PR skipped them and turned main red (#10083).
+          - 'defaults/labels.json'
+          - '.github/labels.yml'
+          - 'defaults/.github/labels.yml'
+          # forge_inventory `include_str!`s the manifest, operations/*.toml
+          # and call-bypass-baseline.toml and fails on drift (#10181).
+          - 'defaults/forge/**'
+          - 'Cargo.toml'
+          - 'Cargo.lock'
+          - 'rust-toolchain.toml'
+          - '.config/nextest.toml'
+          - '.github/workflows/ci.yml'
+        mcp:
+          - 'mcp-loom/**'
+          - '.github/workflows/ci.yml'
+        # `quickstarts/webapp` is the only template with a test suite
+        # (#13851). Before this filter existed no workflow referenced
+        # `quickstarts/` at all, so a PR confined to that tree went green
+        # with its 8 vitest files unrun -- and the template had drifted
+        # unnoticed five times (#5925, #5926, #5927, #13834, #13850).
+        # `desktop` and `api` stay out: neither has test files and `api`
+        # does not typecheck today (#13850).
+        quickstarts:
+          - 'quickstarts/webapp/**'
+          - '.github/workflows/ci.yml'
+        scripts:
+          - 'scripts/**'
+          - 'defaults/**'
+          - 'tests/hooks/**'
+          - 'tests/install/**'
+          - 'tests/hermit/**'
+          - 'install.sh'
+          # .loom/hooks/** is git-tracked (self-install dogfooding) and
+          # several defaults/hooks/tests/*.sh + tests/hooks/*.sh suites
+          # assert it's byte-identical to defaults/hooks/** (#4451) — a
+          # drift here without a matching defaults/ change should still
+          # re-run shell-suite-tests on the PR, not just on push to main.
+          - '.loom/hooks/**'
+          # .loom/config.json is this repo's dogfood guard config, and the
+          # guard suites read it through REPO_ROOT (sql_guard_enabled et al.),
+          # so a config-only PR must run them: #7799 flipped guards.sqlDdl
+          # with shell-suite-tests SKIPPED on the PR and turned main red (#7808).
+          - '.loom/config.json'
+          # `loom-daemon check-renovate-labels` runs in installer-tests
+          # (#9418), so a Renovate-config-only PR must trigger it.
+          - 'renovate.json5'
+          - '.github/workflows/ci.yml'
     outputs:
-      backend: ${{ steps.filter.outputs.backend }}
-      mcp: ${{ steps.filter.outputs.mcp }}
-      quickstarts: ${{ steps.filter.outputs.quickstarts }}
-      scripts: ${{ steps.filter.outputs.scripts }}
+      # Fail open (#13969): a genuine verdict from either attempt wins (a real
+      # 'false' is a non-empty string, so the `||` chain never overrides it);
+      # an empty result from both attempts — GitHub's diff API was
+      # unavailable — resolves to 'true' and runs the full matrix instead of
+      # verifying nothing.
+      backend: ${{ steps.filter.outputs.backend || steps.filter-retry.outputs.backend || 'true' }}
+      mcp: ${{ steps.filter.outputs.mcp || steps.filter-retry.outputs.mcp || 'true' }}
+      quickstarts: ${{ steps.filter.outputs.quickstarts || steps.filter-retry.outputs.quickstarts || 'true' }}
+      scripts: ${{ steps.filter.outputs.scripts || steps.filter-retry.outputs.scripts || 'true' }}
       docker: ${{ steps.images.outputs.docker }}
     steps:
       # Folded in from the former Cancel Superseded Runs job (#9065). It runs
@@ -179,74 +256,33 @@ jobs:
               done
 
       # Path groups trim PR runs only; on push every filtered job runs.
+      # The read is GitHub's PR-diff API, which can transiently answer
+      # "temporarily unavailable due to heavy server load" (`code:
+      # not_available`) — dorny/paths-filter does not retry that (observed on
+      # PR #13967, run 43914701886). One attempt failing must not red the
+      # whole run into an unverified tree, so: attempt 1 continues on error,
+      # a retry runs after a short sleep only when attempt 1 failed, and if
+      # BOTH fail the outputs above fail open to 'true' (full matrix) with a
+      # ::warning:: naming the fallback.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: github.event_name == 'pull_request'
         id: filter
+        continue-on-error: true
         with:
-          filters: |
-            backend:
-              - 'loom-daemon/**'
-              - 'loom-api/**'
-              # The observability artifacts are Rust-tested seams, not inert
-              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs,
-              # signoz_topology_shape.rs (the render + gateway allowlist the
-              # Service Map conclusion rests on) and cycle_time_artifacts.rs all
-              # `include_str!` these files and
-              # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs /
-              # signoz_cycle_time.rs execute the SQL verbatim against a real ClickHouse.
-              # An artifact-only PR must
-              # re-run those, or the only tests that can catch the regression
-              # are skipped on exactly the PRs that cause one (#8665).
-              - 'defaults/observability/**'
-              # Same reason: label_registry `include_str!`s defaults/labels.json
-              # and its tests read both labels.yml copies from disk; a
-              # label-file-only PR skipped them and turned main red (#10083).
-              - 'defaults/labels.json'
-              - '.github/labels.yml'
-              - 'defaults/.github/labels.yml'
-              # forge_inventory `include_str!`s the manifest, operations/*.toml
-              # and call-bypass-baseline.toml and fails on drift (#10181).
-              - 'defaults/forge/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.config/nextest.toml'
-              - '.github/workflows/ci.yml'
-            mcp:
-              - 'mcp-loom/**'
-              - '.github/workflows/ci.yml'
-            # `quickstarts/webapp` is the only template with a test suite
-            # (#13851). Before this filter existed no workflow referenced
-            # `quickstarts/` at all, so a PR confined to that tree went green
-            # with its 8 vitest files unrun -- and the template had drifted
-            # unnoticed five times (#5925, #5926, #5927, #13834, #13850).
-            # `desktop` and `api` stay out: neither has test files and `api`
-            # does not typecheck today (#13850).
-            quickstarts:
-              - 'quickstarts/webapp/**'
-              - '.github/workflows/ci.yml'
-            scripts:
-              - 'scripts/**'
-              - 'defaults/**'
-              - 'tests/hooks/**'
-              - 'tests/install/**'
-              - 'tests/hermit/**'
-              - 'install.sh'
-              # .loom/hooks/** is git-tracked (self-install dogfooding) and
-              # several defaults/hooks/tests/*.sh + tests/hooks/*.sh suites
-              # assert it's byte-identical to defaults/hooks/** (#4451) — a
-              # drift here without a matching defaults/ change should still
-              # re-run shell-suite-tests on the PR, not just on push to main.
-              - '.loom/hooks/**'
-              # .loom/config.json is this repo's dogfood guard config, and the
-              # guard suites read it through REPO_ROOT (sql_guard_enabled et al.),
-              # so a config-only PR must run them: #7799 flipped guards.sqlDdl
-              # with shell-suite-tests SKIPPED on the PR and turned main red (#7808).
-              - '.loom/config.json'
-              # `loom-daemon check-renovate-labels` runs in installer-tests
-              # (#9418), so a Renovate-config-only PR must trigger it.
-              - 'renovate.json5'
-              - '.github/workflows/ci.yml'
+          filters: ${{ env.PR_PATH_FILTERS }}
+      - name: Wait before retrying the PR diff read
+        if: steps.filter.outcome == 'failure'
+        run: sleep 20
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3 — retry; keep this pin identical to the attempt above
+        if: github.event_name == 'pull_request' && steps.filter.outcome == 'failure'
+        id: filter-retry
+        continue-on-error: true
+        with:
+          filters: ${{ env.PR_PATH_FILTERS }}
+      - name: Warn on diff-API fail-open
+        if: steps.filter.outcome == 'failure' && steps.filter-retry.outcome == 'failure'
+        run: |
+          echo "::warning::GitHub's PR-diff API was unavailable on both filter attempts (transient server-side outage); Detect Changes falls OPEN — backend/mcp/quickstarts/scripts resolve to 'true' and every path-filtered job runs. No verdict was silently weakened: the full matrix verifies the tree."
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1989,6 +2025,15 @@ jobs:
       - name: token model-class selection (#8058)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-token-model-class.sh
+      # #13872: a per-model exhaustion mark must survive the whole spawn
+      # chain — spawn-claude.sh exporting the resolved model, claude-wrapper.sh
+      # splicing `retry-classify model-class`'s answer into `tokens mark-bad`,
+      # and this job's build answering for the incident's "hit your <Model>
+      # limit" line — so the mark scopes to the model class instead of parking
+      # the whole pool. Drives the real binaries like its #8058 sibling above.
+      - name: spawn model-class exhaustion mark (#13872)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-spawn-model-class-mark.sh
       # #8697: spawn-claude.sh's contained dispatch through the credential
       # egress proxy — drives a real `loom-daemon worker proxy-exec` listener
       # and host-side `tokens select`, so it needs the binary this job downloads.

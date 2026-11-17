@@ -208,7 +208,7 @@ impl PickSkipReason {
                 P::SharedPr => Self::PrOpenSkip,
                 P::Sequenced => Self::OverlapChain,
                 P::Blocked => Self::Blocked,
-                P::CapabilityMissing => Self::HostConstraint,
+                P::CapabilityMissing | P::HostSkipLabel => Self::HostConstraint,
                 P::Epic | P::Tracker | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
                 P::CiPending | P::HeldAtHead | P::AuthorGateHeld | P::Conflicting | P::Stacked => {
                     Self::Backoff

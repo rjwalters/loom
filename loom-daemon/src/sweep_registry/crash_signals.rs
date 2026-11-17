@@ -1063,6 +1063,56 @@ pub(crate) fn is_pid_alive(_pid: u32) -> bool {
     true
 }
 
+/// Shell-parity liveness probe: `kill -0 <pid>` semantics — true **only** when
+/// the signal would be deliverable. This is the deliberately different sibling
+/// of [`is_pid_alive`]: where `is_pid_alive` resolves the ambiguous `EPERM`
+/// failure to *alive* (#4691) because its callers use "dead" to authorize
+/// destruction, these callers ported shell `kill -0 "$pid" 2>/dev/null`, which
+/// reads any failed probe as "not running".
+///
+/// One shared implementation (Issue #13862) so the five former private copies
+/// cannot keep drifting on this rule; whether a given caller *should* use the
+/// EPERM-is-alive rule instead is a decision for whoever owns that path. The
+/// name makes the difference visible at the call site.
+///
+/// PID `<= 0` is treated as dead without probing: a negative pid addresses a
+/// process group, and pid 0 addresses the caller's own group — neither is a
+/// per-process liveness handle.
+#[cfg(unix)]
+pub(crate) fn pid_signalable(pid: i32) -> bool {
+    pid_signalable_with(pid, |pid_t| {
+        // SAFETY: kill(pid, 0) is a documented liveness probe; signal 0 is not
+        // sent, just checked.
+        if libc_kill(pid_t, 0) == 0 {
+            Ok(())
+        } else {
+            // `errno` is only meaningful immediately after a failed call.
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    })
+}
+
+/// Decision core of [`pid_signalable`], parameterized over the raw
+/// `kill(pid, 0)` syscall so the EPERM rule is unit-testable without needing a
+/// real unsignallable process — same shape as [`is_pid_alive_with`].
+///
+/// `probe` returns `Ok(())` when the signal would be deliverable, or
+/// `Err(errno)` with the raw `errno` from the failed `kill(2)`.
+#[cfg(unix)]
+pub(crate) fn pid_signalable_with(pid: i32, probe: impl Fn(i32) -> Result<(), i32>) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    probe(pid).is_ok()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pid_signalable(_pid: i32) -> bool {
+    // Non-unix platforms are not supported targets for Loom; assume alive
+    // so the test suite can run without a hard panic.
+    true
+}
+
 #[cfg(unix)]
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
@@ -1173,6 +1223,41 @@ mod tests {
     fn is_pid_alive_of_self_is_true_through_the_real_syscall() {
         // End-to-end sanity that the real probe still works after the refactor.
         assert!(is_pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn pid_signalable_reports_deliverable_signal_as_alive() {
+        assert!(pid_signalable_with(4242, |_| Ok(())));
+    }
+
+    #[test]
+    fn pid_signalable_reports_esrch_as_dead() {
+        assert!(!pid_signalable_with(4242, |_| Err(ESRCH)));
+    }
+
+    #[test]
+    fn pid_signalable_treats_eperm_as_dead_shell_parity() {
+        // The rule that distinguishes this helper from `is_pid_alive`: the
+        // Group B callers ported shell `kill -0 "$pid" 2>/dev/null`, which
+        // reads EPERM as "cannot confirm running" — preserved here by design
+        // (Issue #13862), not changed behind their owners' backs.
+        assert!(
+            !pid_signalable_with(4242, |_| Err(EPERM)),
+            "EPERM must read as dead for shell parity — see is_pid_alive for the opposite rule"
+        );
+    }
+
+    #[test]
+    fn pid_signalable_rejects_nonpositive_pids_without_probing() {
+        // Negative pids address process groups; pid 0 addresses the caller's
+        // own group. Neither is a per-process liveness handle.
+        assert!(!pid_signalable_with(0, |_| panic!("must not probe pid 0")));
+        assert!(!pid_signalable_with(-1, |_| panic!("must not probe negative pid")));
+    }
+
+    #[test]
+    fn pid_signalable_of_self_is_true_through_the_real_syscall() {
+        assert!(pid_signalable(i32::try_from(std::process::id()).expect("own pid fits i32")));
     }
 
     /// Issue #4255: `classify_crash` derives a stable label from a dead sweep's

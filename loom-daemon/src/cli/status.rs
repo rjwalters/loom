@@ -544,30 +544,13 @@ fn watchdog_utc_stamp_secs_ago(now: chrono::DateTime<chrono::Utc>, secs_ago: u64
     watchdog_utc_stamp(at)
 }
 
-/// Best-effort `kill -0` liveness probe for a raw pid (Issue #6011 AC4).
-///
-/// The library crate already has (near-)identical probes —
-/// `daemon_install_state::pid_alive`, `sweep_registry::crash_signals::is_pid_alive`
-/// — but both are `pub(crate)` to `loom_daemon`, not reachable from this
-/// separate binary crate. This is a small standalone copy rather than
-/// widening either's visibility for one degraded-path read: unlike those, it
-/// runs only on an already-failing `status` command, so it favors simplicity
-/// (no bounded-timeout wrapper) over the extra robustness the daemon's own
-/// hot-path probes need.
-fn cli_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
 /// Degraded, socket-free view of possibly-in-flight sweeps (Issue #6011 AC4):
 /// when the IPC round-trip cannot complete, the persisted sweep journal
 /// (`~/.loom/sweeps.json`, survives a daemon restart — issue #3953) is the
 /// only other authoritative "what is this daemon doing right now" source this
 /// CLI can read WITHOUT a live connection. Live-pid-filtered via
-/// [`cli_pid_alive`] so a stale entry from a long-dead sweep is not
-/// misreported as still running.
+/// [`crate::sweep_registry::is_pid_alive`] so a stale entry from a long-dead
+/// sweep is not misreported as still running.
 ///
 /// Best-effort throughout: any read/resolve failure yields an empty list
 /// rather than erroring the already-failing `status` command further.
@@ -576,7 +559,7 @@ fn read_degraded_in_flight_sweeps() -> Vec<crate::sweep_journal::JournalEntry> {
         return Vec::new();
     };
     let mut journal = crate::sweep_journal::load(&path);
-    crate::sweep_journal::prune_dead(&mut journal, cli_pid_alive);
+    crate::sweep_journal::prune_dead(&mut journal, crate::sweep_registry::is_pid_alive);
     journal.entries
 }
 
@@ -1622,23 +1605,24 @@ mod degraded_journal_tests {
     //! Issue #6011 AC4: a socket-free, best-effort view of possibly-in-flight
     //! sweeps read from the persisted sweep journal, for when the IPC
     //! round-trip itself is what is slow/unresponsive.
-    use super::{cli_pid_alive, read_degraded_in_flight_sweeps};
+    use super::read_degraded_in_flight_sweeps;
     use crate::sweep_journal::{self, JournalEntry, SweepJournal};
+    use crate::sweep_registry::is_pid_alive;
     use serial_test::serial;
 
     #[test]
-    fn cli_pid_alive_is_true_for_this_running_test_process() {
-        assert!(cli_pid_alive(std::process::id()));
+    fn degraded_probe_is_true_for_this_running_test_process() {
+        assert!(is_pid_alive(std::process::id()));
     }
 
     #[test]
-    fn cli_pid_alive_is_false_for_an_implausible_pid() {
+    fn degraded_probe_is_false_for_an_implausible_pid() {
         // Deliberately NOT `u32::MAX`: as a `pid_t` that is `-1`, which `kill`
         // treats specially (signal every process the caller may signal) —
         // always "succeeds" regardless of whether any such pid is alive.
         // `999_999` is comfortably above any real pid on this host yet still
         // an ordinary positive `pid_t`.
-        assert!(!cli_pid_alive(999_999));
+        assert!(!is_pid_alive(999_999));
     }
 
     /// The core AC4 invariant: a live entry survives, a dead one (an
@@ -1663,7 +1647,7 @@ mod degraded_journal_tests {
                 JournalEntry {
                     repo: "repo-b".to_string(),
                     issue: 43,
-                    // NOT `u32::MAX` — see `cli_pid_alive_is_false_for_an_implausible_pid`
+                    // NOT `u32::MAX` — see `degraded_probe_is_false_for_an_implausible_pid`
                     // for why that value is unsuitable here (`kill`'s `-1`
                     // special case).
                     pid: 999_999,

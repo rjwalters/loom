@@ -2026,11 +2026,30 @@ render_plan_body() {
   # the nondeterminism at the source. It changes only the ORDER within a
   # section, never which items appear in it.
   local held vimp imp ready building review approved curated proposals epics
+  # #13908: `loom:frozen` is not the only hold. The priority, proposal and
+  # epic queries below filtered `loom:frozen` alone, so an issue carrying any
+  # other registry hold (`loom:blocked`, `loom:operator`, retired names until
+  # `labels migrate`, #11795) rendered as takeable work with no indication it
+  # is held. Held entries stay in place — a `## Blocked` section was rejected
+  # as a bigger surface that reshapes the byte-for-byte-checked region — but
+  # gain a ` *(held)*` suffix, the convention ` *(curated)*` / ` *(hermit)*`
+  # already set. The set is the registry's full hold list (`$hold_q`, hoisted
+  # above its first consumer; literal fallback only when the daemon call
+  # fails, as before), never a hardcoded label list, and `loom:frozen` stays
+  # fully excluded by each query's own select(). gh's jq flag cannot bind jq
+  # variables, so the hold set rides inline as a JSON array literal (built by
+  # jq itself, so it stays well-formed whatever the registry returns) inside
+  # a suffix expression appended to each query's jq program.
+  local ready_json hold_q hold_names held_sfx op_q
+  hold_q=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen')
+  hold_names=$(printf '%s' "$hold_q" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  held_sfx=' + (if any(.labels[]?.name; . as $n | '"$hold_names"' | index($n)) then " *(held)*" else "" end)'
+  op_q=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator)
   # #11103: the two priority levels, one section each.
   vimp=$("$GH_READ" issue list --label "loom:very-important" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
   imp=$("$GH_READ" issue list --label "loom:important" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
   # #7008/#7071: `ready` excludes every hold (registry sets, retired names
   # included until `labels migrate`, #11795) and loom:building, the same way
   # "Finding Work" does; `building` excludes the operator holds.
@@ -2041,9 +2060,6 @@ render_plan_body() {
   # merge-pending, not "ready for implementation" — but that exclusion set
   # can only be derived once `approved_json` (fetched further down) is in
   # hand, so the final bullet-formatted `ready` is assembled after it.
-  local ready_json hold_q op_q
-  hold_q=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen')
-  op_q=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator)
   ready_json=$("$GH_READ" issue list --label "loom:issue" --search "-label:loom:building $(sed 's/^/-label:/' <<<"$hold_q" | tr '\n' ' ')" --state open --limit 200 --json number,title \
     --jq 'sort_by(.number)')
   building=$("$GH_READ" issue list --label "loom:building" --search "$(sed 's/^/-label:/' <<<"$op_q" | tr '\n' ' ') -label:loom:frozen" --state open --limit 200 --json number,title \
@@ -2085,15 +2101,15 @@ render_plan_body() {
   ready=$(printf '%s' "$ready_json" | jq -r --argjson excl "$pr_linked_issues" \
     '.[] | select((.number as $n | $excl | index($n)) | not) | "- **#\(.number)**: \(.title)"')
   curated=$("$GH_READ" issue list --label "loom:curated" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(curated)*"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(curated)*"'"$held_sfx")
   local architect hermit
   architect=$("$GH_READ" issue list --label "loom:architect" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(architect)*"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(architect)*"'"$held_sfx")
   hermit=$("$GH_READ" issue list --label "loom:hermit" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(hermit)*"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title) *(hermit)*"'"$held_sfx")
   proposals="${architect}${architect:+${hermit:+$'\n'}}${hermit}"
   epics=$("$GH_READ" issue list --label "loom:epic" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
 
   section "Operator Attention: Merge-Risk-Hold Pileup" \
     "Judge-approved PRs under a hold (\`loom:blocked\` or \`loom:operator\`) — only a human merge decision is missing." \

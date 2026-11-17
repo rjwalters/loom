@@ -463,13 +463,13 @@ fn a_builder_that_opens_no_pr_reports_no_pr_with_its_reason() {
         RoleTickOutcome::Failure("no_pr: ci_pending".to_string())
     );
     let class = |line: Option<&_>| {
-        step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), line)
+        step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), line, false)
             .map(|f| f.class().to_string())
     };
     assert_eq!(class(noop.as_ref()).as_deref(), Some("step-no-pr"));
     assert_eq!(class(None).as_deref(), Some("step-no-outcome-line"));
     assert_eq!(
-        step_failure(StepRole::Judge, StepEnd::Exited(Some(0)), noop.as_ref())
+        step_failure(StepRole::Judge, StepEnd::Exited(Some(0)), noop.as_ref(), false)
             .map(|f| f.class().to_string()),
         None
     );
@@ -482,8 +482,9 @@ fn a_failed_steps_end_maps_to_its_own_class() {
     let noop = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=noop reason=x");
     let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=failed reason=a b");
     let judge = StepRole::Judge;
-    let class =
-        |end, line: Option<&_>| step_failure(judge, end, line).map(|f| f.class().to_string());
+    let class = |end, line: Option<&_>| {
+        step_failure(judge, end, line, false).map(|f| f.class().to_string())
+    };
     assert_eq!(class(StepEnd::TimedOut, noop.as_ref()).as_deref(), Some("step-timed-out"));
     assert_eq!(class(StepEnd::Cancelled, None).as_deref(), Some("step-cancelled"));
     assert_eq!(
@@ -492,7 +493,7 @@ fn a_failed_steps_end_maps_to_its_own_class() {
     );
     assert_eq!(class(StepEnd::Exited(Some(7)), None).as_deref(), Some("step-exit-nonzero"));
     assert_eq!(
-        step_failure(judge, StepEnd::Exited(Some(7)), None)
+        step_failure(judge, StepEnd::Exited(Some(7)), None, false)
             .unwrap()
             .exit_code(),
         Some(7)
@@ -510,13 +511,69 @@ fn a_failed_steps_end_maps_to_its_own_class() {
         ] {
             for line in [None, noop.as_ref(), failed.as_ref()] {
                 assert_eq!(
-                    step_failure(role, end, line).is_some(),
+                    step_failure(role, end, line, false).is_some(),
                     matches!(tick_outcome(role, end, line), RoleTickOutcome::Failure(_)),
                     "{role:?} {end:?} {line:?}"
                 );
             }
         }
     }
+}
+
+/// #13966: a step whose provider feedback said its api-key seat was
+/// exhausted carries the exhaustion class instead of its exit shape — the
+/// launch never had a working credential — but a cancelled step keeps the
+/// operator's own class, and a successful end stays successful.
+#[test]
+fn a_provider_exhausted_step_carries_the_exhaustion_class() {
+    let class = |exhausted, end, line: Option<&_>| {
+        step_failure(StepRole::Builder, end, line, exhausted).map(|f| f.class().to_string())
+    };
+    assert_eq!(
+        class(true, StepEnd::Exited(Some(1)), None).as_deref(),
+        Some("step-provider-exhausted")
+    );
+    // The exit code still rides `exit_code`, never the class.
+    assert_eq!(
+        step_failure(StepRole::Builder, StepEnd::Exited(Some(1)), None, true)
+            .unwrap()
+            .exit_code(),
+        Some(1)
+    );
+    // Even a line the session did write, and a timeout, reclass to it.
+    let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=1 class=failed");
+    assert_eq!(
+        class(true, StepEnd::Exited(Some(1)), failed.as_ref()).as_deref(),
+        Some("step-provider-exhausted")
+    );
+    assert_eq!(class(true, StepEnd::TimedOut, None).as_deref(), Some("step-provider-exhausted"));
+    // A cancel is the operator's act; a Judge's clean exit is not a failure
+    // (a Builder's clean exit without a line is one, #12500, and reclasses).
+    assert_eq!(class(true, StepEnd::Cancelled, None).as_deref(), Some("step-cancelled"));
+    let judge_class = |exhausted, end| {
+        super::capture::step_failure(StepRole::Judge, end, None, exhausted)
+            .map(|f| f.class().to_string())
+    };
+    assert_eq!(judge_class(true, StepEnd::Exited(Some(0))), None);
+    assert_eq!(
+        class(true, StepEnd::Exited(Some(0)), None).as_deref(),
+        Some("step-provider-exhausted")
+    );
+    // Without the evidence the shapes are unchanged.
+    assert_eq!(
+        class(false, StepEnd::Exited(Some(1)), None).as_deref(),
+        Some("step-exit-nonzero")
+    );
+}
+
+/// #13966: the bridge-to-end hand-off is a take-once read of a bounded map.
+#[test]
+fn a_noted_provider_exhaustion_is_taken_once() {
+    let id = "step-builder-13966-take-once";
+    assert!(!super::capture::take_step_provider_exhaustion(id), "nothing noted yet");
+    super::capture::note_step_provider_exhaustion(id);
+    assert!(super::capture::take_step_provider_exhaustion(id), "the end reads it once");
+    assert!(!super::capture::take_step_provider_exhaustion(id), "and it is gone");
 }
 
 /// Capture parity with role ticks (#11877): a step's end writes the same
@@ -1183,10 +1240,10 @@ fn builders_completion_section_requires_a_parseable_outcome_line() {
 /// #13521: the capture-side class splits the same way, and only for it.
 #[test]
 fn a_no_line_builder_that_opened_a_pr_has_its_own_step_class() {
-    let base = step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), None).unwrap();
+    let base = step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), None, false).unwrap();
     let split = super::capture::no_outcome_line_with_pr(base);
     assert_eq!(split.class(), "step-no-outcome-line-pr-opened");
     assert_eq!(split.exit_code(), Some(0));
-    let other = step_failure(StepRole::Builder, StepEnd::Exited(Some(3)), None).unwrap();
+    let other = step_failure(StepRole::Builder, StepEnd::Exited(Some(3)), None, false).unwrap();
     assert_eq!(super::capture::no_outcome_line_with_pr(other).class(), "step-exit-nonzero");
 }

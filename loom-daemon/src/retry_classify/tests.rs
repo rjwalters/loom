@@ -339,6 +339,47 @@ fn a_per_model_ceiling_scopes_but_an_account_wide_one_does_not() {
 }
 
 #[test]
+fn a_hit_phrased_per_model_ceiling_scopes_the_mark() {
+    // Prevents the 2026-11-13 fleet incident (#13872): the CLI writes
+    // "hit your <Model> limit" — the verb `EXHAUSTION_FALLBACK` has always
+    // matched — while CEILING_PHRASE accepted only "reached your", so every
+    // per-model ceiling mark on the fleet degraded to account-wide and one
+    // model's limit parked the whole pool. The library arm asserts the
+    // category the wrapper REALLY passes for that text (`classify_error`
+    // files "hit your … limit" under TOKEN_EXHAUSTED, not the per-tier
+    // credits category), so the phrase arm is the only one that can scope it.
+    let line = "2026-11-13T18:30:25Z agent3-… exhausted: hit your Fable limit";
+    let via_library = with_library(line, 1, "TOKEN_EXHAUSTED", true);
+    assert_eq!(
+        model_class_marker(&via_library, "fable").as_deref(),
+        Some(" [model-class:fable]")
+    );
+    assert_eq!(
+        model_class_marker(&degraded(line, 1), "fable").as_deref(),
+        Some(" [model-class:fable]")
+    );
+}
+
+#[test]
+fn hit_phrased_account_wide_ceilings_stay_account_wide() {
+    // The other direction of accepting "hit" (#13872): the account-wide
+    // qualifiers the "reached" arm already widens on must widen exactly the
+    // same when the verb is "hit".
+    for account_wide in [
+        "You've hit your weekly limit.",
+        "You've hit your monthly usage limit.",
+        "You've hit your session limit.",
+        "You've hit your usage limit.",
+    ] {
+        assert_eq!(
+            model_class_marker(&degraded(account_wide, 1), "claude-opus-5"),
+            None,
+            "'{account_wide}' must leave the mark ACCOUNT-WIDE"
+        );
+    }
+}
+
+#[test]
 fn a_ceiling_that_names_nothing_does_not_scope() {
     // The `{1,3}` in CEILING_PHRASE, not EXHAUSTION_FALLBACK's `{0,3}`: a bare
     // "reached your limit" names no class, so there is nothing to scope TO and

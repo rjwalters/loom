@@ -40,7 +40,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # A fixture repo: .loom/scripts is a copy of the real scripts the stubs need.
 FIX="$WORKDIR/repo"
 mkdir -p "$FIX/.git" "$FIX/.loom/scripts/lib" "$WORKDIR/home" "$WORKDIR/bin-tools" "$WORKDIR/bin-daemon"
-cp "$SCRIPTS_DIR/strip-ansi.sh" "$SCRIPTS_DIR/checkpoint.sh" "$FIX/.loom/scripts/"
+cp "$SCRIPTS_DIR/strip-ansi.sh" "$SCRIPTS_DIR/checkpoint.sh" "$SCRIPTS_DIR/resolve-model.sh" "$FIX/.loom/scripts/"
 cp "$SCRIPTS_DIR"/lib/script-helper.sh "$SCRIPTS_DIR"/lib/locate-daemon-bin.sh "$FIX/.loom/scripts/lib/"
 SYSTEM_PATH="/usr/bin:/bin"
 
@@ -53,6 +53,7 @@ case "\${1:-}" in
   capabilities) echo '{"payload_identity":"supports_installed=0.19.0;requires_daemon=$2;invoked_files=x"}'; exit 0 ;;
   strip-ansi) echo "TOOLS strip-ansi"; exit 0 ;;
   checkpoint) echo "TOOLS checkpoint"; exit 7 ;;
+  resolve-model) echo "TOOLS resolve-model"; exit 0 ;;
 esac
 exit 2
 FAKE
@@ -67,6 +68,7 @@ case "\${1:-}" in
   install-compat) echo '{"payload_identity":"supports_installed=0.19.0;requires_daemon=$2;invoked_files=x"}'; exit 0 ;;
   strip-ansi) echo "DAEMON strip-ansi"; exit 0 ;;
   checkpoint) echo "DAEMON checkpoint"; exit 7 ;;
+  resolve-model) echo "DAEMON resolve-model"; exit 0 ;;
 esac
 exit 2
 FAKE
@@ -94,6 +96,11 @@ assert_contains "TOOLS strip-ansi" "$res" "strip-ansi.sh ran loom-tools"
 res="$(run_stub checkpoint.sh read)"
 assert_eq "7" "${res%%|*}" "checkpoint.sh propagates loom-tools' data exit code unmodified"
 assert_contains "TOOLS checkpoint" "$res" "checkpoint.sh ran loom-tools"
+# resolve-model moved to loom-tools too (#13878): the daemon binary is absent
+# in this section and the stub must still get the tools answer.
+res="$(run_stub resolve-model.sh opus)"
+assert_eq "0" "${res%%|*}" "resolve-model.sh succeeds with only loom-tools"
+assert_contains "TOOLS resolve-model" "$res" "resolve-model.sh ran loom-tools"
 # Same through PATH and through the machine-level install dir.
 STUB_ENV=(); SYSTEM_PATH="$WORKDIR/bin-tools:/usr/bin:/bin"
 res="$(run_stub strip-ansi.sh)"; assert_contains "TOOLS strip-ansi" "$res" "loom-tools found on PATH"
@@ -106,6 +113,8 @@ SYSTEM_PATH="$WORKDIR/bin-daemon:/usr/bin:/bin"
 STUB_ENV=(); res="$(run_stub strip-ansi.sh)"
 assert_contains "DAEMON strip-ansi" "$res" "no loom-tools: loom-daemon on PATH serves the stub"
 assert_contains "transitional" "$res" "the daemon fallback is logged as transitional"
+res="$(run_stub resolve-model.sh opus)"
+assert_contains "DAEMON resolve-model" "$res" "resolve-model.sh keeps the transitional daemon fallback (#13878)"
 cp "$WORKDIR/bin-tools/loom-tools" "$WORKDIR/bin-daemon/loom-tools"
 res="$(run_stub strip-ansi.sh)"
 assert_contains "TOOLS strip-ansi" "$res" "loom-tools beats loom-daemon when both are on PATH"
