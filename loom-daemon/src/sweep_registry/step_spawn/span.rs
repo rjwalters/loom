@@ -63,12 +63,10 @@ pub(crate) fn step_failure(
 ) -> RoleFailure {
     let failed_line = line.filter(|l| l.class == StepOutcomeClass::Failed);
     match end {
-        StepEnd::TimedOut => RoleFailure::new(
-            "timeout-ceiling",
-            None,
-            "step ran past its role timeout and was terminated",
-        ),
         StepEnd::Cancelled => RoleFailure::new("cancelled", None, "step was cancelled"),
+        // Ahead of the timeout arm, as `capture::step_failure` has it: a step
+        // that hit the limit and then hung to its ceiling is one exhaustion
+        // on both vocabularies, not `timed-out` here and exhausted there.
         _ if provider_exhausted => RoleFailure::new(
             "provider-exhausted",
             match end {
@@ -76,6 +74,11 @@ pub(crate) fn step_failure(
                 StepEnd::TimedOut | StepEnd::Cancelled => None,
             },
             "step ended on provider exhaustion (its api-key seat is marked to the reset)",
+        ),
+        StepEnd::TimedOut => RoleFailure::new(
+            "timeout-ceiling",
+            None,
+            "step ran past its role timeout and was terminated",
         ),
         StepEnd::Exited(code) if failed_line.is_some() => RoleFailure::new(
             "step-outcome-failed",

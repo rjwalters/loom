@@ -390,7 +390,10 @@ impl SweepRegistry {
         // a triage that did move its PR. #13966: a provider-exhaustion step
         // releases `provider_exhausted` — not progress, but not the item's
         // fault — so the captain holds nothing and the next draw (which
-        // falls through to the next runtime) may take it at once.
+        // falls through to the next runtime) may take it at once. No cancel
+        // carve-out, unlike `step_failure`: a cancelled step never reaches
+        // the provider feedback that sets the flag (`reaper::finish_cancel`
+        // does not run it), so it keeps its own release.
         let release_class = if provider_exhausted {
             crate::fleet_dispatch::table::PROVIDER_EXHAUSTED_OUTCOME
         } else {

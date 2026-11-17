@@ -360,4 +360,8 @@ fn a_provider_exhausted_step_closes_as_provider_exhausted() {
     assert_eq!(class(StepEnd::Exited(Some(1)), true), "provider-exhausted");
     assert_eq!(class(StepEnd::Exited(Some(1)), false), "exit-1");
     assert_eq!(class(StepEnd::Cancelled, true), "cancelled");
+    // A step that hit the limit and then hung to its timeout: the exhaustion
+    // wins here as it does on `role_tick.outcome` (`capture::step_failure`).
+    assert_eq!(class(StepEnd::TimedOut, true), "provider-exhausted");
+    assert_eq!(class(StepEnd::TimedOut, false), "timeout-ceiling");
 }

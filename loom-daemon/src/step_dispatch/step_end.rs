@@ -80,6 +80,11 @@ fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
 /// ([`outcome_ledger::PROVIDER_EXHAUSTED`]) whatever the forge post-state:
 /// the launch died on an empty seat, so the pair arms no cooldown and the
 /// run is not counted for the repeat cap.
+///
+/// No cancel carve-out is needed here, unlike the two `step_failure`s: the
+/// flag is set only by the exit-time provider feedback, which the cancel
+/// path (`reaper::finish_cancel`, the only producer of `StepEnd::Cancelled`)
+/// never runs, so a cancelled step cannot carry it.
 #[must_use]
 pub fn run_of(
     step: &EndedStep,
@@ -319,18 +324,32 @@ mod tests {
         let run = run_of(&step, None, Some(post));
         assert_eq!(run.outcome.class, OutcomeClass::Refused);
         assert_eq!(run.outcome.reason, outcome_ledger::PROVIDER_EXHAUSTED);
-        // And the refusal charges nothing: not a repeat-cap run, and the
-        // effect re-classifies instead of arming a window.
+        // And the refusal charges nothing: not a repeat-cap run, and not the
+        // state-refusal effect either, whose second identical refusal in a
+        // row arms a doubling window.
         assert!(!outcome_ledger::counts_as_run(&run.outcome));
-        assert!(matches!(
+        assert_eq!(
             outcome_ledger::effect_of(
                 StepRole::Builder,
                 &run.outcome,
                 run.ran_for,
                 &outcome_ledger::LedgerConfig::default(),
             ),
-            outcome_ledger::Effect::Reclassify
-        ));
+            outcome_ledger::Effect::Uncharged
+        );
+        // Measured on the ledger itself, across consecutive exhaustions (the
+        // shape of a multi-seat outage, each launch discovering the next
+        // seat): the pair is never cooling, whatever the count.
+        let mut ledger = outcome_ledger::OutcomeLedger::default();
+        let t0 = chrono::Utc::now();
+        for k in 0..6 {
+            let at = t0 + chrono::Duration::minutes(k);
+            let rec = ledger.record(run.item, run.step, &run.outcome, run.ran_for, at);
+            assert_eq!(rec.effect, outcome_ledger::Effect::Uncharged, "exhaustion {k}");
+            assert_eq!(rec.cooling_until, None, "exhaustion {k} armed a window");
+            assert_eq!(ledger.cooling_cause(run.item, run.step, at), None, "exhaustion {k}");
+            assert!(!rec.repeat_capped, "exhaustion {k} counted as a run");
+        }
     }
 
     #[test]
