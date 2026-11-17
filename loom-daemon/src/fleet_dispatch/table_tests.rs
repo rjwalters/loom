@@ -688,6 +688,55 @@ fn a_host_lost_release_ends_the_row_and_holds_nothing() {
     );
 }
 
+/// #13966: a step that died because its api-key seat was exhausted releases
+/// `provider_exhausted` — the row ends, nothing is held, and the next draw
+/// (which falls through to the next runtime) may take the item at once.
+#[test]
+fn a_provider_exhausted_release_ends_the_row_and_holds_nothing() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder"));
+    assert!(t.release_outcome(at(150), A, &id, PROVIDER_EXHAUSTED_OUTCOME));
+    assert!(t.row("acme/w", 9).is_none(), "the row ends at once");
+    assert!(t.cooldown(at(150), "acme/w", 9, "builder").is_none(), "no hold armed");
+    let next = t.claim(at(151), B, "acme/w", 9, "builder");
+    assert_eq!(
+        lineage_of(&next),
+        Some(Lineage {
+            attempt: 1,
+            prev_assignment_id: id,
+            prev_end: PrevEnd::Released,
+        }),
+        "#12875: the lineage reads the ordinary release, not a host loss"
+    );
+}
+
+/// #13966: exhausted releases never climb the no-progress ladder (contrast
+/// the `noop` shape, whose release arms the first rung), and an exhausted
+/// release clears no hold another outcome armed — it is not progress.
+#[test]
+fn exhausted_releases_never_climb_the_ladder_nor_clear_other_holds() {
+    let mut t = three_hosts(at(100));
+    for host in [A, B, C, A] {
+        let id = granted_id(&t.claim(at(100), host, "acme/w", 9, "builder"));
+        assert!(t.release_outcome(at(100), host, &id, PROVIDER_EXHAUSTED_OUTCOME));
+        assert!(
+            t.cooldown(at(100), "acme/w", 9, "builder").is_none(),
+            "no hold after any number of exhausted releases"
+        );
+    }
+    // A noop hold on the item, then an exhausted release of another step on
+    // the same item: not progress, so the noop hold survives untouched.
+    let id = granted_id(&t.claim(at(101), A, "acme/w", 9, "builder"));
+    assert!(t.release_outcome(at(101), A, &id, "noop"));
+    assert_eq!(t.cooldown(at(102), "acme/w", 9, "builder").unwrap().streak, 1);
+    let id = granted_id(&t.claim(at(102), B, "acme/w", 9, "judge"));
+    assert!(t.release_outcome(at(102), B, &id, PROVIDER_EXHAUSTED_OUTCOME));
+    let c = t
+        .cooldown(at(102), "acme/w", 9, "builder")
+        .expect("the noop hold stands");
+    assert_eq!(c.streak, 1, "exhaustion is not progress: it cleared nothing");
+}
+
 #[test]
 fn a_release_the_table_does_not_know_arms_nothing() {
     let mut t = three_hosts(at(100));
@@ -1177,6 +1226,8 @@ fn ci_wait_and_host_lost_leave_the_streak_alone() {
     // `ci_wait` is neutral too. It sets its own short hold, so the next draw
     // is past it.
     assert!(!run_release(&mut t, 9_400, B, 5, CI_WAIT_OUTCOME).park);
+    // And a provider seat that ran out (#13966): not the item's fault.
+    assert!(!run_release(&mut t, 15_000, C, 5, PROVIDER_EXHAUSTED_OUTCOME).park);
     assert!(run_release(&mut t, 20_000, A, 5, FAST_FAIL_OUTCOME).park);
 }
 

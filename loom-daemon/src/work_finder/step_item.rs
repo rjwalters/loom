@@ -47,6 +47,7 @@
 //! | `loom:frozen` (the PR or **any** open issue it links) | pass `frozen` |
 //! | `loom:operator`, or a retired name that folds into it (the same) | pass `operator` |
 //! | another hard exclusion (`external`) | pass `hard_exclusion` |
+//! | a label in this host's `extraSkipLabels` (the PR or any open issue it links; #13891) | pass `host_skip_label` |
 //! | a claim label (see below), on the PR or any open issue it links | pass `claimed` |
 //! | PR in GitHub's merge queue | pass `queued` |
 //! | issue's linked PR is another item's | pass `shared_pr` |
@@ -331,6 +332,13 @@ pub struct HostInput {
     /// ([`crate::capability::held_capabilities`]).
     #[serde(default)]
     pub held_capabilities: BTreeSet<String>,
+    /// This host's resolved `autonomous.workFinder.extraSkipLabels` (#13891,
+    /// [`crate::work_finder::resolve_extra_skip_labels_with_config`]): an item
+    /// carrying one is never drawn here, the step path's copy of the role-tick
+    /// finder's `is_skipped_with_capabilities` veto. Empty (the default) leaves
+    /// the table byte-identical.
+    #[serde(default)]
+    pub extra_skip_labels: Vec<String>,
 }
 
 // ============================================================================
@@ -495,6 +503,9 @@ pub enum PassReason {
     Frozen,
     Operator,
     HardExclusion,
+    /// A label in this host's `extraSkipLabels` (#13891): the host opted out
+    /// of the item, e.g. a pilot issue reserved for another worker.
+    HostSkipLabel,
     Claimed,
     Queued,
     SharedPr,
@@ -542,6 +553,7 @@ impl PassReason {
             Self::Frozen => "frozen",
             Self::Operator => "operator",
             Self::HardExclusion => "hard_exclusion",
+            Self::HostSkipLabel => "host_skip_label",
             Self::Claimed => "claimed",
             Self::Queued => "queued",
             Self::SharedPr => "shared_pr",
@@ -771,6 +783,10 @@ fn decide(
     }
     if any(&crate::hard_exclusion::is_hard_excluded) {
         return pass(ItemState::Excluded, P::HardExclusion);
+    }
+    let skips = &inputs.host.extra_skip_labels;
+    if !skips.is_empty() && any(&|l| l.iter().any(|x| skips.contains(x))) {
+        return pass(ItemState::Excluded, P::HostSkipLabel);
     }
     let pr_open = pr.is_some();
     if is_claimed(labels.pr, true) || labels.linked.iter().any(|l| is_claimed(l, pr_open)) {

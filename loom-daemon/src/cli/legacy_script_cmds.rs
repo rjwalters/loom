@@ -35,27 +35,59 @@ pub fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
     }
 }
 
-/// `loom-daemon resolve-model` — backs `resolve-model.sh`.
+/// The shared `resolve-model` argument surface: one struct behind both clap
+/// roots (`loom-daemon resolve-model` and, since #13878, `loom-tools
+/// resolve-model`), so the two cannot drift apart.
+#[derive(clap::Args)]
+pub struct ResolveModelArgs {
+    /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
+    /// model ID.
+    #[arg(value_name = "MODEL")]
+    pub model: String,
+
+    /// Path to a `.loom/config.json` to read verbatim (default: resolve
+    /// the `./.loom` config tier chain).
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<String>,
+
+    /// Print the resolved generation number instead of the model ID.
+    #[arg(long)]
+    pub generation: bool,
+
+    /// Map the model back to the nearest value the in-session Task/Agent
+    /// tool's `model` enum accepts (`haiku|sonnet|opus|fable`) — issue
+    /// #4282. Exits 3 with no output when there is no Task-passable alias,
+    /// so the caller omits `model` entirely.
+    #[arg(long = "task-alias")]
+    pub task_alias: bool,
+
+    /// Map the model to the next CHEAPER Task-tool alias (issue #5687) —
+    /// `fable → opus → sonnet → haiku`. This is the "one rung down" step
+    /// `/loom:sweep` applies after a `MODEL_CREDITS_EXHAUSTED` kill.
+    /// Exits 3 with no output when the model is already at the cheapest
+    /// rung or is unrecognized, so the caller falls through to its normal
+    /// mid-phase-death handling instead of guessing a model.
+    #[arg(long)]
+    pub downgrade: bool,
+}
+
+/// `resolve-model` — backs `resolve-model.sh`. Served by both binaries:
+/// `loom-daemon resolve-model` and `loom-tools resolve-model` (#13878), both
+/// calling this one handler.
 ///
 /// Exit codes: `0` on success, `2` (clap) when no model was supplied, and `3`
 /// with NO output when `--task-alias` / `--downgrade` has no mapping so the
 /// caller keeps its own precedence chain.
-pub(crate) fn handle_resolve_model_command(
-    model: &str,
-    config: Option<&str>,
-    generation: bool,
-    task_alias: bool,
-    downgrade: bool,
-) -> Result<()> {
+pub fn handle_resolve_model_command(args: &ResolveModelArgs) -> Result<()> {
     use script_helpers::model_tiers;
 
-    let cfg = model_tiers::load_config(config.map(Path::new));
+    let cfg = model_tiers::load_config(args.config.as_deref().map(Path::new));
 
     // Credit-exhaustion downgrade mode (#5687). Checked before --task-alias:
     // --downgrade already ends at a Task-passable alias, so passing both is a
     // caller shorthand for "degrade, then step one rung down", not a conflict.
-    if downgrade {
-        let cheaper = model_tiers::downgrade_task_alias(model);
+    if args.downgrade {
+        let cheaper = model_tiers::downgrade_task_alias(&args.model);
         if cheaper.is_empty() {
             std::process::exit(3);
         }
@@ -64,8 +96,8 @@ pub(crate) fn handle_resolve_model_command(
     }
 
     // Task-tool degradation mode (#4282).
-    if task_alias {
-        let alias = model_tiers::task_alias_of(model);
+    if args.task_alias {
+        let alias = model_tiers::task_alias_of(&args.model);
         if alias.is_empty() {
             std::process::exit(3);
         }
@@ -73,14 +105,14 @@ pub(crate) fn handle_resolve_model_command(
         return Ok(());
     }
 
-    if generation {
-        match model_tiers::generation_of(model, &cfg) {
+    if args.generation {
+        match model_tiers::generation_of(&args.model, &cfg) {
             Some(g) => println!("{g}"),
             // The Python printed an empty line for an unrecognized model.
             None => println!(),
         }
     } else {
-        println!("{}", model_tiers::resolve_model(model, &cfg));
+        println!("{}", model_tiers::resolve_model(&args.model, &cfg));
     }
     Ok(())
 }

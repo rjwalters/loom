@@ -196,6 +196,13 @@ pub const FAST_FAIL_STREAK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 pub const FAST_FAIL_PARK_HOLD: Duration =
     Duration::from_secs(crate::sweep_registry::DEFAULT_QUARANTINE_TTL_SECS);
 
+/// The `release` outcome of a step that died because its api-key seat was
+/// exhausted (the provider refused the launch; #13966). Not progress, but
+/// not the item's fault either: the seat is marked to its reset and the
+/// draw falls through to the next runtime, so the row ends and nothing is
+/// held — the next draw may take the item at once.
+pub const PROVIDER_EXHAUSTED_OUTCOME: &str = "provider_exhausted";
+
 /// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
 /// the item every ~90 s while CI runs, short enough that its next step is
 /// drawn within minutes of CI finishing.
@@ -1045,7 +1052,8 @@ impl Table {
     /// release ([`FAST_FAIL_OUTCOME`]) adds to the item's fleet-wide streak,
     /// whichever host sent it; the [`FAST_FAIL_PARK_THRESHOLD`]-th orders the
     /// park, once. A progressing release, or any other non-progress outcome
-    /// (not `ci_wait` or `host_lost`, which are neither), ends the streak.
+    /// (not `ci_wait`, `host_lost` or `provider_exhausted`, which are neither),
+    /// ends the streak.
     pub fn release_ordered(
         &mut self,
         now: Mono,
@@ -1073,7 +1081,15 @@ impl Table {
     /// Fold `outcome` into `key`'s fast-fail streak; whether it orders the park.
     fn note_fast_fail(&mut self, key: &(String, u64), now: Mono, outcome: &str) -> bool {
         let outcome = outcome.trim();
-        if outcome == HOST_LOST_OUTCOME || outcome == CI_WAIT_OUTCOME {
+        // Neither the item's failure nor its progress: `host_lost`, `ci_wait`,
+        // and a provider seat that ran out (#13966).
+        if [
+            HOST_LOST_OUTCOME,
+            CI_WAIT_OUTCOME,
+            PROVIDER_EXHAUSTED_OUTCOME,
+        ]
+        .contains(&outcome)
+        {
             return false;
         }
         if outcome != FAST_FAIL_OUTCOME {
@@ -1117,6 +1133,7 @@ impl Table {
         outcome: &str,
     ) -> bool {
         let host_lost = outcome.trim() == HOST_LOST_OUTCOME;
+        let exhausted = outcome.trim() == PROVIDER_EXHAUSTED_OUTCOME;
         let end = if host_lost {
             PrevEnd::HostLost
         } else {
@@ -1124,7 +1141,10 @@ impl Table {
         };
         self.note_ended(&key, &row, end, now);
         let (repo, item) = key;
-        if host_lost {
+        // A lost host and an exhausted provider seat are both not the item's
+        // fault: the row ends and nothing is held, so the next draw may take
+        // it (`host_lost`, #12876; `provider_exhausted`, #13966).
+        if host_lost || exhausted {
             return true;
         }
         if outcome.trim() == CI_WAIT_OUTCOME {
