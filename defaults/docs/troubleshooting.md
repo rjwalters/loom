@@ -427,7 +427,7 @@ of:
 
 1. Its mtime is older than the retention window (below).
 2. Its issue has no live sweep right now (no `.loom/locks/issue-<N>/` claim
-   lock, no `.loom/spawn-loop-state.json` entry).
+   lock).
 3. Its issue has no `.loom/sweep-checkpoint/issue-<N>.json` — a resumable
    sweep (even one not currently running) keeps its log regardless of age.
 

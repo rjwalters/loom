@@ -10294,9 +10294,8 @@ claim was acquired. Everything provably older is still a reap candidate. The
 same narrowing applies to the agent-runtime veto — an agent inside the resolved
 live sweep's own tree no longer vetoes the whole worktree; any other agent still
 does. When the root **cannot** be resolved (a stale lock, an unparseable owner,
-a claim tracked only through the legacy spawn-loop-state union with no lock dir),
-there is nothing to discriminate against and the whole worktree is protected
-exactly as before. An orphan tree that overlaps the live sweep's tree at all is
+no lock dir at all), there is nothing to discriminate against and the whole
+worktree is protected exactly as before. An orphan tree that overlaps the live sweep's tree at all is
 refused whole rather than partially reaped, and the claim is re-resolved
 immediately before each kill: a claim that appeared or *changed* since the plan
 was built fails closed.
