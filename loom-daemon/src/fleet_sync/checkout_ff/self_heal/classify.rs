@@ -242,6 +242,8 @@ fn rebase_commits(gd: &Path) -> Result<Vec<String>, String> {
 
 /// Is a `git` process running with its working directory inside `root`?
 /// Fails closed: a process whose directory cannot be read counts as live.
+/// A zombie (`unreaped`) is skipped first: it matches `pgrep` and answers
+/// `kill(pid, 0)` but is not running anything (#13887).
 pub(super) fn live_git(root: &Path) -> bool {
     let Ok(out) = Command::new("pgrep").args(["-x", "git"]).output() else {
         return true;
@@ -255,15 +257,41 @@ pub(super) fn live_git(root: &Path) -> bool {
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .filter_map(|p| p.parse::<i32>().ok())
-        .any(|pid| match cwd_of(pid) {
-            Some(cwd) => cwd.starts_with(&root),
-            None => process_exists(pid),
+        .any(|pid| match unreaped(pid) {
+            Some(true) => false,
+            _ => match cwd_of(pid) {
+                Some(cwd) => cwd.starts_with(&root),
+                None => process_exists(pid),
+            },
         })
 }
 
 fn process_exists(pid: i32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Is `pid` an exited process its parent has not reaped? Such a process is
+/// running nothing, yet it still matches `pgrep` and still answers
+/// `kill(pid, 0)`, and its working directory is gone, so the cwd check below
+/// cannot tell it from a live one (#13887). `Some(true)` when it is a
+/// zombie, `Some(false)` when it is alive or gone, `None` when the state
+/// cannot be read: the caller keeps its fail-closed fallback.
+fn unreaped(pid: i32) -> Option<bool> {
+    if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The process name sits in parens and may itself close with `)`;
+        // every field after it is numeric, so the state follows the last one.
+        let state = text.rsplit(')').next()?.trim_start().chars().next()?;
+        return Some(state == 'Z');
+    }
+    let out = Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().starts_with('Z'))
 }
 
 fn cwd_of(pid: i32) -> Option<PathBuf> {
@@ -583,4 +611,37 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
         branch_differs: !tip.is_empty() && tip != head,
         detached: reattach,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #13887: a zombie (exited, not yet reaped) still matches
+    /// `pgrep -x git` and still answers `kill(pid, 0)`, but nothing is
+    /// running in it: its working directory died with it. One dropped
+    /// `Child` anywhere on the host — on the nightly run, another test's —
+    /// must not hold every checkout's self-heal.
+    #[test]
+    fn a_zombie_git_is_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("git")
+            .args(["hash-object", "/dev/null"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        let mut zombied = false;
+        for _ in 0..100 {
+            if unreaped(child.id() as i32) == Some(true) {
+                zombied = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(zombied, "the child never exited unreaped");
+        assert!(!live_git(dir.path()), "a zombie is not a running git");
+        child.wait().unwrap();
+    }
 }
