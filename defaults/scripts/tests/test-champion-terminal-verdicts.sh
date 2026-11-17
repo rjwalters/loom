@@ -22,7 +22,10 @@
 # WHAT THIS SUITE DOES
 #
 #   1. BEHAVIOUR -- champion.md's Priority 2 query, Priority 3 loop and Priority 4 query are
-#      EXTRACTED and EXECUTED against a stubbed `gh`.
+#      EXTRACTED and EXECUTED against a stubbed `gh`. Priority 3 also pins the
+#      revise-sent-back exclusion (#13906): a proposal Champion sent back to
+#      Curator (loom:triage swapped in) leaves the queue until Curator returns
+#      it curated.
 #   2. BEHAVIOUR -- curator.md's send-back queue is extracted and executed, and
 #      its unanswered-marker check is executed against the hash Champion's OWN
 #      idempotency block computes for the same issue (so the two formulas
@@ -114,7 +117,9 @@ cat >"$FIXTURE_DIR/issues.json" <<'EOF'
  {"number":6,"title":"auditor report","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:auditor"}]},
  {"number":7,"title":"being evaluated","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:evaluating"}]},
  {"number":8,"title":"blocked verdict","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:blocked"}]},
- {"number":9,"title":"escalated","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:operator"}]}
+ {"number":9,"title":"escalated","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:operator"}]},
+ {"number":10,"title":"revise sent back to Curator","createdAt":"2026-09-29T00:00:00Z","labels":[{"name":"loom:hermit"},{"name":"loom:triage"}]},
+ {"number":11,"title":"fresh hermit proposal","createdAt":"2026-09-28T00:00:00Z","labels":[{"name":"loom:hermit"}]}
 ]
 EOF
 
@@ -165,11 +170,18 @@ if [[ ! -s "$FIXTURE_DIR/p2.sh" || ! -s "$FIXTURE_DIR/p3.sh" ]]; then
 else
     assert_eq "#1" "$(run_query p2.sh | numbers_of)" \
         "Priority 2 returns only the evaluable curated issue (skips issue, evaluating, blocked, operator)"
-    assert_eq "#4 #6" "$(run_query p3.sh | numbers_of)" \
-        "Priority 3 returns the architect and auditor proposals and skips the blocked hermit one"
+    assert_eq "#4 #11 #6" "$(run_query p3.sh | numbers_of)" \
+        "Priority 3 loops architect, hermit, auditor: the fresh hermit proposal is listed; the blocked hermit one and the revise-sent-back triage one are skipped (#13906)"
     assert_not_contains "$(cat "$FIXTURE_DIR/p2.sh" "$FIXTURE_DIR/p3.sh")" "needs-revision" \
         "neither query names the retired loom:needs-revision"
 fi
+# #13906: the loom:triage exclusion ships in every copy of the Priority 3
+# block. `defaults/roles/champion.md` is a symlink to the commands copy the
+# extraction above ran; the .agents skill copy is generator output whose
+# byte-sync CI checks, pinned here so a hand-edited copy cannot drift.
+assert_contains "$(cat "$REPO_ROOT/defaults/.agents/skills/loom-champion/SKILL.md")" \
+    'IN("loom:evaluating","loom:issue","loom:building","loom:curated","loom:triage")' \
+    "the generated loom-champion skill copy carries the same loom:triage exclusion (#13906)"
 
 echo ""
 echo "Test 1b: Champion discovery orders proposals by level, then oldest first (#11103)"

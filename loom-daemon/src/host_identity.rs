@@ -41,6 +41,12 @@
 //! not [`host_identity`]. Changing it would make the daemon and the scripts
 //! disagree on lease ownership on any host without `LOOM_HOST_ID`.
 //!
+//! Both sides read [`LEASE_HOST_ID_ENV`] ahead of that chain. A dispatcher
+//! exports it to the session it spawns (`apply_step_env`), `spawn-codex.sh`
+//! and the private-clone exec carry it into a session container, and there it
+//! is the only thing naming the host the dispatcher's lease was published
+//! under: the container's `$HOSTNAME` is its own.
+//!
 //! # Migrating a hostname-keyed host
 //!
 //! A host that ran without `$LOOM_HOST_ID` used to report its hostname. After
