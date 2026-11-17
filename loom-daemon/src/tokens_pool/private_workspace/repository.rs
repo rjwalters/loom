@@ -36,6 +36,10 @@ pub enum WorkerCommand {
         command: Vec<String>,
     },
     Prepare(PrepareArgs),
+    /// List, publish or discard the unpublished branches of this clone
+    /// (`accounts session recover`, issue #14030). Without `--publish` or
+    /// `--discard` nothing is mutated.
+    Recover(RecoverArgs),
     /// Git credential-helper protocol; output goes only to Git's private pipe.
     Credential {
         operation: String,
@@ -56,6 +60,34 @@ pub struct PrepareArgs {
     pub branch: Option<String>,
     /// Collision-safe directory name of an additional repository (#10795),
     /// cloned at `<volume>/work/<slug>`. Absent: the legacy `<volume>/repo`.
+    #[arg(long)]
+    pub slug: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct RecoverArgs {
+    #[arg(long)]
+    pub account: String,
+    #[arg(long)]
+    pub repository: String,
+    /// The base the checkout is moved to when a discarded branch held it.
+    #[arg(long)]
+    pub base: String,
+    /// Publish every in-scope unpublished branch to origin.
+    #[arg(long, conflicts_with = "discard")]
+    pub publish: bool,
+    /// Delete the named branches with their unpublished commits. Requires an
+    /// explicit branch scope; never touches a branch it was not named for.
+    #[arg(long, conflicts_with = "publish")]
+    pub discard: bool,
+    /// Scope the action to one issue's own branch (`feature/issue-N`).
+    #[arg(long)]
+    pub issue: Option<u64>,
+    /// Scope the action to a named branch (repeatable).
+    #[arg(long, value_name = "BRANCH")]
+    pub branch: Vec<String>,
+    /// Collision-safe directory name of an additional repository (#10795).
+    /// Absent: the legacy `<volume>/repo`.
     #[arg(long)]
     pub slug: Option<String>,
 }
@@ -101,6 +133,18 @@ impl WorkerCommand {
                 match prepare(Path::new(ROOT), &args) {
                     Ok(revision) => {
                         println!("{}", json!({"protocol": PROTOCOL, "revision": revision}))
+                    }
+                    Err(error) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
+                    }
+                }
+            }
+            Self::Recover(args) => {
+                repository_url(&args.repository)?;
+                valid_base(&args.base)?;
+                match recover(Path::new(ROOT), &args) {
+                    Ok(outcome) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "outcome": outcome}))
                     }
                     Err(error) => {
                         println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
@@ -230,23 +274,40 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
     }
     clean_worktrees(&root, &repo)?;
     git(&repo, &["fetch", "--prune", "origin"])?;
-    if !git(&repo, &["rev-list", "--branches", "--not", "--remotes=origin"])?
-        .trim()
-        .is_empty()
-    {
-        bail!("private clone contains unpushed commits; push/recover them before reusing the account (nothing was reset)");
-    }
-    // Detached HEAD can contain work not named by a branch; inspect every
-    // worktree HEAD as well as branch refs before changing the root checkout.
-    {
-        for worktree in worktrees(&repo)? {
-            if !git(&worktree, &["rev-list", "HEAD", "--not", "--remotes=origin"])?
-                .trim()
-                .is_empty()
-            {
-                bail!("private worktree has unpushed/detached commits; preserve it for recovery");
-            }
+    // Unpublished commits are only stranded when no branch names them:
+    // preparation never moves a branch (a resumed one keeps its local tip)
+    // and never touches another one, so work carried by a branch ref
+    // survives every later step — on this clone and on every other clone of
+    // the account, whose preparations are independent (#14030). A detached
+    // HEAD here or in a linked worktree can be lost by re-preparing and
+    // still refuses; the refusal names the branches the `accounts session
+    // recover` verb clears.
+    let stranded = stranded_heads(&repo)?;
+    if !stranded.is_empty() {
+        let mut detail = String::new();
+        for head in &stranded {
+            let short = head.revision.get(..8).unwrap_or(&head.revision);
+            detail.push_str(&format!("\n  {} at {} ({} unpushed)", head.path, short, head.ahead));
         }
+        let mut message = format!(
+            "private work is stranded on a detached HEAD and would be lost by re-preparation{detail}; \
+             name it with a branch (git switch -c NAME) before reuse (nothing was reset)"
+        );
+        let unpublished = unpublished_branches(&repo)?;
+        if !unpublished.is_empty() {
+            let names = unpublished
+                .iter()
+                .map(|b| format!("{} ({} ahead)", b.branch, b.ahead))
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!(
+                "; unpublished branches {names} can be cleared with \
+                 `loom-daemon accounts session recover {} --publish` \
+                 (or `--discard --branch BRANCH`)",
+                args.account
+            ));
+        }
+        bail!("{message}");
     }
     let remote = format!("refs/remotes/origin/{}", args.base);
     let revision = git(&repo, &["rev-parse", "--verify", &format!("{remote}^{{commit}}")])
@@ -296,6 +357,256 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
     identity.revision.clone_from(&revision);
     save(&record, &identity)?;
     Ok(revision)
+}
+
+/// Worktree HEADs (the main checkout included) whose detached HEAD carries
+/// commits no ref of `origin` reaches: preparation could leave them unnamed.
+pub(super) fn stranded_heads(repo: &Path) -> Result<Vec<DetachedWork>> {
+    let mut stranded = Vec::new();
+    for worktree in worktrees(repo)? {
+        // `rev-parse --abbrev-ref HEAD` answers `HEAD` only when detached.
+        if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != "HEAD" {
+            continue;
+        }
+        let ahead = ahead_of_origin(&worktree, "HEAD")?;
+        if ahead > 0 {
+            stranded.push(DetachedWork {
+                path: worktree.display().to_string(),
+                revision: git(&worktree, &["rev-parse", "HEAD"])?.trim().to_owned(),
+                ahead,
+            });
+        }
+    }
+    Ok(stranded)
+}
+
+/// Every local branch with commits no remote-tracking ref of `origin`
+/// reaches, with its ahead count.
+pub(super) fn unpublished_branches(repo: &Path) -> Result<Vec<UnpublishedBranch>> {
+    let names = git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+    let mut unpublished = Vec::new();
+    for name in names.lines().map(str::trim).filter(|name| !name.is_empty()) {
+        let ahead = ahead_of_origin(repo, &format!("refs/heads/{name}"))?;
+        if ahead > 0 {
+            unpublished.push(UnpublishedBranch {
+                branch: name.to_owned(),
+                ahead,
+            });
+        }
+    }
+    Ok(unpublished)
+}
+
+fn ahead_of_origin(repo: &Path, revision: &str) -> Result<u64> {
+    git(repo, &["rev-list", "--count", revision, "--not", "--remotes=origin"])?
+        .trim()
+        .parse::<u64>()
+        .context("workspace Git returned a non-numeric ahead count")
+}
+
+/// The clone paths a `recover` call acts on. Unlike `additional_paths` this
+/// never creates anything: a clone that was never materialized has nothing
+/// to recover.
+fn recover_paths(root: &Path, args: &RecoverArgs) -> Result<(PathBuf, PathBuf)> {
+    match &args.slug {
+        None => Ok((root.join("repo"), root.join("identity.json"))),
+        Some(slug) => {
+            if !safe_segment(slug) || slug.contains("..") {
+                bail!("additional repository directory name is unsafe");
+            }
+            let primary: Identity =
+                serde_json::from_slice(&std::fs::read(root.join("identity.json")).context(
+                    "the account's primary workspace is not prepared; start the session first",
+                )?)?;
+            if primary.protocol != PROTOCOL || primary.account != args.account {
+                bail!("private workspace account identity mismatch; do not reset or remove unknown work");
+            }
+            Ok((
+                root.join("work").join(slug),
+                root.join("work")
+                    .join(".identity")
+                    .join(format!("{slug}.json")),
+            ))
+        }
+    }
+}
+
+/// Nothing to recover where the account never materialized a clone.
+fn empty_outcome(repository: &str) -> RecoverOutcome {
+    RecoverOutcome {
+        repository: repository.to_owned(),
+        cloned: false,
+        branches: Vec::new(),
+        published: Vec::new(),
+        discarded: Vec::new(),
+        ignored: Vec::new(),
+        detached: Vec::new(),
+    }
+}
+
+/// List, publish or discard the clone's unpublished branches (#14030).
+/// Publish only ever fast-forwards `origin`; discard requires an explicit
+/// branch scope, deletes only branches it was named for, and never removes
+/// the volume or moves a branch ref other than the ones being discarded.
+pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome> {
+    let (repo, record) = recover_paths(root, args)?;
+    if !repo.join(".git").is_dir() {
+        return Ok(empty_outcome(&args.repository));
+    }
+    let identity: Identity = serde_json::from_slice(&std::fs::read(&record)?)?;
+    if identity.protocol != PROTOCOL
+        || identity.account != args.account
+        || identity.repository != args.repository
+    {
+        bail!("private clone identity mismatch; do not reset or remove unknown work");
+    }
+    let mut outcome = RecoverOutcome {
+        repository: args.repository.clone(),
+        cloned: true,
+        branches: unpublished_branches(&repo)?,
+        published: Vec::new(),
+        discarded: Vec::new(),
+        ignored: Vec::new(),
+        detached: stranded_heads(&repo)?,
+    };
+    let mut scope = args.branch.clone();
+    if let Some(issue) = args.issue {
+        let name = format!("feature/issue-{issue}");
+        git(&repo, &["check-ref-format", "--branch", &name])?;
+        scope.push(name);
+    }
+    scope.sort();
+    scope.dedup();
+    if args.discard && scope.is_empty() {
+        bail!("discard requires an explicit branch scope (--branch BRANCH or --issue N)");
+    }
+    if !scope.is_empty() {
+        let local = git(&repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+        for name in &scope {
+            if !local.lines().any(|line| line.trim() == name) {
+                outcome.ignored.push(name.clone());
+            }
+        }
+    }
+    if args.publish {
+        let targets: Vec<String> = if scope.is_empty() {
+            outcome
+                .branches
+                .iter()
+                .map(|b| b.branch.clone())
+                .collect::<Vec<_>>()
+        } else {
+            scope
+                .iter()
+                .filter(|name| !outcome.ignored.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for name in &targets {
+            publish(&repo, name)?;
+            outcome.published.push(name.clone());
+        }
+    } else if args.discard {
+        // A scoped branch with nothing unpublished is left alone: deleting a
+        // published (or absent) branch is never part of a discard.
+        let targets: Vec<String> = scope
+            .iter()
+            .filter(|name| outcome.branches.iter().any(|b| name.as_str() == b.branch))
+            .cloned()
+            .collect();
+        for name in &scope {
+            if !targets.contains(name) && !outcome.ignored.contains(name) {
+                outcome.ignored.push(name.clone());
+            }
+        }
+        // Validate every holding checkout before mutating any of them, so a
+        // dirty worktree cannot leave a half-done discard behind.
+        let holds = holds_of(&repo, &targets)?;
+        for name in &targets {
+            discard_branch(&repo, &holds, name, &args.base)?;
+            outcome.discarded.push(name.clone());
+        }
+    }
+    outcome.branches = unpublished_branches(&repo)?;
+    outcome.detached = stranded_heads(&repo)?;
+    Ok(outcome)
+}
+
+/// Push `branch` to `origin` without ever forcing: a diverged remote refuses.
+fn publish(repo: &Path, branch: &str) -> Result<()> {
+    git(
+        repo,
+        &[
+            "push",
+            "origin",
+            &format!("refs/heads/{branch}:refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The worktrees (linked ones and the main checkout) that hold each branch.
+struct Holds {
+    /// Linked worktree to remove, per branch.
+    worktrees: Vec<(String, PathBuf)>,
+    /// The main checkout holds this branch and must be moved off it.
+    main: Vec<String>,
+}
+
+fn holds_of(repo: &Path, branches: &[String]) -> Result<Holds> {
+    let main = repo.canonicalize()?;
+    let mut holds = Holds {
+        worktrees: Vec::new(),
+        main: Vec::new(),
+    };
+    for name in branches {
+        for worktree in worktrees(repo)? {
+            if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != name {
+                continue;
+            }
+            if worktree.canonicalize()? == main {
+                holds.main.push(name.clone());
+            } else if !git(&worktree, &["status", "--porcelain=v1", "--untracked-files=all"])?
+                .is_empty()
+            {
+                bail!(
+                    "worktree {} on discarded branch {} has uncommitted changes; resolve them by hand first",
+                    worktree.display(),
+                    name
+                );
+            } else {
+                holds.worktrees.push((name.clone(), worktree));
+            }
+        }
+    }
+    Ok(holds)
+}
+
+fn discard_branch(repo: &Path, holds: &Holds, branch: &str, base: &str) -> Result<()> {
+    for (name, worktree) in &holds.worktrees {
+        if name == branch {
+            git(repo, &["worktree", "remove", &worktree.display().to_string()])?;
+        }
+    }
+    if holds.main.iter().any(|name| name == branch) {
+        // Move the checkout off the branch without touching any branch ref:
+        // detach it where preparation itself would (the base on origin, or a
+        // bare base revision). Detaching at HEAD would leave the discarded
+        // commits stranded and refused all over again.
+        let target = format!("refs/remotes/origin/{base}");
+        let target = if git(repo, &["rev-parse", "--verify", &target]).is_ok() {
+            target
+        } else if base.len() == 40 && base.chars().all(|c| c.is_ascii_hexdigit()) {
+            base.to_owned()
+        } else {
+            bail!(
+                "cannot move the checkout off discarded branch {branch}: base is not on origin; name the work with a branch by hand"
+            );
+        };
+        git(repo, &["switch", "--detach", &target])?;
+    }
+    git(repo, &["branch", "-D", branch])?;
+    Ok(())
 }
 
 /// Paths of an additional repository: `(clone, identity record, staging)`.
