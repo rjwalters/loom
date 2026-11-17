@@ -189,9 +189,8 @@ Current hermit flags "one-method classes" but not "zero-state classes." A class 
 - **Dispatch-table pattern**: Classes that build dicts/lists of `self.method` references (e.g., `{"key": self.handle_create, ...}`) are intentional dispatch tables.
 - **Structural types and test doubles**: `@dataclass` classes (the generated `__init__` is the state), any class with a base class (Exception/NamedTuple/TypedDict/Enum/Protocol/ABC subclasses and polymorphic hierarchies), classes with declared class-level fields or a `@<x>.setter` property pair, and classes in `test_*.py` / `*_stub*.py` / `conftest.py` (duck-typed test doubles). See `hermit-patterns.md` → "9. Stateless Ceremony".
 
-The AST-based Python detector (with all three exclusions: internal method
-dispatch, the 10+-method namespace threshold, and the dispatch-table pattern) and
-its TypeScript/Rust counterparts live in the companion file so this pattern's
+The AST-based Python detector (with all the exclusions listed above) and its
+TypeScript/Rust counterparts live in the companion file so this pattern's
 detection scripts are maintained in one place. See `hermit-patterns.md` →
 "9. Stateless Ceremony → Detection scripts".
 
