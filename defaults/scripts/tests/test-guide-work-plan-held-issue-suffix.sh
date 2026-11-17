@@ -316,7 +316,8 @@ expect_line "$EPICS_BODY" '- **#500**: Held epic *(held)*' \
 
 # An issue carrying TWO hold labels gets ONE suffix, not two.
 doubly="$(grep -F -- '- **#103**:' <<<"$IMP_BODY" || true)"
-suffix_count="$(grep -oF ' *(held)*' <<<"$doubly" | wc -l)"
+# `tr -d ' '`: BSD `wc -l` (macOS) left-pads its count, so a bare compare to "1" fails there.
+suffix_count="$(grep -oF ' *(held)*' <<<"$doubly" | wc -l | tr -d ' ')"
 assert_eq "$suffix_count" "1" "an issue with two hold labels carries exactly one *(held)* suffix (got: $doubly)"
 
 # The suffix decorates; it must not EXCLUDE — held issues still render.
