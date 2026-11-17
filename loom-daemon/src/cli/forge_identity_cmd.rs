@@ -407,18 +407,28 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether `slug` is a real GitHub `owner/name`: the shared slug rule plus
+/// GitHub's stricter owner (login) rule. Anything else builds no call, which
+/// keeps the verdict `UNTRUSTED`.
+fn github_slug(slug: &str) -> bool {
+    crate::forge_slug::valid_slug(slug)
+        && slug
+            .split_once('/')
+            .is_some_and(|(owner, _)| crate::forge_bucket_book::valid_owner(owner))
+}
+
 /// The real `owner/name` the issue was read from: `repo` itself when it is
 /// one, else (the `gh` placeholder `{owner}/{repo}`, which only `gh api` REST
 /// paths expand) the repository the fetched `issue` object names in its
 /// `repository_url`. `None` when neither is a valid slug, so no later call is
 /// built from a placeholder.
 fn real_repo(repo: &str, issue: &Value) -> Option<String> {
-    if crate::forge_mirror::valid_slug(repo) {
+    if github_slug(repo) {
         return Some(repo.to_string());
     }
     let url = issue.get("repository_url").and_then(Value::as_str)?;
     let (_, slug) = url.rsplit_once("/repos/")?;
-    crate::forge_mirror::valid_slug(slug).then(|| slug.to_string())
+    github_slug(slug).then(|| slug.to_string())
 }
 
 /// The maintainer whose `loom:issue` adoption of issue `number` still stands,
@@ -461,7 +471,7 @@ const BODY_EDITS_QUERY: &str = "query($o:String!,$n:String!,$i:Int!){repository(
 /// `owner/name`: `-f` values reach GraphQL literally, so a placeholder would
 /// name no repository.
 fn body_edits_args(repo: &str, number: u64) -> Option<Vec<String>> {
-    if !crate::forge_mirror::valid_slug(repo) {
+    if !github_slug(repo) {
         return None;
     }
     let (owner, name) = repo.split_once('/')?;
@@ -538,6 +548,25 @@ mod tests {
         assert_eq!(real_repo("{owner}/{repo}", &odd), None);
         let ghes = json!({"repository_url": "https://ghe.example/api/v3/repos/Org-1/my.repo"});
         assert_eq!(real_repo("{owner}/{repo}", &ghes).as_deref(), Some("Org-1/my.repo"));
+        // The owner half follows GitHub's login rule, stricter than the shared
+        // slug rule: no `.` or `_`, at most 39 bytes.
+        let long = format!("{}/r", "a".repeat(40));
+        for bad in [
+            "o.x/r",
+            "o_x/r",
+            "-o/r",
+            long.as_str(),
+            "o/r/x",
+            "o/-r",
+            "o/..",
+            "/r",
+            "o/",
+        ] {
+            assert_eq!(body_edits_args(bad, 7), None, "{bad}");
+            assert_eq!(real_repo(bad, &json!({"number": 7})), None, "{bad}");
+            let url = json!({"repository_url": format!("https://api.github.com/repos/{bad}")});
+            assert_eq!(real_repo("{owner}/{repo}", &url), None, "{bad}");
+        }
     }
 
     /// `--gh-shape` renames the REST fields and keeps the App spelling.
