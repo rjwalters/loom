@@ -556,6 +556,51 @@ if [[ -f "$CHAMPION_EPIC_STANDDOWN" ]]; then
         [[ "$(detect "plain" "native-sub-issue" 2)" == yes ]] \
             && pass "strong open children still stand down without the marker" || fail "strong-children path regressed"
     fi
+
+    # The note must be accurate for zero discovered children (#13874 AC 5):
+    # Step 0 can never close such an epic, so its note must not promise an
+    # automatic close, and must say who closes it. Runs the shipped wording
+    # branch (extracted from §0.5b), not a copy.
+    NOTE_SNIPPET="$(awk '/^    if \[ "\$EPIC_CHILD_STRONG_OPEN" -gt 0 \] \|\| \[ "\$EPIC_CHILD_STRONG_CLOSED" -gt 0 \]; then$/{p=1} p{print} /^    fi$/{if(p) exit}' "$CHAMPION_EPIC_STANDDOWN")"
+    if [[ -z "$NOTE_SNIPPET" ]]; then
+        fail "could not extract the §0.5b note-wording branch"
+    else
+        # shellcheck disable=SC2034  # EPIC_* / DEFAULT_BRANCH are read by the eval'd snippet
+        note_text() { # $1=strong_open $2=strong_closed
+            local EPIC_NUMBER=282 EPIC_CHILD_SOURCES="task-list" DEFAULT_BRANCH=main
+            local EPIC_CHILD_STRONG_OPEN="$1" EPIC_CHILD_STRONG_CLOSED="$2" UMBRELLA_WHY="" UMBRELLA_NEXT=""
+            eval "$NOTE_SNIPPET"
+            printf '%s\n%s\n' "$UMBRELLA_WHY" "$UMBRELLA_NEXT"
+        }
+        DECLARED_NOTE="$(note_text 0 0)"
+        DISCOVERED_NOTE="$(note_text 2 1)"
+        if [[ "$DECLARED_NOTE" == *"declared a tracking epic"* ]] \
+            && ! grep -qiE 'automatic|Nothing is required of anyone' <<<"$DECLARED_NOTE"; then
+            pass "declared epic, zero discovered children: the note promises no automatic close"
+        else
+            fail "declared-epic note still promises an automatic close Step 0 cannot perform"
+        fi
+        if grep -qF 'will **not** close this epic' <<<"$DECLARED_NOTE" \
+            && grep -qF 'its author or an operator closes it by hand' <<<"$DECLARED_NOTE"; then
+            pass "declared epic, zero discovered children: the note says who closes it"
+        else
+            fail "declared-epic note does not say Champion will not close it and who does"
+        fi
+        if grep -qF 'will close it automatically once its last child is closed' <<<"$DISCOVERED_NOTE" \
+            && grep -qF '2 open / 1 closed' <<<"$DISCOVERED_NOTE"; then
+            pass "discovered children: the note keeps the auto-close wording"
+        else
+            fail "discovered-children note lost its auto-close wording"
+        fi
+    fi
+    # The posted comment must take its closing paragraph from the branch, never
+    # carry an unconditional copy of the auto-close promise.
+    if grep -qxF '$UMBRELLA_NEXT' "$CHAMPION_EPIC_STANDDOWN" \
+        && [[ "$(grep -cF 'will close it automatically' "$CHAMPION_EPIC_STANDDOWN")" -eq 1 ]]; then
+        pass "the comment body uses the per-branch closing paragraph"
+    else
+        fail "the comment body carries an unconditional auto-close promise"
+    fi
 else
     fail "stand-down body not found at $CHAMPION_EPIC_STANDDOWN"
 fi
