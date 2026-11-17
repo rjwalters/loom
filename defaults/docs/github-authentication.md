@@ -495,7 +495,11 @@ Every host is configured the same way. There is no per-host pinning:
   `github-app-token.sh`, so with it set credential delivery, agent writes and
   `merge-pr.sh` use that one App for every owner, while `forge token` (lease
   posting) ignores the env and follows `writers[]`. `forge identities` warns
-  when both are present.
+  when both are present. `forge may-write --repo acme/x` agrees with
+  `forge token --repo acme/x` (#13929): the probe mints the listed owner's
+  writer credential the same way before answering, so a writer-covered owner
+  reads as writable when the mint works, and a failed mint is refused with
+  the mint failure named (never a guess).
 
   Each withdrawal is exported as a `forge.reader.withdrawn` span
   ([`telemetry-schema.md`](telemetry-schema.md)), and `loom-daemon status`

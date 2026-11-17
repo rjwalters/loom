@@ -52,24 +52,18 @@ pub struct PendingRestart {
     pub rendered_at: DateTime<Utc>,
 }
 
-/// Resolve `<loom_dir>` the same way [`crate::fleet_sync`] does: the parent
+/// Resolve `<loom_dir>` via the shared
+/// [`crate::autonomy_marker::resolve_loom_dir`] (#13833): the parent
 /// of `LOOM_SOCKET_PATH` when set (so a test daemon pointed at a tempdir
 /// socket never writes into the operator's real `~/.loom`), else `~/.loom`.
 pub fn loom_dir() -> Option<PathBuf> {
-    resolve_loom_dir()
-}
-
-fn resolve_loom_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        return PathBuf::from(path).parent().map(Path::to_path_buf);
-    }
-    dirs::home_dir().map(|h| h.join(".loom"))
+    crate::autonomy_marker::resolve_loom_dir()
 }
 
 /// Path of the host-level marker, or `None` when no loom dir resolves.
 #[must_use]
 pub fn marker_path() -> Option<PathBuf> {
-    resolve_loom_dir().map(|d| d.join(FILENAME))
+    crate::autonomy_marker::resolve_loom_dir().map(|d| d.join(FILENAME))
 }
 
 /// Record `paths` against `observed_pid`. Best-effort on the caller's part —
