@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Issue Promotion Context
 
 This file contains issue promotion instructions for the Champion role. **Read this file when Priority 2 or Priority 3 work is found.**

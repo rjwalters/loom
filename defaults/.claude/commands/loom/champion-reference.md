@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Reference Documentation
 
 This file contains edge cases, complete workflow scripts, and troubleshooting information for the Champion role. **Reference this file when handling non-standard situations.**

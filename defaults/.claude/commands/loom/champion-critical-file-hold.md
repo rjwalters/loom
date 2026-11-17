@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Critical-File Durable Hold (#6879, #9016)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Safety Criteria"
