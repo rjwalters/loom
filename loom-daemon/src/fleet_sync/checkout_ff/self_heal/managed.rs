@@ -109,6 +109,40 @@ pub(super) fn has_marker(content: &str) -> bool {
     content.contains(MARKER)
 }
 
+/// The repo-scoped config OpenCode rewrites (#13970): committed by the squad
+/// installer, never by Loom, yet its tool-added `$schema` entry used to hold
+/// a primary checkout for an operator.
+pub(super) const OPENCODE_CONFIG: &str = "opencode.json";
+
+/// The one entry OpenCode adds to [`OPENCODE_CONFIG`] when the committed
+/// file lacks it.
+const OPENCODE_SCHEMA_ENTRY: &str = "\"$schema\": \"https://opencode.ai/config.json\"";
+
+/// Is a line exactly the `$schema` entry OpenCode adds? Indentation and the
+/// trailing comma of a non-final entry do not count; a different URL does.
+fn is_opencode_schema_entry(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == OPENCODE_SCHEMA_ENTRY || trimmed.strip_suffix(',') == Some(OPENCODE_SCHEMA_ENTRY)
+}
+
+/// Is a working-tree `opencode.json` exactly the committed one plus the one
+/// `$schema` entry OpenCode adds (#13970)? Lines compare without their
+/// surrounding blanks, so CRLF and a missing trailing newline do not count;
+/// any other added, removed or edited line — and a file with no `$schema`
+/// entry at all — is a real change and `false` here.
+pub(super) fn opencode_schema_only(working: &str, head: &str) -> bool {
+    let mut added = 0;
+    let mut rest = Vec::new();
+    for line in working.lines() {
+        if is_opencode_schema_entry(line) {
+            added += 1;
+        } else {
+            rest.push(line.trim());
+        }
+    }
+    added > 0 && rest == head.lines().map(str::trim).collect::<Vec<_>>()
+}
+
 /// How long a detached HEAD must sit before the self-heal re-attaches it.
 ///
 /// Long on purpose. A role session that checks out a PR head or `origin/main`
@@ -216,5 +250,70 @@ mod tests {
         .unwrap();
         assert_eq!(head_moved_at(tmp.path()).unwrap().timestamp(), 1_791_760_325);
         assert!(head_moved_at(&tmp.path().join("none")).is_none());
+    }
+
+    /// The one-line diff OpenCode leaves, as observed in production (#13970).
+    const COMMITTED: &str = "{\n  \"mcp\": {\n    \"squad\": {}\n  }\n}\n";
+    const WITH_SCHEMA: &str = "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \
+                               \"mcp\": {\n    \"squad\": {}\n  }\n}\n";
+
+    #[test]
+    fn the_opencode_schema_entry_alone_is_not_a_real_change() {
+        assert!(opencode_schema_only(WITH_SCHEMA, COMMITTED));
+    }
+
+    #[test]
+    fn opencode_schema_indentation_crlf_and_trailing_newline_do_not_count() {
+        assert!(opencode_schema_only(
+            "{\r\n        \"$schema\": \"https://opencode.ai/config.json\",\r\n  \
+             \"mcp\": {\n    \"squad\": {}\n  }\n}",
+            COMMITTED
+        ));
+    }
+
+    #[test]
+    fn a_first_entry_without_a_trailing_comma_is_still_the_schema_entry() {
+        assert!(opencode_schema_only(
+            "{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}",
+            "{\n}\n",
+        ));
+    }
+
+    #[test]
+    fn any_other_opencode_change_is_a_real_change() {
+        // One edited line beside the schema entry.
+        assert!(!opencode_schema_only(
+            "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+             {\n    \"squad\": {\"other\": true}\n  }\n}\n",
+            COMMITTED
+        ));
+        // A different schema URL.
+        assert!(!opencode_schema_only(
+            "{\n  \"$schema\": \"https://example.invalid/config.json\",\n  \
+             \"mcp\": {\n    \"squad\": {}\n  }\n}\n",
+            COMMITTED
+        ));
+        // The schema entry removed, not added.
+        assert!(!opencode_schema_only(COMMITTED, WITH_SCHEMA));
+        // No `$schema` entry at all: a dirty file identical to HEAD is not
+        // owned on a guess.
+        assert!(!opencode_schema_only(COMMITTED, COMMITTED));
+        // An extra key added (its comma edits the neighbour line too).
+        assert!(!opencode_schema_only(
+            "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+             {\n    \"squad\": {},\n    \"mine\": true\n  }\n}\n",
+            COMMITTED
+        ));
+    }
+
+    #[test]
+    fn only_the_schema_url_opencode_ships_matches() {
+        assert!(is_opencode_schema_entry(
+            "  \"$schema\": \"https://opencode.ai/config.json\",\n"
+        ));
+        assert!(!is_opencode_schema_entry(
+            "  \"$schema\":\"https://opencode.ai/config.json\",\n"
+        ));
+        assert!(!is_opencode_schema_entry("  \"$schema\": null,\n"));
     }
 }

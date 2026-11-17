@@ -327,6 +327,15 @@ fn format_age(seconds: i64) -> String {
     if seconds <= 0 {
         return "just now".to_string();
     }
+    coarse_age_ago(seconds)
+}
+
+/// `"3d 4h ago"` / `"3h 12m ago"` / `"5m ago"` — the shared coarse
+/// seconds-to-string bucketing. Callers own their negative-input message;
+/// a negative `seconds` is clamped to zero here (`"0m ago"`).
+#[must_use]
+pub fn coarse_age_ago(seconds: i64) -> String {
+    let seconds = seconds.max(0);
     let days = seconds / 86_400;
     let hours = (seconds % 86_400) / 3_600;
     let minutes = (seconds % 3_600) / 60;

@@ -458,6 +458,20 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
         if listed.contains(p) {
             return true;
         }
+        // #13970: OpenCode rewrites a tracked `opencode.json` (committed by
+        // the squad installer, not Loom) adding one `$schema` entry, and that
+        // dirt then holds a primary checkout for an operator. Exactly that
+        // one-entry diff in the working tree is Loom's to clear; every other
+        // change to the file, and every committed change, is not. Any read
+        // error fails closed to "not owned".
+        if p == managed::OPENCODE_CONFIG && rev.is_none() {
+            let working = std::fs::read_to_string(root.join(p)).ok();
+            let head = read(env, root, &["show", &format!("HEAD:{p}")]).ok();
+            return matches!(
+                (working, head),
+                (Some(w), Some(h)) if managed::opencode_schema_only(&w, &h)
+            );
+        }
         if !managed::resync_owned(p, &pins) {
             return false;
         }

@@ -13,6 +13,7 @@ mod control;
 pub mod dispatch;
 mod docker;
 pub mod export;
+mod forge_auth;
 mod lease;
 mod lifecycle;
 #[cfg(test)]

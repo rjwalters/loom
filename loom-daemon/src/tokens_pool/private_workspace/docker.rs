@@ -21,18 +21,27 @@ pub(super) fn command(args: &[&str]) -> Result<String> {
 /// [`command`] with an explicit budget, for calls longer than their
 /// subcommand's default (`exec` of `setup`/`prepare`).
 pub(super) fn command_with(args: &[&str], timeout: Duration) -> Result<String> {
+    command_env(args, &[], timeout)
+}
+
+/// [`command_with`] with variables set on the `docker` client process only
+/// (#13916): a forge token resolved for one exec, named in `args` as a bare
+/// `--env NAME` so its value never appears in argv.
+pub(super) fn command_env(
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<String> {
     // Every Docker call of this module goes through here, so a fake installed
     // on this thread (`fake`, tests only) stands in for the whole engine.
     #[cfg(test)]
-    if let Some(result) = fake::dispatch(args) {
+    if let Some(result) = fake::dispatch(args, env) {
         return result;
     }
-    let (success, stdout, _stderr) =
-        docker_cli::run_bounded("docker", args, timeout).map_err(|error| {
-            match error.downcast::<docker_cli::DockerTimedOut>() {
-                Ok(timed_out) => anyhow::Error::new(timed_out),
-                Err(error) => error.context("Docker unavailable"),
-            }
+    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
+        .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
+            Ok(timed_out) => anyhow::Error::new(timed_out),
+            Err(error) => error.context("Docker unavailable"),
         })?;
     if !success {
         bail!(
@@ -460,8 +469,13 @@ pub(super) fn recheck_control(config: &Config, id: &str, bound: &str) -> Result<
     Ok(report)
 }
 
-pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result<String> {
-    prepare_target(config, &config.primary(), id, branch)
+pub(super) fn prepare(
+    config: &Config,
+    workspace: &Path,
+    id: &str,
+    branch: Option<&str>,
+) -> Result<String> {
+    prepare_target(config, workspace, &config.primary(), id, branch)
 }
 
 /// Prepare one repository of the account: the primary, or a lazily cloned
@@ -469,18 +483,31 @@ pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result
 /// exec's own `LOOM_PRIVATE_REPOSITORY`, never widened on the container.
 pub(super) fn prepare_target(
     config: &Config,
+    workspace: &Path,
     target: &Target,
     id: &str,
     branch: Option<&str>,
 ) -> Result<String> {
+    // Resolved per exec (#13916): an App installation token outlives no job.
+    let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
+    prepare_with(config, target, id, branch, &auth)
+}
+
+pub(super) fn prepare_with(
+    config: &Config,
+    target: &Target,
+    id: &str,
+    branch: Option<&str>,
+    auth: &forge_auth::ExecAuth,
+) -> Result<String> {
     let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
     let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
-    // `--env NAME` copies the host process's value directly; secrets never
-    // appear in argv, config files, remote URLs or our captured output.
-    for name in FORGE_ENV {
-        if std::env::var_os(name).is_some() {
-            args.extend(["--env", name]);
-        }
+    // `--env NAME` copies the `docker` client's value directly: the host
+    // process's own, or one this host resolved and set on that child alone
+    // (#13916). Secrets never appear in argv, config files, remote URLs or
+    // our captured output.
+    for name in auth.names() {
+        args.extend(["--env", name]);
     }
     args.extend([
         &config.container,
@@ -502,7 +529,7 @@ pub(super) fn prepare_target(
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);
     }
-    let output = command_with(&args, EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
     let result: Value = serde_json::from_str(&output)
         .context("private workspace endpoint unavailable; update the session image before reuse")?;
     if result["protocol"] != PROTOCOL {
@@ -560,11 +587,19 @@ pub(super) mod fake {
 
     thread_local! {
         static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+        /// The child environment each faked call would have carried (#13916).
+        static ENVS: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Every faked call's `docker` child environment, in call order.
+    pub(in super::super) fn seen_env() -> Vec<Vec<(String, String)>> {
+        ENVS.with(|e| e.borrow().clone())
     }
 
     /// Route this thread's Docker calls to `handler` until the guard drops.
     pub(in super::super) fn install(handler: Handler) -> Guard {
         HANDLER.with(|h| *h.borrow_mut() = Some(handler));
+        ENVS.with(|e| e.borrow_mut().clear());
         Guard
     }
 
@@ -573,10 +608,19 @@ pub(super) mod fake {
     impl Drop for Guard {
         fn drop(&mut self) {
             HANDLER.with(|h| *h.borrow_mut() = None);
+            ENVS.with(|e| e.borrow_mut().clear());
         }
     }
 
-    pub(super) fn dispatch(args: &[&str]) -> Option<anyhow::Result<String>> {
-        HANDLER.with(|h| h.borrow_mut().as_mut().map(|handler| handler(args)))
+    pub(super) fn dispatch(
+        args: &[&str],
+        env: &[(String, String)],
+    ) -> Option<anyhow::Result<String>> {
+        HANDLER.with(|h| {
+            h.borrow_mut().as_mut().map(|handler| {
+                ENVS.with(|e| e.borrow_mut().push(env.to_vec()));
+                handler(args)
+            })
+        })
     }
 }
