@@ -1003,7 +1003,11 @@ impl SweepRegistry {
             // or another hold already has the item): say so, or the captain
             // refuses the item for a park nobody will end.
             if !self.park_ordered_fast_failure(issue) && !self.is_quarantined(issue) {
-                crate::fleet_dispatch::worker::park_ended(&self.config.workspace_root, issue);
+                crate::fleet_dispatch::worker::park_ended(
+                    &self.config.workspace_root,
+                    issue,
+                    crate::fleet_dispatch::proto::ParkEndCause::Expired,
+                );
             }
         }
         self.expire_quarantine();
