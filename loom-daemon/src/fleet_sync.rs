@@ -576,7 +576,7 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
             maintain_only,
             ..
         } => {
-            let claude_state = crate::terminal::claude_config_state_path();
+            let claude_state = crate::claude_config::default_state_file();
             registry.add_and_trust(path, None, *weight, &claude_state)?;
             registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true

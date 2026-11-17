@@ -2,8 +2,8 @@
 //!
 //! Replaces `loom_tools/agent_spawn.py` with full feature parity: tmux session
 //! creation on the shared `loom` socket, log rotation + `pipe-pane` capture,
-//! per-agent `CLAUDE_CONFIG_DIR` isolation (delegated to `terminal.rs`'s
-//! `claude_config` module), folder-trust pre-seeding, worktree/`PYTHONPATH`
+//! per-agent `CLAUDE_CONFIG_DIR` isolation (delegated to the crate-level
+//! [`crate::claude_config`] module), folder-trust pre-seeding, worktree/`PYTHONPATH`
 //! pinning, OAuth token injection from the native pool, spawn verification,
 //! bypass-permissions modal auto-accept, and stuck-session detection/recovery.
 
@@ -663,7 +663,7 @@ pub fn spawn_agent(env: &dyn AgentEnv, opts: &SpawnOptions, repo_root: &Path) ->
         set_session_env(env, &session, "LOOM_SHEPHERD_TASK_ID", task_id);
     }
 
-    // Per-agent CLAUDE_CONFIG_DIR isolation, delegated to terminal.rs's
+    // Per-agent CLAUDE_CONFIG_DIR isolation, delegated to the crate-level
     // `claude_config` module (the single native implementation). Setup is
     // idempotent and skips existing files, so a corrupted dir would otherwise
     // silently persist across every retry — validate first, and reinitialize
