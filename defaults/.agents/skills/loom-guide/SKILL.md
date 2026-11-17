@@ -2228,7 +2228,7 @@ plan_stamp_line() {
 # with no blank line after it — exactly `stamp\n` + body — so one conditional
 # delete is the whole normalization.
 strip_plan_stamp() {
-  sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d}'
+  sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}'
 }
 
 update_work_plan() {
@@ -2244,7 +2244,7 @@ update_work_plan() {
   # branch was dead code, and every tick unconditionally rewrote the file.
   # Comparing the SAME rendered text on both sides is what makes the skip real;
   # a hash buys nothing here, so compare the strings directly.
-  local new_body old_body
+  local new_body old_body stamp
   new_body="$(render_plan_body)"
   # `sed '1d;$d'` drops the two marker lines, leaving only the generated region;
   # `strip_plan_stamp` (#13909) then drops the region's generated-at stamp line
