@@ -15,15 +15,15 @@
 //! # What this does
 //!
 //! Pass 2 of the multi-workspace tick calls [`OpenPrPrefilter::dispatch`]
-//! where it used to call `dispatch_with`. The first time a candidate of a
+//! instead of plain `dispatch`. The first time a candidate of a
 //! workspace reaches that point in a tick, the pre-filter asks the
 //! workspace's dispatcher ONCE for every candidate of that workspace that has
 //! a verified open linked PR ([`WorkDispatcher::open_pr_answer`]; in
 //! production one read of the ETag-cached open-PR listing, see
 //! [`answer_in`]). A candidate in that answer is resolved exactly as the
 //! in-`dispatch()` refusal resolves it — `QueueDisposition::OpenPr`, detail
-//! `open PR #X`, counted in `skipped_pr_open` — without `dispatch_with` being
-//! called. Every other candidate goes to `dispatch_with` as before, unless
+//! `open PR #X`, counted in `skipped_pr_open` — without `dispatch` being
+//! called. Every other candidate goes to `dispatch` as before, unless
 //! the landed pre-filter (#11853, [`super::landed_prefilter`], asked once per
 //! workspace per tick about the candidates without an open PR) finds its
 //! closing PR already merged: that one is resolved `AlreadyLanded`.
@@ -222,7 +222,6 @@ impl OpenPrPrefilter {
         &mut self,
         dispatcher: &mut D,
         cand: &PriorityCandidate,
-        overflow: bool,
         report: &mut TickReport,
     ) -> (Qd, Option<String>) {
         if let Some(pr) = self.open_pr(dispatcher, cand) {
@@ -239,7 +238,7 @@ impl OpenPrPrefilter {
             return (Qd::AlreadyLanded, Some(format!("merged closing PR #{pr}")));
         }
         let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(cand.number, overflow);
+        let outcome = dispatcher.dispatch(cand.number);
         record_dispatch_outcome(report, cand.number, cand.workspace_idx, started, &outcome)
     }
 

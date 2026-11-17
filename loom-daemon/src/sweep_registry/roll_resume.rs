@@ -579,7 +579,6 @@ impl SweepRegistry {
                 effort,
                 depends_on: None,
                 repo: Some(self.config.workspace_root.display().to_string()),
-                overflow: false,
             },
         );
         // The machine journal reconstructs issue sweeps after a restart; a step
