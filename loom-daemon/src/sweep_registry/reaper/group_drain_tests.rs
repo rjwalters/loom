@@ -46,7 +46,6 @@ fn insert_running(registry: &mut SweepRegistry, sweep_id: &str, issue: u32, pid:
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     registry

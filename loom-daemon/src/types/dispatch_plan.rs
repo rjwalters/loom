@@ -176,11 +176,6 @@ pub struct PlanSlots {
     pub free: Option<usize>,
     #[serde(default)]
     pub any_halted: bool,
-    /// Whether the host's single overflow slot (#9244) is unused. Inert
-    /// since #11508: nothing is admitted past the configured cap any more,
-    /// so this only reports an overflow sweep an older daemon started.
-    #[serde(default)]
-    pub overflow_free: Option<bool>,
 }
 
 /// This host's shard posture.

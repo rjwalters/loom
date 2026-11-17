@@ -40,6 +40,9 @@ struct Engine {
     start_dies: bool,
     /// `docker start` hits its deadline (a wedged engine).
     start_times_out: bool,
+    /// The verbatim body the fake returns for `private-workspace recover`
+    /// execs; `None` answers with an empty published report (#14030).
+    recover_response: Option<String>,
     calls: Vec<Vec<String>>,
     created: u32,
 }
@@ -189,6 +192,22 @@ impl Engine {
             ["exec", rest @ ..] if rest.contains(&"prepare") => {
                 Ok(json!({"protocol": PROTOCOL, "revision": "deadbeef"}).to_string())
             }
+            ["exec", rest @ ..] if rest.contains(&"recover") => match &self.recover_response {
+                Some(body) => Ok(body.clone()),
+                None => Ok(json!({
+                    "protocol": PROTOCOL,
+                    "outcome": {
+                        "repository": "https://forge.example/a/b",
+                        "cloned": true,
+                        "branches": [],
+                        "published": [],
+                        "discarded": [],
+                        "ignored": [],
+                        "detached": []
+                    }
+                })
+                .to_string()),
+            },
             ["stop", .., container] => {
                 let name = self.find_name(container).context("no such container")?;
                 self.containers.get_mut(&name).unwrap()["State"]["Running"] = json!(false);
@@ -447,6 +466,28 @@ impl Env {
         self.engine().mutations()
     }
     fn recover(&self, image: Option<&str>) -> Result<Status> {
+        // A git fork anywhere in this test binary (thousands of tests drive
+        // real git in parallel threads) inherits copies of every open
+        // descriptor between fork and exec, and can keep this lease's flock
+        // alive microseconds past its release (the #9409 transient). A real
+        // holder persists; the transient clears, so a bounded retry of the
+        // busy error — which `Lease::acquire` reports before any mutation —
+        // tells the two apart, exactly like `reacquire` does in tests.rs.
+        let mut attempt = 0;
+        loop {
+            match recover(self.workspace.path(), "alice", image, &|| Ok(())) {
+                Err(error) if attempt < 20 && error.to_string().contains("busy") => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Single-shot recovery for the tests that pin the exact engine-call
+    /// sequence, where a retried probe would show up in the record.
+    fn recover_strict(&self, image: Option<&str>) -> Result<Status> {
         recover(self.workspace.path(), "alice", image, &|| Ok(()))
     }
     fn held(&self) -> bool {
@@ -610,7 +651,7 @@ fn recovery_refuses_another_engine_before_reading_any_container() {
     env.seed_volume();
     env.seed_container(CONTAINER_ID, false);
     env.with(|e| e.id = "engine-b".into());
-    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let error = env.recover_strict(Some(IMAGE)).unwrap_err();
     assert!(message(&error).contains("engine changed"), "{error:#}");
     assert_eq!(env.engine().calls, vec![vec!["info", "--format", "{{.ID}}"]]);
 }
@@ -661,7 +702,7 @@ fn recovery_never_breaks_the_exclusive_account_lease() {
     env.seed_volume();
     env.seed_container(CONTAINER_ID, false);
     let holder = lease::Lease::acquire(&env.dir).unwrap();
-    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let error = env.recover_strict(Some(IMAGE)).unwrap_err();
     assert!(message(&error).contains("busy"), "{error:#}");
     assert_eq!(env.engine().calls, vec![vec!["info", "--format", "{{.ID}}"]]);
     drop(holder);
@@ -842,4 +883,226 @@ fn a_wedged_start_surfaces_the_typed_timeout_and_releases_the_lease() {
 fn long_execs_keep_a_budget_beyond_the_quick_call_default() {
     assert!(docker::EXEC_TIMEOUT > docker_cli::timeout_for(&["exec"]));
     assert_eq!(docker_cli::timeout_for(&["start", "c"]), docker_cli::DOCKER_CALL_TIMEOUT);
+}
+
+/// `session_recover` with the #9409 fork transient retried out (see
+/// [`Env::recover`]): a concurrent git fork can keep the previous call's
+/// released lease alive microseconds past its drop.
+fn recover_session(
+    workspace: &Path,
+    name: &str,
+    action: RecoverAction,
+    issue: Option<u64>,
+    branches: &[String],
+) -> Result<RecoverReport> {
+    let mut attempt = 0;
+    loop {
+        match session_recover(workspace, name, action, issue, branches) {
+            Err(error) if attempt < 20 && error.to_string().contains("busy") => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// What `session recover` (#14030) asks under the job's guard policy: the
+/// exclusive lease is held for the whole call, a stopped or busy session is
+/// refused before any exec, and every registered clone of the account is
+/// addressed with the requested scope.
+#[test]
+#[serial]
+fn session_recover_follows_the_job_guard_policy_and_scopes_every_clone() {
+    let env = setup();
+    // No session at all: refused before any exec.
+    let error =
+        recover_session(env.workspace.path(), "alice", RecoverAction::List, None, &[]).unwrap_err();
+    assert!(message(&error).contains("stopped"), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // A live worker: not idle, refused like a job.
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into());
+    });
+    let error =
+        recover_session(env.workspace.path(), "alice", RecoverAction::List, None, &[]).unwrap_err();
+    assert!(message(&error).contains("idle"), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    // Back to idle: the guard checks pass exactly like a job's.
+    env.with(|e| {
+        e.processes.get_mut(&env.config.container).unwrap().pop();
+    });
+
+    // A second registered repository: the recover walk covers it too.
+    let mut config = env.config.clone();
+    let second = identify("https://forge.example/a/c").unwrap();
+    config.schema_version = 2;
+    config.repositories.push(Registered {
+        repository: second.url.clone(),
+        base: "main".into(),
+        slug: second.slug.clone(),
+    });
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+    // The fake reports a completed discard for the scoped call, so the
+    // report is a real action rather than a scoped no-op.
+    env.with(|e| {
+        e.recover_response = Some(
+            json!({
+                "protocol": PROTOCOL,
+                "outcome": {
+                    "repository": "https://forge.example/a/b",
+                    "cloned": true,
+                    "branches": [],
+                    "published": [],
+                    "discarded": ["feature/issue-7"],
+                    "ignored": [],
+                    "detached": []
+                }
+            })
+            .to_string(),
+        )
+    });
+
+    // While the call runs, the exclusive account lease is held: the fake's
+    // handler executes between the acquire and the drop.
+    let engine = env.engine.clone();
+    let dir = env.dir.clone();
+    let probe = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let watcher = probe.clone();
+    let _wrap = docker::fake::install(Box::new(move |args| {
+        if args.contains(&"recover") {
+            watcher
+                .borrow_mut()
+                .push(lease::Lease::acquire(&dir).is_err());
+        }
+        engine.borrow_mut().handle(args)
+    }));
+    let report = recover_session(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        Some(7),
+        &["feature/issue-7".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        probe.borrow().as_slice(),
+        &[true, true],
+        "the lease is exclusive during the call"
+    );
+    assert_eq!(report.account, "alice");
+    assert_eq!(report.clones.len(), 2);
+    // The primary is addressed without a slug, the additional with one, and
+    // both carry the requested scope and the repository-scoped env.
+    let engine = env.engine();
+    let recover_calls: Vec<_> = engine
+        .calls
+        .iter()
+        .filter(|c| c.iter().any(|a| a == "recover"))
+        .collect();
+    assert_eq!(recover_calls.len(), 2);
+    let scoped_flags = |call: &[String]| -> Vec<String> {
+        call.windows(2)
+            .filter(|w| w[0].starts_with("--") && w[0] != "--env")
+            .map(|w| format!("{}={}", w[0], w[1]))
+            .collect()
+    };
+    let first = scoped_flags(recover_calls[0]);
+    assert!(first.iter().all(|f| !f.starts_with("--slug")));
+    assert_eq!(first.iter().filter(|f| f.starts_with("--branch")).count(), 1);
+    let second = scoped_flags(recover_calls[1]);
+    assert!(second.iter().any(|f| f.starts_with("--slug")));
+    for call in recover_calls.iter() {
+        let call: &[String] = call;
+        assert!(call.iter().any(|a| a == "--discard"));
+        assert!(call
+            .windows(2)
+            .any(|w| w[0] == "--branch" && w[1] == "feature/issue-7"));
+        assert!(call.windows(2).any(|w| w[0] == "--issue" && w[1] == "7"));
+        assert!(call.windows(2).any(|w| w[0] == "--base" && w[1] == "main"));
+    }
+    // The exec ran with the same repository-scoped auth context a job uses:
+    // each clone's credential scope is set on its own exec.
+    let scope_of = |call: &Vec<String>| -> Option<String> {
+        call.windows(2)
+            .find(|w| w[0] == "--env" && w[1].starts_with("LOOM_PRIVATE_REPOSITORY="))
+            .map(|w| w[1].clone())
+    };
+    assert_eq!(
+        scope_of(recover_calls[0]).as_deref(),
+        Some("LOOM_PRIVATE_REPOSITORY=https://forge.example/a/b")
+    );
+    assert_eq!(
+        scope_of(recover_calls[1]).as_deref(),
+        Some("LOOM_PRIVATE_REPOSITORY=https://forge.example/a/c")
+    );
+    // The lease went with the finished call; the account is not wedged.
+    drop(lease::Lease::acquire(&env.dir).unwrap());
+}
+
+#[test]
+#[serial]
+fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // A worker-side refusal surfaces with its message (#14030).
+    env.with(|e| {
+        e.recover_response = Some(
+            json!({"protocol": PROTOCOL, "error": "discard requires an explicit branch scope"})
+                .to_string(),
+        )
+    });
+    let error = recover_session(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        Some(7),
+        &["feature/issue-7".into()],
+    )
+    .unwrap_err();
+    assert!(message(&error).contains("explicit branch scope"), "{error:#}");
+
+    // A clone that was never materialized reports cloned=false and is
+    // skipped; a scoped action that acted nowhere is refused, not silent.
+    env.with(|e| {
+        e.recover_response = Some(
+            json!({
+                "protocol": PROTOCOL,
+                "outcome": {
+                    "repository": "https://forge.example/a/b",
+                    "cloned": false,
+                    "branches": [],
+                    "published": [],
+                    "discarded": [],
+                    "ignored": ["feature/issue-7"],
+                    "detached": []
+                }
+            })
+            .to_string(),
+        )
+    });
+    let error = recover_session(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        Some(7),
+        &["feature/issue-7".into()],
+    )
+    .unwrap_err();
+    assert!(message(&error).contains("no clone"), "{error:#}");
+    // The listing form never refuses on a no-op.
+    let report =
+        recover_session(env.workspace.path(), "alice", RecoverAction::List, None, &[]).unwrap();
+    assert!(!report.clones[0].cloned);
+    // An unscoped publish with nothing to publish succeeds quietly.
+    let report =
+        recover_session(env.workspace.path(), "alice", RecoverAction::Publish, None, &[]).unwrap();
+    assert!(report.clones[0].published.is_empty());
 }

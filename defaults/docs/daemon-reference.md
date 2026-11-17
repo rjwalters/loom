@@ -3301,11 +3301,7 @@ On a green `main` the marker grants nothing.
 `loom:very-important` issue is dispatched only once it is `loom:issue`, like
 everything else. No priority label exempts a candidate from any gate: the
 concurrency cap, the build back-off and the file-overlap gate
-defer it exactly like plain work. The per-host overflow slot
-(#9244) is inert: nothing is admitted over the cap, and `plan.slots.overflow_free`
-only reports whether an overflow sweep an older daemon started is still live
-(its `overflow: true` sweep record and claim-lock stamp are still honoured on
-adoption).
+defer it exactly like plain work.
 
 Neither priority label is a hold (`pr_latency::hold_labels` reads an explicit
 set, never a prefix match).
@@ -3463,8 +3459,7 @@ one warning naming the keys and otherwise ignores them. The
 Each multi-workspace tick records one row per ready `loom:issue` it listed, ranked
 by `candidate_cmp`, with what the tick did with it:
 
-- **running**: `dispatched` (detail `overflow` only from an older daemon's
-  over-limit sweep, #9244; the slot is inert since #11508), `in_flight`
+- **running**: `dispatched`, `in_flight`
 - **ready** (waiting on a limit): `deferred_capacity`, `deferred_build_backoff`
   (#9410), `deferred_file_overlap` (#9781). (`deferred_out_of_slice` is retired
   with the dispatch slice, #11682, and never emitted. `deferred_ramp_cap`,
@@ -3508,8 +3503,8 @@ observability export on, the queue also reaches SigNoz as
 (`running` / `next` / `queued` / `blocked`), `gate`, `keys` and
 `owning_shard` (`in_slice` is retired and absent since #11682; `hot` and
 `repo_cap` since #12406). The tick summary carries a `plan` block:
-`slots` (`max_concurrent`, `occupancy`, `free`, `any_halted`,
-`overflow_free`), `tick_interval_secs`, `shard`, `scope` and
+`slots` (`max_concurrent`, `occupancy`, `free`, `any_halted`),
+`tick_interval_secs`, `shard`, `scope` and
 `ordering`. `position` is the order pass 2 actually offered candidates in;
 `rank` is the bare comparator rank. `loom-daemon queue` shows
 `#<position> <plan_state>[/<gate>]` per row plus a `Plan:` slot line.

@@ -24,7 +24,7 @@ mod tests;
 pub mod transport;
 mod worker_setup;
 
-pub use lifecycle::{configured, recover, run_job, start, status, stop};
+pub use lifecycle::{configured, recover, run_job, session_recover, start, status, stop};
 pub use repository::WorkerCommand;
 
 use anyhow::{bail, Context, Result};
@@ -229,6 +229,60 @@ pub enum JobKind {
     Role,
     Sweep,
     Interactive,
+}
+
+/// What `accounts session recover` does with the unpublished branches it
+/// finds (#14030). `List` only reports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverAction {
+    List,
+    Publish,
+    Discard,
+}
+
+/// One branch whose tip is not reachable from `origin`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct UnpublishedBranch {
+    pub branch: String,
+    /// Commits on the branch no remote-tracking ref of `origin` reaches.
+    pub ahead: u64,
+}
+
+/// Unpublished commits stranded on a detached HEAD, here or in a linked
+/// worktree: no branch names them, so only a human (or the recover verb's
+/// publish/discard of a named branch) can make them safe again.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DetachedWork {
+    pub path: String,
+    pub revision: String,
+    pub ahead: u64,
+}
+
+/// One clone's recover outcome, as the in-container
+/// `private-workspace recover` verb reports it (#14030).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RecoverOutcome {
+    pub repository: String,
+    pub cloned: bool,
+    /// Branches still carrying unpublished commits after the action.
+    pub branches: Vec<UnpublishedBranch>,
+    /// Branches this call pushed to origin.
+    pub published: Vec<String>,
+    /// Branches this call deleted, with their unpublished commits.
+    pub discarded: Vec<String>,
+    /// Scoped branches this clone did not act on (absent, or nothing
+    /// unpublished to discard).
+    pub ignored: Vec<String>,
+    /// Detached HEADs still holding unreferenced unpublished work
+    /// (report-only: recover never touches them).
+    pub detached: Vec<DetachedWork>,
+}
+
+/// What one `accounts session recover` call did across the account's clones.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RecoverReport {
+    pub account: String,
+    pub clones: Vec<RecoverOutcome>,
 }
 
 fn account(workspace: &Path, name: &str) -> Result<super::account_registry::AccountDescriptor> {

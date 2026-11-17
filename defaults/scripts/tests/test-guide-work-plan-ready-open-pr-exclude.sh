@@ -37,6 +37,12 @@
 #   4. NEGATIVE CONTROL: the pre-fix (unfiltered) `ready` pipeline DOES
 #      include the open-linked-PR issue — i.e. this test would have failed
 #      before the fix.
+#   5. SELF-DESCRIPTION (#13928): the rendered artifact says the
+#      subtractions exist — the Ready blurb names all three (holds,
+#      `loom:building`, merge-pending), the Backlog Balance row is labelled
+#      net of them, an Approved PR bullet with non-empty
+#      `closingIssuesReferences` carries a `— closes #N` suffix, and a PR
+#      closing nothing renders unchanged (no annotation).
 #
 # Hermetic: `gh` is stubbed with fixture JSON; only the real `jq` binary is
 # invoked (skipped if unavailable) — no forge/network calls.
@@ -179,7 +185,9 @@ JSON
 # query would omit it.
 cat > "$FIX/pr-loom_pr.json" <<'JSON'
 [
-  {"number":8001,"title":"Fix for #7101","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[{"number":7101}]}
+  {"number":8001,"title":"Fix for #7101","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[{"number":7101}]},
+  {"number":8003,"title":"Chore PR closing nothing","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[]},
+  {"number":8004,"title":"Multi-close PR","labels":[{"name":"loom:pr"}],"closingIssuesReferences":[{"number":42},{"number":7}]}
 ]
 JSON
 
@@ -244,6 +252,60 @@ if grep -q '#7101' <<<"$PRE_READY"; then
     pass "without the exclusion, #7101 WOULD have rendered into Ready (#7083 bug reproduced)"
 else
     fail "expected the negative-control (unfiltered) query to include #7101"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 5 (#13928): the artifact self-describes the exclusions — the Ready
+# blurb names all three subtractions and the Backlog row is labelled net.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 5: Ready blurb and Backlog row name the exclusions (#13928)"
+
+BLURB_LINE="$(awk '/^## Ready/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER" | grep -m1 'Human-approved' || true)"
+if grep -q 'excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues closed by an open `loom:pr` PR (listed under Approved)' <<<"$BLURB_LINE"; then
+    pass "Ready blurb names all three subtractions (holds, building, merge-pending)"
+else
+    fail "Ready blurb still reads as a literal loom:issue count: '$BLURB_LINE'"
+fi
+
+if grep -q 'Ready (`loom:issue`, net of holds/building/merge-pending)' <<<"$RENDER"; then
+    pass "Backlog Balance row is labelled net of holds/building/merge-pending"
+else
+    fail "Backlog Balance row still reads as a bare loom:issue count"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 6 (#13928): Approved PR bullets carry the closes-graph — the single
+# fact that resolves the apparent Ready-count contradiction.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 6: Approved PR bullets annotate the issues they close (#13928)"
+
+if grep -q -- '- \*\*#8001\*\*: Fix for #7101 — closes #7101' <<<"$APPROVED_BODY"; then
+    pass "PR #8001 bullet annotates the issue it closes ('— closes #7101')"
+else
+    fail "expected '— closes #7101' on the #8001 bullet, got: $(grep '#8001' <<<"$APPROVED_BODY" || echo MISSING)"
+fi
+
+CLOSES_8003="$(grep '#8003' <<<"$APPROVED_BODY" || true)"
+if [[ -n "$CLOSES_8003" ]] && ! grep -q 'closes' <<<"$CLOSES_8003"; then
+    pass "PR #8003 (empty closingIssuesReferences) renders unchanged — no annotation"
+else
+    fail "PR #8003 (no closing refs) should render without an annotation, got: '$CLOSES_8003'"
+fi
+
+if grep -q -- '- \*\*#8004\*\*: Multi-close PR — closes #7, #42' <<<"$APPROVED_BODY"; then
+    pass "PR #8004 closing two issues annotates them sorted ('— closes #7, #42')"
+else
+    fail "expected a sorted multi-issue annotation on #8004, got: $(grep '#8004' <<<"$APPROVED_BODY" || echo MISSING)"
+fi
+
+APPROVED_LINE="$(grep -A1 '^  approved=\$(printf' <<<"$RPB_BODY")"
+if grep -q '^  approved=\$(printf .%s. "\$approved_json"' <<<"$APPROVED_LINE" \
+   && grep -q 'closingIssuesReferences' <<<"$APPROVED_LINE"; then
+    pass "approved= derives its closes suffix from \$approved_json (no new forge query)"
+else
+    fail "expected approved= to read closingIssuesReferences from \$approved_json"
 fi
 
 # ---------------------------------------------------------------------------
