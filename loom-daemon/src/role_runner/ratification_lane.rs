@@ -19,7 +19,10 @@
 //! `<!-- ratify:key=<ee|market> sha=<40-hex head> -->`. A PR is skipped only
 //! when **both** keys carry a marker for its current head, from a trusted
 //! comment author (the source returns trusted comments only; a marker from an
-//! untrusted author is prose, `.loom/docs/comment-trust.md`).
+//! untrusted author is prose, `.loom/docs/comment-trust.md`). A marker is
+//! posted only when the session's output parses as that key's review
+//! ([`parse_review`], #13762): a session that stops without a verdict posts
+//! nothing, so its head stays marker-less and is selected again.
 
 use crate::champion_hold::ratification::{self, ChangedFile, Comment, Verdict};
 use regex::Regex;
@@ -336,15 +339,95 @@ impl Key {
             Key::Market => "market",
         }
     }
+
+    /// The heading that starts this key's review in the reviewer's final
+    /// message (the pinned output contract, #13762).
+    #[must_use]
+    pub fn review_heading(self) -> &'static str {
+        match self {
+            Key::Ee => "## EE-key review:",
+            Key::Market => "## Market-key review:",
+        }
+    }
+
+    /// The verdict tokens this key's review may carry.
+    #[must_use]
+    pub fn allowed_tokens(self) -> &'static [&'static str] {
+        match self {
+            Key::Ee => &["approve", "request-changes"],
+            Key::Market => &[
+                "competitive",
+                "adequate-for-catalog",
+                "uncompetitive",
+                "escalate",
+            ],
+        }
+    }
+}
+
+/// A key review parsed from a reviewer session's output (#13762).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedReview {
+    /// The verdict token from the `**Overall verdict:**` line.
+    pub token: String,
+    /// The review text: from the key's heading (its last occurrence in the
+    /// session output) to the end of the output.
+    pub text: String,
+}
+
+/// Extract this key's review from a reviewer session's output. The heading
+/// ([`Key::review_heading`]) is the start delimiter: the review runs from its
+/// **last** occurrence in `output` to the end, so launcher or wrapper noise
+/// before it is never read as a verdict or posted. A verdict is the first
+/// word after the colon on an `**Overall verdict:**` line (terminated by a
+/// comma or whitespace) and must be one of [`Key::allowed_tokens`]. Anything
+/// else — no heading, no verdict line, an empty, unknown or conflicting
+/// token — is an `Err` whose reason the lane logs as withheld.
+pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, String> {
+    let heading = key.review_heading();
+    let Some(at) = output.rfind(heading) else {
+        return Err(format!("no {heading} heading in session output"));
+    };
+    let start = output[..at].rfind('\n').map_or(0, |i| i + 1);
+    let review = output[start..].trim_end();
+    const VERDICT_LINE: &str = "**Overall verdict:**";
+    let mut token: Option<String> = None;
+    for line in review.lines() {
+        let Some(rest) = line.trim_start().strip_prefix(VERDICT_LINE) else {
+            continue;
+        };
+        let t: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| *c != ',' && !c.is_whitespace())
+            .collect();
+        if t.is_empty() {
+            return Err(format!("empty verdict token on an {VERDICT_LINE} line"));
+        }
+        match &token {
+            Some(prev) if *prev != t => {
+                return Err(format!("conflicting verdict tokens {prev:?} and {t:?}"));
+            }
+            _ => token = Some(t),
+        }
+    }
+    let token = token.ok_or_else(|| format!("no {VERDICT_LINE} line after {heading}"))?;
+    if !key.allowed_tokens().contains(&token.as_str()) {
+        return Err(format!("unknown verdict token {token:?}"));
+    }
+    Ok(ParsedReview {
+        token,
+        text: review.to_string(),
+    })
 }
 
 /// The comment body for one key: the wire marker (exactly the shape
 /// [`keys_marked`] parses), then a visible `reviewer=` line. `head_sha` is the
 /// head captured at selection time, never re-read.
 ///
-/// `verdict` is the tail of the session's output (#13502), appended after the
-/// marker line. It is bounded to [`MAX_VERDICT_CHARS`] (keeping the end, with
-/// an explicit truncation notice) and its `<!--` / `-->` are escaped so it can
+/// `verdict` is the extracted review text (#13762), appended after the marker
+/// line. It is bounded to [`MAX_VERDICT_CHARS`] (keeping the end, with an
+/// explicit truncation notice) and its `<!--` / `-->` are escaped so it can
 /// never form or alter a marker that [`keys_marked`] would parse.
 #[must_use]
 pub fn marker_body(key: Key, head_sha: &str, reviewer: &str, verdict: Option<&str>) -> String {
@@ -382,9 +465,11 @@ pub enum KeyPost {
 }
 
 /// Post a marker for each key whose session ended in
-/// `KeyOutcome::Ran(RoleTickOutcome::Success)`. Anything else (not launched,
-/// or a session that ran but did not succeed) posts nothing: fail closed. One
-/// key's outcome never affects the other.
+/// `KeyOutcome::Ran(RoleTickOutcome::Success)` **and** whose output parses as
+/// that key's review ([`parse_review`]) — a session that stops without a
+/// verdict posts nothing (#13762). Anything else (not launched, a session
+/// that ran but did not succeed, or no parsed verdict) posts nothing: fail
+/// closed. One key's outcome never affects the other.
 pub fn post_markers(
     pr: u64,
     head_sha: &str,
@@ -397,10 +482,24 @@ pub fn post_markers(
         .into_iter()
         .map(|key| {
             let result = match dispatched.get(key) {
-                KeyOutcome::Ran(RoleTickOutcome::Success) => sink
-                    .post(pr, &marker_body(key, head_sha, role_name(key), dispatched.output(key)))
-                    .map(|()| KeyPost::Posted)
-                    .unwrap_or_else(|e| KeyPost::Withheld(format!("marker post failed: {e}"))),
+                KeyOutcome::Ran(RoleTickOutcome::Success) => {
+                    let parsed = dispatched
+                        .output(key)
+                        .ok_or_else(|| "no session output captured".to_string())
+                        .and_then(|out| parse_review(key, out));
+                    match parsed {
+                        Ok(review) => sink
+                            .post(
+                                pr,
+                                &marker_body(key, head_sha, role_name(key), Some(&review.text)),
+                            )
+                            .map(|()| KeyPost::Posted)
+                            .unwrap_or_else(|e| {
+                                KeyPost::Withheld(format!("marker post failed: {e}"))
+                            }),
+                        Err(reason) => KeyPost::Withheld(reason),
+                    }
+                }
                 KeyOutcome::Ran(other) => {
                     KeyPost::Withheld(format!("session did not succeed: {other:?}"))
                 }
