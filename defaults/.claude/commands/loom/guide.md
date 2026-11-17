@@ -2505,6 +2505,58 @@ create_docs_pr() {
     git -C "$DOCS_WT" add -- "work_log/${archive_file##*/}"
   done
 
+  # Post-stage hook (#13892): a consuming repo can place any of the files this
+  # function stages under a CI integrity check satisfiable only by staging an
+  # additional, tool-produced file in the same PR (e.g. a freshness envelope
+  # pinning content hashes). The tick's fixed staging set cannot produce that
+  # file, so the arbitration surface is this hook: if the repo provides an
+  # executable script at `.loom/docs-post-stage.sh`, run it now — cwd is the
+  # docs worktree and `$DOCS_WT` is exported — AFTER the staging above and
+  # BEFORE the `diff --cached` snapshot below, so anything it adds lands in
+  # DOCS_CHANGED_FILES telemetry. The script prints the paths to stage, one
+  # per line, worktree-relative; EACH is staged by exact path — never
+  # `git add -A`, and nothing it modified without printing is staged, so the
+  # hook cannot silently widen the PR's file set. No script ⇒ behaviour
+  # identical to a repo without the hook. ANY failure — exists but not
+  # executable, non-zero exit, a printed path that is absolute, contains
+  # `..`, or cannot be staged — is fail-closed: discard the staged diff,
+  # release the lock, and abort the tick WITHOUT opening a PR, because the PR
+  # would just fail the repo's integrity check anyway. The repo that places a
+  # tick-staged file under an integrity check owns the recovery (regenerate +
+  # print the covered file); this tick only carries it.
+  local hook_script="$DOCS_WT/.loom/docs-post-stage.sh"
+  if [ -e "$hook_script" ]; then
+    if [ ! -f "$hook_script" ] || [ ! -x "$hook_script" ]; then
+      echo "Docs post-stage hook .loom/docs-post-stage.sh exists but is not an executable regular file — failing closed: no docs PR this tick. chmod +x it or remove it; the next tick retries." >&2
+      git -C "$DOCS_WT" reset --hard HEAD
+      ./.loom/scripts/docs-guide-lock.sh release
+      return 1
+    fi
+    local hook_output hook_rc hook_path
+    hook_output="$(cd "$DOCS_WT" && DOCS_WT="$DOCS_WT" "$hook_script")" && hook_rc=0 || hook_rc=$?
+    if [ "$hook_rc" -ne 0 ]; then
+      echo "Docs post-stage hook exited $hook_rc — failing closed: discarding this tick's staged docs diff, no docs PR. Fix .loom/docs-post-stage.sh; the next tick retries." >&2
+      git -C "$DOCS_WT" reset --hard HEAD
+      ./.loom/scripts/docs-guide-lock.sh release
+      return 1
+    fi
+    while IFS= read -r hook_path; do
+      [ -n "$hook_path" ] || continue
+      if [[ "$hook_path" = /* || "$hook_path" == *..* ]]; then
+        echo "Docs post-stage hook printed an unsafe path ('$hook_path') — only worktree-relative paths without '..' are staged. Failing closed: no docs PR this tick." >&2
+        git -C "$DOCS_WT" reset --hard HEAD
+        ./.loom/scripts/docs-guide-lock.sh release
+        return 1
+      fi
+      if ! git -C "$DOCS_WT" add -- "$hook_path"; then
+        echo "Docs post-stage hook printed '$hook_path' but it could not be staged (missing? outside the worktree?). Failing closed: no docs PR this tick." >&2
+        git -C "$DOCS_WT" reset --hard HEAD
+        ./.loom/scripts/docs-guide-lock.sh release
+        return 1
+      fi
+    done <<< "$hook_output"
+  fi
+
   # Snapshot which of the three files actually changed, for the telemetry
   # record below (issue #6136) — captured now, before the `diff --cached`
   # check below consumes the staged diff.
@@ -2598,18 +2650,23 @@ Automated document maintenance by the Guide triage agent.
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
 - **WORK_PLAN.md**: Regenerated roadmap from current GitHub label state
 - **README.md**: Updated if architectural changes were detected
+- Plus any files reported by the repo's `.loom/docs-post-stage.sh` hook, if installed (e.g. a regenerated freshness envelope)
 
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
 See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
 
-This PR only ever stages `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
-`create_docs_pr()`'s `git add` above), so it always qualifies for the
-docs-only fast path (rjwalters/loom#6134) Judge and Champion apply to any PR
-whose changed-file list matches that exact set. The `<!-- loom:docs-only-fast-path -->`
-marker above is informational only — Judge and Champion never trust it (or
-this section's prose) and always re-derive the changed-file list themselves
-from the paginated files API before taking the fast path.
+This PR normally stages only `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
+`create_docs_pr()`'s `git add` above), so it qualifies for the docs-only fast
+path (rjwalters/loom#6134) Judge and Champion apply to any PR whose
+changed-file list matches that exact set — EXCEPT when the repo's
+`.loom/docs-post-stage.sh` hook (rjwalters/loom#13892) reported additional
+files (e.g. a regenerated integrity envelope): those land in the same PR,
+which simply falls off the fast path to a full review. The
+`<!-- loom:docs-only-fast-path -->` marker above is informational only —
+Judge and Champion never trust it (or this section's prose) and always
+re-derive the changed-file list themselves from the paginated files API
+before taking the fast path.
 
 ---
 *Automated by Guide role - document maintenance phase*
@@ -2650,6 +2707,47 @@ PRBODY
 }
 ```
 
+#### Post-stage hook (optional, repo-provided) — #13892
+
+`create_docs_pr()` supports one arbitration surface for a conflict the tick
+cannot resolve on its own: a repo that places a tick-staged file (`WORK_LOG.md`,
+`WORK_PLAN.md`, `README.md`, a `work_log/` archive) under a CI integrity check
+that is only satisfiable by staging an additional, tool-produced file in the
+same PR — for example a freshness envelope pinning content hashes. The tick's
+staging set is fixed and cannot be widened or narrowed by the tick, so without
+this hook such a PR could never be made green by the tick that opened it. The
+repo that installs the integrity check **owns the recovery**; this hook is how
+it expresses it.
+
+- **Path**: `.loom/docs-post-stage.sh`, relative to the repo root (committed,
+  so it is present in the docs worktree). Deliberately NOT under
+  `.loom/scripts/` or `.loom/hooks/` — both are resync-refreshed Loom-shipped
+  surfaces; a repo-provided hook there could be overwritten or orphaned by a
+  resync.
+- **When it runs**: whenever Step 5 stages, after the fixed staging set and the
+  `work_log/` archive loop and BEFORE the `diff --cached` check — so anything
+  it adds is included in `DOCS_CHANGED_FILES` telemetry and counted by the
+  nothing-to-commit early return.
+- **Contract**: run with cwd = the docs worktree and `$DOCS_WT` exported
+  (absolute worktree path). Exit `0` = success. On stdout it prints the paths
+  to stage, one per line, worktree-relative (blank lines ignored). Each
+  printed path is staged by exact path — never `git add -A`, and nothing the
+  hook modified without printing is staged, so the hook cannot silently widen
+  the PR's file set. (A hook that stages with `git add` itself also works —
+  the `diff --cached` check sees it — but the printed-path contract above is
+  the supported interface.)
+- **Fail-closed**: any failure aborts the tick before commit/push — no PR is
+  opened, the staged diff is discarded (`reset --hard`), the docs-guide lock
+  is released, and the tick's output says so. Failure means: the file exists
+  but is not an executable regular file; a non-zero exit; a printed path that
+  is absolute or contains `..` (paths must resolve inside the worktree); or a
+  printed path that cannot be staged. Aborting beats shipping, because the PR
+  would fail the repo's integrity check anyway; the next tick retries.
+- **No script** ⇒ behaviour byte-identical to a repo without the hook.
+- **Review impact**: a PR carrying hook-produced files falls off the docs-only
+  fast path (rjwalters/loom#6134) to a full review — by design; Judge and
+  Champion re-derive eligibility from the PR's own file list.
+
 ### Document Maintenance Summary
 
 The full document maintenance flow runs at the end of each triage cycle:
@@ -2668,6 +2766,11 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
+  │    ├─ Stage the fixed set + archives, then the post-stage hook (#13892):
+  │    │    run .loom/docs-post-stage.sh if the repo provides it, stage the
+  │    │    worktree-relative paths it prints by exact path; ANY failure is
+  │    │    fail-closed (diff discarded, lock released, no PR) — see
+  │    │    "Post-stage hook" above for the full contract
   │    ├─ Token-pool pressure check (#6135): if the pool is under pressure
   │    │    AND the max-defer ceiling has not elapsed, discard the local diff,
   │    │    release the lock, and defer to a later tick instead of filing
