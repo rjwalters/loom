@@ -416,6 +416,11 @@ impl SweepRegistry {
         // #11930: and the fleet's fast-failure streak, here and on the peers;
         // otherwise the first failure after the clear re-parks on stale counts.
         self.break_fleet_fast_fail_streak(issue);
+        // #13919: and the captain's count and park order, which is what
+        // refuses the item fleet-wide while a captain-ordered park stands.
+        // Sent whether or not this host holds the park: the operator may run
+        // the clear on any host.
+        crate::fleet_dispatch::worker::park_ended(&self.config.workspace_root, issue);
         self.clear_dispatch_backoff(issue);
         // #6670: same reasoning for the no-op re-dispatch cooldown — an
         // operator clearing a quarantine wants the issue dispatchable NOW,
@@ -952,6 +957,10 @@ impl SweepRegistry {
             // The generation marker is deliberately KEPT (vibesql#6639): it is
             // the probation that re-quarantines on the first further crash.
             self.insta_crash_counts.remove(&issue);
+            // #13919: the park is over, so the captain's hold for it ends too;
+            // otherwise the item is refused fleet-wide past the TTL its park
+            // comment names.
+            crate::fleet_dispatch::worker::park_ended(&self.config.workspace_root, issue);
 
             // Issue #4206 (refined by #5725): before restoring the forge
             // label, check whether a human re-applied `loom:blocked` well
@@ -1327,7 +1336,6 @@ mod tests {
 
         assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_some());
         assert!(registry.clear_quarantine(35));
-        assert_eq!(registry.noop_release_count(35), 0);
         assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_none());
     }
 

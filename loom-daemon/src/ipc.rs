@@ -3378,7 +3378,10 @@ fn handle_request(
                 );
             }
             sr.record_noop_release(issue, reason);
-            let consecutive = sr.noop_release_count(issue);
+            // Issue #13861: report the durable hold streak — the count that
+            // actually drives parking (#10156) — not a cooldown-record
+            // counter. `0` when the hold could not read the issue (fail-open).
+            let consecutive = sr.noop_streak_count(issue);
             let cooldown_secs = sr
                 .noop_cooldown_remaining(issue, Utc::now())
                 .map(|d| d.as_secs());

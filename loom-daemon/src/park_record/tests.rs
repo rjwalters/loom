@@ -475,3 +475,140 @@ fn markers_in_indented_quoted_or_multiline_code_are_not_records() {
     let body = "para\n    <!-- loom:park Blocked by: #7 -->\n";
     assert_eq!(blockers(body), n(&[7]));
 }
+
+// --- park-record retract (#13895) ------------------------------------------
+
+#[test]
+fn demotion_hides_the_blocker_and_keeps_the_marker_text_verbatim() {
+    let marker = render(&rec(11));
+    let body = format!("Body text.\n\n{marker}\n");
+    let (out, count) = demote_blocker(&body, &BlockerRef::local(11)).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(blockers(&out), Vec::<BlockerRef>::new(), "{out}");
+    assert!(parse(&out).is_empty(), "{out}");
+    // The marker's own bytes are unchanged — only the backticks were added.
+    assert!(out.contains(&marker), "{out}");
+    assert_eq!(out.replace('`', ""), body, "only backticks inserted");
+}
+
+#[test]
+fn demotion_is_a_noop_without_a_live_marker_for_the_ref() {
+    let body = "no records here\n";
+    let (out, count) = demote_blocker(body, &BlockerRef::local(11)).unwrap();
+    assert_eq!((out.as_str(), count), (body, 0));
+
+    // Already demoted: the marker is inside a code span, so not live.
+    let demoted = format!("`{}`\n", render(&rec(11)));
+    let (out, count) = demote_blocker(&demoted, &BlockerRef::local(11)).unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(out, demoted);
+}
+
+#[test]
+fn a_marker_inside_a_fence_is_not_demoted() {
+    let body = format!("```\n{}\n```\n", render(&rec(11)));
+    let (out, count) = demote_blocker(&body, &BlockerRef::local(11)).unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(out, body);
+}
+
+#[test]
+fn a_multi_reference_marker_is_refused_not_split() {
+    let body = "<!-- loom:park Blocked by: #11, #12 by=builder -->\n";
+    let others = demote_blocker(body, &BlockerRef::local(11)).unwrap_err();
+    assert_eq!(others, n(&[12]), "the other blockers, not the target");
+    // And symmetrically from #12's side.
+    assert_eq!(demote_blocker(body, &BlockerRef::local(12)).unwrap_err(), n(&[11]));
+}
+
+#[test]
+fn demotion_keeps_the_other_records_live() {
+    let body = format!("{}\n{}\n", render(&rec(11)), render(&rec(12)));
+    let (out, count) = demote_blocker(&body, &BlockerRef::local(11)).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(blockers(&out), n(&[12]), "{out}");
+}
+
+#[test]
+fn a_demoted_marker_whose_reason_holds_a_backtick_stays_hidden() {
+    let marker = render(&ParkRecord {
+        blocker: Some(BlockerRef::local(11)),
+        by: Some("doctor".to_string()),
+        at: None,
+        reason: Some("the ` flag".to_string()),
+        transient: None,
+    });
+    let body = format!("{marker}\n");
+    let (out, count) = demote_blocker(&body, &BlockerRef::local(11)).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(blockers(&out), Vec::<BlockerRef>::new(), "{out}");
+    assert!(out.contains(&marker), "{out}");
+}
+
+#[test]
+fn the_withdrawn_audit_line_round_trips() {
+    let line = render_withdrawn(
+        &BlockerRef::local(8860),
+        Some("guide"),
+        "2026-11-15T12:00:00Z",
+        "ruling: #8860 is a follow-up, not a gate",
+    );
+    assert!(line.starts_with(WITHDRAWN_PHRASE), "{line}");
+    assert!(!line.contains(RENDERED_PHRASE), "no `Blocked by` in: {line}");
+    let w = parse_withdrawn(&line).unwrap();
+    assert_eq!(w.blocker, BlockerRef::local(8860));
+    assert_eq!(w.by.as_deref(), Some("guide"));
+    assert_eq!(w.at.as_deref(), Some("2026-11-15T12:00:00Z"));
+    assert_eq!(w.reason.as_deref(), Some("ruling: #8860 is a follow-up, not a gate"));
+    assert_eq!(withdrawn(&line), vec![w]);
+}
+
+#[test]
+fn the_withdrawn_audit_line_handles_a_qualified_ref_and_a_hazardous_reason() {
+    let target = q("example-org/tool-repo", 202);
+    let line = render_withdrawn(
+        &target,
+        Some("curator"),
+        "2026-11-15T12:00:00Z",
+        "see \"o/r#77\" and --force",
+    );
+    assert!(line.contains("Park withdrawn: example-org/tool-repo#202"), "{line}");
+    // Sanitised like a park record: no `"` inside the value, no `--` run that
+    // could end a comment.
+    let w = parse_withdrawn(&line).unwrap();
+    assert!(!w.reason.as_deref().unwrap().contains('"'), "{line}");
+    assert!(!line.contains("--"), "{line}");
+    assert_eq!(w.blocker, target, "{line}");
+    // The `#77` inside the reason is a mention, not the withdrawn ref.
+    assert_ne!(w.blocker, q("o", 77));
+}
+
+#[test]
+fn the_audit_line_is_not_a_park_record() {
+    let line =
+        render_withdrawn(&BlockerRef::local(5), Some("guide"), "2026-11-15T12:00:00Z", "why");
+    assert!(parse(&format!("{line}\n")).is_empty(), "{line}");
+    let body = format!("{}\n{line}\n", render(&rec(5)));
+    assert_eq!(withdrawn(&body).len(), 1);
+    assert_eq!(blockers(&body), n(&[5]), "the audit line declares nothing");
+}
+
+#[test]
+fn a_demoted_line_is_skipped_by_the_shell_park_grep() {
+    // The shape the unblock sweep's grep sees: the demoted line no longer
+    // starts with the sentinel, so the line-anchored grep skips it.
+    let (out, _) = demote_blocker(
+        &format!("{}\n{}\n", render(&rec(11)), render(&rec(12))),
+        &BlockerRef::local(11),
+    )
+    .unwrap();
+    let stage1_park = Regex::new(r"^[[:space:]]*<!-- loom:park [*_:[:space:]]*Blocked by")
+        .expect("static test pattern");
+    let matched: Vec<&str> = out.lines().filter(|l| stage1_park.is_match(l)).collect();
+    assert_eq!(matched.len(), 1, "{out}");
+    assert!(matched[0].contains(" #12 "), "only #12's marker may match: {}", matched[0]);
+    // The audit line itself must not match the generic dependency patterns.
+    let audit =
+        render_withdrawn(&BlockerRef::local(11), Some("guide"), "2026-11-15T12:00:00Z", "why");
+    assert!(!shell_stage1().is_match(&audit), "{audit}");
+}
