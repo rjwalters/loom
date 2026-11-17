@@ -202,6 +202,7 @@ test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-labels-block.sh
 test-resync-installed-local-fix-guard.sh
+test-resync-installed-manifest-prune.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-retired-migrate.sh
 test-resync-installed-dogfood-symlink.sh
