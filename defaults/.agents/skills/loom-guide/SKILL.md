@@ -2020,7 +2020,7 @@ exists:
 # Work Plan
 
 Backlog snapshot from current GitHub label state, maintained by the Guide role.
-Direction lives in the hand-written roadmap: [ROADMAP](ROADMAP.md).
+Direction lives in the hand-written roadmap: `ROADMAP.md`.
 
 The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. Date the snapshot with `git log -1 -- WORK_PLAN.md`.
 
@@ -2028,8 +2028,10 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 ```
 
 The "Direction lives…" line is included **only** when a roadmap file exists,
-and the link target is the file actually found — `ROADMAP.md`,
-`docs/ROADMAP.md`, or `docs/roadmap.md`, as a repo-root-relative path. With no
+and the generated WORK_PLAN.md links the file actually found — `ROADMAP.md`,
+`docs/ROADMAP.md`, or `docs/roadmap.md`, as a repo-root-relative path. The
+fence shows the path backticked only because this role file must not carry a
+link that dangles in repos without a roadmap. With no
 roadmap, omit that line entirely. Keep this preamble wording in lockstep with
 the WORK_PLAN.md template in `defaults/.claude/commands/loom/imagine.md` (the
 bootstrap seed uses the same distinction).
