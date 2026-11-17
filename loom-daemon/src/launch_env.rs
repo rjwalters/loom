@@ -14,7 +14,9 @@
 //! preference marker #8599 carries to the child — without growing either
 //! dispatch surface. #8602 reuses the same seam to pin a profile-pinned tap's
 //! `modelProfile` (`LOOM_MODEL_PROFILE`), rather than re-duplicating the
-//! block a third time.
+//! block a third time; #13965 pins the daemon's registered primary root
+//! (`LOOM_MACHINE_CHECKOUT`) so a dispatched child on a pristine fleet host
+//! can still find the refreshed owner dir.
 //!
 //! # Why the marker travels in the environment
 //!
@@ -52,6 +54,19 @@ pub fn apply_launch_env(cmd: &mut Command, admission: Option<&ResolvedRuntime>, 
     let Some(admission) = admission else {
         return;
     };
+    // #13965: hand the child the daemon's registered primary root when this
+    // process env names none. A pristine `fleet add-worker` unit renders only
+    // `PATH` and `LOOM_DAEMON_SUPERVISOR` (`unit_env_tests::STRUCTURAL`), so
+    // without this pin nothing downstream of the child — the agent session,
+    // its `session-exec host` exec — can find the owner dir the daemon's
+    // refresh tick keeps fresh, and the exec falls back to a managed repo's
+    // never-refreshed copy (the #13933 `HTTP 401`). A path only, never a
+    // token; a unit/operator-provided value is inherited untouched.
+    pin_primary_root(
+        cmd,
+        std::env::var_os("LOOM_MACHINE_CHECKOUT").as_deref(),
+        crate::credential_preflight::primary_workspace_root().as_deref(),
+    );
     cmd.env("LOOM_RUNTIME", &admission.runtime);
     cmd.env("LOOM_ROLE", &admission.role);
     // #12207: the agent `gh` front's read routing (the gateway profiles and
@@ -94,6 +109,24 @@ fn apply_vars(cmd: &mut Command, vars: Vec<(&'static str, Option<std::ffi::OsStr
             Some(v) => cmd.env(key, v),
             None => cmd.env_remove(key),
         };
+    }
+}
+
+/// The primary-root pin (#13965): export the daemon's registered root as
+/// `LOOM_MACHINE_CHECKOUT` when `process` names none. An empty value is as
+/// good as absent (the same filter `forge_auth::primary_root` applies); a
+/// non-empty one — a unit re-rendered in machine mode, an operator export —
+/// stands and is never overridden.
+fn pin_primary_root(
+    cmd: &mut Command,
+    process: Option<&std::ffi::OsStr>,
+    registered: Option<&std::path::Path>,
+) {
+    if process.is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    if let Some(root) = registered {
+        cmd.env("LOOM_MACHINE_CHECKOUT", root);
     }
 }
 
@@ -154,6 +187,46 @@ mod tests {
                 Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))
             })
             .collect()
+    }
+
+    /// #13965: the primary-root pin. A pristine fleet unit's env carries no
+    /// `LOOM_MACHINE_CHECKOUT` (`unit_env_tests::STRUCTURAL`), so the
+    /// daemon's registered root is the only source a dispatched child — and,
+    /// under it, a `session-exec host` — has. A non-empty process-env value
+    /// (a unit re-rendered in machine mode, an operator export) stands and is
+    /// never overridden; an empty one is as good as absent.
+    #[test]
+    fn the_primary_root_is_pinned_only_when_the_process_env_names_none() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        let pinned = |process: Option<&OsStr>, registered: Option<&Path>| {
+            let mut cmd = Command::new("/bin/true");
+            pin_primary_root(&mut cmd, process, registered);
+            env_of(&cmd)
+                .iter()
+                .find(|(name, _)| name == "LOOM_MACHINE_CHECKOUT")
+                .map(|(_, value)| value.clone())
+        };
+
+        // Nothing in the process env, a registered root: pinned.
+        assert_eq!(
+            pinned(None, Some(Path::new("/machine/checkout"))).as_deref(),
+            Some("/machine/checkout")
+        );
+        // An empty value is as good as absent.
+        assert_eq!(
+            pinned(Some(OsStr::new("")), Some(Path::new("/machine/checkout"))).as_deref(),
+            Some("/machine/checkout")
+        );
+        // A process-env value stands: no explicit pin, the child inherits it
+        // (`get_envs` reports only explicit overrides, never inherited vars).
+        assert_eq!(
+            pinned(Some(OsStr::new("/unit/value")), Some(Path::new("/machine/checkout"))),
+            None
+        );
+        // No registered root (a CLI process): pin nothing.
+        assert_eq!(pinned(None, None), None);
     }
 
     #[test]

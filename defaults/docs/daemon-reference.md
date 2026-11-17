@@ -2527,7 +2527,13 @@ blocker is Loom-owned:
   (a repo-local role file under `.loom/roles/` or a repo-local command under
   `.claude/commands/loom/`) does not,
   and a `.agents/skills/` file also needs the generation marker. A path pinned in `.loom/resync-ignore` (also as
-  `agents-skills/<rel>`) is never counted that way. A checkout on a named
+  `agents-skills/<rel>`) is never counted that way. One working-tree
+  exception (#13970): a dirty `opencode.json` — committed by the squad
+  installer, not Loom — whose working file is exactly the committed one plus
+  the single `"$schema": "https://opencode.ai/config.json"` entry OpenCode
+  adds is counted as Loom-owned, so the repair clears it automatically; any
+  other change to that file, and every committed change to it, still holds
+  for the operator. A checkout on a named
   branch other than the default is left alone. Every local commit (and every commit
   of an in-progress rebase, merge or cherry-pick) may change only those paths,
   and so may every dirty tracked path. Dirt counts only on a checkout that is
@@ -3922,6 +3928,27 @@ daemon output. `post_init.rs`'s
 `every_daemon_state_path_is_ignored_by_the_managed_block` test checks both
 rules with `git check-ignore`.
 
+## Daily-rolling `daemon.log` (#13917)
+
+The daemon always writes to the fixed name `daemon.log` (`LOOM_DAEMON_LOG`
+overrides the path), so `tail -f` / `grep daemon.log` keep working. Closed UTC
+days are renamed to `daemon.log.YYYY-MM-DD`; each file holds one UTC day
+(line stamps are UTC, `DAEMON_LOG_STAMP_FORMAT`).
+
+- **Roll:** the first write after 00:00 UTC, and at startup for a live file last
+  modified on an earlier UTC day. A name collision (or the 1 GiB size backstop)
+  yields `daemon.log.YYYY-MM-DD.N`; an existing day file is never overwritten.
+  A time-window reader opens only the day files it needs.
+- **Retention:** by days from the filename date, default 14,
+  `LOOM_DAEMON_LOG_RETENTION_DAYS`.
+- **Archive hook:** with `LOOM_DAEMON_LOG_REQUIRE_ARCHIVE=1`, retention deletes a
+  day file only when its sidecar `<day file>.archived` exists (created by the
+  host's archiver), and removes the pair. Unset: plain age-based deletion.
+- **Legacy files:** numbered `daemon.log.N` from the old startup rotation are
+  never touched; an operator removes them once.
+- `loom-daemon health` reads the newest day file when the live file has no
+  `work_finder:` line (right after a roll).
+
 ## Reaper task
 
 The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
@@ -4297,6 +4324,7 @@ merges of `main`, two rebases — all six with byte-identical patches.
 | Property | Behavior |
 |----------|----------|
 | CI is never exempted | Only the **review** carries over. Every required check re-runs against the new head, whichever kind applied. Nothing in `verdict_equivalence` touches a check, a status, or an auto-merge arm. |
+| A CI-gate-only verdict is never re-anchored (#13822) | Equivalence asks "is this the same change?", which is the wrong question for a verdict that reviewed no change. A `loom:changes-requested` whose newest trusted verdict comment carries `<!-- loom:ci-gate-only -->` or the `Changes Requested - CI Failing` header is **not** carried forward across an equivalent head move — `handle_invalidate` falls through to the ordinary stale-verdict clear, so the PR returns to `loom:review-requested` (and loses `loom:ci-failure`) and a Judge is queued. Its one requested change *is* the head move, so re-anchoring preserved a rejection whose remedy had already been applied, and then stranded the PR: `ci_gate_recovery` read the marker-less re-anchor comment as `VerdictNotCiOnly` and `forge doctor-handback` read the same-head marker as a fresh rejection (exit 13 `RACED`). Observed on PR #13593. An **approved** verdict is unaffected and pays no extra read; a `changes-requested` verdict that carries a real review re-anchors as before; and "cannot classify it" (comments unreadable, no `changes-requested` marker left) clears, the same direction `Indeterminate` fails. The predicate is `ci_gate_recovery::is_ci_only_verdict`, shared with that pass so the two cannot drift. |
 | Kill switches | `LOOM_VERDICT_TREE_CARVEOUT` (`0`/`false`/`no`/`off`) disables **all three** kinds; `LOOM_VERDICT_EQUIVALENCE` is nested inside it and disables only #9416's `clean-merge` and `rebase-patch-identical`, leaving the `tree` kind in place. Both are read inside the shared module, so both paths honour them: the daemon pass (itself nested inside `LOOM_VERDICT_STALENESS_RECONCILE`) and `forge verdict-equivalent`, which with a switch off asks nothing and exits 1 with no answer, so the shell guard invalidates too. Default **ON** — each kind fires only on a positive proof and fails closed otherwise, so it can only ever *reduce* exposure. |
 | Daemon pass | `reanchor_equivalent_verdict` posts a `<!-- loom:verdict-sha … -->` marker for the new head plus a `<!-- loom:verdict-equivalence kind=… from=… to=… -->` audit line naming the kind, and leaves the verdict label untouched. Nothing is disarmed: an armed auto-merge would land the reviewed change. Counter: `VerdictReconcileStats::tree_identical_reanchors`. The equivalence marker is an audit record **only** — no code path reads it back as evidence, because a marker is prose anyone can write (#9548). |
 | Shell guard | Reports `FRESH` (exit 0) with the reason naming the kind, and writes nothing. It does **not** re-anchor — the marker write stays in the daemon — so it pays the comparison per pass until the periodic pass re-anchors. |

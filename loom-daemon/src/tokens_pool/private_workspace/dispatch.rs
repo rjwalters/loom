@@ -179,7 +179,7 @@ impl Selection {
         };
         lease.begin(&job)?;
         // The issue helper owns creation of its worktree/branch in the clone.
-        job.base_revision = docker::prepare_target(&config, &target, id, None)?;
+        job.base_revision = docker::prepare_target(&config, root, &target, id, None)?;
         docker::setup(&config)?;
         // Bind the verified control boundary to this account/container/lease
         // BEFORE any mutable work is admitted. Spawn rechecks the same identity.

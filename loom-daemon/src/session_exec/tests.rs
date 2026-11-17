@@ -126,3 +126,37 @@ fn preflight_reads_the_mounts_from_the_same_inspect() {
     let private = running("[]", r#"{"loom.workspace-mode":"private-clone"}"#);
     assert_eq!(preflight(Some(&private), "/workspace/repo"), Preflight::Ready);
 }
+
+/// #13916: a host-resolved token rides on the `docker exec` child's
+/// environment, named in argv only as a bare `--env GH_TOKEN`.
+#[test]
+fn host_exec_sets_child_env_on_the_docker_child_never_in_argv() {
+    const SECRET: &str = "ghs_hostTESTONLY13916";
+    let args = HostArgs {
+        owner_pid: None,
+        container: "c".into(),
+        workdir: "/workspace/repo".into(),
+        env: vec!["GH_TOKEN".into(), "LOOM_ROLE=builder".into()],
+        child_env: vec![("GH_TOKEN".into(), SECRET.into())],
+        stderr_file: None,
+        command: vec!["git".into(), "fetch".into()],
+    };
+    let command = host::exec_command(&args, "id-1");
+    let argv: Vec<String> = command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"),
+        "{argv:?}"
+    );
+    assert!(!argv.iter().any(|a| a.contains(SECRET)), "token leaked into argv");
+    let envs: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .map(|(k, v)| {
+            (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+        })
+        .collect();
+    assert_eq!(envs, vec![("GH_TOKEN".into(), Some(SECRET.into()))]);
+}

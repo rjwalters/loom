@@ -86,6 +86,19 @@ pub fn run_bounded(
     run_bounded_with(program, args, timeout, &operator_interrupt::pending)
 }
 
+/// [`run_bounded`] with extra variables set on the child process itself
+/// (#13916). The values never reach argv: a caller that wants the container to
+/// see one names it as a bare `--env NAME`, which `docker` copies from its own
+/// environment.
+pub fn run_bounded_env(
+    program: &str,
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<(bool, String, String)> {
+    run_bounded_env_with(program, args, env, timeout, &operator_interrupt::pending)
+}
+
 /// [`run_bounded`] with an explicit pending-signal probe (tests).
 pub(crate) fn run_bounded_with(
     program: &str,
@@ -93,11 +106,24 @@ pub(crate) fn run_bounded_with(
     timeout: Duration,
     pending: &dyn Fn() -> Option<i32>,
 ) -> Result<(bool, String, String)> {
+    run_bounded_env_with(program, args, &[], timeout, pending)
+}
+
+fn run_bounded_env_with(
+    program: &str,
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+    pending: &dyn Fn() -> Option<i32>,
+) -> Result<(bool, String, String)> {
     if let Some(signal) = pending() {
         return Err(Interrupted(signal).into());
     }
     let mut command = Command::new(program);
-    command.args(args).stdin(Stdio::null());
+    command
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null());
     let subcommand = args.first().copied().unwrap_or_default();
     let completion =
         proc_exec::run_bounded_forwarding(command, timeout, FORWARD_GRACE, pending, |pid| {

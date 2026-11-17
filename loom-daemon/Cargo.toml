@@ -88,7 +88,6 @@ tokio = { workspace = true, features = ["taskdump"] }
 [dev-dependencies]
 tokio-test = "0.4"
 serial_test = "4.0"
-criterion = "0.8"
 
 # Explicit so `loom-daemon` keeps its name and path now that a second bin exists.
 [[bin]]
@@ -101,10 +100,6 @@ path = "src/main.rs"
 [[bin]]
 name = "loom-tools"
 path = "src/bin/loom_tools.rs"
-
-[[bench]]
-name = "terminal_benchmarks"
-harness = false
 
 [features]
 # No-op alias kept for CLI compatibility (#10700). The OTLP exporter is now
