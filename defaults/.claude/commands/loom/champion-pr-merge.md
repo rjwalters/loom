@@ -2712,10 +2712,12 @@ only because an operator inspected PR labels by hand. Run this once per Champion
 pass — one `gh pr list` call — and put its output in the completion summary
 (`champion-common.md` → "Completion Report").
 
-**Counts both hold kinds (#6879).** The query keys on the label pair `loom:pr` +
-`loom:blocked` (#11861), not on a marker, so critical-file holds
-([`champion-critical-file-hold.md`](champion-critical-file-hold.md)) count too;
-read "Merge-risk holds" (kept for dashboard continuity) as "Champion-held PRs".
+**Counts every Champion hold kind (#6879).** The query keys on the label pair
+`loom:pr` + `loom:blocked` (#11861), not on a marker, so critical-file holds
+([`champion-critical-file-hold.md`](champion-critical-file-hold.md)) and
+ratification holds ([`champion-ratification-hold.md`](champion-ratification-hold.md),
+#12992) count too; read "Merge-risk holds" (kept for dashboard continuity) as
+"Champion-held PRs".
 A pre-#11861 hold still on `loom:operator` (not yet migrated by `labels migrate
 --holds`) is counted by the second query.
 
@@ -2754,9 +2756,14 @@ for H in loom:blocked loom:operator; do
 "
 done
 HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
+# Same marker set as Step 1's $HOLD_TABLE below (#13885) — extend both
+# together when a hold kind is added. Each kind's "no longer standing"
+# markers: merge-risk clears via a contains() block (embedded in the
+# pre-merge comment), critical-file and ratification clear/release via
+# standalone notices (the same set doctor.md's CHAMPION_HELD_CONFLICT uses).
 HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
-  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->"))
-    and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->")) | not))] | length')
+  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->") or startswith("<!-- champion:ratification-hold -->"))
+    and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->") or startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | not))] | length')
 HELD_AT_DOCTOR=${HELD_AT_DOCTOR:-0}   # a bounded-but-failed read degrades to 0, never breaks the arithmetic (#13930)
 
 HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
@@ -2842,8 +2849,13 @@ fi
 **Step 1 — per-PR hold reason, and conflict-duration tracking (#7020).**
 `$HELD_JSON` carries `mergeable` and out-at-Doctor state, not *why* the PR was
 held or *how long* it has been `CONFLICTING`. Read the reason from the PR's own
-hold comment (the merge-risk marker of the `merge-risk` criterion, else the critical-file
-marker of the `critical-files` and `ci-green` criteria879) — one cached read per held PR, never a second
+hold comment via the `$HOLD_TABLE` below — one `(marker, reason rule)` pair per
+hold kind: the merge-risk marker of the `merge-risk` criterion, the
+critical-file marker of the `critical-files` and `ci-green` criteria (#6879),
+and the ratification marker (#12992, #13885 — its notice has no axis bullet;
+its reason is built from the notice itself). The latest standing marker among
+the table wins; a hold comment whose marker is not in the table is reported as
+an unknown marker, never as an unrecorded reason. One cached read per held PR, never a second
 bulk `gh pr list`. Conflict duration rides a per-PR
 `<!-- champion:conflict-since:PR=<n> TS=<iso> -->` marker carried forward from
 `$OLD_DIGEST_BODY` (Step 0). The clock resets on the first conflict and after
@@ -2861,8 +2873,16 @@ census's structural fields, and the loop above already renders the Base cell
 as "structural fields unavailable: census read stalled".
 
 ```bash
-HOLD_MARKER="<!-- champion:merge-risk-hold -->"
-CRITICAL_FILE_HOLD_MARKER="<!-- champion:critical-file-hold -->"
+# #13885: hold kinds are a TABLE of (marker, reason rule) pairs — the one
+# place a hold kind is registered for this digest, so adding one is a single
+# edit. #12992 added the ratification kind; merge-risk and critical-file
+# share the axis-bullet rule ("The latest standing marker among the table
+# wins" is the selection rule below).
+HOLD_TABLE=(
+  "merge-risk|<!-- champion:merge-risk-hold -->"
+  "critical-file|<!-- champion:critical-file-hold -->"
+  "ratification|<!-- champion:ratification-hold -->"
+)
 CONFLICT_SINCE_PREFIX="<!-- champion:conflict-since:PR="
 ROT_THRESHOLD_DAYS=3   # continuously CONFLICTING at least this long -> "rotting"
 DIGEST_ROWS=""
@@ -2877,22 +2897,54 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
   AT_DOCTOR=$(jq -e '[.labels[].name] | index("loom:changes-requested")' <<<"$ROW" >/dev/null && echo true || echo false)
 
   # Cached ("$GH_READ") — an observation read, same rule as the aggregate
-  # query above: this digest never gates a merge decision. Checks the
-  # merge-risk-hold marker first (the common case), then the critical-file
-  # hold marker — a PR only ever carries one of the two hold kinds at a time.
-  HOLD_BODY=$("$GH_READ" pr view "$PR_NUM" --json comments \
-    --jq "[.comments[] | select(.body | startswith(\"$HOLD_MARKER\"))] | last | .body // \"\"")
-  if [ -z "$HOLD_BODY" ]; then
-    HOLD_BODY=$("$GH_READ" pr view "$PR_NUM" --json comments \
-      --jq "[.comments[] | select(.body | startswith(\"$CRITICAL_FILE_HOLD_MARKER\"))] | last | .body // \"\"")
-  fi
-  if [ -z "$HOLD_BODY" ]; then
-    REASON="reason unrecorded (no hold-marker comment found)"
+  # query above: this digest never gates a merge decision. ONE comment read
+  # per held PR; the hold kind is picked locally from $HOLD_TABLE by latest
+  # standing marker (a held PR carries one standing hold; cleared/released
+  # notices never startswith-match their hold marker, so they do not win —
+  # and a held PR's loom:blocked means one does stand).
+  COMMENTS=$("$GH_READ" pr view "$PR_NUM" --json comments --jq '[.comments[].body]')
+  HOLD_KIND=""; HOLD_BODY=""; WINNING_IDX=-1
+  for TABLE_ENTRY in "${HOLD_TABLE[@]}"; do
+    KIND="${TABLE_ENTRY%%|*}"; MARKER="${TABLE_ENTRY#*|}"
+    IDX=$(jq --arg m "$MARKER" 'to_entries | map(select(.value | startswith($m))) | last | .key // -1' <<<"$COMMENTS")
+    if [ "$IDX" -gt "$WINNING_IDX" ]; then
+      WINNING_IDX=$IDX; HOLD_KIND=$KIND
+      HOLD_BODY=$(jq -r --argjson i "$IDX" '.[$i]' <<<"$COMMENTS")
+    fi
+  done
+  if [ -z "$HOLD_KIND" ]; then
+    # Two distinct fallbacks (#13885): a held PR should always carry a
+    # champion hold comment, but distinguish HOW this table failed. A hold
+    # comment whose marker is NOT in $HOLD_TABLE means this prompt predates
+    # a hold kind — name the marker so the reader knows which table entry
+    # is missing. No champion hold comment at all is the real anomaly.
+    UNKNOWN_MARKER=$(jq -r 'map(select(test("^<!-- champion:[a-z0-9-]+-hold -->"))) | last // ""' <<<"$COMMENTS" \
+      | head -1 | sed -nE 's/^(<!-- champion:[a-z0-9-]+-hold -->).*/\1/p')
+    if [ -n "$UNKNOWN_MARKER" ]; then
+      REASON="unknown hold marker $UNKNOWN_MARKER (digest prompt needs updating)"
+    else
+      REASON="reason unrecorded (no champion hold marker found)"
+    fi
   else
-    # Both hold templates share this one required line shape: "- **<AXIS or
-    # CRITERION NAME>**: <CONCERN>".
-    REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
-    [ -z "$REASON" ] && REASON="hold marker present, reason bullet not parseable"
+    case "$HOLD_KIND" in
+      ratification)
+        # The ratification notice (#12992) has no axis bullet — its only
+        # bullet is a backticked file list — so build the reason from the
+        # notice itself: fixed text plus the first declared file.
+        FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
+        if [ -n "$FIRST_FILE" ]; then
+          REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
+        else
+          REASON="ratification hold (file bullet not parseable)"
+        fi
+        ;;
+      *)
+        # The merge-risk and critical-file hold templates share this one
+        # required line shape: "- **<AXIS or CRITERION NAME>**: <CONCERN>".
+        REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
+        [ -z "$REASON" ] && REASON="hold marker present, reason bullet not parseable"
+        ;;
+    esac
   fi
 
   STATUS="$PR_MERGEABLE"
