@@ -321,7 +321,14 @@ impl State {
             .file_name()
             .and_then(|name| name.to_str())
             .context("launch state directory has no valid uuid name")?;
-        let path = crate::native_state_reclaim::pinned_tmp_base().join(uuid);
+        // The entry is the uuid's short hex prefix, not the uuid itself:
+        // yosys 0.67's `abc` pass deadlocks whenever the full pinned path is
+        // ≥36 bytes (#13935 — its `source <TMPDIR>/yosys-abc-XXXXXX/abc.script`
+        // bootstrap line trips ABC's line-editor redraw), so the path must stay
+        // under the measured 35-byte bound. See
+        // [`crate::native_state_reclaim::PINNED_TMPDIR_ENTRY_CHARS`].
+        let path = crate::native_state_reclaim::pinned_tmp_base()
+            .join(crate::native_state_reclaim::pinned_tmp_entry_id(uuid));
         private_directory(&path)?;
         command.env("TMPDIR", path);
         Ok(())

@@ -205,7 +205,11 @@ fn every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path() {
         std::env::temp_dir()
     };
     let pinned_root = tempfile::Builder::new()
-        .prefix("loom-nt-test-")
+        // `loom-nt` + tempfile's 6 random chars = 13 bytes, exactly the
+        // production default base (`/tmp/loom-nt`) — the #13935 length bound
+        // asserted below is against the *full pinned path*, so the fixture
+        // must not inflate the base.
+        .prefix("loom-nt")
         .tempdir_in(&short_tmp_root)
         .expect("short pinned-tmp root under the platform tmp root");
     let pinned_base = pinned_root.path().to_path_buf();
@@ -213,7 +217,12 @@ fn every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path() {
 
     for runtime in ["pi", "opencode", "kimi"] {
         let state = create(&root, Some(&base), None, None).unwrap();
-        let uuid = state.directory.file_name().unwrap().to_owned();
+        let uuid = state
+            .directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let mut command = Command::new("fixture-harness");
         state.configure(&mut command, runtime).unwrap();
 
@@ -223,13 +232,26 @@ fn every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path() {
             .and_then(|(_, value)| value)
             .map(PathBuf::from)
             .unwrap_or_else(|| panic!("{runtime} launch must pin TMPDIR"));
-        assert_eq!(tmpdir, pinned_base.join(&uuid));
+        assert_eq!(tmpdir, pinned_base.join(native_state_reclaim::pinned_tmp_entry_id(&uuid)));
         assert!(tmpdir.is_dir());
         // 108 bytes is the tightest sockaddr_un.sun_path limit (Linux); leave
         // headroom for a socket file name on top of the pinned directory.
         assert!(
             tmpdir.as_os_str().len() < 90,
             "{runtime} pinned TMPDIR {} is too long for a Unix socket path",
+            tmpdir.display()
+        );
+        // #13935: yosys 0.67's `abc` pass deadlocks once the full pinned path
+        // reaches 36 bytes — its `source <TMPDIR>/yosys-abc-XXXXXX/abc.script`
+        // bootstrap line trips ABC's line-editor redraw into abc's stdout and
+        // the yosys↔abc handshake never completes (measured: ≤35 bytes
+        // completes, ≥36 hangs; `COLUMNS=200` rescues). The socket bound above
+        // would still allow a 89-byte pin, so assert the tighter bound that
+        // actually keeps `yosys synth` usable inside a guarded session.
+        assert!(
+            tmpdir.as_os_str().len() <= 35,
+            "{runtime} pinned TMPDIR {} exceeds the 35-byte bound under which a \
+             yosys `abc` run inside the session is known to complete",
             tmpdir.display()
         );
         #[cfg(unix)]
@@ -262,6 +284,97 @@ fn every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path() {
         assert!(!extract.exists(), "{runtime} native extract must be removed");
         assert!(!tmpdir.exists());
     }
+
+    std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
+}
+
+/// #13935: a guarded session must be able to run a pipe-reading tool child
+/// under the pinned `TMPDIR`. The failing shape: yosys 0.67's `abc` pass
+/// spawns a child fed a `source <TMPDIR>/yosys-abc-XXXXXX/abc.script` line on
+/// stdin, which echoes progress on stdout until EOF — and deadlocked when the
+/// pinned path was 49 bytes (ABC's line-editor redraw corrupted the echo
+/// stream). The pin is now 29 bytes; this test runs that child shape — reads
+/// stdin to EOF, echoes, exits — under the real `configure()`-produced pin,
+/// with a 10 s watchdog so a regression reads as a kill-and-assert-failure,
+/// never a hung test runner.
+#[test]
+#[serial(native_state_reclaim_env)]
+#[cfg(unix)]
+fn pipe_reading_child_under_the_pinned_tmpdir_finishes_within_a_timeout() {
+    use crate::native_state_reclaim::NATIVE_PINNED_TMPDIR_BASE_ENV;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = workspace(temp.path(), "repo");
+    let base = temp.path().join("native-state");
+    let pinned_root = tempfile::Builder::new()
+        .prefix("loom-nt")
+        .tempdir_in(PathBuf::from("/tmp"))
+        .expect("short pinned-tmp root under the platform tmp root");
+    std::env::set_var(NATIVE_PINNED_TMPDIR_BASE_ENV, pinned_root.path());
+
+    let state = create(&root, Some(&base), None, None).unwrap();
+    let mut command = Command::new("fixture-harness");
+    state.configure(&mut command, "opencode").unwrap();
+    let tmpdir = command
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("TMPDIR"))
+        .and_then(|(_, value)| value)
+        .map(PathBuf::from)
+        .expect("guarded launch must pin TMPDIR");
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat; echo CHILD_EOF_DONE")
+        .env("TMPDIR", &tmpdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn pipe-reading child under the pinned TMPDIR");
+    let child_pid = child.id() as i32;
+    let finished = Arc::new(AtomicBool::new(false));
+    let killer_flag = finished.clone();
+    let killer = std::thread::spawn(move || {
+        // 10 s cap: the production deadlock held indefinitely, so a regression
+        // must be turned into a failed assertion, not a hung suite.
+        std::thread::sleep(Duration::from_secs(10));
+        if !killer_flag.load(Ordering::SeqCst) {
+            unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        }
+    });
+
+    {
+        let mut stdin = child.stdin.take().expect("child stdin piped");
+        stdin
+            .write_all(
+                tmpdir
+                    .join("yosys-abc-XXXXXX/abc.script")
+                    .display()
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        // Dropping the handle closes stdin — the EOF the child reads to exit.
+    }
+    let output = child.wait_with_output().expect("wait for pipe child");
+    finished.store(true, Ordering::SeqCst);
+    killer.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "pipe child under the pinned TMPDIR ({}) did not exit cleanly within the timeout: {:?}",
+        tmpdir.display(),
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CHILD_EOF_DONE"),
+        "child stdout missing the EOF marker — pipe hand-off broke: {stdout:?}"
+    );
 
     std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
 }
