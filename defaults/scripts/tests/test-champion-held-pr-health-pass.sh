@@ -1303,9 +1303,16 @@ LA=$(last_activity_from_facts "$INCIDENT_FACTS")
 assert_eq "$LA" "2026-11-14T09:14:11Z" \
     "#13921: a newer role=champion PR-lease record does not reset LAST_ACTIVITY — the genuine Judge approval stays the newest real activity (the criterion's own reading of the example-org/tool-repo#798 shape)"
 
-HOURS_AGO=$(( ($(date -u -d "2026-11-16T20:49:00Z" +%s) - $(date -u -d "$LA" +%s)) / 3600 ))
+# The incident's evaluation instant (2026-11-15T20:49Z, four minutes after the
+# champion lease record). `_iso_to_epoch` is this file's cross-platform helper
+# (GNU `date -d`, BSD `date -j -f`) - a bare `date -d` aborts the suite on macOS.
+# The comparison is `-gt`, the shipped criterion's own (`HOURS_AGO -gt
+# RECENCY_LIMIT` reads FAIL; exactly 24 still reads PASS).
+HOURS_AGO=$(( ($(_iso_to_epoch "2026-11-15T20:49:00Z") - $(_iso_to_epoch "$LA")) / 3600 ))
+assert_eq "$HOURS_AGO" "35" \
+    "#13921: at the incident's evaluation instant HOURS_AGO is 35, the issue's correct reading, not the pre-fix HOURS_AGO=0"
 if [ "$HOURS_AGO" -gt 24 ]; then
-    pass "#13921: at the incident's evaluation instant the recency criterion reads FAIL (HOURS_AGO=$HOURS_AGO >= 24), not the pre-fix HOURS_AGO=0"
+    pass "#13921: at the incident's evaluation instant the recency criterion reads FAIL (HOURS_AGO=$HOURS_AGO > 24, the shipped -gt comparison)"
 else
     fail "#13921: expected HOURS_AGO > 24 at the incident's evaluation instant, got $HOURS_AGO"
 fi
@@ -1342,7 +1349,8 @@ assert_eq "$LA" "2026-11-14T09:14:11Z" \
 
 # Positive control: a genuinely newer trusted comment IS activity — the lease
 # exclusion must not mask real comments (timestamp fresh at test runtime).
-RECENT=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+# BSD `date -v` first, GNU `date -d` as the fallback (cross-platform).
+RECENT=$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
 GENUINE_FACTS="{
   \"createdAt\": \"2026-11-13T10:00:00Z\",
   \"commits\": [],
