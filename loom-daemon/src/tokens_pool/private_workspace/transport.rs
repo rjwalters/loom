@@ -231,6 +231,38 @@ fn authorize_unleased(
     args.child_env = child_env;
 }
 
+/// The caller context a private-clone exec carries into the container. Data
+/// identities only, never a host path.
+///
+/// The three lease/claim names travel together: the daemon pre-claims a
+/// Builder step's issue and publishes its lease under the daemon's own lease
+/// host id before it spawns the session, and the container has a hostname of
+/// its own. Without `LOOM_LEASE_HOST_ID` the session resolves a different
+/// lease host and reads its dispatcher's lease as a peer's — `lease ensure`
+/// is declined (publish exit 4) and `sweep-lease-fence.sh` aborts SUPERSEDED,
+/// so the step ends `refused claim_lost` on its own claim. Without
+/// `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` it cannot know the dispatch already
+/// published and renews that lease, and tries to publish a second one.
+///
+/// The four `GIT_*` names are the commit identity. The session image has no
+/// global git config and the private clone no local one, so without them
+/// `git commit` there fails with "Author identity unknown". `spawn-codex.sh`
+/// resolves them from the host's own git config, the identity a Claude worker
+/// on this host commits under.
+const FORWARDED_CONTEXT: &[&str] = &[
+    "LOOM_ROLE",
+    "LOOM_WORK_ORIGIN",
+    "LOOM_TERMINAL_ID",
+    "LOOM_SWEEP_ID",
+    "LOOM_SWEEP_CLAIM_OWNED",
+    "LOOM_SWEEP_LEASE_RENEW_DISPATCHED",
+    "LOOM_LEASE_HOST_ID",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+];
+
 fn child_env(
     input: &[String],
     config: &Config,
@@ -257,15 +289,7 @@ fn child_env(
     // data identities, not paths; fixed container values own every path.
     for item in input {
         if let Some((key, value)) = item.split_once('=') {
-            if [
-                "LOOM_ROLE",
-                "LOOM_WORK_ORIGIN",
-                "LOOM_TERMINAL_ID",
-                "LOOM_SWEEP_ID",
-                "LOOM_SWEEP_CLAIM_OWNED",
-            ]
-            .contains(&key)
-            {
+            if FORWARDED_CONTEXT.contains(&key) {
                 if value.len() > 256 || value.chars().any(char::is_control) {
                     bail!("invalid private child context");
                 }
@@ -357,6 +381,69 @@ mod tests {
         assert!(!env
             .iter()
             .any(|v| v.contains("/host/") || v.starts_with("LOOM_RUN_JOB")));
+    }
+
+    /// A daemon-dispatched Builder step's lease and claim context, and the
+    /// host's commit identity, cross into the private clone; a host path or an
+    /// unlisted name beside them still does not.
+    #[test]
+    fn child_env_carries_the_dispatchers_lease_context_and_commit_identity() {
+        let config = Config {
+            schema_version: 1,
+            account: "test".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://example.invalid/repo".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: "/host/profile".into(),
+            gh_config: None,
+        };
+        let job = lease::Job {
+            owner: "step-builder-20-1".into(),
+            kind: JobKind::Sweep,
+            issue: Some(20),
+            branch: None,
+            container_id: "a".repeat(64),
+            base_revision: String::new(),
+            host_pid: 1,
+            control: "b".repeat(64),
+            repository: String::new(),
+        };
+        let carried = [
+            "LOOM_SWEEP_ID=step-builder-20-1",
+            "LOOM_SWEEP_CLAIM_OWNED=20",
+            "LOOM_SWEEP_LEASE_RENEW_DISPATCHED=20",
+            "LOOM_LEASE_HOST_ID=fleet-host-7",
+            "GIT_AUTHOR_NAME=fleet-bot[bot]",
+            "GIT_AUTHOR_EMAIL=1+fleet-bot[bot]@users.noreply.example.invalid",
+            "GIT_COMMITTER_NAME=fleet-bot[bot]",
+            "GIT_COMMITTER_EMAIL=1+fleet-bot[bot]@users.noreply.example.invalid",
+        ];
+        let dropped = [
+            "LOOM_HOST_ID=fleet-host-7",
+            "LOOM_ROLE_PR_LEASE_FILE=/host/leases",
+            "LOOM_PICK_JOURNAL=/host/journal",
+            "GIT_DIR=/host/repo/.git",
+            "GIT_CONFIG_GLOBAL=/host/gitconfig",
+        ];
+        let input: Vec<String> = carried
+            .iter()
+            .chain(dropped.iter())
+            .map(|s| (*s).to_string())
+            .collect();
+        let env = child_env(&input, &config, &job, &config.primary(), &no_auth()).unwrap();
+        for item in carried {
+            assert!(env.contains(&item.to_string()), "{item} must be carried: {env:?}");
+        }
+        for item in dropped {
+            assert!(!env.contains(&item.to_string()), "{item} must not be carried");
+        }
+        // The value rule covers the new names too.
+        let bad = ["GIT_AUTHOR_NAME=a\nb".to_string()];
+        assert!(child_env(&bad, &config, &job, &config.primary(), &no_auth()).is_err());
     }
 
     /// The launch environment names the SELECTED clone and its repository, so

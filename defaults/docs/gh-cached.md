@@ -144,6 +144,31 @@ is set. A client cache in front of the egress gateway is fine; invisible
 stacking is not, so views can use this field to separate cache hits from real
 gateway requests. Covered by `defaults/scripts/tests/test-gh-cached.sh`.
 
+### `LOOM_GH_TIMEOUT_S` — the real `gh` call is bounded (#13930)
+
+Every real `gh` invocation the wrapper executes gets a per-call timeout of
+`LOOM_GH_TIMEOUT_S` seconds (default **120**), so a network black hole, a
+credential-helper hang, or a host under heavy `gh` contention fails fast
+instead of hanging the calling role step indefinitely. `0` restores the
+unbounded behavior; a non-numeric or negative value falls back to the default.
+
+- A timed-out **read** (no mutation subcommand, not a `gh api` call with a
+  non-GET `-X`/`--method`) is **retried once** after a ~2 s backoff.
+- **Mutations are never retried** — a timed-out write may already have
+  landed, and a retry could double-post.
+- Final expiry prints one distinguishable stderr line —
+  `gh-cached: gh timed out after 120s (attempts=2): gh pr list` — and exits
+  **124** (`timeout(1)` parity), returning no partial stdout and writing
+  nothing to the cache: the wrapper's existing "failures are never cached"
+  contract applies unchanged.
+
+The same bound covers the ETag/REST `loom-daemon forge … --cached` subprocess
+calls; an expired daemon call degrades to the plain-`gh` path (the documented
+fallback contract). Consumers pinned to a single bulk read degrade explicitly
+instead of dropping output silently — see `champion-pr-merge.md` →
+"Per-PR Digest" (structural fields marked unavailable when the census read
+expires).
+
 ### Mutation-triggered invalidation — and why writes still use plain `gh`
 
 On a successful mutation issued *through the wrapper*, it deletes every cached

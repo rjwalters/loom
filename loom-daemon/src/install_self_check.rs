@@ -29,6 +29,7 @@
 //! | [`Invariant::RuntimesPresent`]  | #4 `.loom/runtimes/` absent in 7 clones (#5002) | yes — converge from `defaults/runtimes/` |
 //! | [`Invariant::TokenRankingFresh`]| #5 stale `.ranking` → wrong concurrency cap     | yes — re-probe via `tokens check --ranking` |
 //! | [`Invariant::GhFrontWired`]| #10516 interactive sessions do not reach the agent `gh` front | no — `loom update` re-provisions the SessionStart hook |
+//! | [`Invariant::DuplicateHookWiring`] | #13958 Loom hooks wired at both user and project scope with a broken transition defer (double-fire) | no — warn-only; `loom migrate` retires the project copies |
 //!
 //! The remaining six conditions (binary freshness, sidecar reachability,
 //! telemetry identity, sweep liveness, pid file, stale repo-local `.mcp.json`)
@@ -72,6 +73,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::workspace_registry::WorkspaceRegistry;
 
+pub mod duplicate_hooks_invariant;
 pub mod gh_front_invariant;
 pub mod loom_ui;
 
@@ -147,6 +149,13 @@ pub enum Invariant {
     /// its prefix resolves `gh` to the front. Not
     /// auto-repairable: see [`gh_front_invariant`].
     GhFrontWired,
+    /// #13958: Loom guard hooks are wired at **both** the user-scope
+    /// `~/.claude/settings.json` (machine-level wrapper) and the repo's
+    /// project-level `.claude/settings.json`, and the wrapper's transition
+    /// defer (#4806) does not hold — both entries fire per tool call. Not
+    /// auto-repairable: see [`duplicate_hooks_invariant`]. Both scopes wired
+    /// *and* deferring is the expected transition shape and does not warn.
+    DuplicateHookWiring,
 }
 
 impl Invariant {
@@ -157,6 +166,7 @@ impl Invariant {
         Self::RuntimesPresent,
         Self::TokenRankingFresh,
         Self::GhFrontWired,
+        Self::DuplicateHookWiring,
     ];
 
     /// Stable machine identifier — used in the issue-dedup marker and logs.
@@ -168,6 +178,7 @@ impl Invariant {
             Self::RuntimesPresent => "runtimes-present",
             Self::TokenRankingFresh => "token-ranking-fresh",
             Self::GhFrontWired => "gh-front-wired",
+            Self::DuplicateHookWiring => "duplicate-hook-wiring",
         }
     }
 
@@ -179,6 +190,9 @@ impl Invariant {
             Self::RuntimesPresent => ".loom/runtimes/ is missing configured runtimes",
             Self::TokenRankingFresh => "token-pool .ranking is stale or missing",
             Self::GhFrontWired => "interactive sessions do not reach the agent gh front",
+            Self::DuplicateHookWiring => {
+                "Loom guard hooks are wired at both scopes without a working transition defer"
+            }
         }
     }
 
@@ -191,7 +205,7 @@ impl Invariant {
     pub fn auto_repairable(self) -> bool {
         match self {
             Self::McpBundleHealth | Self::RuntimesPresent | Self::TokenRankingFresh => true,
-            Self::GhFrontWired => false,
+            Self::GhFrontWired | Self::DuplicateHookWiring => false,
         }
     }
 
@@ -301,6 +315,7 @@ pub fn check(invariant: Invariant, repo_root: &Path, opts: &CheckOptions) -> Inv
         Invariant::RuntimesPresent => check_runtimes_present(repo_root),
         Invariant::TokenRankingFresh => check_token_ranking_fresh(repo_root, opts.ranking_max_age),
         Invariant::GhFrontWired => gh_front_invariant::check(repo_root),
+        Invariant::DuplicateHookWiring => duplicate_hooks_invariant::check(repo_root),
     }
 }
 
@@ -521,6 +536,7 @@ pub fn repair(invariant: Invariant, repo_root: &Path, ctx: &RepairContext) -> Re
         Invariant::TokenRankingFresh => repair_token_ranking(repo_root, ctx),
         Invariant::McpBundleHealth => repair_mcp_bundle(repo_root, ctx),
         Invariant::GhFrontWired => unreachable_repair(),
+        Invariant::DuplicateHookWiring => unreachable_repair(),
     }
 }
 

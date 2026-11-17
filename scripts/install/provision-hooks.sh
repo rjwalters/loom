@@ -186,7 +186,12 @@ PROJECT_HOOKS_WIRED=0
 # `SessionStart` / `gh-front-env.sh` (#10516) is not a guard: it puts the agent
 # `gh` front first on an interactive session's PATH via `$CLAUDE_ENV_FILE`
 # (inherited by Task subagents). Matcher "" covers startup/resume/clear/compact;
-# the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out.
+# the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out. It is
+# the one entry wired with a `timeout` (10 s, #13959): a hung binary lookup,
+# version preflight or `gh-shim session-env` call is killed by the client
+# instead of stalling session start for the 30-50 s the unresolved worst case
+# was reported at. The hook is fail-open, so a killed run costs only the PATH
+# line — the same degradation as any other resolution failure.
 #
 # `roll-pause.sh` (#10830) is wired three times, match-all: PreToolUse parks a
 # daemon-dispatched agent's tool calls at a roll's safe point, and PostToolUse /
@@ -217,6 +222,12 @@ _PHOOK_NAMES=(
     guard-uncommitted-work.sh
     guard-uncommitted-work.sh
 )
+# Parallel array (#13959): per-entry `timeout` seconds for the emitted hook
+# object (the client kills a hung hook after this many), or "" to emit no
+# timeout field at all. Only the SessionStart gh front carries one today — see
+# its comment above. Keep indexed with the three arrays above; the Rust-side
+# drift test (loom-daemon/src/init/hook_wiring.rs) compares all four.
+_PHOOK_TIMEOUTS=("" "" "" "" "" "" "" "10" "" "" "" "" "")
 
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a
 # single hook script <name>. A single-quoted `bash -c '...'` body with NO
@@ -361,9 +372,10 @@ provision_loom_hooks() {
         local htype="${_PHOOK_TYPES[$i]}"
         local matcher="${_PHOOK_MATCHERS[$i]}"
         local name="${_PHOOK_NAMES[$i]}"
+        local tmo="${_PHOOK_TIMEOUTS[$i]}"
         local cmd
         cmd="$(_phook_cmd "$name")"
-        if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd" "" "$_PHOOK_WRAPPER_MARKER"; then
+        if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd" "" "$_PHOOK_WRAPPER_MARKER" "$tmo"; then
             _phook_ok "wired $htype/${matcher:-<all>} -> $name"
         else
             _phook_warn "failed to wire $name into $settings"
@@ -402,8 +414,13 @@ provision_loom_hooks() {
 # name is never touched, only ever left as-is.
 #   $1 settings_file  $2 hook_type  $3 matcher  $4 dedup_marker  $5 command
 #   $6 exclude_marker (optional)  $7 upgrade_marker (optional)
+#   $8 timeout_s (optional, #13959): emitted as the `timeout` field of every
+#     hook object this function appends, and set in place on a duplicate that
+#     <upgrade_marker> identifies as Loom-authored — so an already-provisioned
+#     install converges to the bound without a duplicate entry. Empty = no
+#     field, and never touches a hand-written duplicate's timeout.
 _phook_merge_one() {
-    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}" upgrade="${7:-}"
+    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}" upgrade="${7:-}" tmo="${8:-}"
     local tmp
     tmp="$(mktemp 2>/dev/null)" || return 1
     if jq \
@@ -412,17 +429,20 @@ _phook_merge_one() {
         --arg marker "$marker" \
         --arg exclude "$exclude" \
         --arg upgrade "$upgrade" \
-        --arg cmd "$cmd" '
+        --arg cmd "$cmd" \
+        --arg tmo "$tmo" '
         def is_dup($c): ($c | contains($marker))
             and (($exclude | length) == 0 or ($c | contains($exclude) | not));
         def is_stale_loom_wrapper($c): ($upgrade | length) > 0
             and ($c != $cmd)
             and ($c | contains($upgrade));
+        def new_entry: {type: "command", command: $cmd}
+            + (if ($tmo | length) > 0 then {timeout: ($tmo | tonumber)} else {} end);
         .hooks = (.hooks // {})
         | .hooks[$ht] = (.hooks[$ht] // [])
         | (.hooks[$ht] | map(.matcher // "") | index($m)) as $idx
         | if $idx == null then
-            .hooks[$ht] += [{matcher: $m, hooks: [{type: "command", command: $cmd}]}]
+            .hooks[$ht] += [{matcher: $m, hooks: [new_entry]}]
           else
             .hooks[$ht][$idx].hooks = (.hooks[$ht][$idx].hooks // [])
             | if (.hooks[$ht][$idx].hooks | map(.command // "") | any(is_dup(.)))
@@ -431,13 +451,25 @@ _phook_merge_one() {
                 # PLACE only if it is a stale Loom-authored wrapper (recognized
                 # by upgrade_marker) that differs from the current command —
                 # never touch anything else (already-current, or hand-written).
+                # With a timeout set (#13959), a Loom-authored duplicate also
+                # converges to it in place (added when missing, corrected when
+                # stale) — the bound reaches already-provisioned installs, and
+                # a hand-written duplicate never gains a field it did not have.
                 .hooks[$ht][$idx].hooks |= map(
-                    if is_dup(.command // "") and is_stale_loom_wrapper(.command // "")
-                    then .command = $cmd
+                    if is_dup(.command // "") then
+                        (if is_stale_loom_wrapper(.command // "")
+                         then .command = $cmd
+                         else . end)
+                        | (if ($tmo | length) > 0
+                               and (($upgrade | length) > 0)
+                               and ((.command // "") | contains($upgrade))
+                               and ((.timeout // 0) != ($tmo | tonumber))
+                           then .timeout = ($tmo | tonumber)
+                           else . end)
                     else .
                     end
                 )
-              else .hooks[$ht][$idx].hooks += [{type: "command", command: $cmd}]
+              else .hooks[$ht][$idx].hooks += [new_entry]
               end
           end
         ' "$f" > "$tmp" 2>/dev/null; then
@@ -532,6 +564,7 @@ ensure_project_hook_wiring() {
         [[ -f "$hooks_dir/$name" ]] || continue
         local htype="${_PHOOK_TYPES[$i]}"
         local matcher="${_PHOOK_MATCHERS[$i]}"
+        local tmo="${_PHOOK_TIMEOUTS[$i]}"
         # shellcheck disable=SC2016  # ${CLAUDE_PROJECT_DIR} is expanded by Claude Code, not bash
         # #6544: quoted so a project path containing a space does not get
         # word-split by `sh` at hook-execution time — ${CLAUDE_PROJECT_DIR} is
@@ -562,7 +595,7 @@ ensure_project_hook_wiring() {
         # deliberate customization.
         # shellcheck disable=SC2016
         local legacy_cmd='${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"
-        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/" "$legacy_cmd"; then
+        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/" "$legacy_cmd" "$tmo"; then
             wired=$((wired + 1))
         else
             _phook_warn "failed to assert project-level entry for $name in $settings"
