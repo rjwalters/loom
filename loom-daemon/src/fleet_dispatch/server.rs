@@ -559,7 +559,7 @@ impl<I: Identity> Server<I> {
 
     /// A worker's park of an item ended, or it made none (#13919): forget the
     /// item's fast-fail streak and park order.
-    fn park_ended(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
+    fn park_ended(&self, host: &str, body: &[u8], _call: &mut Call) -> Result<Reply, Reply> {
         let req: ParkEndedRequest = self.parse(host, body)?;
         let known = self.with_table(|t, _, _| t.end_fast_fail_park(&req.repo, req.item));
         Ok(self.ok(&AckResponse {
