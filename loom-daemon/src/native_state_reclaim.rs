@@ -49,6 +49,16 @@
 //! short root (`/tmp/loom-nt` on Unix) regardless of `$HOME`'s length, leaving
 //! comfortable headroom for a socket file name under either limit.
 //!
+//! The entry *name* under that root is likewise length-budgeted, but more
+//! tightly than the socket bound: it is [`pinned_tmp_entry_id`] — the launch
+//! uuid's first 16 hex digits, not the full 36-character uuid — because yosys
+//! 0.67's `abc` pass deadlocks once the full pinned path reaches 36 bytes
+//! (#13935: ABC's interactive line editor redraws the over-long
+//! `source <TMPDIR>/yosys-abc-XXXXXX/abc.script` bootstrap line into its
+//! stdout, corrupting the yosys↔abc handshake; measured bound: ≤35 bytes
+//! completes, ≥36 hangs). The sweep recognizes both the short form and
+//! pre-#13935 full-uuid leftovers.
+//!
 //! Splitting the pinned `TMPDIR` out from the session directory means it needs
 //! its own reclaim ([`sweep_pinned_tmp`]) — but not its own liveness or age
 //! policy. A pinned `TMPDIR` entry can only exist for a launch whose session
@@ -106,6 +116,49 @@ pub const DEFAULT_NATIVE_STATE_MIN_INTERVAL_SECS: u64 = 1_800;
 /// Fixed leaf name for [`pinned_tmp_base`]'s default. Short and constant so
 /// the pinned `TMPDIR` path length never depends on `$HOME`.
 const PINNED_TMPDIR_LEAF: &str = "loom-nt";
+
+/// Length in lowercase-hex characters of the per-launch entry name under
+/// [`pinned_tmp_base`]. The pinned entry is **not** named after the full
+/// 36-character launch uuid: yosys 0.67's `abc` pass feeds ABC a bootstrap
+/// line `source <TMPDIR>/yosys-abc-XXXXXX/abc.script` that ABC's interactive
+/// line editor echoes back, and once that line grows past the editor's
+/// terminal-width arithmetic the echo degrades into a `\r`-prefixed redraw
+/// that corrupts the yosys↔abc output handshake — yosys then waits forever on
+/// abc's stdout while abc polls stdin at its `abc NN>` prompt, with
+/// `output.blif` already written (#13935; deadlocks reproduce whenever the
+/// full pinned path is ≥36 bytes — the full uuid pin was 49 — and never at
+/// ≤35; a `COLUMNS=200` override rescues it, proving the width dependence).
+/// 16 hex characters keeps the default-base entry at `/tmp/loom-nt/<16 hex>` =
+/// 29 bytes, a comfortable margin under the measured 35-byte bound, while
+/// still drawing ~61 bits of v4-uuid entropy (far beyond any realistic
+/// concurrent-launch collision on one host).
+pub const PINNED_TMPDIR_ENTRY_CHARS: usize = 16;
+
+/// The per-launch pinned-`TMPDIR` entry name for a launch id: the launch
+/// uuid's lowercase hex digits (hyphens stripped), truncated to
+/// [`PINNED_TMPDIR_ENTRY_CHARS`]. Deterministic in the uuid alone — no extra
+/// randomness, so the entry and the sweep agree without shared state.
+#[must_use]
+pub fn pinned_tmp_entry_id(launch_id: &str) -> String {
+    launch_id
+        .chars()
+        .filter(|c| c.is_ascii_digit() || ('a'..='f').contains(c))
+        .take(PINNED_TMPDIR_ENTRY_CHARS)
+        .collect()
+}
+
+/// Whether `name` is a (current-format) pinned-`TMPDIR` entry name:
+/// [`PINNED_TMPDIR_ENTRY_CHARS`] lowercase hex characters, i.e. exactly what
+/// [`pinned_tmp_entry_id`] produces. Legacy full-uuid entry names are
+/// recognized by [`is_launch_id`] so a host's pre-shortening leftovers are
+/// still reclaimed.
+#[must_use]
+pub fn is_pinned_tmp_entry_id(name: &str) -> bool {
+    name.len() == PINNED_TMPDIR_ENTRY_CHARS
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 // ============================================================================
 // Config (.loom/config.json → autonomous.worktreeReaper.nativeStateReclaim)
@@ -295,9 +348,40 @@ fn session_directory_exists(session_base: &Path, uuid: &str) -> bool {
         .any(|workspace| workspace.path().join(uuid).is_dir())
 }
 
+/// Whether any launch-id session directory under `session_base` derives the
+/// given pinned-`TMPDIR` entry id ([`pinned_tmp_entry_id`]) — the short-form
+/// counterpart of [`session_directory_exists`]'s exact-name lookup. Sessions
+/// live two levels down (`<session_base>/<workspace-hash>/<launch-uuid>`) and
+/// are visited the same way [`session_directory_exists`] visits them.
+fn session_directory_derives_entry(session_base: &Path, entry_id: &str) -> bool {
+    let Ok(workspaces) = std::fs::read_dir(session_base) else {
+        return false;
+    };
+    workspaces.flatten().any(|workspace| {
+        let Ok(launches) = std::fs::read_dir(workspace.path()) else {
+            return false;
+        };
+        launches.flatten().any(|launch| {
+            let file_name = launch.file_name();
+            let Some(name) = file_name.to_str() else {
+                return false;
+            };
+            is_launch_id(name) && launch.path().is_dir() && pinned_tmp_entry_id(name) == entry_id
+        })
+    })
+}
+
 /// Remove every pinned-`TMPDIR` entry under `pinned_tmp_base` whose owning
 /// session directory (searched across `session_bases`) no longer exists.
 /// Returns `(directories_removed, bytes_freed)`.
+///
+/// Entries come in two shapes: current-format short ids
+/// ([`is_pinned_tmp_entry_id`], owned by whichever launch id derives them) and
+/// legacy full-uuid names written before #13935 shortened the entry
+/// ([`is_launch_id`], exact-name owner lookup). Keeping both recognized is
+/// what lets a host upgrade without stranding its pre-upgrade companions —
+/// they are still removed, by the same owner-absence rule, once their session
+/// is gone.
 ///
 /// Fails safe when `session_bases` is empty: with no session base to check
 /// against, "the owner is gone" cannot be verified, so nothing is removed
@@ -316,16 +400,21 @@ pub fn sweep_pinned_tmp(pinned_tmp_base: &Path, session_bases: &[PathBuf]) -> (u
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !is_launch_id(&name) {
-            continue;
-        }
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        if session_bases
-            .iter()
-            .any(|base| session_directory_exists(base, &name))
-        {
+        let owned = if is_pinned_tmp_entry_id(&name) {
+            session_bases
+                .iter()
+                .any(|base| session_directory_derives_entry(base, &name))
+        } else if is_launch_id(&name) {
+            session_bases
+                .iter()
+                .any(|base| session_directory_exists(base, &name))
+        } else {
+            continue;
+        };
+        if owned {
             continue; // the launch's session directory is still present
         }
         let path = entry.path();
@@ -602,6 +691,42 @@ mod tests {
     }
 
     // ===================================================================
+    // pinned_tmp_entry_id — the #13935 short entry name
+    // ===================================================================
+
+    #[test]
+    fn pinned_tmp_entry_id_is_a_deterministic_short_hex_prefix() {
+        let id = pinned_tmp_entry_id(LAUNCH);
+        assert_eq!(id, pinned_tmp_entry_id(LAUNCH), "must be deterministic");
+        assert_eq!(id.len(), PINNED_TMPDIR_ENTRY_CHARS);
+        assert!(is_pinned_tmp_entry_id(&id));
+        // A different launch id derives a different entry; the derived id is
+        // not itself a launch id (it has no hyphenated uuid shape).
+        let other = pinned_tmp_entry_id(&uuid::Uuid::new_v4().to_string());
+        assert_ne!(id, other);
+        assert!(!is_launch_id(&id));
+    }
+
+    #[test]
+    #[serial(native_state_reclaim_env)]
+    fn pinned_entry_path_stays_under_the_abc_line_editor_bound() {
+        std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
+        let path = pinned_tmp_base().join(pinned_tmp_entry_id(LAUNCH));
+        // #13935: yosys 0.67's `abc` pass deadlocks whenever the full pinned
+        // path is ≥36 bytes (its `source <TMPDIR>/yosys-abc-XXXXXX/abc.script`
+        // bootstrap line trips ABC's line-editor redraw). Measured boundary on
+        // this host: 35 bytes completes, 36 hangs. The old full-uuid pin was
+        // 49 bytes — inside the dead zone, so `yosys synth` could not run at
+        // all inside a guarded session.
+        assert!(
+            path.as_os_str().len() <= 35,
+            "pinned tmp path {} exceeds the 35-byte bound under which a yosys \
+             `abc` run inside a guarded session is known to complete",
+            path.display()
+        );
+    }
+
+    // ===================================================================
     // sweep_pinned_tmp — orphan-by-owner-absence, no age policy
     // ===================================================================
 
@@ -674,6 +799,67 @@ mod tests {
             sweep_pinned_tmp(&temp.path().join("absent"), &[temp.path().join("native-tools")]);
         assert_eq!(removed, 0);
         assert_eq!(bytes, 0);
+    }
+
+    // ===================================================================
+    // sweep_pinned_tmp — short-form entries (#13935) and legacy leftovers
+    // ===================================================================
+
+    #[test]
+    fn sweep_pinned_tmp_keeps_a_short_entry_whose_session_derives_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(session_base.join(HASH).join(LAUNCH)).unwrap();
+        std::fs::create_dir_all(pinned_base.join(pinned_tmp_entry_id(LAUNCH))).unwrap();
+
+        let (removed, bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
+
+        assert_eq!(removed, 0);
+        assert_eq!(bytes, 0);
+        assert!(pinned_base.join(pinned_tmp_entry_id(LAUNCH)).is_dir());
+    }
+
+    #[test]
+    fn sweep_pinned_tmp_removes_a_short_entry_whose_session_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(&session_base).unwrap();
+        let entry = pinned_base.join(pinned_tmp_entry_id(LAUNCH));
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("extract.node"), vec![0u8; 4096]).unwrap();
+
+        let (removed, bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
+
+        assert_eq!(removed, 1);
+        assert!(bytes >= 4096);
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn sweep_pinned_tmp_still_reclaims_legacy_full_uuid_leftovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        // A pre-#13935 leftover: full-uuid-named entry, session long gone. A
+        // current-format launch with a matching short id exists alongside —
+        // unrelated to the legacy entry, which must still be reclaimed.
+        let other_launch = uuid::Uuid::new_v4().to_string();
+        std::fs::create_dir_all(session_base.join(HASH).join(&other_launch)).unwrap();
+        std::fs::create_dir_all(pinned_base.join(LAUNCH)).unwrap();
+        std::fs::create_dir_all(pinned_base.join(pinned_tmp_entry_id(&other_launch))).unwrap();
+
+        let (removed, _bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
+
+        assert_eq!(removed, 1, "the orphaned legacy entry must be reclaimed");
+        assert!(!pinned_base.join(LAUNCH).exists());
+        assert!(
+            pinned_base
+                .join(pinned_tmp_entry_id(&other_launch))
+                .is_dir(),
+            "the live short-form entry must be kept"
+        );
     }
 
     // ===================================================================

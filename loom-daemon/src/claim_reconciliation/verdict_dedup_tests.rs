@@ -323,7 +323,10 @@ exit 0
         bin
     }
 
-    fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+    /// Set `vars` for the duration of `f`, restoring every previous value.
+    /// `pub(super)` so #13822's sibling module reuses it rather than keeping a
+    /// second copy that could drift out of step with it.
+    pub(super) fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
         let prev: Vec<_> = vars
             .iter()
             .map(|(k, _)| (*k, std::env::var(k).ok()))
@@ -648,5 +651,607 @@ exit 0
         );
         assert_eq!(stats2.tree_identical_reanchors, 1, "the tree kind survives the inner switch");
         assert_eq!(stats2.invalidated, 0);
+    }
+}
+
+// ============================================================================
+// Issue #13822: a CI-gate-only verdict is never re-anchored.
+// ============================================================================
+
+/// The #13822 livelock, replayed end to end through
+/// [`forge::reconcile_pr_verdicts`].
+///
+/// # The shape, as observed on PR #13593 (2026-11-13)
+///
+/// 1. Judge rejected head `77525dae` with a CI-gate-only verdict — the
+///    `judge-ci-red.md` template, which says in its own text that no code
+///    review was performed, and whose one requested change is "merge
+///    `origin/main` and push".
+/// 2. A Doctor did exactly that, giving head `b2333d7e`. CI went **green** at
+///    that head.
+/// 3. The re-anchor pass ([`super::verdict_invalidation`]) found the move
+///    `clean-merge`-equivalent and copied the rejection forward onto the fixed
+///    head — in a comment that carries no `<!-- loom:ci-gate-only -->` marker.
+/// 4. [`super::ci_gate_recovery`] then skipped the PR
+///    (`Skip::VerdictNotCiOnly`, read off that newest comment), and `forge
+///    doctor-handback` read the same-head marker as a *fresh* rejection and
+///    withdrew its own `loom:review-requested` (exit 13 `RACED`).
+///
+/// Net: the PR sat on `loom:changes-requested` alone with green CI, and no
+/// pass was willing to queue a Judge. Not a stall that times out — every
+/// later tick repeated step 4.
+///
+/// # What these tests pin
+///
+/// The fix is a refusal, not a repair: step 3 never happens, so the ordinary
+/// stale-verdict clear runs and the PR goes back to `loom:review-requested`.
+/// So the tests assert the *clear* for a CI-only verdict and the *re-anchor*
+/// for a reviewed one, over the same fixture — the control is what shows the
+/// refusal is narrow rather than a disabled carve-out.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod ci_only_reanchor_e2e {
+    use super::forge;
+    use super::tree_carveout_e2e::with_env;
+    use super::{SHA_A, SHA_B};
+    use crate::claim_reconciliation::verdict_invalidation::VERDICT_TREE_CARVEOUT_ENABLED_ENV;
+    use crate::claim_reconciliation::VERDICT_STALENESS_ENABLED_ENV;
+    use serial_test::serial;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    /// The PR the incident was observed on, so a failure names it.
+    const PR: u32 = 13593;
+
+    /// An older verdict's SHA, for the "a real review superseded the CI gate"
+    /// case.
+    const SHA_OLD: &str = "3333333333333333333333333333333333333333";
+
+    fn on() -> [(&'static str, Option<&'static str>); 2] {
+        [
+            (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+            (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+        ]
+    }
+
+    /// Judge's CI-failing verdict (`judge-ci-red.md` step 5): the marker, the
+    /// template header, and the sentence that is the whole argument for not
+    /// carrying it forward — nothing was reviewed.
+    fn ci_only_verdict(sha: &str) -> String {
+        format!(
+            "## Changes Requested - CI Failing\n\nNo code review was performed on this pass. \
+             The required fix is to merge origin/main and push.\n\n<!-- loom:ci-gate-only -->\n\n\
+             <!-- loom:verdict-sha sha={sha} verdict=changes-requested -->"
+        )
+    }
+
+    /// The same verdict as posted before the marker existed: the header alone
+    /// has to be enough, or every legacy CI gate stays re-anchorable.
+    fn legacy_ci_only_verdict(sha: &str) -> String {
+        format!(
+            "## Changes Requested - CI Failing\n\nThe required checks are red at this head.\n\n\
+             <!-- loom:verdict-sha sha={sha} verdict=changes-requested -->"
+        )
+    }
+
+    /// A verdict that reviewed the code and found something. This one HAS
+    /// something to carry across an equivalent head move.
+    fn reviewed_verdict(sha: &str) -> String {
+        format!(
+            "## Changes Requested\n\nThe retry loop in src/lib.rs never backs off, so a 429 \
+             spins.\n\n<!-- loom:verdict-sha sha={sha} verdict=changes-requested -->"
+        )
+    }
+
+    /// The `issues/<n>/comments` listing for `bodies` (oldest first), each
+    /// from a trusted fleet bot so [`crate::comment_trust`] keeps it.
+    ///
+    /// `serde_json` does the escaping, and the result is asserted free of
+    /// `'` because the fixture echoes it inside a single-quoted shell word.
+    fn comments_listing(bodies: &[String]) -> String {
+        let items: Vec<_> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| {
+                serde_json::json!({
+                    "user": { "login": "loom-fleet-dispatch[bot]", "type": "Bot" },
+                    "author_association": "NONE",
+                    "created_at": format!("2026-11-13T10:{:02}:00Z", 10 + i),
+                    "body": body,
+                })
+            })
+            .collect();
+        let json = serde_json::Value::Array(items).to_string();
+        assert!(!json.contains('\''), "fixture bodies must carry no single quote: {json}");
+        json
+    }
+
+    /// How the fixture answers the `issues/<n>/comments` listing.
+    ///
+    /// The pass reads it **twice** on the path under test — once in
+    /// `list_verdict_prs` (which finds the verdict marker, so it must succeed
+    /// or the PR never reaches `handle_invalidate` at all) and once in the
+    /// #13822 gate. The later variants answer the second read differently, to
+    /// drive the fail-closed branches without faking the first.
+    enum Comments {
+        /// Every read answers this listing.
+        Always(String),
+        /// The first read answers; every later one fails (a `gh` outage).
+        ThenFails(String),
+        /// The first read answers; later ones answer `rest` instead (the
+        /// verdict comment deleted out from under the pass).
+        Then(String, String),
+    }
+
+    impl Comments {
+        /// The `sh` arm serving this listing, counting reads in `dir`.
+        fn arm(&self, dir: &Path) -> String {
+            let counter = dir.join("comments.n").display().to_string();
+            let bump = format!(
+                "N=$(cat '{counter}' 2>/dev/null || echo 0); N=$((N+1)); echo \"$N\" > '{counter}'"
+            );
+            match self {
+                Self::Always(json) => format!("echo '{json}'\n  exit 0"),
+                Self::ThenFails(json) => format!(
+                    "{bump}\n  if [ \"$N\" -gt 1 ]; then\n    \
+                     echo 'gh: comments unreadable' >&2\n    exit 1\n  fi\n  \
+                     echo '{json}'\n  exit 0"
+                ),
+                Self::Then(first, rest) => format!(
+                    "{bump}\n  if [ \"$N\" -gt 1 ]; then\n    \
+                     echo '{rest}'\n  else\n    echo '{first}'\n  fi\n  exit 0"
+                ),
+            }
+        }
+    }
+
+    /// A fake `gh` for PR [`PR`]: it carries `loom:changes-requested` +
+    /// `loom:ci-failure` (the CI-gate pair), its head is `SHA_B`, no
+    /// auto-merge is armed, and its base is `main`.
+    ///
+    /// `compare_body` answers every `compare/{a}...{b}` with no
+    /// `<dir>/compare-<refs>.json` route file of its own, exactly as
+    /// `tree_carveout_e2e`'s fixture does.
+    fn fake_gh(dir: &Path, log: &Path, comments: &Comments, compare_body: &str) -> PathBuf {
+        fake_gh_at(dir, log, comments, compare_body, SHA_B)
+    }
+
+    /// [`fake_gh`] with the listed head SHA spelled out, for the clean-merge
+    /// fixture whose head is a real merge commit.
+    fn fake_gh_at(
+        dir: &Path,
+        log: &Path,
+        comments: &Comments,
+        compare_body: &str,
+        head: &str,
+    ) -> PathBuf {
+        let bin = dir.join("fake-gh-ci-only.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{{"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":null,"baseRefName":"main"}}'
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  case "$2" in
+    *compare/*)
+      REFS="${{2##*/compare/}}"
+      if [ -f "{dir}/compare-$REFS.json" ]; then
+        cat "{dir}/compare-$REFS.json"
+      else
+        echo '{compare_body}'
+      fi
+      exit 0
+      ;;
+  esac
+  {comments}
+fi
+exit 0
+"#,
+            log = log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(
+                    PR,
+                    &["loom:changes-requested", "loom:ci-failure"]
+                )
+                .sha(head)
+            ]),
+            dir = dir.display(),
+            comments = comments.arm(dir),
+            compare_body = compare_body,
+        );
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    /// Everything one case needs: a scratch dir, the repo root the pass runs
+    /// against, and the fake `gh`'s call log.
+    struct Case {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        log: PathBuf,
+        gh: PathBuf,
+    }
+
+    fn case(comments: &Comments, compare_body: &str) -> Case {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(dir.path(), &log, comments, compare_body);
+        Case {
+            _dir: dir,
+            root,
+            log,
+            gh,
+        }
+    }
+
+    impl Case {
+        fn calls(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap()
+        }
+    }
+
+    /// The tree-identical compare, the cheapest shape that reaches
+    /// `Equivalence::Equivalent` — the gate is kind-blind, so most cases use
+    /// it; `the_13593_clean_merge_shape_is_cleared_not_reanchored` below pays
+    /// for a real `clean-merge` fixture to show the incident's own kind.
+    const EQUIVALENT: &str = r#"{"status": "ahead", "files": []}"#;
+
+    /// Assert the ordinary stale-verdict clear ran: the label swap went out,
+    /// and no re-anchor comment did.
+    fn assert_cleared(c: &Case, what: &str) {
+        let calls = c.calls();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with(&format!("pr edit {PR}"))),
+            "{what}: the verdict labels must be swapped: {calls}"
+        );
+        assert!(
+            calls.contains("--add-label loom:review-requested"),
+            "{what}: the PR must be re-queued for Judge: {calls}"
+        );
+        assert!(
+            calls.contains("--remove-label loom:ci-failure"),
+            "{what}: the CI finding rides out with the verdict it was applied beside: {calls}"
+        );
+        assert!(
+            !calls.contains("loom:verdict-equivalence"),
+            "{what}: a cleared verdict must not also be re-anchored: {calls}"
+        );
+    }
+
+    /// THE #13822 fix: a CI-gate-only rejection whose head moved to an
+    /// equivalent commit is cleared, not carried forward — so the PR lands on
+    /// `loom:review-requested` and a Judge is queued, instead of keeping a
+    /// rejection whose one requested change has already been made.
+    ///
+    /// Both spellings must count. The marker is what Judge stamps today; the
+    /// header alone is what every verdict posted before the marker carries,
+    /// and those are exactly the ones that have been sitting longest.
+    #[test]
+    #[serial]
+    fn a_ci_gate_only_verdict_is_cleared_not_reanchored() {
+        for (what, verdict) in [
+            ("marker", ci_only_verdict(SHA_A)),
+            ("legacy header only", legacy_ci_only_verdict(SHA_A)),
+        ] {
+            let comments = Comments::Always(comments_listing(&[verdict]));
+            let c = case(&comments, EQUIVALENT);
+
+            let stats = with_env(&on(), || forge::reconcile_pr_verdicts(&c.gh, &c.root));
+
+            assert_eq!(stats.invalidated, 1, "{what}: the CI-only verdict must be cleared");
+            assert_eq!(
+                stats.tree_identical_reanchors, 0,
+                "{what}: a CI-only verdict records no review, so there is nothing to re-anchor"
+            );
+            assert_cleared(&c, what);
+        }
+    }
+
+    /// The control, and the reason this is a narrow refusal rather than a
+    /// disabled carve-out: a `changes-requested` verdict that actually
+    /// reviewed the code still re-anchors across an equivalent head move,
+    /// touching no label — #9124/#9416 behaviour, unchanged.
+    ///
+    /// The second case is the ordering rule: the **newest** verdict decides,
+    /// so a real review that superseded an older CI gate carries forward.
+    #[test]
+    #[serial]
+    fn a_reviewed_changes_requested_verdict_is_still_reanchored() {
+        for (what, bodies) in [
+            ("a review alone", vec![reviewed_verdict(SHA_A)]),
+            (
+                "a review superseding an older CI gate",
+                vec![ci_only_verdict(SHA_OLD), reviewed_verdict(SHA_A)],
+            ),
+        ] {
+            let comments = Comments::Always(comments_listing(&bodies));
+            let c = case(&comments, EQUIVALENT);
+
+            let stats = with_env(&on(), || forge::reconcile_pr_verdicts(&c.gh, &c.root));
+
+            assert_eq!(
+                stats.tree_identical_reanchors, 1,
+                "{what}: an equivalent head move must still re-anchor a real review"
+            );
+            assert_eq!(stats.invalidated, 0, "{what}: and must not also clear it");
+            let calls = c.calls();
+            assert!(
+                !calls
+                    .lines()
+                    .any(|l| l.starts_with(&format!("pr edit {PR}"))),
+                "{what}: no label may be touched by a re-anchor: {calls}"
+            );
+            assert!(
+                calls.contains("loom:verdict-equivalence kind=tree"),
+                "{what}: the re-anchor comment must record which equivalence carried it: {calls}"
+            );
+        }
+    }
+
+    /// Fail closed, the same direction `Equivalence::Indeterminate` already
+    /// fails (#10134): if the pass cannot tell whether the verdict is a CI
+    /// gate, it clears rather than re-anchors.
+    ///
+    /// Two ways to not know, both driven on the SECOND comment read so the
+    /// PR still reaches `handle_invalidate`: the read fails outright, and the
+    /// read succeeds but no `changes-requested` marker is left in it.
+    ///
+    /// The asymmetry is deliberate. A wrong clear costs one Judge pass; a
+    /// wrong re-anchor costs the PR every remaining tick of its life, which
+    /// is what #13593 paid.
+    #[test]
+    #[serial]
+    fn an_unclassifiable_verdict_is_cleared_rather_than_reanchored() {
+        let listing = comments_listing(&[ci_only_verdict(SHA_A)]);
+        let approved_only = comments_listing(&[format!(
+            "LGTM.\n\n<!-- loom:verdict-sha sha={SHA_A} verdict=approved -->"
+        )]);
+        for (what, comments) in [
+            ("comments unreadable", Comments::ThenFails(listing.clone())),
+            (
+                "no changes-requested marker left",
+                Comments::Then(listing.clone(), approved_only),
+            ),
+        ] {
+            let c = case(&comments, EQUIVALENT);
+
+            let stats = with_env(&on(), || forge::reconcile_pr_verdicts(&c.gh, &c.root));
+
+            assert_eq!(stats.invalidated, 1, "{what}: an unclassifiable verdict must be cleared");
+            assert_eq!(stats.tree_identical_reanchors, 0, "{what}: never re-anchor on a guess");
+            assert_cleared(&c, what);
+        }
+    }
+
+    /// An **approved** verdict pays nothing for #13822: it is never a CI gate,
+    /// so the gate does not even read its comments, and a tree-identical head
+    /// move re-anchors exactly as `tree_carveout_e2e` pins it.
+    ///
+    /// This is the half of the carve-out that protects an armed auto-merge
+    /// from a pointless re-review, so a regression here would be expensive
+    /// and silent.
+    #[test]
+    #[serial]
+    fn an_approved_verdict_is_untouched_by_the_ci_only_gate() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = dir.path().join("gh.log");
+        // The listing serves `loom:pr`, and the only comment is an approval
+        // that would read as "not CI-only" if the gate were asked at all.
+        let comments = Comments::Always(comments_listing(&[format!(
+            "LGTM.\n\n<!-- loom:verdict-sha sha={SHA_A} verdict=approved -->"
+        )]));
+        let bin = dir.path().join("fake-gh-approved.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{{"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":null,"baseRefName":"main"}}'
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  case "$2" in
+    *compare/*) echo '{EQUIVALENT}'; exit 0 ;;
+  esac
+  {comments}
+fi
+exit 0
+"#,
+            log = log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(PR, &["loom:pr"]).sha(SHA_B)
+            ]),
+            comments = comments.arm(dir.path()),
+        );
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let stats = with_env(&on(), || forge::reconcile_pr_verdicts(&bin, &root));
+
+        assert_eq!(stats.tree_identical_reanchors, 1, "an approval must still re-anchor");
+        assert_eq!(stats.invalidated, 0);
+    }
+
+    /// The kill switch still wins: with the carve-out off nothing is asked
+    /// about equivalence, so a CI-only verdict clears for the pre-#9124
+    /// reason and the #13822 gate never runs.
+    #[test]
+    #[serial]
+    fn the_kill_switch_short_circuits_the_ci_only_gate() {
+        let comments = Comments::Always(comments_listing(&[ci_only_verdict(SHA_A)]));
+        let c = case(&comments, EQUIVALENT);
+
+        let stats = with_env(
+            &[
+                (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("0")),
+            ],
+            || forge::reconcile_pr_verdicts(&c.gh, &c.root),
+        );
+
+        assert_eq!(stats.invalidated, 1);
+        assert_eq!(stats.tree_identical_reanchors, 0);
+        let calls = c.calls();
+        assert!(
+            !calls.contains("compare/"),
+            "with the switch off no equivalence is asked about: {calls}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // PR #13593's own equivalence kind: a real clean merge of the base.
+    // ------------------------------------------------------------------
+
+    /// Run git in `repo`, asserting success. A local copy rather than
+    /// `verdict_equivalence::tests`'s: that one is `pub(super)` to its own
+    /// module and this is a different subtree.
+    fn git_ok(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// PR #13593's history, for real:
+    ///
+    /// ```text
+    ///   base0 ---------- base1 (main)       main moved: m.txt
+    ///       \                 \
+    ///        reviewed -------- head          the Doctor merged main in
+    /// ```
+    ///
+    /// Returns `(reviewed, head, base1)`. The merge is `--no-ff` and
+    /// conflict-free, which is what `clean_merge` proves with `git merge-tree
+    /// --write-tree`.
+    fn clean_merge_history(repo: &Path) -> (String, String, String) {
+        git_ok(repo, &["init", "--quiet", "."]);
+        git_ok(repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(repo.join("m.txt"), "main-0\n").unwrap();
+        std::fs::write(repo.join("f.txt"), "feature-0\n").unwrap();
+        git_ok(repo, &["add", "-A"]);
+        git_ok(repo, &["commit", "--quiet", "-m", "base0"]);
+
+        git_ok(repo, &["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(repo.join("f.txt"), "feature-1\n").unwrap();
+        git_ok(repo, &["add", "-A"]);
+        git_ok(repo, &["commit", "--quiet", "-m", "the PR change"]);
+        let reviewed = git_ok(repo, &["rev-parse", "HEAD"]);
+
+        git_ok(repo, &["checkout", "--quiet", "main"]);
+        std::fs::write(repo.join("m.txt"), "main-1\n").unwrap();
+        git_ok(repo, &["add", "-A"]);
+        git_ok(repo, &["commit", "--quiet", "-m", "main moved"]);
+        let base1 = git_ok(repo, &["rev-parse", "HEAD"]);
+
+        git_ok(repo, &["checkout", "--quiet", "feature"]);
+        git_ok(repo, &["merge", "--quiet", "--no-ff", "-m", "Merge main", "main"]);
+        let head = git_ok(repo, &["rev-parse", "HEAD"]);
+        (reviewed, head, base1)
+    }
+
+    /// #13593's exact shape, with its own equivalence kind: the head is a real
+    /// clean merge of `main` into the reviewed head, so the tree kind refutes
+    /// and `clean_merge` proves. The CI-only verdict is cleared anyway.
+    ///
+    /// Both verdicts run against the SAME fixture, and that is the point: the
+    /// reviewed one must re-anchor with `kind=clean-merge`. Without that half
+    /// the test would also pass if the fixture never reached
+    /// `Equivalence::Equivalent` at all — i.e. for entirely the wrong reason.
+    #[test]
+    #[serial]
+    fn the_13593_clean_merge_shape_is_cleared_not_reanchored() {
+        for (what, expect_reanchor) in [("the CI gate", false), ("a real review", true)] {
+            let dir = tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+            let (reviewed, head, base1) = clean_merge_history(&root);
+            if !crate::git_merge_tree::supports_merge_tree(Some(root.as_path())) {
+                eprintln!("SKIP: git < 2.38 has no `merge-tree --write-tree`");
+                return;
+            }
+            // `clean_merge` confirms the merged-in parent really is base
+            // content via `compare/<parent>...main`.
+            std::fs::write(
+                dir.path().join(format!("compare-{base1}...main.json")),
+                r#"{"status": "identical", "files": []}"#,
+            )
+            .unwrap();
+
+            let log = dir.path().join("gh.log");
+            let verdict = if expect_reanchor {
+                reviewed_verdict(&reviewed)
+            } else {
+                ci_only_verdict(&reviewed)
+            };
+            let comments = Comments::Always(comments_listing(&[verdict]));
+            // The direct `reviewed...head` compare shows main's file, so the
+            // tree kind refutes and `clean_merge` is the kind that answers.
+            let gh = fake_gh_at(
+                dir.path(),
+                &log,
+                &comments,
+                r#"{"status":"ahead","files":[{"filename":"m.txt"}]}"#,
+                &head,
+            );
+
+            let stats = with_env(&on(), || forge::reconcile_pr_verdicts(&gh, &root));
+
+            let calls = std::fs::read_to_string(&log).unwrap();
+            if expect_reanchor {
+                assert_eq!(
+                    stats.tree_identical_reanchors, 1,
+                    "{what}: the fixture must really be clean-merge-equivalent: {calls}"
+                );
+                assert_eq!(stats.invalidated, 0, "{what}: and must not also clear");
+                assert!(
+                    calls.contains("loom:verdict-equivalence kind=clean-merge"),
+                    "{what}: by the clean-merge kind, which is #13593's own: {calls}"
+                );
+            } else {
+                assert_eq!(
+                    stats.invalidated, 1,
+                    "{what}: #13593's verdict must be cleared, not carried forward: {calls}"
+                );
+                assert_eq!(
+                    stats.tree_identical_reanchors, 0,
+                    "{what}: a clean merge of the base does not make a CI gate re-anchorable"
+                );
+                assert!(
+                    calls
+                        .lines()
+                        .any(|l| l.starts_with(&format!("pr edit {PR}"))),
+                    "{what}: the labels must be swapped: {calls}"
+                );
+                assert!(
+                    calls.contains("--add-label loom:review-requested"),
+                    "{what}: which is how a Judge finally gets queued: {calls}"
+                );
+            }
+        }
     }
 }

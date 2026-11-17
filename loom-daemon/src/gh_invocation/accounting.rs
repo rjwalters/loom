@@ -48,7 +48,7 @@
 //! decision ([`crate::forge_call_stats::ops`]).
 //!
 //! Recording is local I/O only (the per-host sink) and can never fail the
-//! invocation — [`forge_call_stats::record_with_identity`] already
+//! invocation — [`forge_call_stats::record_attributed`] already
 //! guarantees that.
 
 use super::billing::{self, Billing};

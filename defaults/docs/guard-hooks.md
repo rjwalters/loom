@@ -112,6 +112,29 @@ If you want the machine-level end state (no per-repo copies at all), run
 `loom migrate` (Phase 6 / #4254) — it untracks the legacy copies, after which
 `ensure_project_hook_wiring` stops writing project entries on its own.
 
+### Canonical scope and duplicate wiring (#13958)
+
+The **canonical scope is user-scope, machine-level**: the `~/.claude/settings.json`
+wrapper entries written by `provision_loom_hooks` are the designed execution path
+(Phase 5, above). Project-level `.claude/settings.json` entries are
+**transition-only** — the #4401 fallback that keeps guards live while a repo still
+carries `.loom/hooks/` copies. Both scopes wired at once is therefore an **expected
+transition shape, not a defect**: Claude Code does not dedupe the two entries, but
+the user-scope wrapper defers to the project copy (step 2), so each guard fires
+exactly once — the duplicate costs one extra `bash` spawn per matching tool call,
+nothing more.
+
+The shape becomes a **genuine double-fire** only when both scopes are wired *and*
+the defer cannot hold — in practice, a project entry whose `.loom/hooks/<name>`
+copy is missing or no longer executable, so the wrapper stops deferring and execs
+the machine hook on top of the (failing) project entry. The install self-check's
+`duplicate-hook-wiring` invariant (`Invariant::ALL` in
+`loom-daemon/src/install_self_check.rs`; see `defaults/docs/daemon-reference.md`
+§ "Install/host invariant self-check") warns on exactly that case. It is
+**warn-only** — it never edits either settings file; the fix is to remove the stale
+project-level entry (or run `loom migrate`, which retires the project copies
+wholesale), or restore an executable copy so the wrapper defers.
+
 ### Backup retention (#5387)
 
 Both `provision_loom_hooks()` and `deprovision_loom_hooks()` back up the
