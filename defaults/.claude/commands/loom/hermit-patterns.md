@@ -610,7 +610,7 @@ directory argument, workflow `on:`/`run:` paths, a runner's directory
 arguments, an adjacent `test_<name>` file — so before proposing removal of
 anything claimed to "run by nothing", ask the runner, not the text:
 `pytest <dir> --collect-only -q | grep <name>`
-(2AMLogic/gf180-parasynth#847 — a gate with no textual reference anywhere was
+(example-org/tool-repo#202 — a gate with no textual reference anywhere was
 still collected by `pytest tools/` on every `make verify`; full worked example
 in `hermit.md` → "Limits of a name grep").
 

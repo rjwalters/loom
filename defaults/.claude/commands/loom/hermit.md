@@ -83,7 +83,7 @@ pytest <dir> --collect-only -q | grep <name>   # does a test runner collect it?
 ```
 
 Also check workflow `on:`/`run:` paths, a runner's directory arguments, and an
-adjacent `test_<name>` file. Worked example (2AMLogic/gf180-parasynth#847):
+adjacent `test_<name>` file. Worked example (example-org/tool-repo#202):
 `git grep` found no reference to `tools/check_m1a_selection.py` in any build
 file, but `make verify` runs `pytest … tools/ …`, which collects the adjacent
 `tools/test_check_m1a_selection.py` on every run — so the "committed but run

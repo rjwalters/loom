@@ -514,7 +514,7 @@ startable subset un-escalates them there, `SUBSET_CARVEOUT: yes`).
       is not independent verification: it is blind to the discovery conventions
       (pytest directory collection, workflow `on:`/`run:` paths, a runner's
       directory arguments, an adjacent `test_<name>` file) that run code without
-      naming it (2AMLogic/gf180-parasynth#847). Ask the runner yourself
+      naming it (example-org/tool-repo#202). Ask the runner yourself
       (`pytest <dir> --collect-only -q | grep <name>`) or check the discovery
       conventions before confirming the premise
 
