@@ -1003,3 +1003,118 @@ async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
     let (reply, _) = s.handle(A, "/v1/park_ended", ended.as_bytes());
     assert_eq!(reply.status, 403);
 }
+
+// ---------------------------------------------------------------- the filing lock (#13918)
+
+fn filing_body(host: &str, holder: &str) -> Value {
+    json!({"host_id": host, "holder": holder, "label": "architect"})
+}
+
+fn filing_lock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> Value {
+    let (reply, call) =
+        s.handle(host, "/v1/filing-lock", filing_body(host, holder).to_string().as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(call.endpoint, "/v1/filing-lock");
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+fn filing_unlock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> bool {
+    let body = json!({"host_id": host, "holder": holder}).to_string();
+    let (reply, _) = s.handle(host, "/v1/filing-unlock", body.as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let v: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(v["server_epoch"], "epoch-test");
+    v["known"].as_bool().unwrap()
+}
+
+/// Two hosts at once: exactly one is granted, the other is held with a retry
+/// hint, and after the first unlocks the second is granted.
+#[test]
+fn two_hosts_filing_at_once_serialise_through_the_captain() {
+    let s = open_server("node-a");
+    let a = filing_lock(&s, A, "a-1");
+    assert_eq!(a["granted"], true);
+    assert_eq!(a["ttl_s"], 60);
+    let b = filing_lock(&s, B, "b-1");
+    assert_eq!(b["granted"], false);
+    assert_eq!(b["held_by"], A);
+    assert!(b["retry_after_s"].as_u64().unwrap() >= 1);
+    assert!(b.get("ttl_s").is_none());
+
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+#[test]
+fn an_unlock_from_a_non_holder_does_not_free_the_slot() {
+    let s = open_server("node-a");
+    filing_lock(&s, A, "a-1");
+    assert!(!filing_unlock(&s, B, "a-1"), "another host naming the holder id");
+    assert!(!filing_unlock(&s, A, "stale"), "a stale holder id");
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "still held");
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert!(!filing_unlock(&s, A, "a-1"), "a second unlock is a no-op");
+}
+
+/// A holder that never unlocks loses the slot at its TTL, and a refresh under
+/// the same holder id extends it.
+#[test]
+fn a_holder_that_never_unlocks_expires_and_a_refresh_extends_the_ttl() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    assert_eq!(filing_lock(&s, A, "a-1")["granted"], true);
+    clock.set(150);
+    let refreshed = filing_lock(&s, A, "a-1");
+    assert_eq!(refreshed["granted"], true, "the same holder is re-granted");
+    clock.set(200);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "refreshed to 210");
+    clock.set(210);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true, "A never unlocked: expired");
+    assert!(!filing_unlock(&s, A, "a-1"), "A's late unlock must not free B's hold");
+    assert_eq!(filing_lock(&s, A, "a-2")["granted"], false);
+}
+
+/// The sweep expires an abandoned hold without a request arriving.
+#[test]
+fn the_sweep_expires_an_abandoned_filing_hold() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    filing_lock(&s, A, "a-1");
+    clock.set(161);
+    s.sweep_points(chrono::Utc::now());
+    s.expire_filing();
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+/// A restart empties the slot (soft state): the holder's next refresh is
+/// granted again, it does not wedge.
+#[test]
+fn a_restarted_captain_grants_a_holders_refresh_again() {
+    let first = open_server("node-a");
+    filing_lock(&first, A, "a-1");
+    let second = open_server("node-a");
+    assert_eq!(filing_lock(&second, A, "a-1")["granted"], true);
+}
+
+/// Identity is the same `whois` as for claims, and the holder id is bounded.
+#[tokio::test]
+async fn filing_calls_need_a_roster_host_and_a_bounded_holder() {
+    let clock = Arc::new(ManualClock::default());
+    let addr = listen(server(StaticIdentity::default(), Arc::clone(&clock))).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["server_epoch"], "epoch-test");
+
+    let addr = listen(open_server("node-a")).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(B, "b-1")).await;
+    assert_eq!(status, 403, "host_id is not the caller's: {body}");
+    let (status, _) = post(addr, "/v1/filing-lock", &filing_body(A, "")).await;
+    assert_eq!(status, 400);
+    let long = "x".repeat(129);
+    let (status, _) = post(addr, "/v1/filing-unlock", &json!({"host_id": A, "holder": long})).await;
+    assert_eq!(status, 400);
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!((status, &body["granted"]), (200, &json!(true)));
+}

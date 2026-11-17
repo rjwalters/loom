@@ -60,6 +60,43 @@ enum FleetDispatchCommand {
         #[arg(long)]
         no_captain_gate: bool,
     },
+    /// Take or give back the captain-hosted fleet issue-filing lock (#13918).
+    /// The shell filer (`lib/filing-lock.sh`) calls it after taking the
+    /// host-local lock. With fleet mode off, an unreachable captain or an
+    /// older captain it exits 0 and prints nothing: file under the local lock.
+    #[command(subcommand)]
+    FilingLock(FilingLockCommand),
+}
+
+/// Exit code of a filing acquire that gave up waiting: `EX_TEMPFAIL`, the one
+/// `create-issue.sh` already returns for a deferred burst.
+const EXIT_DEFERRED: i32 = 75;
+
+#[derive(Subcommand)]
+enum FilingLockCommand {
+    /// Ask the captain for the fleet filing slot, waiting up to `--wait-secs`.
+    /// Prints the holder id on stdout when it is granted (pass it to
+    /// `release`), nothing when the captain is off or unreachable (exit 0, file
+    /// under the local lock), and exits 75 when the slot stayed held (do not
+    /// file).
+    Acquire {
+        /// What is being filed, for the captain's log.
+        #[arg(long, default_value = "issue-filing")]
+        label: String,
+        /// Longest wait while another host holds the slot, seconds.
+        #[arg(long, default_value_t = crate::filing_lock::DEFAULT_WAIT_SECS)]
+        wait_secs: u64,
+        /// Re-ask under this holder id: refreshes a grant's TTL.
+        #[arg(long)]
+        holder: Option<String>,
+    },
+    /// Give the slot back. Always exits 0: a failed unlock is freed by the
+    /// captain's TTL.
+    Release {
+        /// The holder id `acquire` printed.
+        #[arg(long)]
+        holder: String,
+    },
 }
 
 impl FleetDispatchArgs {
@@ -86,8 +123,46 @@ impl FleetDispatchArgs {
                 )
                 .await
             }
+            FleetDispatchCommand::FilingLock(cmd) => filing_lock(cmd).await,
         }
     }
+}
+
+/// `fleet-dispatch filing-lock …` (module docs of
+/// [`crate::fleet_dispatch::filing`]).
+async fn filing_lock(cmd: FilingLockCommand) -> Result<()> {
+    use crate::fleet_dispatch::filing::{self, Hold, Tier};
+    let root = filing::workspace_root();
+    match cmd {
+        FilingLockCommand::Acquire {
+            label,
+            wait_secs,
+            holder,
+        } => {
+            let holder = holder.unwrap_or_else(filing::new_holder);
+            let tier = tokio::task::spawn_blocking(move || {
+                filing::acquire(&root, &label, &holder, Duration::from_secs(wait_secs))
+            })
+            .await
+            .map_err(|e| anyhow!("filing-lock acquire task failed: {e}"))?;
+            match tier {
+                Tier::Granted(hold) => println!("{}", hold.holder),
+                Tier::Off | Tier::FailOpen { .. } => {}
+                Tier::Deferred { reason } => {
+                    eprintln!("filing-lock: deferred: {reason}");
+                    std::process::exit(EXIT_DEFERRED);
+                }
+            }
+        }
+        FilingLockCommand::Release { holder } => {
+            if let Some(url) = filing::endpoint(&root) {
+                tokio::task::spawn_blocking(move || filing::release(&Hold::new(&url, &holder)))
+                    .await
+                    .map_err(|e| anyhow!("filing-lock release task failed: {e}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `--no-progress-cooldown-secs` ladder: one to four whole seconds,
