@@ -9,8 +9,8 @@
 #
 # Examples:
 #   loom start                    Start all agents from config
-#   loom start --only shepherd    Start only shepherd agents
 #   loom start --only builder     Start only builder agents
+#   loom start --only judge       Start only judge agents
 
 set -euo pipefail
 
@@ -83,15 +83,15 @@ ${YELLOW}USAGE:${NC}
     loom start --help             Show this help
 
 ${YELLOW}OPTIONS:${NC}
-    --only <role>     Filter agents by role file (e.g., shepherd, builder, judge)
+    --only <role>     Filter agents by role file (e.g., builder, judge, curator)
     --dry-run         Preview what would be started without doing it
     --yes, -y         Non-interactive mode, skip prompts
     --force           Force restart of already-running agents
 
 ${YELLOW}EXAMPLES:${NC}
     loom start                    Start all agents from config
-    loom start --only shepherd    Start only shepherd agents
     loom start --only builder     Start only builder agents
+    loom start --only judge       Start only judge agents
     loom start --dry-run          Preview what would start
 
 ${YELLOW}CONFIGURATION:${NC}

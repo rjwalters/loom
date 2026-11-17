@@ -400,6 +400,134 @@ pub fn blockers(text: &str) -> Vec<BlockerRef> {
     set.into_iter().collect()
 }
 
+/// The prefix of the visible audit line a retraction appends (#13895). Plain
+/// text, so it renders — unlike the marker it demotes — and deliberately
+/// without the phrase every dependency parser matches (`Blocked by`), so the
+/// withdrawal never declares anything itself.
+pub const WITHDRAWN_PHRASE: &str = "Park withdrawn:";
+
+/// One withdrawn blocker, parsed from a retraction's audit line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawn {
+    /// The blocker the withdrawal names.
+    pub blocker: BlockerRef,
+    /// `by=` — the role or identity that withdrew it.
+    pub by: Option<String>,
+    /// `at=` — when, as written.
+    pub at: Option<String>,
+    /// `reason="…"` — why it no longer gates the artifact.
+    pub reason: Option<String>,
+}
+
+/// `text` with every live park marker naming `target` wrapped in an inline
+/// code span — the marker's own bytes unchanged — so [`parse`] and
+/// [`blockers`] stop reading it as a declaration (#13895, [`code`]). This is
+/// the mechanical form of the manual demotion `parse` has honoured since
+/// #10837: a quoted marker renders as visible text, not a comment.
+///
+/// Returns the rewritten text and the number of markers demoted; zero means
+/// no live marker names `target` (the caller's idempotent no-op). A marker
+/// naming `target` *and* other references is never split — demoting it would
+/// silently drop the other blockers — and is refused with the other refs.
+pub fn demote_blocker(text: &str, target: &BlockerRef) -> Result<(String, usize), Vec<BlockerRef>> {
+    let mut wrap: Vec<Range<usize>> = Vec::new();
+    let mut refused = None;
+    for (whole, inner) in markers(text) {
+        let records = parse_inner(&text[inner]);
+        if !records.iter().any(|r| r.blocker.as_ref() == Some(target)) {
+            continue;
+        }
+        let others: BTreeSet<BlockerRef> = records
+            .iter()
+            .filter_map(|r| r.blocker.clone())
+            .filter(|b| b != target)
+            .collect();
+        if !others.is_empty() {
+            // Refuse the whole retraction, not just this marker: a partial
+            // withdrawal of a multi-reference record reads as done.
+            refused.get_or_insert(others);
+            continue;
+        }
+        wrap.push(whole);
+    }
+    if let Some(others) = refused {
+        return Err(others.into_iter().collect());
+    }
+    let count = wrap.len();
+    let mut out = text.to_string();
+    // Later offsets first: every insert shifts everything after it by one
+    // byte. `r.end` is one past the marker's final `>`, so the closing
+    // backtick lands on the marker's own line; both insert points are ASCII,
+    // so they stay on char boundaries.
+    for r in wrap.iter().rev() {
+        out.insert(r.end, '`');
+        out.insert(r.start, '`');
+    }
+    Ok((out, count))
+}
+
+/// Render the visible audit line a retraction appends: who, when, why, in the
+/// body's plain text rather than a comment, so the withdrawal is reviewable
+/// and machine-readable (`parse --json`'s `withdrawn`).
+#[must_use]
+pub fn render_withdrawn(blocker: &BlockerRef, by: Option<&str>, at: &str, reason: &str) -> String {
+    let mut out = format!("{WITHDRAWN_PHRASE} {blocker} —");
+    if let Some(b) = by.map(sanitize_attr).filter(|b| !b.is_empty()) {
+        out.push_str(&format!(" by={b}"));
+    }
+    let clean_at = sanitize_attr(at);
+    if !clean_at.is_empty() {
+        out.push_str(&format!(" at={clean_at}"));
+    }
+    let clean = sanitize_reason(reason);
+    if !clean.is_empty() {
+        out.push_str(&format!(" reason=\"{clean}\""));
+    }
+    out
+}
+
+/// Parse one retraction audit line:
+/// `Park withdrawn: #N — by=<role> at=<RFC3339> reason="…"`. The reason is
+/// stripped before the reference is extracted, the same rule as [`parse_inner`]:
+/// a `#N` inside the why is a mention, never the withdrawn blocker.
+#[must_use]
+pub fn parse_withdrawn(line: &str) -> Option<Withdrawn> {
+    let rest = line.trim().strip_prefix(WITHDRAWN_PHRASE)?.trim_start();
+    let reason = reason_re()
+        .captures(rest)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
+    let without_reason = reason_re().replace_all(rest, "");
+    let c = ref_re().captures(&without_reason)?;
+    let blocker = BlockerRef {
+        repo: c.get(1).map(|m| m.as_str().to_string()),
+        number: c.get(2)?.as_str().parse().ok()?,
+    };
+    let (mut by, mut at) = (None, None);
+    for c in attr_re().captures_iter(&without_reason) {
+        let (Some(k), Some(v)) = (c.get(1), c.get(2)) else {
+            continue;
+        };
+        match k.as_str() {
+            "by" => by = Some(v.as_str().to_string()),
+            "at" => at = Some(v.as_str().to_string()),
+            _ => {}
+        }
+    }
+    Some(Withdrawn {
+        blocker,
+        by,
+        at,
+        reason,
+    })
+}
+
+/// Every retraction audit line in `text`, in document order.
+#[must_use]
+pub fn withdrawn(text: &str) -> Vec<Withdrawn> {
+    text.lines().filter_map(parse_withdrawn).collect()
+}
+
 /// Render one park record as the one line a role writes into the artifact body.
 #[must_use]
 pub fn render(record: &ParkRecord) -> String {

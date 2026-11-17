@@ -414,7 +414,6 @@ fn zero_threshold_disables_the_hold_without_touching_the_cooldown() {
     assert!(forge.calls("issue edit").is_empty());
     assert!(forge.calls("api").is_empty(), "no forge reads when disabled");
     assert!(reg.noop_cooldown_remaining(ISSUE, Utc::now()).is_some());
-    assert_eq!(reg.noop_release_count(ISSUE), 5);
 }
 
 #[test]

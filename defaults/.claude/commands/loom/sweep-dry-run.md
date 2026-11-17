@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Sweep — Dry-run gate
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.

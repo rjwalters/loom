@@ -276,6 +276,13 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // which `gh_lifecycle.rs` filters through `TrustPolicy::for_root`. It
         // fetches nothing itself.
         ("forge_merge_queue/clear_gate.rs", "parses already-filtered bodies"),
+        // #13936: `rejection_precedes_claim` parses the records its sole
+        // production caller, `GhHandback::rejected_precedes_claim`
+        // (`cli/forge_verdict_cmd.rs`), read through `fetch_trusted_comments`
+        // (`TrustPolicy::for_root(..).trusted_listing`). It fetches nothing itself.
+        ("doctor_handback.rs", "parses already-filtered records"),
+        // In-memory records for the pure predicate and the `Fake` forge; no forge read.
+        ("doctor_handback/tests.rs", "test fixture"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];

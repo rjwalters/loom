@@ -1669,7 +1669,7 @@ fn dispatch_refused_while_noop_cooldown_is_live() {
     let (mut registry, _log) = fixture_registry(dir.path());
 
     registry.record_noop_release(6917, Some("external blocker unchanged".into()));
-    assert_eq!(registry.noop_release_count(6917), 1);
+    assert!(registry.noop_cooldown_remaining(6917, Utc::now()).is_some());
 
     let err = registry
         .dispatch(&SweepKind::Issue(6917), None, None, None, None)

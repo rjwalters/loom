@@ -257,13 +257,8 @@ pub(super) fn live_git(root: &Path) -> bool {
         .filter_map(|p| p.parse::<i32>().ok())
         .any(|pid| match cwd_of(pid) {
             Some(cwd) => cwd.starts_with(&root),
-            None => process_exists(pid),
+            None => crate::sweep_registry::pid_signalable(pid),
         })
-}
-
-fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 fn cwd_of(pid: i32) -> Option<PathBuf> {

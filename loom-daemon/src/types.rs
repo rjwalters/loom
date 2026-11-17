@@ -751,7 +751,11 @@ pub enum Response {
     /// call is then a no-op — `consecutive` is also `0` in that case).
     NoopReleaseRecorded {
         issue: u32,
-        /// Consecutive no-op releases now on record for `issue`.
+        /// Consecutive no-op sweeps now on the durable hold streak for
+        /// `issue` — the fingerprint-aware count compared against
+        /// `holdThreshold` (#10156), reported here since #13861 in place of
+        /// the cooldown record's own counter. `0` also when the hold could
+        /// not read the issue (fail-open, #10156).
         consecutive: u32,
         /// Seconds until the next dispatch is allowed, or `None` when the
         /// cooldown mechanism is disabled.

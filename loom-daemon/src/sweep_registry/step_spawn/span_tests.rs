@@ -24,7 +24,7 @@ fn line(class: StepOutcomeClass) -> StepOutcomeLine {
 
 fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttributes) {
     let outcome = super::super::capture::tick_outcome(StepRole::Judge, end, line);
-    sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None, None, None)
+    sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None, None, None, false)
 }
 
 /// #12957: a sized step's close carries its points; an unsized one has no
@@ -33,7 +33,18 @@ fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttri
 fn a_sized_steps_close_carries_its_story_points() {
     let outcome = super::super::capture::tick_outcome(StepRole::Judge, StepEnd::TimedOut, None);
     let close = |points| {
-        sweep_close(StepEnd::TimedOut, None, &outcome, StepRole::Judge, None, None, points, None).1
+        sweep_close(
+            StepEnd::TimedOut,
+            None,
+            &outcome,
+            StepRole::Judge,
+            None,
+            None,
+            points,
+            None,
+            false,
+        )
+        .1
     };
     assert_eq!(close(Some(13))["loom.story_points"], "13");
     assert!(!close(None).contains_key("loom.story_points"));
@@ -299,6 +310,7 @@ fn a_close_carries_the_pr_number_only_when_one_is_known() {
             None,
             None,
             pr,
+            false,
         )
         .1
     };
@@ -324,10 +336,31 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
             None,
             None,
             pr,
+            false,
         )
         .1[lifecycle::FAILURE_CLASS]
             .clone()
     };
     assert_eq!(class(Some(7)), "no-outcome-line-pr-opened");
     assert_eq!(class(None), "no-outcome-line");
+}
+
+/// #13966: a step whose provider feedback said its api-key seat was
+/// exhausted closes as `provider-exhausted`, not its exit shape — unless it
+/// was cancelled, where the operator's own act stays the class.
+#[test]
+fn a_provider_exhausted_step_closes_as_provider_exhausted() {
+    let outcome = RoleTickOutcome::Failure("step exited 1".to_string());
+    let class = |end, exhausted| {
+        sweep_close(end, None, &outcome, StepRole::Builder, None, None, None, None, exhausted).1
+            [lifecycle::FAILURE_CLASS]
+            .clone()
+    };
+    assert_eq!(class(StepEnd::Exited(Some(1)), true), "provider-exhausted");
+    assert_eq!(class(StepEnd::Exited(Some(1)), false), "exit-1");
+    assert_eq!(class(StepEnd::Cancelled, true), "cancelled");
+    // A step that hit the limit and then hung to its timeout: the exhaustion
+    // wins here as it does on `role_tick.outcome` (`capture::step_failure`).
+    assert_eq!(class(StepEnd::TimedOut, true), "provider-exhausted");
+    assert_eq!(class(StepEnd::TimedOut, false), "timeout-ceiling");
 }

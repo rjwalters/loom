@@ -800,6 +800,9 @@ pub fn list(
         RepoInput { main_red },
         HostInput {
             held_capabilities: held_capabilities.clone(),
+            extra_skip_labels: crate::work_finder::resolve_extra_skip_labels_with_config(
+                &crate::work_finder::read_work_finder_config(root),
+            ),
         },
     );
     let mut items = step_item::classify(&inputs);

@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Builder: Complexity Assessment and Issue Decomposition
 
 This document covers complexity assessment, issue decomposition, and scope management for the Builder role. For the core builder workflow, see `builder.md`.
