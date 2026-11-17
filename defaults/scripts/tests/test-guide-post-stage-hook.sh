@@ -87,7 +87,9 @@ rearm() {
     rm -f "$DOCS_WT/.loom/docs-post-stage.sh"
 }
 run_stage() { (cd "$RUN_DIR" && git -C "$DOCS_WT" add WORK_LOG.md WORK_PLAN.md README.md && stage_with_hook) >"$OUT" 2>&1; echo $?; }
-staged() { git -C "$DOCS_WT" diff --cached --name-only | sort | paste -sd, -; }
+# LC_ALL=C: a bare `sort` collates by locale (en_US.UTF-8 on macOS puts
+# `envelope.json` before `WORK_LOG.md`); the expected strings are byte order.
+staged() { git -C "$DOCS_WT" diff --cached --name-only | LC_ALL=C sort | paste -sd, -; }
 index_clean() { git -C "$DOCS_WT" diff --cached --quiet && echo yes || echo no; }
 
 echo "Test 1: no hook present -> fixed staging set, lock untouched"
