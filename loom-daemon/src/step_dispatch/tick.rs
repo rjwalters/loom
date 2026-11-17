@@ -513,7 +513,8 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::Tracker
                 | PassReason::Proposal
                 | PassReason::NoStage
-                | PassReason::Draft,
+                | PassReason::Draft
+                | PassReason::HostSkipLabel,
             ) => &mut report.skipped_labeled,
         };
         *slot += n;

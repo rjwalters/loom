@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Shared Cargo Target Dir: Isolation Recipe (#8457)
 
 **Load when**: you are about to run (or just ran) a local `cargo build`/`cargo

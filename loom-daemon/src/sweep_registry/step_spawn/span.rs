@@ -37,6 +37,7 @@
 //! | `no-outcome-line` | a Builder step exited 0, opened no PR (or none was readable) and wrote no outcome line (#12500) |
 //! | `no-outcome-line-pr-opened` | as `no-outcome-line`, but the step opened a PR (#13521) |
 //! | `exit-unobserved` | the step exited, its status is unknown, and it wrote no outcome line |
+//! | `provider-exhausted` | the step's api-key seat was exhausted; the launch died on the provider's refusal (#13966) |
 
 use std::path::Path;
 
@@ -48,21 +49,37 @@ use crate::sweep_registry::reaper::pid_identity;
 use crate::sweep_registry::{LockOwner, SweepRegistry};
 use crate::telemetry::trace::TraceAttributes;
 
-/// Why a step failed, on its `loom.sweep` close.
+/// Why a step failed, on its `loom.sweep` close. A step whose provider
+/// feedback said its api-key seat was exhausted (`provider_exhausted`,
+/// #13966) carries that class instead of its exit shape — the launch never
+/// had a working credential — unless it was cancelled, where the operator's
+/// own act stays the story.
 #[must_use]
 pub(crate) fn step_failure(
     end: StepEnd,
     line: Option<&StepOutcomeLine>,
     pr_number: Option<u32>,
+    provider_exhausted: bool,
 ) -> RoleFailure {
     let failed_line = line.filter(|l| l.class == StepOutcomeClass::Failed);
     match end {
+        StepEnd::Cancelled => RoleFailure::new("cancelled", None, "step was cancelled"),
+        // Ahead of the timeout arm, as `capture::step_failure` has it: a step
+        // that hit the limit and then hung to its ceiling is one exhaustion
+        // on both vocabularies, not `timed-out` here and exhausted there.
+        _ if provider_exhausted => RoleFailure::new(
+            "provider-exhausted",
+            match end {
+                StepEnd::Exited(code) => code,
+                StepEnd::TimedOut | StepEnd::Cancelled => None,
+            },
+            "step ended on provider exhaustion (its api-key seat is marked to the reset)",
+        ),
         StepEnd::TimedOut => RoleFailure::new(
             "timeout-ceiling",
             None,
             "step ran past its role timeout and was terminated",
         ),
-        StepEnd::Cancelled => RoleFailure::new("cancelled", None, "step was cancelled"),
         StepEnd::Exited(code) if failed_line.is_some() => RoleFailure::new(
             "step-outcome-failed",
             code,
@@ -103,7 +120,8 @@ pub(crate) fn step_failure(
 /// `outcome` is the tick outcome the step's `role_tick.outcome` reports
 /// ([`super::capture::tick_outcome`]), so the two agree. `story_points` are
 /// the step's spawn-time points (#12957), absent when unsized. `pr_number` is
-/// the PR a Builder step opened, absent when it opened none. Pure.
+/// the PR a Builder step opened, absent when it opened none.
+/// `provider_exhausted` reclasses the close (#13966). Pure.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_close(
@@ -115,6 +133,7 @@ pub(crate) fn sweep_close(
     effort: Option<&str>,
     story_points: Option<u32>,
     pr_number: Option<u32>,
+    provider_exhausted: bool,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -134,7 +153,7 @@ pub(crate) fn sweep_close(
         );
     }
     if matches!(outcome, RoleTickOutcome::Failure(_)) {
-        close.extend(step_failure(end, line, pr_number).attributes());
+        close.extend(step_failure(end, line, pr_number, provider_exhausted).attributes());
     } else if let StepEnd::Exited(Some(code)) = end {
         close.insert(lifecycle::EXIT_CODE.into(), code.to_string());
     }

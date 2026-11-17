@@ -1984,6 +1984,61 @@
       ]
     },
     {
+      "name": "host extraSkipLabels (#13891): a loom:issue carrying a host skip label is a pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 90,
+            "labels": [
+              "loom:issue",
+              "codex-pilot"
+            ]
+          }
+        ],
+        "pulls": [],
+        "host": {
+          "extra_skip_labels": [
+            "codex-pilot"
+          ]
+        }
+      },
+      "expected": [
+        {
+          "issue": 90,
+          "pr": null,
+          "state": "excluded",
+          "verdict": {
+            "pass": "host_skip_label"
+          }
+        }
+      ]
+    },
+    {
+      "name": "same item without the host label configured: Builder (empty list unchanged)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 91,
+            "labels": [
+              "loom:issue",
+              "codex-pilot"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 91,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        }
+      ]
+    },
+    {
       "name": "external (hard exclusion): pass",
       "inputs": {
         "issues": [
