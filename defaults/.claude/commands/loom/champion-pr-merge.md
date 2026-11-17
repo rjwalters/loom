@@ -3435,8 +3435,10 @@ items (exit `10`) and Step 4 behaves exactly as it did before this gate existed*
 
 **2. Classifying each item — a fixed phrase vocabulary, not judgment.** An item
 requires **out-of-band verification** when it contains one of these
-instruction-shaped fragments (case-insensitive substring of the joined criterion;
-the script's `OUT_OF_BAND_PHRASES` array, matched in declared order so the
+instruction-shaped fragments (case-insensitive, anchored with a leading word
+boundary inside the joined criterion — `Production run:` matches but
+`reproduction run` does not, #13900; the script's `OUT_OF_BAND_PHRASES` array,
+matched in declared order so the
 reported phrase is deterministic). Everything else is CI-checkable.
 
 | Failure shape | Phrases |
@@ -3533,6 +3535,12 @@ hold_issue_on_unverified_ac() {
     esac
     # Quote each unmet criterion VERBATIM so a human sees which is outstanding.
     quoted=$(printf '%s\n' "$report" | awk -F'\t' 'NF{printf "> - [ ] %s\n>\n>   _(matched: `%s`)_\n", $2, $1}')
+    # The notice shows the marker SHAPE with a `<head>` placeholder and names
+    # the real head in prose -- never a live `sha=$head_sha` literal. The
+    # classifier scans this very comment (issue comments are the evidence
+    # corpus) for a marker, and a rendered literal would self-satisfy the hold
+    # it just posted (#13900). The placeholder is rejected by the extractor's
+    # hex requirement, so prose-quoting stays inert.
     ./.loom/scripts/post-comment.sh "$issue" --body "$marker
 **Champion is holding this issue open.** PR #$pr merged, but this issue's own
 acceptance criteria include a step that CI structurally cannot perform, and
@@ -3549,9 +3557,11 @@ check, not a live-source, real-run, or over-time observation. See
 **To clear this**: perform the step, then post a comment on this issue (or on
 PR #$pr) saying what you ran and what you observed, ending with
 
-    <!-- loom:ac-verified sha=$head_sha -->
+    <!-- loom:ac-verified sha=<head> -->
 
-and close the issue. If the criterion was never actually out-of-band, reword it
+where \`<head>\` is the merged head \`$head_sha\` (the full 40-char SHA or a
+7+-char abbreviation of it both match), and close the issue. If the criterion
+was never actually out-of-band, reword it
 so it no longer reads as live/scheduled/over-time and close normally.
 
 *Automated by Champion role*"
