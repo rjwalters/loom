@@ -63,7 +63,13 @@ extract_block() {
 
 PRECHECK="$(extract_block '**Run this precheck before judging the axes**')"
 HOLD_BEHAVIOR="$(extract_block '**Hold behavior** — name the')"
-CENSUS_RELEASED="$(grep -A3 -F 'RELEASED=$("$GH_READ" pr list' "$CHAMPION_MD")"
+# End-marker range, not a fixed -A<N> window (#14078): the `if ! RELEASED=$(…)`
+# wrapper pushed the echo past +3 and a fixed window truncated the block mid-`if`.
+CENSUS_RELEASED="$(awk -v m='RELEASED=$("$GH_READ" pr list' -v e='echo "Released holds, not yet merged:' '
+    f == 0 && index($0, m) { f = 1 }
+    f == 1                 { print }
+    f == 1 && index($0, e) { exit }
+' "$CHAMPION_MD")"
 
 WORK="$(mktemp -d)" && trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/.loom/scripts"
