@@ -52,6 +52,12 @@
 //! otherwise spawn and lose on every tick. A second consecutive `claim_lost`
 //! on the pair arms the same doubling refusal cooldown; it still redraws.
 //!
+//! So does a spawn-time admission refusal (#14032): `runtime_rejected`,
+//! `model_runtime_mismatch` and `admission_refused` map to the ledger's
+//! `admission` reason (`step_end::ledger_reason`) and fall through to this
+//! effect — a launch the runtime will not take says the pair cannot run now,
+//! so redrawing it on every tick only burns slots.
+//!
 //! [`PROVIDER_EXHAUSTED`] does **not** ride it (#13966). The streak is
 //! backpressure for a disagreement about the *item*; an exhausted api-key
 //! seat says nothing about the item, and its backpressure already exists on
