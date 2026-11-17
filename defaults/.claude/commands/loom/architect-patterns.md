@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Architect Patterns and Templates
 
 This file contains detailed templates, examples, and patterns for creating architectural proposals. Load this file when you need to create proposals or epics.

@@ -170,6 +170,39 @@ pub const CI_WAIT_OUTCOME: &str = "ci_wait";
 /// either: the row ends and nothing is held, so the next draw may take it.
 pub const HOST_LOST_OUTCOME: &str = "host_lost";
 
+/// The `release` outcome of a Builder step that failed fast for a reason that
+/// is the item's own (#13919): inside the fast-fail window, not an
+/// environmental class. A non-progress outcome like any other (it climbs the
+/// no-progress ladder), and in addition counted per `(repo, item)` across hosts
+/// toward the fast-fail park ([`FAST_FAIL_PARK_THRESHOLD`]).
+pub const FAST_FAIL_OUTCOME: &str = "fast_fail";
+
+/// Consecutive attributable fast-failure releases of one item, across hosts,
+/// at which the captain orders the park (the #11854 threshold).
+pub const FAST_FAIL_PARK_THRESHOLD: u32 = 3;
+
+/// How long a fast-fail streak that has not ordered a park stands without a
+/// new attributable release (`MAX_PEER_FAST_FAIL_STREAK_AGE`, 24 h).
+pub const FAST_FAIL_STREAK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// The longest a park order refuses claims for its item: the default
+/// quarantine TTL, counted from the order. The hold stands for the park, not
+/// for the streak: a worker whose park ends sooner (TTL expiry, an operator's
+/// `quarantine clear`), or that made no park, says so
+/// ([`Table::end_fast_fail_park`]) and the hold ends then. This bound is the
+/// backstop for a park-ended call that never arrives, and a park that outlasts
+/// it (an escalated TTL) keeps the item ineligible on the forge. When it
+/// lapses the streak is forgotten with it, so the count starts again.
+pub const FAST_FAIL_PARK_HOLD: Duration =
+    Duration::from_secs(crate::sweep_registry::DEFAULT_QUARANTINE_TTL_SECS);
+
+/// The `release` outcome of a step that died because its api-key seat was
+/// exhausted (the provider refused the launch; #13966). Not progress, but
+/// not the item's fault either: the seat is marked to its reset and the
+/// draw falls through to the next runtime, so the row ends and nothing is
+/// held — the next draw may take the item at once.
+pub const PROVIDER_EXHAUSTED_OUTCOME: &str = "provider_exhausted";
+
 /// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
 /// the item every ~90 s while CI runs, short enough that its next step is
 /// drawn within minutes of CI finishing.
@@ -440,6 +473,40 @@ pub struct Cooldown {
     pub set_by_assignment_id: String,
 }
 
+/// One item's fleet-wide fast-fail streak (#13919).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FastFailTally {
+    /// Consecutive attributable fast-failure releases, across hosts.
+    count: u32,
+    /// When the latest one arrived.
+    last: Mono,
+    /// When the park was ordered (to the releasing worker of the threshold
+    /// release); no second order is made while this stands.
+    ordered: Option<Mono>,
+}
+
+impl FastFailTally {
+    /// Still counted at `now`: an ordered park for [`FAST_FAIL_PARK_HOLD`]
+    /// from the order, a streak without one for
+    /// [`FAST_FAIL_STREAK_MAX_AGE`] from its latest release.
+    fn stands(&self, now: Mono) -> bool {
+        match self.ordered {
+            Some(at) => at.plus(FAST_FAIL_PARK_HOLD) > now,
+            None => self.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now,
+        }
+    }
+}
+
+/// What a `release` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Released {
+    /// The row was this host's and is now gone.
+    pub known: bool,
+    /// This release crossed the fast-fail threshold: the releasing worker is
+    /// to park the item. Set on exactly one release per streak.
+    pub park: bool,
+}
+
 /// The assignment table. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -452,6 +519,8 @@ pub struct Table {
     by_id: BTreeMap<String, (String, u64)>,
     hosts: BTreeMap<String, HostState>,
     cooldowns: BTreeMap<(String, u64, String), Cooldown>,
+    /// Fleet-wide fast-fail streaks by `(repo, item)` (#13919).
+    fast_fails: BTreeMap<(String, u64), FastFailTally>,
     lineage: BTreeMap<(String, u64, String), LineageRecord>,
     /// Assignment ids that ended here (released, refused or expired), with
     /// when. A heartbeat built before the end can still list the step; it
@@ -482,6 +551,7 @@ impl Table {
             by_id: BTreeMap::new(),
             hosts: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
+            fast_fails: BTreeMap::new(),
             lineage: BTreeMap::new(),
             ended_ids: BTreeMap::new(),
             expired_rows: Vec::new(),
@@ -638,6 +708,7 @@ impl Table {
         // ladder's last rung (module docs), which also bounds the map.
         let forget = self.policy.no_progress[self.policy.no_progress.len() - 1];
         self.cooldowns.retain(|_, c| c.until.plus(forget) > now);
+        self.fast_fails.retain(|_, t| t.stands(now));
         expired
     }
 
@@ -837,6 +908,20 @@ impl Table {
             }
             replaces_own = true;
         }
+        // A park was ordered for this item (#13919): no host draws it while
+        // the park stands. The hold ends when the parking worker says the park
+        // ended (`end_fast_fail_park`: TTL expiry, an operator's clear, or no
+        // park made), and at the latest `FAST_FAIL_PARK_HOLD` after the order.
+        if let Some(until) = self
+            .fast_fails
+            .get(&(repo.to_string(), item))
+            .filter(|t| t.stands(now))
+            .and_then(|t| t.ordered)
+            .map(|at| at.plus(FAST_FAIL_PARK_HOLD))
+        {
+            let retry = now.secs_until(until, 1);
+            return refused(RefusalReason::Held, None, retry);
+        }
         // The fleet-wide no-progress hold (#12541): whoever asks.
         if let Some(c) = self.cooldown(now, repo, item, step) {
             let retry = now.secs_until(c.until, 1);
@@ -958,13 +1043,97 @@ impl Table {
         assignment_id: &str,
         outcome: &str,
     ) -> bool {
+        self.release_ordered(now, host, assignment_id, outcome)
+            .known
+    }
+
+    /// [`Self::release_outcome`], also saying whether this release makes the
+    /// releasing worker park the item (#13919). An attributable fast-failure
+    /// release ([`FAST_FAIL_OUTCOME`]) adds to the item's fleet-wide streak,
+    /// whichever host sent it; the [`FAST_FAIL_PARK_THRESHOLD`]-th orders the
+    /// park, once. A progressing release, or any other non-progress outcome
+    /// (not `ci_wait`, `host_lost` or `provider_exhausted`, which are neither),
+    /// ends the streak.
+    pub fn release_ordered(
+        &mut self,
+        now: Mono,
+        host: &str,
+        assignment_id: &str,
+        outcome: &str,
+    ) -> Released {
+        let none = Released {
+            known: false,
+            park: false,
+        };
         let Some(key) = self.own_key(host, assignment_id) else {
-            return false;
+            return none;
         };
         let Some(row) = self.remove(&key) else {
-            return false;
+            return none;
         };
+        let park = self.note_fast_fail(&key, now, outcome);
+        Released {
+            known: self.finish_release(now, key, row, assignment_id, outcome),
+            park,
+        }
+    }
+
+    /// Fold `outcome` into `key`'s fast-fail streak; whether it orders the park.
+    fn note_fast_fail(&mut self, key: &(String, u64), now: Mono, outcome: &str) -> bool {
+        let outcome = outcome.trim();
+        // Neither the item's failure nor its progress: `host_lost`, `ci_wait`,
+        // and a provider seat that ran out (#13966).
+        if [
+            HOST_LOST_OUTCOME,
+            CI_WAIT_OUTCOME,
+            PROVIDER_EXHAUSTED_OUTCOME,
+        ]
+        .contains(&outcome)
+        {
+            return false;
+        }
+        if outcome != FAST_FAIL_OUTCOME {
+            self.fast_fails.remove(key);
+            return false;
+        }
+        let prior = self.fast_fails.get(key).copied().filter(|t| t.stands(now));
+        let count = prior.map_or(0, |t| t.count).saturating_add(1);
+        let ordered_at = prior.and_then(|t| t.ordered);
+        let park = ordered_at.is_none() && count >= FAST_FAIL_PARK_THRESHOLD;
+        self.fast_fails.insert(
+            key.clone(),
+            FastFailTally {
+                count,
+                last: now,
+                // A later release of a step that was already running does not
+                // extend the hold: it runs from the order.
+                ordered: ordered_at.or(park.then_some(now)),
+            },
+        );
+        park
+    }
+
+    /// The park of `(repo, item)` ended on a worker, or the ordered worker
+    /// made none (#13919): forget the item's fast-fail streak and its park
+    /// order, so the next claim is answered on its merits and a later streak
+    /// counts from zero. Sent on a quarantine's TTL expiry and on an
+    /// operator's `quarantine clear`, which is what keeps both true to the
+    /// park comment ("clear the park ... or wait for the TTL"). Whether there
+    /// was a streak to forget. The no-progress hold is not touched.
+    pub fn end_fast_fail_park(&mut self, repo: &str, item: u64) -> bool {
+        self.fast_fails.remove(&(repo.to_string(), item)).is_some()
+    }
+
+    fn finish_release(
+        &mut self,
+        now: Mono,
+        key: (String, u64),
+        row: Row,
+        assignment_id: &str,
+        outcome: &str,
+    ) -> bool {
         let host_lost = outcome.trim() == HOST_LOST_OUTCOME;
+        let exhausted = outcome.trim() == PROVIDER_EXHAUSTED_OUTCOME;
         let end = if host_lost {
             PrevEnd::HostLost
         } else {
@@ -972,7 +1141,10 @@ impl Table {
         };
         self.note_ended(&key, &row, end, now);
         let (repo, item) = key;
-        if host_lost {
+        // A lost host and an exhausted provider seat are both not the item's
+        // fault: the row ends and nothing is held, so the next draw may take
+        // it (`host_lost`, #12876; `provider_exhausted`, #13966).
+        if host_lost || exhausted {
             return true;
         }
         if outcome.trim() == CI_WAIT_OUTCOME {

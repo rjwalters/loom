@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Orphan-Stack Replacement: Recover a Stacked Child Whose Parent Closed Unmerged (#12767)
 
 **Load when**: you are working a PR that carries `loom:merge-conflict` and a

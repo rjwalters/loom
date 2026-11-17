@@ -407,8 +407,8 @@ fn a_rate_limit_probe_through_the_facade_is_never_charged() {
 }
 
 /// A probe of a credential whose core bucket is spent must not become the
-/// host's `other` budget reading: that would surface as a host-wide
-/// `rate_limit_quota` stall in the ETA for a bucket unrelated to the work.
+/// host's `other` budget reading: the facade records it under pool `other`
+/// with no rate-limit keys, so no `status_report` budget entry can cite it.
 #[test]
 fn an_exhausted_rate_limit_probe_never_reads_as_an_exhausted_other_pool() {
     let tmp = tempfile::tempdir().unwrap();
@@ -430,8 +430,8 @@ fn an_exhausted_rate_limit_probe_never_reads_as_an_exhausted_other_pool() {
     for key in ["rem", "usd", "rst"] {
         assert!(lines[0].get(key).is_none_or(serde_json::Value::is_null), "{key}: {lines:?}");
     }
-    let exhausted = crate::forge_call_stats::exhausted_pools(chrono::Utc::now());
-    assert!(!exhausted.iter().any(|(p, _)| *p == Pool::Other), "{exhausted:?}");
+    let report = crate::forge_call_stats::status_report(chrono::Utc::now(), None);
+    assert!(!report.budget.iter().any(|b| b.pool == "other"), "{:?}", report.budget);
 }
 
 // ===== 6. loom.forge.calls =====

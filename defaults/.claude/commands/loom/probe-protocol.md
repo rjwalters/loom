@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Terminal Probe Protocol (canonical)
 
 Loom uses an intelligent probe system to detect what's running in each terminal. When you receive a probe command, respond according to this protocol.

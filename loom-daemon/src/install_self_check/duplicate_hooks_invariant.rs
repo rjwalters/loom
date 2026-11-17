@@ -83,7 +83,7 @@ pub fn check_with(user: Option<&str>, project: Option<&str>, repo_root: &Path) -
 
     // Unique hook names (HOOKS wires roll-pause.sh and guard-uncommitted-work.sh
     // several times; dedup/detection is per name, not per wiring entry).
-    let mut names: Vec<&str> = HOOKS.iter().map(|(_, _, name)| *name).collect();
+    let mut names: Vec<&str> = HOOKS.iter().map(|(_, _, name, _)| *name).collect();
     names.sort_unstable();
     names.dedup();
 

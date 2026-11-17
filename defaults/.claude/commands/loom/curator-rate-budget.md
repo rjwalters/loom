@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Curator: GraphQL/REST Budget (#10039)
 
 Why `curator.md`'s per-issue recipes are REST, and what is still unmeasured.

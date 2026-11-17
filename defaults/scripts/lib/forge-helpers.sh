@@ -46,6 +46,18 @@ _LOOM_FORGE_HELPERS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/config-resolver.sh"
 # shellcheck source=./locate-daemon-bin.sh
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/locate-daemon-bin.sh"
+# shellcheck source=./bounded-run.sh
+# bounded_run (#13927): the formal-review reads at the bottom of this file
+# run `gh` under a hard wall-clock budget, because on a loaded multi-sweep
+# host a fraction of `gh` invocations block indefinitely rather than erroring
+# and an unbounded read inside a command substitution wedges the whole verdict
+# chain (see lib/bounded-run.sh's header for the signal-deferral mechanics).
+# A missing lib is an install defect that must not break the dozens of
+# unrelated scripts sourcing this file: the review reads then degrade to the
+# unbounded pre-#13927 behaviour via _forge_review_read_run's guard.
+if [[ -f "$_LOOM_FORGE_HELPERS_LIB_DIR/bounded-run.sh" ]]; then
+  source "$_LOOM_FORGE_HELPERS_LIB_DIR/bounded-run.sh"
+fi
 
 # --- Forge Detection ---
 
@@ -1644,6 +1656,31 @@ forge_gh_create_issue_rl_safe() {
 #
 # Old bodies-only behaviour is one jq away for any caller that genuinely wants
 # it: `forge_get_pr_reviews "$nwo" "$n" | jq -r 'select(.body != "") | .body'`.
+#
+# Wall-clock bound (#13927): every GitHub-branch read below runs `gh` under
+# bounded_run with this budget. Override: LOOM_FORGE_REVIEW_READ_TIMEOUT
+# (seconds). 0 restores the unbounded pre-#13927 behaviour. A timed-out read
+# exits 124 (bounded_run normalizes to GNU timeout's code); callers treat any
+# non-zero as fail-closed, and 124 specifically means "timed out", never
+# "no reviews".
+_LOOM_FORGE_REVIEW_READ_TIMEOUT="${LOOM_FORGE_REVIEW_READ_TIMEOUT:-60}"
+
+# Run ONE review-read gh invocation under that budget (#13927). Preserves the
+# `$gh_cmd` pass-through: tests stub it with a path, and `timeout`/bounded_run
+# exec a path fine. Degrades to the plain unbounded call when the budget is 0
+# or bounded-run.sh is absent (see the sourcing note at the top of this file).
+# The override is RE-RESOLVED per call so `LOOM_FORGE_REVIEW_READ_TIMEOUT=1
+# <script>` (tests, one-off loaded-host runs) is honored, not just a value
+# present when this file was sourced.
+_forge_review_read_run() {
+  _LOOM_FORGE_REVIEW_READ_TIMEOUT="${LOOM_FORGE_REVIEW_READ_TIMEOUT:-60}"
+  if [[ "$_LOOM_FORGE_REVIEW_READ_TIMEOUT" == "0" ]] \
+    || ! declare -F bounded_run > /dev/null 2>&1; then
+    "$@"
+    return $?
+  fi
+  bounded_run "$_LOOM_FORGE_REVIEW_READ_TIMEOUT" "$@"
+}
 
 # jq filter shared by both forges' review reads. Emits one compact JSON record
 # per review. Gitea spells two states differently (REQUEST_CHANGES / COMMENT);
@@ -1685,7 +1722,8 @@ _FORGE_REVIEW_COMMENT_RECORD_JQ='.[] | {
 #   {"id":…,"state":"APPROVED|CHANGES_REQUESTED|COMMENTED|DISMISSED|PENDING|…",
 #    "commit_id":"…","submitted_at":"…","author":"…","body":"…"}
 # Exit: 0 on a complete read (including a genuinely empty review list),
-#       non-zero on ANY read/pagination failure (fail closed).
+#       non-zero on ANY read/pagination failure (fail closed),
+#       124 when the read exceeded LOOM_FORGE_REVIEW_READ_TIMEOUT (#13927).
 #
 # Both forges: GET /repos/{nwo}/pulls/{n}/reviews
 # Always plain `gh` (never a cache wrapper): this read gates a verdict, and the
@@ -1702,7 +1740,7 @@ forge_get_pr_reviews() {
     return $?
   fi
 
-  "$gh_cmd" api "repos/$nwo/pulls/$pr_number/reviews?per_page=100" --paginate \
+  _forge_review_read_run "$gh_cmd" api "repos/$nwo/pulls/$pr_number/reviews?per_page=100" --paginate \
     --jq "$_FORGE_REVIEW_RECORD_JQ"
 }
 
@@ -1710,7 +1748,8 @@ forge_get_pr_reviews() {
 #
 # Usage: forge_get_pr_review_comments NWO PR_NUMBER [GH_CMD]
 # Output: one JSON object per line (see _FORGE_REVIEW_COMMENT_RECORD_JQ).
-# Exit: 0 on a complete read, non-zero on ANY failure (fail closed).
+# Exit: 0 on a complete read, non-zero on ANY failure (fail closed);
+#       124 when the GitHub-branch read timed out (#13927).
 #
 # GitHub: GET /repos/{nwo}/pulls/{n}/comments — a DIFFERENT endpoint from
 #   /issues/{n}/comments (general PR conversation). Both exist; reading only the
@@ -1737,7 +1776,7 @@ forge_get_pr_review_comments() {
     return 0
   fi
 
-  "$gh_cmd" api "repos/$nwo/pulls/$pr_number/comments?per_page=100" --paginate \
+  _forge_review_read_run "$gh_cmd" api "repos/$nwo/pulls/$pr_number/comments?per_page=100" --paginate \
     --jq "$_FORGE_REVIEW_COMMENT_RECORD_JQ"
 }
 
@@ -1749,7 +1788,9 @@ forge_get_pr_review_comments() {
 #    "path":"…","author":"…","body":"…"}
 # Exit: 0 on a complete read, 2 when the forge has no supported
 #       thread-resolution interface (caller must fall back and fail closed on
-#       the unknown resolution state — NOT treat it as resolved), 1 on failure.
+#       the unknown resolution state — NOT treat it as resolved), 1 on failure
+#       (including a per-page timeout, #13927: a bounded_run 124 is folded
+#       into 1 here — callers already fall back on any non-zero).
 #
 # Resolution state is GraphQL-only on GitHub (REST exposes no `isResolved`), so
 # this is the one read here that cannot use the REST pool. `gh api graphql` dies
@@ -1789,10 +1830,10 @@ forge_get_pr_review_threads() {
     fi
 
     if [[ -z "$cursor" ]]; then
-      response=$("$gh_cmd" api graphql -f query="$query" \
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
         -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number") || return 1
     else
-      response=$("$gh_cmd" api graphql -f query="$query" \
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
         -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number" \
         -F cursor="$cursor") || return 1
     fi

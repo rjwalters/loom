@@ -122,6 +122,37 @@ fn release_token(class: &'static str, reason: &str) -> &'static str {
     }
 }
 
+/// The captain release outcome of a step: `failed` becomes
+/// [`crate::fleet_dispatch::table::FAST_FAIL_OUTCOME`] for a Builder step that
+/// ran under the fast-fail window with a reason that is not environmental
+/// (#13919). The window is the ladder's own
+/// ([`crate::sweep_registry::is_fast_failure`]): the wider of
+/// `FAST_FAIL_WINDOW_SECS` and this host's configured `insta_crash_secs`, so
+/// a failure the local ladder counts is never told to the captain as a plain
+/// `failed`, which would end the fleet's streak. Anything else passes
+/// through. Pure.
+pub(crate) fn fast_fail_release_class(
+    role: StepRole,
+    class: &'static str,
+    reason: Option<&str>,
+    ran_for: std::time::Duration,
+    insta_crash_secs: i64,
+) -> &'static str {
+    let window = std::time::Duration::from_secs(
+        u64::try_from(crate::sweep_registry::FAST_FAIL_WINDOW_SECS.max(insta_crash_secs))
+            .unwrap_or(120),
+    );
+    if role == StepRole::Builder
+        && class == "failed"
+        && ran_for < window
+        && !reason.is_some_and(crate::telemetry::disposition::is_environmental_failure_class)
+    {
+        crate::fleet_dispatch::table::FAST_FAIL_OUTCOME
+    } else {
+        class
+    }
+}
+
 /// The captain release outcome of a step that wrote an outcome line.
 pub(crate) fn release_class_of_line(line: &StepOutcomeLine) -> &'static str {
     release_token(line.class.as_str(), &line.reason)
@@ -146,6 +177,41 @@ pub(crate) fn release_class_fallback(
     };
     crate::step_dispatch::outcome_ledger::parse_outcome_line(&text[start..], role, item)
         .map_or("failed", |o| release_token(o.class.as_str(), &o.reason))
+}
+
+/// Steps whose exit-time provider feedback classified the launch's failure
+/// `Exhausted` (#13966), keyed by sweep id with the instant it was noted.
+/// Process-global rather than a [`SweepRegistry`] field for the same reason
+/// `provider_health_feedback`'s in-run watches are: the bridge runs on the
+/// reaper's death pass, a sibling module, and the consumer is this module's
+/// `end_step`. An entry is taken (removed) by the step's own end; one no
+/// step consumed within an hour ages out, so a sweep that never ends
+/// cleanly cannot pin it forever.
+static STEP_PROVIDER_EXHAUSTIONS: std::sync::Mutex<
+    std::collections::BTreeMap<String, std::time::Instant>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Note that `sweep_id`'s exit-time provider feedback said the api-key seat
+/// its launch ran against was exhausted (#13966). Called by the
+/// provider-health bridge, for step sweeps only.
+pub(crate) fn note_step_provider_exhaustion(sweep_id: &str) {
+    let mut entries = STEP_PROVIDER_EXHAUSTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    entries.retain(|_, noted| now.duration_since(*noted) < std::time::Duration::from_secs(3600));
+    entries.insert(sweep_id.to_string(), now);
+}
+
+/// Whether `sweep_id`'s provider feedback said its seat was exhausted
+/// (#13966). Removes the entry: the answer is read once, by the step's end.
+#[must_use]
+pub(crate) fn take_step_provider_exhaustion(sweep_id: &str) -> bool {
+    STEP_PROVIDER_EXHAUSTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(sweep_id)
+        .is_some()
 }
 
 /// How a step's process ended.
@@ -229,16 +295,22 @@ pub(crate) fn no_outcome_line_with_pr(failure: RoleFailure) -> RoleFailure {
 
 /// The closed-vocabulary failure behind a failed [`tick_outcome`] (#12480):
 /// `Some` exactly when `tick_outcome` is a `Failure`, one class per branch.
-/// The exit code rides `exit_code`, never the class. Pure.
+/// The exit code rides `exit_code`, never the class. A step whose provider
+/// feedback said its api-key seat was exhausted (`provider_exhausted`,
+/// #13966) carries that class instead of its exit shape — the launch never
+/// had a working credential, which is the story an operator needs — but
+/// only where the end is a failure at all (the invariant above), and never
+/// on a cancel, where the operator's own act stays the story. Pure.
 #[must_use]
 pub fn step_failure(
     role: StepRole,
     end: StepEnd,
     line: Option<&StepOutcomeLine>,
+    provider_exhausted: bool,
 ) -> Option<RoleFailure> {
     use crate::observability::lifecycle::step;
     let class = line.map(|l| l.class);
-    match (end, class) {
+    let failure = match (end, class) {
         (StepEnd::TimedOut, _) => Some(step::TIMED_OUT.failure(None)),
         (StepEnd::Cancelled, _) => Some(step::CANCELLED.failure(None)),
         (_, Some(StepOutcomeClass::Failed)) => Some(step::OUTCOME_FAILED.failure(None)),
@@ -251,7 +323,15 @@ pub fn step_failure(
             Some(CleanExit::NoOutcomeLine) => Some(step::NO_OUTCOME_LINE.failure(code)),
             None => None,
         },
+    };
+    if provider_exhausted && failure.is_some() && end != StepEnd::Cancelled {
+        let code = match end {
+            StepEnd::Exited(code) => code,
+            StepEnd::TimedOut | StepEnd::Cancelled => None,
+        };
+        return Some(step::PROVIDER_EXHAUSTED.failure(code));
     }
+    failure
 }
 
 /// Everything the end-of-step emit needs, read out of the registry.
@@ -314,13 +394,23 @@ impl SweepRegistry {
         let log_path =
             info.map_or_else(|| self.compute_step_log_path(item, role), |i| i.log_path.clone());
         let line = read_outcome_line(&log_path, sweep_id);
+        // #13966: the exit-time provider feedback (run by the reaper just
+        // before this) said the seat was exhausted — the launch died on an
+        // empty credential, so the release says so instead of `failed`, and
+        // the item is charged nothing.
+        let provider_exhausted = take_step_provider_exhaustion(sweep_id);
         log::info!(
-            "sweep_registry: {role} step {sweep_id} ended ({end:?}), outcome {} (#11906)",
+            "sweep_registry: {role} step {sweep_id} ended ({end:?}), outcome {}{} (#11906)",
             line.as_ref().map_or("none".to_string(), |l| format!(
                 "{} {}",
                 l.class.as_str(),
                 l.reason
-            ))
+            )),
+            if provider_exhausted {
+                " (provider exhausted)"
+            } else {
+                ""
+            }
         );
         // #12450: a granted step's assignment ends with the step, its outcome
         // class the release's outcome (no line reads as `failed`). A no-op
@@ -328,10 +418,33 @@ impl SweepRegistry {
         // writes no `LOOM_STEP_OUTCOME` line, only its `CHAMPION-STEP` one,
         // so its class is that line's fold; before, every Champion release
         // read `failed`, and the captain's no-progress hold would have held
-        // a triage that did move its PR.
-        let release_class = line.as_ref().map_or_else(
-            || release_class_fallback(&log_path, sweep_id, role, item),
-            release_class_of_line,
+        // a triage that did move its PR. #13966: a provider-exhaustion step
+        // releases `provider_exhausted` — not progress, but not the item's
+        // fault — so the captain holds nothing and the next draw (which
+        // falls through to the next runtime) may take it at once. No cancel
+        // carve-out, unlike `step_failure`: a cancelled step never reaches
+        // the provider feedback that sets the flag (`reaper::finish_cancel`
+        // does not run it), so it keeps its own release.
+        let release_class = if provider_exhausted {
+            crate::fleet_dispatch::table::PROVIDER_EXHAUSTED_OUTCOME
+        } else {
+            line.as_ref().map_or_else(
+                || release_class_fallback(&log_path, sweep_id, role, item),
+                release_class_of_line,
+            )
+        };
+        // #13919: an issue-attributable fast failure of a Builder step is told
+        // to the captain apart from a plain `failed`, so it counts the fleet-wide
+        // streak. Same window and carve-outs as the ladder's (`effect_of`,
+        // `is_environmental_failure_class`); a progressing release never is,
+        // and neither is `provider_exhausted`.
+        let ran_for = (Utc::now() - started_at).to_std().unwrap_or_default();
+        let release_class = fast_fail_release_class(
+            role,
+            release_class,
+            line.as_ref().map(|l| l.reason.as_str()),
+            ran_for,
+            self.quarantine_config.insta_crash_secs,
         );
         crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {
@@ -352,6 +465,7 @@ impl SweepRegistry {
                     log_path: log_path.clone(),
                     ran_for: (Utc::now() - started_at).to_std().unwrap_or_default(),
                     timed_out: end == StepEnd::TimedOut,
+                    provider_exhausted,
                 },
             );
         }
@@ -366,7 +480,7 @@ impl SweepRegistry {
             })
         .then(|| self.builder_pr(item))
         .flatten();
-        let mut failure = step_failure(role, end, line.as_ref());
+        let mut failure = step_failure(role, end, line.as_ref(), provider_exhausted);
         if pr_number.is_some() {
             failure = failure.map(no_outcome_line_with_pr);
         }
@@ -396,6 +510,7 @@ impl SweepRegistry {
             info.and_then(|i| i.effort.as_deref()),
             self.step_points(sweep_id),
             pr_number,
+            provider_exhausted,
         );
         self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached
