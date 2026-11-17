@@ -1060,7 +1060,7 @@ line-grep):
 set -euo pipefail
 
 wf=.github/workflows/ci.yml                        # source of truth
-gate=$(jq -r '.scripts["check:ci"]' package.json)  # the mirror
+gate=$(jq -r '.scripts["check:ci"] // empty' package.json)  # the mirror
 
 drift() { # drift <what> <workflow value> <gate value>
   printf 'parity: %s drifted\n  %s: %s\n  package.json scripts["check:ci"]: %s\n' \
@@ -1068,24 +1068,39 @@ drift() { # drift <what> <workflow value> <gate value>
   exit 1
 }
 
-# Interpreter pin (single or matrix): the mirror's pin must be one of the
-# workflow's python-version values.
-ci_pys=$(grep 'python-version:' "$wf" | grep -oE '[0-9]+(\.[0-9]+)+' | sort -u)
-gate_py=$(sed -nE 's/.*--python ([0-9.]+).*/\1/p' <<<"$gate")
-grep -qx "$gate_py" <<<"$ci_pys" \
-  || drift "python pin" "${ci_pys//$'\n'/ }" "${gate_py:-<none found>}"
+# A grep that finds nothing exits 1, which under `set -e` would end the script
+# with no message. Every extraction is therefore `|| true`: a missing fact
+# reaches its check as an empty value and is reported as "<none found>".
 
-# Dependency pins: every pinned spec in the workflow must appear in the mirror.
+# Interpreter pin (single or matrix): the mirror's pin must be one of the
+# workflow's python-version values. A pin missing on either side is drift.
+ci_pys=$({ grep 'python-version:' "$wf" || true; } | { grep -oE '[0-9]+(\.[0-9]+)+' || true; } | sort -u)
+gate_py=$(sed -nE 's/.*--python ([0-9.]+).*/\1/p' <<<"$gate")
+ci_pys_flat=${ci_pys//$'\n'/ }
+if [[ -z "$gate_py" ]] || ! grep -qxF -- "$gate_py" <<<"$ci_pys"; then
+  drift "python pin" "${ci_pys_flat:-<none found>}" "${gate_py:-<none found>}"
+fi
+
+# Dependency pins: every pinned spec in the workflow must appear in the mirror
+# as a whole word. A substring test would pass pkg==1.2.3 against pkg==1.2.30
+# or mypkg==1.2.3, so split the mirror into words and compare whole lines.
+gate_words=$(tr -s '[:space:]\042\047;' '\n' <<<"$gate")
 while IFS= read -r dep; do
-  grep -qF "$dep" <<<"$gate" || drift "dependency pin" "$dep" "absent from gate script"
-done < <(grep -oE '[A-Za-z0-9_-]+==[0-9][0-9.]*' "$wf" | sort -u)
+  grep -qxF -- "$dep" <<<"$gate_words" || drift "dependency pin" "$dep" "absent from gate script"
+done < <({ grep -oE '[A-Za-z0-9._-]+==[0-9][A-Za-z0-9.*+!]*' "$wf" || true; } | sort -u)
 
 # Command/target list: the pytest invocation must be identical in both
 # (quote-stripped, so sh -c quoting in the mirror does not mask a match).
-ci_t=$(grep -oE 'pytest -q [^&|]+' "$wf" | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
-gate_t=$(grep -oE 'pytest -q [^&|]+' <<<"$gate" | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
-[[ "$ci_t" == "$gate_t" ]] || drift "pytest targets" "${ci_t:-<none found>}" "${gate_t:-<none found>}"
+# A pytest invocation missing on either side is drift.
+ci_t=$({ grep -oE 'pytest -q [^&|]+' "$wf" || true; } | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
+gate_t=$({ grep -oE 'pytest -q [^&|]+' <<<"$gate" || true; } | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
+[[ -n "$ci_t" && "$ci_t" == "$gate_t" ]] \
+  || drift "pytest targets" "${ci_t:-<none found>}" "${gate_t:-<none found>}"
 ```
+
+The dependency check runs one way, workflow to mirror: a pin that exists only
+in the mirror is not flagged. Add the reverse loop if your mirror must not
+install anything CI does not.
 
 The shape generalizes: one assertion per mirrored fact, each naming the fact
 and both sides' values and locations on failure. The whole check is a handful
