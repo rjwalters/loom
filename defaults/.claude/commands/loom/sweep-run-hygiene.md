@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Sweep — Stop conditions, pre-wave advisory checks, working-set contract, coexistence
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.

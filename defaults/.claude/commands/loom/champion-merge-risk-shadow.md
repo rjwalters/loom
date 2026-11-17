@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Shadow-Mode Merge-Risk Pre-Score (#8545) — telemetry, never a verdict
 
 Load-gated: `champion-pr-merge.md`'s `merge-risk` criterion points here, and **only when

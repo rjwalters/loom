@@ -168,7 +168,7 @@ there. The step engine's weight-0 exclusions map through the parallel total matc
 → `backoff`, `ci_pending` (a Judge step whose PR head has CI running, #12042)
 → `backoff`, `frozen` / `operator` / `hard_exclusion` → `operator_hold`,
 `claimed` / `queued` → `in_flight`, `shared_pr` → `pr_open_skip`, `sequenced`
-→ `overlap_chain`, `blocked` → `blocked`, `capability_missing` →
+→ `overlap_chain`, `blocked` → `blocked`, `capability_missing` / `host_skip_label` →
 `host_constraint`, `epic` / `proposal` / `no_stage` / `draft` → `no_step`.
 
 ## Rank of an item in each role's latest candidate list

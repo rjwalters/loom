@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Hermit Patterns Reference
 
 This file contains detailed patterns, examples, and reference scripts for the Hermit role. It is meant to be consulted when needed, not loaded as primary instructions.

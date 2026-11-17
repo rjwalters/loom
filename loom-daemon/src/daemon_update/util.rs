@@ -210,12 +210,16 @@ pub fn version_output(bin: &Path) -> String {
 }
 
 /// `kill -0 <pid> 2>/dev/null` — is this pid alive and signalable by us?
+///
+/// A one-line delegate onto the crate's shared shell-parity probe (Issue
+/// #13862) rather than a private `kill(pid, 0)` copy that could drift. The
+/// name keeps the shell rule visible at every call site: `EPERM` reads as
+/// *not* running — the deliberate opposite of
+/// [`crate::sweep_registry::is_pid_alive`], whose callers authorize
+/// destruction and must fail safe.
 #[must_use]
 pub fn pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    unsafe { libc::kill(pid, 0) == 0 }
+    crate::sweep_registry::pid_signalable(pid)
 }
 
 /// Run a command, returning `(exit code, stdout, stderr)` with stderr captured.
