@@ -168,6 +168,30 @@ table, the entries `excludeProviders` or weight 0 removed, and an empty-table
 warning. A stage without `roleDraw` shows the `rolePreference` list or static
 binding that still decides it.
 
+Each candidate of a table is also marked **admitted or not on this host for
+this workspace**, with the full refusal reason (#14027): the real spawn
+path's per-candidate question — capability admission, with a
+containment-eligible refusal retried through the real private-clone
+preparer exactly as a launch would retry it, then credential availability
+and the backstop ceiling, in the walk's order — asked one candidate at a
+time (the walk itself short-circuits on the first admitted tap). The text
+and `--json` forms both carry the verdict; the effective table after
+unavailable and unadmitted candidates are dropped prints renormalised, and
+an attempt nothing can serve prints `no runtime can serve this role here`
+(distinct from the `empty after exclusions` warning, which is about the
+configured table).
+
+The verdict is a probe: nothing is launched, and any account lease
+containment preparation takes is released before the view returns —
+`Preparer::release` drops the selection, which finishes its lease and rolls
+back its admission record, so lease state before and after a run is
+identical. The preparer has no dry mode: a containment-eligible candidate is
+genuinely prepared (a transient lease plus Docker validation), which is what
+makes the view truthful about a runtime the host can never admit (#13983).
+Candidates that `excludeProviders` or weight 0 removed are not probed (they
+were never drawable), and stages without a table are not probed either;
+their `rolePreference` / static fallback is unchanged.
+
 ## Compatibility
 
 - A daemon that predates `roleDraw` ignores `runtimes.roleDraw` and
