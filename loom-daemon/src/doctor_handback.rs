@@ -24,7 +24,11 @@
 //! consecutive API calls in one process and verifies afterwards; it does not
 //! close it.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+use crate::claim_reconciliation::VerdictKind;
+use crate::verdict_gate::parse_verdict;
 
 /// The first token of every answer, so a caller accepts only a positive signal.
 pub const SENTINEL: &str = "LOOM-DOCTOR-HANDBACK";
@@ -135,10 +139,64 @@ pub trait Forge {
     /// Remove one label (absent is not an error the caller relies on).
     fn remove(&mut self, label: &str) -> bool;
     /// Whether a trusted `changes-requested` verdict marker exists for `head`.
-    /// The rejection this Doctor is answering was rendered against an older
-    /// head, so one at the pushed head is a new rejection. `None` when the
-    /// comments could not be read.
+    /// When the Doctor pushed, one at the pushed head is a new rejection (the
+    /// rejection this Doctor is answering was rendered against an older
+    /// head). When it did not push, the verdict being answered can itself sit
+    /// at this head, so a `Some(true)` answer is followed by
+    /// [`Forge::rejected_precedes_claim`] to tell the two apart. `None` when
+    /// the comments could not be read.
     fn rejected_at(&mut self, head: &str) -> Option<bool>;
+    /// Whether the newest trusted `changes-requested` marker at `head`
+    /// predates this Doctor's [`CLAIM`] and was never edited — i.e. it is the
+    /// verdict the Doctor is answering rather than one that landed mid-write.
+    /// Asked only after [`Forge::rejected_at`] reported a marker at `head`;
+    /// it is the same-sha case, where the fix needed no commit so the head
+    /// never moved past the verdict. `None` when the comments or the claim's
+    /// `labeled` event could not be read: the caller keeps the marker
+    /// (today's behaviour).
+    fn rejected_precedes_claim(&mut self, head: &str) -> Option<bool>;
+}
+
+/// Whether the newest trusted `changes-requested` marker for `head` among
+/// `records` (a comment listing, oldest first) predates this Doctor's claim
+/// (`claimed_at`, the `labeled` event for [`CLAIM`]) and its carrying comment
+/// was never edited (`created_at == updated_at`) — i.e. it is the verdict the
+/// Doctor is answering, not one that landed mid-write. A Judge that edits a
+/// marker in place during the claim fails the unedited check; a second
+/// marker created during the claim makes the *newest* one decide.
+///
+/// `None` fails closed: no trusted marker for `head`, a missing or
+/// unparsable timestamp on the newest one.
+#[must_use]
+pub fn rejection_precedes_claim(
+    records: &[Value],
+    head: &str,
+    claimed_at: DateTime<Utc>,
+) -> Option<bool> {
+    let re = regex::Regex::new(
+        r"<!-- loom:verdict-sha sha=([0-9a-f]{7,40}) verdict=(approved|changes-requested) -->",
+    )
+    .ok()?;
+    let newest = records.iter().rev().find(|r| {
+        r.get("body").and_then(Value::as_str).is_some_and(|body| {
+            re.captures_iter(body).any(|c| {
+                crate::verdict_gate::same_sha(&c[1], head)
+                    && parse_verdict(&c[2]) == Some(VerdictKind::ChangesRequested)
+            })
+        })
+    })?;
+    let stamp = |keys: &[&str]| -> Option<DateTime<Utc>> {
+        keys.iter()
+            .find_map(|k| newest.get(*k).and_then(Value::as_str))
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
+    let created = stamp(&["created_at", "createdAt"])?;
+    let updated = stamp(&["updated_at", "updatedAt"])?;
+    if created != updated {
+        return Some(false);
+    }
+    Some(created < claimed_at)
 }
 
 /// The result of one hand-back.
@@ -308,38 +366,45 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
         ));
     }
     // `pre` carrying CHANGES says nothing about *which* rejection: a Judge may
-    // have rejected the pushed head since. Labels carry no identity, so ask the
-    // verdict markers, and keep the label unless the evidence says it is the
-    // old one.
+    // have rejected the pushed head since. Labels carry no identity, so ask
+    // the verdict markers, and keep the label unless the evidence says it is
+    // the old one.
     let mut changes_removed = false;
     let mut fresh_rejection = false;
     if pre.has(CHANGES) {
-        match forge.rejected_at(expected_head) {
-            Some(false) => {
-                changes_removed = forge.remove(CHANGES);
-                // The first answer predates the DELETE; a Judge on another host
-                // can land a rejection in between, and the DELETE took it.
-                if changes_removed {
-                    match forge.rejected_at(expected_head) {
-                        Some(false) => {}
-                        Some(true) => {
-                            if !forge.add(CHANGES) {
-                                return Outcome::Failed(format!(
-                                    "a new {CHANGES} landed before the old one was removed and \
-                                     the removal deleted it; {CHANGES} could not be restored"
-                                ));
-                            }
-                            changes_removed = false;
-                            fresh_rejection = true;
+        // No marker at the expected head: the verdict on the label is the old
+        // one. A marker at the expected head is a new rejection — unless it
+        // predates the claim, which is the same-sha case: the fix needed no
+        // commit, so the verdict being answered still sits at the head. An
+        // unreadable answer to that question keeps today's behaviour and
+        // treats the marker as new.
+        let answered = match forge.rejected_at(expected_head) {
+            Some(false) => true,
+            Some(true) => forge.rejected_precedes_claim(expected_head) == Some(true),
+            None => return unverified_rejection(forge),
+        };
+        if answered {
+            changes_removed = forge.remove(CHANGES);
+            // The first answer predates the DELETE; a Judge on another host
+            // can land a rejection in between, and the DELETE took it.
+            if changes_removed {
+                match forge.rejected_at(expected_head) {
+                    Some(false) => {}
+                    Some(true) => {
+                        if !forge.add(CHANGES) {
+                            return Outcome::Failed(format!(
+                                "a new {CHANGES} landed before the old one was removed and \
+                                 the removal deleted it; {CHANGES} could not be restored"
+                            ));
                         }
-                        None => return unverified_removal(forge),
+                        changes_removed = false;
+                        fresh_rejection = true;
                     }
+                    None => return unverified_removal(forge),
                 }
             }
-            Some(true) => fresh_rejection = true,
-            None => {
-                return unverified_rejection(forge);
-            }
+        } else {
+            fresh_rejection = true;
         }
     }
     forge.remove(CLAIM);

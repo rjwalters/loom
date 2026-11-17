@@ -29,6 +29,10 @@ struct Fake {
     rejected: Option<bool>,
     /// Answers for successive `rejected_at` calls, before falling back to `rejected`.
     rejected_seq: Vec<Option<bool>>,
+    /// What `rejected_precedes_claim` answers: the newest marker at the head
+    /// predates the claim and was never edited. `Some(false)` is the
+    /// conservative default, matching today's behaviour.
+    precedes_claim: Option<bool>,
     /// The head becomes this right after the hand-back's add.
     head_after_add: Option<&'static str>,
     reads: usize,
@@ -42,6 +46,7 @@ impl Fake {
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
             head: head.to_string(),
             rejected: Some(false),
+            precedes_claim: Some(false),
             ..Self::default()
         }
     }
@@ -53,7 +58,11 @@ impl Fake {
     fn writes(&self) -> Vec<&str> {
         self.calls
             .iter()
-            .filter(|c| c.as_str() != "read" && c.as_str() != "rejected_at")
+            .filter(|c| {
+                c.as_str() != "read"
+                    && c.as_str() != "rejected_at"
+                    && c.as_str() != "rejected_precedes_claim"
+            })
             .map(String::as_str)
             .collect()
     }
@@ -111,6 +120,10 @@ impl Forge for Fake {
             return self.rejected_seq.remove(0);
         }
         self.rejected
+    }
+    fn rejected_precedes_claim(&mut self, _head: &str) -> Option<bool> {
+        self.calls.push("rejected_precedes_claim".into());
+        self.precedes_claim
     }
 }
 
@@ -576,4 +589,138 @@ fn an_unverified_removal_whose_restore_fails_keeps_the_queue_label() {
     let out = run(&mut f, PUSHED);
     assert!(matches!(out, Outcome::Failed(_)), "{out:?}");
     assert!(f.sorted().contains(&QUEUE.to_string()), "{:?}", f.sorted());
+}
+
+// --- same-sha hand-back: the verdict being answered sits at the head (#13936)
+// ----------------------------------------------------------------------------
+
+/// The #13936 shape: the Judge's rejection sits at the head the Doctor never
+/// moved (the fix needed no commit) and predates the claim — it is the
+/// verdict being answered, so the hand-back completes with no new commit.
+#[test]
+fn a_same_sha_verdict_that_predates_the_claim_is_handed_back() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    // Marker present at the evidence read; gone once the removal took it.
+    f.rejected_seq = vec![Some(true), Some(false)];
+    f.precedes_claim = Some(true);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HandedBack);
+    assert_eq!(f.sorted(), names(&[QUEUE]));
+    assert!(f.writes().contains(&format!("remove {CHANGES}").as_str()));
+    assert_eq!(out.render().1, 0);
+}
+
+/// A marker at the unchanged head created during the claim is a fresh
+/// rejection: the race protection keeps its teeth (also covers "two markers
+/// at H, old plus fresh", where the newest one decides).
+#[test]
+fn a_same_sha_verdict_created_during_the_claim_still_races() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected = Some(true);
+    f.precedes_claim = Some(false);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]));
+    assert!(!f.writes().contains(&format!("remove {CHANGES}").as_str()));
+    assert_eq!(out.render().1, EXIT_RACED);
+}
+
+/// A marker edited in place during the claim fails the unedited check and
+/// races, even though its `created_at` predates the claim.
+#[test]
+fn a_same_sha_verdict_edited_during_the_claim_still_races() {
+    let claim = chrono::DateTime::parse_from_rfc3339("2026-11-16T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let records = [json!({
+        "body": format!("review\n\n<!-- loom:verdict-sha sha={PUSHED} verdict=changes-requested -->"),
+        "created_at": "2026-11-16T10:00:00Z",
+        "updated_at": "2026-11-16T13:00:00Z",
+    })];
+    assert_eq!(rejection_precedes_claim(&records, PUSHED, claim), Some(false));
+}
+
+/// An unreadable claim-time or comment read fails closed: the marker is kept
+/// and the hand-back races rather than handing back a rejection it cannot
+/// vouch for.
+#[test]
+fn an_unreadable_claim_time_keeps_the_rejection() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected = Some(true);
+    f.precedes_claim = None;
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]));
+    assert_eq!(out.render().1, EXIT_RACED);
+}
+
+/// Even a same-sha hand-back re-checks after the DELETE: a rejection that
+/// lands in the gap is restored and reported as a race.
+#[test]
+fn a_new_rejection_landing_during_a_same_sha_hand_back_is_restored_and_races() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected_seq = vec![Some(true), Some(true)];
+    f.precedes_claim = Some(true);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]), "rejection restored");
+    assert_eq!(out.render().1, EXIT_RACED);
+}
+
+/// Unreadable evidence after the DELETE on a same-sha hand-back: the removal
+/// is undone like any other unverified removal.
+#[test]
+fn unreadable_recheck_after_a_same_sha_removal_restores_changes() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected_seq = vec![Some(true), None];
+    f.precedes_claim = Some(true);
+    let out = run(&mut f, PUSHED);
+    assert!(matches!(&out, Outcome::Failed(why) if why.contains("restored it")), "{out:?}");
+    assert_eq!(f.sorted(), names(&[CHANGES, CLAIM]));
+}
+
+/// The pure claim-time predicate: predates-and-unedited answers the verdict
+/// being answered; at-claim, post-claim, edited, other-sha, approved-only and
+/// timestamp-less records all fail closed to "fresh" or unreadable.
+#[test]
+fn the_pure_claim_time_check_answers_the_edge_cases() {
+    let claim = chrono::DateTime::parse_from_rfc3339("2026-11-16T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let marker = |created: &str, updated: &str, sha: &str, verdict: &str| {
+        json!({
+            "body": format!("review\n\n<!-- loom:verdict-sha sha={sha} verdict={verdict} -->"),
+            "created_at": created,
+            "updated_at": updated,
+        })
+    };
+    let old = marker("2026-11-16T10:00:00Z", "2026-11-16T10:00:00Z", PUSHED, "changes-requested");
+    // Predates the claim, never edited: the verdict being answered.
+    assert_eq!(rejection_precedes_claim(std::slice::from_ref(&old), PUSHED, claim), Some(true));
+    // Created exactly at the claim time: not strictly before, so fresh.
+    let at_claim =
+        marker("2026-11-16T12:00:00Z", "2026-11-16T12:00:00Z", PUSHED, "changes-requested");
+    assert_eq!(rejection_precedes_claim(&[at_claim], PUSHED, claim), Some(false));
+    // Edited after creation: fresh even though it was created before the claim.
+    let edited =
+        marker("2026-11-16T10:00:00Z", "2026-11-16T13:00:00Z", PUSHED, "changes-requested");
+    assert_eq!(rejection_precedes_claim(&[edited], PUSHED, claim), Some(false));
+    // Two markers at the head, old then fresh: the newest one decides.
+    let fresh = marker("2026-11-16T14:00:00Z", "2026-11-16T14:00:00Z", PUSHED, "changes-requested");
+    assert_eq!(rejection_precedes_claim(&[old.clone(), fresh], PUSHED, claim), Some(false));
+    // A newer approval does not answer for the rejection, but does not make
+    // the older rejection unreadable either: the newest *rejection* decides.
+    let approval = marker("2026-11-16T15:00:00Z", "2026-11-16T15:00:00Z", PUSHED, "approved");
+    assert_eq!(rejection_precedes_claim(&[old.clone(), approval], PUSHED, claim), Some(true));
+    // A marker for another SHA is ignored: no marker at PUSHED is unreadable.
+    let other = marker("2026-11-16T10:00:00Z", "2026-11-16T10:00:00Z", OTHER, "changes-requested");
+    assert_eq!(rejection_precedes_claim(&[other], PUSHED, claim), None);
+    // A record without timestamps fails closed.
+    let bare = json!({
+        "body": format!("<!-- loom:verdict-sha sha={PUSHED} verdict=changes-requested -->"),
+    });
+    assert_eq!(rejection_precedes_claim(&[bare], PUSHED, claim), None);
+    // An unparsable timestamp fails closed.
+    let bad = marker("not-a-date", "2026-11-16T10:00:00Z", PUSHED, "changes-requested");
+    assert_eq!(rejection_precedes_claim(&[bad], PUSHED, claim), None);
 }
