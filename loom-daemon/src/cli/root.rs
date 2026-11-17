@@ -893,38 +893,9 @@ pub enum Commands {
     ///
     /// Exit codes: `0` resolved, `2` usage error, `3` no mapping
     /// (`--task-alias` / `--downgrade`) so the caller falls through to its own
-    /// precedence chain.
-    ResolveModel {
-        /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
-        /// model ID.
-        #[arg(value_name = "MODEL")]
-        model: String,
-
-        /// Path to a `.loom/config.json` to read verbatim (default: resolve
-        /// the `./.loom` config tier chain).
-        #[arg(long, value_name = "PATH")]
-        config: Option<String>,
-
-        /// Print the resolved generation number instead of the model ID.
-        #[arg(long)]
-        generation: bool,
-
-        /// Map the model back to the nearest value the in-session Task/Agent
-        /// tool's `model` enum accepts (`haiku|sonnet|opus|fable`) — issue
-        /// #4282. Exits 3 with no output when there is no Task-passable alias,
-        /// so the caller omits `model` entirely.
-        #[arg(long = "task-alias")]
-        task_alias: bool,
-
-        /// Map the model to the next CHEAPER Task-tool alias (issue #5687) —
-        /// `fable → opus → sonnet → haiku`. This is the "one rung down" step
-        /// `/loom:sweep` applies after a `MODEL_CREDITS_EXHAUSTED` kill.
-        /// Exits 3 with no output when the model is already at the cheapest
-        /// rung or is unrecognized, so the caller falls through to its normal
-        /// mid-phase-death handling instead of guessing a model.
-        #[arg(long)]
-        downgrade: bool,
-    },
+    /// precedence chain. The args and handler are shared with `loom-tools
+    /// resolve-model` (#13878); this arm stays as the delegate.
+    ResolveModel(ResolveModelArgs),
 
     /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
     /// `ingest-transcripts` (#8059 — persist transcript token usage into
@@ -2260,7 +2231,7 @@ use super::cleanup_ops::{
 use super::forge_action::{handle_forge_command, ForgeAction};
 use super::legacy_script_cmds::{
     handle_checkpoint_command, handle_resolve_model_command, handle_strip_ansi_command,
-    handle_sweep_experiment_command,
+    handle_sweep_experiment_command, ResolveModelArgs,
 };
 use super::misc_cmds::{handle_update_gitignore_command, handle_validate_command};
 use super::stats::{handle_agent_metrics_command, handle_stats_command};
@@ -2273,19 +2244,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
         // Script helpers (epic #4081 Phase 3 family 5, issue #4275).
         Commands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
-        Commands::ResolveModel {
-            model,
-            config,
-            generation,
-            task_alias,
-            downgrade,
-        } => handle_resolve_model_command(
-            &model,
-            config.as_deref(),
-            generation,
-            task_alias,
-            downgrade,
-        ),
+        Commands::ResolveModel(args) => handle_resolve_model_command(&args),
         Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
         Commands::Claim { command, args } => {

@@ -321,7 +321,7 @@ implementation.
 | --- | --- | --- | --- |
 | `strip-ansi [--file P]` | `loom-tools` | 0; a broken downstream pipe is success (`legacy_script_cmds.rs:19`) | none; `handle_strip_ansi_command` takes plain `Option<&str>` |
 | `checkpoint write\|read\|clear\|stages` | `loom-tools` | `write`/`clear` 1 on failure; `read` and `stages` always 0 (`checkpoint.sh` comment) | `CheckpointAction` (in `main.rs`) moves to the library with its handler |
-| `resolve-model` | `loom-tools` (slice 2) | 0, 2 (clap), **3 with no output** = no mapping (`legacy_script_cmds.rs`) | none |
+| `resolve-model` | `loom-tools` (moved, #13878) | 0, 2 (clap), **3 with no output** = no mapping (`legacy_script_cmds.rs`) | none |
 | `claim` | `loom-tools` (slice 2) | 0 ok, 1 already claimed/error, 2 bad args, 3 not found, 4 agent mismatch (`Commands::Claim` doc) | none; calls `script_helpers::claim::run` |
 | `validate-phase` | `loom-tools` (slice 3) | 0 satisfied, 1 failed, 2 bad args (`Commands::ValidatePhase` doc) | forge reads (section 10.3) |
 | worktree family | `loom-tools` | per command; `worktree-cleanup` is best-effort, soft | none identified; `CleanupAction` is for `clean`/`cleanup`, not these |
@@ -615,7 +615,8 @@ Reasons, each checkable:
   carries the compatibility change.
 - Neither touches the registry, the gateway, readers or telemetry.
 
-Out of the slice: `resolve-model`, `claim`, `sweep-experiment` (slice 2/3).
+Out of the slice: `claim`, `sweep-experiment` (slice 2/3); `resolve-model`
+was slice 2 but has since moved on its own (#13878).
 Bounded to exactly the two stubs above plus the library move of
 `CheckpointAction`.
 

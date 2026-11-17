@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Epic Evaluation Context
 
 This file contains epic evaluation instructions for the Champion role. **Read this file when Priority 4 work is found (epic proposals).**

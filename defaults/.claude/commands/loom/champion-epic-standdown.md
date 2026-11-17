@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Step 0.5 — Tracking-Umbrella Stand-Down (#7666)
 
 This file is the body of `champion-epic.md` → "Step 0.5". **Read it when that

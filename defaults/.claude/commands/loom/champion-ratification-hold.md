@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Ratification Hold (#12992)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Safety Criteria"
