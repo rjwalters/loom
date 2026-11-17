@@ -11,8 +11,8 @@
 //! line at a time; nothing here reads the journal whole (a 5.4 GB journal
 //! read whole OOM-killed the fleet captain). A pass holds the per-host cycle
 //! lock, so it never overlaps a poll cycle, and it is the one place the
-//! journal is rotated ([`super::rotation`]) — only once every line is
-//! exported.
+//! journal is rotated ([`super::rotation`]) — once the bulk cursor passes the
+//! threshold, carrying any unexported tail into the new generation (#13636).
 //!
 //! Delivery to the exporter is at-least-once across a crash between the
 //! queue offer and the cursor save (the same posture as every other
@@ -24,11 +24,13 @@
 //! `ci.job` facts (what ETA consumes) queued behind millions of older spans
 //! whenever the backfill drain is capped. [`ExportCursor::fast_offset`] is a
 //! second persisted cursor over the *same* journal: each pass first offers the
-//! run/job-class lines ([`is_priority`]) past it, then — only once the fast
-//! lane has reached the end of the journal — continues the bulk cursor, which
-//! skips the priority lines the fast lane already offered. Nothing is dropped
-//! or sampled; the journal rotates only when the bulk cursor (and so the fast
-//! one) is at EOF.
+//! run/job-class lines ([`is_priority`]) past it, then continues the bulk
+//! cursor, which skips the priority lines the fast lane already offered. A
+//! fast lane that stops early (scan budget, queue push-back) bounds the bulk
+//! lane to the span it already covered instead of starving it (#13685). Nothing is dropped
+//! or sampled; rotation does not wait for EOF (a live writer keeps the bulk
+//! cursor trailing it): the unexported tail is carried forward and the fast
+//! offset resets, so priority lines in the tail may be re-offered once.
 //!
 //! **Bounded admission (#11115).** Records are offered through
 //! [`QueueSink::offer_backfill`], which never evicts: when any exporter queue
@@ -225,9 +227,10 @@ pub fn pending_count(root: &Path) -> usize {
 /// a time.
 pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
     let path = journal_path(root);
-    if !path.exists() {
+    if !path.exists() && !rotation::carry_path(&path).exists() {
         // Nothing to export — and no lock file is created in a workspace
-        // that has never run the poller.
+        // that has never run the poller. (A lone staging file is an
+        // interrupted tail-carrying rotation: recovered below.)
         return 0;
     }
     let lock = match CycleLock::try_acquire(&state_dir(root)) {
@@ -241,6 +244,19 @@ pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
             return 0;
         }
     };
+    // Finish an interrupted tail-carrying rotation before reading the journal
+    // (#13636): otherwise the carried tail never reaches the exporter.
+    match rotation::recover_carry(&path) {
+        Ok(true) => log::info!("ci_telemetry: recovered an interrupted rotation's carried tail"),
+        Ok(false) => {}
+        Err(error) => {
+            log::warn!("ci_telemetry: could not recover the carried tail, will retry: {error}");
+            return 0;
+        }
+    }
+    if !path.exists() {
+        return 0;
+    }
     let (offered, mut cursor) = export_locked(root, &path, queue);
     let policy = if cursor.byte_offset > 0 {
         RotationPolicy::resolve(&read_config(root))
@@ -260,7 +276,32 @@ enum Offer {
     /// Unparseable: logged and passed over.
     Skipped,
     /// The queue deferred or refused it: the lane stops at this line.
-    Stop,
+    Stop(StopReason),
+}
+
+/// Why an export lane stopped before the end of the journal (#13685).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// The per-pass scan budget ([`FAST_LANE_SCAN_BYTES`]) ran out.
+    Budget,
+    /// An exporter queue is at its backfill limit (#11115).
+    Deferred,
+    /// An exporter queue refused the record.
+    Refused,
+    /// The fast lane spent its share of this pass's backfill headroom, which
+    /// is held back for the bulk lane (#13688).
+    FastShare,
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Budget => "scan budget exhausted",
+            Self::Deferred => "exporter queue deferred (backfill limit)",
+            Self::Refused => "exporter queue refused a record",
+            Self::FastShare => "fast-lane share of backfill headroom spent",
+        }
+    }
 }
 
 fn offer_line(queue: &dyn QueueSink, line: &[u8]) -> Offer {
@@ -278,21 +319,73 @@ fn offer_line(queue: &dyn QueueSink, line: &[u8]) -> Offer {
             // #11115: stop at the first unadmitted record; it stays behind
             // the cursor and no work is spent on the rest of the journal.
             log::debug!("ci_telemetry: export deferred — exporter queue at its backfill limit");
-            Offer::Stop
+            Offer::Stop(StopReason::Deferred)
         }
         Err(error) => {
             log::warn!("ci_telemetry: export queue refused a record, will retry: {error}");
-            Offer::Stop
+            Offer::Stop(StopReason::Refused)
         }
     }
 }
 
+/// Fast lane: offer priority lines from `start` until the end of the journal,
+/// the scan budget, queue push-back, or `budget` admitted offers. Returns the
+/// offset reached and why it stopped early (`None`: end of journal).
+fn fast_lane(
+    path: &Path,
+    queue: &dyn QueueSink,
+    start: u64,
+    budget: Option<usize>,
+    read: &mut u64,
+    offered: &mut usize,
+) -> std::io::Result<(u64, Option<StopReason>)> {
+    let mut admitted = 0_usize;
+    let mut pushed_back: Option<StopReason> = None;
+    let end = scan_lines_at(path, start, MAX_LINE_BYTES, |_, line| {
+        if *read >= FAST_LANE_SCAN_BYTES {
+            pushed_back = Some(StopReason::Budget); // not at the end yet
+            return false;
+        }
+        *read += line.len() as u64 + 1;
+        if line.trim_ascii().is_empty() || !is_priority(line) {
+            return true;
+        }
+        if budget.is_some_and(|budget| admitted >= budget) {
+            pushed_back = Some(StopReason::FastShare);
+            return false;
+        }
+        match offer_line(queue, line) {
+            Offer::Admitted => {
+                *offered += 1;
+                admitted += 1;
+                true
+            }
+            Offer::Skipped => true,
+            Offer::Stop(reason) => {
+                pushed_back = Some(reason);
+                false
+            }
+        }
+    })?;
+    Ok((end, pushed_back))
+}
+
+/// The fast lane's share of `headroom` backfill offers: the larger half, so it
+/// always progresses when there is any room; the bulk lane gets the rest
+/// (#13688).
+fn fast_lane_share(headroom: usize) -> usize {
+    headroom.div_ceil(2)
+}
+
 /// The export pass proper. The caller holds the cycle lock.
 ///
-/// Fast lane first (priority lines past `fast_offset`, byte-bounded), then —
-/// only if the fast lane reached the end of the journal without the queue
-/// pushing back — the bulk lane over everything past `byte_offset`, skipping
-/// priority lines the fast lane already offered.
+/// Fast lane first (priority lines past `fast_offset`, byte-bounded), then the
+/// bulk lane over everything past `byte_offset`, skipping priority lines the
+/// fast lane already offered. If the fast lane reached the end of the journal
+/// the bulk lane runs to the end too; if the fast lane stopped early (scan
+/// budget, queue push-back) the bulk lane is bounded to the span the fast lane
+/// already covered, so it still advances rather than starving behind a fast
+/// lane that cannot finish (#13685) — rotation keys off the bulk cursor.
 fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, ExportCursor) {
     let cursor = load_cursor(root);
     let Some((bulk_start, fast_start)) = start_offsets(path, &cursor) else {
@@ -300,50 +393,37 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
     };
     let mut offered = 0;
 
-    // Fast lane.
+    // Fast lane. It may spend only its share of this pass's backfill headroom:
+    // otherwise a sustained fast-lane backlog fills the queue to its backfill
+    // limit every pass and the bulk lane (whose cursor drives rotation) is
+    // never admitted (#13688).
+    let fast_budget = queue.backfill_headroom().map(fast_lane_share);
     let mut read = 0_u64;
-    let mut pushed_back = false;
-    let fast_scan = scan_lines_at(path, fast_start, MAX_LINE_BYTES, |_, line| {
-        if read >= FAST_LANE_SCAN_BYTES {
-            pushed_back = true; // out of budget, not at the end yet
-            return false;
-        }
-        read += line.len() as u64 + 1;
-        if line.trim_ascii().is_empty() || !is_priority(line) {
-            return true;
-        }
-        match offer_line(queue, line) {
-            Offer::Admitted => {
-                offered += 1;
-                true
+    let (mut fast_end, pushed_back) =
+        match fast_lane(path, queue, fast_start, fast_budget, &mut read, &mut offered) {
+            Ok(result) => result,
+            Err(error) => {
+                log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
+                return (0, cursor);
             }
-            Offer::Skipped => true,
-            Offer::Stop => {
-                pushed_back = true;
-                false
-            }
-        }
-    });
-    let fast_end = match fast_scan {
-        Ok(offset) => offset,
-        Err(error) => {
-            log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
-            return (0, cursor);
-        }
-    };
-    if pushed_back {
-        // Persist what the fast lane did and leave the bulk lane for later.
-        let advanced = ExportCursor {
-            byte_offset: bulk_start,
-            fast_offset: normalized_fast(bulk_start, fast_end),
-            exported: cursor.exported + offered as u64,
         };
-        return (offered, persist(root, cursor, advanced));
+    if let Some(reason) = pushed_back {
+        log::info!(
+            "ci_telemetry: export fast lane stopped at offset {fast_end} of {}: {} (bulk cursor {bulk_start})",
+            path.display(),
+            reason.as_str()
+        );
     }
 
-    // Bulk lane. The fast lane is at EOF, so every priority line before
-    // `fast_end` is already offered.
+    // Bulk lane. Every priority line before `fast_end` is already offered. When
+    // the fast lane stopped early the bulk lane may not pass `fast_end`: lines
+    // beyond it are the fast lane's to classify.
+    let bulk_limit = pushed_back.map(|_| fast_end);
+    let mut bulk_stop = None;
     let bulk_scan = scan_lines_at(path, bulk_start, MAX_LINE_BYTES, |offset, line| {
+        if bulk_limit.is_some_and(|limit| offset >= limit) {
+            return false;
+        }
         if line.trim_ascii().is_empty() || (offset < fast_end && is_priority(line)) {
             return true;
         }
@@ -353,7 +433,10 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
                 true
             }
             Offer::Skipped => true,
-            Offer::Stop => false,
+            Offer::Stop(reason) => {
+                bulk_stop = Some(reason);
+                false
+            }
         }
     });
     let bulk_end = match bulk_scan {
@@ -365,6 +448,24 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
             return (0, cursor);
         }
     };
+    // The share only reserves room for the bulk lane: headroom the bulk lane
+    // left unspent (little to offer before `fast_end`) goes back to the fast
+    // lane, so a capped pass never wastes admission (#13688).
+    if pushed_back == Some(StopReason::FastShare) && bulk_stop.is_none() {
+        match fast_lane(path, queue, fast_end, None, &mut read, &mut offered) {
+            Ok((end, _)) => fast_end = end,
+            Err(error) => {
+                log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
+                return (0, cursor);
+            }
+        }
+    }
+    if let Some(reason) = bulk_stop {
+        log::info!(
+            "ci_telemetry: export bulk lane stopped at offset {bulk_end}: {}",
+            reason.as_str()
+        );
+    }
     let advanced = ExportCursor {
         byte_offset: bulk_end,
         fast_offset: normalized_fast(bulk_end, fast_end.max(bulk_end)),
@@ -389,9 +490,10 @@ fn persist(root: &Path, cursor: ExportCursor, advanced: ExportCursor) -> ExportC
     }
 }
 
-/// Rotate the journal when the cursor has passed `policy`'s threshold **and**
-/// sits exactly at the end of the file, so every line is already exported.
-/// Then reset the cursor's byte offset. The caller holds the cycle lock.
+/// Rotate the journal when the bulk cursor has passed `policy`'s threshold.
+/// Any unexported tail `[byte_offset, EOF)` is copied into the new generation
+/// first (#13636), so a live writer cannot postpone rotation forever. Then
+/// reset the cursor's byte offset. The caller holds the cycle lock.
 /// Returns whether it rotated.
 pub fn rotate_if_due(
     root: &Path,
@@ -410,29 +512,51 @@ pub(crate) fn rotate_if_due_with(
     policy: RotationPolicy,
     save_hook: &dyn Fn(SaveStep) -> io::Result<()>,
 ) -> io::Result<bool> {
-    if cursor.byte_offset < policy.threshold_bytes {
+    if cursor.byte_offset == 0 || cursor.byte_offset < policy.threshold_bytes {
+        // Nothing consumed yet (e.g. the fast lane is still pushed back):
+        // rotating would just copy the whole journal.
         return Ok(false);
     }
     let len = std::fs::metadata(path)?.len();
-    if cursor.byte_offset != len {
-        // Unexported lines (or a torn tail a writer has yet to repair)
-        // remain; a later pass rotates once they are gone.
+    let tail_len = len.saturating_sub(cursor.byte_offset);
+    if tail_len > 0 && policy.keep == 0 {
+        // No retained rotation to replay the tail from after a crash: wait
+        // for it to drain.
         return Ok(false);
     }
+    // Stage the unexported tail (fsynced) before anything is changed.
+    let staged = if tail_len > 0 {
+        Some(rotation::carry_tail(path, cursor.byte_offset)?)
+    } else {
+        None
+    };
     // Durably reset the cursor to 0 BEFORE the journal is renamed/deleted, so
     // a crash anywhere afterwards can never leave the old offset trusted for a
-    // new generation. A crash before the rotation merely replays the old,
-    // already-offered generation (at-least-once). If the reset cannot be made
-    // durable, do not rotate.
+    // new generation. A crash before the rotation merely replays the old
+    // generation (at-least-once); one between the renames leaves the tail in
+    // `.1`, which recovery replay scans. If the reset cannot be made durable,
+    // do not rotate.
     let reset = ExportCursor {
         byte_offset: 0,
         fast_offset: None,
         exported: cursor.exported,
     };
-    save_cursor_with(root, &reset, save_hook)?;
-    rotation::rotate(path, policy.keep)?;
+    let rotated = save_cursor_with(root, &reset, save_hook).and_then(|()| match &staged {
+        Some(tail) => rotation::rotate_carrying(path, policy.keep, tail),
+        None => rotation::rotate(path, policy.keep),
+    });
+    if let Err(error) = rotated {
+        if let Some(tail) = &staged {
+            // Only drop the staging file if the journal still exists; after a
+            // partial rotate it may be the sole copy of the new generation.
+            if path.exists() {
+                let _ = std::fs::remove_file(tail);
+            }
+        }
+        return Err(error);
+    }
     log::info!(
-        "ci_telemetry: rotated the {len}-byte journal (threshold {} bytes, keeping {} rotation(s))",
+        "ci_telemetry: rotated the {len}-byte journal carrying {tail_len} unexported byte(s) (threshold {} bytes, keeping {} rotation(s))",
         policy.threshold_bytes,
         policy.keep
     );

@@ -199,7 +199,6 @@ fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
         ("pick.decision", true),
         ("host.health", true),
         ("host.export", true),
-        ("operator.presence", true),
     ] {
         let meta = kind(tag).unwrap_or_else(|| panic!("contract kind `{tag}` is not registered"));
         assert_eq!(

@@ -400,6 +400,9 @@ fn run_live(
                 std::path::Path::new(&crate::gh_invocation::gh_bin()),
                 root,
                 pr,
+                // `land` runs only after the byte-identity waiver did not
+                // land the PR, so the proof (a) did not hold; (b) decides.
+                false,
             )
         },
         waive: &super::waiver_gh::waive,

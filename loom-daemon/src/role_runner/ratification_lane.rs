@@ -112,6 +112,47 @@ pub trait PrSource {
     fn files(&self, pr: u64, hold: &ratification::Config) -> Vec<ChangedFile>;
     /// Comments by trusted authors only.
     fn trusted_comments(&self, pr: u64) -> Vec<Comment>;
+    /// Why the head content of `path` on `pr` could not be read (the `gh`
+    /// exit status and bounded stderr), when the last [`PrSource::files`] call
+    /// recorded one.
+    fn read_failure(&self, _pr: u64, _path: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Log-once-per-change gate. A failure repeats on every tick; the WARN is
+/// emitted once per `(pr, head_sha, kind)` and again only when its reason text
+/// changes. In-memory: resets with the daemon.
+#[derive(Debug, Default)]
+pub struct WarnDedup {
+    seen: std::collections::HashMap<(u64, String, &'static str), String>,
+}
+
+impl WarnDedup {
+    /// True when this `(pr, head_sha, kind, reason)` has not been logged yet.
+    pub fn should_log(
+        &mut self,
+        pr: u64,
+        head_sha: &str,
+        kind: &'static str,
+        reason: &str,
+    ) -> bool {
+        let key = (pr, head_sha.to_string(), kind);
+        if self.seen.get(&key).is_some_and(|r| r == reason) {
+            return false;
+        }
+        self.seen.insert(key, reason.to_string());
+        true
+    }
+}
+
+/// The process-wide gate the real lane logs through.
+fn warn_once(pr: u64, head_sha: &str, kind: &'static str, reason: &str) -> bool {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<WarnDedup>> = std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .should_log(pr, head_sha, kind, reason)
 }
 
 /// The two review keys.
@@ -135,12 +176,45 @@ pub enum Selection {
 /// and is logged.
 #[must_use]
 pub fn matches_pr(pr: u64, files: &[ChangedFile], hold: &ratification::Config) -> bool {
+    !matches!(
+        match_state(pr, "", files, hold, &|_| None),
+        MatchState::Clear | MatchState::Unreadable
+    )
+}
+
+/// Selection's view of one PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchState {
+    Hold,
+    Clear,
+    Unreadable,
+}
+
+/// [`ratification::scan`] plus the unreadable WARN, with each path's read
+/// failure (`detail`) in the reason and the WARN deduplicated per head.
+fn match_state(
+    pr: u64,
+    head_sha: &str,
+    files: &[ChangedFile],
+    hold: &ratification::Config,
+    detail: &dyn Fn(&str) -> Option<String>,
+) -> MatchState {
     match ratification::scan(files, hold) {
-        Verdict::Hold(_) => true,
-        Verdict::Clear => false,
+        Verdict::Hold(_) => MatchState::Hold,
+        Verdict::Clear => MatchState::Clear,
         Verdict::Unreadable(paths) => {
-            log::warn!("ratification_lane: PR #{pr} not selected; unreadable: {paths:?}");
-            false
+            let reason = paths
+                .iter()
+                .map(|p| match detail(p) {
+                    Some(d) => format!("{p} ({d})"),
+                    None => p.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if warn_once(pr, head_sha, "unreadable", &reason) {
+                log::warn!("ratification_lane: PR #{pr} not selected; unreadable: [{reason}]");
+            }
+            MatchState::Unreadable
         }
     }
 }
@@ -192,13 +266,32 @@ pub fn find_candidates(
     lane_session: Option<&str>,
     src: &dyn PrSource,
 ) -> Vec<Selection> {
+    find_candidates_counted(cfg, lane_session, src).0
+}
+
+/// [`find_candidates`] plus the number of PRs not selected because a candidate
+/// file was unreadable.
+#[must_use]
+pub fn find_candidates_counted(
+    cfg: &Config,
+    lane_session: Option<&str>,
+    src: &dyn PrSource,
+) -> (Vec<Selection>, usize) {
     if !cfg.enabled {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let mut out = Vec::new();
+    let mut unreadable = 0;
     for pr in src.open_prs() {
-        if !matches_pr(pr.number, &src.files(pr.number, &cfg.hold), &cfg.hold) {
-            continue;
+        let files = src.files(pr.number, &cfg.hold);
+        let detail = |path: &str| src.read_failure(pr.number, path);
+        match match_state(pr.number, &pr.head_sha, &files, &cfg.hold, &detail) {
+            MatchState::Hold => {}
+            MatchState::Clear => continue,
+            MatchState::Unreadable => {
+                unreadable += 1;
+                continue;
+            }
         }
         let comments = src.trusted_comments(pr.number);
         if let Some(sid) =
@@ -219,7 +312,7 @@ pub fn find_candidates(
             head_sha: pr.head_sha,
         });
     }
-    out
+    (out, unreadable)
 }
 
 // ---------------------------------------------------------------------------
@@ -314,12 +407,21 @@ pub fn post_markers(
                 KeyOutcome::FailedClosed(reason) => KeyPost::Withheld(reason.clone()),
             };
             if let KeyPost::Withheld(reason) = &result {
-                log::warn!("ratification_lane: PR #{pr} key {} withheld: {reason}", key.wire());
+                let kind = match key {
+                    Key::Ee => "withheld:ee",
+                    Key::Market => "withheld:market",
+                };
+                if warn_once(pr, head_sha, kind, reason) {
+                    log::warn!("ratification_lane: PR #{pr} key {} withheld: {reason}", key.wire());
+                }
             }
             (key, result)
         })
         .collect()
 }
+
+/// Per-PR key results of one lane pass.
+pub type LaneResults = Vec<(u64, Vec<(Key, KeyPost)>)>;
 
 /// One lane pass: select, dispatch both key sessions per candidate, post
 /// markers for the keys that succeeded. A disabled `cfg` returns at once
@@ -332,14 +434,46 @@ pub fn run_lane(
     instructions: &dyn super::ratification_dispatch::InstructionSource,
     sink: &dyn CommentSink,
     runner: &mut dyn super::RoleInvocationRunner,
-) -> Vec<(u64, Vec<(Key, KeyPost)>)> {
+) -> LaneResults {
+    run_lane_counted(cfg, lane_session, target_repo, prs, instructions, sink, runner).0
+}
+
+/// [`run_lane`] plus the number of PRs selection refused (the tick's `skipped`).
+pub fn run_lane_counted(
+    cfg: &Config,
+    lane_session: Option<&str>,
+    target_repo: &str,
+    prs: &dyn PrSource,
+    instructions: &dyn super::ratification_dispatch::InstructionSource,
+    sink: &dyn CommentSink,
+    runner: &mut dyn super::RoleInvocationRunner,
+) -> (LaneResults, usize) {
+    let (results, refused, _unreadable) =
+        run_lane_stats(cfg, lane_session, target_repo, prs, instructions, sink, runner);
+    (results, refused)
+}
+
+/// [`run_lane_counted`] plus the number of PRs left unselected because a
+/// candidate file was unreadable.
+pub fn run_lane_stats(
+    cfg: &Config,
+    lane_session: Option<&str>,
+    target_repo: &str,
+    prs: &dyn PrSource,
+    instructions: &dyn super::ratification_dispatch::InstructionSource,
+    sink: &dyn CommentSink,
+    runner: &mut dyn super::RoleInvocationRunner,
+) -> (LaneResults, usize, usize) {
     let (true, Some(ee), Some(market)) = (cfg.enabled, cfg.ee.as_ref(), cfg.market.as_ref()) else {
-        return Vec::new();
+        return (Vec::new(), 0, 0);
     };
     let mut out = Vec::new();
-    for sel in find_candidates(cfg, lane_session, prs) {
+    let mut refused = 0;
+    let (selections, unreadable) = find_candidates_counted(cfg, lane_session, prs);
+    for sel in selections {
         match sel {
             Selection::Refused { pr, reason } => {
+                refused += 1;
                 log::info!("ratification_lane: PR #{pr} refused: {reason}");
             }
             Selection::Candidate { pr, head_sha } => {
@@ -356,7 +490,162 @@ pub fn run_lane(
             }
         }
     }
-    out
+    (out, refused, unreadable)
+}
+
+/// What one lane tick did: a distinct `reason` for every way a tick can end,
+/// so "never ran" and "nothing to do" are different records (#13707).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// `disabled` | `repo_unresolved` | `in_flight` | `nothing_to_do` | `degraded`
+    /// | `ran`. `degraded`: nothing was selected but some PRs were unreadable
+    /// or had keys withheld, so "no ratification PRs here" would be false.
+    pub reason: &'static str,
+    /// Candidates selected for key review.
+    pub selected: usize,
+    /// PRs selection refused.
+    pub skipped: usize,
+    /// Candidates whose key sessions were dispatched.
+    pub ran: usize,
+    /// Key markers posted.
+    pub posted: usize,
+    /// PRs not selected because a candidate file's head content was unreadable.
+    pub unreadable: usize,
+    /// Keys not posted (pin unresolved, session failed, post failed).
+    pub withheld: usize,
+}
+
+impl TickOutcome {
+    fn bare(reason: &'static str) -> Self {
+        Self {
+            reason,
+            selected: 0,
+            skipped: 0,
+            ran: 0,
+            posted: 0,
+            unreadable: 0,
+            withheld: 0,
+        }
+    }
+
+    /// Summarize a [`run_lane_counted`] result.
+    #[must_use]
+    pub fn from_run(results: &[(u64, Vec<(Key, KeyPost)>)], skipped: usize) -> Self {
+        Self::from_run_stats(results, skipped, 0)
+    }
+
+    /// [`TickOutcome::from_run`] with the unreadable-PR count.
+    #[must_use]
+    pub fn from_run_stats(
+        results: &[(u64, Vec<(Key, KeyPost)>)],
+        skipped: usize,
+        unreadable: usize,
+    ) -> Self {
+        let withheld = results
+            .iter()
+            .flat_map(|(_, keys)| keys)
+            .filter(|(_, p)| matches!(p, KeyPost::Withheld(_)))
+            .count();
+        let posted = results
+            .iter()
+            .flat_map(|(_, keys)| keys)
+            .filter(|(_, p)| *p == KeyPost::Posted)
+            .count();
+        Self {
+            reason: if !results.is_empty() {
+                "ran"
+            } else if unreadable > 0 {
+                "degraded"
+            } else {
+                "nothing_to_do"
+            },
+            selected: results.len(),
+            skipped,
+            ran: results.len(),
+            posted,
+            unreadable,
+            withheld,
+        }
+    }
+}
+
+/// Log the tick and emit its span (when spans are exported on this host).
+fn record_tick(root: &std::path::Path, source: &str, o: &TickOutcome) {
+    log::info!(
+        "ratification_lane: tick root={} source={source} reason={} selected={} skipped={} ran={} posted={} unreadable={} withheld={}",
+        root.display(),
+        o.reason,
+        o.selected,
+        o.skipped,
+        o.ran,
+        o.posted,
+        o.unreadable,
+        o.withheld
+    );
+    if crate::observability::ops::spans_exported() {
+        crate::observability::ops::emit_span(tick_span(root, source, o, chrono::Utc::now()));
+    }
+}
+
+/// Span attribute keys on `ratification_lane.tick`. They must be namespaced
+/// and registered in `bounded_attributes()`; bare keys are dropped at export.
+pub const KEY_REASON: &str = "loom.ratification.reason";
+pub const KEY_SOURCE: &str = "loom.ratification.source";
+pub const KEY_SELECTED: &str = "loom.ratification.selected";
+pub const KEY_SKIPPED: &str = "loom.ratification.skipped";
+pub const KEY_RAN: &str = "loom.ratification.ran";
+pub const KEY_POSTED: &str = "loom.ratification.posted";
+pub const KEY_UNREADABLE: &str = "loom.ratification.unreadable";
+pub const KEY_WITHHELD: &str = "loom.ratification.withheld";
+pub const KEYS: [&str; 8] = [
+    KEY_REASON,
+    KEY_SOURCE,
+    KEY_SELECTED,
+    KEY_SKIPPED,
+    KEY_RAN,
+    KEY_POSTED,
+    KEY_UNREADABLE,
+    KEY_WITHHELD,
+];
+
+/// The `ratification_lane.tick` span: an instant, its own root.
+#[must_use]
+pub fn tick_span(
+    root: &std::path::Path,
+    source: &str,
+    o: &TickOutcome,
+    at: chrono::DateTime<chrono::Utc>,
+) -> crate::telemetry::trace::SpanRecord {
+    use crate::telemetry::trace::{
+        instant, SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext,
+    };
+    let name = SpanName::RatificationLaneTick;
+    let root_s = root.display().to_string();
+    let context = TraceContext::derived(name.as_str(), &[&root_s, source, &instant(at)]);
+    let mut attributes = TraceAttributes::new();
+    let mut put = |k: &str, v: String| {
+        attributes.insert(k.to_string(), v);
+    };
+    put(KEY_REASON, o.reason.to_string());
+    put(KEY_SOURCE, source.to_string());
+    put(KEY_SELECTED, o.selected.to_string());
+    put(KEY_SKIPPED, o.skipped.to_string());
+    put(KEY_RAN, o.ran.to_string());
+    put(KEY_POSTED, o.posted.to_string());
+    put(KEY_UNREADABLE, o.unreadable.to_string());
+    put(KEY_WITHHELD, o.withheld.to_string());
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
+    SpanRecord {
+        context,
+        parent_span_id: None,
+        name,
+        started_at: at,
+        ended_at: at,
+        status: SpanStatus::Ok,
+        attributes,
+        events: Vec::new(),
+        links: Vec::new(),
+    }
 }
 
 /// The real forge for [`PrSource`]: `gh api` against `nwo`, trusting only
@@ -366,6 +655,8 @@ pub struct GhPrSource<'a> {
     pub nwo: &'a str,
     pub policy: &'a crate::comment_trust::TrustPolicy,
     refs: std::cell::RefCell<std::collections::HashMap<u64, (String, String)>>,
+    /// `(pr, path)` -> why the head content could not be read, this pass.
+    failures: std::cell::RefCell<std::collections::HashMap<(u64, String), String>>,
 }
 
 impl<'a> GhPrSource<'a> {
@@ -380,6 +671,7 @@ impl<'a> GhPrSource<'a> {
             nwo,
             policy,
             refs: std::cell::RefCell::default(),
+            failures: std::cell::RefCell::default(),
         }
     }
 
@@ -393,14 +685,9 @@ impl<'a> GhPrSource<'a> {
         crate::comment_trust::parse_listing(&stdout).map(Value::Array)
     }
 
-    fn raw(&self, path: &str, git_ref: &str) -> Option<String> {
+    fn raw(&self, path: &str, git_ref: &str) -> Result<String, String> {
         let endpoint = format!("repos/{}/contents/{path}?ref={git_ref}", self.nwo);
-        let out = crate::script_helpers::run_gh(
-            &["api", "-H", "Accept: application/vnd.github.raw", &endpoint],
-            self.root,
-            false,
-        );
-        Some(String::from_utf8_lossy(&out.ok_output()?.stdout).into_owned())
+        super::ratification_dispatch::read_raw(self.root, &endpoint)
     }
 }
 
@@ -457,11 +744,22 @@ impl PrSource for GhPrSource<'_> {
                     && !head.is_empty()
                     && ratification::is_candidate(&file, hold)
                 {
-                    file.head_content = self.raw(&file.filename, &head);
+                    match self.raw(&file.filename, &head) {
+                        Ok(text) => file.head_content = Some(text),
+                        Err(why) => {
+                            self.failures
+                                .borrow_mut()
+                                .insert((pr, file.filename.clone()), why);
+                        }
+                    }
                 }
                 Some(file)
             })
             .collect()
+    }
+
+    fn read_failure(&self, pr: u64, path: &str) -> Option<String> {
+        self.failures.borrow().get(&(pr, path.to_string())).cloned()
     }
 
     fn trusted_comments(&self, pr: u64) -> Vec<Comment> {
@@ -509,22 +807,74 @@ impl<R: super::RoleInvocationRunner + ?Sized> super::RoleInvocationRunner for Ru
     }
 }
 
+/// Roots with a lane tick in flight, process-wide: the role-tick and
+/// step-dispatch entry points share it, so a root is ticked by at most one
+/// path at a time (#13707).
+fn in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static SET: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+struct InFlight(std::path::PathBuf);
+
+impl InFlight {
+    fn acquire(root: &std::path::Path) -> Option<Self> {
+        let mut set = in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.insert(root.to_path_buf())
+            .then(|| Self(root.to_path_buf()))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
 /// The role-tick entry point: does nothing unless `ratificationLane.enabled`
 /// is set for `root`, and fails closed when the repo cannot be resolved. The
 /// lane's own session id (`LOOM_SWEEP_ID`) feeds the builder-session check.
+/// Every tick, including a no-op one, logs and emits its outcome (#13707).
 pub fn tick_for_root<R: super::RoleInvocationRunner + ?Sized>(
     root: &std::path::Path,
     runner: &mut R,
-) {
+) -> TickOutcome {
+    tick_for_root_from(root, runner, "role_tick")
+}
+
+fn tick_for_root_from<R: super::RoleInvocationRunner + ?Sized>(
+    root: &std::path::Path,
+    runner: &mut R,
+    source: &str,
+) -> TickOutcome {
+    let outcome = tick_inner(root, runner);
+    record_tick(root, source, &outcome);
+    outcome
+}
+
+fn tick_inner<R: super::RoleInvocationRunner + ?Sized>(
+    root: &std::path::Path,
+    runner: &mut R,
+) -> TickOutcome {
     let effective = crate::config_resolver::resolve_effective_config(root);
     let cfg = Config::from_effective(&effective);
     if !cfg.enabled {
-        return;
+        return TickOutcome::bare("disabled");
     }
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
     let Some(nwo) = crate::credential_preflight::nwo_from_git_remote(root) else {
         log::warn!("ratification_lane: repo unresolved; skipping");
-        return;
+        return TickOutcome::bare("repo_unresolved");
+    };
+    let Some(_guard) = InFlight::acquire(root) else {
+        return TickOutcome::bare("in_flight");
     };
     let lane_session = std::env::var("LOOM_SWEEP_ID")
         .ok()
@@ -532,7 +882,7 @@ pub fn tick_for_root<R: super::RoleInvocationRunner + ?Sized>(
     let prs = GhPrSource::new(root, &nwo, &policy);
     let instructions = super::ratification_dispatch::GhInstructionSource { root };
     let sink = GhCommentSink { root, nwo: &nwo };
-    run_lane(
+    let (results, skipped, unreadable) = run_lane_stats(
         &cfg,
         lane_session.as_deref(),
         &nwo,
@@ -541,6 +891,69 @@ pub fn tick_for_root<R: super::RoleInvocationRunner + ?Sized>(
         &sink,
         &mut RunnerRef(runner),
     );
+    TickOutcome::from_run_stats(&results, skipped, unreadable)
+}
+
+/// How often the step-dispatch driver ticks the lane for a root.
+pub const STEP_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether `root` is due a step-dispatch tick at `now`, recording it as ticked
+/// when so. Pure over `last` so the cadence is testable.
+fn step_tick_due(
+    last: &mut std::collections::HashMap<std::path::PathBuf, std::time::Instant>,
+    root: &std::path::Path,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match last.get(root) {
+        Some(t) if now.duration_since(*t) < interval => false,
+        _ => {
+            last.insert(root.to_path_buf(), now);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn step_tick_due_for_test(
+    last: &mut std::collections::HashMap<std::path::PathBuf, std::time::Instant>,
+    root: &std::path::Path,
+    now: std::time::Instant,
+) -> bool {
+    step_tick_due(last, root, now, STEP_TICK_INTERVAL)
+}
+
+/// The step-dispatch entry point (#13707): a fleet host that dispatches by
+/// steps never reaches the champion role tick, so the driver calls this each
+/// tick. Per root, at most once per [`STEP_TICK_INTERVAL`], on its own thread
+/// (the lane shells out and runs reviewer sessions, which must not stall the
+/// driver tick). The shared in-flight guard stops it overlapping a role tick.
+pub fn spawn_step_ticks(roots: &[std::path::PathBuf]) {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let last = LAST.get_or_init(Default::default);
+    for root in roots {
+        let due = {
+            let mut m = last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            step_tick_due(&mut m, root, std::time::Instant::now(), STEP_TICK_INTERVAL)
+        };
+        if !due {
+            continue;
+        }
+        let root = root.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ratification-lane".into())
+            .spawn(move || {
+                let mut runner = super::ScriptRoleInvocationRunner::new(root.clone());
+                tick_for_root_from(&root, &mut runner, "step_dispatch");
+            });
+        if let Err(e) = spawned {
+            log::warn!("ratification_lane: could not spawn step tick: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +1092,44 @@ mod tests {
         let mut f = file("spec/fft.md", "");
         f.head_content = None;
         assert!(!matches_pr(1, &[f], &ratification::Config::default()));
+    }
+
+    /// Fake whose one PR has an unreadable file with a recorded failure.
+    struct Broken(Fake);
+
+    impl PrSource for Broken {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.0.open_prs()
+        }
+        fn files(&self, pr: u64, hold: &ratification::Config) -> Vec<ChangedFile> {
+            self.0.files(pr, hold)
+        }
+        fn trusted_comments(&self, pr: u64) -> Vec<Comment> {
+            self.0.trusted_comments(pr)
+        }
+        fn read_failure(&self, _pr: u64, path: &str) -> Option<String> {
+            Some(format!("exit 1: HTTP 404 for {path}"))
+        }
+    }
+
+    #[test]
+    fn unreadable_pr_is_counted_not_silently_dropped() {
+        let mut f = file("spec/fft.md", "");
+        f.head_content = None;
+        let src = Broken(one_pr("alice", vec![f], vec![]));
+        let (sel, unreadable) = find_candidates_counted(&enabled(), None, &src);
+        assert!(sel.is_empty());
+        assert_eq!(unreadable, 1);
+    }
+
+    #[test]
+    fn warn_dedup_logs_once_per_head_and_again_on_a_new_reason() {
+        let mut d = WarnDedup::default();
+        assert!(d.should_log(7, "aaa", "unreadable", "x (exit 1)"));
+        assert!(!d.should_log(7, "aaa", "unreadable", "x (exit 1)"), "same tick repeat");
+        assert!(d.should_log(7, "bbb", "unreadable", "x (exit 1)"), "new head");
+        assert!(d.should_log(7, "aaa", "withheld:ee", "x (exit 1)"), "other kind");
+        assert!(d.should_log(7, "aaa", "unreadable", "x (exit 4)"), "reason changed");
     }
 
     #[test]

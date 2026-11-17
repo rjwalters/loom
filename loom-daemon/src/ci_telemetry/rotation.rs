@@ -7,9 +7,14 @@
 //!
 //! - **When.** Once the export cursor has passed
 //!   `autonomous.ciTelemetry.journalRotateBytes` (default
-//!   [`DEFAULT_ROTATE_BYTES`]) **and** sits exactly at the end of the file —
-//!   every line has been offered to the export queue and there is no torn
-//!   tail. The export pass ([`super::export::backfill`]) is the only caller,
+//!   [`DEFAULT_ROTATE_BYTES`]). The cursor need **not** be at the end of the
+//!   file: a host whose poller keeps appending while the bulk drain is capped
+//!   (#11115) never lands exactly on EOF, so an at-EOF rule never fired (the
+//!   7.36 GB captain journal, #13636). Any unexported tail
+//!   `[cursor, EOF)` — including a torn fragment — is carried into the new
+//!   generation ([`carry_tail`] / [`rotate_carrying`]), so the cost is one
+//!   copy bounded by the backlog. With `keep = 0` (no rotation is retained
+//!   to replay from) rotation still waits for an empty tail. The export pass ([`super::export::backfill`]) is the only caller,
 //!   and it holds the per-host cycle lock (`poll.lock`), so no poll cycle or
 //!   targeted capture can append in between.
 //! - **How.** `ci-telemetry.jsonl` is renamed to `ci-telemetry.jsonl.1`,
@@ -115,9 +120,109 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Rotate `journal` keeping at most `keep` rotations. **The caller must hold
-/// the cycle lock and must have exported every line** (the cursor at end of
-/// file) — this only moves files.
+/// `<journal>.carry` — where the unexported tail is staged before rotation.
+pub(crate) fn carry_path(journal: &Path) -> PathBuf {
+    let mut name = journal.file_name().unwrap_or_default().to_os_string();
+    name.push(".carry");
+    journal.with_file_name(name)
+}
+
+/// Stream `[from, EOF)` of `journal` into a fsynced staging file next to it
+/// (never reading it whole: #11045) and return its path. Replaces a stale
+/// staging file left by a crash.
+pub fn carry_tail(journal: &Path, from: u64) -> io::Result<PathBuf> {
+    use std::io::{Seek, SeekFrom};
+    let staged = carry_path(journal);
+    let mut src = File::open(journal)?;
+    src.seek(SeekFrom::Start(from))?;
+    let mut dst = File::create(&staged)?;
+    let result = io::copy(&mut src, &mut dst).and_then(|_| dst.sync_all());
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(staged)
+}
+
+/// [`rotate`], then move the staged `tail` (from [`carry_tail`]) into place as
+/// the new journal. Between the two renames there is no journal file and the
+/// tail lives only in `<journal>.carry` (and in `.1`, which the exporter never
+/// reads): [`recover_carry`] puts it back on the next export pass. Needs
+/// `keep >= 1`.
+pub fn rotate_carrying(journal: &Path, keep: usize, tail: &Path) -> io::Result<()> {
+    rotate(journal, keep)?;
+    std::fs::rename(tail, journal)?;
+    if let Some(dir) = journal.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Finish a tail-carrying rotation that was interrupted (a crash between the
+/// two renames, or a failed second rename). Returns whether a staged tail was
+/// consumed. The caller holds the cycle lock.
+///
+/// - Journal absent: the staged tail becomes the journal.
+/// - Journal present and already ending with the staged bytes: the crash came
+///   before the rotation, the tail is still in the old generation; just drop
+///   the staging file.
+/// - Otherwise the poller recreated the journal first: stream the staged tail
+///   onto its end, fsync, then drop the staging file. A crash mid-append at
+///   worst leaves the staging file to be appended again (at-least-once; the
+///   ledger dedups emission).
+pub fn recover_carry(journal: &Path) -> io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let staged = carry_path(journal);
+    if !staged.exists() {
+        return Ok(false);
+    }
+    let sync_dir = || -> io::Result<()> {
+        if let Some(dir) = journal.parent() {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    };
+    if !journal.exists() {
+        std::fs::rename(&staged, journal)?;
+        sync_dir()?;
+        return Ok(true);
+    }
+    let staged_len = std::fs::metadata(&staged)?.len();
+    let mut live = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(journal)?;
+    let live_len = live.metadata()?.len();
+    if staged_len <= live_len {
+        // Compare the journal's suffix with the staged bytes, streaming.
+        live.seek(SeekFrom::Start(live_len - staged_len))?;
+        let mut a = io::BufReader::new(File::open(&staged)?).bytes();
+        let mut b = io::BufReader::new(&mut live).bytes();
+        let mut same = true;
+        for _ in 0..staged_len {
+            if a.next().transpose()? != b.next().transpose()? {
+                same = false;
+                break;
+            }
+        }
+        drop(b);
+        if same {
+            remove_if_present(&staged)?;
+            sync_dir()?;
+            return Ok(true);
+        }
+    }
+    let mut src = File::open(&staged)?;
+    io::copy(&mut src, &mut live)?;
+    live.sync_all()?;
+    remove_if_present(&staged)?;
+    sync_dir()?;
+    Ok(true)
+}
+
+/// Rotate `journal` keeping at most `keep` rotations. This only moves files:
+/// the caller must hold the cycle lock and has either exported every line
+/// (cursor at end of file) or staged the unexported tail ([`carry_tail`]).
 pub fn rotate(journal: &Path, keep: usize) -> io::Result<()> {
     // Drop everything at or past the last retained slot first, so the shift
     // below never overwrites a file that should survive and a lowered `keep`

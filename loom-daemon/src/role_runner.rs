@@ -3985,10 +3985,6 @@ pub use in_progress_global::{
 };
 
 mod skip_counters;
-pub use skip_counters::{
-    load_skipped_count, model_runtime_mismatch_skip_count, no_token_pool_skip_count,
-    pool_exhausted_skip_count,
-};
 use skip_counters::{
     LOAD_SKIPPED_COUNT, MODEL_RUNTIME_MISMATCH_SKIP_COUNT, NO_TOKEN_POOL_SKIP_COUNT,
     POOL_EXHAUSTED_SKIP_COUNT,

@@ -264,7 +264,7 @@ gh pr view "$PR_NUMBER" --comments
 | Finding in the rejection history | Decision | Action |
 |----------------------------------|----------|--------|
 | Latest rejection names defects demonstrably **distinct** from the prior one (prior fix landed, new defects only reachable because of it), fixable in one bounded cycle, chain still converging | **Grant one more Doctor cycle** | Comment with `<!-- champion:capped-pr-grant -->` naming both rejections and the distinction, then remove **`loom:blocked` only** (leave `loom:changes-requested` — it is what routes the PR to Doctor) |
-| Same defect **re-litigated**, comparison **ambiguous**, only one rejection exists, or the chain is no longer converging | **Keep parked** | Comment the *specific* human judgment needed, guarded by a `<!-- champion:capped-pr-parked:<latest-rejection-comment-id> -->` marker so the 10-minute cron does not re-post per tick; change no labels |
+| Same defect **re-litigated**, comparison **ambiguous**, only one rejection exists, or the chain is no longer converging | **Keep parked** | Comment the *specific* human judgment needed, guarded by a `<!-- champion:capped-pr-parked:<latest-rejection-comment-id> -->` marker (id copied verbatim, never a head SHA); suppression is a single key-spelling-tolerant episode check — skip when any park marker is at or after the latest rejection's edit time, so an edited rejection starts a fresh episode and gets a fresh verdict — keeping the 10-minute cron from re-posting per tick; change no labels |
 | The **approach** (not the implementation) is the problem — repeated design rejections, superseded premise | **Recommend closing, route to the operator** | Comment with `<!-- champion:capped-pr-close-recommended -->` and add `loom:operator` (keeping `loom:blocked`); **do not close the PR** — Champion routes, the human decides |
 
 **Rationale**: This is the *same* forward-progress mechanism as the sweep's in-sweep distinct-defect grace cycle (`sweep.md` → "Doctor-cycle cap"), applied at a different decision point — periodically, post-mortem, with the complete history rather than the dying sweep's local context. There is **no hard grant cap**: repeat grants are allowed as long as each new rejection shows fresh progress, because the anti-thrash guarantee comes from re-applying the test every round, not from a counter. Nor is there a double-grant path: a PR only reaches `loom:blocked` after the sweep-side single-use exception was consumed or was not applicable.
@@ -614,6 +614,19 @@ changed file. It waives the `critical-files` criterion only and is never eligibl
 | `src/ci.yml` renamed to `.github/workflows/ci.yml` | the previous name is outside the class: `critical-files` **FAIL**, hold |
 | `docs/guide.md` alone | no critical-file hit: the class does not apply, `critical-files` passes on its own |
 | `ci.yml` plus `package.json` scripts, classes `workflow-critical-only` and `package-scripts` (#13042) | each hit is covered by its own class: `critical-files` **PASS** naming both; a forbidden line in either hunk, or a third critical file neither covers, **FAIL**s |
+
+**Opt-in critical-file verbs.** Two class keys make a `criticalFilesOnly`-shaped class conditional on a
+daemon verb that fails closed (any non-zero exit, forge error or older daemon keeps the hold). Neither is
+on by default and neither is eligible for `merge-risk`:
+
+- `"additiveMigrations": true` (#13102) lifts the `*migrations/*` kept-set entry when
+  `loom-daemon forge additive-migrations <pr>` exits 0 (only newly added additive `.sql` files).
+- `"lockedDepsOnly": true` (2am#6942) covers `Cargo.toml` hits when `loom-daemon forge locked-deps-only <pr>`
+  exits 0: no `Cargo.lock` hunk adds a `source =`/`checksum =` line or changes an existing package, no
+  changed manifest line names `git =`, `registry =`, `build =`, `links =`, `[patch.*]`, `[replace]` or an
+  out-of-repo `path =`, and a manifest change comes with a lock change. Every hit the class covers must be a
+  `Cargo.toml`. Example: a new `infra/<crate>/Cargo.toml` using `reqwest`/`serde` already locked passes; the
+  same crate adding a new registry dependency, or bumping a locked crate, holds.
 
 **Dependabot bumps merge by default (#12948)**: operator direction 2026-10-20,
 "merge Dependabot and then fix things that break". Two more conditions express

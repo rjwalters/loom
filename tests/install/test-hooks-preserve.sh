@@ -26,7 +26,8 @@ source "$SCRIPT_DIR/lib/assert.sh"
 # Stub logging helpers so the extracted function has them in scope.
 info()    { :; }
 success() { :; }
-warning() { :; }
+warning() { WARNINGS+="$*"$'\n'; }
+WARNINGS=""
 error()   { echo "error: $*" >&2; return 1; }
 
 # Extract the install_hooks_and_cli() function body from install.sh and define
@@ -251,6 +252,38 @@ assert_eq "vendored generic STAYS installed when canonical lacks search/jq-mask 
   "yes" \
   "$([[ -f "$TARGET_DIR8/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
 rm -rf "$TARGET_DIR8"
+
+# ============================================================================
+# Test 9 (#13801): hooks written earlier in the same run (not in the pre-init
+# snapshot) are silent; a hook that predates the run still warns + is preserved.
+# ============================================================================
+echo ""
+echo "=== snapshot: fresh-run hook silent, pre-existing hook warns (#13801) ==="
+
+TARGET_DIR9="$(mktemp -d)"
+mkdir -p "$TARGET_DIR9/.loom/hooks"
+cp "$LOOM_ROOT_DIR/defaults/hooks/guard-destructive-generic.sh" "$TARGET_DIR9/.loom/hooks/"
+printf '%s\n' '#!/usr/bin/env bash' "$TUNED_MARKER" > "$TARGET_DIR9/.loom/hooks/guard-destructive.sh"
+WARNINGS=""
+# Snapshot lists only guard-destructive.sh; generic was "written by init".
+install_hooks_and_cli "$LOOM_ROOT_DIR" "$TARGET_DIR9" false "guard-destructive.sh"
+
+assert_eq "pre-existing hook warns" "1" \
+  "$(grep -c 'Preserving existing hook: guard-destructive.sh' <<<"$WARNINGS")"
+assert_eq "same-run hook is silent" "0" \
+  "$(grep -c 'guard-destructive-generic.sh' <<<"$WARNINGS" || true)"
+assert_eq "warning names --confirm-reinstall" "1" \
+  "$(grep -c -- '--confirm-reinstall' <<<"$WARNINGS")"
+assert_eq "pre-existing tuned hook still preserved" "yes" \
+  "$(grep -qF "$TUNED_MARKER" "$TARGET_DIR9/.loom/hooks/guard-destructive.sh" && echo yes || echo no)"
+
+TARGET_DIR10="$(mktemp -d)"
+mkdir -p "$TARGET_DIR10/.loom"
+cp -r "$LOOM_ROOT_DIR/defaults/hooks" "$TARGET_DIR10/.loom/hooks"
+WARNINGS=""
+install_hooks_and_cli "$LOOM_ROOT_DIR" "$TARGET_DIR10" false ""
+assert_eq "empty snapshot: no warnings" "" "$WARNINGS"
+rm -rf "$TARGET_DIR9" "$TARGET_DIR10"
 
 # ============================================================================
 # Summary

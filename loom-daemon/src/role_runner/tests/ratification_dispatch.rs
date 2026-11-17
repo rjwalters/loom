@@ -121,3 +121,68 @@ fn public_or_unknown_visibility_constrains_market_only() {
     let (_, r) = run(&src, &pin("ee.md", EE_SHA), &pin("market.md", MKT_SHA));
     assert!(!r.calls[1].1.contains(PUBLIC_SOURCES_ONLY));
 }
+
+/// Issue #13749: the production runner rejects a role name that
+/// `resolve_and_admit` does not know, which the `Recorder` stub never
+/// exercised. This runner applies the real admission to each role name the
+/// lane dispatches.
+struct AdmittingRunner {
+    root: std::path::PathBuf,
+    admitted: Vec<String>,
+    rejected: Vec<String>,
+}
+
+impl RoleInvocationRunner for AdmittingRunner {
+    fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+        match crate::runtime_admission::resolve_and_admit(&self.root, role, None) {
+            Ok(_) => {
+                self.admitted.push(role.to_string());
+                RoleTickOutcome::Success
+            }
+            Err(e) => {
+                self.rejected.push(role.to_string());
+                RoleTickOutcome::RuntimeRejected(e)
+            }
+        }
+    }
+}
+
+#[test]
+fn lane_sessions_pass_real_runtime_admission() {
+    let _env = crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv::new();
+    let d = tempfile::tempdir().unwrap();
+    for sub in ["defaults/roles", "defaults/runtimes", "defaults/scripts"] {
+        std::fs::create_dir_all(d.path().join(sub)).unwrap();
+    }
+    std::fs::write(d.path().join("defaults/roles/judge.json"), "{}").unwrap();
+    std::fs::write(
+        d.path().join("defaults/runtimes/claude.json"),
+        r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#,
+    )
+    .unwrap();
+    let adapter = d.path().join("defaults/scripts/spawn-claude.sh");
+    std::fs::write(&adapter, "#!/bin/sh\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let src = Src::ok(Some(true));
+    let mut r = AdmittingRunner {
+        root: d.path().to_path_buf(),
+        admitted: vec![],
+        rejected: vec![],
+    };
+    let out = dispatch(
+        &pin("ee.md", EE_SHA),
+        &pin("market.md", MKT_SHA),
+        "owner/repo",
+        PR_REF,
+        &src,
+        &mut r,
+    );
+    assert!(r.rejected.is_empty(), "rejected: {:?}", r.rejected);
+    assert_eq!(r.admitted, vec![role_name(Key::Ee), role_name(Key::Market)]);
+    assert_eq!(out.get(Key::Ee), &KeyOutcome::Ran(RoleTickOutcome::Success));
+    assert_eq!(out.get(Key::Market), &KeyOutcome::Ran(RoleTickOutcome::Success));
+}

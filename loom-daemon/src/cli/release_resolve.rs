@@ -77,7 +77,8 @@ impl ReleaseResolveArgs {
         println!("{}", emit::to_json(&resolution));
         std::process::exit(match resolution {
             crate::release_resolve::Resolution::Resolved(_) => 0,
-            crate::release_resolve::Resolution::Unresolved(_) => 1,
+            crate::release_resolve::Resolution::Unresolved(_)
+            | crate::release_resolve::Resolution::Unavailable(_) => 1,
         });
     }
 }

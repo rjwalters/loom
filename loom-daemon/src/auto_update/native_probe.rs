@@ -83,9 +83,21 @@ pub(super) fn fetch_args(tag: &str) -> Vec<&str> {
 /// the verdict logic compares against.
 #[must_use]
 pub(super) fn native_resolution(root: &Path) -> ArtifactResolution {
-    let inputs = env_inputs(root);
-    match resolve(&inputs) {
+    artifact_resolution(resolve(&env_inputs(root)))
+}
+
+/// Map a release resolution onto the tick's [`ArtifactResolution`].
+#[must_use]
+pub(super) fn artifact_resolution(resolution: Resolution) -> ArtifactResolution {
+    match resolution {
         Resolution::Unresolved(reason) => ArtifactResolution::Unresolved(reason),
+        // #13745: an unreadable forge is the same no-verdict "nothing resolved,
+        // ask again next tick" state, never a `Resolved` (older) release that
+        // `StaleRepo` or the floor stall would then judge. The reason leads
+        // with "releases unavailable" so the tick note says what happened.
+        Resolution::Unavailable(reason) => {
+            ArtifactResolution::Unresolved(format!("releases unavailable: {reason}"))
+        }
         Resolution::Resolved(r) => ArtifactResolution::Resolved(with_running_basis(
             ArtifactInfo {
                 repo: r.repo,
@@ -194,6 +206,35 @@ fn artifact_fetch_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #13745: a rate-limited release read is the no-verdict "ask again next
+    /// tick" state. It never becomes a resolved (older) release, so neither
+    /// the wrong-repo path nor the floor stall can be reached from it.
+    #[test]
+    fn a_rate_limited_release_read_yields_no_verdict_and_no_floor_stall() {
+        let art = artifact_resolution(Resolution::Unavailable(
+            "o/r: releases unavailable (HTTP 403; read via the reader route, never the writer)"
+                .to_string(),
+        ));
+        let ArtifactResolution::Unresolved(why) = &art else {
+            panic!("expected no resolution, got {art:?}");
+        };
+        assert!(why.starts_with("releases unavailable"), "{why}");
+        assert!(!why.contains("wrong-repo") && !why.contains("OLDER"), "{why}");
+        assert!(!art.is_actionable());
+
+        // No newest release => the floor verdict is Unresolved, never the
+        // "FLEET FLOOR UNSATISFIABLE" stall.
+        let verdict = crate::auto_update::floor_roll::floor_verdict(
+            &crate::fleet_sync::FloorKnowledge::Set("9.0.0".to_string()),
+            "0.19.800",
+            None,
+        );
+        assert!(
+            matches!(verdict, crate::auto_update::floor_roll::FloorVerdict::Unresolved { .. }),
+            "{verdict:?}"
+        );
+    }
 
     #[test]
     fn a_deleted_inode_path_is_undetermined_not_the_replacement_binary() {

@@ -108,6 +108,7 @@ mod git;
 pub mod heads;
 mod hold;
 mod host;
+pub mod landing_span;
 mod loom_ui;
 mod memory;
 mod supersede;

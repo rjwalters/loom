@@ -10,6 +10,7 @@
 //! shared files may merge cleanly, and missing conflict evidence is *not* a
 //! clean outcome (it is `Unknown`).
 
+use crate::git_merge_tree::supports_merge_tree;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -40,39 +41,10 @@ pub enum ConflictOutcome {
     Unknown { reason: String },
 }
 
-/// git >= 2.38, where `git merge-tree --write-tree` exists.
-fn supports_merge_tree(repo: &Path) -> bool {
-    let Ok(out) = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("--version")
-        .output()
-    else {
-        return false;
-    };
-    let version = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .nth(2)
-        .map(str::to_string);
-    version.as_deref().is_some_and(merge_tree_in_version)
-}
-
-fn merge_tree_in_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let Some(Ok(major)) = parts.next().map(str::parse::<u32>) else {
-        return false;
-    };
-    let minor = parts
-        .next()
-        .and_then(|m| m.parse::<u32>().ok())
-        .unwrap_or(0);
-    major > 2 || (major == 2 && minor >= 38)
-}
-
 /// One replay: merge `first` then `second` onto `base`.
 fn replay_one(repo: &Path, base: &str, first: &str, second: &str, order: &str) -> ConflictReplay {
     let provenance = "counterfactual".to_string();
-    if !supports_merge_tree(repo) {
+    if !supports_merge_tree(Some(repo)) {
         return ConflictReplay {
             base: base.into(),
             order: order.into(),
@@ -175,15 +147,6 @@ pub fn any_textual_conflict(replays: &[ConflictReplay]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn version_predicate() {
-        assert!(merge_tree_in_version("2.38.0"));
-        assert!(merge_tree_in_version("2.45.1"));
-        assert!(merge_tree_in_version("3.0.0"));
-        assert!(!merge_tree_in_version("2.37.3"));
-        assert!(!merge_tree_in_version("1.9"));
-    }
 
     #[test]
     fn any_conflict_classification() {

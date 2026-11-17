@@ -91,6 +91,24 @@
 //! never verified. Overridden blockers (and overridden read failures) are
 //! reported on stderr as warnings while the probe still answers "safe".
 //!
+//! # An owned claim is not a blocker (`LOOM_SWEEP_CLAIM_OWNED`)
+//!
+//! A dispatcher that pre-claims an issue (a daemon sweep or Builder step, an
+//! attended sweep's `worker run`) flips `loom:building`, publishes the lease
+//! and exports `LOOM_SWEEP_CLAIM_OWNED=<N>` into the session it spawns
+//! (`targeted-role-invocation.md`). When that variable names the issue being
+//! probed, the claim this probe finds is the invoker's own, so three blockers
+//! pass with a stderr note instead of exiting `0`: `BUILDING`,
+//! `LEASE_ALREADY_HELD` **when the lease's host is this host's published
+//! lease host** (another host's fresh lease is a real cross-host race and
+//! still blocks), and `BRANCH_EXISTS`. Nothing else is touched: `OPEN_PR`,
+//! `MERGED_PR`, `TARGET_IS_PR`, `CLOSED`, `FROZEN`, `OPERATOR` and `TRIAGE`
+//! refuse whoever claimed (`TRIAGE` is read ahead of the claim label for an
+//! owned claim, so the label cannot hide it), and an unreadable leg still
+//! fails closed. The exception used to live only in the Builder prompt's
+//! prose, which a low-effort session did not apply and so refused its own
+//! dispatcher's claim on every step; see [`OwnedClaim`].
+//!
 //! `TARGET_IS_PR` is the second never-overridable blocker (Issue #9929). It
 //! is not a claim race at all but a **category error**: the target number is
 //! a pull request, so there is no issue here to claim and `--force-claim`
@@ -199,6 +217,69 @@ pub(crate) enum BranchLeg {
     ProbeFailed,
 }
 
+/// Environment variable a dispatcher exports into the session it spawns to
+/// say "the claim on issue `<N>` is mine" (#3823, #11863).
+pub(crate) const CLAIM_OWNED_ENV: &str = "LOOM_SWEEP_CLAIM_OWNED";
+
+/// The invoker's own claim on the probed issue: `LOOM_SWEEP_CLAIM_OWNED`
+/// names it. Carries what the lease leg needs to tell the invoker's lease
+/// from a peer's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedClaim {
+    /// This host's id as lease comments publish it
+    /// ([`crate::cli::pr_lease::published_host`]). `None` when it cannot be
+    /// resolved, in which case no lease is recognised as the invoker's.
+    pub(crate) lease_host: Option<String>,
+}
+
+impl OwnedClaim {
+    /// `Some` only when `marker` (the raw `LOOM_SWEEP_CLAIM_OWNED` value) is
+    /// exactly `issue`. A marker naming another issue, a blank one, or
+    /// anything that is not a number owns nothing. Pure.
+    #[must_use]
+    pub(crate) fn from_marker(
+        marker: Option<&str>,
+        issue: u32,
+        lease_host: Option<String>,
+    ) -> Option<Self> {
+        let named: u32 = marker?.trim().parse().ok()?;
+        let lease_host = lease_host
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty() && h != crate::host_identity::UNKNOWN_HOST);
+        (named == issue).then_some(Self { lease_host })
+    }
+
+    /// Read the marker and this host's published lease host from the process
+    /// environment.
+    fn from_env(issue: u32) -> Option<Self> {
+        let marker = std::env::var(CLAIM_OWNED_ENV).ok();
+        let mut owned = Self::from_marker(marker.as_deref(), issue, None)?;
+        // Resolved only for an owned claim: the host chain can shell out.
+        owned.lease_host = Some(crate::cli::pr_lease::published_host());
+        Some(owned)
+    }
+
+    /// Is a fresh lease published from `host` this invoker's host's own?
+    fn holds_lease_from(&self, host: &str) -> bool {
+        self.lease_host.as_deref() == Some(host)
+    }
+}
+
+/// Does `owned` let the walk continue past this label reading? Only a claim
+/// label is the invoker's to pass.
+fn owned_passes_labels(owned: Option<&OwnedClaim>, labels: Option<&LabelLeg>) -> bool {
+    owned.is_some() && matches!(labels, Some(LabelLeg::Claimed(_)))
+}
+
+/// Does `owned` let the walk continue past this lease reading? Only a lease
+/// published from this host.
+fn owned_passes_lease(owned: Option<&OwnedClaim>, lease: Option<&LeaseLeg>) -> bool {
+    match (owned, lease) {
+        (Some(owned), Some(LeaseLeg::Held { host, .. })) => owned.holds_lease_from(host),
+        _ => false,
+    }
+}
+
 /// The four legs' evidence. Legs are collected cheapest-first and only up to
 /// the first leg that ends the walk (a blocker, or an unreadable leg when
 /// `--force-claim` was not passed), so `None` means "not consulted" —
@@ -277,8 +358,26 @@ fn unanswered(issue: u32, detail: &str) -> Verdict {
 /// failures become stderr warnings and the walk continues, but the `OPEN_PR`
 /// leg blocks unconditionally, and an unreadable leg 1 fails closed even
 /// when forced (the never-overridable leg was never verified).
+///
+/// This is the verdict for an invoker that owns no claim; [`handle`] calls
+/// [`decide_for`], and the tests pin the unowned contract through this.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) -> Verdict {
+    decide_for(issue, evidence, force_claim, None)
+}
+
+/// [`decide`] for an invoker that may hold the claim itself. With `owned`
+/// set, a claim label, a fresh lease from this host and an existing remote
+/// branch are the invoker's own and pass with a stderr note; every other
+/// blocker and every unreadable leg is decided exactly as without it.
+#[must_use]
+pub(crate) fn decide_for(
+    issue: u32,
+    evidence: &ClaimEvidence,
+    force_claim: bool,
+    owned: Option<&OwnedClaim>,
+) -> Verdict {
     // Leg 1 — open linked PR. Never overridable (#9453: an open PR is
     // someone's submitted work, not a claim race).
     match evidence.open_pr {
@@ -333,6 +432,8 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
     // recorded as a warning when overridden so the caller sees exactly what
     // it forced past.
     let mut forced_past: Vec<String> = Vec::new();
+    // Blockers passed because the claim is the invoker's own (`owned`).
+    let mut owned_past: Vec<String> = Vec::new();
     let mut stop: Option<Verdict> = None;
     let overridable = |detail: String, token: Option<&str>, forced_past: &mut Vec<String>| {
         if force_claim {
@@ -405,6 +506,9 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
                         &mut forced_past,
                     );
                 }
+                LabelLeg::Claimed(claims) if owned.is_some() => {
+                    owned_past.push(format!("BUILDING [{}]", claims.join(", ")));
+                }
                 LabelLeg::Claimed(claims) => {
                     stop = overridable(
                         format!(
@@ -431,6 +535,11 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
     if stop.is_none() {
         if let Some(lease) = &evidence.lease {
             match lease {
+                LeaseLeg::Held { host, sweep_id }
+                    if owned.is_some_and(|o| o.holds_lease_from(host)) =>
+                {
+                    owned_past.push(format!("LEASE_ALREADY_HELD {host} {sweep_id}"));
+                }
                 LeaseLeg::Held { host, sweep_id } => {
                     stop = overridable(
                         format!(
@@ -459,6 +568,9 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
     if stop.is_none() {
         if let Some(branch) = evidence.branch {
             match branch {
+                BranchLeg::Exists if owned.is_some() => {
+                    owned_past.push(format!("BRANCH_EXISTS feature/issue-{issue}"));
+                }
                 BranchLeg::Exists => {
                     let branch_name = format!("feature/issue-{issue}");
                     stop = overridable(
@@ -494,10 +606,18 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
     } else {
         format!("--force-claim overriding: {}; ", forced_past.join("; "))
     };
-    stderr.push_str(&format!(
-        "issue #{issue} is safe to claim: no open linked PR, no claim label, no fresh lease, \
-         and no remote feature/issue-{issue} branch."
-    ));
+    if owned_past.is_empty() {
+        stderr.push_str(&format!(
+            "issue #{issue} is safe to claim: no open linked PR, no claim label, no fresh lease, \
+             and no remote feature/issue-{issue} branch."
+        ));
+    } else {
+        stderr.push_str(&format!(
+            "issue #{issue} is safe to claim: {CLAIM_OWNED_ENV}={issue} says the claim is owned \
+             by your invoker, so these are its own and not a peer's: {}. Proceed; do not refuse.",
+            owned_past.join("; ")
+        ));
+    }
     Verdict {
         code: EX_SAFE_TO_CLAIM,
         stdout: String::new(),
@@ -540,7 +660,22 @@ pub(crate) fn url_is_pull_request(url: &str) -> bool {
 /// an issue ([`LabelLeg::IsPullRequest`]). `gh issue view` serves a PR number
 /// without complaint, so this is the only point in the claim walk where the
 /// target's *kind* is observable at all.
+///
+/// The unowned read; [`handle`] calls [`read_claim_labels_for`].
+#[cfg(test)]
 pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> LabelLeg {
+    read_claim_labels_for(gh_bin, root, issue, false)
+}
+
+/// [`read_claim_labels`] for an invoker that may hold the claim itself.
+/// `claim_owned` reads `loom:triage` ahead of the claim labels: an owned
+/// claim passes `BUILDING`, and `TRIAGE` must still refuse whoever claimed.
+pub(crate) fn read_claim_labels_for(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    claim_owned: bool,
+) -> LabelLeg {
     // #10089: counted via the facade (`claim.labels`); it supplies the #5401
     // cross-owner GH_CONFIG_DIR from `root`. `gh issue view` takes --repo
     // (unlike `gh api`, #8263).
@@ -597,12 +732,14 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
         return LabelLeg::OperatorHold;
     }
     let claims = claim_labels_in(&labels);
-    if !claims.is_empty() {
-        LabelLeg::Claimed(claims)
-    } else if labels
+    let triage = labels
         .iter()
-        .any(|l| l == crate::intake_reconcile::TRIAGE_LABEL)
-    {
+        .any(|l| l == crate::intake_reconcile::TRIAGE_LABEL);
+    if triage && claim_owned {
+        LabelLeg::AwaitingCurator
+    } else if !claims.is_empty() {
+        LabelLeg::Claimed(claims)
+    } else if triage {
         LabelLeg::AwaitingCurator
     } else {
         LabelLeg::Clean
@@ -818,6 +955,8 @@ pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
     // when every earlier leg is Clear (or, under --force-claim, when its
     // blocker/unreadable answer cannot change the verdict anyway — the walk
     // keeps collecting so the stderr warning names everything overridden).
+    let owned = OwnedClaim::from_env(issue);
+    let owned = owned.as_ref();
     let open_pr = probe_open_linked_pr(&root, issue);
     let mut evidence = ClaimEvidence {
         open_pr,
@@ -831,19 +970,21 @@ pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
     }
     let merged_clear = matches!(evidence.merged_pr, Some(MergedBranchPrProbe::NoneMerged));
     if merged_clear {
-        evidence.labels = Some(read_claim_labels(&gh_bin, &root, issue));
-        let labels_clear = matches!(evidence.labels, Some(LabelLeg::Clean));
+        evidence.labels = Some(read_claim_labels_for(&gh_bin, &root, issue, owned.is_some()));
+        let labels_clear = matches!(evidence.labels, Some(LabelLeg::Clean))
+            || owned_passes_labels(owned, evidence.labels.as_ref());
         if labels_clear || force_claim {
             evidence.lease =
                 Some(read_freshest_live_lease(&gh_bin, &root, issue, now, ttl_minutes));
-            let lease_clear = matches!(evidence.lease, Some(LeaseLeg::NoneFresh));
+            let lease_clear = matches!(evidence.lease, Some(LeaseLeg::NoneFresh))
+                || owned_passes_lease(owned, evidence.lease.as_ref());
             if lease_clear || force_claim {
                 evidence.branch = Some(remote_branch_leg(Path::new("git"), &root, issue));
             }
         }
     }
 
-    let v = decide(issue, &evidence, force_claim);
+    let v = decide_for(issue, &evidence, force_claim, owned);
     if !v.stdout.is_empty() {
         println!("{}", v.stdout);
     }
@@ -1162,6 +1303,176 @@ mod tests {
         }
     }
 
+    // --- An owned claim (LOOM_SWEEP_CLAIM_OWNED) ------------------------------
+
+    fn owned_on(host: &str) -> OwnedClaim {
+        OwnedClaim {
+            lease_host: Some(host.to_string()),
+        }
+    }
+
+    fn held(host: &str) -> LeaseLeg {
+        LeaseLeg::Held {
+            host: host.to_string(),
+            sweep_id: "sweep-x".to_string(),
+        }
+    }
+
+    /// The marker owns exactly the issue it names: another number, a blank,
+    /// or a non-number owns nothing, and an unknown host recognises no lease.
+    #[test]
+    fn the_marker_owns_only_the_issue_it_names() {
+        let host = || Some("host-a".to_string());
+        assert_eq!(OwnedClaim::from_marker(Some("20"), 20, host()), Some(owned_on("host-a")));
+        assert_eq!(OwnedClaim::from_marker(Some(" 20\n"), 20, host()), Some(owned_on("host-a")));
+        for marker in [
+            None,
+            Some(""),
+            Some(" "),
+            Some("21"),
+            Some("#20"),
+            Some("20 21"),
+        ] {
+            assert_eq!(OwnedClaim::from_marker(marker, 20, host()), None, "{marker:?}");
+        }
+        for unusable in [None, Some(" "), Some(crate::host_identity::UNKNOWN_HOST)] {
+            let owned = OwnedClaim::from_marker(Some("20"), 20, unusable.map(String::from));
+            assert_eq!(owned, Some(OwnedClaim { lease_host: None }), "{unusable:?}");
+        }
+    }
+
+    /// The daemon pre-claimed the issue and spawned this session: its own
+    /// `loom:building`, its own host's lease and its own pushed branch are
+    /// not a peer's claim, so the probe answers the all-clear and says why.
+    #[test]
+    fn an_owned_claim_passes_building_own_host_lease_and_branch() {
+        let owned = owned_on("host-a");
+        let building = || Some(LabelLeg::Claimed(vec!["loom:building".to_string()]));
+        for (ev, token) in [
+            (
+                evidence(
+                    OpenPrProbe::NoneOpen,
+                    building(),
+                    Some(LeaseLeg::NoneFresh),
+                    Some(BranchLeg::Absent),
+                ),
+                "BUILDING [loom:building]",
+            ),
+            (
+                evidence(
+                    OpenPrProbe::NoneOpen,
+                    Some(LabelLeg::Clean),
+                    Some(held("host-a")),
+                    Some(BranchLeg::Absent),
+                ),
+                "LEASE_ALREADY_HELD host-a sweep-x",
+            ),
+            (
+                evidence(
+                    OpenPrProbe::NoneOpen,
+                    Some(LabelLeg::Clean),
+                    Some(LeaseLeg::NoneFresh),
+                    Some(BranchLeg::Exists),
+                ),
+                "BRANCH_EXISTS feature/issue-20",
+            ),
+            (
+                evidence(
+                    OpenPrProbe::NoneOpen,
+                    building(),
+                    Some(held("host-a")),
+                    Some(BranchLeg::Exists),
+                ),
+                "BUILDING [loom:building]; LEASE_ALREADY_HELD host-a sweep-x; BRANCH_EXISTS",
+            ),
+        ] {
+            let v = decide_for(20, &ev, false, Some(&owned));
+            assert_eq!(v.code, EX_SAFE_TO_CLAIM, "{ev:?}");
+            assert!(v.stdout.is_empty(), "{ev:?} -> {:?}", v.stdout);
+            assert!(v.stderr.contains("LOOM_SWEEP_CLAIM_OWNED=20"), "{}", v.stderr);
+            assert!(v.stderr.contains("owned by your invoker"), "{}", v.stderr);
+            assert!(v.stderr.contains(token), "{}", v.stderr);
+            assert!(!v.stderr.contains("no claim label"), "{}", v.stderr);
+            // The same evidence without ownership still blocks.
+            assert_eq!(decide(20, &ev, false).code, 0, "{ev:?}");
+        }
+    }
+
+    /// Another host's fresh lease is a real cross-host race, owned marker or
+    /// not; so is any lease when this host's lease id is unknown.
+    #[test]
+    fn an_owned_claim_does_not_pass_another_hosts_lease() {
+        let ev = evidence(
+            OpenPrProbe::NoneOpen,
+            Some(LabelLeg::Claimed(vec!["loom:building".to_string()])),
+            Some(held("host-b")),
+            None,
+        );
+        for owned in [owned_on("host-a"), OwnedClaim { lease_host: None }] {
+            let v = decide_for(20, &ev, false, Some(&owned));
+            assert_eq!(v.code, 0, "{owned:?}");
+            assert_eq!(v.stdout, "LEASE_ALREADY_HELD host-b sweep-x", "{owned:?}");
+            assert!(!owned_passes_lease(Some(&owned), ev.lease.as_ref()), "{owned:?}");
+        }
+        assert!(owned_passes_lease(Some(&owned_on("host-b")), ev.lease.as_ref()));
+        assert!(!owned_passes_lease(None, ev.lease.as_ref()));
+    }
+
+    /// Ownership buys past nothing else: the never-overridable tokens and
+    /// `TRIAGE` refuse whoever claimed.
+    #[test]
+    fn an_owned_claim_never_passes_the_other_tokens() {
+        let owned = owned_on("host-a");
+        let label = |leg| evidence(OpenPrProbe::NoneOpen, Some(leg), None, None);
+        for (ev, token) in [
+            (evidence(OpenPrProbe::Open(7), None, None, None), "OPEN_PR #7"),
+            (with_merged(MergedBranchPrProbe::Merged(8)), "MERGED_PR #8"),
+            (label(LabelLeg::IsPullRequest), "TARGET_IS_PR #20"),
+            (label(LabelLeg::Closed), "CLOSED"),
+            (label(LabelLeg::Frozen), "FROZEN"),
+            (label(LabelLeg::OperatorHold), "OPERATOR"),
+            (label(LabelLeg::AwaitingCurator), "TRIAGE"),
+        ] {
+            let v = decide_for(20, &ev, false, Some(&owned));
+            assert_eq!((v.code, v.stdout.as_str()), (0, token), "{ev:?}");
+            assert!(!owned_passes_labels(Some(&owned), ev.labels.as_ref()), "{ev:?}");
+        }
+    }
+
+    /// An unreadable leg is not the invoker's claim: it fails closed.
+    #[test]
+    fn an_owned_claim_still_fails_closed_on_an_unreadable_leg() {
+        let owned = owned_on("host-a");
+        let building = || Some(LabelLeg::Claimed(vec!["loom:building".to_string()]));
+        for ev in [
+            evidence(OpenPrProbe::ProbeFailed, None, None, None),
+            evidence(OpenPrProbe::NoneOpen, Some(LabelLeg::Unknown), None, None),
+            evidence(OpenPrProbe::NoneOpen, building(), Some(LeaseLeg::ReadFailed), None),
+            evidence(
+                OpenPrProbe::NoneOpen,
+                building(),
+                Some(LeaseLeg::NoneFresh),
+                Some(BranchLeg::ProbeFailed),
+            ),
+        ] {
+            let v = decide_for(20, &ev, false, Some(&owned));
+            assert_eq!(v.code, EX_PROBE_FAILED, "{ev:?}");
+            assert!(v.stdout.is_empty(), "{ev:?}");
+        }
+    }
+
+    /// The walk reads on past a claim label only for an owner, so the lease
+    /// and branch legs are still consulted behind an owned `loom:building`.
+    #[test]
+    fn the_walk_continues_past_a_claim_label_only_for_an_owner() {
+        let owned = owned_on("host-a");
+        let building = LabelLeg::Claimed(vec!["loom:building".to_string()]);
+        assert!(owned_passes_labels(Some(&owned), Some(&building)));
+        assert!(!owned_passes_labels(None, Some(&building)));
+        assert!(!owned_passes_labels(Some(&owned), Some(&LabelLeg::Unknown)));
+        assert!(!owned_passes_lease(Some(&owned), Some(&LeaseLeg::ReadFailed)));
+    }
+
     // --- The code surface ----------------------------------------------------
 
     #[test]
@@ -1396,6 +1707,26 @@ mod tests {
             r#"echo '{"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]}'"#,
         );
         assert_eq!(read_claim_labels(&clean, dir.path(), 42), LabelLeg::Clean);
+
+        // An owned claim reads `loom:triage` ahead of its own claim label, so
+        // the label an owner passes cannot hide TRIAGE; unowned is unchanged.
+        let triaged = write_exec(
+            dir.path(),
+            "gh-triaged.sh",
+            r#"echo '{"labels":[{"name":"loom:triage"},{"name":"loom:building"}]}'"#,
+        );
+        assert_eq!(
+            read_claim_labels_for(&triaged, dir.path(), 42, true),
+            LabelLeg::AwaitingCurator
+        );
+        assert_eq!(
+            read_claim_labels_for(&triaged, dir.path(), 42, false),
+            LabelLeg::Claimed(vec!["loom:building".to_string()])
+        );
+        assert_eq!(
+            read_claim_labels_for(&claimed, dir.path(), 42, true),
+            LabelLeg::Claimed(vec!["loom:building".to_string()])
+        );
 
         // #11743: frozen wins over a claim label; `loom:frozen-x` is not frozen.
         let frozen = write_exec(

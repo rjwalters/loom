@@ -34,6 +34,7 @@ fn facts() -> Facts {
             execution,
             started_at,
             failure: None,
+            judge: None,
         },
         ended_at: started_at + chrono::Duration::seconds(60),
     }

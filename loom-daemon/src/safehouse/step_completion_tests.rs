@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::tests::{stub_server, SafehouseTestPaths};
+use super::tests::{reconcile_merges_unwatermarked, stub_server, SafehouseTestPaths};
 use super::*;
 use crate::rate_limit_breaker::evidence::ResetEvidence;
 use crate::rate_limit_breaker::report::{BreakerHandle, BudgetProbe, FailureContext, ProbeMode};
@@ -201,7 +201,7 @@ async fn a_merged_step_narrates_once_and_reconciliation_then_posts_nothing() {
         .await;
         assert!(again.is_none());
         // The backstop sees the same (workspace, issue, PR) and posts nothing.
-        let reconciled = reconcile_recent_merges(
+        let reconciled = reconcile_merges_unwatermarked(
             "loom_daemon",
             &root,
             &mut slug_cache,

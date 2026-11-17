@@ -27,7 +27,6 @@ mod merge_queue_event;
 mod merge_queue_observed;
 mod merge_queue_regime;
 mod metadata;
-mod operator_presence;
 mod ops;
 mod pass;
 mod pick_decision;
@@ -385,6 +384,27 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(sweep_id) = &r.sweep_id {
                 attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
             }
+            // #12362: a Judge tick's found-work split and verdicts, and a
+            // step's own outcome class/reason. Each absent when unobserved.
+            if let Some(found_work) = r.found_work {
+                attributes.push(kv_string("loom.found_work", found_work.to_string()));
+            }
+            if let Some(reason) = &r.noop_reason {
+                attributes.push(kv_string("loom.noop_reason", reason.clone()));
+            }
+            if let Some(verdicts) = r
+                .verdicts
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok())
+            {
+                attributes.push(kv_string("loom.role_tick.verdicts", verdicts));
+            }
+            if let Some(class) = &r.step_class {
+                attributes.push(kv_string("loom.role_tick.step_class", class.clone()));
+            }
+            if let Some(reason) = &r.step_reason {
+                attributes.push(kv_string("loom.role_tick.step_reason", reason.clone()));
+            }
             // #13563: the step's work item, so its tokens attribute to it.
             if let Some(issue) = r.issue {
                 attributes.push(kv_int("loom.issue", i64::from(issue)));
@@ -620,7 +640,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::RosterChange(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::PickDecision(_)
-        | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
         | TelemetryRecord::DispatchState(_)
         | TelemetryRecord::StageOccupancy(_)
@@ -633,9 +652,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // decided). Issue #10196: one fleet-state snapshot (rows +
             // census; anchor/delta scalars ride as `loom.fleet.*`
             // attributes). Issue #10212: one pick decision (the ranked
-            // candidates). Issue #11563: one operator presence beat (the
-            // `loom.presence.*` scalars ride as attributes; `driving[]` is in
-            // the body). Each `log_parts` is `None` for every other kind.
+            // candidates). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| alert_transition::log_parts(r))
@@ -645,7 +662,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
-                .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
                 .or_else(|| dispatch_state::log_parts(r))
                 .or_else(|| stage_occupancy::log_parts(r))

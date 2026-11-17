@@ -133,7 +133,7 @@ pub fn fold(check_runs: &Value, status: &Value) -> Result<Rollup, String> {
     let mut failing: BTreeSet<String> = lines(&rollup.failing);
     // Fail-closed extension (module docs): an unknown terminal conclusion.
     for row in &rows {
-        let done = row.get("status").and_then(Value::as_str) == Some("completed");
+        let done = check_runs_rollup::is_settled(row);
         let conclusion = row.get("conclusion").and_then(Value::as_str);
         if done && !conclusion.is_some_and(|c| SUCCESS_CONCLUSIONS.contains(&c)) {
             failing.insert(name_of(row));
@@ -429,6 +429,25 @@ mod tests {
             };
             assert_eq!(got, want, "{status}/{conclusion:?}");
         }
+    }
+
+    /// #13758: a run GitHub left at `in_progress` after it finished is settled.
+    #[test]
+    fn stuck_in_progress_run_with_conclusion_is_settled() {
+        for (conclusion, want) in [("success", "green"), ("failure", "red"), ("stale", "red")] {
+            let mut row = run("ci", "in_progress", Some(conclusion));
+            row["completed_at"] = json!("2026-11-10T03:25:28Z");
+            let r = fold(&runs(vec![row]), &no_status()).unwrap();
+            let got = match decide(&r, Some(&[][..]), false) {
+                Decision::Green => "green",
+                Decision::Red(_) => "red",
+                Decision::Pending(_) => "pending",
+            };
+            assert_eq!(got, want, "{conclusion}");
+        }
+        // Without `completed_at` the row is still pending.
+        let r = fold(&runs(vec![run("ci", "in_progress", Some("success"))]), &no_status()).unwrap();
+        assert!(matches!(decide(&r, Some(&[][..]), false), Decision::Pending(_)));
     }
 
     #[test]

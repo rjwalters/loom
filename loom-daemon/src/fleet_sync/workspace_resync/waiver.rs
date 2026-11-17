@@ -122,7 +122,8 @@ fn matches_any(patterns: &[&str], path: &str) -> bool {
 
 /// The `defaults/` counterpart of an installed path, per the surface map in
 /// `resync-installed.sh`. `None` when the path has none. Roles and generated
-/// skill copies are deliberately unmapped (#13313).
+/// skill copies are unmapped here (#13313); the strict proof maps them through
+/// [`strict_upstream_path`] (#13665).
 #[must_use]
 pub fn upstream_path(installed: &str) -> Option<String> {
     const MAP: &[(&str, &str)] = &[
@@ -138,6 +139,23 @@ pub fn upstream_path(installed: &str) -> Option<String> {
         installed
             .strip_prefix(from)
             .map(|rest| format!("{to}{rest}"))
+    })
+}
+
+/// [`upstream_path`] plus the two surfaces only the daemon's strict proof
+/// byte-checks (#13665): roles and the generated skill copies. Both are
+/// committed under `defaults/` in the tag, so a blob compare is equivalent to
+/// regenerating.
+fn strict_upstream_path(installed: &str) -> Option<String> {
+    upstream_path(installed).or_else(|| {
+        installed
+            .strip_prefix(".loom/roles/")
+            .map(|rest| format!("defaults/roles/{rest}"))
+            .or_else(|| {
+                installed
+                    .strip_prefix(".agents/skills/")
+                    .map(|rest| format!("defaults/.agents/skills/{rest}"))
+            })
     })
 }
 
@@ -196,7 +214,11 @@ impl Kind {
     /// Whether `file` is inside this kind's install set (#12945).
     fn in_install_set(self, file: &str) -> bool {
         match self {
-            Self::Loom => file.starts_with(".loom/") || file.starts_with(".claude/"),
+            Self::Loom => {
+                file.starts_with(".loom/")
+                    || file.starts_with(".claude/")
+                    || file.starts_with(".agents/skills/")
+            }
             Self::RepoSkills => {
                 file.starts_with(".claude/skills/repo/")
                     || file.starts_with(".claude/commands/repo/")
@@ -208,8 +230,9 @@ impl Kind {
         }
     }
 
-    fn upstream_path(self, installed: &str) -> Option<String> {
+    fn upstream_path(self, installed: &str, strict: bool) -> Option<String> {
         match self {
+            Self::Loom if strict => strict_upstream_path(installed),
             Self::Loom => upstream_path(installed),
             Self::RepoSkills => repo_skills_upstream_path(installed),
         }
@@ -245,6 +268,11 @@ pub trait Source {
     fn metadata(&self, kind: Kind, sha: &str) -> Result<String, String>;
     /// Whether `refs/tags/<tag>` exists in `kind.upstream()`.
     fn tag_exists(&self, kind: Kind, tag: &str) -> Result<bool, String>;
+    /// Whether `tag` in `kind.upstream()` is a published, non-draft release.
+    fn release_published(&self, kind: Kind, tag: &str) -> Result<bool, String>;
+    /// The paths pinned in `.loom/resync-ignore` at `sha` in the PR's repo
+    /// (empty when the file does not exist). `Err` on any other failure.
+    fn resync_ignore(&self, sha: &str) -> Result<Vec<String>, String>;
     /// The blob SHA of `path` at `tag` in `kind.upstream()`; `None` when it is
     /// not a file there.
     fn upstream_blob(&self, kind: Kind, path: &str, tag: &str) -> Result<Option<String>, String>;
@@ -258,6 +286,8 @@ pub enum Verdict {
         head: String,
         /// One `(path, blob sha)` per kept-set file.
         record: Vec<(String, String)>,
+        /// Whether a merge-gate path is among the byte-checked files (#13665).
+        gate_paths_included: bool,
     },
     NotEligible(String),
 }
@@ -271,6 +301,29 @@ impl Verdict {
             out
         })
     }
+}
+
+/// Whether `path` is pinned by a `.loom/resync-ignore` entry. Entries are
+/// `.loom/`-relative and matched exactly; a path is also tried relative to
+/// `.claude/` and `.agents/`, and a leading `./` or `.loom/` on an entry is
+/// tolerated, so the check errs toward refusing.
+fn pinned(ignore: &[String], path: &str) -> bool {
+    let forms = [
+        Some(path),
+        path.strip_prefix(".loom/"),
+        path.strip_prefix(".claude/"),
+        path.strip_prefix(".agents/"),
+        path.strip_prefix('.'),
+    ];
+    ignore.iter().any(|raw| {
+        let e = raw.trim().trim_start_matches("./");
+        let e = e.strip_prefix(".loom/").unwrap_or(e);
+        !e.is_empty()
+            && forms
+                .iter()
+                .flatten()
+                .any(|f| f.strip_prefix(".loom/").unwrap_or(f) == e)
+    })
 }
 
 fn no(why: impl Into<String>) -> Verdict {
@@ -323,6 +376,13 @@ pub fn evaluate(src: &dyn Source, number: u32) -> Verdict {
     prove(src, number, false)
 }
 
+/// The strict proof (what the daemon's `land()` runs), read-only, for
+/// `forge resync-waiver --strict` (#13668).
+#[must_use]
+pub fn evaluate_strict(src: &dyn Source, number: u32) -> Verdict {
+    prove(src, number, true)
+}
+
 /// The proof the daemon merges on alone (no Judge, no Champion): with `strict`
 /// set every changed file must be an added/modified byte-copy of its upstream
 /// counterpart at the tag, not only the kept-set files. A file with no upstream
@@ -362,6 +422,25 @@ fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
     if files.is_empty() || files.len() != pr.changed_files {
         return no("files read incomplete");
     }
+    // A pin is the repo's declaration that a path is its own: the daemon never
+    // lands a resync that touches one (#13665).
+    if strict {
+        let Ok(ignore) = src.resync_ignore(&pr.head_sha) else {
+            return no(".loom/resync-ignore unreadable");
+        };
+        for f in &files {
+            let prev = f.previous_filename.as_deref().unwrap_or(&f.filename);
+            if pinned(&ignore, &f.filename) || pinned(&ignore, prev) {
+                return no(format!("{} is pinned in .loom/resync-ignore", f.filename));
+            }
+        }
+    }
+    // Under the strict Loom proof a gate path is not refused outright: the
+    // release tag is the review point (operator ruling r7-q33, #13487), so a
+    // gate file lands only if it is byte-identical to the tag (checked below)
+    // and the tag is a published release (checked after the loop).
+    let relax_gate = strict && kind == Kind::Loom;
+    let mut gate_paths_included = false;
     let mut record = Vec::new();
     for f in &files {
         let prev = f.previous_filename.as_deref().unwrap_or(&f.filename);
@@ -374,7 +453,10 @@ fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
         // path into `tests/` still hits the gate.
         let is_test = f.filename.starts_with(TESTS_DIR) && prev.starts_with(TESTS_DIR);
         if !is_test && (matches_any(GATE, &f.filename) || matches_any(GATE, prev)) {
-            return no(format!("{} is a merge-gate path", f.filename));
+            if !relax_gate {
+                return no(format!("{} is a merge-gate path", f.filename));
+            }
+            gate_paths_included = true;
         }
         // Every version-bumping resync rewrites the install metadata, which
         // has no `defaults/` counterpart. It is data, not code, and the proof
@@ -393,7 +475,7 @@ fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
         if f.status != "added" && f.status != "modified" {
             return no(format!("{} is {}", f.filename, f.status));
         }
-        let Some(up) = kind.upstream_path(&f.filename) else {
+        let Some(up) = kind.upstream_path(&f.filename, strict) else {
             return no(format!("{} has no upstream counterpart", f.filename));
         };
         match src.upstream_blob(kind, &up, &tag) {
@@ -411,11 +493,22 @@ fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
     {
         return no("no kept-set file to waive");
     }
+    if gate_paths_included {
+        match src.release_published(kind, &tag) {
+            Ok(true) => {}
+            _ => {
+                return no(format!(
+                    "tag {tag} is not a published release upstream; merge-gate files need one"
+                ));
+            }
+        }
+    }
     match src.pr(number) {
         Ok(again) if again.head_sha == pr.head_sha => Verdict::Eligible {
             tag,
             head: pr.head_sha,
             record,
+            gate_paths_included,
         },
         _ => no("head moved while reading"),
     }
@@ -478,13 +571,20 @@ pub trait Landing {
 
 /// The waiver record posted as the merge comment.
 #[must_use]
-pub fn record_comment(tag: &str, head: &str, record: &[(String, String)]) -> String {
+pub fn record_comment(
+    tag: &str,
+    head: &str,
+    record: &[(String, String)],
+    gate_paths_included: bool,
+) -> String {
     format!(
-        "**Resync waiver (daemon): ELIGIBLE** against `{tag}` at head `{head}`.\n\n\
+        "**Resync waiver (daemon): ELIGIBLE** against `{tag}` at head `{head}` \
+         (gate_paths_included={gate_paths_included}, files={}).\n\n\
          Every changed file is byte-identical to its `defaults/` counterpart at the tag \
          (blob SHA), and checks are green on this head. The daemon merges this resync PR itself \
          through `merge-pr.sh`; no Judge or Champion decision applies to a byte-copy of a tag.\n\n\
          ```\n{}```\n",
+        record.len(),
         Verdict::record_lines(record)
     )
 }
@@ -493,8 +593,13 @@ pub fn record_comment(tag: &str, head: &str, record: &[(String, String)]) -> Str
 /// holds with green checks on the same head, merge.
 /// The caller labels `loom:review-requested` on anything but [`Waived::Landed`].
 pub fn land(src: &dyn Source, landing: &dyn Landing, number: u32) -> Waived {
-    let (tag, head, record) = match prove(src, number, true) {
-        Verdict::Eligible { tag, head, record } => (tag, head, record),
+    let (tag, head, record, gate) = match prove(src, number, true) {
+        Verdict::Eligible {
+            tag,
+            head,
+            record,
+            gate_paths_included,
+        } => (tag, head, record, gate_paths_included),
         Verdict::NotEligible(why) => return Waived::Lane(format!("waiver proof failed: {why}")),
     };
     if let Checks::NotGreen(why) = landing.checks(number, &head) {
@@ -515,8 +620,19 @@ pub fn land(src: &dyn Source, landing: &dyn Landing, number: u32) -> Waived {
         Ok(()) => {
             // Record only a merge that happened: a refusal retried every pass
             // must not accumulate "the daemon merges this" comments.
-            let _ = landing.comment(number, &record_comment(&tag, &head, &record));
-            Waived::Landed(format!("merged on the waiver proof against {tag}"))
+            let _ = landing.comment(number, &record_comment(&tag, &head, &record, gate));
+            let files = record.len();
+            // The status line (and the caller's log line) carry the telemetry.
+            let landed = format!(
+                "merged on the waiver proof against {tag} (tag={tag} files={files} \
+                 gate_paths_included={gate})"
+            );
+            log::info!(
+                "resync_waiver: PR #{number} landed: tag={tag} head={head} files={files} \
+                 gate_paths_included={gate} daemon={}",
+                env!("CARGO_PKG_VERSION")
+            );
+            Waived::Landed(landed)
         }
         Err(e) => {
             if !had_pr {
@@ -551,6 +667,14 @@ mod glob_tests {
             Some("defaults/hooks/guard-x.sh")
         );
         assert_eq!(upstream_path(".loom/roles/judge.md"), None);
+        assert_eq!(
+            strict_upstream_path(".loom/roles/judge.md").as_deref(),
+            Some("defaults/roles/judge.md")
+        );
+        assert_eq!(
+            strict_upstream_path(".agents/skills/loom-judge/SKILL.md").as_deref(),
+            Some("defaults/.agents/skills/loom-judge/SKILL.md")
+        );
         assert_eq!(upstream_path(".claude/settings.json"), None);
     }
 }

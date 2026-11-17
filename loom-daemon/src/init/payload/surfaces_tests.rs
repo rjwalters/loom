@@ -699,3 +699,32 @@ fn every_extra_surface_is_exported_and_none_is_install_time_only() {
     assert_eq!(specs[..2], [".loom", ".claude/commands/loom"]);
     assert!(!specs.contains(&".loom/CLAUDE.md"), "already inside .loom");
 }
+
+/// #13793: `.claude/settings.json` gets the missing Loom hook entries for the
+/// staged `.loom/hooks/*`; a second pass changes nothing; a non-JSON file is
+/// skipped and reported, byte for byte as it was.
+#[test]
+fn hook_wiring_surface_wires_idempotently_and_skips_non_json() {
+    let defaults = TempDir::new().unwrap();
+    let stage = TempDir::new().unwrap();
+    let settings = stage.path().join(".claude/settings.json");
+    write(&stage.path().join(".loom/hooks/gh-front-env.sh"), "#!/bin/sh\n");
+    write(&settings, "{}");
+
+    let (mut shipped, mut skipped) = (BTreeSet::new(), Vec::new());
+    stage_extras(defaults.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
+    assert!(shipped.contains(".claude/settings.json"), "{shipped:?}");
+    let first = read(&settings);
+    assert!(first.contains("${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh"));
+    assert!(!first.contains("skill-router.sh"), "absent script must not be wired");
+
+    let (mut shipped, mut skipped) = (BTreeSet::new(), Vec::new());
+    stage_extras(defaults.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
+    assert!(!shipped.contains(".claude/settings.json"));
+    assert_eq!(read(&settings), first);
+
+    write(&settings, "not json");
+    stage_extras(defaults.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
+    assert_eq!(read(&settings), "not json");
+    assert!(skipped.iter().any(|s| s.path == ".claude/settings.json"));
+}

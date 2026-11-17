@@ -34,9 +34,55 @@ pub const HOSTS_KEY: &str = "guards.remoteFleetHosts";
 /// host even when listed here.
 pub const UNMANAGED_KEY: &str = "guards.remoteUnmanagedHosts";
 
+/// Which rule classified a host as a fleet host (named in the ask text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetRule {
+    /// The Loom fleet registry (`LOOM_FLEET_PATH` / `~/.loom/fleet.json`).
+    Registry,
+    /// A `tailscale status --json` peer.
+    TailscalePeer,
+    /// The extend-only [`HOSTS_KEY`] config array.
+    ConfigHosts,
+    /// A tailnet address or name (`*.ts.net`, `100.64.0.0/10`, `fd7a:115c:a1e0::/48`).
+    TailnetRange,
+    /// A roster that does not say which list named the host.
+    Roster,
+}
+
+impl FleetRule {
+    /// Operator-facing name of the rule.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Registry => "the fleet registry",
+            Self::TailscalePeer => "a tailscale peer",
+            Self::ConfigHosts => "`guards.remoteFleetHosts`",
+            Self::TailnetRange => "the tailnet address range",
+            Self::Roster => "the fleet roster",
+        }
+    }
+}
+
+/// A host's fleet classification: the rule, and the `ssh -G` hostname the
+/// rule matched when it matched the resolved name rather than the spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetMatch {
+    pub rule: FleetRule,
+    pub resolved: Option<String>,
+}
+
 /// Answers "is this a fleet host?".
 pub trait Roster {
     fn is_fleet_host(&self, host: &str) -> bool;
+    /// The rule that makes `host` a fleet host, or `None`. `ssh_config` is the
+    /// invocation's `-F` file, used for the `ssh -G` hostname lookup. The
+    /// default defers to [`Roster::is_fleet_host`].
+    fn fleet_match(&self, host: &str, _ssh_config: Option<&Path>) -> Option<FleetMatch> {
+        self.is_fleet_host(host).then_some(FleetMatch {
+            rule: FleetRule::Roster,
+            resolved: None,
+        })
+    }
     fn is_fleet_instance(&self, instance_id: &str) -> bool;
 }
 
@@ -129,7 +175,7 @@ pub fn names_match(a: &str, b: &str) -> bool {
 /// The real roster: fleet registry, tailscale peers, config list, `ssh -G`.
 pub struct ProcessRoster {
     workspace: PathBuf,
-    names: OnceCell<Vec<String>>,
+    names: OnceCell<Vec<(String, FleetRule)>>,
     instances: OnceCell<Vec<String>>,
     unmanaged: OnceCell<Vec<String>>,
 }
@@ -149,20 +195,29 @@ impl ProcessRoster {
         crate::fleet::FleetRegistry::load_default().unwrap_or_default()
     }
 
-    fn names(&self) -> &[String] {
+    fn names(&self) -> &[(String, FleetRule)] {
         self.names.get_or_init(|| {
-            let mut out = Vec::new();
+            let mut out: Vec<(String, FleetRule)> = Vec::new();
             for w in self.registry().workers {
-                out.push(w.ssh_host.clone());
-                out.extend(w.tailnet_name.clone());
+                out.push((w.ssh_host.clone(), FleetRule::Registry));
+                out.extend(w.tailnet_name.clone().map(|n| (n, FleetRule::Registry)));
             }
-            out.extend(tailscale_names(&tailscale_status()));
+            out.extend(
+                tailscale_names(&tailscale_status())
+                    .into_iter()
+                    .map(|n| (n, FleetRule::TailscalePeer)),
+            );
             let config = crate::config_resolver::resolve_effective_config(&self.workspace);
             if let Some(Value::Array(items)) = crate::config_resolver::get_path(&config, HOSTS_KEY)
             {
-                out.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+                out.extend(
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|n| (n.to_string(), FleetRule::ConfigHosts)),
+                );
             }
-            out.retain(|n| !n.trim().is_empty());
+            out.retain(|(n, _)| !n.trim().is_empty());
             out
         })
     }
@@ -182,30 +237,52 @@ impl ProcessRoster {
         })
     }
 
-    fn named(&self, host: &str) -> bool {
-        self.names().iter().any(|n| names_match(n, host))
+    fn named(&self, host: &str) -> Option<FleetRule> {
+        self.names()
+            .iter()
+            .find(|(n, _)| names_match(n, host))
+            .map(|(_, rule)| *rule)
     }
 }
 
 impl Roster for ProcessRoster {
     fn is_fleet_host(&self, host: &str) -> bool {
+        self.fleet_match(host, None).is_some()
+    }
+
+    fn fleet_match(&self, host: &str, ssh_config: Option<&Path>) -> Option<FleetMatch> {
+        let found = |rule, resolved: Option<&str>| {
+            Some(FleetMatch {
+                rule,
+                resolved: resolved.map(str::to_string),
+            })
+        };
         // Named rosters always win: the unmanaged list can never un-protect
         // a host the fleet actually knows.
-        if self.named(host) {
-            return true;
+        if let Some(rule) = self.named(host) {
+            return found(rule, None);
         }
         let scoped = |h: &str| unmanaged_matches(self.unmanaged(), h);
         if is_tailnet_literal(host) && self.unmanaged().is_empty() {
-            return true; // no scoping configured: no `ssh -G` needed
+            return found(FleetRule::TailnetRange, None); // no `ssh -G` needed
         }
-        let resolved = ssh_resolved_hostname(host).filter(|r| !r.eq_ignore_ascii_case(host));
-        if resolved.as_deref().is_some_and(|r| self.named(r)) {
-            return true;
+        let resolved =
+            ssh_resolved_hostname(host, ssh_config).filter(|r| !r.eq_ignore_ascii_case(host));
+        if let Some(r) = resolved.as_deref() {
+            if let Some(rule) = self.named(r) {
+                return found(rule, Some(r));
+            }
         }
         if scoped(host) || resolved.as_deref().is_some_and(scoped) {
-            return false;
+            return None;
         }
-        is_tailnet_literal(host) || resolved.as_deref().is_some_and(is_tailnet_literal)
+        if is_tailnet_literal(host) {
+            return found(FleetRule::TailnetRange, None);
+        }
+        match resolved.as_deref() {
+            Some(r) if is_tailnet_literal(r) => found(FleetRule::TailnetRange, Some(r)),
+            _ => None,
+        }
     }
 
     fn is_fleet_instance(&self, instance_id: &str) -> bool {
@@ -267,12 +344,20 @@ fn tailscale_status() -> Value {
     Value::Null
 }
 
-/// `ssh -G <host>`'s resolved `hostname` (no connection is made).
-fn ssh_resolved_hostname(host: &str) -> Option<String> {
+/// `ssh [-F <config>] -G <host>`'s resolved `hostname` (no connection is
+/// made). A missing or unreadable `-F` file makes `ssh` fail, which yields
+/// `None`: the lookup then falls back to the host's spelling, never an extra allow.
+fn ssh_resolved_hostname(host: &str, ssh_config: Option<&Path>) -> Option<String> {
     if host.starts_with('-') {
         return None;
     }
-    let out = run_with_timeout("ssh", &["-G", "--", host])?;
+    let cfg = ssh_config.map(|p| p.to_string_lossy().into_owned());
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(cfg) = cfg.as_deref() {
+        args.extend(["-F", cfg]);
+    }
+    args.extend(["-G", "--", host]);
+    let out = run_with_timeout("ssh", &args)?;
     out.lines()
         .find_map(|l| l.strip_prefix("hostname "))
         .map(|h| h.trim().to_string())

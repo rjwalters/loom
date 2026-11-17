@@ -611,9 +611,61 @@ pub(crate) fn write_target(root: &Path) -> Result<String, String> {
     }
 }
 
+/// Longest failure reason echoed to stderr (#13743).
+const REASON_MAX_CHARS: usize = 200;
+
+/// `s` trimmed, control characters replaced by spaces, capped at
+/// [`REASON_MAX_CHARS`] (#13743: bounded, redacted diagnostic output).
+fn bounded_reason(s: &str) -> String {
+    let cleaned: String = s
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() > REASON_MAX_CHARS {
+        let head: String = cleaned.chars().take(REASON_MAX_CHARS).collect();
+        format!("{head}…")
+    } else {
+        cleaned
+    }
+}
+
+/// The `claim` stand-down line; the cause, when known, is on this same line.
+fn unreadable_claim_line(why: Option<&str>) -> String {
+    match why {
+        Some(why) => {
+            format!("could not read this PR's lease records; nothing written — stand down: {why}")
+        }
+        None => "could not read this PR's lease records; nothing written — stand down".to_string(),
+    }
+}
+
 impl Gh {
+    /// The `owner/repo` a read names explicitly (#13743): the vetted write
+    /// target if there is one, else this checkout's `origin`. An untargeted
+    /// read (`GhTarget::None` plus a `{owner}/{repo}` placeholder) is shed by
+    /// the cwd router whenever it cannot derive the repository, and a shed
+    /// read never reaches the forge. `None` only when no slug is derivable.
+    fn read_slug(&self) -> Option<String> {
+        if let Ok(nwo) = &self.write_repo {
+            return Some(nwo.clone());
+        }
+        let remotes = crate::write_scope::target::read_remotes(&self.root);
+        crate::write_scope::target::origin_nwo(&remotes)
+    }
+
     fn inv(&self, op: &'static str, intent: AccessIntent, fop: ForgeOp) -> GhInvocation {
-        GhInvocation::new(Operation::new(op), intent, GhTarget::None, GH_TIMEOUT)
+        self.inv_at(op, intent, fop, GhTarget::None)
+    }
+
+    fn inv_at(
+        &self,
+        op: &'static str,
+        intent: AccessIntent,
+        fop: ForgeOp,
+        target: GhTarget,
+    ) -> GhInvocation {
+        GhInvocation::new(Operation::new(op), intent, target, GH_TIMEOUT)
             .forge_op(fop)
             .program(&self.bin)
             .current_dir(&self.root)
@@ -628,36 +680,73 @@ impl Gh {
 
     /// Every trusted `loom:pr-lease*` comment on `pr`; `None` on any failure.
     pub(crate) fn read_rows(&self, pr: u64, policy: &TrustPolicy) -> Option<Vec<Row>> {
+        self.read_rows_why(pr, policy).ok()
+    }
+
+    /// [`read_rows`](Self::read_rows), naming why a failed read failed (a
+    /// shed, a timeout, or the exit status) so a stand-down is diagnosable.
+    pub(crate) fn read_rows_why(&self, pr: u64, policy: &TrustPolicy) -> Result<Vec<Row>, String> {
         let jq = format!(
             r#".[] | select(.body != null and (.body | startswith("{FAMILY_PREFIX}"))) | {{id: .id, updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
         );
+        let slug = self.read_slug();
+        let target = slug
+            .as_deref()
+            .and_then(|s| GhTarget::repo(s).ok())
+            .unwrap_or(GhTarget::None);
+        let repo_path = slug.unwrap_or_else(|| "{owner}/{repo}".to_string());
         let out = self
-            .inv("pr_lease.comments", AccessIntent::Read, ops::COMMENT_LIST)
+            .inv_at("pr_lease.comments", AccessIntent::Read, ops::COMMENT_LIST, target)
             .args([
                 "api",
-                &format!("repos/{{owner}}/{{repo}}/issues/{pr}/comments"),
+                &format!("repos/{repo_path}/issues/{pr}/comments"),
                 "--paginate",
                 "--jq",
                 &jq,
             ])
             .run();
-        let out = out.ok_output()?;
+        let out = match out.into_result() {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let line = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                return Err(format!("gh exited {}: {}", o.status, bounded_reason(line)));
+            }
+            Err(u) => return Err(bounded_reason(&u.to_string())),
+        };
         // #9548/#9631: an untrusted author's marker is prose.
         let trusted = policy.trusted_ndjson(&out.stdout);
-        Some(parse_rows(&String::from_utf8_lossy(&trusted)))
+        Ok(parse_rows(&String::from_utf8_lossy(&trusted)))
     }
 
     /// [`read_rows`](Self::read_rows) with the bounded retry.
     pub(crate) fn read_rows_retrying(&self, pr: u64, policy: &TrustPolicy) -> Option<Vec<Row>> {
+        self.read_rows_retrying_why(pr, policy).ok()
+    }
+
+    /// The bounded retry, returning the last attempt's reason on failure so a
+    /// caller can put the cause on its own (last) stderr line (#13743):
+    /// telemetry keeps only the final non-empty stderr line.
+    pub(crate) fn read_rows_retrying_why(
+        &self,
+        pr: u64,
+        policy: &TrustPolicy,
+    ) -> Result<Vec<Row>, String> {
+        let mut last = String::new();
         for attempt in 1..=READ_ATTEMPTS {
-            if let Some(rows) = self.read_rows(pr, policy) {
-                return Some(rows);
+            match self.read_rows_why(pr, policy) {
+                Ok(rows) => return Ok(rows),
+                Err(why) => last = why,
             }
             if attempt < READ_ATTEMPTS {
                 std::thread::sleep(READ_RETRY_DELAY);
             }
         }
-        None
+        Err(last)
     }
 
     /// Post a comment; its forge `id` on success.
@@ -1052,10 +1141,13 @@ impl Ctx {
             self.say(&format!("refusing to write here (#9548): {why} — stand down"));
             return EXIT_UNVERIFIED;
         }
-        let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
+        let (rows, why) = match self.gh.read_rows_retrying_why(self.pr(), &self.policy) {
+            Ok(rows) => (Some(rows), None),
+            Err(why) => (None, Some(why)),
+        };
         match self.state_of(rows.as_deref()) {
             ClaimState::Unknown => {
-                self.say("could not read this PR's lease records; nothing written — stand down");
+                self.say(&unreadable_claim_line(why.as_deref()));
                 return EXIT_UNVERIFIED;
             }
             ClaimState::HeldByPeer { holder, .. } => {
@@ -1388,9 +1480,14 @@ impl Ctx {
             // A renewer killed mid-PATCH could still land its write; let it.
             std::thread::sleep(Duration::from_secs(2));
         }
-        let Some(rows) = self.gh.read_rows_retrying(self.pr(), &self.policy) else {
-            self.say("could not read lease records; the lease will age out at the TTL");
-            return (EXIT_HELD, 0);
+        let rows = match self.gh.read_rows_retrying_why(self.pr(), &self.policy) {
+            Ok(rows) => rows,
+            Err(why) => {
+                self.say(&format!(
+                    "could not read lease records; the lease will age out at the TTL: {why}"
+                ));
+                return (EXIT_HELD, 0);
+            }
         };
         let mut released = 0;
         // #11855: a Judge leaving the PR still waiting for review records it.

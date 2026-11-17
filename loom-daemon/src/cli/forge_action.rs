@@ -606,6 +606,26 @@ pub(crate) enum ForgeAction {
         repo: Option<String>,
     },
 
+    /// `forge locked-deps-only <pr> [--repo OWNER/REPO]` (2am#6942 ruling, 2026-11-07) — does
+    /// PR `<pr>` add no third-party package? Every `Cargo.lock` patch adds no `source =` /
+    /// `checksum =` line and changes no existing package, no `Cargo.toml` line names `git =`,
+    /// `registry =`, `build =`, `links =`, `[patch]`, `[replace]` or an out-of-repo `path =`,
+    /// and a manifest change comes with a lock change. Backs Champion's opt-in
+    /// `lockedDepsOnly` class key.
+    ///
+    /// Exits 0 (`LOCKED_DEPS_ONLY=1`) ONLY when all of that was read and held. Any other
+    /// outcome exits 1 with the reason on stderr. Callers treat any non-zero exit as "hold".
+    #[command(name = "locked-deps-only")]
+    LockedDepsOnly {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge resync-waiver <pr> [--repo OWNER/REPO]` (#13487) — the resync waiver proof
     /// (#13096): is PR `<pr>` a `chore(loom): resync installed Loom to vX` whose changed
     /// kept-set files are byte-identical to the tag? Exit 0 prints `RESYNC_WAIVER=ELIGIBLE`,
@@ -620,6 +640,12 @@ pub(crate) enum ForgeAction {
         /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
+
+        /// Run the daemon's strict landing proof (every changed file must be a
+        /// byte-copy of its upstream counterpart) instead of Champion's
+        /// kept-set proof. Read-only (#13668).
+        #[arg(long)]
+        strict: bool,
     },
 
     /// `forge suspect-critical-diff <pr> <file> [--repo OWNER/REPO]` (#12999) —
@@ -911,6 +937,10 @@ pub(crate) enum ForgeAction {
         /// `approved` or `changes-requested`.
         #[arg(long)]
         verdict: String,
+        /// The head the verdict was written against; journaled with the
+        /// verdict for telemetry (#12362), never read back from the forge.
+        #[arg(long)]
+        sha: Option<String>,
     },
 
     /// `forge doctor-handback <pr> --expected-head-sha S [--repo R]` (#9388) —
@@ -1230,8 +1260,13 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &nonce,
             );
         }
-        ForgeAction::VerdictLabels { pr, repo, verdict } => {
-            return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict);
+        ForgeAction::VerdictLabels {
+            pr,
+            repo,
+            verdict,
+            sha,
+        } => {
+            return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict, sha.as_deref());
         }
         ForgeAction::ClaimLiveness {
             number,
@@ -1395,9 +1430,20 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 repo,
             })
         }
-        ForgeAction::ResyncWaiver { pr_number, repo } => ForgeCmd::ResyncWaiver {
+        ForgeAction::LockedDepsOnly { pr_number, repo } => {
+            ForgeCmd::LockedDepsOnly(crate::forge_locked_deps_only::Args {
+                pr: pr_number,
+                repo,
+            })
+        }
+        ForgeAction::ResyncWaiver {
+            pr_number,
+            repo,
+            strict,
+        } => ForgeCmd::ResyncWaiver {
             pr: pr_number,
             repo,
+            strict,
         },
         ForgeAction::SuspectCriticalDiff {
             pr_number,
@@ -1612,6 +1658,7 @@ mod write_target_tests {
             pr: 7,
             repo: "unmanaged/repo".into(),
             verdict: "approved".into(),
+            sha: None,
         };
         assert_eq!(write_target(&labels), Some(Some("unmanaged/repo".into())));
         let gate = ForgeAction::VerdictGate {

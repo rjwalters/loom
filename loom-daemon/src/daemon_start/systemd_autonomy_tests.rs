@@ -41,12 +41,56 @@ fn a_polluted_env_yields_a_unit_without_autonomy_keys() {
         "PATH",
         "HOME",
         "LOOM_DAEMON_SUPERVISOR",
-        "LOOM_WORKSPACE",
-        "LOOM_PID_FILE",
         "LOOM_SAFEHOUSE_ENABLED",
         "GH_TOKEN",
     ] {
         assert!(keys.iter().any(|x| x == k), "unit lost {k}:\n{u}");
+    }
+}
+
+#[test]
+fn a_polluted_and_a_clean_env_render_byte_identical_units() {
+    let polluted = format!("{POLLUTED_ENV}LOOM_HOST_ID=loom-worker-2\n");
+    let clean = "HOME=/home/u\nLOOM_SAFEHOUSE_ENABLED=1\nGH_TOKEN=redacted\n";
+    assert_eq!(unit_from(&polluted), unit_from(clean));
+}
+
+#[test]
+fn the_runtime_path_and_identity_keys_are_never_rendered() {
+    let u = unit_from(&format!("{POLLUTED_ENV}LOOM_HOST_ID=loom-worker-2\n"));
+    let keys = systemd_env_keys(&u);
+    for k in ["LOOM_PID_FILE", "LOOM_WORKSPACE", "LOOM_HOST_ID"] {
+        assert!(!keys.iter().any(|x| x == k), "unit carries {k}:\n{u}");
+    }
+    // An empty value is dropped too.
+    let u = unit_from("LOOM_PID_FILE=\nLOOM_WORKSPACE=\nLOOM_HOST_ID=\n");
+    assert!(
+        !u.contains("LOOM_PID_FILE")
+            && !u.contains("LOOM_WORKSPACE")
+            && !u.contains("LOOM_HOST_ID"),
+        "{u}"
+    );
+}
+
+#[test]
+fn an_installed_units_path_and_identity_lines_are_purged_not_carried_forward() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let old = dir.path().join("loom-daemon.service");
+    let installed = systemd_unit("/b", "/w", "/l", "/p", "/h", &[]).replace(
+        "Environment=LOOM_DAEMON_SUPERVISOR=systemd\n",
+        "Environment=LOOM_DAEMON_SUPERVISOR=systemd\n\
+         Environment=LOOM_PID_FILE=/x/.daemon.pid\n\
+         Environment=LOOM_WORKSPACE=/x\n\
+         Environment=LOOM_HOST_ID=old\n",
+    );
+    std::fs::write(&old, &installed).expect("write");
+    let new = systemd_unit("/b", "/w", "/l", "/p", "/h", &[]);
+    for force_env in [false, true] {
+        let merged =
+            warn_dropped_env_keys(&old, "/tmp/new", &new, Mechanism::Systemd, force_env).new_text;
+        for k in ["LOOM_PID_FILE", "LOOM_WORKSPACE", "LOOM_HOST_ID"] {
+            assert!(!merged.contains(k), "{k} carried forward:\n{merged}");
+        }
     }
 }
 

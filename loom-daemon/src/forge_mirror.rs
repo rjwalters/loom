@@ -119,20 +119,14 @@ pub fn resolve_repo(cwd: Option<&std::path::Path>, repo: Option<&str>) -> Option
     valid_slug(&slug).then_some(slug)
 }
 
-/// `owner/name` as GitHub allows them.
+/// `owner/name` as GitHub allows them: the shared slug rule plus GitHub's
+/// stricter owner rule (the mirror is github.com-only).
 #[must_use]
 pub fn valid_slug(slug: &str) -> bool {
-    let Some((owner, name)) = slug.split_once('/') else {
-        return false;
-    };
-    crate::forge_bucket_book::valid_owner(owner)
-        && !name.is_empty()
-        && name.len() <= 100
-        && name != "."
-        && name != ".."
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    crate::forge_slug::valid_slug(slug)
+        && slug
+            .split_once('/')
+            .is_some_and(|(owner, _)| crate::forge_bucket_book::valid_owner(owner))
 }
 
 /// The config block.

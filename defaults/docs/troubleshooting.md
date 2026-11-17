@@ -998,7 +998,7 @@ user-provisioned paths) have no issue state to consult and are unaffected.
 
 **What the #5919 post-mortem could and could not establish.** The ledger exists
 because this incident was *not* attributable from the evidence that existed at
-the time. Against `~/.loom/daemon.log` (+ rotations `.1`–`.5`, covering
+the time. Against `~/.loom/daemon.log` (+ day files `daemon.log.YYYY-MM-DD`, covering
 2026-08-01 → 2026-08-11) for the incident window — issue #5919 filed
 `2026-08-10T21:01:18Z`, PR #5942 opened `23:31:21Z`:
 
@@ -1289,9 +1289,7 @@ Out-of-band rolling is also where this already belongs: the daemon's own
 auto-update loop and `loom-daemon-watchdog.sh` converge the host from *outside*
 any merge. A version-floor refusal is a **symptom** of that loop being behind
 (on 2026-09-18 it was deferring behind the build-stampede guard, #8252) — fix
-it there, not by restarting the daemon from inside its own child. The secondary
-argument, that `merge-pr.sh` is frozen at its file-size-ratchet ceiling, only
-reinforces a conclusion the process model already forces.
+it there, not by restarting the daemon from inside its own child.
 
 ### `rm` of the installed `loom-daemon` binary is denied in an agent session (#5675)
 

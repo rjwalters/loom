@@ -351,7 +351,7 @@ pub fn classify_queue_activity(
 #[must_use]
 pub fn resolve_detection_enabled(repo_root: &Path) -> bool {
     if let Ok(v) = std::env::var(ROLE_COLLISION_DETECT_ENV) {
-        return is_truthy(&v);
+        return crate::env_flag::parse_truthy(&v);
     }
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
     if let Some(explicit) = crate::config_resolver::get_path(&effective, "autonomous.roleRunner")
@@ -391,10 +391,6 @@ pub fn resolve_window(repo_root: &Path, role_interval: Duration) -> Duration {
     };
     let window = secs.map_or(role_interval, Duration::from_secs);
     window.clamp(MIN_WINDOW, MAX_WINDOW)
-}
-
-fn is_truthy(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 // ============================================================================

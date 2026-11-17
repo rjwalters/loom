@@ -410,6 +410,9 @@ impl StepDriver {
     fn tick_blocking(&mut self, input: &TickInputs<'_>) -> TickReport {
         let now = Utc::now();
         self.provider.begin_tick();
+        // Ratification reviewer lane (#13707): step dispatch never reaches the
+        // champion role tick that ticks it, so tick it here (throttled).
+        crate::role_runner::ratification_lane::spawn_step_ticks(input.roots);
         let registries: Vec<_> = input
             .roots
             .iter()

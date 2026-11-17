@@ -18,7 +18,7 @@
 //! | # | Check | State when it fails |
 //! |---|---|---|
 //! | 1 | `origin/HEAD` names the default branch (never a guessed `main`) | `no-default-branch` |
-//! | 2 | HEAD is on it (not another branch, not detached) | `wrong-branch` |
+//! | 2 | HEAD is on it (not another branch, not detached) | `wrong-branch` (a clean one is first put back, #13588) |
 //! | 3 | no rebase, merge, cherry-pick, bisect or revert in progress | `mid-operation` |
 //! | 4 | no main-health gate run is building in this checkout | `gate-in-flight` |
 //! | 4 | the daemon's self-update is not running in this checkout | `self-update-in-flight` |
@@ -597,6 +597,10 @@ pub struct Env<'a> {
     pub elapsed: &'a dyn Fn() -> Duration,
     /// The clock.
     pub clock: &'a dyn Fn() -> DateTime<Utc>,
+    /// Is `sha` the head of a pull request the forge reports as merged
+    /// (#13588)? `None`: it could not be answered (no network, breaker open, a
+    /// failed lookup): the caller treats that as "not merged".
+    pub pr_merged: &'a dyn Fn(&Path, &str) -> Option<bool>,
 }
 
 impl Env<'_> {

@@ -3,6 +3,8 @@
 //! setsid/double-fork descendants owned until they have all been reaped.
 
 mod host;
+#[cfg(test)]
+pub(crate) use host::exec_command;
 pub use host::run as run_host;
 mod owner;
 pub mod posture;
@@ -54,6 +56,12 @@ pub struct HostArgs {
     pub workdir: String,
     #[arg(long = "env")]
     pub env: Vec<String>,
+    /// Variables set on the `docker` client process itself, never in argv
+    /// (#13916): a forge token this host resolved for the exec, which `env`
+    /// names as a bare `NAME` so `docker` copies it into the container
+    /// process. Never a CLI flag, so no caller can pass a secret on argv.
+    #[arg(skip)]
+    pub child_env: Vec<(String, String)>,
     #[arg(long, env = "LOOM_SESSION_STDERR_FILE")]
     pub stderr_file: Option<std::path::PathBuf>,
     #[arg(last = true, required = true)]

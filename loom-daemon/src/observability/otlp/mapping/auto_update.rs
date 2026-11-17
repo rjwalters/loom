@@ -54,7 +54,6 @@ pub(super) fn log_parts(
         kv_bool("loom.auto_update.roll_armed", r.roll_armed),
         kv_bool("loom.auto_update.drain_armed", r.drain.armed),
         kv_bool("loom.auto_update.drain_pending", r.drain.pending),
-        kv_int("loom.auto_update.drain_refusals", i64::from(r.drain.refusals)),
         kv_int("loom.auto_update.consecutive_failures", i64::from(r.consecutive_failures)),
         kv_int("loom.auto_update.duration_ms", to_i64(r.duration_ms)),
         kv_string("loom.auto_update.version", r.loom.version.clone()),

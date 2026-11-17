@@ -429,34 +429,14 @@ pub fn is_secondary_limit(response: Option<&HttpResponse>, stderr: &str) -> bool
         == Some(crate::forge_denial::Denial::SecondaryRateLimit)
 }
 
-/// Record one forge call. Never blocks or fails the caller: a poisoned lock
-/// or an unwritable sink is silently skipped.
-pub fn record(
-    caller: &'static str,
-    pool: Pool,
-    outcome: Outcome,
-    headers: Option<&RateLimitHeaders>,
-) {
-    record_with_identity(caller, &CallIdentity::default(), pool, outcome, headers);
-}
-
-/// [`record`] plus the #9777 call identity. An identity with no operation is
-/// recorded as [`UNKNOWN_OPERATION`] rather than as an absent field, so an
-/// un-migrated call site is *visible* in the accounting instead of silently
-/// indistinguishable from one that has no operation at all.
-pub fn record_with_identity(
-    caller: &'static str,
-    identity: &CallIdentity,
-    pool: Pool,
-    outcome: Outcome,
-    headers: Option<&RateLimitHeaders>,
-) {
-    record_attributed(caller, identity, pool, outcome, headers, &CallAttribution::default());
-}
-
-/// [`record_with_identity`] plus the W1 bucket attribution the `gh` facade
-/// knows ([`CallAttribution`]): which credential, which billed bucket, how
-/// many pages. Same guarantees: never blocks or fails the caller.
+/// Record one forge call with the #9777 call identity and the W1 bucket
+/// attribution the `gh` facade knows ([`CallAttribution`]): which
+/// credential, which billed bucket, how many pages. Never blocks or fails
+/// the caller: a poisoned lock or an unwritable sink is silently skipped.
+/// An identity with no operation is recorded as [`UNKNOWN_OPERATION`]
+/// rather than as an absent field, so an un-migrated call site is *visible*
+/// in the accounting instead of silently indistinguishable from one that
+/// has no operation at all.
 pub fn record_attributed(
     caller: &'static str,
     identity: &CallIdentity,
@@ -1076,34 +1056,6 @@ fn read_spill_rows(now: DateTime<Utc>) -> Vec<crate::types::ReadSpillStatus> {
             mode: latch.mode.as_str().to_string(),
             until: latch.release_at.into(),
         })
-        .collect()
-}
-
-/// The rate-limit pools this process last read at **zero remaining** and
-/// that have not reset yet at `now`, each with its reset instant when the
-/// header carried one (#10210, the ETA's `rate_limit_quota` stall).
-///
-/// Read-only and in-process: the newest free `x-ratelimit-*` reading per pool
-/// this daemon already absorbed — no file read, no forge call. A reading
-/// older than [`WINDOW_SECS`] with no reset is too stale to call a stall.
-#[must_use]
-pub fn exhausted_pools(now: DateTime<Utc>) -> Vec<(Pool, Option<DateTime<Utc>>)> {
-    match process_state().lock() {
-        Ok(state) => exhausted_in(&state.latest, now.timestamp()),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// [`exhausted_pools`] over an explicit reading map. Pure.
-fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option<DateTime<Utc>>)> {
-    latest
-        .iter()
-        .filter(|(_, r)| r.remaining == 0)
-        .filter(|(_, r)| match r.reset_epoch {
-            Some(reset) => reset > now,
-            None => now - r.observed_at <= WINDOW_SECS,
-        })
-        .map(|(pool, r)| (*pool, r.reset_epoch.and_then(epoch)))
         .collect()
 }
 

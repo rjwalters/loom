@@ -26,6 +26,7 @@
 
 mod file_ops;
 pub(crate) mod git;
+pub(crate) mod hook_wiring;
 pub mod payload;
 mod post_init;
 mod repo_owned;

@@ -150,50 +150,109 @@ pub struct GhInstructionSource<'a> {
     pub root: &'a Path,
 }
 
+/// Longest stderr excerpt carried into a failure reason, in characters.
+pub const MAX_GH_DETAIL_CHARS: usize = 200;
+
+/// Why a `gh` call produced no usable answer: the exit status and a bounded
+/// stderr excerpt when it ran, or the [`crate::cmd_out::Unavailable`] reason
+/// when it did not (spawn failure, timeout, ...). Whitespace is collapsed and
+/// token-shaped words are redacted so a credential echoed on stderr is never
+/// logged.
+#[must_use]
+pub fn gh_failure_detail(out: &crate::cmd_out::CmdOutcome) -> String {
+    use crate::cmd_out::CmdOutcome;
+    match out {
+        CmdOutcome::Unavailable(u) => u.to_string(),
+        CmdOutcome::Ran(o) => {
+            let status = o
+                .status
+                .code()
+                .map_or_else(|| "killed by signal".to_string(), |c| format!("exit {c}"));
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let words: Vec<&str> = stderr
+                .split_whitespace()
+                .map(|w| {
+                    let t = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+                    if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+                        .iter()
+                        .any(|p| t.starts_with(p))
+                    {
+                        "[redacted]"
+                    } else {
+                        w
+                    }
+                })
+                .collect();
+            let text = words.join(" ");
+            if text.is_empty() {
+                return format!("{status}, no stderr");
+            }
+            let bounded: String = text.chars().take(MAX_GH_DETAIL_CHARS).collect();
+            let ellipsis = if text.chars().count() > MAX_GH_DETAIL_CHARS {
+                "..."
+            } else {
+                ""
+            };
+            format!("{status}: {bounded}{ellipsis}")
+        }
+    }
+}
+
+/// A forge read through the reader credential path (#12555), as the PR list
+/// and file reads in the lane already are: `Ok(stdout)` or the failure detail.
+fn read_gh(op: &'static str, root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+    let out = crate::claim_reconciliation::gh_call::read(op, &gh, root)
+        .args(args.iter().copied())
+        .run();
+    match &out {
+        crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => Ok(o.stdout.clone()),
+        _ => Err(gh_failure_detail(&out)),
+    }
+}
+
+/// [`read_gh`] for the lane's head-content read (`ratification.raw`).
+pub(super) fn read_raw(root: &Path, endpoint: &str) -> Result<String, String> {
+    read_gh(
+        "ratification.raw",
+        root,
+        &["api", "-H", "Accept: application/vnd.github.raw", endpoint],
+    )
+    .map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 impl InstructionSource for GhInstructionSource<'_> {
     fn fetch(&self, pin: &Pin) -> Result<String, String> {
         let repo = &pin.repo;
         // The pin must resolve to itself: a ref that expands to another commit
         // is a mismatch, not a fetch.
-        let commit = crate::script_helpers::run_gh(
+        let commit = read_gh(
+            "ratification.pin_commit",
+            self.root,
             &[
                 "api",
                 &format!("repos/{repo}/commits/{}", pin.commit),
                 "--jq",
                 ".sha",
             ],
-            self.root,
-            false,
-        );
-        let resolved = commit
-            .ok_output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .to_ascii_lowercase()
-            })
-            .ok_or_else(|| format!("could not resolve {repo}@{}", pin.commit))?;
+        )
+        .map_err(|e| format!("could not resolve {repo}@{}: {e}", pin.commit))?;
+        let resolved = String::from_utf8_lossy(&commit).trim().to_ascii_lowercase();
         if resolved != pin.commit.to_ascii_lowercase() {
             return Err(format!("{repo}@{} resolved to {resolved}", pin.commit));
         }
         let path = format!("repos/{repo}/contents/{}?ref={}", pin.path, pin.commit);
-        let out = crate::script_helpers::run_gh(
-            &["api", "-H", "Accept: application/vnd.github.raw", &path],
-            self.root,
-            false,
-        );
-        out.ok_output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .ok_or_else(|| format!("fetch of {repo}:{} failed", pin.path))
+        read_raw(self.root, &path).map_err(|e| format!("fetch of {repo}:{} failed: {e}", pin.path))
     }
 
     fn repo_is_private(&self, repo: &str) -> Option<bool> {
-        let out = crate::script_helpers::run_gh(
-            &["api", &format!("repos/{repo}"), "--jq", ".private"],
+        let out = read_gh(
+            "ratification.repo_private",
             self.root,
-            false,
-        );
-        match String::from_utf8_lossy(&out.ok_output()?.stdout).trim() {
+            &["api", &format!("repos/{repo}"), "--jq", ".private"],
+        )
+        .ok()?;
+        match String::from_utf8_lossy(&out).trim() {
             "true" => Some(true),
             "false" => Some(false),
             _ => None,

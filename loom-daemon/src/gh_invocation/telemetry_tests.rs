@@ -606,3 +606,27 @@ fn a_304_is_an_ok_span_with_no_failure_record_but_a_404_is_an_error() {
     assert_eq!(spans[0].status, SpanStatus::Error);
     assert_eq!(records.len(), 1);
 }
+
+#[test]
+fn a_graphql_write_span_carries_the_explicit_pr_number() {
+    let graphql = |named: bool| {
+        let inv = GhInvocation::new(
+            Operation::new("merge_queue.enqueue"),
+            AccessIntent::Write,
+            GhTarget::repo("acme/widgets").unwrap(),
+            Duration::from_secs(10),
+        )
+        .parent(ParentContext::Missing)
+        .args(["api", "graphql", "-f", "pullRequestId=PR_kwDOabc"]);
+        if named {
+            inv.number(4242)
+        } else {
+            inv
+        }
+    };
+    let (_, spans, _) = run(graphql(true), "echo ok");
+    assert_eq!(attr(&spans[0], "github.number"), Some("4242"));
+    // Without the explicit number, argv names none: the attribute is absent.
+    let (_, spans, _) = run(graphql(false), "echo ok");
+    assert_eq!(attr(&spans[0], "github.number"), None);
+}

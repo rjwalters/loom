@@ -388,3 +388,41 @@ fn an_approved_conflicting_pr_is_not_a_merge_step() {
     let clean = classify(&pr(&["loom:pr"]));
     assert_eq!(clean[0].step(), Some(Step::ChampionMerge));
 }
+
+/// #13737: an approved, unheld PR on a Loom stack branch is a pass (the janitor
+/// would only skip it); any other base, and any held/contradictory/conflicting
+/// stacked PR, keeps its existing verdict.
+#[test]
+fn an_approved_stacked_pr_is_not_a_merge_step() {
+    let pr = |labels: &[&str], base: Option<&str>| Inputs {
+        pulls: vec![PullInput {
+            number: 70,
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            base_ref: base.map(str::to_string),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    for base in ["feature/issue-371", "feature/harness-ops-350"] {
+        let stacked = classify(&pr(&["loom:pr"], Some(base)));
+        assert_eq!(stacked[0].step(), None, "{base}");
+        assert_eq!(stacked[0].verdict, Verdict::Pass(PassReason::Stacked));
+    }
+    assert_eq!(PassReason::Stacked.as_str(), "stacked");
+    for base in [
+        Some("main"),
+        Some("release/x"),
+        Some("feature/issue-371-x"),
+        None,
+    ] {
+        let c = classify(&pr(&["loom:pr"], base));
+        assert_eq!(c[0].step(), Some(Step::ChampionMerge), "{base:?}");
+    }
+    let conflicting = classify(&pr(&["loom:pr", "loom:merge-conflict"], Some("feature/issue-371")));
+    assert_eq!(conflicting[0].verdict, Verdict::Pass(PassReason::Conflicting));
+    let contradictory =
+        classify(&pr(&["loom:pr", "loom:changes-requested"], Some("feature/issue-371")));
+    assert_eq!(contradictory[0].step(), Some(Step::Doctor));
+    let blocked = classify(&pr(&["loom:pr", "loom:blocked"], Some("feature/issue-371")));
+    assert_eq!(blocked[0].verdict, Verdict::Pass(PassReason::Blocked));
+}

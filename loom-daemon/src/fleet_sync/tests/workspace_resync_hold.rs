@@ -372,6 +372,7 @@ fn a_checkout_hold_clears_when_the_checkout_fast_forwards_in_the_same_pass() {
         budget: None,
         elapsed: &|| Duration::ZERO,
         clock: &|| host.now.get(),
+        pr_merged: &|_, _| None,
     };
     let roots = [host.root.clone()];
     let moved = checkout_ff::run(&env, &roots, &mut checkout_ff::Memory::default());

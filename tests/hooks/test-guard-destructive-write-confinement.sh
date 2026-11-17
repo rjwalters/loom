@@ -1159,8 +1159,7 @@ echo x > \"\$tmp/out.txt\"" "$WT_REPO"
 # The ONE chained exception to that ambiguity rule — a second assignment of
 # the exact `NAME=$(cd "$NAME" && pwd -P)` / `NAME=$(realpath "$NAME")`
 # canonicalization form (#7986) — is covered in its own suite alongside the
-# identical rm-scope half (this file is frozen at its
-# scripts/file-size-baseline.txt size, so new cases go to a sibling):
+# identical rm-scope half:
 # tests/hooks/test-guard-destructive-mktemp-canon.sh.
 
 # A '..' traversal in the suffix after a proven-safe mktemp var fails closed
@@ -2507,6 +2506,11 @@ assert_allow "write-confinement (#12285): unquoted target -> allow" \
     'cd /tmp/probe && for name in a b; do echo x > $name.gds; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): absolute loop value stays denied" \
     "cd /tmp/probe && for n in $WT_REPO/x; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+# #13773: absolute loop value resolving OUTSIDE the checkout, used as a write target
+assert_deny "write-confinement (#13773): absolute loop value outside checkout stays denied" \
+    'cd /tmp/p && for n in /abs; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#13773): absolute /tmp/outside loop value stays denied" \
+    'cd /tmp/p && for n in /tmp/outside/a; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with .. stays denied" \
     'cd /tmp/probe && for n in ../x; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with / stays denied" \
@@ -2631,6 +2635,34 @@ for _c13608 in "linked:$WT_REPO_LINKED" "main:$WT_REPO"; do
     assert_allow "write-confinement (#13608, sky130-temp-por#191 loop-literal-tmp-cwd, cwd=$_l13608): literal /tmp cwd + loop-var filenames allows (characterization)" \
         'mkdir -p /tmp/klt_probe && cd /tmp/klt_probe && for name in a b; do echo x > "$name.gds"; echo y > "$name.json"; done' "$_d13608"
 done
+
+# --- Process substitution `>(cmd)` is not an attached redirect (#13814) ---
+# The attached-redirect extraction treated `>(cmd` as `>` + a file named
+# `(cmd`, resolving a phantom `<repo>/(cmd` write target (ported fix from
+# rjwalters/repo#786). The substitution BODY must still be judged, so a nested
+# write into the main checkout keeps denying.
+assert_allow "write-confinement (#13814): ls >(echo) is not a phantom write target" \
+    "ls >(echo)" "$WT_REPO"
+assert_allow "write-confinement (#13814): ls >(true) is not a phantom write target" \
+    "ls >(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): nested write inside >(...) into the managed worktree allows" \
+    "ls >(echo x > $WT_DIR/f)" "$WT_REPO"
+assert_allow "write-confinement (#13814): 2>(cmd) is not a phantom write target" \
+    "ls 2>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): &>(cmd) is not a phantom write target" \
+    "ls &>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): >>(cmd) is not a phantom write target" \
+    "ls >>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): ls >(true) >/dev/null allows" \
+    "ls >(true) >/dev/null" "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#13814): nested >(tee MAIN/x) still denies (body stays scanned)" \
+    "echo x >(tee $WT_REPO/evil.sh)" 'worktree-isolation bypass' "$WT_REPO"
+assert_deny "write-confinement (#13814): nested >(echo > MAIN/x) still denies" \
+    "ls >(echo x > $WT_REPO/evil.sh)" "$WT_REPO"
+assert_deny "write-confinement (#13814 control): plain > MAIN path still denies" \
+    "echo x > $WT_REPO/blocked.txt" "$WT_REPO"
+assert_allow "write-confinement (#13814 control): read-only <(cmd) allows" \
+    "cat <(printf x)" "$WT_REPO"
 
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"

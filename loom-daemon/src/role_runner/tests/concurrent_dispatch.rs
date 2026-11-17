@@ -1163,3 +1163,105 @@ fn a_capped_pr_with_no_hold_record_skips_the_doctor_queue_read() {
         Some(crate::pr_planning::PrRole::Doctor)
     );
 }
+
+thread_local! {
+    /// The cursor tests' per-tick gate (each test runs on its own thread).
+    /// Dispatchers capture it at construction, on the test thread.
+    static CURSOR_TICK: TickGate = TickGate::default();
+}
+
+fn cursor_dispatcher(role: &'static str, state: &Path) -> RoleDispatcher {
+    let factory = CURSOR_TICK.with(TickGate::factory);
+    dispatcher(role, factory, admit_only(role)).with_cursor_dir(Some(state))
+}
+
+/// Run one tick of `d` and return the roots it spawned, reaping the runs.
+///
+/// Every run is held on the tick's gate until `dispatch_tick` has returned, so
+/// no budget slot frees mid-walk and admits a second root (same race as
+/// #12325; `roleMaxConcurrent` is 1 in [`CURSOR_CFG`]). The gate opens on
+/// drop too, so a failed assertion cannot leave runs blocked.
+fn cursor_tick(
+    rt: &tokio::runtime::Runtime,
+    d: &mut RoleDispatcher,
+    p: &[PathBuf],
+) -> Vec<PathBuf> {
+    let gate = CURSOR_TICK.with(TickGate::current);
+    let _open = OpenOnDrop(gate.clone());
+    let spawned = d
+        .dispatch_tick(p.to_vec(), &new_in_progress_guard())
+        .spawned;
+    gate.open();
+    for _ in 0..spawned.len() {
+        let _ = join_one(rt, d);
+    }
+    CURSOR_TICK.with(TickGate::next);
+    spawned
+}
+
+const CURSOR_CFG: &str =
+    r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1,"guide":1}}}}"#;
+
+/// #13682: a restart mid-rotation resumes after the last admitted root.
+#[test]
+fn cursor_persisted_across_restart_admits_tail_before_head_repeats() {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| workspace(CURSOR_CFG)).collect();
+    let p: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
+    let state = tempfile::tempdir().unwrap();
+    let mut d = cursor_dispatcher("judge", state.path());
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[0].clone()]);
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[1].clone()]);
+    drop(d);
+    let mut d = cursor_dispatcher("judge", state.path());
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[2].clone()]);
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[3].clone()]);
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[0].clone()]);
+}
+
+#[test]
+fn cursor_missing_or_corrupt_file_starts_at_head() {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| workspace(CURSOR_CFG)).collect();
+    let p: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
+    let state = tempfile::tempdir().unwrap();
+    let mut d = cursor_dispatcher("judge", state.path());
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[0].clone()]);
+    for junk in ["", "not json", "{\"root\": 5}", "{\"root\": \"\"}"] {
+        std::fs::write(state.path().join("role-cursor-judge.json"), junk).unwrap();
+        let mut d = cursor_dispatcher("judge", state.path());
+        assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[0].clone()], "junk {junk:?}");
+    }
+}
+
+#[test]
+fn cursor_persisted_root_gone_from_registry_starts_at_head() {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| workspace(CURSOR_CFG)).collect();
+    let p: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
+    let state = tempfile::tempdir().unwrap();
+    let mut d = cursor_dispatcher("judge", state.path());
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[0].clone()]);
+    assert_eq!(cursor_tick(&rt, &mut d, &p), vec![p[1].clone()]);
+    drop(d);
+    let shrunk = vec![p[0].clone(), p[2].clone()];
+    let mut d = cursor_dispatcher("judge", state.path());
+    assert_eq!(cursor_tick(&rt, &mut d, &shrunk), vec![p[0].clone()]);
+}
+
+#[test]
+fn cursor_is_per_role() {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| workspace(CURSOR_CFG)).collect();
+    let p: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
+    let state = tempfile::tempdir().unwrap();
+    let mut guide = cursor_dispatcher("guide", state.path());
+    assert_eq!(cursor_tick(&rt, &mut guide, &p), vec![p[0].clone()]);
+    assert_eq!(cursor_tick(&rt, &mut guide, &p), vec![p[1].clone()]);
+    let mut judge = cursor_dispatcher("judge", state.path());
+    assert_eq!(cursor_tick(&rt, &mut judge, &p), vec![p[0].clone()]);
+}

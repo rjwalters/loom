@@ -18,7 +18,7 @@ pub(super) struct ReconcilePass {
     pub(super) saturated: bool,
 }
 
-/// [`reconcile_recent_merges`] with an optional watermark (#12152): with
+/// [`reconcile_merges_since`] with an optional watermark (#12152): with
 /// `since`, the query reads every PR merged from then on
 /// ([`reconcile_query_args`]). `None` when the forge did not answer, so the
 /// caller keeps its watermark and the next pass reads the same window again.

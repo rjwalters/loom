@@ -76,7 +76,7 @@ pub const HEAD_SCAN_BYTES: usize = 64 * 1024;
 
 /// Slack applied to both ends of the completion's time window when filtering
 /// candidate sessions by mtime. Covers clock skew, a session flushed after the
-/// reaper observed the exit, and `reconcile_recent_merges`' forge-derived
+/// reaper observed the exit, and `reconcile_merges_since`' forge-derived
 /// (rather than sweep-derived) start time.
 pub const WINDOW_SLACK: Duration = Duration::from_secs(2 * 60 * 60);
 

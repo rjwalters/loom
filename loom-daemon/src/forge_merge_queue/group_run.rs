@@ -221,11 +221,16 @@ fn rank(s: CheckState) -> u8 {
     }
 }
 
-fn run_state(status: &str, conclusion: Option<&str>) -> CheckState {
-    match (status, conclusion) {
-        ("completed", Some("success" | "neutral" | "skipped")) => CheckState::Success,
-        ("completed", _) => CheckState::Failure,
-        _ => CheckState::Pending,
+/// One check-run object's state. Terminality is the shared
+/// [`is_settled`](crate::merge_pr::check_runs_rollup::is_settled) (#13764), so a
+/// finished run GitHub left at `status: in_progress` is not stuck `Pending`.
+fn run_state(run: &Value) -> CheckState {
+    if !crate::merge_pr::check_runs_rollup::is_settled(run) {
+        return CheckState::Pending;
+    }
+    match run.get("conclusion").and_then(Value::as_str) {
+        Some("success" | "neutral" | "skipped") => CheckState::Success,
+        _ => CheckState::Failure,
     }
 }
 
@@ -280,12 +285,7 @@ pub fn states_from(
             .iter()
             .filter(|r| r.get("name").and_then(Value::as_str) == Some(ctx))
             .max_by_key(|r| r.get("id").and_then(Value::as_u64).unwrap_or(0))
-            .map(|r| {
-                run_state(
-                    r.get("status").and_then(Value::as_str).unwrap_or(""),
-                    r.get("conclusion").and_then(Value::as_str),
-                )
-            });
+            .map(run_state);
         let st = sts
             .iter()
             .find(|s| s.get("context").and_then(Value::as_str) == Some(ctx))
@@ -916,6 +916,25 @@ mod tests {
             {"id": 1, "name": "ci", "status": "completed", "conclusion": "cancelled"}]});
         let empty = json!({"total_count": 0, "statuses": []});
         assert_eq!(states_from(&req(), &cancelled, &empty).unwrap()[0].1, CheckState::Failure);
+    }
+
+    #[test]
+    fn states_settled_in_progress_run_is_terminal() {
+        let st = json!({"total_count": 0, "statuses": []});
+        let state = |run: serde_json::Value| {
+            let runs = json!({"total_count": 1, "check_runs": [run]});
+            states_from(&req(), &runs, &st).unwrap()[0].1
+        };
+        let base = |conclusion: serde_json::Value, completed_at: serde_json::Value| {
+            json!({"id": 1, "name": "ci", "status": "in_progress",
+                   "conclusion": conclusion, "completed_at": completed_at})
+        };
+        let done = json!("2026-11-11T00:00:00Z");
+        assert_eq!(state(base(json!("success"), done.clone())), CheckState::Success);
+        assert_eq!(state(base(json!("failure"), done.clone())), CheckState::Failure);
+        assert_eq!(state(base(json!(null), json!(null))), CheckState::Pending);
+        assert_eq!(state(base(json!(null), done)), CheckState::Pending);
+        assert_eq!(state(base(json!("success"), json!(null))), CheckState::Pending);
     }
 
     #[test]

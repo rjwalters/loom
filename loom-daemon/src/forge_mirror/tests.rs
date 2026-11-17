@@ -707,3 +707,16 @@ fn the_mirror_reads_aws_profile_like_the_gateway() {
     let (_, w) = parse(&cfg(json!({"origin": "github.com", "keyRef": "file:/k"})));
     assert!(w[0].contains("the mirror, not GitHub"), "{w:?}");
 }
+
+#[test]
+fn valid_slug_keeps_github_owner_rule_on_top_of_the_shared_rule() {
+    assert!(valid_slug("acme/widgets"));
+    assert!(valid_slug("acme/.github"));
+    // GitHub owners are `[A-Za-z0-9-]` only: `.` and `_` are rejected here even
+    // though the shared rule allows them.
+    assert!(!valid_slug("a.b/widgets"));
+    assert!(!valid_slug("a_b/widgets"));
+    // The shared rule still applies to the repo half.
+    assert!(!valid_slug("acme/.."));
+    assert!(!valid_slug("acme/-x"));
+}

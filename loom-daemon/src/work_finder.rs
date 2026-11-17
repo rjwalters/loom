@@ -47,7 +47,7 @@
 //! rate-limit breaker (it protects the API budget), the host-wide launch gap
 //! and `spawnConcurrency`, and the one-Champion-merge-per-repo rule. Disk
 //! hygiene still runs: the eager reclaim pass fires below the free-disk floor
-//! ([`crate::eager_reclaim::EagerTrigger`]).
+//! ([`crate::eager_reclaim::tick`]).
 //!
 //! # Idempotency & fail-safe
 //!
@@ -1933,9 +1933,6 @@ pub fn spawn_multi_work_finder_task(
         let mut was_max_concurrent: Option<usize> = None;
         // Healthy-account transition state (#4344): logged once per change.
         let mut was_healthy_tokens: Option<usize> = None;
-        // Eager reclaim trigger state (#7512, #11192, re-keyed on the
-        // free-disk floor by #12406).
-        let mut eager_trigger = crate::eager_reclaim::EagerTrigger;
         // Missing-root hygiene (#4326): tracks which registered roots are
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
@@ -2025,7 +2022,7 @@ pub fn spawn_multi_work_finder_task(
             // Eager, out-of-cycle reclaim (#7512, #11192) for `fallback_root`,
             // due while free space is below the floor (#12406). Hygiene, not
             // admission: it never changes the cap.
-            eager_trigger.tick(&fallback_root).await;
+            crate::eager_reclaim::tick(&fallback_root).await;
             // Read the filtered CPU idle (#12114) — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`

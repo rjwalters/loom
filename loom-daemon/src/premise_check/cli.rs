@@ -12,7 +12,7 @@
 //! - **Hermetic mode** (`--body-file`) — no forge calls at all, which is what
 //!   the tests drive and what makes a #7855 reconstruction reproducible.
 
-use super::{decide, evidence, exit, record, Inputs, Trigger};
+use super::{decide_with, evidence, exit, record, Inputs, Trigger};
 use crate::premise_check::record::{Exists, Outcome, Verdict};
 use std::path::{Path, PathBuf};
 
@@ -78,7 +78,12 @@ fn evaluate(opts: &Options) -> Result<i32, i32> {
         }
     };
 
-    let decision = decide(&inputs, &content_root);
+    let effective = crate::config_resolver::resolve_effective_config(&repo_root);
+    let policy = record::ReversalPolicy::from_config(
+        crate::config_resolver::get_path(&effective, "hermit.reversalNeedsOperator")
+            .and_then(serde_json::Value::as_str),
+    );
+    let decision = decide_with(&inputs, &content_root, policy);
 
     println!(
         "SCOPE={}",

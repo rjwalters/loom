@@ -20,10 +20,13 @@
 //!   dispatch resolves the target workspace from the registry, so a worker can
 //!   register several repos.
 //!
-//! The **only** remaining cwd coupling is the token pool (#4292, still open):
-//! the systemd unit pins `WorkingDirectory=` to a workspace clone so
-//! `.loom/tokens/` resolves. That workaround is marked with `#4292` in the
-//! rendered unit so it is removed when #4292 lands.
+//! The systemd unit does still pin `WorkingDirectory=` to a workspace clone,
+//! but not for the token pool: the pool is provisioned with `tokens bootstrap
+//! --shared` and resolves independently of cwd. The pin is there because the
+//! fleet unit sets no `LOOM_WORKSPACE`, so the daemon's cwd is what seeds its
+//! *primary workspace* — pinning it to the first registered clone keeps that
+//! workspace a real repo root rather than an incidental cwd, the same property
+//! the canonical `loom-daemon-start` unit maintains.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
@@ -1236,8 +1239,13 @@ fn render_workspace_register(repos: &[String], weight: u32) -> String {
 }
 
 fn render_daemon_unit(primary_rel: &str) -> String {
-    // WorkingDirectory pinned to a workspace clone is the #4292 token-pool cwd
-    // workaround — REMOVE once #4292 lands (token pool no longer cwd-coupled).
+    // WorkingDirectory is pinned to the first registered workspace clone
+    // because the fleet unit sets no LOOM_WORKSPACE, so the daemon's cwd is
+    // what seeds its primary workspace; the canonical loom-daemon-start unit
+    // pins it for the same reason. It is not a token-pool workaround — the
+    // pool is bootstrapped with `tokens bootstrap --shared` and resolves
+    // independently of cwd. The daemon-watchdog step below depends on this
+    // pin: it runs from the SAME workspace root.
     //
     // The supervision directives (Restart=always + RestartPreventExitStatus=,
     // RestartSec=, KillMode=mixed, TimeoutStopSec=20, OOMPolicy=continue,
@@ -1270,10 +1278,9 @@ Wants=network-online.target
 {start_limit}
 [Service]
 Type=simple
-# WORKAROUND(#4292): the token pool resolves via the daemon's cwd, so pin the
-# working directory to a workspace clone whose .loom/tokens/ the daemon can
-# find. Remove this WorkingDirectory line once #4292 (cwd-decoupled token pool)
-# lands.
+# The daemon's cwd seeds its primary workspace, so pin it to the first
+# registered workspace clone instead of leaving it an incidental cwd — the
+# same property the canonical loom-daemon-start unit maintains.
 WorkingDirectory=%h/{primary_rel}
 ExecStart=%h/.local/bin/loom-daemon
 # The supervision block below is rendered by the canonical

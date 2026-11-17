@@ -66,8 +66,8 @@ fn reject_workspace_inside_pool(resolved: &Path) -> Result<()> {
 
 /// `loom-daemon claude-config` handler (issue #4415).
 pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result<()> {
-    use crate::terminal::{
-        claude_config_cleanup, claude_config_setup, claude_config_trust, claude_config_validate,
+    use crate::claude_config::{
+        cleanup_agent_config_dir, setup_agent_config_dir, trust_project, validate_agent_config_dir,
     };
 
     match action {
@@ -77,7 +77,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             json,
         } => {
             let repo_root = resolve_tokens_workspace(&workspace)?;
-            match claude_config_setup(&name, &repo_root) {
+            match setup_agent_config_dir(&name, &repo_root) {
                 Some(config_dir) => {
                     if json {
                         let mut obj = serde_json::Map::new();
@@ -104,7 +104,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             json,
         } => {
             let repo_root = resolve_tokens_workspace(&workspace)?;
-            let removed = claude_config_cleanup(&name, &repo_root);
+            let removed = cleanup_agent_config_dir(&name, &repo_root);
             if json {
                 let mut obj = serde_json::Map::new();
                 obj.insert("removed".to_string(), serde_json::Value::Bool(removed));
@@ -123,7 +123,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             json,
         } => {
             let repo_root = resolve_tokens_workspace(&workspace)?;
-            let healthy = claude_config_validate(&name, &repo_root);
+            let healthy = validate_agent_config_dir(&name, &repo_root);
             if json {
                 let mut obj = serde_json::Map::new();
                 obj.insert("healthy".to_string(), serde_json::Value::Bool(healthy));
@@ -146,7 +146,7 @@ pub(crate) fn handle_claude_config_command(action: ClaudeConfigAction) -> Result
             } else {
                 std::env::current_dir()?.join(p)
             };
-            claude_config_trust(&project_path);
+            trust_project(&project_path);
             Ok(())
         }
     }
@@ -619,6 +619,26 @@ fn print_monitor_import(result: &crate::tokens_pool::monitor_db::MonitorImportRe
     }
 }
 
+/// Render a ranking snapshot as the `tokens pressure` fraction (#13839).
+///
+/// `unhealthy / total` to four decimals, or the literal `0` when there is no
+/// ranking data at all ([`crate::capacity::read_ranking`] returns `None` for
+/// an absent, unreadable, or row-less file). The `0` branch is load-bearing:
+/// Guide's Step 4b fails **open** on missing telemetry, so "no data" must be
+/// indistinguishable from "no pressure" to the caller.
+///
+/// `total == 0` cannot reach here through `read_ranking` (it returns `None`
+/// instead), but it is matched explicitly anyway so this function can never
+/// divide by zero regardless of who constructs the snapshot.
+fn format_pressure(snapshot: Option<crate::capacity::RankingSnapshot>) -> String {
+    match snapshot {
+        Some(s) if s.total > 0 => {
+            format!("{:.4}", s.unhealthy() as f64 / s.total as f64)
+        }
+        _ => "0".to_string(),
+    }
+}
+
 /// Handle `loom-daemon tokens <select|pin|unpin|unblock|mark-bad>` (Issue
 /// #4082, Phase 1 of epic #4081; `mark-bad` added in #4228, Phase 2). Purely
 /// file-based — does not require a running daemon. See
@@ -935,6 +955,12 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             } else {
                 println!("No allowlist was active.");
             }
+            Ok(())
+        }
+
+        TokensAction::Pressure { workspace } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            println!("{}", format_pressure(crate::capacity::read_ranking(&ws)));
             Ok(())
         }
 

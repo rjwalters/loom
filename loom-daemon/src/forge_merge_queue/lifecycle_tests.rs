@@ -706,6 +706,30 @@ fn conflict_drop_routes_to_doctor_with_the_verbatim_reason() {
 }
 
 #[test]
+fn hold_caused_group_failure_is_a_hold_not_a_doctor_route() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    hand(&gh, &ev).unwrap();
+    gh.comments.borrow_mut().push(format!(
+        "<!-- champion:merge-risk-hold -->\nheld\n<!-- champion:hold-state head={SHA1} -->"
+    ));
+    gh.github_drops(
+        Some("Required status check \"Daemon Checks\" failed"),
+        t0() + Duration::minutes(3),
+    );
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(4));
+    let r = reconcile_pr(&c, PR);
+    assert!(matches!(
+        r,
+        Reconciled::Dropped {
+            kind: RemovalKind::HumanHold,
+            route_error: None,
+            ..
+        }
+    ));
+    assert!(gh.has_label("loom:pr") && !gh.has_label("loom:changes-requested"));
+}
+
+#[test]
 fn check_failure_and_timeout_use_their_existing_routes() {
     let (gh, _, r) = drop_with(Some("Required status check \"Daemon Checks\" failed"));
     assert!(matches!(

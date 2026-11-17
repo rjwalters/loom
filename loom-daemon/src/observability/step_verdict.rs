@@ -18,7 +18,7 @@
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
 //! item to a closed, versioned `(class, reason)`. Registered: `champion`
-//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921) and `judge` ([`judge`], #13274);
+//! ([`champion`]), `doctor` ([`doctor`]) and `curator` ([`curator`], #12921) and `judge` ([`judge`], #13274, #12362);
 //! other roles add theirs (#12029).
 //!
 //! # The ledger's view, record-only
@@ -87,6 +87,8 @@ pub enum Event {
         at: DateTime<Utc>,
         action: String,
         by: String,
+        /// The head the write was made against, when its writer knew it.
+        head_sha: Option<String>,
     },
 }
 
@@ -139,7 +141,7 @@ pub struct Projection {
     pub detail: Option<String>,
 }
 
-/// A role's projection (#12027 registers Champion; #12029 adds Judge).
+/// A role's projection (#12027 registers Champion; #12362 adds Judge).
 #[derive(Debug, Clone, Copy)]
 pub struct Projector {
     /// The `step` value for an item of this kind.
@@ -332,6 +334,7 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                 is_pr,
                 action,
                 by,
+                head_sha,
             } => Some((
                 *number,
                 Some(*is_pr),
@@ -339,6 +342,7 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     at: *at,
                     action: action.clone(),
                     by: by.clone(),
+                    head_sha: head_sha.clone(),
                 },
             )),
             JournalEntry::Queue { .. }

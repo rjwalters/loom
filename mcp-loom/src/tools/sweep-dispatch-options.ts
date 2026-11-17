@@ -1,7 +1,7 @@
 /**
  * Optional `dispatch_sweep` operator options (issue #4317 `force`):
- * input-schema properties, defensive argument extraction, and wire-body mapping. Lives beside `sweeps.ts` so that
- * ratcheted file does not grow (.loom/docs/file-size-policy.md).
+ * input-schema properties, defensive argument extraction, and wire-body
+ * mapping. Lives beside `sweeps.ts`.
  */
 
 export interface DispatchOptions {

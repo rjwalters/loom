@@ -52,6 +52,7 @@ const MERGE: &str = "merge settings hidden from a reader App; the merging writer
 const PROTECTION: &str = "classic branch protection (GraphQL) is asker-dependent; a reader that \
                           cannot see it would answer 'no required contexts' and fail the merge \
                           guard open";
+const LOCAL_TOKEN: &str = "local `gh auth token` read of the chosen credential; sends no request";
 
 /// `(file relative to loom-daemon/src, reason)` pairs allowed to pin a read
 /// to the writer. Only ever remove entries.
@@ -74,6 +75,7 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("merge_group_ci/eligibility.rs", ASKER),
     ("merge_pr/stale_checks/fetch.rs", PROTECTION),
     ("observability/ops/ratelimit.rs", ASKER),
+    ("tokens_pool/private_workspace/forge_auth.rs", LOCAL_TOKEN),
     ("write_scope/probe.rs", ASKER),
 ];
 

@@ -222,13 +222,7 @@ pub fn classify(
 /// and nothing is inherited, so no child can write into the caller's
 /// protocol stream.
 fn git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let out = crate::git_utils::git_run(repo, args).ok()?;
     out.status.success().then_some(out.stdout)
 }
 

@@ -529,7 +529,7 @@ fn pin_repo(mut args: Vec<String>, cwd: Option<&Path>) -> Option<Vec<String>> {
         return Some(args);
     }
     let repo = match std::env::var("GH_REPO").ok().filter(|r| !r.is_empty()) {
-        Some(r) => classify::is_slug(&r).then_some(r)?,
+        Some(r) => crate::forge_slug::valid_slug(&r).then_some(r)?,
         None => implicit_repo(&git_remote_config(cwd?)?)?,
     };
     args.extend(["--repo".to_string(), repo]);
@@ -579,7 +579,7 @@ pub fn implicit_repo(remote_config: &str) -> Option<String> {
         }
     }
     let (host, nwo) = crate::forge_etag_store::parse_remote_url(&url?)?;
-    (host == "github.com" && classify::is_slug(&nwo)).then_some(nwo)
+    (host == "github.com" && crate::forge_slug::valid_slug(&nwo)).then_some(nwo)
 }
 
 /// Append one `x-loom-cache` record to `$GH_CACHE_OUTCOME_LOG` (the opt-in

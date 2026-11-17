@@ -29,6 +29,12 @@ struct Fake {
     /// After this many listings of `label`, a new open item carrying it
     /// appears (a concurrent labeller).
     appear: Option<(String, usize, u64)>,
+    /// The listing keeps showing an item for a label removed from it (a
+    /// lagging list endpoint); direct per-item reads stay correct.
+    lag_removals: bool,
+    ghosts: RefCell<BTreeSet<(u64, String)>>,
+    /// Items whose direct label read errors.
+    read_fails: BTreeSet<u64>,
     /// Calls (by index) answered with a rate limit.
     rate_limit_at: Option<usize>,
 }
@@ -62,7 +68,7 @@ impl Fake {
         self.calls
             .borrow()
             .iter()
-            .filter(|c| !c.starts_with("live") && !c.starts_with("list"))
+            .filter(|c| !c.starts_with("live") && !c.starts_with("list") && !c.starts_with("read"))
             .cloned()
             .collect()
     }
@@ -103,7 +109,7 @@ impl MigrateForge for Fake {
                 }
             }
         }
-        let all: Vec<Item> = self
+        let mut all: Vec<Item> = self
             .items
             .borrow()
             .iter()
@@ -113,8 +119,25 @@ impl MigrateForge for Fake {
                 labels: ls.iter().cloned().collect(),
             })
             .collect();
+        for (n, l) in self.ghosts.borrow().iter() {
+            if l == label && !all.iter().any(|i| i.number == *n) {
+                all.push(Item {
+                    number: *n,
+                    labels: vec![l.clone()],
+                });
+            }
+        }
+        all.sort_by_key(|i| i.number);
         let start = (page as usize - 1) * PER_PAGE;
         Ok(all.into_iter().skip(start).take(PER_PAGE).collect())
+    }
+
+    fn item_labels(&self, number: u64) -> Result<Vec<String>, ForgeError> {
+        self.log(format!("read #{number}"))?;
+        if self.read_fails.contains(&number) {
+            return Err(ForgeError::Other("HTTP 502".into()));
+        }
+        Ok(self.labels_of(number).into_iter().collect())
     }
 
     fn add_label(&self, number: u64, label: &str) -> Result<(), ForgeError> {
@@ -141,6 +164,9 @@ impl MigrateForge for Fake {
             .get_mut(&number)
             .is_some_and(|ls| ls.remove(label));
         if removed {
+            if self.lag_removals {
+                self.ghosts.borrow_mut().insert((number, label.to_string()));
+            }
             Ok(())
         } else {
             Err(ForgeError::NotFound("HTTP 404".into()))
@@ -633,4 +659,33 @@ fn the_registry_retires_needs_revision_onto_triage_without_curated() {
     assert_eq!(r.replaced_by.as_deref(), Some(TRIAGE));
     assert_eq!(r.also_remove, vec![CURATED.to_string()]);
     assert!(r.owned);
+}
+
+#[test]
+fn a_lagging_listing_does_not_keep_labels_just_removed_in_the_same_pass() {
+    // #13754: one issue carrying three retired labels; the list endpoint
+    // still returns it after each removal. One apply must reach remaining=0.
+    let (a, b, c) = ("loom:urgent", "loom:operator-only", "loom:operator-mechanical");
+    let mut f = Fake::new(&[a, b, c, IMPORTANT]).item(9, &[a, b, c]);
+    f.lag_removals = true;
+    let m = vec![
+        retired(a, None, true),
+        retired(b, Some(IMPORTANT), true),
+        retired(c, Some(IMPORTANT), true),
+    ];
+    let r = run(&f, "o/r", &m, true);
+    assert_eq!(r.summary.remaining, 0, "{}", text(&r));
+    assert_eq!(r.summary.deleted, 3, "{}", text(&r));
+    assert!(!text(&r).contains("KEPT"), "{}", text(&r));
+}
+
+#[test]
+fn an_unreadable_item_keeps_the_label_when_the_listing_lags() {
+    let mut f = Fake::new(&[STAR, IMPORTANT]).item(7, &[STAR]);
+    f.lag_removals = true;
+    f.read_fails.insert(7);
+    let r = run(&f, "o/r", &[retired(STAR, Some(IMPORTANT), true)], true);
+    assert!(!f.writes().iter().any(|w| w.starts_with("delete")), "{:?}", f.writes());
+    assert!(text(&r).contains("KEPT loom:operator-priority"), "{}", text(&r));
+    assert_eq!(r.summary.remaining, 1);
 }

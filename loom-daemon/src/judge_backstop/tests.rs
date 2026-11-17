@@ -273,3 +273,15 @@ fn refused_and_ordinary_records_mix_by_the_later_end() {
     let many = [ord, refd.clone(), refd.clone(), refd];
     assert_eq!(hold_until(&many, HEAD, "review-requested", at(12)), Some(t(1)));
 }
+
+/// #13758: a finished run GitHub left at `in_progress` is not pending.
+#[test]
+fn stuck_in_progress_run_with_conclusion_is_not_pending() {
+    let page = serde_json::json!({"total_count": 2, "check_runs": [
+        {"status": "in_progress", "conclusion": "success",
+         "completed_at": "2026-11-10T03:25:28Z", "started_at": "a"},
+        {"status": "in_progress", "conclusion": "success",
+         "completed_at": null, "started_at": "b"},
+    ]});
+    assert_eq!(pending_check_runs(&page), vec!["b".to_string()]);
+}

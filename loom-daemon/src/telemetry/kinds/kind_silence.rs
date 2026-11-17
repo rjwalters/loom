@@ -44,7 +44,6 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("eta.stage_entry", None),
     ("pass.verdict", None),
     ("token_ranking.refresh", None),
-    ("operator.presence", None),
     ("checkout.external_change", None),
     ("roster.change", None),
     ("issue.estimate", None),

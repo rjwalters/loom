@@ -1,292 +1,35 @@
-//! Statistics and metrics views for agent effectiveness analysis.
+//! Statistics and metrics queries for agent effectiveness analysis.
 //!
-//! This module provides SQL views and query functions for aggregating
-//! correlation data into actionable metrics:
-//! - Agent effectiveness by role
-//! - Cost efficiency comparisons
-//! - Success rate trends
-//! - Velocity metrics
-//!
-//! # Views
-//!
-//! The following SQL views are created:
-//! - `agent_effectiveness` - Summary metrics per agent role
-//! - `cost_per_issue` - Cost and effort breakdown per GitHub issue
-//! - `daily_velocity` - Daily productivity metrics
+//! This module provides query functions that aggregate correlation data
+//! (querying the base tables directly) into actionable metrics:
+//! - Agent effectiveness by role (optionally per model)
+//! - Cost per issue
+//! - Weekly velocity
+//! - Overall summary metrics
 //!
 //! # Example
 //!
 //! ```ignore
-//! use activity::stats::{AgentEffectiveness, CostPerIssue};
+//! use activity::stats::StatsQueries;
 //!
 //! let db = ActivityDb::new("activity.db".into())?;
-//!
-//! // Get agent effectiveness metrics
-//! let effectiveness = db.get_agent_effectiveness(None)?;
-//! for agent in effectiveness {
-//!     println!("{}: {}% success rate", agent.agent_role, agent.success_rate);
+//! let rows = db.get_effectiveness_rows(None, "all", false)?;
+//! for row in rows {
+//!     println!("{}: {}% success rate", row.role, row.success_rate);
 //! }
-//!
-//! // Get cost breakdown for issue #42
-//! let cost = db.get_cost_per_issue(Some(42))?;
 //! ```
 
-use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-
-/// Agent effectiveness metrics aggregated by role.
-///
-/// Provides summary statistics for each agent role including
-/// success rates, average costs, and average duration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentEffectiveness {
-    /// Agent role (e.g., "builder", "judge", "curator")
-    pub agent_role: String,
-    /// Total number of prompts/tasks for this role
-    pub total_prompts: i64,
-    /// Number of prompts that resulted in successful outcomes
-    pub successful_prompts: i64,
-    /// Success rate as a percentage (0.0 - 100.0)
-    pub success_rate: f64,
-    /// Average cost per prompt in USD
-    pub avg_cost: f64,
-    /// Average duration per prompt in seconds
-    pub avg_duration_sec: f64,
-    /// `true` when at least one `resource_usage` row is joined for this role
-    /// — i.e. `avg_cost`/`avg_duration_sec` reflect a real (possibly-zero)
-    /// measurement rather than "never recorded". `stats`'s text renderer
-    /// prints `n/a` for those two fields when this is `false` (#6128), since
-    /// a bare `0`/`0.0%` is indistinguishable from a genuine failure.
-    #[serde(default = "default_true")]
-    pub cost_data_available: bool,
-    /// `true` when at least one `quality_metrics` row is joined for this
-    /// role — gates `success_rate` the same way `cost_data_available` gates
-    /// the cost/duration fields (#6128).
-    #[serde(default = "default_true")]
-    pub quality_data_available: bool,
-}
-
-/// `serde(default)` helper — see [`AgentEffectiveness::cost_data_available`].
-/// Defaults new deserializers (e.g. a JSON fixture written before #6128) to
-/// `true` so pre-existing callers that never see this field keep the old
-/// "trust the number" behavior instead of silently flipping to `n/a`.
-fn default_true() -> bool {
-    true
-}
-
-/// Cost and effort breakdown per GitHub issue.
-///
-/// Aggregates all prompts associated with a specific issue
-/// to track total cost, token usage, and time spent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostPerIssue {
-    /// GitHub issue number
-    pub issue_number: i32,
-    /// Number of prompts used for this issue
-    pub prompt_count: i64,
-    /// Total cost in USD
-    pub total_cost: f64,
-    /// Total tokens used (input + output)
-    pub total_tokens: i64,
-    /// Timestamp when work started on this issue
-    pub started: Option<DateTime<Utc>>,
-    /// Timestamp when work was completed
-    pub completed: Option<DateTime<Utc>>,
-}
-
-/// Weekly velocity summary for trend analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WeeklyVelocity {
-    /// Week identifier (YYYY-WNN format)
-    pub week: String,
-    /// Total prompts for the week
-    pub prompts: i64,
-    /// Total cost for the week in USD
-    pub cost: f64,
-}
-
-/// Overall stats summary for quick dashboard display.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatsSummary {
-    /// Total number of prompts recorded
-    pub total_prompts: i64,
-    /// Total cost in USD across all activity
-    pub total_cost: f64,
-    /// Total tokens used
-    pub total_tokens: i64,
-    /// Number of unique issues worked on
-    pub issues_count: i64,
-    /// Number of unique PRs created
-    pub prs_count: i64,
-    /// Average success rate across all roles
-    pub avg_success_rate: f64,
-    /// `true` when at least one `resource_usage` row exists anywhere in the
-    /// database — gates `total_cost`/`total_tokens` (#6128): distinguishes
-    /// "no cost telemetry has ever been recorded" from "recorded, and it
-    /// happens to be zero".
-    #[serde(default = "default_true")]
-    pub cost_data_available: bool,
-    /// `true` when at least one `prompt_github` row exists — gates
-    /// `issues_count`/`prs_count` the same way `cost_data_available` gates
-    /// the cost fields (#6128).
-    #[serde(default = "default_true")]
-    pub github_data_available: bool,
-    /// `true` when at least one `quality_metrics` row exists — gates
-    /// `avg_success_rate` the same way (#6128).
-    #[serde(default = "default_true")]
-    pub quality_data_available: bool,
-}
-
-/// Detect and repair a stale pre-#6150 `agent_effectiveness` view shape.
-///
-/// `resource_rows`/`quality_rows` were added to the `agent_effectiveness`
-/// view's `SELECT` list in #6150, but the view is (re)created with `CREATE
-/// VIEW IF NOT EXISTS` below — a no-op when a view of that name already
-/// exists. Unlike the `ALTER TABLE ADD COLUMN` migration pattern used for
-/// tables elsewhere (`schema.rs`'s `migrate_token_usage_table` /
-/// `migrate_quality_metrics_table`), SQLite has no `ALTER VIEW`, so any
-/// `activity.db` created before #6150 keeps the old view shape forever and
-/// `query_agent_effectiveness` crashes with "no such column: resource_rows"
-/// (#8061).
-///
-/// This mirrors that table-migration pattern for views: detect the stale
-/// shape via `PRAGMA table_info` (works for views too) and `DROP VIEW` so the
-/// `CREATE VIEW IF NOT EXISTS` immediately below can recreate it with the
-/// current columns. Idempotent — a view already on the current shape (or a
-/// database where the view doesn't exist yet) is left untouched, so this
-/// does not re-migrate on every startup.
-fn migrate_agent_effectiveness_view(conn: &Connection) {
-    let columns: Vec<String> = match conn.prepare("PRAGMA table_info(agent_effectiveness)") {
-        Ok(mut stmt) => {
-            let result = stmt
-                .query_map([], |row| row.get::<_, String>(1))
-                .and_then(Iterator::collect);
-            match result {
-                Ok(cols) => cols,
-                Err(e) => {
-                    log::debug!(
-                        "Could not inspect agent_effectiveness view columns: {e} (may be expected)"
-                    );
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            log::debug!("Could not prepare PRAGMA table_info(agent_effectiveness): {e}");
-            return;
-        }
-    };
-
-    if columns.is_empty() {
-        // View doesn't exist yet (fresh database) — the CREATE VIEW IF NOT
-        // EXISTS below will create it with the current shape. Nothing to
-        // migrate.
-        return;
-    }
-
-    if columns.iter().any(|c| c == "resource_rows") {
-        // Already the current shape — idempotent no-op.
-        return;
-    }
-
-    log::info!(
-        "Detected stale pre-#6150 agent_effectiveness view shape (missing resource_rows); dropping so it can be recreated"
-    );
-    if let Err(e) = conn.execute_batch("DROP VIEW IF EXISTS agent_effectiveness;") {
-        log::warn!("Could not drop stale agent_effectiveness view: {e}");
-    }
-}
-
-/// Create the SQL views for agent effectiveness metrics.
-///
-/// This function creates the following views:
-/// - `agent_effectiveness` - Aggregates metrics by agent role
-/// - `cost_per_issue` - Aggregates costs by GitHub issue
-/// - `daily_velocity` - Aggregates activity by day
-///
-/// Views use LEFT JOINs to handle cases where correlation tables
-/// may not have data for all prompts (e.g., prompts without GitHub links).
-pub fn create_stats_views(conn: &Connection) -> rusqlite::Result<()> {
-    // Migrate a stale pre-#6150 agent_effectiveness view shape before
-    // (re)creating it below — see `migrate_agent_effectiveness_view` (#8061).
-    migrate_agent_effectiveness_view(conn);
-
-    // Agent effectiveness view
-    // Joins agent_inputs with quality_metrics and resource_usage to compute
-    // success rates, average costs, and durations per agent role.
-    conn.execute_batch(
-        r"
-        CREATE VIEW IF NOT EXISTS agent_effectiveness AS
-        SELECT
-            COALESCE(i.agent_role, 'unknown') as agent_role,
-            COUNT(*) as total_prompts,
-            SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) as successful_prompts,
-            ROUND(100.0 * SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as success_rate,
-            ROUND(COALESCE(AVG(r.cost_usd), 0.0), 4) as avg_cost,
-            ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0.0), 1) as avg_duration_sec,
-            SUM(CASE WHEN r.input_id IS NOT NULL THEN 1 ELSE 0 END) as resource_rows,
-            SUM(CASE WHEN q.input_id IS NOT NULL THEN 1 ELSE 0 END) as quality_rows
-        FROM agent_inputs i
-        LEFT JOIN quality_metrics q ON i.id = q.input_id
-        LEFT JOIN resource_usage r ON i.id = r.input_id
-        GROUP BY COALESCE(i.agent_role, 'unknown');
-        ",
-    )?;
-
-    // Cost per issue view
-    // Aggregates all prompts linked to GitHub issues via prompt_github table
-    // to calculate total cost, tokens, and time span per issue.
-    conn.execute_batch(
-        r"
-        CREATE VIEW IF NOT EXISTS cost_per_issue AS
-        SELECT
-            pg.issue_number,
-            COUNT(DISTINCT i.id) as prompt_count,
-            COALESCE(SUM(r.cost_usd), 0.0) as total_cost,
-            COALESCE(SUM(r.tokens_input + r.tokens_output), 0) as total_tokens,
-            MIN(i.timestamp) as started,
-            MAX(i.timestamp) as completed
-        FROM prompt_github pg
-        JOIN agent_inputs i ON pg.input_id = i.id
-        LEFT JOIN resource_usage r ON i.id = r.input_id
-        WHERE pg.issue_number IS NOT NULL
-        GROUP BY pg.issue_number;
-        ",
-    )?;
-
-    // Daily velocity view
-    // Aggregates activity by day for trend analysis including
-    // prompt counts, issues touched, PRs created, and daily cost.
-    conn.execute_batch(
-        r"
-        CREATE VIEW IF NOT EXISTS daily_velocity AS
-        SELECT
-            DATE(i.timestamp) as date,
-            COUNT(*) as prompts,
-            COUNT(DISTINCT pg.issue_number) as issues_touched,
-            COUNT(DISTINCT CASE WHEN pg.event_type = 'pr_created' THEN pg.pr_number END) as prs_created,
-            COALESCE(SUM(r.cost_usd), 0.0) as daily_cost
-        FROM agent_inputs i
-        LEFT JOIN prompt_github pg ON i.id = pg.input_id
-        LEFT JOIN resource_usage r ON i.id = r.input_id
-        GROUP BY DATE(i.timestamp);
-        ",
-    )?;
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // `agent-metrics` CLI parity (epic #4081 Phase 3 family 4, issue #4274).
 //
 // The types and queries below are the native port of
 // `loom_tools.agent_metrics` — the CLI contract `agent-metrics.sh` and
-// `mcp__loom__get_agent_metrics` invoke. They intentionally do NOT reuse the
-// `AgentEffectiveness`/`CostPerIssue` views above: those back the original
-// `loom-daemon stats` dashboard and have no period filter or per-model
-// dimension. Querying the base tables directly (mirroring the Python SQL)
-// keeps both surfaces independently stable.
+// `mcp__loom__get_agent_metrics` invoke, and the sole source for the
+// `loom-daemon stats` dashboard. They query the base tables directly
+// (mirroring the Python SQL), with period filter and per-model dimension.
 // ---------------------------------------------------------------------------
 
 /// Summary metrics for the `agent-metrics summary` command.
@@ -298,6 +41,17 @@ pub struct SummaryMetrics {
     pub issues_count: i64,
     pub prs_count: i64,
     pub success_rate: f64,
+    /// At least one `resource_usage` row falls in scope. Gates the cost/token
+    /// fields in the `loom-daemon stats` dashboard (`n/a` instead of `0`,
+    /// #6128). `serde(skip)`: not part of the `agent-metrics` JSON contract.
+    #[serde(skip)]
+    pub cost_data_available: bool,
+    /// At least one `prompt_github` row falls in scope (gates issues/PRs).
+    #[serde(skip)]
+    pub github_data_available: bool,
+    /// At least one `quality_metrics` row falls in scope (gates success rate).
+    #[serde(skip)]
+    pub quality_data_available: bool,
 }
 
 /// Effectiveness row for the `agent-metrics effectiveness` command,
@@ -316,6 +70,14 @@ pub struct EffectivenessRow {
     /// JSON shape for existing consumers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// At least one `resource_usage` row backs this group (gates
+    /// `avg_cost`/`avg_duration_sec`, #6128). `serde(skip)`: dashboard only.
+    #[serde(skip)]
+    pub cost_data_available: bool,
+    /// At least one `quality_metrics` row backs this group (gates
+    /// `success_rate`, #6128). `serde(skip)`: dashboard only.
+    #[serde(skip)]
+    pub quality_data_available: bool,
 }
 
 /// Cost row for the `agent-metrics costs` command, optionally grouped by
@@ -328,6 +90,13 @@ pub struct CostRow {
     pub total_tokens: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Earliest prompt timestamp for the issue (raw DB text). `serde(skip)`:
+    /// used only by the `loom-daemon stats --issue` breakdown.
+    #[serde(skip)]
+    pub started: Option<String>,
+    /// Latest prompt timestamp for the issue (raw DB text). `serde(skip)`.
+    #[serde(skip)]
+    pub completed: Option<String>,
 }
 
 /// Weekly velocity row for the `agent-metrics velocity` command (last 8
@@ -374,20 +143,24 @@ pub fn query_summary_metrics(
     let role_filter = role_sql_filter(role);
     let period_filter = period_sql_filter(period);
 
-    let (total_prompts, total_tokens, total_cost, issues_count, prs_count): (
-        i64,
-        i64,
-        f64,
-        i64,
-        i64,
-    ) = conn.query_row(
+    let (
+        total_prompts,
+        total_tokens,
+        total_cost,
+        issues_count,
+        prs_count,
+        resource_rows,
+        github_rows,
+    ): (i64, i64, f64, i64, i64, i64, i64) = conn.query_row(
         &format!(
             r"SELECT
                 COUNT(*),
                 COALESCE(SUM(r.tokens_input + r.tokens_output), 0),
                 ROUND(COALESCE(SUM(r.cost_usd), 0), 4),
                 COUNT(DISTINCT pg.issue_number),
-                COUNT(DISTINCT pg.pr_number)
+                COUNT(DISTINCT pg.pr_number),
+                COUNT(r.input_id),
+                COUNT(pg.input_id)
               FROM agent_inputs i
               LEFT JOIN resource_usage r ON i.id = r.input_id
               LEFT JOIN prompt_github pg ON i.id = pg.input_id
@@ -401,14 +174,15 @@ pub fn query_summary_metrics(
                 row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
 
-    let success_rate: f64 = conn
-        .query_row(
-            &format!(
-                r"SELECT
+    let (success_rate, quality_rows): (f64, i64) = conn.query_row(
+        &format!(
+            r"SELECT
                     ROUND(
                         100.0 * SUM(
                             CASE WHEN q.tests_passed > 0
@@ -416,15 +190,15 @@ pub fn query_summary_metrics(
                             THEN 1 ELSE 0 END
                         ) / NULLIF(COUNT(*), 0),
                         1
-                    )
+                    ),
+                    COUNT(q.input_id)
                   FROM agent_inputs i
                   LEFT JOIN quality_metrics q ON i.id = q.input_id
                   WHERE 1=1 {role_filter} {period_filter}"
-            ),
-            [],
-            |row| row.get::<_, Option<f64>>(0),
-        )?
-        .unwrap_or(0.0);
+        ),
+        [],
+        |row| Ok((row.get::<_, Option<f64>>(0)?.unwrap_or(0.0), row.get::<_, i64>(1)?)),
+    )?;
 
     Ok(SummaryMetrics {
         total_prompts,
@@ -433,6 +207,9 @@ pub fn query_summary_metrics(
         issues_count,
         prs_count,
         success_rate,
+        cost_data_available: resource_rows > 0,
+        github_data_available: github_rows > 0,
+        quality_data_available: quality_rows > 0,
     })
 }
 
@@ -464,7 +241,9 @@ pub fn query_effectiveness_rows(
             SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) as successful_prompts,
             ROUND(100.0 * SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as success_rate,
             ROUND(COALESCE(AVG(r.cost_usd), 0), 4) as avg_cost,
-            ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0), 1) as avg_duration_sec
+            ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0), 1) as avg_duration_sec,
+            COUNT(r.input_id) as resource_rows,
+            COUNT(q.input_id) as quality_rows
           FROM agent_inputs i
           LEFT JOIN quality_metrics q ON i.id = q.input_id
           LEFT JOIN resource_usage r ON i.id = r.input_id
@@ -494,6 +273,8 @@ pub fn query_effectiveness_rows(
             } else {
                 None
             },
+            cost_data_available: row.get::<_, i64>("resource_rows")? > 0,
+            quality_data_available: row.get::<_, i64>("quality_rows")? > 0,
         })
     })?;
 
@@ -527,7 +308,9 @@ pub fn query_cost_rows(
             {model_select}
             COUNT(DISTINCT i.id) as prompt_count,
             ROUND(COALESCE(SUM(r.cost_usd), 0), 4) as total_cost,
-            COALESCE(SUM(r.tokens_input + r.tokens_output), 0) as total_tokens
+            COALESCE(SUM(r.tokens_input + r.tokens_output), 0) as total_tokens,
+            MIN(i.timestamp) as started,
+            MAX(i.timestamp) as completed
           FROM prompt_github pg
           JOIN agent_inputs i ON pg.input_id = i.id
           LEFT JOIN resource_usage r ON i.id = r.input_id
@@ -555,6 +338,8 @@ pub fn query_cost_rows(
                 } else {
                     None
                 },
+                started: row.get("started")?,
+                completed: row.get("completed")?,
             },
         ))
     })?;
@@ -606,39 +391,6 @@ pub fn query_velocity_rows(conn: &Connection) -> rusqlite::Result<Vec<VelocityRo
 /// These methods are implemented on `ActivityDb` via extension trait
 /// to keep the stats functionality modular.
 pub trait StatsQueries {
-    /// Get agent effectiveness metrics, optionally filtered by role.
-    ///
-    /// # Arguments
-    /// * `role` - Optional role filter (e.g., "builder", "judge")
-    ///
-    /// # Returns
-    /// Vector of `AgentEffectiveness` records ordered by success rate descending.
-    fn get_agent_effectiveness(
-        &self,
-        role: Option<&str>,
-    ) -> rusqlite::Result<Vec<AgentEffectiveness>>;
-
-    /// Get cost breakdown per issue, optionally filtered by issue number.
-    ///
-    /// # Arguments
-    /// * `issue_number` - Optional issue number filter
-    ///
-    /// # Returns
-    /// Vector of `CostPerIssue` records ordered by total cost descending.
-    fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>>;
-
-    /// Get weekly velocity summary for trend analysis.
-    ///
-    /// # Returns
-    /// Vector of `WeeklyVelocity` records ordered by week ascending.
-    fn get_weekly_velocity(&self) -> rusqlite::Result<Vec<WeeklyVelocity>>;
-
-    /// Get overall stats summary.
-    ///
-    /// # Returns
-    /// A `StatsSummary` with aggregate metrics.
-    fn get_stats_summary(&self) -> rusqlite::Result<StatsSummary>;
-
     /// `agent-metrics summary` parity: role/period-filtered summary metrics
     /// (issue #4274).
     fn get_summary_metrics(
@@ -669,190 +421,6 @@ pub trait StatsQueries {
     fn get_velocity_rows(&self) -> rusqlite::Result<Vec<VelocityRow>>;
 }
 
-/// Implementation of stats queries for any type that provides a Connection reference.
-pub fn query_agent_effectiveness(
-    conn: &Connection,
-    role: Option<&str>,
-) -> rusqlite::Result<Vec<AgentEffectiveness>> {
-    // Ensure views exist
-    create_stats_views(conn)?;
-
-    let sql = if role.is_some() {
-        r"SELECT agent_role, total_prompts, successful_prompts, success_rate, avg_cost, avg_duration_sec, resource_rows, quality_rows
-          FROM agent_effectiveness
-          WHERE agent_role = ?1
-          ORDER BY success_rate DESC"
-    } else {
-        r"SELECT agent_role, total_prompts, successful_prompts, success_rate, avg_cost, avg_duration_sec, resource_rows, quality_rows
-          FROM agent_effectiveness
-          ORDER BY success_rate DESC"
-    };
-
-    let mut stmt = conn.prepare(sql)?;
-
-    let rows = if let Some(r) = role {
-        stmt.query_map([r], map_agent_effectiveness)?
-    } else {
-        stmt.query_map([], map_agent_effectiveness)?
-    };
-
-    rows.collect()
-}
-
-fn map_agent_effectiveness(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEffectiveness> {
-    let resource_rows: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
-    let quality_rows: i64 = row.get::<_, Option<i64>>(7)?.unwrap_or(0);
-    Ok(AgentEffectiveness {
-        agent_role: row.get(0)?,
-        total_prompts: row.get(1)?,
-        successful_prompts: row.get(2)?,
-        success_rate: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-        avg_cost: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-        avg_duration_sec: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-        cost_data_available: resource_rows > 0,
-        quality_data_available: quality_rows > 0,
-    })
-}
-
-pub fn query_cost_per_issue(
-    conn: &Connection,
-    issue_number: Option<i32>,
-) -> rusqlite::Result<Vec<CostPerIssue>> {
-    // Ensure views exist
-    create_stats_views(conn)?;
-
-    let sql = if issue_number.is_some() {
-        r"SELECT issue_number, prompt_count, total_cost, total_tokens, started, completed
-          FROM cost_per_issue
-          WHERE issue_number = ?1
-          ORDER BY total_cost DESC"
-    } else {
-        r"SELECT issue_number, prompt_count, total_cost, total_tokens, started, completed
-          FROM cost_per_issue
-          ORDER BY total_cost DESC
-          LIMIT 100"
-    };
-
-    let mut stmt = conn.prepare(sql)?;
-
-    let rows = if let Some(num) = issue_number {
-        stmt.query_map([num], map_cost_per_issue)?
-    } else {
-        stmt.query_map([], map_cost_per_issue)?
-    };
-
-    rows.collect()
-}
-
-fn map_cost_per_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostPerIssue> {
-    let started_str: Option<String> = row.get(4)?;
-    let completed_str: Option<String> = row.get(5)?;
-
-    let started = started_str.and_then(|s| {
-        DateTime::parse_from_rfc3339(&s)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-    });
-
-    let completed = completed_str.and_then(|s| {
-        DateTime::parse_from_rfc3339(&s)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-    });
-
-    Ok(CostPerIssue {
-        issue_number: row.get(0)?,
-        prompt_count: row.get(1)?,
-        total_cost: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-        total_tokens: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-        started,
-        completed,
-    })
-}
-
-pub fn query_weekly_velocity(conn: &Connection) -> rusqlite::Result<Vec<WeeklyVelocity>> {
-    // Ensure views exist
-    create_stats_views(conn)?;
-
-    let mut stmt = conn.prepare(
-        r"SELECT
-            strftime('%Y-W%W', date) as week,
-            SUM(prompts) as prompts,
-            SUM(daily_cost) as cost
-          FROM daily_velocity
-          GROUP BY week
-          ORDER BY week ASC",
-    )?;
-
-    let rows = stmt.query_map([], |row| {
-        Ok(WeeklyVelocity {
-            week: row.get(0)?,
-            prompts: row.get(1)?,
-            cost: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-        })
-    })?;
-
-    rows.collect()
-}
-
-pub fn query_stats_summary(conn: &Connection) -> rusqlite::Result<StatsSummary> {
-    // Ensure views exist
-    create_stats_views(conn)?;
-
-    // Get total prompts and cost from agent_inputs + resource_usage
-    let (total_prompts, total_cost, total_tokens): (i64, f64, i64) = conn.query_row(
-        r"SELECT
-            COUNT(*),
-            COALESCE(SUM(r.cost_usd), 0.0),
-            COALESCE(SUM(r.tokens_input + r.tokens_output), 0)
-          FROM agent_inputs i
-          LEFT JOIN resource_usage r ON i.id = r.input_id",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-
-    // Get unique issues and PRs
-    let (issues_count, prs_count): (i64, i64) = conn.query_row(
-        r"SELECT
-            COUNT(DISTINCT issue_number),
-            COUNT(DISTINCT pr_number)
-          FROM prompt_github
-          WHERE issue_number IS NOT NULL OR pr_number IS NOT NULL",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-
-    // Get average success rate from agent_effectiveness view
-    let avg_success_rate: f64 = conn
-        .query_row(r"SELECT COALESCE(AVG(success_rate), 0.0) FROM agent_effectiveness", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0.0);
-
-    // Availability gates (#6128): a bare 0/0.0% is indistinguishable from a
-    // real "nothing happened" result, so callers need to know whether the
-    // underlying table has ever recorded a row at all before trusting the
-    // aggregate above as a real measurement rather than "never recorded".
-    let cost_data_available: bool =
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM resource_usage)", [], |row| row.get(0))?;
-    let github_data_available: bool =
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM prompt_github)", [], |row| row.get(0))?;
-    let quality_data_available: bool =
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM quality_metrics)", [], |row| row.get(0))?;
-
-    Ok(StatsSummary {
-        total_prompts,
-        total_cost,
-        total_tokens,
-        issues_count,
-        prs_count,
-        avg_success_rate,
-        cost_data_available,
-        github_data_available,
-        quality_data_available,
-    })
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -868,339 +436,6 @@ mod tests {
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
         // Return both connection and tempdir to keep tempdir alive
         Ok((conn, temp_dir))
-    }
-
-    #[test]
-    fn test_create_stats_views() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-        create_stats_views(&conn)?;
-
-        // Verify views exist by querying them
-        let _: Vec<AgentEffectiveness> = query_agent_effectiveness(&conn, None)?;
-        let _: Vec<CostPerIssue> = query_cost_per_issue(&conn, None)?;
-
-        Ok(())
-    }
-
-    /// Regression test for #8061: `loom-daemon stats` crashed with "no such
-    /// column: resource_rows" against any `activity.db` created before
-    /// #6150, because `CREATE VIEW IF NOT EXISTS` is a no-op when a view of
-    /// that name already exists and never migrates its shape.
-    ///
-    /// This builds a fixture with the exact pre-#6150 `agent_effectiveness`
-    /// view SQL (see `git show 8e2f3010^:loom-daemon/src/activity/stats.rs`),
-    /// then exercises the migration path via `query_agent_effectiveness` and
-    /// confirms it succeeds and returns the same shape as a freshly created
-    /// database would.
-    #[test]
-    fn test_migrate_stale_agent_effectiveness_view() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-
-        // Simulate a pre-#6150 database: create the OLD view shape (no
-        // resource_rows/quality_rows columns) directly, bypassing
-        // create_stats_views entirely.
-        conn.execute_batch(
-            r"
-            CREATE VIEW agent_effectiveness AS
-            SELECT
-                COALESCE(i.agent_role, 'unknown') as agent_role,
-                COUNT(*) as total_prompts,
-                SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) as successful_prompts,
-                ROUND(100.0 * SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as success_rate,
-                ROUND(COALESCE(AVG(r.cost_usd), 0.0), 4) as avg_cost,
-                ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0.0), 1) as avg_duration_sec
-            FROM agent_inputs i
-            LEFT JOIN quality_metrics q ON i.id = q.input_id
-            LEFT JOIN resource_usage r ON i.id = r.input_id
-            GROUP BY COALESCE(i.agent_role, 'unknown');
-            ",
-        )?;
-
-        // Sanity check: the fixture really does reproduce the pre-fix crash
-        // shape (missing resource_rows).
-        let has_resource_rows_before = conn
-            .prepare("SELECT resource_rows FROM agent_effectiveness LIMIT 0")
-            .is_ok();
-        assert!(
-            !has_resource_rows_before,
-            "fixture should start with the stale pre-#6150 view shape"
-        );
-
-        // Insert a row so the query has something to aggregate.
-        conn.execute(
-            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-              VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
-            [],
-        )?;
-
-        // This must NOT error — it was the crash scenario in #8061.
-        let effectiveness = query_agent_effectiveness(&conn, None)?;
-        assert_eq!(effectiveness.len(), 1);
-        assert_eq!(effectiveness[0].agent_role, "builder");
-        assert_eq!(effectiveness[0].total_prompts, 1);
-        // No resource_usage/quality_metrics rows were inserted, so both
-        // availability flags should be false — same shape a freshly created
-        // database would report for this data.
-        assert!(!effectiveness[0].cost_data_available);
-        assert!(!effectiveness[0].quality_data_available);
-
-        // The view should now have been migrated to the current shape.
-        let has_resource_rows_after = conn
-            .prepare("SELECT resource_rows, quality_rows FROM agent_effectiveness LIMIT 0")
-            .is_ok();
-        assert!(
-            has_resource_rows_after,
-            "view should be migrated to the current shape after querying"
-        );
-
-        Ok(())
-    }
-
-    /// Edge case from #8061's acceptance criteria: a view already on the
-    /// current shape must not be re-migrated (dropped/recreated) on every
-    /// call — `migrate_agent_effectiveness_view` must be idempotent.
-    #[test]
-    fn test_migrate_agent_effectiveness_view_idempotent() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-        create_stats_views(&conn)?;
-
-        // Record the view's rowid in sqlite_master before a second call —
-        // if the view were dropped and recreated, this identity would still
-        // hold (SQLite doesn't version rowids meaningfully here), so instead
-        // assert on behavior: calling create_stats_views (which internally
-        // calls the migration check) repeatedly must not error and must
-        // preserve the current shape.
-        migrate_agent_effectiveness_view(&conn);
-        migrate_agent_effectiveness_view(&conn);
-        create_stats_views(&conn)?;
-
-        let has_resource_rows = conn
-            .prepare("SELECT resource_rows, quality_rows FROM agent_effectiveness LIMIT 0")
-            .is_ok();
-        assert!(has_resource_rows, "view should remain on the current shape");
-
-        // Querying should still succeed after repeated migration checks.
-        let _: Vec<AgentEffectiveness> = query_agent_effectiveness(&conn, None)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_empty_database_stats() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-
-        let effectiveness = query_agent_effectiveness(&conn, None)?;
-        assert!(effectiveness.is_empty());
-
-        let cost_per_issue = query_cost_per_issue(&conn, None)?;
-        assert!(cost_per_issue.is_empty());
-
-        let summary = query_stats_summary(&conn)?;
-        assert_eq!(summary.total_prompts, 0);
-        assert_eq!(summary.total_cost, 0.0);
-        // #6128: an empty database has recorded nothing, so every
-        // availability gate must be false (renders `n/a`, not `0`).
-        assert!(!summary.cost_data_available);
-        assert!(!summary.github_data_available);
-        assert!(!summary.quality_data_available);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_agent_effectiveness_with_data() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-
-        // Insert test data
-        conn.execute(
-            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-              VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
-            [],
-        )?;
-
-        let input_id: i64 = conn.last_insert_rowid();
-
-        // Add quality metrics (successful)
-        conn.execute(
-            r"INSERT INTO quality_metrics (input_id, timestamp, tests_passed, tests_failed)
-              VALUES (?1, datetime('now'), 10, 0)",
-            [input_id],
-        )?;
-
-        // Add resource usage
-        conn.execute(
-            r"INSERT INTO resource_usage (input_id, timestamp, model, tokens_input, tokens_output, cost_usd, duration_ms, provider)
-              VALUES (?1, datetime('now'), 'claude-sonnet', 1000, 500, 0.0105, 1500, 'anthropic')",
-            [input_id],
-        )?;
-
-        let effectiveness = query_agent_effectiveness(&conn, Some("builder"))?;
-        assert_eq!(effectiveness.len(), 1);
-        assert_eq!(effectiveness[0].agent_role, "builder");
-        assert_eq!(effectiveness[0].total_prompts, 1);
-        assert_eq!(effectiveness[0].successful_prompts, 1);
-        assert_eq!(effectiveness[0].success_rate, 100.0);
-        // #6128: both real quality_metrics and resource_usage rows exist for
-        // this role, so the availability gates must be true.
-        assert!(effectiveness[0].quality_data_available);
-        assert!(effectiveness[0].cost_data_available);
-
-        Ok(())
-    }
-
-    /// #13100: a quality row recorded through `record_quality_from_output` with a
-    /// real input id must join to its `agent_inputs` row in the effectiveness view.
-    #[test]
-    fn test_quality_from_output_joins_effectiveness() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-        conn.execute(
-            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-              VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
-            [],
-        )?;
-        let input_id: i64 = conn.last_insert_rowid();
-
-        let output = "running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored\n";
-        let recorded = super::super::quality::record_quality_from_output(&conn, input_id, output)
-            .expect("record quality");
-        assert!(recorded.is_some());
-
-        let effectiveness = query_agent_effectiveness(&conn, Some("builder"))?;
-        assert_eq!(effectiveness.len(), 1);
-        assert_eq!(effectiveness[0].successful_prompts, 1);
-        assert!(effectiveness[0].quality_data_available);
-
-        Ok(())
-    }
-
-    /// #6128: a role whose prompts were only ever recorded via `SendInput`
-    /// (an `agent_inputs` row) and never correlated with a
-    /// `GetTerminalOutput`-parsed `resource_usage`/`quality_metrics` row
-    /// (the exact symptom from the issue report — 26 prompts, every other
-    /// aggregate zero) must report its rate/cost/duration fields as
-    /// unavailable, not as a real zero.
-    #[test]
-    fn test_agent_effectiveness_without_output_data_is_unavailable() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-
-        conn.execute(
-            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-              VALUES ('t1', datetime('now'), 'manual', 'test', 'judge', '{}')",
-            [],
-        )?;
-
-        let effectiveness = query_agent_effectiveness(&conn, Some("judge"))?;
-        assert_eq!(effectiveness.len(), 1);
-        assert_eq!(effectiveness[0].total_prompts, 1);
-        assert!(!effectiveness[0].quality_data_available);
-        assert!(!effectiveness[0].cost_data_available);
-        // The underlying placeholder values are still 0.0 — callers must
-        // gate on the availability flags above, not trust these directly.
-        assert_eq!(effectiveness[0].success_rate, 0.0);
-        assert_eq!(effectiveness[0].avg_cost, 0.0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_cost_per_issue_with_data() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-
-        // Insert test data
-        conn.execute(
-            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-              VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
-            [],
-        )?;
-
-        let input_id: i64 = conn.last_insert_rowid();
-
-        // Link to GitHub issue
-        conn.execute(
-            r"INSERT INTO prompt_github (input_id, issue_number, event_type)
-              VALUES (?1, 42, 'label_added')",
-            [input_id],
-        )?;
-
-        // Add resource usage
-        conn.execute(
-            r"INSERT INTO resource_usage (input_id, timestamp, model, tokens_input, tokens_output, cost_usd, provider)
-              VALUES (?1, datetime('now'), 'claude-sonnet', 1000, 500, 0.0105, 'anthropic')",
-            [input_id],
-        )?;
-
-        let cost = query_cost_per_issue(&conn, Some(42))?;
-        assert_eq!(cost.len(), 1);
-        assert_eq!(cost[0].issue_number, 42);
-        assert_eq!(cost[0].prompt_count, 1);
-        assert!((cost[0].total_cost - 0.0105).abs() < 0.0001);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_stats_summary() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-
-        // Insert test data
-        for i in 0..3 {
-            conn.execute(
-                r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-                  VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
-                [],
-            )?;
-
-            let input_id: i64 = conn.last_insert_rowid();
-
-            conn.execute(
-                r"INSERT INTO resource_usage (input_id, timestamp, model, tokens_input, tokens_output, cost_usd, provider)
-                  VALUES (?1, datetime('now'), 'claude-sonnet', 1000, 500, 0.01, 'anthropic')",
-                [input_id],
-            )?;
-
-            conn.execute(
-                r"INSERT INTO prompt_github (input_id, issue_number, event_type)
-                  VALUES (?1, ?2, 'label_added')",
-                rusqlite::params![input_id, 100 + i],
-            )?;
-        }
-
-        let summary = query_stats_summary(&conn)?;
-        assert_eq!(summary.total_prompts, 3);
-        assert!((summary.total_cost - 0.03).abs() < 0.001);
-        assert_eq!(summary.total_tokens, 4500); // 3 * (1000 + 500)
-        assert_eq!(summary.issues_count, 3);
-        // #6128: resource_usage and prompt_github rows were recorded above,
-        // so those gates are true; no quality_metrics row was ever inserted
-        // in this test, so that gate stays false.
-        assert!(summary.cost_data_available);
-        assert!(summary.github_data_available);
-        assert!(!summary.quality_data_available);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_weekly_velocity() -> rusqlite::Result<()> {
-        let (conn, _temp_dir) = setup_test_db()?;
-
-        // Insert data for multiple days
-        conn.execute(
-            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-              VALUES ('t1', '2026-01-20T10:00:00Z', 'manual', 'test', 'builder', '{}')",
-            [],
-        )?;
-
-        conn.execute(
-            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
-              VALUES ('t1', '2026-01-21T10:00:00Z', 'manual', 'test', 'builder', '{}')",
-            [],
-        )?;
-
-        let weekly = query_weekly_velocity(&conn)?;
-        assert!(!weekly.is_empty());
-
-        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -1320,6 +555,90 @@ mod tests {
         assert_eq!(rows[0].prompts, 1);
         assert_eq!(rows[0].issues, 1);
 
+        Ok(())
+    }
+
+    /// #6128: an empty database has recorded nothing, so every availability
+    /// gate must be false (renders `n/a`, not `0`); recording rows flips only
+    /// the gates whose table has data.
+    #[test]
+    fn test_summary_availability_gates() -> rusqlite::Result<()> {
+        let (conn, _temp_dir) = setup_test_db()?;
+        let empty = query_summary_metrics(&conn, None, "all")?;
+        assert_eq!(empty.total_prompts, 0);
+        assert!(!empty.cost_data_available);
+        assert!(!empty.github_data_available);
+        assert!(!empty.quality_data_available);
+        assert!(query_effectiveness_rows(&conn, None, "all", false)?.is_empty());
+        assert!(query_cost_rows(&conn, None, false)?.is_empty());
+
+        // resource_usage + prompt_github recorded, no quality_metrics.
+        for i in 0..3 {
+            conn.execute(
+                r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
+                  VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
+                [],
+            )?;
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                r"INSERT INTO resource_usage (input_id, timestamp, model, tokens_input, tokens_output, cost_usd, provider)
+                  VALUES (?1, datetime('now'), 'claude-sonnet', 1000, 500, 0.01, 'anthropic')",
+                [id],
+            )?;
+            conn.execute(
+                r"INSERT INTO prompt_github (input_id, issue_number, event_type)
+                  VALUES (?1, ?2, 'label_added')",
+                rusqlite::params![id, 100 + i],
+            )?;
+        }
+        let s = query_summary_metrics(&conn, None, "all")?;
+        assert_eq!(s.total_prompts, 3);
+        assert_eq!(s.total_tokens, 4500);
+        assert_eq!(s.issues_count, 3);
+        assert!(s.cost_data_available);
+        assert!(s.github_data_available);
+        assert!(!s.quality_data_available);
+        Ok(())
+    }
+
+    /// #6128: a role whose prompts have no `resource_usage`/`quality_metrics`
+    /// rows must report its rate/cost fields as unavailable, not a real zero.
+    #[test]
+    fn test_effectiveness_without_output_data_is_unavailable() -> rusqlite::Result<()> {
+        let (conn, _temp_dir) = setup_test_db()?;
+        conn.execute(
+            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
+              VALUES ('t1', datetime('now'), 'manual', 'test', 'judge', '{}')",
+            [],
+        )?;
+        let rows = query_effectiveness_rows(&conn, Some("judge"), "all", false)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_prompts, 1);
+        assert!(!rows[0].quality_data_available);
+        assert!(!rows[0].cost_data_available);
+        Ok(())
+    }
+
+    /// #13100: a quality row recorded through `record_quality_from_output`
+    /// with a real input id must join to its `agent_inputs` row.
+    #[test]
+    fn test_quality_from_output_joins_effectiveness_rows() -> rusqlite::Result<()> {
+        let (conn, _temp_dir) = setup_test_db()?;
+        conn.execute(
+            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
+              VALUES ('t1', datetime('now'), 'manual', 'test', 'builder', '{}')",
+            [],
+        )?;
+        let input_id: i64 = conn.last_insert_rowid();
+        let output = "running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored\n";
+        let recorded = super::super::quality::record_quality_from_output(&conn, input_id, output)
+            .expect("record quality");
+        assert!(recorded.is_some());
+
+        let rows = query_effectiveness_rows(&conn, Some("builder"), "all", false)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].successful_prompts, 1);
+        assert!(rows[0].quality_data_available);
         Ok(())
     }
 }

@@ -1,8 +1,6 @@
 /**
  * The `DispatchSweep` IPC payload the `dispatch_sweep` tool sends. A sibling
- * of `sweeps.ts` (which is over the file-size ratchet,
- * `.loom/docs/file-size-policy.md`) so the wire shape is unit-testable
- * without a daemon socket.
+ * of `sweeps.ts`, so the wire shape is unit-testable without a daemon socket.
  */
 
 import type { SweepKind } from "./sweeps.js";

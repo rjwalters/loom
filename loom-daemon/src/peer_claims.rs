@@ -969,7 +969,7 @@ pub const PEER_COMPLETION_TTL_ENV: &str = "LOOM_PEER_COMPLETION_TTL_SECS";
 /// [`DEFAULT_PEER_CLAIM_TTL`] (120s) — that TTL is tuned for a *live,
 /// re-advertised* dispatch claim; a completion is a one-shot historical fact
 /// with no heartbeat to refresh it, and the race it guards against (two
-/// hosts' `SweepExited`/`reconcile_recent_merges` paths both observing the
+/// hosts' `SweepExited`/`reconcile_merges_since` paths both observing the
 /// same merge within the default 5-minute reconciliation cadence, or a
 /// slower host catching up after a connection hiccup) needs a window well
 /// beyond one reconciliation tick, not just beyond one dispatch tick. A rare

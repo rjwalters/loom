@@ -272,6 +272,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // stdin from `merge-pr.sh`'s `_trusted_pr_comments` (trust-filtered; Gitea
         // reads as absent, so it refuses). It fetches nothing itself.
         ("merge_pr/hold_release.rs", "parses already-filtered bodies"),
+        // #13673: the daemon-landing gate. It reads only `forge.trusted_comments(pr)`,
+        // which `gh_lifecycle.rs` filters through `TrustPolicy::for_root`. It
+        // fetches nothing itself.
+        ("forge_merge_queue/clear_gate.rs", "parses already-filtered bodies"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];

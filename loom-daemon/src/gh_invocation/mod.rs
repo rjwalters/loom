@@ -393,6 +393,9 @@ pub struct GhInvocation {
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
     program: Option<String>,
+    /// The issue/PR number the call targets when argv cannot say (a GraphQL
+    /// node-id mutation, #13674): [`GhInvocation::number`].
+    number: Option<u32>,
     config_dir: Option<PathBuf>,
     /// An explicit child `PATH` ([`GhInvocation::child_path`]).
     path: Option<OsString>,
@@ -463,6 +466,7 @@ impl GhInvocation {
             args: Vec::new(),
             cwd: None,
             program: None,
+            number: None,
             config_dir: None,
             path: None,
             strip_token_env: false,
@@ -544,6 +548,15 @@ impl GhInvocation {
     pub fn program(mut self, program: impl AsRef<OsStr>) -> Self {
         let program = program.as_ref().to_string_lossy();
         self.program = (program != "gh").then(|| program.into_owned());
+        self
+    }
+
+    /// Name the issue/PR number the call targets, for a call whose argv does
+    /// not carry it (a GraphQL mutation by node id). Recorded as
+    /// `github.number` on a write span (#13674).
+    #[must_use]
+    pub fn number(mut self, number: u32) -> Self {
+        self.number = Some(number);
         self
     }
 

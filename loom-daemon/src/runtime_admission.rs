@@ -379,7 +379,12 @@ pub fn suggested_worker_type_mismatch_warning(admission: &ResolvedRuntime) -> Op
 pub fn canonical_role(role: &str) -> Option<&'static str> {
     match role.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "curator" | "issue-curator" => Some("curator"),
-        "judge" | "code-review-specialist" => Some("judge"),
+        // The ratification lane's two read-only reviewer sessions (#13749) are
+        // Judge-shaped, so they ride the Judge binding rather than adding
+        // canonical roles (and `KNOWN_ROLE_KEYS` / manifest entries).
+        "judge" | "code-review-specialist" | "ratification-ee" | "ratification-market" => {
+            Some("judge")
+        }
         "builder" | "development-worker" => Some("builder"),
         "doctor" | "pr-fixer" => Some("doctor"),
         "champion" => Some("champion"),

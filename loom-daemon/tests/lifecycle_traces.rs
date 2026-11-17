@@ -13,26 +13,14 @@ use serde_json::json;
 use std::{
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
-    sync::OnceLock,
 };
 
-fn fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let bin = dir.join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
+use worker_cli::fixture;
+
 fn root() -> tempfile::TempDir {
     common::stub_gh_bin_in_process();
     let dir = tempfile::tempdir().unwrap();

@@ -55,17 +55,17 @@
 //! is #8525.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 /// Same pin as the SigNoz trial's telemetry store (`signoz/casting.yaml`) and
 /// as every other engine-level proof in this trial, so no proof in this repo
 /// can drift from the deployment on ClickHouse version.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::CLICKHOUSE_IMAGE;
 
 /// The committed retro queries, byte for byte.
 const CI_QUERIES: &str = include_str!("../../defaults/observability/signoz/ci-queries.sql");
@@ -96,41 +96,17 @@ type Row = BTreeMap<String, serde_json::Value>;
 /// stdout. Panics with the engine's own stderr on failure — a query that does
 /// not parse must fail this test, not be silently skipped.
 fn clickhouse(script: &str, repo: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            "--format=JSONEachRow",
-            &format!("--param_since={SINCE}"),
-            &format!("--param_repo={repo}"),
-            "--param_top=50",
-            "--param_bucket_hours=24",
-            "--param_window_hours=24",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    clickhouse_local::clickhouse_with(
+        script,
+        &[
+            "--format=JSONEachRow".to_string(),
+            format!("--param_since={SINCE}"),
+            format!("--param_repo={repo}"),
+            "--param_top=50".to_string(),
+            "--param_bucket_hours=24".to_string(),
+            "--param_window_hours=24".to_string(),
+        ],
+    )
 }
 
 /// The committed file's statements. Line comments are stripped **before** the

@@ -65,9 +65,9 @@ mod completion_runtime;
 mod forge_gate;
 mod reconcile_tick;
 mod status_reaction;
+use reconcile_tick::ReconcileState;
 #[cfg(test)]
 use reconcile_tick::ReconcileWatermarks;
-use reconcile_tick::{reconcile_merges_since, ReconcileState};
 pub mod loom_ui_watch;
 
 // ============================================================================
@@ -888,22 +888,6 @@ impl CompletionMeta {
     }
 }
 
-/// Whether `slug` is a forge `owner/repo` slug: exactly one `/`, both halves
-/// non-empty and made of forge-legal name characters.
-fn valid_repo_slug(slug: &str) -> bool {
-    let mut parts = slug.split('/');
-    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    let legal = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 100
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    legal(owner) && legal(name)
-}
-
 /// Validate a `completion-v1` `meta` object **before** it can reach the wire
 /// (#4426). safehoused silently degrades a malformed `meta` to a `chat` — the
 /// event then vanishes from the public feed with no error anywhere — so this
@@ -935,7 +919,7 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
     if !valid_persona(get("agent")) {
         bail!("completion `meta.agent` {:?} is not a valid persona", get("agent"));
     }
-    if !valid_repo_slug(get("repo")) {
+    if !crate::forge_slug::valid_slug(get("repo")) {
         bail!("completion `meta.repo` {:?} is not a forge owner/repo slug", get("repo"));
     }
     let pr_ref = get("ref");
@@ -1924,7 +1908,7 @@ async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
     log_gh_recovery_once("repo view", workspace_root);
     let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
     let slug = parsed.get("nameWithOwner")?.as_str()?.trim().to_owned();
-    if !valid_repo_slug(&slug) {
+    if !crate::forge_slug::valid_slug(&slug) {
         return None;
     }
     // Absent/wrongly-typed ⇒ unknown, never "assume public": the whole point of
@@ -2270,7 +2254,7 @@ async fn completion_for_exit(
 /// ([`completion_for_exit`]), a Champion merge step's end
 /// ([`completion_for_merged_step`], #12152: a step emits no `SweepExited`),
 /// and the periodic merge-reconciliation pass below
-/// ([`reconcile_recent_merges`]), which exists precisely because a
+/// ([`reconcile_tick::reconcile_merges_since`]), which exists precisely because a
 /// champion-tick merge — landing well after the sweep process (and its one
 /// `SweepExited`) already exited — is never observed by the first path alone.
 ///
@@ -2281,7 +2265,7 @@ async fn completion_for_exit(
 /// here because the two callers have different clocks available: a live
 /// sweep's reaper clock for [`completion_for_exit`], the forge's
 /// `createdAt`/`mergedAt` pair (no sweep clock exists) for
-/// [`reconcile_recent_merges`].
+/// [`reconcile_tick::reconcile_merges_since`].
 ///
 /// The dedup key is `(workspace, issue, merged.number)` (Issue #6062), not
 /// `(workspace, issue)` alone — see [`completion_for_exit`]'s doc comment for
@@ -2451,25 +2435,6 @@ fn reconcile_max_age() -> chrono::Duration {
         .filter(|s| *s >= 0)
         .unwrap_or(DEFAULT_RECONCILE_MAX_AGE_SECS);
     chrono::Duration::seconds(secs)
-}
-
-/// Best-effort bulk `gh pr list --state merged` lookup across **all** recently
-/// merged PRs in `workspace_root` (issue #4583) — unlike [`fetch_merged_pr`]
-/// this is not filtered to one issue's branch, which is exactly what lets it
-/// discover a merge the branch-scoped, `SweepExited`-triggered lookup never
-/// ran for (no sweep, no trigger). Rows merged longer than
-/// [`reconcile_max_age`] ago are dropped here, so a first-ever pass cannot
-/// backfill stale history onto the feed. Every failure — missing `gh`, no
-/// network, unauthenticated, timeout, malformed JSON, an unparsable row —
-/// degrades that row (or the whole call) to being silently skipped; a
-/// best-effort reconciliation pass must never panic or block the sink.
-// The unwatermarked form; production goes through the watermarked one (#12152).
-#[cfg_attr(not(test), allow(dead_code))]
-async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
-    fetch_merged_prs_since(workspace_root, None)
-        .await
-        .map(|(rows, _)| rows)
-        .unwrap_or_default()
 }
 
 /// How far before a workspace's watermark a catch-up query starts (#12152).
@@ -2725,49 +2690,6 @@ async fn completion_for_merged_step(
         completion_runtime::Narration::new(crate::observability::ops::feed::Trigger::Step, false),
     )
     .await
-}
-
-/// The periodic reconciliation pass itself (issue #4583): bulk-lists recently
-/// merged PRs for `workspace_root` and narrates a completion for any
-/// `(workspace, issue, merged-PR-number)` not already in `already_narrated` —
-/// sharing that exact dedup set with [`completion_for_exit`]'s `SweepExited`
-/// path is what keeps the two trigger paths from ever double-posting the same
-/// merge, in either direction (whichever path observes the merge first wins;
-/// the other becomes a no-op `contains` check). Keying on the PR number
-/// (Issue #6062) rather than the issue alone also means a *different* merged
-/// PR against the same still-open issue (a partial increment) is narrated
-/// independently instead of being silently swallowed by the first merge's key.
-///
-/// This is the option the issue's curation explicitly favors over a new event
-/// topic/IPC verb: it needs no change to the frozen v0.10.0 event taxonomy,
-/// and — because it queries forge truth directly rather than depending on any
-/// daemon-emitted event — it also naturally covers a merge that happened while
-/// the daemon itself was down, **provided** the dedup set survives the
-/// restart; see [`load_persisted_completed`] / [`persist_completed_best_effort`]
-/// for that half of the story (the in-memory set alone does not survive one).
-// The unwatermarked form; production goes through the watermarked one (#12152).
-#[cfg_attr(not(test), allow(dead_code))]
-async fn reconcile_recent_merges(
-    persona: &str,
-    workspace_root: &str,
-    slug_cache: &mut HashMap<String, RepoIdentity>,
-    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
-    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
-    peer_completions: Option<&PeerCompletionHandle>,
-) -> Vec<Envelope> {
-    reconcile_merges_since(
-        persona,
-        workspace_root,
-        None,
-        slug_cache,
-        already_narrated,
-        activity_db,
-        peer_completions,
-        false,
-    )
-    .await
-    .map(|pass| pass.envelopes)
-    .unwrap_or_default()
 }
 
 /// Reconciliation-pass cadence (issue #4583). Test/operator override mirrors

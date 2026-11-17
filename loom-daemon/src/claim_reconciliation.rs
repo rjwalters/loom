@@ -1053,6 +1053,11 @@ pub struct ClaimedPr {
     /// (Issue #10235), per [`most_recent_head_push_at`]. `None` on fetch
     /// failure or no such push.
     pub most_recent_head_push_at: Option<DateTime<Utc>>,
+    /// `updated_at` of the claim role's live, renewed `loom:pr-lease`
+    /// (#13727), per [`live_pr_lease_at`]. A Judge silent inside a long test
+    /// run still renews its lease while its watched PID lives. `None` on
+    /// fetch failure, a released/yielded or TTL-stale lease (fail-open).
+    pub most_recent_pr_lease_at: Option<DateTime<Utc>>,
     /// The PR's head branch name, when available — the only join key to an
     /// issue number this pass has (see [`crate::worktree_ops::naming::issue_from_branch`]).
     pub head_ref_name: Option<String>,
@@ -1938,7 +1943,7 @@ pub fn spawn_periodic_reconciliation_task(
 /// rather than growing `forge` inline.
 mod liveness;
 pub use liveness::{
-    claim_activity_marker, extra_liveness_at, most_recent_claim_activity_at,
+    claim_activity_marker, extra_liveness_at, live_pr_lease_at, most_recent_claim_activity_at,
     most_recent_head_push_at, most_recent_judge_activity_at, pr_liveness, LivenessSignal,
     PrComment, TimelineEvent, CLAIM_ACTIVITY_MARKER_PREFIX, JUDGE_ACTIVITY_MARKER_PREFIXES,
     STANDDOWN_MARKER_PREFIX,
@@ -2544,26 +2549,29 @@ pub mod forge {
                 let aged = |since: DateTime<Utc>| {
                     (chrono::Utc::now() - since).num_seconds() as f64 / 60.0 >= stale_after
                 };
-                let (most_recent_judge_activity_at, most_recent_head_push_at) =
-                    match claim_labeled_at.filter(|s| aged(*s)) {
-                        Some(since) => (
-                            if is_reviewing {
-                                super::read_cache::JUDGE_ACTIVITY.get_or(key2.clone(), || {
-                                    fetch_most_recent_judge_activity_at(
-                                        gh_bin, root, r.number, since, None,
-                                    )
-                                })
-                            } else {
-                                None
-                            },
-                            super::read_cache::HEAD_PUSH.get_or(key2, || {
-                                fetch_most_recent_head_push_at(
-                                    gh_bin, root, r.number, label, since, None,
+                let aged_since = claim_labeled_at.filter(|s| aged(*s));
+                let most_recent_pr_lease_at = aged_since.and_then(|_| {
+                    super::liveness::fetch_live_pr_lease_at(gh_bin, root, r.number, label, None)
+                });
+                let (most_recent_judge_activity_at, most_recent_head_push_at) = match aged_since {
+                    Some(since) => (
+                        if is_reviewing {
+                            super::read_cache::JUDGE_ACTIVITY.get_or(key2.clone(), || {
+                                fetch_most_recent_judge_activity_at(
+                                    gh_bin, root, r.number, since, None,
                                 )
-                            }),
-                        ),
-                        None => (None, None),
-                    };
+                            })
+                        } else {
+                            None
+                        },
+                        super::read_cache::HEAD_PUSH.get_or(key2, || {
+                            fetch_most_recent_head_push_at(
+                                gh_bin, root, r.number, label, since, None,
+                            )
+                        }),
+                    ),
+                    None => (None, None),
+                };
                 ClaimedPr {
                     number: r.number,
                     updated_at: r
@@ -2575,6 +2583,7 @@ pub mod forge {
                     most_recent_claim_activity_at,
                     most_recent_judge_activity_at,
                     most_recent_head_push_at,
+                    most_recent_pr_lease_at,
                     head_ref_name: r.head_ref,
                 }
             })

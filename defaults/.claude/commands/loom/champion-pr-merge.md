@@ -133,6 +133,17 @@ case "$HRC $HC" in
   "0 "*" state=clear "*|"0 "*" state=champion-hold "*|"2 ") ;;
   "0 "*" state=stray-operator "*) gh pr edit "$PR_NUMBER" --remove-label "loom:operator" ;;
   "0 "*" state=contradiction "*) OTHER_VERDICT_LABEL=${HC##* detail=} ;;
+  "0 "*" state=stacked-on-loom-branch "*)
+    # Stacked child (#12761): never merged; say why once per head (#13737).
+    # The work finder passes these as `stacked`, so only a targeted run lands here.
+    STACK_BASE=${HC##* detail=}
+    STACK_HEAD=$("$GH_READ" pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
+    STACK_MARKER="<!-- champion:stacked-skip base=$STACK_BASE head=$STACK_HEAD -->"
+    if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$STACK_MARKER\"))")" != "true" ]; then
+      ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$STACK_MARKER
+**Champion**: not merging. This PR is stacked on \`$STACK_BASE\`, a Loom stack branch. It merges after its parent lands and the base is retargeted to the default branch."
+    fi
+    echo "SKIP #$PR_NUMBER: stacked on $STACK_BASE"; continue ;;  # outcome=skipped reason=janitor_rc3
   *) echo "SKIP #$PR_NUMBER: ${HC:-rc=$HRC} — no merge, no comment"; continue ;;  # single-PR step: outcome=skipped reason=janitor_rc3
 esac
 
@@ -535,6 +546,22 @@ behavior is byte-for-byte unchanged from before #6850.
   malformed, the entry is skipped in both criteria. Opt-in only; no class
   enables it by default. The waiver is recorded in the pre-merge comment's
   critical-file bullet (scope `critical, additive-migrations waiver`).
+- `lockedDepsOnly` (2am#6942 ruling 2026-11-07, optional, default `false`) — a
+  literal `true` makes the class a `criticalFilesOnly` class (same matching, same
+  `merge-risk` ineligibility) that covers a `Cargo.toml` critical-file hit **only
+  when** `loom-daemon forge locked-deps-only <pr>` exits 0: no `Cargo.lock` in the
+  PR adds a `source =`/`checksum =` line or changes or drops an existing package
+  (a new registry or git package, a version bump), no changed `Cargo.toml` line
+  names `git =`, `registry =`, `build =`, `links =`, `[patch.*]`, `[replace]` or a
+  `path =` outside the repo, and a manifest change comes with a `Cargo.lock`
+  change. This is the new-workspace-crate-with-already-locked-deps shape; the
+  class exists because a `criticalFilesOnly` class never sees `Cargo.lock`. Every
+  critical-file hit the class covers must be a `Cargo.toml`, since the verb proves
+  nothing about other files. A non-zero exit, a forge error or an older daemon
+  without the verb leaves the hold as today. The kept set is untouched. Not a
+  boolean `true`/`false`: malformed, the entry is skipped in both criteria. Opt-in
+  only; no class enables it by default. The waiver is recorded in the pre-merge
+  comment's critical-file bullet (scope `critical, locked-deps-only waiver`).
 - `excludeFilePatterns` (#12528, optional) — globs, matched like
   `filePatterns`. A PR with **any** changed file matching one is disqualified
   from the class (e.g. `.github/workflows/*publish*`, `*release*`,
@@ -777,7 +804,8 @@ standing_auth_class_hits() {
 # STANDING_AUTH_COVERED (the files the classes matched), and STANDING_AUTH_WHY
 # (one line per class/hit that failed a check, for the hold comment), and
 # STANDING_AUTH_ADDITIVE=1 when a passing additiveMigrations class (#13102)
-# lifted the migrations kept-set entry for this PR. Every
+# lifted the migrations kept-set entry for this PR, and STANDING_AUTH_LOCKED=1
+# when a passing lockedDepsOnly class covered a Cargo.toml hit. Every
 # check fails closed. Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval),
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is the critical-files criterion's own $FILES and CRITICAL_PATTERNS its pattern list.
@@ -785,8 +813,9 @@ standing_auth_eval() {
   local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
-  local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0
+  local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0 LOCKED_DEPS LOCKED_STATE="" LOCKED_USED=0
   STANDING_AUTH_ADDITIVE=0
+  STANDING_AUTH_LOCKED=0
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
   STANDING_AUTH_WHY=""
@@ -863,6 +892,16 @@ standing_auth_eval() {
       *) continue ;;
     esac
 
+    # lockedDepsOnly (2am#6942): same shape as additiveMigrations. `true` makes the
+    # class criticalFilesOnly-shaped (critical mode only) and gates its Cargo.toml
+    # coverage on the locked-deps-only verb. Any other value is malformed.
+    LOCKED_DEPS=0
+    case "$(jq -c ".champion.standingAuthorizations[$i].lockedDepsOnly" "$CONFIG_FILE")" in
+      null | false) ;;
+      true) [ "$mode" = "critical" ] || continue; LOCKED_DEPS=1; ONLY_CRIT=1 ;;
+      *) continue ;;
+    esac
+
     # Critical mode: only an explicit boolean true opts the class in.
     if [ "$mode" = "critical" ] && [ "$ONLY_CRIT" -eq 0 ]; then
       [ "$(jq -r ".champion.standingAuthorizations[$i].coversCriticalFiles == true" "$CONFIG_FILE")" = "true" ] || continue
@@ -880,6 +919,10 @@ standing_auth_eval() {
       printf '%s' "$CLASS_HITS" | jq -e 'length > 0' >/dev/null 2>&1 || continue
       CLASS_DIFF="$CLASS_HITS"
       CLASS_FILES=$(printf '%s' "$CLASS_HITS" | jq -r '.[] | .filename, (.previous_filename // empty)') || continue
+      # lockedDepsOnly: the verb proves nothing about a non-Cargo.toml hit.
+      if [ "$LOCKED_DEPS" -eq 1 ]; then
+        printf '%s' "$CLASS_HITS" | jq -e 'all(.[]; (.filename | split("/") | last) == "Cargo.toml")' >/dev/null 2>&1 || { STANDING_AUTH_WHY+="class '$CLASS_ID': lockedDepsOnly covers only Cargo.toml hits"$'\n'; continue; }
+      fi
     fi
 
     # Fail safe: a malformed entry (no id, no patterns, or no conditions)
@@ -933,6 +976,17 @@ standing_auth_eval() {
       done <<<"$EXCLUDES"
     done <<<"$CLASS_FILES"
     [ "$ALL_MATCH" -eq 0 ] && continue
+    # lockedDepsOnly (2am#6942): the class covers its Cargo.toml hits only when the
+    # verb clears the PR. Run once; any non-zero exit (new registry/git package,
+    # version bump, source key, no lock change, forge error, older daemon) skips it.
+    LOCKED_USED=0
+    if [ "$LOCKED_DEPS" -eq 1 ]; then
+      if [ -z "$LOCKED_STATE" ]; then
+        if loom-daemon forge locked-deps-only "$PR_NUMBER" >/dev/null 2>&1; then LOCKED_STATE=ok; else LOCKED_STATE=held; fi
+      fi
+      [ "$LOCKED_STATE" = ok ] || { STANDING_AUTH_WHY+="class '$CLASS_ID': locked-deps-only verb did not clear the PR"$'\n'; continue; }
+      LOCKED_USED=1
+    fi
     if [ "$mode" = "critical" ]; then
       ADD_MIG_LIFTED=0
       while IFS= read -r file; do
@@ -1063,6 +1117,7 @@ standing_auth_eval() {
         # passes once the classes together cover every hit.
         UNION_HITS=$(printf '%s\n%s' "$UNION_HITS" "$CLASS_HITS" | jq -s -c '.[0] + .[1] | unique_by(.filename)') || continue
         [ "$ADD_MIG_LIFTED" -eq 1 ] && STANDING_AUTH_ADDITIVE=1
+        [ "$LOCKED_USED" -eq 1 ] && STANDING_AUTH_LOCKED=1
         USED_IDS="${USED_IDS:+$USED_IDS,}$CLASS_ID"
         continue
       fi
@@ -1139,6 +1194,9 @@ It is eligible only when **all** hold, each read live in this pass:
   comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
   under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
   path sources it: it is compared byte-for-byte like any kept-set file (#13486);
+  (This is Champion's proof. The daemon's own strict landing of its resync PR instead lets
+  byte-identical gate files land without a Judge when the tag is a published release, per
+  operator ruling r7-q33, #13665; a PR the daemon left for the lane still takes this rule.)
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
@@ -2073,6 +2131,7 @@ standing_auth_load_config             # resolved effective config (#12591)
 STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit the merge-risk criterion's ELIGIBLE
 STANDING_AUTH_ID=""
 STANDING_AUTH_ADDITIVE=0
+STANDING_AUTH_LOCKED=0
 # Waiver record (#13031): set only when a class waives this criterion; the
 # pre-merge comment renders its critical-file bullet from these, so a waiver is
 # never reported as "No critical files modified".
@@ -2145,6 +2204,12 @@ if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ] && [ "$STANDING_AUTH_SCOPE" = "criti
     # additiveMigrations class (#13102): migrations kept-set entry lifted by the verb.
     CRITERION3_WAIVER_SCOPE="critical, additive-migrations waiver"
     echo "PASS (standing authorization '$STANDING_AUTH_ID', #13102): additive-migrations waiver — migration files verified additive by loom-daemon forge additive-migrations; critical files: $STANDING_AUTH_COVERED"
+    exit 0
+  fi
+  if [ "$STANDING_AUTH_LOCKED" -eq 1 ]; then
+    # lockedDepsOnly class (2am#6942): Cargo.toml hit covered because the verb proved no third-party package is added.
+    CRITERION3_WAIVER_SCOPE="critical, locked-deps-only waiver"
+    echo "PASS (standing authorization '$STANDING_AUTH_ID', 2am#6942): locked-deps-only waiver — no new third-party package, verified by loom-daemon forge locked-deps-only; critical files: $STANDING_AUTH_COVERED"
     exit 0
   fi
   # #13042: STANDING_AUTH_ID names every class used (comma-joined); each hit
@@ -2660,11 +2725,30 @@ A sticky hold missing its label with no removal on record gets the label back
 # `--label` ANDs: loom:pr + loom:blocked is Champion's hold (#11861). A held
 # PR out at Doctor keeps loom:blocked beside loom:changes-requested; it is
 # counted with its standing marker (a Doctor-cycle-cap park has none).
-HELD_JSON=$(for H in loom:blocked loom:operator; do "$GH_READ" pr list --label "loom:pr" --label "$H" --search "-label:loom:frozen" \
-  --state open --limit 500 --json number,title,createdAt,updatedAt,mergeable,labels,mergeStateStatus,headRefOid,files; done | jq -s 'add | unique_by(.number)')
+#
+# #13930 degraded census: every "$GH_READ" call is bounded by gh-cached's
+# LOOM_GH_TIMEOUT_S — a stalled query fails fast (exit 124, diagnostic on
+# stderr) instead of hanging this pass. A failed query contributes nothing
+# and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR Digest below then marks
+# structural fields unavailable instead of silently dropping the digest.
+# Never issue a second bulk `pr list` to "recover" — the deliberate
+# single-read pin stands; a degraded digest beats a duplicated census read.
+HELD_JSON=""
+HELD_STRUCTURAL_UNAVAILABLE=0
+for H in loom:blocked loom:operator; do
+  if ! H_OUT=$("$GH_READ" pr list --label "loom:pr" --label "$H" --search "-label:loom:frozen" \
+      --state open --limit 500 --json number,title,createdAt,updatedAt,mergeable,labels,mergeStateStatus,headRefOid,files); then
+    HELD_STRUCTURAL_UNAVAILABLE=1   # census query stalled/failed (#13930) — degrade, don't hang
+    continue
+  fi
+  HELD_JSON="${HELD_JSON}${H_OUT}
+"
+done
+HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
 HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
   --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->"))
     and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->")) | not))] | length')
+HELD_AT_DOCTOR=${HELD_AT_DOCTOR:-0}   # a bounded-but-failed read degrades to 0, never breaks the arithmetic (#13930)
 
 HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
 HELD_CONFLICTING=$(printf '%s\n' "$HELD_JSON" | jq '[.[] | select(.mergeable == "CONFLICTING")] | length')
@@ -2678,7 +2762,9 @@ else
   OLDEST_DAYS=0
 fi
 
-echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d"
+HELD_NOTE=""
+[ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ] && HELD_NOTE=" — census read stalled: enumeration may be partial, structural fields unavailable (#13930)"
+echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d${HELD_NOTE}"
 RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
   --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
     or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")')
@@ -2760,7 +2846,10 @@ time. Run
 [`champion-held-pr-staleness.md`](champion-held-pr-staleness.md)'s per-PR tick
 here: from `$HELD_JSON`'s `mergeStateStatus`/`headRefOid`/`files` plus local
 read-only `git`, it sets `$BASE_STALENESS` for this row and comments only on a
-`DIRTY` PR — no label, no route, no rebase.
+`DIRTY` PR — no label, no route, no rebase. Skip Step 1b entirely when
+`$HELD_STRUCTURAL_UNAVAILABLE=1` (#13930 degraded census): its inputs are the
+census's structural fields, and the loop above already renders the Base cell
+as "structural fields unavailable: census read stalled".
 
 ```bash
 HOLD_MARKER="<!-- champion:merge-risk-hold -->"
@@ -2798,7 +2887,22 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
   fi
 
   STATUS="$PR_MERGEABLE"
-  if [ "$PR_MERGEABLE" = "CONFLICTING" ]; then
+  if [ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ]; then
+    # #13930 degraded census: the bulk read failed/expired, so this row's
+    # structural fields (mergeable, mergeStateStatus, headRefOid, files)
+    # cannot be rendered. Mark them in the digest body instead of dropping
+    # the digest — the reason column still comes from the per-PR comment
+    # read above. Carry any prior conflict-since marker forward untouched:
+    # this pass cannot re-evaluate mergeable, and forgetting the marker
+    # would reset the rot clock (#7020) once the census recovers.
+    STATUS="structural fields unavailable: census read stalled"
+    BASE_STALENESS="structural fields unavailable: census read stalled"
+    PRIOR_MARKER=$(printf '%s\n' "$OLD_DIGEST_BODY" | grep -o "${CONFLICT_SINCE_PREFIX}${PR_NUM} TS=[0-9TZ:-]* -->" | head -1)
+    if [ -n "$PRIOR_MARKER" ]; then
+      CONFLICT_SINCE_MARKERS="${CONFLICT_SINCE_MARKERS}${PRIOR_MARKER}
+"
+    fi
+  elif [ "$PR_MERGEABLE" = "CONFLICTING" ]; then
     # Reuse the prior pass's since-timestamp for THIS PR if one exists in
     # $OLD_DIGEST_BODY (Step 0); otherwise this is a fresh conflict episode
     # and the clock starts now. Never accumulates rot time across a
@@ -2841,6 +2945,13 @@ which is how the clock survives into the *next* pass) and writes it:
 ```bash
 DIGEST_TABLE="${DIGEST_ROWS:-| _none_ | _none_ | _none_ | _none_ |
 }"
+# #13930 degraded census: the digest is STILL written when the bulk read
+# failed/expired — with the banner below, so the marker lives in the digest
+# body itself rather than a missing digest.
+DIGEST_DEGRADED_NOTE=""
+if [ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ]; then
+  DIGEST_DEGRADED_NOTE="**Census degraded (#13930)**: structural fields unavailable: census read stalled — a census query failed or expired (bounded by gh-cached's \`LOOM_GH_TIMEOUT_S\`); the enumeration below may be PARTIAL."
+fi
 DIGEST_BODY="$DIGEST_MARKER
 # Merge-Risk Hold Digest
 
@@ -2849,9 +2960,11 @@ issue's body is **overwritten in place every pass** — it is never appended
 to, and it is **not a work item**: do not curate, build, or promote it.
 
 **Last updated**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-**Aggregate**: Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting ($HELD_ROTTING rotting >=${ROT_THRESHOLD_DAYS}d, $HELD_CONFLICTING_CLEAN clean), $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d
+**Aggregate**: Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting ($HELD_ROTTING rotting >=${ROT_THRESHOLD_DAYS}d, $HELD_CONFLICTING_CLEAN clean), $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d${HELD_NOTE}
 **Released, not yet merged**: ${RELEASED:-none}
-
+${DIGEST_DEGRADED_NOTE:+
+$DIGEST_DEGRADED_NOTE
+}
 | PR | Hold reason | Status | Base |
 |---|---|---|---|
 $DIGEST_TABLE
@@ -2876,7 +2989,9 @@ echo "Merge-risk hold digest updated: $DIGEST_URL"
 
 **Report it even when it is zero** — an empty `$HELD_JSON` still writes the
 digest with a single `_none_` row; a fresh "Last updated" is itself the signal
-that the census ran.
+that the census ran. That includes the #13930 degraded case: a census read
+that failed or expired still writes the digest — with the "structural fields
+unavailable: census read stalled" markers — never a silently dropped digest.
 
 **Never let this block a merge decision.** The digest is a read-only summary
 of state this pass already computed for other reasons (`$HELD_JSON`, plus one
@@ -3320,8 +3435,10 @@ items (exit `10`) and Step 4 behaves exactly as it did before this gate existed*
 
 **2. Classifying each item — a fixed phrase vocabulary, not judgment.** An item
 requires **out-of-band verification** when it contains one of these
-instruction-shaped fragments (case-insensitive substring of the joined criterion;
-the script's `OUT_OF_BAND_PHRASES` array, matched in declared order so the
+instruction-shaped fragments (case-insensitive, anchored with a leading word
+boundary inside the joined criterion — `Production run:` matches but
+`reproduction run` does not, #13900; the script's `OUT_OF_BAND_PHRASES` array,
+matched in declared order so the
 reported phrase is deterministic). Everything else is CI-checkable.
 
 | Failure shape | Phrases |
@@ -3418,6 +3535,12 @@ hold_issue_on_unverified_ac() {
     esac
     # Quote each unmet criterion VERBATIM so a human sees which is outstanding.
     quoted=$(printf '%s\n' "$report" | awk -F'\t' 'NF{printf "> - [ ] %s\n>\n>   _(matched: `%s`)_\n", $2, $1}')
+    # The notice shows the marker SHAPE with a `<head>` placeholder and names
+    # the real head in prose -- never a live `sha=$head_sha` literal. The
+    # classifier scans this very comment (issue comments are the evidence
+    # corpus) for a marker, and a rendered literal would self-satisfy the hold
+    # it just posted (#13900). The placeholder is rejected by the extractor's
+    # hex requirement, so prose-quoting stays inert.
     ./.loom/scripts/post-comment.sh "$issue" --body "$marker
 **Champion is holding this issue open.** PR #$pr merged, but this issue's own
 acceptance criteria include a step that CI structurally cannot perform, and
@@ -3434,9 +3557,11 @@ check, not a live-source, real-run, or over-time observation. See
 **To clear this**: perform the step, then post a comment on this issue (or on
 PR #$pr) saying what you ran and what you observed, ending with
 
-    <!-- loom:ac-verified sha=$head_sha -->
+    <!-- loom:ac-verified sha=<head> -->
 
-and close the issue. If the criterion was never actually out-of-band, reword it
+where \`<head>\` is the merged head \`$head_sha\` (the full 40-char SHA or a
+7+-char abbreviation of it both match), and close the issue. If the criterion
+was never actually out-of-band, reword it
 so it no longer reads as live/scheduled/over-time and close normally.
 
 *Automated by Champion role*"
@@ -4324,13 +4449,42 @@ LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
          | select((.body | contains("champion:capped-pr")) | not)
          | select(.body | test("Changes Requested"; "i"))]
         | last | .id // "none"')
+# The key is the id printed by the command above, copied VERBATIM. A head SHA,
+# an abbreviation, or any other spelling is NOT a key: on gf180-parasynth#647
+# four passes keyed on four spellings of one head SHA, so the exact-match guard
+# never fired and five identical verdicts landed on one rejection (#13903).
 PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 
-# Cached ("$GH_READ") — idempotency-marker grep.
-# `startswith`, not a bare substring match — a later comment quoting this
-# marker in prose must never be mistaken for the verdict's own comment and
-# wrongly suppress the real post (#5371).
-if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$PARK_MARKER\"))")" = "true" ]; then
+# Key-spelling-tolerant guard (#13903) — this is the ONLY suppression guard.
+# Skip if ANY comment starting with `<!-- champion:capped-pr-parked:` was
+# posted at or after the newest Judge rejection's last EDIT time (REST
+# `updated_at`: `gh pr view --json comments` has no edit time, and an edited
+# rejection with changed findings must still get a fresh verdict). A rejection
+# newer than every park marker never matches. There is no separate exact-key
+# arm: an edit does not change a comment's id, so a correctly-keyed marker
+# still matched `PARK_MARKER` verbatim after a rejection edit and
+# re-suppressed the fresh verdict the episode check had correctly cleared
+# (removed in the #13968 review).
+# `startswith`, not a bare substring match — a later comment quoting the
+# marker in prose must never be mistaken for a park marker and wrongly
+# suppress the real post (#5371).
+# The read is uncached `gh api --paginate` on purpose: it needs REST
+# `updated_at` (edit time), which the cached `gh pr view` read cannot see,
+# and Champion's 10-minute cron draws on the independent REST pool, which
+# has headroom.
+# `$rejected` takes `updated_at | max` across ALL rejections, deliberately
+# NOT the key's `last`: an older rejection edited today also opens a fresh
+# episode, which errs toward posting — do not "align" the two selectors.
+PARKED_SINCE_REJECTION=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR_NUMBER/comments" --jq '.[]' \
+  | jq -s '([.[]
+             | select((.body | contains("champion:capped-pr")) | not)
+             | select(.body | test("Changes Requested"; "i"))
+             | .updated_at] | max) as $rejected
+           | $rejected != null
+             and any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
+                          and .created_at >= $rejected)')
+
+if [ "$PARKED_SINCE_REJECTION" = "true" ]; then
   echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"
 else
   ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$PARK_MARKER
