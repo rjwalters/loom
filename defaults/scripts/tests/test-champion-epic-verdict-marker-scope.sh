@@ -535,6 +535,7 @@ if [[ -f "$CHAMPION_EPIC_STANDDOWN" ]]; then
     if [[ -z "$SNIPPET" ]]; then
         fail "could not extract the DECLARED_TRACKING_EPIC detection snippet"
     else
+        # shellcheck disable=SC2034  # EPIC_* are read by the eval'd stand-down snippet
         detect() { # $1=body $2=sources $3=strong_open
             local EPIC_JSON EPIC_CHILD_SOURCES="$2" EPIC_CHILD_STRONG_OPEN="$3" IS_TRACKING_UMBRELLA=""
             EPIC_JSON="$(jq -n --arg b "$1" '{body:$b}')"
