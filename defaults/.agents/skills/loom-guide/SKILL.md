@@ -2563,10 +2563,10 @@ changed-file list matches that exact set — EXCEPT when the repo's
 `.loom/docs-post-stage.sh` hook (rjwalters/loom#13892) reported additional
 files (e.g. a regenerated integrity envelope): those land in the same PR,
 which simply falls off the fast path to a full review. The
-`<!-- loom:docs-only-fast-path -->` marker above is informational only — Judge
-and Champion never trust it (or this section's prose) and always re-derive the
-changed-file list themselves from the paginated files API before taking the
-fast path.
+`<!-- loom:docs-only-fast-path -->` marker above is informational only —
+Judge and Champion never trust it (or this section's prose) and always
+re-derive the changed-file list themselves from the paginated files API
+before taking the fast path.
 
 ---
 *Automated by Guide role - document maintenance phase*
