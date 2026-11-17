@@ -219,6 +219,7 @@ pub(super) async fn handle(stream: &mut TcpStream, socket_path: &Path) -> Result
 mod tests {
     use super::*;
     use crate::api_keys_pool::{bad_marks, paths, registry};
+    use serial_test::serial;
     use std::net::Ipv4Addr;
     use tokio::net::TcpListener;
 
@@ -241,6 +242,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn a_registered_account_renders_with_its_provider_and_selectable_state() {
         let tmp = workspace_with_account("alpha");
         let rows = rows_for_workspace(tmp.path());
@@ -253,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn no_key_material_reaches_the_rendered_rows() {
         let tmp = workspace_with_account("alpha");
         let rendered = serde_json::to_string(&rows_for_workspace(tmp.path())).unwrap();
@@ -260,6 +263,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn a_disabled_account_renders_disabled_rather_than_vanishing() {
         let tmp = workspace_with_account("alpha");
         let root = paths::per_repo_api_keys_dir(tmp.path());
@@ -269,6 +273,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn a_bad_marked_account_renders_exhausted_with_its_reason() {
         let tmp = workspace_with_account("alpha");
         let root = paths::per_repo_api_keys_dir(tmp.path());
@@ -283,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn a_malformed_account_file_renders_unusable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = paths::provider_dir(&paths::per_repo_api_keys_dir(tmp.path()), "loomtest");
@@ -296,6 +302,7 @@ mod tests {
     /// — the view has to show that, not "selectable" and not "no accounts".
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn an_unverifiable_account_renders_withheld() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = workspace_with_account("alpha");
@@ -316,6 +323,7 @@ mod tests {
     /// empty pool.
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn an_unreadable_provider_directory_renders_unreadable_not_an_empty_pool() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = workspace_with_account("alpha");
@@ -339,12 +347,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn a_workspace_with_no_pool_contributes_no_rows() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(rows_for_workspace(tmp.path()).is_empty());
     }
 
     #[test]
+    #[serial]
     fn duplicate_workspace_roots_are_not_double_counted() {
         let tmp = workspace_with_account("alpha");
         let roots = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
@@ -360,6 +370,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn http_get_api_keys_lists_the_managed_repos_pool_accounts() {
         let tmp = workspace_with_account("alpha");
         let report = super::super::tests::report_with_repo_root(tmp.path());

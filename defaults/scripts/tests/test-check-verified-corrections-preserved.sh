@@ -261,6 +261,150 @@ run_cvcp "$WORK_DIR/large-section-missing-old.md" "$WORK_DIR/large-section-missi
 assert_eq "1" "$RC" "(9a) Genuine missing paragraph in a large section -> exit 1 (still correctly detected)"
 assert_contains "$OUT" "finding number 2 confirmed" "(9a) Failure names the specific missing paragraph"
 
+# --- Scenario 10: h3 section nested under h2, deleted wholesale (#13938) --
+# Case 1 from the report: the Curator template nests everything under one
+# `## Curator Enhancement` heading with `###` subsections, so the section is
+# written at h3. The pre-fix guard matched only a level-2 heading, printed
+# "OK -- nothing to preserve" and exited 0 even when the section -- and every
+# verified entry in it -- was deleted. The one input the guard exists to
+# catch must exit 1.
+cat > "$WORK_DIR/h3-wholesale-old.md" <<'EOF'
+## Curator Enhancement
+
+### Verified corrections
+
+- **2026-11-14, verified via a live probe**: the sibling directory IS claimed.
+
+### Acceptance Criteria
+
+- [ ] fix it
+EOF
+
+cat > "$WORK_DIR/h3-wholesale-new.md" <<'EOF'
+## Curator Enhancement
+
+### Acceptance Criteria
+
+- [ ] fix it
+EOF
+
+run_cvcp "$WORK_DIR/h3-wholesale-old.md" "$WORK_DIR/h3-wholesale-new.md"
+assert_eq "1" "$RC" "(10a) h3 section deleted wholesale -> exit 1 (pre-fix silent pass, #13938 Case 1)"
+assert_contains "$OUT" "has none at all" "(10a) Failure names the section as entirely absent, not just changed"
+
+# --- Scenario 11: h3 section, sibling h3 subsection edited (#13938) -------
+# The false-positive half of the report: with the section at h3 and an
+# unrelated `### Acceptance Criteria` as a SIBLING (the template shape), the
+# sibling closes the section, so an ordinary edit to its bullet is not a
+# lost verified correction.
+cat > "$WORK_DIR/h3-sibling-old.md" <<'EOF'
+## Curator Enhancement
+
+### Verified corrections
+
+- **2026-11-14, verified via a live probe**: the sibling directory IS claimed.
+
+### Acceptance Criteria
+
+- [ ] fix it
+EOF
+
+cat > "$WORK_DIR/h3-sibling-new.md" <<'EOF'
+## Curator Enhancement
+
+### Verified corrections
+
+- **2026-11-14, verified via a live probe**: the sibling directory IS claimed.
+
+### Acceptance Criteria
+
+- [ ] fix it properly
+EOF
+
+run_cvcp "$WORK_DIR/h3-sibling-old.md" "$WORK_DIR/h3-sibling-new.md"
+assert_eq "0" "$RC" "(11a) Unrelated edit under a sibling h3 heading -> exit 0 (no false positive)"
+assert_contains "$OUT" "OK" "(11a) Success message reported"
+
+# --- Scenario 12: h3 section closed by a following h2, edit under it ------
+# Edge case: a section opened at depth 3 closes at the next heading of the
+# same or SHALLOWER depth -- a following h2 sibling ends it, so edits under
+# that h2 are unrelated to the section.
+cat > "$WORK_DIR/h3-then-h2-old.md" <<'EOF'
+## Curator Enhancement
+
+### Verified corrections
+
+- **2026-11-14, verified via a live probe**: the sibling directory IS claimed.
+
+## Acceptance Criteria
+
+- [ ] fix it
+EOF
+
+sed 's/- \[ \] fix it/- [ ] fix it properly/' "$WORK_DIR/h3-then-h2-old.md" > "$WORK_DIR/h3-then-h2-new.md"
+
+run_cvcp "$WORK_DIR/h3-then-h2-old.md" "$WORK_DIR/h3-then-h2-new.md"
+assert_eq "0" "$RC" "(12a) h3 section closed by a following h2; edit under the h2 -> exit 0"
+
+# --- Scenario 13: h2 section with nested h3 still protects inner entries --
+# Deeper subheadings stay INSIDE the section (only same-or-shallower closes
+# it), so a verified entry recorded under a nested h3 subsection is still
+# append-only protected -- deleting it is detected and named. This is what
+# keeps depth-matching from trading the silent pass for a silent hole.
+cat > "$WORK_DIR/nested-h3-old.md" <<'EOF'
+## Verified corrections
+
+- **2026-11-01, verified via probe A**: outer entry intact.
+
+### Probe details
+
+- **2026-11-02, verified via probe B**: nested entry that must stay protected.
+
+## Acceptance Criteria
+
+- [ ] unrelated
+EOF
+
+grep -v "nested entry that must stay protected" "$WORK_DIR/nested-h3-old.md" > "$WORK_DIR/nested-h3-new.md"
+
+run_cvcp "$WORK_DIR/nested-h3-old.md" "$WORK_DIR/nested-h3-new.md"
+assert_eq "1" "$RC" "(13a) Entry under a nested h3 deleted -> exit 1 (deeper headings stay inside the section)"
+assert_contains "$OUT" "nested entry that must stay protected" "(13a) Failure names the nested missing paragraph"
+
+run_cvcp "$WORK_DIR/nested-h3-old.md" "$WORK_DIR/nested-h3-old.md"
+assert_eq "0" "$RC" "(13b) Same nested document unchanged -> exit 0"
+
+# --- Scenario 14: level-1 heading is ignored but not silent (#13938) ------
+# A depth-1 `# Verified corrections` heading is deliberately not matched (a
+# lone h1 is a document title, not a section inside a body). It must be
+# named in a WARN on stderr so the absent-section OK stays distinguishable
+# from a found-and-checked pass. No new exit code: still 0.
+cat > "$WORK_DIR/h1-old.md" <<'EOF'
+# Verified corrections
+
+- **2026-11-14, verified via a live probe**: would be silently unprotected.
+EOF
+
+run_cvcp "$WORK_DIR/h1-old.md" "$WORK_DIR/h1-old.md"
+assert_eq "0" "$RC" "(14a) Level-1 heading ignored -> exit 0 (no new exit code)"
+assert_contains "$OUT" "WARN" "(14a) WARN emitted for the ignored heading"
+assert_contains "$OUT" "# Verified corrections" "(14a) WARN names the ignored heading"
+assert_contains "$OUT" "nothing to preserve" "(14a) Absent-section OK still reported (now distinguishable via the WARN)"
+
+# --- Scenario 15: depth edge cases — mixed case, trailing whitespace, tab -
+# Trailing whitespace on the heading is tolerated ([ \t]*$), matching is
+# case-insensitive at any depth, and a tab after the hash run is a valid
+# heading separator. printf keeps the trailing whitespace explicit.
+printf '## Curator Enhancement\n\n### VERIFIED CORRECTIONS   \n\n- **2026-11-05, verified via probe T**: trailing-space heading entry.\n\n### Acceptance Criteria\n\n- [ ] x\n' > "$WORK_DIR/h3-edge-old.md"
+printf '## Curator Enhancement\n\n### verified corrections\t\n\n- **2026-11-05, verified via probe T**: trailing-space heading entry.\n\n- **2026-11-06, verified via probe U**: appended entry.\n\n### Acceptance Criteria\n\n- [ ] x\n' > "$WORK_DIR/h3-edge-new.md"
+
+run_cvcp "$WORK_DIR/h3-edge-old.md" "$WORK_DIR/h3-edge-new.md"
+assert_eq "0" "$RC" "(15a) Mixed-case h3 heading with trailing space/tab, preserved + appended -> exit 0"
+
+printf '## Curator Enhancement\n\n### Acceptance Criteria\n\n- [ ] x\n' > "$WORK_DIR/h3-edge-gone.md"
+run_cvcp "$WORK_DIR/h3-edge-old.md" "$WORK_DIR/h3-edge-gone.md"
+assert_eq "1" "$RC" "(15b) Mixed-case h3 heading with trailing whitespace, section deleted -> exit 1"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
