@@ -122,10 +122,16 @@ pub struct MarkerFields {
     pub socket_path: PathBuf,
 }
 
-/// Resolve `<loom_dir>` the same way `main.rs::resolve_loom_dir` /
-/// `daemon_heartbeat` / `daemon_install_state` do: the parent of
-/// `LOOM_SOCKET_PATH` when set (so a test daemon pointed at a tempdir socket
-/// heals into that tempdir, never the operator's real `~/.loom`), else `~/.loom`.
+/// Resolve `<loom_dir>`: the parent of `LOOM_SOCKET_PATH` when set (so a test
+/// daemon pointed at a tempdir socket heals into that tempdir, never the
+/// operator's real `~/.loom`), else `~/.loom`.
+///
+/// The single implementation of this rule (#13833, operator ruling
+/// `consolidate-all`): every site that needs `<loom_dir>` — the heartbeat,
+/// install-state, fleet-sync, pending-restart and alerts-ledger paths, the
+/// daemon log path in [`crate::health`], and the `Result` wrapper
+/// [`crate::cli::common::resolve_loom_dir`] — calls this function, so the
+/// test-isolation property can never drift between them.
 ///
 /// `pub(crate)` since #4774: [`crate::daemon_pidfile`] resolves the pid file
 /// against the *same* loom dir this module records in the marker's `pid_file=`
