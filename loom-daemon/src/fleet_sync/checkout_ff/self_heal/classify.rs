@@ -261,14 +261,9 @@ pub(super) fn live_git(root: &Path) -> bool {
             Some(true) => false,
             _ => match cwd_of(pid) {
                 Some(cwd) => cwd.starts_with(&root),
-                None => process_exists(pid),
+                None => crate::sweep_registry::pid_signalable(pid),
             },
         })
-}
-
-fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// Is `pid` an exited process its parent has not reaped? Such a process is

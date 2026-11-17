@@ -161,16 +161,8 @@ impl Default for NoopCooldownConfig {
 /// Per-issue no-op-cooldown bookkeeping (Issue #6670).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoopCooldownState {
-    /// When this cooldown window was (most recently) armed.
-    pub(crate) recorded_at: DateTime<Utc>,
     /// The instant at which the next dispatch attempt becomes allowed.
     pub(crate) until: DateTime<Utc>,
-    /// Consecutive no-op releases recorded for this issue without an
-    /// intervening real dispatch (cleared by [`SweepRegistry::clear_noop_cooldown`]
-    /// — including the automatic clear on a successful non-no-op dispatch, see
-    /// [`SweepRegistry::dispatch`]). Observability only; never affects the
-    /// (flat, non-exponential) cooldown duration.
-    pub(crate) consecutive: u32,
     /// Free-form context supplied by the recording caller, logged verbatim.
     pub(crate) reason: Option<String>,
     /// The dispatch this self-report belongs to (Issue #8912): the id of the
@@ -289,16 +281,12 @@ impl SweepRegistry {
             return;
         }
         let now = Utc::now();
-        let consecutive = self
-            .noop_cooldown
-            .get(&issue)
-            .map_or(1, |prev| prev.consecutive.saturating_add(1));
         let until = now
             + chrono::Duration::from_std(self.noop_cooldown_config.cooldown)
                 .unwrap_or_else(|_| chrono::Duration::zero());
         log::info!(
-            "sweep_registry: issue #{issue} no-op-release cooldown armed — {consecutive} \
-             consecutive no-op release(s), next dispatch allowed in {}s (#6670){}",
+            "sweep_registry: issue #{issue} no-op-release cooldown armed — \
+             next dispatch allowed in {}s (#6670){}",
             self.noop_cooldown_config.cooldown.as_secs(),
             reason
                 .as_deref()
@@ -314,9 +302,7 @@ impl SweepRegistry {
         self.noop_cooldown.insert(
             issue,
             NoopCooldownState {
-                recorded_at: now,
                 until,
-                consecutive,
                 reason,
                 released_by_sweep: released_by_sweep.clone(),
             },
@@ -402,9 +388,7 @@ impl SweepRegistry {
             self.noop_cooldown.insert(
                 issue,
                 NoopCooldownState {
-                    recorded_at: at,
                     until,
-                    consecutive: 1,
                     reason: Some("replayed from the outcome journal after a restart".into()),
                     released_by_sweep: None,
                 },
@@ -538,11 +522,14 @@ impl SweepRegistry {
         true
     }
 
-    /// Clear `issue`'s no-op-cooldown record (Issue #6670) — called on any
-    /// dispatch that actually starts a sweep, so a genuine content change
-    /// before the cooldown elapses is never suppressed (a fresh dispatch is
-    /// itself proof the candidate is live again). Returns `true` when a record
-    /// existed. Mirrors [`Self::clear_dispatch_backoff`].
+    /// Clear `issue`'s no-op-cooldown record (Issue #6670). The only two
+    /// callers are the operator's `quarantine clear`
+    /// ([`Self::clear_quarantine`]) and the reaper's crashed-reap path
+    /// ([`Self::clear_noop_cooldown_unless_reported`] — a reap that made
+    /// checkpoint progress before dying); **no dispatch path clears it**, and
+    /// an expired window is never pruned — the record simply stays until one
+    /// of those fires. Returns `true` when a record existed. Mirrors
+    /// [`Self::clear_dispatch_backoff`].
     pub(crate) fn clear_noop_cooldown(&mut self, issue: u32) -> bool {
         self.noop_cooldown.remove(&issue).is_some()
     }
@@ -647,14 +634,6 @@ impl SweepRegistry {
         (state.until > now).then_some(state.until)
     }
 
-    /// Consecutive no-op releases recorded for `issue` (Issue #6670). `0` when
-    /// no release is on record. Test/inspection helper, mirroring
-    /// [`Self::dispatch_failure_count`].
-    #[must_use]
-    pub fn noop_release_count(&self, issue: u32) -> u32 {
-        self.noop_cooldown.get(&issue).map_or(0, |s| s.consecutive)
-    }
-
     /// Every issue whose no-op cooldown is still in effect at `now` (Issue
     /// #6670) — the set the work finder skips *before* the capacity gate,
     /// mirroring [`Self::quarantined_issues`] / [`Self::dispatch_backoff_issues`].
@@ -720,24 +699,21 @@ mod tests {
     #[test]
     fn record_arms_cooldown_and_is_reflected_in_skip_set() {
         let mut reg = test_registry();
-        assert_eq!(reg.noop_release_count(4242), 0);
         assert!(reg.noop_cooldown_remaining(4242, Utc::now()).is_none());
 
         reg.record_noop_release(4242, Some("no delta since last survey".into()));
 
-        assert_eq!(reg.noop_release_count(4242), 1);
         let remaining = reg.noop_cooldown_remaining(4242, Utc::now());
         assert!(remaining.is_some_and(|d| d.as_secs() > 0));
         assert!(reg.noop_cooldown_issues(Utc::now()).contains(&4242));
     }
 
     #[test]
-    fn repeated_records_accumulate_consecutive_but_stay_flat() {
+    fn repeated_records_refresh_a_flat_window() {
         let mut reg = test_registry();
         reg.record_noop_release(99, None);
         reg.record_noop_release(99, None);
         reg.record_noop_release(99, None);
-        assert_eq!(reg.noop_release_count(99), 3);
         // Flat, non-exponential: the window is always exactly the configured
         // cooldown from the most recent record, never longer.
         let remaining = reg.noop_cooldown_remaining(99, Utc::now()).unwrap();
@@ -772,7 +748,6 @@ mod tests {
             ..NoopCooldownConfig::default()
         });
         reg.record_noop_release(1, None);
-        assert_eq!(reg.noop_release_count(1), 0);
         assert!(reg.noop_cooldown_remaining(1, Utc::now()).is_none());
         assert!(reg.noop_cooldown_issues(Utc::now()).is_empty());
     }

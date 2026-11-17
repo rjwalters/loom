@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Sweep — Scheduling signals — overlap partitioning, capability lane, operator-gate scan
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.

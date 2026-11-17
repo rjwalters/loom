@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: CI Is Red — Finished Run, Named Test, Recorded Flake Rerun (#12011)
 
 **Load when**: `loom-daemon forge wait-checks` printed `LOOM-CHECKS-RED`, or
