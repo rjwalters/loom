@@ -116,7 +116,11 @@ the next person to add one will have an equally good argument.
    a PR (a cancelled / never-acquired runner otherwise skips every filtered
    job while the always-run required checks stay green, as on #10403), when
    any job failed or was cancelled, or when a job was skipped only because its
-   upstream did not succeed. A skip the path filter decided still passes. The
+   upstream did not succeed. A skip the path filter decided still passes. A
+   transient GitHub diff-API outage inside the filter step itself is retried
+   once and then falls **open**: the path-group outputs resolve to `true` and
+   every filtered job runs under a `::warning::`, so an outage costs CI
+   minutes instead of a red run that verifies nothing (#13969). The
    rule lives in `scripts/ci-result-gate.sh`. `merge-pr.sh` no longer
    re-checks the `CI` run itself (#12063): `CI Result` as the required
    context is what GitHub gates the merge on. Remedy: `gh run rerun --failed
