@@ -13,7 +13,8 @@
 # rebase-stacked-children.sh. #7341 found the SAME gap in three more call
 # sites that also rebase + `git push --force-with-lease` directly:
 # reconcile-stack.sh (`rebase --onto`, the stacked-PR post-merge collapse),
-# three separate recipes in judge.md (Judge's own DIRTY/BEHIND/simple-
+# three separate recipes in judge.md (now judge-merge-conflicts.md, #13957;
+# Judge's own DIRTY/BEHIND/simple-
 # conflict auto-rebase-and-push paths), one in builder-worktree.md
 # (a Builder rebasing an already-open PR branch outside create-pr.sh), and
 # doctor.md's own Step 9 pre-push head-SHA-recheck recovery (the "rebase onto
@@ -110,13 +111,18 @@ echo "Testing version-check-gate.sh call-site wiring across every direct rebase+
 echo ""
 
 DOCTOR_MD="$DEFAULTS_DIR/.claude/commands/loom/doctor.md"
-JUDGE_MD="$DEFAULTS_DIR/.claude/commands/loom/judge.md"
+# #13957 split judge.md into an always-read core plus on-demand sub-skills.
+# Judge's two direct rebase+push recipes are trigger-gated (DIRTY only) and now
+# ship in judge-merge-conflicts.md, so that is the file whose call sites are
+# counted. The core is checked for the pointer that routes a DIRTY PR there.
+JUDGE_CORE_MD="$DEFAULTS_DIR/.claude/commands/loom/judge.md"
+JUDGE_MD="$DEFAULTS_DIR/.claude/commands/loom/judge-merge-conflicts.md"
 BUILDER_WORKTREE_MD="$DEFAULTS_DIR/.claude/commands/loom/builder-worktree.md"
 CREATE_PR_SH="$DEFAULTS_DIR/scripts/create-pr.sh"
 REBASE_STACKED_CHILDREN_SH="$DEFAULTS_DIR/scripts/rebase-stacked-children.sh"
 RECONCILE_STACK_SH="$DEFAULTS_DIR/scripts/reconcile-stack.sh"
 
-for f in "$DOCTOR_MD" "$JUDGE_MD" "$BUILDER_WORKTREE_MD" "$CREATE_PR_SH" \
+for f in "$DOCTOR_MD" "$JUDGE_CORE_MD" "$JUDGE_MD" "$BUILDER_WORKTREE_MD" "$CREATE_PR_SH" \
          "$REBASE_STACKED_CHILDREN_SH" "$RECONCILE_STACK_SH"; do
   if [[ ! -f "$f" ]]; then
     echo "ERROR: expected file not found: $f" >&2
@@ -139,7 +145,15 @@ echo "New call sites (#7341):"
 # #12063 removed judge.md's BEHIND update recipe (a BEHIND PR is reviewed
 # as-is), leaving two gated rebase+push recipes.
 assert_ge 2 "$(call_site_count "$JUDGE_MD")" \
-  "judge.md gates both of its own direct rebase+push recipes (DIRTY, simple-conflict)"
+  "judge-merge-conflicts.md gates both of Judge's direct rebase+push recipes (DIRTY, simple-conflict)"
+assert_contains_file "$JUDGE_CORE_MD" "[judge-merge-conflicts.md](judge-merge-conflicts.md)** (load when DIRTY)" \
+  "judge.md routes a DIRTY PR to judge-merge-conflicts.md, where the gated recipes live (#13957)"
+# The count above only proves the sub-skill is gated. A push recipe re-added to
+# the core would be outside it, so the core must carry none of its own.
+assert_not_contains_file "$JUDGE_CORE_MD" "git push --force-with-lease" \
+  "judge.md's core carries no force-with-lease push recipe of its own (it would sit outside the gated sub-skill)"
+assert_not_contains_file "$JUDGE_CORE_MD" "git push origin" \
+  "judge.md's core carries no direct push recipe of its own (it would sit outside the gated sub-skill)"
 assert_ge 1 "$(call_site_count "$BUILDER_WORKTREE_MD")" \
   "builder-worktree.md gates its conflict-resolution rebase+push recipe"
 assert_ge 1 "$(call_site_count "$RECONCILE_STACK_SH")" \
@@ -164,7 +178,7 @@ echo "Fix guidance points at the real script, not a hand-patch:"
 assert_not_contains_file "$DEFAULTS_DIR/scripts/version-check-gate.sh" "bump patch" \
   "version-check-gate.sh's own Fix: message never recommends a forbidden hand-bump (#7743) -- it points at reverting to origin/main's values instead"
 assert_contains_file "$JUDGE_MD" "never hand-patch the version-bearing files yourself" \
-  "judge.md's DIRTY-rebase recipe explicitly steers away from a hand-patch recovery"
+  "judge-merge-conflicts.md's DIRTY-rebase recipe explicitly steers away from a hand-patch recovery"
 assert_contains_file "$BUILDER_WORKTREE_MD" "Never hand-patch VERSION/CLAUDE.md/etc" \
   "builder-worktree.md's rebase recipe explicitly steers away from a hand-patch recovery"
 assert_contains_file "$DOCTOR_MD" "bef3e07a" \

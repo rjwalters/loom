@@ -46,6 +46,12 @@ else
     PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
 fi
 JUDGE_MD="$PROMPT_DIR/judge.md"
+# #13957 split judge.md into an always-read core plus on-demand sub-skills. The
+# docs-only fast path is trigger-gated (it applies only to a WORK_LOG /
+# WORK_PLAN / README diff), so its eligibility code now ships in
+# judge-fast-paths.md. Every code pin below reads that file; the core is pinned
+# separately for the load trigger that routes a Judge to it.
+JUDGE_FAST_MD="$PROMPT_DIR/judge-fast-paths.md"
 CHAMPION_MD="$PROMPT_DIR/champion-pr-merge.md"
 GUIDE_MD="$PROMPT_DIR/guide.md"
 
@@ -60,7 +66,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # =====================================================================
 # The docs-only fast-path eligibility check, mirrored verbatim from BOTH
-# judge.md's "Docs-Only Fast Path" section and champion-pr-merge.md's
+# judge-fast-paths.md's "Docs-Only Fast Path" section and champion-pr-merge.md's
 # "Docs-only fast path" subsection of the merge-risk criterion — the two shipped copies
 # are intentionally identical, and the doc pins below confirm both actually
 # match this mirror.
@@ -199,38 +205,55 @@ fast_path_block() {
     awk '/^DOCS_FAST_PATH_ALLOWLIST=/{p=1} p{print} p && /^}$/{exit}' "$1" \
         | grep -v '^[[:space:]]*#'
 }
-JUDGE_BLOCK="$(fast_path_block "$JUDGE_MD")"
+JUDGE_BLOCK="$(fast_path_block "$JUDGE_FAST_MD")"
 CHAMPION_BLOCK="$(fast_path_block "$CHAMPION_MD")"
 assert_eq "$JUDGE_BLOCK" "$CHAMPION_BLOCK" \
-    "judge.md and champion-pr-merge.md allowlist+check code is identical (comments aside)"
+    "judge-fast-paths.md and champion-pr-merge.md allowlist+check code is identical (comments aside)"
 
 ARCHIVE_RE_LINE="DOCS_FAST_PATH_ARCHIVE_RE='^(work_log/WORK_LOG|work_plan/WORK_PLAN)_[0-9]{4}-(0[1-9]|1[0-2])\\.md\$'"
-assert_doc_contains "$JUDGE_MD" "$ARCHIVE_RE_LINE" "judge.md pins the narrow archive regex"
+assert_doc_contains "$JUDGE_FAST_MD" "$ARCHIVE_RE_LINE" "judge-fast-paths.md pins the narrow archive regex"
 assert_doc_contains "$CHAMPION_MD" "$ARCHIVE_RE_LINE" "champion-pr-merge.md pins the narrow archive regex"
 assert_doc_contains "$0" "$ARCHIVE_RE_LINE" "this suite's mirror uses the same archive regex"
 
 echo
-echo "--- Doc pins: judge.md ships the mechanical, marker-independent eligibility check ---"
+echo "--- Doc pins: judge-fast-paths.md ships the mechanical, marker-independent eligibility check ---"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")' \
-    "judge.md defines the exact 3-file allowlist"
+    "judge-fast-paths.md defines the exact 3-file allowlist"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '"'"'.[].filename'"'"')' \
-    "judge.md fetches the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
+    "judge-fast-paths.md fetches the changed-file list via the paginated REST endpoint (not the truncating gh pr view --json files)"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'docs_only_fast_path_check() {' \
-    "judge.md defines docs_only_fast_path_check()"
+    "judge-fast-paths.md defines docs_only_fast_path_check()"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     "loom:docs-fast-path-evaluation" \
-    "judge.md's fast-path approval carries the loom:docs-fast-path-evaluation marker"
+    "judge-fast-paths.md's fast-path approval carries the loom:docs-fast-path-evaluation marker"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     "#6134" \
-    "judge.md documents the #6134 fast path"
+    "judge-fast-paths.md documents the #6134 fast path"
+
+echo
+echo "--- Doc pins: the always-read judge.md core routes a docs-only diff to judge-fast-paths.md (#13957) ---"
+
+# The code moving out of the core must not strand it: step 4b has to name the
+# trigger in terms a Judge can evaluate WITHOUT the sub-skill loaded, name the
+# sub-skill, and defer to its mechanical check rather than re-deriving
+# eligibility from the prose.
+JUDGE_STEP_4B="$(grep -F '4b. **Check docs-only fast-path eligibility**' "$JUDGE_MD" || true)"
+for needle in '#6134' '`WORK_LOG.md`' '`WORK_PLAN.md`' '`README.md`' \
+    '[judge-fast-paths.md](judge-fast-paths.md)' '`docs_only_fast_path_check`'; do
+    if [[ "$JUDGE_STEP_4B" == *"$needle"* ]]; then
+        pass "judge.md step 4b names $needle"
+    else
+        fail "judge.md step 4b names $needle (the core no longer routes a docs-only diff to the fast-path sub-skill)"
+    fi
+done
 
 echo
 echo "--- Doc pins: champion-pr-merge.md independently re-derives eligibility, never trusts Judge's marker ---"
@@ -261,9 +284,11 @@ echo "--- Doc pins: neither Judge nor Champion gates eligibility on a label/mark
 # Regression guard for AC2 ("verify the diff's file list server-side... not
 # just trust the PR's stated intent"): the fast path must never be phrased
 # as "if the marker/label is present, skip verification".
-assert_doc_lacks "$JUDGE_MD" \
-    'if grep -q "loom:docs-only-fast-path"' \
-    "judge.md never short-circuits eligibility on a grep for the marker alone"
+for f in "$JUDGE_MD" "$JUDGE_FAST_MD"; do
+    assert_doc_lacks "$f" \
+        'if grep -q "loom:docs-only-fast-path"' \
+        "$(basename "$f") never short-circuits eligibility on a grep for the marker alone"
+done
 
 assert_doc_lacks "$CHAMPION_MD" \
     'if grep -q "loom:docs-only-fast-path"' \

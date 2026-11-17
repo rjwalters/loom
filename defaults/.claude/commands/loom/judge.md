@@ -74,8 +74,9 @@ that hard-denies the `-f body=@path` shape) **lives in
 edit` (mandatory for every verdict) are GraphQL-backed mutations, and GitHub's
 GraphQL and REST quotas are independent: GraphQL can read 0 remaining while
 REST still has thousands left. When a write fails with a rate-limit signature
-(`api rate limit exceeded`, `secondary rate limit`, `abuse detection
-mechanism`, `was submitted too quickly`), do **not** give up or wait idly —
+(`api rate limit·exceeded`, `secondary rate limit`, `abuse detection
+mechanism`, `was submitted too quickly`; `·` is a space, #11411), do **not**
+give up or wait idly —
 retry the same mutation over REST. The signature table, REST command
 equivalents, the `create-issue.sh` fallback, and the `GraphQL: Body is too
 long` carve-out: **[judge-forge-api.md](judge-forge-api.md)** (load when a
@@ -171,7 +172,7 @@ Check for an argument passed via the slash command:
 
 If a number is provided (e.g., `/judge 123`), it is the target **PR**: skip "Finding Work", and gate it before any claim, label or comment (#11863):
 1. **Kind and state probe** (live, one REST read): `gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'`. Refuse, writing nothing, on `false` (an issue number; Judge is a PR role), `closed`, `loom:frozen`, any `loom:operator*` label (#11861; retired names too), or a failed read.
-2. **Stage**: `loom:review-requested` (or `loom:reviewing` alone) → claim exactly as Primary Queue step 2 (stale check, PR lease, then the label) and evaluate. A lease held by your own `$LOOM_SWEEP_ID` is yours, not a peer's: a daemon step pre-takes it, and `lease pr claim` re-attaches (exit 0, "already held by this claimant") — continue and add `loom:reviewing` yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`. Neither those nor a verdict label (e.g. only `loom:important`) → [judge-fallback.md](judge-fallback.md) rules (guard, review only, never claim or label). A verdict label without `loom:review-requested` → no-op, unless the operator asked for this re-review (see "Exception").
+2. **Stage**: `loom:review-requested` (or `loom:reviewing` alone) → claim exactly as Primary Queue step 2 (stale check, PR lease, then the label) and evaluate. A lease held by your own `$LOOM_SWEEP_ID` is yours, not a peer's: a daemon step pre-takes it, and `lease pr claim` re-attaches (exit 0, "already held by this claimant") — continue and add `loom:reviewing` yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`. Neither those nor a verdict label (e.g. only `loom:important`) → "Fallback Queue" rules (guard, review only, never claim or label), in [judge-fallback.md](judge-fallback.md). A verdict label without `loom:review-requested` → no-op, unless the operator asked for this re-review (see "Exception").
 3. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=judge target=<n> class=<verdict|noop|refused|failed> reason=<token>`.
 
 If no argument is provided, use the normal finding work workflow below.
@@ -194,7 +195,7 @@ section for the full carve-out list).
 
 **Before either command below, run the Verdict-Time CAS Recheck** (see "Verdict-Time CAS Recheck" under Evaluation Process) — abort instead of writing if the recheck finds your claim lost, another Judge's verdict already landed, or the head SHA moved out from under your review. That recheck also hands you `$VERDICT_SHA`, the head SHA every verdict comment below **must** be stamped with.
 
-**Post every verdict comment through `./.loom/scripts/post-verdict.sh`, never a bare `gh pr comment` (#6382).** It takes `$VERDICT_SHA` as an argument and appends the `<!-- loom:verdict-sha ... -->` marker itself, so the marker cannot be typed-and-forgotten the way it can in a hand-written heredoc — the same reasoning behind `create-pr.sh` / `merge-pr.sh`. See [judge-verdicts.md](judge-verdicts.md) for why the marker matters; it applies to **every** verdict-label write in this document, not just the two below.
+**Post every verdict comment through `./.loom/scripts/post-verdict.sh`, never a bare `gh pr comment` (#6382).** It takes `$VERDICT_SHA` as an argument and appends the `<!-- loom:verdict-sha ... -->` marker itself, so the marker cannot be typed-and-forgotten the way it can in a hand-written heredoc — the same reasoning behind `create-pr.sh` / `merge-pr.sh`. See "Verdict SHA Marker" under Evaluation Process for why the marker matters; it applies to **every** verdict-label write in this document, not just the two below.
 
 **Every comment you post before the verdict carries a Loom marker, or you post none (#13222).** In an in-session sweep every role comments as the operator's one GitHub account, so an unmarked claim or progress note ("Evaluating this PR…") reads to the Stale-Read Gate as a trusted human comment newer than `REVIEW_STARTED` and refuses your own approval. End any such note with an HTML-comment marker the gate ignores (e.g. `<!-- loom:judge-note -->`); prefer posting nothing, since the PR lease and `loom:reviewing` already record the claim.
 
@@ -366,7 +367,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
    fi
    ```
 4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too); see the Stale-Read Gate under Label Workflow above): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
-4b. **Check docs-only fast-path eligibility** (see [judge-fast-paths.md](judge-fast-paths.md) — load on an exact allowlist match) — if the changed-file list is an exact match against the fast-path allowlist, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+4b. **Check docs-only fast-path eligibility** (#6134): if **every** changed file is root-level `WORK_LOG.md`, `WORK_PLAN.md` or `README.md`, or a month-rotated `work_log/WORK_LOG_YYYY-MM.md` / `work_plan/WORK_PLAN_YYYY-MM.md` archive, load [judge-fast-paths.md](judge-fast-paths.md) and run its `docs_only_fast_path_check` (the authoritative check: paginated file list, exact allowlist; this sentence is only the load trigger). If it prints `ELIGIBLE`, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see [judge-merge-conflicts.md](judge-merge-conflicts.md); load when DIRTY)
 7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see [judge-env-gap.md](judge-env-gap.md)
@@ -383,7 +384,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 8b. **Reconcile formal reviews and inline threads**: `./.loom/scripts/check-review-feedback.sh --number <number> --head-sha "$REVIEW_HEAD_SHA"` — CI green plus friendly issue comments is NOT the whole review record (#7647); it also reads comment-posted changes-requested verdicts (#12475). Exit 0 = clear; 10/11/12 mean something is outstanding, older-head, or unread, and an approval must dispose of it explicitly. See "Formal Review & Inline Thread Reconciliation" below (detail: [judge-review-reconciliation.md](judge-review-reconciliation.md)). **Applies to every approval path, including the fast paths** — `post-verdict.sh` re-runs this gate itself and refuses an ungrounded approval.
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `./.loom/scripts/post-verdict.sh` to provide evaluation feedback
-11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost, another Judge's verdict already landed, or the head SHA moved off `REVIEW_HEAD_SHA`. It yields `$VERDICT_SHA`, which `post-verdict.sh` MUST be given (see [judge-verdicts.md](judge-verdicts.md)) — the script stamps the `<!-- loom:verdict-sha ... -->` marker itself. The script applies the label (the PRIMARY deliverable) itself; see Label Workflow for exits 7/8:
+11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost, another Judge's verdict already landed, or the head SHA moved off `REVIEW_HEAD_SHA`. It yields `$VERDICT_SHA`, which `post-verdict.sh` MUST be given (see "Verdict SHA Marker" below) — the script stamps the `<!-- loom:verdict-sha ... -->` marker itself. The script applies the label (the PRIMARY deliverable) itself; see Label Workflow for exits 7/8:
    - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --review-started "$REVIEW_STARTED" --issue-body-sha "<N>=$ISSUE_HASH_N" --body ...` (blue `loom:pr` - ready for Champion auto-merge)
    - If changes needed: `post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body ...` (amber - Doctor will address)
    - Then release the PR lease: `loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (also on any stand-down)
@@ -460,7 +461,7 @@ Then decide:
 
 | Condition | Verdict | Action |
 |-----------|---------|--------|
-| `loom:reviewing` is still present (your claim intact), neither `loom:pr` nor `loom:changes-requested` has appeared, **and** `$VERDICT_SHA` equals the head SHA you actually reviewed | **Safe** | Proceed with the verdict write as planned, stamping `$VERDICT_SHA` into the verdict comment's marker (see [judge-verdicts.md](judge-verdicts.md)). |
+| `loom:reviewing` is still present (your claim intact), neither `loom:pr` nor `loom:changes-requested` has appeared, **and** `$VERDICT_SHA` equals the head SHA you actually reviewed | **Safe** | Proceed with the verdict write as planned, stamping `$VERDICT_SHA` into the verdict comment's marker (see "Verdict SHA Marker" below). |
 | The lease fence printed `CLAIM LOST`, or `loom:reviewing` was removed or replaced (e.g. reclaimed as stale by another Judge while you were still working) | **Claim lost** | **ABORT.** Discard your verdict — do not write any label. Post a short standing-down note ([judge-verdicts.md](judge-verdicts.md) has the template). Do NOT re-add `loom:reviewing`. |
 | A verdict label (`loom:pr` or `loom:changes-requested`) is already present that you did not just write | **Raced** | **ABORT.** Another Judge's verdict landed first. Discard your verdict and post a short note citing the label you observed — do NOT overwrite their verdict, even if you disagree with it (raise disagreement as a plain PR comment, not a second label write). |
 | `$VERDICT_SHA` differs from the head SHA you checked out and evaluated (someone pushed or force-pushed while you reviewed) | **Tree moved (#5686)** | **ABORT.** Your verdict is about a tree that is no longer here — writing it would create exactly the stale verdict this whole convention exists to prevent. Do not write any label. Post the tree-moved note ([judge-verdicts.md](judge-verdicts.md) has the template), drop `loom:reviewing`, and let a fresh pass evaluate the current head. |
@@ -498,13 +499,59 @@ comment templates) and the race-window rationale:
       it renders my actual review prose, not a literal path string
 - [ ] I passed the SHA from the Verdict-Time CAS Recheck above as
       `post-verdict.sh`'s third argument — the script stamps the
-      `<!-- loom:verdict-sha ... -->` marker itself (see [judge-verdicts.md](judge-verdicts.md)); I do not need to (and should not) type the marker by hand
+      `<!-- loom:verdict-sha ... -->` marker itself (see "Verdict SHA Marker" below); I do not need to (and should not) type the marker by hand
 
-The **Verdict SHA Marker** (`<!-- loom:verdict-sha ... -->`, stamped by
-`post-verdict.sh` itself) and its rules — why a verdict is a statement about a
-specific tree, the canonical spellings, which comments must NOT carry the
-marker, and the distinct `<!-- loom:ac-verified ... -->` marker — live in
-**[judge-verdicts.md](judge-verdicts.md)**.
+### Verdict SHA Marker (MANDATORY on every verdict comment)
+
+A review verdict is a statement about **a specific tree**, not about a PR.
+`loom:changes-requested` means "*this* code needs changes"; `loom:pr` means
+"*this* code is approved". Neither claim survives the head SHA moving, and
+the marker is what records which tree a verdict covers (#5686).
+
+**The rule**: every verdict-label write in this document is posted through
+
+```bash
+./.loom/scripts/post-verdict.sh <number> approved|changes-requested "$VERDICT_SHA" \
+    --body "..." | --body-file <path>
+```
+
+never a bare `gh pr comment` (#6382). Every **approval** also passes
+`--review-started "$REVIEW_STARTED"` and one `--issue-body-sha "N=$HASH"` per
+linked issue (the Stale-Read Gate under Label Workflow, #12614). `$VERDICT_SHA`
+is the `headRefOid` read in the Verdict-Time CAS Recheck immediately above the
+write; `post-verdict.sh` appends the marker itself —
+
+```
+<!-- loom:verdict-sha sha=<sha> verdict=approved -->
+```
+
+(or `verdict=changes-requested`; those two tokens are the only spellings you
+emit) — so it is never typed as prose and cannot be dropped by mistake.
+
+**This applies to EVERY verdict-label write, in this file and its sub-skills**,
+not just the two in Label Workflow: the DIRTY/merge-conflict rejection, the
+CI-failure rejection, the fast-track approval, the docs-only fast-path
+approval, the minor-PR-description-fix approval, and the trivial-fix approval.
+A verdict written without a marker is `UNVERIFIABLE` to every consumer — it
+fails **safe** (kept, never force-cleared), so an unmarked stale approval keeps
+exactly the pre-#5686 danger. Do not hand-write the comment for "just this
+one" site.
+
+**A markerless approval is lost work that HARD-STALLS the PR** (#12136): the
+backstops (the Stale-Verdict Sweep below, `loom-daemon`'s
+`reconcile_pr_verdicts`) re-queue it, never anchor it (#9258), because neither
+knows which tree you reviewed. It never merges until re-posted through
+`post-verdict.sh`. Bypassing it is never a shortcut.
+
+**Only stamp genuine verdicts.** Stand-down notes, progress comments,
+fallback-queue notes, and the stale-verdict notice itself are not verdicts and
+must NOT carry this marker — stamping one would make a non-verdict look like a
+verdict about the current tree.
+
+The incident this closes, the lenient-reader spellings (#12104), the measured
+marker-drop rate behind the backstops (#6319), and the distinct
+`<!-- loom:ac-verified ... -->` marker: [judge-verdicts.md](judge-verdicts.md)
+(background; the rule above is complete without it).
 
 ### Stale-Verdict Sweep (run BEFORE the primary queue, every pass)
 
@@ -721,11 +768,33 @@ mode — or wait in the foreground (`loom-daemon forge wait-checks <n> --timeout
 1800 --settle-red`, branch on the first stdout line) in single-PR mode. Never
 settle a pending CI by arming a background monitor (`Monitor`/`ScheduleWakeup`/
 `run_in_background`) and ending your turn — in headless mode the monitor dies
-with the process and the PR is left claimed with no verdict. The full
-procedure, the zero-check-runs re-trigger path (2am#6467), the
-conditional-verdict fallback, and the background-monitor rule:
-**[judge-ci-pending.md](judge-ci-pending.md)** (load whenever CI is pending at
-verdict time).
+with the process and the PR is left claimed with no verdict (#4883).
+
+**Pending-CI skip check.** Reuse Step 1's snapshot (`--timeout 20`, seconds;
+`--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has
+nothing to wait for). Branch on the first **stdout** line. **One exception
+first**: if that line is `LOOM-CHECKS-TIMEOUT*` or `-NO-RUN*` and the head
+commit is more than 2 hours old, CI may never have started (2am#6467) — load
+**[judge-ci-pending.md](judge-ci-pending.md)** and run its zero-check-runs test
+before releasing.
+
+```bash
+first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1)"
+case "$first" in
+  LOOM-CHECKS-TIMEOUT*)   # still pending: release and skip; PR stays loom:review-requested
+    gh pr comment <number> --body "CI still running; skipping until it settles."
+    gh pr edit <number> --remove-label "loom:reviewing"
+    loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
+    ;;
+  LOOM-CHECKS-RED*) ;;    # "When CI Fails"
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;
+  *) gh pr checks <PR_NUMBER> ;;   # no sentinel (older binary / Gitea): one snapshot, no loop
+esac
+```
+
+Also load **[judge-ci-pending.md](judge-ci-pending.md)** for a single-PR
+foreground wait: it has the bounded-wait recipe and the conditional-verdict
+fallback for a wait that hits its cap.
 
 ### Why CI Verification Matters
 
