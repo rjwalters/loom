@@ -40,18 +40,44 @@ pub(super) struct ExecAuth {
 impl ExecAuth {
     /// The credential for an exec acting on `repository` from `workspace`.
     pub(super) fn resolve(workspace: &Path, repository: &str) -> Self {
-        Self::resolve_with(workspace, repository, &|name| std::env::var_os(name), &|dir| {
-            read_token(dir, None)
-        })
+        Self::resolve_with_root(
+            workspace,
+            repository,
+            &|name| std::env::var_os(name),
+            &|dir| read_token(dir, None),
+            crate::credential_preflight::primary_workspace_root().as_deref(),
+        )
     }
 
     /// [`Self::resolve`] over an injected process environment and token
-    /// reader (tests).
+    /// reader (tests). The daemon's registered root is read from the
+    /// process-global registry, exactly as production does.
+    #[cfg(test)]
     pub(super) fn resolve_with(
         workspace: &Path,
         repository: &str,
         env: &dyn Fn(&str) -> Option<OsString>,
         read: &dyn Fn(&Path) -> Option<String>,
+    ) -> Self {
+        Self::resolve_with_root(
+            workspace,
+            repository,
+            env,
+            read,
+            crate::credential_preflight::primary_workspace_root().as_deref(),
+        )
+    }
+
+    /// [`Self::resolve_with`] with the registered primary root injected too,
+    /// so a test can pin the pristine-dispatch state — no
+    /// `LOOM_MACHINE_CHECKOUT` in the process env, the daemon's registered
+    /// root the only source (#13965) — without touching the set-once global.
+    fn resolve_with_root(
+        workspace: &Path,
+        repository: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+        read: &dyn Fn(&Path) -> Option<String>,
+        registered: Option<&Path>,
     ) -> Self {
         let mut names: Vec<&'static str> = FORGE_ENV
             .iter()
@@ -81,7 +107,7 @@ impl ExecAuth {
         // nothing. The process `GH_CONFIG_DIR` is the workspace-root owner's
         // credential on a daemon host, and handing it to another owner's
         // repository would forward the wrong installation's token.
-        let primary = primary_root(env);
+        let primary = primary_root(env, registered);
         let secret = config_dir_for(workspace, primary.as_deref(), &slug, &gh_host)
             .and_then(|dir| read(&dir));
         if secret.is_some() && !names.contains(&TOKEN_ENV) {
@@ -141,15 +167,23 @@ pub(super) fn github_slug(repository: &str, gh_host: &str) -> Option<String> {
 }
 
 /// The daemon's primary workspace root, where the refresh tick publishes every
-/// owner's App directory: `LOOM_MACHINE_CHECKOUT` when the process carries it
-/// (a worker's systemd unit sets it, so a short-lived `session-exec host` or
-/// hand-run `accounts session job` sees it too, #13937), else the root the
-/// daemon process registered at startup.
-fn primary_root(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+/// owner's App directory: `LOOM_MACHINE_CHECKOUT` when the process carries it,
+/// else the root the daemon process registered at startup. A pristine
+/// `fleet add-worker` unit does NOT set the variable — it renders only `PATH`
+/// and `LOOM_DAEMON_SUPERVISOR` (`unit_env_tests::STRUCTURAL`) — so a
+/// short-lived `session-exec host` sees it only because the daemon pins its
+/// registered root into every dispatched child's environment
+/// (`launch_env::apply_launch_env`, #13965). A unit re-rendered by
+/// `loom-daemon-start.sh` in machine mode carries the same value directly
+/// (#13937), as does any operator export.
+fn primary_root(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    registered: Option<&Path>,
+) -> Option<PathBuf> {
     env("LOOM_MACHINE_CHECKOUT")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(crate::credential_preflight::primary_workspace_root)
+        .or(registered.map(Path::to_path_buf))
 }
 
 /// The `GH_CONFIG_DIR` proven to hold the installation token for `slug`'s
@@ -457,6 +491,33 @@ mod tests {
         let env = env_of(&[("LOOM_MACHINE_CHECKOUT", &elsewhere)]);
         ExecAuth::resolve_with(stale.path(), &repo, &env, &read);
         assert_eq!(seen.borrow().as_deref(), Some(stale_dir.as_path()));
+    }
+
+    /// #13965: the dispatch pin is the only source on a pristine fleet worker.
+    /// The unit carries no `LOOM_MACHINE_CHECKOUT` (`unit_env_tests::STRUCTURAL`)
+    /// and a short-lived `session-exec host` has no registered root of its
+    /// own, so the root the daemon pins into the dispatched child's env must
+    /// select the refreshed owner dir over the stale workspace copy with the
+    /// variable absent from the process env.
+    #[test]
+    fn a_dispatched_primary_root_wins_when_the_env_carries_no_checkout_var() {
+        let owner = "acme-dispatch-13965";
+        let stale = published_owner_workspace(owner);
+        let fresh = published_owner_workspace(owner);
+        let fresh_dir =
+            crate::credential_preflight::github_app_gh_config_dir_for_owner(fresh.path(), owner);
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
+            Some(SECRET.to_owned())
+        };
+        let repo = format!("https://github.com/{owner}/widget");
+        // The pristine unit's env: no `LOOM_MACHINE_CHECKOUT` anywhere.
+        let env = env_of(&[]);
+        let auth =
+            ExecAuth::resolve_with_root(stale.path(), &repo, &env, &read, Some(fresh.path()));
+        assert!(auth.resolved());
+        assert_eq!(seen.borrow().as_deref(), Some(fresh_dir.as_path()));
     }
 
     /// The primary root holds other owners' dirs too: an owner with no dir of
