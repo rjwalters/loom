@@ -117,6 +117,7 @@ test-fleet-check.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
 test-forge-transient-classification.sh
+test-generate-agents-md-layouts.sh
 test-gh-cached.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
