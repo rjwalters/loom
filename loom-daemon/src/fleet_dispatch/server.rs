@@ -45,8 +45,9 @@ use crate::discovery::mirror::TickWorklist;
 use super::identity::{Identity, IdentityError};
 use super::proto::{
     AckResponse, Assignment, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest,
-    HeartbeatResponse, NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
-    CLAIM_PATH, HEARTBEAT_PATH, NEXT_PATH, PATHS, REFUSE_PATH, RELEASE_PATH,
+    HeartbeatResponse, NextRequest, NextResponse, ParkEndedRequest, RefusalReason, RefuseRequest,
+    ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, NEXT_PATH, PARK_ENDED_PATH, PATHS, REFUSE_PATH,
+    RELEASE_PATH,
 };
 use super::queue::{Queue, DEFAULT_REFRESH_SECS};
 use super::roster::{Roster, RosterSource};
@@ -353,6 +354,7 @@ impl<I: Identity> Server<I> {
             REFUSE_PATH => self.refuse(host, body, &mut call),
             RELEASE_PATH => self.release(host, body, &mut call),
             NEXT_PATH => self.next(host, body, &mut call),
+            PARK_ENDED_PATH => self.park_ended(host, body, &mut call),
             _ => Err(self.error(404, "not found")),
         };
         let reply = reply.unwrap_or_else(|e| e);
@@ -555,6 +557,18 @@ impl<I: Identity> Server<I> {
         }))
     }
 
+    /// A worker's park of an item ended, or it made none (#13919): forget the
+    /// item's fast-fail streak and park order.
+    fn park_ended(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
+        let req: ParkEndedRequest = self.parse(host, body)?;
+        let known = self.with_table(|t, _, _| t.end_fast_fail_park(&req.repo, req.item));
+        Ok(self.ok(&AckResponse {
+            server_epoch: self.epoch.clone(),
+            known,
+            park: false,
+        }))
+    }
+
     fn release(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
         let req: ReleaseRequest = self.parse(host, body)?;
         call.assignment_id = Some(req.assignment_id.clone());
@@ -625,7 +639,14 @@ macro_rules! host_body {
         }
     )*};
 }
-host_body!(HeartbeatRequest, ClaimRequest, RefuseRequest, ReleaseRequest, NextRequest);
+host_body!(
+    HeartbeatRequest,
+    ClaimRequest,
+    RefuseRequest,
+    ReleaseRequest,
+    NextRequest,
+    ParkEndedRequest
+);
 
 /// A parsed request head.
 #[derive(Debug, Clone, PartialEq, Eq)]

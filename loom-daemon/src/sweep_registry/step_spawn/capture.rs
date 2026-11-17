@@ -125,15 +125,22 @@ fn release_token(class: &'static str, reason: &str) -> &'static str {
 /// The captain release outcome of a step: `failed` becomes
 /// [`crate::fleet_dispatch::table::FAST_FAIL_OUTCOME`] for a Builder step that
 /// ran under the fast-fail window with a reason that is not environmental
-/// (#13919). Anything else passes through. Pure.
+/// (#13919). The window is the ladder's own
+/// ([`crate::sweep_registry::is_fast_failure`]): the wider of
+/// `FAST_FAIL_WINDOW_SECS` and this host's configured `insta_crash_secs`, so
+/// a failure the local ladder counts is never told to the captain as a plain
+/// `failed`, which would end the fleet's streak. Anything else passes
+/// through. Pure.
 pub(crate) fn fast_fail_release_class(
     role: StepRole,
     class: &'static str,
     reason: Option<&str>,
     ran_for: std::time::Duration,
+    insta_crash_secs: i64,
 ) -> &'static str {
     let window = std::time::Duration::from_secs(
-        u64::try_from(crate::sweep_registry::FAST_FAIL_WINDOW_SECS).unwrap_or(120),
+        u64::try_from(crate::sweep_registry::FAST_FAIL_WINDOW_SECS.max(insta_crash_secs))
+            .unwrap_or(120),
     );
     if role == StepRole::Builder
         && class == "failed"
@@ -367,6 +374,7 @@ impl SweepRegistry {
             release_class,
             line.as_ref().map(|l| l.reason.as_str()),
             ran_for,
+            self.quarantine_config.insta_crash_secs,
         );
         crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {

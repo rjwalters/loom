@@ -999,7 +999,12 @@ impl SweepRegistry {
         self.adopt_restored_parks();
         // #13919: parks the captain ordered on this host's releases.
         for issue in crate::fleet_dispatch::worker::take_park_orders(&self.config.workspace_root) {
-            self.park_ordered_fast_failure(issue);
+            // No park of ours stands behind the order (parks are disabled here,
+            // or another hold already has the item): say so, or the captain
+            // refuses the item for a park nobody will end.
+            if !self.park_ordered_fast_failure(issue) && !self.is_quarantined(issue) {
+                crate::fleet_dispatch::worker::park_ended(&self.config.workspace_root, issue);
+            }
         }
         self.expire_quarantine();
         // Retry any previously-failed quarantine label restores (Issue #4110)

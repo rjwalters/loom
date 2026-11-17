@@ -415,12 +415,31 @@ there was no shadow phase to compare: the incident sequences are replayed in
   it climbs the no-progress ladder like any other).
 - The captain counts consecutive `fast_fail` releases per `(repo, item)` across
   hosts. A progressing release, or any other non-progress outcome, resets the
-  count; `ci_wait` and `host_lost` leave it alone. The streak and a park order
-  age out after 24 h.
+  count; `ci_wait` and `host_lost` leave it alone. A streak that has not
+  ordered a park ages out after 24 h.
+- "Inside the fast-fail window" is each host's own ladder window: the wider of
+  120 s and its configured `insta_crash_secs`. A failure the local ladder
+  counts is therefore never released as a plain `failed`, which would end the
+  fleet's streak.
 - The release that makes the third answers `park: true`, to that worker only,
   once. The worker makes the park (a forge write, section 8) on its next reaper
-  tick through the existing quarantine path. Claims for the item are refused
-  `held` until the park takes effect or the order ages out.
+  tick through the existing quarantine path.
+- **The captain's hold stands for the park, not for the streak.** While the
+  order stands, claims for the item are refused `held`. It ends when the park
+  ends: the worker calls `POST /v1/park_ended` when the quarantine's TTL runs
+  out, when an operator runs `loom-daemon quarantine clear` (on any host), and
+  when the ordered worker made no park (parks disabled there, or another hold
+  already has the item). The captain then forgets the streak and the order, so
+  the park comment's "clear the park, or wait for the TTL" holds for this lane
+  and a later streak counts from zero.
+- A park-ended call is sent once and not retried, and an ordered worker can die
+  before its reaper tick. So the order also lapses by itself one default
+  quarantine TTL (3600 s) after it was made, and the streak with it. Worst
+  case: a host whose TTL is configured below 3600 s loses the call and the
+  item is refused for the difference; a park that outlasts 3600 s (an
+  escalated TTL) keeps the item ineligible through `loom:blocked` on the
+  forge, as before. A captain older than this amendment answers `404` and the
+  same bound applies.
 - **Restart persistence: accepted gap, no snapshot.** The no-progress holds are
   already soft, each host's local streak stays as the floor (section 4), and a
   captain restart costs at most a few extra fast failures before the tally

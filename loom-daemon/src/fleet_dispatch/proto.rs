@@ -12,6 +12,7 @@
 //! | [`REFUSE_PATH`] | [`RefuseRequest`] | [`AckResponse`] |
 //! | [`RELEASE_PATH`] | [`ReleaseRequest`] | [`AckResponse`] |
 //! | [`NEXT_PATH`] | [`NextRequest`] | [`NextResponse`] |
+//! | [`PARK_ENDED_PATH`] | [`ParkEndedRequest`] | [`AckResponse`] |
 //!
 //! A `claim` refusal is an **answer** (HTTP 200, `granted: false`), never a
 //! failure. Non-200 statuses carry an [`ErrorResponse`]: `400` malformed,
@@ -38,13 +39,17 @@ pub const RELEASE_PATH: &str = "/v1/release";
 /// `POST` path of a work request (#12817).
 pub const NEXT_PATH: &str = "/v1/next";
 
+/// `POST` path of a park-ended notice (#13919).
+pub const PARK_ENDED_PATH: &str = "/v1/park_ended";
+
 /// Every path.
-pub const PATHS: [&str; 5] = [
+pub const PATHS: [&str; 6] = [
     HEARTBEAT_PATH,
     CLAIM_PATH,
     REFUSE_PATH,
     RELEASE_PATH,
     NEXT_PATH,
+    PARK_ENDED_PATH,
 ];
 
 /// The `refuse` reason that holds the item for the forge lease TTL: someone
@@ -304,6 +309,21 @@ pub struct ReleaseRequest {
     pub host_id: String,
     pub assignment_id: String,
     pub outcome: String,
+}
+
+/// `POST /v1/park_ended`: the park of `(repo, item)` ended on this host (its
+/// quarantine TTL ran out, or an operator cleared it), or the captain ordered
+/// one and this host made none (#13919). The captain forgets the item's
+/// fast-fail streak and stops refusing claims for it. Names an item, not an
+/// assignment: the park outlives the step whose release ordered it. The
+/// answer's `known` says whether there was a streak to forget. An older
+/// captain answers `404`, which the worker treats like any failed call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkEndedRequest {
+    pub host_id: String,
+    /// `owner/name`.
+    pub repo: String,
+    pub item: u64,
 }
 
 /// `POST /v1/next`: "this host has `free_slots` free; what should it run?"

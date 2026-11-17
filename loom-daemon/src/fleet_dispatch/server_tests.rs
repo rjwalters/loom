@@ -982,4 +982,24 @@ async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
     clock.set(9_400);
     let (reply, _) = s.handle(B, "/v1/claim", claim_body(B, 11, "builder").to_string().as_bytes());
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("held"));
+    // The park ended on a worker (TTL expiry or an operator's clear, from any
+    // host): the hold ends with it. Asked as `judge`, since the Builder
+    // step keeps its own no-progress hold.
+    let judge = claim_body(B, 11, "judge").to_string();
+    let (reply, _) = s.handle(B, "/v1/claim", judge.as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("held"));
+    let ended = json!({"host_id": B, "repo": "acme/w", "item": 11}).to_string();
+    let (reply, call) = s.handle(B, "/v1/park_ended", ended.as_bytes());
+    assert_eq!(reply.status, 200);
+    assert_eq!(call.endpoint, "/v1/park_ended");
+    let ack: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(ack["known"], json!(true));
+    assert!(ack.get("park").is_none());
+    let (reply, _) = s.handle(B, "/v1/claim", judge.as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["granted"], json!(true));
+    // A second notice finds nothing; another host's id in the body is refused.
+    let (reply, _) = s.handle(B, "/v1/park_ended", ended.as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
+    let (reply, _) = s.handle(A, "/v1/park_ended", ended.as_bytes());
+    assert_eq!(reply.status, 403);
 }

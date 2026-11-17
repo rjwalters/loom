@@ -1050,14 +1050,90 @@ fn an_item_fast_failing_on_three_hosts_is_ordered_parked_once_by_the_third() {
             park: true
         }
     );
-    // Further claims are refused until the park takes effect or ages out.
-    t.heartbeat(at(40_000), A, &hb(A, vec![], 8));
-    let d = t.claim(at(40_000), A, "acme/w", 5, "builder");
+    // Further claims are refused while the park stands.
+    t.heartbeat(at(12_000), A, &hb(A, vec![], 8));
+    let d = t.claim(at(12_000), A, "acme/w", 5, "builder");
     assert_eq!(refusal(&d).0, RefusalReason::Held);
-    let d = t.claim(at(40_000), A, "acme/w", 5, "judge");
+    let ClaimDecision::Refused { retry_after_s, .. } = d else {
+        unreachable!()
+    };
+    assert_eq!(
+        retry_after_s,
+        9_300 + FAST_FAIL_PARK_HOLD.as_secs() - 12_000,
+        "retry when the order lapses"
+    );
+    let d = t.claim(at(12_000), A, "acme/w", 5, "judge");
     assert_eq!(refusal(&d).0, RefusalReason::Held, "any step of the item");
     // Another item is untouched.
-    granted_id(&t.claim(at(40_000), A, "acme/w", 6, "builder"));
+    granted_id(&t.claim(at(12_000), A, "acme/w", 6, "builder"));
+}
+
+/// Three fast failures of item 5 on three hosts, the third at 9 300: ordered.
+fn ordered_park() -> Table {
+    let mut t = three_hosts(at(100));
+    run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
+    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
+    assert!(run_release(&mut t, 9_300, C, 5, FAST_FAIL_OUTCOME).park);
+    t
+}
+
+/// Whether the park order refuses item 5 at `now`. Asked as a `judge` claim:
+/// the order refuses every step of the item, while the no-progress hold the
+/// three Builder failures also set is the `builder` step's alone.
+fn order_refuses(t: &mut Table, now: u64) -> bool {
+    t.heartbeat(at(now), A, &hb(A, vec![], 8));
+    match t.claim(at(now), A, "acme/w", 5, "judge") {
+        ClaimDecision::Refused { reason, .. } => {
+            assert_eq!(reason, RefusalReason::Held);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The hold must not outlive the park (the Judge's finding on #13964): a park
+/// that ended (TTL expiry, an operator's clear) ends the hold at once.
+#[test]
+fn a_park_that_ended_ends_the_hold_and_the_streak() {
+    let mut t = ordered_park();
+    let now = 9_300 + FAST_FAIL_PARK_HOLD.as_secs() - 60;
+    assert!(order_refuses(&mut t, now));
+    assert!(t.end_fast_fail_park("acme/w", 5), "there was an order to end");
+    assert!(!t.end_fast_fail_park("acme/w", 5), "and it is gone");
+    assert!(!t.end_fast_fail_park("acme/w", 6), "another item had none");
+    assert!(t.fast_fails.is_empty(), "a later streak counts from zero");
+    assert!(!order_refuses(&mut t, now), "drawable again, by any host");
+}
+
+/// A park-ended call that never arrives: the order lapses by itself one
+/// default quarantine TTL after it was made, not after the 24 h streak age.
+#[test]
+fn an_order_lapses_after_the_default_quarantine_ttl() {
+    assert_eq!(
+        FAST_FAIL_PARK_HOLD.as_secs(),
+        crate::sweep_registry::DEFAULT_QUARANTINE_TTL_SECS
+    );
+    let mut t = ordered_park();
+    let lapse = 9_300 + FAST_FAIL_PARK_HOLD.as_secs();
+    assert!(order_refuses(&mut t, lapse - 1));
+    assert!(!order_refuses(&mut t, lapse));
+    // The streak went with the order: the next fast failure is a first one.
+    let key = ("acme/w".to_string(), 5);
+    assert!(!t.note_fast_fail(&key, at(lapse), FAST_FAIL_OUTCOME));
+    assert_eq!(t.fast_fails[&key].count, 1);
+}
+
+/// A step that was already running when the park was ordered releases
+/// `fast_fail` afterwards: no second order, and the hold still runs from the
+/// order, not from that release.
+#[test]
+fn a_late_fast_fail_release_does_not_extend_the_hold() {
+    let mut t = ordered_park();
+    let key = ("acme/w".to_string(), 5);
+    assert!(!t.note_fast_fail(&key, at(12_000), FAST_FAIL_OUTCOME));
+    let lapse = 9_300 + FAST_FAIL_PARK_HOLD.as_secs();
+    assert!(order_refuses(&mut t, lapse - 1));
+    assert!(!order_refuses(&mut t, lapse));
 }
 
 #[test]
@@ -1098,7 +1174,10 @@ fn ci_wait_and_host_lost_leave_the_streak_alone() {
     run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
     run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
     assert!(!run_release(&mut t, 9_300, C, 5, HOST_LOST_OUTCOME).park);
-    assert!(run_release(&mut t, 9_400, A, 5, FAST_FAIL_OUTCOME).park);
+    // `ci_wait` is neutral too. It sets its own short hold, so the next draw
+    // is past it.
+    assert!(!run_release(&mut t, 9_400, B, 5, CI_WAIT_OUTCOME).park);
+    assert!(run_release(&mut t, 20_000, A, 5, FAST_FAIL_OUTCOME).park);
 }
 
 #[test]
@@ -1109,14 +1188,17 @@ fn a_streak_ages_out_and_so_does_the_order() {
     // Past the 24 h age bound the old two do not count.
     let late = 2_000 + FAST_FAIL_STREAK_MAX_AGE.as_secs() + 1;
     assert!(!run_release(&mut t, late, C, 5, FAST_FAIL_OUTCOME).park);
-    // An order stands only for the same age.
+    // The age-out sweep drops an unordered streak at its 24 h, an order at
+    // its own (shorter) bound.
     let mut t = three_hosts(at(100));
     run_release(&mut t, 100, A, 5, FAST_FAIL_OUTCOME);
-    run_release(&mut t, 2_000, B, 5, FAST_FAIL_OUTCOME);
-    assert!(run_release(&mut t, 9_300, C, 5, FAST_FAIL_OUTCOME).park);
-    let after = 9_300 + FAST_FAIL_STREAK_MAX_AGE.as_secs() + 1;
-    t.heartbeat(at(after), A, &hb(A, vec![], 8));
-    granted_id(&t.claim(at(after), A, "acme/w", 5, "builder"));
+    t.expire(at(100 + FAST_FAIL_STREAK_MAX_AGE.as_secs() - 1));
+    assert_eq!(t.fast_fails.len(), 1);
+    t.expire(at(100 + FAST_FAIL_STREAK_MAX_AGE.as_secs()));
+    assert!(t.fast_fails.is_empty());
+    let mut t = ordered_park();
+    t.expire(at(9_300 + FAST_FAIL_PARK_HOLD.as_secs()));
+    assert!(t.fast_fails.is_empty(), "the order and its streak are forgotten");
 }
 
 #[test]

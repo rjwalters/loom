@@ -73,7 +73,7 @@ use super::client::{self, CallError, CallFacts};
 use super::fallback::{self, Hysteresis, Mode, Transition};
 use super::proto::{
     self, AckResponse, ClaimRequest, ClaimResponse, HeartbeatRequest, HeartbeatResponse, LiveStep,
-    NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
+    NextRequest, NextResponse, ParkEndedRequest, RefusalReason, RefuseRequest, ReleaseRequest,
 };
 use crate::step_role::StepRole;
 
@@ -556,6 +556,31 @@ pub fn release(sweep_id: &str, outcome: &str) {
 /// the worker's (ADR-0027 §8).
 pub fn take_park_orders(root: &Path) -> Vec<u32> {
     state().park_orders.remove(root).unwrap_or_default()
+}
+
+/// The park of `item` in the repo at `root` ended on this host (its
+/// quarantine TTL ran out, or an operator cleared it), or the captain ordered
+/// one and this host made none (#13919): tell the captain, so it stops
+/// refusing claims for the item and forgets its fast-fail streak. Sent
+/// without waiting. A no-op outside fleet mode; a call that gets no answer
+/// leaves the captain's own bound on the hold
+/// ([`super::table::FAST_FAIL_PARK_HOLD`]) to end it.
+pub fn park_ended(root: &Path, item: u32) {
+    let Some(url) = host_endpoint(root) else {
+        return;
+    };
+    let body = ParkEndedRequest {
+        host_id: host_id(),
+        repo: repo_of(root),
+        item: u64::from(item),
+    };
+    let facts = CallFacts {
+        endpoint: proto::PARK_ENDED_PATH,
+        repo: Some(body.repo.clone()),
+        item: Some(body.item),
+        ..CallFacts::default()
+    };
+    send_detached::<_, AckResponse>(&url, proto::PARK_ENDED_PATH, body, facts);
 }
 
 /// This host is being lost (#12876): release every assignment it holds with

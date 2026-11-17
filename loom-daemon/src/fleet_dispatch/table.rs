@@ -181,9 +181,20 @@ pub const FAST_FAIL_OUTCOME: &str = "fast_fail";
 /// at which the captain orders the park (the #11854 threshold).
 pub const FAST_FAIL_PARK_THRESHOLD: u32 = 3;
 
-/// How long a fast-fail streak, and a park order, stand without a new
-/// attributable release (`MAX_PEER_FAST_FAIL_STREAK_AGE`, 24 h).
+/// How long a fast-fail streak that has not ordered a park stands without a
+/// new attributable release (`MAX_PEER_FAST_FAIL_STREAK_AGE`, 24 h).
 pub const FAST_FAIL_STREAK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// The longest a park order refuses claims for its item: the default
+/// quarantine TTL, counted from the order. The hold stands for the park, not
+/// for the streak: a worker whose park ends sooner (TTL expiry, an operator's
+/// `quarantine clear`), or that made no park, says so
+/// ([`Table::end_fast_fail_park`]) and the hold ends then. This bound is the
+/// backstop for a park-ended call that never arrives, and a park that outlasts
+/// it (an escalated TTL) keeps the item ineligible on the forge. When it
+/// lapses the streak is forgotten with it, so the count starts again.
+pub const FAST_FAIL_PARK_HOLD: Duration =
+    Duration::from_secs(crate::sweep_registry::DEFAULT_QUARANTINE_TTL_SECS);
 
 /// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
 /// the item every ~90 s while CI runs, short enough that its next step is
@@ -462,9 +473,21 @@ struct FastFailTally {
     count: u32,
     /// When the latest one arrived.
     last: Mono,
-    /// The park was ordered (to the releasing worker of the threshold
+    /// When the park was ordered (to the releasing worker of the threshold
     /// release); no second order is made while this stands.
-    ordered: bool,
+    ordered: Option<Mono>,
+}
+
+impl FastFailTally {
+    /// Still counted at `now`: an ordered park for [`FAST_FAIL_PARK_HOLD`]
+    /// from the order, a streak without one for
+    /// [`FAST_FAIL_STREAK_MAX_AGE`] from its latest release.
+    fn stands(&self, now: Mono) -> bool {
+        match self.ordered {
+            Some(at) => at.plus(FAST_FAIL_PARK_HOLD) > now,
+            None => self.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now,
+        }
+    }
 }
 
 /// What a `release` did.
@@ -678,8 +701,7 @@ impl Table {
         // ladder's last rung (module docs), which also bounds the map.
         let forget = self.policy.no_progress[self.policy.no_progress.len() - 1];
         self.cooldowns.retain(|_, c| c.until.plus(forget) > now);
-        self.fast_fails
-            .retain(|_, t| t.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now);
+        self.fast_fails.retain(|_, t| t.stands(now));
         expired
     }
 
@@ -879,15 +901,18 @@ impl Table {
             }
             replaces_own = true;
         }
-        // A park was ordered for this item (#13919): no host draws it until the
-        // park takes effect on the forge (which makes it ineligible) or the
-        // order ages out.
-        if let Some(t) = self
+        // A park was ordered for this item (#13919): no host draws it while
+        // the park stands. The hold ends when the parking worker says the park
+        // ended (`end_fast_fail_park`: TTL expiry, an operator's clear, or no
+        // park made), and at the latest `FAST_FAIL_PARK_HOLD` after the order.
+        if let Some(until) = self
             .fast_fails
             .get(&(repo.to_string(), item))
-            .filter(|t| t.ordered && t.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now)
+            .filter(|t| t.stands(now))
+            .and_then(|t| t.ordered)
+            .map(|at| at.plus(FAST_FAIL_PARK_HOLD))
         {
-            let retry = now.secs_until(t.last.plus(FAST_FAIL_STREAK_MAX_AGE), 1);
+            let retry = now.secs_until(until, 1);
             return refused(RefusalReason::Held, None, retry);
         }
         // The fleet-wide no-progress hold (#12541): whoever asks.
@@ -1055,23 +1080,32 @@ impl Table {
             self.fast_fails.remove(key);
             return false;
         }
-        let prior = self
-            .fast_fails
-            .get(key)
-            .copied()
-            .filter(|t| t.last.plus(FAST_FAIL_STREAK_MAX_AGE) > now);
+        let prior = self.fast_fails.get(key).copied().filter(|t| t.stands(now));
         let count = prior.map_or(0, |t| t.count).saturating_add(1);
-        let was_ordered = prior.is_some_and(|t| t.ordered);
-        let park = !was_ordered && count >= FAST_FAIL_PARK_THRESHOLD;
+        let ordered_at = prior.and_then(|t| t.ordered);
+        let park = ordered_at.is_none() && count >= FAST_FAIL_PARK_THRESHOLD;
         self.fast_fails.insert(
             key.clone(),
             FastFailTally {
                 count,
                 last: now,
-                ordered: was_ordered || park,
+                // A later release of a step that was already running does not
+                // extend the hold: it runs from the order.
+                ordered: ordered_at.or(park.then_some(now)),
             },
         );
         park
+    }
+
+    /// The park of `(repo, item)` ended on a worker, or the ordered worker
+    /// made none (#13919): forget the item's fast-fail streak and its park
+    /// order, so the next claim is answered on its merits and a later streak
+    /// counts from zero. Sent on a quarantine's TTL expiry and on an
+    /// operator's `quarantine clear`, which is what keeps both true to the
+    /// park comment ("clear the park ... or wait for the TTL"). Whether there
+    /// was a streak to forget. The no-progress hold is not touched.
+    pub fn end_fast_fail_park(&mut self, repo: &str, item: u64) -> bool {
+        self.fast_fails.remove(&(repo.to_string(), item)).is_some()
     }
 
     fn finish_release(

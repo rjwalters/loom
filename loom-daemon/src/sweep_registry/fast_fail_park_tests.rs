@@ -419,10 +419,134 @@ fn the_release_class_marks_only_an_attributable_fast_builder_failure() {
     use crate::step_role::StepRole;
     use std::time::Duration;
     let fast = Duration::from_secs(60);
-    assert_eq!(f(StepRole::Builder, "failed", Some("exit_1"), fast), "fast_fail");
-    assert_eq!(f(StepRole::Builder, "failed", None, fast), "fast_fail");
-    assert_eq!(f(StepRole::Builder, "failed", Some("preflight-x"), fast), "failed");
-    assert_eq!(f(StepRole::Builder, "failed", None, Duration::from_secs(300)), "failed");
-    assert_eq!(f(StepRole::Builder, "verdict", None, fast), "verdict");
-    assert_eq!(f(StepRole::Judge, "failed", None, fast), "failed");
+    assert_eq!(f(StepRole::Builder, "failed", Some("exit_1"), fast, 60), "fast_fail");
+    assert_eq!(f(StepRole::Builder, "failed", None, fast, 60), "fast_fail");
+    assert_eq!(f(StepRole::Builder, "failed", Some("preflight-x"), fast, 60), "failed");
+    assert_eq!(f(StepRole::Builder, "failed", None, Duration::from_secs(300), 60), "failed");
+    assert_eq!(f(StepRole::Builder, "verdict", None, fast, 60), "verdict");
+    assert_eq!(f(StepRole::Judge, "failed", None, fast, 60), "failed");
+}
+
+/// The release class uses the ladder's own window (`is_fast_failure`): the
+/// wider of 120 s and the configured `insta_crash_secs`. A failure the local
+/// ladder counts must not reach the captain as a plain `failed`, which would
+/// end the fleet's streak.
+#[test]
+fn the_release_class_window_widens_with_insta_crash_secs_like_the_ladder() {
+    use super::step_spawn::capture::fast_fail_release_class as f;
+    use crate::step_role::StepRole;
+    use std::time::Duration;
+    for (ran, insta) in [
+        (60_i64, 60_i64),
+        (119, 60),
+        (120, 60),
+        (200, 60),
+        (200, 300),
+        (300, 300),
+    ] {
+        let expect = if is_fast_failure(ran, Some(1), insta) {
+            "fast_fail"
+        } else {
+            "failed"
+        };
+        let ran_for = Duration::from_secs(u64::try_from(ran).unwrap());
+        assert_eq!(
+            f(StepRole::Builder, "failed", None, ran_for, insta),
+            expect,
+            "ran {ran}s, insta_crash_secs {insta}"
+        );
+    }
+    // The case the 120 s constant alone got wrong.
+    assert_eq!(f(StepRole::Builder, "failed", None, Duration::from_secs(200), 300), "fast_fail");
+}
+
+/// #13919: an order this host makes no park for (parks disabled) is answered
+/// `false`, which is what makes the reaper tell the captain the park ended.
+#[test]
+fn an_ordered_park_is_declined_when_parks_are_disabled() {
+    let dir = tempdir().unwrap();
+    let mut reg = registry(dir.path());
+    reg.set_quarantine_config(QuarantineConfig {
+        enabled: false,
+        ..QuarantineConfig::default()
+    });
+    assert!(!reg.park_ordered_fast_failure(92));
+    assert!(!reg.is_quarantined(92));
+}
+
+/// A registry in fleet mode against a captain that records every call.
+fn fleet_registry(
+    dir: &std::path::Path,
+) -> (SweepRegistry, crate::fleet_dispatch::test_server::TestServer) {
+    use serde_json::json;
+    crate::fleet_dispatch::worker::reset_for_test();
+    let server = crate::fleet_dispatch::test_server::TestServer::start(|_, _| {
+        (200, json!({"server_epoch": "e1", "known": true}))
+    });
+    crate::sweep_registry::test_support::write_config(
+        dir,
+        &json!({"fleetDispatch": {"enabled": true, "url": server.url()}}).to_string(),
+    );
+    (registry(dir), server)
+}
+
+const PARK_ENDED: &str = crate::fleet_dispatch::proto::PARK_ENDED_PATH;
+
+/// #13919 (the Judge's scenario 2 on #13964): the operator's `quarantine
+/// clear` reaches the captain, whose park order is what refuses the item
+/// fleet-wide. Sent even when this host holds no park, since the operator may
+/// run the clear on any host.
+#[test]
+#[serial_test::serial]
+fn an_operator_clear_tells_the_captain_the_park_ended() {
+    let dir = tempdir().unwrap();
+    let (mut reg, server) = fleet_registry(dir.path());
+    assert!(reg.park_ordered_fast_failure(93));
+    assert!(server.requests_to(PARK_ENDED).is_empty(), "a standing park says nothing");
+    assert!(reg.clear_quarantine(93));
+    let sent = server.wait_for(PARK_ENDED, 1);
+    assert_eq!(sent[0]["item"], 93);
+    assert!(sent[0]["repo"].is_string() && sent[0]["host_id"].is_string());
+    // Not parked on this host: still told.
+    assert!(!reg.clear_quarantine(94));
+    assert_eq!(server.wait_for(PARK_ENDED, 2)[1]["item"], 94);
+}
+
+/// #13919 (scenario 1): the quarantine's TTL running out ends the captain's
+/// hold too, so "wait for the TTL" in the park comment stays true.
+#[test]
+#[serial_test::serial]
+fn a_ttl_expiry_tells_the_captain_the_park_ended() {
+    let dir = tempdir().unwrap();
+    let (mut reg, server) = fleet_registry(dir.path());
+    assert!(reg.park_ordered_fast_failure(95));
+    reg.expire_quarantine();
+    assert!(reg.is_quarantined(95), "inside its TTL");
+    assert!(server.requests_to(PARK_ENDED).is_empty());
+    reg.set_quarantine_config(QuarantineConfig {
+        ttl: Duration::ZERO,
+        ..QuarantineConfig::default()
+    });
+    reg.expire_quarantine();
+    assert!(!reg.is_quarantined(95));
+    let sent = server.wait_for(PARK_ENDED, 1);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["item"], 95);
+}
+
+/// Outside fleet mode nothing is sent.
+#[test]
+#[serial_test::serial]
+fn outside_fleet_mode_a_clear_sends_nothing() {
+    use serde_json::json;
+    let dir = tempdir().unwrap();
+    let (mut reg, server) = fleet_registry(dir.path());
+    crate::sweep_registry::test_support::write_config(
+        dir.path(),
+        &json!({"fleetDispatch": {"enabled": false, "url": server.url()}}).to_string(),
+    );
+    assert!(reg.park_ordered_fast_failure(96));
+    assert!(reg.clear_quarantine(96));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(server.requests().is_empty());
 }
