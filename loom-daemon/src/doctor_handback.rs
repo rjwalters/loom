@@ -151,9 +151,12 @@ pub trait Forge {
     /// verdict the Doctor is answering rather than one that landed mid-write.
     /// Asked only after [`Forge::rejected_at`] reported a marker at `head`;
     /// it is the same-sha case, where the fix needed no commit so the head
-    /// never moved past the verdict. `None` when the comments or the claim's
-    /// `labeled` event could not be read: the caller keeps the marker
-    /// (today's behaviour).
+    /// never moved past the verdict. Asked again after the label removal in
+    /// that case, because the answered marker's comment outlives the label
+    /// and [`Forge::rejected_at`] would only find it again. `None` when the
+    /// comments or the claim's `labeled` event could not be read: before the
+    /// removal the caller keeps the marker (today's behaviour), after it the
+    /// removal is undone.
     fn rejected_precedes_claim(&mut self, head: &str) -> Option<bool>;
 }
 
@@ -196,6 +199,8 @@ pub fn rejection_precedes_claim(
     if created != updated {
         return Some(false);
     }
+    // Both stamps are the forge's own (a comment's and a timeline event's), so
+    // no host clock, and no skew between hosts, enters this comparison.
     Some(created < claimed_at)
 }
 
@@ -378,9 +383,12 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
         // commit, so the verdict being answered still sits at the head. An
         // unreadable answer to that question keeps today's behaviour and
         // treats the marker as new.
-        let answered = match forge.rejected_at(expected_head) {
-            Some(false) => true,
-            Some(true) => forge.rejected_precedes_claim(expected_head) == Some(true),
+        let (answered, same_sha_verdict) = match forge.rejected_at(expected_head) {
+            Some(false) => (true, false),
+            Some(true) => {
+                let old = forge.rejected_precedes_claim(expected_head) == Some(true);
+                (old, old)
+            }
             None => return unverified_rejection(forge),
         };
         if answered {
@@ -388,7 +396,21 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
             // The first answer predates the DELETE; a Judge on another host
             // can land a rejection in between, and the DELETE took it.
             if changes_removed {
-                match forge.rejected_at(expected_head) {
+                // Repeat the question the first check asked. Removing a label
+                // deletes no comment, so in the same-sha case the answered
+                // verdict's marker is still at the head: "is there a marker?"
+                // would find it again and report every such hand-back as a
+                // race (#13936). There the question is "is the newest marker
+                // still the one that predates the claim?" — a rejection that
+                // landed meanwhile is newer (or an edit), so it answers no.
+                let landed = if same_sha_verdict {
+                    forge
+                        .rejected_precedes_claim(expected_head)
+                        .map(|still_the_old_one| !still_the_old_one)
+                } else {
+                    forge.rejected_at(expected_head)
+                };
+                match landed {
                     Some(false) => {}
                     Some(true) => {
                         if !forge.add(CHANGES) {

@@ -33,6 +33,19 @@ struct Fake {
     /// predates the claim and was never edited. `Some(false)` is the
     /// conservative default, matching today's behaviour.
     precedes_claim: Option<bool>,
+    /// Answers for successive `rejected_precedes_claim` calls, before falling
+    /// back to `precedes_claim`.
+    precedes_seq: Vec<Option<bool>>,
+    /// Comment records plus the claim time. When set, both rejection
+    /// questions are answered from these records by the production
+    /// predicates, the way `GhHandback` answers them, instead of from the
+    /// scripted fields above. Label writes never touch them.
+    comments: Option<(Vec<serde_json::Value>, DateTime<Utc>)>,
+    /// A rival's comment that lands right after `loom:changes-requested` is
+    /// removed (record-backed mode only).
+    comment_after_changes_removal: Option<serde_json::Value>,
+    /// The last `rejected_at` answer was "a marker is there".
+    marker_seen: bool,
     /// The head becomes this right after the hand-back's add.
     head_after_add: Option<&'static str>,
     reads: usize,
@@ -107,6 +120,14 @@ impl Forge for Fake {
             return false;
         }
         self.labels.retain(|l| l != label);
+        // A label DELETE deletes no comment: the records only ever grow.
+        if label == CHANGES {
+            if let (Some((records, _)), Some(c)) =
+                (self.comments.as_mut(), self.comment_after_changes_removal.take())
+            {
+                records.push(c);
+            }
+        }
         for (_, lands) in self.after_remove.iter().filter(|(r, _)| *r == label) {
             if !self.labels.iter().any(|x| x == lands) {
                 self.labels.push((*lands).to_string());
@@ -114,15 +135,36 @@ impl Forge for Fake {
         }
         true
     }
-    fn rejected_at(&mut self, _head: &str) -> Option<bool> {
+    fn rejected_at(&mut self, head: &str) -> Option<bool> {
         self.calls.push("rejected_at".into());
-        if !self.rejected_seq.is_empty() {
-            return self.rejected_seq.remove(0);
-        }
-        self.rejected
+        let answer = if let Some((records, _)) = &self.comments {
+            let n =
+                crate::verdict_gate::count_markers(records, head, VerdictKind::ChangesRequested);
+            Some(n > 0)
+        } else if self.rejected_seq.is_empty() {
+            self.rejected
+        } else {
+            self.rejected_seq.remove(0)
+        };
+        // The forge cannot do this: a marker lives in a comment, and nothing
+        // the hand-back writes (label adds and removes) deletes a comment. A
+        // script that needs it is modelling a forge that does not exist
+        // (#13936: the same-sha test passed on exactly such a script).
+        assert!(
+            !(self.marker_seen && answer == Some(false)),
+            "fake scripted a marker that vanished between two reads"
+        );
+        self.marker_seen = answer == Some(true);
+        answer
     }
-    fn rejected_precedes_claim(&mut self, _head: &str) -> Option<bool> {
+    fn rejected_precedes_claim(&mut self, head: &str) -> Option<bool> {
         self.calls.push("rejected_precedes_claim".into());
+        if let Some((records, claimed_at)) = &self.comments {
+            return rejection_precedes_claim(records, head, *claimed_at);
+        }
+        if !self.precedes_seq.is_empty() {
+            return self.precedes_seq.remove(0);
+        }
         self.precedes_claim
     }
 }
@@ -594,20 +636,41 @@ fn an_unverified_removal_whose_restore_fails_keeps_the_queue_label() {
 // --- same-sha hand-back: the verdict being answered sits at the head (#13936)
 // ----------------------------------------------------------------------------
 
+/// The evidence reads a hand-back made, in order.
+fn evidence(f: &Fake) -> Vec<&str> {
+    f.calls
+        .iter()
+        .map(String::as_str)
+        .filter(|c| c.starts_with("rejected_"))
+        .collect()
+}
+
 /// The #13936 shape: the Judge's rejection sits at the head the Doctor never
 /// moved (the fix needed no commit) and predates the claim — it is the
 /// verdict being answered, so the hand-back completes with no new commit.
+/// The marker is there on every read: removing the label does not remove the
+/// Judge's comment.
 #[test]
 fn a_same_sha_verdict_that_predates_the_claim_is_handed_back() {
     let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
-    // Marker present at the evidence read; gone once the removal took it.
-    f.rejected_seq = vec![Some(true), Some(false)];
+    f.rejected = Some(true);
     f.precedes_claim = Some(true);
     let out = run(&mut f, PUSHED);
     assert_eq!(out, Outcome::HandedBack);
     assert_eq!(f.sorted(), names(&[QUEUE]));
     assert!(f.writes().contains(&format!("remove {CHANGES}").as_str()));
+    assert!(!f.writes().contains(&format!("add {CHANGES}").as_str()), "{:?}", f.writes());
     assert_eq!(out.render().1, 0);
+    // The check after the removal repeats the claim-time question; asking
+    // "is there a marker?" again would only re-find the answered verdict.
+    assert_eq!(
+        evidence(&f),
+        vec![
+            "rejected_at",
+            "rejected_precedes_claim",
+            "rejected_precedes_claim"
+        ]
+    );
 }
 
 /// A marker at the unchanged head created during the claim is a fresh
@@ -655,16 +718,30 @@ fn an_unreadable_claim_time_keeps_the_rejection() {
 }
 
 /// Even a same-sha hand-back re-checks after the DELETE: a rejection that
-/// lands in the gap is restored and reported as a race.
+/// lands in the gap is newer than the claim, so the newest marker at the head
+/// no longer predates it. It is restored and reported as a race.
 #[test]
 fn a_new_rejection_landing_during_a_same_sha_hand_back_is_restored_and_races() {
     let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
-    f.rejected_seq = vec![Some(true), Some(true)];
-    f.precedes_claim = Some(true);
+    f.rejected = Some(true);
+    f.precedes_seq = vec![Some(true), Some(false)];
     let out = run(&mut f, PUSHED);
     assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
     assert_eq!(f.sorted(), names(&[CHANGES]), "rejection restored");
     assert_eq!(out.render().1, EXIT_RACED);
+}
+
+#[test]
+fn a_same_sha_rejection_that_cannot_be_restored_is_loud() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected = Some(true);
+    f.precedes_seq = vec![Some(true), Some(false)];
+    f.fail_add_of = Some(CHANGES);
+    let out = run(&mut f, PUSHED);
+    assert!(
+        matches!(&out, Outcome::Failed(why) if why.contains("could not be restored")),
+        "{out:?}"
+    );
 }
 
 /// Unreadable evidence after the DELETE on a same-sha hand-back: the removal
@@ -672,11 +749,118 @@ fn a_new_rejection_landing_during_a_same_sha_hand_back_is_restored_and_races() {
 #[test]
 fn unreadable_recheck_after_a_same_sha_removal_restores_changes() {
     let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
-    f.rejected_seq = vec![Some(true), None];
-    f.precedes_claim = Some(true);
+    f.rejected = Some(true);
+    f.precedes_seq = vec![Some(true), None];
     let out = run(&mut f, PUSHED);
     assert!(matches!(&out, Outcome::Failed(why) if why.contains("restored it")), "{out:?}");
     assert_eq!(f.sorted(), names(&[CHANGES, CLAIM]));
+}
+
+// --- the same paths over comment records, answered by the production
+// predicates (`count_markers`, `rejection_precedes_claim`) as `GhHandback`
+// answers them. Label writes never change the records. ----------------------
+
+const CLAIMED_AT: &str = "2026-11-16T12:00:00Z";
+
+fn at(stamp: &str) -> DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn rejection(created: &str, updated: &str, sha: &str) -> serde_json::Value {
+    json!({
+        "body": format!("review\n\n<!-- loom:verdict-sha sha={sha} verdict=changes-requested -->"),
+        "created_at": created,
+        "updated_at": updated,
+    })
+}
+
+/// A PR whose rejection comments are `records` and whose claim landed at
+/// [`CLAIMED_AT`].
+fn with_comments(records: Vec<serde_json::Value>) -> Fake {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.comments = Some((records, at(CLAIMED_AT)));
+    f
+}
+
+/// #13936 end to end over records: one rejection at the unmoved head, written
+/// before the claim, still there after the label is gone. Exit 0.
+#[test]
+fn records_a_same_sha_rejection_older_than_the_claim_is_handed_back() {
+    let mut f = with_comments(vec![rejection(
+        "2026-11-16T10:00:00Z",
+        "2026-11-16T10:00:00Z",
+        PUSHED,
+    )]);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HandedBack);
+    assert_eq!(f.sorted(), names(&[QUEUE]));
+    assert_eq!(out.render().1, 0);
+    // The answered verdict's comment outlived the label removal.
+    assert_eq!(f.comments.as_ref().map(|(r, _)| r.len()), Some(1));
+    // Retrying is not needed, and a second Doctor pass on the same state
+    // (re-claimed, still no commit) completes the same way.
+    let mut again = with_comments(vec![rejection(
+        "2026-11-16T10:00:00Z",
+        "2026-11-16T10:00:00Z",
+        PUSHED,
+    )]);
+    assert_eq!(run(&mut again, PUSHED), Outcome::HandedBack);
+}
+
+/// A second rejection comment at the same head lands between the evidence
+/// read and the re-check: the newest marker is now younger than the claim.
+#[test]
+fn records_a_new_same_sha_rejection_landing_mid_hand_back_races() {
+    let mut f = with_comments(vec![rejection(
+        "2026-11-16T10:00:00Z",
+        "2026-11-16T10:00:00Z",
+        PUSHED,
+    )]);
+    f.comment_after_changes_removal =
+        Some(rejection("2026-11-16T12:30:00Z", "2026-11-16T12:30:00Z", PUSHED));
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]), "the new rejection's label is back");
+    assert_eq!(out.render().1, EXIT_RACED);
+}
+
+/// A same-sha rejection written during the claim is never removed at all.
+#[test]
+fn records_a_same_sha_rejection_younger_than_the_claim_races_untouched() {
+    let mut f = with_comments(vec![rejection(
+        "2026-11-16T12:30:00Z",
+        "2026-11-16T12:30:00Z",
+        PUSHED,
+    )]);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert!(!f.writes().contains(&format!("remove {CHANGES}").as_str()));
+    // So is one edited in place, whenever it was created.
+    let mut f = with_comments(vec![rejection(
+        "2026-11-16T10:00:00Z",
+        "2026-11-16T12:30:00Z",
+        PUSHED,
+    )]);
+    assert_eq!(run(&mut f, PUSHED), Outcome::Raced(vec![CHANGES.into()]));
+    assert!(!f.writes().contains(&format!("remove {CHANGES}").as_str()));
+}
+
+/// The pushed-head path is unchanged: the answered rejection sits at an older
+/// head, and one landing at the pushed head mid-write still races.
+#[test]
+fn records_the_pushed_head_path_still_hands_back_and_still_races() {
+    let old = rejection("2026-11-16T10:00:00Z", "2026-11-16T10:00:00Z", OTHER);
+    let mut f = with_comments(vec![old.clone()]);
+    assert_eq!(run(&mut f, PUSHED), Outcome::HandedBack);
+    assert_eq!(evidence(&f), vec!["rejected_at", "rejected_at"]);
+    let mut f = with_comments(vec![old]);
+    f.comment_after_changes_removal =
+        Some(rejection("2026-11-16T12:30:00Z", "2026-11-16T12:30:00Z", PUSHED));
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]));
 }
 
 /// The pure claim-time predicate: predates-and-unedited answers the verdict
