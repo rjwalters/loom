@@ -465,29 +465,67 @@ function normalizeData(data: RawData): NormalizedData {
 
 **Detection scripts:**
 
+Skip test doubles by default: `test_*.py`, `*_stub*.py`, and `conftest.py`
+files are full of duck-typed fakes (`_FakeGit`, `_NullSink`, ...) that must be
+classes. The Python detector below already skips those file names; do not
+re-flag them by hand.
+
 ```bash
 # Python: Find classes with no instance state (AST-based, excludes dispatch-table classes)
 python3 -c "
 import ast, sys, os
+from fnmatch import fnmatch
+
+STATE_NODES = (ast.Assign, ast.AnnAssign, ast.AugAssign)
+
+def _iter_targets(t):
+    if isinstance(t, (ast.Tuple, ast.List)):
+        for e in t.elts:
+            yield from _iter_targets(e)
+    else:
+        yield t
+
+def _assignment_targets(n):
+    if isinstance(n, ast.Assign):
+        for t in n.targets:
+            yield from _iter_targets(t)
+    elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+        yield n.target
+
 for root, dirs, files in os.walk('.'):
     dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'node_modules']
     for f in files:
         if not f.endswith('.py'): continue
+        if fnmatch(f, 'test_*.py') or fnmatch(f, '*_stub*.py') or f == 'conftest.py': continue
         path = os.path.join(root, f)
         try:
             tree = ast.parse(open(path).read())
         except: continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef): continue
+            # Instance state: assignment to self.<attr> in any assignment form
+            # (plain, annotated, augmented; tuple/list targets unpacked)
             has_self_assign = any(
-                isinstance(n, ast.Assign) and
+                isinstance(n, STATE_NODES) and
                 any(isinstance(t, ast.Attribute) and
-                    isinstance(t.value, ast.Name) and t.value.id == 'self'
-                    for t in n.targets)
+                    isinstance(getattr(t, 'value', None), ast.Name) and t.value.id == 'self'
+                    for t in _assignment_targets(n))
                 for n in ast.walk(node)
             )
             if has_self_assign:
                 continue  # Has instance state -- not a stateless ceremony
+            # Exclusion 0: type-based shapes where 'no self.x =' is correct by design
+            if any('dataclass' in ast.unparse(d) for d in node.decorator_list):
+                continue  # The generated __init__ IS the state
+            if node.bases:
+                continue  # Exceptions, NamedTuple/TypedDict, Enums, Protocols, ABCs,
+                          # and subclasses kept for polymorphism
+            if any(isinstance(n, ast.AnnAssign) for n in node.body):
+                continue  # Declared class-level fields
+            if any(any('setter' in ast.unparse(d) for d in m.decorator_list)
+                   for m in node.body
+                   if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                continue  # Property pair -- state flows through @<x>.setter
             # Exclusion 1: Internal method dispatch (self.method() calls)
             has_self_method_call = any(
                 isinstance(n, ast.Call) and
@@ -498,10 +536,11 @@ for root, dirs, files in os.walk('.'):
             )
             if has_self_method_call:
                 continue  # Uses internal dispatch -- likely a namespace
-            # Exclusion 2: Method count threshold (10+ methods = namespace)
+            # Exclusion 2: Method count threshold (10+ methods = namespace).
+            # Count direct methods only (node.body): nested defs must not inflate it.
             method_count = sum(
-                1 for n in ast.walk(node)
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                1 for m in node.body
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
             )
             if method_count >= 10:
                 continue  # Too many methods to practically convert
