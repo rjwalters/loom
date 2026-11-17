@@ -221,9 +221,18 @@ fi
 # #12475: comment verdicts are read through the trust filter. The mock keeps
 # every comment except those a fixture marks author_association NONE (an
 # outside commenter), and `fail-trust` simulates a daemon without the verb.
+# Like the real verb it exits 1 on EMPTY stdin ("no JSON comment listing to
+# filter") — a bare `jq` exits 0 there, which hid a gh timeout upstream of
+# this filter behind a passing assertion (#13927).
 if [[ "${1:-} ${2:-}" == "forge trusted-comments" ]]; then
   [[ -f "${LOOM_TEST_FIXTURE_DIR:?}/fail-trust" ]] && exit 1
-  jq -c 'if type == "array" then map(select(.author_association != "NONE")) else . end'
+  _listing=$(cat)
+  if [[ -z "$_listing" ]]; then
+    echo "forge trusted-comments: no JSON comment listing to filter (stdin empty)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$_listing" \
+    | jq -c 'if type == "array" then map(select(.author_association != "NONE")) else . end'
   exit $?
 fi
 # #13055: approvals are gated on a live Judge lease; the caller holds it here.
@@ -266,6 +275,9 @@ reset_fixtures() {
 JSON
   printf '[]\n' > "$FIX_DIR/inline-page-1.json"
   printf '[]\n' > "$FIX_DIR/reviews-page-1.json"
+  # Default: no PR comments. `gh api` prints `[]` for an empty listing, never
+  # nothing, and the trust filter rejects empty input (as the real verb does).
+  printf '[]\n' > "$FIX_DIR/comments-page-1.json"
 }
 
 run_gate() {

@@ -387,14 +387,25 @@ printf '%s' "$REVIEW_SUMMARY" | jq -r '(.current_findings + .older_findings + .u
 # that already had to cite it by id. A missing `trusted-comments` verb or a
 # partial read is UNKNOWN, never clean.
 # requires-daemon: forge optional   Without `forge trusted-comments` no author can be verified, so the gate reports UNKNOWN (exit 12) rather than reading unauthenticated verdicts.
-VERDICT_COMMENTS=$(_forge_review_read_run gh api "repos/$NWO/issues/$NUMBER/comments?per_page=100" --paginate 2> /dev/null \
-    | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" forge trusted-comments 2> /dev/null)
+#
+# The read and the trust filter are two steps, each with its own status — NOT
+# one pipeline. Under `pipefail` a pipeline reports its rightmost failure, and
+# `forge trusted-comments` exits 1 on the empty stdin a timed-out `gh` leaves
+# it, so a piped read surfaced a timeout as rc 1: a generic UNKNOWN with
+# REVIEW_FEEDBACK_TIMED_OUT=0, which --reviews-reconciled may still override.
+VERDICT_COMMENTS_RAW=$(_forge_review_read_run gh api "repos/$NWO/issues/$NUMBER/comments?per_page=100" --paginate 2> /dev/null)
 VERDICT_READ_RC=$?
 if [[ "$VERDICT_READ_RC" -eq 124 ]]; then
     _fail_timeout "the comment-verdict read (issues/$NUMBER/comments) timed out after ${_LOOM_FORGE_REVIEW_READ_TIMEOUT}s (LOOM_FORGE_REVIEW_READ_TIMEOUT, #13927) — verdict state could not be established"
 fi
 if [[ "$VERDICT_READ_RC" -ne 0 ]]; then
     _fail_unknown "the comment-verdict read (issues/$NUMBER/comments, trusted authors only) failed or paginated incompletely"
+fi
+VERDICT_COMMENTS=$(printf '%s\n' "$VERDICT_COMMENTS_RAW" \
+    | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" forge trusted-comments 2> /dev/null)
+VERDICT_TRUST_RC=$?
+if [[ "$VERDICT_TRUST_RC" -ne 0 ]]; then
+    _fail_unknown "the comment-verdict trust filter (forge trusted-comments over issues/$NUMBER/comments) failed or is unavailable — verdict authors could not be verified"
 fi
 
 VERDICT_SUMMARY=$(printf '%s\n' "$VERDICT_COMMENTS" | jq -s --arg head "$HEAD_SHA" '
