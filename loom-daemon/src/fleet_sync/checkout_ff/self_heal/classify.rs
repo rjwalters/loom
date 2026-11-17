@@ -241,7 +241,9 @@ fn rebase_commits(gd: &Path) -> Result<Vec<String>, String> {
 }
 
 /// Is a `git` process running with its working directory inside `root`?
-/// Fails closed: a process whose directory cannot be read counts as live.
+/// Fails closed: a live process whose directory cannot be read counts as
+/// live. A zombie — exited, not yet reaped by its parent — runs nothing and
+/// holds no directory, so it does not ([`zombie`], #14059).
 pub(super) fn live_git(root: &Path) -> bool {
     let Ok(out) = Command::new("pgrep").args(["-x", "git"]).output() else {
         return true;
@@ -257,8 +259,31 @@ pub(super) fn live_git(root: &Path) -> bool {
         .filter_map(|p| p.parse::<i32>().ok())
         .any(|pid| match cwd_of(pid) {
             Some(cwd) => cwd.starts_with(&root),
-            None => crate::sweep_registry::pid_signalable(pid),
+            None => !zombie(pid) && crate::sweep_registry::pid_signalable(pid),
         })
+}
+
+/// Is `pid` a zombie, exited but not yet reaped by its parent? It cannot be
+/// running anything, but `kill(pid, 0)` still succeeds for it, so without
+/// this check the unreaped leftover of a neighbour runner's git call counted
+/// as a git working in the repository and held every self-heal repair back
+/// on a busy runner (#14059).
+#[cfg(target_os = "linux")]
+fn zombie(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state is the first field after the comm in parens, which itself
+    // may hold spaces and parens: only what follows the last ')' counts.
+    stat.rsplit(')')
+        .next()
+        .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn zombie(_pid: i32) -> bool {
+    // No readable process state: live_git's fail-closed rule stands as is.
+    false
 }
 
 fn cwd_of(pid: i32) -> Option<PathBuf> {
