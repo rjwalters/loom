@@ -1192,24 +1192,30 @@ It is eligible only when **all** hold, each read live in this pass:
   renders (a `{{PLACEHOLDER}}` substituted on copy) never byte-matches and holds.
   `.claude/settings.json` has no upstream counterpart, so a bump that changes it holds, which
   keeps the rjwalters/repo#733 guard-wiring PRs held;
-- every changed file is under `.loom/` or `.claude/`, and none is a merge-gate path
-  (the daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
-  comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
-  under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
-  path sources it: it is compared byte-for-byte like any kept-set file (#13486);
-  (This is Champion's proof. The daemon's own strict landing of its resync PR instead lets
-  byte-identical gate files land without a Judge when the tag is a published release, per
-  operator ruling r7-q33, #13665; a PR the daemon left for the lane still takes this rule.)
+- every changed file is under `.loom/`, `.claude/` or `.agents/skills/`. A merge-gate path (the
+  daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
+  comment-trust files, `config.json`) is no longer refused outright: it is byte-checked like any
+  kept-set file, and when any gate path is among the changed files the tag must additionally be a
+  published, non-draft release upstream — fail closed if the release cannot be read (operator
+  ruling 2026-11-17, #13982). The gate never waives a change to itself (#12945): a gate file that
+  differs from the tag by even one byte, has no upstream counterpart, or is renamed or removed,
+  holds. A file under `.loom/scripts/tests/` (name and previous name both) is not a gate path,
+  since no merge path sources it: it is compared byte-for-byte like any kept-set file (#13486).
+  The Repo Skills variant keeps refusing gate paths outright (the ruling concerns Loom's own
+  gate). Both proofs — the daemon's strict landing and Champion's non-strict waiver — apply this
+  same gate rule; they differ only in scope (strict byte-checks every changed file, not just the
+  kept set);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
-  `defaults/` counterpart through the surface map in `resync-installed.sh` (`.loom/hooks`,
+  `defaults/` counterpart — through the surface map in `resync-installed.sh` (`.loom/hooks`,
   `.loom/scripts`, `.loom/docs`, `.loom/runtimes`, `.loom/bin`, `.claude/commands/loom`,
-  `.claude/agents`; any other kept-set path, such as `.claude/settings.json`, `.githooks/*` or
-  `.loom/config.json`, has none and holds), and its head blob SHA equals that counterpart's blob SHA
-  at the tag;
+  `.claude/agents`) plus the proof's own mappings for `.loom/roles` (→ `defaults/roles`) and
+  `.agents/skills` (→ `defaults/.agents/skills`, #13665); any other kept-set path, such as
+  `.claude/settings.json`, `.githooks/*` or `.loom/config.json`, has none and holds — and its
+  head blob SHA equals that counterpart's blob SHA at the tag;
 - the PR head did not move while it was read.
 
 A differing byte, a local-only file, a missing or unparsable tag, or any failed read gives
