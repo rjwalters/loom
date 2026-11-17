@@ -519,11 +519,17 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
                 outcome.ignored.push(name.clone());
             }
         }
-        // Validate every holding checkout before mutating any of them, so a
-        // dirty worktree cannot leave a half-done discard behind.
+        // Validate every holding checkout and resolve the discard base
+        // before mutating any of them, so a dirty worktree or an
+        // unresolvable base cannot leave a half-done discard behind.
         let holds = holds_of(&repo, &targets)?;
+        let main_target = if holds.main.is_empty() {
+            None
+        } else {
+            Some(discard_target(&repo, &args.base)?)
+        };
         for name in &targets {
-            discard_branch(&repo, &holds, name, &args.base)?;
+            discard_branch(&repo, &holds, name, main_target.as_deref())?;
             outcome.discarded.push(name.clone());
         }
     }
@@ -564,16 +570,20 @@ fn holds_of(repo: &Path, branches: &[String]) -> Result<Holds> {
             if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != name {
                 continue;
             }
-            if worktree.canonicalize()? == main {
-                holds.main.push(name.clone());
-            } else if !git(&worktree, &["status", "--porcelain=v1", "--untracked-files=all"])?
-                .is_empty()
-            {
+            let is_main = worktree.canonicalize()? == main;
+            // Every holding checkout is dirty-checked — the main checkout
+            // included, since `prepare` leaves it on the requested branch:
+            // a dirty holder of any kind refuses the whole discard.
+            if !git(&worktree, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty() {
                 bail!(
-                    "worktree {} on discarded branch {} has uncommitted changes; resolve them by hand first",
+                    "{} {} on discarded branch {} has uncommitted changes; resolve them by hand first",
+                    if is_main { "main checkout" } else { "worktree" },
                     worktree.display(),
                     name
                 );
+            }
+            if is_main {
+                holds.main.push(name.clone());
             } else {
                 holds.worktrees.push((name.clone(), worktree));
             }
@@ -582,31 +592,44 @@ fn holds_of(repo: &Path, branches: &[String]) -> Result<Holds> {
     Ok(holds)
 }
 
-fn discard_branch(repo: &Path, holds: &Holds, branch: &str, base: &str) -> Result<()> {
+fn discard_branch(
+    repo: &Path,
+    holds: &Holds,
+    branch: &str,
+    main_target: Option<&str>,
+) -> Result<()> {
     for (name, worktree) in &holds.worktrees {
         if name == branch {
             git(repo, &["worktree", "remove", &worktree.display().to_string()])?;
         }
     }
-    if holds.main.iter().any(|name| name == branch) {
-        // Move the checkout off the branch without touching any branch ref:
-        // detach it where preparation itself would (the base on origin, or a
-        // bare base revision). Detaching at HEAD would leave the discarded
-        // commits stranded and refused all over again.
-        let target = format!("refs/remotes/origin/{base}");
-        let target = if git(repo, &["rev-parse", "--verify", &target]).is_ok() {
-            target
-        } else if base.len() == 40 && base.chars().all(|c| c.is_ascii_hexdigit()) {
-            base.to_owned()
-        } else {
-            bail!(
-                "cannot move the checkout off discarded branch {branch}: base is not on origin; name the work with a branch by hand"
-            );
-        };
-        git(repo, &["switch", "--detach", &target])?;
+    // Move the checkout off the branch without touching any branch ref:
+    // detach it where preparation itself would (the base on origin, or a
+    // bare base revision, both resolved before any mutation). Detaching at
+    // HEAD would leave the discarded commits stranded and refused all over
+    // again.
+    if let Some(target) = main_target.filter(|_| holds.main.iter().any(|name| name == branch)) {
+        git(repo, &["switch", "--detach", target])?;
     }
     git(repo, &["branch", "-D", branch])?;
     Ok(())
+}
+
+/// The detached target a discard moves a holding main checkout to: the base
+/// on `origin`, or a bare base revision. Resolved once, before the first
+/// mutation, so an unresolvable base refuses the whole discard instead of
+/// landing mid-way through a multi-branch scope.
+fn discard_target(repo: &Path, base: &str) -> Result<String> {
+    let target = format!("refs/remotes/origin/{base}");
+    if git(repo, &["rev-parse", "--verify", &target]).is_ok() {
+        Ok(target)
+    } else if base.len() == 40 && base.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(base.to_owned())
+    } else {
+        bail!(
+            "cannot move the checkout off a discarded branch: base {base} is not on origin; name the work with a branch by hand"
+        )
+    }
 }
 
 /// Paths of an additional repository: `(clone, identity record, staging)`.

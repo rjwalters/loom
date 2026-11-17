@@ -480,6 +480,70 @@ fn recover_discard_moves_the_checkout_and_removes_a_holding_worktree() {
 #[test]
 #[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
+fn recover_discard_refuses_a_dirty_main_checkout_holding_the_branch() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // The main checkout holds the branch — where `prepare` itself leaves it —
+    // with uncommitted work on top.
+    git(&repo, &["switch", "-c", "held-dirty"]);
+    std::fs::write(repo.join("fixture"), "committed").unwrap();
+    git(&repo, &["commit", "-am", "committed"]);
+    std::fs::write(repo.join("untracked"), "keep").unwrap();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["held-dirty".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("main checkout"), "{error}");
+    assert!(error.contains("uncommitted"), "{error}");
+    // The branch, the checkout, and the uncommitted work are all untouched:
+    // no half-done discard.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/held-dirty"]));
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "held-dirty");
+    assert!(repo.join("untracked").exists());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_resolves_the_base_before_mutating_any_holder() {
+    let _fork = fork_guard();
+    let (f, repo, _issue3, _issue4) = two_unpublished_branches();
+    // A linked worktree holds the branch that sorts first, so the old code
+    // removed it before the main checkout's unresolvable base failed.
+    let worktree = f.root.join("issue-7");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "aaa-wt",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(worktree.join("fixture"), "aaa-wt").unwrap();
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-am", "aaa-wt"]);
+    // The main checkout holds the other discarded branch.
+    git(&repo, &["switch", "issue-3"]);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.base = "no-such-base".into();
+    args.branch = vec!["issue-3".into(), "aaa-wt".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("base"), "{error}");
+    // Neither holder was touched: the base resolves before the first mutation.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-3"]));
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/aaa-wt"]));
+    assert!(worktree.exists(), "the holding worktree was not removed");
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "issue-3");
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
 fn recover_refuses_an_unknown_clone_identity() {
     let _fork = fork_guard();
     let (f, _repo, _issue3, _issue4) = two_unpublished_branches();
