@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Common Utilities
 
 This file contains shared utilities, protocols, and information used across all Champion workflows.
