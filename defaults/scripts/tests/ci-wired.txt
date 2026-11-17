@@ -59,6 +59,7 @@ test-champion-out-of-band-ac-gate-switch.sh
 test-champion-merge-risk-self-release.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh
+test-champion-park-marker-dedupe.sh
 test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
