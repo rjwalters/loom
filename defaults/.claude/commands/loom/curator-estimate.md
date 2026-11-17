@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Curator completion estimates
 
 For every issue you actually curate or re-curate, write exactly one concrete,
