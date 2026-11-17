@@ -29,12 +29,12 @@
 //! activity read proceeds, and says why. A head branch in a fork is not
 //! checked: its pushes are not in this repository's activity.
 
-use chrono::{DateTime, Utc};
-use loom_daemon::forge_call_stats::{ops, ForgeOp};
-use loom_daemon::forge_check_claim::{
+use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_check_claim::{
     issue_lease_comments_jq, live_leases_by_freshness, parse_lease_rows, LeaseRow,
 };
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation};
+use crate::gh_invocation::{AccessIntent, GhInvocation};
+use chrono::{DateTime, Utc};
 
 use super::{live_leases, Ctx, Gh, Identity, LiveLease, Role, Row};
 
@@ -229,7 +229,7 @@ impl Gh {
     pub(crate) fn issue_lease_rows(
         &self,
         number: u64,
-        policy: &loom_daemon::comment_trust::TrustPolicy,
+        policy: &crate::comment_trust::TrustPolicy,
     ) -> Option<Vec<LeaseRow>> {
         // Built through the gh facade (`Gh::inv` -> `GhInvocation`), so the
         // `--paginate` read is counted and page-walkable; the explicit type

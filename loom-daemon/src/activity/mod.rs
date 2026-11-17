@@ -140,10 +140,7 @@ pub use pricing_card::{PricingCard, PricingCardError};
 // Re-export stats types and trait for metrics queries
 // These types are used for the `loom stats` CLI commands
 #[allow(unused_imports)]
-pub use stats::{
-    AgentEffectiveness, CostPerIssue, CostRow, EffectivenessRow, StatsQueries, StatsSummary,
-    SummaryMetrics, VelocityRow, WeeklyVelocity,
-};
+pub use stats::{CostRow, EffectivenessRow, StatsQueries, SummaryMetrics, VelocityRow};
 
 // Issue claim registry types (Issue #1159)
 // Used for reliable work distribution and crash recovery

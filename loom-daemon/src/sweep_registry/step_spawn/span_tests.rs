@@ -24,7 +24,7 @@ fn line(class: StepOutcomeClass) -> StepOutcomeLine {
 
 fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttributes) {
     let outcome = super::super::capture::tick_outcome(StepRole::Judge, end, line);
-    sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None, None)
+    sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None, None, None)
 }
 
 /// #12957: a sized step's close carries its points; an unsized one has no
@@ -33,7 +33,7 @@ fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttri
 fn a_sized_steps_close_carries_its_story_points() {
     let outcome = super::super::capture::tick_outcome(StepRole::Judge, StepEnd::TimedOut, None);
     let close = |points| {
-        sweep_close(StepEnd::TimedOut, None, &outcome, StepRole::Judge, None, None, points).1
+        sweep_close(StepEnd::TimedOut, None, &outcome, StepRole::Judge, None, None, points, None).1
     };
     assert_eq!(close(Some(13))["loom.story_points"], "13");
     assert!(!close(None).contains_key("loom.story_points"));
@@ -283,4 +283,52 @@ fn a_step_with_a_dead_leader_runs_only_while_its_group_has_members() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert!(!step_still_running(root, "step-builder-43-1"), "the group is gone");
+}
+
+/// #13169: a Builder step's close names the PR it opened; absent otherwise.
+#[test]
+fn a_close_carries_the_pr_number_only_when_one_is_known() {
+    let outcome =
+        super::super::capture::tick_outcome(StepRole::Builder, StepEnd::Exited(Some(0)), None);
+    let close = |pr| {
+        sweep_close(
+            StepEnd::Exited(Some(0)),
+            None,
+            &outcome,
+            StepRole::Builder,
+            None,
+            None,
+            None,
+            pr,
+        )
+        .1
+    };
+    assert_eq!(close(Some(99))["loom.pr_number"], "99");
+    assert!(!close(None).contains_key("loom.pr_number"));
+}
+
+/// #13521: a clean-exit Builder step with no outcome line closes as
+/// `no-outcome-line-pr-opened` when it opened a PR, and as `no-outcome-line`
+/// when none is known (an unreadable PR fails closed to the old class).
+#[test]
+fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
+    let outcome =
+        super::super::capture::tick_outcome(StepRole::Builder, StepEnd::Exited(Some(0)), None);
+    assert!(matches!(outcome, RoleTickOutcome::Failure(_)), "tick outcome is unchanged");
+    let class = |pr| {
+        sweep_close(
+            StepEnd::Exited(Some(0)),
+            None,
+            &outcome,
+            StepRole::Builder,
+            None,
+            None,
+            None,
+            pr,
+        )
+        .1[lifecycle::FAILURE_CLASS]
+            .clone()
+    };
+    assert_eq!(class(Some(7)), "no-outcome-line-pr-opened");
+    assert_eq!(class(None), "no-outcome-line");
 }

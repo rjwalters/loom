@@ -2,8 +2,8 @@
 //! instead of "the limiter is work availability".
 use super::below_cap_line;
 use crate::cli::status::sample_report::sample_report;
+use crate::types::{DaemonStatusReport, PoolExhaustionHoldStatus, RepoStatus};
 use chrono::Utc;
-use loom_daemon::types::{DaemonStatusReport, PoolExhaustionHoldStatus, RepoStatus};
 use std::path::PathBuf;
 
 const GENERIC: &str = "the limiter is work availability";
@@ -33,6 +33,7 @@ fn repo(root: &str, halted: bool) -> RepoStatus {
         health_gate_enabled: Some(true),
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,

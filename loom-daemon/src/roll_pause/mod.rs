@@ -181,25 +181,20 @@ pub struct SafePoint {
     pub request_id: Option<String>,
 }
 
-/// Write `bytes` to `path` atomically: a temp file in the same directory,
-/// `fsync`, then `rename`. A reader sees the old file or the new one, never a
-/// partial write.
+/// Write `bytes` to `path` atomically (see [`crate::fs_util::write_atomic`]);
+/// the parent directory is synced so the rename is durable (#10831).
 ///
 /// # Errors
 /// Any I/O failure creating, writing, syncing or renaming the file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    // #10831: make the rename itself durable, not only the file's bytes.
-    // Best-effort where a directory cannot be opened for sync.
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// Raise a pause request for an item (daemon side). A safe-point record

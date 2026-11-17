@@ -24,7 +24,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::worktree_teardown::teardown;
+use crate::merge_pr::worktree_teardown::teardown;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeTeardownArgs {

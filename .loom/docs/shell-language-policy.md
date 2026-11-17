@@ -15,7 +15,7 @@ ruling on issue #7762.
 
 The policy is a review standard, not a CI gate. The per-file allowlist
 (`scripts/shell-allowlist.txt` + `check-shell-allowlist.sh`, #7762) and the
-aggregate shell-volume ratchet (`loom-daemon shell-budget --check`, #8084)
+aggregate shell-volume ratchet (#8084)
 were removed from CI by operator ruling on #12106: they cost every PR a ledger
 edit and a stale-check input without catching what review would not. Judge
 applies the rule when a PR adds a `.sh`: the PR should say why the logic is not
@@ -49,4 +49,4 @@ into `loom-daemon`, and the file trends toward a thin stub ending in `exec`.
 
 - [ADR-0018](https://github.com/rjwalters/loom/blob/main/docs/adr/0018-rust-owns-behavior-shell-reaches-it.md) — the accepted architectural decision.
 - #7810 — the migration epic for shell that already exists.
-- #12106 — removal of the allowlist and shell-budget CI gates.
+- #12106 — removal of the allowlist and shell-volume CI gates.

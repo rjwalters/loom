@@ -104,7 +104,7 @@ const DEFAULT_POLL: Duration = Duration::from_secs(5);
 
 /// Append one timestamped outcome line. Best effort: a log is diagnostics.
 pub(crate) fn record(workspace: &str, issue: u64, line: &str) {
-    let Ok(root) = loom_daemon::repo_root::resolve_repo_root(workspace) else {
+    let Ok(root) = crate::repo_root::resolve_repo_root(workspace) else {
         return;
     };
     let path = log_path(&root, issue);
@@ -140,7 +140,7 @@ pub(crate) fn spawn_with(
 ) -> String {
     let issue = args.issue;
     let mut waits = false;
-    if let Ok(root) = loom_daemon::repo_root::resolve_repo_root(&args.workspace) {
+    if let Ok(root) = crate::repo_root::resolve_repo_root(&args.workspace) {
         // Probe (and immediately release) both locks.
         if try_lock(&session_lock_path(&root, issue, args.watch_pid)).is_none() {
             return format!(
@@ -207,7 +207,7 @@ pub(crate) fn run_with(
     env: &SessionEnv,
     poll: Duration,
 ) -> Option<DeferredEnd> {
-    let root = loom_daemon::repo_root::resolve_repo_root(&args.workspace).ok()?;
+    let root = crate::repo_root::resolve_repo_root(&args.workspace).ok()?;
     let note = |line: &str| record(&args.workspace, args.issue, line);
     let Some(_session) = try_lock(&session_lock_path(&root, args.issue, args.watch_pid)) else {
         note("deferred publisher already waiting for this issue in this session; exiting");
@@ -216,7 +216,7 @@ pub(crate) fn run_with(
     let pid = args.watch_pid;
     let ident = super::super::lease_renewer::start_identity(pid);
     let alive = || {
-        loom_daemon::live_claim::pid_is_live_process(pid)
+        crate::live_claim::pid_is_live_process(pid)
             && (ident.is_none() || super::super::lease_renewer::start_identity(pid) == ident)
     };
     let cap = if args.max_age == 0 {
@@ -314,7 +314,7 @@ pub(crate) fn retry_loop(
     } else {
         args.max_age
     };
-    let ttl_secs = (loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as u64;
+    let ttl_secs = (crate::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as u64;
     let interval = args.retry_interval.max(1);
     loop {
         let wait = if elapsed() < ttl_secs + interval {

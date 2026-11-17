@@ -243,7 +243,6 @@ Loom provides a unified MCP server (`mcp-loom`) for AI-powered debugging:
 - `mcp__loom__read_console_log` - Read frontend console logs
 - `mcp__loom__read_state_file` - Read application state
 - `mcp__loom__read_config_file` - Read terminal configurations
-- `mcp__loom__trigger_force_start` - Start engine without confirmation
 - `mcp__loom__trigger_factory_reset` - Reset to factory defaults
 - `mcp__loom__get_heartbeat` - Check app health status
 
@@ -254,7 +253,6 @@ Loom provides a unified MCP server (`mcp-loom`) for AI-powered debugging:
 
 #### Terminal Tools
 - `mcp__loom__list_terminals` - List all terminals
-- `mcp__loom__get_selected_terminal` - Get primary terminal info
 - `mcp__loom__get_terminal_output` - Read terminal output
 - `mcp__loom__send_terminal_input` - Send input to terminal
 

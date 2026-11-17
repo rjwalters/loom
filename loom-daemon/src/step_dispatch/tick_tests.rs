@@ -97,6 +97,10 @@ fn workspace_cooling(
         weighing: weigh(&items, &ctx, &ItemWeights::default()),
         halted: false,
         created_at: HashMap::new(),
+        merge_slots: 1,
+        merge_concurrency: 1,
+        merge_eligible: 0,
+        merges_in_flight: 0,
     }
 }
 
@@ -299,7 +303,8 @@ fn live_claims_leave_the_pool_as_claimed_and_a_peer_merge_as_merge_in_flight() {
     let before = ws.weighing.pool.len();
     let claims = DrawClaims {
         items: std::collections::HashSet::from([1, 40]),
-        merge_in_flight: Some((61, "peer".to_string())),
+        merges_in_flight: vec![(61, "peer".to_string())],
+        ..DrawClaims::default()
     };
     let claimed_before = ws
         .weighing
@@ -352,7 +357,8 @@ fn a_repo_with_a_merge_in_flight_spends_no_draw_or_pass_on_its_merges() {
     assert_eq!(merge_steps(&busy), 6);
     let claims = DrawClaims {
         items: std::collections::HashSet::new(),
-        merge_in_flight: Some((999, "peer".to_string())),
+        merges_in_flight: vec![(999, "peer".to_string())],
+        ..DrawClaims::default()
     };
     exclude_claimed(&mut busy.weighing, &claims);
     assert_eq!(merge_steps(&busy), 0);
@@ -461,6 +467,85 @@ fn a_merge_spawned_mid_tick_defers_the_repos_other_merges() {
     assert_eq!(replay_record(record).unwrap().len(), 2);
 }
 
+/// `ws` allowed `n` merges at once with `in_flight` already running.
+fn merge_lane(mut ws: StepWorkspace, n: usize, in_flight: usize) -> StepWorkspace {
+    ws.merge_concurrency = n;
+    ws.merges_in_flight = in_flight;
+    ws.merge_slots = n.saturating_sub(in_flight);
+    ws
+}
+
+#[test]
+fn a_merge_concurrency_of_two_spawns_two_merges_then_defers_the_rest() {
+    // #13026: with `champion.mergeConcurrencyPerRepo = 2` the repo's merge
+    // steps close only once the second merge is spawned.
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(
+        vec![merge_lane(
+            workspace(0, "acme/one", &merges_and_a_curator(5)),
+            2,
+            0,
+        )],
+        limits(10),
+        &mut spawner,
+    );
+    let merges = spawner
+        .asked
+        .iter()
+        .filter(|a| a.2 == StepRole::ChampionMerge)
+        .count();
+    assert_eq!(merges, 2, "{:?}", spawner.asked);
+    assert_eq!(tick.report.dispatched, 3);
+    assert_eq!(tick.merge_deferred, 3);
+    assert_eq!(tick.merge_concurrency, 2);
+    assert_eq!(tick.merges_in_flight, 2);
+    assert!(tick.passes.is_empty(), "{:?}", tick.passes);
+}
+
+#[test]
+fn a_merge_already_in_flight_leaves_one_slot_at_a_concurrency_of_two() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(
+        vec![merge_lane(
+            workspace(0, "acme/one", &merges_and_a_curator(5)),
+            2,
+            1,
+        )],
+        limits(10),
+        &mut spawner,
+    );
+    let merges = spawner
+        .asked
+        .iter()
+        .filter(|a| a.2 == StepRole::ChampionMerge)
+        .count();
+    assert_eq!(merges, 1, "{:?}", spawner.asked);
+    assert_eq!(tick.merges_in_flight, 2);
+}
+
+#[test]
+fn exclude_claimed_defers_merges_only_when_the_lane_is_full() {
+    let in_flight = |n: usize, limit: usize| DrawClaims {
+        items: std::collections::HashSet::new(),
+        merges_in_flight: (0..n)
+            .map(|i| (900 + i as u32, "peer".to_string()))
+            .collect(),
+        merge_concurrency: limit,
+    };
+    let merges_left = |claims: DrawClaims| {
+        let mut ws = workspace(0, "acme/one", &merges_and_a_curator(3));
+        exclude_claimed(&mut ws.weighing, &claims);
+        merge_steps(&ws)
+    };
+    // Unset (0) reads as 1: one merge in flight fills the lane.
+    assert_eq!(merges_left(in_flight(1, 0)), 0);
+    assert_eq!(merges_left(in_flight(1, 1)), 0);
+    // Two allowed: one in flight leaves the lane open, two fill it.
+    assert_eq!(merges_left(in_flight(1, 2)), 3);
+    assert_eq!(merges_left(in_flight(2, 2)), 0);
+    assert_eq!(merges_left(in_flight(0, 1)), 3);
+}
+
 #[test]
 fn a_hold_reevaluation_stays_serialised_behind_the_repos_merge() {
     // #12494 asked whether `champion_hold_reevaluate` needs the repo's merge
@@ -484,7 +569,8 @@ fn a_hold_reevaluation_stays_serialised_behind_the_repos_merge() {
         &mut ws.weighing,
         &DrawClaims {
             items: std::collections::HashSet::new(),
-            merge_in_flight: Some((101, "peer".to_string())),
+            merges_in_flight: vec![(101, "peer".to_string())],
+            ..DrawClaims::default()
         },
     );
     assert!(ws
@@ -1249,6 +1335,213 @@ esac
             (60, StepRole::ChampionMerge),
         ])
     );
+}
+
+/// An events source that records every read (#12312).
+#[derive(Default)]
+struct RecordingEvents {
+    reads: Vec<u32>,
+}
+
+impl crate::step_dispatch::stage_entry::EventsSource for RecordingEvents {
+    fn label_times(
+        &mut self,
+        _root: &std::path::Path,
+        _slug: &str,
+        number: u32,
+        _label: &str,
+        _max_pages: usize,
+    ) -> crate::observability::ops::stage_events::LabelTimes {
+        self.reads.push(number);
+        crate::observability::ops::stage_events::LabelTimes {
+            times: Some(Default::default()),
+            pages: 1,
+        }
+    }
+}
+
+/// The stage-entry sources a tick's lookups reach (#12312): a mirror
+/// snapshot (every labelled row carries `labels_at`) answers every stepped
+/// item from the mirror and makes no events read; the same rows without
+/// `labels_at` (the direct shape) read events; a mixed snapshot reads events
+/// only for the rows lacking `labels_at`.
+#[test]
+fn only_the_direct_backend_reaches_the_events_and_created_sources() {
+    use crate::step_dispatch::stage_entry::{Source, StageEntryProvider};
+
+    fn lookups(rows: &[RestIssue]) -> (Vec<u32>, Vec<Source>) {
+        let pulls = rows
+            .iter()
+            .filter(|r| r.is_pull_request)
+            .map(|r| pull_from_row(r, PullMarkers::default()))
+            .collect();
+        let inputs = build_inputs(
+            rows,
+            pulls,
+            &IssueFacts::default(),
+            RepoInput::default(),
+            HostInput::default(),
+        );
+        let items = step_item::classify(&inputs);
+        let mut events = RecordingEvents::default();
+        let mut provider = StageEntryProvider::load(None, 100);
+        let mut sources = Vec::new();
+        let drawn = draw_inputs(items, rows, |r, label| {
+            let e = provider.entry(
+                &mut events,
+                std::path::Path::new("/nonexistent"),
+                "acme/widgets",
+                r,
+                label,
+                now(),
+            );
+            sources.extend(e.map(|e| e.source));
+            e
+        });
+        assert!(drawn.iter().any(|d| d.stage_entry.is_some()));
+        (events.reads, sources)
+    }
+
+    fn mirrored(mut r: RestIssue) -> RestIssue {
+        r.labels_at = Some(
+            r.labels
+                .iter()
+                .map(|l| (l.clone(), "2026-10-05T00:00:00Z".to_string()))
+                .collect(),
+        );
+        r
+    }
+
+    let direct = forge();
+    let mirror: Vec<RestIssue> = direct.iter().cloned().map(mirrored).collect();
+
+    let (reads, sources) = lookups(&mirror);
+    assert!(reads.is_empty(), "a mirror snapshot reads no events: {reads:?}");
+    assert!(!sources.is_empty() && sources.iter().all(|s| *s == Source::Mirror));
+
+    let (reads, sources) = lookups(&direct);
+    assert!(!reads.is_empty(), "the direct shape reads events");
+    assert!(sources.iter().all(|s| *s != Source::Mirror));
+
+    // Mixed: only rows without `labels_at` are read.
+    let mixed: Vec<RestIssue> = direct
+        .iter()
+        .cloned()
+        .map(|r| if r.number % 2 == 0 { mirrored(r) } else { r })
+        .collect();
+    let (reads, _) = lookups(&mixed);
+    assert!(!reads.is_empty());
+    assert!(reads.iter().all(|n| n % 2 == 1), "even rows are mirrored: {reads:?}");
+}
+
+// ---- #12817: items the captain offered ----------------------------------
+
+fn offer(repo: &str, item: u32, role: StepRole) -> Offer {
+    Offer {
+        repo: repo.to_string(),
+        item,
+        role,
+    }
+}
+
+fn run_offered(
+    workspaces: Vec<StepWorkspace>,
+    free_slots: usize,
+    spawner: &mut FakeSpawner,
+    offers: &[Offer],
+) -> StepTick {
+    run_with_offers(workspaces, limits(free_slots), &seed(), &PoolKnobs::default(), spawner, offers)
+}
+
+/// An offer in the gated pool spawns first, holds its slot and is not a draw.
+#[test]
+fn an_offer_in_the_pool_spawns_first_and_holds_its_slot() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        1,
+        &mut spawner,
+        &[offer("ACME/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(spawner.asked.len(), 1);
+    assert_eq!((spawner.asked[0].1, spawner.asked[0].2), (3, StepRole::Builder));
+    assert_eq!(tick.report.dispatched, 1);
+    // No draw was spent on it, and no slot is left for one.
+    assert_eq!(tick.draws, 0);
+    assert_eq!(tick.stop, TickStop::NoSlots);
+    assert_eq!(spawner.terms, vec![None]);
+}
+
+/// The rest of the slots draw as before, never drawing the offered item twice.
+#[test]
+fn the_slots_an_offer_leaves_still_draw() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        3,
+        &mut spawner,
+        &[offer("acme/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(tick.report.dispatched, 3);
+    assert_eq!(tick.draws, 2);
+    let threes = spawner.asked.iter().filter(|a| a.1 == 3).count();
+    assert_eq!(threes, 1);
+}
+
+/// An offer for an item the gates left out never reaches the spawner: the
+/// captain's queue is not authority to skip a gate.
+#[test]
+fn an_offer_cannot_skip_a_gate() {
+    let mut spawner = FakeSpawner::default();
+    // 7 is claimed (`loom:building`), 8 blocked, 9 operator-held; 999 is
+    // unknown; item 3 is a Builder item, not a Judge one; the repo differs.
+    let offers = [
+        offer("acme/one", 7, StepRole::Builder),
+        offer("acme/one", 8, StepRole::Builder),
+        offer("acme/one", 9, StepRole::Builder),
+        offer("acme/one", 999, StepRole::Builder),
+        offer("acme/one", 3, StepRole::Judge),
+        offer("acme/other", 3, StepRole::Builder),
+    ];
+    run_offered(vec![workspace(0, "acme/one", &forge())], 0, &mut spawner, &offers);
+    assert!(spawner.asked.is_empty());
+    let mut spawner = FakeSpawner::default();
+    run_offered(vec![workspace(0, "acme/one", &forge())], 10, &mut spawner, &offers);
+    let asked: BTreeSet<(u32, StepRole)> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+    assert!(!asked.contains(&(7, StepRole::Builder)));
+    assert!(!asked.contains(&(8, StepRole::Builder)));
+    assert!(!asked.contains(&(9, StepRole::Builder)));
+    assert!(!asked.contains(&(999, StepRole::Builder)));
+}
+
+/// A held workspace offers nothing.
+#[test]
+fn an_offer_in_a_held_workspace_is_not_spawned() {
+    let mut ws = workspace(0, "acme/one", &forge());
+    ws.halted = true;
+    let mut spawner = FakeSpawner::default();
+    run_offered(vec![ws], 5, &mut spawner, &[offer("acme/one", 3, StepRole::Builder)]);
+    assert!(spawner.asked.is_empty());
+}
+
+/// A refused offer is counted by reason like a draw's, and spends no pass.
+#[test]
+fn a_refused_offer_is_counted_and_spends_no_pass() {
+    let mut spawner = FakeSpawner {
+        refuse: vec![(3, "captain_not_eligible")],
+        ..FakeSpawner::default()
+    };
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        1,
+        &mut spawner,
+        &[offer("acme/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(tick.passes.get("captain_not_eligible"), Some(&1));
+    assert_eq!(tick.passes.values().sum::<usize>(), 1);
+    // The slot it did not fill is drawn for, and that draw spawned.
+    assert_eq!(spawner.asked.len(), 2);
+    assert_eq!(tick.report.dispatched, 1);
 }
 
 /// #12957: the tick's queue rows and spawn requests carry each item's story

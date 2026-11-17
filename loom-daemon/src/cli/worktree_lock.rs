@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::{issue_lock, lock};
+use crate::worktree_cli::{issue_lock, lock};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum WorktreeLockCommand {

@@ -97,10 +97,10 @@ mod resolve_tokens_pool_dir_for_cli_tests {
     //! workspace" register the test's *actual* `current_dir()` (or a sibling
     //! of it) in a scratch `LOOM_WORKSPACES_PATH` registry instead.
     use super::super::resolve_tokens_pool_dir_for_cli;
-    use loom_daemon::tokens_pool::paths::{
+    use crate::tokens_pool::paths::{
         per_repo_tokens_dir, shared_tokens_dir, SHARED_TOKENS_DIR_ENV,
     };
-    use loom_daemon::workspace_registry::{
+    use crate::workspace_registry::{
         normalize_path, Workspace, WorkspaceRegistry, REGISTRY_PATH_ENV,
     };
     use serial_test::serial;
@@ -161,7 +161,7 @@ mod resolve_tokens_pool_dir_for_cli_tests {
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
         let cwd = std::env::current_dir().unwrap();
-        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert_eq!(dir, crate::tokens_pool::paths::resolve_tokens_dir(&cwd));
         assert!(!anchored);
 
         std::env::remove_var(REGISTRY_PATH_ENV);
@@ -179,7 +179,7 @@ mod resolve_tokens_pool_dir_for_cli_tests {
         std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
-        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert_eq!(dir, crate::tokens_pool::paths::resolve_tokens_dir(&cwd));
         assert!(!anchored);
 
         std::env::remove_var(REGISTRY_PATH_ENV);
@@ -197,12 +197,16 @@ mod resolve_tokens_pool_dir_for_cli_tests {
         let registry_dir = tempfile::tempdir().unwrap();
         write_registry(&registry_dir.path().join("workspaces.json"), &[unrelated.path()]);
         std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
-        std::env::remove_var(SHARED_TOKENS_DIR_ENV); // default shared dir enabled
+        // Shared dir enabled. The lib's test build has no home-dir default, so
+        // set it explicitly rather than relying on the unset-env fallback.
+        let shared = tempfile::tempdir().unwrap();
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path());
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
         assert_eq!(dir, shared_tokens_dir().unwrap());
         assert!(anchored);
 
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
 
@@ -220,10 +224,106 @@ mod resolve_tokens_pool_dir_for_cli_tests {
         std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
-        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert_eq!(dir, crate::tokens_pool::paths::resolve_tokens_dir(&cwd));
         assert!(!anchored);
 
         std::env::remove_var(REGISTRY_PATH_ENV);
         std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    //! Tests for `tokens pressure` (issue #13839) — the non-credential
+    //! surface Guide's Step 4b (#6135) reads instead of opening
+    //! `.loom/tokens/.ranking` itself.
+    //!
+    //! These drive the pool-dir-aware reader directly
+    //! ([`crate::capacity::read_ranking_at`]) against real `.ranking`
+    //! fixtures in a tempdir, then format through the same `format_pressure`
+    //! the subcommand prints with. No env var is set and no process `chdir`
+    //! happens, so nothing here is order-dependent.
+    use super::super::format_pressure;
+
+    fn fraction_for(ranking: Option<&str>) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        if let Some(contents) = ranking {
+            std::fs::write(dir.path().join(".ranking"), contents).expect("write .ranking");
+        }
+        format_pressure(crate::capacity::read_ranking_at(dir.path()))
+    }
+
+    /// The acceptance-criteria case: 3 of 4 rows not `available` → `0.7500`.
+    /// Note the three unhealthy rows use three *different* status words, so
+    /// this also pins that every non-`available` status counts as pressure,
+    /// not just `exhausted`.
+    #[test]
+    fn three_of_four_unavailable_is_three_quarters() {
+        let ranking = "alice|available|0.20|\n\
+                       bob|exhausted|0.99|2026-11-20T00:00:00Z\n\
+                       carol|rate_limited|0.85|2026-11-13T10:00:00Z\n\
+                       dave|blocked|0.50|\n";
+        assert_eq!(fraction_for(Some(ranking)), "0.7500");
+    }
+
+    /// A fully healthy pool is `0.0000` — a real measurement of "no
+    /// pressure", textually distinct from the `0` that means "no data".
+    #[test]
+    fn fully_available_pool_is_zero_point_zero() {
+        let ranking = "alice|available|0.20|\nbob|available|0.10|\n";
+        assert_eq!(fraction_for(Some(ranking)), "0.0000");
+    }
+
+    /// An unrecognized status word counts as unhealthy (`AccountHealth::
+    /// Unknown`). This is the documented behaviour difference from the shell
+    /// version Step 4b used to run, which compared only against the literal
+    /// `available` and treated an empty status field as available.
+    #[test]
+    fn unknown_status_word_counts_as_pressure() {
+        let ranking = "alice|available|0.20|\nbob|wat|0.10|\n";
+        assert_eq!(fraction_for(Some(ranking)), "0.5000");
+    }
+
+    /// An empty ranking file has no parseable rows → `None` → `0` (fail
+    /// open), never a divide-by-zero.
+    #[test]
+    fn empty_ranking_file_is_zero() {
+        assert_eq!(fraction_for(Some("")), "0");
+    }
+
+    /// A file with only comments/blank lines and no `|` row is equally
+    /// unparseable → `0`.
+    #[test]
+    fn unparseable_ranking_file_is_zero() {
+        assert_eq!(fraction_for(Some("# header only\n\nnot-a-row\n")), "0");
+    }
+
+    /// A missing ranking file is the common case on a host that has never
+    /// probed — `0`, exit 0, no error.
+    #[test]
+    fn missing_ranking_file_is_zero() {
+        assert_eq!(fraction_for(None), "0");
+    }
+
+    /// `format_pressure` never divides by zero even if handed a
+    /// zero-total snapshot directly (which `read_ranking` itself cannot
+    /// produce — it returns `None` instead).
+    #[test]
+    fn zero_total_snapshot_is_zero_not_nan() {
+        let snap = crate::capacity::RankingSnapshot::default();
+        assert_eq!(format_pressure(Some(snap)), "0");
+    }
+
+    /// The output is always a bare number with no account material in it —
+    /// the property that lets a role without `credential-store` consume it.
+    #[test]
+    fn output_carries_no_account_material() {
+        let ranking = "alice|available|0.20|\nbob|exhausted|0.99|\n";
+        let out = fraction_for(Some(ranking));
+        assert!(!out.contains("alice") && !out.contains("bob"), "got {out}");
+        assert!(
+            out.chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "output must be digits and at most one '.', got {out}"
+        );
     }
 }

@@ -14,13 +14,13 @@
 
 use anyhow::Result;
 
-use loom_daemon::types::{Request, Response};
+use crate::types::{Request, Response};
 
 use super::common::{query_daemon, resolve_socket_path};
-use crate::NoopCooldownAction;
+use crate::cli::NoopCooldownAction;
 
 /// Handle the `noop-cooldown` subcommand.
-pub(crate) async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> Result<()> {
+pub async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     match action {
         NoopCooldownAction::Record {

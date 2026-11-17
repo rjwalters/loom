@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use loom_daemon::types::{Request, Response};
+use crate::types::{Request, Response};
 
 /// Resolve the daemon's IPC socket path exactly as the running daemon does in
 /// `main()`: honour `LOOM_SOCKET_PATH` (test override) first, else
@@ -26,11 +26,11 @@ pub(crate) fn resolve_socket_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         return Ok(PathBuf::from(path));
     }
-    let default = crate::daemon_service::resolve_loom_dir()?.join("loom-daemon.sock");
+    let default = resolve_loom_dir()?.join("loom-daemon.sock");
     if default.exists() {
         return Ok(default);
     }
-    let pids = loom_daemon::daemon_install_state::pgrep_daemon_pids();
+    let pids = crate::daemon_install_state::pgrep_daemon_pids();
     Ok(pick_socket_path(
         default,
         pids.iter().filter_map(|&pid| daemon_env_socket_path(pid)),
@@ -77,7 +77,7 @@ pub(crate) fn socket_missing_hint(socket_path: &Path, pids: &[u32]) -> Option<St
 
 /// Print [`socket_missing_hint`] for the live dispatchers; true when printed.
 pub(crate) fn eprint_socket_missing_hint(socket_path: &Path) -> bool {
-    let pids = loom_daemon::daemon_install_state::pgrep_daemon_pids();
+    let pids = crate::daemon_install_state::pgrep_daemon_pids();
     match socket_missing_hint(socket_path, &pids) {
         Some(msg) => {
             eprintln!("{msg}");
@@ -186,6 +186,23 @@ pub(crate) fn apply_ipc_timeout_env_floor(base: Duration) -> Duration {
         }
     }
     base
+}
+
+/// Resolve the loom directory (moved from `daemon_service` so the library CLI tree
+/// does not reach into the binary crate; `daemon_service` re-exports it).
+pub fn resolve_loom_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        let socket_path = PathBuf::from(path);
+        let loom_dir = socket_path
+            .parent()
+            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
+            .to_path_buf();
+        return Ok(loom_dir);
+    }
+    let loom_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("No home directory"))?
+        .join(".loom");
+    Ok(loom_dir)
 }
 
 #[cfg(test)]

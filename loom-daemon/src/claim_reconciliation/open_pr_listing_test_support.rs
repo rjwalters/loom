@@ -47,6 +47,11 @@ impl Row {
         head_ref.clone_into(&mut self.head_ref);
         self
     }
+    /// The base branch (a stacked PR's base is its parent's head branch).
+    pub(crate) fn base(mut self, base_ref: &str) -> Self {
+        base_ref.clone_into(&mut self.base_ref);
+        self
+    }
     pub(crate) fn sha(mut self, sha: &str) -> Self {
         sha.clone_into(&mut self.head_sha);
         self

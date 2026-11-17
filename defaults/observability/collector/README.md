@@ -380,7 +380,7 @@ name or credential.
 against this list) add `sweep_ids`, `visibility` and `workspace`. `sweep_ids`
 is the one deliberate exception to "low cardinality": it is the host's
 in-flight sweep-id set on `loom.host.active_sweeps` (sorted, at most 32 ids),
-which the dashboard reconciles live sweeps against once `/ingest` is gone. It
+which the dashboard reconciles live sweeps against now that the daemon no longer sends to `/ingest` (#12813). It
 opens a new series only when the set changes, at most once per `host.health`
 sample (about every 5 minutes per host). `workspace` is a directory name, never
 a path.

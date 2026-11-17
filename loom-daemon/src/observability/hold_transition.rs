@@ -37,6 +37,7 @@ pub fn role_tick_records(
                 trigger,
                 confirmed,
                 entered_at,
+                confidence_pct,
             } = entry
             else {
                 return None;
@@ -54,7 +55,8 @@ pub fn role_tick_records(
                 confirmed: *confirmed,
                 episode_id: is_add.then(|| episode_id(repo, *number, *at)),
                 entered_at,
-                entered_at_lower_bound: entered_at.is_none(),
+                entered_at_lower_bound: entered_at.is_none() && t != transition::DECISION,
+                confidence_pct: *confidence_pct,
                 event_at: *at,
                 observed_at: now,
                 loom: loom.clone(),
@@ -86,6 +88,7 @@ mod tests {
             trigger: "champion_role".to_string(),
             confirmed,
             entered_at: entered,
+            confidence_pct: None,
         }
     }
 
@@ -108,6 +111,25 @@ mod tests {
         let known = Utc.with_ymd_and_hms(2026, 10, 17, 11, 0, 0).unwrap();
         let rs = role_tick_records("o/r", &[hold(5, "remove", true, Some(known))], Utc::now());
         assert_eq!(rs[0].entered_at, Some(known));
+        assert!(!rs[0].entered_at_lower_bound);
+    }
+
+    #[test]
+    fn a_decision_carries_its_confidence_and_no_entry_time() {
+        let mut e = hold(1, "decision", true, None);
+        if let JournalEntry::Hold {
+            confidence_pct,
+            reason_code,
+            ..
+        } = &mut e
+        {
+            *confidence_pct = Some(92);
+            *reason_code = "merge-risk-self-release".to_string();
+        }
+        let rs = role_tick_records("o/r", &[e], Utc::now());
+        assert_eq!(rs[0].confidence_pct, Some(92));
+        assert_eq!(rs[0].reason_code, "merge-risk-self-release");
+        assert_eq!(rs[0].episode_id, None);
         assert!(!rs[0].entered_at_lower_bound);
     }
 

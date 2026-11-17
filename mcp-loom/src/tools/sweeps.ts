@@ -1350,7 +1350,7 @@ export async function handleSweepTool(
         args.depends_on > 0
           ? (args.depends_on as number)
           : undefined;
-      // #4317 / #11284: defensive extraction of force + runtime/model_profile.
+      // #4317: defensive extraction of force.
       const dispatchOptions = extractDispatchOptions(args);
 
       const result = await dispatchSweep({

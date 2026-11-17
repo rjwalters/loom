@@ -312,9 +312,11 @@ GENERAL-CASE BOUNDED RECOVERY + CIRCUIT BREAKER (#5391)
        the state file. A broken binary therefore gets at most 5 restarts,
        never an unbounded loop.
     4. NEVER REVIVES A DELIBERATE STOP — KEYED ON THE MARKER, NOT THE EXIT
-       CODE (#6388). A scripted stop (loom-daemon-stop.sh) removes the
-       autonomy-desired marker BEFORE it kills the daemon, so a deliberate
-       stop never reaches this block at all — the marker-ABSENT branch near
+       CODE (#6388). A scripted stop (loom-daemon-stop.sh) replaces the
+       autonomy-desired marker with an operator-stop record (#9957) and
+       leaves this watchdog loaded; a tick that sees the record exits 0
+       without reviving or paging, so a deliberate stop never reaches this
+       block at all — the marker-ABSENT branch near
        the top of this script is the ONLY place "never revive" fires, and it
        fires unconditionally there, before any exit code is ever read. A
        signal-shaped exit code recorded HERE (marker confirmed present) —

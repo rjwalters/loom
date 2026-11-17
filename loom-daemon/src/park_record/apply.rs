@@ -29,7 +29,10 @@
 
 use std::io::Write;
 
-use super::{blockers, parse, render_park, BlockerRef};
+use super::{
+    blockers, parse, render, render_park, transient_delay_secs, BlockerRef, ParkRecord, Transient,
+    TRANSIENT_CHAIN_RESET_SECS,
+};
 use crate::operator_decision::cli::{Forge as DecisionForge, GhForge, IssueState};
 
 /// The label this command exists to apply.
@@ -100,13 +103,33 @@ pub struct ApplyRequest {
     /// The target is a PR (not an issue). Only a PR park is a merge hold, so
     /// only it journals a `hold.transition` (#12665).
     pub is_pr: bool,
+    /// A self-expiring park for this cause, e.g. `capacity:batch` (#13606).
+    /// Mutually exclusive with [`Self::blocked_by`].
+    pub transient: Option<String>,
+    /// Backoff jitter in `-1.0..=1.0` (see [`transient_delay_secs`]); injected
+    /// so the schedule is deterministic under test.
+    pub jitter: f64,
 }
 
 /// Why a request is refused before any forge call, or `None` when it may run.
 #[must_use]
 pub fn precheck(req: &ApplyRequest) -> Option<String> {
     let has_reason = req.reason.as_deref().is_some_and(|r| !r.trim().is_empty());
-    if req.blocked_by.is_empty() && !has_reason {
+    let has_transient = req
+        .transient
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty());
+    if req.transient.is_some() && !has_transient {
+        return Some("--transient needs a cause (e.g. capacity:batch)".to_string());
+    }
+    if has_transient && !req.blocked_by.is_empty() {
+        return Some(
+            "--transient and --blocked-by are mutually exclusive: a transient park has no \
+             blocker, it expires on its own (#13606)"
+                .to_string(),
+        );
+    }
+    if req.blocked_by.is_empty() && !has_reason && !has_transient {
         return Some(
             "no blocker named: pass --blocked-by N, or state why there is none with \
              --reason (e.g. --reason operator). A park with no named blocker reads as \
@@ -171,6 +194,74 @@ pub fn compose_body(
     })
 }
 
+/// True when `t.until` is more than [`TRANSIENT_CHAIN_RESET_SECS`] before `now`.
+fn chain_expired(t: &Transient, now: Option<chrono::DateTime<chrono::FixedOffset>>) -> bool {
+    let until = t
+        .until
+        .as_deref()
+        .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok());
+    match (until, now) {
+        (Some(u), Some(n)) => (n - u).num_seconds() > TRANSIENT_CHAIN_RESET_SECS,
+        _ => false,
+    }
+}
+
+/// `body` with a transient park record appended, or `None` when the body's
+/// latest record for `cause` has not yet expired at `at` (idempotent re-run).
+///
+/// `attempt` is the previous record for the same cause plus one (else 1, also
+/// when that record is older than [`TRANSIENT_CHAIN_RESET_SECS`]); the
+/// retry time is `at` plus [`transient_delay_secs`].
+#[must_use]
+pub fn compose_transient_body(
+    body: &str,
+    cause: &str,
+    by: Option<&str>,
+    at: &str,
+    reason: Option<&str>,
+    jitter: f64,
+) -> Option<String> {
+    let want = cause.trim();
+    let prior = parse(body)
+        .into_iter()
+        .filter_map(|r| r.transient)
+        .rfind(|t| t.cause == want);
+    let now = chrono::DateTime::parse_from_rfc3339(at).ok();
+    if let Some(t) = &prior {
+        if !super::transient_due(t, at) {
+            return None;
+        }
+    }
+    // A chain whose last retry time is more than `TRANSIENT_CHAIN_RESET_SECS`
+    // old has gone quiet (a success in between): start over at attempt 1.
+    // Missing/unparseable `until` or `at` keeps the chain (as `transient_due`).
+    let attempt = prior
+        .filter(|t| !chain_expired(t, now))
+        .map_or(1, |t| t.attempt.saturating_add(1));
+    let until = now.map(|n| {
+        (n + chrono::Duration::seconds(transient_delay_secs(attempt, jitter)))
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    });
+    let line = render(&ParkRecord {
+        blocker: None,
+        by: by.map(str::to_string),
+        at: Some(at.to_string()),
+        reason: reason.map(str::to_string),
+        transient: Some(Transient {
+            cause: want.to_string(),
+            attempt,
+            until,
+        }),
+    });
+    let head = body.trim_end();
+    Some(if head.is_empty() {
+        format!("{line}\n")
+    } else {
+        format!("{head}\n\n{line}\n")
+    })
+}
+
 /// Apply the park: refuse, or write the body record(s), then `loom:blocked`,
 /// then drop `remove_labels`.
 pub fn apply(
@@ -216,13 +307,23 @@ pub fn apply(
         return exit::REFUSED;
     }
 
-    let new_body = compose_body(
-        &state.body,
-        &req.blocked_by,
-        req.by.as_deref(),
-        &req.at,
-        req.reason.as_deref(),
-    );
+    let new_body = match req.transient.as_deref() {
+        Some(cause) => compose_transient_body(
+            &state.body,
+            cause,
+            req.by.as_deref(),
+            &req.at,
+            req.reason.as_deref(),
+            req.jitter,
+        ),
+        None => compose_body(
+            &state.body,
+            &req.blocked_by,
+            req.by.as_deref(),
+            &req.at,
+            req.reason.as_deref(),
+        ),
+    };
     let has = |l: &str| state.labels.iter().any(|x| x == l);
     let add: Vec<String> = if has(BLOCKED_LABEL) {
         Vec::new()
@@ -268,7 +369,13 @@ pub fn apply(
         // #12665: the hold transition, only when the label was not already on.
         journal_hold_add(req, added.is_ok());
         if let Err(e) = added {
-            let _ = writeln!(err, "park-record apply: labeling #{n} failed: {e}");
+            let _ = writeln!(
+                err,
+                "park-record apply: labeling #{n} failed: {e}\n\
+                 park-record apply: the park record is in the body but the hold label is not on \
+                 the issue; if the label is missing on the forge, run \
+                 ./.loom/scripts/sync-labels.sh --check (then without --check) and re-apply"
+            );
             return exit::FORGE;
         }
     }
@@ -293,6 +400,21 @@ fn hold_reason_code(reason: Option<&str>) -> &'static str {
     }
 }
 
+/// Env the critical-file hold tick sets on a re-arm whose cause was an
+/// unreadable forge compare (`unread`), so the `hold.transition` trigger can
+/// tell it from a real change (#13114). The park `--reason` must stay the
+/// exact hold reason `body_declares_hold` matches, so it cannot carry this.
+pub const HOLD_EQUIVALENCE_ENV: &str = "LOOM_HOLD_EQUIVALENCE";
+
+/// The `hold.transition` trigger token for a Champion park.
+fn hold_trigger(equivalence: Option<&str>) -> &'static str {
+    match equivalence {
+        Some("unread") => "champion_role_equivalence_unread",
+        Some("base-unread") => "champion_role_equivalence_base_unread",
+        _ => "champion_role",
+    }
+}
+
 /// Journal the `loom:blocked` write on a Champion park of a PR as a hold
 /// `add` (#12665). `confirmed` is `false` for a write that failed. Best-effort
 /// and a no-op outside a journaled run or for any other role.
@@ -304,17 +426,20 @@ fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
         req.number,
         crate::telemetry::kinds::hold_transition::transition::ADD,
         hold_reason_code(req.reason.as_deref()),
-        "champion_role",
+        hold_trigger(std::env::var(HOLD_EQUIVALENCE_ENV).ok().as_deref()),
         confirmed,
+        None,
         None,
     );
 }
 
-/// Journal a Champion park that [`apply`] landed (exit `0`, not a dry run,
-/// `--by champion`) for the role run's verdict record (#12027). Best-effort
-/// and a no-op outside a journaled run: it never changes output or exit.
+/// Journal a Champion or Curator park that [`apply`] landed (exit `0`, not a
+/// dry run, `--by champion` / `--by curator`) for the role run's verdict
+/// record (#12027, #12921). Best-effort and a no-op outside a journaled run:
+/// it never changes output or exit.
 pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
-    if code == exit::OK && !req.dry_run && req.by.as_deref() == Some("champion") {
+    if code == exit::OK && !req.dry_run && matches!(req.by.as_deref(), Some("champion" | "curator"))
+    {
         crate::observability::pick_journal::record_applied(
             req.number,
             is_pr,
@@ -326,6 +451,21 @@ pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::hold_trigger;
+
+    #[test]
+    fn an_unread_compare_rearm_has_its_own_trigger() {
+        assert_eq!(hold_trigger(Some("unread")), "champion_role_equivalence_unread");
+        assert_eq!(hold_trigger(Some("changed")), "champion_role");
+        assert_eq!(hold_trigger(Some("base-unread")), "champion_role_equivalence_base_unread");
+        assert_eq!(hold_trigger(Some("unread; echo hostile")), "champion_role");
+        assert_eq!(hold_trigger(Some("equivalence=base-unread")), "champion_role");
+        assert_eq!(hold_trigger(None), "champion_role");
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

@@ -43,10 +43,10 @@
 //!
 //! [`is_bad`]: super::bad_tokens::is_bad
 
+use crate::script_helpers::now_epoch_secs;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -420,13 +420,6 @@ impl std::fmt::Display for NoHealthyAccountError {
 
 impl std::error::Error for NoHealthyAccountError {}
 
-fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn state_path(workspace: &Path) -> PathBuf {
     workspace.join(".loom").join("account-health.json")
 }
@@ -515,7 +508,7 @@ pub fn record_terminal(
     classification: TerminalClassification,
     provenance: &str,
 ) -> Result<()> {
-    record_terminal_at(workspace, id, classification, provenance, now_epoch())
+    record_terminal_at(workspace, id, classification, provenance, now_epoch_secs())
 }
 
 /// [`record_terminal`], telling it which **model** was in flight (#8058 Phase
@@ -528,7 +521,7 @@ pub fn record_terminal_for_model(
     model: Option<&str>,
     provenance: &str,
 ) -> Result<()> {
-    record_terminal_for_model_at(workspace, id, classification, model, provenance, now_epoch())
+    record_terminal_for_model_at(workspace, id, classification, model, provenance, now_epoch_secs())
 }
 
 /// [`record_terminal_for_model`], carrying the **provider-reported reset
@@ -556,7 +549,7 @@ pub fn record_terminal_for_model_with_reset(
         class.as_deref(),
         reset_at,
         provenance,
-        now_epoch(),
+        now_epoch_secs(),
     )
 }
 
@@ -1019,7 +1012,7 @@ pub fn clear_reauth(workspace: &Path, id: &AccountId, provenance: &str) -> Resul
         entry.reason = HealthReason::Healthy;
         entry.cooldown_until = None;
         entry.consecutive_transient_failures = 0;
-        entry.updated_at = now_epoch();
+        entry.updated_at = now_epoch_secs();
         entry.signal_provenance = provenance.to_string();
         Ok(())
     })

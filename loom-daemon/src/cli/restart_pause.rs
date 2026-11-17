@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use loom_daemon::auto_update::pause_manifest::{
+use crate::auto_update::pause_manifest::{
     self, Disposition, ItemStatus, LoadOutcome, PauseManifest, Phase,
 };
-use loom_daemon::types::{Request, Response};
+use crate::types::{Request, Response};
 
 use super::super::common::query_daemon;
 
@@ -217,7 +217,7 @@ pub(crate) fn render_summary(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::auto_update::pause_manifest::{ItemKind, ManifestItem, Roll, WrittenBy};
+    use crate::auto_update::pause_manifest::{ItemKind, ManifestItem, Roll, WrittenBy};
 
     fn item(
         id: &str,

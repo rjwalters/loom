@@ -25,10 +25,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use loom_daemon::cmd_out::Query;
-use loom_daemon::pr_latency::timeline::parse_timeline;
-use loom_daemon::pr_latency::{LatencyReport, PrEvent, PrHistory, PrState};
-use loom_daemon::script_helpers::gh_query;
+use crate::cmd_out::Query;
+use crate::pr_latency::timeline::parse_timeline;
+use crate::pr_latency::{LatencyReport, PrEvent, PrHistory, PrState};
+use crate::script_helpers::gh_query;
 
 use super::pr_latency_render as render;
 
@@ -261,9 +261,9 @@ fn fetch_timeline(pr: u32, repo: Option<&str>, root: &Path) -> (Vec<PrEvent>, bo
         Some(r) => format!("repos/{r}/issues/{pr}/timeline"),
         None => format!("repos/{{owner}}/{{repo}}/issues/{pr}/timeline"),
     };
-    let out = loom_daemon::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+    let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
     let bytes = match &out {
-        loom_daemon::cmd_out::CmdOutcome::Ran(o) if o.status.success() => o.stdout.clone(),
+        crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => o.stdout.clone(),
         _ => return (Vec::new(), false),
     };
     match parse_timeline(&bytes) {

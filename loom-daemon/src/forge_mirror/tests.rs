@@ -254,6 +254,11 @@ fn only_the_discovery_and_wake_modules_name_the_mirror() {
         // The reconciliation readers resolve a workspace's repo slug to find
         // its part of the tick's snapshot (#12307); they make no read.
         "discovery/published.rs",
+        // The stale-draw recheck (#12318) only POSTs "re-read this item" to
+        // the mirror and reads nothing back; the driver's refusal path is
+        // its one call site and resolves the repo slug for it.
+        "discovery/recheck.rs",
+        "step_dispatch/driver.rs",
         // The task spawn and the telemetry drain.
         "daemon_service/observer_tasks.rs",
         "observability/ops/ratelimit.rs",
@@ -701,4 +706,17 @@ fn the_mirror_reads_aws_profile_like_the_gateway() {
     // The mirror's refusals name the mirror.
     let (_, w) = parse(&cfg(json!({"origin": "github.com", "keyRef": "file:/k"})));
     assert!(w[0].contains("the mirror, not GitHub"), "{w:?}");
+}
+
+#[test]
+fn valid_slug_keeps_github_owner_rule_on_top_of_the_shared_rule() {
+    assert!(valid_slug("acme/widgets"));
+    assert!(valid_slug("acme/.github"));
+    // GitHub owners are `[A-Za-z0-9-]` only: `.` and `_` are rejected here even
+    // though the shared rule allows them.
+    assert!(!valid_slug("a.b/widgets"));
+    assert!(!valid_slug("a_b/widgets"));
+    // The shared rule still applies to the repo half.
+    assert!(!valid_slug("acme/.."));
+    assert!(!valid_slug("acme/-x"));
 }

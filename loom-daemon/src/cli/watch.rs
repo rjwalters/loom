@@ -2,19 +2,19 @@
 
 use anyhow::Result;
 
-use loom_daemon::types::{Request, Response};
-use loom_daemon::watch_registry;
+use crate::types::{Request, Response};
+use crate::watch_registry;
 
 use super::common::{query_daemon, resolve_socket_path};
-use crate::WatchAction;
+use crate::cli::WatchAction;
 
 /// Handle the `watch` subcommand (Issue #3971). Connects to the running daemon
 /// over its Unix socket and registers/lists/removes durable watches. The watches
 /// are persisted machine-level (`~/.loom/watches.json`), so — like the daemon's
 /// other file-backed state — they survive both this shell and a daemon restart;
 /// the resolution report lands in `~/.loom/logs/watch-results.log`.
-pub(crate) async fn handle_watch_command(action: WatchAction) -> Result<()> {
-    use loom_daemon::watch_registry::WatchKind;
+pub async fn handle_watch_command(action: WatchAction) -> Result<()> {
+    use crate::watch_registry::WatchKind;
 
     let socket_path = resolve_socket_path()?;
     // `json_out` only applies to `list`; captured here so the request build below

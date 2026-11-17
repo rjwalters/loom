@@ -49,9 +49,8 @@
 //! # Why this is Rust and not four more lines of `worktree.sh`
 //!
 //! It shipped first as `_worktree_resolve_stale_reset_ref` in
-//! `lib/worktree-forge-pr-check.sh` (PR #8351) and the shell budget ratchet
-//! refused it: that file is `contract`-category, whose growth has no override
-//! (`.loom/docs/shell-language-policy.md`). The decision also *already* had a
+//! `lib/worktree-forge-pr-check.sh` (PR #8351) and it was rejected: that file is
+//! `contract`-category (`.loom/docs/shell-language-policy.md`). The decision also *already* had a
 //! tested Rust implementation of its hard part — [`branch_landed`] is the one
 //! Rust copy of the #7812 ladder since #8470, and it is parameterised by
 //! default-branch name, which is exactly what the stacked-child case needs.
@@ -82,6 +81,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use super::wip::git_status_code as git_code;
 
 use super::branch_landed::{self, ForgeProbe, Verdict};
 
@@ -210,18 +211,6 @@ fn rev_count(worktree: &Path, range: &str) -> u64 {
         .trim()
         .parse()
         .unwrap_or(0)
-}
-
-/// `git -C <dir> … >/dev/null 2>&1; echo $?`
-fn git_code(dir: &Path, args: &[&str]) -> i32 {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_or(127, |s| s.code().unwrap_or(127))
 }
 
 #[cfg(test)]

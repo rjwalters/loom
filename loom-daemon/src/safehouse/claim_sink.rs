@@ -175,6 +175,7 @@ fn clear_filing_lock_mirror(host: &str) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::time::Duration;
 
     fn view() -> Arc<Mutex<PeerClaimView>> {
@@ -245,6 +246,63 @@ mod tests {
         assert!(v.is_empty());
         assert_eq!(v.counters().received, 0);
         assert_eq!(v.counters().advertised, 0);
+    }
+
+    /// The sink parses only the envelope `body`: `task_id`, `type` and the room
+    /// are never read. That is what lets the sender drop `task_id` from claim
+    /// ads (so safehoused stops threading them) without breaking a mixed-version
+    /// fleet — an ad arriving with the legacy bare-issue `task_id`, with none at
+    /// all, or with an unrelated one must all fold identically.
+    #[test]
+    fn claim_ads_fold_identically_whatever_their_task_id() {
+        let shapes = [
+            Some(json!("4028")),     // a pre-change peer: bare issue number
+            None,                    // a current peer: no thread key at all
+            Some(json!("other_99")), // anything else safehoused might stamp
+        ];
+        for task_id in shapes {
+            let ad = ClaimAd::advertise(4028, "loom".into(), "peer-host".into(), 7, "ts".into());
+            let mut envelope = json!({
+                "v": 1,
+                "from": "loom_daemon",
+                "to": "*",
+                "type": "task",
+                "body": ad.to_body_json(),
+            });
+            if let Some(t) = &task_id {
+                envelope["task_id"] = t.clone();
+            }
+            let view = view();
+            PeerClaimSink::new(view.clone())
+                .on_event(&json!({"event": "message", "envelope": envelope}));
+            assert!(
+                view.lock()
+                    .unwrap()
+                    .is_claimed_at("loom", 4028, Instant::now()),
+                "task_id {task_id:?} must not change how the claim folds"
+            );
+        }
+    }
+
+    /// Every claim lane leaves the sender with no `task_id`, so no lane (the
+    /// sentinel-issue heartbeat and filing-lock lanes above all) can thread.
+    #[test]
+    fn no_claim_lane_sends_a_task_id() {
+        let ads = [
+            ClaimAd::advertise(7, "loom".into(), "h".into(), 1, "ts".into()),
+            ClaimAd::retract(7, "loom".into(), "h".into(), 1, "ts".into()),
+            ClaimAd::filing_lock("loom".into(), "h".into(), 1, "ts".into()),
+            ClaimAd::filing_unlock("loom".into(), "h".into(), 1, "ts".into()),
+            ClaimAd::heartbeat("loom".into(), "h".into(), 1, "ts".into()),
+        ];
+        for ad in ads {
+            let env = super::super::claim_ad_to_envelope(&ad);
+            assert_eq!(env.task_id, None, "{:?} must not carry a thread key", ad.kind);
+            let req = super::super::build_send_request(&env, 1, Some("claims")).unwrap();
+            assert!(req.get("task_id").is_none(), "{:?}: {req}", ad.kind);
+            // The body format is unchanged: it round-trips to the same ad.
+            assert_eq!(ClaimAd::from_body_str(req["body"].as_str().unwrap()), Some(ad));
+        }
     }
 
     /// Issue #9294: the write half. A send reaching the socket is recorded as

@@ -37,8 +37,11 @@ fn ledger() -> &'static Mutex<Ledger> {
 }
 
 fn alert(kind: &str, key: &str, title: String, detail: String) -> Alert {
-    Alert::new(format!("resync.{kind}"), key, title, Severity::Warning, State::Open)
-        .with_detail(detail)
+    alert_at(kind, key, title, detail, Severity::Warning)
+}
+
+fn alert_at(kind: &str, key: &str, title: String, detail: String, severity: Severity) -> Alert {
+    Alert::new(format!("resync.{kind}"), key, title, severity, State::Open).with_detail(detail)
 }
 
 /// What stands after `pass`, read from `memory`. `held` says whether the
@@ -82,16 +85,25 @@ pub(super) fn alerts(
         if !(protected || b.failures >= ALERT_AFTER || held(&format!("resync.{kind}"), &key)) {
             continue;
         }
-        out.push(alert(
+        let (title, severity) = if protected && b.pr_open {
+            (
+                format!("Loom resync of {key} is stranded in a pull request awaiting merge"),
+                Severity::Critical,
+            )
+        } else {
+            (format!("Loom resync of {key} is failing ({kind})"), Severity::Warning)
+        };
+        out.push(alert_at(
             kind,
             &key,
-            format!("Loom resync of {key} is failing ({kind})"),
+            title,
             format!(
                 "{} failure(s) in a row; next attempt {}: {}",
                 b.failures,
                 b.next_attempt.to_rfc3339(),
                 b.last_error
             ),
+            severity,
         ));
     }
     let ((network, outage), (head_query, query_failing)) = memory.host_conditions();
@@ -172,6 +184,7 @@ mod tests {
             requires_daemon: None,
             refusal: None,
             kind,
+            pr_open: false,
         }
     }
 
@@ -207,6 +220,24 @@ mod tests {
             .backoff
             .insert("/w/a".into(), backoff(FailureKind::Unreachable, 9));
         assert!(rules(&memory, &pass).is_empty());
+    }
+
+    #[test]
+    fn a_protected_repo_with_an_open_resync_pr_alerts_critical() {
+        let pass = pass_with("/w/a", Some("o/a"));
+        let mut memory = Memory::default();
+        memory
+            .backoff
+            .insert("/w/a".into(), backoff(FailureKind::Protected, 1));
+        let plain = alerts(&memory, &pass, &|_, _| false);
+        assert_eq!(plain[0].severity, Severity::Warning);
+        let mut b = backoff(FailureKind::Protected, 1);
+        b.pr_open = true;
+        memory.backoff.insert("/w/a".into(), b);
+        let open = alerts(&memory, &pass, &|_, _| false);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].severity, Severity::Critical);
+        assert_eq!(open[0].rule, "resync.branch-protection");
     }
 
     #[test]

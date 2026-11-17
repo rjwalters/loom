@@ -523,6 +523,153 @@ fn an_operator_pin_disables_fall_through_at_the_hold() {
 }
 
 // ---------------------------------------------------------------------------
+// Tap-less preference resolution is config, not exhaustion (#13428)
+// ---------------------------------------------------------------------------
+
+/// A `roleDraw` table for `sweep-lifecycle` whose only provider is excluded:
+/// the walk runs over ZERO taps, so `resolve_runtime` returns a
+/// `Decision::Preference` whose resolution `is_empty_list()`.
+fn tapless_config() -> serde_json::Value {
+    serde_json::json!({"runtimes": {
+        "excludeProviders": ["codex"],
+        "roleDraw": {"sweep-lifecycle": [{"attempt": 1, "draw": {"codex": 100}}]},
+    }})
+}
+
+/// AC1: a tap-less root over a healthy pool must not hold or arm anything.
+/// Reverting the `is_empty_list()` guard in `observe_root_edge` makes this
+/// fail: the empty resolution has `chosen == None`, so it reads as exhausted.
+#[test]
+#[serial]
+fn a_tapless_root_with_a_healthy_pool_does_not_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(&["a", "b"], &tapless_config());
+
+    let host = PoolHoldState::new();
+    assert!(!host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// AC4: a tap-less root over a genuinely exhausted pool still holds — the
+/// pool-state branch decides, exactly as with no preference configured.
+#[test]
+#[serial]
+fn a_tapless_root_with_a_really_exhausted_pool_still_arms_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(&["a"], &tapless_config());
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 1);
+}
+
+/// AC3: two roots sharing one HEALTHY pool, one tap-less and one with a
+/// preference list. Neither may hold, and no arm/clear edge may appear across
+/// repeated ticks. Before the fix the tap-less root read as exhausted and armed
+/// the shared key, which the other root then cleared: the per-tick WARN /
+/// recovered pair.
+#[test]
+#[serial]
+fn a_tapless_root_does_not_flap_the_hold_shared_with_a_spawnable_root() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+
+    // Neither root has a repo-local pool, so both resolve to the shared one.
+    let shared = tempfile::tempdir().unwrap();
+    fs::write(shared.path().join("a.token"), "sk-ant-oat01-fake").unwrap();
+    let prior = std::env::var_os("LOOM_SHARED_TOKENS_DIR");
+    std::env::set_var("LOOM_SHARED_TOKENS_DIR", shared.path());
+
+    let tapless = workspace_with_pool_and_preference(&[], &tapless_config());
+    let spawnable = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    let mut edges = Vec::new();
+    for _ in 0..3 {
+        for root in [tapless.path(), spawnable.path()] {
+            let obs = host.observe_root_edge(root, chrono::Utc::now());
+            edges.push((root == tapless.path(), obs.held, obs.edge));
+        }
+    }
+    match prior {
+        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+    }
+
+    assert!(edges.iter().all(|(_, held, edge)| !held && edge.is_none()), "{edges:?}");
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// #13539: two roots on ONE pool — A lists only `codex` and no Codex seat
+/// exists, B lists `claude` with a spawnable account. Across repeated ticks A
+/// stays held and B stays free, the hold never disappears between A's ticks
+/// (it used to be cleared by B's, flapping the arm WARN / clear INFO per
+/// tick), and nothing is ever offered for broadcast. When a Codex seat
+/// appears A releases exactly once.
+#[test]
+#[serial]
+fn a_per_workspace_preference_hold_survives_a_sibling_root_on_the_same_pool() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+
+    let shared = tempfile::tempdir().unwrap();
+    fs::write(shared.path().join("a.token"), "sk-ant-oat01-fake").unwrap();
+    let prior = std::env::var_os("LOOM_SHARED_TOKENS_DIR");
+    std::env::set_var("LOOM_SHARED_TOKENS_DIR", shared.path());
+
+    let codex_only = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["codex"]}}),
+    );
+    let claude = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    let mut observed = Vec::new();
+    for _ in 0..4 {
+        for root in [codex_only.path(), claude.path()] {
+            let obs = host.observe_root_edge(root, chrono::Utc::now());
+            observed.push((root == codex_only.path(), obs.held, obs.edge));
+            if root == codex_only.path() {
+                assert_eq!(
+                    host.held_pool_count(),
+                    1,
+                    "the sibling root's tick must not clear the codex-only hold"
+                );
+            }
+        }
+    }
+    assert!(
+        observed
+            .iter()
+            .all(|(is_codex_only, held, edge)| *is_codex_only == *held && edge.is_none()),
+        "{observed:?}"
+    );
+    assert_eq!(host.active_holds().len(), 1);
+
+    // A Codex seat logs in: the codex-only root releases, once.
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let obs = host.observe_root_edge(codex_only.path(), chrono::Utc::now());
+    assert!(!obs.held && obs.edge.is_none());
+    assert_eq!(host.held_pool_count(), 0);
+    assert!(!host.observe_root(codex_only.path(), chrono::Utc::now()));
+
+    match prior {
+        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fleet broadcast of the hold (Issue #8001)
 // ---------------------------------------------------------------------------
 //
@@ -619,6 +766,8 @@ fn a_peer_holds_on_the_broadcast_without_rederiving_exhaustion_itself() {
     let host_b = FleetHost::new("host-b", ws_b.path());
 
     assert!(host_a.preflight(ws_a.path(), now), "A's own read must hold");
+    // #13508: the ad goes out once the hold survives its arming tick.
+    assert!(host_a.preflight(ws_a.path(), now), "A's own read must keep holding");
     // Before the ad arrives B is free — this is the baseline the broadcast
     // has to change, and it proves B's OWN read says "healthy".
     assert!(
@@ -695,6 +844,7 @@ fn a_recovery_broadcast_releases_the_peer_early() {
     let host_b = FleetHost::new("host-b", ws_b.path());
 
     assert!(host_a.preflight(ws_a.path(), now));
+    assert!(host_a.preflight(ws_a.path(), now), "second tick publishes the arm (#13508)");
     host_a.deliver_to(&host_b);
     assert!(host_b.preflight(ws_b.path(), now), "B holds on the arm ad");
 
@@ -810,6 +960,51 @@ fn the_arm_edge_is_broadcast_once_per_outage() {
     }
     assert_eq!(ads.len(), 1, "three recovered ticks must publish one clear ad");
     assert_eq!(ads[0].kind, ClaimKind::PoolHoldCleared);
+}
+
+/// #13508: an arm that clears within the same tick publishes neither an arm
+/// nor a clear ad — peers never act on a hold that lived for one tick.
+#[test]
+fn a_same_tick_arm_then_clear_publishes_nothing() {
+    let now = chrono::Utc::now();
+    let ws = workspace_with_pool(&["a"]);
+    bad_mark_all(ws.path(), &["a"]);
+    let mut host = FleetHost::new("host-a", ws.path());
+
+    assert!(host.preflight(ws.path(), now), "arming tick holds locally");
+    readmit_all(ws.path());
+    assert!(!host.preflight(ws.path(), now), "recovers the same tick");
+
+    assert!(host.outbound.try_recv().is_err(), "no arm and no orphan clear ad");
+    assert_eq!(host.holds.held_pool_count(), 0);
+}
+
+/// #13508: a hold that persists across ticks publishes exactly one arm, and
+/// its eventual clear exactly one clear.
+#[test]
+fn a_multi_tick_hold_publishes_one_arm_and_one_clear() {
+    let now = chrono::Utc::now();
+    let ws = workspace_with_pool(&["a"]);
+    bad_mark_all(ws.path(), &["a"]);
+    let mut host = FleetHost::new("host-a", ws.path());
+
+    assert!(host.preflight(ws.path(), now));
+    assert!(host.outbound.try_recv().is_err(), "arming tick publishes nothing");
+    for _ in 0..3 {
+        assert!(host.preflight(ws.path(), now));
+    }
+    let arm = host
+        .outbound
+        .try_recv()
+        .expect("arm published on the second tick");
+    assert_eq!(arm.kind, ClaimKind::PoolHoldArmed);
+    assert!(host.outbound.try_recv().is_err(), "exactly one arm ad");
+
+    readmit_all(ws.path());
+    assert!(!host.preflight(ws.path(), now));
+    let clear = host.outbound.try_recv().expect("clear published");
+    assert_eq!(clear.kind, ClaimKind::PoolHoldCleared);
+    assert!(host.outbound.try_recv().is_err(), "exactly one clear ad");
 }
 
 /// A wrapper-confirmed death (the post-mortem path the reaper drives) is the

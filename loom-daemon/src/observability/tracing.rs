@@ -1,4 +1,5 @@
 //! Owned process-boundary trace propagation. Export remains independently opt-in.
+use super::lifecycle::StepKeys;
 use crate::telemetry::trace::store::{
     TraceStore, CONTEXT_FILE_ENV, TRACEPARENT_ENV, W3C_TRACEPARENT_ENV,
 };
@@ -29,7 +30,7 @@ fn valid_endpoint(endpoint: &str) -> bool {
 /// Persist before spawn. A corrupt/busy/full store disables this execution's
 /// tracing with a diagnostic; it cannot fail the actual issue dispatch.
 ///
-/// Every execution is its own root trace; `issue` is a plain span attribute.
+/// Every execution is its own root trace; the `keys` are plain span attributes.
 ///
 /// The context is exported under **both** [`TRACEPARENT_ENV`] (Loom's own
 /// namespaced variable) and [`W3C_TRACEPARENT_ENV`] (the standard `TRACEPARENT`,
@@ -39,7 +40,7 @@ fn valid_endpoint(endpoint: &str) -> bool {
 /// parents its own spans inside this execution's trace instead of emitting
 /// orphan roots. Both are `env_remove`d on the disabled and error paths, so a
 /// stale ambient value can never be mistaken for this execution's context.
-pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue: Option<u32>) {
+pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, keys: &StepKeys) {
     command
         .env_remove(TRACEPARENT_ENV)
         .env_remove(W3C_TRACEPARENT_ENV)
@@ -53,7 +54,7 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
             command.env(W3C_TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
-            super::lifecycle::prepare_execution(command, root, execution, issue);
+            super::lifecycle::prepare_execution(command, root, execution, keys);
         }
         Err(error) => {
             log::warn!("observability: trace context unavailable; child is untraced: {error}")
@@ -70,38 +71,6 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
 pub fn resolve_repo(root: &Path) -> Option<String> {
     let slug = crate::release_resolve::host::repo_slug(root)?;
     Some(crate::telemetry::repo_identity::resolve(&slug)?.full_name)
-}
-
-/// The OTLP signal an OTLP-only record kind belongs to, or `None` for a kind
-/// the native HTTPS backend also accepts. Spans and `metric.points` (#8860)
-/// never reach native ingest.
-///
-/// Both halves are read off the kind's own registry row in
-/// `telemetry/kinds.rs` (#8921) — `native: false` makes a kind OTLP-only, and
-/// its `otlp:` class names the signal — so adding a record kind never edits
-/// this function.
-pub(super) fn otlp_only_signal(record: &crate::telemetry::TelemetryRecord) -> Option<&'static str> {
-    if record.accepted_by_native_ingest() {
-        return None;
-    }
-    record.otlp_class().signal()
-}
-
-/// Existing native ingest accepts lifecycle records, never OTLP-only payloads
-/// ([`otlp_only_signal`]). Also strips the additive context fields for older
-/// native backend versions.
-pub(super) fn native_envelopes(
-    envelopes: &[crate::telemetry::TelemetryEnvelope],
-) -> Vec<crate::telemetry::TelemetryEnvelope> {
-    envelopes
-        .iter()
-        .filter(|e| otlp_only_signal(&e.record).is_none())
-        .cloned()
-        .map(|mut envelope| {
-            envelope.trace_context = None;
-            envelope
-        })
-        .collect()
 }
 
 #[cfg(test)]

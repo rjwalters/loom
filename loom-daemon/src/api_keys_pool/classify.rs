@@ -33,14 +33,19 @@
 //!
 //! ## Honest limits of this revision
 //!
-//! One real capture is folded in: the `provider.auth`/HTTP 401 event below.
-//! **No live Z.ai coding-plan *exhaustion* has been captured yet** — forcing
-//! one requires actually running a subscription dry, which no test host here
-//! can do on demand, and fabricating a plausible-looking string would be worse
-//! than an honestly-labelled documented shape. Those rows therefore stay
-//! [`Provenance::DocumentedShape`] and the gap stays open; fold each new
-//! capture in as it is observed, replacing that row's provenance. A test keeps
-//! the labelling honest rather than pretending the gap is closed.
+//! Real captures are folded in for the `provider.auth`/HTTP 401 event below
+//! and, since 2026-11-16, for the three Z.ai coding-plan refusals the fleet
+//! met in ordinary use (#12395): the weekly cap, the 5-hour window and the
+//! plain request rate limit ([`CAPTURED_ZAI_WEEKLY_LIMIT_EVENT`],
+//! [`CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT`], [`CAPTURED_ZAI_RATE_LIMIT_EVENT`]).
+//! Before those captures the weekly and 5-hour refusals matched no
+//! `Exhausted` row, fell through to the bare `statusCode: 429` and were
+//! bad-marked `RateLimited` for 60 s, so an exhausted seat was relaunched
+//! every minute for the rest of its window. The older generic exhaustion rows
+//! (`insufficient balance`, `quota exceeded`, …) are still
+//! [`Provenance::DocumentedShape`]: nothing has been observed emitting them.
+//! Fold each new capture in as it is observed, replacing that row's
+//! provenance. A test keeps the labelling honest.
 //!
 //! ## Kimi (issue #8563), and a corrected premise
 //!
@@ -195,6 +200,33 @@ pub const CAPTURED_OPENCODE_AUTH_EVENT: &str = r#"{"type":"error","error":{"type
 /// Citation used by every row taken from [`CAPTURED_OPENCODE_AUTH_EVENT`].
 const OPENCODE_2_0_10: &str = "opencode 2.0.10 `run --format json`, observed 2026-09-20 (#8438)";
 
+/// Captured from OpenCode 1.18.31 `run --format json` on the `zai-coding-plan`
+/// provider (`api.z.ai/api/coding/paas/v4`), in a fleet Doctor step on
+/// 2026-11-16T16:49:39Z: a seat whose **weekly** cap was spent (#12395). The
+/// session id, trace id, request id, log-id suffix and cookie are redacted;
+/// every other byte is as emitted. Provider error code `1310`.
+///
+/// Two facts the reset parser ([`super::reset`]) relies on are visible here:
+/// the reset stamp carries no timezone, and the provider's own `x-log-id`
+/// (`20261117004939…`) is the response's `date` header (`16:49:39 GMT`) in the
+/// provider's wall clock, eight hours ahead of UTC.
+pub const CAPTURED_ZAI_WEEKLY_LIMIT_EVENT: &str = r#"{"type":"error","timestamp":1794847779636,"sessionID":"ses_REDACTED","error":{"name":"APIError","data":{"message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-11-17 01:52:07","statusCode":429,"isRetryable":true,"responseHeaders":{"alt-svc":"h3=\":443\"; ma=3600","connection":"keep-alive","date":"Mon, 16 Nov 2026 16:49:39 GMT","ga-traceid":"REDACTED","transfer-encoding":"chunked","vary":"Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Origin","x-log-id":"20261117004939REDACTED","x-request-id":"REDACTED","set-cookie":"REDACTED"},"responseBody":"{\"error\":{\"code\":\"1310\",\"message\":\"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-11-17 01:52:07\"}}","metadata":{"url":"https://api.z.ai/api/coding/paas/v4/chat/completions"}}}}"#;
+
+/// The same harness and provider on 2026-11-16T11:07:07Z: a seat whose
+/// **5-hour** window was spent (provider error code `1308`). Redacted as
+/// above. The stated reset, `19:09:58`, is 11:09:58Z: under three minutes
+/// after the capture, and the last refusal this seat gave that day.
+pub const CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT: &str = r#"{"type":"error","timestamp":1794827227912,"sessionID":"ses_REDACTED","error":{"name":"APIError","data":{"message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-16 19:09:58","statusCode":429,"isRetryable":true,"responseHeaders":{"alt-svc":"h3=\":443\"; ma=3600","connection":"keep-alive","date":"Mon, 16 Nov 2026 11:07:07 GMT","ga-traceid":"REDACTED","transfer-encoding":"chunked","vary":"Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Origin","x-log-id":"20261116190707REDACTED","x-request-id":"REDACTED","set-cookie":"REDACTED"},"responseBody":"{\"error\":{\"code\":\"1308\",\"message\":\"Usage limit reached for 5 hour. Your limit will reset at 2026-11-16 19:09:58\"}}","metadata":{"url":"https://api.z.ai/api/coding/paas/v4/chat/completions"}}}}"#;
+
+/// The same harness and provider on 2026-11-16T11:33:36Z: the transient
+/// request **rate limit** (provider error code `1302`), which names no reset.
+/// Redacted as above.
+pub const CAPTURED_ZAI_RATE_LIMIT_EVENT: &str = r#"{"type":"error","timestamp":1794828816841,"sessionID":"ses_REDACTED","error":{"name":"APIError","data":{"message":"Rate limit reached for requests","statusCode":429,"isRetryable":true,"responseHeaders":{"alt-svc":"h3=\":443\"; ma=3600","connection":"keep-alive","date":"Mon, 16 Nov 2026 11:33:36 GMT","ga-traceid":"REDACTED","transfer-encoding":"chunked","vary":"Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Origin","x-log-id":"20261116193336REDACTED","x-request-id":"REDACTED","set-cookie":"REDACTED"},"responseBody":"{\"error\":{\"code\":\"1302\",\"message\":\"Rate limit reached for requests\"}}","metadata":{"url":"https://api.z.ai/api/coding/paas/v4/chat/completions"}}}}"#;
+
+/// Citation used by every row taken from the three Z.ai captures above.
+const OPENCODE_1_18_31_ZAI: &str = "opencode 1.18.31 `run --format json`, provider \
+     zai-coding-plan, observed 2026-11-16 in fleet Builder/Doctor steps (#12395, #11286)";
+
 /// The whole pattern table, grouped for readability only — precedence is
 /// decided by [`classify`], not by position (see its docs).
 pub const PATTERNS: &[Pattern] = &[
@@ -268,7 +300,28 @@ pub const PATTERNS: &[Pattern] = &[
         classification: Classification::Exhausted,
         provenance: Provenance::DocumentedShape,
     },
+    // Z.ai coding plan, live (#12395). Both name their own reset instant,
+    // which `super::reset` reads; neither says "rate limit", so before these
+    // rows they fell through to the bare 429 and a 60 s cooldown.
+    Pattern {
+        needle: "weekly/monthly limit exhausted",
+        classification: Classification::Exhausted,
+        provenance: Provenance::LiveCapture(OPENCODE_1_18_31_ZAI),
+    },
+    Pattern {
+        needle: "usage limit reached for",
+        classification: Classification::Exhausted,
+        provenance: Provenance::LiveCapture(OPENCODE_1_18_31_ZAI),
+    },
     // ---- Rate / concurrency ceiling ----
+    Pattern {
+        // Z.ai's transient request ceiling, live (#12395). The generic
+        // `rate limit` row below matches it too; this row carries the
+        // capture's provenance.
+        needle: "rate limit reached for requests",
+        classification: Classification::RateLimited,
+        provenance: Provenance::LiveCapture(OPENCODE_1_18_31_ZAI),
+    },
     Pattern {
         needle: "rate limit",
         classification: Classification::RateLimited,
@@ -737,6 +790,9 @@ mod tests {
             CAPTURED_OPENCODE_AUTH_EVENT,
             CAPTURED_KIMI_NO_MODEL_CONFIGURED,
             CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED,
+            CAPTURED_ZAI_WEEKLY_LIMIT_EVENT,
+            CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT,
+            CAPTURED_ZAI_RATE_LIMIT_EVENT,
         ];
         for pattern in PATTERNS {
             assert_eq!(
@@ -766,10 +822,49 @@ mod tests {
                 .any(|p| matches!(p.provenance, Provenance::LiveCapture(_))),
             "the table must hold at least one real capture"
         );
-        assert!(PATTERNS
+        // #12395: the exhaustion rows are no longer all inference. The two
+        // Z.ai rows are live; the generic ones stay documented shapes.
+        let live_exhaustion: Vec<&str> = PATTERNS
             .iter()
             .filter(|p| p.classification == Classification::Exhausted)
-            .all(|p| p.provenance == Provenance::DocumentedShape));
+            .filter(|p| matches!(p.provenance, Provenance::LiveCapture(_)))
+            .map(|p| p.needle)
+            .collect();
+        assert_eq!(live_exhaustion, ["weekly/monthly limit exhausted", "usage limit reached for"]);
+    }
+
+    /// #12395: the three refusals a Z.ai coding-plan seat gave the fleet on
+    /// 2026-11-16. The weekly cap and the 5-hour window are exhaustion, not a
+    /// 60 s rate limit: read as a rate limit, an exhausted seat was relaunched
+    /// every minute until its window reset.
+    #[test]
+    fn the_real_captured_zai_limit_events_classify_as_exhaustion_not_rate_limit() {
+        for exhausted in [
+            CAPTURED_ZAI_WEEKLY_LIMIT_EVENT,
+            CAPTURED_ZAI_FIVE_HOUR_LIMIT_EVENT,
+        ] {
+            assert_eq!(classify(exhausted, 1), Some(Classification::Exhausted), "{exhausted}");
+            // The automatic path reads a retained launch log, where the event
+            // sits among Loom's markers and the agent's transcript.
+            let log = format!(
+                "# LOOM_LAUNCH {{\"schema\":1}}\n# LOOM_CLI_START runtime=opencode\n\
+                 {{\"type\":\"text\",\"text\":\"working\"}}\n{exhausted}\n"
+            );
+            assert_eq!(classify_launch_region(&log, 1), Some(Classification::Exhausted));
+        }
+        assert_eq!(classify(CAPTURED_ZAI_RATE_LIMIT_EVENT, 1), Some(Classification::RateLimited));
+        assert_eq!(
+            classify_launch_region(CAPTURED_ZAI_RATE_LIMIT_EVENT, 1),
+            Some(Classification::RateLimited)
+        );
+        // An agent that merely quotes the refusal does not mark a seat.
+        assert_eq!(
+            classify_launch_region(
+                r#"{"type":"text","text":"Weekly/Monthly Limit Exhausted. Usage limit reached for 5 hour."}"#,
+                1
+            ),
+            None
+        );
     }
 
     /// #8521: the automatic path's prose table must not read the model's own

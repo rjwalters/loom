@@ -32,7 +32,7 @@
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
 //! | pool_hold | [`crate::types::DaemonStatusReport::pool_exhaustion_holds`] (published by [`crate::work_finder::pool_preflight::active_hold_statuses`], Issues #7708/#7990) — its own bucket, deliberately NOT folded into `tokens` |
-//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
+//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
 //! [`HealthInputs`] and returns a [`HealthReport`] — so every verdict rule
@@ -2873,7 +2873,7 @@ const WORK_FINDER_LOG_MARKER: &str = "work_finder:";
 
 /// How much of the daemon log's tail to read for the corroborating probe.
 ///
-/// The log rotates at 10 MiB and the work finder writes at least one line per
+/// The log rolls daily (#13917) and the work finder writes at least one line per
 /// tick, so a quarter-megabyte tail always spans far more than the grace window
 /// this signal is compared against — while keeping the probe a single bounded
 /// read rather than a scan of the whole file.
@@ -2943,10 +2943,23 @@ pub fn resolve_daemon_log_path() -> Option<PathBuf> {
 /// treats as "no corroboration either way".
 #[must_use]
 pub fn probe_work_finder_log_tick_age() -> Option<u64> {
+    let path = resolve_daemon_log_path()?;
+    let now = chrono::Utc::now().naive_utc();
+    // Right after a daily roll (#13917) the live file is empty or short, so
+    // fall back to the newest `daemon.log.YYYY-MM-DD[.N]` day file.
+    read_log_tail(&path)
+        .and_then(|t| work_finder_log_tick_age_secs(&t, now))
+        .or_else(|| {
+            let day_file = newest_day_file(&path)?;
+            work_finder_log_tick_age_secs(&read_log_tail(&day_file)?, now)
+        })
+}
+
+/// Read the last [`DAEMON_LOG_TAIL_BYTES`] of `path` (lossy UTF-8).
+fn read_log_tail(path: &std::path::Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let path = resolve_daemon_log_path()?;
-    let mut file = std::fs::File::open(&path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if len > DAEMON_LOG_TAIL_BYTES {
         file.seek(SeekFrom::Start(len - DAEMON_LOG_TAIL_BYTES))
@@ -2956,7 +2969,29 @@ pub fn probe_work_finder_log_tick_age() -> Option<u64> {
     file.take(DAEMON_LOG_TAIL_BYTES)
         .read_to_end(&mut buf)
         .ok()?;
-    work_finder_log_tick_age_secs(&String::from_utf8_lossy(&buf), chrono::Utc::now().naive_utc())
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Newest `<live>.YYYY-MM-DD[.N]` day file next to `live` (date, then `.N`).
+#[must_use]
+pub fn newest_day_file(live: &std::path::Path) -> Option<PathBuf> {
+    let dir = live.parent()?;
+    let base = live.file_name()?.to_str()?;
+    let key = |name: &str| -> Option<(String, u32)> {
+        let rest = name.strip_prefix(base)?.strip_prefix('.')?;
+        let (date, n) = match rest.split_once('.') {
+            Some((d, n)) => (d, n.parse::<u32>().ok()?),
+            None => (rest, 0),
+        };
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+        (date.len() == 10).then(|| (date.to_string(), n))
+    };
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| Some((key(e.file_name().to_str()?)?, e.path())))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, p)| p)
 }
 
 /// Render an age in seconds compactly (`43s`, `7m`, `2h`, `3d`). Negative ages

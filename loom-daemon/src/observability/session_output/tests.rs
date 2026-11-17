@@ -108,18 +108,6 @@ fn no_otlp_queue_means_no_sink_and_therefore_no_publication() {
     assert!(SessionOutputSink::new(Vec::new(), "host").is_none());
 }
 
-#[test]
-fn the_kind_is_refused_by_the_native_ingest_backend() {
-    // Restated here, next to the producer, because this is the property that
-    // makes "live output cannot start a managed-cloud export" true rather
-    // than merely configured.
-    let meta = crate::telemetry::TELEMETRY_KINDS
-        .iter()
-        .find(|m| m.kind == "session.output")
-        .unwrap();
-    assert!(!meta.native_ingest);
-}
-
 // ---------------------------------------------------------------------------
 // Run identity and separation
 // ---------------------------------------------------------------------------

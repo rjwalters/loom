@@ -17,6 +17,7 @@
 //! argv for every call, so the tests can say which credential each call ran
 //! under.
 
+use crate::test_git_helpers::run as git;
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -140,17 +141,6 @@ impl Drop for TwoOwners {
         crate::credential_preflight::clear_owner_root_registry();
         probe::clear_memory();
     }
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
 }
 
 /// The fleet case end to end: the Champion ladder marker written through the

@@ -40,6 +40,8 @@ STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export LOOM_VERDICT_LOCK_DIR="$STUB_DIR/locks"
+# #12714: the review start is the dispatch epoch in the sweep id, not the agent's word.
+export LOOM_SWEEP_ID="step-judge-1-$(date +%s)"
 
 # --- Stateful stub gh: one PR (owner/repo), comments.json + labels.txt -------
 cat > "$STUB_DIR/gh" <<'STUB'
@@ -83,6 +85,13 @@ if [[ "${1:-}" == "api" ]]; then
       grep -vxF "$l" "$D/labels.txt" > "$D/labels.tmp"; mv "$D/labels.tmp" "$D/labels.txt"; exit 0 ;;
   esac
   # The #7647 review gate's reads: a clean, empty review state.
+  if [[ "${2:-}" == "graphql" && "$*" == *userContentEdits* ]]; then
+    # #12714: the linked issue's body-edit history.
+    if [[ -f "$D/edits-read-fail" ]]; then echo "HTTP 502" >&2; exit 1; fi
+    if [[ -f "$D/edits.json" ]]; then cat "$D/edits.json"; else
+      echo '{"data":{"repository":{"issueOrPullRequest":{"userContentEdits":{"nodes":[]}}}}}'; fi
+    exit 0
+  fi
   if [[ "${2:-}" == "graphql" ]]; then
     printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}\n'
   fi
@@ -147,6 +156,8 @@ REAL_DAEMON="${LOOM_DAEMON_BIN:-loom-daemon}"
 cat > "$STUB_DIR/daemon" <<WRAP
 #!/usr/bin/env bash
 [[ "\${1:-} \${2:-}" == "forge wait-checks" ]] && { echo "LOOM-CHECKS-GREEN \$(cat "$STUB_DIR/cur-sha")"; exit 0; }
+# #13055: approvals are gated on a live Judge lease; the caller holds it here.
+[[ "\${1:-} \${2:-} \${3:-}" == "lease pr check" ]] && { echo "PR_LEASE_STATE=held-self"; exit 0; }
 exec "$REAL_DAEMON" "\$@"
 WRAP
 chmod +x "$STUB_DIR/daemon"
@@ -291,6 +302,7 @@ cat > "$STUB_DIR/old-daemon" <<OLD
 case "\${1:-} \${2:-}" in
   "--version "*) echo "loom-daemon 0.19.870 (pre-10581)"; exit 0 ;;
   "forge wait-checks") echo "LOOM-CHECKS-GREEN \$(cat "$STUB_DIR/cur-sha")"; exit 0 ;;
+  "lease pr") echo "PR_LEASE_STATE=held-self"; exit 0 ;;  # #13055: the caller holds the Judge lease
   "forge verdict-"*) printf "error: unrecognized subcommand '%s'\n\nUsage: loom-daemon forge <COMMAND>\n" "\$2" >&2; exit 2 ;;
 esac
 exec "$REAL_DAEMON" "\$@"
@@ -415,22 +427,63 @@ state "$OP_COMMENT" loom:review-requested loom:reviewing
 pv 12614 changes-requested "$HEAD" --body "Changes requested: see the spec." --review-started "$PAST_T"
 check "changes-requested is never refused by it" 0 "$RC"
 
+# #13134: --acknowledged-comment is forwarded and excuses only the listed id.
 state "$OP_COMMENT" loom:review-requested loom:reviewing
-pv 12614 approved "$HEAD" --body "Approved: covered by the new tests."
-check "no --review-started: unchanged (approves)" 0 "$RC"
-contains "no --review-started: warns" "$OUT" "no --review-started"
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --acknowledged-comment 4242
+check "acknowledged comment id: exit 0" 0 "$RC"
+check "acknowledged comment id: posted" 12614 "$POSTED"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --acknowledged-comment 9999
+check "acknowledging a different id still refuses: exit 7" 7 "$RC"
+contains "refusal names the remedy flag" "$OUT" "--acknowledged-comment"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --acknowledged-comment 4242 --issue-body-sha "50=$(printf %s 'stale body' | sha256sum | cut -d' ' -f1)"
+check "acknowledged id never excuses a body-hash mismatch: exit 7" 7 "$RC"
+
+# #12714: the start comes from the dispatch, so omitting or lying about the flag cannot hide a comment.
+DISPATCH_T="$(($(date +%s) - 3600))"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+LOOM_SWEEP_ID="step-judge-1-$DISPATCH_T" pv 12614 approved "$HEAD" --body "Approved: covered by the new tests."
+check "no --review-started, dispatch before the comment: exit 7" 7 "$RC"
+contains "no flag: names the comment" "$OUT" "comment 4242 by the-operator"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+LOOM_SWEEP_ID="step-judge-1-$DISPATCH_T" pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+check "a late --review-started cannot hide the comment: exit 7" 7 "$RC"
+state "[]" loom:review-requested loom:reviewing
+OUT="$(env -u LOOM_SWEEP_ID "$POST_VERDICT" 12614 approved "$HEAD" --body "Approved: covered by the new tests." 2>&1)"; RC=$?
+check "no resolvable start: exit 7" 7 "$RC"
+contains "no resolvable start: says so" "$OUT" "no review start time"
 
 state "[]" loom:review-requested loom:reviewing
 pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$OLD_HASH"
 check "issue body unchanged: exit 0" 0 "$RC"
 check "issue body unchanged: posted" 12614 "$POSTED"
 
+# #13600: a hash of the raw `gh --jq .body` output (trailing newline kept) is accepted.
+NL_HASH="$(printf '%s\n' 'the design as reviewed' | sha256sum | cut -d' ' -f1)"
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$NL_HASH"
+check "trailing-newline body hash: exit 0" 0 "$RC"
+check "trailing-newline body hash: posted" 12614 "$POSTED"
+
 echo '{"body":"rescoped to a daemon-only design"}' > "$STUB_DIR/issue-50.json"
 state "[]" loom:review-requested loom:reviewing
 pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$OLD_HASH"
 check "issue body rescoped: exit 7" 7 "$RC"
 contains "names the issue" "$OUT" "issue #50's body changed"
+contains "refusal says what was hashed" "$OUT" "trailing newlines trimmed"
+contains "refusal shows the recipe" "$OUT" "sha256sum"
 check "issue body rescoped: nothing posted" "" "$POSTED"
+
+echo '{"body":"the design as reviewed"}' > "$STUB_DIR/issue-50.json"
+cat > "$STUB_DIR/edits.json" <<EDITS
+{"data":{"repository":{"issueOrPullRequest":{"userContentEdits":{"nodes":[{"editedAt":"$NOW_T","editor":{"login":"the-operator","__typename":"User"}}]}}}}}
+EDITS
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T"
+check "human body edit after start (PR body links Closes #50): exit 7" 7 "$RC"
+contains "names the edit" "$OUT" "issue #50's body was edited by the-operator"
+rm -f "$STUB_DIR/edits.json"
 
 touch "$STUB_DIR/issue-50-read-fail"
 state "[]" loom:review-requested loom:reviewing

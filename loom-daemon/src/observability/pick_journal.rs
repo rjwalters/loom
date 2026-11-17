@@ -114,6 +114,10 @@ pub enum JournalEntry {
         is_pr: bool,
         action: String,
         by: String,
+        /// The head the write was made against, when the caller knew it
+        /// (`forge verdict-labels --sha`, #12362).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
     },
     /// A hold-label transition a daemon subcommand or the Champion prompt
     /// made on a PR (#12665): the source of `hold.transition`. `confirmed` is
@@ -129,6 +133,10 @@ pub enum JournalEntry {
         /// When the hold began, when the caller knows it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entered_at: Option<DateTime<Utc>>,
+        /// Champion's merge-risk confidence in whole percent (#12950), on a
+        /// `decision`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence_pct: Option<u8>,
     },
 }
 
@@ -265,11 +273,29 @@ pub fn take(root: &Path) -> Option<Journal> {
     if owner != root {
         return None;
     }
-    Some(Journal {
+    Some(journal_of(raw))
+}
+
+/// Read this thread's journal for `root` without consuming it (#12362): the
+/// `role_attempt` span closes before the drain, which still needs the file.
+/// `None` when no journal is attached for `root`.
+#[must_use]
+pub fn peek(root: &Path) -> Option<Journal> {
+    let path = ACTIVE.with(|a| {
+        a.borrow()
+            .as_ref()
+            .filter(|(owner, _)| owner == root)
+            .map(|(_, path)| path.clone())
+    })?;
+    Some(journal_of(std::fs::read_to_string(path)))
+}
+
+fn journal_of(raw: std::io::Result<String>) -> Journal {
+    Journal {
         read: raw.is_ok(),
         entries: parse(raw.as_deref().unwrap_or_default()),
         front_expected: front_expected(),
-    })
+    }
 }
 
 /// Parse journal lines, skipping any that do not decode.
@@ -582,16 +608,25 @@ fn is_marker(line: &str) -> bool {
 }
 
 /// The head Champion pinned for PR `number`, from its pin file
-/// (`$(git rev-parse --git-common-dir)/loom-champion-pin-pr-N`, first token;
-/// `champion-targeted.md` step 1). A local read; `None` when there is none.
+/// (`/tmp/loom-champion/<sha256(git common dir)[..12]>/pin-pr-N`, first
+/// token; `champion-targeted.md` step 1, #13200). A local read; `None` when
+/// there is none.
 fn champion_pin_head(number: u32) -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let text = std::fs::read_to_string(dir.join(format!("loom-champion-pin-pr-{number}"))).ok()?;
+    // The shell side hashes `git rev-parse ... | sha256sum`: the path plus a newline.
+    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let key = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(format!("{common}\n").as_bytes()))[..12].to_string()
+    };
+    let path = PathBuf::from("/tmp/loom-champion")
+        .join(key)
+        .join(format!("pin-pr-{number}"));
+    let text = std::fs::read_to_string(path).ok()?;
     let sha = text.split_whitespace().next()?;
     (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sha.to_string())
 }
@@ -625,9 +660,43 @@ pub fn record_marker(number: u64, is_pr: bool, body: &str) {
     }
 }
 
+/// Journal a Judge approval refused by the exact-head CI gate (#13274):
+/// `class` is `ci_red` (exit 6) or `ci_incomplete` (exit 5). A marker entry
+/// carrying the head, so the Judge projection reads it. A no-op outside a
+/// journaled run.
+pub fn record_ci_refusal(number: u64, class: &str, head_sha: Option<&str>) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(number) {
+        append(&JournalEntry::Marker {
+            at: Utc::now(),
+            number,
+            is_pr: true,
+            marker: format!("<!-- judge:ci-refused:{class} -->"),
+            head_sha: head_sha.map(str::to_string),
+        });
+    }
+}
+
 /// Journal a write a daemon subcommand made on `number` (#12027). A no-op
 /// outside a journaled run.
 pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
+    record_applied_at(number, is_pr, action, by, None);
+}
+
+/// The `by` of the verdict write `forge verdict-labels` journals (#12362).
+pub const VERDICT_LABELS_BY: &str = "verdict-labels";
+
+/// Journal a verdict's label transition on PR `pr` (`approved` or
+/// `changes_requested`, #12362), after it held. A no-op outside a journaled
+/// run; makes no forge call.
+pub fn record_verdict(pr: u64, action: &str, head_sha: Option<&str>) {
+    record_applied_at(pr, true, action, VERDICT_LABELS_BY, head_sha);
+}
+
+/// [`record_applied`] with the head the write was made against (#12362).
+pub fn record_applied_at(number: u64, is_pr: bool, action: &str, by: &str, head_sha: Option<&str>) {
     if journal_path().is_none() {
         return;
     }
@@ -638,6 +707,7 @@ pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
             is_pr,
             action: action.to_string(),
             by: by.to_string(),
+            head_sha: head_sha.filter(|s| !s.is_empty()).map(str::to_string),
         });
     }
 }
@@ -651,6 +721,7 @@ pub fn record_hold(
     trigger: &str,
     confirmed: bool,
     entered_at: Option<DateTime<Utc>>,
+    confidence_pct: Option<u8>,
 ) {
     if journal_path().is_none() {
         return;
@@ -664,6 +735,7 @@ pub fn record_hold(
             trigger: trigger.to_string(),
             confirmed,
             entered_at,
+            confidence_pct,
         });
     }
 }

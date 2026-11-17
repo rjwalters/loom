@@ -66,6 +66,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::cmd_out::{run_command, CmdOutcome};
+use crate::shell_quote::shell_quote;
 
 #[cfg(test)]
 mod tests;
@@ -506,11 +507,6 @@ pub fn rebase(plan: &Plan) -> Result<(), String> {
         .to_string())
 }
 
-/// Single-quote a value for `eval` in POSIX shell.
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 /// The plan as `eval`-able shell assignments — the script's stdout contract.
 #[must_use]
 pub fn render_shell(plan: &Plan) -> String {
@@ -527,11 +523,11 @@ pub fn render_shell(plan: &Plan) -> String {
          LOOM_RS_CHILD_WORKTREE={}\n\
          LOOM_RS_PARENT_REF={}\n\
          LOOM_RS_PARENT_PIN_REF={}\n",
-        sh_quote(&plan.target_commit),
-        sh_quote(&plan.target_ref),
-        sh_quote(&plan.git_dir.display().to_string()),
-        sh_quote(&worktree),
-        sh_quote(&plan.parent_ref),
-        sh_quote(&pin),
+        shell_quote(&plan.target_commit),
+        shell_quote(&plan.target_ref),
+        shell_quote(&plan.git_dir.display().to_string()),
+        shell_quote(&worktree),
+        shell_quote(&plan.parent_ref),
+        shell_quote(&pin),
     )
 }

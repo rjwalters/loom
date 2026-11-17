@@ -86,7 +86,7 @@ fn the_binary_cli_parses_status_sections() {
     ])
     .unwrap();
     match cli.command {
-        Some(crate::Commands::Status(args)) => {
+        Some(crate::cli::Commands::Status(args)) => {
             assert!(args.json);
             assert_eq!(args.section, vec![StatusSection::DaemonBuild, StatusSection::AutoUpdate]);
         }
@@ -132,7 +132,7 @@ fn old_daemon_reply(line: &str) -> Response {
         DaemonStatus,
     }
     let err = serde_json::from_str::<OldRequest>(line).unwrap_err();
-    Response::StructuredError(loom_daemon::errors::DaemonError::ipc_parse_error(line, &err))
+    Response::StructuredError(crate::errors::DaemonError::ipc_parse_error(line, &err))
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn the_full_selection_is_the_default_payload() {
 #[test]
 fn a_sectioned_payload_is_exactly_those_keys_of_the_default_payload() {
     let mut report = sample_report();
-    report.per_repo = vec![loom_daemon::types::RepoStatus {
+    report.per_repo = vec![crate::types::RepoStatus {
         root: std::path::PathBuf::from("/repo/a"),
         maintain_only: None,
         weight: 100,
@@ -272,6 +272,7 @@ fn a_sectioned_payload_is_exactly_those_keys_of_the_default_payload() {
         health_gate_enabled: Some(true),
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: Some("full".to_string()),

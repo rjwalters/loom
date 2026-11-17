@@ -11,7 +11,7 @@ Role records carry the queue the role agent **actually consumed** and what it
 below; the daemon's admission-gate listing is only the fallback when the agent's
 queue was not observed. `candidate_source` and `decisions_observed` say which.
 
-OTLP-only log record (`otlp: Logs`, `native: false`), envelope
+OTLP-only log record (`otlp: Logs`), envelope
 `schema_version: 12` (`NEW_KIND_SCHEMA_VERSION`). The log **body** is the
 record's JSON; the attributes are `loom.kind` (`pick.decision`, which the
 queries below filter on), `loom.role` and, on a role record, `loom.repo`
@@ -245,9 +245,12 @@ root adds roughly 1.5 k. Lists are not capped (#11567): an empty tick is under 4
 work-finder tick with ~575 candidates and ~350 draws is several hundred KB.
 At 1,440 work-finder ticks/day/host that is on the order of 0.5 GB/day/host
 in the worst case (typical ticks with a handful of candidates stay around
-1 KB). A record whose JSON exceeds `CHUNK_BYTES` (1,000,000) is split into
-chunks, so each chunk is bounded
-(`a_busy_tick_splits_into_bounded_chunks_and_reassembles_exactly` pins that);
+1 KB). A record whose JSON exceeds `CHUNK_BYTES` (16 KiB, the fleet's ~16 KB
+log ingest cap, #12973) is split into chunks, so each chunk is bounded and stays
+queryable in SigNoz (`a_worst_case_tick_keeps_every_chunk_under_the_ingest_cap`
+pins that; a busy tick is now tens of chunks). Known limit: the header repeats
+on every chunk and a lone oversized entry goes out whole, so a header alone
+larger than the cap (hundreds of `item_draw.repos[]`) would exceed it;
 the compact `[repo_idx, number, reason_code]` encoding is the fallback
 if volume proves unacceptable.
 

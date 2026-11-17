@@ -6,7 +6,7 @@ use chrono::{Duration, TimeZone, Utc};
 
 use super::*;
 use crate::priority_pick::Level;
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::types::{QueueDisposition as Qd, ReadyQueueRow, RowPlan, WorkFinderTickSummary};
 
 fn at(secs: i64) -> chrono::DateTime<Utc> {

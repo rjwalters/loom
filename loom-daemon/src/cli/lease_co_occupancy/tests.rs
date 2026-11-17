@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 use tempfile::TempDir;
 
-use loom_daemon::forge_identity::{FleetLogins, Roster};
+use crate::forge_identity::{FleetLogins, Roster};
 
 const ISSUE: u64 = 5781;
 

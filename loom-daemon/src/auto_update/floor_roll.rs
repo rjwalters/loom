@@ -118,6 +118,10 @@ pub enum TargetSource {
     /// one (#10719): roll now, no settle. The one roll a fleet host makes
     /// besides the floor's.
     RepoAhead,
+    /// Restart-required config changed since boot (#12425): a same-binary
+    /// restart, roll now, no settle, no fetch. It selects no release, so
+    /// [`select_target`] never returns it.
+    ConfigRestart,
     /// An ordinary autoUpdate roll on a host with no fleet store: the settle
     /// gate and its ceiling apply.
     AutoUpdate,

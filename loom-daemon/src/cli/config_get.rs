@@ -1,7 +1,7 @@
 //! `loom-daemon config get <key>` — read one key of the resolved effective
 //! config (#12591).
 //!
-//! Thin clap wiring over [`loom_daemon::config_resolver`]; `main.rs` is frozen
+//! Thin clap wiring over [`crate::config_resolver`]; `main.rs` is frozen
 //! by the file-size ratchet, so the variant there is one line.
 //!
 //! Prints one JSON object: `{"key", "found", "value", "tier", "source"}`.
@@ -16,14 +16,14 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
-use loom_daemon::config_resolver::{
+use crate::config_resolver::{
     get_path, resolve_effective_config, source_of, FLEET_REPO_CONFIG_REL, LEGACY_CONFIG_REL,
     LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
 };
 
 /// `loom-daemon config` arguments.
 #[derive(Args)]
-pub(crate) struct ConfigArgs {
+pub struct ConfigArgs {
     #[command(subcommand)]
     command: ConfigCommand,
 }
@@ -39,14 +39,30 @@ enum ConfigCommand {
         /// Accepted for symmetry with other verbs; output is always JSON.
         #[arg(long)]
         json: bool,
+        /// Print only the short digest of `champion.standingAuthorizations`
+        /// (the `auth=` value Champion records in a hold marker, #12933).
+        #[arg(long)]
+        digest: bool,
         /// Repo root to resolve against. Defaults to the current directory.
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
     },
 }
 
-pub(crate) fn dispatch(args: ConfigArgs) -> Result<()> {
+pub fn dispatch(args: ConfigArgs) -> Result<()> {
     match args.command {
+        ConfigCommand::Get {
+            key,
+            workspace,
+            digest: true,
+            ..
+        } => {
+            if key != "champion.standingAuthorizations" {
+                bail!("--digest is only defined for champion.standingAuthorizations");
+            }
+            println!("{}", crate::champion_hold::standing_auth_digest(Path::new(&workspace)));
+            Ok(())
+        }
         ConfigCommand::Get { key, workspace, .. } => {
             let report = lookup(Path::new(&workspace), &key)?;
             println!("{report}");
@@ -104,9 +120,9 @@ mod tests {
     }
 
     fn lookup_isolated(root: &Path, key: &str) -> Value {
-        std::env::set_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let v = lookup(root, key).unwrap();
-        std::env::remove_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV);
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         v
     }
 

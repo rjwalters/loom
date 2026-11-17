@@ -47,7 +47,7 @@ fn git_checkout_with_origin(slug: &str) -> tempfile::TempDir {
 fn reason(r: &Resolution) -> String {
     match r {
         Resolution::Unresolved(s) => s.clone(),
-        Resolution::Resolved(_) => panic!("expected Unresolved"),
+        Resolution::Resolved(_) | Resolution::Unavailable(_) => panic!("expected Unresolved"),
     }
 }
 
@@ -630,7 +630,11 @@ fn latest_incomplete_rolls_to_the_older_complete_release() {
     let mut asked = Vec::new();
     let got = pick_complete(&cands, |tag| {
         asked.push(tag.to_string());
-        tag != "v0.19.12"
+        if tag == "v0.19.12" {
+            Probe::Incomplete
+        } else {
+            Probe::Complete
+        }
     });
     assert_eq!(
         got,
@@ -650,7 +654,7 @@ fn a_newer_unpromoted_release_with_assets_beats_a_lower_latest() {
         listed("v0.19.10", false, false),
     ]);
     assert_eq!(
-        pick_complete(&cands, |_| true),
+        pick_complete(&cands, |_| Probe::Complete),
         Some(Walk::Found {
             tag: "v0.19.10".to_string(),
             version: "0.19.10".to_string()
@@ -667,7 +671,7 @@ fn no_complete_release_names_the_newest_and_inspects_a_bounded_number() {
     let mut calls = 0;
     let got = pick_complete(&cands, |_| {
         calls += 1;
-        false
+        Probe::Incomplete
     });
     assert_eq!(
         got,
@@ -676,7 +680,7 @@ fn no_complete_release_names_the_newest_and_inspects_a_bounded_number() {
         })
     );
     assert_eq!(calls, WALK_MAX_RELEASES);
-    assert_eq!(pick_complete(&[], |_| true), None);
+    assert_eq!(pick_complete(&[], |_| Probe::Complete), None);
 }
 
 // ---- retry + error detail on unreadable release metadata (#12849) ----
@@ -710,24 +714,25 @@ fn a_read_that_fails_once_then_succeeds_resolves() {
 #[test]
 fn a_read_that_always_fails_reports_the_last_error_after_bounded_retries() {
     let mut calls = 0;
-    let got: Result<u8, String> = read_retrying(
+    let got: Result<u8, ReadFailure> = read_retrying(
         || {
             calls += 1;
-            failed("HTTP 403: API rate limit exceeded")
+            failed("HTTP 502: Bad Gateway")
         },
         2,
         Duration::ZERO,
     );
     assert_eq!(calls, 3, "one attempt plus two retries");
     let e = got.unwrap_err();
-    assert!(e.contains("rate limit"), "{e}");
-    assert!(e.contains("3 attempts"), "{e}");
+    assert!(e.why.contains("Bad Gateway"), "{}", e.why);
+    assert!(e.why.contains("3 attempts"), "{}", e.why);
+    assert!(e.unavailable, "a 5xx is an unreadable forge, not a missing release");
 }
 
 #[test]
 fn an_empty_result_is_an_answer_and_is_not_retried() {
     let mut calls = 0;
-    let got: Result<u8, String> = read_retrying(
+    let got: Result<u8, ReadFailure> = read_retrying(
         || {
             calls += 1;
             Query::Empty
@@ -756,4 +761,97 @@ fn an_unreadable_asset_list_carries_the_error_and_cannot_rule_out_an_upload() {
         "{why}"
     );
     assert!(why.contains("in-flight upload cannot be ruled out"), "{why}");
+}
+
+// ---- an unreadable forge is not a missing release (#13745) ----
+
+const RATE_LIMITED: &str = "HTTP 403: API rate limit exceeded for installation ID 1. \
+     X-RateLimit-Reset: 1794350000";
+
+#[test]
+fn a_rate_limited_read_is_unavailable_and_not_hammered_within_the_tick() {
+    let mut calls = 0;
+    let got: Result<u8, ReadFailure> = read_retrying(
+        || {
+            calls += 1;
+            failed(RATE_LIMITED)
+        },
+        2,
+        Duration::ZERO,
+    );
+    assert_eq!(calls, 1, "the next tick asks again; this one does not retry a rate limit");
+    let e = got.unwrap_err();
+    assert!(e.unavailable);
+    assert!(e.why.starts_with("releases unavailable"), "{}", e.why);
+    assert!(e.why.contains("HTTP 403"), "{}", e.why);
+    assert!(e.why.contains("never the writer"), "{}", e.why);
+    assert!(e.why.contains("resets 2026-"), "reset time is surfaced: {}", e.why);
+}
+
+#[test]
+fn a_not_found_answer_is_not_unavailable() {
+    for stderr in ["release not found", "HTTP 404: Not Found"] {
+        let q: Query<u8> = failed(stderr);
+        assert!(!is_unavailable(&q), "{stderr}");
+    }
+    let q: Query<u8> = Query::Empty;
+    assert!(!is_unavailable(&q));
+}
+
+#[test]
+fn secondary_limits_server_errors_and_shed_reads_are_unavailable() {
+    for stderr in [
+        "HTTP 429: Too Many Requests",
+        "You have exceeded a secondary rate limit",
+        "HTTP 503: Service Unavailable",
+    ] {
+        let q: Query<u8> = failed(stderr);
+        assert!(is_unavailable(&q), "{stderr}");
+    }
+    let shed: Query<u8> = Query::Unavailable(Unavailable::Shed {
+        until: std::time::SystemTime::now(),
+    });
+    assert!(is_unavailable(&shed));
+}
+
+#[test]
+fn a_walk_never_steps_past_a_release_whose_assets_could_not_be_read() {
+    // v0.19.12 is the newest and its asset read is rate-limited; v0.19.11 is
+    // complete. Skipping to v0.19.11 would present an older release as the
+    // newest the repo publishes — the false "floor unsatisfiable" / "OLDER".
+    let cands = walk_candidates(vec![
+        listed("v0.19.12", false, false),
+        listed("v0.19.11", false, false),
+    ]);
+    let mut asked = Vec::new();
+    let got = pick_complete(&cands, |tag| {
+        asked.push(tag.to_string());
+        if tag == "v0.19.12" {
+            Probe::Unreadable("releases unavailable (HTTP 403)".to_string())
+        } else {
+            Probe::Complete
+        }
+    });
+    assert_eq!(
+        got,
+        Some(Walk::Unavailable {
+            reason: "releases unavailable (HTTP 403)".to_string()
+        })
+    );
+    assert_eq!(asked, ["v0.19.12"], "the walk stops at the unreadable release");
+}
+
+#[test]
+fn unavailable_of_only_reports_unreadable_failures() {
+    let unreadable: Result<u8, ReadFailure> = Err(ReadFailure {
+        why: "releases unavailable (HTTP 403)".into(),
+        unavailable: true,
+    });
+    let missing: Result<u8, ReadFailure> = Err(ReadFailure {
+        why: "gh returned an empty result".into(),
+        unavailable: false,
+    });
+    assert!(unavailable_of(&unreadable).is_some());
+    assert_eq!(unavailable_of(&missing), None);
+    assert_eq!(unavailable_of(&Ok(1u8)), None);
 }

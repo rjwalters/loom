@@ -2,9 +2,8 @@
 # test-resync-installed-agent-skills-guard.sh - marker-gated .agents/skills/
 # resync in resync-installed.sh (#8673)
 #
-# Split out as its own file rather than grown into test-resync-installed.sh
-# (frozen by the file-size ratchet, .loom/docs/file-size-policy.md) — same
-# pattern as test-resync-installed-local-fix-guard.sh.
+# Split out as its own file rather than grown into test-resync-installed.sh —
+# same pattern as test-resync-installed-local-fix-guard.sh.
 #
 # Covers resync_agent_skills()'s marker gate: a destination
 # .agents/skills/loom-<name>/SKILL.md WITHOUT the `<!-- loom-managed-skill -->`
@@ -26,25 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/resync-installed.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/test-resync-agentskills.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below

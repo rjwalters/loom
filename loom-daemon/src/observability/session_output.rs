@@ -30,9 +30,8 @@
 //!   endpoint, never constructs an exporter, and never adds one to the
 //!   configured list — no OTLP exporter configured means
 //!   [`register_sink`] registers nothing and every emit is a no-op.
-//! - `session.output` is declared `native: false`, so even on a host whose
-//!   configured sink *is* the managed HTTPS backend, no session text is
-//!   offered to it.
+//! - `session.output` is an OTLP-only kind (`otlp: Logs`); the managed HTTPS
+//!   backend it never reached has since been removed (#12813).
 //!
 //! # Latency budget
 //!

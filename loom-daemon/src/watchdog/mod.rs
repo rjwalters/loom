@@ -53,6 +53,7 @@
 //! what its author thought to write down. See
 //! `defaults/docs/verification-recipes.md` §6 for the differential step.
 
+use crate::script_helpers::now_epoch_secs;
 use std::path::{Path, PathBuf};
 
 pub mod config;
@@ -324,7 +325,7 @@ fn outage(
     snap: &liveness::Snapshot,
     sup: &supervisor::Supervisor,
 ) -> i32 {
-    let now = now_secs();
+    let now = now_epoch_secs();
     let started_at = snap.started_at.clone().unwrap_or_default();
 
     // Step 1: the supervisor may be able to fix this itself.
@@ -825,13 +826,6 @@ fn cli_dir_from(exported: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod high_fix_tests;
 
-/// Unix seconds.
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// What the bounded in-band probe concluded.
 ///
 /// `healthy` is NOT `exit.is_none()`. A probe that was disabled, skipped, or
@@ -1062,7 +1056,7 @@ fn hang_recovery(
             pid,
         ),
         &ev,
-        now_secs(),
+        now_epoch_secs(),
         guard,
         supervisor_cmd::run_hang_restart,
     )

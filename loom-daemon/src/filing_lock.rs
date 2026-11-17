@@ -92,8 +92,9 @@
 //!    a role that wraps a whole burst does not deadlock against the per-call
 //!    acquire inside `create-issue.sh`.
 
+use crate::script_helpers::now_epoch_secs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
@@ -307,13 +308,6 @@ impl FilingLockOwner {
 pub fn read_owner(store: &Path) -> Option<FilingLockOwner> {
     let raw = std::fs::read_to_string(holder_path(store).join("owner.json")).ok()?;
     FilingLockOwner::from_json_str(&raw)
-}
-
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Age of `path` by mtime. `None` when the mtime is unreadable — never reap a

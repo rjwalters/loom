@@ -1,13 +1,13 @@
-//! `repos.yml` → the desired workspace set, and its diff against the daemon's
+//! `fleet.json` roster → the desired workspace set, and its diff against the daemon's
 //! workspace registry.
 //!
-//! When the store has the compiled `fleet.json` (#10705), the roster is that
-//! document's top-level `root` and `repos`, with the same contract and the same
-//! validation ([`from_snapshot`]); `repos.yml` is read only when it is absent.
+//! The roster is the compiled `fleet.json`'s (#10705) top-level `root` and
+//! `repos` ([`from_snapshot`]). A legacy `repos.yml` is no longer read.
 //!
 //! # Contract
 //!
 //! ```yaml
+//! # (shown as YAML; `fleet.json` carries the same keys as JSON)
 //! root: ~/GitHub          # where every repo is cloned (`~` = home)
 //! repos:
 //!   - name: app           # unique
@@ -129,26 +129,14 @@ impl Roster {
     }
 }
 
-/// Parse and validate `repos.yml`. `home` expands a leading `~` in `root`.
-pub fn parse(text: &str, home: &Path) -> Result<Roster> {
-    let doc = super::yaml::parse(text).map_err(|e| anyhow!("repos.yml: {e:#}"))?;
-    let top = doc
-        .as_object()
-        .ok_or_else(|| anyhow!("repos.yml: top level must be a mapping"))?;
-    from_map(top, home, super::ROSTER_PATH)
-}
-
-/// The roster from a store snapshot: `fleet.json`'s top level when the store
-/// has it, else `repos.yml`. `Ok(None)` when it has neither. A present but
-/// invalid `fleet.json` is an error and never falls back to `repos.yml`.
+/// The roster from a store snapshot: `fleet.json`'s top level. `Ok(None)` when
+/// the store has no `fleet.json`; a legacy `repos.yml` is not read. A present
+/// but invalid `fleet.json` is an error.
 pub fn from_snapshot(snapshot: &Snapshot, home: &Path) -> Result<Option<Roster>> {
-    if let Some(doc) = super::compiled::from_snapshot(snapshot)? {
-        return from_map(doc.roster(), home, super::FLEET_JSON_PATH).map(Some);
+    match super::compiled::from_snapshot(snapshot)? {
+        Some(doc) => from_map(doc.roster(), home, super::FLEET_JSON_PATH).map(Some),
+        None => Ok(None),
     }
-    let Some(text) = snapshot.text(super::ROSTER_PATH)? else {
-        return Ok(None);
-    };
-    parse(&text, home).map(Some)
 }
 
 /// The roster from a compiled `fleet.json`'s top-level `root` and `repos`,
@@ -157,20 +145,21 @@ pub fn from_compiled(top: &serde_json::Map<String, Value>, home: &Path) -> Resul
     from_map(top, home, super::FLEET_JSON_PATH)
 }
 
-/// The message for a snapshot with no roster at all ([`from_snapshot`]
-/// returned `Ok(None)`).
+/// The message for a snapshot with no roster ([`from_snapshot`] returned
+/// `Ok(None)`).
 #[must_use]
 pub fn missing_message(snapshot: &Snapshot) -> String {
     format!(
-        "the store has neither {} nor {} (commit {})",
+        "the store has no {} (the only supported roster source; a legacy {} is no longer \
+         read; publish a compiled {}) (commit {})",
         super::FLEET_JSON_PATH,
         super::ROSTER_PATH,
+        super::FLEET_JSON_PATH,
         snapshot.short_commit()
     )
 }
 
-/// Validate a roster held as a parsed mapping (`repos.yml`'s top level, or
-/// `fleet.json`'s). `source` names the file in messages.
+/// Validate a roster held as a parsed mapping (`fleet.json`'s top level). `source` names the file in messages.
 fn from_map(top: &serde_json::Map<String, Value>, home: &Path, source: &str) -> Result<Roster> {
     let root = top
         .get("root")

@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 79 file(s), 249 direct call site(s) at baseline.
+# 80 file(s), 253 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -123,7 +123,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/verdict-staleness-guard.sh"
-calls = 7
+calls = 9
 owner = "role-scripts"
 removal_issue = 9799
 
@@ -212,7 +212,7 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/daemon_service.rs"
+path = "loom-daemon/src/daemon_service/credential_startup.rs"
 calls = 1
 owner = "daemon-other"
 removal_issue = 9799
@@ -296,14 +296,14 @@ owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/merge_pr/head_sync/fetch.rs"
+path = "loom-daemon/src/merge_pr/partial_reset.rs"
 calls = 1
 owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/merge_pr/partial_reset.rs"
-calls = 1
+path = "loom-daemon/src/merge_pr/post_merge_bookkeeping.rs"
+calls = 4
 owner = "daemon-landing"
 removal_issue = 9799
 

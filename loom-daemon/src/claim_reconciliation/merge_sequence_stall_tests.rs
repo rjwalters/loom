@@ -1,13 +1,8 @@
 //! Fixtures for #10060: direct-overlap edges, level-first ordering, and the
 //! stalled-head release + escalation.
 
-use std::collections::BTreeMap;
-
-use super::super::{
-    hold_action, plan_group_with, plan_repo_with, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
-};
+use super::super::SEQUENCE_LABEL;
 use super::*;
-use crate::priority_pick::{IMPORTANT_LABEL, VERY_IMPORTANT_LABEL};
 
 const NOW: &str = "2026-10-03T12:00:00Z";
 const BOUND: f64 = 12.0;
@@ -36,199 +31,6 @@ fn pr(number: u32, created: &str, updated: &str, labels: &[&str]) -> SequencePr 
     }
 }
 
-/// A fresh PR (active one hour before [`NOW`]).
-fn fresh(number: u32, created: &str, labels: &[&str]) -> SequencePr {
-    pr(number, created, "2026-10-03T11:00:00Z", labels)
-}
-
-fn files(entries: &[(u32, &[&str])]) -> BTreeMap<u32, BTreeSet<String>> {
-    entries
-        .iter()
-        .map(|(n, paths)| (*n, paths.iter().map(|p| (*p).to_string()).collect()))
-        .collect()
-}
-
-fn edges(g: &SequenceGroup) -> Vec<(u32, u32)> {
-    g.edges.iter().map(|e| (e.follower, e.after)).collect()
-}
-
-const NONE: BTreeMap<u32, SequenceMarker> = BTreeMap::new();
-
-// --- Slice 1: direct-overlap DAG ----------------------------------------
-
-#[test]
-fn transitive_only_members_get_no_edge() {
-    // A–B share x.rs, B–C share y.rs, A and C share nothing. One component,
-    // but C waits only for B, and nothing links A and C directly.
-    let prs = [
-        fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]),
-        fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]),
-        fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
-    ];
-    let f = files(&[(1, &["x.rs"]), (2, &["x.rs", "y.rs"]), (3, &["y.rs"])]);
-    let groups = plan_repo_with(&prs, &f, &NONE, &BTreeSet::new());
-    assert_eq!(groups.len(), 1, "{groups:?}");
-    assert_eq!(groups[0].order, vec![1, 2, 3]);
-    assert_eq!(edges(&groups[0]), vec![(2, 1), (3, 2)]);
-}
-
-#[test]
-fn disjoint_members_of_one_component_are_never_ordered_against_each_other() {
-    // The #10053/#10056 shape: a hub PR shares one file with each, the two
-    // share none. #56 must wait for the hub, not for #53, and no
-    // `SharedFiles` edge may join two PRs with disjoint file sets.
-    let prs = [
-        fresh(10, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]),
-        fresh(53, "2026-10-02T00:00:00Z", &[APPROVED_LABEL]),
-        fresh(56, "2026-10-02T01:00:00Z", &[APPROVED_LABEL]),
-    ];
-    let f = files(&[
-        (
-            10,
-            &[
-                "defaults/docs/label-state-machine.md",
-                "loom-daemon/src/forge_check_branch.rs",
-            ],
-        ),
-        (
-            53,
-            &[
-                "defaults/docs/label-state-machine.md",
-                "defaults/scripts/check-labels-drift.sh",
-            ],
-        ),
-        (
-            56,
-            &[
-                "defaults/scripts/sweep-lease-fence.sh",
-                "loom-daemon/src/forge_check_branch.rs",
-            ],
-        ),
-    ]);
-    let g = &plan_repo_with(&prs, &f, &NONE, &BTreeSet::new())[0];
-    assert_eq!(g.order, vec![10, 53, 56]);
-    assert_eq!(edges(g), vec![(53, 10), (56, 10)]);
-    for e in &g.edges {
-        assert_eq!(e.reason, EdgeReason::SharedFiles);
-        let (a, b) = (&f[&e.after], &f[&e.follower]);
-        assert!(a.iter().any(|p| b.contains(p)), "edge {e:?} claims overlap that does not exist");
-    }
-}
-
-#[test]
-fn a_follower_waits_for_its_nearest_direct_overlap() {
-    // #4 overlaps #1 and #2 (not #3): it waits for #2, the latest of them.
-    let order = [1, 2, 3, 4];
-    let by: BTreeMap<u32, SequencePr> = order
-        .iter()
-        .map(|n| (*n, fresh(*n, "2026-10-01T00:00:00Z", &[])))
-        .collect();
-    let f = files(&[
-        (1, &["a", "z"]),
-        (2, &["a", "b"]),
-        (3, &["b"]),
-        (4, &["z", "b2", "a"]),
-    ]);
-    let g = plan_group_with(
-        "seq-t",
-        &order,
-        &by,
-        &f,
-        &crate::claim_reconciliation::merge_sequence::conflict::assume_conflict,
-    );
-    assert_eq!(edges(&g), vec![(2, 1), (3, 2), (4, 2)]);
-}
-
-/// Golden: the pre-#10060 planner chained `order.windows(2)` and ordered the
-/// placeable set oldest-first. A group where every pair overlaps, nothing is
-/// starred and nothing is stalled must plan exactly that.
-#[test]
-fn a_ready_group_with_no_stalled_head_is_unchanged() {
-    let prs = [
-        fresh(4, "2026-10-01T03:00:00Z", &["loom:pr"]),
-        fresh(2, "2026-10-01T01:00:00Z", &["loom:pr"]),
-        fresh(1, "2026-10-01T00:00:00Z", &["loom:pr"]),
-        fresh(3, "2026-10-01T02:00:00Z", &["loom:pr"]),
-    ];
-    let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"]), (4, &["s"])]);
-    let stalled = stalled_for_ordering(&prs, now(), BOUND);
-    assert!(stalled.is_empty());
-    let groups = plan_repo_with(&prs, &f, &NONE, &stalled);
-    assert_eq!(groups.len(), 1);
-    let g = &groups[0];
-    assert_eq!(g.order, vec![1, 2, 3, 4], "oldest-first, as before");
-    let legacy: Vec<(u32, u32)> = g.order.windows(2).map(|w| (w[1], w[0])).collect();
-    assert_eq!(edges(g), legacy, "chain edges identical to the windows(2) planner");
-    assert!(g.edges.iter().all(|e| e.reason == EdgeReason::SharedFiles));
-
-    // Hold actions: with no stalled head, the stall-aware decision is the
-    // old decision for every input shape.
-    let soft = marker(1, Some("pass"), "seq-x");
-    let hard = marker(1, None, "manual");
-    let quiet = pred(1, Some("2026-01-01T00:00:00Z"));
-    let busy = pred(1, Some(&Utc::now().to_rfc3339()));
-    let moved = sha(4242);
-    for m in [&soft, &hard] {
-        for p in [Some(&quiet), Some(&busy), None] {
-            for fh in [Some(m.follower_head.as_str()), Some(moved.as_str()), None] {
-                for approved in [true, false] {
-                    assert_eq!(
-                        hold_action_with_stall(m, p, fh, approved, 72.0, None),
-                        hold_action(m, p, fh, approved, 72.0),
-                        "{m:?} {p:?} {fh:?} {approved}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-// --- Slice 2: level-first ordering (#11510) -----------------------------
-
-#[test]
-fn a_higher_level_pr_is_ordered_ahead_of_a_lower_level_predecessor() {
-    // All approved: one readiness tier (#10371), so only the level reorders.
-    let old = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
-    let mid = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]);
-    let star = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL, IMPORTANT_LABEL]);
-    let very = fresh(4, "2026-10-01T03:00:00Z", &[APPROVED_LABEL, VERY_IMPORTANT_LABEL]);
-    let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
-    let prs = [old.clone(), mid.clone(), star.clone()];
-    let g = &plan_repo_with(&prs, &f, &NONE, &BTreeSet::new())[0];
-    assert_eq!(g.order, vec![3, 1, 2], "important first, then oldest-first");
-    assert_eq!(edges(g), vec![(1, 3), (2, 1)]);
-
-    // Very important goes before important.
-    let f4 = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"]), (4, &["s"])]);
-    let four = [old.clone(), mid.clone(), star.clone(), very];
-    assert_eq!(plan_repo_with(&four, &f4, &NONE, &BTreeSet::new())[0].order, vec![4, 3, 1, 2]);
-
-    // No level anywhere ⇒ the old oldest-first order.
-    let plain = [
-        old.clone(),
-        mid.clone(),
-        fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
-    ];
-    assert_eq!(plan_repo_with(&plain, &f, &NONE, &BTreeSet::new())[0].order, vec![1, 2, 3]);
-
-    // A constraint edge beats the level: a trusted marker puts #3 after #1.
-    let mut markers = NONE;
-    markers.insert(3, marker_between(3, 1));
-    assert_eq!(plan_repo_with(&prs, &f, &markers, &BTreeSet::new())[0].order, vec![1, 3, 2]);
-}
-
-#[test]
-fn a_stacked_base_beats_the_level() {
-    let base = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
-    let mut stacked = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL, IMPORTANT_LABEL]);
-    stacked.base_ref = base.head_ref.clone();
-    let other = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]);
-    let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
-    let g = &plan_repo_with(&[base, stacked, other], &f, &NONE, &BTreeSet::new())[0];
-    assert_eq!(g.order, vec![1, 2, 3]);
-    assert_eq!(g.edges[0].reason, EdgeReason::StackedBase);
-}
-
 // --- Slice 3: stalled heads ---------------------------------------------
 
 fn marker(after: u32, source: Option<&str>, plan: &str) -> SequenceMarker {
@@ -238,13 +40,6 @@ fn marker(after: u32, source: Option<&str>, plan: &str) -> SequenceMarker {
         follower_head: sha(99),
         plan: plan.into(),
         source: source.map(str::to_string),
-    }
-}
-
-fn marker_between(follower: u32, after: u32) -> SequenceMarker {
-    SequenceMarker {
-        follower_head: sha(follower),
-        ..marker(after, None, "manual")
     }
 }
 
@@ -330,24 +125,6 @@ fn an_unreadable_or_moved_predecessor_is_never_stall_released() {
         hold_action_with_stall(&soft, Some(&moved), live, true, 72.0, cause.as_ref()),
         HoldAction::VoidAndReplan
     );
-}
-
-#[test]
-fn a_stalled_no_verdict_member_is_planned_last_so_released_work_lands_first() {
-    // After the release, the next tick re-plans: the stalled head must not
-    // pull the approved follower straight back behind it.
-    let head = pr(7, "2026-09-30T00:00:00Z", "2026-10-02T00:00:00Z", &["loom:review-requested"]);
-    let ready = fresh(8, "2026-10-01T00:00:00Z", &["loom:pr"]);
-    let other = fresh(9, "2026-10-01T01:00:00Z", &[]);
-    let prs = [head, ready, other];
-    let f = files(&[(7, &["s"]), (8, &["s"]), (9, &["s"])]);
-    let stalled = stalled_for_ordering(&prs, now(), BOUND);
-    assert_eq!(stalled, BTreeSet::from([7]));
-    let g = &plan_repo_with(&prs, &f, &NONE, &stalled)[0];
-    assert_eq!(g.order, vec![8, 9, 7]);
-    // #10371: #7 would wait for the nearest earlier member, #9, which has no
-    // verdict — no hold is written behind a non-ready predecessor.
-    assert_eq!(edges(g), vec![(9, 8)]);
 }
 
 #[test]

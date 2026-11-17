@@ -38,9 +38,8 @@
 //!    executable logic goes into `loom-daemon`, not into shell
 //!    (`.loom/docs/shell-language-policy.md`, ADR-0018). Both files it would
 //!    have to grow — `lib/classify-error.sh` and `spawn-codex.sh` — are
-//!    `contract` entries in the epic #7810 portable pool, so
-//!    `loom-daemon shell-budget --check` refuses the growth by design and
-//!    names this module's approach as the first-listed remedy.
+//!    `contract` entries in the epic #7810 portable pool, which is not meant
+//!    to grow.
 //! 2. **No version skew.** A `v=3` record is silently dropped by any daemon
 //!    older than the adapter that emitted it (the parser fails closed on an
 //!    unknown arity), which would lose the *whole* terminal signal — the

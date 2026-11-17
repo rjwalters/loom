@@ -373,3 +373,17 @@ fn a_startup_curator_restore_leaves_a_later_label_only_claim_alone() {
     reg.restore_dead_step_at_startup(42, StepRole::Curator, mine, start);
     assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty());
 }
+
+/// #13171: releasing a dead step runs under the step's sweep identity, and
+/// the thread identity is restored when the release returns.
+#[test]
+fn releasing_a_dead_step_leaves_no_thread_sweep_identity_behind() {
+    let mine = "step-doctor-41-1";
+    let start = Utc::now() - chrono::Duration::minutes(40);
+    let dir = tempdir().unwrap();
+    let rows = released_doctor_row(5, mine, start + chrono::Duration::minutes(20));
+    let (mut reg, _log) =
+        registry_with_label_time(dir.path(), &rows, start + chrono::Duration::minutes(2));
+    reg.release_dead_step(mine, 41, StepRole::Doctor, start, StepEnd::Exited(None));
+    assert_eq!(crate::gh_invocation::telemetry::ambient_sweep(), (None, None));
+}

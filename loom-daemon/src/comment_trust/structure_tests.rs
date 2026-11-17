@@ -120,6 +120,11 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "fetch_trusted_comments_since(",
     ),
     (
+        "claim_reconciliation/liveness.rs",
+        "fetch_live_pr_lease_at",
+        "TrustPolicy::for_root(root).trusted_ndjson(",
+    ),
+    (
         "claim_reconciliation.rs",
         "fetch_comment_bodies",
         "TrustPolicy::for_root(root).trusted_bodies(",

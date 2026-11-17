@@ -130,12 +130,6 @@ pub fn read_config(root: &Path) -> ClaudeCodeTelemetryConfig {
     }
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|value| {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
-}
-
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -146,14 +140,16 @@ fn env_nonempty(name: &str) -> Option<String> {
 /// **env > config > default** (`false`).
 #[must_use]
 pub fn resolve_enabled(config: &ClaudeCodeTelemetryConfig) -> bool {
-    env_bool(ENABLED_ENV).or(config.enabled).unwrap_or(false)
+    crate::env_flag::env_flag(ENABLED_ENV)
+        .or(config.enabled)
+        .unwrap_or(false)
 }
 
 /// **env > config > default** (`false`), resolved independently of
 /// [`resolve_enabled`] — see the module doc.
 #[must_use]
 pub fn resolve_log_tool_details(config: &ClaudeCodeTelemetryConfig) -> bool {
-    env_bool(LOG_TOOL_DETAILS_ENV)
+    crate::env_flag::env_flag(LOG_TOOL_DETAILS_ENV)
         .or(config.log_tool_details)
         .unwrap_or(false)
 }

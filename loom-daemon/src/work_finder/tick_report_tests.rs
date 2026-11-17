@@ -412,7 +412,7 @@ fn admission_span_carries_loom_repo_when_the_workspace_resolves() {
     let mut repo_refs = HashMap::new();
     repo_refs.insert(
         0,
-        crate::telemetry::queue_snapshot::QueueRepoRef {
+        crate::telemetry::queue_repo::QueueRepoRef {
             repo: "acme/widgets".to_string(),
             visibility: crate::telemetry::RepoVisibility::Public,
         },
@@ -443,7 +443,7 @@ fn a_pr_open_admission_in_a_locked_repo_carries_the_lockout_weight() {
     let mut repo_refs = HashMap::new();
     repo_refs.insert(
         0,
-        crate::telemetry::queue_snapshot::QueueRepoRef {
+        crate::telemetry::queue_repo::QueueRepoRef {
             repo: "acme/widgets".to_string(),
             visibility: crate::telemetry::RepoVisibility::Public,
         },

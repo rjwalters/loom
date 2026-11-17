@@ -29,6 +29,8 @@
 //! incident is recorded in the template's own header.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
@@ -41,7 +43,7 @@ use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 
 /// Same pin as the SigNoz trial's telemetry store (`signoz/casting.yaml`), so
 /// this proof and that deployment can never drift apart on ClickHouse version.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::CLICKHOUSE_IMAGE;
 /// Same pin as the OTLP transport proof (`otlp_collector.rs`).
 const COLLECTOR_IMAGE: &str = "otel/opentelemetry-collector-contrib:0.139.0@sha256:faf125d656fa47cea568b2f3b4494efd2525083bc75c1e96038bc23f05cd68fd";
 

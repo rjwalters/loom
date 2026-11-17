@@ -35,8 +35,7 @@
 //!
 //! - **The `FORGE_TYPE == github` gate.** `merge-pr.sh` already knows which
 //!   forge it is talking to, and the retained suite asserts the pin flag is
-//!   GitHub-gated by reading the guard body
-//!   (`test-merge-pr-auto-queued-stacked-children.sh`). Nothing is gained by
+//!   GitHub-gated by reading the guard body. Nothing is gained by
 //!   moving a fact the caller already holds.
 //! - **`STACKED_CHILDREN_JSON` / `STACKED_CHILDREN_PIN_WRITTEN`.** They are
 //!   read by later shell steps this port has not reached yet (the post-merge

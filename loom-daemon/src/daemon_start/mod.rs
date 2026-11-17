@@ -59,7 +59,7 @@ pub mod envh;
 pub mod guards;
 pub mod launch;
 pub mod marker;
-pub mod out;
+pub use crate::shell_out as out;
 pub mod paths;
 pub mod platform;
 pub mod render;

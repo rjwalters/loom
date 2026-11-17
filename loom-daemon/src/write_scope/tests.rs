@@ -1,6 +1,7 @@
 use super::probe::{classify_repo_permissions, Permission, PermissionProbe};
 use super::target::{gh_target, parse_remote_config, parse_remote_url};
 use super::*;
+use crate::test_git_helpers::run as git;
 use std::cell::Cell;
 
 // ---- gh's base-repo resolution --------------------------------------------
@@ -196,17 +197,6 @@ fn repo_permissions_classify_user_roles() {
 
 // ---- a real checkout -------------------------------------------------------
 
-fn git(dir: &Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
-}
-
 #[test]
 fn a_fork_checkout_with_an_upstream_remote_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -265,6 +255,76 @@ fn the_cache_answers_repeat_questions_without_a_second_probe() {
     assert!(matches!(other.permission("acme/cache-test"), Permission::Insufficient(_)));
     assert_eq!(other.inner.calls.get(), 1, "a different credential probes again");
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+}
+
+/// #13152: a snapshot miss is cached for a minute only, so a repo added to
+/// the installation later is re-probed soon.
+#[test]
+#[serial_test::serial(write_scope_cache)]
+fn a_not_in_installation_answer_is_cached_for_a_minute_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
+    probe::clear_memory();
+    let kd = dir.path().join("cred-m");
+    let cached = probe::Cached {
+        inner: FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into())),
+        key_dir: Some(kd.clone()),
+    };
+    let key = probe::cache_key(Some(&kd), &cached.cache_scope(), "acme/new").unwrap();
+    assert!(matches!(cached.permission("acme/new"), Permission::Insufficient(_)));
+    assert!(matches!(cached.permission("acme/new"), Permission::Insufficient(_)));
+    assert_eq!(cached.inner.calls.get(), 1, "a fresh miss is reused");
+    // Two minutes on (memory dropped, disk entry aged): re-probed.
+    probe::clear_memory();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 120;
+    let body = serde_json::json!({
+        "write": false, "detail": probe::NOT_IN_INSTALLATION, "at": at
+    });
+    std::fs::write(probe::cache_dir().join(format!("{key}.json")), body.to_string()).unwrap();
+    let _ = cached.permission("acme/new");
+    assert_eq!(cached.inner.calls.get(), 2, "a miss older than a minute is re-probed");
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+}
+
+/// #13306: a writer token minted before a repo joined the installation lists
+/// the installation without it. The probe re-mints once and re-reads, so the
+/// repo is answered WRITE; a repo that stays absent after the re-mint is
+/// still refused, and a failed re-mint stays fail-closed.
+#[test]
+fn a_repo_absent_from_a_stale_writer_listing_is_admitted_after_a_remint() {
+    use crate::forge_repo_facts::installation::tests::{page, Listing};
+    use crate::forge_repo_facts::test_support::Env;
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "remintco/old", false)]));
+    let probe = probe::GhProbe::new(fake.gh.clone(), Some(env.tmp.path().join("cfg-writer")));
+    let dir = fake.dir.clone();
+    let minted = std::rc::Rc::new(Cell::new(0));
+    let seen = minted.clone();
+    probe::TEST_REMINT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_repo: &str| {
+            seen.set(seen.get() + 1);
+            std::fs::write(
+                dir.join("page1"),
+                page(2, &[(1, "remintco/old", false), (2, "remintco/new", true)]),
+            )
+            .unwrap();
+            Some(std::path::PathBuf::new())
+        }));
+    });
+    assert_eq!(probe.permission("remintco/new"), Permission::Write);
+    assert_eq!(minted.get(), 1, "one forced mint");
+    assert_eq!(fake.listing_calls(), 2, "{:?}", fake.calls());
+    // A repo the fresh token also lacks stays refused; the owner's debounce
+    // window keeps this from minting again.
+    assert!(matches!(probe.permission("remintco/gone"), Permission::Insufficient(_)));
+    assert_eq!(minted.get(), 1, "debounced per owner");
+    probe::TEST_REMINT.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// The library-test fixture is admitted by the real decision, and only
@@ -435,6 +495,15 @@ fn daemon_write_paths_are_scoped() {
                 "the resync PR of a workspace repo the pass vetted with repo_writable (#12572)",
             ),
         ),
+        ("fleet_sync/workspace_resync/waiver_gh.rs", Gated),
+        (
+            "fleet_sync/workspace_resync/supersede.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "closes the older daemon resync PRs (title + branch + version trailer) of a \
+                 workspace repo the pass vetted with repo_writable before w2::attempt (#13488)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         (
             "parent_link.rs",
@@ -446,6 +515,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("epic_supervisor.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         (
             "intake_reconcile/demote.rs",
@@ -491,6 +561,10 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/step_cap_notice.rs",
             Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
         ),
+        (
+            "sweep_registry/step_outcome_notice.rs",
+            Via(DISPATCH, "noop/failed reason comment on an item whose Builder step was dispatched (#13054)"),
+        ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
@@ -512,6 +586,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
+        ),
+        (
+            "script_helpers/validate_phase_curator.rs",
+            Via(DISPATCH, "curator recovery split out of validate_phase.rs; runs inside a dispatched sweep"),
         ),
         ("forge_rerun.rs", Gated),
         (
@@ -657,6 +735,14 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite(
                 "classifies an agent gh argv as a gateway read; the method/field flags it names \
                  are what keep a call off the gateway, runs none (2am#4367 P4)",
+            ),
+        ),
+        (
+            "agent_gh/write_span.rs",
+            NotAWrite(
+                "classifies the agent's own gh write argv for a span and re-runs it unchanged \
+                 as a child, in place of the exec it replaces: same argv, same credential, no \
+                 target chosen and no write added by the daemon (#13170)",
             ),
         ),
         (

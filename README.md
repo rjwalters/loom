@@ -185,7 +185,7 @@ stateDiagram-v2
 **Developer Experience**
 - Git worktree isolation per issue
 - Simple slash command: `/loom:sweep 42` runs a single issue end-to-end
-- MCP integration for programmatic control (30 tools)
+- MCP integration for programmatic control (22 tools)
 - Crash-safe checkpoints: restart `/loom:sweep N` to resume from the last completed phase
 
 ## Forge Support
@@ -249,6 +249,12 @@ your-repo/
 ├── .github/labels.yml   # Workflow labels
 └── CLAUDE.md            # AI context document
 ```
+
+The installer also makes user-level changes outside your repo (`--dry-run` lists them):
+
+- the `loom-daemon` binary in `~/.local/bin` (override with `LOOM_DAEMON_BIN_DIR`), keeping the previous one as `loom-daemon.previous`
+- a mirror of the defaults payload in `~/.local/share/loom-daemon/defaults` (override with `LOOM_DAEMON_DEFAULTS_DIR`)
+- user-scope guard hooks in `~/.claude/settings.json`, after a `settings.json.loom-backup-<timestamp>` backup
 
 ## Usage
 
@@ -347,6 +353,7 @@ gh pr create --label "loom:review-requested"
 | Document | Description |
 |----------|-------------|
 | [ADR Index](docs/adr/README.md) | Architecture decision records |
+| [Roadmap](docs/ROADMAP.md) | Where the project stands and what comes next |
 | [MCP Tools](docs/mcp/README.md) | Programmatic control interface |
 
 ### Repository Layout

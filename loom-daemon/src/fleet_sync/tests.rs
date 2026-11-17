@@ -14,7 +14,16 @@ use serde_json::json;
 
 use super::*;
 use crate::fleet_store::render::Tier;
-use crate::fleet_store::test_support::{location, sample_files, FakeForge};
+use crate::fleet_store::test_support::{location, sample_compiled, FakeForge};
+
+/// [`crate::fleet_store::test_support::sample_files`] plus the compiled
+/// `fleet.json` of the same store: the only roster, run-state and floor source
+/// (a legacy `repos.yml` / `fleet/state.yml` is no longer read).
+fn sample_files() -> std::collections::BTreeMap<String, String> {
+    let mut f = crate::fleet_store::test_support::sample_files();
+    f.insert("fleet.json".to_string(), sample_compiled().to_string());
+    f
+}
 
 fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: BTreeMap<String, String> = pairs
@@ -53,7 +62,7 @@ fn config_repo_enables_with_defaults() {
     assert_eq!(cfg.location.repo, "acme/fleet");
     assert_eq!(cfg.location.reference, "main");
     assert_eq!(cfg.interval.as_secs(), DEFAULT_SYNC_INTERVAL_SECS);
-    assert!(!cfg.auto_apply, "autoApply must default off (roster --apply deregisters)");
+    assert!(!cfg.auto_apply.any(), "autoApply must default off (roster --apply deregisters)");
 }
 
 #[test]
@@ -65,7 +74,7 @@ fn env_overrides_config_for_interval_and_auto_apply() {
         .expect("resolve")
         .expect("enabled");
     assert_eq!(cfg.interval.as_secs(), 120);
-    assert!(cfg.auto_apply);
+    assert!(cfg.auto_apply.any());
 }
 
 #[test]
@@ -85,7 +94,45 @@ fn non_truthy_auto_apply_env_reads_as_off() {
     let cfg = resolve_config(&config, &env)
         .expect("resolve")
         .expect("enabled");
-    assert!(!cfg.auto_apply, "an explicit env 0 must disarm the write path");
+    assert!(!cfg.auto_apply.any(), "an explicit env 0 must disarm the write path");
+}
+
+#[test]
+fn per_write_flags_resolve_over_the_umbrella() {
+    let writes = |fleet: serde_json::Value, env: &[(&str, &str)]| {
+        resolve_auto_apply_writes(&json!({ "fleet": fleet }), &env_from(env))
+    };
+    let only = |roster, config, resync, checkout| AutoApply {
+        roster,
+        config,
+        resync,
+        checkout,
+    };
+    // Nothing set: all off.
+    assert_eq!(writes(json!({}), &[]), AutoApply::default());
+    // Umbrella only: all four, as before.
+    assert_eq!(writes(json!({"autoApply": true}), &[]), AutoApply::ALL);
+    // Per-key only (the roster-only fleet shape).
+    assert_eq!(writes(json!({"autoApplyRoster": true}), &[]), only(true, false, false, false));
+    // An explicit false beats the umbrella.
+    assert_eq!(
+        writes(json!({"autoApply": true, "autoApplyResync": false}), &[]),
+        only(true, true, false, true)
+    );
+    // Env beats config, per key.
+    assert_eq!(
+        writes(json!({"autoApplyCheckout": true}), &[(AUTO_APPLY_CHECKOUT_ENV, "0")]),
+        AutoApply::default()
+    );
+    assert_eq!(
+        writes(json!({"autoApplyConfig": false}), &[(AUTO_APPLY_CONFIG_ENV, "1")]),
+        only(false, true, false, false)
+    );
+    // A non-boolean config value falls back to the umbrella.
+    assert_eq!(
+        writes(json!({"autoApply": true, "autoApplyRoster": "yes"}), &[]),
+        AutoApply::ALL
+    );
 }
 
 #[test]
@@ -486,10 +533,9 @@ fn roster_fails_closed_when_the_forge_cannot_confirm_it() {
 #[test]
 fn a_both_flags_record_is_a_hard_error_for_the_whole_roster() {
     let mut files = sample_files();
-    files.insert(
-        "repos.yml".to_string(),
-        "root: /srv/src\nrepos:\n  - name: app\n    fleet: true\n    firewall: true\n".to_string(),
-    );
+    let mut doc = sample_compiled();
+    doc["repos"][0]["firewall"] = json!(true);
+    files.insert("fleet.json".to_string(), doc.to_string());
     let forge = FakeForge::new(files);
     let cache = tempfile::tempdir().expect("cache");
     let err = plan_from(&forge, cache.path(), &[]).expect_err("both flags must be refused");
@@ -543,6 +589,7 @@ pub(crate) fn sample_status() -> FleetSyncStatus {
         at: Utc::now(),
         interval_secs: 300,
         auto_apply: false,
+        auto_apply_writes: AutoApply::default(),
         config: ConfigPass::default(),
         roster: RosterPass::default(),
         state: StatePass::default(),
@@ -833,13 +880,13 @@ fn a_state_that_could_not_be_read_is_never_silent() {
 fn valid(v: &str) -> Result<FloorRead, String> {
     Ok(FloorRead::Valid {
         version: v.to_string(),
-        source: "repos.yml",
+        source: "fleet.json",
     })
 }
 
 fn malformed() -> Result<FloorRead, String> {
     Ok(FloorRead::Malformed {
-        source: "repos.yml",
+        source: "fleet.json",
         detail: "got 1.2".to_string(),
     })
 }
@@ -855,7 +902,7 @@ fn an_absent_floor_is_unset_and_reports_nothing() {
 fn a_valid_floor_is_set_with_its_source() {
     let pass = resolve_floor(valid("0.19.831"), Some("0.19.830"));
     assert_eq!(pass.floor.as_deref(), Some("0.19.831"));
-    assert_eq!(pass.source.as_deref(), Some("repos.yml"));
+    assert_eq!(pass.source.as_deref(), Some("fleet.json"));
     assert!(!pass.carried);
     assert_eq!(pass.error, None);
 }
@@ -906,8 +953,9 @@ fn the_last_good_floor_survives_across_passes() {
 #[test]
 fn the_floor_half_reads_the_refreshed_cache_without_a_forge_request() {
     let mut files = sample_files();
-    let roster = files.get("repos.yml").cloned().expect("roster");
-    files.insert("repos.yml".to_string(), format!("loom_min_version: \"0.19.830\"\n{roster}"));
+    let mut doc = sample_compiled();
+    doc["loom_min_version"] = json!("0.19.830");
+    files.insert("fleet.json".to_string(), doc.to_string());
     let forge = FakeForge::new(files);
     let dir = tempfile::tempdir().expect("dir");
     let (machine, local) = tier_paths(dir.path());
@@ -926,7 +974,7 @@ fn the_floor_half_reads_the_refreshed_cache_without_a_forge_request() {
 
     let pass = floor_half(&cache, &location(), None, Utc::now());
     assert_eq!(pass.floor.as_deref(), Some("0.19.830"));
-    assert_eq!(pass.source.as_deref(), Some("repos.yml"));
+    assert_eq!(pass.source.as_deref(), Some("fleet.json"));
     assert!(forge.calls.borrow().is_empty(), "no extra forge request");
 
     // A store change lands on the next pass with no restart.
@@ -998,7 +1046,7 @@ fn status_line_shows_the_floor_and_a_malformed_one_is_an_error() {
     let mut status = sample_status();
     status.floor = resolve_floor(valid("0.19.830"), None);
     let block = render_line(Some(&status), Utc::now()).expect("block");
-    assert!(block.contains("loom_min_version: 0.19.830 (from repos.yml)"), "{block}");
+    assert!(block.contains("loom_min_version: 0.19.830 (from fleet.json)"), "{block}");
     assert!(!status.errored());
 
     status.floor = resolve_floor(malformed(), Some("0.19.830"));

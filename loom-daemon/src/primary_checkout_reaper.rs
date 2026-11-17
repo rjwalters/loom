@@ -678,7 +678,6 @@ pub async fn reap_primary_checkout_for(root: &Path) {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::process::Stdio;
 
     // ===================================================================
     // Pure decision logic — scripted probes, no `git`/forge/clock
@@ -931,17 +930,7 @@ mod tests {
     // `make_origin_and_clone` pattern.
     // ===================================================================
 
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", dir.display());
-    }
+    use crate::test_git_helpers::run as git;
 
     /// Bare `origin` seeded with an initial `main` commit, plus a working
     /// clone checked out on `main`. Returns `(origin_dir, clone_dir)` — both

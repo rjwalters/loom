@@ -17,7 +17,7 @@ pub(crate) struct TelemetryExportArgs {
 }
 impl TelemetryExportArgs {
     pub(crate) async fn run(self) -> Result<()> {
-        use loom_daemon::observability::{endpoint_policy, exporter::Exporter, otlp::OtlpExporter};
+        use crate::observability::{endpoint_policy, exporter::Exporter, otlp::OtlpExporter};
         use std::io::Read;
         anyhow::ensure!(
             endpoint_policy::reserved_placeholder_host(&self.endpoint).is_none(),
@@ -33,7 +33,7 @@ impl TelemetryExportArgs {
             .read_to_end(&mut input)?;
         anyhow::ensure!(input.len() <= 1_048_576, "fixture exceeds 1 MiB");
         let text = std::str::from_utf8(&input)?;
-        let envelopes: Vec<loom_daemon::telemetry::TelemetryEnvelope> = text
+        let envelopes: Vec<crate::telemetry::TelemetryEnvelope> = text
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(serde_json::from_str)

@@ -1,4 +1,6 @@
-//! The systemd unit no longer carries the dispatcher's autonomy env (#11951).
+//! The systemd unit no longer carries the dispatcher's autonomy env (#11951),
+//! nor its runtime path/identity env (`LOOM_PID_FILE`, `LOOM_WORKSPACE`,
+//! `LOOM_HOST_ID`, #13692).
 //!
 //! # The ruling
 //!
@@ -40,11 +42,24 @@ use super::args::Want;
 use super::out;
 
 /// The keys a rendered systemd unit never carries (#11951).
-pub const UNRENDERED_KEYS: [&str; 4] = [
+///
+/// The last three are the daemon's own runtime path/identity env, not
+/// autonomy settings (#13692): an auto-update relaunch renders from the running
+/// daemon's env, which would freeze them into the unit, where they outrank the
+/// config tiers (and the worker spec's `UNIT_AUTONOMY_KEYS` drift check flags
+/// them). The daemon resolves its pid file (`daemon_pidfile` machine/repo/
+/// `<loom_dir>` tiers), workspace and host id (`fleet.hostId`, the hostname)
+/// from its fallbacks when unset. `daemon_start/mod.rs` still exports the
+/// derived `LOOM_PID_FILE` to the stop/update/watchdog ends; only the unit's
+/// copy goes.
+pub const UNRENDERED_KEYS: [&str; 7] = [
     "LOOM_WORK_FINDER",
     "LOOM_MAIN_HEALTH_GATE",
     "LOOM_FORCE_SCOPE",
     "LOOM_GUARD_DECISION_LOG",
+    "LOOM_PID_FILE",
+    "LOOM_WORKSPACE",
+    "LOOM_HOST_ID",
 ];
 
 /// The two dispatch loops, with the flag that asks for each and the config key
@@ -58,11 +73,6 @@ const LOOPS: [(&str, &str, &str); 2] = [
 #[must_use]
 pub fn is_unrendered_key(key: &str) -> bool {
     UNRENDERED_KEYS.contains(&key)
-}
-
-/// The daemon's own truthiness test for a loop's env value.
-fn truthy(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 /// `<unit path>.d` — the user drop-in directory systemd reads for the unit.
@@ -202,7 +212,7 @@ impl Layer {
             return false;
         };
         match &self.dropin[i] {
-            Some(v) => truthy(v),
+            Some(v) => crate::env_flag::parse_truthy(v),
             None => self.config[i] == Some(true),
         }
     }
@@ -242,7 +252,8 @@ fn asked_on(want: Want, pre_exported: &str, flag: &str, key: &str) -> Option<Str
     if want == Want::On {
         return Some(flag.to_string());
     }
-    (want == Want::Unset && truthy(pre_exported)).then(|| format!("exported {key}={pre_exported}"))
+    (want == Want::Unset && crate::env_flag::parse_truthy(pre_exported))
+        .then(|| format!("exported {key}={pre_exported}"))
 }
 
 /// A loop this invocation asked to be on that the re-rendered unit cannot turn

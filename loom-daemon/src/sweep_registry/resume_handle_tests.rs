@@ -88,9 +88,6 @@ fn stamping_and_the_snapshot_round_trip_through_owner_json() {
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].pid, 999);
     assert_eq!(snap[0].resume_handle.as_ref().unwrap().session_id, s.claude_session_id);
-    let input = snap[0].classify_input(chrono::Utc::now() + chrono::Duration::seconds(600));
-    assert!(input.agent_age_secs.unwrap() >= 599);
-    assert_eq!(input.session_id, s.claude_session_id);
 }
 
 #[test]

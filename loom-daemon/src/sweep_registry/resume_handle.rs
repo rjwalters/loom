@@ -266,7 +266,6 @@ impl DispatchSession {
 }
 
 /// One in-flight agent, as the H4 classifier (PR 2) sees it.
-#[allow(dead_code)] // consumed by the H4 pause (#10831); exercised by tests here
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InFlightAgent {
     pub(crate) issue: u32,
@@ -277,34 +276,6 @@ pub(crate) struct InFlightAgent {
     pub(crate) scope_unit: Option<String>,
     pub(crate) agent_started_at: Option<String>,
     pub(crate) resume_handle: Option<ResumeHandle>,
-}
-
-#[allow(dead_code)] // consumed by the H4 pause (#10831)
-impl InFlightAgent {
-    /// The classifier input at `now`.
-    pub(crate) fn classify_input(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> crate::auto_update::pause_classify::ClassifyInput {
-        use crate::auto_update::pause_manifest::{ItemKind, Runtime};
-        let age = self
-            .agent_started_at
-            .as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .and_then(|t| u64::try_from((now - t.with_timezone(&chrono::Utc)).num_seconds()).ok());
-        crate::auto_update::pause_classify::ClassifyInput {
-            kind: ItemKind::Sweep,
-            agent_age_secs: age,
-            runtime: self
-                .resume_handle
-                .as_ref()
-                .map(|h| Runtime::from(h.runtime.clone())),
-            session_id: self
-                .resume_handle
-                .as_ref()
-                .and_then(|h| h.session_id.clone()),
-        }
-    }
 }
 
 /// Fill a dispatch-time handle with what the spawn script captured after
@@ -382,7 +353,6 @@ impl SweepRegistry {
     /// Every live claim lock of this registry as an in-flight agent, with its
     /// resume handle (and any live-captured Codex session id) merged in. The
     /// H4 classifier's input (PR 2); read-only.
-    #[allow(dead_code)] // consumed by the H4 pause (#10831)
     pub(crate) fn in_flight_snapshot(&self) -> Vec<InFlightAgent> {
         let pause_root = roll_pause::default_pause_root(&self.config.workspace_root);
         let Ok(entries) = std::fs::read_dir(self.config.locks_dir()) else {

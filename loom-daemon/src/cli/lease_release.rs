@@ -29,12 +29,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::comment_trust::TrustPolicy;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::host_identity::lease_host_identity;
+use crate::sweep_registry::opaque_host_id;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use loom_daemon::comment_trust::TrustPolicy;
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::host_identity::lease_host_identity;
-use loom_daemon::sweep_registry::opaque_host_id;
 
 use super::lease_co_occupancy::{live_pairs, read_rows, LeaseRow};
 use super::lease_renewer::{self, Store};
@@ -93,9 +93,15 @@ pub(crate) enum Outcome {
     /// Another host holds a live lease; nothing was touched.
     Refused(Vec<(String, String)>),
     /// `renewers` stopped, `yielded` records posted.
-    Released { renewers: usize, yielded: usize },
+    Released {
+        renewers: Vec<(u32, String)>,
+        yielded: usize,
+    },
     /// A yield could not be posted; re-running is safe.
-    PostFailed { renewers: usize, sweep: String },
+    PostFailed {
+        renewers: Vec<(u32, String)>,
+        sweep: String,
+    },
 }
 
 /// The whole decision, with the forge post and the process table injected.
@@ -113,10 +119,17 @@ pub(crate) fn release_lease(
     if !plan.foreign.is_empty() {
         return Ok(Outcome::Refused(plan.foreign.clone()));
     }
-    let mut renewers = 0;
+    let mut renewers = Vec::new();
     for host in mine {
-        renewers +=
-            lease_renewer::end_owners(store, repo, issue, Some(host), None, is_live, signal)?;
+        renewers.extend(lease_renewer::end_owners_detail(
+            store,
+            repo,
+            issue,
+            Some(host),
+            None,
+            is_live,
+            signal,
+        )?);
     }
     for (host, sweep) in &plan.own {
         if !post(&yield_body(host, sweep)) {
@@ -132,18 +145,30 @@ pub(crate) fn release_lease(
     })
 }
 
+/// `pid=N sweep=ID, …` for the renewers a release stopped (#13252).
+fn describe_renewers(renewers: &[(u32, String)]) -> String {
+    if renewers.is_empty() {
+        return "none".into();
+    }
+    renewers
+        .iter()
+        .map(|(pid, sweep)| format!("pid={pid} sweep={sweep}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Every id this host's leases may carry: the opaque published id, and the raw
 /// one when `LOOM_LEASE_PUBLISH_HOSTNAME` opted in.
-fn my_host_ids() -> Vec<String> {
+pub(crate) fn my_host_ids() -> Vec<String> {
     let raw = lease_host_identity();
     vec![opaque_host_id(&raw), raw]
 }
 
 fn post_comment(gh_bin: &Path, root: &Path, issue: u64, body: &str) -> bool {
-    use loom_daemon::forge_call_stats::ops;
-    let nwo = match loom_daemon::write_scope::may_write_from(root, None) {
-        loom_daemon::write_scope::Verdict::Allow(nwo) => nwo,
-        loom_daemon::write_scope::Verdict::Deny(why) => {
+    use crate::forge_call_stats::ops;
+    let nwo = match crate::write_scope::may_write_from(root, None) {
+        crate::write_scope::Verdict::Allow(nwo) => nwo,
+        crate::write_scope::Verdict::Deny(why) => {
             eprintln!("lease release: refusing to write here (#9548): {why}");
             return false;
         }
@@ -227,17 +252,21 @@ impl LeaseReleaseArgs {
             }
             Outcome::Released { renewers, yielded } => {
                 eprintln!(
-                    "lease release: issue #{}: stopped {renewers} renewer(s), posted {yielded} \
+                    "lease release: issue #{}: stopped {} renewer(s) ({}), posted {yielded} \
                      yield record(s)",
-                    self.issue
+                    self.issue,
+                    renewers.len(),
+                    describe_renewers(&renewers)
                 );
                 Ok(())
             }
             Outcome::PostFailed { renewers, sweep } => {
                 eprintln!(
-                    "lease release: issue #{}: stopped {renewers} renewer(s) but could not post \
+                    "lease release: issue #{}: stopped {} renewer(s) ({}) but could not post \
                      the yield for sweep {sweep}; re-run to retry",
-                    self.issue
+                    self.issue,
+                    renewers.len(),
+                    describe_renewers(&renewers)
                 );
                 std::process::exit(1);
             }

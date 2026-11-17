@@ -35,7 +35,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::telemetry::kinds::fleet_state::FleetStage;
 use crate::telemetry::provenance::Provenance;
 
 /// `source` values: what observed the start.
@@ -64,6 +63,61 @@ pub mod role {
     /// A sweep's own merge phase (the role name `sweep-checkpoint begin` uses).
     pub const MERGE: &str = "merge";
     pub const CHAMPION: &str = "champion";
+}
+
+/// The stage an item is in, in a work-start fact. Neutral (not tied to any
+/// estimator); the wire strings are the stage names `fleet.state` (retired,
+/// #12094) established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum FleetStage {
+    /// Ready (`loom:issue`), in this host's dispatch plan.
+    #[serde(rename = "ready_wait")]
+    ReadyWait,
+    /// A sweep on this host, from dispatch until its Curator phase completes.
+    #[serde(rename = "sweep.curator")]
+    SweepCurator,
+    /// A sweep on this host, Curator done, Builder not yet done.
+    #[serde(rename = "sweep.builder")]
+    SweepBuilder,
+    /// A PR waiting for, or receiving, a Judge verdict.
+    #[serde(rename = "review_wait")]
+    ReviewWait,
+    /// Doctor rework after `loom:changes-requested`.
+    #[serde(rename = "doctor")]
+    Doctor,
+    /// Approved (`loom:pr`), waiting to merge.
+    #[serde(rename = "merge_wait")]
+    MergeWait,
+    /// Approved, held for a human by an operator hold label.
+    #[serde(rename = "merge_hold")]
+    MergeHold,
+    /// Pre-ready: from the issue's creation (or latest reopen) until
+    /// `loom:curated`, or `loom:issue` for a one-step promotion (#11368).
+    /// Pre-ready stage.
+    #[serde(rename = "triage_wait")]
+    TriageWait,
+    /// Pre-ready: from `loom:curated` until `loom:issue` (#11368). Only ever
+    /// a pre-ready stage.
+    #[serde(rename = "approval_wait")]
+    ApprovalWait,
+}
+
+impl FleetStage {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetStage::ReadyWait => "ready_wait",
+            FleetStage::SweepCurator => "sweep.curator",
+            FleetStage::SweepBuilder => "sweep.builder",
+            FleetStage::ReviewWait => "review_wait",
+            FleetStage::Doctor => "doctor",
+            FleetStage::MergeWait => "merge_wait",
+            FleetStage::MergeHold => "merge_hold",
+            FleetStage::TriageWait => "triage_wait",
+            FleetStage::ApprovalWait => "approval_wait",
+        }
+    }
 }
 
 /// The `dispatch_origin` of a role-runner tick's start. A sweep's start carries

@@ -10,12 +10,9 @@
 #   - wt_write_mktemp_same_command_safe()   (#6949, worktree-write-confinement-
 #                                            unresolved-var)
 #
-# WHY A SEPARATE SUITE rather than extending the two existing ones: the
-# write-confinement suite is at its recorded size in
-# scripts/file-size-baseline.txt (frozen — it may shrink, not grow, see
-# .loom/docs/file-size-policy.md), so the ratchet's own preferred remedy is a
-# new sibling file. Keeping the rm-scope half here too means the whole
-# mechanism is asserted in one readable place instead of split across three.
+# WHY A SEPARATE SUITE rather than extending the two existing ones: keeping
+# both halves here means the whole mechanism is asserted in one readable place
+# instead of split across three.
 #
 # Usage: ./tests/hooks/test-guard-destructive-mktemp-canon.sh
 
@@ -180,8 +177,8 @@ assert_deny "write-confinement (#7986 regression): mktemp then arbitrary reassig
 
 # ---- #8221: the write-confinement sibling of the rm-scope fix above -----
 # New test cases land HERE rather than in test-guard-destructive-write-
-# confinement.sh (frozen at its scripts/file-size-baseline.txt size, same
-# reason #7986's own cases live in this sibling file -- see the suite header).
+# confinement.sh, for the same reason #7986's own cases live in this sibling
+# file -- see the suite header.
 #
 # The same ambiguity-counting gap: a same-command rebind of the mktemp-
 # captured variable via a declaration keyword or an `=`-free mechanism

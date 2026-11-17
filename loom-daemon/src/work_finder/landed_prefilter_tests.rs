@@ -730,6 +730,7 @@ fn the_closes_graph_read_goes_to_the_reader_pool_and_is_shed_not_spilled() {
         gh_bin: PathBuf::from("gh"),
         root: root.path().to_path_buf(),
         slug: "acme/shed".to_string(),
+        reads: 0,
     };
     assert_eq!(forge.closing_verdicts(&[5, 6]), None, "a shed is no verdict");
     assert_eq!(sheds(), 1, "shed, never run on the writer");

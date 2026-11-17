@@ -545,10 +545,19 @@ matched line is captured, not just the first (#4508):
 | Depends on | `Depends on #123`, `_Depends on_ #123` |
 | Requires | `Requires #123` |
 | Task list (unchecked only) | `- [ ] #123: Description` — a checked `- [x] #123` records done work, not a gate (#7973) |
+| Park record (wins) | `<!-- loom:park Blocked by: #123 ... -->` — when present, ONLY these lines are gates; unchecked acceptance-criterion `- [ ] #N` lines in the same body are not (#13414) |
 
 ```bash
 parse_dependencies() {
   local body="$1"
+  # Park record wins (#13414): a body carrying `<!-- loom:park ... -->` names its
+  # gates there; ordinary `- [ ] #N` acceptance criteria must not count.
+  if grep -qE '^[[:space:]]*<!-- loom:park ' <<<"$body"; then
+    grep -E '^[[:space:]]*<!-- loom:park [*_:[:space:]]*Blocked by' <<<"$body" \
+      | sed -E 's/^[[:space:]]*<!-- loom:park //; s/ by=.*//' \
+      | grep -oE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' | sed 's/^#//' | sort -u
+    return
+  fi
   # Two-stage parse (#4508): select dependency lines (checkbox UNCHECKED-only,
   # #7973), then extract every N / OWNER/REPO#N.
   echo "$body" \
@@ -676,6 +685,11 @@ has_permanent_block() {  # unreadable => true
   jq -e 'any(.[]; (.body // "") | test("(^|\n)[ \t]*<!-- loom:permanent-block -->[ \t\r]*(\n|$)"))' <<<"$t" >/dev/null && echo true || echo false
 }
 
+has_restore_note() {  # #13414: latest trusted comment is a Champion/operator hold-restore note; unreadable => true
+  local t; t=$(loom-daemon forge trusted-comments --fetch "$1" --with-body 2>/dev/null) || { echo true; return; }
+  jq -e '(. | last | .body // "") | test("(^|\n)[ \t]*<!-- loom:hold-restored -->[ \t\r]*(\n|$)")' <<<"$t" >/dev/null && echo true || echo false
+}
+
 check_and_unblock() {
   # --limit: gh defaults to 30 (#10553)
   local blocked_limit=1000 blocked_json blocked_count
@@ -691,6 +705,7 @@ check_and_unblock() {
     local title=$(printf '%s\n' "$issue" | jq -r '.title')
 
     [ "$(has_permanent_block "$number")" = "true" ] && continue  # #8742
+    [ "$(has_restore_note "$number")" = "true" ] && continue  # #13414: Champion/operator restored the hold
 
     local deps=$(parse_dependencies "$body")
 
@@ -725,7 +740,22 @@ check_and_unblock() {
       # was blocked. An issue blocked pre-approval (e.g. Curator-blocked) must
       # NOT be promoted into the Builder queue — just clear loom:blocked and let
       # it re-enter the curation/approval flow.
-      if [ "$(was_previously_approved "$number")" = "true" ]; then
+      # Split-parent gate (#13635): a tracker whose children are all closed is
+      # not work. `loom:issue` in its history can be an operator's accidental
+      # add/remove, so approval archaeology alone would promote it to a Builder.
+      # Exit 0 = split + all closed; 1 = not split; anything else = unreadable,
+      # which fails closed (no promotion).
+      split_out=$(loom-daemon forge parent split-state --parent "$number" 2>/dev/null); split_rc=$?
+      if [ "$split_rc" != "1" ]; then
+        gh issue edit "$number" --remove-label "loom:blocked"
+        if [ "$split_rc" = "0" ]; then
+          ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: Dependencies resolved ($resolved_deps), and this is a split tracker whose children are all closed (${split_out#SPLIT_ALL_CLOSED }). Not restoring \`loom:issue\`: the children carry the code, so a Builder has nothing to build. It re-enters intake/curation, where Curator can close it as already covered."
+          echo "Unblocked #$number (split parent, children all closed; no loom:issue): $title"
+        else
+          ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: Dependencies resolved ($resolved_deps). Could not read this issue's children, so \`loom:issue\` was not restored (fail closed); it re-enters intake/curation."
+          echo "Unblocked #$number (children unreadable; no loom:issue): $title"
+        fi
+      elif [ "$(was_previously_approved "$number")" = "true" ]; then
         gh issue edit "$number" --remove-label "loom:blocked" --add-label "loom:issue"
         ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: Dependencies resolved ($resolved_deps). Restored \`loom:issue\` (previously approved). Ready for implementation."
         echo "Unblocked #$number (restored loom:issue): $title"
@@ -740,6 +770,8 @@ check_and_unblock() {
   # Pull requests (#8925): a SEPARATE enumeration (`gh issue list` never
   # surfaces a PR) — see "Problem: Stuck Blocked Issues".
   check_and_unblock_prs
+  convert_awaiting_revision_parks  # #10936: unnamed awaiting-revision parks -> revise path
+  release_due_transient_parks      # #13606: expired `--transient` parks release by `until`
 }
 ```
 
@@ -751,6 +783,113 @@ PR's. `check_and_unblock_prs`, `pr_has_superseding_block` and
 `previous_review_label` are defined in full, with a worked example, in
 `.loom/docs/park-record.md#the-unblock-sweeps-pr-side-functions`
 — read on demand, not inlined here.
+
+### Awaiting-Revision Parks → Revise Path (#10936)
+
+A `loom:blocked` **issue** whose park names no blocker and whose reason is only
+"awaiting (Architect) revision" / "awaiting a design epic" is read by no role:
+this sweep needs a named blocker, Curator's queues exclude `loom:blocked`. Move
+it onto the revise path Curator already handles ("Revising a Champion
+send-back" in `curator.md`) — no new label. `convert_awaiting_revision_parks`
+runs right after `check_and_unblock`; it converts in one step (remove
+`loom:blocked`, add `loom:triage`, strip the park record, post the revision ask)
+and leaves **alone** anything that:
+
+- names any `Blocked by:` ref (open or cross-repo; the normal sweep owns it) or
+  whose reason is not an awaiting-revision/design-epic one;
+- carries `loom:operator`, `loom:frozen`, `loom:building`, `loom:curating`, or a
+  `<!-- loom:permanent-block` marker (`has_permanent_block`);
+- has a park record whose `at=` is more than 5 min older than the latest
+  `loom:blocked` application (the block was re-applied for another reason);
+- is a pull request (`gh issue list` never returns one, and PRs are not converted).
+
+```bash
+awaiting_revision_park() {  # $1=body [$2=ISO time of latest loom:blocked label]; 0 = convertible
+  local body="$1" blocked_at="${2:-}" rec at a b
+  rec=$(grep -E '^[[:space:]]*<!-- loom:park ' <<<"$body" | tail -1)
+  [ -n "$rec" ] || return 1
+  grep -qE 'Blocked by:[*_[:space:]]*\(unstated\)' <<<"$rec" || return 1  # any named ref => normal sweep
+  grep -qiE 'reason="[^"]*(awaiting[^"]*revision|awaiting[^"]*design epic)' <<<"$rec" || return 1
+  if [ -n "$blocked_at" ]; then
+    at=$(sed -nE 's/.* at=([^ ]+).*/\1/p' <<<"$rec")
+    a=$(date -u -d "$at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$at" +%s 2>/dev/null) || return 1
+    b=$(date -u -d "$blocked_at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$blocked_at" +%s 2>/dev/null) || return 1
+    [ "$a" -ge $((b - 300)) ] || return 1  # stale record: block re-applied since
+  fi
+  return 0
+}
+
+release_due_transient_parks() {
+  # #13606: a park written with `park-record apply --transient <cause>` carries
+  # its own retry time. Releasing it needs no dependency and no person.
+  # Preventing: capacity refusals (batch_no_capacity) parked as a plain reason
+  # never released, stranding seven issues on 2026-11-05.
+  # Only the LAST park record counts (a later blocker/reason park supersedes it);
+  # a legacy park (`transient` null) is never touched here.
+  "$GH_READ" issue list --label "loom:blocked" --state open --limit 1000 --json number,body,labels \
+    | jq -c '.[] | select(any(.labels[]?.name; IN("loom:operator","loom:frozen","loom:building","loom:curating")) | not)' \
+    | while read -r issue; do
+    local number body recs t cause attempt first_at age_days
+    number=$(jq -r '.number' <<<"$issue"); body=$(jq -r '.body // ""' <<<"$issue")
+    grep -q 'transient=' <<<"$body" || continue   # cheap body check before any API call
+    recs=$(loom-daemon park-record parse --json <<<"$body") || continue
+    t=$(jq -c '.records | last | .transient // empty' <<<"$recs")
+    [ -n "$t" ] || continue                                  # last record is not transient
+    cause=$(jq -r '.cause' <<<"$t"); attempt=$(jq -r '.attempt' <<<"$t")
+    # `due` is computed by the daemon (transient_due): a missing/garbled `until` is due.
+    [ "$(jq -r '.due' <<<"$t")" = "true" ] || continue       # unexpired: leave alone
+    [ "$(has_permanent_block "$number")" = "true" ] && continue
+    [ "$(has_restore_note "$number")" = "true" ] && continue
+
+    # Escalate once at attempt >= 6 or park age >= 7 days: a comment, never a hold.
+    # Age runs from the start of the TRAILING chain (last attempt==1 record for the
+    # cause): apply.rs resets the chain after TRANSIENT_CHAIN_RESET_SECS, so older
+    # records from a prior chain must not count (#13615).
+    first_at=$(jq -r --arg c "$cause" '[.records[] | select(.transient.cause == $c)] | (map(.transient.attempt == 1) | rindex(true) // 0) as $i | .[$i].at // empty' <<<"$recs")
+    age_days=0
+    if [ -n "$first_at" ]; then
+      local fe; fe=$(date -u -d "$first_at" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$first_at" +%s 2>/dev/null) \
+        && age_days=$(( ($(date -u +%s) - fe) / 86400 ))
+    fi
+    if [ "$(jq -r '.escalate' <<<"$t")" = "true" ] || [ "$age_days" -ge 7 ]; then
+      local esc="<!-- loom:transient-escalated cause=$cause -->"   # one per issue+cause
+      if [ "$(loom-daemon forge trusted-comments --fetch "$number" --with-body 2>/dev/null | jq -r --arg m "$esc" 'any(.[]; (.body // "") | contains($m))')" != "true" ]; then
+        ./.loom/scripts/post-comment.sh "$number" --body "**Guide: transient park not clearing** — \`$cause\` has refused $attempt time(s) over ~${age_days}d. Retrying continues at the 24 h cap; no hold is added. A person may want to look at the cause itself.
+$esc"
+      fi
+    fi
+
+    if [ "$(was_previously_approved "$number")" = "true" ]; then
+      gh issue edit "$number" --remove-label "loom:blocked" --add-label "loom:issue" || continue
+    else
+      gh issue edit "$number" --remove-label "loom:blocked" || continue
+    fi
+    ./.loom/scripts/post-comment.sh "$number" --body "🔓 **Unblocked**: transient park \`$cause\` (attempt $attempt) reached its retry time. The park record stays in the body so a re-park counts attempt $((attempt + 1))."
+    echo "Released transient park #$number cause=$cause attempt=$attempt"
+  done
+}
+
+convert_awaiting_revision_parks() {
+  "$GH_READ" issue list --label "loom:blocked" --state open --limit 1000 --json number,title,body,labels \
+    | jq -c '.[] | select(any(.labels[]?.name; IN("loom:operator","loom:frozen","loom:building","loom:curating")) | not)' \
+    | while read -r issue; do
+    local number title body blocked_at newbody H
+    number=$(jq -r '.number' <<<"$issue"); title=$(jq -r '.title' <<<"$issue"); body=$(jq -r '.body // ""' <<<"$issue")
+    awaiting_revision_park "$body" || continue   # cheap body check before any API call
+    [ "$(has_permanent_block "$number")" = "true" ] && continue
+    blocked_at=$(gh api --paginate "repos/{owner}/{repo}/issues/${number}/events?per_page=100" \
+      --jq '.[] | select(.event=="labeled" and .label.name=="loom:blocked") | .created_at' | tail -1)
+    awaiting_revision_park "$body" "$blocked_at" || continue
+    newbody=$(grep -vE '^[[:space:]]*<!-- loom:park .* -->[[:space:]]*$' <<<"$body")
+    gh issue edit "$number" --body "$newbody" && gh issue edit "$number" --remove-label "loom:blocked" --add-label "loom:triage" || continue
+    # Curator keys on the hash of the CURRENT title + body (curator.md "Revising a Champion send-back")
+    H=$(printf '%s\n%s' "$title" "$newbody" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)
+    ./.loom/scripts/post-comment.sh "$number" --body "**Guide: NEEDS REVISION** — this issue was parked only as awaiting a revision/design epic, with no named blocker, so no role would act on it. Moved to the revise path (\`loom:triage\`, park record removed). Curator: revise the body per the park reason, or split/close/decide per \`curator.md\` \"Revising a Champion send-back\".
+<!-- champion:revise:body-$H -->"
+    echo "Converted #$number to revise path: $title"
+  done
+}
+```
 
 ### Example Unblocking Flow
 
@@ -2118,43 +2257,56 @@ Guide-filed PR still has to clear Judge (and possibly Doctor), so filing one
 at exactly the worst time competes with substantive work for the resource
 under the most pressure.
 
-**Cheap by construction (AC4):** this reads the **already-written**
-`.loom/tokens/.ranking` file — the running daemon self-refreshes it on its
-own ~10-minute loop (`autonomous.tokenRankingRefresh`, see
+**Cheap by construction (AC4):** `loom-daemon tokens pressure` parses the
+**already-written** ranking file — the running daemon self-refreshes it on
+its own ~10-minute loop (`autonomous.tokenRankingRefresh`, see
 `.loom/docs/token-pool.md`) — rather than
 invoking `loom-daemon tokens check --ranking`, which would trigger a fresh
 per-account probe (a real, if minimal, request against the very pool this
-check exists to protect) on every dry-queue tick. A plain file read costs
-nothing. Missing/empty/unparseable ranking data fails **open** (proceeds as
-if there is no pressure) — the same fail-open posture the rest of this phase
-uses for best-effort forge probes; a missing telemetry file is not evidence
-of pressure, and starving doc maintenance because the ranking file happens to
-be absent would be worse than occasionally filing without one.
+check exists to protect) on every dry-queue tick. The verb is filesystem-only
+and costs nothing. Missing/empty/unparseable ranking data fails **open**
+(prints `0`, so this proceeds as if there is no pressure) — the same
+fail-open posture the rest of this phase uses for best-effort forge probes; a
+missing telemetry file is not evidence of pressure, and starving doc
+maintenance because the ranking file happens to be absent would be worse than
+occasionally filing without one.
+
+**Why a verb and not a file read (#13839):** do **not** open the pool
+directory yourself. Reading a path under `.loom/tokens` fails twice over.
+First, the role-tool-policy hook (#8256) treats that directory as a
+credential store, and `guide`'s `toolPolicy.allowedCapabilities` is empty, so
+a Bash call naming the path is denied *at the harness* — and the denial takes
+down the whole call, not just the one read, so a Guide that batches this with
+other commands loses all of them. Second, the path would be wrong anyway: the
+pool usually resolves to the shared machine-level directory
+(`~/.loom/tokens`, `$LOOM_SHARED_TOKENS_DIR`), not to a repo-local one, so a
+hardcoded `<repo>/.loom/tokens/.ranking` silently reports "no pressure" on
+every shared-pool host. The verb resolves the same directory the ranking
+writer targets and prints only a number — no account names, no statuses, no
+token material — which is precisely why a role without the
+`credential-store` capability may call it. `guide.json` stays unchanged.
 
 ```bash
-# Fraction of pool accounts NOT `available` (0.0-1.0), read straight off the
-# `.ranking` file's pipe-delimited `name|status|5h_util|limit_reset` lines
-# (token-pool.md "Account health probe + ranking") -- never a fresh probe.
-# A malformed row (empty status field) is treated as available (fail open),
-# never counted as pressure.
+# Fraction of pool accounts NOT `available` (0.0-1.0), obtained from
+# `loom-daemon tokens pressure` -- a filesystem-only read of the ranking the
+# daemon already refreshes (token-pool.md "Account health probe + ranking"),
+# never a fresh probe. The verb resolves the pool the SAME way the ranking
+# writer does (repo-local, else the shared machine-level pool), which a
+# hardcoded path here could not, and it prints only this number, so no
+# `credential-store` capability is needed (#13839).
+#
+# Fails open to "0" on anything unexpected: a daemon too old to know the verb
+# (exit != 0), a verb that printed nothing, or output that is not a bare
+# number. The verb itself already prints "0" for an absent, unreadable, or
+# unparseable ranking, so the no-data and no-pressure cases agree.
 pool_pressure_fraction() {
-  local ranking="$(git rev-parse --show-toplevel 2>/dev/null)/.loom/tokens/.ranking"
-  [ -f "$ranking" ] || { echo "0"; return; }
-
-  local total unavailable
-  # `grep -c` exits 1 (a normal "zero matches" result, not an error) on an
-  # empty/no-pipe file while still printing "0" to stdout -- an `|| echo 0`
-  # fallback here would fire on that same exit 1 and duplicate the output
-  # into two lines ("0\n0"), corrupting the arithmetic below. `grep -c`
-  # always prints exactly one numeric line regardless of match count, so no
-  # fallback is needed; only guard against a genuinely empty capture.
-  total=$(grep -c '|' "$ranking" 2>/dev/null)
-  if [ -z "$total" ] || [ "$total" -eq 0 ]; then
-    echo "0"
-    return
-  fi
-  unavailable=$(awk -F'|' '$2 != "" && $2 != "available" { c++ } END { print c+0 }' "$ranking")
-  awk -v u="$unavailable" -v t="$total" 'BEGIN { printf "%.4f", u/t }'
+  local out
+  out="$(loom-daemon tokens pressure --workspace "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" 2>/dev/null)" \
+    || { echo "0"; return; }
+  case "$out" in
+    '' | *[!0-9.]*) echo "0" ;;
+    *) echo "$out" ;;
+  esac
 }
 
 # Epoch seconds of the most recently MERGED docs-maintenance PR of ANY kind
@@ -2543,8 +2695,10 @@ Document Maintenance Phase
   (and possibly Doctor), competing with substantive work for the pool's
   scarcest capacity at exactly the moment other roles are retrying against
   a shrinking set of available accounts. Gated on `pool_pressure_fraction()`
-  (a cheap read of the already-refreshed `.loom/tokens/.ranking` file, never
-  a fresh probe) against `guide.docsMaintenance.poolPressureThreshold`
+  (`loom-daemon tokens pressure`: a filesystem-only read of the
+  already-refreshed ranking, never a fresh probe — and never a direct read
+  inside the token pool, which `guide`'s tool policy denies, #13839) against
+  `guide.docsMaintenance.poolPressureThreshold`
   (default 0.70), and bounded by an absolute
   `guide.docsMaintenance.poolPressureMaxDeferSecs` ceiling (default 14400 =
   4h) so doc maintenance never starves permanently even if pressure never

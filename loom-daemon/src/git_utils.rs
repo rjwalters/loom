@@ -4,9 +4,25 @@
 //! agent prompts, enabling correlation of prompts with code changes.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use crate::activity::PromptChanges;
+
+/// Run `git -C <dir> <args>` and return the raw [`Output`].
+///
+/// Shared runner for the private `git(dir, args)` wrappers: stdin is null,
+/// stdout and stderr are piped, and there is no timeout or env tweaking.
+/// Callers keep a thin adapter for their own return shape (decode/trim).
+pub fn git_run(dir: &Path, args: &[&str]) -> std::io::Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+}
 
 /// Capture the current HEAD commit hash
 pub fn get_current_commit(working_dir: &Path) -> Option<String> {
@@ -419,16 +435,7 @@ mod tests {
     // `#[serial]` test (the single largest env-mutation lock domain in this
     // crate) — closing the race window instead of just hiding the symptom by
     // serializing this module against itself.
-    fn git(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?} failed in {}", dir.display());
-    }
+    use crate::test_git_helpers::run as git;
 
     /// A repo with `main` at one commit and a `feature` branch (checked out)
     /// carrying one additional commit that adds `new.txt` (3 lines) and

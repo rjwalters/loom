@@ -43,6 +43,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::host_pressure::{parse_meminfo, MeminfoSample};
 use crate::tmpfs_reclaim::{human_size, ram_backed_mount_points, MountEntry};
 
 // ============================================================================
@@ -71,40 +72,13 @@ pub const DEFAULT_WARN_FRACTION_PERCENT: f64 = 15.0;
 // /proc/meminfo parsing (pure)
 // ============================================================================
 
-/// The subset of `/proc/meminfo` this module reads, each `None` when the
-/// field is absent/malformed — never a fabricated `0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MeminfoSnapshot {
-    pub total_kb: Option<u64>,
-    pub available_kb: Option<u64>,
-    /// `Shmem` — tmpfs-resident + SysV/POSIX shared-memory pages, the same
-    /// figure `free -h`'s `shared` column reports.
-    pub shmem_kb: Option<u64>,
-}
-
-fn meminfo_field(contents: &str, key: &str) -> Option<u64> {
-    let prefix = format!("{key}:");
-    let line = contents.lines().find(|l| l.starts_with(&prefix))?;
-    line.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// Parse `/proc/meminfo` contents into [`MeminfoSnapshot`]. Pure — every field
-/// independently defaults to `None` on a missing/malformed line, so a kernel
-/// that omits one field does not blind the others.
-#[must_use]
-pub fn parse_meminfo(contents: &str) -> MeminfoSnapshot {
-    MeminfoSnapshot {
-        total_kb: meminfo_field(contents, "MemTotal"),
-        available_kb: meminfo_field(contents, "MemAvailable"),
-        shmem_kb: meminfo_field(contents, "Shmem"),
-    }
-}
-
-fn read_meminfo() -> MeminfoSnapshot {
+/// Read `/proc/meminfo` (or the test override) through the daemon's shared
+/// parser; every field is `None` when absent/malformed — never a fabricated `0`.
+fn read_meminfo() -> MeminfoSample {
     let path = std::env::var(MEMINFO_FILE_ENV).unwrap_or_else(|_| DEFAULT_MEMINFO_FILE.to_string());
     match std::fs::read_to_string(path) {
         Ok(contents) => parse_meminfo(&contents),
-        Err(_) => MeminfoSnapshot::default(),
+        Err(_) => MeminfoSample::default(),
     }
 }
 
@@ -289,8 +263,8 @@ pub fn collect() -> TmpfsVisibilitySnapshot {
     let oom_kill_count = read_oom_kill_count();
     let mounts = mount_usages(&ram_backed_mount_points(), DEFAULT_MOUNT_FLOOR_BYTES);
     TmpfsVisibilitySnapshot {
-        total_kb: meminfo.total_kb,
-        available_kb: meminfo.available_kb,
+        total_kb: meminfo.mem_total_kb,
+        available_kb: meminfo.mem_available_kb,
         shmem_kb: meminfo.shmem_kb,
         oom_kill_count,
         mounts,
@@ -383,23 +357,23 @@ mod tests {
                     MemAvailable:    8192000 kB\n\
                     Shmem:            512000 kB\n";
         let snap = parse_meminfo(out);
-        assert_eq!(snap.total_kb, Some(16_384_000));
-        assert_eq!(snap.available_kb, Some(8_192_000));
+        assert_eq!(snap.mem_total_kb, Some(16_384_000));
+        assert_eq!(snap.mem_available_kb, Some(8_192_000));
         assert_eq!(snap.shmem_kb, Some(512_000));
     }
 
     #[test]
     fn parse_meminfo_missing_fields_are_independently_none() {
         let snap = parse_meminfo("MemTotal: 16384000 kB\n");
-        assert_eq!(snap.total_kb, Some(16_384_000));
-        assert_eq!(snap.available_kb, None);
+        assert_eq!(snap.mem_total_kb, Some(16_384_000));
+        assert_eq!(snap.mem_available_kb, None);
         assert_eq!(snap.shmem_kb, None);
     }
 
     #[test]
     fn parse_meminfo_empty_is_all_none() {
         let snap = parse_meminfo("");
-        assert_eq!(snap, MeminfoSnapshot::default());
+        assert_eq!(snap, MeminfoSample::default());
     }
 
     // ===================================================================

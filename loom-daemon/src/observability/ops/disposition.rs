@@ -27,8 +27,8 @@
 //! # Where this runs, and why not the tick loop
 //!
 //! Driven from the collector's periodic sample
-//! (`observability::collector::sample_snapshots`, the same cadence as
-//! [`super::super::queue_snapshot::record`]),
+//! (`observability::collector::sample_snapshots`, the same cadence as the
+//! other queue samples),
 //! reading [`crate::work_finder::last_tick_summary`] — never from the
 //! work-finder tick itself, which must never block on a `gh repo view` probe
 //! (see `queue_snapshot`'s module doc for the identical rationale). A
@@ -90,7 +90,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::telemetry::RepoVisibility;
 use crate::types::{
@@ -144,6 +144,8 @@ pub const UNKNOWN_VALUE: &str = "unknown";
 /// | `gate` | `RowPlan::gate` | `loom.queue.gate` | `capacity`/`build_backoff`/`file_overlap`/`unknown`; only when the plan names one |
 /// | `step` | `RowPlan::step` | `loom.queue.step` | a `Step` name or `unknown`; only when the row names one (absent = `builder`, as on the wire) |
 /// | `owning_shard` | `RowPlan::owning_shard` | `loom.queue.owning_shard` | integer < `shard_count`; only when sharding is configured |
+/// | `level` | `ReadyQueueRow::level` | `loom.queue.level` | `default`/`important`/`very-important`; present on every emission that has a row |
+/// | `workspace_weight` | `ReadyQueueRow::workspace_weight` | `loom.queue.workspace_weight` | integer (the owning workspace's draw weight) |
 /// | `created_at` | `ReadyQueueRow::created_at` | `loom.queue.created_at` | RFC 3339 UTC, seconds precision; only when the listing supplied a parseable one |
 ///
 /// Every field is `None` on a `left_queue` emission.
@@ -154,6 +156,8 @@ pub struct PlanAttributes {
     pub gate: Option<&'static str>,
     pub step: Option<&'static str>,
     pub owning_shard: Option<u32>,
+    pub level: Option<&'static str>,
+    pub workspace_weight: Option<u32>,
     pub created_at: Option<String>,
 }
 
@@ -216,6 +220,8 @@ impl PlanAttributes {
             gate: row.plan.gate.map(plan_gate_token),
             step: row.plan.step.as_ref().map(plan_step_token),
             owning_shard: row.plan.owning_shard,
+            level: Some(row.level.as_str()),
+            workspace_weight: Some(row.workspace_weight),
             created_at: created_at_token(row.created_at.as_deref()),
         }
     }
@@ -236,6 +242,12 @@ impl PlanAttributes {
         }
         if let Some(shard) = self.owning_shard {
             attributes.insert("loom.queue.owning_shard".to_string(), shard.to_string());
+        }
+        if let Some(level) = self.level {
+            attributes.insert("loom.queue.level".to_string(), level.to_string());
+        }
+        if let Some(weight) = self.workspace_weight {
+            attributes.insert("loom.queue.workspace_weight".to_string(), weight.to_string());
         }
         if let Some(created_at) = &self.created_at {
             attributes.insert("loom.queue.created_at".to_string(), created_at.clone());
@@ -463,7 +475,7 @@ fn allowed_park_label(disposition: QueueDisposition, detail: Option<&str>) -> Op
 /// The PR number in an `OpenPr` row's detail (`"open PR #<n>"`, the text
 /// `work_finder::tick_report::classify` formats) — structured extraction,
 /// never the free-form text itself. Mirrors
-/// `telemetry::queue_snapshot::exportable_detail`'s allowlist-by-disposition
+/// `telemetry::queue_repo::exportable_detail`'s allowlist-by-disposition
 /// rule.
 #[must_use]
 fn open_pr_number(disposition: QueueDisposition, detail: Option<&str>) -> Option<u32> {
@@ -582,13 +594,6 @@ pub fn refresh_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_REFRESH_SECS)
 }
 
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
-
 fn int(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -651,7 +656,7 @@ pub fn build_span(
     };
     let mut attributes: TraceAttributes = [
         ("loom.repo", emission.slug.clone()),
-        ("loom.repo.visibility", visibility_str(emission.visibility).to_string()),
+        ("loom.repo.visibility", emission.visibility.as_str().to_string()),
         ("loom.issue", issue),
         ("loom.queue.disposition", emission.disposition.as_str().to_string()),
         ("loom.queue.state", emission.disposition.state().to_string()),
@@ -748,7 +753,7 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
     let previous_sample = *LAST_SAMPLED_TICK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !super::super::queue_snapshot::is_new_tick(summary.at, previous_sample) {
+    if !super::super::repo_ref::is_new_tick(summary.at, previous_sample) {
         return;
     }
     let roots: HashSet<&str> = summary

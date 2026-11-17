@@ -122,7 +122,7 @@ pub fn shell_quote(value: &str) -> String {
             .replace('\t', "\\t");
         return format!("$'{escaped}'");
     }
-    format!("'{}'", value.replace('\'', r"'\''"))
+    crate::shell_quote::shell_quote(value)
 }
 
 /// Run the requested subcommand, returning its exit code.

@@ -48,21 +48,18 @@ impl HostResources {
     }
 }
 
-/// Memory and swap from Linux `/proc/meminfo` (values in kB). Swap used is
-/// `SwapTotal - SwapFree`.
+/// Memory and swap from Linux `/proc/meminfo`, converted from the shared
+/// parser's kB to bytes. Swap used is `SwapTotal - SwapFree`.
 #[must_use]
 pub fn parse_meminfo(contents: &str) -> HostResources {
-    let field = |label: &str| -> Option<u64> {
-        let line = contents.lines().find(|l| l.starts_with(label))?;
-        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kb.saturating_mul(1024))
-    };
-    let swap_total = field("SwapTotal:");
+    let m = crate::host_pressure::parse_meminfo(contents);
+    let bytes = |kb: Option<u64>| kb.map(|kb| kb.saturating_mul(1024));
+    let swap_total = bytes(m.swap_total_kb);
     HostResources {
-        memory_available: field("MemAvailable:"),
-        memory_total: field("MemTotal:"),
+        memory_available: bytes(m.mem_available_kb),
+        memory_total: bytes(m.mem_total_kb),
         swap_used: swap_total
-            .zip(field("SwapFree:"))
+            .zip(bytes(m.swap_free_kb))
             .map(|(t, f)| t.saturating_sub(f)),
         swap_total,
         ..HostResources::default()

@@ -28,6 +28,7 @@
 //!   recorded owner is dead is broken and retried; but only one retry, so two
 //!   processes racing to break the same stale lock cannot livelock.
 
+use crate::script_helpers::now_iso;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,10 +134,6 @@ fn rand_suffix() -> u32 {
     ((a ^ t) & 0x7fff) as u32
 }
 
-fn iso_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
 /// The pid recorded in a lock, if the file is readable and parseable.
 fn recorded(lock: &Path) -> Option<Owner> {
     let text = std::fs::read_to_string(lock.join("owner.json")).ok()?;
@@ -213,7 +210,7 @@ pub fn acquire(
                 owner_pid: pid,
                 token: token.clone(),
                 script: "worktree.sh".to_string(),
-                acquired_at: iso_now(),
+                acquired_at: now_iso(),
             };
             // Best-effort, exactly as the shell's heredoc was: a lock whose
             // metadata could not be written is still HELD. Failing here would

@@ -2,7 +2,7 @@
 //! `spawn-claude.sh` puts on its systemd `--user` scope (#11094, slice 2).
 //!
 //! The work finder records every agent scope's `memory.peak` into a per-repo
-//! rolling history ([`loom_daemon::ram_peaks`], `~/.loom/ram-peaks.json`) and
+//! rolling history ([`crate::ram_peaks`], `~/.loom/ram-peaks.json`) and
 //! charges admission with it. This is the containment half: a scope gets a
 //! `MemoryMax` sized from the SAME history, so an over-budget build (a 13 GB
 //! `rustc`) is OOM-killed INSIDE its own cgroup — with `OOMPolicy=continue`
@@ -32,7 +32,7 @@
 //!
 //! Env > config tiers > default, per key; the config tiers include the
 //! daemon workspace's host-local file, where the fleet sets host overrides.
-//! [`loom_daemon::ram_scope_limit`] owns that resolution. Config is read on
+//! [`crate::ram_scope_limit`] owns that resolution. Config is read on
 //! every call, so a change applies to the next spawn. One stderr line names
 //! the source that decided the limit.
 //!
@@ -54,8 +54,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
-use loom_daemon::ram_peaks;
-use loom_daemon::ram_scope_limit::{MaxMode, Resolved};
+use crate::ram_peaks;
+use crate::ram_scope_limit::{MaxMode, Resolved};
 
 /// No limit applies. Not an error.
 const EX_NO_LIMIT: i32 = 1;
@@ -101,7 +101,7 @@ pub(crate) fn scope_limit_mb(s: &Resolved, peak_bytes: Option<u64>, total_mb: u6
 fn host_total_mb() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|t| loom_daemon::host_pressure::parse_meminfo(&t).mem_total_kb)
+        .and_then(|t| crate::host_pressure::parse_meminfo(&t).mem_total_kb)
         .map_or(0, |kb| kb / 1024)
 }
 
@@ -158,7 +158,7 @@ impl RamScopeLimitArgs {
             })
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
-        let settings = loom_daemon::ram_scope_limit::resolve_process(&workspace);
+        let settings = crate::ram_scope_limit::resolve_process(&workspace);
         let peak = observed_peak(&workspace);
         let limit = scope_limit_mb(&settings, peak, host_total_mb());
         eprintln!("ram-scope-limit: {}", describe(&settings, limit));
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn describe_names_the_source() {
         let mut r = s(Some(MaxMode::Off), None, None);
-        r.max.source = loom_daemon::ram_scope_limit::Source::Env("LOOM_SWEEP_MEMORY_MAX");
+        r.max.source = crate::ram_scope_limit::Source::Env("LOOM_SWEEP_MEMORY_MAX");
         assert_eq!(
             describe(&r, None),
             "no MemoryMax (off); agentMemoryMax from env LOOM_SWEEP_MEMORY_MAX"

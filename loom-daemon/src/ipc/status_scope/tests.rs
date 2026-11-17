@@ -5,6 +5,7 @@
 use super::*;
 use crate::status_section::StatusSection;
 use crate::workspace_registry::REGISTRY_PATH_ENV;
+use std::time::{Duration, Instant};
 
 fn runtime_handle() -> tokio::runtime::Handle {
     use std::sync::OnceLock;
@@ -262,4 +263,43 @@ fn overlay_drain_tracks_the_live_drain_state() {
     assert!(drain.abort());
     overlay_drain(&mut report, &drain);
     assert!(!report.draining && report.drain_roll.is_none());
+}
+
+/// **#13443 AC.** One root whose registry mutex is held past the deadline
+/// must not stall the reply: the build returns near the deadline, that root
+/// is `lock_busy`, and every other root is still present and not busy.
+#[test]
+#[serial_test::serial]
+fn a_root_with_a_held_registry_lock_is_reported_busy_without_stalling_the_walk() {
+    let fixture = ManyRoots::new(3);
+    let pool = ManyRoots::pool();
+    // Provision every registry, and prove the uncontended path first.
+    let calm = fixture.build(&pool, &SectionSet::all());
+    assert!(calm.per_repo.iter().all(|r| !r.lock_busy));
+
+    let busy_root = fixture.roots[0].clone();
+    let registry = pool.provisioned_registry_for(&busy_root).unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = registry.lock().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
+
+    let start = Instant::now();
+    let report = fixture.build(&pool, &SectionSet::all());
+    let elapsed = start.elapsed();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+
+    assert!(
+        elapsed < super::super::REGISTRY_LOCK_DEADLINE + Duration::from_secs(3),
+        "status build stalled {elapsed:?} on a held registry lock"
+    );
+    assert_eq!(report.per_repo.len(), 3, "every root still has a row");
+    for row in &report.per_repo {
+        assert_eq!(row.lock_busy, row.root == busy_root, "{}", row.root.display());
+    }
 }

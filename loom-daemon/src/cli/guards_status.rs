@@ -1,13 +1,13 @@
 //! `loom-daemon guards status` (Issue #10434): effective guard configuration
 //! with its source, hook wiring, decision-log summary, and misconfiguration
 //! warnings. Argument parsing and rendering only; the logic is
-//! [`loom_daemon::guards_status`]. Always exits 0 (it is a diagnostic).
+//! [`crate::guards_status`]. Always exits 0 (it is a diagnostic).
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::guards_status::{self, Inputs, DEFAULT_ASK_THRESHOLD};
+use crate::guards_status::{self, Inputs, DEFAULT_ASK_THRESHOLD};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum GuardsCommand {
@@ -61,7 +61,7 @@ impl GuardsCommand {
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| PathBuf::from("."));
                 if let Some(reason) =
-                    loom_daemon::remote_fleet_exec::check_process(&args.for_command, &cwd)
+                    crate::remote_fleet_exec::check_process(&args.for_command, &cwd)
                 {
                     println!("{reason}");
                     std::process::exit(1);

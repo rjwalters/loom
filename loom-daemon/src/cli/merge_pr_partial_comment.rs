@@ -46,11 +46,11 @@
 //! `merge-pr.sh` never passes it: the retired shell read its own clock at the
 //! moment of the post, and so does this.
 
-use anyhow::Result;
-use loom_daemon::merge_pr::partial_comment::{
+use crate::merge_pr::partial_comment::{
     now_timestamp, partial_merged_comment, partial_merged_held_comment, premature_close_comment,
 };
-use loom_daemon::merge_pr::partial_reset::hold_from_json;
+use crate::merge_pr::partial_reset::hold_from_json;
+use anyhow::Result;
 use std::io::{Read, Write};
 
 /// Which of the pass's two comments to render.

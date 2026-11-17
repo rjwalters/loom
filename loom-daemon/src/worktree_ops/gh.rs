@@ -772,22 +772,32 @@ pub fn merged_branch_pr_args(owner: &str, repo: &str, issue: u32) -> Vec<String>
 /// a JSON array is [`MergedBranchPrProbe::ProbeFailed`], never an absence.
 #[must_use]
 pub fn parse_merged_branch_pr(stdout: &str, issue: u32) -> MergedBranchPrProbe {
-    let Ok(serde_json::Value::Array(prs)) = serde_json::from_str::<serde_json::Value>(stdout)
+    match merged_branch_pr_candidates(stdout, issue) {
+        None => MergedBranchPrProbe::ProbeFailed,
+        Some(c) => c
+            .iter()
+            .map(|(n, _)| *n)
+            .min()
+            .map_or(MergedBranchPrProbe::NoneMerged, MergedBranchPrProbe::Merged),
+    }
+}
+
+/// Every merged, unlinked PR in the [`merged_branch_pr_args`] listing as
+/// `(number, merged_at)`; `None` when the output is not a readable listing.
+fn merged_branch_pr_candidates(stdout: &str, issue: u32) -> Option<Vec<(u32, String)>> {
+    let serde_json::Value::Array(prs) = serde_json::from_str::<serde_json::Value>(stdout).ok()?
     else {
-        return MergedBranchPrProbe::ProbeFailed;
+        return None;
     };
-    let mut lowest: Option<u32> = None;
+    let mut out = Vec::new();
     for pr in &prs {
-        if pr.get("merged_at").is_none_or(serde_json::Value::is_null) {
+        let Some(merged_at) = pr.get("merged_at").and_then(serde_json::Value::as_str) else {
             continue;
-        }
-        let Some(number) = pr
+        };
+        let number = pr
             .get("number")
             .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-        else {
-            return MergedBranchPrProbe::ProbeFailed;
-        };
+            .and_then(|n| u32::try_from(n).ok())?;
         let body = pr
             .get("body")
             .and_then(serde_json::Value::as_str)
@@ -795,15 +805,69 @@ pub fn parse_merged_branch_pr(stdout: &str, issue: u32) -> MergedBranchPrProbe {
         if linkage_refs(body).iter().any(|&(n, _)| n == issue) {
             continue;
         }
-        lowest = Some(lowest.map_or(number, |l: u32| l.min(number)));
+        out.push((number, merged_at.to_string()));
+    }
+    Some(out)
+}
+
+/// `gh` arguments reading, per page, the newest `labeled loom:issue` event
+/// timestamp (or `null`) of `issue` — the (re)promotion time.
+fn promotion_events_args(issue: u32) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        format!("repos/{{owner}}/{{repo}}/issues/{issue}/events?per_page=100"),
+        "--paginate".to_string(),
+        "--jq".to_string(),
+        r#"[.[] | select(.event == "labeled" and .label.name == "loom:issue")] | last | .created_at"#
+            .to_string(),
+    ]
+}
+
+/// Apply the re-promotion exception (#13053) to leg 1b's candidates.
+///
+/// A merged unlinked PR blocks only if it merged at or after the newest
+/// `loom:issue` labeling: a later promotion means a Curator/Champion
+/// deliberately re-opened the issue for remaining scope. No promotion event
+/// keeps the #12615 behavior. Any unparseable timestamp is
+/// [`MergedBranchPrProbe::ProbeFailed`] (fail closed).
+fn filter_after_repromotion(
+    candidates: &[(u32, String)],
+    promotion_stdout: &str,
+) -> MergedBranchPrProbe {
+    let parse = |ts: &str| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
+    let mut promoted: Option<chrono::DateTime<chrono::Utc>> = None;
+    for line in promotion_stdout.lines() {
+        let ts = line.trim().trim_matches('"');
+        if ts.is_empty() || ts == "null" {
+            continue;
+        }
+        let Some(dt) = parse(ts) else {
+            return MergedBranchPrProbe::ProbeFailed;
+        };
+        promoted = Some(promoted.map_or(dt, |p| p.max(dt)));
+    }
+    let mut lowest: Option<u32> = None;
+    for (number, merged_at) in candidates {
+        let Some(merged) = parse(merged_at) else {
+            return MergedBranchPrProbe::ProbeFailed;
+        };
+        if promoted.is_some_and(|p| merged < p) {
+            continue;
+        }
+        lowest = Some(lowest.map_or(*number, |l| l.min(*number)));
     }
     lowest.map_or(MergedBranchPrProbe::NoneMerged, MergedBranchPrProbe::Merged)
 }
 
 /// Best-effort probe for a **merged** PR from `feature/issue-<issue>` that
 /// never closed or partially referenced the issue (#12615; PR #12512 / issue
-/// #12509). One REST read, fail-closed: every failure is
-/// [`MergedBranchPrProbe::ProbeFailed`].
+/// #12509) and was not followed by a `loom:issue` re-promotion (#13053). One
+/// REST read, plus one events read when a candidate exists; fail-closed:
+/// every failure is [`MergedBranchPrProbe::ProbeFailed`].
 #[must_use]
 pub fn probe_merged_branch_pr(repo_root: &Path, issue: u32) -> MergedBranchPrProbe {
     let Some((owner, repo)) = resolve_owner_repo(repo_root) else {
@@ -816,9 +880,28 @@ pub fn probe_merged_branch_pr(repo_root: &Path, issue: u32) -> MergedBranchPrPro
         GH_CALL_TIMEOUT,
         merged_branch_pr_args(&owner, &repo, issue),
     );
-    match inv.run() {
+    let candidates = match inv.run() {
         CmdOutcome::Ran(o) if o.status.success() => {
-            parse_merged_branch_pr(&String::from_utf8_lossy(&o.stdout), issue)
+            match merged_branch_pr_candidates(&String::from_utf8_lossy(&o.stdout), issue) {
+                Some(c) => c,
+                None => return MergedBranchPrProbe::ProbeFailed,
+            }
+        }
+        _ => return MergedBranchPrProbe::ProbeFailed,
+    };
+    if candidates.is_empty() {
+        return MergedBranchPrProbe::NoneMerged;
+    }
+    let events = invocation(
+        "worktree.merged_branch_pr_promotion",
+        AccessIntent::Read,
+        repo_root,
+        GH_CALL_TIMEOUT,
+        promotion_events_args(issue),
+    );
+    match events.run() {
+        CmdOutcome::Ran(o) if o.status.success() => {
+            filter_after_repromotion(&candidates, &String::from_utf8_lossy(&o.stdout))
         }
         _ => MergedBranchPrProbe::ProbeFailed,
     }
@@ -1143,6 +1226,28 @@ mod tests {
         assert_eq!(parse_merged_branch_pr("garbage", 5), MergedBranchPrProbe::ProbeFailed);
         let nonum = r#"[{"merged_at":"t","body":""}]"#;
         assert_eq!(parse_merged_branch_pr(nonum, 5), MergedBranchPrProbe::ProbeFailed);
+    }
+
+    #[test]
+    fn repromotion_after_merge_clears_leg_1b_and_fails_closed() {
+        let c = vec![(12512, "2026-10-16T01:00:00Z".to_string())];
+        // Promoted after the merge (newest page wins): clear.
+        let after = "\"2026-10-15T00:00:00Z\"\n\"2026-10-17T00:00:00Z\"\n";
+        assert_eq!(filter_after_repromotion(&c, after), MergedBranchPrProbe::NoneMerged);
+        // Never re-promoted after the merge: still blocks.
+        let before = "\"2026-10-15T00:00:00Z\"\nnull\n";
+        assert_eq!(filter_after_repromotion(&c, before), MergedBranchPrProbe::Merged(12512));
+        assert_eq!(filter_after_repromotion(&c, "null\n"), MergedBranchPrProbe::Merged(12512));
+        // Newer unlinked PR merged after promotion still blocks.
+        let two = vec![
+            (1, "2026-10-16T01:00:00Z".to_string()),
+            (2, "2026-10-18T00:00:00Z".to_string()),
+        ];
+        assert_eq!(filter_after_repromotion(&two, after), MergedBranchPrProbe::Merged(2));
+        // Unreadable timestamps: no verdict.
+        assert_eq!(filter_after_repromotion(&c, "garbage\n"), MergedBranchPrProbe::ProbeFailed);
+        let bad = vec![(1, "t".to_string())];
+        assert_eq!(filter_after_repromotion(&bad, after), MergedBranchPrProbe::ProbeFailed);
     }
 
     #[test]

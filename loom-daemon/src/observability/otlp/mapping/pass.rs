@@ -1,5 +1,5 @@
-//! OTLP mapping for `pass.summary` and `pass.verdict` (#10752): one log record
-//! per pass and one per artifact verdict, each stamped when it was decided.
+//! OTLP mapping for `pass.verdict` (#10752): one log record per artifact
+//! verdict, stamped when it was decided (`pass.summary` retired, #12094).
 //!
 //! The body is the record's JSON (the per-verdict and per-reason maps, the
 //! blockers, the provenance). `log_record_for` stamps `loom.kind` (what the
@@ -9,80 +9,15 @@
 //! per pass" and "why is #n still held" need no `JSONExtract`; the two count
 //! maps are also flattened into `name=count,…` strings.
 
-use std::collections::BTreeMap;
-
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::{kv_bool, kv_int, kv_string, nanos};
-use crate::telemetry::kinds::pass::{PassOutcome, PassSummaryRecord, PassVerdictRecord, StepFacts};
+use crate::telemetry::kinds::pass::{PassVerdictRecord, StepFacts};
 use crate::telemetry::TelemetryRecord;
 
 fn int(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
-}
-
-/// `a=1,b=2`, in key order.
-fn flatten(counts: &BTreeMap<String, u64>) -> String {
-    counts
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// A refused pass, or one with a failed write, is a warning: the mechanism is
-/// not doing its job. Everything else is info.
-fn summary_severity(r: &PassSummaryRecord) -> SeverityNumber {
-    let failed = r.verdicts.get("failed").copied().unwrap_or(0) > 0;
-    if r.outcome == PassOutcome::Refused || failed {
-        SeverityNumber::Warn
-    } else {
-        SeverityNumber::Info
-    }
-}
-
-fn summary(r: &PassSummaryRecord) -> (&'static str, SeverityNumber, u64, Vec<KeyValue>, String) {
-    let mut attributes = vec![
-        kv_string("loom.repo", r.repo.clone()),
-        kv_string("loom.pass.id", r.pass_id.clone()),
-        kv_string("loom.pass.mechanism", r.mechanism.clone()),
-        kv_string("loom.pass.mode", r.mode.as_str()),
-        kv_string("loom.pass.outcome", r.outcome.as_str()),
-        kv_int("loom.pass.examined", int(r.examined)),
-        kv_string("loom.pass.verdicts", flatten(&r.verdicts)),
-        kv_string("loom.pass.skip_reasons", flatten(&r.skipped)),
-        kv_int("loom.pass.skipped", int(r.skipped.values().sum())),
-        kv_bool("loom.pass.write_cap_hit", r.write_cap_hit),
-        kv_int("loom.pass.duration_ms", int(r.duration_ms)),
-        kv_int("loom.pass.github_calls", int(r.github.calls)),
-        kv_int("loom.pass.github_writes", int(r.github.writes)),
-        kv_int("loom.pass.github_not_modified", int(r.github.not_modified)),
-        kv_int("loom.pass.verdicts_emitted", int(r.verdicts_emitted)),
-        kv_int("loom.pass.verdicts_unchanged", int(r.verdicts_unchanged)),
-        kv_string("loom.pass.version", r.loom.version.clone()),
-        kv_string("loom.pass.revision", r.loom.revision.clone()),
-    ];
-    if !r.unevaluated_reasons.is_empty() {
-        attributes
-            .push(kv_string("loom.pass.unevaluated_reasons", flatten(&r.unevaluated_reasons)));
-    }
-    if let Some(b) = &r.budget {
-        for (key, v) in [
-            ("loom.pass.budget.core_start", b.core_start),
-            ("loom.pass.budget.core_end", b.core_end),
-            ("loom.pass.budget.graphql_start", b.graphql_start),
-            ("loom.pass.budget.graphql_end", b.graphql_end),
-            ("loom.pass.budget.core_floor", Some(b.core_floor)),
-            ("loom.pass.budget.graphql_floor", Some(b.graphql_floor)),
-        ] {
-            if let Some(v) = v {
-                attributes.push(kv_int(key, int(v)));
-            }
-        }
-    }
-    let body = serde_json::to_string(r).unwrap_or_default();
-    ("pass.summary", summary_severity(r), nanos(r.ended_at), attributes, body)
 }
 
 /// A role step's facts (#12027), each only when present.
@@ -172,12 +107,11 @@ fn verdict(r: &PassVerdictRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
 }
 
 /// `(event_name, severity, record time, attributes, body)` for a
-/// `pass.summary` or `pass.verdict` record; `None` for every other kind.
+/// `pass.verdict` record; `None` for every other kind.
 pub(super) fn log_parts(
     record: &TelemetryRecord,
 ) -> Option<(&'static str, SeverityNumber, u64, Vec<KeyValue>, String)> {
     match record {
-        TelemetryRecord::PassSummary(r) => Some(summary(r)),
         TelemetryRecord::PassVerdict(r) => Some(verdict(r)),
         _ => None,
     }

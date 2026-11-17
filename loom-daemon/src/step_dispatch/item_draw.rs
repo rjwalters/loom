@@ -446,6 +446,17 @@ impl Candidate {
     }
 }
 
+/// A weight-0 item, kept by identity (#12918): [`Weighing::excluded`] only
+/// counts them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedItem {
+    pub item: Item,
+    pub exclusion: Exclusion,
+    /// When the gate lifts, for a [`Exclusion::CoolingDown`] item: the end of
+    /// its `(item, step)` window. `None` for a gate with no per-item end.
+    pub gate_until: Option<DateTime<Utc>>,
+}
+
 /// One workspace's items, weighed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Weighing {
@@ -453,6 +464,9 @@ pub struct Weighing {
     pub pool: Vec<Candidate>,
     /// The weight-0 items, counted by reason.
     pub excluded: BTreeMap<Exclusion, usize>,
+    /// The same weight-0 items by identity, in item order, then those the
+    /// shaping took out of the pool.
+    pub excluded_items: Vec<ExcludedItem>,
     /// The cap's demotions, in item order.
     pub demotions: Vec<ViDemotion>,
 }
@@ -513,20 +527,29 @@ pub fn weigh(inputs: &[DrawInput], ctx: &WeighContext, weights: &ItemWeights) ->
 
     let mut pool = Vec::new();
     let mut excluded: BTreeMap<Exclusion, usize> = BTreeMap::new();
+    let mut excluded_items: Vec<ExcludedItem> = Vec::new();
+    let mut exclude = |input: &DrawInput, exclusion: Exclusion, gate_until| {
+        *excluded.entry(exclusion).or_default() += 1;
+        excluded_items.push(ExcludedItem {
+            item: input.item.clone(),
+            exclusion,
+            gate_until,
+        });
+    };
     for (input, work) in inputs.iter().zip(&capped) {
         let step = match input.item.verdict {
             Verdict::Pass(reason) => {
-                *excluded.entry(Exclusion::Pass(reason)).or_default() += 1;
+                exclude(input, Exclusion::Pass(reason), None);
                 continue;
             }
             Verdict::Step(step) => step,
         };
         if ctx.pool_exhausted_roles.contains(step.role()) {
-            *excluded.entry(Exclusion::PoolExhausted).or_default() += 1;
+            exclude(input, Exclusion::PoolExhausted, None);
             continue;
         }
         if step == Step::Builder && ctx.build_backoff_engaged && input.item.lane != Lane::RedMain {
-            *excluded.entry(Exclusion::BuildBackoff).or_default() += 1;
+            exclude(input, Exclusion::BuildBackoff, None);
             continue;
         }
         let target = input.item.target().unwrap_or_default();
@@ -534,7 +557,8 @@ pub fn weigh(inputs: &[DrawInput], ctx: &WeighContext, weights: &ItemWeights) ->
             .cooldowns
             .is_cooling(target, StepRole::from(step), ctx.now)
         {
-            *excluded.entry(Exclusion::CoolingDown).or_default() += 1;
+            let until = ctx.cooldowns.until(target, StepRole::from(step));
+            exclude(input, Exclusion::CoolingDown, until);
             continue;
         }
         let (age_minutes, age_source) = stage_age(input, ctx.now);
@@ -556,6 +580,7 @@ pub fn weigh(inputs: &[DrawInput], ctx: &WeighContext, weights: &ItemWeights) ->
     Weighing {
         pool,
         excluded,
+        excluded_items,
         demotions,
     }
 }

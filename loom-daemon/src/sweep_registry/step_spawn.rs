@@ -114,6 +114,10 @@ pub struct StepSpawnRequest {
     /// [`crate::work_finder::step_item::Item::story_points`]): a telemetry
     /// fact only, never a gate. `None` when unsized or not drawn.
     pub story_points: Option<u32>,
+    /// The standing-authorization digest the item's Champion hold recorded
+    /// (#13029): read at the step's end for `champion.run`'s `auth_before`.
+    /// `None` for a legacy hold or an item with no hold.
+    pub hold_auth: Option<String>,
 }
 
 impl StepSpawnRequest {
@@ -128,6 +132,7 @@ impl StepSpawnRequest {
             resumed: false,
             draw: None,
             story_points: None,
+            hold_auth: None,
         }
     }
 
@@ -719,6 +724,11 @@ impl SweepRegistry {
             self.step_points.retain(|id, _| entries.contains_key(id));
             self.step_points.insert(sweep_id.clone(), points);
         }
+        if let Some(auth) = &request.hold_auth {
+            let entries = &self.entries;
+            self.step_hold_auth.retain(|id, _| entries.contains_key(id));
+            self.step_hold_auth.insert(sweep_id.clone(), auth.clone());
+        }
         self.start_step_lease_renewal(item, role, &sweep_id, pid, &log_path);
         self.publish_step_slots();
         self.emit_dispatch(&sweep_id, &launch.admission, None, None);
@@ -854,6 +864,11 @@ impl SweepRegistry {
     /// when unsized or unknown to this daemon.
     pub(crate) fn step_points(&self, sweep_id: &str) -> Option<u32> {
         self.step_points.get(sweep_id).copied()
+    }
+
+    /// The hold digest step `sweep_id` was spawned with (#13029).
+    pub(crate) fn step_hold_auth(&self, sweep_id: &str) -> Option<String> {
+        self.step_hold_auth.get(sweep_id).cloned()
     }
 }
 

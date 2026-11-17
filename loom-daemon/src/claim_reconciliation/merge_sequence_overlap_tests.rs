@@ -4,20 +4,9 @@
 
 use std::cell::Cell;
 
-use super::super::{
-    plan_repo_with, release_comment_body, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
-};
+use super::super::{plan_repo, release_comment_body, SEQUENCE_LABEL};
 use super::*;
 use crate::merge_pr::sequence::marker_text;
-
-/// Plan with no stalled PRs: the deterministic spelling of the live pass.
-fn plan_repo(
-    open_prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    markers: &BTreeMap<u32, SequenceMarker>,
-) -> Vec<SequenceGroup> {
-    plan_repo_with(open_prs, files, markers, &BTreeSet::new())
-}
 
 fn sha(n: u32) -> String {
     format!("{n:040x}")
@@ -103,7 +92,7 @@ fn decide(
         calls.set(calls.get() + 1);
         sets.get(&p.number).cloned()
     };
-    let conflicts = super::super::conflict::assume_conflict;
+    let conflicts = |_: &SequencePr, _: &SequencePr| true;
     let (f, open) = (&c.follower, &c.open);
     let out = with_no_overlap(action, m, pred_state, f, open, &mut cache, fetch, &conflicts);
     (out, calls.get())
@@ -284,70 +273,6 @@ fn moved_heads_and_other_outcomes_keep_their_precedence() {
 
 // --- Shared per-tick cache ------------------------------------------------
 
-#[test]
-fn the_tick_cache_reads_each_pr_once_and_remembers_a_failed_read() {
-    let calls = Cell::new(0);
-    let fetch = |p: &SequencePr| {
-        calls.set(calls.get() + 1);
-        (p.number == 1).then(|| set(&["a.rs"]))
-    };
-    let (a, b) = (pr(1, "2026-01-01T00:00:00Z", &[]), pr(2, "2026-01-02T00:00:00Z", &[]));
-    let mut cache = TickFiles::default();
-    assert_eq!(cache.get_or_fetch(&a, fetch), Some(&set(&["a.rs"])));
-    assert_eq!(cache.get_or_fetch(&a, fetch), Some(&set(&["a.rs"])));
-    assert_eq!(cache.get_or_fetch(&b, fetch), None);
-    assert_eq!(cache.get_or_fetch(&b, fetch), None, "a failed read is not retried this tick");
-    assert_eq!(calls.get(), 2, "at most one read per PR per tick");
-    // The planner sees only successful reads, and only the PRs it asks for.
-    let known = cache.known([1, 2, 3]);
-    assert_eq!(known, BTreeMap::from([(1, set(&["a.rs"]))]));
-}
-
-// --- No churn --------------------------------------------------------------
-
-fn edges(groups: &[SequenceGroup]) -> Vec<(u32, u32)> {
-    groups
-        .iter()
-        .flat_map(|g| g.edges.iter().map(|e| (e.follower, e.after)))
-        .collect()
-}
-
-#[test]
-fn re_planning_after_a_release_never_re_creates_the_released_edge() {
-    // #10061 was recorded after #10056 through #10053's files. After the
-    // release the label is gone, so the follower has no marker and is
-    // planned afresh: it may wait for a PR it really overlaps (#10060), never
-    // for the disjoint one again.
-    let prs = [
-        pr(1, "2026-10-01T00:00:00Z", &["loom:pr"]),
-        pr(2, "2026-10-01T01:00:00Z", &["loom:pr"]),
-        pr(3, "2026-10-01T02:00:00Z", &["loom:pr"]),
-    ];
-    let files = BTreeMap::from([
-        (1, set(&["docs/a.md", "lib.rs"])),
-        (2, set(&["lib.rs", "src/x.rs"])),
-        (3, set(&["src/x.rs"])),
-    ]);
-    let m = soft(3, 1);
-    let c = Case {
-        pred: prs[0].clone(),
-        follower: prs[2].clone(),
-        open: prs.to_vec(),
-    };
-    assert_eq!(
-        decide(HoldAction::HoldSoft, &m, Some(&pred_at(sha(1))), &c, &files).0,
-        HoldAction::ReleaseNoOverlap
-    );
-    let replan = || edges(&plan_repo_with(&prs, &files, &BTreeMap::new(), &BTreeSet::new()));
-    let after = replan();
-    assert!(!after.contains(&(3, 1)), "{after:?}");
-    assert!(after.contains(&(3, 2)), "it waits for the PR it overlaps: {after:?}");
-    // Re-planning a second time is stable (no oscillation).
-    assert_eq!(after, replan());
-    // Through the wall-clock planner too: whatever it orders, never (3, 1).
-    assert!(!edges(&plan_repo(&prs, &files, &BTreeMap::new())).contains(&(3, 1)));
-}
-
 // --- Dry run ---------------------------------------------------------------
 
 /// A fake `gh` answering from JSON files under `dir`, logging every call.
@@ -389,53 +314,24 @@ fn comment(body: &str) -> serde_json::Value {
 }
 
 #[cfg(unix)]
+// --- Shared per-tick cache ------------------------------------------------
 #[test]
-#[serial_test::serial]
-fn the_dry_run_lists_disjoint_holds_reads_once_and_writes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("repo");
-    std::fs::create_dir_all(&root).unwrap();
-    let d = dir.path();
-    // #20 holds after #10 (disjoint) — would release. #21 holds after #10 but
-    // shares a file — kept. #22 carries the label with no marker — a manual
-    // hold, never read for files.
-    let open = vec![
-        pr(10, "2026-10-01T00:00:00Z", &[]),
-        pr(20, "2026-10-02T00:00:00Z", &[SEQUENCE_LABEL]),
-        pr(21, "2026-10-02T01:00:00Z", &[SEQUENCE_LABEL]),
-        pr(22, "2026-10-02T02:00:00Z", &[SEQUENCE_LABEL]),
-    ];
-    write_json(d, "comments-20.json", &comment(&marker_text(&soft(20, 10))));
-    write_json(d, "comments-21.json", &comment(&marker_text(&soft(21, 10))));
-    let now = chrono::Utc::now().to_rfc3339();
-    write_json(
-        d,
-        "pull-10.json",
-        &serde_json::json!({"state": "open", "merged": false, "head": {"sha": sha(10)}, "updated_at": now}),
-    );
-    for (n, paths) in [
-        (10, vec!["docs/a.md"]),
-        (20, vec!["src/b.rs"]),
-        (21, vec!["docs/a.md"]),
-    ] {
-        let rows: Vec<_> = paths
-            .iter()
-            .map(|p| serde_json::json!({"filename": p}))
-            .collect();
-        write_json(d, &format!("files-{n}.json"), &serde_json::json!(rows));
-    }
-    let (gh, log) = fake_gh(d);
+fn the_tick_cache_reads_each_pr_once_and_remembers_a_failed_read() {
+    let calls = Cell::new(0);
+    let fetch = |p: &SequencePr| {
+        calls.set(calls.get() + 1);
+        (p.number == 1).then(|| set(&["a.rs"]))
+    };
+    let (a, b) = (pr(1, "2026-01-01T00:00:00Z", &[]), pr(2, "2026-01-02T00:00:00Z", &[]));
     let mut cache = TickFiles::default();
-    let conflicts = super::super::conflict::assume_conflict;
-    let out = would_release(&gh, &root, &open, &mut cache, &conflicts);
-    assert_eq!(out, vec![(20, 10)]);
-    let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
-    for n in [10, 20, 21] {
-        assert!(calls.matches(&format!("pulls/{n}/files")).count() <= 1, "{calls}");
-    }
-    assert!(!calls.contains("--json files"), "no GraphQL files read (#10382): {calls}");
-    assert!(!calls.contains("pulls/22/files"), "a manual hold reads no files: {calls}");
+    assert_eq!(cache.get_or_fetch(&a, fetch), Some(&set(&["a.rs"])));
+    assert_eq!(cache.get_or_fetch(&a, fetch), Some(&set(&["a.rs"])));
+    assert_eq!(cache.get_or_fetch(&b, fetch), None);
+    assert_eq!(cache.get_or_fetch(&b, fetch), None, "a failed read is not retried this tick");
+    assert_eq!(calls.get(), 2, "at most one read per PR per tick");
+    // The planner sees only successful reads, and only the PRs it asks for.
+    let known = cache.known([1, 2, 3]);
+    assert_eq!(known, BTreeMap::from([(1, set(&["a.rs"]))]));
 }
 
 // --- Property test ---------------------------------------------------------
@@ -499,61 +395,95 @@ fn gen_case(rng: &mut Rng) -> (Vec<SequencePr>, BTreeMap<u32, BTreeSet<String>>)
     (prs, files)
 }
 
-/// Check one case; `Ok` carries the number of `(SharedFiles, StackedBase)`
-/// edges seen, so the test can prove it was not vacuous.
-fn check(
-    prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-) -> Result<(usize, usize), String> {
-    let mut seen = (0, 0);
+/// Check one case; `Ok` carries the number of edges seen, so the test can
+/// prove it was not vacuous.
+fn check(prs: &[SequencePr], files: &BTreeMap<u32, BTreeSet<String>>) -> Result<usize, String> {
+    let mut seen = 0;
     let by: BTreeMap<u32, &SequencePr> = prs.iter().map(|p| (p.number, p)).collect();
-    for g in plan_repo(prs, files, &BTreeMap::new()) {
+    for g in plan_repo(prs, files) {
         for e in &g.edges {
             if e.follower == e.after {
                 return Err(format!("self-predecessor {e:?}"));
             }
             let (f, p) = (by[&e.follower], by[&e.after]);
-            if e.reason != EdgeReason::StackedBase && !super::super::ready::ready(p) {
-                return Err(format!("edge behind a non-ready predecessor {e:?} (#10371)"));
+            if f.base_ref != p.head_ref {
+                return Err(format!("edge without stacking {e:?}"));
             }
-            match e.reason {
-                EdgeReason::SharedFiles => {
-                    let shared = files
-                        .get(&e.follower)
-                        .zip(files.get(&e.after))
-                        .is_some_and(|(a, b)| !a.is_disjoint(b));
-                    if !shared {
-                        return Err(format!("SharedFiles edge between disjoint PRs {e:?}"));
-                    }
-                    seen.0 += 1;
-                }
-                EdgeReason::StackedBase => {
-                    if f.base_ref != p.head_ref {
-                        return Err(format!("StackedBase edge without stacking {e:?}"));
-                    }
-                    seen.1 += 1;
-                }
+            let shared = files
+                .get(&e.follower)
+                .zip(files.get(&e.after))
+                .is_some_and(|(a, b)| !a.is_disjoint(b));
+            if !shared {
+                return Err(format!("stacked edge between disjoint PRs {e:?}"));
             }
+            seen += 1;
         }
     }
     Ok(seen)
 }
 
 #[test]
-fn seeded_property_every_edge_joins_directly_related_prs() {
+fn seeded_property_every_edge_is_a_stacked_pair_sharing_a_file() {
     const SEED: u64 = 0x1007_7a11_5eed_0001;
     const CASES: usize = 600;
     let mut rng = Rng(SEED);
-    let mut total = (0, 0);
+    let mut total = 0;
     for i in 0..CASES {
         let (prs, files) = gen_case(&mut rng);
         match check(&prs, &files) {
-            Ok((shared, stacked)) => total = (total.0 + shared, total.1 + stacked),
+            Ok(seen) => total += seen,
             Err(why) => panic!("seed {SEED:#x} case {i}: {why}\nprs: {prs:#?}\nfiles: {files:#?}"),
         }
     }
-    assert!(
-        total.0 > 0 && total.1 > 0,
-        "the generator must exercise both edge kinds: {total:?}"
+    assert!(total > 0, "the generator must exercise stacked edges: {total:?}");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn the_dry_run_lists_disjoint_holds_reads_once_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = dir.path();
+    // #20 holds after #10 (disjoint) — would release. #21 holds after #10 but
+    // shares a file — kept. #22 carries the label with no marker — a manual
+    // hold, never read for files.
+    let open = vec![
+        pr(10, "2026-10-01T00:00:00Z", &[]),
+        pr(20, "2026-10-02T00:00:00Z", &[SEQUENCE_LABEL]),
+        pr(21, "2026-10-02T01:00:00Z", &[SEQUENCE_LABEL]),
+        pr(22, "2026-10-02T02:00:00Z", &[SEQUENCE_LABEL]),
+    ];
+    write_json(d, "comments-20.json", &comment(&marker_text(&soft(20, 10))));
+    write_json(d, "comments-21.json", &comment(&marker_text(&soft(21, 10))));
+    let now = chrono::Utc::now().to_rfc3339();
+    write_json(
+        d,
+        "pull-10.json",
+        &serde_json::json!({"state": "open", "merged": false, "head": {"sha": sha(10)}, "updated_at": now}),
     );
+    for (n, paths) in [
+        (10, vec!["docs/a.md"]),
+        (20, vec!["src/b.rs"]),
+        (21, vec!["docs/a.md"]),
+    ] {
+        let rows: Vec<_> = paths
+            .iter()
+            .map(|p| serde_json::json!({"filename": p}))
+            .collect();
+        write_json(d, &format!("files-{n}.json"), &serde_json::json!(rows));
+    }
+    let (gh, log) = fake_gh(d);
+    let mut cache = TickFiles::default();
+    let conflicts = |_: &SequencePr, _: &SequencePr| true;
+    let out = would_release(&gh, &root, &open, &mut cache, &conflicts);
+    assert_eq!(out, vec![(20, 10)]);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
+    for n in [10, 20, 21] {
+        assert!(calls.matches(&format!("pulls/{n}/files")).count() <= 1, "{calls}");
+    }
+    assert!(!calls.contains("--json files"), "no GraphQL files read (#10382): {calls}");
+    assert!(!calls.contains("pulls/22/files"), "a manual hold reads no files: {calls}");
 }

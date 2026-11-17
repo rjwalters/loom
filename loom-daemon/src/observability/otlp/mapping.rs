@@ -4,15 +4,17 @@
 
 mod alert_transition;
 mod auto_update;
+mod champion_run;
 mod checkout_external_change;
 mod checkout_freshness;
 mod ci;
+mod completion_narrated;
 mod daemon_event;
 mod daemon_exit;
 mod dispatch_eligibility;
+mod dispatch_state;
 mod executing_host;
 mod fact_id;
-mod fleet_state;
 mod hold_transition;
 mod host_export;
 mod host_health;
@@ -20,13 +22,12 @@ mod host_resource;
 mod host_status;
 mod issue_estimate;
 mod merge_authorization;
+mod merge_lane_wait;
 mod merge_queue_event;
 mod merge_queue_observed;
 mod merge_queue_regime;
 mod metadata;
-mod operator_presence;
 mod ops;
-mod outcome_facts;
 mod pass;
 mod pick_decision;
 mod prompt_tree;
@@ -45,7 +46,7 @@ mod write_scope_refused;
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
 pub(super) use host_resource::resource_for_host;
-use metadata::{role_tick_result_str, severity_for_role_tick, visibility_str};
+use metadata::{role_tick_result_str, severity_for_role_tick};
 
 use std::collections::BTreeMap;
 
@@ -62,7 +63,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 
 use crate::telemetry::{
-    AnomalyFlag, RepoVisibility, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
+    AnomalyFlag, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
 };
 
 // ============================================================================
@@ -202,7 +203,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
@@ -225,7 +226,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SweepIdentity(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
@@ -251,7 +252,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             format!("sweep phase {}: {} issue #{}", r.phase, r.repo, r.issue),
             vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.phase", r.phase.clone()),
@@ -262,7 +263,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // unresolved case is stamped explicitly instead of a path ever
             // being written.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
@@ -289,7 +290,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #9442: `loom.repo` only when the slug resolved;
             // `loom.repo_unresolved=true` replaces it, never a host path.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
@@ -345,7 +346,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // tick is an event with a result and a detail string, not a gauge.
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.role", r.role.clone()),
                 kv_string("loom.result", role_tick_result_str(r.result)),
                 kv_int("loom.duration_sec", r.duration_sec),
@@ -383,11 +384,41 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(sweep_id) = &r.sweep_id {
                 attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
             }
+            // #12362: a Judge tick's found-work split and verdicts, and a
+            // step's own outcome class/reason. Each absent when unobserved.
+            if let Some(found_work) = r.found_work {
+                attributes.push(kv_string("loom.found_work", found_work.to_string()));
+            }
+            if let Some(reason) = &r.noop_reason {
+                attributes.push(kv_string("loom.noop_reason", reason.clone()));
+            }
+            if let Some(verdicts) = r
+                .verdicts
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok())
+            {
+                attributes.push(kv_string("loom.role_tick.verdicts", verdicts));
+            }
+            if let Some(class) = &r.step_class {
+                attributes.push(kv_string("loom.role_tick.step_class", class.clone()));
+            }
+            if let Some(reason) = &r.step_reason {
+                attributes.push(kv_string("loom.role_tick.step_reason", reason.clone()));
+            }
+            // #13563: the step's work item, so its tokens attribute to it.
+            if let Some(issue) = r.issue {
+                attributes.push(kv_int("loom.issue", i64::from(issue)));
+            }
+            if let Some(pr) = r.pr_number {
+                attributes.push(kv_int("loom.pr_number", i64::from(pr)));
+            }
             if let Some(models) = metadata::models(r.models_used.as_deref()) {
                 attributes.push(models);
             }
             if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
                 attributes.push(usage);
+                // #13563: flat per-step totals; absent (never zero) without usage.
+                attributes.extend(metadata::token_totals(r.tokens_by_model.as_deref()));
             }
             if let Some(actions) = &r.actions {
                 attributes
@@ -419,7 +450,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the parse never copies message text or tool output, so
             // nothing here needs a free-text bound beyond `bounded`'s.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.session_id", r.session_id.clone()),
                 kv_string("loom.runtime", r.runtime.clone()),
                 kv_int("loom.tokens.input", r.tokens_input),
@@ -497,7 +528,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // rollup, mapped as a log record like `session.summary` — an
             // event with counts and a dollar figure, not a gauge.
             let mut attributes = vec![
-                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.repo.visibility", r.visibility.as_str()),
                 kv_string("loom.session_id", r.session_id.clone()),
             ];
             // Absent, never a directory name — see the `session.summary` arm
@@ -607,12 +638,10 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
         | TelemetryRecord::RosterChange(_)
-        | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
-        | TelemetryRecord::FleetState(_)
         | TelemetryRecord::PickDecision(_)
-        | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
+        | TelemetryRecord::DispatchState(_)
         | TelemetryRecord::StageOccupancy(_)
         | TelemetryRecord::StageEntry(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
@@ -623,9 +652,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // decided). Issue #10196: one fleet-state snapshot (rows +
             // census; anchor/delta scalars ride as `loom.fleet.*`
             // attributes). Issue #10212: one pick decision (the ranked
-            // candidates). Issue #11563: one operator presence beat (the
-            // `loom.presence.*` scalars ride as attributes; `driving[]` is in
-            // the body). Each `log_parts` is `None` for every other kind.
+            // candidates). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| alert_transition::log_parts(r))
@@ -634,10 +661,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| checkout_external_change::log_parts(r))
                 .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
-                .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
-                .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
+                .or_else(|| dispatch_state::log_parts(r))
                 .or_else(|| stage_occupancy::log_parts(r))
                 .or_else(|| stage_entry::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;
@@ -649,16 +675,17 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
+        | TelemetryRecord::CompletionNarrated(_)
         | TelemetryRecord::MergeQueueEvent(_)
         | TelemetryRecord::MergeAuthorization(_)
         | TelemetryRecord::HoldTransition(_)
+        | TelemetryRecord::MergeLaneWait(_)
+        | TelemetryRecord::ChampionRun(_)
         | TelemetryRecord::MergeQueueObserved(_)
         | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::RunStateRequest(_)
-        | TelemetryRecord::ScopeMemory(_)
-        | TelemetryRecord::PrResolved(_)
-        | TelemetryRecord::StageOutcome(_) => {
+        | TelemetryRecord::ScopeMemory(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
             // and these kinds override BOTH timestamps — the source event's
             // time and the producer's read time are separate facts here, and
@@ -668,16 +695,18 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // merge/close or stage exit and observed when the daemon saw it.
             let r = &envelope.record;
             let parts = session_output::log_parts(r)
-                .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
                 .or_else(|| run_state_request::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
+                .or_else(|| completion_narrated::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
                 .or_else(|| merge_authorization::log_parts(r))
                 .or_else(|| hold_transition::log_parts(r))
+                .or_else(|| merge_lane_wait::log_parts(r))
+                .or_else(|| champion_run::log_parts(r))
                 .or_else(|| merge_queue_observed::log_parts(r))
                 .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;

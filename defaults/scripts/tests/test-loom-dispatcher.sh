@@ -48,12 +48,7 @@ for _s in loom-daemon node npm; do printf '#!/usr/bin/env bash\nexit 0\n' > "$DA
 WITH_DAEMON_PATH="$DAEMON_STUB_DIR:$PATH"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-assert_contains() {
-    if [[ "$1" == *"$2"* ]]; then pass "$3"; else fail "$3 (missing substring: '$2' in: $1)"; fi
-}
-assert_not_contains() {
-    if [[ "$1" != *"$2"* ]]; then pass "$3"; else fail "$3 (unexpected substring: '$2')"; fi
-}
+# Local assert_eq kept: takes (actual, expected, msg); shared assert_eq is (expected, actual, msg).
 assert_eq() {
     if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
 }
@@ -139,7 +134,7 @@ make_sweep_repo() {
     local r; r="$(mktemp -d)"
     mkdir -p "$r/.loom/scripts/lib"
     cp "$REAL_SPAWN_WORKER" "$r/.loom/scripts/spawn-worker.sh"
-    cp "$REPO_ROOT/defaults/scripts/lib/"{locate-daemon-bin,loom-tools}.sh "$r/.loom/scripts/lib/"
+    cp "$REPO_ROOT/defaults/scripts/lib/"{locate-daemon-bin,repo-root}.sh "$r/.loom/scripts/lib/"
     # Stub runners: each announces which runtime ran and forwards its argv so a
     # test can assert on both the selected runner and the passthrough flags.
     cat > "$r/.loom/scripts/spawn-claude.sh" <<'EOF'

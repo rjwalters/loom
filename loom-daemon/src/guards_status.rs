@@ -159,6 +159,13 @@ const CATEGORIES: &[Category] = &[
         tags: &["stash-scope:"],
     },
     Category {
+        key: "primaryCheckoutMutation",
+        env: "LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["primary-checkout-mutation:"],
+    },
+    Category {
         key: "backgroundSubagents",
         env: "LOOM_GUARD_BACKGROUND_SUBAGENTS",
         kind: Kind::Bool {
@@ -333,12 +340,16 @@ fn settings_env(path: &Path) -> BTreeMap<String, String> {
     out
 }
 
-fn wiring(path: &Path) -> Wiring {
+/// Repo-scope wiring must name Loom's own path: Repo Skills' guard lives at
+/// `.claude/skills/repo/hooks/guard-destructive.sh` and must not count (#13787).
+const REPO_NEEDLE: &str = ".loom/hooks/guard-destructive";
+
+fn wiring(path: &Path, needle: &str) -> Wiring {
     let json = read_json(path);
     let wired = json
         .as_ref()
         .and_then(|v| v.get("hooks"))
-        .is_some_and(|h| h.to_string().contains("guard-destructive"));
+        .is_some_and(|h| h.to_string().contains(needle));
     Wiring {
         path: path.display().to_string(),
         exists: path.exists(),
@@ -556,15 +567,15 @@ pub fn collect(inputs: &Inputs) -> Report {
     }
 
     let categories = resolve_categories(repo, &layers);
-    let repo_wiring = wiring(&repo_settings);
-    let repo_local_wiring = wiring(&repo_local);
+    let repo_wiring = wiring(&repo_settings, REPO_NEEDLE);
+    let repo_local_wiring = wiring(&repo_local, REPO_NEEDLE);
     let global_wiring = global_settings.as_deref().map_or(
         Wiring {
             path: "(no HOME)".into(),
             exists: false,
             wired: false,
         },
-        wiring,
+        |p| wiring(p, "guard-destructive"),
     );
 
     let log_path = inputs
@@ -927,6 +938,15 @@ mod tests {
         let r = collect(&inputs(repo.path(), home.path()));
         assert!(r.global_wiring.wired);
         assert!(r.warnings.iter().any(|w| w.headline == "DOUBLE-WIRED-HOOK"));
+    }
+
+    #[test]
+    fn repo_skills_guard_does_not_count_as_loom_wiring() {
+        let (repo, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let skills = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/guard-destructive.sh"}]}]}}"#;
+        put(repo.path(), ".claude/settings.json", skills);
+        let r = collect(&inputs(repo.path(), home.path()));
+        assert!(r.repo_wiring.exists && !r.repo_wiring.wired);
     }
 
     #[test]

@@ -62,6 +62,15 @@ pub struct TickPasses {
     /// had a merge in flight (#12494): the tick span's
     /// `loom.dispatch.merge_deferred`.
     pub merge_deferred: usize,
+    /// The largest `champion.mergeConcurrencyPerRepo` among the tick's repos
+    /// (#13026): the span's `loom.champion.merge_concurrency`.
+    pub merge_concurrency: usize,
+    /// Eligible `champion_merge` steps across the tick's repos (#13367): the
+    /// span's `loom.champion.merge_eligible`.
+    pub merge_eligible: usize,
+    /// Champion merges in flight across the tick's repos after it drew
+    /// (#13026): the span's `loom.champion.merges_in_flight`.
+    pub merges_in_flight: usize,
     /// Passes by reason (`claim_lost`, `merge_in_flight`, ...).
     pub by_reason: std::collections::BTreeMap<String, usize>,
     /// The slots the tick could fill (its free slots).

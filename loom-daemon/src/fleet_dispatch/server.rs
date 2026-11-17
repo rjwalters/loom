@@ -52,6 +52,7 @@ use super::queue::{Queue, DEFAULT_REFRESH_SECS};
 use super::roster::{Roster, RosterSource};
 use super::table::{ClaimDecision, ExpiredAssignment, Mono, Policy, RefuseOutcome, Table};
 use super::telemetry::{self, Call, Counters, HoldFacts};
+use crate::step_role::StepRole;
 use crate::telemetry::ops::MetricPoint;
 
 /// The span reason of a claim refused `held` by a no-progress hold
@@ -285,6 +286,9 @@ impl<I: Identity> Server<I> {
             server_epoch: self.epoch.clone(),
             assignment_id: Some(row.assignment_id.clone()),
             item: Some((row.repo.clone(), row.item, row.step.clone())),
+            merge_slot_holder: row.merge_slot_holder.clone().or_else(|| {
+                (row.step == StepRole::ChampionMerge.as_str()).then(|| "none".to_string())
+            }),
             ..Call::default()
         };
         telemetry::emit_call(&call, chrono::Utc::now(), self.next_seq());
@@ -400,6 +404,9 @@ impl<I: Identity> Server<I> {
                 } else {
                     counters.claim_refused(*reason);
                 }
+            }
+            if step_is_merge(&req.step) {
+                call.merge_slot_holder = Some(slot_holder(t, &req.repo));
             }
             d
         });
@@ -555,7 +562,13 @@ impl<I: Identity> Server<I> {
             if let Some(((repo, item), row)) = t.row_by_id(&req.assignment_id) {
                 call.item = Some((repo.clone(), *item, row.step.clone()));
             }
-            t.release_outcome(now, host, &req.assignment_id, &req.outcome)
+            let known = t.release_outcome(now, host, &req.assignment_id, &req.outcome);
+            if let Some((repo, _, step)) = &call.item {
+                if step_is_merge(step) {
+                    call.merge_slot_holder = Some(slot_holder(t, repo));
+                }
+            }
+            known
         });
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),
@@ -584,6 +597,16 @@ impl<I: Identity> Server<I> {
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
+}
+
+fn step_is_merge(step: &str) -> bool {
+    step == StepRole::ChampionMerge.as_str()
+}
+
+/// The `merge_slot_holder` span value: the repo's `champion_merge` holder,
+/// or `none` (#13009).
+fn slot_holder(t: &Table, repo: &str) -> String {
+    t.merge_holder(repo).unwrap_or("none").to_string()
 }
 
 /// A request body that names its host.

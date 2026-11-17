@@ -43,7 +43,7 @@
 //! [`request_next`] asks the captain for assignments for the host's free
 //! slots (`/v1/next`, #12817); [`super::request`] decides *when* (on newly
 //! available capacity, with capped jittered backoff on empty answers, never
-//! a fixed period). An assignment is a [`Candidate`] and nothing more.
+//! a fixed period). An assignment is a [`Candidate`]: the step tick keeps its grant ([`offer`]), draws it through its gates first, and the spawn's [`claim`] takes the grant instead of asking again; an offer no claim took goes back with [`decline_offered`].
 //!
 //! # Heartbeat
 //!
@@ -264,6 +264,9 @@ struct State {
     last_heartbeat: Option<Instant>,
     /// The `server_epoch` of the last `next` answer (#12817).
     next_epoch: Option<String>,
+    /// Grants the captain offered in answer to a `next` that no claim has
+    /// consumed yet (#12817).
+    offered: Vec<Grant>,
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -372,6 +375,12 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
         item: u64::from(item),
         step: role.as_str().to_string(),
     };
+    // The captain already granted this item in answer to a `next`: the grant
+    // stands in for the claim, and the step goes on through the same gates,
+    // live pre-check and forge pre-claim as any other (#12817).
+    if let Some(grant) = take_offered(&request.repo, request.item, &request.step) {
+        return Ask::Granted(grant);
+    }
     let started = Instant::now();
     let answer = client::post_blocking::<_, ClaimResponse>(&url, proto::CLAIM_PATH, &request)
         .and_then(|r| {
@@ -563,16 +572,21 @@ fn send_release(grant: &Grant, outcome: &str) {
 /// through today's admission after a grant, and the captain does not yet
 /// use `roles_ok` to pick hosts.
 pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
+    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok(exhausted)));
+}
+
+/// The role names this host can run: every step role's, but `exhausted`.
+#[must_use]
+pub fn roles_ok(exhausted: &BTreeSet<String>) -> Vec<String> {
     // Several steps share a role name (the Champion's three): a set, so
     // each role is listed once, in a stable order.
-    let roles: Vec<String> = StepRole::ALL
+    StepRole::ALL
         .iter()
         .map(|r| r.role_name().to_string())
         .filter(|name| !exhausted.contains(name))
         .collect::<BTreeSet<String>>()
         .into_iter()
-        .collect();
-    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles));
+        .collect()
 }
 
 /// One reaper tick of the registry at `root`, whose live steps are `live`
@@ -860,6 +874,44 @@ fn candidates_of(url: &str, resp: &NextResponse) -> Vec<Candidate> {
         }
     }
     out
+}
+
+/// Keep the grants of `candidates` for the claims that follow: the step tick
+/// draws them through its gates, and the spawn's [`claim`] takes the grant
+/// instead of asking the captain again. Replaces an earlier offer of the same
+/// item; one the tick leaves unclaimed is given back by [`decline_offered`].
+pub fn offer(candidates: &[Candidate]) {
+    let mut s = state();
+    for c in candidates {
+        s.offered
+            .retain(|g| !same_item(g, &c.grant.repo, c.grant.item, &c.grant.step));
+        s.offered.push(c.grant.clone());
+    }
+}
+
+fn same_item(g: &Grant, repo: &str, item: u64, step: &str) -> bool {
+    g.item == item && g.step == step && g.repo.eq_ignore_ascii_case(repo)
+}
+
+/// The offered grant for `(repo, item, step)`, removed.
+fn take_offered(repo: &str, item: u64, step: &str) -> Option<Grant> {
+    let mut s = state();
+    let at = s
+        .offered
+        .iter()
+        .position(|g| same_item(g, repo, item, step))?;
+    Some(s.offered.remove(at))
+}
+
+/// Give back every offered grant no claim took (`reason` is the refusal
+/// token): the item did not pass this host's gates, or the tick had no slot
+/// for it, so its row must not sit out its TTL. Returns how many.
+pub fn decline_offered(reason: &str) -> usize {
+    let left = std::mem::take(&mut state().offered);
+    for grant in &left {
+        refuse(grant, reason);
+    }
+    left.len()
 }
 
 /// [`candidates_of`] for another module's tests.

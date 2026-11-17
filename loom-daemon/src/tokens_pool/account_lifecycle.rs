@@ -309,7 +309,9 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         let root = codex_profile_root()
             .ok_or_else(|| anyhow!("Codex profiles are disabled by LOOM_CODEX_PROFILE_ROOT"))?;
         reject_repository_local_root(&workspace, &root)?;
-        ensure_private_dir(&root)?;
+        // Read-only actions (`check`, `list`, `status`) construct this too, and
+        // the root is a shared, operator-managed directory (#13319): do not
+        // create or chmod it here. First write creates it, create-only.
         Ok(Self {
             workspace,
             root,
@@ -829,6 +831,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     /// touching the winner's files or registration.
     fn claim_profile_dir(&self, name: &str) -> Result<PathBuf> {
         let profile = self.profile(name)?;
+        ensure_root_created(&self.root)?;
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -851,6 +854,22 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         }
         Ok(profile)
     }
+}
+
+/// Create the shared profile root `0700` if it is missing; never touch the mode
+/// of one that already exists (it may be operator/chezmoi-managed, #13319).
+fn ensure_root_created(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)?;
+    Ok(())
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -1254,6 +1273,26 @@ mod tests {
         service.import("bob", &source).unwrap();
         assert!(service.remove("bob", true).unwrap().purged);
         assert!(!root.path().join("bob").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn read_only_paths_leave_existing_root_mode_and_missing_root_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (workspace, root, _env) = setup();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.list(false).unwrap();
+        let mode = fs::metadata(root.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "read-only path must not chmod the shared root");
+
+        let missing = root.path().join("absent");
+        // Re-point under the already-held guard (its lock is not reentrant).
+        std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, &missing);
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        let _ = service.list(false);
+        assert!(!missing.exists(), "read-only path must not create the root");
     }
 
     #[test]

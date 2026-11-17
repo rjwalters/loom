@@ -90,7 +90,6 @@ impl ActivityDb {
 
     /// Get terminal activity history (inputs joined with outputs)
     /// Returns entries in reverse chronological order (most recent first)
-    #[allow(dead_code)]
     pub fn get_terminal_activity(
         &self,
         terminal_id: &str,
@@ -174,7 +173,6 @@ impl ActivityDb {
     // ========================================================================
 
     /// Parse and record quality metrics from terminal output.
-    #[allow(dead_code)]
     pub fn record_quality_from_output(&self, input_id: i64, output: &str) -> Result<Option<i64>> {
         quality::record_quality_from_output(&self.conn, input_id, output)
     }
@@ -347,12 +345,6 @@ impl ActivityDb {
         claims::get_claims_by_terminal(&self.conn, terminal_id)
     }
 
-    /// Get stale claims (those without heartbeat for longer than threshold).
-    #[allow(dead_code)]
-    pub fn get_stale_claims(&self, stale_threshold_secs: i64) -> Result<Vec<IssueClaim>> {
-        claims::get_stale_claims(&self.conn, stale_threshold_secs)
-    }
-
     /// Release all stale claims and return the count of claims released.
     pub fn release_stale_claims(&self, stale_threshold_secs: i64) -> Result<usize> {
         claims::release_stale_claims(&self.conn, stale_threshold_secs)
@@ -373,31 +365,10 @@ impl ActivityDb {
 }
 
 // Implement StatsQueries trait for ActivityDb
-use super::stats::{
-    self, AgentEffectiveness, CostPerIssue, StatsQueries, StatsSummary, WeeklyVelocity,
-};
+use super::stats::{self, StatsQueries};
 use chrono::NaiveDate;
 
 impl StatsQueries for ActivityDb {
-    fn get_agent_effectiveness(
-        &self,
-        role: Option<&str>,
-    ) -> rusqlite::Result<Vec<AgentEffectiveness>> {
-        stats::query_agent_effectiveness(&self.conn, role)
-    }
-
-    fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>> {
-        stats::query_cost_per_issue(&self.conn, issue_number)
-    }
-
-    fn get_weekly_velocity(&self) -> rusqlite::Result<Vec<WeeklyVelocity>> {
-        stats::query_weekly_velocity(&self.conn)
-    }
-
-    fn get_stats_summary(&self) -> rusqlite::Result<StatsSummary> {
-        stats::query_stats_summary(&self.conn)
-    }
-
     fn get_summary_metrics(
         &self,
         role: Option<&str>,

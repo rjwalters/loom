@@ -4,10 +4,10 @@
 //! update state (H0–H5, H7 or `unknown`), the running and on-disk versions, the
 //! fleet floor when one is set, and the roll target with who chose it. The
 //! state is classified daemon-side
-//! ([`loom_daemon::auto_update::update_observation`]); this only renders it.
+//! ([`crate::auto_update::update_observation`]); this only renders it.
 //! The per-workspace resync lines are unchanged.
 
-use loom_daemon::types::DaemonStatusReport;
+use crate::types::DaemonStatusReport;
 
 /// The line for `report`, or `None` from a daemon that predates the field.
 #[must_use]
@@ -41,7 +41,7 @@ pub fn print(report: &DaemonStatusReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_daemon::auto_update::update_observation::{
+    use crate::auto_update::update_observation::{
         HostState, HostUpdateObservation, ObservedTargetSource,
     };
 

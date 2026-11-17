@@ -176,7 +176,6 @@ const KNOWN_SITES: &[(&str, &[&str])] = &[
     ("auto_update/pause_resume/host.rs", &["item.step", "requeue_step("]),
     ("sweep_registry/reaper.rs", KIND_NEEDLES),
     ("cli/cancel.rs", KIND_NEEDLES),
-    ("dispatch_tap.rs", KIND_NEEDLES),
     ("sweep_registry/roll_resume.rs", KIND_NEEDLES),
     ("sweep_registry/model_dispatch.rs", KIND_NEEDLES),
     ("work_finder/forge.rs", KIND_NEEDLES),
@@ -234,6 +233,12 @@ const ISSUE_KIND_FIELDS: &[(&str, usize, &str)] = &[
         "SlotLedger counts steps; TurnoverLedger is issue-only by design",
     ),
     ("safehouse/envelopes.rs", 1, "event_to_envelope names Step"),
+    (
+        "sweep_registry/published_repo.rs",
+        1,
+        "a #[cfg(test)] fixture seeding a live issue sweep; the lookup itself goes \
+         through live_issue_sweep_id, which already names the Builder step",
+    ),
     (
         "safehouse.rs",
         1,

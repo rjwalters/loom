@@ -43,6 +43,7 @@
 //! | `4` | refused before any forge call (`NOT_QUEUE_MODE` / `EXECUTION_DORMANT`) |
 
 pub mod authz;
+pub mod clear_gate;
 pub mod events;
 pub mod forge;
 pub mod gh_lifecycle;

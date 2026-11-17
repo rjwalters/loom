@@ -33,6 +33,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{valid_item_id, ITEM_ENV};
+use crate::shell_quote::shell_quote;
 
 /// Names the `roll-pause.sh` to wire, overriding the lookup (tests, or a
 /// launch whose hooks live elsewhere).
@@ -130,11 +131,6 @@ fn user_config_dir() -> Option<PathBuf> {
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
-}
-
-/// `s` as one POSIX shell word.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// The `--settings` JSON that wires `hook` to every tool call.

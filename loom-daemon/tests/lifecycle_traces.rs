@@ -13,26 +13,14 @@ use serde_json::json;
 use std::{
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
-    sync::OnceLock,
 };
 
-fn fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let bin = dir.join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
+use worker_cli::fixture;
+
 fn root() -> tempfile::TempDir {
     common::stub_gh_bin_in_process();
     let dir = tempfile::tempdir().unwrap();
@@ -82,7 +70,12 @@ fn failed_spawn_completes_and_retires_the_prepared_root() {
     let root = dir.path();
     let execution = "missing-executable";
     let mut cmd = Command::new(root.join("does-not-exist"));
-    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, None);
+    loom_daemon::observability::tracing::prepare_child(
+        &mut cmd,
+        root,
+        execution,
+        &Default::default(),
+    );
     assert!(TraceStore::new(root).path(root, execution).exists());
     let error = lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -113,7 +106,12 @@ fn issue_sweeps(
     let mut sweeps = Vec::new();
     for execution in executions {
         let mut cmd = Command::new(root.join("does-not-exist"));
-        loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, Some(issue));
+        loom_daemon::observability::tracing::prepare_child(
+            &mut cmd,
+            root,
+            execution,
+            &loom_daemon::observability::lifecycle::StepKeys::issue(Some(issue)),
+        );
         lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
         sweeps.extend(
             spans(root).into_iter().filter(|s| {

@@ -64,9 +64,10 @@ use crate::types::{Event, SweepKind};
 mod completion_runtime;
 mod forge_gate;
 mod reconcile_tick;
+mod status_reaction;
+use reconcile_tick::ReconcileState;
 #[cfg(test)]
 use reconcile_tick::ReconcileWatermarks;
-use reconcile_tick::{reconcile_merges_since, ReconcileState};
 pub mod loom_ui_watch;
 
 // ============================================================================
@@ -92,6 +93,14 @@ const ROOMS_BY_REPO_ENV: &str = "LOOM_SAFEHOUSE_ROOMS_BY_REPO";
 /// falls back to [`SafehouseConfig::signal_room`] — see
 /// [`SafehouseConfig::claims_room`].
 const ROOM_CLAIMS_ENV: &str = "LOOM_SAFEHOUSE_ROOM_CLAIMS";
+
+/// The optional alerts room (#13070): when set, `handoff`-type envelopes
+/// (fleet-degraded edges and their `Cleared`, BLOCKED, crashed) go here instead
+/// of the main/signal room. Dispatch, phase, ack and completion lines stay put.
+/// Deliberately separate from [`ROOM_SIGNAL_ENV`], which turns on attention
+/// routing and would move completions (the public-feed egress is pinned to the
+/// main room).
+const ROOM_ALERTS_ENV: &str = "LOOM_SAFEHOUSE_ROOM_ALERTS";
 
 /// Alias prefix for a lazily-created per-repo firehose room (#4225): the
 /// `vibesql` workspace's firehose is `fleet-vibesql`. Deliberately **not** the
@@ -239,6 +248,11 @@ pub struct RoomMap {
     /// ensure every host's safehoused bot is joined to it (the same
     /// cross-host-provisioning requirement documented for `signal`).
     pub claims: Option<String>,
+    /// Optional alerts room (#13070), opt-in. When set, `handoff` envelopes —
+    /// and only those — resolve here; everything else routes exactly as it
+    /// would without it. Like `claims`, an alerts-only map does **not**
+    /// activate attention-class narration routing.
+    pub alerts: Option<String>,
 }
 
 impl RoomMap {
@@ -246,7 +260,10 @@ impl RoomMap {
     /// callers normalize it to `None` (single-room mode).
     #[must_use]
     fn is_empty(&self) -> bool {
-        self.signal.is_none() && self.by_repo.is_empty() && self.claims.is_none()
+        self.signal.is_none()
+            && self.by_repo.is_empty()
+            && self.claims.is_none()
+            && self.alerts.is_none()
     }
 
     /// Whether this map carries a **narration** routing target (`signal` and/or
@@ -420,6 +437,11 @@ fn rooms_from_value(block: Option<&Value>) -> Option<RoomMap> {
             map.claims = Some(claims.trim().to_owned());
         }
     }
+    if let Some(alerts) = rooms.get("alerts").and_then(Value::as_str) {
+        if !alerts.trim().is_empty() {
+            map.alerts = Some(alerts.trim().to_owned());
+        }
+    }
     (!map.is_empty()).then_some(map)
 }
 
@@ -451,6 +473,7 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
 ///
 /// - `LOOM_SAFEHOUSE_ROOM_SIGNAL` overrides `rooms.signal` alone.
 /// - `LOOM_SAFEHOUSE_ROOM_CLAIMS` (#4713) overrides `rooms.claims` alone.
+/// - `LOOM_SAFEHOUSE_ROOM_ALERTS` (#13070) overrides `rooms.alerts` alone.
 /// - `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,repo=room…`) replaces the
 ///   **whole** `byRepo` map rather than merging into it, so an operator can
 ///   override a stale committed map from the environment without editing config
@@ -464,8 +487,9 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
 fn apply_room_env_overrides(rooms: Option<RoomMap>) -> Option<RoomMap> {
     let signal = env_nonempty(ROOM_SIGNAL_ENV);
     let claims = env_nonempty(ROOM_CLAIMS_ENV);
+    let alerts = env_nonempty(ROOM_ALERTS_ENV);
     let by_repo = env_nonempty(ROOMS_BY_REPO_ENV).map(|raw| parse_by_repo_env(&raw));
-    if signal.is_none() && claims.is_none() && by_repo.is_none() {
+    if signal.is_none() && claims.is_none() && alerts.is_none() && by_repo.is_none() {
         return rooms;
     }
     let mut map = rooms.unwrap_or_default();
@@ -474,6 +498,9 @@ fn apply_room_env_overrides(rooms: Option<RoomMap>) -> Option<RoomMap> {
     }
     if let Some(claims) = claims {
         map.claims = Some(claims);
+    }
+    if let Some(alerts) = alerts {
+        map.alerts = Some(alerts);
     }
     if let Some(by_repo) = by_repo {
         map.by_repo = by_repo;
@@ -861,22 +888,6 @@ impl CompletionMeta {
     }
 }
 
-/// Whether `slug` is a forge `owner/repo` slug: exactly one `/`, both halves
-/// non-empty and made of forge-legal name characters.
-fn valid_repo_slug(slug: &str) -> bool {
-    let mut parts = slug.split('/');
-    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    let legal = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 100
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    legal(owner) && legal(name)
-}
-
 /// Validate a `completion-v1` `meta` object **before** it can reach the wire
 /// (#4426). safehoused silently degrades a malformed `meta` to a `chat` — the
 /// event then vanishes from the public feed with no error anywhere — so this
@@ -908,7 +919,7 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
     if !valid_persona(get("agent")) {
         bail!("completion `meta.agent` {:?} is not a valid persona", get("agent"));
     }
-    if !valid_repo_slug(get("repo")) {
+    if !crate::forge_slug::valid_slug(get("repo")) {
         bail!("completion `meta.repo` {:?} is not a forge owner/repo slug", get("repo"));
     }
     let pr_ref = get("ref");
@@ -1275,6 +1286,13 @@ impl RoomRouter {
         // same: `rooms.claims` redirects the peer-claim coordination connection
         // only, and must not switch narration into attention-class routing —
         // per-repo lazy firehose creation included — as a side effect.
+        // The alerts room (#13070) is checked first and independently of
+        // narration routing: handoffs only, and it works in single-room mode.
+        if kind == EnvelopeKind::Handoff.as_str() {
+            if let Some(alerts) = self.map.as_ref().and_then(|map| map.alerts.clone()) {
+                return RoomDecision::Send(Some(alerts));
+            }
+        }
         let Some(map) = self.map.as_ref().filter(|map| map.routes_narration()) else {
             return RoomDecision::Send(self.single.clone());
         };
@@ -1447,11 +1465,12 @@ struct PendingDispatch {
 /// `dispatched 7: loom×6 (#4028 #4106 #4144 #4157 #4162 #4164), vibesql×1
 /// (#6173)`. Groups sort by descending count (ties broken alphabetically) so
 /// the busiest repo leads; issue numbers within a group sort ascending.
-/// `seq` gives each digest a distinct `task_id` so consecutive digests are
-/// separate thread roots rather than one perpetual accumulating thread — this
-/// module's contract is "one root per burst", not "one root ever" ([`Envelope::task_id`]
-/// must be `[A-Za-z0-9_]`, which a plain counter satisfies trivially).
-fn build_dispatch_digest_envelope(batch: &[PendingDispatch], seq: u64) -> Envelope {
+/// The digest carries **no** `task_id`: it is a plain top-level line, so each
+/// burst is its own root. A per-process counter id (`dispatch_digest_<seq>`)
+/// collided across hosts and daemon restarts, and safehoused's first-seen-wins
+/// thread roots then threaded a later digest as a reply under an unrelated
+/// one (#13077).
+fn build_dispatch_digest_envelope(batch: &[PendingDispatch]) -> Envelope {
     let mut groups: std::collections::BTreeMap<String, Vec<u32>> =
         std::collections::BTreeMap::new();
     for dispatch in batch {
@@ -1478,7 +1497,7 @@ fn build_dispatch_digest_envelope(batch: &[PendingDispatch], seq: u64) -> Envelo
     Envelope {
         to: "*".to_owned(),
         kind: "digest".to_owned(),
-        task_id: Some(format!("dispatch_digest_{seq}")),
+        task_id: None,
         body: format!("dispatched {}: {}", batch.len(), parts.join(", ")),
         meta: None,
     }
@@ -1695,10 +1714,18 @@ async fn run_sink_gh(
         .args(args);
     let why = match inv.run_async().await {
         CmdOutcome::Ran(output) => return Some(output),
-        CmdOutcome::Unavailable(Unavailable::TimedOut { .. }) => {
-            format!("timed out after {}s", timeout.as_secs())
+        CmdOutcome::Unavailable(u) => {
+            // Every failure is counted (#13156); the log below stays one-shot.
+            crate::observability::ops::safehouse_forge_lookup::record_failed(
+                call,
+                &crate::peer_claims::repo_slug(workspace_root),
+                &u,
+            );
+            match u {
+                Unavailable::TimedOut { .. } => format!("timed out after {}s", timeout.as_secs()),
+                u => format!("could not run gh: {u}"),
+            }
         }
-        CmdOutcome::Unavailable(u) => format!("could not run gh: {u}"),
     };
     log_gh_failure_once(call, workspace_root, &why);
     None
@@ -1881,7 +1908,7 @@ async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
     log_gh_recovery_once("repo view", workspace_root);
     let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
     let slug = parsed.get("nameWithOwner")?.as_str()?.trim().to_owned();
-    if !valid_repo_slug(&slug) {
+    if !crate::forge_slug::valid_slug(&slug) {
         return None;
     }
     // Absent/wrongly-typed ⇒ unknown, never "assume public": the whole point of
@@ -2214,6 +2241,10 @@ async fn completion_for_exit(
         already_narrated,
         activity_db,
         peer_completions,
+        completion_runtime::Narration::new(
+            crate::observability::ops::feed::Trigger::SweepExit,
+            false,
+        ),
     )
     .await
 }
@@ -2223,7 +2254,7 @@ async fn completion_for_exit(
 /// ([`completion_for_exit`]), a Champion merge step's end
 /// ([`completion_for_merged_step`], #12152: a step emits no `SweepExited`),
 /// and the periodic merge-reconciliation pass below
-/// ([`reconcile_recent_merges`]), which exists precisely because a
+/// ([`reconcile_tick::reconcile_merges_since`]), which exists precisely because a
 /// champion-tick merge — landing well after the sweep process (and its one
 /// `SweepExited`) already exited — is never observed by the first path alone.
 ///
@@ -2234,7 +2265,7 @@ async fn completion_for_exit(
 /// here because the two callers have different clocks available: a live
 /// sweep's reaper clock for [`completion_for_exit`], the forge's
 /// `createdAt`/`mergedAt` pair (no sweep clock exists) for
-/// [`reconcile_recent_merges`].
+/// [`reconcile_tick::reconcile_merges_since`].
 ///
 /// The dedup key is `(workspace, issue, merged.number)` (Issue #6062), not
 /// `(workspace, issue)` alone — see [`completion_for_exit`]'s doc comment for
@@ -2252,6 +2283,7 @@ async fn build_and_narrate_completion(
     already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
+    narration: completion_runtime::Narration,
 ) -> Option<Envelope> {
     let key = (workspace_root.to_owned(), issue, merged.number);
     if already_narrated.contains(&key) {
@@ -2332,6 +2364,7 @@ async fn build_and_narrate_completion(
     {
         Ok(envelope) => {
             let pr = key.2;
+            completion_runtime::emit_narration_record(&meta, issue, pr, narration);
             already_narrated.insert(key);
             // Issue #6352: this host is the one narrating — tell peers so
             // they don't also narrate it. Fire-and-forget; a dropped ad
@@ -2402,25 +2435,6 @@ fn reconcile_max_age() -> chrono::Duration {
         .filter(|s| *s >= 0)
         .unwrap_or(DEFAULT_RECONCILE_MAX_AGE_SECS);
     chrono::Duration::seconds(secs)
-}
-
-/// Best-effort bulk `gh pr list --state merged` lookup across **all** recently
-/// merged PRs in `workspace_root` (issue #4583) — unlike [`fetch_merged_pr`]
-/// this is not filtered to one issue's branch, which is exactly what lets it
-/// discover a merge the branch-scoped, `SweepExited`-triggered lookup never
-/// ran for (no sweep, no trigger). Rows merged longer than
-/// [`reconcile_max_age`] ago are dropped here, so a first-ever pass cannot
-/// backfill stale history onto the feed. Every failure — missing `gh`, no
-/// network, unauthenticated, timeout, malformed JSON, an unparsable row —
-/// degrades that row (or the whole call) to being silently skipped; a
-/// best-effort reconciliation pass must never panic or block the sink.
-// The unwatermarked form; production goes through the watermarked one (#12152).
-#[cfg_attr(not(test), allow(dead_code))]
-async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
-    fetch_merged_prs_since(workspace_root, None)
-        .await
-        .map(|(rows, _)| rows)
-        .unwrap_or_default()
 }
 
 /// How far before a workspace's watermark a catch-up query starts (#12152).
@@ -2497,13 +2511,33 @@ async fn fetch_merged_prs_since(
     log_gh_recovery_once("pr list (reconcile)", workspace_root);
     let rows = serde_json::from_slice::<Value>(&output.stdout).ok()?;
     let array = rows.as_array()?;
-    let saturated = u32::try_from(array.len()).is_ok_and(|n| n >= limit);
     let cutoff = Utc::now() - reconcile_max_age();
+    let saturated = page_may_hide_in_window_merges(array, limit, cutoff);
     let rows = array
         .iter()
         .filter_map(|row| reconciled_row(row, cutoff))
         .collect();
     Some((rows, saturated))
+}
+
+/// Whether a reconciliation page could still hide a merge the pass may
+/// narrate (#13481): the forge handed back a full page (`limit` rows) AND
+/// every row it holds was merged inside the lookback window. A row dated
+/// before `cutoff` proves the page already reached past everything the pass
+/// could narrate, however many rows the repository has merged in its life —
+/// the unwatermarked query's newest-`limit` page of a long-lived repo is
+/// full of out-of-window history, and judging saturation on the raw count
+/// alone warned "filled its page (0 rows)" on every pass over such a repo. A
+/// row without a readable `mergedAt` counts as in-window, so an odd answer
+/// errs towards the warning rather than away from it. Pure.
+fn page_may_hide_in_window_merges(rows: &[Value], limit: u32, cutoff: DateTime<Utc>) -> bool {
+    let full = u32::try_from(rows.len()).is_ok_and(|n| n >= limit);
+    full && rows.iter().all(|row| {
+        row.get("mergedAt")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .is_none_or(|merged_at| merged_at.with_timezone(&Utc) >= cutoff)
+    })
 }
 
 /// One merged-PR row (from `gh pr list` or `gh pr view`, same fields:
@@ -2653,50 +2687,9 @@ async fn completion_for_merged_step(
         already_narrated,
         activity_db,
         peer_completions,
+        completion_runtime::Narration::new(crate::observability::ops::feed::Trigger::Step, false),
     )
     .await
-}
-
-/// The periodic reconciliation pass itself (issue #4583): bulk-lists recently
-/// merged PRs for `workspace_root` and narrates a completion for any
-/// `(workspace, issue, merged-PR-number)` not already in `already_narrated` —
-/// sharing that exact dedup set with [`completion_for_exit`]'s `SweepExited`
-/// path is what keeps the two trigger paths from ever double-posting the same
-/// merge, in either direction (whichever path observes the merge first wins;
-/// the other becomes a no-op `contains` check). Keying on the PR number
-/// (Issue #6062) rather than the issue alone also means a *different* merged
-/// PR against the same still-open issue (a partial increment) is narrated
-/// independently instead of being silently swallowed by the first merge's key.
-///
-/// This is the option the issue's curation explicitly favors over a new event
-/// topic/IPC verb: it needs no change to the frozen v0.10.0 event taxonomy,
-/// and — because it queries forge truth directly rather than depending on any
-/// daemon-emitted event — it also naturally covers a merge that happened while
-/// the daemon itself was down, **provided** the dedup set survives the
-/// restart; see [`load_persisted_completed`] / [`persist_completed_best_effort`]
-/// for that half of the story (the in-memory set alone does not survive one).
-// The unwatermarked form; production goes through the watermarked one (#12152).
-#[cfg_attr(not(test), allow(dead_code))]
-async fn reconcile_recent_merges(
-    persona: &str,
-    workspace_root: &str,
-    slug_cache: &mut HashMap<String, RepoIdentity>,
-    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
-    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
-    peer_completions: Option<&PeerCompletionHandle>,
-) -> Vec<Envelope> {
-    reconcile_merges_since(
-        persona,
-        workspace_root,
-        None,
-        slug_cache,
-        already_narrated,
-        activity_db,
-        peer_completions,
-    )
-    .await
-    .map(|pass| pass.envelopes)
-    .unwrap_or_default()
 }
 
 /// Reconciliation-pass cadence (issue #4583). Test/operator override mirrors
@@ -2943,6 +2936,18 @@ impl SafehouseClient {
         env: &Envelope,
         room: Option<&str>,
     ) -> std::result::Result<(), SendError> {
+        self.send_to_with_event_id(env, room).await.map(|_| ())
+    }
+
+    /// [`send_to`](Self::send_to) that also returns the Matrix `event_id`
+    /// safehoused reports for the accepted message (`None` when an older
+    /// daemon's reply omits it). The status-reaction tracker (#13069) uses it
+    /// to remember an issue's thread root.
+    pub async fn send_to_with_event_id(
+        &mut self,
+        env: &Envelope,
+        room: Option<&str>,
+    ) -> std::result::Result<Option<String>, SendError> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         // A malformed envelope is a transport-class caller bug (the connection
@@ -2951,6 +2956,51 @@ impl SafehouseClient {
         let req = build_send_request(env, id, room).map_err(SendError::Transport)?;
         self.write_line(&req).await.map_err(SendError::Transport)?;
         let reply = self.read_reply().await.map_err(SendError::Transport)?;
+        Self::check_reply(&reply, id)?;
+        Ok(reply
+            .get("event_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
+    /// Put an `m.annotation` reaction (`key`, an emoji) on `event_id` in `room`
+    /// via the socket `react` op, returning the reaction's own event id.
+    pub async fn react(
+        &mut self,
+        room: &str,
+        event_id: &str,
+        key: &str,
+    ) -> std::result::Result<Option<String>, SendError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let req = json!({"id": id, "op": "react", "room": room, "event_id": event_id, "key": key});
+        self.write_line(&req).await.map_err(SendError::Transport)?;
+        let reply = self.read_reply().await.map_err(SendError::Transport)?;
+        Self::check_reply(&reply, id)?;
+        Ok(reply
+            .get("event_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
+    /// Take back one of this daemon's own reactions via the socket `redact` op.
+    pub async fn redact(
+        &mut self,
+        room: &str,
+        event_id: &str,
+    ) -> std::result::Result<(), SendError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let req = json!({"id": id, "op": "redact", "room": room, "event_id": event_id});
+        self.write_line(&req).await.map_err(SendError::Transport)?;
+        let reply = self.read_reply().await.map_err(SendError::Transport)?;
+        Self::check_reply(&reply, id)
+    }
+
+    /// Shared reply gate: `ok:false` is a [`SendError::Rejected`]; a reply `id`
+    /// that does not echo the request is a stream desync (Transport), so the
+    /// sink reconnects.
+    fn check_reply(reply: &Value, id: u64) -> std::result::Result<(), SendError> {
         if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             let reason = reply
                 .get("error")
@@ -2959,9 +3009,6 @@ impl SafehouseClient {
                 .to_owned();
             return Err(SendError::Rejected { reason });
         }
-        // Replies echo the request id (handle_conn stamps it). A mismatch means
-        // the stream desynced — treat it as a transport error so the sink
-        // reconnects.
         if let Some(reply_id) = reply.get("id").and_then(Value::as_u64) {
             if reply_id != id {
                 return Err(SendError::Transport(anyhow::anyhow!(
@@ -3275,7 +3322,8 @@ async fn run_sink(
     // guard on the flush branch below is what actually gates it, and the
     // guard starts `false` (buffer starts empty).
     let mut pending_dispatches: Vec<PendingDispatch> = Vec::new();
-    let mut digest_seq: u64 = 0;
+    // Per-issue thread roots + status reactions (#13069).
+    let mut status = status_reaction::StatusTracker::default();
     let digest_sleep = tokio::time::sleep_until(
         tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600),
     );
@@ -3288,6 +3336,7 @@ async fn run_sink(
         // (no cross-task race between the two trigger paths).
         let mut outbox: Vec<Envelope> = Vec::new();
         let mut narrated_repo: Option<String> = None;
+        let mut status_update: Option<(String, &'static str)> = None;
 
         tokio::select! {
             biased;
@@ -3414,6 +3463,7 @@ async fn run_sink(
                     }
                 }
 
+                status_update = status_reaction::status_for_event(&event);
                 narrated_repo = event_repo(&event).map(ToOwned::to_owned);
             }
 
@@ -3464,8 +3514,7 @@ async fn run_sink(
                     narrated_repo = repo;
                     outbox.push(envelope);
                 } else {
-                    digest_seq = digest_seq.wrapping_add(1);
-                    outbox.push(build_dispatch_digest_envelope(&batch, digest_seq));
+                    outbox.push(build_dispatch_digest_envelope(&batch));
                     // A digest spans (potentially) several repos and always
                     // routes via `AttentionClass::Signal`, which ignores the
                     // `repo` argument entirely (see `RoomRouter::resolve`) —
@@ -3587,9 +3636,37 @@ async fn run_sink(
                         }
                     },
                 };
-                if let Err(err) = connected.send_to(envelope, room.as_deref()).await {
-                    send_failure = Some(err);
-                    break;
+                match connected
+                    .send_to_with_event_id(envelope, room.as_deref())
+                    .await
+                {
+                    Ok(event_id) => {
+                        if let Err(err) = status_reaction::note_sent(
+                            connected,
+                            &mut status,
+                            envelope,
+                            room.as_deref(),
+                            event_id,
+                        )
+                        .await
+                        {
+                            send_failure = Some(err);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        send_failure = Some(err);
+                        break;
+                    }
+                }
+            }
+            if send_failure.is_none() {
+                if let Some((task_id, key)) = &status_update {
+                    if let Err(err) =
+                        status_reaction::apply_status(connected, &mut status, task_id, key).await
+                    {
+                        send_failure = Some(err);
+                    }
                 }
             }
         }
@@ -3709,8 +3786,20 @@ pub use claim_sink::PeerClaimSink;
 
 /// Build the `task`-typed advertisement envelope for a claim ad (Gap 2 of
 /// #4028): the envelope `type` enum is closed and owned by the safehouse repo, so
-/// a claim rides a `task` envelope with the bare issue number as `task_id` and
-/// the structured payload in `body`.
+/// a claim rides a `task` envelope with the structured payload in `body`.
+///
+/// **No `task_id`.** safehoused threads every send that carries a `task_id`
+/// under the first root it saw for that id. Claim ads used to carry the bare
+/// issue number, which threaded the machine traffic into a handful of
+/// unrelated threads: every heartbeat and filing lock (sentinel issue `0`)
+/// piled into one ever-growing thread `0`, issue #N in two repos shared a
+/// thread, and a claims-room root could capture a narration line that used
+/// the same bare id. A claim ad is not a conversation, so it is sent as a
+/// plain top-level message. Receivers are unaffected: [`PeerClaimSink`] reads
+/// only the envelope `body` (falling back to a top-level `body`) and parses it
+/// with [`ClaimAd::from_body_str`]; it never reads `task_id`, `type` or the
+/// room, so a peer on an older version folds these ads exactly as before, and
+/// this host still folds an older peer's ads that do carry a `task_id`.
 ///
 /// **Routing exception (#4225).** By the attention-class table this `task`
 /// envelope would belong in the per-repo firehose — claim ads *are* per-repo
@@ -3723,7 +3812,7 @@ pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
     Envelope {
         to: "*".to_owned(),
         kind: "task".to_owned(),
-        task_id: Some(ad.issue.to_string()),
+        task_id: None,
         body: ad.to_body_json(),
         meta: None,
     }

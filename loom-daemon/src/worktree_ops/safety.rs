@@ -1098,19 +1098,33 @@ mod tests {
     // build-artifact sweep from unlinking a running program's binary.
     // ------------------------------------------------------------------
 
-    /// Copy the host's `sleep` into `dir/<name>` and run it, so a live process
-    /// is executing an image inside `dir`.
+    /// Copy a host binary (`sh` on Linux, `sleep` elsewhere) into `dir/<name>`
+    /// and run it, so a live process is executing an image inside `dir`.
     ///
     /// The spawn is retried on `ETXTBSY`: a *concurrent* test thread forking
     /// while our write fd is briefly open leaves the child holding that fd, and
     /// Linux then refuses to exec the file. Nothing to do with the code under
     /// test — just the standard fork/exec race in a multi-threaded harness.
     fn spawn_from(dir: &Path, name: &str) -> std::process::Child {
-        let source = ["/bin/sleep", "/usr/bin/sleep"]
+        // The stand-in image and its arguments. On Linux it is a copy of the host
+        // shell run as `-c 'read _'`, blocked reading a stdin pipe the returned
+        // `Child` holds open. Not `sleep`: on Ubuntu 26.04 (`ubuntu-latest` since
+        // 2026-11-14) `sleep` is uutils' multicall coreutils, and a copy run under
+        // another file name exits at once with status 1, even with argv[0] set to
+        // "sleep" (#13924). `read` is a shell builtin, so the process stays the
+        // copied shell (no fork, no exec) and `/proc/<pid>/exe` names the copy.
+        // macOS keeps the `sleep` copy its `ps -o comm` detection path was built
+        // and verified against.
+        #[cfg(target_os = "linux")]
+        let (candidates, args): (&[&str], &[&str]) =
+            (&["/bin/sh", "/usr/bin/sh"], &["-c", "read _"]);
+        #[cfg(not(target_os = "linux"))]
+        let (candidates, args): (&[&str], &[&str]) = (&["/bin/sleep", "/usr/bin/sleep"], &["300"]);
+        let source = candidates
             .iter()
             .map(Path::new)
             .find(|p| p.is_file())
-            .expect("a `sleep` binary is needed to stand in for a service");
+            .expect("a stand-in binary is needed to play a service");
         let program = dir.join(name);
         std::fs::copy(source, &program).unwrap();
         // Re-sign the relocated copy on macOS: a plain `fs::copy` of a system binary
@@ -1136,15 +1150,20 @@ mod tests {
         let mut last_err = None;
         for _ in 0..100 {
             match Command::new(&program)
-                .arg("300")
-                .stdin(std::process::Stdio::null())
+                .args(args)
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
             {
-                Ok(child) => {
+                Ok(mut child) => {
                     // Let the kernel publish the exec'd image (/proc/<pid>/exe).
                     std::thread::sleep(std::time::Duration::from_millis(250));
+                    // A stand-in that already exited would fail every detection
+                    // assertion for a reason unrelated to the detector.
+                    if let Ok(Some(status)) = child.try_wait() {
+                        panic!("the stand-in service exited before the test ran: {status}");
+                    }
                     return child;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {

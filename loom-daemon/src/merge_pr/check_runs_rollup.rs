@@ -40,9 +40,8 @@
 //! # Fidelity inside the contract
 //!
 //! For every payload inside the contract the three strings are the retired
-//! filters' output byte for byte, AFTER `$(...)` — held by
-//! `tests/merge_pr_check_runs_rollup_differential.rs` against the frozen
-//! filters in `tests/fixtures/merge-pr-check-runs-rollup-retired.sh`:
+//! filters' output byte for byte, AFTER `$(...)` (the differential against the
+//! frozen filters went with the `merge-pr check-runs-rollup` verb, #12063):
 //!
 //! - `unique` sorts and de-duplicates the name VALUES: `null` (a check-run
 //!   with no `name`) sorts before every string, strings sort by UTF-8 bytes
@@ -127,6 +126,23 @@ impl std::fmt::Display for Refusal {
 /// The retired failing filter's terminal non-success conclusions.
 const FAILING_CONCLUSIONS: [&str; 4] = ["failure", "timed_out", "cancelled", "action_required"];
 
+/// Whether a check-run object is terminal (#13758). `status == "completed"`
+/// is the normal signal, but GitHub sometimes leaves a finished run at
+/// `status: in_progress` with a string `conclusion` and a `completed_at`;
+/// that is settled too. Both fields are required so a half-written row still
+/// reads as pending. Shared by every CI classifier.
+#[must_use]
+pub fn is_settled(run: &Value) -> bool {
+    run.as_object().is_some_and(is_settled_obj)
+}
+
+/// [`is_settled`] on an already-unwrapped object.
+fn is_settled_obj(run: &Map<String, Value>) -> bool {
+    run.get("status").and_then(Value::as_str) == Some("completed")
+        || (run.get("conclusion").is_some_and(Value::is_string)
+            && run.get("completed_at").is_some_and(|v| !v.is_null()))
+}
+
 /// Classify one `forge_get_check_runs` payload. See the module docs.
 ///
 /// # Errors
@@ -160,7 +176,7 @@ pub fn classify(raw: &str) -> Result<Rollup, Refusal> {
         {
             failing.push(name);
         }
-        if run.get("status").and_then(Value::as_str) != Some("completed") {
+        if !is_settled_obj(run) {
             pending.push(name);
         }
     }

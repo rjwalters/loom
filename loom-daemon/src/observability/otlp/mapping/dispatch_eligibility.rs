@@ -25,14 +25,7 @@ use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::{kv_int, kv_string, nanos};
-use crate::telemetry::{RepoVisibility, TelemetryRecord};
-
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
+use crate::telemetry::TelemetryRecord;
 
 /// `(event_name, severity, record time, attributes, body)` for an
 /// `eta.dispatch_eligibility` record; `None` for every other kind.
@@ -44,7 +37,7 @@ pub(super) fn log_parts(
     };
     let attributes = vec![
         kv_string("loom.repo", r.repo.clone()),
-        kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+        kv_string("loom.repo.visibility", r.visibility.as_str()),
         kv_int("loom.issue", i64::from(r.issue)),
         // The schedulability signal, promoted out of the body so SigNoz can
         // query it (#12867). These three keys are
@@ -213,7 +206,10 @@ mod tests {
         // And the gateway keeps each one.
         let log_keep = CONFIG
             .lines()
-            .find(|l| l.contains("keep_keys(attributes, [") && l.contains("loom.eta.pr.state"))
+            .find(|l| {
+                l.contains("keep_keys(attributes, [")
+                    && l.contains("loom.eta.dispatch_state.artifact")
+            })
             .expect("the transform/privacy log keep_keys line");
         for key in DISPATCH_ELIGIBILITY_LOG_ATTRIBUTE_KEYS {
             assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");

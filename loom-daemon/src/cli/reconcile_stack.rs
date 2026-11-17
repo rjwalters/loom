@@ -29,7 +29,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::reconcile_stack::{self, Level, PlanRequest};
+use crate::reconcile_stack::{self, Level, PlanRequest};
 
 #[derive(clap::Args)]
 pub(crate) struct ReconcileStackArgs {

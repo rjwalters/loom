@@ -27,6 +27,8 @@ fn severity(r: &AutoUpdateTickRecord) -> SeverityNumber {
         TickDecisionKind::Panic => SeverityNumber::Error,
         _ if r.roll_held.is_some() => SeverityNumber::Warn,
         TickDecisionKind::StaleRepo => SeverityNumber::Warn,
+        // The restart was refused: the demand stands and the next tick tries again.
+        TickDecisionKind::ConfigRestart if !r.roll_armed => SeverityNumber::Warn,
         TickDecisionKind::Fetch | TickDecisionKind::Rebuild
             if r.outcome.as_deref() != Some("success") =>
         {
@@ -52,7 +54,6 @@ pub(super) fn log_parts(
         kv_bool("loom.auto_update.roll_armed", r.roll_armed),
         kv_bool("loom.auto_update.drain_armed", r.drain.armed),
         kv_bool("loom.auto_update.drain_pending", r.drain.pending),
-        kv_int("loom.auto_update.drain_refusals", i64::from(r.drain.refusals)),
         kv_int("loom.auto_update.consecutive_failures", i64::from(r.consecutive_failures)),
         kv_int("loom.auto_update.duration_ms", to_i64(r.duration_ms)),
         kv_string("loom.auto_update.version", r.loom.version.clone()),
@@ -66,6 +67,7 @@ pub(super) fn log_parts(
         ("loom.auto_update.target_version", r.target_version.clone()),
         ("loom.auto_update.target_published_at", r.target_published_at.clone()),
         ("loom.auto_update.drain_target", r.drain.target.clone()),
+        ("loom.auto_update.target_source", r.target_source.clone()),
     ] {
         if let Some(value) = value {
             attributes.push(kv_string(key, value));
@@ -75,6 +77,7 @@ pub(super) fn log_parts(
         ("loom.auto_update.commits_behind", r.commits_behind.map(i64::from)),
         ("loom.auto_update.hours_behind", r.hours_behind.map(i64::from)),
         ("loom.auto_update.in_flight", r.in_flight.map(to_i64)),
+        ("loom.auto_update.config_restart_paths", r.config_restart_paths.map(to_i64)),
     ] {
         if let Some(value) = value {
             attributes.push(kv_int(key, value));

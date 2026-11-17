@@ -8,7 +8,8 @@
 
 use anyhow::{anyhow, Result};
 
-use super::{resolve_tokens_workspace, shell_single_quote};
+use super::resolve_tokens_workspace;
+use crate::shell_quote::shell_quote;
 
 /// Parsed `tokens select` arguments. A struct rather than six positional
 /// parameters so the call site stays readable and a future flag cannot be
@@ -37,7 +38,7 @@ pub(crate) struct SelectArgs {
 /// exits the process with `EX_CONFIG` (78) rather than returning, preserving
 /// the exit code `spawn-claude.sh` keys on.
 pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
-    use loom_daemon::tokens_pool::{bad_tokens, select};
+    use crate::tokens_pool::{bad_tokens, select};
 
     let SelectArgs {
         workspace,
@@ -52,30 +53,30 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
     // `FromStr` rather than compared against two hardcoded string
     // literals, so the valid vocabulary has exactly one definition
     // and the error message enumerates it from that same place.
-    let provider: loom_daemon::tokens_pool::AccountProvider =
+    let provider: crate::tokens_pool::AccountProvider =
         provider.parse().map_err(|error| anyhow!("{error}"))?;
     let ws = resolve_tokens_workspace(&workspace)?;
     // Resolved workspace (issue #4948, suggested-fix option 3) —
     // always stderr so `--export`'s stdout stays eval-safe and
     // `--json`'s (non-`--export`) stdout stays a bare JSON object.
     eprintln!("Resolved workspace: {}", ws.display());
-    if provider == loom_daemon::tokens_pool::AccountProvider::Codex {
+    if provider == crate::tokens_pool::AccountProvider::Codex {
         // #8277: the same `--model` this arm's Claude sibling already
         // accepts (see `select_token_for_model_and_role` below) now also
         // narrows Codex selection past a class-scoped
         // `MODEL_CREDITS_EXHAUSTED` hold (#8058 Phase 2).
-        let selected = loom_daemon::tokens_pool::select_account(&ws, provider, model.as_deref())
+        let selected = crate::tokens_pool::select_account(&ws, provider, model.as_deref())
             .map_err(|error| anyhow!(error))?;
         let directory = match &selected.binding {
-            loom_daemon::tokens_pool::AccountBinding::CodexHome { directory } => directory,
+            crate::tokens_pool::AccountBinding::CodexHome { directory } => directory,
             _ => unreachable!("Codex selection returned a non-Codex binding"),
         };
         if export {
-            println!("export CODEX_HOME={}", shell_single_quote(&directory.display().to_string()));
+            println!("export CODEX_HOME={}", shell_quote(&directory.display().to_string()));
             println!(
                 "export LOOM_ACCOUNT_PROVIDER='{}'\nexport LOOM_ACCOUNT_NAME={}",
                 selected.id.provider,
-                shell_single_quote(&selected.id.name)
+                shell_quote(&selected.id.name)
             );
             // #5609 AC 6: alongside the existing PROVIDER/NAME pair,
             // so a dispatched sweep can be correlated back to the
@@ -84,7 +85,7 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
             // doc comment), so this is a no-op today and becomes live
             // the day a Codex-backed `ProviderAdapter` gains one.
             if let Some(upstream_id) = &selected.upstream_id {
-                println!("export LOOM_ACCOUNT_UPSTREAM_ID={}", shell_single_quote(upstream_id));
+                println!("export LOOM_ACCOUNT_UPSTREAM_ID={}", shell_quote(upstream_id));
             }
             println!("LOOM_TOKEN_MODE='{}'", selected.mode);
         } else {
@@ -102,9 +103,9 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
         }
         return Ok(());
     }
-    debug_assert_eq!(provider, loom_daemon::tokens_pool::AccountProvider::Claude);
+    debug_assert_eq!(provider, crate::tokens_pool::AccountProvider::Claude);
     if auto_unpin {
-        if let Some(msg) = loom_daemon::tokens_pool::maybe_auto_unpin(&ws) {
+        if let Some(msg) = crate::tokens_pool::maybe_auto_unpin(&ws) {
             eprintln!("{msg}");
         }
     }

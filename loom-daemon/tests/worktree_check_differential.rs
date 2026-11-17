@@ -67,6 +67,8 @@
 
 mod common;
 
+use common::git;
+use common::hermetic_git as hermetic;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -128,22 +130,6 @@ impl Side {
 
 fn tmpdir(tag: &str) -> PathBuf {
     common::unique_tmpdir("loom-wt-check-diff", tag)
-}
-
-fn hermetic(cmd: &mut Command) -> &mut Command {
-    common::hermetic_git(cmd)
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let mut cmd = Command::new("git");
-    hermetic(&mut cmd);
-    let out = cmd.arg("-C").arg(dir).args(args).output().expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} in {} failed: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// One side's fixture: a repo with a commit, a subdirectory, and a linked

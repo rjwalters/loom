@@ -31,7 +31,7 @@
 //! must not arrive wrapped in ANSI codes.
 //!
 //! The porcelain arrives on stdin rather than being read here. That is
-//! deliberate and is explained in [`loom_daemon::merge_pr::dirty_guard`]'s
+//! deliberate and is explained in [`crate::merge_pr::dirty_guard`]'s
 //! module docs: `git status` FAILING has always meant "no dirt, proceed" on
 //! this path (the #5177 orphaned-directory case cleanup exists to handle), and
 //! the `|| true` that encodes it stays where it already lives.
@@ -39,7 +39,7 @@
 use anyhow::Result;
 use std::io::Read;
 
-use loom_daemon::merge_pr::dirty_guard::{assess, Context, CLEAN};
+use crate::merge_pr::dirty_guard::{assess, Context, CLEAN};
 
 #[derive(clap::Args)]
 pub(crate) struct DirtyGuardArgs {

@@ -48,39 +48,10 @@ fn absent_everywhere_is_absent() {
 }
 
 #[test]
-fn quoted_floor_in_repos_yml_is_read() {
+fn a_floor_in_a_legacy_repos_yml_is_no_longer_read() {
     let roster = roster_with("loom_min_version: \"0.19.830\"");
-    assert_eq!(
-        read(&store(None, Some(&roster))),
-        FloorRead::Valid {
-            version: "0.19.830".to_string(),
-            source: "repos.yml"
-        }
-    );
-}
-
-#[test]
-fn unquoted_and_single_quoted_floors_are_read_too() {
-    for line in ["loom_min_version: 0.19.830", "loom_min_version: '0.19.830'"] {
-        let roster = roster_with(line);
-        assert_eq!(
-            read(&store(None, Some(&roster))),
-            FloorRead::Valid {
-                version: "0.19.830".to_string(),
-                source: "repos.yml"
-            },
-            "{line}"
-        );
-    }
-}
-
-#[test]
-fn the_roster_itself_still_parses_with_the_key_present() {
-    // The key is additive: `roster::parse` ignores it, unchanged.
-    let roster = roster_with("loom_min_version: \"0.19.830\"");
-    let parsed = crate::fleet_store::roster::parse(&roster, std::path::Path::new("/home/u"))
-        .expect("roster still parses");
-    assert_eq!(parsed.records.len(), 1);
+    assert_eq!(read(&store(None, Some(&roster))), FloorRead::Absent);
+    assert_eq!(read(&store(None, Some("- just\n- a list\n"))), FloorRead::Absent);
 }
 
 #[test]
@@ -126,33 +97,32 @@ fn the_key_is_read_from_the_top_level_not_the_repos_roster() {
 
 #[test]
 fn malformed_values_are_malformed_never_absent() {
-    for line in [
-        "loom_min_version: 1.2",
-        "loom_min_version: 12",
-        "loom_min_version: true",
-        "loom_min_version:",
-        "loom_min_version: \"v0.19.830\"",
-        "loom_min_version: \"0.19\"",
-        "loom_min_version: \"0.19.830.1\"",
-        "loom_min_version: \"0.19.830-rc1\"",
-        "loom_min_version: \"\"",
-        "loom_min_version: \"01.2.3\"",
-        "loom_min_version: \"1.02.3\"",
-        "loom_min_version: \"1.2.03\"",
-        "loom_min_version: \" 0.19.830 \"",
-        "loom_min_version: \"0.19.830 \"",
-        "loom_min_version: \"a.b.c\"",
+    for value in [
+        json!(1.2),
+        json!(12),
+        json!(true),
+        json!(null),
+        json!("v0.19.830"),
+        json!("0.19"),
+        json!("0.19.830.1"),
+        json!("0.19.830-rc1"),
+        json!(""),
+        json!("01.2.3"),
+        json!("1.02.3"),
+        json!("1.2.03"),
+        json!(" 0.19.830 "),
+        json!("0.19.830 "),
+        json!("a.b.c"),
     ] {
-        let roster = roster_with(line);
         assert!(
             matches!(
-                read(&store(None, Some(&roster))),
+                read(&store(Some(&compiled_with(Some(value.clone()))), None)),
                 FloorRead::Malformed {
-                    source: "repos.yml",
+                    source: "fleet.json",
                     ..
                 }
             ),
-            "{line}"
+            "{value}"
         );
     }
 }
@@ -182,17 +152,6 @@ fn malformed_fleet_json_is_malformed_and_does_not_fall_back() {
             "{body}"
         );
     }
-}
-
-#[test]
-fn an_unparseable_repos_yml_is_malformed() {
-    assert!(matches!(
-        read(&store(None, Some("- just\n- a list\n"))),
-        FloorRead::Malformed {
-            source: "repos.yml",
-            ..
-        }
-    ));
 }
 
 #[test]

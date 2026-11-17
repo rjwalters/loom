@@ -24,10 +24,10 @@ pub(crate) enum ScriptPortCommand {
     Preflight(super::preflight::PreflightArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
-    SessionExec(loom_daemon::session_exec::SessionExecCommand),
+    SessionExec(crate::session_exec::SessionExecCommand),
     /// Private workspace endpoint used inside a session container.
     #[command(subcommand)]
-    PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    PrivateWorkspace(crate::tokens_pool::private_workspace::WorkerCommand),
     /// Readiness of Loom's managed Codex hook, behind
     /// `provision-codex-hooks.sh verify` (#9390).
     #[command(subcommand)]
@@ -591,7 +591,10 @@ pub(crate) enum ScriptPortCommand {
     /// cites one of them as a blocker and now classifies stale. Reuses
     /// `check-stale-blocked`'s enumeration and the `dep_recheck` parsers.
     /// Called from `merge-pr.sh`'s post-merge path. Unlike
-    /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
+    /// `CheckStaleBlocked` it WRITES: a comment, plus the #13331 carve-out
+    /// that swaps `loom:blocked` for `loom:curated` on a fully-resolved
+    /// Curator park. `--resweep` applies that carve-out to every open
+    /// `loom:blocked` issue regardless of prior markers; `--dry-run`
     /// previews. Always exits 0.
     NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
     /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
@@ -670,6 +673,14 @@ pub(crate) enum ScriptPortCommand {
     /// the persisted `~/.loom/host-id`, never the hostname. One line on
     /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
     HostId(super::host_id_cmd::HostIdArgs),
+
+    /// Write the #9588 operator-stop record on behalf of
+    /// `loom-daemon-stop.sh` (#9957), so the shell stop never carries its own
+    /// copy of the record format. Hidden: a plumbing verb, not an operator
+    /// command. Optional to its caller — an older binary lacking it leaves the
+    /// script on its `rm -f` fallback.
+    #[command(subcommand, hide = true)]
+    OperatorStop(crate::operator_stop::OperatorStopCommand),
 }
 
 impl ScriptPortCommand {
@@ -759,6 +770,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
             ScriptPortCommand::HostId(args) => args.run(),
+            ScriptPortCommand::OperatorStop(cmd) => cmd.run(),
             ScriptPortCommand::HooksHome(args) => args.run(),
         }
     }
@@ -772,31 +784,21 @@ pub(crate) enum MergePrCommand {
     /// Refuse a PR carrying `loom:pr` alongside a contradicting label.
     VerdictContradiction(super::merge_pr_labels::VerdictContradictionArgs),
 
+    /// Decide whether an operator may release Champion's human-merge hold
+    /// (`merge-pr.sh --release-hold`, #13517). Exit 0+OK = release, 1 = refuse.
+    ReleaseHold(super::merge_pr_release_hold::ReleaseHoldArgs),
+
     /// Run the repo's `merge.treeChecks` against the merge tree (base + PR
     /// head) in a temp dir (#10026). Exit 0+CLEAN = pass/none declared (or
     /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
 
-    /// Refuse a plain (non-`--auto`) merge whose head has a required context
-    /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
+    /// Refuse a plain merge whose head has a required context that concluded
+    /// red (#10688); hold (exit 3) on a missing/pending one.
     /// `--allow-red-required <ctx>` overrides named contexts with an audit
     /// comment. Exit 0 = clean/bypassed, 1 = refuse, 2 = forge unreadable.
     RequiredChecks(super::merge_pr_required_checks::RequiredChecksArgs),
-
-    /// The stale-cached-mergeable recheck decision (#6104): once REST
-    /// `.mergeable` has read `false`, classify the backoff re-reads plus the
-    /// local `git merge-tree` corroboration into `merge:` / `refuse-stale:` /
-    /// `refuse-conflict:` — distinguishing "genuinely conflicts" from "the
-    /// forge's cached state is stale/unknown". Always exits 0 with exactly
-    /// one `<action>:<reason>` line; the I/O loop stays in the shell.
-    MergeableRecheck(super::merge_pr_mergeable_recheck::MergeableRecheckArgs),
-
-    /// Decide whether a head-SHA-mismatch refusal was caused by THIS merge
-    /// run's own base-sync push (#8164) and may be retried once against a
-    /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
-    /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
-    HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
 
     /// Read-only report of which required checks and paths forced the #8508
     /// re-dates (#9746), from the trailers on the re-date commits reachable
@@ -913,41 +915,6 @@ pub(crate) enum MergePrCommand {
     /// text; always exits 0. The shell prints a one-line usage instead when
     /// the sentinel is absent — see `cli::merge_pr_usage`.
     Usage(super::merge_pr_usage::UsageArgs),
-
-    /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
-    /// settle now, keep waiting, or report the whole wait spent. Bounded only
-    /// when the base branch requires no status-check contexts; a lookup that
-    /// errors, or a required context present, keeps #6169's full wait. Always
-    /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
-    ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
-
-    /// The persistent-vs-transient check-runs HTTP 404 classification in the
-    /// same wait loop (#6389, an #8191 slice): invoked only after a poll's
-    /// fetch attempt has already failed, decides whether a confirmed 404 has
-    /// now repeated `LOOM_CHECK_RUNS_404_STREAK` times in a row — in which
-    /// case give up waiting and proceed straight to the synchronous merge —
-    /// or is still below threshold, in which case the caller's existing
-    /// truncated-check/deadline/sleep handling runs unchanged. Always exits 0
-    /// with one `LOOM-CHECK-RUNS-STREAK <PROCEED|PENDING> <streak>` line —
-    /// see `cli::merge_pr_check_runs_streak`.
-    CheckRunsStreak(super::merge_pr_check_runs_streak::CheckRunsStreakArgs),
-
-    /// The per-poll READ of the check-runs rollup in the same wait loop
-    /// (#8191 slice): failing names, pending names and `total_count` out of
-    /// the `forge_get_check_runs` payload on stdin. Exit 0 with four
-    /// NUL-terminated fields ending `LOOM-CHECK-RUNS-ROLLUP`; exit 2 (nothing
-    /// on stdout) for a payload outside the forge contract, which the caller
-    /// treats as still pending — see `cli::merge_pr_check_runs_rollup`.
-    CheckRunsRollup(super::merge_pr_check_runs_rollup::CheckRunsRollupArgs),
-
-    /// The OTHER classification in the same wait loop (#8191 slice): once a
-    /// poll finds a FAILING check, whether it is a required status-check
-    /// context (refuse), informational with nothing pending (proceed to the
-    /// synchronous merge), or informational with something else still
-    /// pending (keep waiting, unchanged). Exit 0 = `PROCEED`/`PENDING`, 1 =
-    /// `REQUIRED` (refuse), 2 = malformed stdin frame (also refuse) — see
-    /// `cli::merge_pr_checks_failure`.
-    ChecksFailure(super::merge_pr_checks_failure::ChecksFailureArgs),
 
     /// The pre-merge no-hand-bump guard (#7827) and its oracle choice
     /// (#8284): run the canonical version checker from the right ref against
@@ -1103,46 +1070,48 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_discovered_worktree`.
     DiscoveredWorktree(super::merge_pr_discovered_worktree::DiscoveredWorktreeArgs),
 
-    /// The backoff-attempt count for the merge-admission telemetry record
-    /// (#6978, #8191 slice): the `recheck #N` figure in the stale-mergeable
-    /// recheck's reason text, else the configured budget. One line, exit 0;
-    /// the shell falls back to the budget on any fault — see
-    /// `cli::merge_pr_retries_used`.
-    RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
-
     /// The already-merged / closed-unmerged terminal-state gate at the top of
     /// `merge-pr.sh` (#8191 slice). One line `LOOM-PR-STATE MERGED|CLOSED|OPEN`,
     /// exit 0; the shell acts only on MERGED/CLOSED and proceeds otherwise —
     /// see `cli::merge_pr_pr_state`.
     PrState(super::merge_pr_pr_state::PrStateArgs),
 
-    /// The wait-or-timeout decision for `--auto`'s unfetchable-check-runs and
-    /// pending-checks poll arms (#8191 slice): one `LOOM-POLL-WAIT
-    /// <WAIT|TIMEOUT> <level> <message>` line, exit 0; the shell keeps the
-    /// deadline compare itself on any fault — see `cli::merge_pr_poll_wait`.
-    PollWait(super::merge_pr_poll_wait::PollWaitArgs),
-
-    /// The post-`--auto`-wait re-read decision (#8410/#8896, #8191 slice):
-    /// stdin is the uncached PR payload; prints MERGED / NO-HEAD / MOVED <sha>
-    /// / CLEAR + labels. The shell refuses on any other output — see
-    /// `cli::merge_pr_revalidate_head`.
-    RevalidateHead(super::merge_pr_revalidate_head::RevalidateHeadArgs),
-
     /// The per-attempt route of the synchronous merge-retry loop (#8191
     /// slice): stdin is the failed merge's response; prints `LOOM-MERGE-ROUTE
     /// AWAIT|SYNC|FAIL` plus its narration, exit 0. The shell routes on the
     /// classifier's kind itself on any fault — see `cli::merge_pr_merge_route`.
     MergeRoute(super::merge_pr_merge_route::MergeRouteArgs),
+
+    /// The whole post-merge worktree/branch cleanup block (#8191, slice 1 of
+    /// the orchestrator port): target naming, the remove-vs-preserve decision,
+    /// the primary/sentinel/dirty-work guards, the removal, the ledger, the
+    /// local-branch delete and the cargo-target reclaim, sequenced in one
+    /// process. Prints `LEVEL<TAB>message` records to replay, or `LOOM-NEED
+    /// <fact>` (exit 3, nothing done) when a forge fact must be fetched first
+    /// — see `cli::merge_pr_post_merge_cleanup`.
+    PostMergeCleanup(super::merge_pr_post_merge_cleanup::PostMergeCleanupArgs),
+
+    /// The post-merge issue bookkeeping (#8191, slice 2): the partial-increment
+    /// reset, the branch-derived issue close and the closed-issue label strip,
+    /// one `--step` per call. Prints `LEVEL<TAB>message` records ending in a
+    /// terminator, or `LOOM-NEED close-targets` (exit 3, nothing done) — see
+    /// `cli::merge_pr_post_merge_bookkeeping`.
+    PostMergeBookkeeping(super::merge_pr_post_merge_bookkeeping::PostMergeBookkeepingArgs),
+
+    /// The whole post-merge stacked-child reconcile pass (#8191 slice 3): plan,
+    /// per-child route, deferral comment or `reconcile-stack.sh`. Snapshot on
+    /// stdin; `LEVEL<TAB>message` records ended by `LOOM-STACKED-RECONCILE DONE`
+    /// — see `cli::merge_pr_stacked_reconcile`.
+    StackedReconcile(super::merge_pr_stacked_reconcile::StackedReconcileArgs),
 }
 
 impl MergePrCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
-            MergePrCommand::MergeableRecheck(args) => args.run(),
+            MergePrCommand::ReleaseHold(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
-            MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::LoomPrOverrideComment(args) => args.run(),
@@ -1157,9 +1126,6 @@ impl MergePrCommand {
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::WorktreeTeardown(args) => args.run(),
             MergePrCommand::Usage(args) => args.run(),
-            MergePrCommand::ZeroChecksSettle(args) => args.run(),
-            MergePrCommand::CheckRunsStreak(args) => args.run(),
-            MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::WorkflowScope(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
@@ -1176,16 +1142,15 @@ impl MergePrCommand {
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::RetargetChildren(args) => args.run(),
-            MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
-            MergePrCommand::RetriesUsed(args) => args.run(),
             MergePrCommand::PrState(args) => args.run(),
-            MergePrCommand::PollWait(args) => args.run(),
-            MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
+            MergePrCommand::PostMergeCleanup(args) => args.run(),
+            MergePrCommand::PostMergeBookkeeping(args) => args.run(),
+            MergePrCommand::StackedReconcile(args) => args.run(),
         }
     }
 }

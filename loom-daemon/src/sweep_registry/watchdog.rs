@@ -1083,6 +1083,8 @@ impl SweepRegistry {
                              the MCP-init hang).",
                             elapsed.as_secs()
                         );
+                        // The give-up comment is posted for this sweep (#13171).
+                        let _sweep = crate::gh_invocation::telemetry::enter_sweep(&sweep_id, None);
                         self.post_watchdog_gaveup_comment(issue, elapsed);
                     }
                 }
@@ -1465,6 +1467,8 @@ impl SweepRegistry {
     /// fixtures that never publish/read lease comments keep exercising the
     /// pre-#7612 recovery path byte-for-byte unchanged.
     pub(crate) fn midbuild_lease_veto(&self, issue: u32, dead_sweep_id: &str) -> Option<String> {
+        // The lease read is made for the dead sweep (#13171).
+        let _sweep = crate::gh_invocation::telemetry::enter_sweep(dead_sweep_id, None);
         if self.config.skip_label_flip {
             return None;
         }

@@ -304,10 +304,7 @@ forge_split_nwo() {
 
 # --- Forge-Dispatched Operations ---
 
-# forge_detect_merge_method() (#7754) lives in the sibling module below --
-# forge-helpers.sh is already over the file-size ratchet's threshold and
-# frozen at its current size (scripts/file-size-baseline.txt), so new
-# functionality is split out rather than added here.
+# forge_detect_merge_method() (#7754) lives in the sibling module below.
 # shellcheck source=./forge-merge-method.sh
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 
@@ -401,7 +398,6 @@ forge_update_branch() {
 # Returns JSON with .state, .merged, .head.ref, .title, .mergeable
 # On failure stderr carries the forge's own error (#9192) -- silence it at the
 # call site (`2>/dev/null`) if unwanted; the helper no longer discards it.
-# (Compacted to offset forge_fetch_error_cause on the shell-budget ratchet.)
 forge_get_pr() {
   local nwo="$1" pr_number="$2" gh_cmd="${3:-gh}"
   if [[ "$FORGE_TYPE" == "gitea" ]]; then forge_split_nwo "$nwo"; gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number"; else "$gh_cmd" api "repos/$nwo/pulls/$pr_number"; fi; }
@@ -524,9 +520,7 @@ forge_check_auto_delete() {
 #
 # jq (a hard dependency of this lib already) rather than a bash character loop:
 # `@uri` is exactly the RFC 3986 encoder and handles multi-byte input without
-# locale juggling. Written as a one-liner because `defaults/scripts/lib/` is
-# inside the portable pool `loom-daemon shell-budget --check` ratchets, where
-# comments are free and code lines are not.
+# locale juggling.
 url_encode_path_segment() { printf '%s' "${1:-}" | jq -sRr 'split("/") | map(@uri) | join("/")'; }
 
 # Delete a remote branch.
@@ -535,9 +529,7 @@ url_encode_path_segment() { printf '%s' "${1:-}" | jq -sRr 'split("/") | map(@ur
 # Gitea: DELETE /repos/{owner}/{repo}/branches/{branch}
 forge_delete_branch() {
   # Declaration and assignment are separate statements sharing one physical
-  # line: the encode call is net-new code in the portable pool
-  # `loom-daemon shell-budget --check` ratchets, and packing it against the
-  # `local` is what pays for it there.
+  # line.
   local nwo="$1" branch; branch="$(url_encode_path_segment "$2")"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
@@ -1095,7 +1087,6 @@ _forge_nwo_from_remote() {
 # `loom-daemon forge may-write` (loom-daemon/src/write_scope.rs: managed repo +
 # the credential has WRITE). See .loom/docs/comment-trust.md.
 # requires-daemon: forge optional   With no binary, or one predating `may-write` (any exit but 0/1, or 0 without OWNER/REPO on stdout), the fallback allows a write only when the checkout's ONLY remote is origin, only to origin, and GH_REPO is unset or origin: it cannot check permission, but it cannot reach any repository but the one this Loom checkout was cloned from.
-# Five dense body lines on purpose: this file is frozen by the file-size ratchet.
 loom_write_repo() {
   local want="${1:-}" out rc=0 err origin; err="$(mktemp)"; origin="$(_forge_nwo_from_remote)" || origin=""
   if [[ -n "$want" ]]; then out="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge may-write --repo "$want" 2>"$err")" || rc=$?; else out="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge may-write 2>"$err")" || rc=$?; fi
@@ -1552,10 +1543,9 @@ forge_gh_remove_label_rl_safe() {
 # "not created" are indistinguishable from here, so a caller must LOOK before
 # retrying rather than blind-retry into a real duplicate.
 #
-# Implemented as two MODIFIED lines, no added ones, on purpose: this file is
-# frozen by scripts/check-file-size-budget.sh, and a "never silent" guarantee
-# belongs at the point of failure, not in a sibling module the one caller
-# would have to remember to route through.
+# Implemented as two MODIFIED lines, no added ones, on purpose: a "never
+# silent" guarantee belongs at the point of failure, not in a sibling module
+# the one caller would have to remember to route through.
 forge_gh_create_issue_rl_safe() {
   local nwo="$1" title="$2" body="$3"; nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
   shift 3
@@ -2010,10 +2000,7 @@ forge_get_required_status_check_contexts() {
   forge_split_nwo "$nwo"
 
   # Both queries are written as single lines rather than backslash-continued
-  # blocks: `defaults/scripts/lib/` is `contract` in scripts/shell-allowlist.txt,
-  # i.e. inside the portable pool `loom-daemon shell-budget --check` ratchets,
-  # and a continuation line is a code line there. Comments are free, so the
-  # explanation lives here instead of in the invocation.
+  # blocks, so the explanation lives here instead of in the invocation.
   #
   # `--jq` yielding nothing is not an error in either query: `.[]?` over an
   # empty rules array and a `null` branchProtectionRule both mean "this source

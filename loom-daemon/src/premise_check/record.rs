@@ -98,6 +98,34 @@ pub struct Record {
     pub searched: Vec<String>,
     /// `premise-extends:` free text.
     pub extends: Option<String>,
+    /// `premise-protected:` free text — the protected-class check a Hermit
+    /// removal attests under [`ReversalPolicy::ProtectedOnly`]. `none` means
+    /// no protected class applies; anything else names the class that does.
+    pub protected: Option<String>,
+}
+
+/// `hermit.reversalNeedsOperator` — whether a deliberate-code reversal must
+/// always go to the operator, or only when it touches a protected class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReversalPolicy {
+    /// Today's rule: `deliberate=yes reversal=yes` ⇒ `operator-decision`.
+    #[default]
+    Always,
+    /// A Hermit removal may be `verdict=clear` when the record attests
+    /// `premise-protected: none` (operator ruling r7-q11, #13620).
+    ProtectedOnly,
+}
+
+impl ReversalPolicy {
+    /// Parse the config value. Anything unrecognised — including a wrong type
+    /// or a different case — fails closed to [`ReversalPolicy::Always`].
+    #[must_use]
+    pub fn from_config(value: Option<&str>) -> Self {
+        match value {
+            Some("protected-only") => Self::ProtectedOnly,
+            _ => Self::Always,
+        }
+    }
 }
 
 /// Keys the marker accepts. An unknown key is an error rather than ignored
@@ -189,6 +217,7 @@ pub fn parse(chunk: &str) -> Result<Record, String> {
         evidence: companion_citations(chunk, "premise-evidence:"),
         searched: companion_citations(chunk, "premise-searched:"),
         extends: companion_text(chunk, "premise-extends:"),
+        protected: companion_text(chunk, "premise-protected:"),
     })
 }
 
@@ -225,9 +254,16 @@ fn companion_text(chunk: &str, prefix: &str) -> Option<String> {
     })
 }
 
-/// Apply the consistency rules.
+/// Apply the consistency rules under the default [`ReversalPolicy::Always`].
 #[must_use]
 pub fn check(rec: &Record, repo_root: &Path) -> Outcome {
+    check_with(rec, repo_root, ReversalPolicy::Always)
+}
+
+/// Apply the consistency rules under an explicit [`ReversalPolicy`].
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn check_with(rec: &Record, repo_root: &Path, policy: ReversalPolicy) -> Outcome {
     if rec.exists == Exists::No && rec.deliberate {
         return Outcome::Malformed(
             "exists=no with deliberate=yes: a behaviour that does not exist as described \
@@ -248,7 +284,18 @@ pub fn check(rec: &Record, repo_root: &Path) -> Outcome {
                     .to_string(),
             );
         }
-        if rec.reversal && rec.verdict != Verdict::OperatorDecision {
+        if policy == ReversalPolicy::ProtectedOnly && rec.verdict == Verdict::Clear {
+            if let Some(class) = rec.protected.as_deref().filter(|p| !is_none_attestation(p)) {
+                return Outcome::Malformed(format!(
+                    "premise-protected: `{class}` names a protected class (attested/tier or \
+                     append-only sim records, provenance/vendoring, published public API, infra \
+                     state, product direction); that requires verdict=operator-decision"
+                ));
+            }
+        }
+        let protected_cleared = policy == ReversalPolicy::ProtectedOnly
+            && rec.protected.as_deref().is_some_and(is_none_attestation);
+        if rec.reversal && rec.verdict != Verdict::OperatorDecision && !protected_cleared {
             return Outcome::Malformed(
                 "deliberate=yes reversal=yes requires verdict=operator-decision. Reversing a \
                  documented decision is an operator ruling; an issue's own filing is never that \
@@ -283,6 +330,15 @@ pub fn check(rec: &Record, repo_root: &Path) -> Outcome {
         (Verdict::Clear, Exists::No) => Outcome::PremiseFalse,
         (Verdict::Clear, _) => Outcome::Proceed,
     }
+}
+
+/// Is a `premise-protected:` value the explicit "no protected class" attestation?
+/// Matches `none` (any case), optionally followed by free-text explanation.
+fn is_none_attestation(value: &str) -> bool {
+    value.split_whitespace().next().is_some_and(|t| {
+        t.trim_matches(|c: char| !c.is_alphanumeric())
+            .eq_ignore_ascii_case("none")
+    })
 }
 
 /// Why an unresolvable citation is malformed, **naming the tree it was

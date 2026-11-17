@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::types::PeerClaimStatus;
+use crate::types::PeerClaimStatus;
 
 use super::common::resolve_socket_path;
 use super::status::{query_daemon_status, resolve_status_timeout};
@@ -24,7 +24,7 @@ use super::status::{query_daemon_status, resolve_status_timeout};
 /// itself is unreachable (same failure mode `status` reports) — an empty or
 /// absent peer-claim view is a normal, healthy answer (safehouse disabled),
 /// never an error.
-pub(crate) async fn handle_peer_claims_command(json: bool) -> Result<()> {
+pub async fn handle_peer_claims_command(json: bool) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     // #6011: same load-scaled default `status` itself uses — this thin
     // wrapper has no `--timeout-secs` of its own yet, so it always resolves

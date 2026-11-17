@@ -43,7 +43,7 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 /// Span attribute keys the call span carries beyond the lifecycle allowlist.
 /// Listed in [`crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS`] and the
 /// gateway collector's `keep_keys`.
-pub const KEYS: [&str; 17] = [
+pub const KEYS: [&str; 18] = [
     "loom.fleet_dispatch.side",
     "loom.fleet_dispatch.host",
     "loom.fleet_dispatch.endpoint",
@@ -61,6 +61,7 @@ pub const KEYS: [&str; 17] = [
     "loom.fleet_dispatch.hold_set_by_outcome",
     "loom.fleet_dispatch.hold_set_by_assignment_id",
     "loom.fleet_dispatch.holder_assignment_id",
+    "loom.fleet_dispatch.merge_slot_holder",
 ];
 
 /// `loom.fleet_dispatch.endpoint` of the span the captain emits when an
@@ -115,6 +116,10 @@ pub struct Call {
     pub held_by: Option<String>,
     /// The holder's assignment id, on a `held` refusal from a live row (#12740).
     pub holder_assignment_id: Option<String>,
+    /// The repo's `champion_merge` slot holder once this call was applied:
+    /// an assignment id, or `none` (#13009). Set only on a call that touched
+    /// a `champion_merge` row.
+    pub merge_slot_holder: Option<String>,
     /// Seconds before asking again is worthwhile, on a refusal (#12707).
     pub retry_after_s: Option<u64>,
     /// The no-progress hold that refused a claim (#12707).
@@ -169,6 +174,9 @@ pub fn span(call: &Call, started_at: DateTime<Utc>, seq: u64) -> SpanRecord {
     }
     if let Some(id) = &call.holder_assignment_id {
         a.insert("loom.fleet_dispatch.holder_assignment_id".into(), id.clone());
+    }
+    if let Some(holder) = &call.merge_slot_holder {
+        a.insert("loom.fleet_dispatch.merge_slot_holder".into(), holder.clone());
     }
     if let Some(retry) = call.retry_after_s {
         a.insert("loom.fleet_dispatch.retry_after_s".into(), retry.to_string());
@@ -372,6 +380,19 @@ mod tests {
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
                 "{key} is dropped at export"
             );
+        }
+    }
+
+    #[test]
+    fn a_merge_call_exports_the_slot_holder_after_it() {
+        let mut call = claim_call();
+        let key = "loom.fleet_dispatch.merge_slot_holder";
+        assert!(!span(&call, Utc::now(), 1).attributes.contains_key(key));
+        for holder in ["a-9", "none"] {
+            call.merge_slot_holder = Some(holder.into());
+            let s = span(&call, Utc::now(), 1);
+            assert_eq!(s.attributes.get(key).map(String::as_str), Some(holder));
+            assert!(s.validate().is_ok());
         }
     }
 

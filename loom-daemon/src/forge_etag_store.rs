@@ -198,27 +198,18 @@ pub(crate) fn write_private_json<T: serde::Serialize>(path: &Path, value: &T) {
 /// only inside a [`private_dir`]. Best-effort, like [`write_disk_entry`]:
 /// any failure leaves the previous file (or none) in place.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
-    use std::io::Write;
     let Some(dir) = path.parent() else { return };
     if !private_dir(dir, true) {
         return;
     }
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("entry")
-    ));
-    // A stale temp from a crashed writer with a recycled pid: drop and retry.
-    let file = create_private_file(&tmp).or_else(|_| {
-        let _ = std::fs::remove_file(&tmp);
-        create_private_file(&tmp)
-    });
-    let Ok(mut file) = file else { return };
-    if file.write_all(bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    );
 }
 
 mod deferrable;

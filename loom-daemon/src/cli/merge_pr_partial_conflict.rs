@@ -27,8 +27,8 @@
 //! Every field arrives on stdin, never in argv: the body and commit messages
 //! are forge-controlled text that routinely runs to tens of kilobytes.
 
+use crate::merge_pr::partial_conflict::{plan, render, Frame};
 use anyhow::Result;
-use loom_daemon::merge_pr::partial_conflict::{plan, render, Frame};
 use std::io::{Read, Write};
 
 #[derive(clap::Args)]

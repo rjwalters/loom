@@ -221,3 +221,25 @@ fn nested_hops_through_a_non_fleet_host_ask_through_the_hook() {
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+#[test]
+fn unmanaged_hosts_are_scoped_out_but_roster_hosts_stay_protected() {
+    let f = Fixture::new();
+    let lab = "ssh ubuntu@100.100.1.2 'git reset --hard'";
+    let (d, _, _) = f.run(lab, &[]);
+    assert_eq!(d, "ask", "tailnet-range host asks without the unmanaged list");
+    // loom-worker-2's tailscale address sits in the listed /16 too: the
+    // roster must still win over the unmanaged list.
+    std::fs::write(
+        f.repo().join(".loom/config.json"),
+        r#"{"guards": {"remoteUnmanagedHosts": ["100.100.0.0/16", "100.70.0.0/16"]}}"#,
+    )
+    .unwrap();
+    let (d, _, _) = f.run(lab, &[]);
+    assert_eq!(d, "allow", "listed CIDR is outside the guard's scope");
+    let (d, _, _) = f.run("ssh ubuntu@100.70.0.2 'git reset --hard'", &[]);
+    assert_eq!(d, "ask", "a roster host stays protected even if listed");
+    let (d, reason, _) = f.run("ssh ubuntu@$IP 'git reset --hard'", &[]);
+    assert_eq!(d, "ask");
+    assert!(reason.contains("remoteUnmanagedHosts"), "{reason}");
+}

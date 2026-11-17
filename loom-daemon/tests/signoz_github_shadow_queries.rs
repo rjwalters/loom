@@ -25,53 +25,20 @@
 //!   served/passthrough.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 /// Same pin as `signoz_queue_quota_queries.rs` and the trial's telemetry store.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::{clickhouse, CLICKHOUSE_IMAGE};
 
 const SHADOW: &str = include_str!("../../defaults/observability/signoz/github-shadow.sql");
 const FIXTURE: &str = include_str!("fixtures/signoz_github_shadow/fixture.sql");
 
 type Row = BTreeMap<String, serde_json::Value>;
-
-fn clickhouse(script: &str, format: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            &format!("--format={format}"),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 /// The committed statements, line comments stripped before the split on `;`
 /// (no `--` or `;` occurs inside a string literal in the file).

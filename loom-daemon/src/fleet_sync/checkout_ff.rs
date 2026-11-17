@@ -18,7 +18,7 @@
 //! | # | Check | State when it fails |
 //! |---|---|---|
 //! | 1 | `origin/HEAD` names the default branch (never a guessed `main`) | `no-default-branch` |
-//! | 2 | HEAD is on it (not another branch, not detached) | `wrong-branch` |
+//! | 2 | HEAD is on it (not another branch, not detached) | `wrong-branch` (a clean one is first put back, #13588) |
 //! | 3 | no rebase, merge, cherry-pick, bisect or revert in progress | `mid-operation` |
 //! | 4 | no main-health gate run is building in this checkout | `gate-in-flight` |
 //! | 4 | the daemon's self-update is not running in this checkout | `self-update-in-flight` |
@@ -185,6 +185,7 @@ pub(crate) mod external_change;
 mod freshness;
 pub(crate) mod git;
 mod host;
+mod identical;
 mod self_heal;
 
 use std::collections::HashMap;
@@ -198,6 +199,8 @@ use crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRec
 
 #[cfg(test)]
 pub(in crate::fleet_sync) use host::note_remote_head_at;
+#[cfg(test)]
+pub(in crate::fleet_sync) use host::with_daemon_root;
 pub use host::BUSY_NOTE;
 pub(super) use host::{after_resync, announce, note_remote_head, startup};
 #[cfg(test)]
@@ -594,6 +597,10 @@ pub struct Env<'a> {
     pub elapsed: &'a dyn Fn() -> Duration,
     /// The clock.
     pub clock: &'a dyn Fn() -> DateTime<Utc>,
+    /// Is `sha` the head of a pull request the forge reports as merged
+    /// (#13588)? `None`: it could not be answered (no network, breaker open, a
+    /// failed lookup): the caller treats that as "not merged".
+    pub pr_merged: &'a dyn Fn(&Path, &str) -> Option<bool>,
 }
 
 impl Env<'_> {
@@ -958,7 +965,17 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
         }
     }
     let old = found.head.clone().unwrap_or_else(|| "unknown".to_string());
-    match git::fast_forward(root, &branch) {
+    let mut attempt = git::fast_forward(root, &branch);
+    // #13580: a file in the way that is byte-identical to what the merge would
+    // write holds nothing. Remove it and retry once; any doubt keeps the hold.
+    let mut removed = Vec::new();
+    if let Err(git::Refusal::WouldOverwrite(_, named)) = &attempt {
+        if let Some(paths) = identical::remove_identical_collisions(root, &branch, named, local()) {
+            removed = paths;
+            attempt = git::fast_forward(root, &branch);
+        }
+    }
+    match attempt {
         Ok(()) => {
             found.head = git::head(root, local());
             let new = found.head.clone().unwrap_or_else(|| "unknown".to_string());
@@ -969,9 +986,13 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
                 detail.push_str("; discarded local edits identical to origin: ");
                 detail.push_str(&git::summarize(&identical));
             }
+            if !removed.is_empty() {
+                detail.push_str("; removed untracked files identical to origin: ");
+                detail.push_str(&git::summarize(&removed));
+            }
             found.end(S::FastForwarded, detail)
         }
-        Err(git::Refusal::WouldOverwrite(paths)) => {
+        Err(git::Refusal::WouldOverwrite(paths, _)) => {
             found.end(S::WouldOverwrite, format!("a local file is in the way: {paths}"))
         }
         Err(git::Refusal::Other(e)) => found.end(S::GitFailure, e),

@@ -232,6 +232,16 @@
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
 //!
+//! [`post_merge_cleanup`] is where the cleanup family above stops being a set of
+//! verbs the shell sequences and becomes one orchestrator (#8191, slice 1 of
+//! `docs/migration/merge-pr-orchestrator-port.md`): target naming, the
+//! remove-vs-preserve decision, the primary/sentinel/uncommitted-work guards, the
+//! removal, the ledger, the local-branch delete and the cargo-target reclaim run
+//! in one process, in the order the shell ran them. Forge facts it needs are
+//! asked for (`LOOM-NEED`, exit 3, nothing done) rather than fetched, so the
+//! Gitea-aware shell libraries keep serving them and the lazy-read behaviour is
+//! unchanged.
+//!
 //! [`retarget_children`] is not a port — it is #9372's gate in front of the
 //! post-merge remote-branch delete: a bare ref delete makes GitHub CLOSE every
 //! open PR based on that branch (unrecoverably), so each open child is
@@ -246,10 +256,9 @@
 //! (#8191 slice): already merged (exit 0) versus closed unmerged (refuse)
 //! versus carry on. Merged wins over closed, since a merged PR also reads
 //! `state: closed`. The shell acts on a positively received verdict; a lost
-//! one falls back to the retired shell predicate (as `revalidate-head` does).
+//! one falls back to the retired shell predicate.
 
 pub mod check_runs_rollup;
-pub mod check_runs_streak;
 pub mod checks_failure;
 pub mod cleanup_paths;
 pub mod closed_building;
@@ -257,17 +266,17 @@ pub mod closed_by_merge;
 pub mod consolidate;
 pub mod dirty_guard;
 pub mod discovered_worktree;
-pub mod head_sync;
+pub mod hold_release;
 pub mod hold_state;
 pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod merge_route;
-pub mod mergeable_recheck;
 pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
-pub mod poll_wait;
+pub mod post_merge_bookkeeping;
+pub mod post_merge_cleanup;
 pub mod pr_state;
 pub mod reconcile;
 pub mod redate;
@@ -275,10 +284,9 @@ pub mod refs;
 pub mod remove_gate;
 pub mod response;
 pub mod retarget_children;
-pub mod retries_used;
-pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
+pub mod stacked_reconcile;
 pub mod stale_checks;
 pub mod superseded_runs;
 pub mod tree_checks;

@@ -1,12 +1,12 @@
 //! Weekly-limit-point sampling for `loom-daemon tokens check` (Issue #8347,
 //! part of #8063) — the write side of
-//! [`loom_daemon::activity::weekly_point_history`].
+//! [`crate::activity::weekly_point_history`].
 //!
 //! # Why this call site
 //!
 //! `tokens check` is the **only** process that already probes every
 //! bootstrapped account on a cadence: the daemon's
-//! [`loom_daemon::token_ranking_refresh`] loop shells out to `loom-daemon
+//! [`crate::token_ranking_refresh`] loop shells out to `loom-daemon
 //! tokens check --ranking --workspace <root>` every ~10 minutes by default.
 //! Sampling from [`record_probe_run`], which `super::tokens`'
 //! `run_probe_against_pool` calls once per completed probe, therefore rides
@@ -44,7 +44,7 @@
 
 use std::path::Path;
 
-use loom_daemon::tokens_pool::check::ProbeReport;
+use crate::tokens_pool::check::ProbeReport;
 
 /// Record today's weekly-limit-point sample from a completed probe run.
 ///
@@ -55,11 +55,11 @@ use loom_daemon::tokens_pool::check::ProbeReport;
 ///
 /// **Best-effort**: a database that cannot be opened or written warns on
 /// stderr inside
-/// [`loom_daemon::activity::record_daily_sample_best_effort`] and is
+/// [`crate::activity::record_daily_sample_best_effort`] and is
 /// otherwise ignored, so neither `.ranking` nor `tokens check`'s exit code is
 /// affected.
 pub(crate) fn record_probe_run(ranking: bool, report: &ProbeReport) {
-    use loom_daemon::activity::{record_daily_sample_best_effort, sum_account_points};
+    use crate::activity::{record_daily_sample_best_effort, sum_account_points};
 
     if !ranking {
         return;
@@ -88,7 +88,7 @@ pub(crate) fn record_probe_run(ranking: bool, report: &ProbeReport) {
 /// sidecar never outlives the `.ranking` it described. Best-effort: a failed
 /// write warns and leaves `.ranking` and the exit code alone.
 pub(crate) fn write_weekly_sidecar(ranking: bool, tokens_dir: &Path, report: &ProbeReport) {
-    use loom_daemon::tokens_pool::ranking_weekly::write_weekly_utilization_sidecar;
+    use crate::tokens_pool::ranking_weekly::write_weekly_utilization_sidecar;
 
     if !ranking {
         return;

@@ -1,8 +1,8 @@
 //! `loom-daemon forge merge-queue …` (#10255) — clap surface only. All
-//! decisions live in [`loom_daemon::forge_merge_queue`].
+//! decisions live in [`crate::forge_merge_queue`].
 
+use crate::forge_merge_queue::{handle, MergeQueueCmd};
 use clap::Subcommand;
-use loom_daemon::forge_merge_queue::{handle, MergeQueueCmd};
 
 /// Dormant merge-queue controls (#9978 Phase A). `mode`, `preflight` and
 /// `status` are read-only; `enqueue`/`dequeue` refuse (exit 4) under

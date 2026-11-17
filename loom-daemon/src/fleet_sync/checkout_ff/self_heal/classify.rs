@@ -309,6 +309,92 @@ fn untracked_in_the_way(
         .map(str::to_string))
 }
 
+/// A HEAD that is off the default branch with nothing of its own to lose
+/// (#13588): the repair puts the checkout back on the branch.
+#[derive(Debug)]
+pub(super) struct Strand {
+    /// The branch HEAD is on, `None` when detached.
+    pub from: Option<String>,
+    /// HEAD, for the rescue ref and the log.
+    pub head: String,
+    /// Commits on HEAD that are not on `origin/<branch>` (all of them a merged
+    /// pull request's).
+    pub unique: usize,
+}
+
+/// Is `root` stranded off `branch` with everything on its HEAD safe elsewhere?
+/// `Ok(None)`: HEAD is on `branch`. `Err(why)`: stranded, but not provably
+/// safe, or in doubt; the hold stays. Every doubt, including a failed forge
+/// lookup, is an `Err`.
+pub(super) fn stranded(
+    env: &Env<'_>,
+    root: &Path,
+    branch: &str,
+    gd: &Path,
+) -> Result<Option<Strand>, String> {
+    let current = git::current_branch(root, local(env))?;
+    if current.as_deref() == Some(branch) {
+        return Ok(None);
+    }
+    if operation(gd)
+        .map_err(|()| "an operation is in progress")?
+        .is_some()
+    {
+        return Err("an operation is in progress".to_string());
+    }
+    if gd.join("index.lock").exists() {
+        return Err("index.lock exists".to_string());
+    }
+    if !dirty_paths(env, root)?.is_empty() {
+        return Err("the working tree has a tracked change".to_string());
+    }
+    let tracking = git::tracking(branch);
+    read(env, root, &["rev-parse", "--verify", "--quiet", &tracking])
+        .map_err(|_| format!("no {tracking} to compare with"))?;
+    let head = read(env, root, &["rev-parse", "HEAD"])?;
+    let unique = read(env, root, &["rev-list", "HEAD", "--not", &tracking])?
+        .lines()
+        .count();
+    if unique > MAX_COMMITS {
+        return Err(format!("{unique} commits are more than are read"));
+    }
+    if current.is_none() {
+        let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
+            .unwrap_or_default();
+        if keep.trim().eq_ignore_ascii_case("keep") {
+            return Err("HEAD is detached on purpose (loom.checkoutFf.detached=keep)".to_string());
+        }
+    }
+    let moved = managed::head_moved_at(gd);
+    let old_enough = moved.is_some_and(|at| {
+        (env.clock)()
+            .signed_duration_since(at)
+            .to_std()
+            .is_ok_and(|age| age >= managed::detached_after())
+    });
+    if !old_enough {
+        return Err("HEAD moved recently".to_string());
+    }
+    if live_git(root) {
+        return Err("a git process is running in the repository".to_string());
+    }
+    // Last, because it is the only forge read on this path (#13835): every
+    // cheaper local check above has already agreed, so this lookup is the one
+    // answer that can still change the outcome. Before the reorder a checkout
+    // parked on an unmerged branch spent one `commits/<sha>/pulls` read per
+    // pass that a local refusal then threw away.
+    if unique > 0 && (env.pr_merged)(root, &head) != Some(true) {
+        return Err(format!(
+            "{unique} commit(s) are not on {tracking} and HEAD is not a merged pull request's head"
+        ));
+    }
+    Ok(Some(Strand {
+        from: current,
+        head,
+        unique,
+    }))
+}
+
 /// Classify what blocks `root`'s fast-forward to `origin/<branch>`.
 pub(super) fn classify(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Verdict {
     match classify_inner(env, root, branch, gd) {
@@ -377,6 +463,20 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
         if listed.contains(p) {
             return true;
         }
+        // #13970: OpenCode rewrites a tracked `opencode.json` (committed by
+        // the squad installer, not Loom) adding one `$schema` entry, and that
+        // dirt then holds a primary checkout for an operator. Exactly that
+        // one-entry diff in the working tree is Loom's to clear; every other
+        // change to the file, and every committed change, is not. Any read
+        // error fails closed to "not owned".
+        if p == managed::OPENCODE_CONFIG && rev.is_none() {
+            let working = std::fs::read_to_string(root.join(p)).ok();
+            let head = read(env, root, &["show", &format!("HEAD:{p}")]).ok();
+            return matches!(
+                (working, head),
+                (Some(w), Some(h)) if managed::opencode_schema_only(&w, &h)
+            );
+        }
         if !managed::resync_owned(p, &pins) {
             return false;
         }
@@ -437,10 +537,11 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     // Re-attached only when the repair resets anyway, or the HEAD is behind.
     let reattach = stray && (stray_behind || !commits.is_empty() || blocking_dirt);
     if reattach {
-        // A tool that pins a checkout to a commit on purpose (2am's
-        // `provision.sh` keeps geode-fem at the newest green one) says so here;
-        // while main is red such a HEAD is detached, behind and unmoved, which
-        // is exactly the shape this repair puts back.
+        // A tool that pins a registered workspace to a commit on purpose
+        // says so here; while the default branch is red such a HEAD is
+        // detached, behind and unmoved, which is exactly the shape this repair
+        // puts back. A tool clone kept outside the registered workspaces is
+        // never reached by a pass and needs no opt-out.
         let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
             .unwrap_or_default();
         if keep.trim().eq_ignore_ascii_case("keep") {

@@ -13,15 +13,18 @@ mod control;
 pub mod dispatch;
 mod docker;
 pub mod export;
+mod forge_auth;
 mod lease;
 mod lifecycle;
+#[cfg(test)]
+mod recover_tests;
 mod repository;
 #[cfg(test)]
 mod tests;
 pub mod transport;
 mod worker_setup;
 
-pub use lifecycle::{configured, run_job, start, status, stop};
+pub use lifecycle::{configured, recover, run_job, start, status, stop};
 pub use repository::WorkerCommand;
 
 use anyhow::{bail, Context, Result};

@@ -22,6 +22,7 @@ fn rec(blocker: u64) -> ParkRecord {
         by: Some("doctor".to_string()),
         at: Some("2026-09-19T12:09:00Z".to_string()),
         reason: None,
+        transient: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn round_trips() {
         by: Some("champion".to_string()),
         at: Some("2026-09-25T16:52:03Z".to_string()),
         reason: Some("needs an architecture ruling".to_string()),
+        transient: None,
     };
     assert_eq!(parse(&render(&original)), vec![original]);
 }
@@ -121,6 +123,7 @@ fn a_reference_inside_the_reason_is_not_a_declared_blocker() {
         by: Some("doctor".to_string()),
         at: None,
         reason: Some("compounded by the #8940 dispatch bug".to_string()),
+        transient: None,
     };
     let line = render(&record);
     assert_eq!(blockers(&line), n(&[8322]));
@@ -136,6 +139,7 @@ fn a_reason_containing_a_double_dash_cannot_terminate_the_comment_early() {
         by: None,
         at: None,
         reason: Some("blocked on --force being removed".to_string()),
+        transient: None,
     });
     assert_eq!(line.matches("-->").count(), 1, "got {line}");
     assert_eq!(blockers(&line), n(&[7]));
@@ -148,6 +152,7 @@ fn a_multiline_reason_is_flattened_to_one_line() {
         by: None,
         at: None,
         reason: Some("first line\nsecond line".to_string()),
+        transient: None,
     });
     assert_eq!(line.lines().count(), 1, "got {line}");
     assert_eq!(parse(&line)[0].reason.as_deref(), Some("first line second line"));
@@ -160,6 +165,7 @@ fn an_attribute_value_with_spaces_cannot_truncate_the_next_attribute() {
         by: Some("champion merge risk".to_string()),
         at: Some("2026-09-25T16:52:03Z".to_string()),
         reason: None,
+        transient: None,
     }))[0];
     assert_eq!(parsed.by.as_deref(), Some("champion_merge_risk"));
     assert_eq!(parsed.at.as_deref(), Some("2026-09-25T16:52:03Z"));
@@ -201,6 +207,7 @@ fn two_parks_applied_at_different_times_both_survive() {
             by: Some("curator".to_string()),
             at: None,
             reason: None,
+            transient: None,
         })
     );
     let parsed = parse(&body);

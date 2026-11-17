@@ -217,42 +217,128 @@ fn no_rotation_below_the_threshold() {
     assert_eq!(export::load_cursor(dir.path()).byte_offset, size);
 }
 
+/// Offers the fast lane (run/job lines) uses before the bulk lane starts.
+fn priority_lines(root: &Path) -> usize {
+    std::fs::read_to_string(journal_path(root))
+        .unwrap()
+        .lines()
+        .filter(|l| export::is_priority(l.as_bytes()))
+        .count()
+}
+
 #[test]
-fn rotation_waits_until_every_line_is_exported() {
+fn rotation_carries_the_unexported_tail_instead_of_waiting_for_eof() {
     let dir = TempDir::new().unwrap();
     run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
     set_rotation(dir.path(), 1, 2);
     let path = journal_path(dir.path());
+    let all = identities(&journal(dir.path()));
+    let total = journal(dir.path()).len();
+    let room = priority_lines(dir.path()) + 5;
+    assert!(total > room);
 
-    // The queue refuses part-way: the cursor is past the threshold but not
-    // at the end, so nothing rotates.
+    // The queue refuses part-way: the cursor is past the threshold but not at
+    // the end. The journal still rotates, carrying the unexported tail (#13636).
     let partial = RefusingSink {
-        room: AtomicUsize::new(5),
+        room: AtomicUsize::new(room),
+        taken: Mutex::new(Vec::new()),
+    };
+    export::backfill(dir.path(), &partial);
+    assert!(rotated_path(&path, 1).exists(), "rotated despite a tail");
+    assert!(!rotation::carry_path(&path).exists(), "staging file consumed");
+    assert_eq!(export::load_cursor(dir.path()).byte_offset, 0);
+    let carried = journal(dir.path()).len();
+    assert!(carried > 0 && carried < total, "new journal is the tail");
+
+    // The next pass offers the carried tail (priority lines may repeat once:
+    // the fast offset resets); nothing is lost.
+    let rest = sink();
+    assert!(export::backfill(dir.path(), &rest) >= carried);
+    let mut seen = identities(&partial.taken.lock().unwrap());
+    seen.extend(identities(&rest.0.lock().unwrap()));
+    assert_eq!(seen, all);
+}
+
+#[test]
+fn rotation_carries_a_torn_trailing_fragment_for_the_writer_to_repair() {
+    let dir = TempDir::new().unwrap();
+    run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
+    set_rotation(dir.path(), 1, 2);
+    let path = journal_path(dir.path());
+    let total = journal(dir.path()).len();
+    let room = priority_lines(dir.path()) + 5;
+    assert!(total > room);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"{\"schema_version\":8,");
+    std::fs::write(&path, bytes).unwrap();
+
+    let partial = RefusingSink {
+        room: AtomicUsize::new(room),
+        taken: Mutex::new(Vec::new()),
+    };
+    export::backfill(dir.path(), &partial);
+    assert!(rotated_path(&path, 1).exists());
+    // The fragment travelled with the tail; a writer repairs it as before.
+    Journal::open(path.clone()).unwrap();
+    let carried = journal(dir.path()).len();
+    assert!(carried > 0 && carried < total);
+}
+
+#[test]
+fn keep_zero_still_waits_for_an_empty_tail() {
+    let dir = TempDir::new().unwrap();
+    run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
+    set_rotation(dir.path(), 1, 0);
+    let path = journal_path(dir.path());
+    let room = priority_lines(dir.path()) + 5;
+    let partial = RefusingSink {
+        room: AtomicUsize::new(room),
         taken: Mutex::new(Vec::new()),
     };
     export::backfill(dir.path(), &partial);
     assert!(path.exists() && !rotated_path(&path, 1).exists());
+    export::backfill(dir.path(), &sink());
+    assert!(!path.exists(), "deleted once every line is exported");
+}
 
-    // A torn tail past the cursor also holds rotation back...
-    let total = journal(dir.path()).len();
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes.extend_from_slice(b"{\"schema_version\":8,");
-    std::fs::write(&path, bytes).unwrap();
-    assert_eq!(export::backfill(dir.path(), &sink()), total - 5);
-    assert!(path.exists() && !rotated_path(&path, 1).exists());
+#[test]
+fn a_live_writer_cannot_postpone_rotation_forever() {
+    let dir = TempDir::new().unwrap();
+    run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
+    set_rotation(dir.path(), 1, 2);
+    let path = journal_path(dir.path());
+    let template = journal(dir.path());
+    let expected = identities(&template);
+    let writer = Journal::open(path.clone()).unwrap();
+    let room = priority_lines(dir.path()) + 3;
 
-    // ...until a writer repairs it; then the next pass rotates.
-    Journal::open(path.clone()).unwrap();
-    assert_eq!(export::backfill(dir.path(), &sink()), 0);
-    assert!(!path.exists() && rotated_path(&path, 1).exists());
-    assert_eq!(
-        export::load_cursor(dir.path()),
-        ExportCursor {
-            byte_offset: 0,
-            exported: total as u64,
-            ..Default::default()
+    // Each pass admits only part of the backlog while the writer appends
+    // between passes, so the cursor never lands on EOF.
+    let mut offered = Vec::new();
+    let mut rotated_at = None;
+    for pass in 0..10 {
+        let queue = RefusingSink {
+            room: AtomicUsize::new(room),
+            taken: Mutex::new(Vec::new()),
+        };
+        export::backfill(dir.path(), &queue);
+        offered.extend(queue.taken.into_inner().unwrap());
+        if rotated_at.is_none() && rotated_path(&path, 1).exists() {
+            rotated_at = Some(pass);
         }
+        writer.append(&template).unwrap();
+    }
+    assert!(
+        rotated_at.is_some_and(|p| p <= 2),
+        "rotated within a bounded number of passes: {rotated_at:?}"
     );
+    // Drain: every line ever journaled was offered at least once.
+    let rest = sink();
+    for _ in 0..50 {
+        export::backfill(dir.path(), &rest);
+    }
+    offered.extend(rest.0.into_inner().unwrap());
+    assert!(expected.is_subset(&identities(&offered)));
 }
 
 #[test]

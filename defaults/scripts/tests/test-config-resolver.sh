@@ -25,6 +25,7 @@ CONFIG_RESOLVER_LIB="$SCRIPTS_DIR/lib/config-resolver.sh"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
+# Local assert_eq kept: takes (actual, expected, msg); shared assert_eq is (expected, actual, msg).
 assert_eq() {
     if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
 }
@@ -201,12 +202,12 @@ g init -q -b main
 mkdir -p "$repo/.loom"
 echo '{"a": 1}' > "$repo/.loom/config.json"
 g add -A; g commit -q -m one
-echo '{"a": 1, "forge": {"trustedCommenters": ["turian"]}}' > "$repo/.loom/config.json"
+echo '{"a": 1, "forge": {"trustedCommenters": ["example-reviewer"]}}' > "$repo/.loom/config.json"
 g commit -q -am two
 g update-ref refs/remotes/origin/main HEAD
 g symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
 g reset -q --hard HEAD~1
-assert_eq "$(loom_resolve_config "$repo" | jq -c .forge.trustedCommenters)" '["turian"]' "behind clean checkout sees origin/HEAD value"
+assert_eq "$(loom_resolve_config "$repo" | jq -c .forge.trustedCommenters)" '["example-reviewer"]' "behind clean checkout sees origin/HEAD value"
 echo '{"a": 9}' > "$repo/.loom/config.json"
 assert_eq "$(loom_resolve_config "$repo")" '{"a":9}' "local uncommitted edit wins (working copy read)"
 g checkout -q --detach HEAD

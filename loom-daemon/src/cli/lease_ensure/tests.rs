@@ -530,7 +530,7 @@ fn a_deferred_publisher_is_bounded_even_when_max_age_is_zero() {
 #[test]
 fn a_deferred_publisher_backs_off_once_the_peer_is_provably_live() {
     let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
-    let ttl = (loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as u64;
+    let ttl = (crate::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as u64;
     let t = FakeTime::new();
     let end = deferred::retry_loop(
         &args(&dir),
@@ -654,7 +654,7 @@ fn a_dead_owners_lock_never_orphans_another_sessions_declined_publish() {
     let a_id = session_sweep_id(a.watch_pid).expect("A's session identity");
     let b_id = session_sweep_id(b.watch_pid).expect("B's session identity");
     let log = || {
-        let root = loom_daemon::repo_root::resolve_repo_root(&a.workspace).unwrap();
+        let root = crate::repo_root::resolve_repo_root(&a.workspace).unwrap();
         fs::read_to_string(deferred::log_path(&root, 8193)).unwrap_or_default()
     };
     assert!(
@@ -714,7 +714,7 @@ fn a_dead_owners_lock_never_orphans_another_sessions_declined_publish() {
 #[test]
 fn a_waiting_publisher_ends_with_its_own_session_while_the_owner_lives() {
     let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
-    let root = loom_daemon::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
+    let root = crate::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
     let owner = deferred::try_lock(&deferred::lock_path(&root, 8193))
         .expect("stand-in owner takes the issue lock");
     let mut session = session_process();
@@ -742,7 +742,7 @@ fn outcomes_are_recorded_in_the_per_issue_log() {
     let dir = checkout(PUBLISH_OK, RENEW_OK);
     deferred::record(&dir.path().to_string_lossy(), 8193, "first line");
     deferred::record(&dir.path().to_string_lossy(), 8193, "second line");
-    let root = loom_daemon::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
+    let root = crate::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
     let log = fs::read_to_string(deferred::log_path(&root, 8193)).unwrap();
     assert!(log.contains(" first line\n") && log.contains(" second line\n"), "{log}");
 }
@@ -792,4 +792,93 @@ fn a_sweep_run_id_keeps_publish_on_its_own_identity() {
 
     a.ensure(&env);
     assert_eq!(argv(&dir, "publish-argv").unwrap().trim(), "publish 8193");
+}
+
+fn lease_row(host: &str, sweep: &str, age_secs: i64) -> crate::cli::lease_co_occupancy::LeaseRow {
+    crate::cli::lease_co_occupancy::LeaseRow {
+        updated_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
+        body: format!("<!-- loom:lease host={host} sweep={sweep} -->\nbody"),
+    }
+}
+
+fn ttl() -> chrono::Duration {
+    chrono::Duration::minutes(15)
+}
+
+fn mine() -> Vec<String> {
+    vec!["h-me".to_string()]
+}
+
+#[test]
+fn a_live_orchestrator_lease_on_this_host_is_reused() {
+    let rows = [lease_row("h-me", "run-1", 30)];
+    assert_eq!(
+        reusable_lease(&rows, chrono::Utc::now(), ttl(), &mine(), Some("sweep-insession-s1-x")),
+        Some(("h-me".to_string(), "run-1".to_string()))
+    );
+}
+
+#[test]
+fn a_stale_foreign_or_own_session_lease_is_not_reused() {
+    let now = chrono::Utc::now();
+    let stale = [lease_row("h-me", "run-1", 3600)];
+    assert_eq!(reusable_lease(&stale, now, ttl(), &mine(), None), None);
+    let foreign = [lease_row("h-other", "run-2", 30)];
+    assert_eq!(reusable_lease(&foreign, now, ttl(), &mine(), None), None);
+    let both = [
+        lease_row("h-me", "run-1", 30),
+        lease_row("h-other", "run-2", 30),
+    ];
+    assert_eq!(reusable_lease(&both, now, ttl(), &mine(), None), None);
+    let own = [lease_row("h-me", "sweep-insession-s1-x", 30)];
+    assert_eq!(
+        reusable_lease(&own, now, ttl(), &mine(), Some("sweep-insession-s1-x")),
+        None,
+        "the session's own lease is publish's re-attach case"
+    );
+}
+
+#[test]
+fn ensure_with_a_live_orchestrator_lease_publishes_and_renews_nothing() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let a = args(&dir);
+    // `reusable_lease` matches on this host's published id.
+    let host = crate::cli::lease_release::my_host_ids().remove(0);
+    let env = SessionEnv {
+        lease_rows: Some(vec![lease_row(&host, "run-1", 30)]),
+        ..in_session()
+    };
+    let out = a.ensure(&env);
+    assert_eq!(
+        out,
+        Outcome::ReusedExisting {
+            host,
+            sweep_id: "run-1".into()
+        }
+    );
+    assert!(argv(&dir, "publish-argv").is_none(), "no second lease");
+    assert!(argv(&dir, "renew-argv").is_none(), "no second renewer");
+}
+
+#[test]
+#[serial_test::serial(loom_auto_update_env)]
+fn the_reuse_decision_follows_the_lease_ttl_env() {
+    let env_var = crate::claim_reconciliation::LEASE_TTL_MINUTES_ENV;
+    // A lease aged 10 minutes: live under the 15 min default, expired under 5.
+    let rows = [lease_row("h-me", "run-1", 600)];
+    let reused = |ttl| reusable_lease(&rows, chrono::Utc::now(), ttl, &mine(), None).is_some();
+
+    std::env::remove_var(env_var);
+    assert_eq!(reuse_ttl(), chrono::Duration::minutes(15));
+    assert!(reused(reuse_ttl()), "default TTL reuses a 10 min old lease");
+
+    std::env::set_var(env_var, "5");
+    assert_eq!(reuse_ttl(), chrono::Duration::minutes(5));
+    assert!(!reused(reuse_ttl()), "a 5 min TTL treats it as expired");
+
+    for bad in ["0", "junk", "-3"] {
+        std::env::set_var(env_var, bad);
+        assert_eq!(reuse_ttl(), chrono::Duration::minutes(15), "{bad:?} falls back");
+    }
+    std::env::remove_var(env_var);
 }

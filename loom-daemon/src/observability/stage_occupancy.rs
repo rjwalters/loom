@@ -10,7 +10,7 @@
 //! Driven from the collector's periodic sample
 //! (`observability::collector::sample_snapshots`), never from a role or
 //! work-finder tick, on the same cadence and with the same listing machinery as
-//! the `loom:blocked` rows of `queue.snapshot` ([`super::queue_blocked`]):
+//! the `loom:blocked` listing ([`super::queue_blocked`]):
 //!
 //! - **Mirror mode** (#12307): the counts come from the tick's published
 //!   snapshot, which holds every open issue of each repo it read. No forge call.

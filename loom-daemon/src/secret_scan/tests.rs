@@ -5,6 +5,7 @@
 //! None of them was ever a credential.
 
 use super::*;
+use crate::test_git_helpers::run as git;
 use std::process::Command;
 
 /// `sk-ant-<kind>-` + 93 varied characters + `AA`: the real length and alphabet.
@@ -45,16 +46,6 @@ fn repo() -> tempfile::TempDir {
     git(&["add", "README"]);
     git(&["commit", "-q", "-m", "seed"]);
     dir
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(ok.success(), "git {args:?}");
 }
 
 #[test]

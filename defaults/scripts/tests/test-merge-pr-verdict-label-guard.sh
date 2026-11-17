@@ -65,10 +65,9 @@ loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 # --- Extract the function under test from merge-pr.sh and source it ---
 # From `_check_verdict_label_contradiction() {` up to (not including) the
 # following `_check_verdict_label_contradiction` invocation line — the
-# function is written as a single dense line (file-size-ratchet offset, see
-# merge-pr.sh's own comment above it), so the extraction captures exactly
-# that one line. Extracting from source keeps the test in lockstep with the
-# script instead of re-implementing it.
+# function is written as a single dense line, so the extraction captures
+# exactly that one line. Extracting from source keeps the test in lockstep
+# with the script instead of re-implementing it.
 #
 # Two more lines come with it (#8285): the one-line `_mp_daemon_roll_hint`,
 # which the refusal path calls to name the daemon version floor and the roll
@@ -193,7 +192,7 @@ assert_eq "1" "$LAST_RC" "loom:pr + loom:review-requested -> merge hard-blocked 
 assert_contains "$LAST_OUT" "loom:review-requested" "Block message names loom:review-requested"
 
 # T10 (#9016): the critical-file-hold release path, end to end through this
-# guard. Champion's criterion-#3 hold keeps `loom:pr` and adds `loom:operator`,
+# guard. Champion's critical-files hold keeps `loom:pr` and adds `loom:operator`,
 # and its documented human path is "remove the label, then run merge-pr.sh".
 # Before #9016 Champion re-added the label on its next tick, so the operator's
 # second command hit T4's block again (merge train #8996: the label was back

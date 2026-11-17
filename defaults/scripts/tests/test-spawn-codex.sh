@@ -57,6 +57,7 @@ loom_test_require_daemon_bin --self-only --path "$SCRIPTS_DIR" spawn-worker sess
 # shellcheck source=lib/assert.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
+# Local assert_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_contains() {
     local needle="$1" haystack="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -71,6 +72,7 @@ assert_contains() {
     fi
 }
 
+# Local assert_not_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_not_contains() {
     local needle="$1" haystack="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -841,7 +843,7 @@ STAGE="$TMPROOT/stage"
 WS="$TMPROOT/ws"
 mkdir -p "$STAGE/lib" "$WS/.loom"
 cp "$SCRIPTS_DIR/spawn-worker.sh" "$STAGE/spawn-worker.sh"
-cp "$SCRIPTS_DIR/lib/"{config-resolver,locate-daemon-bin,loom-tools}.sh "$STAGE/lib/"
+cp "$SCRIPTS_DIR/lib/"{config-resolver,locate-daemon-bin,loom-tools,repo-root}.sh "$STAGE/lib/"
 cp "$SPAWN_CODEX" "$STAGE/spawn-codex.sh"
 # A stub claude runner so the "available runtimes" list and the default path
 # stay realistic without ever reaching the real token-selection code.
@@ -949,8 +951,8 @@ assert_classify "TOKEN_EXPIRED" \
     1 codex "invalid_api_key is TOKEN_EXPIRED"
 
 # --- TOKEN_EXHAUSTED: plan/quota exhaustion ---
-# Kept on one line each (rather than the usual continuations) so the #8539
-# capture below could be added without growing this over-ratchet file.
+# Kept on one line each (rather than the usual continuations), matching the
+# #8539 capture below.
 assert_classify "TOKEN_EXHAUSTED" "You've hit your usage limit. Upgrade to Pro to continue using Codex" 1 codex "\"hit your usage limit\" is TOKEN_EXHAUSTED"
 # The wording captured verbatim on the #8539 host (a headless `codex exec`
 # inside an account's session container, every registered account walled). The

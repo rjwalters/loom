@@ -1,19 +1,14 @@
-//! Delivery accounting shared by native HTTPS and OTLP senders.
+//! Delivery accounting for the OTLP sender.
 use super::exporter;
 
 /// Live record of whether telemetry is actually *reaching* the backend, written
 /// by [`super::sender::try_flush`] on every attempt and read back by
 /// [`super::global_export_status`] for `loom-daemon status` / `health`.
 ///
-/// The complement to [`super::HostIdStatus`], which is anomaly-only by design (#4830)
-/// and therefore cannot answer "is it working?" — only "is it working *wrong*
-/// in this one specific way?". This cell is always readable and always has an
-/// answer, including the answer #4830 could never give: *configured, running,
-/// and has never successfully exported anything*.
-///
-/// Unlike [`super::HostIdStatus`] this is **not** write-once: it is a rolling record,
-/// so `last_success_at` genuinely means "the last time data landed" and a watch
-/// loop can alert on its age.
+/// This cell is always readable and always has an answer, including
+/// *configured, running, and has never successfully exported anything*. It is
+/// a rolling record, so `last_success_at` genuinely means "the last time data
+/// landed" and a watch loop can alert on its age.
 #[derive(Debug)]
 pub struct ExportStatus {
     inner: std::sync::Mutex<crate::types::ObservabilityExportStatus>,
@@ -29,7 +24,7 @@ pub struct ExportStatus {
 
 // Allow expect_used: a poisoned status mutex means another thread panicked
 // while holding it — unrecoverable, matching the crash-on-poison policy
-// `HostIdStatus` above (and `auto_update`/`ipc`) already use.
+// `auto_update` and `ipc` already use.
 #[allow(clippy::expect_used)]
 impl ExportStatus {
     /// A status cell for an exporter that is starting *now* under `host_id`,
@@ -44,7 +39,6 @@ impl ExportStatus {
         let mut initial = crate::types::ObservabilityExportStatus {
             state: crate::types::ObservabilityExportState::Starting,
             host_id: Some(host_id.to_string()),
-            ingest_host_id: None,
             endpoint: Some(endpoint.to_string()),
             exporter: Some(exporter.to_string()),
             started_at: Some(chrono::Utc::now()),
@@ -142,18 +136,6 @@ impl ExportStatus {
         guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
     }
 
-    /// The sink answered 410 (#12812): it is retired, not failing. Clears the
-    /// failure streak so a prior transient run cannot escalate or read as
-    /// degraded.
-    pub fn record_retired(&self) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("observability export status mutex poisoned");
-        guard.sink_retired = true;
-        guard.consecutive_failures = 0;
-    }
-
     /// A status cell for an exporter that never started because a required
     /// piece of config could not be resolved (Issue #5337) — `enabled: true`
     /// but no endpoint, no ingest key file, or an unreadable/empty ingest key
@@ -171,9 +153,7 @@ impl ExportStatus {
     }
 
     /// The current record, with [`crate::types::ObservabilityExportStatus::state`]
-    /// (and the #9015 scope fields) re-derived as of now. `ingest_host_id` is folded in from
-    /// [`super::global_host_id_mismatch`] by [`super::global_export_status`], not here — this
-    /// cell knows nothing about identity.
+    /// (and the #9015 scope fields) re-derived as of now.
     #[must_use]
     pub fn snapshot(&self) -> crate::types::ObservabilityExportStatus {
         let mut snapshot = self

@@ -2,42 +2,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A confirmed disagreement between the host identity this daemon resolves for
-/// itself and the `host_id` the ingest backend echoes back for the key it
-/// authenticated (Issue #4830).
-///
-/// Filed as a *data* type on the status wire rather than a log-only condition
-/// because the 2026-07-31 incident it exists for was invisible for hours: a Mac
-/// Studio pushed its whole first night of telemetry under another host's id
-/// because the wrong key file had been installed on it, and neither side had any
-/// way to notice. The backend cannot notice (a key-bound id is authoritative by
-/// design), so the *daemon* is the only party that holds both halves.
-///
-/// Lives beside [`ObservabilityExportStatus`] in this sibling module (moved
-/// from `types.rs` inline for the file-size ratchet, #8756); re-exported as
-/// `crate::types::ObservabilityHostIdMismatch` so every existing path is
-/// unchanged.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObservabilityHostIdMismatch {
-    /// What this daemon calls itself —
-    /// [`crate::sweep_registry::host_identity`], resolved with the precedence
-    /// `fleet.hostId`, then `$LOOM_HOST_ID`, then the persisted
-    /// `~/.loom/host-id`, then `"unknown-host"` (#11530). The same value it stamps on every outgoing envelope.
-    pub daemon_host_id: String,
-    /// The `host_id` the `/ingest` response echoed — the identity the
-    /// authenticated key is bound to, i.e. the host every pushed record is
-    /// actually being filed under.
-    pub ingest_host_id: String,
-    /// When the mismatch was first observed this daemon process. Never
-    /// re-stamped on subsequent flushes: the WARN and this record are both
-    /// once-per-lifetime, so this is the age of the condition, not of the last
-    /// flush.
-    pub first_seen_at: DateTime<Utc>,
-}
-
 /// Positive, always-present state of this daemon's telemetry export (Issue
-/// #5083) — the counterpart to [`ObservabilityHostIdMismatch`]'s anomaly-only
-/// signal.
+/// #5083).
 ///
 /// The 2026-08-03 incident this exists for: two hosts with byte-identical
 /// observability config, one showing an `observability` health section and one
@@ -48,8 +14,7 @@ pub struct ObservabilityHostIdMismatch {
 ///
 /// Published by [`crate::observability::ExportStatus`] (updated by
 /// [`crate::observability::sender::try_flush`] on every attempt) and read back
-/// via [`crate::observability::global_export_status`], mirroring the
-/// process-global pattern [`ObservabilityHostIdMismatch`] already uses.
+/// via [`crate::observability::global_export_status`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservabilityExportStatus {
     /// The state as classified by the *daemon* at status-build time. Consumers
@@ -67,18 +32,12 @@ pub struct ObservabilityExportStatus {
     /// not running. This is the "under which `host_id`" half of the AC.
     #[serde(default)]
     pub host_id: Option<String>,
-    /// The `host_id` the ingest backend echoed back, when it *disagrees* with
-    /// [`Self::host_id`] — i.e. `Some` exactly when a #4830 mismatch has been
-    /// confirmed, so [`Self::classify`] needs no second input. `None`
-    /// otherwise, including when the ids agree.
-    #[serde(default)]
-    pub ingest_host_id: Option<String>,
     /// The configured export endpoint, so an operator can confirm *where* the
     /// data is going without opening the config. `None` when not running.
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Which exporter implementation is running: `"https"` (Loom's native
-    /// ingest) or `"otlp"`. `None` when not running.
+    /// Which exporter implementation is running: `"otlp"`. `None` when not
+    /// running. (Pre-#12813 daemons also reported `"https"`.)
     #[serde(default)]
     pub exporter: Option<String>,
     /// When the exporter task started this daemon process. The denominator for
@@ -115,11 +74,6 @@ pub struct ObservabilityExportStatus {
     /// any ack). Non-zero ⇒ [`ObservabilityExportState::Failing`].
     #[serde(default)]
     pub consecutive_failures: u32,
-    /// The sink answered HTTP 410: the dashboard `/ingest` endpoint is retired
-    /// (#12812). The exporter stops sending and the state reads
-    /// [`ObservabilityExportState::Disabled`], not a fault.
-    #[serde(default)]
-    pub sink_retired: bool,
     /// The flush cadence this exporter resolved, in seconds — the unit the
     /// grace window is scaled by, so a host configured with a long interval
     /// does not false-alarm as never-exported. `None` when not running.
@@ -297,13 +251,10 @@ impl ObservabilityExportStatus {
     ///    fields) — `Misconfigured` is the one sticky, explicitly-set
     ///    terminal state, since nothing else ever transitions out of it.
     /// 1. not running ⇒ `Disabled`
-    /// 2. confirmed id disagreement ⇒ `HostIdMismatch` (config-shaped, cannot
-    ///    self-recover — outranks a transient flush failure, whose facts stay
-    ///    readable in `last_failure_*` either way)
-    /// 3. the last attempt failed ⇒ `Failing`
-    /// 4. something has been acked ⇒ `Healthy`
-    /// 5. nothing acked, still inside the grace window ⇒ `Starting`
-    /// 6. nothing acked, past the grace window ⇒ `NeverExported`
+    /// 2. the last attempt failed ⇒ `Failing`
+    /// 3. something has been acked ⇒ `Healthy`
+    /// 4. nothing acked, still inside the grace window ⇒ `Starting`
+    /// 5. nothing acked, past the grace window ⇒ `NeverExported`
     #[must_use]
     pub fn classify(&self, now: DateTime<Utc>) -> ObservabilityExportState {
         if self.state == ObservabilityExportState::Misconfigured {
@@ -312,16 +263,6 @@ impl ObservabilityExportStatus {
         let Some(uptime) = self.uptime_secs(now) else {
             return ObservabilityExportState::Disabled;
         };
-        if self.sink_retired {
-            return ObservabilityExportState::Disabled;
-        }
-        if self
-            .ingest_host_id
-            .as_ref()
-            .is_some_and(|ingest| Some(ingest) != self.host_id.as_ref())
-        {
-            return ObservabilityExportState::HostIdMismatch;
-        }
         if self.consecutive_failures > 0 {
             return ObservabilityExportState::Failing;
         }
@@ -383,12 +324,6 @@ pub enum ObservabilityExportState {
     /// fail. Telemetry is flowing, filed under
     /// [`ObservabilityExportStatus::host_id`].
     Healthy,
-    /// Batches are being acked, but the backend echoes a *different* `host_id`
-    /// than this daemon reports for itself (#4830) — the records are landing,
-    /// under the wrong host. Takes precedence over [`Self::Failing`]: it is a
-    /// config-shaped fault that cannot self-recover, whereas a failing flush
-    /// usually can.
-    HostIdMismatch,
     /// The most recent flush attempt failed (the queue is retrying with
     /// backoff). `last_failure_detail` carries the exporter's own error text;
     /// `last_success_at` says whether this is a regression or has never worked.
@@ -436,7 +371,6 @@ impl ObservabilityExportState {
             ObservabilityExportState::Starting => "starting",
             ObservabilityExportState::NeverExported => "NEVER EXPORTED",
             ObservabilityExportState::Healthy => "OK",
-            ObservabilityExportState::HostIdMismatch => "HOST-ID MISMATCH",
             ObservabilityExportState::Failing => "FAILING",
             ObservabilityExportState::Unrecognized => "unrecognized",
         }
@@ -450,7 +384,6 @@ impl ObservabilityExportState {
             self,
             ObservabilityExportState::Misconfigured
                 | ObservabilityExportState::NeverExported
-                | ObservabilityExportState::HostIdMismatch
                 | ObservabilityExportState::Failing
         )
     }

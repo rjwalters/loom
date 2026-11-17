@@ -6,12 +6,12 @@
 //! 200 / 304 / limited / error counts over the last hour host-wide, this
 //! daemon's own since-start totals, and the latest free budget reading.
 
-use chrono::{DateTime, Utc};
-use loom_daemon::health::format_window;
-use loom_daemon::types::{
+use crate::health::format_window;
+use crate::types::{
     DaemonStatusReport, ForgeBucketStatus, ForgeBudgetReading, ForgeCallCounts, ReadSpillStatus,
     ReaderWithdrawalStatus,
 };
+use chrono::{DateTime, Utc};
 
 /// Every line of the section; empty for a pre-#9251 daemon (no field).
 pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>) -> Vec<String> {
@@ -201,7 +201,7 @@ fn render_budget(b: &ForgeBudgetReading, own: Option<u64>, now: DateTime<Utc>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_daemon::types::ForgeCallsStatus;
+    use crate::types::ForgeCallsStatus;
 
     fn report(fc: Option<ForgeCallsStatus>) -> DaemonStatusReport {
         DaemonStatusReport {
@@ -280,7 +280,7 @@ mod tests {
                 observed_at: now - chrono::Duration::seconds(5),
                 source: "headers".into(),
             }],
-            own_window: Some(vec![loom_daemon::types::ForgePoolSpend {
+            own_window: Some(vec![crate::types::ForgePoolSpend {
                 pool: "core".into(),
                 consumed: 36,
             }]),

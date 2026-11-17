@@ -230,6 +230,27 @@ fn an_entirely_unavailable_list_yields_no_choice_and_names_every_reason() {
     assert!(diagnostic.contains("codex -> unavailable"), "{diagnostic}");
 }
 
+/// #13428: a walk over zero taps is a configuration outcome, distinct from
+/// "every tap skipped" — pool pre-flight keys off this to avoid a bogus hold.
+#[test]
+fn an_empty_walk_is_an_empty_list_but_an_all_skipped_walk_is_not() {
+    let empty = resolve(
+        &taps(&[]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    assert!(empty.chosen.is_none());
+    assert!(empty.is_empty_list());
+
+    let all_skipped = resolve(
+        &taps(&["claude"]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, tap, _| Err(unavailable(&format!("{}_pool", tap.runtime))),
+    );
+    assert!(all_skipped.chosen.is_none());
+    assert!(!all_skipped.is_empty_list());
+}
+
 /// The telemetry criterion: the chosen tier AND every higher tier's skip
 /// reason are in the launch record.
 #[test]
@@ -1280,3 +1301,52 @@ fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_
 
 #[path = "session_down_tests.rs"]
 mod session_down;
+
+/// #13916: a containment refusal names its obligation in both the dispatch
+/// diagnostic (uncapped) and the preference marker (capped, one line), not
+/// just the bare unmet capability.
+#[test]
+fn a_containment_refusal_names_its_obligation_in_the_diagnostic_and_marker() {
+    let obligation = "private-clone containment requires a GitHub token for the exec";
+    let long_tail = "x".repeat(400);
+    let refusal = |tail: &str| SkipReason::NotAdmitted {
+        unmet: vec!["worktreeIsolation".into()],
+        detail: format!(
+            "unmet capabilities: worktreeIsolation; verified private-clone containment \
+             could not satisfy it: {obligation}{tail}"
+        ),
+    };
+    let resolution = resolve(
+        &taps(&["codex", "claude"]),
+        |tap| {
+            if tap.runtime == "codex" {
+                Err(refusal(&long_tail))
+            } else {
+                Ok("admitted")
+            }
+        },
+        |_, tap, _| Err(unavailable(&format!("{}_pool", tap.runtime))),
+    );
+    let diagnostic = resolution.exhausted_diagnostic("builder");
+    assert!(
+        diagnostic.contains("codex -> not-admitted(worktreeIsolation: verified private-clone"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains(obligation), "{diagnostic}");
+    assert!(diagnostic.contains(&long_tail), "diagnostic is uncapped");
+
+    let line = resolution.marker_line();
+    assert!(!line.contains('\n'), "{line}");
+    assert!(line.contains("codex:not-admitted(worktreeIsolation: verified"), "{line}");
+    assert!(!line.contains(&long_tail), "marker detail is capped: {line}");
+    let summary = resolution.skipped[0].reason.summary();
+    assert!(summary.ends_with('\u{2026}'), "{summary}");
+    assert!(
+        summary.chars().count() <= "worktreeIsolation: ".len() + super::resolve::SUMMARY_DETAIL_MAX,
+        "{summary}"
+    );
+
+    // A short obligation is rendered whole in the marker too.
+    let short = refusal("").summary();
+    assert!(short.ends_with(obligation), "{short}");
+}

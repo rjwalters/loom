@@ -6,13 +6,13 @@
 # Extract-and-execute (#7979), not a mirror: the SHIPPED bash blocks are lifted
 # out of champion-pr-merge.md and run against canned forge JSON with `gh`,
 # `loom-daemon`, `$GH_READ` and `post-comment.sh` stubbed. Blocks run:
-#   1. criterion #2's sticky-hold precheck ("Run this precheck before judging
+#   1. the merge-risk criterion's sticky-hold precheck ("Run this precheck before judging
 #      the axes") -> MERGE_BLOCKED_BY_HOLD / RELEASE_REASON /
 #      MANUAL_RELEASE_SINCE_HOLD / label repair;
 #   2. "Hold behavior" -> same-concern PASS vs. fresh hold notice + label;
 #   3. the Held-PR Census `RELEASED` line.
 # The four risk axes are an LLM judgment with no executable form, so the
-# narrowed criterion-2 rule and its kept set are pinned as doc literals
+# narrowed merge-risk rule and its kept set are pinned as doc literals
 # (Test 1); the precheck itself is shown never to hold an unheld PR.
 #
 # Hermetic: no network, no forge, no tokens.
@@ -39,15 +39,14 @@ CHAMPION_MD="$PROMPT_DIR/champion-pr-merge.md"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-assert_eq() {
-    if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected '$1', got '$2')"; fi
-}
+# Local assert_contains kept: uses grep -qF matching; shared helper uses a bash substring match.
 assert_contains() {
     if grep -qF -- "$2" <<<"$1"; then pass "$3"; else fail "$3 (missing '$2' in: $1)"; fi
 }
 assert_lacks() {
     if grep -qF -- "$2" <<<"$1"; then fail "$3 (unexpected '$2' in: $1)"; else pass "$3"; fi
 }
+# Local assert_doc_contains kept: fixed $DOC/$CHAMPION_MD target, so (needle, msg) not (file, needle, msg).
 assert_doc_contains() {
     if grep -qF -- "$1" "$CHAMPION_MD"; then pass "$2"; else fail "$2 (missing literal: $1)"; fi
 }
@@ -76,13 +75,17 @@ chmod +x "$WORK/.loom/scripts/post-comment.sh"
 # FIX_COMMENTS its trusted comments (loom-daemon forge trusted-comments --gh-shape)
 # FIX_EVENTS   issues/N/events payload; FIX_EVENTS_FAIL=1 makes the read fail
 # FIX_LIST     gh pr list payload for the census
-git() { [[ "$*" == "rev-parse --git-common-dir" ]] && echo "$WORK"; }
+# #13200: the facts file lives under /tmp/loom-champion/<sha256 of the git common dir, first 12 hex>, not in .git.
+FACTS_DIR="/tmp/loom-champion/$(printf '%s\n' "$WORK" | sha256sum | cut -c1-12)"
+mkdir -p "$FACTS_DIR"; trap 'rm -rf "$WORK" "$FACTS_DIR"' EXIT
+git() { [[ "$*" == "rev-parse --path-format=absolute --git-common-dir" ]] && echo "$WORK"; }
 # Write the "0. PR facts" file the precheck reads, from FIX_PR + FIX_COMMENTS.
-write_facts() { jq --argjson c "$FIX_COMMENTS" '.comments = $c' <<<"$FIX_PR" >"$WORK/loom-champion-facts-pr-$1.json"; }
+write_facts() { jq --argjson c "$FIX_COMMENTS" '.comments = $c' <<<"$FIX_PR" >"$FACTS_DIR/facts-pr-$1.json"; }
 gh() {
     case "$1 $2" in
         "pr view") printf '%s\n' "$FIX_PR" ;;
         "pr edit") echo "EDIT $*" >>"$STUB_LOG" ;;
+        "api repos/{owner}/{repo}/pulls/"*) echo "false false" ;;   # #13534: live state re-read: open
         "api repos/{owner}/{repo}/issues/"*)
             [[ "${FIX_EVENTS_FAIL:-0}" == 1 ]] && return 1
             local filter="" a
@@ -175,18 +178,18 @@ assert_contains "$HOLD_BEHAVIOR" 'CONCERN_BULLET=' "Hold behavior block extracte
 assert_contains "$CENSUS_RELEASED" 'Released holds, not yet merged' "census RELEASED line extracted"
 echo
 
-echo "Test 1: criterion #2 narrowed — claim/label machinery is not red by itself; the kept set is listed (#11416)"
+echo "Test 1: the merge-risk criterion narrowed — claim/label machinery is not red by itself; the kept set is listed (#11416)"
 assert_doc_contains '**Claim/label machinery is not red by itself (#11416).**' "the narrowed rule is stated"
 assert_doc_contains '"Reverting cannot undo forge labels already changed" or "a defect could strand work fleet-wide" is **not** a red reason.' \
     "the reasoning behind the #10280/#11321 holds is named and rejected"
-assert_doc_contains '1. **Irreversible migration, no rollback step**' "kept set item 1: irreversible migrations"
-assert_doc_contains '2. **The merge gate itself**' "kept set item 2: the merge gate"
+assert_doc_contains '- **Irreversible migration, no rollback step**' "kept set: irreversible migrations"
+assert_doc_contains '- **The merge gate itself**' "kept set: the merge gate"
 assert_doc_contains 'Writing a verdict label (the Judge'"'"'s `loom:pr` approval) is part of the gate, not a role hand-back' \
-    "kept set item 2: verdict-label writes are the gate, not a hand-back"
+    "kept set: the merge gate: verdict-label writes are the gate, not a hand-back"
 for producer in post-verdict.sh verdict-staleness-guard.sh reconcile_pr_verdicts comment_trust.rs 'forge trusted-comments' check-review-feedback.sh; do
-    assert_doc_contains "\`$producer\`" "kept set item 2 names gate-input producer $producer"
+    assert_doc_contains "\`$producer\`" "kept set: the merge gate names gate-input producer $producer"
 done
-assert_doc_contains '3. **The other red entries in the table above**, unchanged.' "kept set item 3: existing red entries"
+assert_doc_contains '- **The other red entries in the table above**, unchanged.' "kept set: existing red entries"
 echo
 
 echo "Test 2: never held -> the precheck does not block (a claim-machinery PR is judged on the axes alone)"
@@ -412,7 +415,7 @@ OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=true PRIOR=true" "a [bot] citing clear does not close the condition"
 # Closing the condition is not itself a release of the merge-risk hold: at the
 # held head the ordinary rows apply (still held); a new head then releases it.
-FIX_COMMENTS="[$HOLD_COMMENT, $COND, $(cond_comment "-met" "2026-10-12T09:00:00Z" "predecessor merged" "turian")]"
+FIX_COMMENTS="[$HOLD_COMMENT, $COND, $(cond_comment "-met" "2026-10-12T09:00:00Z" "predecessor merged" "example-reviewer")]"
 OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false REASON=" "a person's -met closes the condition; the merge-risk hold still stands at its head"
 assert_lacks "$OUT" "POST" "no condition notice once it is closed"

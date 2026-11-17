@@ -102,25 +102,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/resync-installed.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # Not counted toward pass/fail: used when a test's precondition (e.g. a
 # `update-gitignore`-capable loom-daemon binary) is unavailable in this
@@ -1116,8 +1098,8 @@ OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
 # resync_paths list ("would be: git add <paths>") so this test can keep
 # verifying suggest_commit_if_resync_only_dirt()'s CLASSIFICATION logic
 # (retired-vs-shipped, #7336) independently of how the commit is landed. The
-# precondition below asserts both halves (this file is frozen by the
-# file-size ratchet, #7711, so the #6646 check shares the existing assertion).
+# precondition below asserts both halves (the #6646 check shares the existing
+# assertion, #7711).
 commit_line="$(grep -m1 'would be: git add ' <<<"$OUT")"
 if [[ -n "$commit_line" ]] && grep -q './.loom/scripts/land-resync-commit\.sh' <<<"$OUT"; then
     pass "(#7336/#6646) fixture precondition: the dirty-tree commit hint fired and recommends land-resync-commit.sh"
@@ -1705,6 +1687,56 @@ if grep -q "removed.*hooks/guard-destructive-generic.sh" <<<"$OUT"; then
     pass "(#4403) removal reported as before"
 else
     fail "(#4403) removal not reported"
+fi
+
+# --- (#13680) a pin on the generic guard is not a dead pin ---------------------
+echo "Test group 15d: pin on hooks/guard-destructive-generic.sh is not reported dead (#13680)"
+_mk_canonical() {
+    mkdir -p "$1/.claude/skills/repo/hooks"
+    printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\necho canonical\n' \
+        > "$1/.claude/skills/repo/hooks/guard-destructive.sh"
+}
+for FORM in "hooks/guard-destructive-generic.sh" ".loom/hooks/guard-destructive-generic.sh"; do
+    REPO="$(make_fixture)"
+    _mk_canonical "$REPO"
+    printf '#!/usr/bin/env bash\necho vendored\n' > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+    printf '#!/usr/bin/env bash\necho vendored\n' > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+    printf '%s  # keep\nhooks/gaurd-typo.sh  # dead\n' "$FORM" > "$REPO/.loom/resync-ignore"
+    for FLAGS in "" "--dry-run"; do
+        OUT="$(cd "$REPO" && bash "$SCRIPT" $FLAGS 2>&1)"
+        if ! grep -q "pin had no effect: '$FORM'" <<<"$OUT"; then
+            pass "(#13680) canonical present, pin '$FORM' ${FLAGS:-apply}: not reported dead"
+        else
+            fail "(#13680) canonical present, pin '$FORM' ${FLAGS:-apply}: wrongly reported dead"
+        fi
+        if grep -q "pin had no effect: 'hooks/gaurd-typo.sh'" <<<"$OUT"; then
+            pass "(#13680) mistyped pin still reported dead (${FLAGS:-apply})"
+        else
+            fail "(#13680) mistyped pin no longer reported dead (${FLAGS:-apply})"
+        fi
+    done
+done
+
+echo "Test group 15e: canonical guard absent + pin on generic guard is honoured, not dead (#13680)"
+REPO="$(make_fixture)"
+printf '#!/usr/bin/env bash\necho vendored-new\n' > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf 'LOCAL-GUARD\n' > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+printf 'hooks/guard-destructive-generic.sh  # keep\nhooks/gaurd-typo.sh  # dead\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+if [[ "$(cat "$REPO/.loom/hooks/guard-destructive-generic.sh")" == "LOCAL-GUARD" ]]; then
+    pass "(#13680) pinned local guard left unsynced"
+else
+    fail "(#13680) pinned local guard was overwritten"
+fi
+if ! grep -q "pin had no effect: 'hooks/guard-destructive-generic.sh'" <<<"$OUT"; then
+    pass "(#13680) valid pin not reported dead (canonical absent)"
+else
+    fail "(#13680) valid pin reported dead (canonical absent)"
+fi
+if grep -q "pin had no effect: 'hooks/gaurd-typo.sh'" <<<"$OUT"; then
+    pass "(#13680) mistyped pin still reported dead (canonical absent)"
+else
+    fail "(#13680) mistyped pin not reported dead (canonical absent)"
 fi
 
 # --- (#4894) capability-gap canonical guard: vendored guard must be KEPT ----
@@ -2862,8 +2894,7 @@ else
 fi
 
 # The guard-hook install check's wiring (#7761) is covered by the sibling
-# test-resync-installed-guard-check.sh, split out to respect this file's
-# file-size ratchet (.loom/docs/file-size-policy.md).
+# test-resync-installed-guard-check.sh.
 
 # --- summary -----------------------------------------------------------------
 echo ""

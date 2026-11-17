@@ -524,22 +524,6 @@ fn dead_daemon_exits_two_and_marks_other_sections_unknown() {
 // Observability section (#4830)
 // ===================================================================
 
-/// An inputs fixture whose daemon has confirmed a host-identity mismatch —
-/// the live 2026-07-31 shape (the Studio's key bound to `robb-pro`).
-fn mismatched_inputs(age_secs: i64) -> HealthInputs {
-    let mut inputs = healthy_inputs();
-    inputs
-        .status
-        .as_mut()
-        .unwrap()
-        .observability_host_id_mismatch = Some(crate::types::ObservabilityHostIdMismatch {
-        daemon_host_id: "robb-studio".to_string(),
-        ingest_host_id: "robb-pro".to_string(),
-        first_seen_at: now() - chrono::Duration::seconds(age_secs),
-    });
-    inputs
-}
-
 #[test]
 fn no_observability_section_when_the_host_ids_agree() {
     // AC: "no behavior change when they match" — a healthy daemon's report
@@ -556,11 +540,7 @@ fn no_observability_section_for_a_disabled_or_keyless_exporter() {
     // `None` on the wire — indistinguishable, by design, from "enabled and
     // correctly bound".
     let mut inputs = healthy_inputs();
-    inputs
-        .status
-        .as_mut()
-        .unwrap()
-        .observability_host_id_mismatch = None;
+    inputs.status.as_mut().unwrap().observability_export = None;
     assert!(assess_observability(&inputs).is_none());
 }
 
@@ -569,23 +549,6 @@ fn no_observability_section_when_the_daemon_is_unreachable() {
     let mut inputs = healthy_inputs();
     inputs.status = None;
     assert!(assess_observability(&inputs).is_none());
-}
-
-#[test]
-fn a_host_id_mismatch_is_a_degraded_observability_note() {
-    let report = assess(&mismatched_inputs(3600));
-    let section = report.section("observability").expect("section present");
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(
-        section.summary.contains("robb-pro") && section.summary.contains("robb-studio"),
-        "the note must name BOTH identities: {}",
-        section.summary
-    );
-    assert_eq!(section.detail["daemon_host_id"], "robb-studio");
-    assert_eq!(section.detail["ingest_host_id"], "robb-pro");
-    assert_eq!(section.detail["first_seen_age_secs"], 3600);
-    assert_eq!(report.overall, Verdict::Degraded);
-    assert_eq!(report.exit_code(), EXIT_DEGRADED);
 }
 
 // ===================================================================
@@ -1034,6 +997,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -1067,6 +1031,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -1138,6 +1103,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,
@@ -1576,6 +1542,7 @@ fn role_liveness_repo_with_intervals(
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,

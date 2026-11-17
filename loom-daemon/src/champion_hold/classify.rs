@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | [`PrClass::ForeignPark`] | `loom:blocked`, no standing hold marker | skips the PR: no merge attempt, no comment, no label change |
 //! | [`PrClass::Contradiction`] | `loom:pr` beside `loom:changes-requested` / `loom:review-requested` | the janitor repairs it (strips `loom:pr`) |
-//! | [`PrClass::ChampionHold`] | `loom:blocked` with a standing hold marker | leaves it; criteria #2/#3 decide |
+//! | [`PrClass::ChampionHold`] | `loom:blocked` with a standing hold marker | leaves it; the `merge-risk` and `critical-files` criteria decide |
 //! | [`PrClass::StrayOperator`] | a hold, plus a fleet-added `loom:operator` and no capped-hold recommendation | removes `loom:operator`; the hold stands |
 //! | [`PrClass::StackedOnLoomBranch`] | otherwise clear, but based on a Loom stack branch | skips the PR: no merge attempt, no comment, no label change |
 //! | [`PrClass::Clear`] | none of these | the 6 criteria run |
@@ -118,6 +118,8 @@ impl PrClass {
             | PrClass::StrayOperator(HoldKind::MergeRisk) => "merge-risk",
             PrClass::ChampionHold(HoldKind::CriticalFile)
             | PrClass::StrayOperator(HoldKind::CriticalFile) => "critical-file",
+            PrClass::ChampionHold(HoldKind::Ratification)
+            | PrClass::StrayOperator(HoldKind::Ratification) => "ratification",
             PrClass::Clear | PrClass::ForeignPark => "-",
         };
         format!("{CLASSIFY_SENTINEL} state={} pr={pr} detail={detail}", self.state())

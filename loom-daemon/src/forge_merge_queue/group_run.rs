@@ -221,11 +221,16 @@ fn rank(s: CheckState) -> u8 {
     }
 }
 
-fn run_state(status: &str, conclusion: Option<&str>) -> CheckState {
-    match (status, conclusion) {
-        ("completed", Some("success" | "neutral" | "skipped")) => CheckState::Success,
-        ("completed", _) => CheckState::Failure,
-        _ => CheckState::Pending,
+/// One check-run object's state. Terminality is the shared
+/// [`is_settled`](crate::merge_pr::check_runs_rollup::is_settled) (#13764), so a
+/// finished run GitHub left at `status: in_progress` is not stuck `Pending`.
+fn run_state(run: &Value) -> CheckState {
+    if !crate::merge_pr::check_runs_rollup::is_settled(run) {
+        return CheckState::Pending;
+    }
+    match run.get("conclusion").and_then(Value::as_str) {
+        Some("success" | "neutral" | "skipped") => CheckState::Success,
+        _ => CheckState::Failure,
     }
 }
 
@@ -280,12 +285,7 @@ pub fn states_from(
             .iter()
             .filter(|r| r.get("name").and_then(Value::as_str) == Some(ctx))
             .max_by_key(|r| r.get("id").and_then(Value::as_u64).unwrap_or(0))
-            .map(|r| {
-                run_state(
-                    r.get("status").and_then(Value::as_str).unwrap_or(""),
-                    r.get("conclusion").and_then(Value::as_str),
-                )
-            });
+            .map(run_state);
         let st = sts
             .iter()
             .find(|s| s.get("context").and_then(Value::as_str) == Some(ctx))
@@ -378,6 +378,50 @@ fn emit_regime_on_change(nwo: &str, regime: QueueRegime) {
     ));
 }
 
+/// Repositories whose last rules-unreadable failure was already signalled as
+/// plan/billing, in this process only (cleared when the rules read again).
+static PLAN_GATE_SIGNALLED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Record a rules-read failure for `nwo`; true when it is a plan/billing gate
+/// that was not already signalled. A successful read (`err` None) or a non-plan
+/// failure re-arms the signal. Pure over `signalled`.
+fn plan_gate_newly_seen(
+    signalled: &mut std::collections::HashSet<String>,
+    nwo: &str,
+    err: Option<&str>,
+) -> bool {
+    match err {
+        Some(e) if crate::merge_pr::stale_checks::fetch::is_plan_gated(e) => {
+            signalled.insert(nwo.to_string())
+        }
+        _ => {
+            signalled.remove(nwo);
+            false
+        }
+    }
+}
+
+/// Once per change, say that the repo's rules are unreadable because of the
+/// GitHub plan or billing (an org-wide cause), not because of any one PR.
+/// Telemetry only; the caller still fails closed.
+pub(super) fn signal_rules_unreadable(nwo: &str, err: Option<&str>) {
+    let fresh = {
+        let mut guard = PLAN_GATE_SIGNALLED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        plan_gate_newly_seen(guard.get_or_insert_with(Default::default), nwo, err)
+    };
+    if fresh {
+        log::error!(
+            "loom.alert merge-queue.rules-unreadable cause=plan-or-billing repo={nwo}: GitHub \
+             refuses to read the rules on this repository (\"Upgrade to GitHub Pro or make this \
+             repository public\"); the org's plan or billing has lapsed. Failing closed: no \
+             enqueue, no direct merge."
+        );
+    }
+}
+
 /// Daemon pass: evaluate every live merge group so a group whose other
 /// checks finished since the last look gets its verdict without waiting for
 /// a workflow. Queue mode only. This is an accelerator: the enforcement is
@@ -389,9 +433,11 @@ pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
     let required = match super::preflight::github_preflight(gh, &nwo, None) {
         Ok(c) => {
             emit_regime_on_change(&nwo, c.regime);
+            signal_rules_unreadable(&nwo, None);
             c.required_checks
         }
         Err(e) => {
+            signal_rules_unreadable(&nwo, Some(&e.to_string()));
             log::warn!("merge-queue: group pass skipped, required contexts unreadable: {e}");
             return;
         }
@@ -428,6 +474,25 @@ pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #[test]
+    fn plan_gate_signals_once_and_only_for_plan_gates() {
+        let gate = "HTTP 403: Upgrade to GitHub Pro or make this repository public to enable this feature.";
+        let mut seen = std::collections::HashSet::new();
+        assert!(super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        // A successful read re-arms the signal.
+        assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", None));
+        assert!(super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        // A non-plan 403 (scope, rate limit) is never labelled plan/billing.
+        let mut seen = std::collections::HashSet::new();
+        for e in [
+            "HTTP 403: Resource not accessible by integration",
+            "HTTP 403: API rate limit exceeded",
+        ] {
+            assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", Some(e)));
+        }
+    }
+
     use std::cell::RefCell;
 
     use super::super::authz::AuthzFacts;
@@ -851,6 +916,25 @@ mod tests {
             {"id": 1, "name": "ci", "status": "completed", "conclusion": "cancelled"}]});
         let empty = json!({"total_count": 0, "statuses": []});
         assert_eq!(states_from(&req(), &cancelled, &empty).unwrap()[0].1, CheckState::Failure);
+    }
+
+    #[test]
+    fn states_settled_in_progress_run_is_terminal() {
+        let st = json!({"total_count": 0, "statuses": []});
+        let state = |run: serde_json::Value| {
+            let runs = json!({"total_count": 1, "check_runs": [run]});
+            states_from(&req(), &runs, &st).unwrap()[0].1
+        };
+        let base = |conclusion: serde_json::Value, completed_at: serde_json::Value| {
+            json!({"id": 1, "name": "ci", "status": "in_progress",
+                   "conclusion": conclusion, "completed_at": completed_at})
+        };
+        let done = json!("2026-11-11T00:00:00Z");
+        assert_eq!(state(base(json!("success"), done.clone())), CheckState::Success);
+        assert_eq!(state(base(json!("failure"), done.clone())), CheckState::Failure);
+        assert_eq!(state(base(json!(null), json!(null))), CheckState::Pending);
+        assert_eq!(state(base(json!(null), done)), CheckState::Pending);
+        assert_eq!(state(base(json!("success"), json!(null))), CheckState::Pending);
     }
 
     #[test]

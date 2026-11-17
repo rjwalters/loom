@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::*;
+use crate::worktree_cli::test_support;
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -120,35 +121,11 @@ fn sentinel_content_is_the_documented_format() {
 
 /// A scratch directory whose path contains a space.
 fn tmpdir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-sparse fixture-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmpdir");
-    fs::canonicalize(&base).expect("canonicalize tmpdir")
+    test_support::tmpdir("loom-sparse fixture", tag)
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    String::from_utf8_lossy(&test_support::git(dir, args).stdout).into_owned()
 }
 
 /// `git config --worktree --get <key>` in `wt`, or `None` when unset.

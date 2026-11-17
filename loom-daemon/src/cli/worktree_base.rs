@@ -1,6 +1,6 @@
 //! `loom-daemon worktree-base` — `worktree.sh`'s default-branch fetch and
 //! `--base` resolution (#8195 slice 13). Exit 0 resolved, 1 refused; the
-//! record protocol is documented on [`loom_daemon::worktree_cli::base`].
+//! record protocol is documented on [`crate::worktree_cli::base`].
 //!
 //! clap because the only caller is `worktree.sh`; `--repo` exists so tests need
 //! not `chdir`.
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::base;
+use crate::worktree_cli::base;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeBaseArgs {

@@ -219,7 +219,13 @@ pub fn apply(
             }
             if !add.is_empty() {
                 if let Err(e) = forge.add_labels(issue, &add) {
-                    let _ = writeln!(err, "operator-decision: labeling #{issue} failed: {e}");
+                    let _ = writeln!(
+                        err,
+                        "operator-decision: labeling #{issue} failed: {e}\n\
+                         operator-decision: the decision record is in the body but the hold label \
+                         is not on the issue; if the label is missing on the forge, run \
+                         ./.loom/scripts/sync-labels.sh --check (then without --check) and re-apply"
+                    );
                     return exit::FORGE;
                 }
             }

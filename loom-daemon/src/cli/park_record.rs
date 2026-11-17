@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::park_record::{self, BlockerRef, ParkRecord};
+use crate::park_record::{self, BlockerRef, ParkRecord};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ParkRecordCommand {
@@ -49,6 +49,33 @@ pub(crate) enum ParkRecordCommand {
     /// `remove` for a `loom:blocked` removal the caller just made. Writes
     /// nothing to the forge; a no-op outside a role tick. Exit 0 always.
     Released(ReleasedArgs),
+
+    /// Journal a Champion merge-risk decision with its confidence (#12950):
+    /// a `hold.transition` of kind `decision`. Writes nothing to the forge; a
+    /// no-op outside a role tick. Exit 0 always.
+    Decision(DecisionArgs),
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum DecisionOutcome {
+    Hold,
+    SelfRelease,
+    Pass,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct DecisionArgs {
+    /// The PR the decision was made on.
+    #[arg(long, value_name = "N")]
+    pub pr: u64,
+
+    /// What the `merge-risk` criterion decided.
+    #[arg(long, value_enum)]
+    pub outcome: DecisionOutcome,
+
+    /// Confidence (0-1) that a human would release the PR.
+    #[arg(long, value_name = "0-1")]
+    pub confidence: Option<f64>,
 }
 
 #[derive(clap::Args)]
@@ -99,6 +126,12 @@ pub(crate) struct ApplyArgs {
     /// Who is parking it — a role name or `human`.
     #[arg(long = "by", value_name = "ROLE")]
     pub by: Option<String>,
+
+    /// Park transiently for a cause that clears by itself, e.g. `capacity:batch`
+    /// (#13606). Writes `attempt` and an exponential-backoff `until`; the unblock
+    /// sweep releases it once `until` passes. Excludes `--blocked-by`.
+    #[arg(long, value_name = "CAUSE")]
+    pub transient: Option<String>,
 
     /// Label to remove once parked (repeatable), e.g. loom:building.
     #[arg(long = "remove-label", value_name = "LABEL")]
@@ -158,6 +191,10 @@ impl ParkRecordCommand {
                 args.run();
                 Ok(())
             }
+            ParkRecordCommand::Decision(args) => {
+                args.run();
+                Ok(())
+            }
         }
     }
 }
@@ -182,7 +219,7 @@ impl RenderArgs {
 
 impl ReleasedArgs {
     fn run(self) {
-        use loom_daemon::telemetry::kinds::hold_transition::{reason, transition};
+        use crate::telemetry::kinds::hold_transition::{reason, transition};
         let token = |t: &str| {
             let ok = !t.is_empty()
                 && t.len() <= 40
@@ -199,13 +236,39 @@ impl ReleasedArgs {
             .as_deref()
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
             .map(|d| d.with_timezone(&chrono::Utc));
-        loom_daemon::observability::pick_journal::record_hold(
+        crate::observability::pick_journal::record_hold(
             self.pr,
             transition::REMOVE,
             reason::HOLD_RELEASED,
             &token(&self.trigger),
             !self.failed,
             entered_at,
+            None,
+        );
+    }
+}
+
+impl DecisionArgs {
+    fn run(self) {
+        use crate::telemetry::kinds::hold_transition::{reason, transition};
+        // A non-finite or out-of-range value is dropped, never exported.
+        let confidence_pct = self
+            .confidence
+            .filter(|c| c.is_finite() && (0.0..=1.0).contains(c))
+            .map(|c| (c * 100.0).round() as u8);
+        let reason_code = match self.outcome {
+            DecisionOutcome::Hold => reason::MERGE_RISK_HOLD,
+            DecisionOutcome::SelfRelease => reason::MERGE_RISK_SELF_RELEASE,
+            DecisionOutcome::Pass => reason::MERGE_RISK_PASS,
+        };
+        crate::observability::pick_journal::record_hold(
+            self.pr,
+            transition::DECISION,
+            reason_code,
+            "champion_role",
+            true,
+            None,
+            confidence_pct,
         );
     }
 }
@@ -213,8 +276,8 @@ impl ReleasedArgs {
 impl ApplyArgs {
     /// Never returns: exits with the command's own code.
     fn run(self) -> Result<()> {
-        use loom_daemon::operator_decision::cli::{default_repo_root, GhForge};
-        use loom_daemon::park_record::apply::{apply, ApplyRequest};
+        use crate::operator_decision::cli::{default_repo_root, GhForge};
+        use crate::park_record::apply::{apply, ApplyRequest};
         let is_pr = self.issue.is_none() && self.pr.is_some();
         let req = ApplyRequest {
             number: self.issue.or(self.pr).unwrap_or_default(),
@@ -226,12 +289,23 @@ impl ApplyArgs {
             remove_labels: self.remove_label,
             dry_run: self.dry_run,
             is_pr,
+            transient: self.transient,
+            jitter: random_unit(),
         };
         let mut forge = GhForge::new(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
-        loom_daemon::park_record::apply::journal_applied(&req, is_pr, code);
+        crate::park_record::apply::journal_applied(&req, is_pr, code);
         std::process::exit(code)
     }
+}
+
+/// A value in `-1.0..=1.0` from the clock's sub-second nanos: backoff jitter
+/// needs spread across hosts, not cryptographic randomness.
+fn random_unit() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    f64::from(nanos % 2001) / 1000.0 - 1.0
 }
 
 impl ParseArgs {
@@ -283,11 +357,70 @@ impl ParseArgs {
 }
 
 fn record_json(r: &ParkRecord) -> serde_json::Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    // `null` for a legacy park; `due` reuses `transient_due` so a shell caller
+    // (Guide's unblock sweep, #13606) never re-implements the missing/garbled
+    // `until` rule.
+    let transient = r.transient.as_ref().map(|t| {
+        serde_json::json!({
+            "cause": t.cause,
+            "attempt": t.attempt,
+            "until": t.until,
+            "due": park_record::transient_due(t, &now),
+            "escalate": t.attempt >= park_record::TRANSIENT_ESCALATE_ATTEMPT,
+        })
+    });
     serde_json::json!({
         "blocker": r.blocker.as_ref().map(|b| b.number),
         "blocker_repo": r.blocker.as_ref().and_then(|b| b.repo.clone()),
         "by": r.by,
         "at": r.at,
         "reason": r.reason,
+        "transient": transient,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_record_json(body: &str) -> serde_json::Value {
+        record_json(&park_record::parse(body)[0])
+    }
+
+    #[test]
+    fn legacy_park_has_null_transient() {
+        let v = first_record_json(
+            "<!-- loom:park Blocked by: #5 by=builder at=2026-11-05T12:00:00Z -->",
+        );
+        assert!(v["transient"].is_null());
+    }
+
+    #[test]
+    fn expired_transient_is_due_and_future_is_not() {
+        let past = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=2 until=2026-11-05T12:30:00Z -->",
+        );
+        assert_eq!(past["transient"]["cause"], "capacity:batch");
+        assert_eq!(past["transient"]["attempt"], 2);
+        assert_eq!(past["transient"]["due"], true);
+        assert_eq!(past["transient"]["escalate"], false);
+
+        let future = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=6 until=2999-01-01T00:00:00Z -->",
+        );
+        assert_eq!(future["transient"]["due"], false);
+        assert_eq!(future["transient"]["escalate"], true);
+    }
+
+    #[test]
+    fn missing_until_is_due() {
+        let v = first_record_json(
+            "<!-- loom:park Blocked by: (unstated) by=builder at=2026-11-05T12:00:00Z \
+             transient=capacity:batch attempt=1 -->",
+        );
+        assert_eq!(v["transient"]["due"], true);
+    }
 }

@@ -140,15 +140,68 @@ impl SkipReason {
     }
 
     /// The parenthetical detail rendered after [`Self::kind`]. Deliberately
-    /// short: the full diagnostic already went to the log.
+    /// short — a refusal's own wording is capped at [`SUMMARY_DETAIL_MAX`]
+    /// characters, since this rides on the one-line preference marker — the
+    /// full diagnostic already went to the log.
     #[must_use]
     pub fn summary(&self) -> String {
+        self.summary_capped(Some(SUMMARY_DETAIL_MAX))
+    }
+
+    /// [`Self::summary`] with an explicit cap on the refusal wording (`None`:
+    /// the whole of it, for the multi-line operator diagnostic).
+    ///
+    /// A [`Self::NotAdmitted`] with named unmet capabilities renders them
+    /// first, then whatever admission appended to its own
+    /// `unmet capabilities: …` wording — the containment obligation that
+    /// failed (#13916). Without it a contained runtime refused for a broken
+    /// obligation read exactly like one that was never contained at all. A
+    /// detail of any other shape (the `excludedRole` explanation) stays out:
+    /// the named capability already says it, and it would only lengthen the
+    /// marker.
+    #[must_use]
+    pub fn summary_capped(&self, cap: Option<usize>) -> String {
+        let bound = |text: &str| bounded_detail(text, cap);
         match self {
-            Self::NotAdmitted { unmet, detail } if unmet.is_empty() => detail.clone(),
-            Self::NotAdmitted { unmet, .. } => unmet.join("+"),
+            Self::NotAdmitted { unmet, detail } if unmet.is_empty() => bound(detail),
+            Self::NotAdmitted { unmet, detail } => {
+                let named = unmet.join("+");
+                let bare = format!("unmet capabilities: {}", unmet.join(", "));
+                let extra = detail
+                    .strip_prefix(&bare)
+                    .unwrap_or_default()
+                    .trim_start_matches(|c: char| c == ';' || c.is_whitespace());
+                if extra.is_empty() {
+                    named
+                } else {
+                    format!("{named}: {}", bound(extra))
+                }
+            }
             Self::Unavailable { source, detail } => format!("{source}: {detail}"),
             Self::Ceiling { detail, .. } => detail.clone(),
         }
+    }
+}
+
+/// Cap on a refusal's own wording inside [`SkipReason::summary`], in
+/// characters. Long enough to name a containment obligation, short enough to
+/// keep the preference marker one readable line.
+pub const SUMMARY_DETAIL_MAX: usize = 160;
+
+/// `text` on one line (control characters become spaces), cut to `cap`
+/// characters with a trailing ellipsis when longer.
+fn bounded_detail(text: &str, cap: Option<usize>) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    match cap {
+        Some(cap) if flat.chars().count() > cap => {
+            let mut cut: String = flat.chars().take(cap.saturating_sub(1)).collect();
+            cut.push('\u{2026}');
+            cut
+        }
+        _ => flat,
     }
 }
 
@@ -199,6 +252,15 @@ pub struct Resolution<T> {
 }
 
 impl<T> Resolution<T> {
+    /// `true` when the walk ran over no taps at all (an empty preference
+    /// list or an empty role-draw table). That is a configuration outcome —
+    /// nothing may serve the role here — not "every tap was skipped", so
+    /// pool pre-flight must not read it as pool exhaustion (#13428).
+    #[must_use]
+    pub fn is_empty_list(&self) -> bool {
+        self.order.is_empty()
+    }
+
     /// `true` when the chosen tap is not the most-preferred one — i.e. the
     /// fall-through actually fired. The question "how much work is going to
     /// the backstop" reduces to counting these.
@@ -287,8 +349,15 @@ impl<T> Resolution<T> {
              (fail-closed, exactly as before #8436).\n  preference order: {}",
             self.order_summary()
         );
+        // The whole refusal wording here, uncapped: this is the operator's
+        // diagnostic, and a containment refusal must name its obligation.
         for skipped in &self.skipped {
-            out.push_str(&format!("\n  {} -> {}", skipped.tap, skipped.reason));
+            out.push_str(&format!(
+                "\n  {} -> {}({})",
+                skipped.tap,
+                skipped.reason.kind(),
+                skipped.reason.summary_capped(None)
+            ));
         }
         out
     }

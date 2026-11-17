@@ -2,15 +2,6 @@
 
 use super::*;
 
-/// Plan with no stalled PRs: the deterministic spelling of the live pass.
-fn plan_repo(
-    open_prs: &[SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    markers: &BTreeMap<u32, SequenceMarker>,
-) -> Vec<SequenceGroup> {
-    plan_repo_with(open_prs, files, markers, &BTreeSet::new())
-}
-
 /// An open, Judge-approved PR. Approved by default: these fixtures exercise
 /// grouping and constraints, and since #10371 no hold is planned behind a
 /// predecessor without `loom:pr` (`merge_sequence_ready_tests.rs` covers that).
@@ -53,8 +44,6 @@ fn files(entries: &[(u32, &[&str])]) -> BTreeMap<u32, BTreeSet<String>> {
         .collect()
 }
 
-const NO_MARKERS: BTreeMap<u32, SequenceMarker> = BTreeMap::new();
-
 // --- Eligibility --------------------------------------------------------
 
 #[test]
@@ -69,158 +58,128 @@ fn drafts_holds_and_in_flight_prs_are_ineligible() {
     assert!(!base.clone().held("loom:treating").eligible_for_ordering());
 }
 
+/// `pr(number)` stacked on `parent`: its base branch is the parent's head.
+fn stacked_on(number: u32, parent: u32, created: &str) -> SequencePr {
+    let mut p = pr(number, created);
+    p.base_ref = format!("feature/issue-{parent}");
+    p
+}
+
+fn shared(nums: &[u32]) -> BTreeMap<u32, BTreeSet<String>> {
+    nums.iter()
+        .map(|n| (*n, BTreeSet::from(["s.rs".to_string()])))
+        .collect()
+}
+
 #[test]
 fn trigger_requires_more_than_two_open_prs() {
-    let prs = [pr(1, "2026-01-01T00:00:00Z"), pr(2, "2026-01-02T00:00:00Z")];
-    assert!(plan_repo(&prs, &files(&[]), &NO_MARKERS).is_empty());
+    let prs = [
+        stacked_on(2, 1, "2026-01-02T00:00:00Z"),
+        pr(1, "2026-01-01T00:00:00Z"),
+    ];
+    assert!(plan_repo(&prs, &shared(&[1, 2])).is_empty());
 }
 
-// --- Grouping -----------------------------------------------------------
+// --- Planning: stacked pairs only (#12775) ------------------------------
 
 #[test]
-fn shared_files_group_and_isolated_prs_do_not() {
-    let a = pr(1, "2026-01-01T00:00:00Z");
-    let b = pr(2, "2026-01-02T00:00:00Z");
-    let c = pr(3, "2026-01-03T00:00:00Z");
-    let prs = [a, b.clone(), c];
-    let f = files(&[
-        (1, &["src/a.rs"]),
-        (2, &["src/a.rs", "src/b.rs"]),
-        (3, &["docs/x.md"]),
-    ]);
-    let groups = plan_repo(&prs, &f, &NO_MARKERS);
-    assert_eq!(groups.len(), 1, "one overlapping pair, one singleton: {groups:?}");
+fn overlapping_prs_are_never_ordered_against_each_other() {
+    // Three PRs on `main` that all change the same file: independent, so no
+    // group and no edge, whatever the file overlap says.
+    let prs = [
+        pr(1, "2026-01-01T00:00:00Z"),
+        pr(2, "2026-01-02T00:00:00Z"),
+        pr(3, "2026-01-03T00:00:00Z"),
+    ];
+    assert!(plan_repo(&prs, &shared(&[1, 2, 3])).is_empty());
+    assert!(stacked_preds(&prs).is_empty());
+}
+
+#[test]
+fn a_stacked_pair_is_ordered_and_its_unrelated_neighbour_is_not() {
+    let prs = [
+        pr(4, "2026-01-02T00:00:00Z"),
+        stacked_on(5, 4, "2026-01-01T00:00:00Z"),
+        pr(6, "2026-01-03T00:00:00Z"),
+    ];
+    let groups = plan_repo(&prs, &shared(&[4, 5, 6]));
+    assert_eq!(groups.len(), 1, "{groups:?}");
     let g = &groups[0];
-    assert_eq!(g.order, vec![1, 2], "oldest first");
+    assert_eq!(g.order, vec![4, 5], "parent first, whatever the ages");
     assert_eq!(g.edges.len(), 1);
-    assert_eq!(g.edges[0].follower, 2);
-    assert_eq!(g.edges[0].after, 1);
-    assert_eq!(g.edges[0].reason, EdgeReason::SharedFiles);
-    // The singleton got no edge and no marker.
-    assert!(!g.order.contains(&3));
+    assert_eq!((g.edges[0].follower, g.edges[0].after), (5, 4));
+    assert_eq!(g.edges[0].follower_head, format!("{:040x}", 5));
+    assert_eq!(g.edges[0].pred_head, format!("{:040x}", 4));
 }
 
 #[test]
-fn a_failed_files_read_is_a_singleton_not_a_wildcard() {
-    // Missing files entry = unknown, never "overlaps with everything".
-    let a = pr(1, "2026-01-01T00:00:00Z");
-    let b = pr(2, "2026-01-02T00:00:00Z");
-    let prs = [a, b];
-    let f = files(&[(1, &["src/a.rs"])]);
-    assert!(plan_repo(&prs, &f, &NO_MARKERS).is_empty());
-}
-
-#[test]
-fn three_way_overlap_forms_one_chain_not_a_star() {
-    // A chain means #3 waits for #2 AND #2 waits for #1 — a stable landing
-    // order, not "everyone after the oldest".
+fn a_stacked_pair_without_a_shared_file_is_still_not_grouped() {
+    // Unchanged by #12775: file-less stacking has never been a group.
     let prs = [
-        pr(1, "2026-01-01T00:00:00Z"),
-        pr(2, "2026-01-02T00:00:00Z"),
+        pr(4, "2026-01-02T00:00:00Z"),
+        stacked_on(5, 4, "2026-01-01T00:00:00Z"),
+        pr(6, "2026-01-03T00:00:00Z"),
+    ];
+    let f = files(&[(4, &["a.rs"]), (5, &["b.rs"])]);
+    assert!(plan_repo(&prs, &f).is_empty());
+    // A failed files read is unknown, never a wildcard.
+    assert!(plan_repo(&prs, &files(&[(4, &["a.rs"])])).is_empty());
+}
+
+#[test]
+fn a_stacked_chain_orders_parent_first_with_chain_edges() {
+    let prs = [
+        stacked_on(3, 2, "2026-01-01T00:00:00Z"),
+        stacked_on(2, 1, "2026-01-02T00:00:00Z"),
+        pr(1, "2026-01-03T00:00:00Z"),
+    ];
+    let groups = plan_repo(&prs, &shared(&[1, 2, 3]));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].order, vec![1, 2, 3]);
+    let edges: Vec<_> = groups[0]
+        .edges
+        .iter()
+        .map(|e| (e.follower, e.after))
+        .collect();
+    assert_eq!(edges, vec![(2, 1), (3, 2)]);
+}
+
+#[test]
+fn a_stacking_cycle_skips_the_component() {
+    let prs = [
+        stacked_on(1, 2, "2026-01-01T00:00:00Z"),
+        stacked_on(2, 1, "2026-01-02T00:00:00Z"),
         pr(3, "2026-01-03T00:00:00Z"),
     ];
-    let f = files(&[
-        (1, &["shared.rs"]),
-        (2, &["shared.rs"]),
-        (3, &["shared.rs"]),
-    ]);
-    let groups = plan_repo(&prs, &f, &NO_MARKERS);
-    assert_eq!(groups.len(), 1);
-    let g = &groups[0];
-    assert_eq!(g.order, vec![1, 2, 3]);
-    assert_eq!(
-        g.edges
-            .iter()
-            .map(|e| (e.follower, e.after))
-            .collect::<Vec<_>>(),
-        vec![(2, 1), (3, 2)],
-        "chain edges"
-    );
-}
-
-// --- Ordering constraints -----------------------------------------------
-
-#[test]
-fn an_existing_marker_is_a_constraint_not_an_override_target() {
-    // #2 carries a manual (hard) marker after #3. The computed order must
-    // honor the constraint, and Phase 2 must not re-mark #2 (it is a
-    // holder) — pinned here at the planner level: the marker edge lands
-    // #3 before #2 despite #2 being older. #1 is an unrelated singleton
-    // that also clears the >2 trigger.
-    let prs = [
-        pr(1, "2026-01-01T00:00:00Z"),
-        pr(2, "2026-01-02T00:00:00Z"),
-        pr(3, "2026-01-03T00:00:00Z"),
-    ];
-    let f = files(&[(1, &["other.rs"]), (2, &["s.rs"]), (3, &["s.rs"])]);
-    let mut markers = NO_MARKERS;
-    markers.insert(
-        2,
-        SequenceMarker {
-            after: 3,
-            pred_head: format!("{:040x}", 3),
-            follower_head: format!("{:040x}", 2),
-            plan: "manual".into(),
-            source: None,
-        },
-    );
-    let groups = plan_repo(&prs, &f, &markers);
-    // Both are eligible members; the constraint orders 3 before 2.
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].order, vec![3, 2]);
+    assert!(plan_repo(&prs, &shared(&[1, 2, 3])).is_empty(), "cycle ⇒ no plan");
 }
 
 #[test]
-fn a_stacked_base_constrains_the_order() {
-    let mut follower = pr(5, "2026-01-01T00:00:00Z");
-    follower.base_ref = "feature/issue-4".to_string();
-    let pred = pr(4, "2026-01-02T00:00:00Z");
-    let prs = [follower, pred];
-    // Even with NO shared files, the stacked base is a real dependency.
-    let f = files(&[]);
-    let groups = plan_repo(&prs, &f, &NO_MARKERS);
-    // No file overlap ⇒ no component at all in this release (base stacking
-    // alone is #9372's domain); pinned here so a future widening is a
-    // deliberate choice, not an accident.
-    assert!(groups.is_empty(), "file-less stacking must not group yet");
+fn ineligible_or_unpinnable_prs_are_never_planned() {
+    let parent = pr(1, "2026-01-01T00:00:00Z");
+    let mut unpinned = stacked_on(2, 1, "2026-01-02T00:00:00Z");
+    unpinned.head_sha = None;
+    let drafted = stacked_on(3, 1, "2026-01-03T00:00:00Z").draft();
+    let held = stacked_on(4, 1, "2026-01-04T00:00:00Z").held("loom:operator");
+    let prs = [parent, unpinned, drafted, held];
+    assert!(plan_repo(&prs, &shared(&[1, 2, 3, 4])).is_empty());
 }
-
-#[test]
-fn a_constraint_cycle_skips_the_whole_component() {
-    let prs = [pr(1, "2026-01-01T00:00:00Z"), pr(2, "2026-01-02T00:00:00Z")];
-    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"])]);
-    let mut markers = NO_MARKERS;
-    // #1 after #2 and #2 after #1 — unsatisfiable.
-    for (follower, after) in [(1, 2), (2, 1)] {
-        markers.insert(
-            follower,
-            SequenceMarker {
-                after,
-                pred_head: format!("{after:040x}"),
-                follower_head: format!("{follower:040x}"),
-                plan: "manual".into(),
-                source: None,
-            },
-        );
-    }
-    assert!(plan_repo(&prs, &f, &markers).is_empty(), "cycle ⇒ no plan");
-}
-
-// --- Determinism --------------------------------------------------------
 
 #[test]
 fn the_plan_is_stable_across_listing_order() {
-    let shared = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
     let forward = [
         pr(1, "2026-01-01T00:00:00Z"),
-        pr(2, "2026-01-02T00:00:00Z"),
-        pr(3, "2026-01-03T00:00:00Z"),
+        stacked_on(2, 1, "2026-01-02T00:00:00Z"),
+        stacked_on(3, 1, "2026-01-03T00:00:00Z"),
     ];
     let mut reversed = forward.clone();
     reversed.reverse();
-    let a = plan_repo(&forward, &shared, &NO_MARKERS);
-    let b = plan_repo(&reversed, &shared, &NO_MARKERS);
-    assert_eq!(a, b, "identical input in any order yields the identical plan");
+    let f = shared(&[1, 2, 3]);
+    assert_eq!(
+        plan_repo(&forward, &f),
+        plan_repo(&reversed, &f),
+        "identical input in any order yields the identical plan"
+    );
 }
 
 #[test]
@@ -424,7 +383,7 @@ fn a_moved_follower_head_never_defers_a_repair() {
 #[test]
 fn apply_and_release_comments_carry_marker_and_reason() {
     let m = marker_after(11, Some("pass"));
-    let apply = apply_comment_body(&m, EdgeReason::SharedFiles);
+    let apply = apply_comment_body(&m);
     assert!(apply.contains(&marker_text(&m)), "the marker is the state: {apply}");
     assert!(apply.contains("#11"), "{apply}");
     let release = release_comment_body(&m, HoldAction::Release, None);
@@ -448,128 +407,77 @@ fn plan_report_counts_groups_without_writing() {
     assert_eq!(r.skipped_held, 0);
 }
 
-// --- Judge-requested coverage (re-review of #9707) ----------------------
+// --- Retired generated holds (#12775) -----------------------------------
 
-#[test]
-fn a_three_node_cycle_skips_the_component() {
-    // 1→2→3→1 via manual markers. Kahn's detection is general; this pins
-    // that a cycle longer than the trivial 2-cycle is also skipped whole.
-    let prs = [
+fn soft_marker(after: u32, plan: &str) -> SequenceMarker {
+    SequenceMarker {
+        plan: plan.into(),
+        ..marker_after(after, Some("pass"))
+    }
+}
+
+fn open_pair() -> Vec<SequencePr> {
+    vec![
         pr(1, "2026-01-01T00:00:00Z"),
         pr(2, "2026-01-02T00:00:00Z"),
         pr(3, "2026-01-03T00:00:00Z"),
-    ];
-    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["s.rs"])]);
-    let mut markers = NO_MARKERS;
-    for (follower, after) in [(1, 2), (2, 3), (3, 1)] {
-        markers.insert(
-            follower,
-            SequenceMarker {
-                after,
-                pred_head: format!("{:040x}", after),
-                follower_head: format!("{:040x}", follower),
-                plan: "manual".into(),
-                source: None,
-            },
-        );
-    }
-    assert!(plan_repo(&prs, &f, &markers).is_empty(), "3-cycle ⇒ no plan");
+    ]
 }
 
 #[test]
-fn a_diamond_orders_both_paths_without_dropping_a_member() {
-    // 4 depends on 2 AND 3; both depend on 1. Every member placed exactly
-    // once, 4 last, 1 first — the two middle members in age order.
-    let prs = [
-        pr(1, "2026-01-01T00:00:00Z"),
-        pr(2, "2026-01-02T00:00:00Z"),
-        pr(3, "2026-01-03T00:00:00Z"),
-        pr(4, "2026-01-04T00:00:00Z"),
-    ];
-    let f = files(&[
-        (1, &["s.rs"]),
-        (2, &["s.rs"]),
-        (3, &["s.rs"]),
-        (4, &["s.rs"]),
-    ]);
-    let mut markers = NO_MARKERS;
-    for (follower, after) in [(2, 1), (3, 1), (4, 2), (4, 3)] {
-        markers.insert(
-            follower,
-            SequenceMarker {
-                after,
-                pred_head: format!("{:040x}", after),
-                follower_head: format!("{:040x}", follower),
-                plan: "manual".into(),
-                source: None,
-            },
-        );
-    }
-    let groups = plan_repo(&prs, &f, &markers);
-    assert_eq!(groups.len(), 1, "{groups:?}");
-    let g = &groups[0];
-    assert_eq!(g.order.first(), Some(&1));
-    assert_eq!(g.order.last(), Some(&4));
-    assert_eq!(g.order.len(), 4, "every member placed: {:?}", g.order);
-    // Edges are a CHAIN over the placed order (4 has one predecessor, not two).
-    assert_eq!(g.edges.len(), 3);
+fn a_generated_hold_between_independent_prs_is_retired() {
+    let open = open_pair();
+    assert!(retired_generated_hold(&soft_marker(1, "seq-abc"), &open[1], &open));
 }
 
 #[test]
-fn a_follower_marker_disagreeing_with_age_order_wins() {
-    // Without the marker, ages put #2 before #1. The trusted marker says
-    // #2 lands AFTER #1 — the constraint beats the age default.
-    let prs = [pr(1, "2026-01-02T00:00:00Z"), pr(2, "2026-01-01T00:00:00Z")];
-    let third = pr(3, "2026-01-03T00:00:00Z");
-    let prs = [prs[0].clone(), prs[1].clone(), third];
-    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["other.rs"])]);
-    let mut markers = NO_MARKERS;
-    markers.insert(
-        2,
-        SequenceMarker {
-            after: 1,
-            pred_head: format!("{:040x}", 1),
-            follower_head: format!("{:040x}", 2),
-            plan: "manual".into(),
-            source: None,
-        },
+fn only_positively_generated_holds_are_retired() {
+    let open = open_pair();
+    let follower = &open[1];
+    // Human shapes: no `source=`, or a source this pass did not write.
+    assert!(!retired_generated_hold(&marker_after(1, None), follower, &open), "hard");
+    assert!(!retired_generated_hold(&marker_after(1, Some("operator")), follower, &open));
+    assert!(
+        !retired_generated_hold(&marker_after(1, Some("")), follower, &open),
+        "ambiguous"
     );
-    let groups = plan_repo(&prs, &f, &markers);
-    assert_eq!(groups.len(), 1, "{groups:?}");
-    assert_eq!(groups[0].order, vec![1, 2], "the marker overrides age order");
+    // Consolidation reservation.
+    assert!(!retired_generated_hold(&soft_marker(1, "cons-abc"), follower, &open));
+    // Predecessor outside the listing: provenance cannot be confirmed.
+    assert!(!retired_generated_hold(&soft_marker(99, "seq-abc"), follower, &open));
+    // A marker naming the follower itself.
+    assert!(!retired_generated_hold(&soft_marker(2, "seq-abc"), follower, &open));
 }
 
 #[test]
-fn a_new_pr_chains_behind_a_held_predecessor() {
-    // The Phase-2 membership fix (Judge re-review of #9707): #1 is already
-    // held (loom:sequenced with a plan marker), #2 arrives later touching
-    // the same files. #2 must be planned AFTER #1 — the hold's existence
-    // must not make the overlap invisible for the life of the hold.
-    let mut held = pr(1, "2026-01-01T00:00:00Z");
-    held.labels.push(SEQUENCE_LABEL.to_string());
-    let fresh = pr(2, "2026-01-05T00:00:00Z");
-    let prs = [held.clone(), fresh, pr(3, "2026-01-03T00:00:00Z")];
-    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["other.rs"])]);
-    let mut markers = NO_MARKERS;
-    markers.insert(
-        1,
-        SequenceMarker {
-            after: 99,
-            pred_head: format!("{:040x}", 99),
-            follower_head: format!("{:040x}", 1),
-            plan: "seq-old".into(),
-            source: Some("pass".into()),
-        },
+fn stacked_holds_are_never_retired() {
+    let mut open = open_pair();
+    open[1] = stacked_on(2, 1, "2026-01-02T00:00:00Z");
+    assert!(
+        !retired_generated_hold(&soft_marker(1, "seq-abc"), &open[1], &open),
+        "on the pred"
     );
-    let groups = plan_repo(&prs, &f, &markers);
-    assert_eq!(groups.len(), 1, "{groups:?}");
-    let g = &groups[0];
-    // The held #1 participates in the order (its marker points out-of-group,
-    // which order_component_with ignores; it is still a group member and lands
-    // first by age), and the fresh #2 is planned after it.
-    assert_eq!(g.order, vec![1, 2], "{g:?}");
-    assert_eq!(g.edges.len(), 1);
-    assert_eq!((g.edges[0].follower, g.edges[0].after), (2, 1));
+    // Stacked on a DIFFERENT open PR than the marker names: still stacked.
+    assert!(
+        !retired_generated_hold(&soft_marker(3, "seq-abc"), &open[1], &open),
+        "on another PR"
+    );
+    // Unknown branch names never prove "not stacked".
+    let mut unknown = open_pair();
+    unknown[1].base_ref = String::new();
+    assert!(!retired_generated_hold(&soft_marker(1, "seq-abc"), &unknown[1], &unknown));
+    unknown[1].base_ref = "main".into();
+    unknown[0].head_ref = String::new();
+    assert!(!retired_generated_hold(&soft_marker(1, "seq-abc"), &unknown[1], &unknown));
+}
+
+#[test]
+fn the_release_comment_names_the_retirement() {
+    let m = soft_marker(1, "seq-abc");
+    let body = release_comment_body(&m, HoldAction::ReleaseRetired, None);
+    assert!(body.contains("retired"), "{body}");
+    assert!(body.contains("#1"), "{body}");
+    assert!(body.contains("loom:sequence released plan=seq-abc"), "{body}");
 }
 
 // ---- #4429 follow-up: reuse of the review-conflict pass's listing ----

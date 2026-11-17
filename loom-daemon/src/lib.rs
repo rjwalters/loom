@@ -120,6 +120,14 @@
 //! If you add a test that touches the tmux server, or any other machine-global
 //! resource, put it in the group — do not rely on `#[serial]`.
 
+// The `status --json` builder (`cli::status_render`) is one large
+// `serde_json::json!` invocation; each field this repo has added over time
+// pushes the macro's token-tree munching recursion a little deeper. #6470
+// added two more fields (`role_runner_env_override` /
+// `role_runner_host_env_override`) and tripped the default (128) limit —
+// bump it here rather than trimming the JSON shape to fit an arbitrary
+// compiler default.
+#![recursion_limit = "512"]
 // These modules were originally private to the binary crate. Exposing them as
 // a library (to allow unit tests to run without the binary's tokio runtime)
 // triggers public-API clippy lints that don't apply to internal-use code.
@@ -134,6 +142,7 @@
 
 pub mod activity;
 pub mod agent_gh;
+pub mod agent_residue_reaper;
 pub mod agent_session;
 pub mod agent_skills;
 /// Alert transitions as `alert.transition` OTLP log records (#11295, #12806).
@@ -155,6 +164,8 @@ pub mod ci_telemetry;
 pub mod claim_liveness;
 pub mod claim_reconciliation;
 pub mod classify_error;
+pub mod claude_config;
+pub mod cli;
 pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
@@ -166,6 +177,7 @@ pub mod daemon_bin_resolve;
 pub mod daemon_heartbeat;
 pub mod daemon_install_state;
 pub mod daemon_pidfile;
+pub mod daemon_root_freshness;
 pub mod daemon_start;
 /// Non-blocking wrapper around the startup claim-reconciliation +
 /// stranded-quarantine reconciliation passes (Issue #7974) — a new sibling
@@ -174,6 +186,7 @@ pub mod daemon_start;
 /// (`.loom/docs/file-size-policy.md`).
 pub mod daemon_startup_reconciliation;
 pub mod daemon_update;
+pub mod daily_log;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
@@ -181,10 +194,12 @@ pub mod dep_recheck;
 /// from the mirror's worklist or per-repo listings.
 pub mod discovery;
 pub mod disk_headroom;
-pub mod dispatch_tap;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
+/// Doctor hand-back as a conditional, verified label transition (#9388).
+pub mod doctor_handback;
 pub mod eager_reclaim;
+pub(crate) mod env_flag;
 #[cfg(test)]
 pub(crate) mod env_test_support;
 pub mod epic_state;
@@ -201,6 +216,7 @@ pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
+pub mod forge_additive_migrations;
 pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;
@@ -220,6 +236,7 @@ pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;
 pub mod forge_listing;
+pub mod forge_locked_deps_only;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_merge_queue;
@@ -232,6 +249,9 @@ pub mod forge_pull_listing;
 pub mod forge_read_pool;
 pub(crate) mod forge_repo_facts;
 pub mod forge_rerun;
+pub mod forge_retry;
+pub mod forge_slug;
+pub mod forge_suspect_critical_diff;
 pub mod forge_tree_unchanged;
 pub mod forge_version_only_diff;
 pub mod forge_wait_checks;
@@ -270,7 +290,9 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
+pub mod shell_out;
 // #11855: bound Judge re-runs on a PR whose passes end without a verdict.
+pub(crate) mod git_merge_tree;
 pub mod judge_backstop;
 pub mod key_ref;
 pub mod kimi_usage;
@@ -288,7 +310,6 @@ mod live_gh_guard;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;
-pub mod merge_policy;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
@@ -376,6 +397,7 @@ pub mod self_update;
 pub mod serve;
 pub mod session_reconcile;
 pub mod session_status;
+pub mod shell_quote;
 pub mod short_hash;
 pub mod signoz_read;
 /// `stack-parent`: the open PR a Builder's conflicting work stacks on (#12759).
@@ -431,9 +453,11 @@ pub mod task_dump;
 pub mod task_liveness;
 pub mod telemetry;
 pub mod telemetry_join;
-pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
+/// Test-only hermetic git helpers shared by the orphan-stack test modules.
+#[cfg(test)]
+pub mod test_git_helpers;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's
 /// one-per-process `log::set_boxed_logger` installation is shared by every test
 /// module that asserts on log severity.
@@ -451,6 +475,7 @@ pub mod tmpfs_visibility;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;
+pub mod tools_mode;
 pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;

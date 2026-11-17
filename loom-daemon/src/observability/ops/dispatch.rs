@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use chrono::{DateTime, Utc};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{Admission, TickReport};
@@ -274,7 +274,7 @@ pub fn admission_spans(
                 attributes.insert("loom.repo".to_string(), repo_ref.repo.clone());
                 attributes.insert(
                     "loom.repo.visibility".to_string(),
-                    visibility_str(repo_ref.visibility).to_string(),
+                    repo_ref.visibility.as_str().to_string(),
                 );
                 // Issue #9674: stamp the repo's lockout weight on the very
                 // admission spans the open-PR guard produced.
@@ -326,17 +326,6 @@ pub fn admission_spans(
             }
         })
         .collect()
-}
-
-/// UCUM-free wire text for a repo visibility tag (mirrors the private
-/// `visibility_str` helpers in `otlp::mapping` and `ci_telemetry::records` —
-/// each ops-adjacent module keeps its own copy rather than sharing one across
-/// unrelated call graphs).
-fn visibility_str(visibility: crate::telemetry::RepoVisibility) -> &'static str {
-    match visibility {
-        crate::telemetry::RepoVisibility::Public => "public",
-        crate::telemetry::RepoVisibility::Private => "private",
-    }
 }
 
 /// The workspace roots referenced by `admissions` and by `report`'s ready-

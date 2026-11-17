@@ -18,7 +18,7 @@
 `loom-daemon-stop.sh` is "stopped for now"; the watchdog, a supervised relaunch, the
 auto-update roll or `loom update` can bring a daemon back. For a durable opt-out run
 `loom-daemon host disable --reason "<why>"` (writes `~/.loom/autonomy-disabled`, stops
-the daemon and removes its jobs). Every start/re-provision path then refuses with the
+the daemon; the watchdog job stays loaded and refuses on the marker). Every start/re-provision path then refuses with the
 reason, who and when; `loom-daemon status` shows `disabled by operator: <reason>
 (<when>)`. Undo with `loom-daemon host enable` (it does not start anything). Agents must
 not start or repair a daemon on such a host. See `daemon-reference.md`.
@@ -998,7 +998,7 @@ user-provisioned paths) have no issue state to consult and are unaffected.
 
 **What the #5919 post-mortem could and could not establish.** The ledger exists
 because this incident was *not* attributable from the evidence that existed at
-the time. Against `~/.loom/daemon.log` (+ rotations `.1`–`.5`, covering
+the time. Against `~/.loom/daemon.log` (+ day files `daemon.log.YYYY-MM-DD`, covering
 2026-08-01 → 2026-08-11) for the incident window — issue #5919 filed
 `2026-08-10T21:01:18Z`, PR #5942 opened `23:31:21Z`:
 
@@ -1289,9 +1289,7 @@ Out-of-band rolling is also where this already belongs: the daemon's own
 auto-update loop and `loom-daemon-watchdog.sh` converge the host from *outside*
 any merge. A version-floor refusal is a **symptom** of that loop being behind
 (on 2026-09-18 it was deferring behind the build-stampede guard, #8252) — fix
-it there, not by restarting the daemon from inside its own child. The secondary
-argument, that `merge-pr.sh` is frozen at its file-size-ratchet ceiling, only
-reinforces a conclusion the process model already forces.
+it there, not by restarting the daemon from inside its own child.
 
 ### `rm` of the installed `loom-daemon` binary is denied in an agent session (#5675)
 
@@ -1404,9 +1402,8 @@ with `git commit --allow-empty -m test && git log -1 --format='%an <%ae>'`
 ```
 
 Label sync is a manual/install-time step, not something CI re-applies when
-`.github/labels.yml` changes. (In an installed repo the script is
-`.loom/scripts/sync-labels.sh`, as above; `./scripts/install/sync-labels.sh` is
-the installer-side copy and exists only in a Loom source checkout.) If a label is
+`.github/labels.yml` changes. (The installer's Step 4 calls the same
+`.loom/scripts/sync-labels.sh`.) If a label is
 defined in `labels.yml` but missing from the live repo, applying it fails with
 `failed to update 1 issue` (the standard `gh` error for "label does not exist").
 Run the sync script — or create the one label directly — to reconcile:
@@ -3095,6 +3092,24 @@ git push -u origin HEAD   # open a PR from here
 cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checkout when done
 ```
 
+**Which file to trust while a resync PR is open (#13592).** The re-stamp of
+`.loom/install-metadata.json` (`loom_version`, `loom_commit`, `last_resync`)
+lands wherever the files land, so `--output` stamps only the staging worktree and
+the PR branch: the primary checkout's metadata keeps naming the version whose
+files it actually carries until the PR merges and you pull. A *bare* run from the
+primary checkout (or `--allow-worktree`) writes the files **and** the stamp into
+that checkout's working tree; if you then move the changes onto a PR branch and
+reset the primary, a **gitignored** metadata file (some consumers ignore it) is
+not reset and keeps reporting the target version while the tracked `.loom/` files
+on the default branch are still the old ones. So while a resync PR is open:
+treat the **default branch's tracked `.loom/` files** (e.g. `git show
+origin/<default>:.loom/install-metadata.json`, or a vendored script's content) as
+the source of truth for "which Loom is installed", not a working-tree
+`install-metadata.json`, and prefer `--output` over a bare run so the primary's
+metadata is never touched. A daemon resync (`fleet_sync/workspace_resync.rs`)
+already works in a throwaway worktree. A mid-resync interruption is recorded by
+`resync_pending` in the metadata, never by bumping `loom_version`.
+
 Or skip the hand-rolled add entirely and let
 `./.loom/scripts/land-resync-commit.sh` stage and commit for you — it stages an
 explicit allowlist of resync-surface pathspecs (never `-A`), refuses to land if
@@ -3412,5 +3427,12 @@ heartbeats but its work finder has not ticked for 2x its own interval.
    manual run is the way past it.
 4. Reclaim only touches Loom-managed paths. Space held by anything else (logs,
    caches, another tenant) must be freed by hand.
+   **The uv cache** (`~/.cache/uv`, 28 GB on one busy host, #12460) is such a
+   path: the daemon never prunes it, because uv is a host tool provisioned from
+   the worker spec (`infra/aws/loom-worker/` in 2AMLogic/2am), not by Loom.
+   uv has no size cap, so the bound is a periodic `uv cache prune --ci` (drops
+   pre-built wheels, keeps source-built ones; add it to the worker spec's
+   housekeeping, not to a sweep) or `UV_CACHE_DIR` pointed at a volume that can
+   fill harmlessly. `uv cache prune` alone removes only unreferenced entries.
 5. If the host keeps filling, lower its `autonomous.workFinder.maxConcurrent`
    in fleet config.

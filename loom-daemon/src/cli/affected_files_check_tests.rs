@@ -3,7 +3,7 @@
 use std::fs;
 use std::process::Command;
 
-use loom_daemon::work_finder::affected_files::check::{
+use crate::work_finder::affected_files::check::{
     EXIT_CLEAR, EXIT_COULD_NOT_RUN, EXIT_UNCOMMITTED, EXIT_UNKNOWN,
 };
 
@@ -18,7 +18,7 @@ fn parse(args: &[&str]) -> CheckArgs {
         panic!("{argv:?} did not parse");
     };
     match cli.command {
-        Some(crate::Commands::ScriptPorts(
+        Some(crate::cli::Commands::ScriptPorts(
             crate::cli::script_ports::ScriptPortCommand::AffectedFiles(
                 AffectedFilesCommand::Check(args),
             ),

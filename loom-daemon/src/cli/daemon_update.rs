@@ -46,7 +46,7 @@ impl DaemonUpdateArgs {
             .argv0
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "loom-daemon-update.sh".to_string());
-        loom_daemon::daemon_update::run(&raw_tail(&self.argv), &argv0);
+        crate::daemon_update::run(&raw_tail(&self.argv), &argv0);
     }
 }
 

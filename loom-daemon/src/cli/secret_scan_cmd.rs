@@ -1,5 +1,5 @@
 //! `loom-daemon secret-scan` — refuse content carrying a credential shape
-//! (#9133). The scan itself lives in [`loom_daemon::secret_scan`]; this is the
+//! (#9133). The scan itself lives in [`crate::secret_scan`]; this is the
 //! argument surface the three callers share:
 //!
 //! - `guard-loom-workflow.sh` (PreToolUse, every fleet repo): `--for-command`
@@ -12,8 +12,8 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use crate::secret_scan::{modes_for_command, scan, Mode, Scanner};
 use anyhow::{Context, Result};
-use loom_daemon::secret_scan::{modes_for_command, scan, Mode, Scanner};
 
 const EX_FOUND: i32 = 1;
 const EX_ERROR: i32 = 2;

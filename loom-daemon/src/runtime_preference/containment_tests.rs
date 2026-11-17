@@ -205,6 +205,11 @@ fn unverified_containment_is_skipped_with_its_obligation() {
     };
     assert_eq!(unmet, &vec!["worktreeIsolation".to_string()]);
     assert!(detail.contains("hook trust unproven"), "{detail}");
+    // #13916: the marker and the dispatch diagnostic name the obligation.
+    let summary = skip.reason.summary();
+    assert!(summary.starts_with("worktreeIsolation: "), "{summary}");
+    assert!(summary.contains("hook trust unproven"), "{summary}");
+    assert!(resolution.marker_line().contains("hook trust unproven"));
 }
 
 /// An explicit pin never falls through: a verified pin is admitted on

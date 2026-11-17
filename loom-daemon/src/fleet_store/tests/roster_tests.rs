@@ -1,42 +1,42 @@
 use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
+
 use super::*;
 
-const ROSTER: &str = r#"# fleet roster
-root: ~/src
+/// The roster fixture, as the top level of a compiled `fleet.json`.
+fn roster_doc() -> serde_json::Value {
+    json!({
+        "root": "~/src",
+        "repos": [
+            {"name": "tooling", "remote": "git@example.com:acme/tooling.git", "dir": "tooling",
+             "visibility": "public", "fleet": true, "weight": 10, "fleet_priority": 3,
+             "purpose": "Build tooling", "consumes": ["lib-a", "lib-b"]},
+            {"name": "product", "remote": "git@example.com:acme/product.git",
+             "dir": "product-src", "fleet": true, "weight": 1},
+            {"name": "secrets", "remote": "git@example.com:acme/secrets.git", "dir": "secrets",
+             "firewall": true, "fleet": false},
+            {"name": "docs", "remote": null, "dir": "docs", "fleet": false}
+        ]
+    })
+}
 
-repos:
-  - name: tooling
-    remote: git@example.com:acme/tooling.git
-    dir: tooling
-    visibility: public          # ignored: not part of the contract
-    fleet: true
-    weight: 10                  # drawn most
-    fleet_priority: 3           # ignored since #11742
-    purpose: Build tooling — "the" tools.
-    consumes: [lib-a, lib-b]    # ignored
+/// `roster_doc()` with `edit` applied to its `repos[idx]` record.
+fn with_repo(idx: usize, edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
+    let mut doc = roster_doc();
+    edit(&mut doc["repos"][idx]);
+    doc
+}
 
-  - name: product
-    remote: git@example.com:acme/product.git
-    dir: product-src
-    fleet: true
-    weight: 1
-    purpose: >-
-      Folded purpose text
-      over two lines.
-
-  - name: secrets
-    remote: git@example.com:acme/secrets.git
-    dir: secrets
-    firewall: true
-    fleet: false
-
-  - name: docs
-    remote: null
-    dir: docs
-    fleet: false
-"#;
+/// Validate a roster document (the compiled `fleet.json` top level).
+fn parse(doc: &serde_json::Value, home: &Path) -> anyhow::Result<Roster> {
+    from_compiled(
+        doc.as_object()
+            .ok_or_else(|| anyhow::anyhow!("not a mapping"))?,
+        home,
+    )
+}
 
 fn home() -> PathBuf {
     PathBuf::from("/home/op")
@@ -56,7 +56,7 @@ fn reg(path: &str, weight: u32) -> Registered {
 
 #[test]
 fn parses_the_contract_and_ignores_other_keys() {
-    let r = parse(ROSTER, &home()).unwrap();
+    let r = parse(&roster_doc(), &home()).unwrap();
     assert_eq!(r.root, PathBuf::from("/home/op/src"));
     assert_eq!(r.records.len(), 4);
     assert_eq!(
@@ -76,7 +76,7 @@ fn parses_the_contract_and_ignores_other_keys() {
 
 #[test]
 fn desired_is_fleet_true_and_not_firewall_with_its_weight() {
-    let r = parse(ROSTER, &home()).unwrap();
+    let r = parse(&roster_doc(), &home()).unwrap();
     let d = r.desired();
     assert_eq!(
         d,
@@ -99,9 +99,8 @@ fn desired_is_fleet_true_and_not_firewall_with_its_weight() {
 
 #[test]
 fn fleet_and_firewall_together_is_a_hard_error_not_a_silent_exclusion() {
-    let text =
-        ROSTER.replace("firewall: true\n    fleet: false", "firewall: true\n    fleet: true");
-    let err = parse(&text, &home()).unwrap_err();
+    let doc = with_repo(2, |r| r["fleet"] = json!(true));
+    let err = parse(&doc, &home()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("`secrets`") && msg.contains("fleet: true AND firewall: true"),
@@ -111,35 +110,39 @@ fn fleet_and_firewall_together_is_a_hard_error_not_a_silent_exclusion() {
 
 #[test]
 fn malformed_flags_and_weights_are_hard_errors() {
-    for (from, to) in [
-        ("weight: 10", "weight: high"),
-        ("weight: 10", "weight: -1"),
-        ("weight: 10", "weight: 1.5"),
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(&str, Edit); 10] = [
+        ("weight: high", |d| d["repos"][0]["weight"] = json!("high")),
+        ("weight: -1", |d| d["repos"][0]["weight"] = json!(-1)),
+        ("weight: 1.5", |d| d["repos"][0]["weight"] = json!(1.5)),
         // #11742: a fleet record with no weight is refused, with no default.
-        ("    weight: 1\n", ""),
-        ("firewall: true", "firewall: \"yes\""),
-        ("firewall: true", "firewall: yes"),
-        ("dir: docs", "dir: ../docs"),
-        ("dir: product-src", "dir: tooling"),
-        ("name: docs", "name: tooling"),
-        ("root: ~/src", "root: relative/src"),
-    ] {
-        let text = ROSTER.replacen(from, to, 1);
-        assert!(parse(&text, &home()).is_err(), "{from} -> {to} must be refused");
+        ("no weight", |d| {
+            d["repos"][1].as_object_mut().unwrap().remove("weight");
+        }),
+        ("firewall: \"yes\"", |d| d["repos"][2]["firewall"] = json!("yes")),
+        ("firewall: 1", |d| d["repos"][2]["firewall"] = json!(1)),
+        ("dir: ../docs", |d| d["repos"][3]["dir"] = json!("../docs")),
+        ("dir: tooling twice", |d| d["repos"][1]["dir"] = json!("tooling")),
+        ("name: tooling twice", |d| d["repos"][3]["name"] = json!("tooling")),
+        ("root: relative/src", |d| d["root"] = json!("relative/src")),
+    ];
+    for (what, edit) in cases {
+        let mut doc = roster_doc();
+        edit(&mut doc);
+        assert!(parse(&doc, &home()).is_err(), "{what} must be refused");
     }
 }
 
 #[test]
-fn unparseable_yaml_fails_closed() {
-    assert!(parse("root: /x\nrepos:\n  - name: a\n\tfleet: true\n", &home()).is_err());
-    assert!(parse("root: /x\nrepos:\n  - name: &a app\n", &home()).is_err());
-    assert!(parse("root: /x\n", &home()).is_err(), "missing repos");
-    assert!(parse("- a\n- b\n", &home()).is_err(), "not a mapping");
+fn a_malformed_roster_document_fails_closed() {
+    assert!(parse(&json!({"root": "/x"}), &home()).is_err(), "missing repos");
+    assert!(parse(&json!({"repos": []}), &home()).is_err(), "missing root");
+    assert!(parse(&json!(["a", "b"]), &home()).is_err(), "not a mapping");
 }
 
 #[test]
 fn plan_adds_removes_and_reprioritizes() {
-    let r = parse(ROSTER, &home()).unwrap();
+    let r = parse(&roster_doc(), &home()).unwrap();
     let registered = vec![
         reg("/home/op/src/tooling", 50),  // priority change 50 -> 10
         reg("/home/op/src/secrets", 100), // firewall: must go
@@ -180,7 +183,7 @@ fn plan_adds_removes_and_reprioritizes() {
 
 #[test]
 fn a_missing_clone_is_reported_never_added() {
-    let r = parse(ROSTER, &home()).unwrap();
+    let r = parse(&roster_doc(), &home()).unwrap();
     let registered = vec![reg("/home/op/src/tooling", 10)];
     let plan = plan(&r, &registered, &ident, &|p| !p.ends_with("product-src"));
     assert_eq!(
@@ -198,7 +201,7 @@ fn a_missing_clone_is_reported_never_added() {
 
 #[test]
 fn a_matching_registry_is_in_sync() {
-    let r = parse(ROSTER, &home()).unwrap();
+    let r = parse(&roster_doc(), &home()).unwrap();
     let registered = vec![
         reg("/home/op/src/tooling", 10),
         reg("/home/op/src/product-src", DEFAULT_WORKSPACE_WEIGHT),
@@ -211,7 +214,7 @@ fn a_matching_registry_is_in_sync() {
 
 #[test]
 fn paths_are_compared_after_normalization() {
-    let r = parse(ROSTER, &home()).unwrap();
+    let r = parse(&roster_doc(), &home()).unwrap();
     // The registry stores canonical paths (e.g. a symlinked home resolved).
     let canon = |p: &Path| PathBuf::from(p.to_string_lossy().replace("/home/op", "/data/op"));
     let registered = vec![
@@ -228,7 +231,10 @@ fn paths_are_compared_after_normalization() {
 // #11186: `fleet: maintain`
 // ----------------------------------------------------------------------------
 
-const PRODUCT: &str = "dir: product-src\n    fleet: true\n    weight: 1\n";
+/// `roster_doc()` with the `product` record's `fleet` set to `fleet`.
+fn product_fleet(fleet: serde_json::Value) -> serde_json::Value {
+    with_repo(1, |r| r["fleet"] = fleet)
+}
 
 fn maintain(path: &str, priority: u32) -> Registered {
     Registered {
@@ -239,9 +245,7 @@ fn maintain(path: &str, priority: u32) -> Registered {
 
 #[test]
 fn fleet_maintain_is_desired_and_maintain_only() {
-    let text =
-        ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n    weight: 1\n", 1);
-    let r = parse(&text, &home()).unwrap();
+    let r = parse(&product_fleet(json!("maintain")), &home()).unwrap();
     assert!(r.records[1].fleet && r.records[1].maintain_only);
     assert!(!r.records[0].maintain_only);
     let d = r.desired();
@@ -256,20 +260,13 @@ fn fleet_maintain_is_desired_and_maintain_only() {
 
 #[test]
 fn fleet_must_be_true_false_or_maintain() {
-    for bad in [
-        "fleet: Maintain",
-        "fleet: \"yes\"",
-        "fleet: 1",
-        "fleet: dispatch",
-    ] {
-        let text = ROSTER.replacen(PRODUCT, &format!("dir: product-src\n    {bad}\n"), 1);
-        let msg = format!("{:#}", parse(&text, &home()).unwrap_err());
+    for bad in [json!("Maintain"), json!("yes"), json!(1), json!("dispatch")] {
+        let msg = format!("{:#}", parse(&product_fleet(bad.clone()), &home()).unwrap_err());
         assert!(msg.contains("true, false or maintain"), "{bad}: {msg}");
     }
     // Maintain plus firewall is refused like fleet: true plus firewall.
-    let text =
-        ROSTER.replace("firewall: true\n    fleet: false", "firewall: true\n    fleet: maintain");
-    let msg = format!("{:#}", parse(&text, &home()).unwrap_err());
+    let doc = with_repo(2, |r| r["fleet"] = json!("maintain"));
+    let msg = format!("{:#}", parse(&doc, &home()).unwrap_err());
     assert!(msg.contains("fleet: maintain AND firewall: true"), "{msg}");
 }
 
@@ -279,20 +276,14 @@ fn fleet_must_be_true_false_or_maintain() {
 /// "other keys are ignored" is a deliberate one.
 #[test]
 fn an_unknown_dispatch_key_is_ignored_which_is_why_the_mode_lives_in_fleet() {
-    let text = ROSTER.replacen(
-        PRODUCT,
-        "dir: product-src\n    fleet: true\n    weight: 1\n    dispatch: false\n",
-        1,
-    );
-    let r = parse(&text, &home()).unwrap();
+    let doc = with_repo(1, |r| r["dispatch"] = json!(false));
+    let r = parse(&doc, &home()).unwrap();
     assert!(!r.desired()[1].maintain_only, "ignored: dispatched as fleet: true");
 }
 
 #[test]
 fn flipping_the_mode_is_a_change_in_place_never_a_remove_and_add() {
-    let into =
-        ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n    weight: 1\n", 1);
-    let r = parse(&into, &home()).unwrap();
+    let r = parse(&product_fleet(json!("maintain")), &home()).unwrap();
     let registered = vec![
         reg("/home/op/src/tooling", 10),
         reg("/home/op/src/product-src", DEFAULT_WORKSPACE_WEIGHT),
@@ -318,7 +309,7 @@ fn flipping_the_mode_is_a_change_in_place_never_a_remove_and_add() {
     assert!(plan(&r, &synced, &ident, &|_| true).is_in_sync());
 
     // And back out: the store says `fleet: true` again.
-    let back = parse(ROSTER, &home()).unwrap();
+    let back = parse(&roster_doc(), &home()).unwrap();
     let p = plan(&back, &synced, &ident, &|_| true);
     assert_eq!(
         p.changes,
@@ -339,9 +330,7 @@ fn flipping_the_mode_is_a_change_in_place_never_a_remove_and_add() {
 
 #[test]
 fn a_maintain_only_add_registers_it_maintain_only_in_one_change() {
-    let text =
-        ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n    weight: 1\n", 1);
-    let r = parse(&text, &home()).unwrap();
+    let r = parse(&product_fleet(json!("maintain")), &home()).unwrap();
     let p = plan(&r, &[reg("/home/op/src/tooling", 10)], &ident, &|_| true);
     assert_eq!(
         p.changes,
@@ -356,7 +345,7 @@ fn a_maintain_only_add_registers_it_maintain_only_in_one_change() {
     let json = serde_json::to_value(&p.changes[0]).unwrap();
     assert_eq!(json["maintain_only"], true);
     // A normal add serializes exactly as before.
-    let normal = parse(ROSTER, &home()).unwrap();
+    let normal = parse(&roster_doc(), &home()).unwrap();
     let p = plan(&normal, &[reg("/home/op/src/tooling", 10)], &ident, &|_| true);
     assert!(serde_json::to_value(&p.changes[0])
         .unwrap()
@@ -368,8 +357,11 @@ fn a_maintain_only_add_registers_it_maintain_only_in_one_change() {
 /// dispatched); it registers at weight 0.
 #[test]
 fn a_maintain_record_needs_no_weight() {
-    let text = ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n", 1);
-    let r = parse(&text, &home()).unwrap();
+    let doc = with_repo(1, |r| {
+        r["fleet"] = json!("maintain");
+        r.as_object_mut().unwrap().remove("weight");
+    });
+    let r = parse(&doc, &home()).unwrap();
     let d = r.desired();
     assert!(d[1].maintain_only);
     assert_eq!(d[1].weight, 0);

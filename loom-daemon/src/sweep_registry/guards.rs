@@ -1616,7 +1616,7 @@ impl SweepRegistry {
     /// record anywhere — dispatched a duplicate builder 76 minutes later.
     ///
     /// So when this dispatcher is the SOLE in-window claimant
-    /// ([`claim_label::is_sole_claimant`]), one further signal is consulted
+    /// ([`claim_label::issue_claim_state`]), one further signal is consulted
     /// before committing to [`LeaseOrderDecision::Proceed`]: the issue's newest
     /// `labeled loom:building` timeline event, via the
     /// [`fetch_claim_labeled_at`](Self::fetch_claim_labeled_at) read the reap
@@ -1625,8 +1625,8 @@ impl SweepRegistry {
     /// [`LeaseOrderDecision::YieldToLeaselessClaim`] — see
     /// [`SweepRegistry::resolve_leaseless_claim_order`] for why a bare label is
     /// evidence only now that Phase 2 leases every compliant lane, and
-    /// [`claim_label::claim_label_is_live_foreign`] for why the event this
-    /// dispatcher's own flip just created cannot trigger it.
+    /// [`claim_label::claim_label_is_live_foreign`] for the timestamp predicate.
+    /// Dispatch separately verifies an own flip before honoring a leaseless yield.
     ///
     /// The leg is additive and changes nothing when a lease comment IS found:
     /// with any foreign record in-window the comment-order verdict stands
@@ -1745,7 +1745,8 @@ impl SweepRegistry {
             let Some(earliest) = in_window.iter().min_by_key(|c| c.id) else {
                 return LeaseOrderDecision::Proceed;
             };
-            let sole = claim_label::is_sole_claimant(&in_window, &host, sweep_id);
+            let sole = claim_label::issue_claim_state(Some(&in_window), &host, sweep_id)
+                .permits_leaseless_leg();
             return if earliest.id < own_id {
                 LeaseOrderDecision::Yield {
                     earliest_host: earliest.host.clone(),

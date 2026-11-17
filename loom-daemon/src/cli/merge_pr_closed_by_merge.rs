@@ -21,13 +21,13 @@
 //! `clap`'s "unrecognized subcommand" on a binary predating this verb, and the
 //! caller treats every code other than 0 and 1 as "could not answer" — no
 //! reopen, and a line saying so. The decision lives in
-//! [`loom_daemon::merge_pr::closed_by_merge`]; this verb makes no forge call
+//! [`crate::merge_pr::closed_by_merge`]; this verb makes no forge call
 //! and no write.
 //!
 //! The facts arrive on stdin, never in argv: they are forge-controlled text.
 
+use crate::merge_pr::closed_by_merge::{decide, query, render, Facts, Verdict};
 use anyhow::Result;
-use loom_daemon::merge_pr::closed_by_merge::{decide, query, render, Facts, Verdict};
 use std::io::{Read, Write};
 
 #[derive(clap::Args)]

@@ -71,6 +71,7 @@
 //!   shells out to a subprocess and makes network calls) so it never parks a
 //!   runtime worker, mirroring the main-health gate's command execution.
 
+use crate::fs_util::truncate_tail;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -297,7 +298,7 @@ fn run_probe_with_timeout(
                 break RefreshOutcome::Failure(format!(
                     "`{}` exited with {status}: {}",
                     bin.display(),
-                    truncate_tail(&tail)
+                    truncate_tail(&tail, MAX_OUTPUT_TAIL_BYTES)
                 ));
             }
             Ok(None) => {
@@ -319,20 +320,6 @@ fn run_probe_with_timeout(
     };
     let _ = std::fs::remove_file(&log_path);
     result
-}
-
-/// Truncate captured probe output to the last [`MAX_OUTPUT_TAIL_BYTES`] bytes
-/// (the failure detail is usually last), trimmed of surrounding whitespace.
-fn truncate_tail(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_TAIL_BYTES {
-        return s.trim().to_string();
-    }
-    // Slice on a char boundary at-or-before the byte cutoff.
-    let start = s.len() - MAX_OUTPUT_TAIL_BYTES;
-    let start = (start..s.len())
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(s.len());
-    s[start..].trim().to_string()
 }
 
 // ============================================================================

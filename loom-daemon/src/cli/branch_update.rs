@@ -1,5 +1,5 @@
 //! `loom-daemon branch-update` CLI surface (#10771). The policy itself lives
-//! in [`loom_daemon::branch_update`]; this file is only the clap shape.
+//! in [`crate::branch_update`]; this file is only the clap shape.
 
 use std::path::PathBuf;
 
@@ -21,7 +21,7 @@ impl BranchUpdateCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             BranchUpdateCommand::Strategy(args) => {
-                loom_daemon::branch_update::handle_strategy(
+                crate::branch_update::handle_strategy(
                     args.repo_dir.as_deref(),
                     args.repo.as_deref(),
                     !args.no_cache,

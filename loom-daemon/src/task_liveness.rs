@@ -43,7 +43,7 @@ pub const GRACE: Duration = Duration::from_secs(60);
 
 /// Task name of the self-update loop (`auto_update`).
 pub const AUTO_UPDATE: &str = "auto_update";
-/// Task name of the CI telemetry poller (#12793), periodic and feed-driven.
+/// Task name of the CI telemetry poller (#12793).
 pub const CI_TELEMETRY: &str = "ci_telemetry";
 /// Task name of the Codex session-container watch (#10600): its snapshot is
 /// what dispatch selection and `loom-daemon status` read.

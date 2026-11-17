@@ -183,7 +183,8 @@ struct UserJson {
     kind: String,
 }
 
-/// `owner`'s kind: declared, cached, or probed via `GET /users/{login}`.
+/// `owner`'s kind: declared, cached, or probed via `GET /users/{login}` (with
+/// one `GET /orgs/{login}` retry when that probe fails in transport).
 /// Never guessed — any failure is returned for the caller to skip the owner.
 pub fn resolve_kind(
     api: &dyn GithubApi,
@@ -206,7 +207,24 @@ pub fn resolve_kind(
         });
     }
     *requests += 1;
-    let response = api.get(&path, None)?;
+    let response = match api.get(&path, None) {
+        Ok(response) => response,
+        // #13640: a transport failure (timeout, `gh` could not run) on the
+        // `users/` probe gets one more read on the `orgs/` route, same reader
+        // routing — never the writer (#12394). An HTTP answer (404, 401, rate
+        // limit) is a verdict, not a transport fault, and is not second-guessed.
+        Err(ApiError::Transport(first)) => {
+            let org_path = format!("orgs/{}", owner.login);
+            *requests += 1;
+            api.get(&org_path, None).map_err(|second| match second {
+                ApiError::Transport(second) => ApiError::Transport(format!(
+                    "{first}; fallback {org_path} also failed: {second}"
+                )),
+                other => other,
+            })?
+        }
+        Err(other) => return Err(other),
+    };
     let parsed: UserJson = serde_json::from_str(&response.body).map_err(|e| ApiError::Parse {
         path: path.clone(),
         detail: e.to_string(),

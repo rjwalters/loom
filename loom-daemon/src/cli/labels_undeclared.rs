@@ -15,7 +15,7 @@
 //! unanswered "is it in use?" is not a "no". Closed items do not hold a
 //! label back: Loom never cleans labels off closed items (#2838), so they
 //! say nothing about live use. Write scope (#9548): `--prune` is gated here by
-//! `loom_daemon::write_scope::may_write_from`, before the first label is read or
+//! `crate::write_scope::may_write_from`, before the first label is read or
 //! deleted, so a direct caller cannot bypass `sync-labels.sh`'s
 //! `loom_write_repo`; the report-only read is ungated.
 //!
@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 /// The forge reads and the one write this command makes.
 pub(crate) trait LabelForge {
@@ -213,9 +213,9 @@ pub(crate) fn dispatch(repo: &str, labels_file: &Path, prune: bool) -> i32 {
     };
     let gate = || {
         let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
-        match loom_daemon::write_scope::may_write_from(&cwd, Some(repo)) {
-            loom_daemon::write_scope::Verdict::Allow(_) => Ok(()),
-            loom_daemon::write_scope::Verdict::Deny(why) => Err(why),
+        match crate::write_scope::may_write_from(&cwd, Some(repo)) {
+            crate::write_scope::Verdict::Allow(_) => Ok(()),
+            crate::write_scope::Verdict::Deny(why) => Err(why),
         }
     };
     run_gated(&forge, &yaml, prune, &gate, &mut std::io::stdout())

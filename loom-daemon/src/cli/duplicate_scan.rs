@@ -9,9 +9,8 @@
 //! prompts and CI rely on, and its allowlist entry — like every `contract`
 //! entry — says "new logic goes behind it into loom-daemon". PR #8353 added
 //! the near-match band as +71 inline shell lines there (+54 more in
-//! `create-issue.sh`) and the Shell Budget Ratchet correctly refused it:
-//! portable (`contract`) growth has no override, because the epic the ratchet
-//! enforces (#7810) exists to retire exactly that shell. This module is the
+//! `create-issue.sh`), which was rejected: epic #7810 exists to retire
+//! exactly that shell. This module is the
 //! port the policy asks for: the keyword extraction, the true-Jaccard
 //! scoring, the threshold banding, and the degenerate-result detector now
 //! live in Rust, and the script keeps only the forge fetch (with its

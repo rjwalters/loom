@@ -13,6 +13,8 @@ mod containment;
 mod control;
 #[path = "private_workspace_docker/dispatch.rs"]
 mod dispatch;
+#[path = "private_workspace_docker/recovery.rs"]
+mod recovery;
 
 #[track_caller]
 fn checked(output: Output) -> String {

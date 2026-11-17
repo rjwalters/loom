@@ -4,8 +4,8 @@
 //! workspaces, no provider or forge is contacted, and the only file read
 //! outside them is this host's own sweep-outcome journal, used read-only as
 //! the reference denominator.
+use crate::observability::overhead::{self, RunShape};
 use anyhow::{Context, Result};
-use loom_daemon::observability::overhead::{self, RunShape};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]

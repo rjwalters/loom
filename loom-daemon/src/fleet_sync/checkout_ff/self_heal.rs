@@ -45,6 +45,8 @@ use super::{git, CheckoutReport, CheckoutState, Env, Level, Memory, Net, Transit
 pub(super) const RESCUE_PREFIX: &str = "refs/loom/rescue/";
 
 const ESCALATE_ENV: &str = "LOOM_CHECKOUT_ESCALATE_AFTER_MINUTES";
+const REREPORT_ENV: &str = "LOOM_CHECKOUT_REREPORT_AFTER_MINUTES";
+const DEFAULT_REREPORT_MINUTES: u64 = 60;
 const RETAIN_ENV: &str = "LOOM_RESCUE_REF_RETAIN_DAYS";
 const DEFAULT_ESCALATE_MINUTES: u64 = 120;
 const DEFAULT_RETAIN_DAYS: u64 = 14;
@@ -60,6 +62,11 @@ fn env_number(name: &str, default: u64) -> u64 {
 /// How long a hold may stand before it is escalated.
 pub(super) fn escalate_after() -> Duration {
     Duration::from_secs(env_number(ESCALATE_ENV, DEFAULT_ESCALATE_MINUTES) * 60)
+}
+
+/// How often a standing `wrong-branch` hold is said again (#13588).
+pub(super) fn rereport_after() -> Duration {
+    Duration::from_secs(env_number(REREPORT_ENV, DEFAULT_REREPORT_MINUTES) * 60)
 }
 
 /// How long a rescue ref is kept.
@@ -100,6 +107,7 @@ pub(super) fn heal(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) {
     let Some(gd) = classify::git_dir(env, root) else {
         return;
     };
+    rehome(env, root, branch, &gd, net);
     let plan = match classify::classify(env, root, branch, &gd) {
         Verdict::Clean => None,
         Verdict::Leave(why) => {
@@ -135,8 +143,105 @@ pub(super) fn heal(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) {
     }
 }
 
+/// A checkout left on another branch, or detached, whose HEAD holds nothing
+/// that is not on `origin/<branch>` or a merged pull request's head (#13588)
+/// goes back on `branch`; the rules after this fast-forward it. Anything in
+/// doubt is left, and reported as `wrong-branch` as before.
+fn rehome(env: &Env<'_>, root: &Path, branch: &str, gd: &Path, net: &mut Net) {
+    let strand = match classify::stranded(env, root, branch, gd) {
+        Ok(Some(strand)) => strand,
+        Ok(None) => return,
+        Err(why) => {
+            log::debug!("checkout_ff: {}: self-heal: stays off `{branch}`: {why}", root.display());
+            return;
+        }
+    };
+    let Some(_hold) = writable(env, root) else {
+        return;
+    };
+    let result = (|| -> Result<(), String> {
+        // A rescue ref already at this HEAD is the same way back, so reuse it
+        // rather than making one per pass (#13835): the checkout below can
+        // fail for a reason that holds pass after pass (the default branch is
+        // checked out in another worktree, an untracked file is in the way),
+        // and each new ref then sat until it was pruned 14 days later.
+        let rescue = match existing_rescue_ref(root, &strand.head) {
+            Some(found) => found,
+            None => {
+                let made = rescue_ref(root, &stamp((env.clock)()), "", &strand.head)?;
+                say(
+                    net,
+                    root,
+                    "rescue-ref",
+                    Level::Info,
+                    format!("rescue ref {made} -> {}", strand.head),
+                );
+                made
+            }
+        };
+        let own = format!("refs/heads/{branch}");
+        let exists =
+            git::ok(root, &["rev-parse", "--verify", "--quiet", &own], git::LOCAL_TIMEOUT).is_ok();
+        let tracking = git::tracking(branch);
+        let args: Vec<&str> = if exists {
+            vec!["checkout", "--quiet", branch]
+        } else {
+            vec!["checkout", "--quiet", "-B", branch, "--track", &tracking]
+        };
+        let out = git::run(root, &["core.hooksPath=/dev/null"], &args, git::MERGE_TIMEOUT)?;
+        if !out.status.success() {
+            return Err(format!("git {} failed: {}", args.join(" "), git::stderr(&out)));
+        }
+        let was = strand
+            .from
+            .as_deref()
+            .map_or_else(|| "a detached HEAD".to_string(), |b| format!("`{b}`"));
+        // Nothing was carried when every commit on HEAD was already on
+        // `origin/<branch>`; the clause would read "(0 commit(s) ...)" (#13835).
+        let carried = if strand.unique == 0 {
+            String::new()
+        } else {
+            format!(" ({} commit(s) only on a merged PR)", strand.unique)
+        };
+        say(
+            net,
+            root,
+            "rehomed",
+            Level::Warn,
+            format!("put back on `{branch}` from {was}{carried}, recoverable from {rescue}"),
+        );
+        Ok(())
+    })();
+    if let Err(e) = result {
+        say(
+            net,
+            root,
+            "repair-failed",
+            Level::Warn,
+            format!("stopped, checkout left as is: {e}"),
+        );
+    }
+}
+
 fn stamp(at: DateTime<Utc>) -> String {
     at.format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// An existing rescue ref already pointing at `sha`, if there is one (#13835).
+/// Any of them is an equally good way back to that commit, so the first by
+/// refname (`for-each-ref`'s own order, so the answer is stable across passes)
+/// is taken. `None` on a failed read: the caller then makes a new ref, which is
+/// the behaviour from before this reuse existed.
+fn existing_rescue_ref(root: &Path, sha: &str) -> Option<String> {
+    let args = [
+        "for-each-ref",
+        "--format=%(refname)",
+        "--points-at",
+        sha,
+        RESCUE_PREFIX,
+    ];
+    let listed = git::ok(root, &args, git::LOCAL_TIMEOUT).ok()?;
+    listed.lines().next().map(str::to_string)
 }
 
 /// A rescue ref at `sha` named `refs/loom/rescue/<ts><suffix>`, never over an
@@ -317,6 +422,9 @@ pub(super) fn expired_rescue_refs(
 pub struct Ledger {
     /// Root -> the `since` of the hold that was escalated.
     asked: HashMap<PathBuf, DateTime<Utc>>,
+    /// Root -> (the `since` of a standing `wrong-branch` hold, when it was
+    /// last said).
+    said: HashMap<PathBuf, (DateTime<Utc>, DateTime<Utc>)>,
 }
 
 /// The holds the self-heal does not clear: a person's or an agent's work.
@@ -390,6 +498,47 @@ pub(super) fn escalate(
     });
 }
 
+/// Say a standing `wrong-branch` hold again every `every` (#13588): the
+/// ordinary transition is logged once, and a checkout left off its default
+/// branch goes stale silently. One `still-held` transition (a log line and an
+/// event on the checkout topic) per interval, so the hold can be counted.
+pub(super) fn rereport(
+    ledger: &mut Ledger,
+    report: &CheckoutReport,
+    now: DateTime<Utc>,
+    every: Duration,
+    out: &mut Vec<Transition>,
+) {
+    if report.state != CheckoutState::WrongBranch {
+        ledger.said.remove(&report.root);
+        return;
+    }
+    let last = match ledger.said.get(&report.root) {
+        Some((since, last)) if *since == report.since => *last,
+        _ => report.since,
+    };
+    if now.signed_duration_since(last).to_std().unwrap_or_default() < every {
+        return;
+    }
+    ledger.said.insert(report.root.clone(), (report.since, now));
+    let stood = now
+        .signed_duration_since(report.since)
+        .to_std()
+        .unwrap_or_default();
+    out.push(Transition {
+        kind: "still-held",
+        level: Level::Warn,
+        previous: None,
+        line: format!(
+            "{}: still `wrong-branch` after {} min, not repaired: {}",
+            report.root.display(),
+            stood.as_secs() / 60,
+            report.detail.as_deref().unwrap_or("off the default branch"),
+        ),
+        report: report.clone(),
+    });
+}
+
 /// Turn a checkout's repair steps into transitions, and escalate its hold.
 pub(super) fn after(
     env: &Env<'_>,
@@ -406,4 +555,5 @@ pub(super) fn after(
         report: report.clone(),
     }));
     escalate(&mut memory.escalated, report, (env.clock)(), escalate_after(), out);
+    rereport(&mut memory.escalated, report, (env.clock)(), rereport_after(), out);
 }

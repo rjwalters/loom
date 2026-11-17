@@ -424,7 +424,7 @@ impl SweepRegistry {
     /// `issue`, if any (Issue #8912) — the most recently started one when more
     /// than one entry matches (a superseded claim leaves the older entry behind
     /// until its own reap).
-    fn live_issue_sweep_id(&self, issue: u32) -> Option<String> {
+    pub(crate) fn live_issue_sweep_id(&self, issue: u32) -> Option<String> {
         self.entries
             .values()
             .filter(|info| {

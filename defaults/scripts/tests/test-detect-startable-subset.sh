@@ -41,39 +41,8 @@ loom_test_require_daemon_bin "$SCRIPTS_DIR" "detect-startable-subset"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    if [[ "$expected" == "$actual" ]]; then
-        pass "$msg"
-    else
-        fail "$msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
-
-assert_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then
-        pass "$msg"
-    else
-        fail "$msg"
-        echo "    Expected to contain: '$needle'"
-        echo "    Actual: '$haystack'"
-    fi
-}
-
 assert_true() { if "$@"; then pass "${!#}"; else fail "${!#}"; fi; }
 assert_false() { if "$@"; then fail "${!#}"; else pass "${!#}"; fi; }
-
-assert_doc_contains() {
-    local file="$1" needle="$2" msg="$3"
-    if grep -qF -- "$needle" "$file"; then
-        pass "$msg"
-    else
-        fail "$msg (missing literal in $file: $needle)"
-    fi
-}
 
 # =====================================================================
 # Where the pure-helper unit tests went (epic #7810, PR 3)

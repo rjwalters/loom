@@ -178,6 +178,21 @@ impl RollTarget {
         }
     }
 
+    /// A same-binary restart for restart-required config (#12425): the roll
+    /// is to the running version, so H5 records `from_version == to_version`.
+    /// No artifact identity: nothing is fetched and a newer release never
+    /// supersedes it.
+    #[must_use]
+    pub fn config_restart(running_version: &str) -> Self {
+        Self {
+            source: TargetSource::ConfigRestart,
+            to_version: Some(running_version.to_string()),
+            to_artifact_sha256: None,
+            label: None,
+            floor_at_arm: None,
+        }
+    }
+
     /// A source-rebuild roll: the checkout is ahead of the running binary.
     #[must_use]
     pub fn repo_ahead() -> Self {
@@ -566,10 +581,6 @@ impl Run<'_> {
         });
     }
 
-    /// Undo a pause that has stopped nothing: withdraw every pause request,
-    /// hand the sweeps back to the reaper, delete the manifest. Only this
-    /// run's: a superseded run that gets here late leaves its replacement's
-    /// manifest, requests and holds alone ([`RunLedger::undo`]).
     /// Why the floor no longer asks for this roll, when it does not (#12610).
     /// Only a floor-driven roll can be withdrawn this way.
     fn floor_withdrawn(&self) -> Option<String> {
@@ -615,6 +626,10 @@ impl Run<'_> {
         H4Outcome::StoodDown { promoted: false }
     }
 
+    /// Undo a pause that has stopped nothing: withdraw every pause request,
+    /// hand the sweeps back to the reaper, delete the manifest. Only this
+    /// run's: a superseded run that gets here late leaves its replacement's
+    /// manifest, requests and holds alone ([`RunLedger::undo`]).
     fn stand_down(&mut self, promoted: bool) -> H4Outcome {
         self.ledger.undo(self.host.as_ref());
         log::warn!(

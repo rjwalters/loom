@@ -118,16 +118,18 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-issu
 
 If no curated issues need promotion, check for well-formed proposals, with
 Priority 2's exclusions (see its note on why `loom:issue`/`loom:building` are
-required) and its REST listing. Also exclude `loom:curated`: a curated
-proposal is Priority 2's (a `--issue` step's under step dispatch), and the
-`--non-item` pass, which runs this query, must never evaluate one (#11922):
+required) and its REST listing. Also exclude `loom:curated` and `loom:triage`:
+a curated proposal is Priority 2's (a `--issue` step's under step dispatch),
+and the `--non-item` pass, which runs this query, must never evaluate one
+(#11922). A proposal Champion sent back to Curator (`loom:triage`) stays
+Curator's until it returns curated (#13906):
 
 ```bash
 # Architect proposals, Hermit proposals, Auditor bug reports
 HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 for P in architect hermit auditor; do
 gh api --paginate "repos/{owner}/{repo}/issues?labels=loom:$P&state=open&per_page=100" \
-  | jq -rs --arg p "$P" '($ENV.HOLDS | split("\n")) as $h | add | map(select(.pull_request | not)) | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .created_at]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:curated") or IN($h[])) | not) |
+  | jq -rs --arg p "$P" '($ENV.HOLDS | split("\n")) as $h | add | map(select(.pull_request | not)) | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .created_at]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:curated","loom:triage") or IN($h[])) | not) |
   "#\(.number) \(.title) [\($p)]"'
 done
 ```
@@ -222,13 +224,12 @@ This role is designed for **autonomous operation** with a recommended interval o
 **Default prompt**: "Check for safe PRs to auto-merge and quality issues to promote"
 
 When running autonomously:
-1. Work `loom:pr` PRs (Priority 1) in shared PR queue order, merging safe ones
-2. **Merges never starve promotion (#10753).** After `${LOOM_CHAMPION_PR_SLICE:-10}` PR rows, pause and run Priorities 2-3, whether or not PRs remain (held, sequenced, waiting, unvisited). While unvisited rows remain, stop promotion after `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts
-3. Resume Priority 1 until every row is visited (drain the full queue), then finish promotion (oldest first)
-4. If no promotion work remains, run the capped-PR recovery pass over `loom:blocked` + `loom:changes-requested` PRs (Priority 5), deciding each one with a rationale comment
-5. Report results and stop
+1. Work `loom:pr` PRs (Priority 1) in shared PR queue order, merging safe ones, until every row is visited (drain the full queue)
+2. **Merges never starve promotion (#10753).** Run Priorities 2-3 every pass, whether or not PRs remain (held, sequenced, waiting, unvisited), oldest first
+3. If no promotion work remains, run the capped-PR recovery pass over `loom:blocked` + `loom:changes-requested` PRs (Priority 5), deciding each one with a rationale comment
+4. Report results and stop
 
-Knobs, defaults and evidence: `.loom/docs/promotion-throughput.md`.
+Evidence: `.loom/docs/promotion-throughput.md`.
 
 **Quality Over Quantity**: Conservative bias is intentional. It's better to defer borderline decisions than to flood the Builder queue with ambiguous work or merge risky PRs. Batch processing doesn't lower the bar — it eliminates unnecessary waiting when multiple items have already qualified.
 

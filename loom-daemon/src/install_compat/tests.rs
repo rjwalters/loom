@@ -5,6 +5,7 @@ use crate::install_compat_harness::{
     floors_above_claim, hard_floors, installed_shell_files, invoked_files_from_source,
     optional_subs, parse_detector_list, subcommand_unrecognized,
 };
+use crate::test_git_helpers::run as git;
 use std::path::PathBuf;
 
 /// Today's `.loom/install-metadata.json` shape (this repo, 2026-10-07): no
@@ -339,16 +340,6 @@ fn only_claps_refusal_counts_as_a_missing_subcommand() {
 
 // ---- reader -----------------------------------------------------------------
 
-fn git(dir: &Path, args: &[&str]) {
-    let st = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(st.success(), "git {args:?}");
-}
-
 fn repo_with_origin_main(metadata: Option<&str>) -> tempfile::TempDir {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path();
@@ -438,4 +429,41 @@ fn reader_returns_none_without_metadata_and_errors_without_a_branch() {
 fn reader_rejects_malformed_metadata() {
     let repo = repo_with_origin_main(Some("{not json"));
     assert!(read_default_branch(repo.path()).is_err());
+}
+
+/// Pins the `capabilities --json` / `install-compat show --json` schema
+/// (#12939). The shell side reads `payload_identity` and `schema_version`;
+/// removing or renaming a key is a `CAPABILITIES_SCHEMA_VERSION` bump.
+#[test]
+fn capabilities_json_schema_is_pinned() {
+    let d = daemon();
+    let obj = capabilities_json(&d, None);
+    let mut keys: Vec<&str> = obj
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "classification",
+            "installed",
+            "invoked_files",
+            "payload_identity",
+            "requires_daemon",
+            "running",
+            "schema_version",
+            "supports_installed",
+        ]
+    );
+    assert_eq!(obj["schema_version"], CAPABILITIES_SCHEMA_VERSION);
+    assert_eq!(obj["payload_identity"], payload_identity());
+    assert!(obj["installed"].is_null() && obj["classification"].is_null());
+
+    let m = meta(Some("0.19.700"), Some(REQUIRES_DAEMON));
+    let with = capabilities_json(&d, Some(&m));
+    assert_eq!(with["installed"]["loom_version"], "0.19.700");
+    assert!(with["classification"].is_string());
 }

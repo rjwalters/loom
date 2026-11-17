@@ -393,7 +393,10 @@ fn group_check_report(env: &Env, commit: &str, repo: Option<&String>) -> Report 
     }
     let required = match super::preflight::github_preflight(&env.gh, &nwo, None) {
         Ok(c) => c.required_checks,
-        Err(e) => return undetermined(&format!("required contexts unreadable: {e}")),
+        Err(e) => {
+            super::group_run::signal_rules_unreadable(&nwo, Some(&e.to_string()));
+            return undetermined(&format!("required contexts unreadable: {e}"));
+        }
     };
     let store = CommentGrantStore::new(&l.forge, "group-check", chrono::Utc::now());
     let states = GhContextStates {

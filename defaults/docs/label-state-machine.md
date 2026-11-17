@@ -47,7 +47,7 @@ Loom has three hold labels, each with one meaning:
 
 | Label | Meaning | Release |
 |---|---|---|
-| `loom:blocked` | Waiting on something outside the item: another change merging, a capability, a dependency. The park record or a `Blocked by #N` line says what. Also Champion's own merge-risk and critical-file PR holds (#11861, "Champion's PR holds" below) | A role or a human, once the blocker resolves. Nothing lifts it automatically: the daemon's release pass was retired (#11301). `check-stale-blocked` and `merge-pr.sh`'s cleared-blocker notice report cleared blockers; see [`park-record.md`](park-record.md). Champion releases its own PR holds |
+| `loom:blocked` | Waiting on something outside the item: another change merging, a capability, a dependency. The park record or a `Blocked by #N` line says what. Also Champion's own merge-risk and critical-file PR holds (#11861, "Champion's PR holds" below) | A role or a human, once the blocker resolves. Nothing lifts it automatically, with one carve-out (#13331): `merge-pr.sh`'s cleared-blocker notice (`notify-cleared-blockers`) swaps `loom:blocked` for `loom:curated` on an issue whose park records are all `by=curator`, name a blocker, and whose every blocker has merged or closed (no unticked dependency, no `loom:operator`/`loom:frozen`/hard-exclusion label); it never adds `loom:issue`. The daemon's release pass stays retired (#11301). `check-stale-blocked` and `merge-pr.sh`'s cleared-blocker notice report cleared blockers; see [`park-record.md`](park-record.md). Champion releases its own PR holds |
 | `loom:operator` | A human must act or decide. The body says which: a ```` ```decision ```` block is a ruling ([`operator-decision.md`](operator-decision.md)); otherwise the comment names the step; a `Blocked by #N` line says the human action waits on something named | A human removes it. Nothing else does |
 | `loom:frozen` | Not now; don't touch (#11743). No agent or daemon path reads it as work, comments on it or relabels it | A human removes it |
 
@@ -214,8 +214,8 @@ the migration table in `priority-model.md`.
 
 | Role | Trigger | Label |
 |---|---|---|
-| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (criterion #2) | `loom:blocked` (#11861) — `champion-pr-merge.md`, "Hold behavior" |
-| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | `loom:blocked` (#11861) — `champion-critical-file-hold.md` |
+| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (the `merge-risk` criterion) | `loom:blocked` (#11861) — `champion-pr-merge.md`, "Hold behavior" |
+| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because the `critical-files` criterion matched a critical-file pattern | `loom:blocked` (#11861) — `champion-critical-file-hold.md` |
 | Champion (issue close) | Holds a merged PR's linked **issue** open because one of its acceptance criteria needs out-of-band verification and no `loom:ac-verified` marker attests it | `loom:operator` (#6883) — `champion-pr-merge.md`, Step 4; per-repo off switch `champion.outOfBandAcGate=false` (#12703, first use: 2AMLogic/loom-ui) |
 | Champion (promotion) | A proposal's only recurring finding is an open dependency | `loom:blocked` + one park record per blocker (#11860, #11861) — Step 4 `park-record apply --blocked-by` |
 | Curator / Builder / Doctor / Judge | Encounters work that needs a ruling or a human's hands | `loom:operator` (#11795) — "Routing to a human" above |
@@ -223,7 +223,7 @@ the migration table in `priority-model.md`.
 
 ## Champion's PR holds (#11861)
 
-A merge-risk hold (criterion #2) and a critical-file hold (criterion #3) are
+A merge-risk hold (the `merge-risk` criterion) and a critical-file hold (the `critical-files` criterion) are
 Champion's own, and Champion must keep re-evaluating and releasing them. Before
 #11861 they used `loom:operator`, which was not a park on a PR. Under the
 all-role rule they moved to `loom:blocked`:
@@ -271,16 +271,16 @@ gh pr edit <N> --remove-label "loom:blocked"
 ./.loom/scripts/merge-pr.sh <N>
 ```
 
-- **Critical-file hold** (criterion #3): the release is scoped to the **diff**,
+- **Critical-file hold** (the `critical-files` criterion): the release is scoped to the **diff**,
   not to a commit id (#9416). Champion acknowledges it once, behind a
   `champion:critical-file-release-respected` marker, and does not re-apply the
   label. A push that changes the diff re-arms the hold; a head move across which
   the PR's own change is *provably* unchanged (`loom-daemon forge
   verdict-equivalent`) does not. See `champion-critical-file-hold.md` and
   `critical-file-hold.md`.
-- **Merge-risk hold** (criterion #2): your removal (a human `unlabeled` event
+- **Merge-risk hold** (the `merge-risk` criterion): your removal (a human `unlabeled` event
   after the hold) **releases** it (#11416). Champion merges it on its next tick
-  unless it finds a concern the hold did not name (criteria #3-#6 still apply),
+  unless it finds a concern the hold did not name (the `critical-files`, `mergeable`, `recency` and `ci-green` criteria still apply),
   posting the reversal comment. A human removal of the pre-#11861
   `loom:operator` counts too, so a hold released before the migration stays
   released.
@@ -340,11 +340,25 @@ Champion's content criteria say nothing about who wrote the issue. So before any
 `check-promotion-landed.sh --apply` backstop) it asks
 `loom-daemon forge promotion-author --number N`, which judges the issue **author**
 with the same predicate as [`comment-trust.md`](comment-trust.md) (repo insider, a
-fleet App, this daemon, `forge.trustedCommenters`, the fleet admin roster), with
+fleet App, this daemon, `forge.trustedCommenters`, the fleet admin roster, the fleet trusted Apps list
+`apps` in `fleet/admins.json`, #13545), with
 no second trust table. Only `TRUSTED` promotes. An `UNTRUSTED` author, or an
 `UNKNOWN` one (the issue could not be read), leaves the issue at `loom:curated`
-with one comment (keyed on `<!-- loom:promotion-author-gate -->`, so retries do not
-repeat it). Unreadable evidence never counts as trust.
+with one comment (keyed on its `<!-- loom:promotion-author-gate rev=… trust=… -->`
+marker line, so retries do not repeat it). Unreadable evidence never counts as trust.
+The marker records the issue's title/body revision and the trust-rules digest; while a
+trusted notice matches both, the step tick excludes the issue from `champion_promote`
+(pass reason `author_gate_held`, #13142) instead of re-drawing a session that can only
+repeat the verdict. A body edit, a trust-list change, or a legacy unstamped notice
+makes it drawable once; a trusted `loom:issue` takes it out of the queue.
+
+**ci-daily tracker exception (#13378).** `promotion-author` also returns `TRUSTED` for an
+issue authored by exactly `github-actions[bot]` whose title starts with `[ci-daily] ` and
+whose body contains ``opened, updated and closed by `.github/workflows/ci-daily.yml` ``
+(the sentence the workflow writes into every tracker); all three must hold. The exception
+lives in the author gate only: the bot is not added to `forge.trustedCommenters`, so its
+comments and markers stay untrusted everywhere (`forge trusted-comments`, verdict and
+hold markers, PRs and non-tracker issues).
 
 Adoption is a trusted maintainer applying `loom:issue` by hand, or re-filing the
 issue; an automated Champion verdict alone is not adoption. Trusted authors see no
@@ -353,12 +367,12 @@ a compromised trusted agent, and it adds no signed decisions or keys.
 
 ## Current implementation
 
-- **Criterion #2 (merge-risk hold)** — `champion-pr-merge.md`: entry in
+- **The `merge-risk` criterion (merge-risk hold)** — `champion-pr-merge.md`: entry in
   "Hold behavior" (`park-record apply --pr`), exit in Step 2 (`gh pr edit
   --remove-label loom:blocked`, gated on `$HOLD_REVERSAL_BLOCK`), repair in
   the sticky precheck (`LABEL_REPAIR`).
-- **Criterion #3 (critical-file hold, #6879, #9016)** —
-  `champion-critical-file-hold.md`, run after criterion #3's check-loop: add on
+- **The `critical-files` criterion (critical-file hold, #6879, #9016)** —
+  `champion-critical-file-hold.md`, run after the `critical-files` criterion's check-loop: add on
   FAIL, remove with the `champion:critical-file-hold-cleared` notice once a push
   leaves every pattern, and respect a human's hand-removal at the held diff.
 - **Queues** — `pr-queue --role champion` keeps `loom:pr` + `loom:blocked`
@@ -706,6 +720,13 @@ hold); factual findings get one Curator disposition round first.
 `loom:triage` (`labels migrate` also strips `loom:curated`). Contract and
 bound: [`promotion-throughput.md`](promotion-throughput.md).
 
+**Awaiting-revision parks (#10936)**: a `loom:blocked` issue parked only as
+"awaiting (Architect) revision" / "awaiting a design epic", with no named
+blocker, is converted by Guide onto this same revise path (`loom:triage`, park
+record removed, a `champion:revise:body-<HASH>` ask). No new label. A park that
+names a blocker, or carries `loom:operator` / `loom:frozen` / `loom:building` /
+`loom:curating` / a permanent-block marker, is left alone.
+
 ## Fact-based de-escalation of a Champion `proposal-escalated` hold (#7650, retired by #11861)
 
 Curator used to remove `loom:operator` from Champion's escalation once it had
@@ -798,6 +819,20 @@ a park record with no blocker and `reason="ci-gate"`.
 A CI-only gate must not add `loom:blocked`; if one is unavoidable, park with
 `loom-daemon park-record apply --issue <PR> --reason ci-gate --by judge` so the
 pass can tell it from a real hold.
+
+**A CI-only verdict is never re-anchored across a head move (#13822).** The
+head-move re-anchor carve-out (`verdict_invalidation`, #9124/#9416) carries a
+verdict forward when the new head is the same *change*; it skips a CI-only
+`changes-requested` entirely, because that verdict records no review and its one
+requested change is the head move itself. Such a PR takes the ordinary
+stale-verdict clear instead: `loom:changes-requested` + `loom:ci-failure` off,
+`loom:review-requested` on. Without that skip the rejection was copied onto the
+very head that fixed it, in a comment carrying no `<!-- loom:ci-gate-only -->`
+marker — so this pass skipped the PR as `VerdictNotCiOnly`, `forge
+doctor-handback` read the re-anchored same-head marker as a *fresh* rejection and
+withdrew its own `loom:review-requested`, and the PR sat on
+`loom:changes-requested` alone with green CI and no Judge ever queued (PR #13593).
+A verdict carrying a real review still re-anchors.
 
 ## Follow-up work
 

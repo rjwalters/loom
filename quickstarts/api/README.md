@@ -96,8 +96,6 @@ Visit `http://localhost:8787/docs` to see the Swagger UI.
 │   │   └── judge.md        # API review criteria
 │   └── scripts/
 │       └── worktree.sh
-├── .github/
-│   └── labels.yml
 ├── migrations/
 │   └── 0001_initial.sql    # D1 schema
 ├── src/

@@ -259,8 +259,12 @@ fn a_failed_kind_probe_skips_only_that_owner_names_it_and_retries_next_cycle() {
     assert!(status.owners[0].error.is_some() && status.owners[0].kind.is_none());
 
     // An owner skip is not a cycle failure: health is `degraded` and names
-    // the skipped owners, with no failure count accrued.
-    assert_eq!(status.consecutive_failures, 0);
+    // the skipped owners, and the skip counts as a failure (#13640).
+    assert_eq!(status.consecutive_failures, 1);
+    assert!(status
+        .last_error
+        .as_deref()
+        .is_some_and(|e| e.starts_with("owner ghost")));
     match state::classify(&status, status.last_attempt_at.unwrap(), 120) {
         state::Health::Degraded { failing_owners, .. } => {
             let names: Vec<_> = failing_owners.iter().map(|(o, _)| o.as_str()).collect();
@@ -508,4 +512,101 @@ fn a_user_owned_repos_issue_branch_run_carries_no_story_keys() {
         })
         .collect();
     assert!(stories.is_empty(), "no span carries a story key: {stories:?}");
+}
+
+/// An API whose `users/<login>` probe fails in transport (a hung `gh`) and
+/// whose `orgs/<login>` answer is configurable; everything else is the fixture.
+struct HungUsersProbe {
+    inner: FixtureApi,
+    orgs_ok: bool,
+}
+
+impl GithubApi for HungUsersProbe {
+    fn get(&self, path: &str, etag: Option<&str>) -> Result<ApiResponse, ApiError> {
+        if path == format!("users/{ORG}") {
+            self.inner
+                .requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), None));
+            return Err(ApiError::Transport("gh api users timed out after 120s".into()));
+        }
+        if path == format!("orgs/{ORG}") && !self.orgs_ok {
+            self.inner
+                .requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), None));
+            return Err(ApiError::Transport("gh api orgs timed out after 120s".into()));
+        }
+        self.inner.get(path, etag)
+    }
+
+    fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError> {
+        self.inner.get_document(path)
+    }
+}
+
+#[test]
+fn a_transport_failure_on_the_users_probe_falls_back_to_orgs() {
+    let dir = TempDir::new().unwrap();
+    let inner = FixtureApi::new();
+    inner
+        .responses
+        .lock()
+        .unwrap()
+        .insert(format!("orgs/{ORG}"), owner_kind_body("Organization"));
+    let api = HungUsersProbe {
+        inner,
+        orgs_ok: true,
+    };
+    let kinds: Arc<KindCache> = Arc::default();
+    let ctx = CycleContext {
+        owners: vec![Owner::probed(ORG)],
+        owner_kinds: kinds.clone(),
+        ..ctx(dir.path())
+    };
+    let report = run_cycle(&ctx, &api).unwrap();
+    assert!(report.owners[0].error.is_none(), "{:?}", report.owners);
+    assert_eq!(report.owners[0].kind, Some(OwnerKind::Organization));
+    assert_eq!(kinds.lock().unwrap().get(ORG), Some(&OwnerKind::Organization));
+    let paths = requested(&api.inner);
+    assert_eq!(&paths[..2], [format!("users/{ORG}"), format!("orgs/{ORG}")]);
+}
+
+#[test]
+fn both_probes_timing_out_skips_the_owner_and_counts_a_failure() {
+    let dir = TempDir::new().unwrap();
+    let api = HungUsersProbe {
+        inner: two_owner_api(),
+        orgs_ok: false,
+    };
+    let ctx = CycleContext {
+        owners: vec![Owner::probed(ORG), Owner::probed(USER)],
+        owner_kinds: Arc::default(),
+        ..ctx(dir.path())
+    };
+    let report = run_cycle(&ctx, &api).unwrap();
+    assert_eq!(report.repo_errors.len(), 1, "{:?}", report.repo_errors);
+    assert!(report.repo_errors[0].contains("also failed"), "{:?}", report.repo_errors);
+    assert_eq!(report.summary.repos_polled, 1, "the other owner is still polled");
+    let status = state::load_status(&state_dir(dir.path()));
+    assert_eq!(status.consecutive_failures, 1);
+    assert!(matches!(
+        state::classify(&status, status.last_attempt_at.unwrap(), 120),
+        state::Health::Degraded { .. }
+    ));
+}
+
+#[test]
+fn a_404_on_the_users_probe_does_not_try_orgs() {
+    let dir = TempDir::new().unwrap();
+    let api = FixtureApi::new();
+    let ctx = CycleContext {
+        owners: vec![Owner::probed("ghost")],
+        owner_kinds: Arc::default(),
+        ..ctx(dir.path())
+    };
+    let _ = run_cycle(&ctx, &api);
+    assert!(!requested(&api).iter().any(|p| p.starts_with("orgs/ghost")));
 }

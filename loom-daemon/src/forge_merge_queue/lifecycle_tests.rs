@@ -58,6 +58,8 @@ struct Gh {
     /// Pushed to the head the instant the enqueue mutation arrives.
     push_during_enqueue: RefCell<Option<String>>,
     calls: Cell<u32>,
+    /// GitHub's `headCommit` for a queued entry can be the merge-group commit.
+    entry_reports_group_commit: Cell<bool>,
 }
 
 impl Gh {
@@ -78,6 +80,7 @@ impl Gh {
             cannot_post: Cell::new(false),
             push_during_enqueue: RefCell::new(None),
             calls: Cell::new(0),
+            entry_reports_group_commit: Cell::new(false),
         }
     }
     fn tick(&self) {
@@ -143,7 +146,11 @@ impl QueueApi for Gh {
             entry: self.queued.borrow().clone().map(|h| QueueEntry {
                 state: "AWAITING_CHECKS".into(),
                 position: Some(1),
-                head_oid: Some(h),
+                head_oid: Some(if self.entry_reports_group_commit.get() {
+                    GROUP_SHA.into()
+                } else {
+                    h
+                }),
             }),
         })
     }
@@ -306,6 +313,124 @@ fn enqueue_is_not_merge_and_merge_is_confirmed_once() {
         }
     );
     assert_eq!(kinds(&ev), vec![EventKind::Enqueued, EventKind::Merged]);
+}
+
+#[test]
+fn a_merge_group_head_on_the_entry_does_not_revoke_a_same_head_grant() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    gh.entry_reports_group_commit.set(true);
+    hand(&gh, &ev).unwrap();
+    let r = reconcile_pr(&ctx(&gh, &ev, MergeMode::Queue, t0()), PR);
+    assert!(matches!(r, Reconciled::StillQueued { .. }), "{r:?}");
+    assert_eq!(gh.count("loom:merge-queue-revoke"), 0);
+    assert!(gh.queued.borrow().is_some(), "still queued");
+    assert!(matches!(hand(&gh, &ev), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+}
+
+#[test]
+fn a_moved_head_after_the_grant_is_still_revoked_withdrawing_the_status() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    gh.entry_reports_group_commit.set(true);
+    hand(&gh, &ev).unwrap();
+    *gh.head.borrow_mut() = SHA2.into();
+    let r = reconcile_pr(&ctx(&gh, &ev, MergeMode::Queue, t0()), PR);
+    assert!(matches!(r, Reconciled::Continue(Some(_))), "{r:?}");
+    assert_eq!(gh.count("loom:merge-queue-revoke"), 1);
+    assert!(gh.queued.borrow().is_none(), "dequeued");
+    assert_eq!(
+        gh.head_status.borrow().get(SHA1),
+        Some(&StatusState::Failure),
+        "no success status beside a revoked grant"
+    );
+}
+
+/// A forge whose enqueue loses a race to a concurrent enqueue of the same head.
+struct Racing<'a>(&'a Gh);
+
+impl QueueApi for Racing<'_> {
+    fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+        self.0.status(pr)
+    }
+    fn enqueue(&self, pr: u32, n: &str, expected: &str) -> Result<EnqueueAck, QueueError> {
+        self.0.enqueue(pr, n, expected)?;
+        Ok(EnqueueAck::AlreadyQueued)
+    }
+    fn dequeue(&self, pr: u32, n: &str) -> Result<DequeueAck, QueueError> {
+        self.0.dequeue(pr, n)
+    }
+}
+
+#[test]
+fn direct_enqueue_of_a_queued_same_head_pr_ignores_the_group_commit() {
+    let gh = Gh::new();
+    gh.entry_reports_group_commit.set(true);
+    *gh.queued.borrow_mut() = Some(SHA1.into());
+    assert!(matches!(enqueue(&gh, PR, SHA1), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+}
+
+#[test]
+fn direct_enqueue_of_a_queued_moved_head_pr_is_queued_at_other_head() {
+    let gh = Gh::new();
+    gh.entry_reports_group_commit.set(true);
+    *gh.queued.borrow_mut() = Some(SHA1.into());
+    *gh.head.borrow_mut() = SHA2.into();
+    match enqueue(&gh, PR, SHA1) {
+        Err(QueueError::QueuedAtOtherHead { queued, .. }) => assert_eq!(queued, SHA2),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_enqueue_race_branch_ignores_the_group_commit() {
+    let gh = Gh::new();
+    gh.entry_reports_group_commit.set(true);
+    gh.head_status
+        .borrow_mut()
+        .insert(SHA1.into(), StatusState::Success);
+    assert!(matches!(
+        enqueue(&Racing(&gh), PR, SHA1),
+        Ok(EnqueueOutcome::AlreadyQueued { .. })
+    ));
+}
+
+#[test]
+fn the_enqueue_race_branch_still_flags_a_moved_head_and_a_vanished_entry() {
+    let gh = Gh::new();
+    gh.head_status
+        .borrow_mut()
+        .insert(SHA1.into(), StatusState::Success);
+    struct Moves<'a>(&'a Gh);
+    impl QueueApi for Moves<'_> {
+        fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+            self.0.status(pr)
+        }
+        fn enqueue(&self, pr: u32, n: &str, e: &str) -> Result<EnqueueAck, QueueError> {
+            self.0.enqueue(pr, n, e)?;
+            *self.0.head.borrow_mut() = SHA2.into();
+            Ok(EnqueueAck::AlreadyQueued)
+        }
+        fn dequeue(&self, pr: u32, n: &str) -> Result<DequeueAck, QueueError> {
+            self.0.dequeue(pr, n)
+        }
+    }
+    assert!(matches!(
+        enqueue(&Moves(&gh), PR, SHA1),
+        Err(QueueError::QueuedAtOtherHead { .. })
+    ));
+    struct Vanishes<'a>(&'a Gh);
+    impl QueueApi for Vanishes<'_> {
+        fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+            self.0.status(pr)
+        }
+        fn enqueue(&self, _: u32, _: &str, _: &str) -> Result<EnqueueAck, QueueError> {
+            Ok(EnqueueAck::AlreadyQueued)
+        }
+        fn dequeue(&self, pr: u32, n: &str) -> Result<DequeueAck, QueueError> {
+            self.0.dequeue(pr, n)
+        }
+    }
+    let gh2 = Gh::new();
+    assert!(matches!(enqueue(&Vanishes(&gh2), PR, SHA1), Err(QueueError::Forge { .. })));
 }
 
 #[test]
@@ -581,6 +706,30 @@ fn conflict_drop_routes_to_doctor_with_the_verbatim_reason() {
 }
 
 #[test]
+fn hold_caused_group_failure_is_a_hold_not_a_doctor_route() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    hand(&gh, &ev).unwrap();
+    gh.comments.borrow_mut().push(format!(
+        "<!-- champion:merge-risk-hold -->\nheld\n<!-- champion:hold-state head={SHA1} -->"
+    ));
+    gh.github_drops(
+        Some("Required status check \"Daemon Checks\" failed"),
+        t0() + Duration::minutes(3),
+    );
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(4));
+    let r = reconcile_pr(&c, PR);
+    assert!(matches!(
+        r,
+        Reconciled::Dropped {
+            kind: RemovalKind::HumanHold,
+            route_error: None,
+            ..
+        }
+    ));
+    assert!(gh.has_label("loom:pr") && !gh.has_label("loom:changes-requested"));
+}
+
+#[test]
 fn check_failure_and_timeout_use_their_existing_routes() {
     let (gh, _, r) = drop_with(Some("Required status check \"Daemon Checks\" failed"));
     assert!(matches!(
@@ -798,11 +947,39 @@ fn classify_matches_github_snake_case_tokens() {
 }
 
 #[test]
+fn classify_recognises_queue_cleared() {
+    for t in ["queue_cleared", "Queue cleared", "  QUEUE_CLEARED\n"] {
+        assert_eq!(classify(Some(t)), RemovalKind::QueueCleared, "{t:?}");
+    }
+    assert_eq!(classify(Some("queue_cleared_by_octocat")), RemovalKind::Unknown);
+    assert_eq!(RemovalKind::QueueCleared.as_str(), "queue-cleared");
+}
+
+#[test]
+fn queue_cleared_drop_keeps_loom_pr_and_does_not_page_the_operator() {
+    let (gh, _, r) = drop_with(Some("queue_cleared"));
+    assert!(matches!(
+        r,
+        Reconciled::Dropped {
+            kind: RemovalKind::QueueCleared,
+            route_error: None,
+            ..
+        }
+    ));
+    assert!(gh.has_label("loom:pr"), "loom:pr is kept");
+    assert!(!gh.has_label("loom:operator"), "no operator hold");
+    assert!(!gh.has_label("loom:changes-requested"));
+    // Unrelated unknown text still pages the operator.
+    let (gh, _, _) = drop_with(Some("some_new_token"));
+    assert!(gh.has_label("loom:operator"));
+}
+
+#[test]
 fn manual_removal_does_not_page_the_operator() {
     let r = super::removal::route(RemovalKind::Manual);
     assert!(r.add.is_empty() && r.remove.is_empty());
     assert_eq!(RemovalKind::Manual.as_str(), "manual");
-    assert!(super::removal::drop_prose(RemovalKind::Manual, Some("manual"), None)
+    assert!(super::removal::drop_prose(RemovalKind::Manual, Some("manual"), None, None)
         .contains("**manual**"));
 }
 
@@ -1119,4 +1296,31 @@ fn group_revoke_reports_a_failed_head_write() {
     let rev = revoke_for_transition_groups(&c, &groups, PR, "stale-verdict").unwrap();
     assert!(rev.head_failed.is_err());
     assert!(group_transition_line(&rev).contains("PR head status failure NOT confirmed"));
+}
+
+#[test]
+fn the_dropped_infra_revoke_names_the_cancelled_jobs() {
+    let (gh, _, _) = infra_drop(Ok(vec![run("ci", "success", 0), run("shard-3", "cancelled", 0)]));
+    assert_eq!(gh.count("Cancelled or timed-out group job(s): `shard-3`."), 1);
+}
+
+#[test]
+fn a_declined_infra_refinement_says_which_guard_declined() {
+    let (gh, _, _) = infra_drop(Ok(vec![run("shard-3", "cancelled", 1)]));
+    assert_eq!(gh.count("a step of `shard-3` ended `failure`"), 1);
+    let (gh, _, _) = infra_drop(Ok(vec![run("a", "cancelled", 0), run("lint", "failure", 2)]));
+    assert_eq!(gh.count("`lint` ended with a real failure"), 1);
+    let (gh, _, _) = infra_drop(Err("HTTP 403".to_string()));
+    assert_eq!(gh.count("check runs were unreadable"), 1);
+}
+
+#[test]
+fn a_retry_spent_drop_says_so() {
+    let (gh, ev, _) = infra_drop(Ok(vec![run("t", "cancelled", 0)]));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(10));
+    assert!(handoff(&c, PR, SHA1, &required_ok).is_ok());
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(13));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(14));
+    let _ = reconcile_pr(&c, PR);
+    assert_eq!(gh.count("already had its one infra retry"), 1);
 }

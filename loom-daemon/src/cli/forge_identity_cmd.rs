@@ -1,13 +1,13 @@
 //! `loom-daemon forge token | is-fleet | identities | trusted-comments |
 //! verdict-stale-notice` (#9537, #9548, #9709): the scripts' entry point to the
-//! forge identity broker ([`loom_daemon::forge_identity`]) and the
-//! comment-trust predicate ([`loom_daemon::comment_trust`]).
+//! forge identity broker ([`crate::forge_identity`]) and the
+//! comment-trust predicate ([`crate::comment_trust`]).
 
 use std::path::{Path, PathBuf};
 
+use crate::credential_preflight::{GithubAppMinter, GithubAppOutcome};
+use crate::forge_identity::{self, Identity, IdentityMinter, Roster};
 use anyhow::Result;
-use loom_daemon::credential_preflight::{GithubAppMinter, GithubAppOutcome};
-use loom_daemon::forge_identity::{self, Identity, IdentityMinter, Roster};
 use serde_json::{json, Value};
 
 /// The workspace the command runs for: the MAIN checkout of the cwd's repo
@@ -42,7 +42,7 @@ pub(super) fn workspace() -> PathBuf {
 }
 
 fn mint_as(ws: &Path, identity: &Identity, repo: &str, force: bool) -> GithubAppOutcome {
-    let Some(script_path) = loom_daemon::credential_preflight::resolve_github_app_script(ws) else {
+    let Some(script_path) = crate::credential_preflight::resolve_github_app_script(ws) else {
         return GithubAppOutcome::Error("github-app-token.sh not found in this workspace".into());
     };
     let minter = IdentityMinter {
@@ -220,7 +220,7 @@ pub(crate) fn identities(as_json: bool) -> Result<()> {
 /// (stdin, or issue/PR N's REST listing with `--fetch`) in REST or `gh
 /// --json` shape (one array, concatenated pages, or an object with
 /// `comments`/`reviews`); stdout is the same JSON holding only the comments
-/// whose author [`loom_daemon::comment_trust`] trusts. Exits 1 with nothing
+/// whose author [`crate::comment_trust`] trusts. Exits 1 with nothing
 /// on stdout when the input is not such a document (including empty stdin)
 /// or cannot be fetched, so a caller can never mistake a failed filter for
 /// "no trusted comments".
@@ -239,9 +239,8 @@ pub(crate) fn trusted_comments(
             Some(input)
         }
     };
-    let policy =
-        loom_daemon::comment_trust::TrustPolicy::for_root(&root).with_self_login(self_login);
-    match input.and_then(|i| loom_daemon::comment_trust::filter_document(&policy, &i)) {
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root).with_self_login(self_login);
+    match input.and_then(|i| crate::comment_trust::filter_document(&policy, &i)) {
         Some(Value::Array(items)) if gh_shape => {
             println!("{}", Value::Array(items.iter().map(gh_comment).collect()));
             Ok(())
@@ -262,7 +261,7 @@ pub(crate) fn trusted_comments(
 
 /// `forge claim-liveness` (#10235): the daemon's extra liveness evidence for a
 /// PR claim, as one RFC3339 timestamp (or nothing) — see
-/// [`loom_daemon::claim_reconciliation::extra_liveness_at`]. Exits 1 only on an
+/// [`crate::claim_reconciliation::extra_liveness_at`]. Exits 1 only on an
 /// unparseable `--claimed-at`; a failed forge read prints nothing (fail-safe).
 pub(crate) fn claim_liveness(
     number: u32,
@@ -274,7 +273,7 @@ pub(crate) fn claim_liveness(
         eprintln!("forge claim-liveness: --claimed-at {claimed_at:?} is not RFC3339");
         std::process::exit(1)
     };
-    if let Some(at) = loom_daemon::claim_reconciliation::extra_liveness_at(
+    if let Some(at) = crate::claim_reconciliation::extra_liveness_at(
         &workspace(),
         number,
         label,
@@ -295,7 +294,7 @@ pub(crate) fn verdict_stale_notice(
     head_sha: &str,
     source: &str,
 ) -> Result<()> {
-    use loom_daemon::verdict_stale_notice as notice;
+    use crate::verdict_stale_notice as notice;
     use std::io::Read;
     let Some(kind) = notice::kind_for_label(label) else {
         eprintln!("forge verdict-stale-notice: {label:?} is not a terminal verdict label");
@@ -305,9 +304,9 @@ pub(crate) fn verdict_stale_notice(
     let untrusted = std::io::stdin()
         .read_to_end(&mut input)
         .ok()
-        .and_then(|_| loom_daemon::comment_trust::parse_listing(&input))
+        .and_then(|_| crate::comment_trust::parse_listing(&input))
         .and_then(|items| {
-            let policy = loom_daemon::comment_trust::TrustPolicy::for_root(&workspace());
+            let policy = crate::comment_trust::TrustPolicy::for_root(&workspace());
             notice::untrusted_newer_marker(&policy, &items, kind)
         });
     println!("{}", notice::body(label, marker_sha, head_sha, "", untrusted.as_ref(), source));
@@ -319,7 +318,7 @@ pub(crate) fn verdict_stale_notice(
 fn fetch_listing(root: &Path, n: u64, repo: Option<&str>, with_body: bool) -> Option<Vec<u8>> {
     let repo = repo.unwrap_or("{owner}/{repo}");
     let get = |path: String| {
-        let out = loom_daemon::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+        let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
         out.ok_output().map(|o| o.stdout.clone())
     };
     let comments = get(format!("repos/{repo}/issues/{n}/comments"))?;
@@ -328,7 +327,7 @@ fn fetch_listing(root: &Path, n: u64, repo: Option<&str>, with_body: bool) -> Op
     }
     let issue: Value = serde_json::from_slice(&get(format!("repos/{repo}/issues/{n}"))?).ok()?;
     let mut items = vec![issue];
-    items.extend(loom_daemon::comment_trust::parse_listing(&comments)?);
+    items.extend(crate::comment_trust::parse_listing(&comments)?);
     serde_json::to_vec(&items).ok()
 }
 
@@ -346,12 +345,12 @@ fn gh_comment(c: &Value) -> Value {
 /// name on the write, or exit 1 with the refusal on stderr. Never returns.
 pub(crate) fn may_write(repo: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    match loom_daemon::write_scope::may_write_from(&cwd, repo.as_deref()) {
-        loom_daemon::write_scope::Verdict::Allow(nwo) => {
+    match crate::write_scope::may_write_from(&cwd, repo.as_deref()) {
+        crate::write_scope::Verdict::Allow(nwo) => {
             println!("{nwo}");
             std::process::exit(0)
         }
-        loom_daemon::write_scope::Verdict::Deny(why) => {
+        crate::write_scope::Verdict::Deny(why) => {
             eprintln!("{why}");
             std::process::exit(1)
         }
@@ -359,22 +358,31 @@ pub(crate) fn may_write(repo: Option<String>) -> Result<()> {
 }
 
 /// `forge promotion-author --number N [--repo R]` (#10827): the author gate on
-/// automatic promotion — see [`loom_daemon::promotion_author`]. Prints the
+/// automatic promotion — see [`crate::promotion_author`]. Prints the
 /// verdict token, then the one-time notice body when the issue is held. Exits 1
 /// when the issue could not be read, so a caller cannot take silence for trust.
 pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
-    use loom_daemon::promotion_author::{classify, notice_body};
+    use crate::promotion_author::{classify, notice_body};
     let root = workspace();
     let repo = repo.unwrap_or("{owner}/{repo}");
-    let issue = loom_daemon::comment_trust::records::fetch_issue_object(
-        repo,
-        &number.to_string(),
-        &root,
-        false,
-    );
-    let gate = classify(&loom_daemon::comment_trust::TrustPolicy::for_root(&root), issue.as_ref());
+    let issue =
+        crate::comment_trust::records::fetch_issue_object(repo, &number.to_string(), &root, false);
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let gate = classify(&policy, issue.as_ref());
     println!("{}", gate.token());
-    let body = notice_body(&gate);
+    let text = |key: &str| {
+        issue
+            .as_ref()
+            .and_then(|i| i.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let stamp = issue.as_ref().map(|_| crate::promotion_author::Stamp {
+        rev: crate::promotion_author::revision(&text("title"), &text("body")),
+        trust: policy.digest(),
+    });
+    let body = notice_body(&gate, stamp.as_ref());
     if !body.is_empty() {
         print!("{body}");
     }

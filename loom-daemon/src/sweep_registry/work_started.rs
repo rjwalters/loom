@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::step_role::StepRole;
-use crate::telemetry::kinds::fleet_state::FleetStage;
+use crate::telemetry::kinds::work_started::FleetStage;
 use crate::telemetry::kinds::work_started::{
     role, source, sweep_role_for_marker, WorkStartedRecord,
 };

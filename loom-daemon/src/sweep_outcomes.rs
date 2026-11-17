@@ -1192,8 +1192,15 @@ mod tests {
                 actions: None,
                 source: None,
                 sweep_id: None,
+                issue: None,
+                pr_number: None,
                 deferred_by: None,
                 shard_owner: None,
+                found_work: None,
+                noop_reason: None,
+                verdicts: None,
+                step_class: None,
+                step_reason: None,
             }),
         )
     }

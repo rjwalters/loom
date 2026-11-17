@@ -3,11 +3,11 @@
 //!
 //! Everything opinionated (every verdict rule, the #4694 liveness precedence,
 //! the transient-vs-persistent role classifier, the exit-code contract) lives
-//! in the pure [`loom_daemon::health`] collector. This module only *collects*:
+//! in the pure [`crate::health`] collector. This module only *collects*:
 //! one IPC round-trip, one local install-state probe, one `pgrep`, one
 //! `.ranking` stat, one bounded forge fan-out, and one best-effort
 //! calibration read — then hands the result to
-//! [`loom_daemon::health::assess`] and renders.
+//! [`crate::health::assess`] and renders.
 //!
 //! # Why every probe here is best-effort
 //!
@@ -59,7 +59,7 @@
 //! every other section uses.
 //!
 //! The collection itself is
-//! [`loom_daemon::limit_calibration::compute_with_fallback`]: claude-monitor's
+//! [`crate::limit_calibration::compute_with_fallback`]: claude-monitor's
 //! `usage_history` where that companion is installed, else #8347's persisted
 //! `weekly_point_samples` joined against #8062's daily cost-equivalent by
 //! #8348's pure `calibrate()` — one more best-effort *local* input, never
@@ -82,13 +82,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use loom_daemon::activity::transcript_ingest;
-use loom_daemon::daemon_install_state;
-use loom_daemon::daemon_pidfile;
-use loom_daemon::health::{self, HealthInputs, HealthReport};
-use loom_daemon::limit_calibration::{self, CalibrationStatus};
-use loom_daemon::pipeline_snapshot::{self, GhPipelineSource, PipelineMetrics};
-use loom_daemon::types::{DaemonStatusReport, Request, Response};
+use crate::activity::transcript_ingest;
+use crate::daemon_install_state;
+use crate::daemon_pidfile;
+use crate::health::{self, HealthInputs, HealthReport};
+use crate::limit_calibration::{self, CalibrationStatus};
+use crate::pipeline_snapshot::{self, GhPipelineSource, PipelineMetrics};
+use crate::types::{DaemonStatusReport, Request, Response};
 
 use super::common::{query_daemon_bounded, resolve_socket_path};
 
@@ -118,8 +118,8 @@ use super::common::{query_daemon_bounded, resolve_socket_path};
 /// 2. [`query_status`] retries **exactly once** on a *timeout*-classified
 ///    failure (never a hard one) before ever reporting a failure at all — the
 ///    single-invocation analog of the watchdog's consecutive-failure
-///    debounce, via [`loom_daemon::health::ipc_error_is_probe_timeout`].
-/// 3. If both attempts still fail, [`loom_daemon::health::assess_liveness`]
+///    debounce, via [`crate::health::ipc_error_is_probe_timeout`].
+/// 3. If both attempts still fail, [`crate::health::assess_liveness`]
 ///    reports a lone surviving timeout against a demonstrably-alive daemon as
 ///    `Verdict::Unknown` ("probe budget exceeded"), not `Verdict::Degraded`
 ///    ("confirmed unhealthy") — so it does not, by itself, flip `overall` to
@@ -131,7 +131,7 @@ use super::common::{query_daemon_bounded, resolve_socket_path};
 /// fault, but every retry still used the same short budget, and the resulting
 /// all-`Unknown` report still exited `1` — the same code a genuine
 /// degradation uses. Reconciled two more ways, both gated on
-/// [`loom_daemon::health::alive_with_fresh_heartbeat`] (a signal collected
+/// [`crate::health::alive_with_fresh_heartbeat`] (a signal collected
 /// entirely without IPC, so it costs nothing extra to consult):
 ///
 /// 4. [`query_status`]'s retry uses an **escalated** budget
@@ -139,25 +139,25 @@ use super::common::{query_daemon_bounded, resolve_socket_path};
 ///    verbatim, when local evidence already corroborates the process as alive
 ///    with a fresh heartbeat — worth waiting a little longer for, rather than
 ///    giving up at the same short budget a second time.
-/// 5. If the escalated retry also fails, [`loom_daemon::health::assess`]'s
+/// 5. If the escalated retry also fails, [`crate::health::assess`]'s
 ///    roll-up reports `overall` as the distinct `Verdict::IndeterminateBusy`
 ///    ("busy, not confirmed unhealthy") rather than the ordinary
 ///    `Verdict::Unknown`, at its own exit code
-///    ([`loom_daemon::health::EXIT_INDETERMINATE_BUSY`]) — so a watch loop can
+///    ([`crate::health::EXIT_INDETERMINATE_BUSY`]) — so a watch loop can
 ///    tell "try again shortly" apart from "alert" without parsing `--json`.
 ///
 /// # The budget has to fit the work (#8163)
 ///
 /// Both #6103's load scaling and #6191's escalation are keyed on **host
 /// load**; neither accounts for the fact that the daemon-side work being
-/// waited on ([`loom_daemon::ipc::build_daemon_status`]) is `O(registered
+/// waited on ([`crate::ipc::build_daemon_status`]) is `O(registered
 /// workspace roots)`. On a many-workspace host that build outran even the
 /// escalated `10s` budget on every call, so `health` reported
 /// `indeterminate-busy` on an idle daemon and every section downstream of
 /// liveness came back `unknown`:
 ///
 /// 6. [`resolve_retry_timeout`] takes the **larger** of #6191's fixed floor
-///    and [`loom_daemon::status_budget::client_probe_budget`], derived from
+///    and [`crate::status_budget::client_probe_budget`], derived from
 ///    the registered root count read locally before the round-trip. The
 ///    *first* attempt is deliberately left short (this function's own
 ///    load-scaled base): a fast miss against a genuinely wedged daemon is
@@ -175,12 +175,12 @@ const BASE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// This was the whole escalated budget until #8163, which is exactly why
 /// `health` broke on many-workspace hosts: the daemon's
-/// [`loom_daemon::ipc::build_daemon_status`] is `O(registered roots)` and
+/// [`crate::ipc::build_daemon_status`] is `O(registered roots)` and
 /// measured `13.1s`/`14.3s` on a host with several dozen of them, so both
 /// attempts timed out and `health` reported `indeterminate-busy` (exit `3`)
 /// on an idle, healthy daemon. [`resolve_retry_timeout`] now takes the
 /// **larger** of this floor and
-/// [`loom_daemon::status_budget::client_probe_budget`], which is derived from
+/// [`crate::status_budget::client_probe_budget`], which is derived from
 /// the registered root count — so a single-workspace host keeps this exact
 /// `10s` behaviour and a many-workspace host gets a budget that can actually
 /// cover the build it is waiting on.
@@ -192,9 +192,9 @@ const ESCALATED_IPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// applies to its own IPC budget), then floored — never lowered — by the
 /// shared `LOOM_DAEMON_IPC_TIMEOUT_MS` override.
 fn resolve_ipc_timeout() -> Duration {
-    let logical_cpus = loom_daemon::cpu_headroom::logical_cpu_count();
-    let loadavg_1m = loom_daemon::cpu_headroom::read_loadavg_1m();
-    let load_per_core = loom_daemon::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
+    let logical_cpus = crate::cpu_headroom::logical_cpu_count();
+    let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
+    let load_per_core = crate::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
     resolve_ipc_timeout_for_load(load_per_core)
 }
 
@@ -218,7 +218,7 @@ fn resolve_ipc_timeout_for_load(load_per_core: Option<f64>) -> Duration {
 /// Never returns `Err` for a *health* problem — an unhealthy fleet is a
 /// successful report with a non-zero exit code. `Err` is reserved for the
 /// command being unable to run at all (e.g. an unparseable `--since`).
-pub(crate) async fn handle_health_command(since: Option<String>, json: bool) -> Result<()> {
+pub async fn handle_health_command(since: Option<String>, json: bool) -> Result<()> {
     let window = match since.as_deref() {
         Some(raw) => health::parse_since(raw).map_err(|e| anyhow::anyhow!(e))?,
         None => Duration::from_secs(health::DEFAULT_WINDOW_SECS),
@@ -259,7 +259,7 @@ async fn collect(window: Duration) -> HealthReport {
     // describes the host the probe actually ran against rather than whatever
     // it settled to afterwards. Corroborates (or refutes) the
     // `indeterminate-busy` roll-up — see `health::busy`.
-    let load_per_core = loom_daemon::cpu_headroom::load_per_core();
+    let load_per_core = crate::cpu_headroom::load_per_core();
 
     // 2. The IPC round-trip — the only source for the dispatch/tokens/roles
     //    sections, and the strongest liveness signal there is.
@@ -343,12 +343,12 @@ async fn collect(window: Duration) -> HealthReport {
         .flatten();
 
     // 6. This CLI process's own read-only source-vs-built-commit comparison
-    //    (Issue #6261) — the same `loom_daemon::self_update::check()` call
+    //    (Issue #6261) — the same `crate::self_update::check()` call
     //    `loom-daemon status --json`'s `.self_update` already makes. Feeds
     //    `assess_auto_update`'s staleness magnitude (Issue #7584): no
     //    daemon-side wire change needed since this is cheap enough to run on
     //    every invocation, exactly as `status` already does.
-    let self_update = loom_daemon::self_update::check();
+    let self_update = crate::self_update::check();
 
     // 7. A configured codesign identity's own non-interactive preflight
     //    (Issue #7605) — client-side, no IPC involved, so it is threaded in
@@ -400,7 +400,7 @@ async fn collect(window: Duration) -> HealthReport {
     let transcript_ingest_config =
         transcript_ingest::read_transcript_ingest_config(&transcript_ingest_repo_root);
     let transcript_ingest_status =
-        loom_daemon::transcript_tokens::claude_projects_dir().map(|projects_dir| {
+        crate::transcript_tokens::claude_projects_dir().map(|projects_dir| {
             transcript_ingest::collect_health_status(
                 &limit_calibration::default_activity_db_path(),
                 &projects_dir,
@@ -413,14 +413,14 @@ async fn collect(window: Duration) -> HealthReport {
     //     `transcript_ingest_status` above. `tmpfs_visibility_section` omits
     //     the section entirely when nothing was measurable (e.g. macOS), so
     //     this always collects rather than pre-filtering.
-    let tmpfs_visibility_status = Some(loom_daemon::tmpfs_visibility::collect());
+    let tmpfs_visibility_status = Some(crate::tmpfs_visibility::collect());
 
     // 13. Each managed root's `.loom/resync-ignore` pins (#11970) — local
     //     file reads, from the roots the daemon reported.
     let resync_pins = status
         .iter()
         .flat_map(|r| r.per_repo.iter())
-        .map(|r| (r.root.display().to_string(), loom_daemon::resync_pin::read_pins(&r.root)))
+        .map(|r| (r.root.display().to_string(), crate::resync_pin::read_pins(&r.root)))
         .collect();
 
     health::assess(&HealthInputs {
@@ -440,7 +440,7 @@ async fn collect(window: Duration) -> HealthReport {
         // against `DaemonStatusReport::daemon_build_commit` so a newer CLI
         // querying an older daemon reports build skew rather than a phantom
         // dead work finder.
-        cli_build_commit: loom_daemon::self_update::BUILT_COMMIT.to_string(),
+        cli_build_commit: crate::self_update::BUILT_COMMIT.to_string(),
         work_finder_log_tick_age_secs,
         self_update: Some(self_update),
         codesign_preflight,
@@ -450,9 +450,9 @@ async fn collect(window: Duration) -> HealthReport {
         transcript_ingest: transcript_ingest_status,
         tmpfs_visibility: tmpfs_visibility_status,
         // 11. CI-telemetry poller health (#9014) — local status.json read.
-        ci_telemetry: Some(loom_daemon::ci_telemetry::collect_health(&transcript_ingest_repo_root)),
+        ci_telemetry: Some(crate::ci_telemetry::collect_health(&transcript_ingest_repo_root)),
         // 12. The last fleet-sync snapshot (#11740) — local file read.
-        fleet_sync: loom_daemon::fleet_sync::probe_status(),
+        fleet_sync: crate::fleet_sync::probe_status(),
         resync_pins,
     })
 }
@@ -468,11 +468,11 @@ async fn collect(window: Duration) -> HealthReport {
 /// an unreadable registry: an optional signal's absence never becomes a
 /// non-green line (the same rule `codesign_preflight` follows).
 fn probe_codex_accounts() -> Option<health::codex_accounts::CodexAccountsSnapshot> {
-    use loom_daemon::tokens_pool::{codex_check, provider_capacity_at, AccountProvider};
+    use crate::tokens_pool::{codex_check, provider_capacity_at, AccountProvider};
 
     let workspace = super::tokens::resolve_tokens_workspace(".").ok()?;
     let inventory =
-        loom_daemon::tokens_pool::account_inventory(&workspace, AccountProvider::Codex).ok()?;
+        crate::tokens_pool::account_inventory(&workspace, AccountProvider::Codex).ok()?;
     if inventory.is_empty() {
         return None;
     }
@@ -584,8 +584,8 @@ fn resolve_configured_codesign_identity(status: Option<&DaemonStatusReport>) -> 
         .or_else(|| status.and_then(|s| s.per_repo.first().map(|r| r.root.clone())))
         .or_else(|| std::env::current_dir().ok())?;
 
-    let effective = loom_daemon::config_resolver::resolve_effective_config(&repo_root);
-    loom_daemon::config_resolver::get_path(&effective, "codesign.identity")
+    let effective = crate::config_resolver::resolve_effective_config(&repo_root);
+    crate::config_resolver::get_path(&effective, "codesign.identity")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -692,7 +692,7 @@ fn codesign_run_capped(args: &[&str], cap: Duration) -> (bool, String) {
 /// `(Some(report), None)` / `(None, Some(why))`.
 ///
 /// #6103: a first attempt that merely **timed out** (never a hard failure —
-/// see [`loom_daemon::health::ipc_error_is_probe_timeout`]) is retried
+/// see [`crate::health::ipc_error_is_probe_timeout`]) is retried
 /// exactly once before this function reports a failure at all. A single
 /// bounded miss on a busy host is not, by itself, evidence of an unhealthy
 /// daemon; this is the one-shot-CLI-invocation substitute for the watchdog's
@@ -719,7 +719,7 @@ async fn query_status(escalate: bool) -> (Option<DaemonStatusReport>, Option<Str
             // #8163: the root count is read from the LOCAL workspace registry
             // (a cheap JSON read), not from the daemon — the client cannot
             // learn it from a round-trip it has not managed to complete.
-            let root_count = loom_daemon::status_budget::registered_root_count();
+            let root_count = crate::status_budget::registered_root_count();
             let retry_timeout = resolve_retry_timeout(timeout, escalate, root_count);
             match query_status_once(&socket_path, retry_timeout).await {
                 Ok(report) => (Some(report), None),
@@ -741,7 +741,7 @@ async fn query_status(escalate: bool) -> (Option<DaemonStatusReport>, Option<Str
 ///    load-scaled [`resolve_ipc_timeout`], or an operator's own
 ///    `LOOM_DAEMON_IPC_TIMEOUT_MS` override) is never *narrowed*;
 /// 2. [`ESCALATED_IPC_TIMEOUT`] — #6191's fixed floor;
-/// 3. [`loom_daemon::status_budget::client_probe_budget`] over `root_count` —
+/// 3. [`crate::status_budget::client_probe_budget`] over `root_count` —
 ///    #8163's root-scaled term, which is what makes the escalated retry
 ///    actually able to cover an `O(roots)` `build_daemon_status` on a
 ///    many-workspace host. At `root_count == 1` it is well under the `10s`
@@ -756,7 +756,7 @@ async fn query_status(escalate: bool) -> (Option<DaemonStatusReport>, Option<Str
 fn resolve_retry_timeout(base: Duration, escalate: bool, root_count: usize) -> Duration {
     if escalate {
         base.max(ESCALATED_IPC_TIMEOUT)
-            .max(loom_daemon::status_budget::client_probe_budget(root_count))
+            .max(crate::status_budget::client_probe_budget(root_count))
     } else {
         base
     }
@@ -792,7 +792,7 @@ fn resolve_health_pool_dir(status: Option<&DaemonStatusReport>) -> Option<PathBu
         Some(dir) => Some(dir),
         None => {
             let ws = super::tokens::resolve_tokens_workspace(".").ok()?;
-            Some(loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws))
+            Some(crate::tokens_pool::paths::resolve_tokens_dir(&ws))
         }
     }
 }
@@ -810,31 +810,31 @@ fn probe_ranking(status: Option<&DaemonStatusReport>) -> (bool, Option<u64>) {
 ///
 /// Filesystem-only, like every other input this collector gathers: it reads
 /// `.ranking` and `.bad_tokens` and asks
-/// [`loom_daemon::tokens_pool::bad_tokens`] the same class-scoped blocking
+/// [`crate::tokens_pool::bad_tokens`] the same class-scoped blocking
 /// question the selector asks, so the counts cannot drift from what a spawn
 /// would actually be handed.
 fn probe_class_capacity(
     status: Option<&DaemonStatusReport>,
-) -> Option<loom_daemon::capacity::model_class::ClassCapacity> {
+) -> Option<crate::capacity::model_class::ClassCapacity> {
     let dir = resolve_health_pool_dir(status)?;
-    loom_daemon::capacity::model_class::read_class_capacity_at(&dir)
+    crate::capacity::model_class::read_class_capacity_at(&dir)
 }
 
 /// `(present, age_secs)` for `<dir>/.ranking`. Delegates to
-/// [`loom_daemon::capacity::ranking_file_state`] (#5269) — the same probe
+/// [`crate::capacity::ranking_file_state`] (#5269) — the same probe
 /// `ipc::build_daemon_status` uses to populate each registered repo's own
 /// `RepoStatus::ranking_present`/`ranking_age_secs`, so this CLI's single
 /// anchored-pool probe and the daemon's per-repo snapshot can never disagree
 /// about what "present"/"age" means for the same directory.
 fn ranking_state(dir: &Path) -> (bool, Option<u64>) {
-    loom_daemon::capacity::ranking_file_state(dir)
+    crate::capacity::ranking_file_state(dir)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::status_budget;
+    use crate::status_budget;
 
     #[test]
     fn ranking_state_reports_absent_when_there_is_no_file() {
@@ -1042,10 +1042,10 @@ mod tests {
 
         std::env::remove_var("LOOM_CODESIGN_IDENTITY");
         std::env::set_var("LOOM_ROOT", tmp.path());
-        std::env::set_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let resolved = resolve_configured_codesign_identity(None);
         std::env::remove_var("LOOM_ROOT");
-        std::env::remove_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV);
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
 
         assert_eq!(resolved, None);
     }

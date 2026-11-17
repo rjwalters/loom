@@ -134,9 +134,6 @@ pub struct CycleReport {
     pub ledger_repaired: bool,
     /// At least one job log was downloaded successfully this cycle (#8825).
     pub logs_fetched: bool,
-    /// Cleared when GraphQL rate-limits a closing-reference lookup (#9088):
-    /// no further lookup is made this cycle.
-    pub graphql_suppressed: bool,
     /// Each owner's kind / eligible repo count / skip reason (#9188).
     pub owners: Vec<OwnerStatus>,
 }
@@ -368,8 +365,17 @@ fn record_outcome(
             let skipped_owners = report.owners.iter().filter(|o| o.error.is_some()).count();
             if report.repo_errors.len() <= skipped_owners {
                 status.last_ok_at = Some(ctx.now);
-                status.consecutive_failures = 0;
                 status.backoff_until = None;
+                if skipped_owners == 0 {
+                    status.consecutive_failures = 0;
+                } else {
+                    // #13640: a skipped owner is a failure `health` must see —
+                    // a dead main org went unnoticed for 20+ days with the
+                    // counter pinned at 0. `last_error_at` stays unset so
+                    // `classify` still reads `degraded`, not `failing`.
+                    status.consecutive_failures += 1;
+                    status.last_error = report.repo_errors.first().cloned();
+                }
             } else {
                 status.last_error = Some(format!(
                     "{} repo(s) failed; first: {}",

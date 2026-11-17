@@ -1024,9 +1024,6 @@ async fn sample_snapshots(
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
-    // The work finder's ranked ready queue (Issue #8852, phase 2) — native
-    // HTTPS only, and only when the work finder has ticked since last time.
-    super::queue_snapshot::record(workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;

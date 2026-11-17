@@ -54,6 +54,7 @@ mod tests {
             at: chrono::Utc::now(),
             interval_secs: 300,
             auto_apply: true,
+            auto_apply_writes: crate::fleet_sync::AutoApply::ALL,
             config: ConfigPass {
                 error: Some("not in the store".to_string()),
                 host_not_in_store,

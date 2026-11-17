@@ -6,7 +6,7 @@
 //! `.loom/docs/file-size-policy.md`. Pure relocation: the derive tree below is
 //! byte-for-byte what `main.rs` carried, plus the new `Provision` sub-action.
 //!
-//! `main.rs` re-exports the enum (`pub(crate) use`), so `crate::AccountsAction`
+//! `main.rs` re-exports the enum (`pub(crate) use`), so `crate::cli::AccountsAction`
 //! continues to resolve for every existing caller. `SessionAction` lives in its
 //! own sibling, `cli::accounts_session`, alongside its handler.
 

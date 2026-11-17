@@ -517,6 +517,12 @@ pub fn worker_attempt(root: &Path, role: &str) -> Option<Span> {
         ("loom.phase", role),
         ("loom.timing_source", "owned_boundary"),
     ]);
+    // The role attempt joins its repo/issue/PR like every other attempt span.
+    metadata.extend(execution_scope(
+        &journal.active().ok()?,
+        &root_context,
+        &TraceStore::repo_attribute(root),
+    ));
     // `spawn-worker` runs before `spawn-claude.sh` computes the CPU budget, so
     // any `LOOM_SWEEP_CPU_*` here is the parent's; only host state is stamped.
     metadata.extend(open_host_attributes());
@@ -564,6 +570,7 @@ pub fn checkpoint_completed(
         model,
         pr,
         "checkpoint_write_observed",
+        &TraceStore::repo_attribute(root),
     );
 }
 
@@ -603,9 +610,11 @@ pub fn checkpoint_begun(
         role,
         attempt,
         model,
+        &TraceStore::repo_attribute(root),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checkpoint_begin_observation(
     journal: &Journal,
     root: &TraceContext,
@@ -614,6 +623,7 @@ fn checkpoint_begin_observation(
     role: &str,
     attempt: Option<u32>,
     model: Option<&str>,
+    repo: &str,
 ) -> Option<ActiveSpan> {
     if !CHECKPOINT_ROLES.contains(&role) {
         return None;
@@ -636,7 +646,7 @@ fn checkpoint_begin_observation(
     metadata.extend(spawn_budget_attributes());
     let at = Utc::now();
     let active = journal.active().ok()?;
-    metadata.extend(execution_scope(&active, root));
+    metadata.extend(execution_scope(&active, root, repo));
     // A re-dispatch of the same phase (the earlier subagent died without its
     // checkpoint) supersedes the begun attempt it replaces. Its outcome is
     // unknown, so `worked` stays absent.
@@ -719,18 +729,30 @@ pub(crate) fn checkpoint_workspace(root: &Path) -> PathBuf {
 }
 
 /// The execution's own scope (#10637): `loom.repo` and `loom.sweep_id` as its
-/// root span carries them. `prepare_execution` stamps both on every sweep
-/// root, so a checkpoint span that names only an issue also names the
-/// repository and sweep it belongs to, with values that join that root's
-/// exactly. A key the root lacks, or a root no longer open, stays absent.
-fn execution_scope(active: &[ActiveSpan], root: &TraceContext) -> TraceAttributes {
-    let Some(span) = active.iter().find(|span| span.record.context == *root) else {
-        return TraceAttributes::new();
-    };
-    ["loom.repo", "loom.sweep_id"]
-        .into_iter()
-        .filter_map(|key| Some((key.to_owned(), span.record.attributes.get(key)?.clone())))
-        .collect()
+/// root span carries them, plus the root's `loom.issue` / `loom.pr_number` when
+/// it names them (a step root does, #13169). `prepare_execution` stamps the
+/// repo and sweep on every sweep root, so a span that names only an issue also
+/// names the repository and sweep it belongs to, with values that join that
+/// root's exactly. A root that is missing or no longer open, or that lacks
+/// `loom.repo`, falls back to `repo` (the workspace's own spelling, #13562) so
+/// no role attempt is ever repo-less; the other keys stay absent.
+fn execution_scope(active: &[ActiveSpan], root: &TraceContext, repo: &str) -> TraceAttributes {
+    let mut scope: TraceAttributes = active
+        .iter()
+        .find(|span| span.record.context == *root)
+        .map(|span| {
+            ["loom.repo", "loom.sweep_id", "loom.issue", "loom.pr_number"]
+                .into_iter()
+                .filter_map(|key| Some((key.to_owned(), span.record.attributes.get(key)?.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !repo.is_empty() {
+        scope
+            .entry("loom.repo".into())
+            .or_insert_with(|| repo.to_owned());
+    }
+    scope
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -744,6 +766,7 @@ fn checkpoint_observation(
     model: Option<&str>,
     pr: Option<u32>,
     source: &str,
+    repo: &str,
 ) {
     let role = phase
         .strip_suffix("-done")
@@ -776,17 +799,6 @@ fn checkpoint_observation(
     // The owned-start branch below overwrites this with `true`: there the
     // checkpoint completes an attempt whose begin Loom itself recorded.
     insert_worked(&mut metadata, Some(!SYNTHETIC_TIMING_SOURCES.contains(&source)));
-    if role == "judge" {
-        metadata.insert(
-            "loom.judge_verdict".into(),
-            if result == "success" {
-                "approved"
-            } else {
-                "rejected"
-            }
-            .into(),
-        );
-    }
     if let Some(attempt) = attempt {
         metadata.insert("loom.attempt".into(), attempt.to_string());
     }
@@ -798,9 +810,14 @@ fn checkpoint_observation(
     }
     let at = Utc::now();
     let active = journal.active();
+    // The explicit `issue` / `pr` of this call win over the root's.
+    let own = metadata.clone();
     if let Ok(active) = &active {
-        metadata.extend(execution_scope(active, root));
+        metadata.extend(execution_scope(active, root, repo));
+    } else {
+        metadata.insert("loom.repo".into(), repo.to_owned());
     }
+    metadata.extend(own);
     // An explicitly launched role already has an authoritative start. Its
     // checkpoint completes that same attempt; never fabricate a second one.
     // A begun attempt names its issue (#9935): parallel builders in one wave
@@ -890,10 +907,38 @@ pub fn phase_transition(root: &Path, execution: &str, phase: &str, issue: u32, p
         None,
         pr,
         "checkpoint_poll_observed",
+        &TraceStore::repo_attribute(root),
     );
 }
 
-pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, issue: Option<u32>) {
+/// The work item's join keys a step's `loom.sweep` root carries from the
+/// moment it opens (#13169), so a step that never closes still names its item.
+/// Each is absent when unknown rather than guessed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepKeys {
+    /// The issue the execution belongs to (`loom.issue`).
+    pub issue: Option<u32>,
+    /// The PR a PR step acts on (`loom.pr_number`).
+    pub pr_number: Option<u32>,
+    /// The step's role (`loom.role`).
+    pub role: Option<&'static str>,
+    /// The PR's head commit as of open (`loom.head_sha`), when the PR exists.
+    pub head_sha: Option<String>,
+}
+
+impl StepKeys {
+    /// Only an issue key: a non-step execution (an issue sweep).
+    #[must_use]
+    pub fn issue(issue: Option<u32>) -> Self {
+        Self {
+            issue,
+            ..Self::default()
+        }
+    }
+}
+
+pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, keys: &StepKeys) {
+    let issue = keys.issue;
     // The root carries its own ID-derivation inputs (repo + sweep id) and the
     // installed prompt surface the child is about to run.
     let mut metadata = crate::telemetry::trace::provenance::workspace(root);
@@ -910,6 +955,15 @@ pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, is
     metadata.insert("loom.repo".into(), repo);
     if let Some(issue) = issue {
         metadata.insert("loom.issue".into(), issue.to_string());
+    }
+    if let Some(pr) = keys.pr_number {
+        metadata.insert("loom.pr_number".into(), pr.to_string());
+    }
+    if let Some(role) = keys.role {
+        metadata.insert("loom.role".into(), role.to_owned());
+    }
+    if let Some(head) = &keys.head_sha {
+        metadata.insert(git_facts::HEAD_SHA.into(), head.clone());
     }
     if let Some(base) = git_facts::base_sha(root) {
         metadata.insert(git_facts::BASE_SHA.into(), base);
@@ -1143,6 +1197,13 @@ fn step_sweep_id(active: &[ActiveSpan]) -> Option<&str> {
         .filter(|id| crate::step_role::StepRole::parse_sweep_id(id).is_some())
 }
 
+/// A drained journal that no running step owns and that has not been written
+/// for this long is moved to `trace-context/stale/` (#13439).
+const STALE_JOURNAL_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// A zero-byte journal with no running step is removed once this old, so a
+/// journal just created by a live step is never raced.
+const EMPTY_JOURNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
     if !super::tracing::enabled(root) {
         return 0;
@@ -1173,7 +1234,17 @@ pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
         }) {
             Ok(n) => {
                 count += n;
-                if journal.retire_if_drained().is_err() {
+                let retired = journal.retire_if_drained();
+                if !matches!(retired, Ok(true))
+                    && !running_step(root, &journal)
+                    && matches!(
+                        journal.retire_stale(EMPTY_JOURNAL_GRACE, STALE_JOURNAL_AGE),
+                        Ok(true)
+                    )
+                {
+                    continue;
+                }
+                if retired.is_err() {
                     log::warn!("observability: completed trace journal retained");
                 }
             }
@@ -1286,6 +1357,8 @@ pub struct RoleTrace {
     /// Why the tick failed, when it did (#10640) — the same class, code and
     /// message its root span closed with.
     pub failure: Option<RoleFailure>,
+    /// What a launched Judge tick did (#12362); `None` for any other role.
+    pub judge: Option<judge_tick::JudgeTick>,
 }
 
 /// Run one role tick under its `loom.role_attempt` root span — **if it
@@ -1339,6 +1412,8 @@ pub fn role_invocation_classified(
         let unlaunched = role_failure::for_unlaunched(&outcome, noted);
         return (outcome, None, unlaunched);
     };
+    // #12362: before the drain takes the journal; local reads only.
+    let judge = (role == "judge").then(|| judge_tick::observe(root, pr));
     let roll = roll_interruption::stopped(&span);
     let failure = role_failure::for_outcome(&outcome, noted).filter(|_| roll.is_none());
     let rolled = roll
@@ -1349,6 +1424,7 @@ pub fn role_invocation_classified(
         execution: execution.clone(),
         started_at: span.active.record.started_at,
         failure: failure.clone(),
+        judge: judge.clone(),
     });
     let (result, _) = crate::role_tick_telemetry::classify(&outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -1367,8 +1443,26 @@ pub fn role_invocation_classified(
     if let Some(drawn) = drawn {
         close.extend(drawn);
     }
-    if let Some(pr) = pr {
-        close.insert(role_target::PR_NUMBER.into(), pr.to_string());
+    if let Some(judge) = &judge {
+        close.insert(judge_tick::FOUND_WORK.into(), judge.found_work.to_string());
+        if let Some(reason) = &judge.noop_reason {
+            close.insert(judge_tick::NOOP_REASON.into(), reason.clone());
+        }
+        if let Some(v) = judge.latest() {
+            close.insert(judge_tick::JUDGE_VERDICT.into(), v.verdict.clone());
+            if let Some(sha) = &v.head_sha {
+                close.insert(judge_tick::HEAD_SHA.into(), sha.clone());
+            }
+        }
+    }
+    // A claim or prompt names the PR; a verdict write names it when neither did.
+    if let Some(pr) = pr.map(|p| p.to_string()).or_else(|| {
+        judge
+            .as_ref()
+            .and_then(judge_tick::JudgeTick::verdict_pr)
+            .map(|p| p.to_string())
+    }) {
+        close.insert(role_target::PR_NUMBER.into(), pr);
     }
     // #11982: an assigned Builder/Curator tick's issue rides its root too.
     if let Some(issue) = issue {
@@ -1383,6 +1477,7 @@ pub fn role_invocation_classified(
 }
 
 pub mod git_facts;
+pub mod judge_tick;
 pub mod role_draw;
 mod role_failure;
 pub mod role_runtime;

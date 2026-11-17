@@ -6,7 +6,7 @@ use crate::observability::ops::capture::capture;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_spawn::StepSpawnRequest;
 use crate::sweep_registry::test_support::*;
-use crate::telemetry::kinds::fleet_state::FleetStage;
+use crate::telemetry::kinds::work_started::FleetStage;
 use crate::telemetry::kinds::work_started::WorkStartedRecord;
 use crate::telemetry::{DispatchOrigin, TelemetryRecord};
 use serial_test::serial;

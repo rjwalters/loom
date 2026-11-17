@@ -10,8 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-use loom_daemon::comment_trust::TrustPolicy;
-use loom_daemon::forge_identity::{FleetLogins, Roster};
+use crate::comment_trust::TrustPolicy;
+use crate::forge_identity::{FleetLogins, Roster};
 
 const SELF_LOGIN: &str = "loom-fleet-dispatch[bot]";
 const HOST: &str = "host-a1b2c3d4";

@@ -12,8 +12,9 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <BrowserRouter>
       <ThemeProvider>
         <DatabaseProvider>
-          <App />
-          <Toaster />
+          <Toaster>
+            <App />
+          </Toaster>
         </DatabaseProvider>
       </ThemeProvider>
     </BrowserRouter>

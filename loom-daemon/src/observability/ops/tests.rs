@@ -245,6 +245,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
         MetricName::QueueListingIncompleteRepos,
+        MetricName::QueueSeen,
         MetricName::QueueHostShard,
         MetricName::LlmTokensInput,
         MetricName::LlmTokensOutput,
@@ -295,6 +296,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::AgentScopeOomKills,
         MetricName::ForgeMirrorReads,
         MetricName::ForgeMirrorChanges,
+        MetricName::DiscoveryRecheck,
         MetricName::ForgeMirrorWakeLatency,
         MetricName::StageEntryLookups,
         MetricName::FeedCompletions,
@@ -320,25 +322,6 @@ fn every_metric_name_serializes_to_its_as_str() {
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
-}
-
-#[test]
-fn native_https_path_drops_metric_points() {
-    let envelopes = vec![
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::MetricPoints(MetricPointsRecord {
-                captured_at: at(0),
-                interval_start: None,
-                points: vec![MetricPoint::int(MetricName::DispatchCandidates, 1)],
-            }),
-        ),
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::Span(tick_span(&TickReport::default(), 1, at(0), at(1))),
-        ),
-    ];
-    assert!(crate::observability::tracing::native_envelopes(&envelopes).is_empty());
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -706,10 +689,11 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     ]);
     summary.listing_failed = vec!["/r2".into()];
     summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
+    summary.seen = 9;
     let points = super::queue::queue_points(&summary);
-    // + listing_failed, listing_incomplete and the four already_landed
-    // evidence points (#11858).
-    assert_eq!(points.len(), Qd::ALL.len() + 2 + 4);
+    // + listing_failed, listing_incomplete, seen (#13007) and the four
+    // already_landed evidence points (#11858).
+    assert_eq!(points.len(), Qd::ALL.len() + 3 + 4);
     let value = |reason: &str| {
         points
             .iter()
@@ -738,6 +722,12 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         .find(|p| p.name == MetricName::QueueListingIncompleteRepos)
         .unwrap();
     assert_eq!(partial.value, MetricValue::Int(2));
+    // #13007: the OTLP gauge equals the `/ingest` record's `seen`.
+    let seen = points
+        .iter()
+        .find(|p| p.name == MetricName::QueueSeen)
+        .unwrap();
+    assert_eq!(seen.value, MetricValue::Int(9));
     for point in &points {
         // Every label survives the export policy unchanged: only allowlisted,
         // bounded keys (state, reason), never an issue number or repo.

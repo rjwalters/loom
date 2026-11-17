@@ -61,17 +61,17 @@
 //! the trial deployment is #9006, and the real-canary gap is #8525.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 /// Same pin as the SigNoz trial's telemetry store (`signoz/casting.yaml`) and
 /// as every other engine-level proof in this trial, so no proof in this repo
 /// can drift from the deployment on ClickHouse version.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::{clickhouse, CLICKHOUSE_IMAGE};
 
 /// The committed alert rule, byte for byte.
 const ALERT: &str =
@@ -82,42 +82,6 @@ const FIXTURE: &str = include_str!("fixtures/signoz_queue_starvation/fixture.sql
 
 /// One result row: column name -> JSON value, as `JSONEachRow` renders it.
 type Row = BTreeMap<String, serde_json::Value>;
-
-/// Runs `script` through `clickhouse local` in the pinned image and returns
-/// stdout. Panics with the engine's own stderr on failure — a query that does
-/// not parse must fail this test, not be silently skipped.
-fn clickhouse(script: &str, format: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            &format!("--format={format}"),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 fn rows(script: &str) -> Vec<Row> {
     clickhouse(script, "JSONEachRow")

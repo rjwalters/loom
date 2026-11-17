@@ -5,8 +5,8 @@
 //! `runtimes.roleDraw` table shows the `rolePreference` list (or static
 //! binding) that still decides it. Read-only; never consults a credential pool.
 
+use crate::runtime_preference::role_draw::explain;
 use anyhow::Result;
-use loom_daemon::runtime_preference::role_draw::explain;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]

@@ -330,9 +330,8 @@ fn new_archive_preamble(month: &str) -> Block {
 }
 
 pub(super) fn atomic_write(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))
+    crate::fs_util::write_atomic(path, text.as_bytes(), crate::fs_util::AtomicOpts::default())
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Rotate eligible sections of `<root>/WORK_LOG.md`. `today` is injected for

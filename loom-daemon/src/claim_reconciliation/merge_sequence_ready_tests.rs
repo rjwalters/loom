@@ -1,13 +1,10 @@
 //! Fixtures for #10371: ready-first ordering, no holds behind a non-ready
 //! head, and the not-ready release of existing soft holds.
 
-use std::collections::BTreeSet;
-
 use chrono::Utc;
 
-use super::super::{hold_action, plan_repo_with, release_comment_body, SEQUENCE_LABEL};
+use super::super::{hold_action, release_comment_body, SEQUENCE_LABEL};
 use super::*;
-use crate::priority_pick::IMPORTANT_LABEL;
 
 fn sha(n: u32) -> String {
     format!("{n:040x}")
@@ -24,28 +21,6 @@ fn pr(number: u32, created: &str, labels: &[&str]) -> SequencePr {
         draft: false,
         labels: labels.iter().map(|l| (*l).to_string()).collect(),
     }
-}
-
-/// Every PR in `nums` changes the same file.
-fn all_share(nums: &[u32]) -> BTreeMap<u32, BTreeSet<String>> {
-    nums.iter()
-        .map(|n| (*n, BTreeSet::from(["src/shared.rs".to_string()])))
-        .collect()
-}
-
-fn edges(prs: &[SequencePr], markers: &BTreeMap<u32, SequenceMarker>) -> Vec<(u32, u32)> {
-    let nums: Vec<u32> = prs.iter().map(|p| p.number).collect();
-    plan_repo_with(prs, &all_share(&nums), markers, &BTreeSet::new())
-        .iter()
-        .flat_map(|g| g.edges.iter().map(|e| (e.follower, e.after)))
-        .collect()
-}
-
-fn order(prs: &[SequencePr]) -> Vec<u32> {
-    let nums: Vec<u32> = prs.iter().map(|p| p.number).collect();
-    let groups = plan_repo_with(prs, &all_share(&nums), &BTreeMap::new(), &BTreeSet::new());
-    assert_eq!(groups.len(), 1, "{groups:?}");
-    groups[0].order.clone()
 }
 
 /// The marker `follower` carries behind `after`, pinned at both heads.
@@ -104,108 +79,7 @@ fn ready_means_approved_with_no_contrary_label() {
 
 // --- Acceptance: an approved PR is never held behind an older non-ready one --
 
-#[test]
-fn an_approved_pr_overlapping_an_older_changes_requested_pr_is_not_held() {
-    let older_cr = pr(9897, "2026-10-01T00:00:00Z", &[CR]);
-    let approved = pr(10185, "2026-10-03T00:00:00Z", &[APPROVED_LABEL]);
-    let unrelated = pr(1, "2026-09-01T00:00:00Z", &[]);
-    let prs = [older_cr.clone(), approved.clone(), unrelated];
-    let nums = [9897, 10185];
-    let groups = plan_repo_with(&prs, &all_share(&nums), &BTreeMap::new(), &BTreeSet::new());
-    assert_eq!(groups.len(), 1, "{groups:?}");
-    let g = &groups[0];
-    assert_eq!(g.order, vec![10185, 9897], "ready first despite being younger");
-    assert!(
-        g.edges.iter().all(|e| e.follower != 10185),
-        "the approved PR gets no hold: {:?}",
-        g.edges
-    );
-
-    // The same with the stale-verdict shape (`loom:pr` still on beside the
-    // changes-requested label): still not ready, still no hold.
-    let both = pr(9897, "2026-10-01T00:00:00Z", &[APPROVED_LABEL, CR]);
-    let prs = [both, approved, pr(1, "2026-09-01T00:00:00Z", &[])];
-    assert!(edges(&prs, &BTreeMap::new())
-        .iter()
-        .all(|(f, _)| *f != 10185));
-}
-
-#[test]
-fn no_edge_is_ever_planned_behind_a_non_ready_predecessor() {
-    // Three non-ready PRs: nothing to save, so nothing is held.
-    let prs = [
-        pr(1, "2026-10-01T00:00:00Z", &[]),
-        pr(2, "2026-10-01T01:00:00Z", &["loom:review-requested"]),
-        pr(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL, "loom:ci-failure"]),
-    ];
-    assert!(edges(&prs, &BTreeMap::new()).is_empty());
-
-    // Mixed: every edge's predecessor is ready.
-    let prs = [
-        pr(1, "2026-10-01T00:00:00Z", &[CR]),
-        pr(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]),
-        pr(3, "2026-10-01T02:00:00Z", &[]),
-        pr(4, "2026-10-01T03:00:00Z", &[APPROVED_LABEL]),
-    ];
-    let planned = edges(&prs, &BTreeMap::new());
-    assert_eq!(planned, vec![(4, 2), (1, 4)], "approved chain; #3 waits for no one");
-    let by: BTreeMap<u32, &SequencePr> = prs.iter().map(|p| (p.number, p)).collect();
-    assert!(planned.iter().all(|(_, a)| ready(by[a])), "{planned:?}");
-}
-
 // --- Acceptance: a convoy behind a non-ready head releases next tick --------
-
-#[test]
-fn a_convoy_of_approved_prs_behind_a_non_approved_head_releases_on_the_next_tick() {
-    // The 2026-10-05 chain: #10365 → #10308 → #10228 → #10205 → #10185 →
-    // #9897, every link approved and soft-held, the head changes-requested.
-    let head = pr(9897, "2026-09-30T00:00:00Z", &[CR]);
-    let chain = [10185, 10205, 10228, 10308, 10365];
-    let mut listing = vec![head.clone()];
-    for (i, n) in chain.iter().enumerate() {
-        let created = format!("2026-10-0{}T00:00:00Z", i + 1);
-        listing.push(pr(*n, &created, &[APPROVED_LABEL, SEQUENCE_LABEL]));
-    }
-    let after = |i: usize| if i == 0 { 9897 } else { chain[i - 1] };
-
-    // Tick N: the link holding onto the non-ready head is released; every
-    // other link waits for an APPROVED predecessor, the order that saves
-    // rebases among ready work (it drains as each lands).
-    let decisions: Vec<HoldAction> = chain
-        .iter()
-        .enumerate()
-        .map(|(i, n)| decide(&soft(*n, after(i)), &listing[i + 1], &listing))
-        .collect();
-    assert_eq!(decisions[0], HoldAction::ReleaseNotReady);
-    assert!(decisions[1..].iter().all(|d| *d == HoldAction::HoldSoft), "{decisions:?}");
-
-    // Before #10371 every link held, waiting on the changes-requested head.
-    let p = open_at_pin(9897, &Utc::now().to_rfc3339());
-    assert_eq!(
-        hold_action(&soft(10185, 9897), Some(&p), Some(&sha(10185)), true, 72.0),
-        HoldAction::HoldSoft
-    );
-
-    // Tick N+1: re-planned from scratch (no holds), the approved work comes
-    // first, nothing waits on the head, and the head itself goes last.
-    let unheld: Vec<SequencePr> = listing
-        .iter()
-        .map(|p| {
-            let mut p = p.clone();
-            p.labels.retain(|l| l != SEQUENCE_LABEL);
-            p
-        })
-        .collect();
-    let mut want = chain.to_vec();
-    want.push(9897);
-    assert_eq!(order(&unheld), want);
-    let replanned = edges(&unheld, &BTreeMap::new());
-    assert!(replanned.iter().all(|(_, a)| *a != 9897), "{replanned:?}");
-    assert!(
-        !replanned.iter().any(|(f, _)| *f == 10185),
-        "the convoy's head is free: {replanned:?}"
-    );
-}
 
 #[test]
 fn a_hold_releases_when_the_predecessor_loses_its_verdict_or_gains_a_blocking_label() {
@@ -227,30 +101,6 @@ fn a_hold_releases_when_the_predecessor_loses_its_verdict_or_gains_a_blocking_la
     let body = release_comment_body(&m, HoldAction::ReleaseNotReady, None);
     assert!(body.contains("loom:sequence released plan=seq-c0ffee00"), "{body}");
     assert!(body.contains("#10 is not ready"), "{body}");
-}
-
-#[test]
-fn a_verdict_flip_re_plans_the_order_on_the_next_tick() {
-    // #10 (older) was approved, #20 was planned behind it. #10 then got
-    // changes requested: tick N releases #20, tick N+1 puts #20 first and
-    // never re-holds it behind #10.
-    let follower = pr(20, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
-    let flipped = pr(10, "2026-10-01T00:00:00Z", &[CR]);
-    let listing = [
-        flipped.clone(),
-        follower.clone(),
-        pr(1, "2026-09-01T00:00:00Z", &[]),
-    ];
-    assert_eq!(decide(&soft(20, 10), &follower, &listing), HoldAction::ReleaseNotReady);
-    let next = [
-        flipped.clone(),
-        pr(20, "2026-10-02T00:00:00Z", &[APPROVED_LABEL]),
-        pr(30, "2026-10-03T00:00:00Z", &[]),
-    ];
-    assert_eq!(order(&next), vec![20, 10, 30]);
-    assert!(!edges(&next, &BTreeMap::new()).contains(&(20, 10)));
-    // Stable across ticks: the same input re-plans identically.
-    assert_eq!(edges(&next, &BTreeMap::new()), edges(&next, &BTreeMap::new()));
 }
 
 // --- Acceptance: hard markers are unchanged ---------------------------------
@@ -331,59 +181,6 @@ fn reservations_and_every_other_decision_are_left_alone() {
 // --- Ordering inside a tier -------------------------------------------------
 
 #[test]
-fn higher_level_first_and_oldest_first_within_each_readiness_tier() {
-    let prs = [
-        pr(1, "2026-10-01T00:00:00Z", &[]),
-        pr(2, "2026-10-01T01:00:00Z", &[IMPORTANT_LABEL]),
-        pr(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
-        pr(4, "2026-10-01T03:00:00Z", &[APPROVED_LABEL, IMPORTANT_LABEL]),
-        pr(5, "2026-10-01T04:00:00Z", &[APPROVED_LABEL]),
-        pr(6, "2026-10-01T05:00:00Z", &[]),
-    ];
-    // Ready tier: important #4, then #3, #5 by age. Then the rest: important
-    // #2, then #1, #6 by age. A level never lifts a non-ready PR over ready
-    // work.
-    assert_eq!(order(&prs), vec![4, 3, 5, 2, 1, 6]);
-}
-
-#[test]
-fn a_constraint_edge_still_beats_readiness() {
-    // A trusted marker puts the approved #2 after the non-ready #1: the
-    // planner honors it (it never rewrites someone's stated order).
-    let prs = [
-        pr(1, "2026-10-01T00:00:00Z", &[CR]),
-        pr(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]),
-        pr(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
-    ];
-    let markers = BTreeMap::from([(2, marker(2, 1, None, "manual"))]);
-    let groups = plan_repo_with(&prs, &all_share(&[1, 2, 3]), &markers, &BTreeSet::new());
-    assert_eq!(groups[0].order, vec![3, 1, 2]);
-
-    // A stacked base likewise: #5 is based on non-ready #4's branch.
-    let base = pr(4, "2026-10-01T00:00:00Z", &[]);
-    let mut stacked = pr(5, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]);
-    stacked.base_ref = base.head_ref.clone();
-    let prs = [base, stacked, pr(6, "2026-10-01T02:00:00Z", &[])];
-    let groups = plan_repo_with(&prs, &all_share(&[4, 5, 6]), &BTreeMap::new(), &BTreeSet::new());
-    assert_eq!(groups[0].order, vec![4, 5, 6]);
-    // The stacked edge is a dependency, not a rebase-saving preference: it is
-    // kept behind the non-ready base, so the approved #5 cannot land into an
-    // unready branch. No shared-files edge is written behind #4.
-    let planned: Vec<(u32, u32, EdgeReason)> = groups[0]
-        .edges
-        .iter()
-        .map(|e| (e.follower, e.after, e.reason))
-        .collect();
-    assert!(planned.contains(&(5, 4, EdgeReason::StackedBase)), "{planned:?}");
-    assert!(
-        planned
-            .iter()
-            .all(|(_, a, r)| *a != 4 || *r == EdgeReason::StackedBase),
-        "{planned:?}"
-    );
-}
-
-#[test]
 fn a_stacked_soft_hold_stays_held_behind_a_non_ready_base() {
     let base = pr(10, "2026-10-01T00:00:00Z", &[CR]);
     let mut stacked = pr(20, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
@@ -404,39 +201,7 @@ fn a_stacked_soft_hold_stays_held_behind_a_non_ready_base() {
     assert_eq!(decide(&m, &follower, &[base, follower.clone()]), HoldAction::ReleaseNotReady);
 }
 
-#[test]
-fn an_all_ready_group_orders_exactly_oldest_first() {
-    let prs = [
-        pr(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
-        pr(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]),
-        pr(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]),
-    ];
-    assert_eq!(order(&prs), vec![1, 2, 3]);
-    assert_eq!(edges(&prs, &BTreeMap::new()), vec![(2, 1), (3, 2)]);
-}
-
 // --- #10465: readiness is transitive ----------------------------------------
-
-#[test]
-fn a_ready_pr_is_never_held_behind_an_approved_but_sequenced_pr() {
-    // A (ready) overlaps B (`loom:pr`, sequenced behind C); C has no verdict.
-    let c = pr(3, "2026-10-01T00:00:00Z", &[]);
-    let b = pr(2, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
-    let a = pr(1, "2026-10-03T00:00:00Z", &[APPROVED_LABEL]);
-    let prs = [c, b, a];
-    let nums = [1, 2, 3];
-    let markers = BTreeMap::from([(2, soft(2, 3))]);
-    let groups = plan_repo_with(&prs, &all_share(&nums), &markers, &BTreeSet::new());
-    assert!(
-        groups.iter().all(|g| g.edges.iter().all(|e| e.after != 2)),
-        "no hold behind B: {groups:?}"
-    );
-    // Control: with C ready, B is landable and A may queue behind it.
-    let c_ready = pr(3, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
-    let prs = [c_ready, prs[1].clone(), prs[2].clone()];
-    let groups = plan_repo_with(&prs, &all_share(&nums), &markers, &BTreeSet::new());
-    assert!(groups.iter().any(|g| g.edges.iter().any(|e| e.after == 2)), "{groups:?}");
-}
 
 #[test]
 fn a_soft_hold_behind_a_sequenced_non_landable_pr_is_released_but_a_pin_is_kept() {

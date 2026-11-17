@@ -193,6 +193,20 @@ if [[ "${1:-} ${2:-}" == "forge verdict-body-check" ]]; then
 fi
 if [[ "${1:-}" == forge && "${2:-}" == verdict-* && "${3:-}" == --help ]]; then
   [[ -f "$D/old-daemon" ]] && { echo "error: unrecognized subcommand '$2'" >&2; exit 2; }
+  # #12362: verdict-labels advertises --sha unless the mock is a pre-#12362 daemon.
+  [[ "$2" == verdict-labels && ! -f "$D/no-sha-daemon" ]] && echo "      --sha <SHA>  the head the verdict was written against"
+  exit 0
+fi
+# #13055: `lease pr check` answers from lease-state ("<rc> <line>"); default held-self.
+if [[ "${1:-} ${2:-} ${3:-}" == "lease pr check" ]]; then
+  printf '%s\n' "$*" >> "$D/lease-calls.log"
+  [[ -f "$D/lease-state" ]] || { echo "PR_LEASE_STATE=held-self"; exit 0; }
+  read -r rc line < "$D/lease-state"; [[ -n "$line" ]] && echo "$line"; exit "$rc"
+fi
+# #13264: `lease pr release` is logged; lease-release-rc makes it fail.
+if [[ "${1:-} ${2:-} ${3:-}" == "lease pr release" ]]; then
+  printf '%s\n' "$*" >> "$D/lease-release.log"
+  [[ -f "$D/lease-release-rc" ]] && { echo "release failed" >&2; exit "$(cat "$D/lease-release-rc")"; }
   exit 0
 fi
 if [[ "${1:-}" == --version ]]; then echo "loom-daemon 0.19.870 (mock)"; exit 0; fi
@@ -249,7 +263,7 @@ reset_state() {
     "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent "$STUB_DIR"/ci-empty "$STUB_DIR"/ci-required \
     "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log" \
     "$STUB_DIR/gate-answer" "$STUB_DIR/reconcile-answer" "$STUB_DIR"/reconcile-answer.* "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log" \
-    "$STUB_DIR/old-daemon" "$STUB_DIR/body-answer" "$STUB_DIR/body-check-missing" "$STUB_DIR/body-check-input.txt" "$STUB_DIR/delete-fail" "$STUB_DIR/labels-read-fail" "$STUB_DIR/pr-edit.log" "$STUB_DIR/pr-edit-fail"
+    "$STUB_DIR/lease-state" "$STUB_DIR/lease-calls.log" "$STUB_DIR/old-daemon" "$STUB_DIR/body-answer" "$STUB_DIR/body-check-missing" "$STUB_DIR/body-check-input.txt" "$STUB_DIR/delete-fail" "$STUB_DIR/labels-read-fail" "$STUB_DIR/pr-edit.log" "$STUB_DIR/pr-edit-fail"
 }
 
 run_pv() {
@@ -318,6 +332,22 @@ assert_eq "" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "no comment at
 reset_state
 run_pv abc approved abc1234 --body "x"
 assert_eq "2" "$EXIT_CODE" "non-numeric PR number -> exit 2"
+
+# T8a: aliases normalise to the canonical verdict tokens (#12692).
+reset_state
+run_pv 110 approve abc1234 --body "x"
+assert_eq "0" "$EXIT_CODE" "alias 'approve' -> exits 0"
+assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->" "'approve' posts verdict=approved"
+reset_state
+run_pv 111 request-changes abc1234 --body "x"
+assert_eq "0" "$EXIT_CODE" "alias 'request-changes' -> exits 0"
+assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=abc1234 verdict=changes-requested -->" "'request-changes' posts verdict=changes-requested"
+reset_state
+run_pv 112 bogus abc1234 --body "x"
+assert_eq "2" "$EXIT_CODE" "unknown verdict 'bogus' still -> exit 2"
+reset_state
+run_pv 113 Approve abc1234 --body "x"
+assert_eq "2" "$EXIT_CODE" "aliases are case-sensitive: 'Approve' -> exit 2"
 
 # T8: invalid verdict token -> rejected (only approved/changes-requested are
 # valid, matching verdict-staleness-guard.sh's verdict_token_for_label()).
@@ -638,6 +668,20 @@ assert_contains "$CALLS" "forge verdict-labels 300 --repo owner/repo --verdict a
 assert_contains "$CALLS" "forge verdict-lock acquire 300 --repo owner/repo" "the per-PR lock is taken before the gate"
 assert_contains "$CALLS" "forge verdict-lock release 300 --repo owner/repo" "the per-PR lock is released at exit"
 
+# #12362: the head reaches verdict-labels (journaled there for telemetry) and
+# nothing else about the call, its stdout or its exit code changes.
+assert_contains "$CALLS" "forge verdict-labels 300 --repo owner/repo --verdict approved --sha abc1234" "verdict-labels gets the head via --sha (main path)"
+
+# A daemon that predates --sha is never handed it (clap would reject the call
+# and stall the verdict): the labels still apply, exit 0.
+reset_state
+touch "$STUB_DIR/no-sha-daemon"
+run_pv 308 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "pre-#12362 daemon: verdict still lands"
+assert_eq "0" "$(grep -c -- '--sha' <<<"$(grep 'forge verdict-labels 308' "$STUB_DIR/daemon-calls.log")")" "pre-#12362 daemon: no --sha on verdict-labels"
+assert_eq "1" "$(grep -c 'forge verdict-labels 308 --repo owner/repo --verdict approved' "$STUB_DIR/daemon-calls.log")" "pre-#12362 daemon: label transition still runs"
+rm -f "$STUB_DIR/no-sha-daemon"
+
 # Lock timeout: exit 9 (fail closed), the gate never runs, nothing is posted.
 reset_state
 touch "$STUB_DIR/lock-fail"
@@ -716,6 +760,8 @@ assert_contains "$(cat "$STUB_DIR/last-body.txt" 2>/dev/null || true)" "verdict=
 # The reconcile runs BEFORE the labels: an approval is never live while arbitration is pending.
 CALLS="$(cat "$STUB_DIR/daemon-calls.log")"
 assert_eq "yes" "$([[ "${CALLS%%forge verdict-labels*}" == *"forge verdict-reconcile"* ]] && echo yes || echo no)" "reconcile precedes verdict-labels"
+
+assert_contains "$CALLS" "forge verdict-labels 321 --repo owner/repo --verdict changes-requested --sha abc1234" "superseded path hands the head to its changes-requested flip"
 
 # A changes-requested that prevails re-asserts its own labels.
 reset_state
@@ -825,6 +871,52 @@ run_pv 332 changes-requested abc1234 --body "please fix"
 assert_eq "8" "$EXIT_CODE" "legacy path label failure -> exit 8"
 assert_eq "332" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "the comment itself was posted"
 assert_contains "$OUTPUT" "Repair: gh pr edit 332 --repo owner/repo --add-label loom:changes-requested" "repair command is printed"
+
+# --- Judge lease gate (#13055) ------------------------------------------------
+for case_ in "0 PR_LEASE_STATE=free" "4 PR_LEASE_STATE=held-peer" "5 PR_LEASE_STATE=unknown" "5 garbage-no-state-line" "0 "; do
+  reset_state
+  echo "$case_" > "$STUB_DIR/lease-state"
+  run_pv 340 approved abc1234 --body "ok"
+  assert_eq "10" "$EXIT_CODE" "lease '$case_' -> approval refused with exit 10"
+  no_comment "lease '$case_'"
+  assert_contains "$OUTPUT" "does not hold a live Judge lease" "lease '$case_': stderr names the refusal"
+done
+reset_state
+echo "0 PR_LEASE_STATE=free" > "$STUB_DIR/lease-state"
+run_pv 341 changes-requested abc1234 --body "please fix"
+assert_eq "0" "$EXIT_CODE" "changes-requested is not gated on the lease"
+reset_state
+echo "0 PR_LEASE_STATE=held-self" > "$STUB_DIR/lease-state"
+run_pv 342 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "held-self -> approval posted"
+assert_contains "$(cat "$STUB_DIR/lease-calls.log")" "lease pr check 342 --role judge --watch-pid" "check asked for this PR and role"
+reset_state
+echo "2 error: unrecognized subcommand 'pr'" > "$STUB_DIR/lease-state"
+run_pv 343 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "binary without lease pr (exit 2) -> approval proceeds"
+assert_contains "$OUTPUT" "not gating the approval" "older binary: loud warning"
+
+# --- Judge lease release after a posted verdict (#13264) ---------------------
+for v in approved changes-requested; do
+  reset_state
+  rm -f "$STUB_DIR/lease-release.log" "$STUB_DIR/lease-release-rc"
+  run_pv 344 "$v" abc1234 --body "ok"
+  assert_eq "0" "$EXIT_CODE" "$v: posted"
+  assert_contains "$(cat "$STUB_DIR/lease-release.log" 2>/dev/null || true)" "lease pr release 344 --role judge --watch-pid" "$v: lease released after the verdict"
+done
+reset_state
+rm -f "$STUB_DIR/lease-release.log"
+echo 2 > "$STUB_DIR/lease-release-rc"
+run_pv 345 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "release failure (exit 2) never fails the verdict"
+assert_contains "$OUTPUT" "releasing the Judge lease failed" "release failure warns"
+rm -f "$STUB_DIR/lease-release-rc"
+reset_state
+echo "0 PR_LEASE_STATE=free" > "$STUB_DIR/lease-state"
+rm -f "$STUB_DIR/lease-release.log"
+run_pv 346 approved abc1234 --body "ok"
+assert_contains "$OUTPUT" "gate-refused:lease" "exit-10 message names the skip reason"
+assert_eq "" "$(cat "$STUB_DIR/lease-release.log" 2>/dev/null || true)" "refused approval: script does not release"
 
 # --- Summary ---
 echo ""

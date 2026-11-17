@@ -5,19 +5,19 @@
 //!   the repo's recorded side (read from its default branch) and how they
 //!   classify. Read-only.
 //! * `check` is the CI proof across adjacent releases
-//!   ([`loom_daemon::install_compat_harness`]). Exit `0` when every claim
+//!   ([`crate::install_compat_harness`]). Exit `0` when every claim
 //!   holds, `1` when one is violated, `2` when the check could not run.
 //!
 //! Rust rather than a script under `scripts/` because new executable logic
 //! goes into the daemon (`.loom/docs/shell-language-policy.md`).
 
-use anyhow::Result;
-use loom_daemon::install_compat::{
+use crate::install_compat::{
     self, classify, DaemonCompat, Version, DAEMON_INVOKED_INSTALLED_FILES, REQUIRES_DAEMON,
     SUPPORTS_INSTALLED,
 };
-use loom_daemon::install_compat_harness as harness;
-use loom_daemon::release_resolve::host;
+use crate::install_compat_harness as harness;
+use crate::release_resolve::host;
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]
@@ -96,18 +96,7 @@ impl ShowArgs {
             .as_ref()
             .map(|m| format!("{:?}", classify(m, &daemon)));
         if self.json {
-            let obj = serde_json::json!({
-                "running": daemon.running.to_string(),
-                "supports_installed": SUPPORTS_INSTALLED,
-                "requires_daemon": REQUIRES_DAEMON,
-                "invoked_files": DAEMON_INVOKED_INSTALLED_FILES,
-                "installed": installed.as_ref().map(|m| serde_json::json!({
-                    "loom_version": m.loom_version,
-                    "requires_daemon": m.requires_daemon,
-                })),
-                "classification": classification,
-            });
-            println!("{obj}");
+            println!("{}", install_compat::capabilities_json(&daemon, installed.as_ref()));
             return Ok(());
         }
         println!("running            {}", daemon.running);

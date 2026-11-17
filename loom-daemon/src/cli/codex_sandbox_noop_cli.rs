@@ -4,7 +4,7 @@
 //! The adapter tees Codex's stderr to a capture file. This reads that file
 //! and answers one question: did the session run nothing because Codex's own
 //! sandbox refused every shell command? The rule lives in
-//! [`loom_daemon::codex_sandbox_noop`], next to the role runner's in-process
+//! [`crate::codex_sandbox_noop`], next to the role runner's in-process
 //! use of the same scan, rather than as a second copy in the frozen
 //! `contract` script.
 //!
@@ -32,7 +32,7 @@ impl CodexSandboxNoopArgs {
         let Ok(bytes) = std::fs::read(&self.capture) else {
             std::process::exit(1);
         };
-        match loom_daemon::codex_sandbox_noop::scan(&String::from_utf8_lossy(&bytes)) {
+        match crate::codex_sandbox_noop::scan(&String::from_utf8_lossy(&bytes)) {
             Some(noop) => {
                 println!("{noop}");
                 std::process::exit(0);

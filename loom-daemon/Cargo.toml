@@ -25,7 +25,7 @@ base64 = "0.23"
 # math functions D1 ships and the bundled build does not (#9934). `limits`
 # enables `set_limit`, which the D1 execution tests use to apply D1's 5-term
 # compound-SELECT ceiling (`tests/support/d1_sqlite.rs`, #10066).
-rusqlite = { version = "0.40", features = ["bundled", "functions", "limits"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions", "limits"] }
 regex = "1.12"
 clap = { version = "4.6", features = ["derive", "env"] }
 sha2 = "0.11.0"
@@ -88,11 +88,18 @@ tokio = { workspace = true, features = ["taskdump"] }
 [dev-dependencies]
 tokio-test = "0.4"
 serial_test = "4.0"
-criterion = "0.8"
 
-[[bench]]
-name = "terminal_benchmarks"
-harness = false
+# Explicit so `loom-daemon` keeps its name and path now that a second bin exists.
+[[bin]]
+name = "loom-daemon"
+path = "src/main.rs"
+
+# Tools-only entry point (#12938, epic #12708): the shared slice commands behind
+# a mode gate. It links the library, never `daemon_service` (private to the
+# `loom-daemon` bin crate), so the daemon entry point is not in this artifact.
+[[bin]]
+name = "loom-tools"
+path = "src/bin/loom_tools.rs"
 
 [features]
 # No-op alias kept for CLI compatibility (#10700). The OTLP exporter is now

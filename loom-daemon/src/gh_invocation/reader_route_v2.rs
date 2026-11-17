@@ -244,7 +244,7 @@ impl GhInvocation {
                 };
                 continue;
             }
-            let Some(failure) = failure_of(&first, resource) else {
+            let Some(mut failure) = failure_of(&first, resource) else {
                 // Not the credential's fault (a 5xx, a network error):
                 // another reader would not help.
                 return Ok(first);
@@ -269,6 +269,10 @@ impl GhInvocation {
                         ));
                     }
                     served::CoverageRefusal::Withdraw => {}
+                    // No evidence at all: a short withdrawal (#12511).
+                    served::CoverageRefusal::WithdrawUnproven => {
+                        failure = Failure::CoverageUnproven;
+                    }
                 }
             }
             // A rate limit, a refused token, or a 403/404 from a reader with

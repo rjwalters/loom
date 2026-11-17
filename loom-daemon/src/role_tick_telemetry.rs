@@ -127,12 +127,46 @@ pub struct RoleTickTelemetry {
     /// The step's sweep id when a step-engine step, not a role tick, ran
     /// (#11906); the record then carries `source = "step"`.
     pub step_sweep_id: Option<String>,
+    /// The step's work item as `(number, is_pr)` (#13563); `None` for a role
+    /// tick, which has no single item.
+    pub step_item: Option<(u32, bool)>,
     /// The host limit that deferred this repo's tick (#12084); `Some` exactly
     /// when `result` is [`RoleTickResult::SkippedDeferred`].
     pub deferred_by: Option<String>,
     /// `<index>/<count>` of the shard that owns this repo (#12084), when the
     /// host is sharded.
     pub shard_owner: Option<String>,
+    /// What a Judge tick or a step observed about its own work (#12362).
+    pub extras: TickExtras,
+}
+
+/// The #12362 additions to a `role_tick.outcome` record, all optional and
+/// additive: a Judge tick's found-work split and verdicts, and a step's
+/// `LOOM_STEP_OUTCOME` class and reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickExtras {
+    pub found_work: Option<bool>,
+    pub noop_reason: Option<String>,
+    pub verdicts: Option<Vec<crate::telemetry::JudgeVerdictRecord>>,
+    pub step_class: Option<String>,
+    pub step_reason: Option<String>,
+}
+
+impl TickExtras {
+    fn of(
+        trace: Option<&crate::observability::lifecycle::RoleTrace>,
+        step: Option<(String, String)>,
+    ) -> Self {
+        let judge = trace.and_then(|t| t.judge.as_ref());
+        let (step_class, step_reason) = step.unzip();
+        Self {
+            found_work: judge.map(|j| j.found_work),
+            noop_reason: judge.and_then(|j| j.noop_reason.clone()),
+            verdicts: judge.map(|j| j.verdicts.clone()).filter(|v| !v.is_empty()),
+            step_class,
+            step_reason,
+        }
+    }
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -306,21 +340,32 @@ pub fn emit_for_tick_correlated(
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
 ) {
-    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None);
+    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None, None, None);
+}
+
+/// The step-specific inputs of [`emit_for_step`], bundled so the emit stays
+/// under clippy's argument limit.
+pub struct StepTelemetry<'a> {
+    /// The class the step's end derived (#12480); `None` on a failure falls
+    /// back to `unclassified:step`.
+    pub failure: Option<crate::observability::lifecycle::RoleFailure>,
+    pub sweep_id: &'a str,
+    /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362).
+    pub step_outcome: Option<(String, String)>,
+    /// The step's work item and whether it is a PR (#13563).
+    pub item: (u32, bool),
 }
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
 /// record marked `source = "step"` with the step's sweep id, so it is never
-/// counted as a role-runner tick. `failure` is the class the step's end
-/// derived (#12480); `None` on a failure falls back to `unclassified:step`.
+/// counted as a role-runner tick.
 pub fn emit_for_step(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
-    failure: Option<crate::observability::lifecycle::RoleFailure>,
-    sweep_id: &str,
+    step: StepTelemetry<'_>,
 ) {
     emit_tick(
         root,
@@ -329,8 +374,10 @@ pub fn emit_for_step(
         outcome,
         resolved,
         None,
-        failure,
-        Some(sweep_id.to_string()),
+        step.failure,
+        Some(step.sweep_id.to_string()),
+        Some(step.item),
+        step.step_outcome,
     );
 }
 
@@ -373,6 +420,8 @@ fn emit_tick(
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
     step_sweep_id: Option<String>,
+    step_item: Option<(u32, bool)>,
+    step_outcome: Option<(String, String)>,
 ) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
     crate::observability::pick_decision::emit_role_tick(
@@ -421,8 +470,10 @@ fn emit_tick(
             role_draw,
             prompt,
             step_sweep_id,
+            step_item,
             deferred_by: None,
             shard_owner: None,
+            extras: TickExtras::of(trace.as_ref(), step_outcome),
         },
         trace,
     );
@@ -533,12 +584,6 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
     if has_label_flag && (command.contains("gh issue edit") || command.contains("gh pr edit")) {
         actions.issues_labeled = actions.issues_labeled.saturating_add(1);
     }
-    if command.contains("merge-pr.sh")
-        || command.contains("gh pr merge")
-        || (command.contains("gh api") && command.contains("/merge"))
-    {
-        actions.prs_merged = actions.prs_merged.saturating_add(1);
-    }
     if command.contains("gh issue comment")
         || command.contains("gh pr comment")
         || (command.contains("gh api") && command.contains("/comments"))
@@ -547,13 +592,80 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
     }
 }
 
+/// Whether `command` attempts a PR merge. An attempt is not a merge: it is
+/// counted into `prs_merged` only once its `tool_result` confirms success
+/// (see [`merge_result_confirms`]).
+fn is_merge_command(command: &str) -> bool {
+    command.contains("merge-pr.sh")
+        || command.contains("gh pr merge")
+        || (command.contains("gh api") && command.contains("/merge"))
+}
+
+/// Whether a merge command's `tool_result` shows a completed merge.
+///
+/// Keyed on a stable success line, never on exit status alone: `merge-pr.sh`
+/// exits 0 for `--dry-run` and for "already merged" paths too. The lines are
+/// `merge-pr.sh`'s terminal `success "PR #N merged successfully"`, `gh pr
+/// merge`'s `Merged pull request`, and the merge API's `"merged": true`.
+fn merge_result_confirms(block: &Value) -> bool {
+    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    let text = match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return false,
+    };
+    let text = text.to_ascii_lowercase();
+    text.contains("merged successfully")
+        || text.contains("merged pull request")
+        || text.replace(' ', "").contains("\"merged\":true")
+}
+
+/// Whether a record's top-level `timestamp` falls in `[start, end)`. A record
+/// with no parseable timestamp is **outside** (excluded: counting it would
+/// re-count it in every later tick).
+fn in_window(obj: &Value, window: (DateTime<Utc>, DateTime<Utc>)) -> bool {
+    obj.get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| {
+            let t = t.with_timezone(&Utc);
+            t >= window.0 && t < window.1
+        })
+}
+
 /// Fold one transcript record's `tool_use` blocks into `actions`.
-fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
+///
+/// A merge `tool_use` only registers its id in `pending_merges` (regardless of
+/// window, since its result may land in a later one); `prs_merged` is
+/// incremented when the matching `tool_result` confirms success, and only if
+/// that result record is in the window (`in_win`).
+fn tally_record_actions(
+    obj: &Value,
+    in_win: bool,
+    pending_merges: &mut std::collections::HashSet<String>,
+    actions: &mut RoleTickActions,
+) {
     let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(obj);
     let Some(content) = container.get("content").and_then(Value::as_array) else {
         return;
     };
     for block in content {
+        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            let id = block.get("tool_use_id").and_then(Value::as_str);
+            if id.is_some_and(|id| pending_merges.remove(id))
+                && in_win
+                && merge_result_confirms(block)
+            {
+                actions.prs_merged = actions.prs_merged.saturating_add(1);
+            }
+            continue;
+        }
         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
             continue;
         }
@@ -564,7 +676,14 @@ fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
         else {
             continue;
         };
-        tally_command(command, actions);
+        if is_merge_command(command) {
+            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                pending_merges.insert(id.to_string());
+            }
+        }
+        if in_win {
+            tally_command(command, actions);
+        }
     }
 }
 
@@ -577,8 +696,18 @@ fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
 /// exact record decoders their single-purpose counterparts use
 /// ([`crate::script_helpers::transcript_usage::usage_from_record`]), so the
 /// token numbers here cannot drift from `sweep.outcome`'s.
+///
+/// Only records whose top-level `timestamp` lies in `[started_at, ended_at)`
+/// contribute (actions and tokens alike): a transcript still being appended to
+/// is selected by mtime in the next tick's window too, and without this filter
+/// it would be re-counted from line 1. Records with no parseable timestamp
+/// are excluded from both.
 #[must_use]
-pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
+pub fn scan_transcripts(
+    transcripts: &[PathBuf],
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+) -> Option<TranscriptScan> {
     use std::collections::BTreeMap;
 
     let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
@@ -587,6 +716,8 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
     // One fold across every transcript: deduped on `message.id` per scan, not
     // per file (#8186, #9303, #9315).
     let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
+    let window = (started_at, ended_at);
+    let mut pending_merges = std::collections::HashSet::new();
 
     for path in transcripts {
         if std::fs::metadata(path)
@@ -607,7 +738,11 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
             let Ok(obj) = serde_json::from_str::<Value>(raw) else {
                 continue;
             };
-            tally_record_actions(&obj, &mut actions);
+            let in_win = in_window(&obj, window);
+            tally_record_actions(&obj, in_win, &mut pending_merges, &mut actions);
+            if !in_win {
+                continue;
+            }
             if let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) {
                 fold.add(rec);
             }
@@ -722,8 +857,15 @@ pub fn build_record(
             .as_ref()
             .map(|_| crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string()),
         sweep_id: tick.step_sweep_id.clone(),
+        issue: tick.step_item.filter(|(_, is_pr)| !is_pr).map(|(n, _)| n),
+        pr_number: tick.step_item.filter(|(_, is_pr)| *is_pr).map(|(n, _)| n),
         deferred_by: tick.deferred_by.clone().filter(|d| !d.is_empty()),
         shard_owner: tick.shard_owner.clone().filter(|s| !s.is_empty()),
+        found_work: tick.extras.found_work,
+        noop_reason: tick.extras.noop_reason.clone().filter(|s| !s.is_empty()),
+        verdicts: tick.extras.verdicts.clone(),
+        step_class: tick.extras.step_class.clone().filter(|s| !s.is_empty()),
+        step_reason: tick.extras.step_reason.clone().filter(|s| !s.is_empty()),
     }
 }
 
@@ -847,7 +989,7 @@ fn emit_correlated(
             tick.started_at,
             tick.ended_at,
         );
-        scan_transcripts(&transcripts)
+        scan_transcripts(&transcripts, tick.started_at, tick.ended_at)
     });
     let scan = scan.flatten();
     // The launch record's runtime, else the resolved-runtime marker (#8594);
@@ -933,7 +1075,7 @@ fn export(envelope: &TelemetryEnvelope) {
 /// path reaches the wire (#9442).
 fn exportable(mut record: TelemetryRecord) -> TelemetryRecord {
     if let TelemetryRecord::RoleTickOutcome(r) = &mut record {
-        if !crate::agent_gh::classify::is_slug(&r.repo) {
+        if !crate::forge_slug::valid_slug(&r.repo) {
             r.repo = crate::observability::pick_decision::REPO_UNRESOLVED.to_string();
         }
     }

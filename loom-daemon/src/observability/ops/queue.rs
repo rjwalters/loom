@@ -23,8 +23,9 @@
 //! queue reads as `0` and not as a missing series. A missing series then
 //! means only one thing: this host stopped ticking or stopped exporting. The
 //! labels are two small closed vocabularies. An issue number or a repo never
-//! becomes a label; the per-issue rows go to the native backend as
-//! `queue.snapshot` (`crate::telemetry::queue_snapshot`).
+//! becomes a label; per-issue rows ride the `pick.decision` and
+//! `eta.*` kinds instead (the native `queue.snapshot` record was removed in
+//! #12813).
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
@@ -65,6 +66,7 @@ pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
         MetricName::QueueListingIncompleteRepos,
         int(summary.listing_incomplete.len()),
     ));
+    points.push(MetricPoint::int(MetricName::QueueSeen, int(summary.seen)));
     points.extend(already_landed_points(summary));
     points.extend(host_shard_point(summary));
     points

@@ -1,5 +1,5 @@
 //! `loom-daemon preflight` — the Builder's in-session pre-PR gate
-//! (Issue #10476). Logic lives in [`loom_daemon::preflight`].
+//! (Issue #10476). Logic lives in [`crate::preflight`].
 //!
 //! Exit codes: `0` pass / gate not configured; `1` failed, attempts remain
 //! (output tail printed — fix and re-run); `4` attempts exhausted
@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use loom_daemon::preflight::{self, skip_ci, Verdict};
+use crate::preflight::{self, skip_ci, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct PreflightArgs {

@@ -21,6 +21,10 @@
 //! Then the live `worktree.sh` is driven end to end with the port pinned via
 //! `LOOM_DAEMON_SELF_BIN`, to prove the one-line stub wires it correctly.
 
+mod common;
+
+use common::git;
+use common::hermetic_git as hermetic;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -33,22 +37,6 @@ fn scripts() -> PathBuf {
 }
 fn fixture_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worktree-branch-reuse-retired.sh")
-}
-
-fn hermetic(cmd: &mut Command) -> &mut Command {
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = hermetic(Command::new("git").arg("-C").arg(dir).args(args))
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 
 fn rev(dir: &Path, r: &str) -> String {
@@ -230,6 +218,20 @@ fn json_doc(o: &Output) -> Option<String> {
 
 const BRANCH: &str = "feature/issue-42";
 
+/// #13056 replaced the retired shell's generic divergence warning with one that
+/// names ahead/behind/age. Everything else is still compared byte for byte, so
+/// fold the new parenthetical and trailing period back to the retired text.
+fn legacy_divergence(msg: &str) -> String {
+    let Some(open) = msg.find(" has diverged from ") else {
+        return msg.to_string();
+    };
+    let (Some(lp), Some(rp)) = (msg[open..].find(" ("), msg[open..].find(") - reusing")) else {
+        return msg.to_string();
+    };
+    let tail = msg[open + rp + 1..].trim_end_matches('.');
+    format!("{} (does not contain all of its history){}", &msg[..open + lp], tail)
+}
+
 #[test]
 fn port_agrees_with_the_retired_shell_on_every_case() {
     for forge in [Forge::MergedAtTip, Forge::None, Forge::Off] {
@@ -240,7 +242,8 @@ fn port_agrees_with_the_retired_shell_on_every_case() {
                 let (s, p) = (shell(&a, BRANCH, json), port(&b, BRANCH, json));
                 let ctx = format!("forge={forge:?} advance_main={advance_main} json={json}");
                 assert_eq!(s.status.code(), p.status.code(), "exit for {ctx}");
-                assert_eq!(msgs(&s), msgs(&p), "messages for {ctx}");
+                let legacy: Vec<String> = msgs(&p).iter().map(|m| legacy_divergence(m)).collect();
+                assert_eq!(msgs(&s), legacy, "messages for {ctx}");
                 if json && s.status.code() != Some(0) {
                     // Compared as VALUES: the shell spaced its hand-built
                     // document (`"a": b`), serde emits it compact.

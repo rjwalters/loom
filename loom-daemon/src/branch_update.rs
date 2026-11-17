@@ -49,9 +49,10 @@
 //! goes to stderr (suppressed by `--quiet`). There is no error outcome a caller
 //! could mishandle into a rebase.
 
+use crate::script_helpers::now_epoch_secs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -224,12 +225,6 @@ struct CacheEntry {
     settings: MergeSettings,
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// A cached answer for `nwo`, if one younger than `ttl` exists at `path`.
 fn read_cache(path: &Path, nwo: &str, now: u64, ttl: Duration) -> Option<MergeSettings> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -323,7 +318,7 @@ fn probe_forge(dir: &Path, nwo_arg: Option<&str>, use_cache: bool) -> Probe {
         return Probe::Unknown("no owner/repo resolvable from origin".to_string());
     };
     let cache = git_common_dir(dir).map(|d| d.join(CACHE_FILE));
-    let now = now_secs();
+    let now = now_epoch_secs();
     if use_cache {
         if let Some(settings) = cache
             .as_deref()

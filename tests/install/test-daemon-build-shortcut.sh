@@ -21,27 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-PASS=0
-FAIL=0
-TOTAL=0
-
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  TOTAL=$((TOTAL + 1))
-  if [[ "$expected" == "$actual" ]]; then
-    echo -e "${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo -e "${RED}FAIL${NC}: $desc"
-    echo "  expected: '$expected'"
-    echo "  actual:   '$actual'"
-    FAIL=$((FAIL + 1))
-  fi
-}
+source "$SCRIPT_DIR/lib/assert.sh"
 
 # Extract the loom_daemon_dest_binary_current() function body from install.sh
 # and define it here. awk grabs from the function header to the first

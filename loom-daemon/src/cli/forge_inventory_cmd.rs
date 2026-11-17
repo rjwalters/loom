@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use loom_daemon::forge_inventory::{
+use crate::forge_inventory::{
     self, gate, model::Profile, observed, probe, report, validate, Inventory,
 };
 
@@ -422,8 +422,8 @@ impl ObservedArgs {
         let inv = load(self.manifest_dir.as_ref())?;
         let now = chrono::Utc::now();
         let seen = match self.sink_dir.as_deref() {
-            Some(dir) => loom_daemon::forge_call_stats::observed_operations_in(dir, now),
-            None => loom_daemon::forge_call_stats::observed_operations(now).context(
+            Some(dir) => crate::forge_call_stats::observed_operations_in(dir, now),
+            None => crate::forge_call_stats::observed_operations(now).context(
                 "the forge call sink is disabled (LOOM_FORGE_CALL_STATS_DIR=off): nothing was observed",
             )?,
         };

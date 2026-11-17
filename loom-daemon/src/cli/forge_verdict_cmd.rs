@@ -1,13 +1,14 @@
 //! `loom-daemon forge verdict-gate | verdict-labels` (#10581): the I/O half of
-//! [`loom_daemon::verdict_gate`], called by `post-verdict.sh` before and after
-//! it posts a verdict comment. Reads and writes go through REST (`gh api`),
+//! [`crate::verdict_gate`], called by `post-verdict.sh` before and after
+//! it posts a verdict comment. Also `forge doctor-handback` (#9388), the I/O
+//! half of [`crate::doctor_handback`]. Reads and writes go through REST (`gh api`),
 //! never GraphQL, so they survive an exhausted GraphQL pool.
 
 use std::path::Path;
 
+use crate::claim_reconciliation::VerdictKind;
+use crate::verdict_gate::{self as gate, Decision, GateInput};
 use anyhow::Result;
-use loom_daemon::claim_reconciliation::VerdictKind;
-use loom_daemon::verdict_gate::{self as gate, Decision, GateInput};
 use serde_json::Value;
 
 fn verdict_or_exit(cmd: &str, verdict: &str) -> VerdictKind {
@@ -17,10 +18,18 @@ fn verdict_or_exit(cmd: &str, verdict: &str) -> VerdictKind {
     })
 }
 
+/// The `ROLE_ACTIONS` word a verdict's label write journals as (#12362).
+const fn journal_action(kind: VerdictKind) -> &'static str {
+    match kind {
+        VerdictKind::Approved => "approved",
+        VerdictKind::ChangesRequested => "changes_requested",
+    }
+}
+
 /// The PR's label names, live (uncached). `None` when the read failed.
 fn read_labels(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
     let path = format!("repos/{repo}/issues/{pr}/labels?per_page=100");
-    let out = loom_daemon::script_helpers::run_gh(&["api", &path], root, false);
+    let out = crate::script_helpers::run_gh(&["api", &path], root, false);
     let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
     gate::label_names(&doc)
 }
@@ -31,12 +40,60 @@ pub(crate) fn verdict_body_check() -> Result<()> {
     use std::io::Read;
     let mut body = String::new();
     let result = match std::io::stdin().read_to_string(&mut body) {
-        Ok(_) => loom_daemon::verdict_body::check(&body),
-        Err(_) => Err(loom_daemon::verdict_body::Reject::Empty),
+        Ok(_) => crate::verdict_body::check(&body),
+        Err(_) => Err(crate::verdict_body::Reject::Empty),
     };
-    let (line, code) = loom_daemon::verdict_body::render(result);
+    let (line, code) = crate::verdict_body::render(result);
     println!("{line}");
     std::process::exit(code)
+}
+
+/// The body-edit history of issue `n` (GraphQL `userContentEdits`; REST has no
+/// edit time). `None` when the read failed: never a pass (#12714).
+///
+/// `n` may name a pull request (`Part of #N` often points at one), so the
+/// field is read through the `Comment` interface both types implement; an
+/// `... on Issue`-only fragment returns no `userContentEdits` for a PR, and
+/// that `None` would refuse every approval linking it, for good.
+fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit>> {
+    let (owner, name) = repo.split_once('/')?;
+    let query = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
+                 issueOrPullRequest(number:$i){... on Comment{userContentEdits(first:50){nodes{\
+                 editedAt editor{login __typename}}}}}}}";
+    let args = [
+        "api".to_string(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={query}"),
+        "-f".into(),
+        format!("o={owner}"),
+        "-f".into(),
+        format!("n={name}"),
+        "-F".into(),
+        format!("i={n}"),
+    ];
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = crate::script_helpers::run_gh(&argv, root, false);
+    let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
+    let nodes = doc
+        .pointer("/data/repository/issueOrPullRequest/userContentEdits/nodes")?
+        .as_array()?;
+    nodes
+        .iter()
+        .map(|e| {
+            let at = chrono::DateTime::parse_from_rfc3339(e.get("editedAt")?.as_str()?).ok()?;
+            let kind = e.pointer("/editor/__typename").and_then(Value::as_str);
+            Some(gate::BodyEdit {
+                at: at.with_timezone(&chrono::Utc),
+                editor: e
+                    .pointer("/editor/login")
+                    .and_then(Value::as_str)
+                    .unwrap_or("an unknown editor")
+                    .to_string(),
+                bot: matches!(kind, Some("Bot" | "Mannequin")),
+            })
+        })
+        .collect()
 }
 
 /// The issues an approval is checked against for a stale read (#12614): those
@@ -48,12 +105,8 @@ fn read_linked_issues(
     hashes: &[(u64, String)],
     root: &Path,
 ) -> Option<Vec<gate::IssueSnapshot>> {
-    let pr_obj = loom_daemon::comment_trust::records::fetch_issue_object(
-        repo,
-        &pr.to_string(),
-        root,
-        false,
-    )?;
+    let pr_obj =
+        crate::comment_trust::records::fetch_issue_object(repo, &pr.to_string(), root, false)?;
     let body = pr_obj.get("body").and_then(Value::as_str).unwrap_or("");
     let mut numbers = gate::closing_issues(body);
     numbers.extend(hashes.iter().map(|(n, _)| *n));
@@ -64,8 +117,7 @@ fn read_linked_issues(
             .into_iter()
             .map(|n| {
                 let ns = n.to_string();
-                let obj =
-                    loom_daemon::comment_trust::records::fetch_issue_object(repo, &ns, root, false);
+                let obj = crate::comment_trust::records::fetch_issue_object(repo, &ns, root, false);
                 gate::IssueSnapshot {
                     number: n,
                     expected_body_sha: hashes.iter().find(|(h, _)| *h == n).map(|(_, v)| v.clone()),
@@ -75,9 +127,10 @@ fn read_linked_issues(
                             .unwrap_or("")
                             .to_string()
                     }),
-                    comments: loom_daemon::comment_trust::records::fetch_trusted_comments(
+                    comments: crate::comment_trust::records::fetch_trusted_comments(
                         repo, &ns, root, false,
                     ),
+                    edits: read_body_edits(repo, n, root),
                 }
             })
             .collect(),
@@ -95,10 +148,11 @@ pub(crate) fn verdict_gate(
     window_secs: i64,
     review_started: Option<&str>,
     issue_body_sha: &[String],
+    acknowledged_comment: &[u64],
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-gate", verdict);
     let root = super::forge_identity_cmd::workspace();
-    let started = review_started.map(|s| {
+    let flag_started = review_started.map(|s| {
         chrono::DateTime::parse_from_rfc3339(s.trim())
             .map(|d| d.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| {
@@ -119,17 +173,21 @@ pub(crate) fn verdict_gate(
                 })
         })
         .collect();
+    let comments =
+        crate::comment_trust::records::fetch_trusted_comments(repo, &pr.to_string(), &root, false);
+    // The start comes from the dispatch, not the agent (#12714): the agent's
+    // value may only move it earlier.
+    let dispatch = std::env::var("LOOM_SWEEP_ID")
+        .ok()
+        .and_then(|id| gate::dispatch_epoch(&id))
+        .or_else(|| comments.as_deref().and_then(gate::lease_start));
+    let started = gate::resolve_start(flag_started, dispatch);
     let issues = match (started, kind) {
         (Some(_), VerdictKind::Approved) => read_linked_issues(repo, pr, &hashes, &root),
         _ => Some(Vec::new()),
     };
-    let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
-        repo,
-        &pr.to_string(),
-        &root,
-        false,
-    );
     let labels = read_labels(repo, pr, &root);
+    let own_sweep = std::env::var("LOOM_SWEEP_ID").ok();
     let decision = gate::decide(&GateInput {
         verdict: kind,
         sha,
@@ -140,6 +198,8 @@ pub(crate) fn verdict_gate(
         window_secs,
         review_started: started,
         issues: issues.as_deref(),
+        own_sweep: own_sweep.as_deref(),
+        acknowledged: acknowledged_comment,
     });
     if matches!(decision, Decision::Proceed(_)) && (comments.is_none() || labels.is_none()) {
         eprintln!(
@@ -180,22 +240,17 @@ pub(crate) fn verdict_reconcile(
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-reconcile", verdict);
     let root = super::forge_identity_cmd::workspace();
-    let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
-        repo,
-        &pr.to_string(),
-        &root,
-        false,
-    );
+    let comments =
+        crate::comment_trust::records::fetch_trusted_comments(repo, &pr.to_string(), &root, false);
     let outcome =
         gate::reconcile(kind, sha, seen_opposite, seen_same_max_id, nonce, comments.as_deref());
     // The loser of an identical-verdict race withdraws its own comment, so
     // exactly one stands. A failed delete is an unconfirmed state, not a pass.
     if let gate::Reconciled::Duplicate(id) = &outcome {
         let path = format!("repos/{repo}/issues/comments/{id}");
-        let deleted =
-            loom_daemon::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false)
-                .ok_output()
-                .is_some();
+        let deleted = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false)
+            .ok_output()
+            .is_some();
         if !deleted {
             println!(
                 "{} UNREAD duplicate comment {id} could not be withdrawn",
@@ -210,7 +265,7 @@ pub(crate) fn verdict_reconcile(
 }
 
 /// `forge verdict-labels`.
-pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
+pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&str>) -> Result<()> {
     let kind = verdict_or_exit("verdict-labels", verdict);
     let root = super::forge_identity_cmd::workspace();
     let (add, remove) = gate::transition(kind);
@@ -226,7 +281,7 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
     // Never delete the source/claim labels unless the add landed: a failed
     // POST followed by the DELETEs would drop the PR out of its queue with
     // no verdict label to replace it.
-    if loom_daemon::script_helpers::run_gh(&argv, &root, false)
+    if crate::script_helpers::run_gh(&argv, &root, false)
         .ok_output()
         .is_none()
     {
@@ -242,13 +297,16 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
     // is what decides success, so the individual results are not consulted.
     for l in remove {
         let path = format!("{base}/{}", l.replace(':', "%3A"));
-        let _ = loom_daemon::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false);
+        let _ = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false);
     }
     let problems = match read_labels(repo, pr, &root) {
         Some(labels) => gate::label_problems(kind, &labels),
         None => vec!["the labels could not be re-read to verify the transition".to_string()],
     };
     if problems.is_empty() {
+        // Telemetry only (#12362): the verdict the run observed, from this
+        // write; no forge call.
+        crate::observability::pick_journal::record_verdict(pr, journal_action(kind), sha);
         println!("{} OK {}", gate::LABELS_SENTINEL, add.join(","));
         return Ok(());
     }
@@ -259,6 +317,89 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
         gate::repair_command(pr, repo, kind)
     );
     std::process::exit(1)
+}
+
+/// [`crate::doctor_handback::Forge`] over REST (`gh api`, uncached).
+struct GhHandback<'a> {
+    repo: String,
+    pr: u64,
+    labels: String,
+    pull: String,
+    root: &'a Path,
+}
+
+impl crate::doctor_handback::Forge for GhHandback<'_> {
+    fn read(&mut self) -> Option<crate::doctor_handback::Snapshot> {
+        // One `pulls/{n}` read carries both labels and head, so they agree.
+        let out = crate::script_helpers::run_gh(&["api", &self.pull], self.root, false);
+        let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
+        crate::doctor_handback::snapshot_from_pull(&doc)
+    }
+    fn add(&mut self, label: &str) -> bool {
+        let field = format!("labels[]={label}");
+        let argv = ["api", "-X", "POST", &self.labels, "-f", &field];
+        crate::script_helpers::run_gh(&argv, self.root, false)
+            .ok_output()
+            .is_some()
+    }
+    fn remove(&mut self, label: &str) -> bool {
+        let path = format!("{}/{}", self.labels, label.replace(':', "%3A"));
+        crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], self.root, false)
+            .ok_output()
+            .is_some()
+    }
+    fn rejected_at(&mut self, head: &str) -> Option<bool> {
+        let comments = crate::comment_trust::records::fetch_trusted_comments(
+            &self.repo,
+            &self.pr.to_string(),
+            self.root,
+            false,
+        )?;
+        Some(gate::count_markers(&comments, head, VerdictKind::ChangesRequested) > 0)
+    }
+}
+
+/// `forge doctor-handback` (#9388). Held under the per-PR verdict lock so a
+/// same-host `post-verdict.sh` cannot interleave; the re-read covers other hosts.
+pub(crate) fn doctor_handback(pr: u64, repo: Option<&str>, expected_head: &str) -> Result<()> {
+    use crate::doctor_handback as hb;
+    if expected_head.trim().is_empty() {
+        eprintln!("forge doctor-handback: --expected-head-sha must be the SHA you pushed");
+        std::process::exit(2)
+    }
+    let cwd = std::env::current_dir()?;
+    let repo = match crate::write_scope::may_write_from(&cwd, repo) {
+        crate::write_scope::Verdict::Allow(nwo) => nwo,
+        crate::write_scope::Verdict::Deny(why) => {
+            println!("{} FAILED may not write: {why}", hb::SENTINEL);
+            std::process::exit(hb::EXIT_FAILED)
+        }
+    };
+    let root = super::forge_identity_cmd::workspace();
+    let lock = lock_path(pr, &repo);
+    let wait = std::env::var("LOOM_VERDICT_LOCK_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90);
+    let outcome = if acquire_lock(&lock, std::time::Duration::from_secs(wait)) {
+        let mut forge = GhHandback {
+            repo: repo.clone(),
+            pr,
+            labels: format!("repos/{repo}/issues/{pr}/labels"),
+            pull: format!("repos/{repo}/pulls/{pr}"),
+            root: &root,
+        };
+        let outcome = hb::run(&mut forge, expected_head);
+        let _ = std::fs::remove_dir(&lock);
+        outcome
+    } else {
+        hb::Outcome::Failed(format!(
+            "a verdict on PR #{pr} held the lock for {wait}s; wrote nothing, retry"
+        ))
+    };
+    let (line, code) = outcome.render();
+    println!("{line}");
+    std::process::exit(code)
 }
 
 /// The lock directory for one PR (`owner/name` flattened, so it is one path

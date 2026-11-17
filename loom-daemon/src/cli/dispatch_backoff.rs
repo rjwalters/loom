@@ -12,13 +12,13 @@
 
 use anyhow::Result;
 
-use loom_daemon::types::{Request, Response};
+use crate::types::{Request, Response};
 
 use super::common::{query_daemon, resolve_socket_path};
-use crate::DispatchBackoffAction;
+use crate::cli::DispatchBackoffAction;
 
 /// Handle the `dispatch-backoff` subcommand.
-pub(crate) async fn handle_dispatch_backoff_command(action: DispatchBackoffAction) -> Result<()> {
+pub async fn handle_dispatch_backoff_command(action: DispatchBackoffAction) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     match action {
         DispatchBackoffAction::Record {

@@ -196,3 +196,134 @@ fn legacy_missing_and_corrupt_cursors_stay_safe() {
     std::fs::write(&file, "{not json").unwrap();
     assert_eq!(export::load_cursor(dir.path()), ExportCursor::default());
 }
+
+/// Identities of every envelope the sink received (order-insensitive).
+fn offered_lines(sink: &VecSink) -> Vec<String> {
+    let mut lines: Vec<String> = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Journal text with a cursor that trails EOF by all but the first line, plus
+/// the staged tail, as a tail-carrying rotation would have them.
+fn tail_scenario(root: &Path) -> (String, String, PathBuf) {
+    let text = generation(root);
+    assert!(valid_lines(&text) >= 2, "fixture needs a tail");
+    let first_end = text.find('\n').unwrap() + 1;
+    let path = journal_path(root);
+    let staged = rotation::carry_tail(&path, first_end as u64).unwrap();
+    (text.clone(), text[first_end..].to_string(), staged)
+}
+
+/// #13636: a crash between the two renames of a tail-carrying rotation leaves
+/// no journal; the next export pass must put the tail back and offer it.
+#[test]
+fn tail_carry_crash_between_renames_loses_no_line() {
+    let dir = TempDir::new().unwrap();
+    let (text, tail, staged) = tail_scenario(dir.path());
+    let path = journal_path(dir.path());
+    // The durable cursor reset happened, then the crash: journal moved to
+    // `.1`, tail not yet in place.
+    export::save_cursor_with(dir.path(), &ExportCursor::default(), &|_| Ok(())).unwrap();
+    rotation::rotate(&path, 1).unwrap();
+    assert!(!path.exists() && staged.exists());
+    assert_eq!(std::fs::read_to_string(rotated_path(&path, 1)).unwrap(), text);
+
+    let sink = sink();
+    export::backfill(dir.path(), &sink);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), tail, "tail restored as the journal");
+    assert!(!staged.exists());
+    let expected: Vec<String> = {
+        let mut v: Vec<String> = tail
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::to_string(&serde_json::from_str::<TelemetryEnvelope>(l).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(offered_lines(&sink), expected, "every carried line was offered");
+}
+
+/// #13636: the poller recreated the journal before the next export pass: the
+/// staged tail is appended to it, not lost and not overwritten.
+#[test]
+fn tail_carry_recovery_appends_to_a_recreated_journal() {
+    let dir = TempDir::new().unwrap();
+    let (_, tail, staged) = tail_scenario(dir.path());
+    let path = journal_path(dir.path());
+    rotation::rotate(&path, 1).unwrap();
+    std::fs::write(&path, "{\"fresh\":true}\n").unwrap();
+    assert!(rotation::recover_carry(&path).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{{\"fresh\":true}}\n{tail}"));
+    assert!(!staged.exists());
+    assert!(!rotation::recover_carry(&path).unwrap(), "idempotent");
+}
+
+/// #13636: a crash after staging but before the rotation leaves the full old
+/// journal; recovery just drops the staging file (no duplicated tail).
+#[test]
+fn tail_carry_recovery_drops_a_stale_staging_file() {
+    let dir = TempDir::new().unwrap();
+    let (text, _, staged) = tail_scenario(dir.path());
+    let path = journal_path(dir.path());
+    assert!(rotation::recover_carry(&path).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert!(!staged.exists());
+}
+
+/// #13636 (criterion 4): a failure at each step of the cursor reset with a
+/// non-empty tail leaves the journal intact, and a restart loses no line.
+#[test]
+fn failed_durable_reset_with_a_tail_loses_no_line() {
+    for step in STEPS {
+        let dir = TempDir::new().unwrap();
+        let text = generation(dir.path());
+        let path = journal_path(dir.path());
+        let first_end = text.find('\n').unwrap() as u64 + 1;
+        let mut cursor = ExportCursor {
+            byte_offset: first_end,
+            fast_offset: None,
+            exported: 1,
+        };
+        let result =
+            export::rotate_if_due_with(dir.path(), &path, &mut cursor, policy(1), &failing(step));
+        assert!(result.is_err(), "{step:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{step:?}: journal intact");
+        assert!(!rotated_path(&path, 1).exists(), "{step:?}");
+        // The staging file is either gone or recoverable without loss.
+        let sink = sink();
+        set_rotation(dir.path(), u64::MAX, 1);
+        export::backfill(dir.path(), &sink);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{step:?}");
+        assert!(!rotation::carry_path(&path).exists(), "{step:?}");
+    }
+}
+
+/// #13636: a rotation that carries a tail leaves cursor 0 and the tail first.
+#[test]
+fn tail_carry_rotation_resets_the_cursor_and_puts_the_tail_first() {
+    let dir = TempDir::new().unwrap();
+    let (text, _) = exported_generation(dir.path());
+    let path = journal_path(dir.path());
+    let first_end = text.find('\n').unwrap() as u64 + 1;
+    let mut cursor = ExportCursor {
+        byte_offset: first_end,
+        fast_offset: Some(first_end + 1),
+        exported: 1,
+    };
+    assert!(export::rotate_if_due(dir.path(), &path, &mut cursor, policy(1)).unwrap());
+    assert_eq!(cursor.byte_offset, 0);
+    assert_eq!(cursor.fast_offset, None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text[first_end as usize..]);
+    assert_eq!(std::fs::read_to_string(rotated_path(&path, 1)).unwrap(), text);
+}

@@ -268,7 +268,6 @@ Loom provides a unified MCP server (`mcp-loom`) for AI-powered testing and debug
 **UI Tools:**
 - `read_state_file` - Application state
 - `read_config_file` - Terminal configurations
-- `trigger_force_start` - Start engine
 - `trigger_factory_reset` - Reset to defaults
 - `get_heartbeat` - Health status
 
@@ -279,7 +278,6 @@ Loom provides a unified MCP server (`mcp-loom`) for AI-powered testing and debug
 
 **Terminal Tools:**
 - `list_terminals` - All terminals
-- `get_selected_terminal` - Primary terminal
 - `get_terminal_output` - Terminal output
 - `send_terminal_input` - Send input
 
@@ -338,9 +336,6 @@ Optional metadata for role files.
 {
   "name": "Worker Bot",
   "description": "General development worker",
-  "defaultInterval": 0,
-  "defaultIntervalPrompt": "Continue working on open tasks",
-  "autonomousRecommended": false,
   "suggestedWorkerType": "claude"
 }
 ```

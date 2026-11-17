@@ -14,7 +14,7 @@ use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 use opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint;
 
-use super::{kv, kv_string, nanos, visibility_str};
+use super::{kv, kv_string, nanos};
 use crate::telemetry::ci::{CiAttr, CiDurationRecord};
 use crate::telemetry::TelemetryRecord;
 
@@ -90,7 +90,7 @@ pub(super) fn log_parts(
     };
     let mut attributes = vec![
         kv_string("loom.repo", repo.clone()),
-        kv_string("loom.repo.visibility", visibility_str(visibility)),
+        kv_string("loom.repo.visibility", visibility.as_str()),
     ];
     attributes.extend(
         ci_attributes

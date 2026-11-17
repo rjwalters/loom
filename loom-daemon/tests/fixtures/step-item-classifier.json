@@ -263,6 +263,57 @@
       ]
     },
     {
+      "name": "loom:triage + loom:curated (a landed route or a Champion send-back): Curator, not Champion promote (#12713)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 21,
+            "labels": [
+              "loom:triage",
+              "loom:curated"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 21,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:triage + loom:issue (a claim release put the ready label back on a routed issue): Curator, not Builder (#12713)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 22,
+            "labels": [
+              "loom:triage",
+              "loom:issue",
+              "loom:curated"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 22,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
       "name": "a proposal label (loom:architect) stays on Champion's non-item run: pass",
       "inputs": {
         "issues": [
@@ -282,6 +333,108 @@
           "state": "proposal",
           "verdict": {
             "pass": "proposal"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a proposal sent back to loom:triage is Curator's turn (#13623)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 9301,
+            "labels": [
+              "loom:architect",
+              "loom:triage"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 9301,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a proposal with loom:decision-malformed is Curator's turn (#13623)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 9302,
+            "labels": [
+              "loom:hermit",
+              "loom:decision-malformed"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 9302,
+          "pr": null,
+          "state": "decision_malformed",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a triaged proposal under loom:blocked is still held: pass (#13623)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 9303,
+            "labels": [
+              "loom:auditor",
+              "loom:triage",
+              "loom:blocked"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 9303,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a triaged proposal under loom:operator is still held: pass (#13623)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 9304,
+            "labels": [
+              "loom:architect",
+              "loom:triage",
+              "loom:operator"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 9304,
+          "pr": null,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
           }
         }
       ]

@@ -205,7 +205,7 @@ fn cli_parses_plan_flag() {
         panic!("did not parse");
     };
     match cli.command {
-        Some(crate::Commands::ScriptPorts(
+        Some(crate::cli::Commands::ScriptPorts(
             crate::cli::script_ports::ScriptPortCommand::WorkDocs(
                 super::super::work_docs_archive::WorkDocsCommand::Archive(a),
             ),

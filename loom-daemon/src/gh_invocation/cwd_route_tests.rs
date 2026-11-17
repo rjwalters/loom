@@ -347,6 +347,20 @@ fn a_lone_github_origin_is_the_sole_answer() {
     assert_eq!(checkout_answer(&root, GhRepoEnv::Honour), CwdAnswer::Sole("acme/widget".into()));
 }
 
+/// origin = base but the canonical record names a renamed repo: the read
+/// routes to the canonical slug (#13719), not shed.
+#[test]
+fn a_renamed_repo_routes_to_the_canonical_slug() {
+    let env = Env::new(&[]);
+    let root = env.repo("renamed", &[("origin", "https://github.com/acme/app.git")]);
+    let forge = crate::forge_repo_facts::test_support::Forge::new(env.tmp.path(), "newco/app");
+    assert!(matches!(
+        crate::forge_repo_facts::canonical_with(&forge.gh, &root, GhRepoEnv::Honour),
+        crate::forge_repo_facts::Lookup::Fact(_)
+    ));
+    assert_eq!(checkout_answer(&root, GhRepoEnv::Honour), CwdAnswer::Sole("newco/app".into()));
+}
+
 #[test]
 fn ambiguous_checkouts_keep_the_writer_and_count_a_disagreement() {
     let env = Env::new(&[]);

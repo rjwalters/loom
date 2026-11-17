@@ -19,8 +19,11 @@
 //!   closed on (the probe cache's stale-WRITE grace still applies).
 //!
 //! **Age.** The snapshot answers for up to its own TTL and the probe cache
-//! then keeps the answer for the probe's: the two stack (about two hours
-//! with the defaults), see [`super::probe`].
+//! then keeps a WRITE for the probe's. A repo the snapshot does not list is
+//! different (#13152): the snapshot is revalidated once on such a miss
+//! (rate-limited to one per minute), and the probe cache keeps the resulting
+//! `NOT_IN_INSTALLATION` for only a minute, so a newly created or newly
+//! added repo is answered within about a minute, see [`super::probe`].
 
 use super::probe::{names_a_lesser_role, Permission, NO_REPOSITORY_ROLE};
 use crate::forge_repo_facts::installation::Answer;

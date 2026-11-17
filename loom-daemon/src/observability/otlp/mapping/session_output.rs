@@ -86,13 +86,7 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
         attributes.push(kv_string("loom.repo", repo.clone()));
         // Only meaningful alongside a repo, and only ever the fail-closed
         // `private` here — this producer makes no forge call to ask.
-        attributes.push(kv_string(
-            "loom.repo.visibility",
-            match r.identity.visibility {
-                crate::telemetry::RepoVisibility::Public => "public",
-                crate::telemetry::RepoVisibility::Private => "private",
-            },
-        ));
+        attributes.push(kv_string("loom.repo.visibility", r.identity.visibility.as_str()));
     }
     if let Some(issue) = r.identity.issue {
         attributes.push(kv_int("loom.issue", i64::from(issue)));
