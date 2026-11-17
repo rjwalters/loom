@@ -27,7 +27,6 @@ use loom_daemon::idle_exit;
 use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
-use loom_daemon::metrics_collector;
 use loom_daemon::orphan_process_reaper;
 use loom_daemon::primary_checkout_reaper;
 use loom_daemon::quarantine_stash_status;
@@ -300,15 +299,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::info!("tmux health monitoring enabled (interval: {interval}s)");
         // Note: health_handle is dropped here, but the thread keeps running
         // health_state could be stored for querying crash status if needed
-    }
-
-    // Start GitHub metrics collection (if workspace is set)
-    // Workspace can be set via LOOM_WORKSPACE environment variable (reuse variable from above)
-    let db_str = db_path.to_str().map(std::string::ToString::to_string);
-
-    if let (Some(workspace), Some(db)) = (workspace_from_env.as_deref(), db_str) {
-        let _metrics_handle = metrics_collector::try_init_metrics_collector(Some(workspace), &db);
-        // Note: metrics_handle is dropped here, but the thread keeps running if enabled
     }
 
     // Initialize the sweep registry (Issue #3452 — Phase A of #3449).

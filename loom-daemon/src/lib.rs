@@ -311,7 +311,6 @@ pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;
 pub mod merge_pr;
-pub mod metrics_collector;
 pub mod observability;
 pub mod opencode_usage;
 pub mod operator_decision;
