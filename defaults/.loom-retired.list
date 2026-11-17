@@ -211,3 +211,8 @@ scripts/cli/loom-scale.sh
 # next resync too.
 commands/loom/loom-iteration.md
 commands/loom/loom-parent.md
+
+# #13911 (2026-11-17) — generate-agents-md.sh is source-tree-only tooling (it
+# resolves defaults/.loom/ from the repo root) and exited 1 in every consumer;
+# it moved to the upstream-only scripts/ and stopped shipping.
+scripts/generate-agents-md.sh

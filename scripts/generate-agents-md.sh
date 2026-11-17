@@ -23,6 +23,10 @@
 # hand-authored static file; this repo generates the content instead, per
 # #4479's single-source non-goal.
 #
+# Source-tree-only (#13911): this script lives in scripts/ (NOT defaults/scripts/)
+# because it resolves defaults/.loom/ relative to the repo root; it must never
+# ship to a consumer's .loom/scripts/, where those paths do not exist.
+#
 # Usage:
 #   generate-agents-md.sh              Write defaults/.loom/AGENTS.md (canonical)
 #   generate-agents-md.sh --stdout     Print the generated content to stdout
@@ -34,8 +38,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$SCRIPT_DIR/../.loom/CLAUDE.md"
-DEFAULT_OUT="$SCRIPT_DIR/../.loom/AGENTS.md"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC="$ROOT/defaults/.loom/CLAUDE.md"
+DEFAULT_OUT="$ROOT/defaults/.loom/AGENTS.md"
 
 START_MARKER="<!-- agents-md:include:start -->"
 END_MARKER="<!-- agents-md:include:end -->"
@@ -111,7 +116,7 @@ fi
 emit() {
   cat <<'HEADER'
 <!-- GENERATED FILE — DO NOT EDIT DIRECTLY.
-     Produced by defaults/scripts/generate-agents-md.sh from the
+     Produced by scripts/generate-agents-md.sh from the
      `agents-md:include` marker ranges in defaults/.loom/CLAUDE.md. To change
      this file, edit those ranges in the source and re-run the generator;
      CI (scripts/check-agents-md-sync.sh) fails if this file is stale.
