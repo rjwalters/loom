@@ -407,15 +407,21 @@ pub fn body_sha(body: &str) -> String {
     hex::encode(Sha256::digest(body.trim_end_matches(['\n', '\r']).as_bytes()))
 }
 
-/// Whether `expected` is the hash of `body`: the canonical [`body_sha`], or that
-/// same trimmed body plus exactly one `\n`, which is what
-/// `gh api … --jq .body | sha256sum` yields (jq appends the newline).
+/// Whether `expected` is the hash of `body`: the canonical [`body_sha`], that
+/// same trimmed body plus exactly one `\n`, or the **raw** body plus exactly
+/// one `\n`. The last is what `gh api … --jq .body | sha256sum` yields for
+/// any body — jq appends its own newline after the body, so a body that
+/// already ends in `\n` hashes to trimmed + two newlines, which none of the
+/// other forms match. Every candidate is an exact digest of (a function of)
+/// the current body, so a match cannot admit an edited body beyond the
+/// trailing-newline equivalence [`body_sha`] already grants.
 fn body_sha_matches(expected: &str, body: &str) -> bool {
     use sha2::{Digest, Sha256};
     let expected = expected.trim();
     let trimmed = body.trim_end_matches(['\n', '\r']);
     expected.eq_ignore_ascii_case(&body_sha(body))
         || expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(format!("{trimmed}\n"))))
+        || expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(format!("{body}\n"))))
 }
 
 /// The issue numbers a PR body closes or contributes to (`Closes #N`,
@@ -567,9 +573,13 @@ pub fn stale_read(
         if let Some(expected) = issue.expected_body_sha.as_deref() {
             if !body_sha_matches(expected, body) {
                 why.push(format!(
-                    "issue #{n}'s body changed since this review started (it no longer matches \
-                     the body you reviewed). The gate compares the sha256 of the issue body with \
-                     trailing newlines trimmed; recompute yours with: printf %s \"$(gh \
+                    "issue #{n}'s body changed since this review started, or \
+                     --issue-body-sha was hashed in a form the gate does not accept — \
+                     a hash-convention mismatch is not a spec change and needs no \
+                     re-review, only the recomputed hash. The gate accepts the sha256 of \
+                     the issue body with trailing newlines trimmed, that plus one newline, \
+                     or the raw body plus one newline (what gh api … --jq .body | \
+                     sha256sum yields); recompute yours with: printf %s \"$(gh \
                      api repos/OWNER/REPO/issues/{n} --jq .body)\" | sha256sum | cut -d' ' -f1"
                 ));
             }

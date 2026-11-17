@@ -467,14 +467,30 @@ fn trailing_newline_hash_is_accepted_but_edited_body_still_refuses() {
     let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
     assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
 
-    iss[0].body = Some("edited".into());
+    // The jq form for a body that itself ends in a newline (#13980): jq
+    // appends its own newline after the body's, so the hashed bytes end in
+    // two newlines — the raw body plus exactly one.
+    let jq = hex::encode(Sha256::digest(b"same\n\n"));
+    let mut iss = [issue(12510, "same\n", "same\n", vec![])];
+    iss[0].expected_body_sha = Some(jq);
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+    // A body genuinely edited after the review still refuses under that form.
+    iss[0].body = Some("edited\n".into());
     let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
     assert!(matches!(&d, Decision::Refuse(m) if m.contains("body changed")), "{d:?}");
-    // The refusal says what was hashed and shows the recipe (#13600).
+
+    iss[0].body = Some("edited".into());
+    iss[0].expected_body_sha = Some(nl);
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(&d, Decision::Refuse(m) if m.contains("body changed")), "{d:?}");
+    // The refusal says what was hashed, that an unaccepted hash form is one
+    // possibility, and shows the recipe (#13600, #13980).
     assert!(
         matches!(&d, Decision::Refuse(m) if m.contains("trailing newlines trimmed")
+            && m.contains("does not accept")
             && m.contains("sha256sum")
-            && m.contains("issues/12509")),
+            && m.contains("issues/12510")),
         "{d:?}"
     );
 
