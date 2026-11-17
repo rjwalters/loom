@@ -10,6 +10,10 @@
 #   2. verify_plan_provenance() ACCEPTS a body whose titles match the pinned
 #      repo, REJECTS a foreign body whose numbers all exist under other titles,
 #      fails closed when the title lookup fails, and passes a body with no #N.
+#      Every ` *(x)*` suffix render_plan_body() can emit (read from its source,
+#      so a new one cannot be added without the gate learning it) is accepted,
+#      alone and combined with ` *(held)*` (#13908); a wrong order, an unknown
+#      suffix and a held bullet under a foreign title are rejected.
 #   3. splice_plan_body() writes through a per-tick scratch dir (removed after),
 #      replaces only the marker region, and leaves the file untouched when the
 #      markers are missing.
@@ -47,6 +51,7 @@ cat >"$GH_STUB" <<'EOF'
 case "$2" in
   repos/owner/mine/issues/1) echo "Add widget" ;;
   repos/owner/mine/issues/2) echo "Fix gizmo" ;;
+  repos/owner/mine/issues/3) echo "Odd title *(held)*" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -63,6 +68,37 @@ FAIL_LOOKUP=1 verify_plan_provenance '- **#1**: Add widget' 2>/dev/null \
   && fail "failed lookup accepted" || pass "failed title lookup fails closed"
 verify_plan_provenance $'## None\n\n_None._' 2>/dev/null \
   && pass "body with zero #N accepted" || fail "zero-#N body rejected"
+
+echo "Test 2b: every suffix render_plan_body() emits is accepted (#13908 lockstep)"
+ok() { verify_plan_provenance "$1" 2>/dev/null && pass "accepted: $1" || fail "rejected: $1"; }
+no() { verify_plan_provenance "$1" 2>/dev/null && fail "accepted: $1" || pass "rejected: $1"; }
+# The suffix set comes from render_plan_body()'s own source, never a list kept
+# here: a suffix added to the render without teaching the gate fails this test.
+RPB="$(extract render_plan_body)"
+TAGS="$(grep -v '^ *#' <<<"$RPB" | grep -oE ' \*\([a-z-]+\)\*' | sort -u | sed -E 's/^ \*\(|\)\*$//g')"
+grep -qx held <<<"$TAGS" && pass "render emits the *(held)* suffix" || fail "render no longer emits *(held)* (test assumptions stale)"
+for want_tag in curated architect hermit; do
+  grep -qx "$want_tag" <<<"$TAGS" && pass "render emits *($want_tag)*" || fail "render no longer emits *($want_tag)*"
+done
+ok '- **#1**: Add widget *(held)*'
+while IFS= read -r t; do
+  [[ "$t" == held ]] && continue
+  ok "- **#1**: Add widget *($t)*"
+  ok "- **#1**: Add widget *($t)* *(held)*"
+  no "- **#1**: Add widget *(held)* *($t)*"
+  no "- **#1**: Foreign title *($t)* *(held)*"
+done <<<"$TAGS"
+ok $'## Very Important\n\n- **#1**: Add widget *(held)*\n- **#2**: Fix gizmo *(curated)* *(held)*\n- **#2**: Fix gizmo'
+ok '- **#3**: Odd title *(held)*'
+ok '- **#3**: Odd title *(held)* *(held)*'
+no '- **#1**: Foreign title *(held)*'
+no '- **#1**: Add widget *(held)* *(held)*'
+no '- **#1**: Add widget *(curated)* *(hermit)*'
+no '- **#1**: Add widget *(bogus)*'
+no '- **#1**: Add widget extra'
+no '- **#1**: Add'
+FAIL_LOOKUP=1 verify_plan_provenance '- **#1**: Add widget *(held)*' 2>/dev/null \
+  && fail "failed lookup accepted for a held bullet" || pass "failed lookup still fails closed for a held bullet"
 
 echo "Test 3: splice_plan_body"
 eval "$SPB"

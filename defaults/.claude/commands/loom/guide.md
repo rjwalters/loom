@@ -2245,38 +2245,56 @@ update_work_plan() {
 # repo reports for #N (issues and PRs share the `issues/N` endpoint). Existence
 # is NOT enough — a foreign render's numbers can all exist, closed, under
 # unrelated titles. Zero bullets passes; a failed lookup fails closed.
+#
+# SUFFIX LOCKSTEP, DO NOT LET THIS DRIFT: `render_plan_body()` appends at most
+# one section tag (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) and then,
+# for a held issue, ` *(held)*` (#13908) — in that order. The bullet must be the
+# forge title followed by exactly one of those combinations, so a title is
+# never guessed by stripping (a title that itself ends in ` *(held)*` still
+# matches). A new ` *(x)*` suffix in the render MUST be added here in the same
+# change: an unknown suffix fails closed and WORK_PLAN.md stops updating.
+# `test-guide-work-plan-provenance.sh` reads the render's suffix literals and
+# fails if this gate rejects any of them.
 verify_plan_provenance() {
-  local body="$1" line num want got bad=0
+  local body="$1" line num rest got tag ok bad=0
   while IFS= read -r line; do
     num="${line#- **#}"; num="${num%%\**}"
-    want="${line#*\*\*: }"
-    want="${want% \*(curated)\*}"; want="${want% \*(architect)\*}"; want="${want% \*(hermit)\*}"
+    rest="${line#*\*\*: }"
     got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '.title' 2>/dev/null)" || got=""
     if [ -z "$got" ]; then
       echo "provenance: cannot fetch title of #$num from $GUIDE_REPO" >&2; bad=1
-    elif [ "$got" != "$want" ]; then
-      echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$want', forge '$got')" >&2; bad=1
+      continue
+    fi
+    # Plain string equality only: a `${var% \*(x)\*}` strip is a no-op under
+    # zsh (the shell an interactive Guide may run this in), so never strip.
+    ok=0
+    for tag in '' ' *(curated)*' ' *(architect)*' ' *(hermit)*'; do
+      if [ "$rest" = "$got$tag" ] || [ "$rest" = "$got$tag *(held)*" ]; then ok=1; fi
+    done
+    if [ "$ok" -ne 1 ]; then
+      echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$rest', forge '$got')" >&2; bad=1
     fi
   done < <(printf '%s\n' "$body" | grep -E '^- \*\*#[0-9]+\*\*: ')
   return "$bad"
 }
 
 # #13923: write $1 between the plan-body markers of "$DOCS_WT/WORK_PLAN.md"
-# through a per-tick scratch dir that is removed on exit. Fails (file untouched)
-# if the markers are missing.
+# through a per-tick scratch dir that is removed before returning (explicitly,
+# not via `trap ... RETURN`, which is bash-only and leaks the dir under zsh).
+# Fails (file untouched) if the markers are missing.
 splice_plan_body() {
-  local plan="$DOCS_WT/WORK_PLAN.md" scratch
+  local plan="$DOCS_WT/WORK_PLAN.md" scratch rc=0
   grep -q '<!-- guide:plan-body:start -->' "$plan" 2>/dev/null \
     && grep -q '<!-- guide:plan-body:end -->' "$plan" 2>/dev/null || return 1
   scratch="$(mktemp -d "${TMPDIR:-/tmp}/guide-plan.XXXXXX")" || return 1
-  # shellcheck disable=SC2064
-  trap "rm -rf '$scratch'" RETURN
-  printf '%s\n' "$1" > "$scratch/body.md" || return 1
-  awk -v body="$scratch/body.md" '
-    /<!-- guide:plan-body:start -->/ { print; while ((getline l < body) > 0) print l; skip=1; next }
-    /<!-- guide:plan-body:end -->/   { skip=0 }
-    !skip { print }' "$plan" > "$scratch/plan.new" || return 1
-  cat "$scratch/plan.new" > "$plan"
+  printf '%s\n' "$1" > "$scratch/body.md" \
+    && awk -v body="$scratch/body.md" '
+      /<!-- guide:plan-body:start -->/ { print; while ((getline l < body) > 0) print l; skip=1; next }
+      /<!-- guide:plan-body:end -->/   { skip=0 }
+      !skip { print }' "$plan" > "$scratch/plan.new" \
+    && cat "$scratch/plan.new" > "$plan" || rc=1
+  rm -rf "$scratch"
+  return "$rc"
 }
 ```
 
