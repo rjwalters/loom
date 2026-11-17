@@ -489,13 +489,15 @@ fn ambiguous_exhaustion_evidence(
     else {
         return AmbiguousExhaustionEvidence::FixedCooldown;
     };
-    let Some(util_5h) = row.util_5h else {
-        return AmbiguousExhaustionEvidence::FixedCooldown;
-    };
     if row.status == "exhausted" {
         // The probe's 7d verdict: still weekly-exhausted (#13893). Hold to
         // the row's recorded 7d reset instant when it is credible; anything
-        // less falls back to the fixed cooldown.
+        // less falls back to the fixed cooldown. Note this arm must NOT
+        // require `row.util_5h`: `check::ranking_line`'s `(None, Some(r))`
+        // arm writes `name|exhausted||limit_reset` (empty third field, util
+        // unknown), and the codex probe emits exactly that for a
+        // weekly-blocked account whose 5h window has already rolled over —
+        // the steady state of the account class this hold exists for.
         if let Some(reset) = row.limit_reset.as_deref() {
             if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%SZ") {
                 let reset_at = naive.and_utc().timestamp();
@@ -512,6 +514,12 @@ fn ambiguous_exhaustion_evidence(
     }
     // Not `exhausted` (the probe's 7d signal is clear): release only when 5h
     // utilization is also back under the load gate (#7538's two signals).
+    // `util_5h` is load-bearing only here — the release arm needs the actual
+    // utilization; an unknown utilization cannot prove recovery, so it falls
+    // back to the fixed cooldown.
+    let Some(util_5h) = row.util_5h else {
+        return AmbiguousExhaustionEvidence::FixedCooldown;
+    };
     if util_5h < super::select::resolve_load_gate() {
         AmbiguousExhaustionEvidence::Release
     } else {

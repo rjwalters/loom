@@ -1286,6 +1286,48 @@ fn exhausted_reprobe_holds_entry_until_limit_reset_past_the_fixed_cooldown() {
     );
 }
 
+/// #13893, AC 2 for the writer's own empty-util row shape: a fresh
+/// `exhausted` row that knows its 7d reset but not its 5h utilization —
+/// `check::ranking_line`'s `(None, Some(r))` arm writes
+/// `name|exhausted||limit_reset` — must hold past the fixed cooldown exactly
+/// like a row with a utilization. The codex probe emits this shape in the
+/// steady state of a weekly-blocked account whose 5h window has already
+/// rolled over; gating the hold on `util_5h` would send exactly those rows
+/// back to the 6h re-mark churn.
+#[test]
+#[serial]
+fn exhausted_reprobe_without_5h_util_still_holds_until_limit_reset() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    // Marked 7h ago — past the 6h default cooldown, so any blocking below
+    // can only come from the #13893 hold.
+    let marked = (Utc::now() - chrono::Duration::seconds(7 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    // Re-probed AFTER the mark: still `exhausted`, 5h utilization unknown
+    // (empty third field — `name|status||limit_reset`), 7d reset 5 days out.
+    let reset = (Utc::now() + chrono::Duration::seconds(5 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted||{reset}\n")).unwrap();
+
+    let entry = blocking_entry(tmp.path(), "agent-1")
+        .expect("an exhausted row with unknown 5h util must hold past the fixed cooldown");
+    assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    let remaining = entry
+        .cooldown_remaining_secs
+        .expect("the hold reports a countdown");
+    assert!(
+        ((5 * 24 * 3600) - 3600..=(5 * 24 * 3600)).contains(&remaining),
+        "expected ~5d to the recorded reset instant, got {remaining}s"
+    );
+}
+
 /// #13893: even while the entry is still inside its fixed cooldown, a fresh
 /// `exhausted` row's countdown switches to the recorded reset instant — here
 /// the instant (2h out) is EARLIER than the remaining cooldown (~5h50m), and
