@@ -6253,6 +6253,8 @@ knobs not yet audited here.
 | Config key | Env override | Default | Notes |
 |------------|--------------|---------|-------|
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
+| `autonomous.modelFallback.enabled` | *(config only)* | `false` | Selection-time model fallback (#13873): with `true`, a role tick / step spawn whose configured model's *class* has no usable pool account falls one rung down `modelFallback.chain` instead of holding, and the pool preflights scope their exhaustion verdict to the class the launch would run. Absent/false reproduces pre-#13873 behaviour exactly |
+| `autonomous.modelFallback.chain` | *(config only)* | `["fable", "opus", "sonnet"]` | The fallback ladder, strongest first (#13873); walked strictly **below** the configured model (never climbs; a configured model not in the chain never falls back). Blank/unrecognized entries are skipped, not fatal |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default. **Restart required** — the ticker is built once at startup with this period (#12090 follow-up) |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512, and the only sweep cap since #12406 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
@@ -11039,6 +11041,64 @@ The same pass-through can be requested deliberately with
 `autonomous.roleRunner.roleModels.<role> = "default"` (or the global
 `autonomous.roleRunner.model`); see
 [`runtime-adapters.md` § "Per-role model override"](runtime-adapters.md#per-role-model-override-autonomousrolerunnerrolemodels).
+
+**Pinned models fall back one rung at selection time when their class limit
+is hit (#13873).** A model pin has no answer to an org-wide class ceiling:
+when every pool account is bad-marked `[model-class:fable]` (#8058/#13872),
+rotation has nothing to rotate to, the pool preflights hold dispatch, and
+the fleet idles until an operator moves every role off the pinned model by
+hand (the 2026-11-13 fable incident). `autonomous.modelFallback` makes the
+daemon fall a rung automatically instead — keep the stronger model
+configured; when its limit resets, the next spawn returns to it:
+
+```json
+{
+  "autonomous": {
+    "model": "fable",
+    "modelFallback": { "enabled": true, "chain": ["fable", "opus", "sonnet"] }
+  }
+}
+```
+
+- **Default off.** An absent block — or `"enabled": false` — reproduces the
+  pre-#13873 behaviour byte-for-byte, on every path below. Rollout is an
+  explicit per-repo choice; the shipped `chain` is `fable → opus → sonnet`
+  (the sweep ladder's upper rungs), configurable per repo through the
+  effective config like the model keys.
+- **What falls back.** Role-runner ticks and step-engine spawns (every
+  `StepRole`, including Builder steps): after the model-resolution chain
+  above resolves the configured model, the daemon probes the pool for that
+  model's *class* and, finding no usable account, walks the chain strictly
+  **below** the configured model to the first rung with one and launches
+  that. The walk never climbs: a configured model absent from the chain has
+  no provable "below" and never falls back (a weak pin can never silently
+  reach fable, #4501's original defect). Blank or unrecognized chain
+  entries are skipped, never fatal. When no rung is usable the launch holds
+  exactly as before.
+- **Nothing is sticky.** Config and pool state are re-read on every spawn,
+  so the moment an account usable for the configured model reappears (mark
+  expired, `tokens unblock`, probe headroom), the next spawn uses the
+  configured model again. An explicit-credential spawn
+  (`CLAUDE_CODE_OAUTH_TOKEN` / `LOOM_SPAWN_NO_EXPORT`) never consults the
+  pool and never changes model.
+- **The pool preflights follow.** With the block enabled, the role runner's
+  pre-spawn gate, the work finder's pool hold and the preference walk's
+  availability read all scope their "exhausted" verdict to the class of the
+  model the launch would actually run (or, model-less, ask whether *any*
+  class could spawn) — so a fable-exhausted pool with healthy opus capacity
+  dispatches instead of idling the fleet. A class-less mark (or an auth
+  mark) still holds everything: a credential broken for every class has no
+  rung to fall to.
+- **Telemetry.** Each `loom.dispatch.step` span records
+  `loom.step.model_configured` (the pre-fallback model) alongside
+  `loom.step.model_launched`, plus `loom.step.model_fallback_from` /
+  `loom.step.model_fallback_reason` (`no-account-for-class`) when a
+  fallback fired — how an operator sees how much work ran below its
+  configured model. The role-runner per-role log header names the fallback
+  through the model source label.
+- **In-flight re-dispatch is separate (#13905).** This is the
+  *selection-time* half only; re-dispatching a child that dies mid-run on
+  `hit your <Model> limit`, and its quarantine exemption, is #13905.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an

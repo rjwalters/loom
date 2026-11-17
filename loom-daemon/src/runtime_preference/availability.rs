@@ -301,7 +301,13 @@ fn claude(root: &Path) -> Availability {
                 .to_string(),
         };
     }
-    let pool = crate::tokens_pool::select::spawnable_pool_state(root);
+    // #13873: `model_fallback::preflight_pool_state` is the same read the
+    // gate performs — account-wide unless the fallback block is enabled, in
+    // which case an account whose live marks are all class-scoped still
+    // counts as spawnable (some lower rung can use it), keeping this
+    // mapping's "one implementation of what spawnable means" agreement with
+    // `claude_gate` intact on both sides of the toggle.
+    let pool = crate::sweep_registry::model_fallback::preflight_pool_state(root);
     if pool.total > 0 && pool.usable == 0 {
         return Availability::Exhausted {
             source,

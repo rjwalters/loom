@@ -1247,3 +1247,108 @@ fn a_no_line_builder_that_opened_a_pr_has_its_own_step_class() {
     let other = step_failure(StepRole::Builder, StepEnd::Exited(Some(3)), None, false).unwrap();
     assert_eq!(super::capture::no_outcome_line_with_pr(other).class(), "step-exit-nonzero");
 }
+
+// ---- selection-time model fallback (#13873) -------------------------------
+
+/// #13873, end-to-end on the step engine: with `roleModels.judge = fable`,
+/// `modelFallback.enabled` and every pool account bad-marked
+/// `[model-class:fable]`, a Judge step launches `/loom:judge` on the `opus`
+/// rung — and its `loom.dispatch.step` span records
+/// `model_configured=fable`, `model_launched=opus`,
+/// `model_fallback_from=fable` / `_reason=no-account-for-class`.
+#[test]
+#[serial]
+fn a_step_falls_back_a_model_rung_when_the_configured_class_is_exhausted() {
+    let dir = tempdir().unwrap();
+    let (mut reg, record) = fixture_registry(dir.path());
+    write_config(
+        dir.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "fable"}},
+            "modelFallback": {"enabled": true}}}"#,
+    );
+    // The fixture workspace is not a git worktree, so its per-repo pool is
+    // the one selection resolves: two accounts, every one fable-marked —
+    // fable has nothing to select, opus still does.
+    let tokens = dir.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let mut marks = String::new();
+    for account in ["alpha", "beta"] {
+        std::fs::write(tokens.join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+        marks.push_str(&format!(
+            "{now} {account} exhausted: hit your Fable limit [model-class:fable]\n"
+        ));
+    }
+    std::fs::write(tokens.join(".bad_tokens"), marks).unwrap();
+
+    let request = StepSpawnRequest::new(9_101, StepRole::Judge);
+    let (outcome, signals) = capture(|| reg.spawn_step(&request));
+    let outcome = outcome.unwrap();
+    let recorded = assert_child_wrote(&record, "--model");
+    let lines: Vec<&str> = recorded.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| *l == "arg: --model")
+        .expect("--model pinned");
+    assert_eq!(lines[idx + 1], "arg: opus", "launched model must be the rung: {recorded}");
+
+    let span = signals
+        .spans
+        .iter()
+        .find(|s| s.name.as_str() == "loom.dispatch.step")
+        .unwrap();
+    assert_eq!(span.attributes["loom.step.model_configured"], "fable");
+    assert_eq!(span.attributes["loom.step.model_launched"], "opus");
+    assert_eq!(span.attributes["loom.step.model_fallback_from"], "fable");
+    assert_eq!(span.attributes["loom.step.model_fallback_reason"], "no-account-for-class");
+    assert_eq!(span.attributes["loom.dispatch.admission_result"], "spawned");
+    cancel_all(&mut reg);
+    let _ = outcome;
+}
+
+/// #13873 AC: with the block absent, the same exhausted-for-fable pool is
+/// byte-identical to today — the step still launches on `fable` (and the
+/// real wrapper's selection is what fails later), with no fallback keys on
+/// the span.
+#[test]
+#[serial]
+fn a_step_without_the_fallback_block_launches_the_configured_model() {
+    let dir = tempdir().unwrap();
+    let (mut reg, record) = fixture_registry(dir.path());
+    write_config(
+        dir.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "fable"}}}}"#,
+    );
+    let tokens = dir.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let mut marks = String::new();
+    for account in ["alpha", "beta"] {
+        std::fs::write(tokens.join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+        marks.push_str(&format!(
+            "{now} {account} exhausted: hit your Fable limit [model-class:fable]\n"
+        ));
+    }
+    std::fs::write(tokens.join(".bad_tokens"), marks).unwrap();
+
+    let request = StepSpawnRequest::new(9_102, StepRole::Judge);
+    let (outcome, signals) = capture(|| reg.spawn_step(&request));
+    outcome.unwrap();
+    let recorded = assert_child_wrote(&record, "--model");
+    let lines: Vec<&str> = recorded.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| *l == "arg: --model")
+        .expect("--model pinned");
+    assert_eq!(lines[idx + 1], "arg: fable", "no fallback may fire: {recorded}");
+    let span = signals
+        .spans
+        .iter()
+        .find(|s| s.name.as_str() == "loom.dispatch.step")
+        .unwrap();
+    assert_eq!(span.attributes["loom.step.model_configured"], "fable");
+    assert!(!span
+        .attributes
+        .contains_key("loom.step.model_fallback_from"));
+    cancel_all(&mut reg);
+}

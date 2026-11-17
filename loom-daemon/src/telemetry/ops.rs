@@ -215,6 +215,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.in_flight_repo",
     "loom.step.model_selected",
     "loom.step.model_launched",
+    // #13873: the configured model and, when a selection-time fallback
+    // fired, what it fell back from and why.
+    "loom.step.model_configured",
+    "loom.step.model_fallback_from",
+    "loom.step.model_fallback_reason",
     // #12957: the item's story points, on `loom.dispatch.step` and on the
     // step's `loom.sweep` close (the key `sweep.started` already exports).
     "loom.story_points",

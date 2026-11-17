@@ -393,6 +393,69 @@ fn test_invoke_config_model_override_wins() {
     );
 }
 
+/// #13873: selection-time model fallback on the role-runner path — with
+/// `roleModels.judge = fable`, `modelFallback.enabled` and every pool
+/// account bad-marked `[model-class:fable]`, the tick still launches, on
+/// `opus`, instead of holding the pool. The per-role log header names the
+/// fallback through the model source label.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+fn test_invoke_falls_back_a_model_rung_when_the_class_is_exhausted() {
+    test_invoke_falls_back_a_model_rung_when_the_class_is_exhausted_body();
+}
+
+#[serial]
+fn test_invoke_falls_back_a_model_rung_when_the_class_is_exhausted_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(
+        tmp.path(),
+        r#"{"autonomous": {"roleRunner": {
+                "enabled": true,
+                "roleModels": {"judge": "fable"}
+            },
+            "modelFallback": {"enabled": true}}}"#,
+    );
+    // The pool lives in the shared dir (a registered checkout's in-worktree
+    // per-repo pool is refused by design, #9135): two accounts, every one
+    // fable-class-marked (#13872's mark shape) — fable has nothing to
+    // select, opus still does.
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
+    fs::remove_file(pool.path().join("fake.token")).unwrap();
+    for account in ["alpha", "beta"] {
+        fs::write(pool.path().join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+    }
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    fs::write(
+        pool.path().join(".bad_tokens"),
+        format!(
+            "{now} alpha exhausted: hit your Fable limit [model-class:fable]\n\
+             {now} beta exhausted: hit your Fable limit [model-class:fable]\n"
+        ),
+    )
+    .unwrap();
+    // Precondition: the pool really is fable-exhausted, with opus capacity.
+    let state = crate::tokens_pool::select::spawnable_pool_state_for_class(tmp.path(), "fable");
+    assert_eq!((state.total, state.usable), (2, 0));
+    let state = crate::tokens_pool::select::spawnable_pool_state_for_class(tmp.path(), "opus");
+    assert_eq!(state.usable, 2);
+
+    let script = write_fake_script(
+        tmp.path(),
+        "fake-spawn.sh",
+        "printf '%s\\n' \"$@\" > argv-fallback.txt; exit 0",
+    );
+    let ws = crate::write_scope_test_support::WritableRoot::register(tmp.path());
+    let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script);
+    assert_eq!(runner.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
+    let argv = fs::read_to_string(tmp.path().join("argv-fallback.txt")).unwrap();
+    assert!(
+        argv.contains("--model\nopus\n"),
+        "the tick must launch on the opus rung; argv: {argv}"
+    );
+}
+
 /// Issue #5001: end-to-end, a `roleModels.<role>` override reaches the actual
 /// `--model` argv for that role while a peer role (no override) still gets the
 /// global `autonomous.roleRunner.model`. This is the argv-level proof of the
