@@ -3191,6 +3191,37 @@ _gitignore_source_ephemeral_patterns() {
         | sed -n -E 's/^[[:space:]]*"([^"]*)",?[[:space:]]*(\/\/.*)?$/\1/p'
 }
 
+# #13898: the stub-conditional companion list (STUB_WORKSPACE_PATTERNS in the
+# same post_init.rs) — pnpm-artifact entries the managed block carries ONLY in
+# a workspace whose root package.json is the loom-workspace stub. Parsed from
+# source for the same ground-truth reason as _gitignore_source_ephemeral_patterns;
+# same best-effort contract (echoes nothing without a full checkout).
+_gitignore_source_stub_patterns() {
+    local post_init="$SOURCE_ROOT/loom-daemon/src/init/post_init.rs"
+    [[ -f "$post_init" ]] || return 0
+    awk '/pub const STUB_WORKSPACE_PATTERNS/ { flag=1; next } flag && /^\];/ { exit } flag' "$post_init" \
+        | sed -n -E 's/^[[:space:]]*"([^"]*)",?[[:space:]]*(\/\/.*)?$/\1/p'
+}
+
+# #13898: is $WRITE_ROOT's root package.json the loom-workspace stub? Uses the
+# same "name" marker as resync_workspace_stub_version. Echoes "yes"/"no"; echoes
+# "unknown" (which callers must treat as stand-down, never as "no") when the
+# answer cannot be determined without jq -- stripping the stub entries on an
+# "unknown" would undo what a correct binary just wrote, while tolerating them
+# costs at most one stale-extra pattern surviving until jq is available.
+_gitignore_workspace_is_stub() {
+    local pj="$WRITE_ROOT/package.json"
+    [[ -f "$pj" ]] || { echo "no"; return 0; }
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "unknown"
+        return 0
+    fi
+    local name
+    name="$(jq -r '.name // empty' "$pj" 2>/dev/null)" || { echo "unknown"; return 0; }
+    [[ -z "$name" ]] && { echo "unknown"; return 0; }
+    [[ "$name" == "loom-workspace" ]] && echo "yes" || echo "no"
+}
+
 # #5991: rewrite the Loom-managed `.gitignore` block in place from the given
 # SOURCE pattern list (ground truth, independent of whichever loom-daemon
 # binary wrote the block), preserving everything outside the block untouched.
@@ -3252,18 +3283,34 @@ _gitignore_restore_managed_block() {
 # gitlink hazard that way, #5985) or re-ADDS one removed since (febfc4335
 # re-added `.loom/concierge/`, #11323). Restore the block from source (else
 # revert the file) so neither lands; no source list = cannot verify, no-op.
+#
+# #13898: the expected list is the source base list PLUS the stub-conditional
+# patterns when $WRITE_ROOT is a loom-workspace stub repo -- without that, this
+# check would classify the stub entries a correct binary just wrote as "extra"
+# and strip them out of every stub repo on every resync. When stub detection is
+# "unknown" (no jq) the whole check stands down instead of guessing: a wrong
+# guess in either direction either strips correct entries or force-adds
+# `/pnpm-lock.yaml` to a real Node repo's block (hiding its committed lockfile).
 _gitignore_warn_if_stale() {
     local bin="$1" post_init="$SOURCE_ROOT/loom-daemon/src/init/post_init.rs" pattern block current wanted
-    local -a missing=() extra=() source_patterns=()
+    local -a missing=() extra=() source_patterns=() stub_patterns=()
 
     while IFS= read -r pattern; do [[ -n "$pattern" ]] && source_patterns+=("$pattern"); done < <(_gitignore_source_ephemeral_patterns)
     [[ "${#source_patterns[@]}" -gt 0 && -f "$WRITE_ROOT/.gitignore" ]] || return 0
+    while IFS= read -r pattern; do [[ -n "$pattern" ]] && stub_patterns+=("$pattern"); done < <(_gitignore_source_stub_patterns)
+    local stub_state
+    stub_state="$(_gitignore_workspace_is_stub)"
+    [[ "$stub_state" != "unknown" ]] || { note "  .gitignore stale-check skipped: stub detection needs jq (#13898)"; return 0; }
+    local -a expected=("${source_patterns[@]}")
+    if [[ "$stub_state" == "yes" ]]; then
+        expected+=("${stub_patterns[@]+"${stub_patterns[@]}"}")
+    fi
     block="$(sed -n '/# >>> loom-managed/,/# <<< loom-managed/p' "$WRITE_ROOT/.gitignore")"
     [[ -n "$block" ]] || return 0
     current="$(sed '1,2d;$d' <<<"$block")"
-    wanted="$(printf '%s\n' "${source_patterns[@]}")"
+    wanted="$(printf '%s\n' "${expected[@]}")"
     [[ "$current" != "$wanted" ]] || return 0
-    for pattern in "${source_patterns[@]}"; do grep -qxF -- "$pattern" <<<"$current" || missing+=("$pattern"); done
+    for pattern in "${expected[@]}"; do grep -qxF -- "$pattern" <<<"$current" || missing+=("$pattern"); done
     while IFS= read -r pattern; do [[ -z "$pattern" ]] || grep -qxF -- "$pattern" <<<"$wanted" || extra+=("$pattern"); done <<<"$current"
     [[ "${#missing[@]}" -eq 0 ]] || warn "The resolved loom-daemon binary ($bin) regenerated .gitignore WITHOUT ${#missing[@]} pattern(s) that $post_init currently declares:"
     for pattern in ${missing[@]+"${missing[@]}"}; do warn "    $pattern"; done
@@ -3273,7 +3320,7 @@ _gitignore_warn_if_stale() {
     warn "  '$bin' is likely older than the source just synced (#5294) — rebuild loom-daemon"
     warn "  (cargo build --release -p loom-daemon under $SOURCE_ROOT) and re-run resync-installed.sh."
 
-    if _gitignore_restore_managed_block "$block" "${source_patterns[@]}"; then
+    if _gitignore_restore_managed_block "$block" "${expected[@]}"; then
         warn "  ${GREEN}restored${NC} the missing pattern(s) and dropped the extra ones directly from $post_init so the regression cannot land (#5991, #11323)."
     elif git -C "$WRITE_ROOT" checkout -- .gitignore 2>/dev/null; then
         warn "  Could not rewrite the block in place — ${GREEN}reverted${NC} .gitignore to its last-committed state instead (#5991)."

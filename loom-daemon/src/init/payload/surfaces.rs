@@ -32,7 +32,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use super::super::scaffolding::install_agent_skills_where;
 use super::super::templates::{render_dotloom_guide, LoomMetadata};
-use super::super::{update_gitignore, InitReport};
+use super::super::{update_gitignore_in, InitReport};
 use super::labels_block;
 use crate::agent_skills;
 
@@ -50,7 +50,7 @@ pub(crate) enum Rule {
     /// Verbatim copy, created when absent.
     CopyOrBackfill,
     /// The Loom-managed block of the repo's `.gitignore`, merged by
-    /// [`update_gitignore`]. Only when the file exists. The file is the
+    /// [`update_gitignore_in`]. Only when the file exists. The file is the
     /// repo's, so it is never recorded as Loom-owned.
     GitignoreBlock,
     /// A template-substituted guide, re-rendered with the install date the
@@ -272,7 +272,10 @@ pub(crate) enum SkipReason {
 
 /// Run every extra step over `stage`, which already holds the workspace's
 /// copy of each surface and the installer step's output. Paths a step wrote
-/// are added to `shipped` (the files this payload ships).
+/// are added to `shipped` (the files this payload ships). `workspace` is the
+/// REAL workspace root the stage was seeded from: the `.gitignore` step's
+/// stub detection (#13898) reads `<workspace>/package.json`, which the stage
+/// deliberately does not carry (an install-time-only surface).
 ///
 /// A surface whose own file in the workspace is unusable (see
 /// [`SkipReason`]) is added to `skipped` and left byte for byte as it is: it
@@ -285,6 +288,7 @@ pub(crate) enum SkipReason {
 pub(super) fn stage_extras(
     defaults: &Path,
     stage: &Path,
+    workspace: &Path,
     shipped: &mut BTreeSet<String>,
     skipped: &mut Vec<Skipped>,
 ) -> Result<(), String> {
@@ -311,9 +315,11 @@ pub(super) fn stage_extras(
             Rule::GitignoreBlock => {
                 // `update_gitignore` fails on a file that is not UTF-8. Such
                 // a file is the repo's to keep, not a reason to stop.
+                // #13898: stub detection reads the real workspace root, not
+                // the stage (which carries no package.json).
                 match fs::read_to_string(&dst) {
                     Ok(_) if present => {
-                        update_gitignore(stage)?;
+                        update_gitignore_in(stage, workspace)?;
                         true
                     }
                     Err(e) if present => {

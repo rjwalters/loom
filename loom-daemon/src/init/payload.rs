@@ -596,7 +596,7 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
     let mut shipped =
         install_into(payload.defaults(), stage).map_err(|e| anyhow!("stage the payload: {e}"))?;
     let mut skipped_surfaces = Vec::new();
-    surfaces::stage_extras(payload.defaults(), stage, &mut shipped, &mut skipped_surfaces)
+    surfaces::stage_extras(payload.defaults(), stage, dest, &mut shipped, &mut skipped_surfaces)
         .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
 
     skipped_surfaces.extend(unreachable);
