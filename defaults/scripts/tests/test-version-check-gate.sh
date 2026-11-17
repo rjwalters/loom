@@ -163,7 +163,7 @@ assert_eq "1" "$EXIT_CODE" "Explicit LOOM_VERSION_CHECK_SCRIPT override is honor
 
 make_fixture_repo() {
   local dir="$1" version="$2" meta_version="${3-__omit__}"
-  mkdir -p "$dir/mcp-loom" "$dir/loom-daemon" "$dir/loom-api" "$dir/scripts" "$dir/.loom"
+  mkdir -p "$dir/mcp-loom" "$dir/loom-daemon" "$dir/scripts" "$dir/.loom"
   cp "$REAL_VERSION_SCRIPT" "$dir/scripts/version.sh"
   chmod +x "$dir/scripts/version.sh"
 
@@ -171,16 +171,10 @@ make_fixture_repo() {
   printf '{"version": "%s"}\n' "$version" > "$dir/mcp-loom/package.json"
   # Since #7780 the members inherit version from [workspace.package], so
   # version.sh reads/edits the ROOT Cargo.toml — the fixture must provide it.
-  printf '[workspace]\nmembers = ["loom-daemon", "loom-api"]\nresolver = "2"\n\n[workspace.package]\nversion = "%s"\n' "$version" > "$dir/Cargo.toml"
+  printf '[workspace]\nmembers = ["loom-daemon"]\nresolver = "2"\n\n[workspace.package]\nversion = "%s"\n' "$version" > "$dir/Cargo.toml"
   printf '[package]\nname = "loom-daemon"\nversion.workspace = true\n' > "$dir/loom-daemon/Cargo.toml"
-  printf '[package]\nname = "loom-api"\nversion.workspace = true\n' > "$dir/loom-api/Cargo.toml"
   printf '%s\n' "$version" > "$dir/VERSION"
   cat > "$dir/Cargo.lock" <<EOF
-[[package]]
-name = "loom-api"
-version = "$version"
-dependencies = []
-
 [[package]]
 name = "loom-daemon"
 version = "$version"
@@ -257,7 +251,7 @@ rm -rf "$FIXTURE7"
 # so the whole recipe runs unmodified.
 make_rebase_base() {
   local dir="$1" version="$2"
-  mkdir -p "$dir/mcp-loom" "$dir/loom-daemon" "$dir/loom-api" "$dir/scripts" "$dir/.loom"
+  mkdir -p "$dir/mcp-loom" "$dir/loom-daemon" "$dir/scripts" "$dir/.loom"
   cp "$REAL_VERSION_SCRIPT" "$dir/scripts/version.sh"
   chmod +x "$dir/scripts/version.sh"
   cp "$GATE" "$dir/version-check-gate.sh"
@@ -267,16 +261,10 @@ make_rebase_base() {
   printf '{"version": "%s"}\n' "$version" > "$dir/mcp-loom/package.json"
   # Since #7780 the members inherit version from [workspace.package], so
   # version.sh reads/edits the ROOT Cargo.toml — the fixture must provide it.
-  printf '[workspace]\nmembers = ["loom-daemon", "loom-api"]\nresolver = "2"\n\n[workspace.package]\nversion = "%s"\n' "$version" > "$dir/Cargo.toml"
+  printf '[workspace]\nmembers = ["loom-daemon"]\nresolver = "2"\n\n[workspace.package]\nversion = "%s"\n' "$version" > "$dir/Cargo.toml"
   printf '[package]\nname = "loom-daemon"\nversion.workspace = true\n' > "$dir/loom-daemon/Cargo.toml"
-  printf '[package]\nname = "loom-api"\nversion.workspace = true\n' > "$dir/loom-api/Cargo.toml"
   printf '%s\n' "$version" > "$dir/VERSION"
   cat > "$dir/Cargo.lock" <<EOF
-[[package]]
-name = "loom-api"
-version = "$version"
-dependencies = []
-
 [[package]]
 name = "loom-daemon"
 version = "$version"
@@ -317,7 +305,7 @@ bump_version_files() {
   printf '%s\n' "$new" > "$dir/VERSION"
   sed -i.bak "s/version = \"$old\"/version = \"$new\"/g" "$dir/Cargo.lock"
   sed -i.bak "s/\"version\": \"$old\"/\"version\": \"$new\"/g" "$dir/mcp-loom/package-lock.json"
-  rm -f "$dir"/*.bak "$dir"/mcp-loom/*.bak "$dir"/loom-daemon/*.bak "$dir"/loom-api/*.bak
+  rm -f "$dir"/*.bak "$dir"/mcp-loom/*.bak "$dir"/loom-daemon/*.bak
 }
 
 # T8: local branch bumps every VERSION_FILES entry in one commit, then a

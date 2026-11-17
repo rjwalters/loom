@@ -111,7 +111,7 @@ check_versions() {
 
   # Check Cargo.lock
   local lock_versions
-  lock_versions=$(grep -A1 'name = "loom-daemon"\|name = "loom-api"' "$REPO_ROOT/Cargo.lock" | grep '^version' | sed 's/version = "\(.*\)"/\1/' | sort -u)
+  lock_versions=$(grep -A1 'name = "loom-daemon"' "$REPO_ROOT/Cargo.lock" | grep '^version' | sed 's/version = "\(.*\)"/\1/' | sort -u)
   local lock_count
   lock_count=$(echo "$lock_versions" | wc -l | tr -d ' ')
   if [ "$lock_count" -eq 1 ] && [ "$(echo "$lock_versions" | tr -d '[:space:]')" = "$expected" ]; then
@@ -185,9 +185,9 @@ set_version() {
     echo "  Updated $file"
   done
 
-  # Workspace root Cargo.toml - the single crate version (#7780). Both
-  # members carry `version.workspace = true` and inherit it, so this one
-  # edit covers loom-daemon and loom-api.
+  # Workspace root Cargo.toml - the single crate version (#7780). The one
+  # member carries `version.workspace = true` and inherits it, so this one
+  # edit covers loom-daemon.
   #
   # Uses awk instead of sed to reliably replace only the first 'version =' line
   # (BSD sed on macOS doesn't support GNU sed's 0,/pattern/ address). The first
@@ -224,8 +224,8 @@ set_version() {
   # inside the subshell, so a failure here is reported immediately with a
   # clear message naming the step, instead of silently leaving Cargo.lock
   # stale while every other version-bearing file has already moved on.
-  if ! (cd "$REPO_ROOT" && cargo update loom-daemon loom-api); then
-    echo "ERROR: 'cargo update loom-daemon loom-api' failed — Cargo.lock was NOT updated to $new_version." >&2
+  if ! (cd "$REPO_ROOT" && cargo update loom-daemon); then
+    echo "ERROR: 'cargo update loom-daemon' failed — Cargo.lock was NOT updated to $new_version." >&2
     exit 1
   fi
   echo "  Updated Cargo.lock"

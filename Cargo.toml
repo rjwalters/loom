@@ -1,5 +1,5 @@
 [workspace]
-members = ["loom-api", "loom-daemon"]
+members = ["loom-daemon"]
 resolver = "2"
 
 # Single source of the crate version (#7780). Both members inherit via

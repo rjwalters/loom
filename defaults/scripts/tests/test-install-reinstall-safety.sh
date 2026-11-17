@@ -247,7 +247,7 @@ HARNESS=$(mktemp /tmp/loom-stale-binary-harness.XXXXXX.sh)
 chmod +x "$HARNESS"
 
 T2=$(mktemp -d /tmp/loom-stale-binary-test.XXXXXX)
-mkdir -p "$T2/loom-daemon/src" "$T2/loom-api/src" "$T2/target/release"
+mkdir -p "$T2/loom-daemon/src" "$T2/target/release"
 echo 'fn main() {}' > "$T2/loom-daemon/src/main.rs"
 touch "$T2/Cargo.toml" "$T2/Cargo.lock"
 

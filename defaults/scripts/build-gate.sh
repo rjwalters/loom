@@ -5,7 +5,7 @@
 # meaningful. See .loom/docs/build-gate.md.
 #
 # Scope decisions (issue #3749):
-#   - The Rust crates (loom-daemon, loom-api) are covered by `cargo nextest run
+#   - The Rust crate (loom-daemon) is covered by `cargo nextest run
 #     --profile ci` when cargo-nextest is installed — the same runner and
 #     profile CI uses — falling back to `cargo test` with a loud warning when it
 #     is not (#8326; the shared-process race is #4385). Doctests are a separate

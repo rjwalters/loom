@@ -33,7 +33,7 @@ Ctrl+C cleanly stops the daemon.
 
 ### 1. Make Code Changes
 
-Edit Rust code in `loom-daemon/`, `loom-api/`, or TypeScript in `mcp-loom/`. Edit shell scripts in `defaults/scripts/` or `scripts/`.
+Edit Rust code in `loom-daemon/`, or TypeScript in `mcp-loom/`. Edit shell scripts in `defaults/scripts/` or `scripts/`.
 
 ### 2. Rebuild and Test
 

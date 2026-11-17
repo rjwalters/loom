@@ -219,7 +219,7 @@ stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
    phases' minutes) and it runs in **both** tiers. See "The structural phase"
    below.
 1. `cargo nextest run --workspace --lib --bins --profile ci` — the Rust crates'
-   **unit tests** (`loom-daemon`, `loom-api`), run with the same runner and the
+   **unit tests** (`loom-daemon`), run with the same runner and the
    same profile CI uses. Falls back to `cargo test --workspace --lib --bins`
    with a loud warning when `cargo-nextest` is not installed — see "Why the
    gate prefers `cargo nextest`" below. The integration test **targets** under

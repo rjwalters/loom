@@ -224,7 +224,7 @@ fi
 
 make_fixture_repo() {
   local dir="$1" version="$2" meta_version="${3-__omit__}"
-  mkdir -p "$dir/mcp-loom" "$dir/loom-daemon" "$dir/loom-api" "$dir/scripts" "$dir/.loom"
+  mkdir -p "$dir/mcp-loom" "$dir/loom-daemon" "$dir/scripts" "$dir/.loom"
   cp "$REAL_VERSION_SCRIPT" "$dir/scripts/version.sh"
   chmod +x "$dir/scripts/version.sh"
 
@@ -234,16 +234,10 @@ make_fixture_repo() {
   # manifest's [workspace.package] and both members inherit it. A fixture with
   # two hardcoded crate versions and no workspace root no longer resembles the
   # tree version.sh operates on.
-  printf '[workspace]\nmembers = ["loom-api", "loom-daemon"]\nresolver = "2"\n\n[workspace.package]\nversion = "%s"\n' "$version" > "$dir/Cargo.toml"
+  printf '[workspace]\nmembers = ["loom-daemon"]\nresolver = "2"\n\n[workspace.package]\nversion = "%s"\n' "$version" > "$dir/Cargo.toml"
   printf '[package]\nname = "loom-daemon"\nversion.workspace = true\n' > "$dir/loom-daemon/Cargo.toml"
-  printf '[package]\nname = "loom-api"\nversion.workspace = true\n' > "$dir/loom-api/Cargo.toml"
   printf '%s\n' "$version" > "$dir/VERSION"
   cat > "$dir/Cargo.lock" <<EOF
-[[package]]
-name = "loom-api"
-version = "$version"
-dependencies = []
-
 [[package]]
 name = "loom-daemon"
 version = "$version"

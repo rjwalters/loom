@@ -40,10 +40,10 @@ mod tests {
         FAIL [   0.010s] loom-daemon c::fails
      Summary [   1.000s] 3 tests run: 2 passed (1 flaky), 1 failed
        FLAKY 2/2 [   0.020s] loom-daemon b::flaky
-FLAKY 2/2 [   1.500s] loom-api d::also_flaky
+FLAKY 2/2 [   1.500s] loom-daemon d::also_flaky
 FLAKY without a duration
 ";
-        assert_eq!(flaky_tests(log), vec!["loom-daemon b::flaky", "loom-api d::also_flaky"]);
+        assert_eq!(flaky_tests(log), vec!["loom-daemon b::flaky", "loom-daemon d::also_flaky"]);
         assert!(flaky_tests("all good\n").is_empty());
     }
 }

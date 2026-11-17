@@ -186,7 +186,6 @@ jobs:
           filters: |
             backend:
               - 'loom-daemon/**'
-              - 'loom-api/**'
               # The observability artifacts are Rust-tested seams, not inert
               # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs,
               # signoz_topology_shape.rs (the render + gateway allowlist the
@@ -458,9 +457,9 @@ jobs:
       - run: cargo fmt --all -- --check
       # --all-targets (#11967) so test code, benches and examples are linted
       # too; it covers every target `cargo check --workspace --all-targets`
-      # did (the workspace is exactly these two crates), so that step is gone.
+      # did (the workspace is exactly this crate), so that step is gone.
       # Keep the allow-list in exact sync with .cargo/config.toml (#3837).
-      - run: cargo clippy --package loom-daemon --package loom-api --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
+      - run: cargo clippy --package loom-daemon --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.

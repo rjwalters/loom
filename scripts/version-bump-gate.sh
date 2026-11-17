@@ -122,7 +122,7 @@ eligible_ct=$((last_ct + interval))
 # a scheduled or dispatched run does not get (keep the two in step: the
 # workflow identity test pins both). diff-tree compares tree ids only, so a
 # blob:none partial clone answers it without fetching blobs.
-RELEASE_PATHS=(defaults/ loom-daemon/ loom-api/)
+RELEASE_PATHS=(defaults/ loom-daemon/)
 rc=0
 git diff-tree --quiet -r "$last_sha" "$ref" -- "${RELEASE_PATHS[@]}" || rc=$?
 case "$rc" in

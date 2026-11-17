@@ -21,8 +21,8 @@ direction (2026-10-09) is **at most one release a day**.
   `VERSION`, timed by its **committer** time (PRs cannot change `VERSION`, so
   only bump commits match; tags and Release dates are never read). A run bumps
   only when `now - last_bump >= RELEASE_MIN_INTERVAL` **and** something under
-  a release path changed since that bump: `defaults/`, `loom-daemon/` or
-  `loom-api/` (the gate's `RELEASE_PATHS`; the two crates are what compiles
+  a release path changed since that bump: `defaults/` or `loom-daemon/`
+  (the gate's `RELEASE_PATHS`; the crate is what compiles
   into the `loom-daemon-*` release assets, #13452). Otherwise it exits green and changes
   nothing, with `deferred: last bump <sha> at <UTC>; next bump eligible at
   <UTC>` (or `nothing to release`) in the job summary. The gate is re-checked
@@ -45,9 +45,9 @@ direction (2026-10-09) is **at most one release a day**.
   never falls back to "always bump". `0` explicitly disables the limit. A
   missing bump commit or a shallow checkout also fails red: a gate wrong in
   the "defer" direction would silently stop releases.
-- **Triggers.** A push to `main` under `defaults/**`, `loom-daemon/**` or
-  `loom-api/**` (the release paths; a bump commit touches none of them, both
-  crates inherit `version.workspace = true`); an **hourly**
+- **Triggers.** A push to `main` under `defaults/**` or
+  `loom-daemon/**` (the release paths; a bump commit touches none of them, the
+  crate inherits `version.workspace = true`); an **hourly**
   `schedule` catch-up, which is what ships a quiet day's merges; and
   `workflow_dispatch`. Worst-case delay from the first unreleased merge to its
   bump is `RELEASE_MIN_INTERVAL` + about 1 h, plus GitHub's own schedule delay

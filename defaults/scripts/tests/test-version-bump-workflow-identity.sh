@@ -441,21 +441,21 @@ echo "Case 6: no-self-trigger invariant"
 assert_present 'branches: [main]' \
     "Case 6: trigger is restricted to pushes on main"
 
-# The release paths: defaults/ plus the two workspace crates that compile
-# into the release binaries (#13452). The gate's RELEASE_PATHS must be the
+# The release paths: defaults/ plus the workspace crate that compiles
+# into the release binary (#13452). The gate's RELEASE_PATHS must be the
 # same set, so a scheduled or dispatched run sees what a push would have.
-EXPECTED_PATHS=$'"defaults/**"\n"loom-daemon/**"\n"loom-api/**"'
+EXPECTED_PATHS=$'"defaults/**"\n"loom-daemon/**"'
 TRIGGER_PATHS="$(workflow_code | awk '/^ +paths:/{found=1; next} found {if ($1 == "-") print $2; else exit}')"
 if [[ "$TRIGGER_PATHS" == "$EXPECTED_PATHS" ]]; then
-    pass "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)"
+    pass "Case 6: path filter is exactly defaults/**, loom-daemon/** (two entries)"
 else
-    fail "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
+    fail "Case 6: path filter is exactly defaults/**, loom-daemon/** (two entries)" \
         "Parsed path list was: '${TRIGGER_PATHS:-<none>}'" \
         "Widening this filter past the release paths lets the bump commit re-trigger the workflow." \
         "Publisher App commits DO trigger workflows, so this is the real loop guard."
 fi
 GATE_PATHS="$(sed -n 's/^RELEASE_PATHS=(\(.*\))$/\1/p' "$REPO_ROOT/scripts/version-bump-gate.sh")"
-if [[ "$GATE_PATHS" == "defaults/ loom-daemon/ loom-api/" ]]; then
+if [[ "$GATE_PATHS" == "defaults/ loom-daemon/" ]]; then
     pass "Case 6: the gate's RELEASE_PATHS is the same set as the push path filter"
 else
     fail "Case 6: the gate's RELEASE_PATHS is the same set as the push path filter" \
@@ -470,9 +470,9 @@ SET_COUNT="$(grep -c 'files=(' <<<"$FILE_SETS" || true)"
 if [[ "$SET_COUNT" -ne 2 ]]; then
     fail "Case 6: version-file sets stage no release path" \
         "expected 2 files=(...) sets (bump-version, publish), found $SET_COUNT"
-elif grep -qE 'defaults/|loom-daemon/|loom-api/' <<<"$FILE_SETS"; then
+elif grep -qE 'defaults/|loom-daemon/' <<<"$FILE_SETS"; then
     fail "Case 6: version-file sets stage no release path" \
-        "A defaults/, loom-daemon/ or loom-api/ path would make the bump commit re-trigger the workflow:" "$FILE_SETS"
+        "A defaults/ or loom-daemon/ path would make the bump commit re-trigger the workflow:" "$FILE_SETS"
 else
     pass "Case 6: version-file sets stage no release path (cannot re-trigger itself)"
 fi
@@ -808,15 +808,15 @@ ANCHORS
 
     # Widen the trigger path filter past the release paths (would let a
     # bump commit, or anything else, re-trigger).
-    awk '/- "loom-api\/\*\*"/ { print; sub(/"loom-api\/\*\*"/, "\"docs/**\""); print; next } { print }' \
+    awk '/- "loom-daemon\/\*\*"/ { print; print "      - \"docs/**\""; next } { print }' \
         "$WORKFLOW" >"$MUTANT"
-    expect_child_fails "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
+    expect_child_fails "Case 6: path filter is exactly defaults/**, loom-daemon/** (two entries)" \
         "Case 8: widened paths: filter is rejected"
 
     # Narrow it back to defaults/** alone (the #13452 defect: a Rust-only
     # daemon change never releases).
-    grep -vE '^      - "(loom-daemon|loom-api)/\*\*"$' "$WORKFLOW" >"$MUTANT"
-    expect_child_fails "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
+    grep -vE '^      - "loom-daemon/\*\*"$' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 6: path filter is exactly defaults/**, loom-daemon/** (two entries)" \
         "Case 8: narrowed paths: filter (defaults/** alone) is rejected"
 
     # Grant contents: write at workflow level.

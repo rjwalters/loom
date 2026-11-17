@@ -559,10 +559,10 @@ pub(crate) enum ForgeAction {
     /// is `<file>`'s diff in PR `<pr>` nothing but a version-string change?
     /// Champion's `critical-files` criterion's version-only carve-out (#6147).
     ///
-    /// Exits 0 (`VERSION_ONLY=1`) ONLY when `<file>` is exactly one of the six
+    /// Exits 0 (`VERSION_ONLY=1`) ONLY when `<file>` is exactly one of the five
     /// version-bearing files (`package.json`, `mcp-loom/package.json`,
     /// `mcp-loom/package-lock.json`, `loom-daemon/Cargo.toml`,
-    /// `loom-api/Cargo.toml`, `Cargo.lock`), the paginated
+    /// `Cargo.lock`), the paginated
     /// `pulls/<pr>/files` read succeeded, the file carries a non-empty
     /// `patch`, and every changed line is the version line. Every other
     /// outcome — a forge error, unparseable JSON, the file absent, no

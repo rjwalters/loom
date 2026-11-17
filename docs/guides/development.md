@@ -112,7 +112,6 @@ loom/
 │       ├── main.rs        # Daemon entry point
 │       ├── ipc.rs         # Unix socket server
 │       └── ...
-├── loom-api/              # Shared Rust types and IPC protocol
 ├── mcp-loom/              # Unified MCP server (TypeScript/Node)
 ├── defaults/              # Default configuration templates installed into target repos
 ├── scripts/               # Installation, daemon, and maintenance scripts
