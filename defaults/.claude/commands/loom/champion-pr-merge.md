@@ -2406,7 +2406,7 @@ below is hold-aware: it preserves the hold marker, the park record and
 ### `ci-green`: CI Status Check
 - [ ] If CI checks exist, all **required** checks must be passing — "required" means the ruleset's required status contexts (the same set `merge-pr.sh` classifies against)
 - [ ] A failing or cancelled **non-required** check does not block, but name it (check + run URL) in the pre-merge comment, so a merge over a red non-required check is visible. This holds for a check that goes pending → failed during `merge-pr.sh --auto`'s wait: `merge-pr.sh` logs the same names and the same rule
-- [ ] If no CI checks exist, this criterion passes automatically
+- [ ] If no CI checks exist, this criterion passes automatically — "no checks" still passes `ci-green` by design: the Judge verdict on a no-checks PR must now record a local test result or an explicit "unverified by any test" statement, and Champion's existing `judge-approval` read is where that is weighed
 
 **Verification command**:
 ```bash
