@@ -2025,6 +2025,15 @@ jobs:
       - name: token model-class selection (#8058)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-token-model-class.sh
+      # #13872: a per-model exhaustion mark must survive the whole spawn
+      # chain — spawn-claude.sh exporting the resolved model, claude-wrapper.sh
+      # splicing `retry-classify model-class`'s answer into `tokens mark-bad`,
+      # and this job's build answering for the incident's "hit your <Model>
+      # limit" line — so the mark scopes to the model class instead of parking
+      # the whole pool. Drives the real binaries like its #8058 sibling above.
+      - name: spawn model-class exhaustion mark (#13872)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-spawn-model-class-mark.sh
       # #8697: spawn-claude.sh's contained dispatch through the credential
       # egress proxy — drives a real `loom-daemon worker proxy-exec` listener
       # and host-side `tokens select`, so it needs the binary this job downloads.

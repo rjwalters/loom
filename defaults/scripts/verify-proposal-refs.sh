@@ -198,6 +198,10 @@ for raw_candidate in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
     while [[ "$candidate" == *. ]]; do
         candidate="${candidate%.}"
     done
+    # A dot-stripped directory citation (`rtl-sketch/...` in prose) is left
+    # with a trailing slash, which `git ls-tree` never emits -- so it misses
+    # whatever `-t` does (#13901, third input of the #10191/#11338 class).
+    candidate="${candidate%/}"
     [[ -z "$candidate" ]] && continue
 
     path="$candidate"

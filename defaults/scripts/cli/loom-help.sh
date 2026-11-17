@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Single source of the CLI version string: the help footer below and the
+# --version output, which .loom/bin/loom's version arm delegates to (#13899).
+LOOM_CLI_VERSION="v0.1.0"
+
 # Find repository root
 find_repo_root() {
     local dir="$PWD"
@@ -89,7 +93,7 @@ ${YELLOW}QUICK START:${NC}
     ./.loom/bin/loom health
 
     ${GRAY}# View an agent's terminal${NC}
-    ./.loom/bin/loom attach shepherd-1
+    ./.loom/bin/loom attach builder-1
 
     ${GRAY}# Send a command to an agent${NC}
     ./.loom/bin/loom send builder-1 "/loom:sweep 123"
@@ -151,7 +155,7 @@ ${YELLOW}RELATED COMMANDS:${NC}
     /builder, /judge, etc.    Assume specialized agent roles
     mcp__loom__dispatch_sweep Multi-issue dispatch via loom-daemon (Tier 2)
 
-${GRAY}Loom CLI v0.1.0${NC}
+${GRAY}Loom CLI ${LOOM_CLI_VERSION}${NC}
 EOF
 }
 
@@ -264,6 +268,9 @@ main() {
     case "${1:-}" in
         ""|--help|-h)
             show_main_help
+            ;;
+        --version|-v)
+            echo "Loom CLI ${LOOM_CLI_VERSION}"
             ;;
         *)
             show_command_help "$1"

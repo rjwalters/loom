@@ -2,7 +2,7 @@
 //!
 //! The one remote-URL read the daemon-resident sites share
 //! (`credential_preflight`, `forge_etag_store`,
-//! `metrics_collector`, `serve`, `tokens_pool::private_workspace::dispatch`),
+//! `serve`, `tokens_pool::private_workspace::dispatch`),
 //! so a `git` that hangs costs at most [`FORGE_CMD_TIMEOUT`] instead of
 //! stalling its caller indefinitely.
 
