@@ -249,6 +249,7 @@ pub mod forge_pull_listing;
 pub mod forge_read_pool;
 pub(crate) mod forge_repo_facts;
 pub mod forge_rerun;
+pub mod forge_retry;
 pub mod forge_slug;
 pub mod forge_suspect_critical_diff;
 pub mod forge_tree_unchanged;
