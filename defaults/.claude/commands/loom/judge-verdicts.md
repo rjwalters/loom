@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Verdict-Time Branch Handling & Verdict Marker Background
 
 **Load when**: a Verdict-Time CAS Recheck branch fires (claim lost, raced, tree moved) and you need the stand-down template, or you want the Verdict SHA Marker's background (incident, lenient reader spellings, backstops, the `ac-verified` distinction). The marker **rule** itself is always-read: `judge.md` → "Verdict SHA Marker".

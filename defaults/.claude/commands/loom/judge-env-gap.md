@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Environment Gap — Cannot Verify Here
 
 **Load when**: your environment cannot run a command you need to reach a verdict.

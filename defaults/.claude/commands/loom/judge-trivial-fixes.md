@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Fixing Trivial Code Issues During Evaluation
 
 **Load when**: you spot a trivial, non-controversial code issue (unused import, typo, whitespace) during evaluation.

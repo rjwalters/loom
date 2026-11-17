@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Stale `loom:reviewing` Claim Check (Step 2)
 
 **Load when**: the candidate PR already carries `loom:reviewing` (another Judge may hold it fresh, or its process may have died mid-review).

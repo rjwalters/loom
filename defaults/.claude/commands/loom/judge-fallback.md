@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Fallback Queue (Review Only)
 
 **Load when**: `loom-daemon pr-queue --role judge` serves a `mode=fallback` row (unlabeled / external-contributor PRs).

@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Fast Paths — Conflict-Only Fast-Track and Docs-Only Fast Path
 
 **Load when**: a trusted `<!-- loom:conflict-only -->` marker is present (fast-track), or step 4b's docs-only allowlist exactly matches the changed-file list.

@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: GraphQL Rate-Limit Exhaustion — REST Fallback for Labels/Comments
 
 **Load when**: a `gh` write (comment, label edit, issue create) fails with a rate-limit signature, or you need the REST equivalent of a GraphQL mutation.

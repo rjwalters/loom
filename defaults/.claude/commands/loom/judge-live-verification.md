@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Live Verification and the Circular-Fixture Smell
 
 **Load when**: trigger (A): the diff drives live behavior (browser-driving, scraper, DOM-parsing code); or trigger (B): the linked issue reports an "X was silently dropped / missed / not observed" failure (#6883).

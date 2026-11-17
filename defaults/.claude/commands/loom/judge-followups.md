@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Handling Minor Concerns & Raising Concerns
 
 **Load when**: a minor concern is worth tracking (follow-up issue) or you found a bug unrelated to the current PR.

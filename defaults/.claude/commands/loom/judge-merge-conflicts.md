@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Merge Conflicts — Rebase Check and Automated Update
 
 **Load when**: `mergeStateStatus` is `DIRTY`, or you are about to simulate or inspect a merge (never mutate the main checkout's index or stash).

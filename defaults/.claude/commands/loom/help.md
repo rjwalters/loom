@@ -81,6 +81,7 @@ After printing the overview, do a lightweight accuracy check against what is act
    - anything ending in `-patterns` or `-reference` (e.g. `architect-patterns`, `loom-reference`)
    - the builder sub-docs: `builder-pr`, `builder-worktree`, `builder-complexity`
    - the champion helper docs: `champion-common`, `champion-epic`, `champion-issue-promo`, `champion-pr-merge` (any `champion-*` other than `champion` itself)
+   - the judge sub-skills: `judge-claims`, `judge-verdicts`, `judge-ci-red` (any `judge-*` other than `judge` itself)
    - `sweep-*` sub-docs, plus `cargo-target-isolation`, `comment-body-literal-path`, `probe-protocol`
    - reference sub-docs are marked: their file starts with `disable-model-invocation: true` frontmatter, which keeps them out of the model-facing skill listing (#13960) while `/loom:<name>` and Read-by-path keep working
 4. Compare the surviving set against the curated command names above.
@@ -96,7 +97,7 @@ Keep warnings brief.
 
 The user asked about one command. Resolve `<command>` to a file at `.claude/commands/loom/<name>.md` (fall back to `defaults/.claude/commands/loom/<name>.md`).
 
-**If the name resolves to a reference sub-doc** (matches the exclude rules above — `*-patterns`, `*-reference`, `builder-pr/-worktree/-complexity`, a `champion-*` helper): explain that it is an internal reference file, not a user-invocable command, and point at its parent command (e.g. `builder-pr` → `/loom:builder`). Do not summarize it as if it were a command.
+**If the name resolves to a reference sub-doc** (matches the exclude rules above — `*-patterns`, `*-reference`, `builder-pr/-worktree/-complexity`, a `champion-*` or `judge-*` helper): explain that it is an internal reference file, not a user-invocable command, and point at its parent command (e.g. `builder-pr` → `/loom:builder`). Do not summarize it as if it were a command.
 
 **If the file does not exist**: say so plainly, list the closest matches from the curated command names, and suggest `/loom:help` (no args) for the full list. Do not guess or fabricate behavior.
 

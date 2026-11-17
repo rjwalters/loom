@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: Formal Review & Inline Thread Reconciliation — Exits, Dispositions, Enforcement
 
 **Load when**: `check-review-feedback.sh` exits non-zero (10/11/12), or you are preparing an approval that must cite finding dispositions.

@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: PR Description & Issue Linking — Check, Exceptions, and Direct Fixes
 
 **Load when**: the PR body is missing a closing keyword, uses a non-closing reference, may auto-close a `Part of` issue via a stray keyword, or needs a minor description fix.

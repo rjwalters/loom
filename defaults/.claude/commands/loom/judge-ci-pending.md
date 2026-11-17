@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Judge: CI Pending — Skip, Foreground Wait, or Re-trigger
 
 **Load when**: CI is pending and either the result is `LOOM-CHECKS-TIMEOUT` / `-NO-RUN` on a head commit more than 2 hours old (the zero-check-runs re-trigger path), or you are in a single-PR foreground wait. The routine pending-CI skip check (release and continue the batch) is always-read: `judge.md` → "When CI is Pending".
