@@ -357,6 +357,22 @@ impl crate::doctor_handback::Forge for GhHandback<'_> {
         )?;
         Some(gate::count_markers(&comments, head, VerdictKind::ChangesRequested) > 0)
     }
+    fn rejected_precedes_claim(&mut self, head: &str) -> Option<bool> {
+        let comments = crate::comment_trust::records::fetch_trusted_comments(
+            &self.repo,
+            &self.pr.to_string(),
+            self.root,
+            false,
+        )?;
+        let gh_bin = crate::gh_invocation::gh_bin();
+        let claimed_at = crate::claim_reconciliation::forge::fetch_claim_labeled_at(
+            Path::new(&gh_bin),
+            self.root,
+            u32::try_from(self.pr).ok()?,
+            crate::doctor_handback::CLAIM,
+        )?;
+        crate::doctor_handback::rejection_precedes_claim(&comments, head, claimed_at)
+    }
 }
 
 /// `forge doctor-handback` (#9388). Held under the per-PR verdict lock so a

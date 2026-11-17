@@ -371,6 +371,102 @@ fi
 
 rm -rf "$REV_STUB_DIR"
 
+# --- Test review reads are wall-clock bounded (#13927) ----------------------
+# The wedge: under multi-sweep host load a fraction of `gh` invocations block
+# indefinitely (SNl, no output, no progress) instead of erroring. The three
+# review-read helpers must fail the read inside the budget (rc 124, GNU
+# timeout's code) rather than hang the caller's command substitution forever.
+echo ""
+echo "Testing review reads are wall-clock bounded (#13927)..."
+
+HUNG_STUB_DIR=$(mktemp -d)
+cat > "$HUNG_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+# Simulates a wedged gh: never writes, never exits on its own (the SNl
+# process tree of #13927). Plain `sleep` dies on SIGTERM, as the real
+# binary does under `timeout`'s TERM.
+sleep 30
+exit 0
+STUB
+chmod +x "$HUNG_STUB_DIR/gh"
+
+run_hung_read() { # FUNC ARGS... -> sets hung_rc/hung_elapsed
+  local t0=$SECONDS
+  set +e
+  LOOM_FORGE_REVIEW_READ_TIMEOUT=1 "$@" > /dev/null 2>&1
+  hung_rc=$?
+  set -e
+  hung_elapsed=$((SECONDS - t0))
+}
+
+FORGE_TYPE="github"
+run_hung_read forge_get_pr_reviews "owner/repo" "5369" "$HUNG_STUB_DIR/gh"
+assert_eq "124" "$hung_rc" "a hung gh fails forge_get_pr_reviews with rc 124 (timeout, fail closed)"
+if [[ "$hung_elapsed" -le 10 ]]; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the reviews read returned in ${hung_elapsed}s, not the 30s the stub sleeps (bounded)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the reviews read took ${hung_elapsed}s — the hung gh was not bounded"
+fi
+
+run_hung_read forge_get_pr_review_comments "owner/repo" "5369" "$HUNG_STUB_DIR/gh"
+assert_eq "124" "$hung_rc" "a hung gh fails forge_get_pr_review_comments with rc 124"
+
+# The threads helper folds a per-page timeout into its documented rc 1 (any
+# non-zero means "fall back / fail closed") — the caller never hangs.
+run_hung_read forge_get_pr_review_threads "owner/repo" "5369" "$HUNG_STUB_DIR/gh"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$hung_rc" -ne 0 ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: a hung graphql read fails forge_get_pr_review_threads non-zero (rc $hung_rc), never hangs"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: a hung graphql read exited 0 — the wedge would look like an empty thread list"
+fi
+
+# LOOM_FORCE_PORTABLE_TIMEOUT=1 exercises the no-timeout(1) fallback path
+# (the default macOS shape) so the bound holds there too. Assignment prefixes
+# before a function call are visible inside it and restored afterwards.
+run_hung_read_portable() {
+  local t0=$SECONDS
+  set +e
+  LOOM_FORCE_PORTABLE_TIMEOUT=1 LOOM_FORGE_REVIEW_READ_TIMEOUT=1 \
+    forge_get_pr_reviews "owner/repo" "5369" "$HUNG_STUB_DIR/gh" > /dev/null 2>&1
+  hung_rc=$?
+  set -e
+  hung_elapsed=$((SECONDS - t0))
+}
+run_hung_read_portable
+assert_eq "124" "$hung_rc" "the portable bounded_run path (no timeout(1)) also bounds a hung read"
+if [[ "$hung_elapsed" -le 10 ]]; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the portable path returned in ${hung_elapsed}s (bounded)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the portable path took ${hung_elapsed}s — not bounded"
+fi
+
+# 0 restores the unbounded pre-#13927 behaviour (escape hatch): with it the
+# budget is not applied at all — asserted structurally by the fast stub still
+# succeeding under a 1s budget above and below, which a clipped call would not.
+set +e
+LOOM_FORGE_REVIEW_READ_TIMEOUT=0 forge_get_pr_reviews "owner/repo" "5369" "$HUNG_STUB_DIR/gh" > /dev/null 2>&1 &
+UNBOUNDED_PID=$!
+sleep 2
+if kill -0 "$UNBOUNDED_PID" 2>/dev/null; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: LOOM_FORGE_REVIEW_READ_TIMEOUT=0 leaves the read unbounded (still running after 2s)"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: LOOM_FORGE_REVIEW_READ_TIMEOUT=0 was bounded anyway — the escape hatch is broken"
+fi
+kill "$UNBOUNDED_PID" 2>/dev/null
+wait "$UNBOUNDED_PID" 2>/dev/null
+set -e
+
+rm -rf "$HUNG_STUB_DIR"
+
 # --- Test gitea_api auth-mode selection (issue #3297) ---
 # Use a `curl` shim on PATH that records its argv and returns a fake 200.
 echo ""
