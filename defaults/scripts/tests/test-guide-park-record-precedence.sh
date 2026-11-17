@@ -51,8 +51,12 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
     # Daemon answers (exit 0): its blocker list is the dependency list.
     STUB_PARK_OUT='200'; STUB_PARK_RC=0
     assert_eq "$(parse_dependencies "$AC$PARK")" "200" "park record wins over AC checkbox; reason refs ignored"
-    STUB_PARK_OUT=$'200\nexample-org/tool-repo#7'
-    assert_eq "$(parse_dependencies "$AC$PARK")" $'200\nexample-org/tool-repo#7' "daemon blocker list passed through, cross-repo ref intact"
+    # Two lines, built with printf: an escape written next to the owner would
+    # read as part of its name to check-vendored-private-refs.sh.
+    TWO_DEPS="$(printf '%s\n%s' '200' 'example-org/tool-repo#7')"
+    STUB_PARK_OUT="$TWO_DEPS"
+    assert_eq "$(parse_dependencies "$AC$PARK")" "$TWO_DEPS" "daemon blocker list passed through, cross-repo ref intact"
+    assert_eq "$(parse_dependencies "$AC$PARK" | wc -l | tr -d ' ')" "2" "daemon blocker list keeps one blocker per line"
     STUB_PARK_OUT=''
     assert_eq "$(parse_dependencies "$UNSTATED")" "" "unstated park record gates nothing from AC"
     STUB_PARK_OUT='201'
