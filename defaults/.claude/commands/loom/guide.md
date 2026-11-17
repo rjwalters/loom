@@ -1114,7 +1114,7 @@ echo "$DOCS_WT"   # e.g. <repo>/.loom/worktrees/docs-guide
 # (which `gh issue|pr list` honours — one mechanism, no per-call flag to forget;
 # `repo:` in search queries uses `$GUIDE_REPO` directly). On a shared host the cwd can belong to a
 # sibling repo; an unpinned `gh ... list` then renders that repo's state into
-# this repo's WORK_PLAN.md (2AMLogic/gf180-comparator#411).
+# this repo's WORK_PLAN.md (observed on a consumer repo; the incident behind #13923).
 GUIDE_REPO="$(git -C "$DOCS_WT" remote get-url origin 2>/dev/null \
   | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')"
 [ -n "$GUIDE_REPO" ] || { echo "docs maintenance: cannot derive repo from $DOCS_WT — skipping (fail closed)" >&2; return 1 2>/dev/null || exit 1; }

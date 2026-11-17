@@ -2,7 +2,7 @@
 # test-guide-work-plan-provenance.sh - Regression test for issue #13923
 #
 # On a shared host, one repo's Guide docs tick published another repo's
-# WORK_PLAN.md render (2AMLogic/gf180-comparator#411): unpinned `gh` queries,
+# WORK_PLAN.md render (observed on a consumer repo): unpinned `gh` queries,
 # literal /tmp scratch paths, and no check that the rendered `#N` are this
 # repo's. Verifies (stubbed `gh`, hermetic):
 #   1. no unpinned `$GH_READ ... list` remains in the docs-maintenance steps,
@@ -35,7 +35,6 @@ pass "helpers extracted from $GUIDE_MD"
 echo "Test 1: queries are pinned"
 # Docs-maintenance region: from Step 1's repo derivation to check_readme.
 REGION="$(awk '/^GUIDE_REPO=/{f=1} f{print} /^check_readme_staleness\(\)/{if(f) exit}' "$GUIDE_MD")"
-UNPINNED=""
 grep -q '^export GH_REPO="\$GUIDE_REPO"' <<<"$REGION" && pass "GH_REPO pinned to the docs-worktree repo for all list queries" || fail "GH_REPO not exported from GUIDE_REPO"
 CNT="$(extract _work_log_search_total_count)"
 if grep -q 'git remote get-url origin' <<<"$CNT"; then fail "_work_log_search_total_count still reads the cwd remote"; else pass "_work_log_search_total_count does not read the cwd remote"; fi
