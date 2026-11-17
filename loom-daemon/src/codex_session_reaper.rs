@@ -22,9 +22,15 @@
 //! * Age floor (default 30 days) is far above the longest sweep, so a live
 //!   sweep or `--resume` keeps its rollout.
 //!
+//! **Opt-in** (operator ruling 2026-11-16): a deleted rollout cannot be
+//! restored by a revert, so nothing is deleted until a host turns the pass on.
+//! While it is off, the pass only *measures* — at most once per reaper tick it
+//! logs how many rollout files are older than the floor and how many bytes
+//! they hold, so an operator can see what enabling it would remove.
+//!
 //! Config precedence **env > config > default**:
 //! `LOOM_CODEX_SESSION_REAPER` / `autonomous.codexSessionReaper.enabled`
-//! (default on) and `LOOM_CODEX_SESSION_RETENTION_DAYS` /
+//! (default **off**) and `LOOM_CODEX_SESSION_RETENTION_DAYS` /
 //! `autonomous.codexSessionReaper.retentionDays` (default 30).
 
 use std::collections::HashSet;
@@ -44,7 +50,7 @@ const HISTORY_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 /// The subset of `.loom/config.json → autonomous.codexSessionReaper` consumed here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodexSessionReaperConfig {
-    /// `autonomous.codexSessionReaper.enabled` (default **true**).
+    /// `autonomous.codexSessionReaper.enabled` (default **false**: opt-in).
     pub enabled: Option<bool>,
     /// `autonomous.codexSessionReaper.retentionDays` (default 30, must be > 0).
     pub retention_days: Option<u64>,
@@ -67,13 +73,22 @@ pub fn read_config(repo_root: &Path) -> CodexSessionReaperConfig {
     }
 }
 
-/// Resolve whether the pass runs — env > config > default(true).
+/// Resolve whether the pass deletes — env > config > default(**false**).
 #[must_use]
 pub fn resolve_enabled(config: &CodexSessionReaperConfig) -> bool {
-    if let Ok(v) = std::env::var(CODEX_SESSION_REAPER_ENABLE_ENV) {
+    let env = std::env::var(CODEX_SESSION_REAPER_ENABLE_ENV).ok();
+    resolve_enabled_from(env.as_deref(), config)
+}
+
+/// [`resolve_enabled`] with the env value passed in. A set env var wins and
+/// enables only on an explicit truthy value; unset falls to the config key,
+/// and an unset config key means **off**.
+#[must_use]
+pub fn resolve_enabled_from(env: Option<&str>, config: &CodexSessionReaperConfig) -> bool {
+    if let Some(v) = env {
         return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
     }
-    config.enabled.unwrap_or(true)
+    config.enabled.unwrap_or(false)
 }
 
 /// Resolve the retention floor in days — env > config > default(30).
@@ -94,6 +109,11 @@ pub struct CodexSessionReapOutcome {
     pub files_removed: usize,
     /// Bytes those files held.
     pub bytes_reclaimed: u64,
+    /// Rollout files older than the floor that were found and left in place
+    /// (a measure-only pass, or a delete that failed).
+    pub files_eligible: usize,
+    /// Bytes those left-in-place files hold.
+    pub bytes_eligible: u64,
     /// Emptied date directories removed.
     pub dirs_removed: usize,
     /// History dirs skipped because their real target is outside the allowed roots.
@@ -107,8 +127,15 @@ fn is_rollout(name: &str) -> bool {
             .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
 }
 
-/// Prune `dir` (a real, non-symlink directory); returns true when it is left empty.
-fn prune_tree(dir: &Path, cutoff: SystemTime, out: &mut CodexSessionReapOutcome) -> bool {
+/// Walk `dir` (a real, non-symlink directory); returns true when it is left
+/// empty. With `delete` false nothing on disk is changed: old rollouts are
+/// only counted into `files_eligible` / `bytes_eligible`.
+fn prune_tree(
+    dir: &Path,
+    cutoff: SystemTime,
+    delete: bool,
+    out: &mut CodexSessionReapOutcome,
+) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
@@ -122,7 +149,10 @@ fn prune_tree(dir: &Path, cutoff: SystemTime, out: &mut CodexSessionReapOutcome)
             continue;
         };
         if ft.is_dir() {
-            if prune_tree(&path, cutoff, out) && std::fs::remove_dir(&path).is_ok() {
+            if prune_tree(&path, cutoff, delete, out)
+                && delete
+                && std::fs::remove_dir(&path).is_ok()
+            {
                 out.dirs_removed += 1;
             } else if path.exists() {
                 empty = false;
@@ -133,10 +163,15 @@ fn prune_tree(dir: &Path, cutoff: SystemTime, out: &mut CodexSessionReapOutcome)
                 .as_ref()
                 .and_then(|m| m.modified().ok())
                 .is_some_and(|t| t < cutoff);
-            if old && std::fs::remove_file(&path).is_ok() {
+            let len = meta.map_or(0, |m| m.len());
+            if old && delete && std::fs::remove_file(&path).is_ok() {
                 out.files_removed += 1;
-                out.bytes_reclaimed += meta.map_or(0, |m| m.len());
+                out.bytes_reclaimed += len;
             } else {
+                if old {
+                    out.files_eligible += 1;
+                    out.bytes_eligible += len;
+                }
                 empty = false;
             }
         } else {
@@ -155,6 +190,27 @@ pub fn prune_profiles(
     profile_root: &Path,
     default_home: Option<&Path>,
     cutoff: SystemTime,
+) -> CodexSessionReapOutcome {
+    scan_profiles(profile_root, default_home, cutoff, true)
+}
+
+/// Measure-only twin of [`prune_profiles`]: the same walk, the same symlink
+/// and allowed-roots rules, but nothing is deleted. The rollouts a real pass
+/// would remove are reported in `files_eligible` / `bytes_eligible`.
+#[must_use]
+pub fn measure_profiles(
+    profile_root: &Path,
+    default_home: Option<&Path>,
+    cutoff: SystemTime,
+) -> CodexSessionReapOutcome {
+    scan_profiles(profile_root, default_home, cutoff, false)
+}
+
+fn scan_profiles(
+    profile_root: &Path,
+    default_home: Option<&Path>,
+    cutoff: SystemTime,
+    delete: bool,
 ) -> CodexSessionReapOutcome {
     let mut out = CodexSessionReapOutcome::default();
     let Ok(root) = profile_root.canonicalize() else {
@@ -185,7 +241,7 @@ pub fn prune_profiles(
             }
             if seen.insert(real.clone()) {
                 // The tree root itself is kept, even when emptied.
-                prune_tree(&real, cutoff, &mut out);
+                prune_tree(&real, cutoff, delete, &mut out);
             }
         }
     }
@@ -201,10 +257,15 @@ fn default_codex_home() -> Option<PathBuf> {
 
 /// Run one pass for the tick of `root`, gated by that repo's config. The
 /// profile root is machine-level, so the pass is idempotent across roots.
-pub async fn reap_codex_sessions_for(root: &Path) {
+///
+/// Enabled: delete rollouts older than the floor. Disabled (the default):
+/// delete nothing, and report what enabling it would remove. `reported` is the
+/// caller's per-tick flag: the disabled report is machine-level too, so it is
+/// made at most once per tick however many registered roots there are.
+pub async fn reap_codex_sessions_for(root: &Path, reported: &mut bool) {
     let config = read_config(root);
-    if !resolve_enabled(&config) {
-        log::debug!("codex_session_reaper: disabled for {} — skipping", root.display());
+    let enabled = resolve_enabled(&config);
+    if !enabled && *reported {
         return;
     }
     let Some(profile_root) = crate::tokens_pool::paths::codex_profile_root() else {
@@ -214,11 +275,13 @@ pub async fn reap_codex_sessions_for(root: &Path) {
     let cutoff = SystemTime::now() - Duration::from_secs(days * 86_400);
     let default_home = default_codex_home();
     let joined = tokio::task::spawn_blocking(move || {
-        prune_profiles(&profile_root, default_home.as_deref(), cutoff)
+        scan_profiles(&profile_root, default_home.as_deref(), cutoff, enabled)
     })
     .await;
+    // A tick that pruned or measured has nothing more to report.
+    *reported = true;
     match joined {
-        Ok(o) if o.files_removed > 0 || o.skipped_outside_root > 0 => log::info!(
+        Ok(o) if enabled && (o.files_removed > 0 || o.skipped_outside_root > 0) => log::info!(
             "codex_session_reaper: removed {} rollout(s) ({} bytes), {} empty dir(s); \
              skipped {} history dir(s) outside the profile root (retention {days}d)",
             o.files_removed,
@@ -226,7 +289,19 @@ pub async fn reap_codex_sessions_for(root: &Path) {
             o.dirs_removed,
             o.skipped_outside_root
         ),
-        Ok(_) => log::debug!("codex_session_reaper: nothing to prune"),
+        Ok(_) if enabled => log::debug!("codex_session_reaper: nothing to prune"),
+        Ok(o) if o.files_eligible > 0 => log::info!(
+            "codex_session_reaper: disabled, nothing deleted; enabling it would remove {} \
+             rollout(s) ({} bytes) older than {days}d ({} history dir(s) outside the profile \
+             root would be skipped). Opt in with autonomous.codexSessionReaper.enabled=true \
+             or {CODEX_SESSION_REAPER_ENABLE_ENV}=1",
+            o.files_eligible,
+            o.bytes_eligible,
+            o.skipped_outside_root
+        ),
+        Ok(_) => log::debug!(
+            "codex_session_reaper: disabled, nothing deleted; no rollout older than {days}d"
+        ),
         Err(e) => log::error!("codex_session_reaper: pass panicked ({e}); continuing"),
     }
 }
@@ -348,6 +423,120 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = prune_profiles(&tmp.path().join("nope"), None, cutoff());
         assert_eq!(out, CodexSessionReapOutcome::default());
+    }
+
+    #[test]
+    fn disabled_by_default_and_enabled_only_explicitly() {
+        let unset = CodexSessionReaperConfig::default();
+        assert!(!resolve_enabled_from(None, &unset), "unset env + unset config is off");
+        let on = CodexSessionReaperConfig {
+            enabled: Some(true),
+            retention_days: None,
+        };
+        assert!(resolve_enabled_from(None, &on));
+        for v in ["1", "true", "YES", " on "] {
+            assert!(resolve_enabled_from(Some(v), &unset), "{v}");
+        }
+        // A set env var wins over the config key, and only a truthy value enables.
+        for v in ["0", "false", "", "maybe"] {
+            assert!(!resolve_enabled_from(Some(v), &on), "{v:?}");
+        }
+    }
+
+    /// Every path under `dir`, sorted, with file sizes — a before/after
+    /// fingerprint proving a pass changed nothing.
+    fn listing(dir: &Path) -> Vec<(PathBuf, u64)> {
+        let mut out = vec![];
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                let ft = e.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(p.clone());
+                }
+                out.push((
+                    p,
+                    if ft.is_file() {
+                        e.metadata().unwrap().len()
+                    } else {
+                        0
+                    },
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn default_configuration_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prof = tmp.path().join("alice");
+        rollout(&prof.join("sessions/2026/01/02"), "rollout-a.jsonl", 90);
+        rollout(&prof.join("archived_sessions/2025/12/31"), "rollout-b.jsonl", 400);
+        let before = listing(tmp.path());
+
+        // The pass exactly as `reap_codex_sessions_for` runs it with nothing
+        // configured: no env var, no config key.
+        let delete = resolve_enabled_from(None, &CodexSessionReaperConfig::default());
+        let out = scan_profiles(tmp.path(), None, cutoff(), delete);
+
+        assert_eq!(listing(tmp.path()), before, "nothing on disk changed");
+        assert_eq!((out.files_removed, out.bytes_reclaimed, out.dirs_removed), (0, 0, 0));
+    }
+
+    #[test]
+    fn disabled_pass_reports_and_leaves_every_file_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prof = tmp.path().join("alice");
+        let old_a = rollout(&prof.join("sessions/2026/01/02"), "rollout-a.jsonl", 90);
+        let old_b = rollout(&prof.join("archived_sessions/2025/12/31"), "rollout-b.jsonl", 400);
+        fs::write(&old_b, b"0123456789").unwrap();
+        age(&old_b, 400);
+        rollout(&prof.join("sessions/2026/10/20"), "rollout-new.jsonl", 1);
+        rollout(&prof.join("sessions"), "notes.txt", 365);
+        let before = listing(tmp.path());
+
+        let out = measure_profiles(tmp.path(), None, cutoff());
+
+        assert_eq!(listing(tmp.path()), before, "nothing on disk changed");
+        assert_eq!((out.files_removed, out.bytes_reclaimed, out.dirs_removed), (0, 0, 0));
+        // Only the two old rollouts are reported: not the new one, not notes.txt.
+        assert_eq!(out.files_eligible, 2);
+        let expect = fs::metadata(&old_a).unwrap().len() + fs::metadata(&old_b).unwrap().len();
+        assert_eq!(out.bytes_eligible, expect);
+
+        // The report matches what enabling it then removes.
+        let pruned = prune_profiles(tmp.path(), None, cutoff());
+        assert_eq!(pruned.files_removed, out.files_eligible);
+        assert_eq!(pruned.bytes_reclaimed, out.bytes_eligible);
+        assert_eq!(pruned.files_eligible, 0);
+        assert!(!old_a.exists() && !old_b.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_pass_counts_a_shared_symlink_target_once_and_skips_outside_roots() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("profiles");
+        let default_home = tmp.path().join("dot-codex");
+        let elsewhere = tmp.path().join("elsewhere");
+        let shared = rollout(&default_home.join("sessions/2026/01/01"), "rollout-x.jsonl", 90);
+        let outside = rollout(&elsewhere.join("sessions"), "rollout-y.jsonl", 90);
+        for p in ["alice", "bob"] {
+            fs::create_dir_all(root.join(p)).unwrap();
+            symlink(default_home.join("sessions"), root.join(p).join("sessions")).unwrap();
+        }
+        fs::create_dir_all(root.join("carol")).unwrap();
+        symlink(elsewhere.join("sessions"), root.join("carol/sessions")).unwrap();
+
+        let out = measure_profiles(&root, Some(&default_home), cutoff());
+
+        assert_eq!(out.files_eligible, 1, "shared target counted once, outside root not at all");
+        assert_eq!(out.skipped_outside_root, 1);
+        assert!(shared.exists() && outside.exists());
     }
 
     #[test]

@@ -40,15 +40,29 @@ Each surface of the profile gets exactly one mechanism, chosen for a reason:
 | `hooks.json` | installed by `provision-codex-hooks.sh` | the managed `pre_tool_use` bridge already owns this file and preserves every operator entry; a second writer with its own idempotency record would fight it |
 | `auth.json`, identity keys, per-project trust state | **never shared** | |
 
-**Retention bound (#12966).** Codex never expires its rollout files, so the
-daemon's reaper tick (`loom-daemon/src/codex_session_reaper.rs`) deletes
-`rollout-*.jsonl` older than `autonomous.codexSessionReaper.retentionDays`
-(default 30; `LOOM_CODEX_SESSION_RETENTION_DAYS`, off via
-`LOOM_CODEX_SESSION_REAPER=0`) under each real `sessions/` and
-`archived_sessions/` tree, once per symlink target. It never touches
-`auth.json`, `config.toml`, `hooks.json`, the session markers, the
-thread-history db or dot-dirs, and skips a target outside the profile root and
-default Codex home.
+**Retention bound (#12966), opt-in.** Codex never expires its rollout files,
+and a deleted rollout cannot be restored, so the daemon deletes none until a
+host turns the pass on. It is **off by default**; enable it with
+`autonomous.codexSessionReaper.enabled: true` in the config (fleet tier or
+`.loom/config.json`) or `LOOM_CODEX_SESSION_REAPER=1` in the daemon's
+environment (env wins; unset means off).
+
+- **Off (default):** the reaper tick (`loom-daemon/src/codex_session_reaper.rs`)
+  deletes nothing. At most once per tick it logs, at info level, how many
+  `rollout-*.jsonl` files are older than the retention floor and their total
+  bytes (`codex_session_reaper: disabled, nothing deleted; enabling it would
+  remove N rollout(s) (B bytes) ...`), so you can see what enabling it would
+  remove before you do.
+- **On:** it deletes `rollout-*.jsonl` older than
+  `autonomous.codexSessionReaper.retentionDays` (default 30;
+  `LOOM_CODEX_SESSION_RETENTION_DAYS`) under each real `sessions/` and
+  `archived_sessions/` tree, once per symlink target, then the date
+  directories it emptied. This reaches the default Codex home's history when
+  pooled profiles symlink to it.
+
+Either way it never touches `auth.json`, `config.toml`, `hooks.json`, the
+session markers, the thread-history db or dot-dirs, and skips a target outside
+the profile root and default Codex home.
 
 The TOML merge goes through a format-preserving document model
 (`toml_edit`), so every key Loom does not own — comments, ordering and
