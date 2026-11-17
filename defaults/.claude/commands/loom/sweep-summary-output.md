@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Sweep — Summary output and session transcript archival
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.

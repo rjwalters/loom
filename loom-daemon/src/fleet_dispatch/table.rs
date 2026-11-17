@@ -170,6 +170,13 @@ pub const CI_WAIT_OUTCOME: &str = "ci_wait";
 /// either: the row ends and nothing is held, so the next draw may take it.
 pub const HOST_LOST_OUTCOME: &str = "host_lost";
 
+/// The `release` outcome of a step that died because its api-key seat was
+/// exhausted (the provider refused the launch; #13966). Not progress, but
+/// not the item's fault either: the seat is marked to its reset and the
+/// draw falls through to the next runtime, so the row ends and nothing is
+/// held — the next draw may take the item at once.
+pub const PROVIDER_EXHAUSTED_OUTCOME: &str = "provider_exhausted";
+
 /// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
 /// the item every ~90 s while CI runs, short enough that its next step is
 /// drawn within minutes of CI finishing.
@@ -965,6 +972,7 @@ impl Table {
             return false;
         };
         let host_lost = outcome.trim() == HOST_LOST_OUTCOME;
+        let exhausted = outcome.trim() == PROVIDER_EXHAUSTED_OUTCOME;
         let end = if host_lost {
             PrevEnd::HostLost
         } else {
@@ -972,7 +980,10 @@ impl Table {
         };
         self.note_ended(&key, &row, end, now);
         let (repo, item) = key;
-        if host_lost {
+        // A lost host and an exhausted provider seat are both not the item's
+        // fault: the row ends and nothing is held, so the next draw may take
+        // it (`host_lost`, #12876; `provider_exhausted`, #13966).
+        if host_lost || exhausted {
             return true;
         }
         if outcome.trim() == CI_WAIT_OUTCOME {
