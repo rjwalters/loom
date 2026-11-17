@@ -367,3 +367,7 @@ test-create-issue-curated.sh
 # #13414: guide unblock sweep honors a park record over AC checkboxes. Hermetic.
 test-guide-park-record-precedence.sh
 test-guide-transient-first-at.sh
+# #13956: resolve-role-model.sh — tools-first slice wiring, exit-3 data-code
+# passthrough, the 0.19.1311 version floor, and the resync-keeps-the-setting
+# recheck (agents stay unpinned, config survives). Hermetic: mocks only.
+test-resolve-role-model.sh
