@@ -601,8 +601,18 @@ rg "use.*::" --type rust | cut -d':' -f3 | sort -u
 rg "export (function|class|const|interface)" --type ts -n
 
 # For each export, check if it's imported elsewhere
-# If no imports found outside its own file, it's dead code
+# "No imports found" = no explicit reference — NOT proof it never runs
 ```
+
+"No imports found" establishes only that no file names the export. Runners
+reach code by discovery convention — pytest collecting `test_*.py` under a
+directory argument, workflow `on:`/`run:` paths, a runner's directory
+arguments, an adjacent `test_<name>` file — so before proposing removal of
+anything claimed to "run by nothing", ask the runner, not the text:
+`pytest <dir> --collect-only -q | grep <name>`
+(2AMLogic/gf180-parasynth#847 — a gate with no textual reference anywhere was
+still collected by `pytest tools/` on every `make verify`; full worked example
+in `hermit.md` → "Limits of a name grep").
 
 ### Complexity Metrics
 
@@ -936,6 +946,12 @@ Examples:
 rg "functionName" --type ts
 # Output: [show the results]
 ```
+
+**Dead-code / "run by nothing" claims** must also name which runners were
+checked and how — by explicit reference or by discovery convention
+(`pytest <dir> --collect-only -q | grep <name>`, workflow `on:`/`run:` paths,
+a runner's directory arguments, an adjacent `test_<name>` file). A name grep
+alone is "no explicit reference", not wiring evidence.
 
 ## Impact Analysis
 
