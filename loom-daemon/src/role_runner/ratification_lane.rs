@@ -371,14 +371,18 @@ pub struct ParsedReview {
     /// The verdict token from the `**Overall verdict:**` line.
     pub token: String,
     /// The review text: from the key's heading (its last occurrence in the
-    /// session output) to the end of the output.
+    /// session output) to the first launcher/wrapper line after it — the
+    /// wrapper writes its own lines after the model's final message, and
+    /// they are never posted.
     pub text: String,
 }
 
 /// Extract this key's review from a reviewer session's output. The heading
 /// ([`Key::review_heading`]) is the start delimiter: the review runs from its
-/// **last** occurrence in `output` to the end, so launcher or wrapper noise
-/// before it is never read as a verdict or posted. A verdict is the first
+/// **last** occurrence in `output` to the first launcher/wrapper line after
+/// it ([`is_wrapper_line`]), so launcher or wrapper noise on either side of
+/// the review is never read as a verdict or posted — no auth-mode line, no
+/// wrapper tail. A verdict is the first
 /// word after the colon on an `**Overall verdict:**` line (terminated by a
 /// comma or whitespace) and must be one of [`Key::allowed_tokens`]. Anything
 /// else — no heading, no verdict line, an empty, unknown or conflicting
@@ -389,7 +393,13 @@ pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, String> {
         return Err(format!("no {heading} heading in session output"));
     };
     let start = output[..at].rfind('\n').map_or(0, |i| i + 1);
-    let review = output[start..].trim_end();
+    let lines: Vec<&str> = output[start..].lines().collect();
+    let end = lines
+        .iter()
+        .position(|line| is_wrapper_line(line))
+        .unwrap_or(lines.len());
+    let joined = lines[..end].join("\n");
+    let review = joined.trim_end();
     const VERDICT_LINE: &str = "**Overall verdict:**";
     let mut token: Option<String> = None;
     for line in review.lines() {
@@ -421,13 +431,47 @@ pub fn parse_review(key: Key, output: &str) -> Result<ParsedReview, String> {
     })
 }
 
+/// A launcher or `claude-wrapper.sh` line rather than review prose: a
+/// timestamped log line (`[<ISO-8601>] [INFO|WARN|ERROR] …`) or a
+/// `[claude-wrapper]` diagnostic. The wrapper writes these *after* the
+/// model's final message, so in a captured role log they follow the review;
+/// they end the extracted review and are never posted (#13762).
+fn is_wrapper_line(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.starts_with("[claude-wrapper]") {
+        return true;
+    }
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let Some((stamp, after)) = rest.split_once(']') else {
+        return false;
+    };
+    let after = after.trim_start();
+    is_timestamp(stamp)
+        && (after.starts_with("[INFO]")
+            || after.starts_with("[WARN]")
+            || after.starts_with("[ERROR]"))
+}
+
+/// Plausible ISO-8601 timestamp: only digits and ISO-8601 separators, at
+/// least a full date long, with a date separator — so a markdown link or a
+/// short citation such as `[2026]` is not mistaken for a log line.
+fn is_timestamp(s: &str) -> bool {
+    s.len() >= 10
+        && s.contains('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b':' | b'T' | b'Z' | b'+' | b'.'))
+}
+
 /// The comment body for one key: the wire marker (exactly the shape
 /// [`keys_marked`] parses), then a visible `reviewer=` line. `head_sha` is the
 /// head captured at selection time, never re-read.
 ///
 /// `verdict` is the extracted review text (#13762), appended after the marker
-/// line. It is bounded to [`MAX_VERDICT_CHARS`] (keeping the end, with an
-/// explicit truncation notice) and its `<!--` / `-->` are escaped so it can
+/// line. It is bounded to [`MAX_VERDICT_CHARS`] (keeping the head, with an
+/// explicit truncation notice — the heading and verdict line survive) and its
+/// `<!--` / `-->` are escaped so it can
 /// never form or alter a marker that [`keys_marked`] would parse.
 #[must_use]
 pub fn marker_body(key: Key, head_sha: &str, reviewer: &str, verdict: Option<&str>) -> String {
@@ -452,8 +496,8 @@ fn bound_verdict(text: &str) -> String {
     if total <= MAX_VERDICT_CHARS {
         return escaped;
     }
-    let tail: String = escaped.chars().skip(total - MAX_VERDICT_CHARS).collect();
-    format!("[truncated: first {} characters omitted]\n{tail}", total - MAX_VERDICT_CHARS)
+    let head: String = escaped.chars().take(MAX_VERDICT_CHARS).collect();
+    format!("{head}\n[truncated: last {} characters omitted]", total - MAX_VERDICT_CHARS)
 }
 
 /// What the lane did for one key of one PR.

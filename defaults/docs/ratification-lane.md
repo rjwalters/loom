@@ -67,16 +67,20 @@ without markers, so the PR is selected again. After the marker the comment
 carries a `Verdict:` section: the extracted review text, never the session's
 log. The review is delimited by the reviewer's own heading — `## EE-key
 review:` or `## Market-key review:` — and runs from that heading's **last**
-occurrence in the session output to the end, so launcher or wrapper noise
-before it is never read as a verdict or posted (no auth-mode line can leak).
+occurrence in the session output to the first launcher/wrapper line after it
+(a timestamped `[<ISO-8601>] [INFO|WARN|ERROR]` log line or a
+`[claude-wrapper]` diagnostic), so launcher or wrapper noise on either side
+of the review is never read as a verdict or posted — no auth-mode line, no
+wrapper tail.
 A marker is posted only when the review also carries an `**Overall verdict:**`
 line whose first token is one of the key's verdicts: `approve` /
 `request-changes` for `ee`; `competitive` / `adequate-for-catalog` /
 `uncompetitive` / `escalate` for `market`. Anything else — the reviewer
 declined, authored the PR or reported a disclosure problem (all no verdict),
 no heading, an unknown token, or two different tokens — posts no marker and
-is logged as withheld. The text is at most 4000 characters, with an explicit
-truncation notice when cut; its `<!--` and `-->` are escaped, so it cannot
+is logged as withheld. The text is at most 4000 characters — the head is
+kept on truncation, so the heading and verdict line survive — with an
+explicit notice when cut; its `<!--` and `-->` are escaped, so it cannot
 form or alter a marker.
 
 ## Trust model

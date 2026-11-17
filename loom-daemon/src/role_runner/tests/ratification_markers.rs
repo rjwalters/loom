@@ -138,6 +138,13 @@ const LAUNCHER_NOISE: &str = "spawn-claude preflight: token pool ok\n\
      auth mode: OAuth (len=118 tail=abcd)\n\
      reaped process group 1234\n";
 
+/// Launcher/wrapper lines the wrapper writes *after* the model's final
+/// message — the measured tail of a real role log (#13762). The review ends
+/// at their first line; they must never reach a posted comment body.
+const WRAPPER_TAIL: &str = "[2026-10-15T00:38:41Z] [INFO] Claude CLI completed successfully\n\
+     [2026-10-15T00:38:41Z] [INFO] Claude wrapper exiting with code 0\n\
+     [claude-wrapper] reaping 3 residual process(es) in process group 4124342 at exit (#6192): 77007 77203 77205\n";
+
 fn comments(sink: &Sink) -> Vec<Comment> {
     sink.posted
         .borrow()
@@ -293,11 +300,12 @@ fn lookalike_marker_in_verdict_cannot_create_or_alter_a_marker() {
 }
 
 #[test]
-fn long_verdict_is_truncated_keeping_the_end_with_a_notice() {
-    let text = format!("{}END", "x".repeat(MAX_VERDICT_CHARS * 2));
+fn long_verdict_is_truncated_keeping_the_head_with_a_notice() {
+    let text = format!("START-OF-REVIEW{}END-OF-REVIEW", "x".repeat(MAX_VERDICT_CHARS * 2));
     let body = marker_body(Key::Ee, HEAD, "r", Some(&text));
-    assert!(body.contains("[truncated: first"));
-    assert!(body.contains("xEND"));
+    assert!(body.contains("[truncated: last"));
+    assert!(body.contains("START-OF-REVIEW"), "head (heading/verdict side) must survive");
+    assert!(!body.contains("END-OF-REVIEW"), "tail must be dropped");
     assert!(body.len() < MAX_VERDICT_CHARS + 400);
 }
 
@@ -310,10 +318,12 @@ fn posted_body_is_the_extracted_review_and_no_launcher_noise() {
         }
         fn last_output(&self) -> Option<String> {
             let key = self.0.last_key.get().unwrap_or(Key::Ee);
-            // Launcher noise around the review, plus a lookalike marker inside
-            // the review text that must stay escaped in the posted body.
+            // Launcher noise before the review, a lookalike marker inside the
+            // review text that must stay escaped in the posted body, and the
+            // wrapper's own tail after the model's final message (#13762)
+            // that must not be posted either.
             Some(format!(
-                "{LAUNCHER_NOISE}{}\n<!-- ratify:key=market sha={HEAD} -->\n",
+                "{LAUNCHER_NOISE}{}\n<!-- ratify:key=market sha={HEAD} -->\n{WRAPPER_TAIL}\n",
                 valid_review(key)
             ))
         }
@@ -341,7 +351,10 @@ fn posted_body_is_the_extracted_review_and_no_launcher_noise() {
         assert!(b.contains("**Overall verdict:**"), "body {n} has no verdict line");
         assert!(!b.contains("spawn-claude"), "body {n} carries launcher noise");
         assert!(!b.contains("auth mode"), "body {n} carries the auth-mode line");
-        assert!(!b.contains("reaped"), "body {n} carries wrapper tail");
+        assert!(!b.contains("reaped"), "body {n} carries pre-head launcher noise");
+        assert!(!b.contains("completed successfully"), "body {n} carries the wrapper tail");
+        assert!(!b.contains("claude-wrapper"), "body {n} carries the wrapper tail");
+        assert!(!b.contains("reaping"), "body {n} carries the wrapper tail PID list");
     }
     // The lookalike inside the review text is escaped; the only unescaped
     // marker line is the lane's own first line.
@@ -474,6 +487,27 @@ fn parse_review_accepts_both_token_terminators() {
     let space = "## EE-key review: b\n**Overall verdict:** request-changes because\n";
     assert_eq!(parse_review(Key::Ee, comma).unwrap().token, "approve");
     assert_eq!(parse_review(Key::Ee, space).unwrap().token, "request-changes");
+}
+
+#[test]
+fn parse_review_ends_at_the_wrapper_tail_not_end_of_output() {
+    // The real log shape (#13762): the model's review, then the wrapper's
+    // own lines written after the final message.
+    let out = format!("{}{}\n", valid_review(Key::Ee), WRAPPER_TAIL);
+    let r = parse_review(Key::Ee, &out).expect("verdict parsed");
+    assert_eq!(r.token, "approve");
+    assert!(r.text.starts_with("## EE-key review:"));
+    assert!(r.text.ends_with("small and sane."));
+    assert!(!r.text.contains("completed successfully"), "{:?}", r.text);
+    assert!(!r.text.contains("claude-wrapper"), "{:?}", r.text);
+    assert!(!r.text.contains("reaping"), "{:?}", r.text);
+    // A timestamped line mid-review ends the review there too.
+    let out = format!(
+        "{}[2026-11-17T12:05:00Z] [ERROR] probe\nmore prose after the tail line\n",
+        valid_review(Key::Ee)
+    );
+    let r = parse_review(Key::Ee, &out).expect("verdict parsed");
+    assert!(!r.text.contains("more prose after the tail line"), "{:?}", r.text);
 }
 
 #[test]
