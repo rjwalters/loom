@@ -161,13 +161,18 @@ async fn serve(
     )
     .with_no_progress(no_progress);
     let epoch = fleet_dispatch::new_epoch();
-    let server = Arc::new(Server::new(
-        TailscaleWhois::new(tailscale_socket),
-        Arc::new(SystemClock::start()),
-        roster,
-        policy,
-        epoch.clone(),
-    ));
+    let server = Arc::new(
+        Server::new(
+            TailscaleWhois::new(tailscale_socket),
+            Arc::new(SystemClock::start()),
+            roster,
+            policy,
+            epoch.clone(),
+        )
+        // #13942: every heartbeat answer publishes the captain's own pool
+        // probe, so fleet workers converge on one probe result.
+        .with_token_probe(crate::tokens_pool::paths::resolve_tokens_dir(&root)),
+    );
     let opts = Options::default();
     let listener = tokio::net::TcpListener::bind((addr, port))
         .await

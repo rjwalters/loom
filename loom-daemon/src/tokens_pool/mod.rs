@@ -75,6 +75,7 @@ pub mod codex_probe;
 pub mod codex_reset;
 pub mod docker_cli;
 pub mod failure_counts;
+pub mod fleet_probe;
 pub mod health;
 pub mod locking;
 pub mod monitor;

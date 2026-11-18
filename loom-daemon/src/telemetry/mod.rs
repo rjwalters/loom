@@ -1393,6 +1393,14 @@ pub struct TokenSnapshotRecord {
     pub captured_at: DateTime<Utc>,
     /// Per-account state for every account in the pool.
     pub accounts: Vec<TokenAccountState>,
+    /// Age of the fleet token-probe snapshot this host has applied
+    /// (#13942): `captured_at` minus the captain's probe instant. `None`
+    /// when no fleet sidecar exists (fleet mode off, or the captain has not
+    /// answered a heartbeat yet) — unknown, not zero. Signed on purpose: a
+    /// small negative value is captain/worker clock skew, the same honest
+    /// contract `seconds_until_reset` holds for a stale instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_probe_age_secs: Option<i64>,
 }
 
 /// One `(root, role)` pair's persistent tick-failure detail inside a host's

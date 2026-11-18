@@ -294,21 +294,23 @@ pub const SESSION_WINDOW_SECS: i64 = 5 * 3600;
 const SESSION_RESET_UTIL_THRESHOLD: f64 = 0.70;
 
 /// Determine whether the account's 5h session window has already rolled over,
-/// per the live `.ranking` snapshot in `tokens_dir` (issue #7522).
+/// per the freshest probe evidence in `tokens_dir` (issue #7522; the fleet
+/// sidecar joins `.ranking` as a second source since #13942 — see
+/// [`super::fleet_probe::evidence_row`], newest probe winning).
 ///
 /// Returns:
-/// - `Some(true)` — a `.ranking` row for `token_name` proves the window has
+/// - `Some(true)` — evidence for `token_name` proves the window has
 ///   reset: either its recorded 5h reset instant (`limit_reset`, issue #4874)
 ///   falls **after** `marked_at` (so it describes the window that produced this
 ///   mark) and is now in the past, or a probe taken **after** `marked_at`
 ///   reports 5h utilization back under [`SESSION_RESET_UTIL_THRESHOLD`] (the
 ///   "next `tokens check` probe" signal the issue also asks for, used when no
 ///   exact reset instant was recorded).
-/// - `Some(false)` — a `.ranking` row exists but proves the window has not
+/// - `Some(false)` — evidence exists but proves the window has not
 ///   yet reset.
-/// - `None` — no usable evidence either way (no `.ranking` file, no row for
-///   this account, or the only row present predates the mark) — the caller
-///   falls back to the fixed-TTL cooldown.
+/// - `None` — no usable evidence either way (no `.ranking` row and no fleet
+///   sidecar row for this account, or the only row present predates the mark)
+///   — the caller falls back to the fixed-TTL cooldown.
 ///
 /// Note on `limit_reset`: the field is the row's **binding**-window reset, and
 /// which window that is depends on the row's status — [`super::check::limit_reset`]
@@ -322,18 +324,7 @@ fn session_window_has_reset(
     marked_at: i64,
     now: i64,
 ) -> Option<bool> {
-    let ranking_path = tokens_dir.join(".ranking");
-    let meta = std::fs::metadata(&ranking_path).ok()?;
-    let ranking_mtime: i64 = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-    let text = std::fs::read_to_string(&ranking_path).ok()?;
-    let row = text
-        .lines()
-        .filter_map(super::select::parse_ranking_line)
-        .find(|r| r.name == token_name)?;
+    let row = super::fleet_probe::evidence_row(tokens_dir, token_name)?;
 
     // Strongest signal: the recorded 5h reset instant for the window that was
     // gating this account (issue #4874) has already passed.
@@ -366,7 +357,7 @@ fn session_window_has_reset(
     // Fallback: a probe taken AFTER this entry was marked bad reports 5h
     // utilization back under the load-gate threshold — the window rolled
     // over even though we never learned its exact reset instant.
-    if ranking_mtime > marked_at {
+    if row.probed_at > marked_at {
         if let Some(util) = row.util_5h {
             return Some(util < SESSION_RESET_UTIL_THRESHOLD);
         }
@@ -409,8 +400,11 @@ enum AmbiguousExhaustionEvidence {
 /// rather than freezing the account out until a corrupt instant.
 const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
 
-/// Read the fresh `.ranking` evidence for an ambiguous (non-session-limit-
-/// matching) exhaustion entry, as [`AmbiguousExhaustionEvidence`].
+/// Read the freshest probe evidence for an ambiguous (non-session-limit-
+/// matching) exhaustion entry, as [`AmbiguousExhaustionEvidence`]. Since
+/// #13942 the evidence is whichever probe is newer: the local `.ranking`
+/// row (file mtime as the probe instant) or the fleet sidecar's row (the
+/// captain's `probed_at`) — see [`super::fleet_probe::evidence_row`].
 ///
 /// [`session_window_has_reset`] is deliberately NOT reused here, and this is
 /// a distinct, separate check rather than a widened version of it: releasing
@@ -420,15 +414,15 @@ const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
 /// regardless of the still-active 7-day block) — exactly the harm issue #4212
 /// declined to risk by leaving ambiguous reasons out of the regex in the first
 /// place. So an ambiguous entry is released only when the re-probed
-/// `.ranking` row shows **both**:
+/// evidence shows **both**:
 ///
 /// 1. 5h utilization under the load gate ([`super::select::resolve_load_gate`],
 ///    the same threshold [`session_window_has_reset`]'s fallback and
 ///    `select`'s own tier-1 pick use — not a second, unrelated cutoff), AND
 /// 2. 7d utilization under the exhausted threshold
-///    ([`super::check::EXHAUSTED_THRESHOLD`]). `.ranking`
+///    ([`super::check::EXHAUSTED_THRESHOLD`]). The evidence rows
 ///    (`name|status|5h_util|limit_reset`, see
-///    [`super::select::parse_ranking_line`]) does not carry a raw 7d-utilization
+///    [`super::select::parse_ranking_line`]) do not carry a raw 7d-utilization
 ///    field — only the `status` string a probe already derived from it
 ///    (`super::check::status_from_utilization`: `status == "exhausted"` iff 7d
 ///    utilization cleared [`super::check::EXHAUSTED_THRESHOLD`]). So signal 2 is
@@ -452,12 +446,13 @@ const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
 /// unchanged wherever the evidence is not positive.
 ///
 /// Requires **freshness**, exactly like [`session_window_has_reset`]'s
-/// fallback branch: the `.ranking` file's mtime must be after `marked_at`, so
+/// fallback branch: the winning probe's instant must be after `marked_at`, so
 /// a stale pre-mark row (e.g. left over from before this entry was ever
-/// probed) can never satisfy the check. This is what makes the widened
-/// probe-eligibility in `check::discover_tokens` (#7538) load-bearing — an
-/// ambiguous entry that has never been re-probed since it was marked bad has
-/// no fresh row to read, and correctly falls through to
+/// probed, or a fleet snapshot the captain took before the mark) can never
+/// satisfy the check. This is what makes the widened probe-eligibility in
+/// `check::discover_tokens` (#7538) load-bearing — an ambiguous entry that
+/// has never been re-probed since it was marked bad has no fresh row to
+/// read, and correctly falls through to
 /// [`AmbiguousExhaustionEvidence::FixedCooldown`] (full fixed-TTL cooldown,
 /// unchanged).
 fn ambiguous_exhaustion_evidence(
@@ -466,29 +461,13 @@ fn ambiguous_exhaustion_evidence(
     marked_at: i64,
     now: i64,
 ) -> AmbiguousExhaustionEvidence {
-    let ranking_path = tokens_dir.join(".ranking");
-    let Some(meta) = std::fs::metadata(&ranking_path).ok() else {
+    let Some(row) = super::fleet_probe::evidence_row(tokens_dir, token_name) else {
         return AmbiguousExhaustionEvidence::FixedCooldown;
     };
-    let ranking_mtime: i64 = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-    if ranking_mtime <= marked_at {
+    if row.probed_at <= marked_at {
         // No probe evidence taken since this entry was marked bad.
         return AmbiguousExhaustionEvidence::FixedCooldown;
     }
-    let Ok(text) = std::fs::read_to_string(&ranking_path) else {
-        return AmbiguousExhaustionEvidence::FixedCooldown;
-    };
-    let Some(row) = text
-        .lines()
-        .filter_map(super::select::parse_ranking_line)
-        .find(|r| r.name == token_name)
-    else {
-        return AmbiguousExhaustionEvidence::FixedCooldown;
-    };
     if row.status == "exhausted" {
         // The probe's 7d verdict: still weekly-exhausted (#13893). Hold to
         // the row's recorded 7d reset instant when it is credible; anything

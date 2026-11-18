@@ -173,6 +173,7 @@ fn tokens_snapshot_envelope() -> TelemetryEnvelope {
         "host-b",
         TelemetryRecord::TokensSnapshot(TokenSnapshotRecord {
             captured_at: ts(),
+            fleet_probe_age_secs: None,
             accounts: vec![
                 TokenAccountState {
                     account: "agent-1".to_string(),
@@ -1325,5 +1326,43 @@ fn sweep_started_exports_story_points_numerically_when_sized() {
     assert_eq!(
         story_points(envelope("host-a", TelemetryRecord::SweepStarted(record))),
         Some(any_value::Value::IntValue(13))
+    );
+}
+
+/// #13942: the applied-snapshot-age gauge is a host-level series beside the
+/// per-account ones, emitted only when the host has a fleet sidecar.
+#[test]
+fn tokens_snapshot_fleet_probe_age_is_a_host_gauge_absent_when_unknown() {
+    let mut envelope = tokens_snapshot_envelope();
+    let TelemetryRecord::TokensSnapshot(record) = &mut envelope.record else {
+        unreachable!();
+    };
+    record.fleet_probe_age_secs = Some(311);
+    let request = build_metrics_request(&[envelope]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let age = metrics
+        .iter()
+        .find(|m| m.name == "loom.tokens.fleet_probe_age")
+        .expect("fleet_probe_age metric must exist");
+    let points = match &age.data {
+        Some(metric::Data::Gauge(gauge)) => &gauge.data_points,
+        other => panic!("expected Gauge, got {other:?}"),
+    };
+    assert_eq!(points.len(), 1);
+    assert!(
+        points[0].attributes.is_empty(),
+        "host-level: no account attribute, so it compares across hosts"
+    );
+    assert_eq!(points[0].value, Some(number_data_point::Value::AsInt(311)));
+
+    // The default record carries no sidecar age: no series, per the
+    // absent-not-zero rule.
+    let request = build_metrics_request(&[tokens_snapshot_envelope()]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    assert!(
+        metrics
+            .iter()
+            .all(|m| m.name != "loom.tokens.fleet_probe_age"),
+        "unknown age must not fabricate a zero series"
     );
 }

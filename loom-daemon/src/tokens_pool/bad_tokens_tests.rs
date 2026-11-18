@@ -1519,3 +1519,172 @@ fn cleanup_retention_covers_the_extended_weekly_hold() {
     assert!(text.contains("agent-hold"), "mid-hold entry was pruned: {text}");
     assert!(!text.contains("agent-old"));
 }
+
+// -----------------------------------------------------------------
+// #13942: the fleet token-probe sidecar joins `.ranking` as evidence.
+// -----------------------------------------------------------------
+
+/// Write `lines` as the pool's `.bad_tokens` and return the pool dir.
+fn pool_with_bad_lines(ws: &Path, lines: &str) -> PathBuf {
+    let dir = pool_dir(ws);
+    fs::write(dir.join(".bad_tokens"), lines).unwrap();
+    dir
+}
+
+/// One ambiguous (non-session-limit) exhaustion mark, stamped `hours` ago.
+fn ambiguous_mark(hours: i64) -> String {
+    (Utc::now() - chrono::Duration::seconds(hours * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+/// Store a fleet snapshot into `dir`'s sidecar (#13942).
+fn apply_fleet_snapshot(
+    dir: &Path,
+    probed_at: chrono::DateTime<Utc>,
+    rows: Vec<crate::tokens_pool::fleet_probe::TokenProbeAccount>,
+) {
+    let snapshot = crate::tokens_pool::fleet_probe::TokenProbeSnapshot {
+        probed_at,
+        accounts: rows,
+    };
+    crate::tokens_pool::fleet_probe::write_sidecar(dir, &snapshot).unwrap();
+}
+
+fn probe_account(
+    name: &str,
+    status: &str,
+    util: Option<f64>,
+) -> crate::tokens_pool::fleet_probe::TokenProbeAccount {
+    crate::tokens_pool::fleet_probe::TokenProbeAccount {
+        name: name.into(),
+        status: status.into(),
+        util_5h: util,
+        limit_reset: None,
+    }
+}
+
+/// AC 2 (#13942): two workers fed the same snapshot report the same
+/// usable-account count. Worker B is fresh (no local `.ranking` at all —
+/// the exact host the incident's 1/20 count came from); worker A still has
+/// a local `.ranking` its own probe wrote, which the captain's newer probe
+/// outranks. The verdicts must be identical account by account: released,
+/// held to the recorded reset, and fixed-cooldown for an account the
+/// snapshot has no row for.
+#[test]
+#[serial]
+fn two_workers_fed_the_same_snapshot_agree() {
+    let mark = ambiguous_mark(1); // inside the 6h cooldown: evidence decides
+    let reset = (Utc::now() + chrono::Duration::seconds(4 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let marks = format!(
+        "{mark} agent-1 exhausted: used 100% of your weekly limit\n\
+         {mark} agent-2 exhausted: used 100% of your weekly limit\n\
+         {mark} agent-3 exhausted: used 100% of your weekly limit\n"
+    );
+
+    let worker_a = make_pool();
+    let dir_a = pool_with_bad_lines(worker_a.path(), &marks);
+    // Worker A's own last probe: stale next to the captain's.
+    fs::write(dir_a.join(".ranking"), "agent-1|exhausted||1970-01-01T00:00:00Z\n").unwrap();
+
+    let worker_b = make_pool();
+    let dir_b = pool_with_bad_lines(worker_b.path(), &marks);
+    // Worker B has no local evidence at all.
+
+    // The captain's snapshot: strictly newer than A's local `.ranking`
+    // mtime (written above), so it wins on both hosts.
+    let snapshot_rows = vec![
+        probe_account("agent-1", "available", Some(0.10)),
+        crate::tokens_pool::fleet_probe::TokenProbeAccount {
+            name: "agent-2".into(),
+            status: "exhausted".into(),
+            util_5h: None,
+            limit_reset: Some(reset),
+        },
+        // agent-3: absent from the snapshot — no evidence either way.
+    ];
+    let probed_at = Utc::now() + chrono::Duration::seconds(61);
+    apply_fleet_snapshot(&dir_a, probed_at, snapshot_rows.clone());
+    apply_fleet_snapshot(&dir_b, probed_at, snapshot_rows);
+
+    let usable = |dir: &Path| -> Vec<(String, bool)> {
+        ["agent-1", "agent-2", "agent-3"]
+            .iter()
+            .map(|name| ((*name).to_string(), blocking_entry_in_dir(dir, name).is_none()))
+            .collect()
+    };
+    let a = usable(&dir_a);
+    let b = usable(&dir_b);
+    assert_eq!(a, b, "two workers fed the same snapshot must agree");
+    let verdict =
+        |usable: &[(String, bool)], name: &str| usable.iter().find(|(n, _)| n == name).unwrap().1;
+    assert!(verdict(&a, "agent-1"), "released: probe shows both windows clear");
+    assert!(!verdict(&a, "agent-2"), "held: still exhausted, reset recorded");
+    assert!(!verdict(&a, "agent-3"), "no row: fixed cooldown applies unchanged");
+}
+
+/// AC 3 (#13942): a snapshot older than the mark is ignored — only a probe
+/// taken after the mark may release or extend the hold.
+#[test]
+#[serial]
+fn a_snapshot_older_than_the_mark_is_ignored() {
+    let tmp = make_pool();
+    // Marked 1h ago; the fleet snapshot was probed 2h ago — before the mark.
+    let dir = pool_with_bad_lines(
+        tmp.path(),
+        &format!("{} agent-1 exhausted: used 100% of your weekly limit\n", ambiguous_mark(1)),
+    );
+    apply_fleet_snapshot(
+        &dir,
+        Utc::now() - chrono::Duration::seconds(2 * 3600),
+        vec![probe_account("agent-1", "available", Some(0.10))],
+    );
+    assert!(
+        blocking_entry_in_dir(&dir, "agent-1").is_some(),
+        "a pre-mark snapshot must not release the entry"
+    );
+
+    // The same shape, probed after the mark: released.
+    apply_fleet_snapshot(&dir, Utc::now(), vec![probe_account("agent-1", "available", Some(0.10))]);
+    assert!(
+        blocking_entry_in_dir(&dir, "agent-1").is_none(),
+        "a post-mark snapshot proving recovery releases it"
+    );
+}
+
+/// AC 3 (#13942): the readers prefer the newer of `.ranking` and the sidecar
+/// — a locally refreshed `.ranking` outranks an older fleet snapshot, so a
+/// host that probes its own pool keeps today's behaviour byte-for-byte.
+#[test]
+#[serial]
+fn a_local_ranking_newer_than_the_sidecar_still_wins() {
+    let tmp = make_pool();
+    let dir = pool_with_bad_lines(
+        tmp.path(),
+        &format!("{} agent-1 exhausted: used 100% of your weekly limit\n", ambiguous_mark(1)),
+    );
+    // A fleet snapshot an hour old says still-exhausted with a far reset…
+    apply_fleet_snapshot(
+        &dir,
+        Utc::now() - chrono::Duration::seconds(3600),
+        vec![crate::tokens_pool::fleet_probe::TokenProbeAccount {
+            name: "agent-1".into(),
+            status: "exhausted".into(),
+            util_5h: None,
+            limit_reset: Some(
+                (Utc::now() + chrono::Duration::seconds(4 * 24 * 3600))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string(),
+            ),
+        }],
+    );
+    // …but this host's own newer probe already showed recovery.
+    fs::write(dir.join(".ranking"), "agent-1|available|0.10\n").unwrap();
+    assert_eq!(
+        blocking_entry_in_dir(&dir, "agent-1"),
+        None,
+        "the newer local probe releases; the older fleet snapshot cannot hold"
+    );
+}
