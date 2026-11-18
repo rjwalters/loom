@@ -38,25 +38,8 @@ pub enum Request {
         id: TerminalId,
         start_byte: Option<usize>,
     },
-    ResizeTerminal {
-        id: TerminalId,
-        cols: u16,
-        rows: u16,
-    },
     CheckSessionHealth {
         id: TerminalId,
-    },
-    ListAvailableSessions,
-    AttachToSession {
-        id: TerminalId,
-        session_name: String,
-    },
-    KillSession {
-        session_name: String,
-    },
-    SetWorktreePath {
-        id: TerminalId,
-        worktree_path: String,
     },
     GetTerminalActivity {
         id: TerminalId,
@@ -614,9 +597,6 @@ pub enum Response {
     SessionHealth {
         has_session: bool,
     },
-    AvailableSessions {
-        sessions: Vec<String>,
-    },
     TerminalActivity {
         entries: Vec<ActivityEntry>,
     },
@@ -735,7 +715,8 @@ pub enum Response {
     /// [`Response::DispatchFailureRecorded`]'s shape so the caller can
     /// log/report the resulting window without a second round trip.
     /// `cooldown_secs` is `None` when the mechanism is disabled (the record
-    /// call is then a no-op — `consecutive` is also `0` in that case).
+    /// call is then a no-op — see the `consecutive` field for why it can
+    /// still be non-zero in that case).
     NoopReleaseRecorded {
         issue: u32,
         /// Consecutive no-op sweeps now on the durable hold streak for
@@ -886,7 +867,6 @@ pub struct TerminalInfo {
     pub created_at: i64,
     // Agent-specific fields
     pub role: Option<String>,
-    pub worktree_path: Option<String>,
     pub agent_pid: Option<u32>,
     #[serde(default)]
     pub agent_status: AgentStatus,

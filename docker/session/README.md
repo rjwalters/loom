@@ -360,6 +360,34 @@ unregistered repository is refused. The account-wide lease still admits one
 job at a time across all of the account's clones. Dispatch admission remains
 primary-repository-only until #10796.
 
+**Declaring the repositories instead of starting each by hand (#14111).** The
+per-account, per-host `session start --private-clone` step can be replaced by a
+config key, `autonomous.sessionReconcile.privateClones`, in the machine or fleet
+tier (or any other config tier):
+
+```json
+{ "autonomous": { "sessionReconcile": { "privateClones": {
+  "ACCOUNT": [
+    { "repository": "https://github.com/OWNER/REPO", "base": "main" }
+  ]
+} } } }
+```
+
+`base` defaults to `main`. The daemon's session reconcile pass registers each
+declared repository that is missing, exactly as repeating `session start
+--private-clone URL` would while the account is idle (still lazy: the clone is
+made by the first job). A busy account is retried on a later pass and never
+interrupted, and an operator `session stop` hold is never lifted. An account
+with no binding behaves as before. Removing a binding never deletes a clone or
+unfinished work: the pass WARNs that the repository is registered but no longer
+declared, and keeps it. An unknown account, a non-HTTPS URL, a repository the
+fleet roster marks `firewall: true`, a base that differs from the registered one,
+or an account running a host-mounted session is refused with a log line naming
+the key. A binding does not convert a host-mounted session. Edits apply on the
+next pass (every `autonomous.sessionReconcile.intervalSecs`, default 60 s)
+without a daemon restart. The full table is in
+[daemon-reference](../../defaults/docs/daemon-reference.md) (session reconcile).
+
 `session job` is the explicit lease-consuming primitive for future dispatch.
 `--kind role|sweep|interactive` shares one exclusion domain. It prepares the
 remote base, optionally selects an issue branch, and runs the supplied command

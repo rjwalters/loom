@@ -147,6 +147,8 @@ use serde_json::Value;
 #[path = "session_reconcile_drift.rs"]
 pub mod drift;
 pub use drift::DeferReason;
+#[path = "session_reconcile_bindings.rs"]
+pub mod bindings;
 #[path = "session_reconcile_skew.rs"]
 pub mod skew;
 
@@ -443,6 +445,8 @@ pub struct ReconcileState {
     docker_failures: u32,
     docker_retry_at: u64,
     docker_last_error: Option<String>,
+    /// Declared private-clone bindings: backoff and what was already WARNed.
+    bindings: bindings::State,
 }
 
 /// The container read failed: the runtime, not the account, is the problem.
@@ -1062,9 +1066,11 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             .collect::<Vec<_>>(),
     );
     let acting = registry.effective_roots(fallback_root);
-    let inventories = hold_inventories
+    let acting_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> = hold_inventories
         .into_iter()
-        .filter(|(root, _)| acting.contains(root));
+        .filter(|(root, _)| acting.contains(root))
+        .collect();
+    let inventories = acting_inventories.iter().cloned();
     // One container read for the whole pass (every root), taken lazily,
     // classified with the shared drift definition (#10600).
     let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
@@ -1151,6 +1157,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             all.extend(outcomes);
         }
     }
+    converge_bindings(fallback_root, &index, &acting_inventories, state, now);
     if all.iter().any(|o| o.outcome.started()) {
         // Selection reads the published snapshot: show it the start now.
         let started = std::time::Instant::now();
@@ -1158,6 +1165,65 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     }
     crate::session_status::record_pass(&all, now);
     all
+}
+
+/// Make the declared private-clone bindings true ([`bindings`], #14111), after
+/// every account's own recovery so a dead container is restored first. Costs a
+/// config read when nothing is declared; skipped while Docker is backing off.
+fn converge_bindings(
+    fallback_root: &Path,
+    index: &AccountIndex,
+    inventories: &[(PathBuf, Vec<AccountDescriptor>)],
+    state: &mut ReconcileState,
+    now: u64,
+) -> bindings::Pass {
+    let declared = bindings::read(fallback_root);
+    if declared.bindings.is_empty() && declared.invalid.is_empty() {
+        return bindings::Pass::default();
+    }
+    if state.docker_retry_at > now {
+        return bindings::Pass::default();
+    }
+    // The first acting root whose inventory lists the account (accounts are
+    // host-global; a machine-tier binding reaches every root).
+    let root_of = |account: &str| {
+        inventories
+            .iter()
+            .find(|(_, inventory)| {
+                inventory.iter().any(|a| {
+                    a.id.provider == AccountProvider::Codex
+                        && crate::tokens_pool::account_registry::account_matches_reference(
+                            a, account,
+                        )
+                })
+            })
+            .map(|(root, _)| root.as_path())
+    };
+    let converge = |binding: &bindings::Binding, hold: &dyn Fn() -> anyhow::Result<()>| {
+        let root = root_of(&binding.account)
+            .ok_or_else(|| anyhow::anyhow!("Codex account not found in any registered root"))?;
+        private_workspace::converge(
+            root,
+            &binding.account,
+            &binding.repository,
+            &binding.base,
+            hold,
+        )
+    };
+    let registered = |account: &str| {
+        root_of(account)
+            .map_or(Ok(None), |root| private_workspace::registered_repositories(root, account))
+    };
+    bindings::converge_pass(
+        &declared,
+        &bindings::Inputs {
+            index,
+            converge: &converge,
+            registered: &registered,
+        },
+        state,
+        now,
+    )
 }
 
 /// Spawn the loop on the shared runtime. The first tick fires immediately, so

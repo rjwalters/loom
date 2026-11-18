@@ -1115,7 +1115,8 @@ citing this subsection):
    Duplicate Checks") and must **never edit or generate** one.
 2. **First creation is create-by-default.** When `WORK_LOG.md` /
    `WORK_PLAN.md` do not exist yet (a repo that has never tracked them), a
-   pass **creates them without asking** — Steps 2 and 3 below say how. Both
+   pass **creates them without asking** (unless the file is listed in
+   `skipDocs` — rule 3) — Steps 2 and 3 below say how. Both
    files land as a reviewable docs PR that already passes Judge and
    Champion, so **the PR itself is the ask**. Never defer first creation as
    an "operator scope" decision: on `2AMLogic/pdks` two Guide passes (#78,
@@ -1125,16 +1126,22 @@ citing this subsection):
    these documents (or want them generated differently)" is the
    `guide.docsMaintenance` namespace in `.loom/config.json` (where
    `workLogDebounceSecs` / `workPlanDebounceSecs` / `poolPressure*` already
-   live). No per-file or on/off key exists yet — tracked separately in
-   #14116. Until one lands, having one file without the other is NOT an
-   opt-out signal: create-by-default applies to each missing file
-   independently.
+   live). The key is `guide.docsMaintenance.skipDocs` (#14116): a JSON array
+   of file names, allowed values `"WORK_LOG.md"` / `"WORK_PLAN.md"` (e.g.
+   `"skipDocs": ["WORK_PLAN.md"]`); absent or `[]` means both are generated,
+   and unrecognised entries are ignored. A listed file is **neither created
+   nor updated** (first creation included), and no docs PR is opened for it;
+   the other file is unaffected. The entry is the recorded answer — a pass
+   that sees it proceeds without deferring or asking. Absent a `skipDocs`
+   entry, having one file without the other is NOT an opt-out signal:
+   create-by-default applies to each missing file independently. No `LOOM_*`
+   env override exists for this key.
 4. **Declining anything must be visible.** A pass that declines any part of
    this phase (suppresses a README refresh, skips a link, archives nothing)
    says so **in its docs PR body, citing this subsection**, so the next pass
    reads the recorded answer instead of deciding afresh. With creation as
    the default there is no deferral to remember; the recorded answers that
-   exist are the config key (once #14116 lands) and these PR-body notes.
+   exist are the `skipDocs` config key and these PR-body notes.
 5. **Cross-links and layout.** The static preamble outside the
    `guide:plan-body` markers is where a WORK_PLAN.md points at the repo's
    roadmap when one exists — Step 3's first-creation preamble does this
@@ -1416,6 +1423,12 @@ phase unless a future regression run of `test-guide-docs-pr-race.sh` actually
 finds the lock+recheck insufficient.
 
 ### Step 2: Update WORK_LOG.md
+
+**Opt-out (#14116).** If `WORK_LOG.md` is listed in
+`guide.docsMaintenance.skipDocs`, `update_work_log()` returns before doing
+anything — no create, no update, no rotation (Step 2b), no PR for that file —
+and this pass proceeds without deferring. See "WORK_PLAN.md vs a hand-written
+ROADMAP.md", rule 3.
 
 Append entries for newly merged PRs and newly closed issues not yet recorded
 (presence checks, not number watermarks — see #5516 and #5539 below). Only
@@ -1700,7 +1713,25 @@ fetch_merged_prs_complete() {
   _fetch_complete pr "$@"
 }
 
+# #14116: per-file opt-out. `guide.docsMaintenance.skipDocs` is a JSON array of
+# file names ("WORK_LOG.md" / "WORK_PLAN.md"); a listed file is neither created
+# nor updated. Absent/`[]`/non-array/unreadable config = nothing skipped (today's
+# behaviour); entries other than the two document names never match. No env
+# override. $1 = the document name; returns 0 when it is skipped.
+docs_maintenance_skipped() {
+  jq -r '(.guide.docsMaintenance.skipDocs // []) | if type == "array" then .[] | strings else empty end' \
+    .loom/config.json 2>/dev/null | grep -Fxq -- "$1"
+}
+
 update_work_log() {
+  # #14116: a repo that opted out of WORK_LOG.md via
+  # `guide.docsMaintenance.skipDocs` gets no create and no update, so return
+  # before any forge query. Non-zero = "nothing written", like the debounce.
+  if docs_maintenance_skipped WORK_LOG.md; then
+    echo "WORK_LOG.md is listed in guide.docsMaintenance.skipDocs — skipping (no create, no update)."
+    return 1
+  fi
+
   # Neither PRs nor issues are filtered by a number watermark anymore — see
   # the #5516 (PR) and #5539 (issue) comments below. `work_log_max_issue()` /
   # `work_log_max_pr()` are not called here at all; presence checks against
@@ -1945,6 +1976,9 @@ WORK_LOG_ARCHIVE_GLOB='work_log/WORK_LOG_[0-9][0-9][0-9][0-9]-[0-9][0-9].md'
 rotate_work_log() {
   local wrote="${1:-0}" report moved
 
+  # #14116: rotation rewrites WORK_LOG.md, so a skipped file is left untouched.
+  docs_maintenance_skipped WORK_LOG.md && return 1
+
   # Fail-safe invariant (see the note above work_log_has_pr()): the cutoff must
   # stay older than the lookback by the margin, or archived entries would be
   # re-appended by update_work_log(). Skip loudly, never rotate.
@@ -2005,6 +2039,12 @@ gitignored sidecar holds any state.
 
 ### Step 3: Update WORK_PLAN.md
 
+**Opt-out (#14116).** If `WORK_PLAN.md` is listed in
+`guide.docsMaintenance.skipDocs`, `update_work_plan()` returns before doing
+anything — no create (first creation included), no update, no PR for that
+file — and this pass proceeds without deferring. See "WORK_PLAN.md vs a
+hand-written ROADMAP.md", rule 3.
+
 Regenerate the backlog snapshot from current GitHub label state. Only rewrite if labels
 have changed **and** that change has survived a debounce window since the last
 docs-maintenance merge (see "WORK_PLAN debounce" below, #5890).
@@ -2031,7 +2071,7 @@ exists:
 Backlog snapshot from current GitHub label state, maintained by the Guide role.
 Direction lives in the hand-written roadmap: `ROADMAP.md`.
 
-The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. Date the snapshot with `git log -1 -- WORK_PLAN.md`.
+The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. The `_Generated:` stamp at the top of the generated region dates the snapshot; `git log -1 -- WORK_PLAN.md` finds the merge that wrote it.
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 ```
@@ -2044,6 +2084,24 @@ link that dangles in repos without a roadmap. With no
 roadmap, omit that line entirely. Keep this preamble wording in lockstep with
 the WORK_PLAN.md template in `defaults/.claude/commands/loom/imagine.md` (the
 bootstrap seed uses the same distinction).
+
+**#13909 stamp-on-write — the region carries its own generated-at line.** The
+spliced region's first line is a fixed-shape stamp,
+`_Generated: <UTC instant> (snapshot; compare against live labels)_` (the
+`plan_stamp_line()` helper below). It is written ONLY by the splice step at the
+bottom of `update_work_plan()`, never emitted by `render_plan_body()`. That
+split is load-bearing: `old_body` is normalized through `strip_plan_stamp()`
+before the `new_body = old_body` comparison, so wall-clock text participates in
+NEITHER side of the equality test and cannot make an unchanged tick look
+changed. Emitting the stamp from `render_plan_body()` instead would put a fresh
+timestamp into `new_body` on every tick, making that comparison permanently
+false — the #5413 dead-skip failure replayed as one content-free docs PR per
+debounce window (the #5930/#5890 churn class, throttled by the debounce but
+still pure noise). Because the stamp is written only when the body otherwise
+changed, it dates the last genuine label-state rewrite — never the last time
+Guide looked — so the committed snapshot is self-describing at zero churn
+cost. That is the line the `WORK_PLAN.md` header caveat (#13894) points readers
+at.
 
 The generated region is never archived (`defaults/docs/work-docs-archive.md`, "WORK_PLAN").
 
@@ -2205,7 +2263,7 @@ render_plan_body() {
   building=$("$GH_READ" issue list --label "loom:building" --search "$(sed 's/^/-label:/' <<<"$op_q" | tr '\n' ' ') -label:loom:frozen" --state open --limit 200 --json number,title \
     --jq 'sort_by(.number) | .[] | "- **#\(.number)**: \(.title)"')
   review=$("$GH_READ" pr list --label "loom:review-requested" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
   # #5930/#6457: PRs carrying `loom:operator` are Judge-approved work stuck on
   # a human merge-risk-hold decision — folded into the generated region (see
   # the "#5930, DO NOT put a hand-written narrative section outside the
@@ -2297,7 +2355,37 @@ render_plan_body() {
     "| Active epics | $(count "$epics") |")"
 }
 
+# #13909 stamp-on-write, part 1: the generated region's FIRST line is a
+# generated-at stamp in this exact fixed shape (see the "#13909 stamp-on-write"
+# note above Step 3's code). Called ONLY by the splice step at the bottom of
+# update_work_plan() — part 2 below is why it must never be called from
+# render_plan_body().
+plan_stamp_line() {
+  printf '_Generated: %s (snapshot; compare against live labels)_' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# #13909 stamp-on-write, part 2: strip that stamp line from a committed plan
+# body so update_work_plan()'s equality test compares ONLY label-derived
+# content. Applied to old_body alone — new_body comes straight from
+# render_plan_body() and never carries a stamp. The line-1 match is
+# conditional, never an unconditional `1d`: a region with no stamp (written
+# before #13909, or the empty first-ever region) passes through byte-identical
+# and still compares equal. The splice writes the stamp directly on line 1
+# with no blank line after it — exactly `stamp\n` + body — so one conditional
+# delete is the whole normalization.
+strip_plan_stamp() {
+  sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}'
+}
+
 update_work_plan() {
+  # #14116: a repo that opted out of WORK_PLAN.md via
+  # `guide.docsMaintenance.skipDocs` gets no create and no update (first
+  # creation included), so return before rendering anything.
+  if docs_maintenance_skipped WORK_PLAN.md; then
+    echo "WORK_PLAN.md is listed in guide.docsMaintenance.skipDocs — skipping (no create, no update)."
+    return 1
+  fi
+
   # Change detection: compare the freshly-rendered body against the body already
   # committed between the markers. No gitignored side-car (which resets to "" on
   # every fresh checkout) — the committed file IS the state.
@@ -2310,11 +2398,17 @@ update_work_plan() {
   # branch was dead code, and every tick unconditionally rewrote the file.
   # Comparing the SAME rendered text on both sides is what makes the skip real;
   # a hash buys nothing here, so compare the strings directly.
-  local new_body old_body
+  local new_body old_body stamp
   new_body="$(render_plan_body)"
-  # `sed '1d;$d'` drops the two marker lines, leaving only the generated region.
+  # `sed '1d;$d'` drops the two marker lines, leaving only the generated region;
+  # `strip_plan_stamp` (#13909) then drops the region's generated-at stamp line
+  # so the comparison below sees ONLY label-derived content on both sides.
+  # new_body needs no such filter — render_plan_body() never emits a stamp, and
+  # if it ever did, the equality test below would go permanently false and
+  # every tick would rewrite the file (the #5413 dead-skip bug, replayed as one
+  # stamp-only docs PR per debounce window).
   old_body="$(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' \
-    "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d')"
+    "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d' | strip_plan_stamp)"
 
   if [ "$new_body" = "$old_body" ]; then
     echo "WORK_PLAN.md is current (no label changes detected)."
@@ -2365,12 +2459,25 @@ update_work_plan() {
   # Both sides above are `$(...)`-captured, so trailing newlines are stripped on
   # both — only the internal structure has to match.
   #
-  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body "$new_body"`, which
+  # #13909 stamp-on-write: the spliced region's FIRST line is a fresh
+  # "$(plan_stamp_line)", directly above $new_body's first line with NO blank
+  # line between (strip_plan_stamp's shape contract). This is the ONLY place a
+  # stamp is ever written, and it runs only after BOTH gates above passed:
+  #   stamp="$(plan_stamp_line)"
+  #   spliced_region="$(printf '%s\n%s\n' "$stamp" "$new_body")"
+  # A no-change tick never reaches here, so the committed stamp is never
+  # refreshed in place and no PR's only diff can be a timestamp; a
+  # debounce-suppressed tick reaches it even less. Never hand-write the stamp
+  # either — a hand-written timestamp freezes at typing time and then asserts
+  # a specific wrong time; it appears only on the next genuine generation.
+  #
+  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body`, which
   # uses a per-tick `mktemp -d` dir. NEVER stage the body or the spliced file at
   # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
   # repos' ticks share /tmp, and a tick whose own write was denied then consumes
   # another repo's stale file. Never read a scratch file this tick did not write.
-  splice_plan_body "$new_body" || return 1
+  stamp="$(plan_stamp_line)"
+  splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || return 1
 
   return 0
 }
@@ -2835,6 +2942,7 @@ Automated document maintenance by Guide triage agent."
 Automated document maintenance by the Guide triage agent.
 
 ### Changes
+<!-- Keyword safety (#14176): never put a closing keyword (close, closes, or the fix/resolve families in any tense) immediately before an issue or PR reference — GitHub parses `<keyword> #N` as a closing link, and merging this docs-only PR would then close the referenced issue. Describe dropped or merged items as "drops completed <refs>" or "drops <refs>"; the intervening word breaks the link. -->
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
 - **WORK_PLAN.md**: Regenerated backlog snapshot from current GitHub label state (a repo's hand-written ROADMAP.md, if any, remains the direction document)
 - **README.md**: Updated if architectural changes were detected
@@ -2879,6 +2987,26 @@ PRBODY
       --duration-sec "$DOCS_PHASE_AGE_SECS" \
       --files "${DOCS_CHANGED_FILES:-WORK_LOG.md,WORK_PLAN.md,README.md}" \
       || echo "guide-docs-telemetry.sh record failed — non-fatal, PR #$DOCS_PR_NUMBER already exists"
+  fi
+
+  # Keyword-safety backstop (issue #14176): a docs-only PR must never close
+  # an issue. If the model rewrote a `### Changes` bullet into a closing
+  # keyword sitting directly before an issue reference, GitHub parsed it as
+  # a closing link and merging would close an unrelated issue. Comment
+  # naming the numbers and close the PR — the next tick regenerates it with
+  # reworded bullets. Non-fatal to the tick: the telemetry above and the
+  # lock release below still run. A failed read is reported, NOT treated as
+  # clean.
+  if [[ "$DOCS_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    if ! DOCS_CLOSING_REFS="$(gh pr view "$DOCS_PR_NUMBER" --json closingIssuesReferences --jq '[.closingIssuesReferences[].number]' 2>/dev/null)"; then
+      echo "guide: WARNING (#14176) — could not read closingIssuesReferences for PR #$DOCS_PR_NUMBER; closing-link check inconclusive, not treated as clean."
+    elif [[ "$DOCS_CLOSING_REFS" != "[]" ]]; then
+      echo "guide: WARNING (#14176) — docs PR #$DOCS_PR_NUMBER would close issue(s) $DOCS_CLOSING_REFS via a closing keyword in its body. Commenting and closing it; the next tick regenerates."
+      gh pr comment "$DOCS_PR_NUMBER" --body "Closing this docs-only PR: its body has a closing keyword directly before an issue reference, so merging it would close unrelated issue(s) $DOCS_CLOSING_REFS. The next Guide tick regenerates it with reworded \`### Changes\` bullets (no closing keyword immediately before a reference)." >/dev/null 2>&1 \
+        || echo "guide: comment on PR #$DOCS_PR_NUMBER failed — non-fatal"
+      gh pr close "$DOCS_PR_NUMBER" >/dev/null 2>&1 \
+        || echo "guide: closing PR #$DOCS_PR_NUMBER failed — non-fatal"
+    fi
   fi
 
   # Release the docs-guide lock (see Step 1) now that the PR exists. Step 1's

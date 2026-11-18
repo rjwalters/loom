@@ -255,8 +255,8 @@ fn an_in_memory_state_records_nothing() {
     assert!(drain.stop_marker.is_none());
 }
 
-// Moved from `ipc/tests.rs` (frozen by the file-size ratchet) when #9588
-// changed their force-escalation expectations.
+// Moved from `ipc/tests.rs` when #9588 changed their force-escalation
+// expectations.
 
 /// The `DrainState` machine: begin sets the flag and a deadline, a second
 /// begin is idempotent (does not stack / move the deadline), abort clears

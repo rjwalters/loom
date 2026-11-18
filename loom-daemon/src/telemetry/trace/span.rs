@@ -293,6 +293,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     // runtime/model/role from the `loom.sweep` close.
                     | "loom.step.outcome.class"
                     | "loom.step.outcome.reason"
+                    // #14234: whether the forge post-state agreed with it.
+                    | "loom.step.outcome.agrees"
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"

@@ -3944,6 +3944,16 @@ days are renamed to `daemon.log.YYYY-MM-DD`; each file holds one UTC day
 - **Archive hook:** with `LOOM_DAEMON_LOG_REQUIRE_ARCHIVE=1`, retention deletes a
   day file only when its sidecar `<day file>.archived` exists (created by the
   host's archiver), and removes the pair. Unset: plain age-based deletion.
+- **Step-log archive gate (#14177):** the `.loom/logs/` retention pass
+  (`loom-clean`, `logs.retentionDays` / `LOOM_LOGS_RETENTION_DAYS`) never
+  removes per-step logs `step-<role>-<item>.log` — the durable
+  `LOOM_STEP_OUTCOME` history — unless `LOOM_STEP_LOG_REQUIRE_ARCHIVE=1`.
+  With the gate on, one is deleted (with its `<log>.archived` sidecar, the
+  same convention as the day-file hook above) only when ALL hold: the sidecar
+  exists (the off-host preserver's checksum-confirmed archival proof), the
+  item has no live sweep, no `.loom/sweep-checkpoint/issue-<item>.json`, the
+  log is past the retention window, and its last dispatch attempt wrote a
+  terminal outcome line. Any unreadable or ambiguous case keeps the file.
 - **Legacy files:** numbered `daemon.log.N` from the old startup rotation are
   never touched; an operator removes them once.
 - `loom-daemon health` reads the newest day file when the live file has no
@@ -10674,6 +10684,40 @@ across the registered roots:
 |---|---|---|---|
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
+
+**Declared private-clone bindings (#14111).** `autonomous.sessionReconcile.privateClones`
+maps an account to the repositories its private-clone session serves, in any
+config tier (machine defaults, fleet, repo, host-local; precedence as in
+[`fleet-config-lifecycle.md`](fleet-config-lifecycle.md)), read from the daemon
+root:
+
+```json
+{ "autonomous": { "sessionReconcile": { "privateClones": {
+  "work-account": [ { "repository": "https://github.com/OWNER/REPO", "base": "main" } ]
+} } } }
+```
+
+`base` is optional (default `main`). The pass registers each missing
+repository by the path `accounts session start ACCOUNT --private-clone URL`
+takes while the account is idle, so the per-host manual step goes away. It
+runs after every account's own recovery, and is skipped while Docker is backing
+off.
+
+- An account with no binding is never read or touched.
+- A **busy** account (a job holds its lease, or a worker is alive) is retried on
+  the next pass and never interrupted. A held (`session stop`) or disabled
+  account is skipped; a binding never lifts a hold.
+- A repository already registered with that base costs no `docker` call.
+- Removing a binding **deletes nothing**. While the account still has at least
+  one binding, any registered repository no binding declares is WARNed once per
+  distinct set as drift and retained.
+- Fails closed, WARNing with the key (`autonomous.sessionReconcile.privateClones.ACCOUNT`),
+  and retried on the reconcile backoff, for: an unknown account, a non-HTTPS or
+  credential-bearing URL, a `firewall: true` repository, a base that conflicts
+  with the registered one, an account running a host-mounted session (a binding
+  never converts it), and a private session whose container is missing (the
+  reconcile recovery restores it first, with its recorded image).
+- Live: re-read every pass, no restart.
 
 **Seeing it: `loom-daemon status` (#10600).** `status` lists every
 session-managed Codex account across the registered roots under `Session

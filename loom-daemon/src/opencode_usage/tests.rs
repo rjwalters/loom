@@ -178,12 +178,13 @@ fn works_identically_when_the_db_has_no_credential_or_account_tables_at_all() {
         "CREATE TABLE session (
              model TEXT, tokens_input INTEGER, tokens_output INTEGER,
              tokens_reasoning INTEGER, tokens_cache_read INTEGER,
-             tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
+             tokens_cache_write INTEGER, directory TEXT, time_created INTEGER,
+             id TEXT
          );",
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO session VALUES (?1, 10, 20, 0, 5, 1, '/repo/a', 1000)",
+        "INSERT INTO session VALUES (?1, 10, 20, 0, 5, 1, '/repo/a', 1000, 'ses_a')",
         rusqlite::params![model_json("zai-org/GLM-5.3", "friendli")],
     )
     .unwrap();
@@ -775,4 +776,52 @@ fn tokens_by_model_in(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<ModelUsageTotals>> {
     fold_sessions(sessions_in(db, directories, window)?)
+}
+
+// --- Session-id selection (#14018) ---------------------------------------
+
+#[test]
+fn session_id_selection_counts_only_the_named_sessions_not_their_directory_neighbours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let model = model_json("m", "p");
+    let mine = Row {
+        input: 100,
+        output: 10,
+        ..row(&model, "/repo", 1_000)
+    };
+    let neighbour = Row {
+        input: 9_999,
+        ..row(&model, "/repo", 1_000)
+    };
+    seed_db(&db, &[mine, neighbour]);
+    // `seed_db` names its rows `session-<index>`.
+    let ids = ["session-0"].into_iter().collect();
+    let sessions = sessions_by_id_in(&db, &ids).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "session-0");
+    let rows = fold_sessions(sessions).unwrap();
+    assert_eq!((rows[0].input, rows[0].output), (100, 10));
+    // No directory or window narrows an id: a session elsewhere, long ago, is
+    // still the one the log named.
+    let elsewhere = Row {
+        input: 7,
+        ..row(&model, "/somewhere/else", 5)
+    };
+    seed_db(&tmp.path().join("other.db"), &[elsewhere]);
+    let ids = ["session-0"].into_iter().collect();
+    assert_eq!(
+        sessions_by_id_in(&tmp.path().join("other.db"), &ids)
+            .unwrap()
+            .len(),
+        1
+    );
+    // An id the store does not hold selects nothing (an empty read, not a failure).
+    let ids = ["ses_unknown"].into_iter().collect();
+    assert_eq!(sessions_by_id_in(&db, &ids).unwrap(), Vec::new());
+}
+
+#[test]
+fn no_session_ids_yield_no_totals() {
+    assert_eq!(tokens_by_session_ids(&[], None), None);
 }

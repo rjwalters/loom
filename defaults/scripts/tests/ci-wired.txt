@@ -97,7 +97,9 @@ test-clean-stale-building-labels.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
+test-create-issue-body-at-path.sh
 test-create-issue-refuse-labels.sh
+test-create-pr-body-at-path.sh
 test-create-pr-priority-labels.sh
 test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
@@ -142,6 +144,7 @@ test-guide-superseding-block-merge-state.sh
 test-guide-work-log-rotation.sh
 test-guide-unblock-merged-blocker.sh
 test-guide-split-parent-unblock.sh
+test-guide-skip-docs.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
@@ -155,6 +158,7 @@ test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-guide-work-plan-roadmap-convention.sh
+test-guide-work-plan-stamp.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
 test-install-active-session.sh

@@ -779,6 +779,7 @@ fn rejection_serialization_is_structured_backward_compatible_and_secret_free() {
         source: RuntimeSource::RoleConfig,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     };
     let json = serde_json::to_string(&rejection).unwrap();
     assert!(json.contains("\"role\":\"builder\""));
