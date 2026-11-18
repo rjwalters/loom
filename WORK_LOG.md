@@ -16,6 +16,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-18
 
+- **PR #14471**: feat: apply session image and extra mounts to private-clone seats
+- **PR #14459**: test: guard configured session image preference in recreate paths
+- **PR #14453**: feat: attribute waiver-checks and curation-complete daemon self-spawns
+- **PR #14447**: fix: mirror an observed step end onto its attempt and phase spans
+- **Issue #14451** (closed): Private-clone seats ignore accounts.session.image and extraMounts, so a derived image and PDK mounts cannot be pinned for them
+- **Issue #14421** (closed): No regression test for the configured-session-image preference in the recreate paths or the shell wiring
+- **Issue #14417** (closed): Two more unattributed loom-daemon self-spawn sites after #14362 (workspace-resync waiver checks, validate-phase curation-complete)
+- **Issue #14407** (closed): Telemetry: work-role loom.role_attempt spans say exit_unobserved with no runtime although the run succeeded
+- **Issue #13881** (closed): Champion re-discovers a proposal it just sent to Curator: Priority 3 does not exclude loom:triage, so a loom:hermit/architect/auditor revise verdict walks the whole bound ladder in ~30 min
 - **PR #14444**: docs: soften GROUP_CHECK_UNGATED_WORKFLOW_RUN row to what the audit checks
 - **PR #14449**: fix: refuse session extra mounts targeting the mounted workspace label
 - **PR #14423**: fix(telemetry): journal usage spans at a step's end, read from the step's own log
