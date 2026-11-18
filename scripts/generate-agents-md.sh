@@ -28,7 +28,7 @@
 # ship to a consumer's .loom/scripts/, where those paths do not exist.
 #
 # Usage:
-#   generate-agents-md.sh              Write defaults/.loom/AGENTS.md (canonical)
+#   generate-agents-md.sh              Write the AGENTS.md beside the source CLAUDE.md (canonical)
 #   generate-agents-md.sh --stdout     Print the generated content to stdout
 #   generate-agents-md.sh <path>       Write to <path> instead of the canonical file
 #
@@ -52,11 +52,6 @@ case "${1:-}" in
   "") ;;
   *) OUT="$1" ;;
 esac
-
-if [[ ! -f "$SRC" ]]; then
-  echo "generate-agents-md: source not found: $SRC" >&2
-  exit 1
-fi
 
 # Extract the marked ranges. awk validates marker balance and fails loudly
 # (exit 2) on malformed markers rather than silently emitting a wrong file:

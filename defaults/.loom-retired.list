@@ -216,3 +216,11 @@ commands/loom/loom-parent.md
 # resolves defaults/.loom/ from the repo root) and exited 1 in every consumer;
 # it moved to the upstream-only scripts/ and stopped shipping.
 scripts/generate-agents-md.sh
+
+# #13911 (2026-11-18) — #13910's two-layout test suite rode along when
+# test-generate-agents-md-layouts.sh shipped briefly (2026-11-17..18): it
+# copies defaults/scripts/generate-agents-md.sh, which no longer ships, so
+# consumers holding it carry a permanently-failing suite. Removed upstream
+# together with the generator it tested; this entry removes it from
+# already-installed repos on their next resync.
+scripts/tests/test-generate-agents-md-layouts.sh
