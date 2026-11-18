@@ -136,6 +136,7 @@ rm -f "$COMMANDS"
 if [[ "$INCOMPLETE" -eq 1 ]]; then
     echo -e "${RED}INCOMPLETE${NC}: Repo Skills guard not measured ($WHY) — this is not a pass." >&2
     echo "  Total: $TOTAL  Passed: $PASS  Failed: $FAIL (Loom half only)"
+    _GUARD_HARNESS_FINISHED=1   # deliberate non-zero exit, not an abort (#14020)
     [[ "$FAIL" -gt 0 ]] && exit 1
     exit 3
 fi
