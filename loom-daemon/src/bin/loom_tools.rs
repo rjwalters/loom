@@ -23,8 +23,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
     config_get_dispatch, handle_checkpoint_command, handle_forge_read_command,
-    handle_resolve_model_command, handle_resolve_role_model_command, handle_strip_ansi_command,
-    CheckpointAction, ConfigArgs, ForgeReadCli, InstallBinaryCommand, ReleaseFetchArgs,
+    handle_operator_decision_command, handle_park_record_command, handle_resolve_model_command,
+    handle_resolve_role_model_command, handle_strip_ansi_command, CheckpointAction, ConfigArgs,
+    ForgeReadCli, InstallBinaryCommand, OperatorDecisionCli, ParkRecordCli, ReleaseFetchArgs,
     ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
@@ -33,7 +34,7 @@ use loom_daemon::tools_mode::{self, Route};
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads, park-record, operator-decision)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -81,6 +82,16 @@ enum ToolsCommands {
     /// (#14395), on the person's own forge credential. A verb that writes is
     /// refused with exit 64 (served by `loom-daemon forge` until #14396).
     Forge(ForgeReadCli),
+    /// Render, read, apply and retract the `loom:blocked` park record: the
+    /// same arguments, stdin, stdout and exit codes as `loom-daemon
+    /// park-record` (#14464). `render`, `parse`, `retract --file`, `released`
+    /// and `decision` run offline; `apply` and a forge `retract` edit the body
+    /// (and `apply` the labels) on the person's own credential.
+    ParkRecord(ParkRecordCli),
+    /// Validate, apply and resolve an operator decision: the same arguments,
+    /// stdin, stdout and exit codes as `loom-daemon operator-decision`
+    /// (#14464). `resolve` records only from an attended terminal.
+    OperatorDecision(OperatorDecisionCli),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -131,6 +142,19 @@ fn mode_gate() -> Result<()> {
     Ok(())
 }
 
+/// `apply --new` files through `create-issue.sh`, which calls `$LOOM_DAEMON_BIN
+/// forge create-issue` (default `loom-daemon`). A tools-only host has no daemon
+/// binary, so unless the caller named one, the nested call resolves to this
+/// binary: the filing stays on the route the mode gate just chose.
+fn use_this_binary_for_nested_filing() {
+    if std::env::var_os("LOOM_DAEMON_BIN").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    if let Ok(me) = std::env::current_exe() {
+        std::env::set_var("LOOM_DAEMON_BIN", me);
+    }
+}
+
 fn run() -> Result<()> {
     match ToolsCli::parse().command {
         ToolsCommands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
@@ -153,6 +177,23 @@ fn run() -> Result<()> {
                 mode_gate()?;
             }
             handle_forge_read_command(cli)
+        }
+        ToolsCommands::ParkRecord(cli) => {
+            // Classified by effect, from the parsed invocation: the offline
+            // forms never resolve `mode`, so they work with `mode` unset.
+            if cli.reaches_forge() {
+                mode_gate()?;
+            }
+            handle_park_record_command(cli)
+        }
+        ToolsCommands::OperatorDecision(cli) => {
+            if cli.reaches_forge() {
+                mode_gate()?;
+            }
+            if cli.files_new_issue() {
+                use_this_binary_for_nested_filing();
+            }
+            handle_operator_decision_command(cli)
         }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
@@ -244,6 +285,110 @@ mod tests {
                     ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
                 assert!(matches!(cli.command, ToolsCommands::Forge(_)), "{argv:?}");
             }
+        });
+    }
+
+    /// #14464: both families keep the daemon's argv, and the mode gate is
+    /// chosen from the parsed invocation's effects: only a form that can reach
+    /// the forge reports `reaches_forge`.
+    #[test]
+    fn park_record_and_operator_decision_classify_by_effect() {
+        on_main_sized_stack(|| {
+            // (argv tail, reaches the forge?)
+            let park: [(&[&str], bool); 6] = [
+                (&["render", "--blocked-by", "5"], false),
+                (&["parse", "--json"], false),
+                (&["released", "--pr", "7"], false),
+                (&["decision", "--pr", "7", "--outcome", "hold"], false),
+                (&["apply", "--issue", "7", "--blocked-by", "5", "--dry-run"], true),
+                (
+                    &[
+                        "retract",
+                        "--issue",
+                        "7",
+                        "--blocked-by",
+                        "5",
+                        "--reason",
+                        "r",
+                    ],
+                    true,
+                ),
+            ];
+            for (tail, want) in park {
+                let mut argv = vec!["loom-tools", "park-record"];
+                argv.extend(tail);
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let ToolsCommands::ParkRecord(c) = cli.command else {
+                    panic!("{argv:?}")
+                };
+                assert_eq!(c.reaches_forge(), want, "{argv:?}");
+            }
+            let offline = ToolsCli::try_parse_from([
+                "loom-tools",
+                "park-record",
+                "retract",
+                "--file",
+                "-",
+                "--blocked-by",
+                "5",
+                "--reason",
+                "r",
+            ])
+            .unwrap();
+            let ToolsCommands::ParkRecord(c) = offline.command else {
+                panic!()
+            };
+            assert!(!c.reaches_forge(), "retract --file composes offline");
+
+            let od: [(&[&str], bool, bool); 6] = [
+                (&["validate", "--input", "-"], false, false),
+                (
+                    &[
+                        "apply",
+                        "--new",
+                        "--title",
+                        "T",
+                        "--input",
+                        "-",
+                        "--dry-run",
+                    ],
+                    false,
+                    false,
+                ),
+                (&["apply", "--new", "--title", "T", "--input", "-"], true, true),
+                (&["apply", "7", "--input", "-"], true, false),
+                (&["apply", "7", "--input", "-", "--dry-run"], true, false),
+                (&["resolve", "7", "--option", "a", "--dry-run"], true, false),
+            ];
+            for (tail, reaches, files) in od {
+                let mut argv = vec!["loom-tools", "operator-decision"];
+                argv.extend(tail);
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let ToolsCommands::OperatorDecision(c) = cli.command else {
+                    panic!("{argv:?}")
+                };
+                assert_eq!(c.reaches_forge(), reaches, "{argv:?}");
+                assert_eq!(c.files_new_issue(), files, "{argv:?}");
+            }
+            // An unknown effect refuses before any forge call.
+            let bad = ToolsCli::try_parse_from([
+                "loom-tools",
+                "operator-decision",
+                "resolve",
+                "7",
+                "--option",
+                "a",
+                "--effect",
+                "bogus",
+                "--dry-run",
+            ])
+            .unwrap();
+            let ToolsCommands::OperatorDecision(c) = bad.command else {
+                panic!()
+            };
+            assert!(!c.reaches_forge());
         });
     }
 

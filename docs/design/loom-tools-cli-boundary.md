@@ -31,6 +31,7 @@ re-reading the source it names. Counts are from the pinned tree below.
 11. [Phase 2 hand-off and serialization](#11-phase-2-hand-off-and-serialization)
 12. [Not traced, and open questions](#12-not-traced-and-open-questions)
 13. [Phase 3a: forge reads (#14395)](#13-phase-3a-forge-reads-14395)
+14. [Phase 3b: park records and operator decisions (#14464)](#14-phase-3b-park-records-and-operator-decisions-14464)
 
 ## 1. Pinned inputs
 
@@ -746,7 +747,7 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | Verb or family | Reason |
 | --- | --- |
 | `forge comment`, `create-issue`, `rerun`, `auto-merge`, `disable-auto-merge`, `verdict-labels`, `verdict-reconcile`, `verdict-lock`, `doctor-handback`, `journal-ci-refusal`, `parent link`, `merge-queue enqueue\|dequeue\|reconcile\|handoff\|step\|revoke\|group-check\|authorize-check` | write the forge, a local journal or lock, or were not shown to be read-only (`authorize-check` and `group-check` post or compute merge-authorization state). #14396 |
-| `merge-pr*`, `park-record`, `operator-decision`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 |
+| `merge-pr*`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
@@ -771,3 +772,57 @@ No wrapper or locator changed. `loom_tools_serves` in
 `forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
 which can now read the served list from `capabilities --json`.
 
+## 14. Phase 3b: park records and operator decisions (#14464)
+
+Part of #14462 (Phase 3b, #14396). A role in a tools-only checkout can park or
+retract an issue or PR and submit a decision; an attended operator can record a
+resolution. Merge integration is #14463, hold diagnostics and curation labels
+are #14465, the shared forge dispatcher is #14461, and the general role and
+wrapper switch-over is #14398.
+
+### 14.1 Mechanism
+
+`loom-tools park-record <action>` and `loom-tools operator-decision <action>`
+wrap the existing `ParkRecordCommand` / `OperatorDecisionCommand` clap trees
+(`cli/park_record.rs`, `cli/operator_decision.rs`) and run the same in-process
+handlers `loom-daemon` runs, through the shared `GhForge` adapter. Nothing was
+copied; `loom-daemon park-record` and `loom-daemon operator-decision` are
+unchanged. Their `reaches_forge` methods are exhaustive `match`es with no
+wildcard arm, so a new action does not compile until its author says whether it
+reaches the forge.
+
+### 14.2 Mode gate, classified by effect
+
+`mode_gate()` (§7.3, §10.3) runs only for an invocation that can reach the
+forge; the offline forms work with `mode` unset.
+
+| Invocation | Gate | Effect |
+| --- | --- | --- |
+| `park-record render`, `parse`, `retract --file` | no | argv, stdin or a local file only |
+| `park-record released`, `decision` | no | local role journal only, offline |
+| `park-record apply` (also `--dry-run`), `retract` | yes | reads the target (and a blocker, in its own repo); writes the body, then labels |
+| `operator-decision validate`, `apply --new --dry-run` | no | validate or render offline |
+| `operator-decision apply <issue>` (also `--dry-run`) | yes | reads the body and labels, writes the body before labels |
+| `operator-decision apply --new` | yes | files through `create-issue.sh` (duplicate check, filing lock, exit 3 / 75 / 4 unchanged) |
+| `operator-decision resolve` | yes, when it can proceed | a preview reads; a recording run that is not attended, or names an unknown effect, refuses (5 / 2) before any forge call and is not turned into a mode error first |
+
+### 14.3 Filing and write scope
+
+`GhForge::create` now checks the target's write scope before it runs
+`create-issue.sh`, so a denied or unverifiable target is refused (exit 4) with no
+duplicate scan, lock or nested call. `create-issue.sh` calls `$LOOM_DAEMON_BIN
+forge create-issue`; when `loom-tools` runs `apply --new` and `LOOM_DAEMON_BIN`
+is unset, it points it at itself, so the nested call stays on the route the gate
+chose and needs no daemon binary. **`loom-tools forge create-issue` is
+#14461's slice and is still refused (exit 64) at the time of this section**, so a
+tools-only `apply --new` that reaches the nested call fails with the handler's
+forge-failure exit (4) until #14461 lands; the existing-issue forms do not depend
+on it. Gitea behavior is unchanged: it is whatever the shared adapter and the
+facade's decline already do, identical from both roots.
+
+### 14.4 Served commands
+
+`install_compat::TOOLS_COMMANDS` lists all nine subcommands: `park-record
+render|parse|apply|released|decision|retract` and `operator-decision
+validate|apply|resolve`. The unit test in `bin/loom_tools.rs` still fails if the
+list and the clap tree disagree.
