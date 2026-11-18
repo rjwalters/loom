@@ -66,7 +66,7 @@ The verb folds the state, the detector and the release comment into one
 | `stands` | re-assert `loom:blocked` + park record, no comment; **stop** |
 | `release` | post the released marker, remove `loom:blocked`; continue (a later tick sees `none` at this head) |
 | `clear` | the head no longer declares it: post the cleared marker, remove `loom:blocked` unless another Champion hold stands; continue |
-| `defer` | unreadable candidate, no hold standing: do not merge this tick, write nothing; **stop** |
+| `defer` | unreadable candidate: do not merge this tick, write nothing (a read-failure tick does not re-assert `loom:blocked` or the park record); **stop** |
 
 Exit 3 or no stdout (a failed read) is `defer`; exit 2 (a `loom-daemon` older
 than the verb) is `none`, since `merge-pr.sh` still refuses a held PR.

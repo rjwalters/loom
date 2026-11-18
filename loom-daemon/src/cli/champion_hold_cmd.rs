@@ -57,8 +57,8 @@ pub(crate) enum ChampionHoldCommand {
 
     /// Decide the ratification hold's tick for a PR (#12992): reads the head
     /// contents of every spec/decision file the PR changes and the trusted
-    /// comments, and prints `LOOM-CHAMPION-RATIFICATION verdict=<clear|hold|
-    /// unreadable> action=<none|hold|stands|release|clear|defer> pr=<N>
+    /// comments, and prints `LOOM-CHAMPION-RATIFICATION verdict=<clear|hold>
+    /// action=<none|hold|stands|release|clear|defer> pr=<N>
     /// head=<sha> files=<a,b|->`. Exit 3 with no stdout when a read failed.
     Ratification(TargetArgs),
 
@@ -297,7 +297,8 @@ fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
     let (name, hit) = match &verdict {
         Verdict::Clear => ("clear", Vec::new()),
         Verdict::Hold(h) => ("hold", h.clone()),
-        Verdict::Unreadable(u) => ("unreadable", u.clone()),
+        // Gated by `unreadable_candidates` above (exit 3 before `scan` runs).
+        Verdict::Unreadable(_) => unreachable!("gated by unreadable_candidates above"),
     };
     let listed = if hit.is_empty() {
         "-".to_string()
