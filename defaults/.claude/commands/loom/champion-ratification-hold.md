@@ -100,7 +100,7 @@ case "$RT_ACTION" in
 
 This PR adds or changes a spec or decision record that declares it is ratified by merging:
 
-- \`${RT_FILES//,/\`, \`}\`
+- **Ratification by merge**: declared in \`${RT_FILES//,/\`, \`}\`; only the operator can release (comment \`clear the hold — <why>\`)
 
 Champion will not merge it, and nothing but you can release it: no standing authorization covers this hold, and removing \`loom:blocked\` by hand does not release it (Champion puts it back).
 

@@ -2730,10 +2730,16 @@ A pre-#11861 hold still on `loom:operator` (not yet migrated by `labels migrate
 **A hand-released hold is listed, not dropped (#11416).** A merge-risk hold
 whose `loom:blocked` a human removed is released (precheck (e)) and merges
 next tick unless the `critical-files`, `mergeable`, `recency` and `ci-green` criteria block it; a critical-file one waits for the
-operator's own merge (`champion-critical-file-hold.md`, #9016). Either way the
+operator's own merge (`champion-critical-file-hold.md`, #9016); a ratification
+one is released only by the operator's own `clear the hold —` comment
+(`champion-ratification-hold.md`, #12992) — the label's absence never releases
+it, so `RELEASED` keys on its latest marker being
+`champion:ratification-release-respected` (a still-standing marker gets the
+label re-armed by the precheck, not listed). Either way the
 PR no longer carries the label, so `RELEASED` below lists every open `loom:pr`
 PR still bearing a hold marker without it — never silently plain approved
-(a critical-file hold whose last marker is `-cleared` was auto-cleared, not listed).
+(a critical-file or ratification hold whose last marker is `-cleared` was
+auto-cleared, not listed).
 A sticky hold missing its label with no removal on record gets the label back
 (precheck), so it stays in `HELD_COUNT`.
 
@@ -2762,11 +2768,12 @@ for H in loom:blocked loom:operator; do
 "
 done
 HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
-# Same marker set as Step 1's $HOLD_TABLE below (#13885) — extend both
-# together when a hold kind is added. Each kind's "no longer standing"
-# markers: merge-risk clears via a contains() block (embedded in the
-# pre-merge comment), critical-file and ratification clear/release via
-# standalone notices (the same set doctor.md's CHAMPION_HELD_CONFLICT uses).
+# Same marker set as Step 1's $HOLD_TABLE below (#13885) and RELEASED's
+# per-kind selectors (#13875) — extend all three together when a hold kind is
+# added. Each kind's "no longer standing" markers: merge-risk clears via a
+# contains() block (embedded in the pre-merge comment), critical-file and
+# ratification clear/release via standalone notices (the same set doctor.md's
+# CHAMPION_HELD_CONFLICT uses).
 HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
   --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->") or startswith("<!-- champion:ratification-hold -->"))
     and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->") or startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | not))] | length')
@@ -2788,8 +2795,9 @@ HELD_NOTE=""
 [ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ] && HELD_NOTE=" — census read stalled: enumeration may be partial, structural fields unavailable (#13930)"
 echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d${HELD_NOTE}"
 RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
-  --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
-    or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")')
+  --jq '"<!-- champion:critical-file-hold" as $cf | "<!-- champion:ratification-" as $rt | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
+    or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))
+    or ([.comments[].body | select(startswith($rt))] | last // "" | startswith($rt + "release-respected -->"))) | "#\(.number)"] | join(" ")')
 echo "Released holds, not yet merged: ${RELEASED:-none}"
 ```
 
@@ -2895,8 +2903,9 @@ held or *how long* it has been `CONFLICTING`. Read the reason from the PR's own
 hold comment via the `$HOLD_TABLE` below — one `(marker, reason rule)` pair per
 hold kind: the merge-risk marker of the `merge-risk` criterion, the
 critical-file marker of the `critical-files` and `ci-green` criteria (#6879),
-and the ratification marker (#12992, #13885 — its notice has no axis bullet;
-its reason is built from the notice itself). The latest standing marker among
+and the ratification marker (#12992, #13885, #13875 — its notice has carried
+a `**Ratification by merge**` reason bullet since #13875; an older notice's
+reason is built from its backticked file list). The latest standing marker among
 the table wins; a hold comment whose marker is not in the table is reported as
 an unknown marker, never as an unrecorded reason. One cached read per held PR, never a second
 bulk `gh pr list`. Conflict duration rides a per-PR
@@ -2971,14 +2980,19 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
   else
     case "$HOLD_KIND" in
       ratification)
-        # The ratification notice (#12992) has no axis bullet — its only
-        # bullet is a backticked file list — so build the reason from the
-        # notice itself: fixed text plus the first declared file.
-        FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
-        if [ -n "$FIRST_FILE" ]; then
-          REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
-        else
-          REASON="ratification hold (file bullet not parseable)"
+        # The ratification notice (#12992) has carried a leading
+        # "- **Ratification by merge**: ..." reason bullet since #13875 —
+        # read it like the other kinds. Notices posted before then have no
+        # axis bullet, only a backticked file list — build the reason from
+        # that (#13885): fixed text plus the first declared file.
+        REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
+        if [ -z "$REASON" ]; then
+          FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
+          if [ -n "$FIRST_FILE" ]; then
+            REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
+          else
+            REASON="ratification hold (file bullet not parseable)"
+          fi
         fi
         ;;
       *)
