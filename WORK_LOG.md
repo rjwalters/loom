@@ -16,6 +16,27 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-18
 
+- **PR #14385**: test: pin closing-issue clause in docs-only fast-path prose
+- **PR #14383**: fix: prefer branch-declared issue when create-pr body has several references
+- **PR #14380**: fix: declare installed merge-group-check workflow as a forge caller
+- **PR #14378**: fix: give critical-file hold tick's paste an explicit stdin operand for macOS
+- **PR #14377**: docs: split attended-spawn model lookup by --json vs bare form
+- **PR #14361**: fix: warn when an unterminated code fence swallows the Verified corrections section
+- **PR #14360**: fix: persist Guide WORK_PLAN receipt to a file across Step 3 and Step 5
+- **PR #14342**: docs: document host_state, target_source and config_restart_paths in the auto_update.tick schema table
+- **PR #14306**: fix: name why a stranded checkout was not put back in its wrong-branch detail
+- **PR #14262**: fix: make docs-only fast path ineligible when the PR has closing issue references
+- **PR #14225**: judge: cover full-suite-only documented repos in the no-checks unverified fallback
+- **Issue #14363** (closed): main red: forge_inventory gate — .github/workflows/merge-group-check.yml unclassified (2 gh release download call sites)
+- **Issue #14351** (closed): create-pr.sh _cpr_body_ref_issue: stale `head -1` comment, and multi-`Closes` bodies now resolve to the last reference
+- **Issue #14340** (closed): Document host_state, target_source and config_restart_paths in the auto_update.tick schema table
+- **Issue #14321** (closed): test-docs-only-fast-path.sh pins the fast-path code block but not the inline prose restatements that can re-grant it
+- **Issue #14305** (closed): sweep-execution-model.md's attended-spawn note still prescribes --task-alias, not the new task_model field
+- **Issue #14259** (closed): Guide WORK_PLAN receipt is held in shell globals that may not survive Step 3 -> Step 5
+- **Issue #14231** (closed): test flake: fleet_sync::checkout_ff::tests::self_heal_tests::a_rehome_whose_checkout_keeps_failing_reuses_its_rescue_ref fails on Rust Unit Tests (3/5)
+- **Issue #14182** (closed): Docs-only fast path (#6134) never checks closingIssuesReferences: a generated docs PR can auto-close an unrelated issue on merge
+- **Issue #14123** (closed): check-verified-corrections-preserved.sh: WARN when a body ends inside an unterminated fence (the fence-aware fail-open residual)
+- **Issue #14114** (closed): Judge: no-checks test rule and the "Full suite / build gate" skip row give opposite instructions when the documented command IS the full suite
 - **Issue #14016** (closed): Floor-driven artifact fetch logs "backing off 60s" but retries only at the next update tick
 - **PR #14152**: fix(daemon): retry auto-update at its stated backoff and name gh release-read failures
 - **Issue #13831** (closed): Remove SweepState::Pending: a lifecycle state nothing constructs, matched at 25 production sites
