@@ -23,6 +23,10 @@
 # hand-authored static file; this repo generates the content instead, per
 # #4479's single-source non-goal.
 #
+# Source-tree-only (#13911): this script lives in scripts/ (NOT defaults/scripts/)
+# because it resolves defaults/.loom/ relative to the repo root; it must never
+# ship to a consumer's .loom/scripts/, where those paths do not exist.
+#
 # Usage:
 #   generate-agents-md.sh              Write the AGENTS.md beside the source CLAUDE.md (canonical)
 #   generate-agents-md.sh --stdout     Print the generated content to stdout
@@ -34,27 +38,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Layout-aware source resolution (#13910): the same script ships in two
-# layouts, so SRC and DEFAULT_OUT are resolved from the CLAUDE.md candidate
-# that actually exists rather than a hard-coded sibling path.
-#   - Installed layout: X/.loom/scripts/generate-agents-md.sh, whose source is
-#     X/.loom/CLAUDE.md (one directory up, beside this script).
-#   - Source layout: defaults/scripts/generate-agents-md.sh, whose source is
-#     defaults/.loom/CLAUDE.md (two levels up, under .loom/).
-# The source layout has no defaults/CLAUDE.md, so the two candidates cannot
-# both exist and the layouts cannot collide.
-INSTALLED_SRC="$SCRIPT_DIR/../CLAUDE.md"
-SOURCE_SRC="$SCRIPT_DIR/../.loom/CLAUDE.md"
-
-if [[ -f "$INSTALLED_SRC" ]]; then
-  SRC="$INSTALLED_SRC"
-elif [[ -f "$SOURCE_SRC" ]]; then
-  SRC="$SOURCE_SRC"
-else
-  echo "generate-agents-md: source not found — tried: $INSTALLED_SRC and $SOURCE_SRC" >&2
-  exit 1
-fi
-DEFAULT_OUT="$(cd "$(dirname "$SRC")" && pwd)/AGENTS.md"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC="$ROOT/defaults/.loom/CLAUDE.md"
+DEFAULT_OUT="$ROOT/defaults/.loom/AGENTS.md"
 
 START_MARKER="<!-- agents-md:include:start -->"
 END_MARKER="<!-- agents-md:include:end -->"
@@ -125,7 +111,7 @@ fi
 emit() {
   cat <<'HEADER'
 <!-- GENERATED FILE — DO NOT EDIT DIRECTLY.
-     Produced by defaults/scripts/generate-agents-md.sh from the
+     Produced by scripts/generate-agents-md.sh from the
      `agents-md:include` marker ranges in defaults/.loom/CLAUDE.md. To change
      this file, edit those ranges in the source and re-run the generator;
      CI (scripts/check-agents-md-sync.sh) fails if this file is stale.
