@@ -1361,7 +1361,7 @@ Branch on the first stdout line:
 
 - **Run the repo's documented test command on the PR head**, in your review worktree (step 5's checkout), at the PR head SHA. "Documented" is whatever the repo itself names — its CLAUDE.md / README test section, or its package manifest (`scripts.test`, Makefile target); no new config key. A targeted run of what the repo documents is enough; this does not license the full suite or `buildGate.command` (#11690 still applies).
 - **The verdict must state the command and its result** — e.g. "`pnpm test` — pass" or "`make check` — 2 failures (names in the verdict)". A verdict that neither states a run nor says the repo documents no command is incomplete for a no-checks PR.
-- **No documented test command anywhere?** The verdict must say plainly "unverified by any test" — never "safe", never a silent pass.
+- **No documented test command anywhere?** The verdict must say plainly "unverified by any test" — never "safe", never a silent pass. The same fallback covers the case where a documented command exists but the only one the repo documents is a full-suite / `buildGate.command` command that #11690 keeps out of bounds and no targeted subset is nameable: the verdict must then say, e.g., "unverified by any test: only documented command is `<cmd>` (full suite, out of bounds per #11690)" — again never "safe", never a silent pass.
 
 A failing local run is "When CI Fails"-grade evidence: do not approve on it.
 
@@ -2147,7 +2147,7 @@ gh pr view <number> --json body --jq '.body'
 | **Automatable** | "run `pnpm test:unit`", "verify output contains X", "check file Z exists", "run `pnpm test:unit -- path/to/one.test.ts`" | Execute and capture output |
 | **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed — **except** when the diff touches browser-driving / scraper / DOM-parsing code, or the PR's linked issue reports a silent-omission failure (#6883), where "manually test in browser" is not sufficient on its own: see "Live Verification and the Circular-Fixture Smell" below |
 | **Long-running (>2 min)** | "run full integration suite", "stress test for 5 minutes" | Skip with explanation |
-| **Full suite / build gate** | "run `pnpm check:ci`", "run `buildGate.command`", "run `cargo test --workspace`", "run `build-gate.sh`" | Skip: CI already ran it — cite the green CI from step 2b (#11690) |
+| **Full suite / build gate** | "run `pnpm check:ci`", "run `buildGate.command`", "run `cargo test --workspace`", "run `build-gate.sh`" | Skip: CI already ran it — cite the green CI from step 2b (#11690) (on a no-checks PR there is no green CI: the skip stands — this row is out of bounds locally per #11690 — and the verdict records "unverified by any test", see "No-Checks PRs") |
 | **External dependency** | "test against staging API", "verify email delivery" | Skip with explanation |
 | **Unclear/ambiguous** | Vague steps without concrete commands | Ask for clarification |
 
