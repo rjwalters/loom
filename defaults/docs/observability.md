@@ -1102,11 +1102,13 @@ repo/issue to bound cardinality.
 Since #14048 the record also carries the step's **launch identity**, read back
 off the step's own per-item log (`step-<role>-<item>.log`) and anchored to the
 step's `sweep_id=` dispatch header — never the per-role log a role-runner tick
-reads, which a step never writes. A native runtime's token rows are keyed by
+reads, which a step never writes. A native runtime's token rows are narrowed to
 the **exact session ids that log names** (OpenCode's `--format json` event
 stream `sessionID`, Codex's `session id: <uuid>` banner), which is strictly
 more precise than directory+window: two concurrent same-role steps in one
 workspace overlap in time by construction, so only the id can separate them.
+OpenCode's id is the whole key; the Codex arm still ANDs the ids with the
+workspace directory and window (the window bounds the rollout scan).
 Claude steps keep the transcript scan; a Kimi step has no id source yet and
 keeps directory+window.
 

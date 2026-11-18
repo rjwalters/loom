@@ -72,9 +72,12 @@
 //! (`session_meta.session_id`, which is also the rollout filename's own uuid),
 //! so [`sessions`] reports it on every row and [`SessionFilter::ids`] accepts
 //! an explicit id set — the strictly-more-precise attribution #8507's design
-//! note asked for. It is offered rather than required: nothing in the daemon
-//! captures a launch's Codex session ids today, so directory+window remains
-//! the default, and an id set narrows it when a caller has one.
+//! note asked for. It is offered rather than required: directory+window
+//! remains the default, and an id set narrows it when a caller has one (a
+//! step's log names its own, #14048). Ids NARROW rather than replace: the
+//! directory and window constraints still apply to an id-matched rollout
+//! (`SessionFilter::matches`); only an ids-only filter (empty `directories`)
+//! drops the directory constraint.
 //!
 //! # Mapping to [`ModelUsageTotals`]
 //!
