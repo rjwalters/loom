@@ -1615,6 +1615,20 @@ impl AutoUpdateState {
         }
     }
 
+    /// Time left on a retryable-failure backoff as of `now`, or `None` when
+    /// the loop may retry (Issue #14016). The run loop schedules the next
+    /// tick at `min(interval, this)`, so the retry lands when the "backing
+    /// off Ns" log line said it would instead of a full interval later. An
+    /// ELAPSED backoff is `None`, not zero: the gates past the backoff gate
+    /// (settle, the failed-roll hold, the unsupervised hold) can keep a tick
+    /// from retrying, and an immediate wake against such a hold would spin.
+    #[must_use]
+    pub fn backoff_remaining(&self, now: Instant) -> Option<Duration> {
+        self.backoff_until
+            .filter(|until| *until > now)
+            .map(|until| until.saturating_duration_since(now))
+    }
+
     /// Terminal-state and backoff gates, shared by both paths.
     fn terminal_or_backoff_gate(&self, now: Instant) -> Option<TickDecision> {
         if let Some(reason) = &self.terminal_reason {

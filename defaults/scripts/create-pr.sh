@@ -259,9 +259,31 @@ fi
 # authority -- this is a defense-in-depth pre-check, not the only gate.
 EX_REVIEW_GATE_COLLISION=6
 
+# One keyword-reference extractor shared by the review-gate lookup (#9453
+# phase 5) and the superseded-target lookup (#6277) below, so the two cannot
+# drift (#13939). First-match semantics, as before.
+#
+# The leading-guard alternation skips a keyword whose immediately preceding
+# token is a PR/issue reference: `PR #605 fixed #597` narrates history, it
+# does not close #597, so it must not win `head -1` over the real trailing
+# `Closes #N` (#13939). The three guard branches, most specific first:
+#   ^                            keyword opens the line (any body line)
+#   [^#0-9][[:space:]]+          ordinary prose before the keyword -- a
+#                                digit/`#` right before the whitespace run
+#                                is the `#N`-reference narration signature
+#   [^[:alnum:]_#[:space:]]      punctuation attached with no space, the
+#                                `**Fixes #1**` / `(closes #1)` shapes the
+#                                old bare `\b` also admitted
+# The guard classes are digit-free by construction, so the trailing `#N` is
+# the only number run in the match and the final grep picks exactly it.
+_cpr_body_ref_issue() {
+  # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
+  grep -ioE "(^|[^#0-9][[:space:]]+|[^[:alnum:]_#[:space:]])($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
+    | head -1 | grep -oE '[0-9]+' || true
+}
+
 # An empty body matches nothing (grep's no-match is absorbed by `|| true`).
-TARGET_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to)[[:space:]]+#[0-9]+' <<< "$BODY" \
-  | head -1 | grep -oE '[0-9]+' || true)"
+TARGET_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to')"
 
 # One daemon resolution, shared by every daemon call below (#10518).
 # shellcheck source=./lib/locate-daemon-bin.sh
@@ -313,8 +335,7 @@ fi
 # partial-increment references for a family/epic issue that intentionally
 # stays open across multiple PRs -- never match this pattern, so those PRs
 # are exempt by construction; no separate carve-out is needed.
-CLOSES_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<< "$BODY" \
-  | head -1 | grep -oE '[0-9]+' || true)"
+CLOSES_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?')"
 
 if [[ -n "$CLOSES_ISSUE" ]]; then
   # shellcheck disable=SC2054  # the comma is inside a single --json value, not an array separator

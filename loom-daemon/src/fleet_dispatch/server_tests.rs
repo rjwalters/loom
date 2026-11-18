@@ -988,6 +988,7 @@ async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
     let judge = claim_body(B, 11, "judge").to_string();
     let (reply, _) = s.handle(B, "/v1/claim", judge.as_bytes());
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("held"));
+    // No `cause` means a TTL expiry: it ends the order, never the hold.
     let ended = json!({"host_id": B, "repo": "acme/w", "item": 11}).to_string();
     let (reply, call) = s.handle(B, "/v1/park_ended", ended.as_bytes());
     assert_eq!(reply.status, 200);
@@ -1002,4 +1003,39 @@ async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
     let (reply, _) = s.handle(A, "/v1/park_ended", ended.as_bytes());
     assert_eq!(reply.status, 403);
+}
+
+/// #14047, end to end: the Builder step's no-progress hold survives a TTL
+/// expiry (`cause: expired`) and ends on an operator's clear (`cause:
+/// cleared`).
+#[tokio::test]
+async fn an_operator_clear_lifts_the_no_progress_hold_but_a_ttl_expiry_does_not() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    claim_release(&s, &clock, 100, A, "fast_fail");
+    claim_release(&s, &clock, 2_000, B, "fast_fail");
+    claim_release(&s, &clock, 9_300, A, "fast_fail");
+    // Past the park order's hold, inside the 6 h no-progress hold.
+    clock.set(9_300 + 3_600 + 600);
+    let builder = claim_body(B, 11, "builder").to_string();
+    let reason = |s: &Server<StaticIdentity>| {
+        let (reply, _) = s.handle(B, "/v1/claim", builder.as_bytes());
+        serde_json::from_str::<Value>(&reply.body).unwrap()
+    };
+    assert_eq!(reason(&s)["reason"], json!("cooldown"), "refused before any park-ended call");
+
+    let expired = json!({"host_id": B, "repo": "acme/w", "item": 11, "cause": "expired"});
+    let (reply, _) = s.handle(B, "/v1/park_ended", expired.to_string().as_bytes());
+    assert_eq!(reply.status, 200);
+    assert_eq!(reason(&s)["reason"], json!("cooldown"), "a TTL expiry leaves the hold");
+
+    let cleared = json!({"host_id": B, "repo": "acme/w", "item": 11, "cause": "cleared"});
+    let (reply, _) = s.handle(B, "/v1/park_ended", cleared.to_string().as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(true));
+    assert_eq!(reason(&s)["granted"], json!(true), "granted right after the clear");
+
+    // A clear on an item with nothing to forget: acknowledged, `known` false.
+    let (reply, _) = s.handle(B, "/v1/park_ended", cleared.to_string().as_bytes());
+    assert_eq!(reply.status, 200);
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
 }
