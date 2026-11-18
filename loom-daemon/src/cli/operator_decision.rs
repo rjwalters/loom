@@ -56,6 +56,38 @@ pub(crate) enum OperatorDecisionCommand {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
+    /// Record the operator's choice of one ranked option on an issue's
+    /// published decision (#14399), bound to the exact decision and proposal
+    /// reviewed. Attended only: needs a terminal and a typed confirmation, and
+    /// refuses under a dispatched sweep. `premise-check` then lets a deliberate
+    /// reversal proceed for an `--effect proceed` resolution it can verify.
+    Resolve {
+        /// Issue whose published decision is being resolved.
+        #[arg(value_name = "ISSUE")]
+        issue: u64,
+
+        /// The approved option's `id` from the decision block.
+        #[arg(long, value_name = "ID")]
+        option: String,
+
+        /// What the choice means: `proceed` approves the proposal as filed;
+        /// `reject`, `defer` and `rescope` are recorded but never open the gate.
+        #[arg(long, value_name = "EFFECT", default_value = "proceed")]
+        effect: String,
+
+        /// After the resolution verifies, remove the loom:operator hold
+        /// (`--effect proceed` only).
+        #[arg(long)]
+        release: bool,
+
+        /// Show the review (option, scope digests) and record nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Target repository; defaults to the checkout's remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
 }
 
 impl OperatorDecisionCommand {
@@ -109,7 +141,63 @@ impl OperatorDecisionCommand {
                     }
                 }
             }
+            OperatorDecisionCommand::Resolve {
+                issue,
+                option,
+                effect,
+                release,
+                dry_run,
+                repo,
+            } => run_resolve(issue, option, &effect, release, dry_run, repo, &mut out, &mut err),
         };
         std::process::exit(code)
     }
+}
+
+/// The `resolve` shim: parse the effect, insist on an attended session unless
+/// this is a read-only `--dry-run`, and confirm by having the operator type the
+/// option id.
+#[allow(clippy::too_many_arguments)]
+fn run_resolve(
+    issue: u64,
+    option: String,
+    effect: &str,
+    release: bool,
+    dry_run: bool,
+    repo: Option<String>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    use crate::operator_decision::{resolution::Effect, resolve};
+    let effect = match Effect::parse(effect) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return cli::exit::USAGE;
+        }
+    };
+    if !dry_run {
+        if let Err(why) = resolve::require_attended() {
+            eprintln!(
+                "operator-decision: REFUSED - an operator resolution is an attended action: {why}"
+            );
+            return resolve::UNATTENDED;
+        }
+    }
+    let root = default_repo_root();
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let mut forge = GhForge::new(root, repo).with_call_site("operator_decision.resolve");
+    let req = resolve::ResolveRequest {
+        issue,
+        option,
+        effect,
+        release,
+        dry_run,
+    };
+    let mut confirm = |expected: &str| {
+        eprint!("Type the option id `{expected}` to record this resolution: ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).is_ok() && line.trim() == expected
+    };
+    resolve::resolve(&mut forge, &policy, &req, &mut confirm, out, err)
 }
