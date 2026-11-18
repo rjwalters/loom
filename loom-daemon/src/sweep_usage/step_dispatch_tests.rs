@@ -24,7 +24,8 @@ const SWEEP_ID: &str = "step-builder-14166-1";
 /// One fixture rollout in the live Codex shape, attributed to the issue's
 /// worktree and timestamped inside the test window.
 fn write_rollout(home: &Path, cwd: &Path, model: &str) {
-    let created = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+    let created_at = Utc::now() - Duration::minutes(10);
+    let created = created_at.to_rfc3339();
     let usage = serde_json::json!({
         "input_tokens": 1_000, "cached_input_tokens": 400,
         "output_tokens": 100, "reasoning_output_tokens": 40, "total_tokens": 1_100,
@@ -39,7 +40,9 @@ fn write_rollout(home: &Path, cwd: &Path, model: &str) {
             "type": "token_count", "info": {
                 "total_token_usage": usage, "last_token_usage": usage}}}),
     ];
-    let dir = home.join("sessions").join("2026").join("11").join("18");
+    let dir = home
+        .join("sessions")
+        .join(created_at.format("%Y/%m/%d").to_string());
     std::fs::create_dir_all(&dir).unwrap();
     let mut file = std::fs::File::create(dir.join("rollout-s1.jsonl")).unwrap();
     for line in lines {
