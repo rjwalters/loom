@@ -84,15 +84,15 @@ else
     fail "could not extract update_work_plan() from guide.md"
 fi
 
-assert_contains "$UWP_BODY" 'WORK_PLAN_RECEIPT="current"' \
+assert_contains "$UWP_BODY" 'record_work_plan_receipt "current"' \
     "the no-change fast path records receipt 'current'"
-assert_contains "$UWP_BODY" 'WORK_PLAN_RECEIPT="debounced (elapsed ${elapsed}s < window ${debounce_secs}s)"' \
+assert_contains "$UWP_BODY" 'record_work_plan_receipt "debounced (elapsed ${elapsed}s < window ${debounce_secs}s)"' \
     "the debounce suppression records receipt 'debounced' with elapsed vs window figures"
-assert_contains "$UWP_BODY" 'WORK_PLAN_RECEIPT="provenance-refused"' \
+assert_contains "$UWP_BODY" 'record_work_plan_receipt "provenance-refused"' \
     "the provenance gate records receipt 'provenance-refused'"
-assert_contains "$UWP_BODY" 'WORK_PLAN_RECEIPT="written"' \
+assert_contains "$UWP_BODY" 'record_work_plan_receipt "written"' \
     "the successful splice records receipt 'written'"
-assert_contains "$UWP_BODY" 'WORK_PLAN_RECEIPT="write-failed"' \
+assert_contains "$UWP_BODY" 'record_work_plan_receipt "write-failed"' \
     "a failed splice records receipt 'write-failed' instead of leaving a stale value"
 assert_contains "$UWP_BODY" 'WORK_PLAN_RENDER_HASH="$(printf' \
     "update_work_plan() fingerprints the rendered body into WORK_PLAN_RENDER_HASH"
@@ -129,7 +129,7 @@ else
     fail "could not extract create_docs_pr() from guide.md"
 fi
 
-assert_contains "$CDP_BODY" '- **WORK_PLAN check**: ${WORK_PLAN_RECEIPT:-NOT RUN} (render-hash ${WORK_PLAN_RENDER_HASH:-none}' \
+assert_contains "$CDP_BODY" '- **WORK_PLAN check**: ${wp_receipt:-NOT RUN} (render-hash ${wp_hash:-none}' \
     "the rendered line carries the receipt, a NOT RUN fallback and a render-hash fallback"
 assert_contains "$CDP_BODY" "%Y-%m-%dT%H:%M:%SZ" \
     "the rendered line carries a UTC timestamp"
@@ -172,28 +172,47 @@ assert_grep 'free-text a claim like "WORK_PLAN.md is' "$GUIDE_MD" \
 echo ""
 echo "Test 5: extracted receipt lines, evaluated in a sandbox, classify each outcome"
 
-# Extract the exact receipt lines from create_docs_pr() (leading whitespace
-# stripped so they eval at top level in the sandbox): the WORK_PLAN_CHECK_LINE
-# assignment AND the DOCS_PR_BODY splice that consumes it (the next line).
-SPLICE_LINES="$(grep -m1 -A1 'WORK_PLAN_CHECK_LINE=' "$GUIDE_MD" | sed 's/^[[:space:]]*//')"
-if [[ "$(grep -c 'DOCS_PR_BODY="' <<<"$SPLICE_LINES")" -ge 1 ]]; then
-    pass "extracted the WORK_PLAN_CHECK_LINE assignment + DOCS_PR_BODY splice from create_docs_pr()"
+# Extract the exact receipt-resolution block from create_docs_pr() (#14259: the
+# globals-then-file resolution, the WORK_PLAN_CHECK_LINE assignment AND the
+# DOCS_PR_BODY splice that consumes it), leading whitespace stripped so it
+# evals at top level in the sandbox. `local` is not valid outside a function,
+# so the sandbox wraps the block in one.
+SPLICE_LINES="$(awk '/local wp_receipt=/{flag=1} flag{print} /DOCS_PR_BODY="\$\{DOCS_PR_BODY\/"@@WORK_PLAN_RECEIPT_LINE@@"/{if(flag){exit}}' "$GUIDE_MD" | sed 's/^[[:space:]]*//')"
+if [[ "$(grep -c 'DOCS_PR_BODY="' <<<"$SPLICE_LINES")" -ge 1 && "$(grep -c 'WORK_PLAN_CHECK_LINE=' <<<"$SPLICE_LINES")" -ge 1 ]]; then
+    pass "extracted the receipt resolution + WORK_PLAN_CHECK_LINE assignment + DOCS_PR_BODY splice from create_docs_pr()"
 else
-    fail "could not extract the WORK_PLAN_CHECK_LINE assignment + DOCS_PR_BODY splice from create_docs_pr()"
+    fail "could not extract the receipt resolution + WORK_PLAN_CHECK_LINE assignment + DOCS_PR_BODY splice from create_docs_pr()"
+fi
+
+# The receipt helpers, extracted verbatim from guide.md for the sandbox.
+RECORD_FN="$(awk '/^WORK_PLAN_RECEIPT_FILE_NAME=/{print} /^record_work_plan_receipt\(\) \{/{flag=1} flag{print} /^\}/{flag=0}' "$GUIDE_MD")"
+READ_FN="$(awk '/^read_work_plan_receipt_field\(\) \{/{flag=1} flag{print} /^\}/{flag=0}' "$GUIDE_MD")"
+if [[ -n "$RECORD_FN" && -n "$READ_FN" ]]; then
+    pass "extracted record_work_plan_receipt()/read_work_plan_receipt_field() from guide.md"
+else
+    fail "could not extract the receipt helper functions from guide.md"
 fi
 
 run_pr_body_splice() {
     # $1 = WORK_PLAN_RECEIPT value ("__unset__" = leave unset, the
     #      never-called tick), $2 = WORK_PLAN_RENDER_HASH (same sentinel),
-    # $3 = fixture PR body template. Prints the spliced DOCS_PR_BODY.
-    local receipt="$1" hash="$2" body="$3"
+    # $3 = fixture PR body template, $4 = optional receipt-file content
+    # (printf-interpreted; empty/absent = no file). Prints the spliced
+    # DOCS_PR_BODY.
+    local receipt="$1" hash="$2" body="$3" file_content="${4:-}"
     local SANDBOX
     SANDBOX="$(mktemp -d)"
+    mkdir -p "$SANDBOX/wt"
+    if [ -n "$file_content" ]; then
+        printf "$file_content" > "$SANDBOX/wt/.loom-work-plan-receipt"
+    fi
     {
+        printf 'DOCS_WT=%q\n' "$SANDBOX/wt"
+        printf '%s\n' "$RECORD_FN" "$READ_FN"
         if [ "$receipt" != "__unset__" ]; then printf 'WORK_PLAN_RECEIPT=%q\n' "$receipt"; fi
         if [ "$hash" != "__unset__" ]; then printf 'WORK_PLAN_RENDER_HASH=%q\n' "$hash"; fi
         printf 'DOCS_PR_BODY=%q\n' "$body"
-        printf '%s\n' "$SPLICE_LINES"
+        printf 'f() {\n%s\n}\nf\n' "$SPLICE_LINES"
         printf '%s\n' 'printf "%s\n" "$DOCS_PR_BODY"'
     } > "$SANDBOX/run.sh"
     bash "$SANDBOX/run.sh"
@@ -221,9 +240,11 @@ assert_contains "$RESULT" '- **WORK_PLAN check**: debounced (elapsed 300s < wind
 
 # 5c. The debounced receipt assignment, extracted from update_work_plan(),
 # composes its elapsed/window figures from the live arithmetic variables.
-DEBOUNCED_LINE="$(grep -m1 'WORK_PLAN_RECEIPT="debounced' "$GUIDE_MD" | sed 's/^[[:space:]]*//')"
+DEBOUNCED_LINE="$(grep -m1 'record_work_plan_receipt "debounced' "$GUIDE_MD" | sed 's/^[[:space:]]*//')"
 SANDBOX="$(mktemp -d)"
 {
+    printf 'DOCS_WT=%q\n' "$SANDBOX"
+    printf '%s\n' "$RECORD_FN"
     printf 'elapsed=300\ndebounce_secs=3600\n'
     printf '%s\n' "$DEBOUNCED_LINE"
     printf '%s\n' 'printf "%s\n" "$WORK_PLAN_RECEIPT"'
@@ -232,6 +253,71 @@ RESULT="$(bash "$SANDBOX/run.sh")"
 assert_eq "$RESULT" "debounced (elapsed 300s < window 3600s)" \
     "the extracted debounced assignment composes elapsed/window from the tick's arithmetic"
 rm -rf "$SANDBOX"
+
+# 5d. (#14259) SEPARATE SHELL INVOCATIONS: Step 3 runs in one process, Step 5
+# in another, so no global survives. The receipt must still arrive populated.
+RESULT="$(run_pr_body_splice "__unset__" "__unset__" "$FIXTURE_TEMPLATE" 'receipt=written\nrender_hash=6c47a827e98f\n')"
+assert_contains "$RESULT" '- **WORK_PLAN check**: written (render-hash 6c47a827e98f,' \
+    "unset globals + receipt file => the PR body line is populated from the file"
+
+# 5e. The tick's `NOT RUN` initialization is not an outcome: it must not mask a
+# real receipt file.
+RESULT="$(run_pr_body_splice "NOT RUN" "__unset__" "$FIXTURE_TEMPLATE" 'receipt=current\nrender_hash=abcdef012345\n')"
+assert_contains "$RESULT" '- **WORK_PLAN check**: current (render-hash abcdef012345,' \
+    "a NOT RUN initialization global does not mask a receipt file"
+
+# 5f. Absent file + unset globals keeps the visible NOT RUN fallback.
+RESULT="$(run_pr_body_splice "__unset__" "__unset__" "$FIXTURE_TEMPLATE")"
+assert_contains "$RESULT" '- **WORK_PLAN check**: NOT RUN (render-hash none,' \
+    "absent receipt file => NOT RUN (render-hash none, ...)"
+
+# 5g. Globals still win when set (single-shell execution unchanged).
+RESULT="$(run_pr_body_splice "written" "111111111111" "$FIXTURE_TEMPLATE" 'receipt=current\nrender_hash=222222222222\n')"
+assert_contains "$RESULT" '- **WORK_PLAN check**: written (render-hash 111111111111,' \
+    "a global carrying a real outcome wins over the file"
+
+# 5h. A debounced classification (contains parens and '<') survives the file.
+RESULT="$(run_pr_body_splice "__unset__" "__unset__" "$FIXTURE_TEMPLATE" 'receipt=debounced (elapsed 300s < window 3600s)\nrender_hash=6c47a827e98f\n')"
+assert_contains "$RESULT" '- **WORK_PLAN check**: debounced (elapsed 300s < window 3600s) (render-hash 6c47a827e98f,' \
+    "a debounced receipt round-trips through the file intact"
+
+# 5i. The writer, run as its OWN process, then the reader in a SECOND process.
+SANDBOX="$(mktemp -d)"
+{
+    printf 'DOCS_WT=%q\n' "$SANDBOX"
+    printf '%s\n' "$RECORD_FN"
+    printf 'WORK_PLAN_RENDER_HASH=cafe00112233\n'
+    printf '%s\n' 'record_work_plan_receipt "write-failed"'
+} > "$SANDBOX/step3.sh"
+{
+    printf 'DOCS_WT=%q\n' "$SANDBOX"
+    printf '%s\n' "$RECORD_FN" "$READ_FN"
+    printf '%s\n' 'printf "%s|%s|%s\n" "${WORK_PLAN_RECEIPT:-unset}" "$(read_work_plan_receipt_field receipt)" "$(read_work_plan_receipt_field render_hash)"'
+} > "$SANDBOX/step5.sh"
+bash "$SANDBOX/step3.sh"
+RESULT="$(bash "$SANDBOX/step5.sh")"
+assert_eq "$RESULT" "unset|write-failed|cafe00112233" \
+    "write-failed recorded by one process is recovered by a second process"
+
+# 5j. The file is never staged: the staging paths are exact names, none of
+# which is the receipt file, and no blanket add exists in create_docs_pr().
+CDP_CODE="$(grep -v '^[[:space:]]*#' <<<"$CDP_BODY")"
+assert_not_contains "$CDP_CODE" 'add -A' "create_docs_pr() never blanket-stages (comments excluded)"
+assert_not_contains "$CDP_BODY" '.loom-work-plan-receipt' \
+    "create_docs_pr() never stages the receipt file by name"
+
+# 5k. Entry reset: update_work_plan() removes any stale file BEFORE its first
+# early return (the skipDocs one), so a stale file cannot leak.
+FIRST_RM_LINE="$(grep -n 'rm -f "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME"' <<<"$UWP_BODY" | head -1 | cut -d: -f1)"
+FIRST_RETURN_LINE="$(grep -n 'return 1' <<<"$UWP_BODY" | head -1 | cut -d: -f1)"
+# The skipDocs guard must stay the function's first statement (test-guide-skip-docs.sh),
+# so the reset lives INSIDE that branch (before its `return 1`) AND right after it.
+RM_COUNT="$(grep -c 'rm -f "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME"' <<<"$UWP_BODY")"
+if [[ "$RM_COUNT" -ge 2 && -n "$FIRST_RM_LINE" && -n "$FIRST_RETURN_LINE" && "$FIRST_RM_LINE" -lt "$FIRST_RETURN_LINE" ]]; then
+    pass "update_work_plan() deletes the stale receipt file before the skipDocs early return and again after it"
+else
+    fail "update_work_plan() must delete the stale receipt file before its first early return (rm at ${FIRST_RM_LINE:-none}, return at ${FIRST_RETURN_LINE:-none})"
+fi
 
 # ---------------------------------------------------------------------------
 # Test 6: the render-hash line computes the real sha256 prefix

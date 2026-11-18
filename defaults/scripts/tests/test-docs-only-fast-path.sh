@@ -192,6 +192,56 @@ out="$(printf 'work_log/WORK_LOG_2026-08.md\nsrc/main.rs\n' | docs_only_fast_pat
 assert_eq "NOT ELIGIBLE: src/main.rs" "$out" "an archive file mixed with a non-docs file is ineligible"
 
 echo
+echo "--- closing-reference condition (#14182): a docs-only diff that closes an issue is ineligible ---"
+
+# Mirror of the shipped docs_only_fast_path_closing_check(), extracted from
+# judge.md so this suite exercises the documented code, not a hand copy. `gh`
+# is stubbed: GH_STUB_OUT is its stdout, GH_STUB_RC its exit status.
+gh() { printf '%s' "${GH_STUB_OUT-}"; return "${GH_STUB_RC:-0}"; }
+closing_fn_block() {
+    awk '/^docs_only_fast_path_closing_check\(\) \{/{p=1} p{print} p && /^}$/{exit}' "$1"
+}
+eval "$(closing_fn_block "$JUDGE_MD")"
+
+GH_STUB_RC=0 GH_STUB_OUT='closers=' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "ELIGIBLE" "$out" "a PR with an empty closing set stays eligible"
+
+GH_STUB_RC=0 GH_STUB_OUT='closers=42' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closes #42" "$out" "a PR closing one issue is ineligible"
+
+GH_STUB_RC=0 GH_STUB_OUT='closers=42,77' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closes #42, #77" "$out" "a PR closing several issues is ineligible"
+
+GH_STUB_RC=1 GH_STUB_OUT='' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closing-reference read failed" "$out" \
+    "a failed read fails closed (not treated as 'no closers')"
+
+GH_STUB_RC=1 GH_STUB_OUT='closers=' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closing-reference read failed" "$out" \
+    "a non-zero exit fails closed even when stdout looks like an empty set"
+
+GH_STUB_RC=0 GH_STUB_OUT='' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closing-reference read returned no proof" "$out" \
+    "an empty-because-errored read (exit 0, no 'closers=' proof) fails closed"
+
+unset -f gh
+
+JUDGE_CLOSING="$(closing_fn_block "$JUDGE_MD" | grep -v '^[[:space:]]*#')"
+CHAMPION_CLOSING="$(closing_fn_block "$CHAMPION_MD" | grep -v '^[[:space:]]*#')"
+assert_contains "$JUDGE_CLOSING" "docs_only_fast_path_closing_check() {" "judge.md ships docs_only_fast_path_closing_check()"
+assert_eq "$JUDGE_CLOSING" "$CHAMPION_CLOSING" \
+    "judge.md and champion-pr-merge.md closing-check code is identical (comments aside)"
+
+assert_doc_contains "$JUDGE_MD" \
+    'ELIGIBILITY=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
+    "judge.md folds the closing check into ELIGIBILITY"
+assert_doc_contains "$CHAMPION_MD" \
+    'FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
+    "champion-pr-merge.md folds the closing check into FAST_PATH_RESULT"
+assert_doc_contains "$JUDGE_MD" "closingIssuesReferences" "judge.md reads closingIssuesReferences"
+assert_doc_contains "$CHAMPION_MD" "closingIssuesReferences" "champion-pr-merge.md reads closingIssuesReferences"
+
+echo
 echo "--- Judge and Champion allowlist + archive pattern are byte-identical (#12636) ---"
 
 fast_path_block() {

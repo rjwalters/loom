@@ -2563,7 +2563,8 @@ record's JSON. The scalars ride as `loom.auto_update.*` attributes
 allowlists). Three floor-diagnostic fields — `floor_not_rolling`,
 `floor_stall` and `roll_held` — are deliberately not in that list: they ride
 in the record body only, never as `loom.auto_update.*` attributes, so a
-dashboard that needs them must extract them from the body. The record time
+dashboard that needs them must extract them from the body. `host_state` is
+body-only too: it has no `loom.auto_update.*` attribute key. The record time
 is the tick's start. Provenance is required: `loom` exports as
 `loom.auto_update.version` / `revision` / `tree_state` /
 `provenance_complete`, and a record whose provenance does not validate is
@@ -2577,7 +2578,7 @@ roll it reported; no record carries it any more.)
 |---|---|---|
 | `tick_id` | string | derived, never random: `derived_hex(["loom.auto_update.tick", host_id, tick start], 32)` |
 | `started_at` | RFC3339 | the tick's start |
-| `decision` | string | `skip` (nothing to roll onto; since #10885 this includes a fleet host at or above its floor, or whose floor is not known, whatever newer release exists), `defer` (a target is tracked, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, or the failed-roll guard holding a target whose last roll did not take, #10880), `stale_repo` (a WARN-level "nothing to roll onto": the artifact resolved from a repo other than the one this binary was built from, #8513, or a below-floor host with no release resolved, #11029/#14224 — tell the two apart with `floor_not_rolling` = `no_release`, set only for the below-floor cause, or the `reason` text), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `panic` (the tick panicked; the loop keeps running) |
+| `decision` | string | `skip` (nothing to roll onto; since #10885 this includes a fleet host at or above its floor, or whose floor is not known, whatever newer release exists), `defer` (a target is tracked, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, or the failed-roll guard holding a target whose last roll did not take, #10880), `stale_repo` (a WARN-level "nothing to roll onto": the artifact resolved from a repo other than the one this binary was built from, #8513, or a below-floor host with no release resolved, #11029/#14224 — tell the two apart with `floor_not_rolling` = `no_release`, set only for the below-floor cause, or the `reason` text), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `config_restart` (restart-required config changed since boot; the tick armed a same-binary restart for it, #12425), `panic` (the tick panicked; the loop keeps running) |
 | `reason` | string | the tick's note, the same text as `last tick:` in `loom-daemon status` |
 | `outcome` | string? | `success` / `retryable` / `terminal`, for `fetch` and `rebuild` |
 | `roll_armed` | bool | the fetch or rebuild succeeded and its pause-and-roll started (#10831) |
@@ -2589,6 +2590,9 @@ roll it reported; no record carries it any more.)
 | `floor_stall` | string? | the unsatisfiable-floor alert text (#10712), or an unsatisfiable repo-ahead demand (#10719); absent otherwise |
 | `floor_not_rolling` | string? | #11042: why a host below its fleet floor did not roll this tick; absent while the host is at or above the floor, has no fleet store, or is rolling to the floor. One of `unsatisfiable` (no published release meets the floor — the #10712 stall), `no_release` (no release resolved this tick, or its version cannot be compared), `unsupervised` (no launchd/systemd supervisor would relaunch the daemon, so the roll cannot start; the release is fetched once per target, then not again), `backoff` (the last fetch for this target failed; the loop is backing off), `terminal` (the last fetch for this target failed terminally) or `roll_refused` (the release is installed but the pause-and-roll refused to start for another reason — a live pause manifest, a roll-attempt backoff, no state directory; the daemon log names it) |
 | `roll_held` | object? | #10880: a release roll this tick left held, raised on every such tick: `{floor?, running, target, cause, attempts, last_failure?, next_retry?}`. `cause` is `failed_roll` (an armed roll did not take; the failed-roll guard holds it), `fetch_backoff` (three or more consecutive fetch failures) or `fetch_terminal`. `floor` is set when the host is below its fleet floor. `next_retry` is absent only for a terminal failure on a target that is not the floor's |
+| `host_state` | string? | #12420: the host's update state at the end of the tick — `H0` current, `H1` settling, `H2` fetching, `H3` staged, `H4` pausing, `H5` verifying, `H7` stalled or `unknown` (there is no `H6`; the states are the ones `status`'s `Host update:` line reports, defined in [`daemon-reference.md`](daemon-reference.md)). Absent from a record written before the projection. Body-only |
+| `target_source` | string? | #12420: who would choose the roll target — `floor`, `repo-ahead`, `autoUpdate` or `none`; `config_restart` (#12425) on a tick that armed a same-binary restart for restart-required config. Exported as `loom.auto_update.target_source` |
+| `config_restart_paths` | integer? | #12425: how many restart-required paths asked for the restart. A count, never the paths. Exported as `loom.auto_update.config_restart_paths` |
 | `consecutive_failures` | integer | retryable failures for the tracked target |
 | `duration_ms` | integer | wall time of the tick |
 | `loom` | object | the deciding (running) daemon's provenance (required) |
