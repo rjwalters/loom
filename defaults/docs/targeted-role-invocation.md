@@ -123,12 +123,14 @@ exits (pre-state = the state the step was drawn on):
 | Builder | an open PR linked to `<N>` with `loom:review-requested` was created during the step; or the issue was parked (`loom:blocked` / `loom:operator`) or closed | `.loom/worktrees/issue-<N>/.no-changes-needed` exists (the sweep's own signal, #6670) | nothing changed and `forge check-claim` would refuse the pre-state | `loom:building` is still held with no PR and no marker |
 | Curator | the issue gained `loom:curated`, was parked or was closed, and `loom:curating` is gone | `loom:curating` is gone and nothing else changed, with a `noop` outcome line | nothing changed and the pre-state fails gates 1 to 3, or a stand-down marker was posted | `loom:curating` is still on the issue after exit |
 | Doctor | the PR gained `loom:review-requested` | the PR is unmoved with no claim left, and the line says `noop` (`no_fix_needed`) | the unmoved item takes the line's `refused` | the Doctor claim is still held after exit |
-| Champion (promote) | the issue gained `loom:issue` or `loom:triage` | the issue is unmoved with no claim left (`requeued` / `skipped`) | `not-eligible` on an open item | the claim is still held after exit |
-| Champion (merge) | the PR left `loom:pr` or closed (merged) | as promote | as promote | as promote |
+| Champion (promote) | the issue gained `loom:issue` or `loom:triage` | the issue is unmoved with no claim left (`blocked`) | `not-eligible` on an open item | the claim is still held after exit |
+| Champion (merge) | the PR closed (merged), or left `loom:pr` with a replacement label (`loom:review-requested`, `loom:changes-requested`, `loom:blocked`, or `loom:operator`) | the PR is unmoved and the line says `noop` (`held` / `requeued` / `skipped`) | as promote | the line says `failed` (merge holds no claim, so a held claim can never fire) |
 
 (Doctor and Champion are classified by the same `outcome_ledger::classify`; the
 labels each role moves an item to are `advanced_labels` in
-`sweep_registry/restore_to_ready/step_restore.rs`.)
+`sweep_registry/restore_to_ready/step_restore.rs`. The one exception is
+Champion merge, whose verdict post-state is the special-case arm in
+`step_post_state` in that same file — `advanced_labels` is empty for it.)
 
 Champion writes a `CHAMPION-STEP` line rather than a `LOOM_STEP_OUTCOME` one,
 so the claim-versus-post-state check below has no claimed class for it.
