@@ -262,7 +262,9 @@ still writable — the same pre-session step
 writes a `trusted_hash` by hand and `--dangerously-bypass-hook-trust` is not
 passed. What §12 measures is therefore the recorded-trust path exactly as a
 private-clone session runs it. (Host-mode sessions may instead pass the waiver
-for a sealed registration, #10102. Private-clone sessions never do.)
+for a sealed registration, #10102, and since #14105 so may private-clone
+sessions, which add it inside the container for a registration that vets; §12
+measures the recorded-trust path only.)
 
 Two profiles are provisioned and registered identically and differ **only** in
 the answer to that one prompt — `2` (*Trust all and continue*) versus `3`
