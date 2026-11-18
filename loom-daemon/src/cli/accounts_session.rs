@@ -289,6 +289,21 @@ pub(crate) fn handle_session_command(
                     .as_ref()
                     .map_or("idle", |job| job.owner.as_str())
             );
+            println!("{}: image={}", status.config.account, status.image.as_deref().unwrap_or("-"));
+            if !status.extra_mounts.is_empty() {
+                let mounts: Vec<String> = status
+                    .extra_mounts
+                    .iter()
+                    .map(|mount| {
+                        format!("{} -> {}:ro", mount.host.display(), mount.container.display())
+                    })
+                    .collect();
+                println!(
+                    "{}: extra read-only mounts: {}",
+                    status.config.account,
+                    mounts.join(", ")
+                );
+            }
         }
         Ok(())
     }

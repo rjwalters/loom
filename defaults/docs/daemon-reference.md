@@ -10637,10 +10637,31 @@ Extra mounts are for **data** — PDKs, model files, caches. Tools belong in
 a derived image: system-package tools are linked against shared libraries
 across `/usr`, which no per-path mount can carry. The mounts a container
 was created with are recorded in its `loom.extra-mounts` label; `accounts
-session status` (text and `--json`) reports them. The override and the
-mounts apply to **host-mode sessions only** — private-clone sessions keep
-their own image handling and their exactly-counted mount inventory. The
-pass makes no extra Docker call for an unset config, and a malformed
+session status` (text and `--json`) reports them.
+
+**Private-clone sessions (#14451)** take the same two keys. An operator
+`session start` resolves them once, when it creates the container, in the
+order explicit `--image` > `accounts.session.image` > stock, and records the
+configured image and the mounts in the seat's `workspace.json`
+(`session_image`, `extra_mounts`; absent state reads as unset). The **host
+tier** decides for a seat that serves several repositories: the keys are read
+from the daemon's primary workspace root, never per repository, because a
+seat is one container. A configured image gets the same digest pin and sealed
+bundle verification as host mode, before the throwaway profile container or
+the session is created. Extra mounts are always read-only and pass the same
+host-source denials; their container target may not shadow or nest inside
+`/workspace`, the `CODEX_HOME` profile, the sealed bundle root or the
+forge-configuration mount, nor overlap another extra mount. The mount
+inventory check counts exactly the recorded extras — one that is not recorded,
+one that is missing, or a writable one fails it closed. Reconcile `recover`
+of a missing container recreates it from the **recorded** image and mounts,
+never the config as edited since and never the stock image, re-running the
+bundle verification: a daemon roll that leaves the derived image not yet
+rebuilt refuses with a WARN. A configuration edit applies to a seat after
+`accounts session stop` and a new `start`. `accounts session status` reports
+the image and the extra mounts of a private-clone seat.
+
+The pass makes no extra Docker call for an unset config, and a malformed
 `accounts.session` block refuses an operator `start` outright (the
 reconcile pass warns and carries on; it never puts a fresh seat on the
 stock image because the override failed to parse).
@@ -10674,7 +10695,7 @@ across the registered roots:
 | restarting, 2+ consecutive passes | one WARN `crash loop`; never reused or stopped |
 | stopped, host-mounted | `docker start`, via the `accounts session start` path |
 | missing, host-mounted | recreated with the workspace and image of the last operator `session start`; otherwise the label last seen on it; otherwise the registered roots' common parent, logged as a guess. Never `/`: that is refused and reported |
-| stopped or missing, private-clone | skipped with one WARN; never recreated host-mounted |
+| stopped or missing, private-clone | recovered in place against its surviving volume (#12772) with the image and extra mounts recorded at the last operator `start` (#14451); never recreated host-mounted, and skipped with one WARN when not positively configured |
 | running, workspace mounts drifted, idle | stopped, removed and recreated with the current registry (#10364, below) |
 | running, workspace mounts drifted, in-flight exec or a dispatch starting | deferred and re-checked next pass; never stopped |
 | running, drift that cannot be decided | left running (rule 1 below) |
