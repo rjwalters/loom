@@ -29,6 +29,8 @@ fn terminal_result_parser_threads_the_model_field_on_v2() {
             exit_code: 1,
             model: Some("gpt-5-codex".into()),
             requested_model: None,
+            effort: None,
+            tier: None,
         })
     );
     // `model=none` — the sentinel the adapter emits when no model was in
@@ -46,6 +48,8 @@ fn terminal_result_parser_threads_the_model_field_on_v2() {
             exit_code: 0,
             model: None,
             requested_model: None,
+            effort: None,
+            tier: None,
         })
     );
     // v1 (5 fields, no model=) still parses, with model always None.
