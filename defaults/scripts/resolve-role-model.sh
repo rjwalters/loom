@@ -22,8 +22,8 @@
 #
 # Usage:
 #   resolve-role-model.sh <role>                    # prints the resolved model
-#   resolve-role-model.sh <role> --task-alias       # nearest Task-tool alias (#4282)
-#   resolve-role-model.sh <role> --json             # {"role","model","source"} record
+#   resolve-role-model.sh <role> --task-alias       # nearest Task-tool alias (#4282; bare form only)
+#   resolve-role-model.sh <role> --json             # {"role","model","source","task_model"} record
 #   resolve-role-model.sh <role> --model <m>        # explicit tier-1 override
 #   resolve-role-model.sh <role> --config <path>    # explicit .loom/config.json path
 #
@@ -34,7 +34,7 @@
 # Examples:
 #   resolve-role-model.sh judge            # -> opus          (roleConfig.model pin)
 #   resolve-role-model.sh Judge            # -> opus          (case-insensitive)
-#   resolve-role-model.sh builder --json   # -> {"role":"builder","model":"opus","source":"suggestedModel"}
+#   resolve-role-model.sh builder --json   # -> {"role":"builder","model":"opus","source":"suggestedModel","task_model":"opus"}
 #   resolve-role-model.sh auditor          # -> (exit 3; unconfigured role, inherit)
 #   resolve-role-model.sh judge --task-alias
 #                                          # -> opus (claude-opus-5 degraded for the Task tool)
