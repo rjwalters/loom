@@ -419,6 +419,8 @@ mod tests {
             volume: format!("loom-codex-workspace-{name}"),
             profile: profile.canonicalize().unwrap(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         save(&dir.join("workspace.json"), &config).unwrap();
         profile
@@ -579,6 +581,8 @@ mod tests {
             volume: "v".into(),
             profile: PathBuf::from("/nonexistent"),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         }
     }
     fn reservation(dir: &Path) -> Selection {

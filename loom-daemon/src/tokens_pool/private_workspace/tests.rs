@@ -739,6 +739,8 @@ fn config() -> Config {
         volume: "private-volume".into(),
         profile: "/external/account".into(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     }
 }
 
@@ -917,6 +919,8 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         volume: "volume".into(),
         profile: "/external/profile".into(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     assert!(lease
         .recover(&config, Some(&serde_json::json!({"Id":"new", "State":{"Running":false}})))
