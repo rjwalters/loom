@@ -116,10 +116,14 @@ pub(super) fn run_curation_complete(repo_root: &Path, issue: i64) -> Result<(), 
 /// (#14417, #14100): a `self_spawn start` line when the child spawns and a
 /// `self_spawn exit` line (status, wall time, peak RSS) once it is reaped, so a
 /// kernel `Killed process <pid> (loom-daemon)` line names this site. Captures
-/// stdout and stderr exactly as `.output()` does (stdin stays inherited, as it
-/// was); a spawn failure is the same `Err` it always was.
+/// stdout and stderr with null stdin, as at the original `.output()` call
+/// sites. Spawn failures still return `Err`.
 fn output_tracked(site: &'static str, cmd: &mut Command) -> std::io::Result<Output> {
-    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
     let tracked = crate::self_spawn_log::track(site, cmd, child.id());
     let out = child.wait_with_output()?;
     tracked.finish(out.status);
