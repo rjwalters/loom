@@ -1414,6 +1414,10 @@ git fetch origin main
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
 # Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
 
+# Workflow-lint gate (#13896): the merge above — and any conflict resolution in it — can textually union two copies of one setup block, leaving a touched workflow with a duplicate step id or a duplicate mapping key. GitHub rejects such a file at validation with zero jobs, so its gate vanishes and every rollup reads green. Lint every workflow the resolved result touched BEFORE pushing; a defect — or the lint being unable to run (a stale loom-daemon without the subcommand exits non-zero) — blocks the push and any "conflict resolved" claim. Fail closed: never treat silence as a pass.
+WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files; verify .github/workflows by hand before pushing." >&2; exit 1; }
+[ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "Aborting: workflow-lint failed above — resolve the defect; do not push and do not claim the conflict resolved." >&2; exit 1; }
+
 # Version-gate: if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files out of sync (see BLOCKER:/Fix:); report, do not hand-bump." >&2

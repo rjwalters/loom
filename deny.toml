@@ -19,7 +19,13 @@
 # Everything in the RustSec database is an error by default under the current
 # schema; the old per-class severity knobs no longer exist. Exceptions go in
 # `ignore` below, each with a comment saying why and when it goes away.
-ignore = []
+ignore = [
+    # unsafe-libyaml - unmaintained (repository archived 2024-03-25); transitive
+    # via serde_yaml_ng, the workflow-lint parser (loom-daemon, #14086). No known
+    # vulnerability: the soundness advisory RUSTSEC-2023-0075 is patched at the
+    # pinned 0.2.11. Remove when workflow-lint swaps to a maintained YAML parser.
+    "RUSTSEC-2024-0449",
+]
 # A yanked crate in the lockfile is a warning, not a failure: yanking is often
 # administrative (a bad publish, a version-number mistake) and the daily run
 # should not go red for one while a `cargo update` is pending.
