@@ -1009,6 +1009,11 @@ jobs:
       - name: Check defaults/ deletions are recorded in .loom-retired.list
         if: ${{ !cancelled() }}
         run: bash scripts/check-retired-list-drift.sh
+      - name: Check workflow self-repo guards name the canonical repo (#14158)
+        if: ${{ !cancelled() }}
+        run: |
+          bash scripts/check-workflow-self-repo.sh --self-test
+          bash scripts/check-workflow-self-repo.sh
       # component: Stale Model Pin Check
       # Cheap structural check; always runs, and deliberately NOT path-filtered:
       # the things it guards are workflow files and dispatching scripts, so a
@@ -2419,7 +2424,7 @@ jobs:
     needs: [changes, release-build]
     if: >-
       always() && needs.release-build.result == 'success' &&
-      github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == '2AMLogic/loom' &&
       (needs.changes.result != 'success' || needs.changes.outputs.docker != 'false')
     runs-on: ubuntu-latest
     timeout-minutes: 30
