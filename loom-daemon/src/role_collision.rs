@@ -1336,8 +1336,7 @@ JSON
     /// # Lock order
     ///
     /// `loom_config_env` outside, default inside. Many other tests nest this
-    /// key pair (list them with `grep -rn -A1 'serial(loom_config_env)'
-    /// loom-daemon/src`), and every one nests in this same order. No cycle
+    /// key pair, and every one nests in this same order. No cycle
     /// exists because **no** site in the crate nests the pair in the reverse
     /// order (a bare-`#[serial]` test calling a `#[serial(loom_config_env)]`
     /// body); any future test that needs both MUST nest in this same order.
