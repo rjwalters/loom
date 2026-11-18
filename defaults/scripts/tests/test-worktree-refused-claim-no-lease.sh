@@ -103,7 +103,7 @@ chmod +x "$TMP/shim/git"
 
 run_wt() { # <args...> -> sets RC, resets log
     : > "$LOG"; RC=0
-    ./.loom/scripts/worktree.sh "$@" >"$TMP/out.log" 2>&1 || RC=$?
+    LOOM_BUILDER_CLAIM="${LOOM_BUILDER_CLAIM-1}" ./.loom/scripts/worktree.sh "$@" >"$TMP/out.log" 2>&1 || RC=$?
 }
 lease_calls() { grep -c '^lease ensure' "$LOG" || true; }
 expect_refused_no_lease() { # <issue> <label>
@@ -266,6 +266,10 @@ git push -q origin feature/issue-520 && git checkout -q main && git branch -D -q
 git fetch -q origin
 STUB_OWNERSHIP_RC=4 run_wt 520
 if [[ "$RC" -eq 0 ]] && grep -q '^lease ensure 520 --watch-pid' "$LOG" && ! grep -q -- '--require-ownership' "$LOG"; then pass "authorized branch reuse unaffected"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
+
+echo "Test 23: standalone (non-Builder) fresh creation keeps the fail-open lease even when ownership is unverifiable"
+STUB_CHECK_CLAIM_RC=1 STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' LOOM_BUILDER_CLAIM="" run_wt 523
+if [[ "$RC" -eq 0 && -e ".loom/worktrees/issue-523/.git" ]] && ! grep -q -- '--require-ownership' "$LOG"; then pass "standalone not refused"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
 
 echo
 echo "Tests run: $TESTS_RUN, failed: $TESTS_FAILED"

@@ -432,7 +432,7 @@ After claiming an issue, **before writing any code**, verify you are in the corr
 
 ```bash
 # 1. Create the worktree (if not already created)
-./.loom/scripts/worktree.sh <issue-number>
+LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number>   # strict native ownership for a Builder (#14376)
 
 # 2. Capture the worktree's ABSOLUTE path ONCE — do not rely on cwd persisting
 WORKTREE_ABS="$(cd .loom/worktrees/issue-<issue-number> && pwd)"

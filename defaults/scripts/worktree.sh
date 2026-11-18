@@ -1580,7 +1580,7 @@ _wt_lease_claim_owned() {
     # requires-daemon: lease-ownership required   #14376 a fresh Builder handoff needs positive ownership; a daemon predating `lease ensure --require-ownership` cannot prove it
     _tok=$("$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" 3>&-) || _rc=$?
     [[ "$_rc" -ne 4 ]] || return 4
-    [[ "$_rc" -eq 0 && "$_tok" == *OWNED* && "$_tok" != *PEER_OWNED* && "$_tok" != *INDETERMINATE* ]] || return 5
+    [[ "$_rc" -eq 0 && "$_tok" == "OWNED" ]] || return 5
     return 0
 }
 
@@ -1650,7 +1650,7 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     _wt_lease_claim; exit 0
 fi
 
-# Set only on the fresh-branch Builder arm below (#14376): origin/local branch
+# Set only on the fresh-branch Builder-claim arm below (#14376): origin/local branch
 # reuse (a Doctor continuing a PR) and standalone operations keep the fail-open lease.
 _WT_FRESH_BUILDER_CLAIM=false
 
@@ -1723,7 +1723,14 @@ else
         elif [[ "${LOOM_SWEEP_CLAIM_OWNED:-}" != "$ISSUE_NUMBER" ]]; then
             _wt_claim_flags=(--attended-claim)
         fi
-        _WT_FRESH_BUILDER_CLAIM=true
+        # Strict native ownership (#14376) applies to a Builder claim only: a
+        # dispatcher-owned claim (LOOM_SWEEP_CLAIM_OWNED names this issue) or an
+        # attended Builder that opted in with LOOM_BUILDER_CLAIM=1 (builder.md).
+        # A standalone/operator `worktree.sh N` (no agent session, no daemon, a
+        # hermetic fixture) keeps the fail-open `_wt_lease_claim` contract.
+        if [[ "${LOOM_SWEEP_CLAIM_OWNED:-}" == "$ISSUE_NUMBER" || "${LOOM_BUILDER_CLAIM:-}" == "1" ]]; then
+            _WT_FRESH_BUILDER_CLAIM=true
+        fi
         # requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
         # shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
         [[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" ${_wt_claim_flags[@]+"${_wt_claim_flags[@]}"} >&3 && exit 1 || true
