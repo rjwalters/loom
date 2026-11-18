@@ -1,12 +1,24 @@
 //! Busy slots by role (Issue #11847): the slot accounting must close, so a
 //! dashboard can add busy-by-role to idle and get the ceiling back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+
+use uuid::Uuid;
 
 use super::{busy_points, role_ceiling, SWEEP_ROLE};
+use crate::observability::ops::{capture, register_global_ops_sink, OpsSink};
+use crate::observability::queue::DurableQueue;
 use crate::role_runner::{RoleRunnerConfig, DEFAULT_ROLES};
-use crate::telemetry::ops::{bounded_labels, MetricName, MetricPoint, MetricValue};
+use crate::telemetry::ops::{
+    bounded_labels, MetricName, MetricPoint, MetricValue, STEP_OCCUPANCY_PROCESS_ID,
+};
 use crate::work_finder::TickReport;
+
+const FIXTURE_PROCESS: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001);
 
 fn value(point: &MetricPoint) -> i64 {
     match point.value {
@@ -57,6 +69,7 @@ fn role_busy_by_role_plus_role_idle_is_the_role_ceiling() {
         .find(|p| role(p).as_deref() == Some("judge"))
         .unwrap();
     assert_eq!(value(judge), 2);
+    assert_eq!(judge.labels, BTreeMap::from([("role".into(), "judge".into())]));
     let busy = sum(&points, MetricName::DispatchBusySlots, |r| r != SWEEP_ROLE);
     let idle = sum(&points, MetricName::DispatchRoleIdleSlots, |_| true);
     let ceiling = sum(&points, MetricName::DispatchRoleMaxConcurrent, |_| true);
@@ -123,12 +136,17 @@ fn the_role_ceiling_is_the_largest_enabled_roots() {
 fn step_slots_are_counted_by_role_under_the_step_pool() {
     let t = chrono::Utc::now();
     let running = BTreeMap::from([("judge", vec![t, t]), ("champion", vec![t])]);
-    let points = super::step_points(&running);
+    let points = super::step_points(&running, FIXTURE_PROCESS);
     let by_role: BTreeMap<String, i64> = points
         .iter()
         .map(|p| {
             assert_eq!(p.labels.get("pool").map(String::as_str), Some(super::STEP_POOL));
-            assert_eq!(bounded_labels(&p.labels), p.labels, "labels survive the policy");
+            let mut ordinary = p.labels.clone();
+            assert_eq!(
+                ordinary.remove(STEP_OCCUPANCY_PROCESS_ID),
+                Some(FIXTURE_PROCESS.to_string())
+            );
+            assert_eq!(bounded_labels(&ordinary), ordinary, "ordinary labels survive the policy");
             (p.labels["role"].clone(), value(p))
         })
         .collect();
@@ -138,6 +156,116 @@ fn step_slots_are_counted_by_role_under_the_step_pool() {
         assert_eq!(by_role[role], 0, "{role} reads 0, not absent");
     }
     assert_eq!(by_role.len(), 5);
+}
+
+#[test]
+fn record_tick_binds_slots_to_the_reporting_process() {
+    // Isolate the real global sink, registry map and OnceLock from other tests.
+    const CHILD: &str = "LOOM_TEST_STEP_OCCUPANCY_PROCESS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = TickReport {
+            occupancy: Some(2),
+            ..TickReport::default()
+        };
+        let tick = |roots: &[PathBuf]| {
+            capture::capture(|| super::record_tick(&report, roots))
+                .1
+                .metrics
+        };
+
+        assert!(tick(&[]).is_empty(), "no sink means no emission");
+        assert!(super::REPORTING_PROCESS_ID.get().is_none());
+        let queue = Arc::new(DurableQueue::open(dir.path().join("ops.jsonl"), 16));
+        register_global_ops_sink(OpsSink::new(queue, "same-host"));
+
+        let sweep = MetricPoint::int(MetricName::DispatchBusySlots, 2).label("role", SWEEP_ROLE);
+        assert_eq!(tick(&[]), vec![sweep.clone()], "unpublished registry");
+        assert!(super::REPORTING_PROCESS_ID.get().is_none());
+
+        let scope = dir.path().join("workspace");
+        super::set_steps(&scope, super::LiveSteps::new());
+        let empty = tick(std::slice::from_ref(&scope));
+        let instance = *super::REPORTING_PROCESS_ID.get().unwrap();
+        assert_eq!(instance.get_version_num(), 4);
+        assert_eq!(instance.get_variant(), uuid::Variant::RFC4122);
+        let identity = instance.to_string();
+        let slots: Vec<_> = empty
+            .iter()
+            .filter(|p| p.labels.contains_key(STEP_OCCUPANCY_PROCESS_ID))
+            .collect();
+        let expected_roles: BTreeSet<_> = crate::step_role::StepRole::ALL
+            .iter()
+            .map(|role| role.role_name())
+            .collect();
+        let observed_roles: BTreeSet<_> = slots
+            .iter()
+            .map(|point| point.labels["role"].as_str())
+            .collect();
+        assert_eq!(observed_roles, expected_roles);
+        assert_eq!(slots.len(), expected_roles.len());
+        assert!(slots
+            .iter()
+            .all(|p| p.name == MetricName::DispatchBusySlots && value(p) == 0));
+        assert!(slots
+            .iter()
+            .all(|p| p.labels[STEP_OCCUPANCY_PROCESS_ID] == identity));
+
+        let other = dir.path().join("other-workspace");
+        super::set_steps(
+            &other,
+            super::LiveSteps::from([("judge", vec![live("2026-11-18T00:00:00Z", Some(3))])]),
+        );
+        let occupied = tick(&[scope, other]);
+        assert!(occupied.contains(&sweep), "aggregate alert input is unchanged");
+        for point in occupied {
+            if point.name == MetricName::DispatchBusySlots && point.labels.contains_key("pool") {
+                assert_eq!(point.labels[STEP_OCCUPANCY_PROCESS_ID], identity);
+                if point.labels["role"] == "judge" {
+                    assert_eq!(value(&point), 1);
+                }
+            } else {
+                assert!(!point.labels.contains_key(STEP_OCCUPANCY_PROCESS_ID));
+            }
+        }
+        println!("capture-process={identity}");
+        // Keep this process alive until the parent has spawned the other one.
+        std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+        return;
+    }
+
+    let module = module_path!().split_once("::").unwrap().1;
+    let test_name = format!("{module}::record_tick_binds_slots_to_the_reporting_process");
+    let start = || {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let finish = |mut child: Child| {
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        stdout
+            .split_once("capture-process=")
+            .and_then(|(_, rest)| rest.lines().next())
+            .expect("isolated child did not emit a process token")
+            .to_owned()
+    };
+
+    let first = start();
+    let overlapping = start();
+    let first_id = finish(first);
+    let overlapping_id = finish(overlapping);
+    let restarted_id = finish(start());
+    assert_ne!(first_id, overlapping_id);
+    assert_ne!(first_id, restarted_id);
+    assert_ne!(overlapping_id, restarted_id);
 }
 
 fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -234,7 +362,7 @@ fn bucket_edges_and_a_future_start() {
         .map(value);
     assert_eq!(oldest, Some(4 * 3600));
     // The existing busy_slots step counts come from the same start times.
-    let busy = super::step_points(&running);
+    let busy = super::step_points(&running, FIXTURE_PROCESS);
     let doctor = busy
         .iter()
         .find(|p| p.labels["role"] == "doctor")
@@ -294,7 +422,7 @@ fn running_steps_are_counted_by_points_class_and_add_up_to_busy_slots() {
     assert_eq!(get("judge", "5"), 1);
     assert_eq!(get("curator", super::POINTS_UNSIZED), 0);
 
-    let busy = super::step_points(&super::step_starts(&running));
+    let busy = super::step_points(&super::step_starts(&running), FIXTURE_PROCESS);
     for p in &busy {
         let role = &p.labels["role"];
         let classes: i64 = super::POINTS_CLASSES.iter().map(|c| get(role, c)).sum();

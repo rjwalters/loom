@@ -952,6 +952,11 @@ pub(crate) enum ForgeAction {
     /// 0 HANDED-BACK, 10 ALREADY-ADVANCED (success: claim released only),
     /// 11 CLAIM-LOST (nothing written), 12 HEAD-MOVED (claim released only),
     /// 13 RACED (own add withdrawn), 1 FAILED (unread, or did not hold).
+    /// Self-bounded (#14165): per-call deadlines on every forge call, a
+    /// bounded lock wait, and `--deadline-secs` for the whole run (default
+    /// 300; a watchdog prints a named FAILED line instead of letting a
+    /// shorter caller wrapper kill the verb silently). FAILED lines name the
+    /// failing call; a 401 is classed `[github_auth]`.
     #[command(name = "doctor-handback")]
     DoctorHandback {
         /// The PR number.
@@ -962,6 +967,10 @@ pub(crate) enum ForgeAction {
         /// `owner/name` (default: this checkout's vetted origin).
         #[arg(long)]
         repo: Option<String>,
+        /// Overall budget in seconds (default 300). The verb answers — or
+        /// fails with a named reason — inside it (#14165).
+        #[arg(long)]
+        deadline_secs: Option<u64>,
     },
 
     /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
@@ -1285,11 +1294,13 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             pr,
             expected_head_sha,
             repo,
+            deadline_secs,
         } => {
             return super::forge_verdict_cmd::doctor_handback(
                 pr,
                 repo.as_deref(),
                 &expected_head_sha,
+                deadline_secs,
             );
         }
         ForgeAction::VerdictStaleNotice {
@@ -1683,12 +1694,14 @@ mod write_target_tests {
             pr: 7,
             expected_head_sha: "a".repeat(40),
             repo: Some("unmanaged/repo".into()),
+            deadline_secs: None,
         };
         assert_eq!(write_target(&explicit), Some(Some("unmanaged/repo".into())));
         let implicit = ForgeAction::DoctorHandback {
             pr: 7,
             expected_head_sha: "a".repeat(40),
             repo: None,
+            deadline_secs: None,
         };
         assert_eq!(write_target(&implicit), Some(None));
     }
