@@ -2558,10 +2558,11 @@ every `autonomous.autoUpdate.intervalSecs` (default 900 s). Envelopes carry
 `schema_version: 12`. **OTLP-only** (native: `false`). The body is the
 record's JSON. The scalars ride as `loom.auto_update.*` attributes
 (`AUTO_UPDATE_LOG_ATTRIBUTE_KEYS`, which the collector's `transform/privacy`
-allowlists). Four fields — `floor_not_rolling`, `floor_stall`,
-`roll_held` and `host_state` — are deliberately not in that list: they ride
+allowlists). Three floor-diagnostic fields — `floor_not_rolling`,
+`floor_stall` and `roll_held` — are deliberately not in that list: they ride
 in the record body only, never as `loom.auto_update.*` attributes, so a
-dashboard that needs them must extract them from the body. The record time
+dashboard that needs them must extract them from the body. `host_state` is
+body-only too: it has no `loom.auto_update.*` attribute key. The record time
 is the tick's start. Provenance is required: `loom` exports as
 `loom.auto_update.version` / `revision` / `tree_state` /
 `provenance_complete`, and a record whose provenance does not validate is
