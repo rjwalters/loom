@@ -16,11 +16,16 @@
 //! The release notes its read before it decides anything: for the role
 //! steps (`restore_role_step`) `note_step_post` precedes the release plan,
 //! so the post-state is noted even when the plan then leaves the claim
-//! untouched because a peer holds the item; the Builder's
-//! `restore_builder_step` notes its read unconditionally too. The only
-//! steps with no noted read are the `skip_label_flip` early return and a
-//! `ChampionMerge` step (no claim label); the tick reads the item itself
-//! for those. The queue is per workspace root and
+//! untouched (its `Nothing` plan fires when the claim label is already
+//! gone — the step released it, or another role advanced the item — or
+//! when the item is frozen); the Builder's `restore_builder_step` notes
+//! its read unconditionally too. The steps with no noted read are three:
+//! the `skip_label_flip` early return, a `ChampionMerge` step (no claim
+//! label), and a step whose item is held elsewhere — every caller of
+//! `restore_step_claim` (the reaper, startup adoption and a roll requeue)
+//! checks `step_claim_held_elsewhere` first and skips the release entirely,
+//! so no read and no note happen; the tick reads the item itself for those.
+//! The queue is per workspace root and
 //! in-memory: a step that ended just before a restart is not recorded, which
 //! costs at most one cooldown the ledger would have armed.
 
