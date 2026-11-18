@@ -115,6 +115,27 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Move an additional private-clone registration to the repository's
+    /// canonical URL after a forge transfer, keeping its clone, branches and
+    /// local changes (issue #14357). Runs under the exclusive idle account
+    /// lease; refuses (changing nothing) a busy or held account, a wrong
+    /// repository, and two populated clones. Safe to repeat.
+    Rebind {
+        /// The account's short profile name, or its registered email.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The registered (pre-transfer) repository URL.
+        #[arg(long, value_name = "URL")]
+        from: String,
+        /// The canonical repository URL after the transfer.
+        #[arg(long, value_name = "URL")]
+        to: String,
+        /// Verify everything and report; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) fn handle_session_command(
@@ -340,6 +361,44 @@ pub(crate) fn handle_session_command(
                 &private::session_recover(&workspace, &name, action, issue, &branch)?,
                 json,
             )
+        }
+        SessionAction::Rebind {
+            name,
+            from,
+            to,
+            dry_run,
+            json,
+        } => {
+            if !private::configured(&workspace, &name)? {
+                anyhow::bail!("account does not use a private workspace; nothing to rebind");
+            }
+            let report = private::rebind(&workspace, &name, &from, &to, dry_run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{}: {:?}: {} -> {} (clone {}, registration {})",
+                    report.account,
+                    report.status,
+                    report.from,
+                    report.to,
+                    report.clone_path,
+                    if report.registration_changed {
+                        "updated"
+                    } else {
+                        "unchanged"
+                    },
+                );
+            }
+            if report.status == private::RebindStatus::BothPopulated {
+                anyhow::bail!(
+                    "both {} and the old location hold a clone; nothing was changed. Publish or \
+                     discard one with `accounts session recover {name}` (or attach and move the \
+                     work by hand), then rerun",
+                    report.clone_path
+                );
+            }
+            Ok(())
         }
         SessionAction::Stop { name, force, json } => {
             if private::configured(&workspace, &name)? {

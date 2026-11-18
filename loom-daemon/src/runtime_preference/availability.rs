@@ -301,7 +301,20 @@ fn claude(root: &Path) -> Availability {
                 .to_string(),
         };
     }
-    let pool = crate::tokens_pool::select::spawnable_pool_state(root);
+    // #13873: `model_fallback::preflight_pool_state` shares the gate's
+    // scans but asks the pool-level question — account-wide unless the
+    // fallback block is enabled, in which case an account counts while
+    // some known model class stays unmarked for it, so this mapping holds
+    // only when no class could serve any spawn the pool would receive.
+    // `claude_gate` (`exhausted_for_launch`) keeps its finer per-launch
+    // scope: the resolved model's own rung chain, or the account-wide read
+    // when no model resolves. The two agree at the states the preference
+    // walk decides on — a pool no class can serve is Exhausted here and
+    // skipped there; anything else is Spawnable here and gated only
+    // per-launch — which is what
+    // `claude_availability_agrees_with_the_preflight_gate` pins, toggle
+    // included.
+    let pool = crate::sweep_registry::model_fallback::preflight_pool_state(root);
     if pool.total > 0 && pool.usable == 0 {
         return Availability::Exhausted {
             source,

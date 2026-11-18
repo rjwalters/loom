@@ -158,6 +158,21 @@ fn reason_blocks_class(reason: &str, queried_class: Option<&str>) -> bool {
     }
 }
 
+/// [`reason_blocks_class`] across every [`ClassQuery`] arm (#13873): the
+/// any-class arm blocks only entries that carry no recognizable class —
+/// a class-scoped entry leaves the account usable for the classes it does
+/// not name, which is exactly the readmission the selection-time model
+/// fallback depends on.
+fn reason_blocks_query(reason: &str, query: &ClassQuery<'_>) -> bool {
+    match query {
+        ClassQuery::AccountWide => true,
+        ClassQuery::Class(class) => reason_blocks_class(reason, Some(class)),
+        ClassQuery::AnyClass => reason_model_class(reason)
+            .and_then(model_class_of)
+            .is_none(),
+    }
+}
+
 /// On-disk retention for **non-auth** (exhaustion) entries on the routine
 /// cleanup path (#4643).
 ///
@@ -724,6 +739,49 @@ pub fn blocking_entry_in_dir_for_class(
     token_name: &str,
     model_class: Option<&str>,
 ) -> Option<BlockingEntry> {
+    let query = match model_class.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(class) => ClassQuery::Class(class),
+        None => ClassQuery::AccountWide,
+    };
+    blocking_entry_in_dir_for_query(tokens_dir, token_name, query)
+}
+
+/// [`blocking_entry_in_dir_for_class`] asking the **class-less-entry**
+/// question (#13873): only class-LESS entries (and auth entries, which are
+/// never class-scoped) block. This is *not* the "could any class spawn"
+/// read: an account whose live marks name every known class has no
+/// class-less entry yet cannot serve any class — that question is answered
+/// by scanning each known class
+/// ([`super::select::usable_account_count_any_class`]); this scan is its
+/// tested primitive, pinned here so the `ClassQuery` arms stay explicit.
+#[must_use]
+pub fn blocking_entry_in_dir_any_class(
+    tokens_dir: &Path,
+    token_name: &str,
+) -> Option<BlockingEntry> {
+    blocking_entry_in_dir_for_query(tokens_dir, token_name, ClassQuery::AnyClass)
+}
+
+/// How a `.bad_tokens` scan scopes class-marked entries (#13873). The
+/// account-wide and one-class arms are #8058's two existing questions; the
+/// any-class arm is the fallback preflights' (#13873).
+pub(crate) enum ClassQuery<'a> {
+    /// The account-wide question: every live entry blocks.
+    AccountWide,
+    /// One model class: entries scoped to a *different* class do not block.
+    Class(&'a str),
+    /// Any class: only class-less (or auth) entries block — the account can
+    /// still serve a class none of its marks name.
+    AnyClass,
+}
+
+/// The single scan every [`ClassQuery`] arm shares (#8058's one-scan rule,
+/// extended by #13873), so the three questions can never drift apart.
+fn blocking_entry_in_dir_for_query(
+    tokens_dir: &Path,
+    token_name: &str,
+    query: ClassQuery<'_>,
+) -> Option<BlockingEntry> {
     let bad_file = bad_tokens_path(tokens_dir);
     let text = std::fs::read_to_string(&bad_file).ok()?;
     let pattern = name_pattern(token_name);
@@ -751,9 +809,9 @@ pub fn blocking_entry_in_dir_for_class(
                 cooldown_remaining_secs: None,
             });
         }
-        // #8058: an entry scoped to a different model class does not block
-        // this query. A class-less entry, or a class-less query, always does.
-        if !reason_blocks_class(reason, model_class) {
+        // #8058/#13873: an entry the query does not scope out does not block
+        // this scan. A class-less entry, or a class-less query, always does.
+        if !reason_blocks_query(reason, &query) {
             continue;
         }
         // Non-auth (exhaustion) entries expire after the cooldown. A
