@@ -1311,7 +1311,10 @@ pub struct RoleRunnerConfig {
     /// trimmed; blank keys and blank/non-string values are dropped **per
     /// entry**, so an entry never emits `--effort ""`. Absent / malformed /
     /// non-object soft-fails to an empty map (every role falls through to the
-    /// global tier). Resolved by [`resolve_role_runner_effort`].
+    /// global tier). Since #14017 a key may be runtime-qualified
+    /// (`"<role>@<runtime>"`), which beats the bare role key for that runtime
+    /// only; a malformed qualified key is dropped with a warning. Resolved by
+    /// [`resolve_role_runner_effort_for_runtime`].
     pub role_efforts: BTreeMap<String, String>,
     /// `autonomous.roleRunner.architectMaxProposals` — the **per-invocation**
     /// cap on how many proposal issues one architect dispatch may file
@@ -3816,8 +3819,10 @@ pub use roster::spawn_roster_heartbeat_task;
 pub(crate) mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
-    is_cli_default_model_sentinel, resolve_role_runner_effort, resolve_role_runner_model,
-    ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL, UNSET_EFFORT_SOURCE,
+    is_cli_default_model_sentinel, resolve_role_runner_effort,
+    resolve_role_runner_effort_for_runtime, resolve_role_runner_model, ModelRuntimeMismatch,
+    CLI_DEFAULT_MODEL_SENTINEL, CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE,
+    UNSET_EFFORT_SOURCE,
 };
 
 // Per-reason skipped-tick tallies, with a race-free per-thread view for
