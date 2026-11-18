@@ -24,7 +24,11 @@ mod tests;
 pub mod transport;
 mod worker_setup;
 
-pub use lifecycle::{configured, recover, run_job, session_recover, start, status, stop};
+pub use lease::AccountBusy;
+pub use lifecycle::{
+    check_binding, configured, converge, recover, registered_repositories, run_job,
+    session_recover, start, status, stop, Converged,
+};
 pub use repository::WorkerCommand;
 
 use anyhow::{bail, Context, Result};

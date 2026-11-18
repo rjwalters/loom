@@ -145,11 +145,39 @@ echo "Test 4: two concurrent acquire attempts — exactly one wins (THE #5573 RA
 RESULTS_DIR="$SANDBOX/race-results"
 mkdir -p "$RESULTS_DIR"
 
+# Each attempt keeps its own output (attempt-N.log) and the lock path it
+# resolves (attempt-N.path), so a double-win (#14292, seen only on GitHub-hosted
+# runners) explains itself instead of leaving two bare exit codes. The path is
+# resolved the same way docs-guide-lock.sh does (git-common-dir + pwd -P).
+# Nothing from these files is printed unless the assertion below fails.
 race_attempt() {
     local id="$1"
     local rc=0
-    (cd "$SANDBOX_REPO" && "$LOCK_SH" acquire >/dev/null 2>&1) || rc=$?
+    (
+        cd "$SANDBOX_REPO" || exit 99
+        gcd="$(git rev-parse --git-common-dir 2>&1)"
+        resolved="$(cd "$(dirname "$gcd")" 2>/dev/null && pwd -P)/.loom/locks/docs-guide-lock"
+        echo "git-common-dir=$gcd resolved-lock-path=$resolved" > "$RESULTS_DIR/attempt-$id.path"
+        "$LOCK_SH" acquire
+    ) >"$RESULTS_DIR/attempt-$id.log" 2>&1 || rc=$?
     echo "$rc" > "$RESULTS_DIR/attempt-$id.rc"
+}
+
+# Print everything needed to diagnose a Test 4 double-win / no-win (failure only).
+race_diagnostics() {
+    local id
+    echo "--- Test 4 diagnostics (#14292) ---"
+    for id in 1 2; do
+        echo "attempt $id rc=$(cat "$RESULTS_DIR/attempt-$id.rc" 2>/dev/null || echo MISSING)"
+        echo "attempt $id path: $(cat "$RESULTS_DIR/attempt-$id.path" 2>/dev/null || echo MISSING)"
+        echo "attempt $id output:"
+        sed 's/^/    /' "$RESULTS_DIR/attempt-$id.log" 2>/dev/null || echo "    MISSING"
+    done
+    echo "sandbox repo (pwd -P): $(cd "$SANDBOX_REPO" && pwd -P)"
+    echo "sandbox filesystem type: $(stat -f -c %T "$SANDBOX_REPO" 2>/dev/null || stat -f %T "$SANDBOX_REPO" 2>/dev/null || echo unknown)"
+    echo "locks dir listing:"
+    ls -la "$SANDBOX_REPO/.loom/locks" 2>&1 | sed 's/^/    /'
+    echo "--- end Test 4 diagnostics ---"
 }
 
 race_attempt 1 &
@@ -170,6 +198,7 @@ if [[ "$WINS" == "1" ]]; then
     pass "exactly one of two truly-concurrent acquire attempts wins (rc1=$RC1, rc2=$RC2)"
 else
     fail "expected exactly one winner, got $WINS winners (rc1=$RC1, rc2=$RC2) — the race is NOT closed"
+    race_diagnostics
 fi
 
 if [[ -d "$LOCK_DIR_EXPECTED" ]]; then

@@ -3325,6 +3325,73 @@ else
 fi
 echo ""
 
+echo "Test: check-links — links inside fenced code blocks are not resolved (#14134)"
+CL_FENCE_OK="$TEST_DIR/check-links-fence-ok"
+seed_check_links_repo "$CL_FENCE_OK"
+cat > "$CL_FENCE_OK/.loom/docs/a.md" <<'EOF'
+# Fixture
+
+Backtick-fenced markdown example:
+
+```markdown
+See [ROADMAP](ROADMAP.md) and `.loom/docs/missing-backtick.md`.
+```
+
+  Indented tilde fence:
+
+  ~~~
+  [x](MISSING-TILDE.md) and `.loom/docs/missing-tilde.md`
+  ~~~
+
+Unterminated fence at EOF: the remainder counts as fenced.
+
+```
+[x](MISSING-EOF.md) and `.loom/docs/missing-eof.md`
+EOF
+set +e
+CL_FENCE_OK_OUT=$(cd "$CL_FENCE_OK" && bash "$VERIFY_INSTALL_SCRIPT" check-links 2>&1)
+CL_FENCE_OK_RC=$?
+set -e
+if [[ $CL_FENCE_OK_RC -eq 0 ]]; then
+  pass "check-links: markdown links and backtick paths inside \`\`\`/~~~ fences (incl. indented + unterminated) are skipped (exit 0)"
+else
+  fail "check-links: fenced links were resolved (rc=$CL_FENCE_OK_RC): $CL_FENCE_OK_OUT"
+fi
+echo ""
+
+echo "Test: check-links — dangling links outside a fence still fail next to a fence (#14134)"
+CL_FENCE_BAD="$TEST_DIR/check-links-fence-bad"
+seed_check_links_repo "$CL_FENCE_BAD"
+cat > "$CL_FENCE_BAD/.loom/docs/a.md" <<'EOF'
+```markdown
+[x](FENCED-OK.md) and `.loom/docs/fenced-ok.md`
+```
+
+Outside after the fence: [x](OUTSIDE-MD.md) and `.loom/docs/outside-bt.md`
+EOF
+set +e
+CL_FENCE_BAD_OUT=$(cd "$CL_FENCE_BAD" && bash "$VERIFY_INSTALL_SCRIPT" check-links 2>&1)
+CL_FENCE_BAD_RC=$?
+set -e
+if [[ $CL_FENCE_BAD_RC -eq 6 ]]; then
+  pass "check-links: dangling links outside a fence still exit 6"
+else
+  fail "check-links: expected exit 6 for dangling links outside a fence, got $CL_FENCE_BAD_RC"
+fi
+if echo "$CL_FENCE_BAD_OUT" | grep -qF "OUTSIDE-MD.md" \
+   && echo "$CL_FENCE_BAD_OUT" | grep -qF ".loom/docs/outside-bt.md"; then
+  pass "check-links: both outside-fence targets (markdown + backtick) named in output"
+else
+  fail "check-links: outside-fence targets not named: $CL_FENCE_BAD_OUT"
+fi
+if echo "$CL_FENCE_BAD_OUT" | grep -qF "FENCED-OK.md" \
+   || echo "$CL_FENCE_BAD_OUT" | grep -qF "fenced-ok.md"; then
+  fail "check-links: fenced targets were wrongly reported: $CL_FENCE_BAD_OUT"
+else
+  pass "check-links: fenced targets not reported"
+fi
+echo ""
+
 # ==========================================================================
 # Machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157)
 # ==========================================================================

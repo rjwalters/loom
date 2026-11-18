@@ -48,6 +48,8 @@ use std::path::Path;
 use anyhow::Result;
 use regex::Regex;
 
+use crate::forge_additive_migrations::{decode_contents, gh_head_sha, safe_path};
+
 /// Dependency-ish `Cargo.toml` table-name segments.
 const CARGO_SUSPECT_SEGMENTS: [&str; 6] = [
     "dependencies",
@@ -576,36 +578,11 @@ where
     Ok(())
 }
 
-/// Reject file names that could address a different API endpoint.
-fn safe_path(file: &str) -> bool {
-    !file.is_empty()
-        && !file.starts_with('/')
-        && !file
-            .split('/')
-            .any(|p| p.is_empty() || p == "." || p == "..")
-        && file
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
-}
-
-/// Decode a `repos/<r>/contents/<f>?ref=<sha>` JSON body to text.
-fn decode_contents(body: &[u8]) -> Result<String, String> {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine as _;
-    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    if v.get("encoding").and_then(|e| e.as_str()) != Some("base64") {
-        return Err("contents API returned no base64 body".into());
-    }
-    let raw: String = v
-        .get("content")
-        .and_then(|c| c.as_str())
-        .ok_or("contents API returned no content")?
-        .split_whitespace()
-        .collect();
-    let bytes = STANDARD.decode(raw).map_err(|e| e.to_string())?;
-    String::from_utf8(bytes).map_err(|e| e.to_string())
-}
-
+/// The PR-head contents of `file`, via the shared path-traversal guard, SHA
+/// lookup and base64 decoder. The contents read keeps this verb's own
+/// `forge.suspect_critical_diff` op label; the SHA read inside `gh_head_sha`
+/// carries `forge.additive_migrations` (the same trade
+/// `forge_locked_deps_only` already makes).
 fn gh_head_file(gh_bin: &Path, repo: &str, pr: u32, file: &str) -> Result<String, String> {
     if !safe_path(file) {
         return Err("unsafe file path".into());
@@ -618,13 +595,7 @@ fn gh_head_file(gh_bin: &Path, repo: &str, pr: u32, file: &str) -> Result<String
             path,
         )
     };
-    let pr_body = read(&format!("repos/{repo}/pulls/{pr}"))?;
-    let v: serde_json::Value = serde_json::from_slice(&pr_body).map_err(|e| e.to_string())?;
-    let sha = v
-        .pointer("/head/sha")
-        .and_then(|s| s.as_str())
-        .filter(|s| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or("PR head sha missing")?;
+    let sha = gh_head_sha(gh_bin, repo, pr)?;
     decode_contents(&read(&format!("repos/{repo}/contents/{file}?ref={sha}"))?)
 }
 

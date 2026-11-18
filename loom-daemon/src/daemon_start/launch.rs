@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::render::{self, Mechanism};
 use super::{advisories, marker, out, platform, watchdog_job, Ctx};
+use crate::launchd_env_drift::is_secret_env_key;
 
 /// `tail -n 20 "$START_LOG"` inside the `[[ -s ]]` guard, on stderr.
 fn dump_start_log(start_log: &Path) {
@@ -553,9 +554,9 @@ fn launchd_env_matches_plist(plist: &Path, print_output: &str) -> EnvVerdict {
             None => problems.push(format!(
                 "launchd env verification: key '{key}' is in the plist but missing from the running job's reported environment."
             )),
-            Some((_, got)) if got != &expected => problems.push(format!(
-                "launchd env verification: key '{key}' expected [{expected}] but the running job reports [{got}]."
-            )),
+            Some((_, got)) if got != &expected => {
+                problems.push(env_mismatch_message(&key, &expected, got));
+            }
             Some(_) => {}
         }
     }
@@ -563,6 +564,39 @@ fn launchd_env_matches_plist(plist: &Path, print_output: &str) -> EnvVerdict {
         EnvVerdict::Match
     } else {
         EnvVerdict::Mismatch(problems.join("\n"))
+    }
+}
+
+/// Env keys whose values are safe to echo in a verification diagnostic. Anything
+/// else (notably the forge tokens `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN`
+/// that `envh` forwards into the plist) is reported by key only (#14175).
+const NON_SECRET_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "LANG",
+    "TMPDIR",
+    "LOOM_RUNTIME",
+    "LOOM_ROLE",
+    "LOOM_TERMINAL_ID",
+];
+
+/// The mismatch line for one env key. Values are printed only for
+/// [`NON_SECRET_ENV_KEYS`] that the shared classifier
+/// ([`is_secret_env_key`], also used by the drift warning, #14352) does not
+/// flag as secret; for every other key the message says the values differ and
+/// carries neither value (no fingerprint) so a credential never reaches stderr,
+/// scrollback or a support paste (#14175).
+fn env_mismatch_message(key: &str, expected: &str, got: &str) -> String {
+    if NON_SECRET_ENV_KEYS.contains(&key) && !is_secret_env_key(key) {
+        format!(
+            "launchd env verification: key '{key}' expected [{expected}] but the running job reports [{got}]."
+        )
+    } else {
+        format!(
+            "launchd env verification: key '{key}' differs between the plist and the running job's reported environment (values withheld)."
+        )
     }
 }
 
@@ -723,6 +757,36 @@ mod tests {
         assert!(is_eio("Bootstrap failed: 5: Input/output error"));
         assert!(is_eio("5: Input/output error"));
         assert!(!is_eio("error 125: Input/output error"));
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_secret_values() {
+        let msg = env_mismatch_message("GH_TOKEN", "ghp_fake_expected_123", "ghp_fake_got_456");
+        assert!(msg.contains("GH_TOKEN"), "key is still named: {msg}");
+        assert!(!msg.contains("ghp_fake_expected_123"), "expected leaked: {msg}");
+        assert!(!msg.contains("ghp_fake_got_456"), "actual leaked: {msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_loom_prefixed_credential_values() {
+        for key in ["LOOM_PERSONAL_GH_TOKEN", "LOOM_OPENWEIGHTS_API_KEY"] {
+            let msg = env_mismatch_message(key, "secret_expected_123", "secret_got_456");
+            assert!(msg.contains(key), "key is still named: {msg}");
+            assert!(!msg.contains("secret_expected_123"), "expected leaked: {msg}");
+            assert!(!msg.contains("secret_got_456"), "actual leaked: {msg}");
+        }
+    }
+
+    #[test]
+    fn env_mismatch_message_stays_fail_closed_for_unknown_non_loom_keys() {
+        let msg = env_mismatch_message("SOME_OTHER_VAR", "expected_val", "got_val");
+        assert!(!msg.contains("expected_val") && !msg.contains("got_val"), "{msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_keeps_values_for_allowlisted_keys() {
+        let msg = env_mismatch_message("PATH", "/usr/bin", "/bin");
+        assert!(msg.contains("[/usr/bin]") && msg.contains("[/bin]"), "{msg}");
     }
 
     #[test]

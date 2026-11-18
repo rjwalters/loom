@@ -15,9 +15,8 @@
 //! rejects a `--repo` argument, and it answers only when `GH_REPO` names the
 //! expected repo.
 //!
-//! Sibling file rather than an inline `mod`: `guards.rs` is over the
-//! file-size ratchet threshold (`scripts/file-size-baseline.txt`), and keeping
-//! test modules out of it is that policy's own preferred remedy.
+//! Sibling file rather than an inline `mod`, to keep test modules out of the
+//! already-large `guards.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

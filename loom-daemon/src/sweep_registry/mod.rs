@@ -1040,7 +1040,7 @@ pub struct CancelOutcome {
     /// `true` when the child did not exit within the grace window and
     /// a SIGKILL was issued.
     pub sigkill_sent: bool,
-    /// `true` when the sweep was in `Running`/`Pending` state at the
+    /// `true` when the sweep was in `Running` state at the
     /// moment of the call; `false` when it was already terminal.
     pub was_running: bool,
 }
@@ -1403,7 +1403,7 @@ impl SweepRegistry {
         })
     }
 
-    /// For a `Running`/`Pending` entry with no `latest_phase` yet (i.e. every
+    /// For a `Running` entry with no `latest_phase` yet (i.e. every
     /// live sweep — see the [`SweepInfo::latest_phase`] doc comment), overlay
     /// the phase read live from the on-disk checkpoint
     /// (`.loom/sweep-checkpoint/issue-<N>.json`), the same source
@@ -1514,7 +1514,7 @@ impl SweepRegistry {
     /// Idempotency-key dedup lookup consulted first by `begin_issue_dispatch`
     /// (Issue #6592 preserves this contract unchanged across the
     /// begin/poll/finish split — see `begin_issue_dispatch_idempotency_hit_returns_done_without_spawning`
-    /// in `dispatch.rs`'s tests). Deliberately scoped to `Running`/`Pending`
+    /// in `dispatch.rs`'s tests). Deliberately scoped to `Running`
     /// only: a same-key retry arriving after the original sweep already
     /// reached a terminal state (`Exited`/`Crashed`) intentionally does NOT
     /// dedup against it and proceeds to a fresh dispatch — a finished sweep
@@ -1548,7 +1548,7 @@ impl SweepRegistry {
     /// coverage.**
     pub(crate) fn find_running_by_key(&self, key: &str) -> Option<&SweepInfo> {
         self.entries.values().find(|info| {
-            matches!(info.state, SweepState::Running | SweepState::Pending)
+            matches!(info.state, SweepState::Running)
                 && info.idempotency_key.as_deref() == Some(key)
         })
     }
@@ -1559,9 +1559,7 @@ impl SweepRegistry {
 /// body taking that path directly, usable from [`RegistrySnapshot::list`]
 /// (Issue #7526) without a `&SweepRegistry` receiver / the registry's mutex.
 fn overlay_live_phase_at(checkpoint_dir: &Path, info: &mut SweepInfo) {
-    if info.latest_phase.is_none()
-        && matches!(info.state, SweepState::Running | SweepState::Pending)
-    {
+    if info.latest_phase.is_none() && matches!(info.state, SweepState::Running) {
         match info.kind {
             SweepKind::Issue(issue) => {
                 let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));

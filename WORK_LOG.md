@@ -14,8 +14,87 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-18
+
+- **Issue #14016** (closed): Floor-driven artifact fetch logs "backing off 60s" but retries only at the next update tick
+- **PR #14152**: fix(daemon): retry auto-update at its stated backoff and name gh release-read failures
+- **Issue #13831** (closed): Remove SweepState::Pending: a lifecycle state nothing constructs, matched at 25 production sites
+- **PR #14148**: refactor: remove the never-constructed SweepState::Pending variant
+- **Issue #13940** (closed): wait-checks: a previously-present check vanishing should not satisfy GREEN
+- **PR #14050**: wait-checks: fold a startup-failed run owning no check runs in as RED
+- **Issue #13974** (closed): Assert the Detect Changes fail-open shape in the merge_group_ci workflow tests (drift guard for #13971)
+- **PR #14146**: test: guard Detect Changes fail-open shape in ci.yml
+- **PR #14063**: fix: bump quinn-udp to 0.5.16 in Cargo.lock (RUSTSEC-2026-0538)
+- **Issue #14093** (closed): self-release-calibration verb misses live self-release records (marker is mid-comment, parser requires comment to start with it)
+- **PR #14137**: fix: recognise self-release marker embedded mid-comment in calibration
+- **Issue #14061** (closed): RUSTSEC-2026-0543: chrono 0.4.45 unmaintained — blocks cargo audit / cargo deny advisories on main (no patched release)
+- **PR #14115**: chore: ignore RUSTSEC-2026-0543 (chrono unmaintained) in deny.toml and audit.toml
+- **Issue #13776** (closed): Remove write-only prompt_changes pipeline (git_parser, CaptureGitChanges): no reader, uncorrelatable rows
+- **PR #14144**: refactor: remove write-only prompt_changes pipeline and git_parser
+- **Issue #13998** (closed): check-claim owned lease: unknown-host filter is skipped at runtime; lease-host resolution loose ends
+- **PR #14064**: fix: align lease-host resolution across check-claim, lease scripts, and session forwarding
+- **Issue #14010** (closed): duplicate-hook-wiring: the defaults/hooks/ exclusion is per-file, not per-command (false negative on a mixed project settings.json)
+- **PR #14120**: docs: fix duplicate_hooks_invariant docstring — whole-file exclusion, not per-command
+- **Issue #14087** (closed): Refresh remaining stale shepherd examples in loom CLI help text (and the removed `scale` verb in agent-pool-cli.md)
+- **PR #14147**: docs: replace stale shepherd examples in CLI help and drop unimplemented scale verb
+- **Issue #13818** (closed): Remove dead spawn-loop-state.json reader: loom-clean deletes live claim locks because its only liveness source is never present
+- **PR #14044**: fix: judge claim locks by their own owner.json liveness; drop retired spawn-loop-state reader
+- **Issue #14012** (closed): resync deletes retired defaults files but leaves their installed_files manifest entries behind
+- **PR #14090**: fix: prune retired entries from installed_files manifest during resync
+- **Issue #13876** (closed): Concurrent Champion passes create duplicate merge-risk-hold digest issues, and Step 0 then silently ignores the loser forever
+- **PR #14077**: fix: dedupe Champion merge-risk-hold digest issues
+- **Issue #13982** (closed): Resync waiver refuses merge-pr.sh even when it is byte-identical to the upstream tag, so every release that touches it holds the whole fleet
+- **PR #14130**: fix(resync-waiver): waive byte-identical gate, role and skill files on the non-strict proof
+- **Issue #14178** (closed): main CI red: Lint compat contract — daemon 0.19.1311 has no resolve-role-model subcommand
+- **PR #14180**: fix: raise resolve-role-model daemon floor to 0.19.1312
+- **Issue #14047** (closed): quarantine clear and TTL expiry do not lift the captain's no-progress hold
+- **PR #14142**: fix: lift the captain's no-progress hold on an operator's quarantine clear
+- **Issue #13893** (closed): Token exhaustion: captain-coordinated probe shared by all workers; weekly marks follow probe evidence, not a fixed 6 h timer
+- **PR #14037**: fix: hold weekly-exhausted token marks until the probe-recorded 7d reset
+
 ### 2026-11-17
 
+- **Issue #13944** (closed): Remove write-only Nudge fields and MISSED_TYPES from forge_mirror wake.rs
+- **PR #14126**: refactor: remove write-only Nudge fields and MISSED_TYPES from forge_mirror wake
+- **Issue #13956** (closed): Make role model, provider and effort configurable for attended subagents (experiment support)
+- **PR #14097**: feat: resolve-role-model — per-role model config for attended subagents
+- **Issue #13910** (closed): generate-agents-md.sh's relative paths assume the source checkout layout and break in every installed repo
+- **PR #14131**: fix: resolve generate-agents-md.sh source paths per layout
+- **Issue #14068** (closed): outcome_ledger module doc: the state-refusal cooldown is described as broadcast, but refusals have been host-local since #11909
+- **PR #14127**: docs: state refusal cooldowns are host-local in ledger docs
+- **Issue #13880** (closed): Champion capped-PR keep-parked marker key is free-form: five duplicate verdicts on one PR, four mis-keyed (class of #6860/#6872)
+- **PR #14085**: fix(champion): suppress capped-PR keep-parked reposts on zero-rejection threads
+- **Issue #14009** (closed): Review the WORK_PLAN.md and ROADMAP.md conventions: what Guide should do in a repo that keeps a hand-written roadmap
+- **PR #14118**: docs(guide): write the WORK_PLAN snapshot vs ROADMAP direction convention
+- **Issue #13902** (closed): Champion Priority 3 re-draws a proposal it just routed to Curator, spending the revision ladder before Curator's turn
+- **PR #14089**: fix: Champion --issue step 1 rejects loom:triage proposals as Curator's turn
+- **Issue #13912** (closed): Dedupe daemon-reply error arms copy-pasted across loom-daemon CLI handlers
+- **PR #14083**: refactor: dedupe daemon-failure match arms into shared exit_on_daemon_failure helper
+- **PR #14107**: docs(hermit): drop stale exclusion count from §4 detector sentence
+- **PR #14104**: docs(guide): make WORK_PLAN.md's Ready section self-describe its #7083 exclusions
+- **PR #14098**: docs(judge): require a local test run before approving no-checks PRs
+- **PR #14091**: refactor: drive role-loop tests through the production multi-workspace loop
+- **PR #14079**: fix: forge may-write probes under a covered per-owner writer credential
+- **PR #14076**: fix: held-PR digest reads the ratification hold kind via a (marker, reason rule) table
+- **PR #14073**: fix: scope private-clone unpushed refusal to unnamed work; add session recover
+- **PR #14070**: fix: champion-hold ratification fails closed when a candidate head read fails
+- **PR #14060**: fix(ratification): gate key markers on a parsed verdict, post review text only
+- **PR #14058**: refactor: remove the inert per-host overflow slot's write, restart and report paths
+- **PR #14057**: fix: match underscore-emphasised out-of-band phrases in the AC gate
+- **PR #14053**: ledger: cool down standing admission refusals via the state-refusal streak
+- **PR #14043**: fix: skip unreaped git zombies in the self-heal's live-git probe
+- **Issue #14065** (closed): hermit.md §4 prose still says "all three exclusions" after the fourth was added
+- **Issue #14032** (closed): Step refused at admission for a standing reason is retried every tick with no back-off
+- **Issue #14030** (closed): Private clone with unpushed commits refuses every later job and has no supported recovery verb
+- **Issue #14004** (closed): classify-ac-verification: underscore-emphasised phrase (`_next run_`) no longer matches the AC gate vocabulary
+- **Issue #13932** (closed): champion-hold ratification returns a non-deterministic files= evidence list at rc=0: a subset of the changed paths is silently omitted against an unchanged head
+- **Issue #13929** (closed): forge may-write false negative: refuses a repo a configured per-owner writer (#12446) can mint for, and the refusal does not name the mintable route
+- **Issue #13928** (closed): WORK_PLAN.md Ready section/row apply the #7083 exclusion silently — the artifact reads lower than the loom:issue query it is named after, and never says why
+- **Issue #13885** (closed): Champion held-PR digest reports 'reason unrecorded' for a ratification-held PR: Step 1's marker list was never extended by #12992
+- **Issue #13883** (closed): Judge: when a pull request has no checks at all, run the repo's test command before approving
+- **Issue #13832** (closed): Remove the single-workspace role and main-health cadence loops: production runs only the multi-workspace ones, and 7 tests exercise the stale copy
+- **Issue #13829** (closed): Remove the inert per-host overflow slot: nothing can set the flag since #11508, but its write, restart and report paths remain
+- **Issue #13762** (closed): Ratification lane posts ratify:key markers with no verdict, as the PR author, with wrapper logs as the body
 - **PR #14072**: fix: drop the write-only no-op cooldown counter; report the hold streak over IPC
 - **PR #14071**: feat: mark each roles draw --explain candidate admitted or not on this host
 - **PR #14062**: refactor(cli): collapse loom dispatch arms and drop inline help fallback

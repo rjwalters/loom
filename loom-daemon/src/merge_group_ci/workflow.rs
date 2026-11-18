@@ -42,6 +42,8 @@ pub struct Step {
     /// 0-based position in `steps:`.
     pub index: usize,
     pub line: usize,
+    /// The step's `id:`, which later steps reference as `steps.<id>.*`.
+    pub id: Option<String>,
     pub name: Option<String>,
     pub uses: Option<String>,
     /// The `run:` script body, when the step has one.
@@ -98,6 +100,8 @@ pub struct Job {
     pub concurrency: Option<Concurrency>,
     pub permissions: Option<String>,
     pub steps: Vec<Step>,
+    /// The job's `outputs:` as raw `(name, expression)` pairs, in file order.
+    pub outputs: Vec<(String, String)>,
     /// Reason text after [`PR_ONLY_MARKER`], when the job carries one.
     pub pr_only: Option<String>,
 }
@@ -306,6 +310,7 @@ fn job(id: &str, line: usize, n: &Node, block: &[&str]) -> Job {
                 .map(|(index, st)| Step {
                     index,
                     line: st.entries().first().map_or(line, |e| e.line),
+                    id: st.get("id").and_then(Node::as_str).map(str::to_string),
                     name: st.get("name").and_then(Node::as_str).map(str::to_string),
                     uses: st.get("uses").and_then(Node::as_str).map(str::to_string),
                     run: st.get("run").and_then(Node::as_str).map(str::to_string),
@@ -366,6 +371,15 @@ fn job(id: &str, line: usize, n: &Node, block: &[&str]) -> Job {
             .map(|c| concurrency(c, concurrency_line)),
         permissions: n.get("permissions").map(render_compact),
         steps,
+        outputs: n
+            .get("outputs")
+            .map(|o| {
+                o.entries()
+                    .iter()
+                    .map(|e| (e.key.clone(), e.value.as_str().unwrap_or_default().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         pr_only,
     }
 }

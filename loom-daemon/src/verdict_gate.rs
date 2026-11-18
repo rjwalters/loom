@@ -407,15 +407,20 @@ pub fn body_sha(body: &str) -> String {
     hex::encode(Sha256::digest(body.trim_end_matches(['\n', '\r']).as_bytes()))
 }
 
-/// Whether `expected` is the hash of `body`: the canonical [`body_sha`], or that
-/// same trimmed body plus exactly one `\n`, which is what
-/// `gh api … --jq .body | sha256sum` yields (jq appends the newline).
+/// Whether `expected` is the hash of `body`, compared case-insensitively.
+/// Accepts: the canonical [`body_sha`] (trailing newlines trimmed); that
+/// trimmed body plus exactly one `\n`, which `gh api … --jq .body | sha256sum`
+/// yields when the body has no trailing newline; and (#13992) the raw
+/// untrimmed body, with or without that one `\n` — the forms the same command
+/// yields when the body itself already ends in a newline.
 fn body_sha_matches(expected: &str, body: &str) -> bool {
     use sha2::{Digest, Sha256};
     let expected = expected.trim();
     let trimmed = body.trim_end_matches(['\n', '\r']);
     expected.eq_ignore_ascii_case(&body_sha(body))
         || expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(format!("{trimmed}\n"))))
+        || expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(body.as_bytes())))
+        || expected.eq_ignore_ascii_case(&hex::encode(Sha256::digest(format!("{body}\n"))))
 }
 
 /// The issue numbers a PR body closes or contributes to (`Closes #N`,
@@ -568,8 +573,10 @@ pub fn stale_read(
             if !body_sha_matches(expected, body) {
                 why.push(format!(
                     "issue #{n}'s body changed since this review started (it no longer matches \
-                     the body you reviewed). The gate compares the sha256 of the issue body with \
-                     trailing newlines trimmed; recompute yours with: printf %s \"$(gh \
+                     the body you reviewed) — or the hash form is wrong: the gate accepts the \
+                     sha256 of the body you read, trailing newlines trimmed, and also the raw \
+                     body with or without one trailing newline. Recompute yours and retry in \
+                     this dispatch with: printf %s \"$(gh \
                      api repos/OWNER/REPO/issues/{n} --jq .body)\" | sha256sum | cut -d' ' -f1"
                 ));
             }

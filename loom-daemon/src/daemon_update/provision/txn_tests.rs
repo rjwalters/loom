@@ -3,6 +3,7 @@
 //! Every test works in its own tempdir; none touches a real daemon
 //! destination, supervisor or state dir.
 
+use crate::exec_test_support::write_executable;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -29,15 +30,6 @@ fn stub_body(version: &str) -> Vec<u8> {
     format!("#!/bin/sh\necho \"loom-daemon {version} (commit abc1234)\"\n").into_bytes()
 }
 
-fn write_exec(path: &Path, body: &[u8]) {
-    std::fs::write(path, body).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
 /// A tempdir holding `loom-daemon` (when `live` is given) plus a second
 /// tempdir for candidates, so candidates never show up beside the destination.
 struct Fixture {
@@ -51,7 +43,7 @@ impl Fixture {
         let dir = tmpdir();
         let dest = dir.path().join("loom-daemon");
         if let Some(body) = live {
-            write_exec(&dest, body);
+            write_executable(&dest, body);
         }
         Self {
             dir,
@@ -62,7 +54,7 @@ impl Fixture {
 
     fn candidate(&self, name: &str, body: &[u8]) -> PathBuf {
         let p = self.src.path().join(name);
-        write_exec(&p, body);
+        write_executable(&p, body);
         p
     }
 
@@ -273,7 +265,7 @@ fn a_symlinked_destination_keeps_the_binary_it_pointed_at() {
     let old = stub_body("1");
     let fx = Fixture::new(None);
     let real = fx.src.path().join("real");
-    write_exec(&real, &old);
+    write_executable(&real, &old);
     std::os::unix::fs::symlink(&real, &fx.dest).unwrap();
 
     assert!(install_to(&fx.candidate("fresh", &stub_body("2")), &fx.dest));
@@ -418,7 +410,7 @@ fn publish_refuses_a_file_that_was_not_staged_for_the_destination() {
     let fx = Fixture::new(Some(&old));
     let stray = fx.candidate("fresh", &stub_body("2"));
     let beside = fx.dir.path().join("fresh");
-    write_exec(&beside, &stub_body("2"));
+    write_executable(&beside, stub_body("2"));
 
     for not_staged in [&stray, &beside] {
         let err = publish(not_staged, &fx.dest).unwrap_err();
@@ -718,7 +710,7 @@ fn a_missing_or_corrupt_previous_binary_is_refused_and_nothing_is_written() {
 #[test]
 fn a_destination_another_install_replaced_is_never_overwritten() {
     let (fx, id) = installed_v2_over_v1();
-    write_exec(&fx.dest, &stub_body("3"));
+    write_executable(&fx.dest, stub_body("3"));
     let why = refused(restore(&fx.dest, &id));
     assert!(why.contains("not the candidate"), "{why}");
     assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("3"));
@@ -859,7 +851,7 @@ fn a_restorer_waits_for_a_publisher_then_refuses_instead_of_overwriting_it() {
         finishes_within(std::time::Duration::from_millis(300), move || restore(&dest, &id));
     assert!(!done, "the restore must wait for the lock holder");
     // The competing publisher lands another install in the check/rename gap.
-    write_exec(&fx.dest, &stub_body("3"));
+    write_executable(&fx.dest, stub_body("3"));
     drop(lock);
     let why = refused(handle.join().unwrap());
     assert!(why.contains("not the candidate"), "{why}");

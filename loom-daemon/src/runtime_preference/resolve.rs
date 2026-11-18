@@ -139,6 +139,31 @@ impl SkipReason {
         }
     }
 
+    /// Whether this skip is an admission rejection that ONLY verified
+    /// private-clone containment could lift — the
+    /// [`RuntimeRejection::containment_eligible`](crate::runtime_admission::RuntimeRejection::containment_eligible)
+    /// shape (a Codex tap whose single unmet requirement is
+    /// `worktreeIsolation`), reconstructed from the recorded skip because the
+    /// walk drops the rejection itself. `runtime` is the skipped tap's own
+    /// runtime id, which is the string the rejection carried: admission
+    /// resolves the binding from it, so an id that does not name the Codex
+    /// manifest exactly cannot have produced a containment-eligible rejection.
+    ///
+    /// `false` for every other skip: an `Unavailable` tap stays skipped on a
+    /// launch path with a preparer too, and a `NotAdmitted` naming any other
+    /// unmet capability — or any additional one — is a refusal containment
+    /// never overrides (#8787).
+    #[must_use]
+    pub fn containment_liftable(&self, runtime: &str) -> bool {
+        match self {
+            Self::NotAdmitted { unmet, .. } => {
+                runtime == "codex"
+                    && unmet.as_slice() == [crate::runtime_admission::CONTAINMENT_SATISFIES]
+            }
+            _ => false,
+        }
+    }
+
     /// The parenthetical detail rendered after [`Self::kind`]. Deliberately
     /// short — a refusal's own wording is capped at [`SUMMARY_DETAIL_MAX`]
     /// characters, since this rides on the one-line preference marker — the
@@ -177,7 +202,12 @@ impl SkipReason {
                     format!("{named}: {}", bound(extra))
                 }
             }
-            Self::Unavailable { source, detail } => format!("{source}: {detail}"),
+            // Flattened but deliberately uncapped: an unavailable pool's
+            // session detail rides whole on the marker (pinned by the
+            // session-down tests); only control characters are rewritten.
+            Self::Unavailable { source, detail } => {
+                bounded_detail(&format!("{source}: {detail}"), None)
+            }
             Self::Ceiling { detail, .. } => detail.clone(),
         }
     }
@@ -259,6 +289,23 @@ impl<T> Resolution<T> {
     #[must_use]
     pub fn is_empty_list(&self) -> bool {
         self.order.is_empty()
+    }
+
+    /// `true` when at least one skipped tap was refused ONLY by a
+    /// containment-liftable admission rejection ([`SkipReason::
+    /// containment_liftable`], #13983). A launch path that carries a
+    /// preparer (#8787 — the step spawn's `Preparer`) may still admit such a
+    /// tap, so `chosen == None` crossed with this is **not** proof that the
+    /// real launch path is exhausted: a read-only probe resolving with
+    /// `NoContainment` sees a rejection the spawn would not. Callers that
+    /// hold dispatch on a fail-closed walk must treat this as non-holding —
+    /// the dispatch's own pre-spawn gate still refuses cleanly (before any
+    /// claim) when containment cannot in fact be proven.
+    #[must_use]
+    pub fn any_containment_liftable_skip(&self) -> bool {
+        self.skipped
+            .iter()
+            .any(|skip| skip.reason.containment_liftable(&skip.tap.runtime))
     }
 
     /// `true` when the chosen tap is not the most-preferred one — i.e. the
@@ -360,6 +407,37 @@ impl<T> Resolution<T> {
             ));
         }
         out
+    }
+
+    /// [`Self::exhausted_diagnostic`] flattened onto ONE line for the daemon
+    /// log (#14026): every skipped candidate and its full, uncapped reason,
+    /// so a filter by level or time window keeps them. The multi-line form
+    /// stays the operator CLI / role-log diagnostic; this is the line the
+    /// `runtime_rejected` refusal renders, so the wording a `skipped=` field
+    /// caps at [`SUMMARY_DETAIL_MAX`] is carried in full here.
+    #[must_use]
+    pub fn exhausted_summary_line(&self, role: &str) -> String {
+        if self.skipped.is_empty() {
+            return format!(
+                "runtime_rejected role={role}: preference list is empty — no candidate to \
+                 admit (preference order: {})",
+                self.order_summary()
+            );
+        }
+        let candidates = self
+            .skipped
+            .iter()
+            .map(|skipped| {
+                format!(
+                    "{} -> {}({})",
+                    skipped.tap,
+                    skipped.reason.kind(),
+                    skipped.reason.summary_capped(None)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("runtime_rejected role={role}: {candidates}")
     }
 }
 

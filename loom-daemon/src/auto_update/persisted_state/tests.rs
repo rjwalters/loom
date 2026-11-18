@@ -52,6 +52,7 @@ fn decide(
         check: &check,
         tree_clean: false,
         in_flight: 0,
+        repo_source: None,
     };
     state.decide(now, &inputs, SETTLE, Duration::from_secs(3600))
 }

@@ -66,6 +66,23 @@ fn is_tracked_key(key: &str) -> bool {
     key.starts_with("LOOM_") || matches!(key, "GH_TOKEN" | "GITEA_TOKEN" | "FORGE_TOKEN")
 }
 
+/// Name suffixes that mark an environment variable as a credential. Matched
+/// case-insensitively against the end of the key, so it also catches keys under
+/// the `LOOM_` prefix (`LOOM_PERSONAL_GH_TOKEN`, `LOOM_OPENWEIGHTS_API_KEY`).
+const SECRET_ENV_KEY_SUFFIXES: &[&str] = &["TOKEN", "SECRET", "PASSWORD", "API_KEY", "CREDENTIAL"];
+
+/// The single answer to "must this env key's value be withheld from
+/// diagnostics?". Shared by [`display_value`] (drift warning) and
+/// `daemon_start::launch::env_mismatch_message` (launchd env verification) so
+/// the two sinks cannot drift apart (#14352). Name-pattern based rather than an
+/// exact denylist, so the next credential-named variable fails closed instead
+/// of open. Covers `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN` via the `TOKEN`
+/// suffix.
+pub(crate) fn is_secret_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    SECRET_ENV_KEY_SUFFIXES.iter().any(|s| upper.ends_with(s))
+}
+
 /// Resolve the launchd label this host's daemon runs under: `LOOM_LAUNCHD_LABEL`
 /// wins (mirrors `resolve_launchd_label()` in `loom-daemon-start.sh`), else the
 /// shared default constant.
@@ -174,13 +191,14 @@ fn env_drift(
 /// the environment and must never be echoed in full — only the last 4
 /// characters (mirrors `credential_preflight::env_fingerprint`'s convention),
 /// enough to tell "differs" from "same" without leaking the credential.
-/// `LOOM_*` keys are plain config (paths, booleans, small enums) and are safe
-/// to show verbatim.
+/// Which keys count as secret is decided by [`is_secret_env_key`] (shared with
+/// `daemon_start::launch::env_mismatch_message`); every other `LOOM_*` key is
+/// plain config (paths, booleans, small enums) and is safe to show verbatim.
 fn display_value(key: &str, value: &Option<String>) -> String {
     match value {
         None => "(unset)".to_string(),
         Some(v) => {
-            if matches!(key, "GH_TOKEN" | "GITEA_TOKEN" | "FORGE_TOKEN") {
+            if is_secret_env_key(key) {
                 let tail: String = v
                     .chars()
                     .rev()
@@ -495,6 +513,51 @@ mod tests {
     #[test]
     fn loom_star_values_are_shown_verbatim() {
         assert_eq!(display_value("LOOM_WORKSPACE", &Some("/repo".to_string())), "/repo");
+        assert_eq!(
+            display_value("LOOM_LAUNCHD_LABEL", &Some("com.loom.daemon".to_string())),
+            "com.loom.daemon"
+        );
+    }
+
+    #[test]
+    fn classifier_flags_credential_named_keys_including_under_the_loom_prefix() {
+        for key in [
+            "GH_TOKEN",
+            "GITEA_TOKEN",
+            "FORGE_TOKEN",
+            "LOOM_PERSONAL_GH_TOKEN",
+            "LOOM_OPENWEIGHTS_API_KEY",
+            "LOOM_SOME_SECRET",
+            "LOOM_DB_PASSWORD",
+            "LOOM_SERVICE_CREDENTIAL",
+            "TOKEN",
+        ] {
+            assert!(is_secret_env_key(key), "{key} must be classified secret");
+        }
+    }
+
+    #[test]
+    fn classifier_leaves_plain_config_keys_alone() {
+        for key in [
+            "LOOM_WORKSPACE",
+            "LOOM_LAUNCHD_LABEL",
+            "LOOM_RUNTIME",
+            "PATH",
+            "HOME",
+            "LOOM_TOKEN_POOL_DIR",
+        ] {
+            assert!(!is_secret_env_key(key), "{key} must not be classified secret");
+        }
+    }
+
+    #[test]
+    fn loom_prefixed_token_values_are_masked_not_shown_verbatim() {
+        let full = Some("ghp_personal1234567890".to_string());
+        let rendered = display_value("LOOM_PERSONAL_GH_TOKEN", &full);
+        assert!(!rendered.contains("personal1234567890"), "must not leak: {rendered}");
+        assert!(rendered.ends_with("7890"));
+        assert_eq!(display_value("LOOM_PERSONAL_GH_TOKEN", &Some(String::new())), "***");
+        assert_eq!(display_value("LOOM_PERSONAL_GH_TOKEN", &None), "(unset)");
     }
 
     #[test]
