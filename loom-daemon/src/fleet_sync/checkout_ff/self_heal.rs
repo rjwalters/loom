@@ -153,6 +153,7 @@ fn rehome(env: &Env<'_>, root: &Path, branch: &str, gd: &Path, net: &mut Net) {
         Ok(None) => return,
         Err(why) => {
             log::debug!("checkout_ff: {}: self-heal: stays off `{branch}`: {why}", root.display());
+            net.stayed_off = Some(why);
             return;
         }
     };

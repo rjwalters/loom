@@ -681,6 +681,10 @@ struct Net {
     /// for its `checkout.freshness` record. Reset before each attempt.
     last_head: Option<String>,
     repairs: Vec<self_heal::Repair>,
+    /// Why the self-heal left the checkout being attempted off its default
+    /// branch (the `Err` of `classify::stranded`), for the `wrong-branch`
+    /// detail. Reset before each attempt, so it is said once per pass.
+    stayed_off: Option<String>,
 }
 
 /// Run one checkout pass over `roots`. Never fails: every failure is a state.
@@ -697,6 +701,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
             break;
         }
         net.last_head = None;
+        net.stayed_off = None;
         let low_before = net.low_disk;
         let found = attempt(env, root, &mut net);
         let now = (env.clock)();
@@ -874,6 +879,10 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
             let detail = match on {
                 Some(on) => format!("on `{on}`, not `{branch}`"),
                 None => format!("detached HEAD, not on `{branch}`"),
+            };
+            let detail = match net.stayed_off.take() {
+                Some(why) => format!("{detail} (not put back: {why})"),
+                None => detail,
             };
             return found.end(S::WrongBranch, detail);
         }
