@@ -51,12 +51,22 @@ fn write_rollout(home: &Path, cwd: &Path, model: &str) {
 }
 
 fn step_log(root: &Path) -> PathBuf {
+    // #14048: a step's runtime marker is read from the region after its own
+    // dispatch header, so the fixture log carries one for `SWEEP_ID`.
     let log = root
         .join(".loom")
         .join("logs")
         .join(format!("step-builder-{ISSUE}.log"));
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-    std::fs::write(&log, "# LOOM_RUNTIME_RESOLVED runtime=codex\n").unwrap();
+    std::fs::write(
+        &log,
+        format!(
+            "\n==== loom-daemon dispatch: {} sweep_id={SWEEP_ID} item={ISSUE} step=builder ====\n\
+             # LOOM_RUNTIME_RESOLVED runtime=codex\n",
+            Utc::now().to_rfc3339()
+        ),
+    )
+    .unwrap();
     log
 }
 
@@ -243,4 +253,210 @@ fn a_step_dispatched_opencode_run_yields_an_opencode_usage_span() {
     // No invented dollars for a model off the rate card.
     assert_eq!(attr("llm.billing"), Some("unknown"));
     assert_eq!(attr("loom.cost.usd_estimate"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14406: the step's END reaches a `loom.runtime.usage` span.
+//
+// The tests above prove the usage READERS resolve a step; these drive the
+// entry the registry's step end really calls (`emit_for_step`, from
+// `step_spawn::capture::emit_step_capture`) and read the span back from the
+// step's own trace journal. Before #14406 that call passed no trace, so no
+// step-dispatched Builder/Judge/Curator/Doctor ever journalled usage, on any
+// runtime, whatever the readers could resolve.
+// ---------------------------------------------------------------------------
+
+use crate::role_runner::RoleTickOutcome;
+use crate::role_tick_telemetry::{emit_for_step, ResolvedLaunch, StepTelemetry};
+use crate::telemetry::trace::journal::Journal;
+use crate::telemetry::trace::SpanRecord;
+
+/// The step's own end, as `emit_step_capture` calls it.
+fn end_step(root: &Path, role: &str, sweep_id: &str, item: (u32, bool)) {
+    let log_path = root
+        .join(".loom")
+        .join("logs")
+        .join(format!("step-{role}-{}.log", item.0));
+    emit_for_step(
+        root,
+        role,
+        Utc::now() - Duration::hours(1),
+        &RoleTickOutcome::Success,
+        Some(ResolvedLaunch::new("fixture-model", "high")),
+        StepTelemetry {
+            failure: None,
+            sweep_id,
+            step_outcome: None,
+            item,
+            stage: role,
+            log_path: &log_path,
+        },
+    );
+}
+
+/// Every `loom.runtime.usage` span in the step's own trace journal.
+fn usage_spans(root: &Path, sweep_id: &str) -> Vec<SpanRecord> {
+    let store = TraceStore::new(root);
+    let journal = Journal::for_context(&store.path(root, sweep_id));
+    if !journal.path().exists() {
+        return Vec::new();
+    }
+    journal
+        .completed()
+        .unwrap()
+        .into_iter()
+        .filter(|span| span.name.as_str() == "loom.runtime.usage")
+        .collect()
+}
+
+/// One Claude transcript whose first message is `command_args` to `/loom:<role>`
+/// and which spent `input`/`output` tokens a minute ago.
+fn write_claude_session(
+    config: &Path,
+    root: &Path,
+    file: &str,
+    role: &str,
+    command_args: &str,
+    input: i64,
+    output: i64,
+) {
+    let project = config
+        .join("projects")
+        .join(crate::transcript_tokens::project_slug(root));
+    std::fs::create_dir_all(&project).unwrap();
+    let at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+    let head = format!(
+        "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\
+         \"<command-message>loom:{role}</command-message>\\n\
+         <command-name>/loom:{role}</command-name>\\n\
+         <command-args>{command_args}</command-args>\"}}}}\n"
+    );
+    let usage = format!(
+        "{{\"type\":\"assistant\",\"timestamp\":\"{at}\",\"message\":{{\"id\":\"{file}\",\
+         \"model\":\"claude-fixture-5\",\"usage\":{{\"input_tokens\":{input},\
+         \"output_tokens\":{output}}}}}}}\n"
+    );
+    std::fs::write(project.join(file), format!("{head}{usage}")).unwrap();
+}
+
+#[test]
+#[serial_test::serial]
+fn a_step_dispatched_claude_builder_yields_a_usage_span_for_its_own_issue_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = tmp.path().join("claude-config");
+    // This step's session, and a concurrent sibling Builder step on another
+    // issue: same role, same window, so only the item tells them apart.
+    write_claude_session(&config, &root, "mine.jsonl", "builder", &ISSUE.to_string(), 900, 120);
+    write_claude_session(&config, &root, "sibling.jsonl", "builder", "99999", 5_000, 700);
+    TraceStore::new(&root)
+        .load_or_create(&root, SWEEP_ID)
+        .unwrap();
+
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+    end_step(&root, "builder", SWEEP_ID, (ISSUE, false));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+    let spans = usage_spans(&root, SWEEP_ID);
+    let [span] = spans.as_slice() else {
+        panic!("one model, one usage span: {spans:?}");
+    };
+    let attr = |key: &str| span.attributes.get(key).map(String::as_str);
+    assert_eq!(attr("loom.role"), Some("builder"));
+    // A Claude step names no runtime in its log; the transcript source is
+    // Claude's, so the span says so rather than leaving it blank.
+    assert_eq!(attr("loom.runtime"), Some("claude"));
+    assert_eq!(attr("loom.sweep_id"), Some(SWEEP_ID));
+    assert_eq!(attr("loom.model"), Some("claude-fixture-5"));
+    assert_eq!(attr("loom.tokens.input"), Some("900"));
+    assert_eq!(attr("loom.tokens.output"), Some("120"));
+}
+
+#[test]
+#[serial_test::serial]
+fn a_step_dispatched_pr_role_matches_its_pr_not_a_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = tmp.path().join("claude-config");
+    let judge_id = "step-judge-14407-1";
+    write_claude_session(&config, &root, "mine.jsonl", "judge", "14407", 300, 40);
+    write_claude_session(&config, &root, "sibling.jsonl", "judge", "14408", 9_000, 900);
+    TraceStore::new(&root)
+        .load_or_create(&root, judge_id)
+        .unwrap();
+
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+    end_step(&root, "judge", judge_id, (14407, true));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+    let spans = usage_spans(&root, judge_id);
+    let [span] = spans.as_slice() else {
+        panic!("one model, one usage span: {spans:?}");
+    };
+    let attr = |key: &str| span.attributes.get(key).map(String::as_str);
+    assert_eq!(attr("loom.role"), Some("judge"));
+    assert_eq!(attr("loom.tokens.input"), Some("300"));
+}
+
+#[test]
+#[serial_test::serial(codex_home_env)]
+fn a_step_dispatched_codex_builder_yields_a_codex_usage_span_at_its_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    let home = tmp.path().join(".codex");
+    let worktree = root
+        .join(".loom")
+        .join("worktrees")
+        .join(format!("issue-{ISSUE}"));
+    std::fs::create_dir_all(&worktree).unwrap();
+    write_rollout(&home, &worktree, "gpt-unpriced-fixture");
+    // The step's OWN log names the runtime. The role runner's
+    // `role-builder.log`, which the tick reader used to consult, does not exist.
+    step_log(&root);
+    TraceStore::new(&root)
+        .load_or_create(&root, SWEEP_ID)
+        .unwrap();
+
+    std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, &home);
+    end_step(&root, "builder", SWEEP_ID, (ISSUE, false));
+    std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
+
+    let spans = usage_spans(&root, SWEEP_ID);
+    let [span] = spans.as_slice() else {
+        panic!("one model, one usage span: {spans:?}");
+    };
+    let attr = |key: &str| span.attributes.get(key).map(String::as_str);
+    assert_eq!(attr("loom.role"), Some("builder"));
+    assert_eq!(attr("loom.runtime"), Some("codex"));
+    assert_eq!(attr("loom.model"), Some("gpt-unpriced-fixture"));
+    assert_eq!(attr("loom.tokens.input"), Some("600"));
+    assert_eq!(attr("loom.tokens.cache_read"), Some("400"));
+    assert_eq!(attr("loom.tokens.output"), Some("100"));
+}
+
+#[test]
+#[serial_test::serial]
+fn a_step_with_no_session_or_no_trace_journals_no_usage_span() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = tmp.path().join("claude-config");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+
+    // Trace persisted but the session left no transcript: unknown is not zero.
+    TraceStore::new(&root)
+        .load_or_create(&root, SWEEP_ID)
+        .unwrap();
+    end_step(&root, "builder", SWEEP_ID, (ISSUE, false));
+    assert!(usage_spans(&root, SWEEP_ID).is_empty());
+
+    // A transcript exists but the step has no persisted trace (tracing off):
+    // nothing to parent a span to, and no span, no panic.
+    write_claude_session(&config, &root, "mine.jsonl", "builder", &ISSUE.to_string(), 10, 1);
+    let untraced = "step-builder-14166-2";
+    end_step(&root, "builder", untraced, (ISSUE, false));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    assert!(usage_spans(&root, untraced).is_empty());
 }

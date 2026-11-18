@@ -380,6 +380,14 @@ pub(crate) struct StepCapture {
     pub(crate) failure: Option<RoleFailure>,
     pub(crate) model: String,
     pub(crate) effort: String,
+    /// The step-engine stage, the wire [`StepRole`] name (#14048) — finer
+    /// than the role name the record's `role` field folds Champion's two
+    /// stages onto.
+    pub(crate) stage: String,
+    /// The step's own per-item log (#14048): the source of its `# LOOM_LAUNCH`
+    /// record, resolved-runtime marker and native session ids. The per-role
+    /// log a role tick reads is wrong for a step.
+    pub(crate) log_path: PathBuf,
 }
 
 /// Emit the role tick's capture for one finished step: its journal drained
@@ -400,11 +408,46 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
             sweep_id: &capture.sweep_id,
             step_outcome: capture.step_outcome.clone(),
             item: (capture.item, capture.role.acts_on_pr()),
+            stage: &capture.stage,
+            log_path: &capture.log_path,
         },
     );
 }
 
 impl SweepRegistry {
+    /// Whether a step's death was a model-limit kill with a rung left to step
+    /// down to (#13905, `model_limit_kill`), updating that module's memo. The
+    /// kill is only possible for an exit that is not a clean zero, not a
+    /// timeout or cancel (the operator's or the clock's act, not the
+    /// provider's), and that wrote no verdict line.
+    fn observe_model_limit_kill(
+        &self,
+        sweep_id: &str,
+        item: u32,
+        role: StepRole,
+        log_path: &Path,
+        end: StepEnd,
+        line: Option<&StepOutcomeLine>,
+    ) -> bool {
+        use super::super::model_limit_kill::{observe_step_end, EndKind};
+        let died = matches!(end, StepEnd::Exited(code) if code != Some(0))
+            && !line.is_some_and(|l| l.class == StepOutcomeClass::Verdict);
+        let killed = observe_step_end(
+            &self.config.workspace_root,
+            item,
+            role.role_name(),
+            log_path,
+            if died { EndKind::Died } else { EndKind::Clean },
+        );
+        if killed {
+            log::info!(
+                "sweep_registry: {role} step {sweep_id} on #{item} died on a model limit; \
+                 charged to the provider, not the item (#13905)"
+            );
+        }
+        killed
+    }
+
     /// A step ended (`release_dead_step`, or found dead at startup with no
     /// entry): reap the leases it still listed, then emit its capture off the
     /// lock. Returns its outcome line.
@@ -429,7 +472,8 @@ impl SweepRegistry {
         // before this) said the seat was exhausted — the launch died on an
         // empty credential, so the release says so instead of `failed`, and
         // the item is charged nothing.
-        let provider_exhausted = take_step_provider_exhaustion(sweep_id);
+        let provider_exhausted = take_step_provider_exhaustion(sweep_id)
+            | self.observe_model_limit_kill(sweep_id, item, role, &log_path, end, line.as_ref());
         log::info!(
             "sweep_registry: {role} step {sweep_id} ended ({end:?}), outcome {}{} (#11906)",
             line.as_ref().map_or("none".to_string(), |l| format!(
@@ -526,6 +570,8 @@ impl SweepRegistry {
             failure,
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
+            stage: role.as_str().to_string(),
+            log_path: log_path.clone(),
         };
         // #12253: the step's `loom.sweep` span ends here, with the outcome
         // its `role_tick.outcome` reports, not at the next restart's orphan
