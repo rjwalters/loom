@@ -15,7 +15,7 @@
 #      parameter") reaches the caller unmodified on both the tools and the
 #      transitional-daemon path.
 #   B. Version floor (#8484 convention): a daemon binary below the declared
-#      0.19.1311 floor is REFUSED (never mistaken for an answer), and one at
+#      0.19.1312 floor is REFUSED (never mistaken for an answer), and one at
 #      the floor passes.
 #   C. Resync keeps the setting (#13956 AC4): after a real resync-installed.sh
 #      run over a synthetic repo, the synced agent copies still carry no
@@ -123,13 +123,13 @@ rm -f "$WORKDIR/bin-daemon/loom-tools"
 SYSTEM_PATH="/usr/bin:/bin"
 
 echo "C. version floor: a pre-#13956 binary is refused, never mistaken for an answer"
-_fake_daemon "$WORKDIR/bin-daemon/old-daemon" 0.19.1310 0   # last version WITHOUT the subcommand
+_fake_daemon "$WORKDIR/bin-daemon/old-daemon" 0.19.1311 0   # last version WITHOUT the subcommand
 STUB_ENV=(LOOM_DAEMON_SELF_BIN="$WORKDIR/bin-daemon/old-daemon")
 res="$(run_stub judge)"
 assert_not_contains "DAEMON opus" "$res" "a binary below the floor never answers"
 assert_contains "requires-daemon" "$res" "the refusal names the floor (the actionable #8385 message)"
 STUB_ENV=()
-_fake_daemon "$WORKDIR/bin-daemon/floor-daemon" 0.19.1311 0 # the floor itself passes
+_fake_daemon "$WORKDIR/bin-daemon/floor-daemon" 0.19.1312 0 # the floor itself passes
 STUB_ENV=(LOOM_DAEMON_SELF_BIN="$WORKDIR/bin-daemon/floor-daemon")
 res="$(run_stub judge)"
 assert_contains "DAEMON opus" "$res" "a binary at the floor is served"

@@ -45,13 +45,6 @@ pub enum Request {
         id: TerminalId,
         limit: usize,
     },
-    /// Capture git changes for a specific input
-    /// Called after a prompt completes to record code changes
-    CaptureGitChanges {
-        input_id: i64,
-        working_dir: String,
-        before_commit: Option<String>,
-    },
     /// Get the current git commit hash for a directory
     GetCurrentCommit {
         working_dir: String,
@@ -610,12 +603,6 @@ pub enum Response {
     /// Response with current git commit hash
     CurrentCommit {
         commit: Option<String>,
-    },
-    /// Response with git changes captured
-    GitChangesCaptured {
-        files_changed: i32,
-        lines_added: i32,
-        lines_removed: i32,
     },
     // ========================================================================
     // Issue Claim Registry Responses (Issue #1159)
