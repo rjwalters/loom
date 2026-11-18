@@ -143,6 +143,30 @@ clears a hold: a published branch is never discarded, so an already-published
 hold is cleared by hand (`accounts session attach <account>`, then
 `git worktree remove <path>` in the clone — nothing unpublished is lost).
 
+### A dirty leftover worktree (`seat_dirty`)
+
+A leftover worktree with uncommitted or untracked files refuses preparation of
+**its own clone** (the account's other registered repositories prepare
+independently) with a message starting `seat_dirty:`; the step's failure is
+recorded with that reason instead of `unclassified`. The listing form of
+`accounts session recover <account>` names every dirty worktree — path,
+branch, tracked and untracked counts, and commits unpublished at its HEAD —
+even when no branch is unpublished. Clear one with
+`recover <account> --discard --worktree <path>` (repeatable): it removes
+exactly the named linked worktree and its uncommitted files, never a branch
+ref and never an unnamed worktree. It refuses the main checkout, a path
+outside the volume, and a worktree whose HEAD carries unpublished commits —
+`--publish` them (or `--discard --branch B`) first.
+
+Two things are forgiven rather than listed: Loom's own `.loom/lease-renew`
+residue and a worktree-root `.cache/` of tool caches (untracked files there
+never count as dirty; tracked changes under `.cache/` are hidden too). During
+preparation, a linked worktree whose branch has commits of its own and whose
+tip is already an ancestor of `origin/<base>` is removed automatically, dirty
+or not, since the base carries everything it had. The proof is git-only:
+preparation holds no forge credential to ask whether the pull request merged,
+so a squash-merged branch is not recognized and needs `--discard --worktree`.
+
 ## Rebinding a registration after a repository transfer
 
 A forge transfer changes the owner-qualified URL, and with it the registration

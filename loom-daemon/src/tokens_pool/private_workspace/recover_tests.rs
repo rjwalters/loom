@@ -914,7 +914,7 @@ fn recover_session(
 ) -> Result<RecoverReport> {
     let mut attempt = 0;
     loop {
-        match session_recover(workspace, name, action, issue, branches) {
+        match session_recover(workspace, name, action, issue, branches, &[]) {
             Err(error) if attempt < 20 && error.to_string().contains("busy") => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(5));

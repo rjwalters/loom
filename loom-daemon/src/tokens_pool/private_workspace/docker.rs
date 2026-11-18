@@ -507,6 +507,7 @@ pub(super) fn recover_target(
     action: RecoverAction,
     issue: Option<u64>,
     branches: &[String],
+    worktrees: &[PathBuf],
     auth: &forge_auth::ExecAuth,
 ) -> Result<RecoverOutcome> {
     let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
@@ -537,6 +538,10 @@ pub(super) fn recover_target(
     }
     for branch in branches {
         args.extend(["--branch", branch]);
+    }
+    let worktree_flags: Vec<String> = worktrees.iter().map(|w| w.display().to_string()).collect();
+    for worktree in &worktree_flags {
+        args.extend(["--worktree", worktree]);
     }
     if let Some(slug) = &target.slug {
         args.extend(["--slug", slug]);

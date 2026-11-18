@@ -262,6 +262,27 @@ pub struct DetachedWork {
     pub ahead: u64,
 }
 
+/// The step-outcome reason of a preparation the seat's own dirty worktree
+/// refused (#14458). The refusal message carries it verbatim so the step's
+/// end can classify the failure by it instead of `unclassified`.
+pub const SEAT_DIRTY_REASON: &str = "seat_dirty";
+
+/// One worktree of a clone (the main checkout included) with uncommitted or
+/// untracked files, as the recover listing reports it (#14458). Counted over
+/// the same `git status` preparation refuses on, so the two cannot disagree.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DirtyWorktree {
+    pub path: String,
+    /// The checked-out branch; `None` on a detached HEAD.
+    pub branch: Option<String>,
+    /// Paths with tracked changes (modified, staged, merge state).
+    pub tracked: usize,
+    /// Untracked paths.
+    pub untracked: usize,
+    /// Commits at this worktree's HEAD that no ref of `origin` reaches.
+    pub unpublished: u64,
+}
+
 /// One clone's recover outcome, as the in-container
 /// `private-workspace recover` verb reports it (#14030).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -280,6 +301,13 @@ pub struct RecoverOutcome {
     /// Detached HEADs still holding unreferenced unpublished work
     /// (report-only: recover never touches them).
     pub detached: Vec<DetachedWork>,
+    /// Worktrees still dirty after the action, whether or not anything is
+    /// unpublished (#14458).
+    #[serde(default)]
+    pub dirty_worktrees: Vec<DirtyWorktree>,
+    /// Worktrees this call removed (`--discard --worktree`, #14458).
+    #[serde(default)]
+    pub removed_worktrees: Vec<String>,
 }
 
 /// What one `accounts session recover` call did across the account's clones.

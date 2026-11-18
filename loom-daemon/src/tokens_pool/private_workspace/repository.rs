@@ -90,6 +90,12 @@ pub struct RecoverArgs {
     /// Scope the action to a named branch (repeatable).
     #[arg(long, value_name = "BRANCH")]
     pub branch: Vec<String>,
+    /// With `--discard`: remove this linked worktree (repeatable) and whatever
+    /// uncommitted or untracked files it holds, when nothing at its HEAD is
+    /// unpublished (#14458). Never deletes a branch; never touches a worktree
+    /// it was not named for.
+    #[arg(long, value_name = "PATH", requires = "discard")]
+    pub worktree: Vec<PathBuf>,
     /// Collision-safe directory name of an additional repository (#10795).
     /// Absent: the legacy `<volume>/repo`.
     #[arg(long)]
@@ -310,8 +316,9 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
     if git(&repo, &["remote", "get-url", "origin"])?.trim() != args.repository {
         bail!("private clone origin changed; preserve work and restore its verified identity");
     }
-    clean_worktrees(&root, &repo)?;
     git(&repo, &["fetch", "--prune", "origin"])?;
+    reap_merged_worktrees(&root, &repo, &args.base)?;
+    clean_worktrees(&root, &repo, &args.account)?;
     // Unpublished commits are only stranded when no branch names them:
     // preparation never moves a branch (a resumed one keeps its local tip)
     // and never touches another one, so work carried by a branch ref
@@ -546,6 +553,8 @@ fn empty_outcome(repository: &str) -> RecoverOutcome {
         discarded: Vec::new(),
         ignored: Vec::new(),
         detached: Vec::new(),
+        dirty_worktrees: Vec::new(),
+        removed_worktrees: Vec::new(),
     }
 }
 
@@ -573,6 +582,8 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
         discarded: Vec::new(),
         ignored: Vec::new(),
         detached: stranded_heads(&repo)?,
+        dirty_worktrees: Vec::new(),
+        removed_worktrees: Vec::new(),
     };
     let mut scope = args.branch.clone();
     if let Some(issue) = args.issue {
@@ -582,8 +593,8 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
     }
     scope.sort();
     scope.dedup();
-    if args.discard && scope.is_empty() {
-        bail!("discard requires an explicit branch scope (--branch BRANCH or --issue N)");
+    if args.discard && scope.is_empty() && args.worktree.is_empty() {
+        bail!("discard requires an explicit scope (--branch BRANCH, --issue N or --worktree PATH)");
     }
     if !scope.is_empty() {
         let local = git(&repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
@@ -638,8 +649,12 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
             outcome.discarded.push(name.clone());
         }
     }
+    if args.discard {
+        remove_named_worktrees(root, &repo, &args.worktree, &mut outcome)?;
+    }
     outcome.branches = unpublished_branches(&repo)?;
     outcome.detached = stranded_heads(&repo)?;
+    outcome.dirty_worktrees = dirty_worktrees(&repo)?;
     Ok(outcome)
 }
 
@@ -1044,26 +1059,41 @@ fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
 /// container.
 const LEASE_RENEW_EXCLUDE: &str = ":(exclude).loom/lease-renew";
 
+/// A repo's tool caches (`.cache/actionlint`, 8.8 MB in the measured seat)
+/// are untracked in clones whose ignore rules do not cover them, and wedged a
+/// seat for every repository (#14458). Forgiven by the same pathspec
+/// mechanism as [`LEASE_RENEW_EXCLUDE`], not by a new config key. A forgiven
+/// directory is still removed with its worktree.
+const TOOL_CACHE_EXCLUDE: &str = ":(exclude).cache";
+
 /// The dirty refusal names at most this many paths, so an operator can tell
 /// stranded work from residue without exhausting the message (#14160).
 const DIRTY_PATH_LIMIT: usize = 10;
 
-fn clean_worktrees(root: &Path, repo: &Path) -> Result<()> {
+/// The `git status` lines of one worktree after forgiving Loom's own residue
+/// and tool caches. The single definition of "dirty" that both the
+/// preparation refusal and the recover listing read, so they cannot disagree.
+fn worktree_status(path: &Path) -> Result<String> {
+    git(
+        path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            ".",
+            LEASE_RENEW_EXCLUDE,
+            TOOL_CACHE_EXCLUDE,
+        ],
+    )
+}
+
+fn clean_worktrees(root: &Path, repo: &Path, account: &str) -> Result<()> {
     for path in worktrees(repo)? {
         if !path.canonicalize()?.starts_with(root) {
             bail!("worktree points outside the private volume; refuse reuse");
         }
-        let status = git(
-            &path,
-            &[
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-                "--",
-                ".",
-                LEASE_RENEW_EXCLUDE,
-            ],
-        )?;
+        let status = worktree_status(&path)?;
         if status.is_empty() {
             continue;
         }
@@ -1077,9 +1107,159 @@ fn clean_worktrees(root: &Path, repo: &Path) -> Result<()> {
             detail.push_str(&format!("\n  … and {} more", total - DIRTY_PATH_LIMIT));
         }
         bail!(
-            "private clone/worktree is dirty; retain and recover its work before reuse ({}):\n  {detail}",
+            "{SEAT_DIRTY_REASON}: private clone/worktree is dirty; retain and recover its work before reuse ({}):\n  {detail}\n\
+             list every dirty worktree with `loom-daemon accounts session recover {account}`; \
+             remove a leftover holding nothing unpublished with \
+             `loom-daemon accounts session recover {account} --discard --worktree {}`",
+            path.display(),
             path.display()
         );
+    }
+    Ok(())
+}
+
+/// Every worktree of the clone (the main checkout included) that
+/// [`worktree_status`] calls dirty, with its counts (#14458).
+pub(super) fn dirty_worktrees(repo: &Path) -> Result<Vec<DirtyWorktree>> {
+    let mut dirty = Vec::new();
+    for path in worktrees(repo)? {
+        let status = worktree_status(&path)?;
+        if status.is_empty() {
+            continue;
+        }
+        let untracked = status.lines().filter(|line| line.starts_with("??")).count();
+        let branch = git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_owned();
+        dirty.push(DirtyWorktree {
+            path: path.display().to_string(),
+            branch: (branch != "HEAD").then_some(branch),
+            tracked: status.lines().count() - untracked,
+            untracked,
+            unpublished: ahead_of_origin(&path, "HEAD")?,
+        });
+    }
+    Ok(dirty)
+}
+
+/// Remove the linked worktrees a discard names, and only those (#14458).
+/// A path that is not a linked worktree of this clone is reported as ignored
+/// (another clone of the account may own it); the main checkout, a worktree
+/// outside the volume and one carrying unpublished commits refuse the whole
+/// call before anything is removed. Only the worktree goes: its branch ref,
+/// and every commit on it, is left exactly as it was.
+fn remove_named_worktrees(
+    root: &Path,
+    repo: &Path,
+    named: &[PathBuf],
+    outcome: &mut RecoverOutcome,
+) -> Result<()> {
+    if named.is_empty() {
+        return Ok(());
+    }
+    let main = repo.canonicalize()?;
+    let linked: Vec<PathBuf> = worktrees(repo)?;
+    let mut targets = Vec::new();
+    for want in named {
+        let wanted = want.canonicalize().ok();
+        let found = linked.iter().find(|path| {
+            path.canonicalize()
+                .ok()
+                .is_some_and(|c| Some(&c) == wanted.as_ref())
+        });
+        let Some(path) = found else {
+            outcome.ignored.push(want.display().to_string());
+            continue;
+        };
+        let canonical = path.canonicalize()?;
+        if canonical == main {
+            bail!(
+                "{} is the clone's main checkout, not a leftover worktree; it is never removed",
+                path.display()
+            );
+        }
+        if !canonical.starts_with(root) {
+            bail!("worktree points outside the private volume; refuse removal");
+        }
+        let unpublished = ahead_of_origin(path, "HEAD")?;
+        if unpublished > 0 {
+            bail!(
+                "worktree {} carries {unpublished} unpublished commit(s); publish them first \
+                 (`accounts session recover <seat> --publish`) or discard the branch by name \
+                 (`--discard --branch BRANCH`) — removing the worktree alone is refused",
+                path.display()
+            );
+        }
+        targets.push(path.clone());
+    }
+    for path in targets {
+        git(repo, &["worktree", "remove", "--force", &path.display().to_string()])?;
+        outcome.removed_worktrees.push(path.display().to_string());
+    }
+    Ok(())
+}
+
+/// Whether `branch` ever moved off the commit it was created at. A branch
+/// still at its creation point has no history of its own, so its tip being an
+/// ancestor of the base proves nothing about a merge — the base merely moved
+/// on, and its worktree may hold unsaved first work. Read from the branch's
+/// reflog (oldest entry = creation); an empty or unreadable reflog answers
+/// `false`, so doubt never reaps.
+fn branch_has_own_commits(repo: &Path, branch: &str, tip: &str) -> bool {
+    git(
+        repo,
+        &[
+            "reflog",
+            "show",
+            "--format=%H",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .ok()
+    .and_then(|log| log.lines().last().map(|oldest| oldest.trim() != tip))
+    .unwrap_or(false)
+}
+
+/// Remove linked worktrees whose branch is already part of `origin/<base>`
+/// (#14458): a merged branch's worktree carries nothing the base does not, so
+/// whatever it holds uncommitted is residue of finished work, and a seat must
+/// not stay wedged on it. The proof is git-only — the branch moved off its
+/// creation point and its tip is a strict ancestor of the base on origin, so
+/// the worktree is not merely cut from a base that has since advanced — because preparation holds no forge credential for a PR lookup. A
+/// branch merged some other way (squash) is not provably merged here and stays
+/// refused by [`clean_worktrees`]; `recover --discard --worktree` clears it.
+/// Only the worktree goes; the branch ref is never touched.
+fn reap_merged_worktrees(root: &Path, repo: &Path, base: &str) -> Result<()> {
+    let remote = format!("refs/remotes/origin/{base}");
+    let Ok(base_tip) = git(repo, &["rev-parse", "--verify", &format!("{remote}^{{commit}}")])
+    else {
+        return Ok(());
+    };
+    let base_tip = base_tip.trim().to_owned();
+    let main = repo.canonicalize()?;
+    for path in worktrees(repo)? {
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if canonical == main || !canonical.starts_with(root) {
+            continue;
+        }
+        // Detached HEADs are `stranded_heads`' business, never reaped here.
+        let branch = git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_owned();
+        if branch == "HEAD" {
+            continue;
+        }
+        let tip = git(&path, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if tip == base_tip
+            || git(repo, &["merge-base", "--is-ancestor", &tip, &base_tip]).is_err()
+            || ahead_of_origin(&path, "HEAD")? > 0
+            || !branch_has_own_commits(repo, &branch, &tip)
+        {
+            continue;
+        }
+        git(repo, &["worktree", "remove", "--force", &path.display().to_string()])?;
     }
     Ok(())
 }

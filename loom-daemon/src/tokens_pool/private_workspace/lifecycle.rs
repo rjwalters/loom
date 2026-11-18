@@ -389,6 +389,7 @@ pub fn session_recover(
     action: RecoverAction,
     issue: Option<u64>,
     branches: &[String],
+    worktrees: &[PathBuf],
 ) -> Result<RecoverReport> {
     let (config, dir) = resolve(workspace, name)?;
     let targets = {
@@ -413,22 +414,26 @@ pub fn session_recover(
     let mut clones = Vec::new();
     for target in &targets {
         let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
-        clones.push(docker::recover_target(&config, target, action, issue, branches, &auth)?);
+        clones.push(docker::recover_target(
+            &config, target, action, issue, branches, worktrees, &auth,
+        )?);
     }
     let report = RecoverReport {
         account: config.account.clone(),
         clones,
     };
     if action != RecoverAction::List
-        && (issue.is_some() || !branches.is_empty())
-        && report
-            .clones
-            .iter()
-            .all(|clone| clone.published.is_empty() && clone.discarded.is_empty())
+        && (issue.is_some() || !branches.is_empty() || !worktrees.is_empty())
+        && report.clones.iter().all(|clone| {
+            clone.published.is_empty()
+                && clone.discarded.is_empty()
+                && clone.removed_worktrees.is_empty()
+        })
     {
         bail!(
-            "no clone of this account has unpublished commits on the named branches; \
-             run the listing form (`accounts session recover {name}`) to see what is unpublished"
+            "no clone of this account has unpublished commits on the named branches or a \
+             worktree at the named paths; run the listing form (`accounts session recover \
+             {name}`) to see what is unpublished and which worktrees are dirty"
         );
     }
     Ok(report)
