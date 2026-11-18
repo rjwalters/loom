@@ -368,7 +368,9 @@ pub struct CommentArgs {
 fn reject_lone_at_body(text: &str) -> anyhow::Result<()> {
     if crate::verdict_body::is_lone_at_token(text) {
         anyhow::bail!(
-            "refusing to post: --body {:?} is a lone '@' token, which posts the literal string              and reads nothing — use --body-file <path> (or --body-file - for stdin)",
+            "refusing to post: --body {:?} is a lone '@' token, which posts the \
+             literal string and reads nothing — use --body-file <path> (or \
+             --body-file - for stdin)",
             text.trim()
         );
     }
