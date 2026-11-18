@@ -79,7 +79,9 @@ triggers on `workflow_run` (`completed`, `gh-readonly-queue/**`) so the `pending
 status posted at `checks_requested` is re-evaluated when CI finishes; set
 `workflows:` to the name of your CI workflow. This is why the job needs no wait
 step; a copy that polls for CI holds a runner for the whole check duration and
-should drop the wait and keep this trigger.
+should drop the wait and keep this trigger. Its job-level `if:` admits a
+`workflow_run` only from a same-repo `merge_group` CI run. Keep that gate: the
+branch filter alone admits fork PRs (see "Trust boundary" below).
 
 A job that exists only to trim PR runs, such as `ci.yml`'s `changes`
 path-filter job, declares itself with a marker comment inside the job block:
@@ -201,14 +203,40 @@ proves `merge-group-check.yml` has no `GROUP_CHECK_WITHOUT_CHECKOUT`,
 `--workflow merge-group-check.yml` with `--required "CI Result"`: that
 restricts the audit to a file that does not host the job.)
 
-`merge-group-check.yml` runs only on base-repo events (`merge_group`, and
-`workflow_run` filtered to `gh-readonly-queue/**`); it has no `pull_request` or
-`pull_request_target` trigger, so untrusted PR-head code never runs with its
-`statuses: write` token. It checks out the merge-group commit with a sparse
-`.loom/` checkout, holds `statuses: write`, `pull-requests: read`,
-`checks: read`, `contents: read`, and uses a non-cancelling per-head
-concurrency group. `workflow_run.workflows` names this repo's CI workflow
-(`CI`), which re-evaluates the `pending` status when CI completes.
+**Trust boundary.** The `workflow_run` `branches: ['gh-readonly-queue/**']`
+filter is **not** a security control. It matches the triggering CI run's head
+branch, and a fork PR author can name a fork branch `gh-readonly-queue/x`. Its
+`CI` run would then fire `merge-group-check.yml` in base-repo, default-branch
+context, with the `statuses: write` token. The job checks out that run's head,
+and `group-check` runs `forge.mergeQueue.statusCommand` from the checked-out
+`.loom/config.json` (`status_command::resolve`). Even with no queue, an empty
+group list still reaches `post_status`. What keeps untrusted code out is the
+**job-level `if:`**: it accepts a `merge_group` event, or a `workflow_run`
+whose triggering run had `event == 'merge_group'` and
+`head_repository.full_name == github.repository`. Merge groups exist only in
+the base repository, so a fork PR's CI run is skipped. A skipped run posts
+nothing, and nothing authorizes nothing (fail-closed). Keep the gate in every
+copy of the workflow, including copies made from
+`defaults/optional/github-workflows/merge-group-check.yml`.
+
+Two residual limits are known and accepted for the pilot:
+
+- On a genuine merge-group run, `.loom/config.json` comes from the group-head
+  checkout, so it includes queued PRs' edits. Those PRs are Judge-approved, but
+  a queued diff can still change the `statusCommand` that the writer runs.
+  Reading `.loom/` from `merge_group.base_sha` would close this, but the
+  `merge-group-ci` audit currently flags any checkout whose `ref:` is not the
+  merge-group head (`NON_MERGE_GROUP_CHECKOUT`). Changing that needs an audit
+  rule change, which is out of scope here.
+- The install step checks the binary's `.sha256`, which ships in the same
+  release. That is an integrity check only. The published `.sig`/`.pem` are not
+  verified, so the pinned `LOOM_VERSION` is the protection.
+
+Otherwise the workflow uses a sparse `.loom/` checkout of the merge-group
+commit. It holds `statuses: write`, `pull-requests: read`, `checks: read` and
+`contents: read`, and uses a non-cancelling per-head concurrency group.
+`workflow_run.workflows` names this repo's CI workflow (`CI`), which
+re-evaluates the `pending` status when CI completes.
 
 ## Enablement prerequisites (all required, in order)
 
@@ -286,9 +314,11 @@ Every step is a read except step 6, which is an operator action. Do not set
    ```
    `NO_MERGE_QUEUE_RULE` is expected before step 6 and is the only failure
    allowed. The daemon on the host must include the `merge-group-ci` and
-   `forge merge-queue` subcommands (present from 0.19.1306; using the
+   `forge merge-queue` subcommands. `merge-group-ci` has shipped since
+   v0.19.695, `forge merge-queue preflight` since v0.19.761, `group-check`
+   since v0.19.879, and the `statusCommand` route since v0.19.1185. Running the
    v0.19.1311 that `merge-group-check.yml` pins as `LOOM_VERSION` keeps the
-   host and the workflow on one version).
+   host and the workflow on one version.
 4. **Broker / App enrollment (external, must be verified, not assumed).** The
    writer identity that posts `loom/merge-authorization` needs `statuses: write`
    on this repository. If the writer App's grant is read-only or too broad,
