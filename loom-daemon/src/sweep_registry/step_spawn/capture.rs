@@ -380,6 +380,14 @@ pub(crate) struct StepCapture {
     pub(crate) failure: Option<RoleFailure>,
     pub(crate) model: String,
     pub(crate) effort: String,
+    /// The step-engine stage, the wire [`StepRole`] name (#14048) — finer
+    /// than the role name the record's `role` field folds Champion's two
+    /// stages onto.
+    pub(crate) stage: String,
+    /// The step's own per-item log (#14048): the source of its `# LOOM_LAUNCH`
+    /// record, resolved-runtime marker and native session ids. The per-role
+    /// log a role tick reads is wrong for a step.
+    pub(crate) log_path: PathBuf,
 }
 
 /// Emit the role tick's capture for one finished step: its journal drained
@@ -400,6 +408,8 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
             sweep_id: &capture.sweep_id,
             step_outcome: capture.step_outcome.clone(),
             item: (capture.item, capture.role.acts_on_pr()),
+            stage: &capture.stage,
+            log_path: &capture.log_path,
         },
     );
 }
@@ -526,6 +536,8 @@ impl SweepRegistry {
             failure,
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
+            stage: role.as_str().to_string(),
+            log_path: log_path.clone(),
         };
         // #12253: the step's `loom.sweep` span ends here, with the outcome
         // its `role_tick.outcome` reports, not at the next restart's orphan

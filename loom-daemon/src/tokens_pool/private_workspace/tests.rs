@@ -1354,6 +1354,25 @@ fn rebind_moves_an_old_clone_keeping_its_work_and_is_idempotent() {
 }
 
 #[test]
+fn rebind_succeeds_when_the_canonical_remote_already_publishes_a_local_branch() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    // The transferred repository already carries the branch (published by
+    // someone else, or pushed after the transfer): the move's `fetch --prune`
+    // shifts the unpublished count without any local work changing.
+    git(&clone, &["push", &new.to_string_lossy(), "feature/issue-9"]);
+    let tip = git(&clone, &["rev-parse", "feature/issue-9"]);
+    let done = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(done.status, RebindStatus::Moved);
+    assert_eq!(done.from.branches[0].branch, "feature/issue-9");
+    assert!(done.to.branches.is_empty(), "published upstream by now");
+    let moved = f.root.join("work").join(NEW_SLUG);
+    assert_eq!(git(&moved, &["rev-parse", "feature/issue-9"]), tip);
+    assert_eq!(std::fs::read_to_string(moved.join("scratch")).unwrap(), "dirty");
+    assert_eq!(git(&moved, &["remote", "get-url", "origin"]), new.to_string_lossy());
+}
+
+#[test]
 fn rebind_finishes_an_interrupted_move() {
     let _fork = fork_guard();
     let (f, old, new, clone) = old_clone_with_work();

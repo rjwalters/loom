@@ -1456,6 +1456,45 @@ fn rebind_refuses_busy_held_firewalled_primary_and_unregistered_before_the_volum
     }
     assert_eq!(rebind_calls(&env), 0, "refused before any volume exec");
     assert_eq!(registered(&env), [OLD_URL]);
+
+    // Firewalled: the fleet roster marks the canonical repository
+    // `firewall: true`, so the move is refused before the volume is touched.
+    let _roster = seed_firewall_roster(NEW_REPO);
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(message(&error).contains("firewall: true"), "{error:#}");
+    assert_eq!(rebind_calls(&env), 0, "refused before any volume exec");
+    assert_eq!(registered(&env), [OLD_URL]);
+}
+
+/// A cached fleet store whose roster marks `remote` `firewall: true`, reached
+/// through a throwaway `$HOME`. The guard restores the environment on drop.
+fn seed_firewall_roster(remote: &str) -> (crate::env_test_support::EnvGuard, tempfile::TempDir) {
+    use crate::env_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join(".loom/fleet-store/acme/fleet");
+    std::fs::create_dir_all(cache.join("blobs")).unwrap();
+    let fleet = json!({
+        "_generated": {"schema_version": 1},
+        "root": "/srv/src",
+        "repos": [{"name": "notebook", "dir": "notebook", "remote": remote, "firewall": true}],
+        "state": {},
+        "config": {"defaults": {}},
+    });
+    std::fs::write(cache.join("blobs/fleet-json"), fleet.to_string()).unwrap();
+    let manifest = json!({
+        "version": 1,
+        "repo": "acme/fleet",
+        "reference": "main",
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+        "etag": null,
+        "confirmedAt": "2026-11-18T00:00:00Z",
+        "files": {"fleet.json": "fleet-json"},
+    });
+    std::fs::write(cache.join("manifest.json"), manifest.to_string()).unwrap();
+    let guard = EnvGuard::set("HOME", home.path())
+        .and_set("LOOM_FLEET_REPO", Some("acme/fleet".as_ref()))
+        .and_set("LOOM_FLEET_REF", None);
+    (guard, home)
 }
 
 #[test]

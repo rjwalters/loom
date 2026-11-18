@@ -51,12 +51,22 @@ fn write_rollout(home: &Path, cwd: &Path, model: &str) {
 }
 
 fn step_log(root: &Path) -> PathBuf {
+    // #14048: a step's runtime marker is read from the region after its own
+    // dispatch header, so the fixture log carries one for `SWEEP_ID`.
     let log = root
         .join(".loom")
         .join("logs")
         .join(format!("step-builder-{ISSUE}.log"));
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-    std::fs::write(&log, "# LOOM_RUNTIME_RESOLVED runtime=codex\n").unwrap();
+    std::fs::write(
+        &log,
+        format!(
+            "\n==== loom-daemon dispatch: {} sweep_id={SWEEP_ID} item={ISSUE} step=builder ====\n\
+             # LOOM_RUNTIME_RESOLVED runtime=codex\n",
+            Utc::now().to_rfc3339()
+        ),
+    )
+    .unwrap();
     log
 }
 
@@ -263,6 +273,10 @@ use crate::telemetry::trace::SpanRecord;
 
 /// The step's own end, as `emit_step_capture` calls it.
 fn end_step(root: &Path, role: &str, sweep_id: &str, item: (u32, bool)) {
+    let log_path = root
+        .join(".loom")
+        .join("logs")
+        .join(format!("step-{role}-{}.log", item.0));
     emit_for_step(
         root,
         role,
@@ -274,6 +288,8 @@ fn end_step(root: &Path, role: &str, sweep_id: &str, item: (u32, bool)) {
             sweep_id,
             step_outcome: None,
             item,
+            stage: role,
+            log_path: &log_path,
         },
     );
 }
