@@ -1455,10 +1455,13 @@ the parser accepts all three, one test each). The close carries, beside the
 `role_tick.outcome` record carries the same pair additively as
 `loom.role_tick.step_class` / `loom.role_tick.step_reason`, with
 `step_class="none"` in the no-line case. Additive; no `schema_version` bump.
-`loom.step.outcome.agrees` (#14234) is on both too. Group by it to ask how
-often a runtime claims a result the forge does not show:
+`loom.step.outcome.agrees` (#14234) is on the **close span only** — the
+`role_tick.outcome` record does not carry it (backfilling it there could
+follow separately), so ask the disagreement question of the trace store, not
+the record stream. Group by it to ask how often a runtime claims a result the
+forge does not show:
 `attributes_string['loom.step.outcome.agrees'] = 'false'` over the query below.
-Both new keys are on the daemon export allowlist and the collector's span
+All three keys are on the daemon export allowlist and the collector's span
 `keep_keys` (contract-tested).
 
 One query answers "outcomes by runtime, model and role" for a day
