@@ -1115,7 +1115,8 @@ citing this subsection):
    Duplicate Checks") and must **never edit or generate** one.
 2. **First creation is create-by-default.** When `WORK_LOG.md` /
    `WORK_PLAN.md` do not exist yet (a repo that has never tracked them), a
-   pass **creates them without asking** — Steps 2 and 3 below say how. Both
+   pass **creates them without asking** (unless the file is listed in
+   `skipDocs` — rule 3) — Steps 2 and 3 below say how. Both
    files land as a reviewable docs PR that already passes Judge and
    Champion, so **the PR itself is the ask**. Never defer first creation as
    an "operator scope" decision: on `2AMLogic/pdks` two Guide passes (#78,

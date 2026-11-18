@@ -5,7 +5,8 @@
 # WORK_LOG.md / WORK_PLAN.md generation (the "tracked separately" placeholder
 # #14009 left in the roadmap-convention subsection). This suite pins, on EVERY
 # shipped copy of the Guide role prompt (source + generated skill copy):
-#   1. the placeholder text is gone and the convention names skipDocs;
+#   1. the placeholder text is gone and the convention names skipDocs, and
+#      rule 2's create-by-default cross-references the opt-out;
 #   2. update_work_log() and update_work_plan() each call the skip check for
 #      their own file as their first statement (before any forge query /
 #      render), and rotate_work_log() does too;
@@ -46,6 +47,7 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
     grep_lacks "$f" 'Until one lands' "$copy: 'Until one lands' placeholder removed"
     grep_has "$f" 'guide\.docsMaintenance\.skipDocs' "$copy: convention names guide.docsMaintenance.skipDocs"
     grep_has "$f" 'neither created' "$copy: convention says a skipped file is neither created nor updated"
+    grep_has "$f" '`skipDocs` — rule 3)' "$copy: rule 2 create-by-default cross-references the skipDocs opt-out (rule 3)"
 
     # 2. Honour sites: guard is the first statement of each function.
     grep_has "$f" "jq -r '(.guide.docsMaintenance.skipDocs // \[\])" "$copy: skipDocs read via the sibling-key jq idiom"
