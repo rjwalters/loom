@@ -1,8 +1,7 @@
 //! Per-model-class `.bad_tokens` marks (issue #8058) — the read/write rules
 //! that let an account bad-marked for one model class keep serving another.
 //!
-//! Its own file rather than more lines in `bad_tokens_tests.rs`: that file is
-//! already at `scripts/check-file-size-budget.sh`'s threshold, and this is a
+//! Its own file rather than more lines in `bad_tokens_tests.rs`: this is a
 //! self-contained behaviour with its own fixtures. `bad_tokens.rs` declares
 //! both with `#[path]` module declarations, so `super::*` below resolves to
 //! `bad_tokens` in either file.

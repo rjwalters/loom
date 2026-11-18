@@ -1,9 +1,8 @@
 //! Tests for session-container liveness in selection (Issues #10454, #10660).
 //!
-//! The selection-side tests live here rather than in `select_tests.rs`, which
-//! is at the file-size threshold — and Codex selection is
-//! `account_registry::select_codex_account_where`, not `select.rs` (the Claude
-//! token selector).
+//! The selection-side tests live here rather than in `select_tests.rs` — and
+//! Codex selection is `account_registry::select_codex_account_where`, not
+//! `select.rs` (the Claude token selector).
 
 use super::test_support::{running, set, set_selector_docker, states, unavailable};
 use super::*;

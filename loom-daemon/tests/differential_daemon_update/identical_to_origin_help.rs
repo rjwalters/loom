@@ -3,7 +3,7 @@
 //! independently of `help.txt` so
 //! [`super::Divergence::HelpDocumentsIdenticalToOriginSafeAbort`] verifies the
 //! EXACT intended text rather than "whatever the port prints". A sibling of
-//! the main file, which is at the file-size ratchet's threshold.
+//! the main file.
 
 /// #11539: the second `--auto-resolve-safe-abort` usage line, inserted before
 /// the `--fetch` usage line (that is, directly after the first one).

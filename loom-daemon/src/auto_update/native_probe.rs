@@ -12,7 +12,9 @@
 
 use super::artifact_verdict::compare_versions;
 use super::{ArtifactInfo, ArtifactResolution};
-use crate::release_resolve::{build_time_repo, resolve, resolve_repo, Inputs, Resolution};
+use crate::release_resolve::{
+    build_time_repo, resolve, resolve_repo_with_source, Inputs, RepoSource, Resolution,
+};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
@@ -57,7 +59,14 @@ fn below_floor() -> Option<String> {
 /// resolution deciding to roll and the roll itself must name one repo.
 #[must_use]
 pub(super) fn fetch_repo(root: &Path) -> Option<String> {
-    resolve_repo(&env_inputs(root))
+    fetch_repo_with_source(root).map(|(repo, _)| repo)
+}
+
+/// [`fetch_repo`] paired with the tier that supplied the slug (#14224), so a
+/// below-floor tick that resolves no release can name what it asked.
+#[must_use]
+pub(super) fn fetch_repo_with_source(root: &Path) -> Option<(String, RepoSource)> {
+    resolve_repo_with_source(&env_inputs(root))
 }
 
 /// The update-script args for an artifact roll to `tag` (#10709).

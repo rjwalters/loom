@@ -1,7 +1,6 @@
 //! Tests for the runtime-aware pre-spawn credential-pool gate (Issue #8408).
 //!
-//! Kept beside the module they cover rather than in `role_runner/tests.rs`,
-//! which is at its `scripts/file-size-baseline.txt` ceiling.
+//! Kept beside the module they cover rather than in `role_runner/tests.rs`.
 //!
 //! Every test that reaches `invoke()` leaves `spawn_bin` unset so runtime
 //! admission — and with it the gate — runs for real against an on-disk

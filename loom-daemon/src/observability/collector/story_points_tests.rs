@@ -1,6 +1,5 @@
 //! `sweep.started` story-point plumbing tests (Issue #9432, epic #9429) — in
-//! their own sibling module because `tests.rs` is pinned by the file-size
-//! ratchet (`scripts/check-file-size-budget.sh`).
+//! their own sibling module rather than in `tests.rs`.
 //!
 //! The collector makes no forge calls of its own, so everything it can know
 //! about an issue's size arrives on the `sweep.global.dispatch` event (resolved
