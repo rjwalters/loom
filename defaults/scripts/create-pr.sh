@@ -266,20 +266,33 @@ EX_REVIEW_GATE_COLLISION=6
 # The leading-guard alternation skips a keyword whose immediately preceding
 # token is a PR/issue reference: `PR #605 fixed #597` narrates history, it
 # does not close #597, so it must not win `head -1` over the real trailing
-# `Closes #N` (#13939). The three guard branches, most specific first:
-#   ^                            keyword opens the line (any body line)
+# `Closes #N` (#13939). The guard branches:
+#   ^[[:space:]]*                keyword opens the line, optionally indented
+#                                -- a one-space/one-tab prefix satisfies no
+#                                branch under the bare `^` of #13939, so
+#                                ` Closes #N` extracted nothing and both
+#                                guards were skipped (#14157)
+#   (^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+
+#                                a whitespace-delimited token that ENDS in a
+#                                digit and contains no `#` (`Phase 3`,
+#                                `v1.2`, `ADR-0015`) -- the #13939 prose
+#                                branch rejected ANY digit before the
+#                                whitespace run, over-rejecting these; the
+#                                no-`#` class keeps `PR #605 fixed #597`
+#                                narration unmatched
 #   [^#0-9][[:space:]]+          ordinary prose before the keyword -- a
 #                                digit/`#` right before the whitespace run
 #                                is the `#N`-reference narration signature
 #   [^[:alnum:]_#[:space:]]      punctuation attached with no space, the
 #                                `**Fixes #1**` / `(closes #1)` shapes the
 #                                old bare `\b` also admitted
-# The guard classes are digit-free by construction, so the trailing `#N` is
-# the only number run in the match and the final grep picks exactly it.
+# Only the digit-ending-token branch can put a number run in the match
+# before the trailing `#N`, so the extraction takes the LAST number run of
+# the first match -- for every other branch first and last coincide.
 _cpr_body_ref_issue() {
   # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
-  grep -ioE "(^|[^#0-9][[:space:]]+|[^[:alnum:]_#[:space:]])($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
-    | head -1 | grep -oE '[0-9]+' || true
+  grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
+    | head -1 | grep -oE '[0-9]+' | tail -1 || true
 }
 
 # An empty body matches nothing (grep's no-match is absorbed by `|| true`).
