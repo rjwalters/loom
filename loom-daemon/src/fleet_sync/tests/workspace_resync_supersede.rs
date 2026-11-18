@@ -29,7 +29,7 @@ fn comments(fx: &Fixture) -> Vec<(u64, String)> {
 fn opening_the_newer_resync_pull_request_closes_the_older_one() {
     let fx = Fixture::new(STALE);
     refuse_main_only(&fx);
-    resync_pr(&fx, 7, "0.19.879");
+    resync_pr(&fx, 7, "1.0.879");
     let host = Host::new(&fx, "host-a");
 
     let pass = host.pass();
@@ -39,7 +39,7 @@ fn opening_the_newer_resync_pull_request_closes_the_older_one() {
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, 7);
     assert!(said[0].1.contains(&format!("#2 (v{RUNNING})")), "{said:?}");
-    assert_eq!(fx.forge.ref_sha("refs/heads/chore/loom-resync-v0.19.879"), None);
+    assert_eq!(fx.forge.ref_sha("refs/heads/chore/loom-resync-v1.0.879"), None);
     assert_eq!(fx.forge.pulls.borrow().len(), 1, "only the newest stays open");
 }
 
@@ -49,7 +49,7 @@ fn an_older_pull_request_is_closed_when_a_later_pass_finds_the_newest_open() {
     refuse_main_only(&fx);
     let host = Host::new(&fx, "host-a");
     assert_eq!(only(&host.pass()).state, WState::W1);
-    resync_pr(&fx, 9, "0.19.700");
+    resync_pr(&fx, 9, "1.0.700");
     host.now.set(t0() + ChronoDuration::hours(7));
     host.pass();
     assert_eq!(*fx.forge.closed.borrow(), vec![9]);
@@ -78,14 +78,14 @@ fn a_checkout_already_at_the_version_closes_the_resync_pull_request() {
 fn a_pull_request_for_a_newer_version_than_the_running_one_is_left_alone() {
     let fx = Fixture::new(STALE);
     refuse_main_only(&fx);
-    resync_pr(&fx, 5, "0.19.881");
+    resync_pr(&fx, 5, "1.0.881");
     let host = Host::new(&fx, "host-a");
     host.pass();
     assert!(fx.forge.closed.borrow().is_empty());
     assert!(comments(&fx).is_empty());
     assert!(fx
         .forge
-        .ref_sha("refs/heads/chore/loom-resync-v0.19.881")
+        .ref_sha("refs/heads/chore/loom-resync-v1.0.881")
         .is_some());
 }
 
@@ -93,13 +93,13 @@ fn a_pull_request_for_a_newer_version_than_the_running_one_is_left_alone() {
 fn pull_requests_that_are_not_this_daemons_resync_are_left_alone() {
     let fx = Fixture::new(STALE);
     refuse_main_only(&fx);
-    let trailer = "Loom-Resync-Version: 0.19.870\n";
-    let title = "chore(loom): resync installed Loom to v0.19.870";
+    let trailer = "Loom-Resync-Version: 1.0.870\n";
+    let title = "chore(loom): resync installed Loom to v1.0.870";
     // A person's PR with the title but not the branch, the branch but not the
     // trailer, and an unrelated one.
     open_pr(&fx, 11, title, "somebody/resync", trailer);
-    open_pr(&fx, 12, title, "chore/loom-resync-v0.19.870", "no trailer here");
-    open_pr(&fx, 13, "docs: unrelated", "chore/loom-resync-v0.19.870x", trailer);
+    open_pr(&fx, 12, title, "chore/loom-resync-v1.0.870", "no trailer here");
+    open_pr(&fx, 13, "docs: unrelated", "chore/loom-resync-v1.0.870x", trailer);
     open_pr(
         &fx,
         14,
@@ -117,7 +117,7 @@ fn pull_requests_that_are_not_this_daemons_resync_are_left_alone() {
 fn a_failed_close_is_logged_and_does_not_change_the_pass() {
     let fx = Fixture::new(STALE);
     refuse_main_only(&fx);
-    resync_pr(&fx, 7, "0.19.879");
+    resync_pr(&fx, 7, "1.0.879");
     fx.forge
         .fault("PATCH repos/acme/app/pulls/7", Fault::Status(500));
     let host = Host::new(&fx, "host-a");
@@ -135,6 +135,6 @@ fn a_failed_close_is_logged_and_does_not_change_the_pass() {
     // The branch stays with its still-open PR.
     assert!(fx
         .forge
-        .ref_sha("refs/heads/chore/loom-resync-v0.19.879")
+        .ref_sha("refs/heads/chore/loom-resync-v1.0.879")
         .is_some());
 }

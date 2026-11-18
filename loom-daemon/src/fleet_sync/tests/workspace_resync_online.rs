@@ -203,8 +203,8 @@ fn a_refusal_on_the_resync_fetch_keeps_counting_and_alerts() {
 #[test]
 fn a_refused_repo_that_reads_again_and_needs_nothing_ends_its_run() {
     let fx = Fixture::new(Seed {
-        version: "0.19.900",
-        requires: Some("0.19.772"),
+        version: "1.0.900",
+        requires: Some("1.0.772"),
         ..STALE
     });
     let host = Host::new(&fx, "host-a");

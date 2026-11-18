@@ -48,15 +48,41 @@ fn verdicts(seen: &[Observation]) -> (Verdict, Verdict) {
     (seen[0].default_branch.verdict, seen[0].checkout.verdict)
 }
 
-/// The operator's ratchet-guard case, end to end: a host on 0.19.880 meets a
-/// repo a newer host (0.19.900) stamped, whose files still work with
-/// 0.19.880. It reports repo-ahead, never resyncs it, holds nothing and
+/// The real declared break still holds old files; equality is checked before
+/// dispatch is held, while an install exactly at the floor remains compatible.
+#[test]
+fn the_compiled_support_floor_distinguishes_stale_files_from_an_old_stamp() {
+    assert!(v("0.0.0") < v(SUPPORTS_INSTALLED));
+    let held = Verdict::Hold(HoldKind::InstallIncompatible);
+    for (version, current, state, verdict) in [
+        (SUPPORTS_INSTALLED, false, WState::W1, Verdict::Clear),
+        ("0.0.0", false, WState::W3, held),
+        ("0.0.0", true, WState::W0, Verdict::Clear),
+    ] {
+        let fx = Fixture::new(Seed {
+            version,
+            requires: Some(SUPPORTS_INSTALLED),
+            current,
+            ..STALE
+        });
+        let host = Host::new(&fx, "host-a");
+        let mut holds = Holds::default();
+        let (pass, seen) = hold_pass_in(&host, Mode::Check, None, &mut holds);
+        assert_eq!(only(&pass).state, state, "{version}, current={current}: {pass:?}");
+        assert_eq!(verdicts(&seen), (verdict, verdict));
+        assert_eq!(holds.demand(), None, "the installed floor never requests a daemon roll");
+    }
+}
+
+/// The operator's ratchet-guard case, end to end: a host on 1.0.880 meets a
+/// repo a newer host (1.0.900) stamped, whose files still work with
+/// 1.0.880. It reports repo-ahead, never resyncs it, holds nothing and
 /// demands no roll.
 #[test]
 fn a_repo_stamped_by_a_newer_compatible_host_is_neither_held_nor_a_roll_demand() {
     let fx = Fixture::new(Seed {
-        version: "0.19.900",
-        requires: Some("0.19.772"),
+        version: "1.0.900",
+        requires: Some("1.0.772"),
         ..STALE
     });
     let older = Host::new(&fx, "host-older");
@@ -72,8 +98,8 @@ fn a_repo_stamped_by_a_newer_compatible_host_is_neither_held_nor_a_roll_demand()
 #[test]
 fn a_repo_that_needs_a_newer_daemon_holds_both_copies_and_demands_it() {
     let fx = Fixture::new(Seed {
-        version: "0.19.900",
-        requires: Some("0.19.890"),
+        version: "1.0.900",
+        requires: Some("1.0.890"),
         ..STALE
     });
     let host = Host::new(&fx, "host-a");
@@ -83,7 +109,7 @@ fn a_repo_that_needs_a_newer_daemon_holds_both_copies_and_demands_it() {
     assert_eq!(verdicts(&seen), (w4, w4));
     let hold = holds.holds().into_values().next().unwrap();
     assert_eq!((hold.kind, hold.copy), (HoldKind::DaemonTooOld, HeldCopy::DefaultBranch));
-    assert_eq!(holds.demand().unwrap().version, "0.19.890");
+    assert_eq!(holds.demand().unwrap().version, "1.0.890");
 }
 
 #[test]
@@ -95,8 +121,8 @@ fn a_too_old_checkout_is_held_only_while_its_files_differ() {
         ..STALE
     });
     let host = Host::new(&fx, "host-a");
-    let floor = Some("0.19.850");
-    write(&host.root.join(INSTALL_METADATA_PATH), &metadata("0.19.800", Some("0.19.772")));
+    let floor = Some("1.0.850");
+    write(&host.root.join(INSTALL_METADATA_PATH), &metadata("1.0.800", Some("1.0.772")));
     let mut holds = Holds::default();
 
     // An old stamp over files equal to the payload: W0, not held.
@@ -107,13 +133,13 @@ fn a_too_old_checkout_is_held_only_while_its_files_differ() {
     // The checkout's files really are old, but its requires_daemon is met:
     // behind only the floor, so not held (#11052).
     write(&host.root.join(".loom/scripts/a.sh"), "#!/bin/sh\necho old\n");
-    write(&host.root.join(INSTALL_METADATA_PATH), &metadata("0.19.801", Some("0.19.772")));
+    write(&host.root.join(INSTALL_METADATA_PATH), &metadata("1.0.801", Some("1.0.772")));
     let seen = hold_pass(&host, floor, &mut holds);
     assert_eq!(verdicts(&seen), (Verdict::Clear, Verdict::Clear));
     assert!(holds.holds().is_empty());
 
     // The same with no requires_daemon on record: held, on the checkout copy.
-    write(&host.root.join(INSTALL_METADATA_PATH), &metadata("0.19.802", None));
+    write(&host.root.join(INSTALL_METADATA_PATH), &metadata("1.0.802", None));
     let seen = hold_pass(&host, floor, &mut holds);
     assert_eq!(verdicts(&seen), (Verdict::Clear, Verdict::Hold(HoldKind::InstallIncompatible)));
     let hold = holds.holds().into_values().next().unwrap();
@@ -153,10 +179,10 @@ fn a_checkout_with_resync_pending_is_held_whatever_its_versions_say() {
 
     write(
         &host.root.join(INSTALL_METADATA_PATH),
-        &interrupted("0.19.801", Some("0.19.772"), "0.19.802"),
+        &interrupted("1.0.801", Some("1.0.772"), "1.0.802"),
     );
     host.advance(INTERVAL);
-    let seen = hold_pass(&host, Some("0.19.800"), &mut holds);
+    let seen = hold_pass(&host, Some("1.0.800"), &mut holds);
     assert_eq!(verdicts(&seen).1, Verdict::Hold(HoldKind::InstallIncompatible));
     assert_eq!(seen[0].checkout.demand, None);
 }
@@ -178,7 +204,7 @@ fn a_repo_ahead_checkout_with_resync_pending_is_held() {
 
     write(
         &host.root.join(INSTALL_METADATA_PATH),
-        &interrupted("0.19.900", Some("0.19.772"), "0.19.901"),
+        &interrupted("1.0.900", Some("1.0.772"), "1.0.901"),
     );
     host.advance(INTERVAL);
     let seen = hold_pass(&host, None, &mut holds);
@@ -201,10 +227,10 @@ fn an_interrupted_newer_resync_is_held_and_demands_no_roll() {
     let mut holds = Holds::default();
     assert_eq!(verdicts(&hold_pass(&host, None, &mut holds)), (Verdict::Clear, Verdict::Clear));
 
-    fx.push_from_seed("a resync to 0.19.950, interrupted", |seed| {
+    fx.push_from_seed("a resync to 1.0.950, interrupted", |seed| {
         write(
             &seed.join(INSTALL_METADATA_PATH),
-            &interrupted(RUNNING, Some("0.19.772"), "0.19.950"),
+            &interrupted(RUNNING, Some("1.0.772"), "1.0.950"),
         );
     });
     let before = fx.origin_head();
@@ -216,7 +242,7 @@ fn an_interrupted_newer_resync_is_held_and_demands_no_roll() {
     assert_eq!(seen[0].default_branch.demand, None, "an interrupted resync names no need");
     let hold = holds.holds().into_values().next().expect("held");
     assert_eq!((hold.kind, hold.copy), (HoldKind::InstallIncompatible, HeldCopy::DefaultBranch));
-    assert!(hold.detail.contains("a resync to 0.19.950 was interrupted"), "{}", hold.detail);
+    assert!(hold.detail.contains("a resync to 1.0.950 was interrupted"), "{}", hold.detail);
     assert!(hold.detail.contains("mix of two releases"), "{}", hold.detail);
     assert_eq!(holds.demand(), None, "held without a roll demand: the ratchet guard stands");
     assert_eq!(fx.origin_head(), before, "and never completed from this older payload");
@@ -225,7 +251,7 @@ fn an_interrupted_newer_resync_is_held_and_demands_no_roll() {
     let own = fs::read_to_string(host.root.join(INSTALL_METADATA_PATH)).unwrap();
     write(
         &host.root.join(INSTALL_METADATA_PATH),
-        &interrupted(RUNNING, Some("0.19.772"), "0.19.950"),
+        &interrupted(RUNNING, Some("1.0.772"), "1.0.950"),
     );
     host.advance(INTERVAL);
     let seen = hold_pass(&host, None, &mut holds);
@@ -235,7 +261,7 @@ fn an_interrupted_newer_resync_is_held_and_demands_no_roll() {
 
     // A host on that release finishes the run, and the checkout is repaired.
     fx.push_from_seed("the resync, finished", |seed| {
-        write(&seed.join(INSTALL_METADATA_PATH), &metadata(RUNNING, Some("0.19.772")));
+        write(&seed.join(INSTALL_METADATA_PATH), &metadata(RUNNING, Some("1.0.772")));
     });
     write(&host.root.join(INSTALL_METADATA_PATH), &own);
     host.advance(INTERVAL);
@@ -251,18 +277,18 @@ fn an_interrupted_newer_resync_is_held_and_demands_no_roll() {
 #[test]
 fn a_w4_workspace_in_backoff_keeps_its_requirement_demand_and_detail() {
     let fx = Fixture::new(Seed {
-        version: "0.19.900",
-        requires: Some("0.19.890"),
+        version: "1.0.900",
+        requires: Some("1.0.890"),
         ..STALE
     });
     let host = Host::new(&fx, "host-a");
     // Only the default branch is W4, so the demand is its alone to carry.
-    write(&host.root.join(INSTALL_METADATA_PATH), &metadata(RUNNING, Some("0.19.772")));
+    write(&host.root.join(INSTALL_METADATA_PATH), &metadata(RUNNING, Some("1.0.772")));
     let w4 = Verdict::Hold(HoldKind::DaemonTooOld);
     let healthy = hold_pass(&host, None, &mut Holds::default());
     assert_eq!(verdicts(&healthy), (w4, Verdict::Clear));
     let want = healthy[0].default_branch.clone();
-    assert_eq!(want.demand, Some(v("0.19.890")));
+    assert_eq!(want.demand, Some(v("1.0.890")));
 
     // The repo's remote starts refusing: a failure, and a backoff.
     let fault = super::super::heads::Fault::NotFound("no such repository".into());
@@ -282,16 +308,16 @@ fn a_w4_workspace_in_backoff_keeps_its_requirement_demand_and_detail() {
     let report = only(&waiting);
     assert!(reason(report).starts_with("backoff until "), "{report:?}");
     assert_eq!(report.state, WState::W4);
-    assert_eq!(report.installed.as_deref(), Some("0.19.900"));
-    assert_eq!(report.requires_daemon.as_deref(), Some("0.19.890"));
+    assert_eq!(report.installed.as_deref(), Some("1.0.900"));
+    assert_eq!(report.requires_daemon.as_deref(), Some("1.0.890"));
 
     // A fresh `Holds`, so nothing is owed to what an earlier pass left.
     let mut holds = Holds::default();
     let seen = hold_pass(&host, None, &mut holds);
     assert_eq!(seen[0].default_branch, want, "same verdict, demand and detail as when healthy");
-    assert_eq!(holds.demand().expect("still a roll demand").version, "0.19.890");
+    assert_eq!(holds.demand().expect("still a roll demand").version, "1.0.890");
     let hold = holds.holds().into_values().next().unwrap();
-    assert!(hold.detail.contains("0.19.890"), "{}", hold.detail);
+    assert!(hold.detail.contains("1.0.890"), "{}", hold.detail);
     assert!(!hold.detail.contains("backoff"), "{}", hold.detail);
 }
 
@@ -306,7 +332,7 @@ fn a_w4_workspace_in_backoff_keeps_its_requirement_demand_and_detail() {
 fn a_compatible_w3_repo_is_not_held_and_is_still_resynced() {
     let fx = Fixture::new(STALE);
     let host = Host::new(&fx, "host-a");
-    let floor = Some("0.19.850");
+    let floor = Some("1.0.850");
     let mut holds = Holds::default();
     let (check, seen) = hold_pass_in(&host, Mode::Check, floor, &mut holds);
     assert_eq!(only(&check).state, WState::W3);
@@ -328,7 +354,7 @@ fn a_compatible_w3_repo_is_not_held_and_is_still_resynced() {
 fn a_behind_but_compatible_repo_is_named_once_and_still_not_held() {
     let fx = Fixture::new(STALE);
     let host = Host::new(&fx, "host-a");
-    let floor = Some("0.19.850");
+    let floor = Some("1.0.850");
     let mut holds = Holds::default();
     let behind = InstalledBehind {
         installed: STALE.version.to_string(),
@@ -357,7 +383,7 @@ fn a_behind_but_compatible_repo_is_named_once_and_still_not_held() {
 
     // Its installed version changes: named again.
     let mut moved = seen.clone();
-    moved[0].default_branch = Finding::clear_behind(Some("0.19.801".to_string()));
+    moved[0].default_branch = Finding::clear_behind(Some("1.0.801".to_string()));
     holds.step(&moved, v(RUNNING), host.now.get(), ALERT_AFTER);
     assert_eq!(holds.newly_behind().len(), 1);
 
@@ -403,7 +429,7 @@ fn a_held_w3_repo_is_not_reported_as_behind() {
     });
     let host = Host::new(&fx, "host-a");
     let mut holds = Holds::default();
-    let (_, seen) = hold_pass_in(&host, Mode::Check, Some("0.19.850"), &mut holds);
+    let (_, seen) = hold_pass_in(&host, Mode::Check, Some("1.0.850"), &mut holds);
     assert_eq!(seen[0].default_branch.behind, None);
     assert!(holds.installed_behind().is_empty());
 }
@@ -418,7 +444,7 @@ fn a_w3_repo_whose_requires_daemon_cannot_be_read_is_held() {
     });
     let host = Host::new(&fx, "host-a");
     let mut holds = Holds::default();
-    let (check, seen) = hold_pass_in(&host, Mode::Check, Some("0.19.850"), &mut holds);
+    let (check, seen) = hold_pass_in(&host, Mode::Check, Some("1.0.850"), &mut holds);
     assert_eq!(only(&check).state, WState::W3);
     let held = Verdict::Hold(HoldKind::InstallIncompatible);
     assert_eq!(verdicts(&seen), (held, held));
@@ -438,7 +464,7 @@ fn a_checkout_hold_clears_when_the_checkout_fast_forwards_in_the_same_pass() {
         ..STALE
     });
     let host = Host::new(&fx, "host-a");
-    let floor = Some("0.19.850");
+    let floor = Some("1.0.850");
     let mut holds = Holds::default();
     // The writing pass resyncs the default branch; this host's checkout is
     // still the old install, and holds.
@@ -507,7 +533,7 @@ fn a_maintain_only_workspace_is_still_resynced() {
     let mut holds = Holds::default();
     let (pass, _) = hold_pass_in(&host, Mode::Write, None, &mut holds);
     assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
-    assert!(reason(only(&pass)).starts_with("resynced to v0.19.880"), "{pass:?}");
+    assert!(reason(only(&pass)).starts_with("resynced to v1.0.880"), "{pass:?}");
     assert_eq!(fx.origin_commits(), commits + 1, "resynced");
     assert!(holds.holds().is_empty(), "no pass hold");
     assert_eq!(holds.demand(), None, "no roll demand");

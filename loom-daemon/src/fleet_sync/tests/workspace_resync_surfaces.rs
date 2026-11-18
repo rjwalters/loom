@@ -6,8 +6,8 @@
 use super::*;
 
 const CURRENT: Seed = Seed {
-    version: "0.19.800",
-    requires: Some("0.19.772"),
+    version: "1.0.800",
+    requires: Some("1.0.772"),
     current: true,
     ignore_bin: false,
 };
@@ -93,7 +93,7 @@ fn a_release_that_changes_no_surface_makes_no_claim_and_no_commit() {
     let commits = fx.origin_commits();
 
     // A newer daemon whose payload is the same files: a daemon-only release.
-    let host = Host::running(&fx, "host-a", "0.19.881", defaults);
+    let host = Host::running(&fx, "host-a", "1.0.881", defaults);
     let pass = host.pass();
     let report = only(&pass);
     assert_eq!(report.state, WState::W0, "{report:?}");
