@@ -1753,8 +1753,7 @@ code evaluation, never review reconciliation. `post-verdict.sh` enforces it on
 the approval write below regardless (#7647).
 
 **2. Still verify CI status** (step 8, "CI Status Check" above) — a docs-only
-diff can still fail a structural CI job (`claude-md-budget`,
-`agents-md-sync`, `docs-defaults-parity`, `dangling-links`,
+diff can still fail a structural CI job (`agents-md-sync`, `dangling-links`,
 `gitignore-convergence`) even though the build/test matrix is skipped by the
 path filter. Apply the same When CI Fails / When CI is Pending handling as
 the normal flow — this fast path shortcuts code review, not CI verification.

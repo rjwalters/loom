@@ -11,9 +11,8 @@
 # artifact differs, keeping instructions single-source (the issue's own
 # non-goal: "no hand-maintained AGENTS.md").
 #
-# This mirrors scripts/check-claude-md-budget.sh's pattern (dedicated script,
-# wired into .github/workflows/ci.yml) but checks CONTENT SYNC rather than a
-# line budget.
+# Dedicated script wired into .github/workflows/ci.yml, checking content sync
+# rather than a line budget.
 #
 # Usage:
 #   check-agents-md-sync.sh
