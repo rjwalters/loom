@@ -43,14 +43,22 @@
 //! second state refusal of the same `(item, step)` with the **same reason**,
 //! with no other outcome in between, arms [`LedgerConfig::refusal_cooldown`]
 //! (10 min), doubling per further identical refusal up to
-//! [`MAX_SHORT_COOLDOWN`], broadcast like every window. A verdict or any
-//! other outcome on the pair resets the streak.
+//! [`MAX_SHORT_COOLDOWN`]. Unlike every other window this one is host-local,
+//! not broadcast (#11909): a refusal is this host's own (its exhausted pool,
+//! its claim race, its runtime or model pin) and says nothing about a peer's.
+//! A verdict or any other outcome on the pair resets the streak.
 //!
 //! `claim_lost` rides the same streak guard (#11969): one lost claim is a
 //! race and only redraws, but a pair whose claim is lost on every draw (a
 //! peer or an attended session holding it for longer than a tick) would
 //! otherwise spawn and lose on every tick. A second consecutive `claim_lost`
 //! on the pair arms the same doubling refusal cooldown; it still redraws.
+//!
+//! So does a spawn-time admission refusal (#14032): `runtime_rejected`,
+//! `model_runtime_mismatch` and `admission_refused` map to the ledger's
+//! `admission` reason (`step_end::ledger_reason`) and fall through to this
+//! effect — a launch the runtime will not take says the pair cannot run now,
+//! so redrawing it on every tick only burns slots.
 //!
 //! [`PROVIDER_EXHAUSTED`] does **not** ride it (#13966). The streak is
 //! backpressure for a disagreement about the *item*; an exhausted api-key
@@ -101,7 +109,8 @@
 //! # Durability
 //!
 //! Every window the ledger arms is at most [`MAX_SHORT_COOLDOWN`] (24 h, the
-//! landed cooldown's own ceiling), and the registry broadcasts each one on
+//! landed cooldown's own ceiling), and the registry broadcasts each one but a
+//! refusal's (host-local, #11909) on
 //! the peer channel (`ClaimKind::StepCooldownArmed`), so peers keep honouring
 //! a window after this host restarts. A host never gets its own windows back
 //! from peers (they never re-send them, and a host ignores its own ads), so

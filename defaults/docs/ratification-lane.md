@@ -46,9 +46,12 @@ them. Selection also honors `champion.ratificationPaths` / `ratificationPhrases`
    whose current head already carries both markers is skipped. The head SHA is captured here.
 3. Two sessions run, `ratification-ee` and `ratification-market`. Each prompt is
    its pinned instructions plus the PR reference and nothing else.
-4. For each key whose session ends in success the daemon posts one comment
-   (below). A key that failed closed, or whose session did not succeed, posts
-   nothing and the reason is logged; the other key is unaffected.
+4. For each key whose session ends in success **and** whose output parses as
+   that key's review (below) the daemon posts one comment. A key that failed
+   closed, whose session did not succeed, or whose output carries no verdict
+   posts nothing and the reason is logged; the other key is unaffected. A
+   withheld key posts no marker, so the PR is selected again at the same head
+   on a later tick.
 
 ## Marker format
 
@@ -60,11 +63,25 @@ reviewer=<ratification-ee|ratification-market>
 The first line is the wire format `keys_marked` parses; `reviewer=` is a visible
 line beside it and is not part of the regex. The `sha` is the head captured at
 selection, not re-read at post time: a push mid-review leaves the new head
-without markers, so the PR is selected again. After the marker the comment carries a
-`Verdict:` section: the tail of the session's output (its role log from launch),
-at most 4000 characters, with an explicit truncation notice when cut. `<!--` and
-`-->` in it are escaped, so it cannot form or alter a marker. It is posted only
-for a session that succeeded.
+without markers, so the PR is selected again. After the marker the comment
+carries a `Verdict:` section: the extracted review text, never the session's
+log. The review is delimited by the reviewer's own heading — `## EE-key
+review:` or `## Market-key review:` — and runs from that heading's **last**
+occurrence in the session output to the first launcher/wrapper line after it
+(a timestamped `[<ISO-8601>] [INFO|WARN|ERROR]` log line or a
+`[claude-wrapper]` diagnostic), so launcher or wrapper noise on either side
+of the review is never read as a verdict or posted — no auth-mode line, no
+wrapper tail.
+A marker is posted only when the review also carries an `**Overall verdict:**`
+line whose first token is one of the key's verdicts: `approve` /
+`request-changes` for `ee`; `competitive` / `adequate-for-catalog` /
+`uncompetitive` / `escalate` for `market`. Anything else — the reviewer
+declined, authored the PR or reported a disclosure problem (all no verdict),
+no heading, an unknown token, or two different tokens — posts no marker and
+is logged as withheld. The text is at most 4000 characters — the head is
+kept on truncation, so the heading and verdict line survive — with an
+explicit notice when cut; its `<!--` and `-->` are escaped, so it cannot
+form or alter a marker.
 
 ## Trust model
 

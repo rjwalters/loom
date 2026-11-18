@@ -192,21 +192,365 @@ fn dirty_root_and_dirty_worktree_are_preserved() {
 }
 
 #[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
 fn unpushed_and_detached_commits_survive_refused_reuse() {
     let _fork = fork_guard();
-    let f = RepoFixture::new();
+    let mut f = RepoFixture::new();
     f.prepare().unwrap();
     let repo = f.root.join("repo");
     git(&repo, &["switch", "-c", "issue-3"]);
     std::fs::write(repo.join("fixture"), "unpushed").unwrap();
     git(&repo, &["commit", "-am", "unpublished"]);
     let tip = git(&repo, &["rev-parse", "HEAD"]);
-    assert!(f.prepare().unwrap_err().to_string().contains("unpushed"));
+    // A branch names the work and preparation never moves a branch: a new
+    // step on the same issue resumes its own unpublished tip (#14030).
+    f.args.branch = Some("issue-3".into());
+    f.prepare().unwrap();
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), tip);
+    // A step for a different issue proceeds and leaves the branch untouched.
+    f.args.branch = Some("issue-4".into());
+    f.prepare().unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), git(&repo, &["rev-parse", "issue-4"]));
+    // With no requested branch the dispatch detaches to the base; the
+    // branch keeps carrying the work.
+    f.args.branch = None;
+    f.prepare().unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), tip);
+    // Work no longer named by a branch still refuses (a detached HEAD could
+    // be detached away from): the refusal preserves it, names the leftover
+    // unpublished branch and the exact command that clears it.
+    f.args.branch = Some("issue-3".into());
+    f.prepare().unwrap();
+    std::fs::write(repo.join("fixture"), "more").unwrap();
+    git(&repo, &["commit", "-am", "more-unpublished"]);
+    git(&repo, &["switch", "-c", "strand"]);
+    std::fs::write(repo.join("fixture"), "stranded").unwrap();
+    git(&repo, &["commit", "-am", "stranded"]);
     git(&repo, &["switch", "--detach"]);
-    git(&repo, &["branch", "-D", "issue-3"]);
-    assert!(f.prepare().unwrap_err().to_string().contains("detached"));
-    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), tip);
+    git(&repo, &["branch", "-D", "strand"]);
+    let stranded_tip = git(&repo, &["rev-parse", "HEAD"]);
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("unpushed"), "{error}");
+    assert!(error.contains("detached"), "{error}");
+    assert!(error.contains("issue-3"), "{error}");
+    assert!(error.contains("accounts session recover fixture --publish"), "{error}");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), stranded_tip);
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn unpublished_commits_in_one_clone_do_not_block_another_clone_or_branch() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    git(&repo, &["switch", "-c", "issue-3"]);
+    std::fs::write(repo.join("fixture"), "unpushed").unwrap();
+    git(&repo, &["commit", "-am", "unpublished"]);
+    let tip = git(&repo, &["rev-parse", "issue-3"]);
+    // A second registered repository of the same account clones and
+    // prepares independently of the primary's unpublished work (#14030).
+    let additional = repository::PrepareArgs {
+        account: "fixture".into(),
+        repository: f.remote.to_string_lossy().into_owned(),
+        base: "main".into(),
+        container_id: "test-container".into(),
+        branch: Some("feature/issue-9".into()),
+        slug: Some("owner-repo-12345678".into()),
+    };
+    let add = repository::prepare(&f.root, &additional).unwrap();
+    assert!(!add.is_empty());
+    // Unpublished commits on one branch of the additional clone do not
+    // block re-preparing it for its own branch, nor the primary at all.
+    let clone = f.root.join("work").join("owner-repo-12345678");
+    git(&clone, &["switch", "-c", "other-unpushed"]);
+    std::fs::write(clone.join("fixture"), "other").unwrap();
+    git(&clone, &["commit", "-am", "other-unpublished"]);
+    f.args.branch = Some("issue-4".into());
+    f.prepare().unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), tip);
+    repository::prepare(&f.root, &additional).unwrap();
+    assert_eq!(
+        git(&clone, &["rev-parse", "feature/issue-9"]),
+        add,
+        "the additional clone resumes its own branch"
+    );
+}
+
+/// Fallible git probe for assertions on ref existence (`test_git_helpers::run`
+/// panics on failure).
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    crate::test_git_helpers::git_out(dir, args).status.success()
+}
+
+fn recover_args(remote: &Path) -> repository::RecoverArgs {
+    repository::RecoverArgs {
+        account: "fixture".into(),
+        repository: remote.to_string_lossy().into_owned(),
+        base: "main".into(),
+        publish: false,
+        discard: false,
+        issue: None,
+        branch: Vec::new(),
+        slug: None,
+    }
+}
+
+/// Two unpublished branches (one ahead each) with the root checkout
+/// detached at the base, and the base revision.
+fn two_unpublished_branches() -> (RepoFixture, PathBuf, String, String) {
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let base = git(&repo, &["rev-parse", "origin/main"]);
+    let branch = |name: &str, content: &str, repo: &Path| {
+        git(repo, &["switch", "-c", name]);
+        std::fs::write(repo.join("fixture"), content).unwrap();
+        git(repo, &["commit", "-am", content]);
+        let tip = git(repo, &["rev-parse", name]);
+        git(repo, &["switch", "--detach", &base]);
+        tip
+    };
+    let issue3 = branch("issue-3", "first", &repo);
+    let issue4 = branch("issue-4", "second", &repo);
+    (f, repo, issue3, issue4)
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_lists_unpublished_branches_and_stranded_detached_work() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, issue4) = two_unpublished_branches();
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert!(list.cloned);
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("issue-3", 1), ("issue-4", 1)]
+    );
+    assert!(list.published.is_empty() && list.discarded.is_empty());
+    assert!(list.ignored.is_empty() && list.detached.is_empty());
+    // Detached, unnamed work is reported (never touched) by the listing.
+    git(&repo, &["switch", "-c", "strand"]);
+    std::fs::write(repo.join("fixture"), "stranded").unwrap();
+    git(&repo, &["commit", "-am", "stranded"]);
+    let stranded = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["switch", "--detach"]);
+    git(&repo, &["branch", "-D", "strand"]);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(list.detached.len(), 1);
+    assert_eq!(list.detached[0].revision, stranded);
+    assert_eq!(list.detached[0].ahead, 1);
+    // The detached tip is preserved exactly (nothing was reset).
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), stranded);
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+    // A clone the account never materialized reports cloned=false.
+    let mut absent = recover_args(&f.remote);
+    absent.slug = Some("owner-other-12345678".into());
+    let list = repository::recover(&f.root, &absent).unwrap();
+    assert!(!list.cloned);
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_publishes_scoped_branches_and_leaves_others_unpublished() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, issue4) = two_unpublished_branches();
+    let mut args = recover_args(&f.remote);
+    args.publish = true;
+    args.branch = vec!["issue-3".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.published, vec!["issue-3".to_owned()]);
+    // The remote carries the branch now, and the listing agrees.
+    assert_eq!(git(&f.remote, &["rev-parse", "issue-3"]), issue3);
+    assert_eq!(
+        out.branches
+            .iter()
+            .map(|b| b.branch.as_str())
+            .collect::<Vec<_>>(),
+        vec!["issue-4"]
+    );
+    // issue-4 was never touched: still unpublished at its own tip.
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+    // Publishing an absent branch is ignored, not an error.
+    args.branch = vec!["absent".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.ignored, vec!["absent".to_owned()]);
+    assert!(out.published.is_empty());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_requires_a_scope_and_only_touches_named_branches() {
+    let _fork = fork_guard();
+    let (f, repo, _issue3, issue4) = two_unpublished_branches();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("scope"), "{error}");
+    // Nothing was discarded without a scope.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-3"]));
+    // Only the named branch is discarded.
+    args.branch = vec!["issue-3".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["issue-3".to_owned()]);
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-3"]));
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+    // A published branch (and an absent one) is ignored: a discard never
+    // deletes a branch it was not named for, nor one carrying no unpublished
+    // commits.
+    args.branch = vec!["main".into(), "ghost".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.ignored, vec!["ghost".to_owned(), "main".to_owned()]);
+    assert!(out.discarded.is_empty());
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/main"]));
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_moves_the_checkout_and_removes_a_holding_worktree() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let base = git(&repo, &["rev-parse", "origin/main"]);
+    // A branch held by the main checkout.
+    git(&repo, &["switch", "-c", "held"]);
+    std::fs::write(repo.join("fixture"), "held").unwrap();
+    git(&repo, &["commit", "-am", "held"]);
+    // A branch held by a linked worktree.
+    let worktree = f.root.join("issue-5");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wt-held",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(worktree.join("fixture"), "wt-held").unwrap();
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-am", "wt-held"]);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["held".into(), "wt-held".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded.len(), 2);
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/held"]));
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/wt-held"]));
+    // The main checkout was moved to the base on origin, not left stranded.
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
+    assert!(!worktree.exists(), "the holding worktree was removed");
+    // A dirty worktree holding a discarded branch refuses before any
+    // mutation.
+    let dirty = f.root.join("issue-6");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "dirty-holder",
+            dirty.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(dirty.join("fixture"), "committed").unwrap();
+    git(&dirty, &["add", "."]);
+    git(&dirty, &["commit", "-am", "committed"]);
+    std::fs::write(dirty.join("untracked"), "keep").unwrap();
+    args.branch = vec!["dirty-holder".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("uncommitted"), "{error}");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/dirty-holder"]));
+    assert!(dirty.join("untracked").exists());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_refuses_a_dirty_main_checkout_holding_the_branch() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // The main checkout holds the branch — where `prepare` itself leaves it —
+    // with uncommitted work on top.
+    git(&repo, &["switch", "-c", "held-dirty"]);
+    std::fs::write(repo.join("fixture"), "committed").unwrap();
+    git(&repo, &["commit", "-am", "committed"]);
+    std::fs::write(repo.join("untracked"), "keep").unwrap();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["held-dirty".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("main checkout"), "{error}");
+    assert!(error.contains("uncommitted"), "{error}");
+    // The branch, the checkout, and the uncommitted work are all untouched:
+    // no half-done discard.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/held-dirty"]));
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "held-dirty");
+    assert!(repo.join("untracked").exists());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_resolves_the_base_before_mutating_any_holder() {
+    let _fork = fork_guard();
+    let (f, repo, _issue3, _issue4) = two_unpublished_branches();
+    // A linked worktree holds the branch that sorts first, so the old code
+    // removed it before the main checkout's unresolvable base failed.
+    let worktree = f.root.join("issue-7");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "aaa-wt",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(worktree.join("fixture"), "aaa-wt").unwrap();
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-am", "aaa-wt"]);
+    // The main checkout holds the other discarded branch.
+    git(&repo, &["switch", "issue-3"]);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.base = "no-such-base".into();
+    args.branch = vec!["issue-3".into(), "aaa-wt".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("base"), "{error}");
+    // Neither holder was touched: the base resolves before the first mutation.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-3"]));
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/aaa-wt"]));
+    assert!(worktree.exists(), "the holding worktree was not removed");
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "issue-3");
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_refuses_an_unknown_clone_identity() {
+    let _fork = fork_guard();
+    let (f, _repo, _issue3, _issue4) = two_unpublished_branches();
+    let mut args = recover_args(&f.remote);
+    args.account = "mallory".into();
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("identity mismatch"), "{error}");
 }
 
 #[test]

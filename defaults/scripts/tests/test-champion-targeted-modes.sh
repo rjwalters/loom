@@ -218,6 +218,8 @@ check "--issue: a blocked issue is lifted only once its blocker has closed (#118
   doc_has "$TARGETED_MD" 'body is a closed issue or a merged PR, remove `loom:blocked` and go on.'
 check "--issue: a still-blocked issue is left untouched, outcome blocked (#12078)" \
   doc_has "$TARGETED_MD" 'Otherwise leave the issue exactly as it is (no comment, no label change,'
+check "--issue: a proposal carrying loom:triage is not-eligible, Curator's turn (#13902)" \
+  doc_has "$TARGETED_MD" 'A proposal carrying `loom:triage` is'
 # --non-item
 NONITEM="$(awk '/^## `--non-item`/{on=1} on' "$TARGETED_MD")"
 out="$NONITEM"

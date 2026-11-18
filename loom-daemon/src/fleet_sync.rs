@@ -861,21 +861,10 @@ fn cell() -> &'static Mutex<Option<FleetSyncStatus>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
-/// Resolve `<loom_dir>` the same way [`crate::daemon_heartbeat`] and
-/// [`crate::autonomy_marker`] do: the parent of `LOOM_SOCKET_PATH` when set (so
-/// a test daemon pointed at a tempdir socket never writes into the operator's
-/// real `~/.loom`), else `~/.loom`.
-fn resolve_loom_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        return PathBuf::from(path).parent().map(Path::to_path_buf);
-    }
-    dirs::home_dir().map(|h| h.join(".loom"))
-}
-
 /// Path of the host-level snapshot, or `None` when no loom dir resolves.
 #[must_use]
 pub fn status_path() -> Option<PathBuf> {
-    resolve_loom_dir().map(|d| d.join(STATUS_FILENAME))
+    crate::autonomy_marker::resolve_loom_dir().map(|d| d.join(STATUS_FILENAME))
 }
 
 /// Record `status` in process memory and in the host-level snapshot file.
