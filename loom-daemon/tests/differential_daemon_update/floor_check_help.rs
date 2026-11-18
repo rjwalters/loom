@@ -1,7 +1,7 @@
 //! The `--help` text #11044 added for the fleet floor confirmation, spelled
 //! out independently of `help.txt` so [`super::Divergence::HelpDocumentsFleetFloorCheck`]
 //! verifies the EXACT intended text rather than "whatever the port prints".
-//! A sibling of the main file, which is at the file-size ratchet's threshold.
+//! A sibling of the main file.
 
 use super::{classify, insert_before_unique, Answer, Divergence};
 

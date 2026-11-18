@@ -1,5 +1,5 @@
 //! #10454: the ordered resolver passes over a Codex pool of down session
-//! containers — split from `tests.rs` (file-size ratchet).
+//! containers — split from `tests.rs`.
 
 use super::{fixture, provision_claude_pool, write_config, ClearedRuntimeEnv};
 use crate::runtime_preference::{resolve_runtime, Decision};

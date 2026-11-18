@@ -112,6 +112,8 @@ pub(super) fn heal(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) {
         Verdict::Clean => None,
         Verdict::Leave(why) => {
             log::debug!("checkout_ff: {}: self-heal: left alone: {why}", root.display());
+            net.self_heal_left
+                .push(format!("{}: left alone: {why}", root.display()));
             None
         }
         Verdict::Repair(plan) => Some(plan),
@@ -153,7 +155,8 @@ fn rehome(env: &Env<'_>, root: &Path, branch: &str, gd: &Path, net: &mut Net) {
         Ok(None) => return,
         Err(why) => {
             log::debug!("checkout_ff: {}: self-heal: stays off `{branch}`: {why}", root.display());
-            net.stayed_off = Some(why);
+            net.self_heal_left
+                .push(format!("{}: stays off `{branch}`: {why}", root.display()));
             return;
         }
     };

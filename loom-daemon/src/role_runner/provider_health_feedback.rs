@@ -97,6 +97,15 @@ pub(super) fn apply_role_tick_provider_health_feedback(
         );
         return;
     }
+    // #14121: a v3 terminal record names the pinned model the adapter dropped
+    // before exec (spawn-codex.sh's ChatGPT-plan guard). Surface it here so a
+    // configured-but-ignored model is visible in the daemon log without
+    // reading the adapter's own WARN lines.
+    if let Some(requested) = &result.requested_model {
+        log::warn!(
+            "role_runner: spawn-codex dropped the pinned model '{requested}' before exec (issue #14121); the step ran on the profile's default model"
+        );
+    }
     let id = AccountId {
         provider: result.provider,
         name: result.account,

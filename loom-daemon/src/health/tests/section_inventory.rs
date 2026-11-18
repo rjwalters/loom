@@ -2,8 +2,7 @@
 //! unconditional [`super::super::assess`] section, in order, and therefore
 //! have to be updated by every PR that adds one. Split out of `tests.rs`
 //! (#7990, which adds `pool_hold`) so they sit together under a name that
-//! says what they are, and so that file stays inside its
-//! `.loom/docs/file-size-policy.md` ratchet.
+//! says what they are.
 
 use super::*;
 
