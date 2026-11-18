@@ -385,14 +385,11 @@ fn rc(next_after: u64, latest: u64, truncated: bool) -> Value {
 }
 
 #[test]
-fn change_kinds_map_onto_webhook_types() {
-    assert_eq!(wake::webhook_type("issue", None), Some("issues"));
-    assert_eq!(wake::webhook_type("label", Some("issue")), Some("issues"));
-    assert_eq!(wake::webhook_type("label", Some("pr")), Some("pull_request"));
-    assert_eq!(wake::webhook_type("pr", None), Some("pull_request"));
-    assert_eq!(wake::webhook_type("pr_merged", None), Some("pull_request"));
-    assert_eq!(wake::webhook_type("check", None), Some("check_run"));
-    assert_eq!(wake::webhook_type("future_kind", None), None);
+fn only_known_change_kinds_count() {
+    for kind in ["issue", "label", "pr", "pr_merged", "check"] {
+        assert!(wake::is_known_kind(kind), "{kind}");
+    }
+    assert!(!wake::is_known_kind("future_kind"));
 
     let mut cursors = Cursors::new("https://m");
     cursors.repos.insert(REPO.into(), 3);
@@ -403,7 +400,6 @@ fn change_kinds_map_onto_webhook_types() {
         false,
     );
     wake::apply(&mut cursors, &[REPO.to_string()], &p, now(), &mut nudge);
-    assert_eq!(nudge.types.iter().copied().collect::<Vec<_>>(), vec!["issues"]);
     assert_eq!(nudge.repos.iter().cloned().collect::<Vec<_>>(), vec![REPO.to_string()]);
     assert_eq!(nudge.latencies, vec![(REPO.to_string(), "label".to_string(), 2.0)]);
     assert_eq!(cursors.repos[REPO], 4);
@@ -428,7 +424,7 @@ fn cursors_advance_and_a_truncated_or_reset_log_prompts_a_reread() {
         now(),
         &mut nudge,
     );
-    assert!(!nudge.prompts(), "nothing new is no prompt");
+    assert_eq!(nudge, Nudge::default(), "nothing new is no prompt");
 
     // The log restarted below our cursor (a recreated mirror).
     let mut nudge = Nudge::default();
@@ -439,7 +435,7 @@ fn cursors_advance_and_a_truncated_or_reset_log_prompts_a_reread() {
         now(),
         &mut nudge,
     );
-    assert!(nudge.prompts() && nudge.missed);
+    assert!(nudge.missed);
     assert_eq!(cursors.repos[REPO], 2);
 
     // Truncated: changes were dropped from retention before we read them.
@@ -467,7 +463,7 @@ fn cursors_advance_and_a_truncated_or_reset_log_prompts_a_reread() {
         now(),
         &mut nudge,
     );
-    assert!(!nudge.prompts());
+    assert_eq!(nudge, Nudge::default());
     assert_eq!(cursors.repos[REPO], 100);
     assert!(!cursors.repos.contains_key("acme/other"));
 }
@@ -514,14 +510,13 @@ async fn a_pass_baselines_new_repos_then_reads_changes() {
 
     let (first, r) = wake::pass(&http, &a, &repos, &mut cursors).await;
     r.unwrap();
-    assert!(!first.prompts(), "a baseline never prompts");
+    assert_eq!(first, Nudge::default(), "a baseline never prompts");
     assert_eq!(cursors.repos[REPO], 10);
 
     let (second, r) = wake::pass(&http, &a, &repos, &mut cursors).await;
     r.unwrap();
     assert_eq!(cursors.repos[REPO], 11);
-    assert!(second.prompts());
-    assert!(second.types.contains("pull_request"));
+    assert_eq!(second.repos, std::collections::BTreeSet::from([REPO.to_string()]));
 
     let seen = seen.lock().unwrap().clone();
     assert!(seen[0].0.contains("after=0") && seen[0].0.contains("limit=1"), "{}", seen[0].0);
@@ -556,7 +551,7 @@ async fn a_caller_held_mirror_passes_for_its_repo_set_only() {
 
     let (first, r) = wake::pass(&http, &own, &repos, &mut cursors).await;
     r.unwrap();
-    assert!(!first.prompts(), "a baseline never prompts");
+    assert_eq!(first, Nudge::default(), "a baseline never prompts");
     let (second, r) = wake::pass(&http, &own, &repos, &mut cursors).await;
     r.unwrap();
     assert_eq!(second.repos, std::collections::BTreeSet::from([REPO.to_string()]));
@@ -647,7 +642,7 @@ fn a_key_that_cannot_be_read_backs_off_exponentially_to_fifteen_minutes() {
 }
 
 #[test]
-fn a_missed_changes_pass_carries_every_change_type() {
+fn a_missed_changes_pass_rereads_the_repo() {
     let mut cursors = Cursors::new("https://m");
     cursors.repos.insert(REPO.into(), 50);
     let mut nudge = Nudge::default();
@@ -658,10 +653,9 @@ fn a_missed_changes_pass_carries_every_change_type() {
         now(),
         &mut nudge,
     );
-    assert!(nudge.missed && nudge.count == 0);
-    for wanted in wake::MISSED_TYPES {
-        assert!(nudge.types.contains(wanted), "{wanted}: {:?}", nudge.types);
-    }
+    assert!(nudge.missed);
+    assert_eq!(nudge.repos, std::collections::BTreeSet::from([REPO.to_string()]));
+    assert!(nudge.latencies.is_empty());
 }
 
 #[test]
@@ -688,7 +682,7 @@ async fn a_pass_that_fails_part_way_still_returns_what_it_read() {
     let (nudge, result) = wake::pass(&http, &a, &[REPO.to_string()], &mut cursors).await;
     assert_eq!(result, Err(MirrorError::Status(500)));
     assert_eq!(cursors.repos[REPO], 11, "the cursor moved past the change read");
-    assert!(nudge.prompts(), "so that change must still be recorded");
+    assert_eq!(nudge.latencies.len(), 1, "so that change must still be recorded");
 }
 
 #[test]
