@@ -2181,7 +2181,7 @@ render_plan_body() {
   building=$("$GH_READ" issue list --label "loom:building" --search "$(sed 's/^/-label:/' <<<"$op_q" | tr '\n' ' ') -label:loom:frozen" --state open --limit 200 --json number,title \
     --jq 'sort_by(.number) | .[] | "- **#\(.number)**: \(.title)"')
   review=$("$GH_READ" pr list --label "loom:review-requested" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
   # #5930/#6457: PRs carrying `loom:operator` are Judge-approved work stuck on
   # a human merge-risk-hold decision — folded into the generated region (see
   # the "#5930, DO NOT put a hand-written narrative section outside the
