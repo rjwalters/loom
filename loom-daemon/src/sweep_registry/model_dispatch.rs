@@ -85,10 +85,24 @@ impl DispatchModel<'_> {
         kind: &SweepKind,
         admitted: Option<&str>,
     ) -> Option<String> {
-        if let Self::Resolved(model) = self {
-            return model.map(str::to_owned);
-        }
         let root = &config.workspace_root;
+        if let Self::Resolved(model) = self {
+            // A literal launch argument stands, with one exception (#14443):
+            // the reaper's resume re-dispatch passes `Resolved(None)` (no
+            // `--model`, the CLI default). When that issue's last sweep was
+            // killed by a model limit there is a step-down to honour, which
+            // needs a model to step down FROM, so resolve one as a fresh
+            // dispatch would. No pending kill: unchanged.
+            let resume_after_kill = model.is_none()
+                && matches!(kind, SweepKind::Issue(n) if super::model_limit_kill::step_down_pending(
+                    root,
+                    *n,
+                    super::model_limit_kill::ISSUE_SWEEP_ROLE,
+                ));
+            if !resume_after_kill {
+                return model.map(str::to_owned);
+            }
+        }
         // Only hermetic skip-label fixtures lack admission. Reading their
         // configured binding does not select credentials or reserve a slot.
         //
@@ -113,7 +127,7 @@ impl DispatchModel<'_> {
             SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
         };
         let resolved = match (self, experiment_issue) {
-            (Self::Request(None) | Self::Autonomous, Some(issue)) => {
+            (Self::Request(None) | Self::Autonomous | Self::Resolved(None), Some(issue)) => {
                 resolve_autonomous_model_for_runtime(root, issue, policy)
             }
             _ => {
@@ -145,8 +159,49 @@ impl DispatchModel<'_> {
             resolved.source_label,
             resolved.arm,
         );
-        (!resolved.model.is_empty()).then_some(resolved.model)
+        match kind {
+            SweepKind::Issue(issue) => issue_sweep_fallback(root, *issue, resolved.model),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => {
+                (!resolved.model.is_empty()).then_some(resolved.model)
+            }
+        }
     }
+}
+
+/// The two-stage model fallback the step engine applies at launch
+/// (`step_spawn::with_model_fallback`), for a legacy issue sweep (#14443):
+/// selection-time fallback (#13873), then the in-flight step-down (#13905)
+/// when the issue's previous sweep was killed by a model limit. Both are
+/// no-ops while `autonomous.modelFallback` is absent or disabled, and an empty
+/// model (the CLI default) has no class to fall back from.
+fn issue_sweep_fallback(root: &Path, issue: u32, configured: String) -> Option<String> {
+    if configured.is_empty() {
+        return None;
+    }
+    let effective = super::model_fallback::effective_model(root, &configured);
+    if let Some((model, decision)) = super::model_limit_kill::step_down(
+        root,
+        issue,
+        super::model_limit_kill::ISSUE_SWEEP_ROLE,
+        &effective.model,
+        &effective.configured,
+    ) {
+        log::info!(
+            "sweep dispatch: issue sweep #{issue} stepped down {} -> {model} ({})",
+            decision.from,
+            decision.reason
+        );
+        return Some(model);
+    }
+    if let Some(decision) = &effective.fallback {
+        log::info!(
+            "sweep dispatch: issue sweep #{issue} fell back {} -> {} ({})",
+            decision.from,
+            decision.model,
+            decision.reason
+        );
+    }
+    (!effective.model.is_empty()).then_some(effective.model)
 }
 
 impl SweepRegistry {

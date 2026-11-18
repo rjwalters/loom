@@ -11254,8 +11254,9 @@ configured; when its limit resets, the next spawn returns to it:
   explicit per-repo choice; the shipped `chain` is `fable → opus → sonnet`
   (the sweep ladder's upper rungs), configurable per repo through the
   effective config like the model keys.
-- **What falls back.** Role-runner ticks and step-engine spawns (every
-  `StepRole`, including Builder steps): after the model-resolution chain
+- **What falls back.** Role-runner ticks, step-engine spawns (every
+  `StepRole`, including Builder steps) and legacy issue-sweep launches
+  (#14443): after the model-resolution chain
   above resolves the configured model, the daemon probes the pool for that
   model's *class* and, finding no usable account, walks the chain strictly
   **below** the configured model to the first rung with one and launches
@@ -11303,10 +11304,17 @@ configured; when its limit resets, the next spawn returns to it:
   step's own dispatch and only for a non-zero exit with no verdict line — a
   generic `hit your weekly limit` is account-wide, no rung escapes it, and
   stays as today. With the block absent or `enabled: false` nothing is
-  recorded and nothing changes. The issue-sweep path's insta-crash
-  quarantine tally already exempts these banners (`account-exhaustion`
-  re-attribution, #4122/#4501); it re-dispatches through the sweep reaper,
-  not this memo.
+  recorded and nothing changes. **Legacy issue sweeps (#14443)** use the same
+  memo under the fixed pseudo-role `issue-sweep` (one process runs the whole
+  lifecycle, so there is no per-role key): the sweep reaper records the kill
+  when it reaps the dead child, and the next launch of that issue (a fresh
+  dispatch, or the reaper's resume re-dispatch) steps down a rung with the
+  same never-climb / last-rung / `enabled: false` semantics. An issue
+  sweep's launch also gets selection-time fallback above, which it did not
+  before. The issue-sweep path's insta-crash quarantine tally already exempts
+  these banners (`account-exhaustion` re-attribution, #4122/#4501); a kill is
+  still counted by the PR-less retry bound, unlike a step's uncharged
+  `provider_exhausted` end.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an

@@ -212,3 +212,144 @@ fn the_exact_fable_banner_classifies_as_account_exhaustion_not_an_issue_crash() 
         "an insta-crash on this banner must not be charged to the issue's tally"
     );
 }
+
+// ---- the legacy issue-sweep path (#14443) --------------------------------
+
+mod issue_sweep {
+    use super::*;
+    use crate::sweep_registry::test_support::{fixture_registry, insert_dead_running_with_log};
+    use crate::sweep_registry::{DispatchModel, SweepRegistry};
+    use crate::types::SweepKind;
+
+    const ISSUE: u32 = 14_443;
+    const CONFIG: &str =
+        r#"{"autonomous": {"model": "fable", "modelFallback": {"enabled": true}}}"#;
+
+    fn registry(config: &str) -> (tempfile::TempDir, SweepRegistry) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (registry, _record) = fixture_registry(tmp.path());
+        write_config(tmp.path(), config);
+        (tmp, registry)
+    }
+
+    /// An issue sweep dies with `log` as its output and the reaper sees it.
+    fn die(registry: &mut SweepRegistry, seq: u32, log: &str) {
+        let id = insert_dead_running_with_log(registry, ISSUE, seq, "unknown", log);
+        assert!(registry.reap_once() >= 1);
+        assert!(registry.get(&id).is_some());
+    }
+
+    /// The model the issue's next fresh dispatch launches with.
+    fn next_launch(registry: &SweepRegistry) -> Option<String> {
+        DispatchModel::Autonomous.resolve_for_runtime(
+            &registry.config,
+            &SweepKind::Issue(ISSUE),
+            Some("claude"),
+        )
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_killed_issue_sweep_is_relaunched_one_rung_down_and_never_loops() {
+        let (_tmp, mut registry) = registry(CONFIG);
+        assert_eq!(next_launch(&registry).as_deref(), Some("fable"), "no kill yet");
+
+        die(&mut registry, 0, FABLE_DEATH);
+        assert_eq!(next_launch(&registry).as_deref(), Some("opus"));
+
+        // The relaunch on opus was killed too: one rung further, not opus again.
+        die(&mut registry, 1, OPUS_DEATH);
+        assert_eq!(next_launch(&registry).as_deref(), Some("sonnet"));
+
+        // Killed at the last rung: nothing below, so no memo and the death is
+        // handled as today; the next launch goes back to the configured model.
+        die(&mut registry, 2, SONNET_DEATH);
+        assert_eq!(next_launch(&registry).as_deref(), Some("fable"));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn the_stepped_down_launch_carries_the_model_limit_kill_decision() {
+        let (tmp, mut registry) = registry(CONFIG);
+        die(&mut registry, 0, FABLE_DEATH);
+        let (model, decision) = step_down(tmp.path(), ISSUE, ISSUE_SWEEP_ROLE, "fable", "fable")
+            .expect("the reaper recorded the kill");
+        assert_eq!(model, "opus");
+        assert_eq!(decision.reason, REASON_MODEL_LIMIT_KILL);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn the_reaper_resume_redispatch_also_steps_down() {
+        // `Resolved(None)` is what the reaper's resume passes: no `--model`
+        // today. With a kill pending it resolves a model and steps it down.
+        let (_tmp, mut registry) = registry(CONFIG);
+        let resume = |r: &SweepRegistry| {
+            DispatchModel::Resolved(None).resolve_for_runtime(
+                &r.config,
+                &SweepKind::Issue(ISSUE),
+                Some("claude"),
+            )
+        };
+        assert_eq!(resume(&registry), None, "no kill pending: the literal None stands");
+        die(&mut registry, 0, FABLE_DEATH);
+        assert_eq!(resume(&registry).as_deref(), Some("opus"));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_literal_model_pin_is_never_overridden_by_a_pending_kill() {
+        let (_tmp, mut registry) = registry(CONFIG);
+        die(&mut registry, 0, FABLE_DEATH);
+        assert_eq!(
+            DispatchModel::Resolved(Some("fable"))
+                .resolve_for_runtime(&registry.config, &SweepKind::Issue(ISSUE), Some("claude"))
+                .as_deref(),
+            Some("fable")
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn absent_or_disabled_fallback_leaves_the_launch_alone() {
+        for config in [
+            r#"{"autonomous": {"model": "fable"}}"#,
+            r#"{"autonomous": {"model": "fable", "modelFallback": {"enabled": false}}}"#,
+        ] {
+            let (tmp, mut registry) = registry(config);
+            die(&mut registry, 0, FABLE_DEATH);
+            assert_eq!(next_launch(&registry).as_deref(), Some("fable"), "{config}");
+            assert!(!step_down_pending(tmp.path(), ISSUE, ISSUE_SWEEP_ROLE), "{config}");
+        }
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_banner_naming_no_model_does_not_step_down() {
+        let (tmp, mut registry) = registry(CONFIG);
+        die(&mut registry, 0, "working...\nYou've hit your weekly limit.\n");
+        assert!(!step_down_pending(tmp.path(), ISSUE, ISSUE_SWEEP_ROLE));
+        assert_eq!(next_launch(&registry).as_deref(), Some("fable"));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_death_without_the_banner_spends_a_pending_step_down() {
+        let (tmp, mut registry) = registry(CONFIG);
+        die(&mut registry, 0, FABLE_DEATH);
+        assert!(step_down_pending(tmp.path(), ISSUE, ISSUE_SWEEP_ROLE));
+        die(&mut registry, 1, "working...\nsegfault\n");
+        assert!(!step_down_pending(tmp.path(), ISSUE, ISSUE_SWEEP_ROLE));
+        assert_eq!(next_launch(&registry).as_deref(), Some("fable"));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn a_step_and_an_issue_sweep_on_one_item_do_not_share_a_memo() {
+        let (tmp, mut registry) = registry(CONFIG);
+        die(&mut registry, 0, FABLE_DEATH);
+        for role in ["builder", "judge", "doctor"] {
+            assert!(!step_down_pending(tmp.path(), ISSUE, role), "{role}");
+        }
+    }
+}
