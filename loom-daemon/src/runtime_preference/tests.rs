@@ -251,6 +251,99 @@ fn an_empty_walk_is_an_empty_list_but_an_all_skipped_walk_is_not() {
     assert!(!all_skipped.is_empty_list());
 }
 
+/// #14026 acceptance criterion 3: a containment refusal longer than the
+/// [`super::resolve::SUMMARY_DETAIL_MAX`] cap the preference marker applies
+/// appears **untruncated** on the one-line refusal rendering — no `…`, no
+/// embedded newline — so a log filter by level or time window keeps the
+/// obligation the `skipped=` field cuts off.
+#[test]
+fn the_summary_line_carries_a_long_containment_refusal_untruncated_on_one_line() {
+    let obligation = "owned account lease plus durable workspace preparation for the drawn \
+                      model claude/sonnet on credential profile zai-metered is still \
+                      outstanding, so this tap cannot serve the role yet (#13916)";
+    assert!(obligation.chars().count() > super::resolve::SUMMARY_DETAIL_MAX);
+    let resolution = resolve(
+        &taps(&["codex", "claude"]),
+        |tap| -> Result<&'static str, SkipReason> {
+            if tap.runtime == "codex" {
+                Err(SkipReason::NotAdmitted {
+                    unmet: vec!["worktreeIsolation".into()],
+                    detail: format!("unmet capabilities: worktreeIsolation; {obligation}"),
+                })
+            } else {
+                Err(unavailable("claude_pool"))
+            }
+        },
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    assert!(resolution.chosen.is_none());
+    let line = resolution.exhausted_summary_line("curator");
+    assert!(!line.contains('\n'), "refusal line must be one line: {line}");
+    assert!(line.contains(obligation), "{line}");
+    assert!(!line.contains('\u{2026}'), "nothing may be truncated: {line}");
+    assert!(line.starts_with("runtime_rejected role=curator: "), "{line}");
+    assert!(line.contains("codex -> not-admitted("), "{line}");
+    assert!(line.contains("claude -> unavailable("), "{line}");
+    // The multi-line operator diagnostic keeps the same full wording, so the
+    // two renderings agree on content and differ only in layout.
+    let diagnostic = resolution.exhausted_diagnostic("curator");
+    assert!(diagnostic.contains('\n'));
+    assert!(diagnostic.contains(obligation), "{diagnostic}");
+}
+
+/// #14026 edge cases: several skipped candidates all appear, joined with
+/// `; `; control characters in a reason are flattened to spaces so the line
+/// stays a line; a zero-candidate walk names the empty list instead of
+/// rendering nothing.
+#[test]
+fn the_summary_line_joins_candidates_flattens_control_characters_and_names_an_empty_list() {
+    let multi = resolve(
+        &taps(&["codex", "opencode", "claude"]),
+        |tap| -> Result<&'static str, SkipReason> {
+            match tap.runtime.as_str() {
+                "codex" => Err(SkipReason::NotAdmitted {
+                    unmet: vec!["worktreeIsolation".into()],
+                    detail: "unmet capabilities: worktreeIsolation".into(),
+                }),
+                "opencode" => Err(unavailable("zai")),
+                _ => Err(unavailable("claude_pool")),
+            }
+        },
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    let line = multi.exhausted_summary_line("judge");
+    assert!(!line.contains('\n'), "{line}");
+    assert!(
+        line.contains(
+            "codex -> not-admitted(worktreeIsolation); \
+             opencode -> unavailable(zai: 0/21 spawnable); \
+             claude -> unavailable(claude_pool: 0/21 spawnable)"
+        ),
+        "{line}"
+    );
+
+    let controls = resolve(
+        &taps(&["claude"]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, _, _| Err(unavailable("cla\u{0000}ude_pool\u{0007}")),
+    );
+    let line = controls.exhausted_summary_line("builder");
+    assert!(
+        !line.contains('\n') && !line.contains('\u{0000}') && !line.contains('\u{0007}'),
+        "{line}"
+    );
+
+    let empty = resolve(
+        &taps(&[]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    assert!(empty.is_empty_list());
+    let line = empty.exhausted_summary_line("builder");
+    assert!(!line.contains('\n'), "{line}");
+    assert!(line.contains("preference list is empty"), "an empty walk must say so: {line}");
+}
+
 /// The telemetry criterion: the chosen tier AND every higher tier's skip
 /// reason are in the launch record.
 #[test]
