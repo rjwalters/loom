@@ -1007,14 +1007,75 @@ pub(crate) fn ranking_line(
 /// the in-memory [`ProbeReport`] (so `--json` and [`format_table`] show them —
 /// the operator-visible signal the pool lacked before this issue), and every
 /// other status is written exactly as before.
+///
+/// This is the pure formatter: it sees only this round's report. The
+/// previous-round carry-forward that [`write_ranking_atomic`] applies on disk
+/// (issue #14145) lives in [`format_ranking_lines_with_preserve`].
 #[must_use]
 pub fn format_ranking_lines(report: &ProbeReport) -> String {
+    format_ranking_lines_with_preserve(report, &HashMap::new())
+}
+
+/// `true` for the statuses a **failed or inconclusive** probe produces:
+/// `error` (transport failure — timeout, connection, 5xx) and `blocked`
+/// (no request possible: empty token, credential-shape mismatch, `401`).
+/// Neither carries a utilization measurement — the round says nothing about
+/// the account's quota state (issue #14145). Every other status was derived
+/// from a response that actually reported rate-limit headers (or the monitor's
+/// own data) and is positive evidence.
+fn is_evidence_free_status(status: &str) -> bool {
+    status == "error" || status == "blocked"
+}
+
+/// Read the current `.ranking` and keep its `exhausted` rows (keyed by
+/// account name, line text trimmed) for [`format_ranking_lines_with_preserve`]
+/// to carry forward. An unreadable file simply preserves nothing — the write
+/// then behaves exactly as before this existed.
+fn previous_exhausted_rows(ranking_path: &Path) -> HashMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(ranking_path) else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let row = super::select::parse_ranking_line(line)?;
+            (row.status == "exhausted").then(|| (row.name, line.trim().to_string()))
+        })
+        .collect()
+}
+
+/// [`format_ranking_lines`], additionally carrying `preserve`'s rows forward
+/// in place of this round's own row for that account.
+///
+/// A failed probe must not destroy the previous round's knowledge. This is
+/// the probe-path twin of a rule the monitor path already applies
+/// (`run_monitor_check_with_reprobe`, issue #7420): an inconclusive (`error`)
+/// outcome "leaves the row alone" rather than downgrading a hard exclusion.
+/// Before #14145 the probe path had no such rule — a single transport failure
+/// overwrote `name|exhausted||<7d-reset>` with a bare `name|error`, and the
+/// next `bad_tokens::ambiguous_exhaustion_evidence` read then fell to the
+/// 6h fixed cooldown, readmitting an account whose weekly hold still had
+/// days to run. The carry-forward applies only when the fresh row is
+/// [`is_evidence_free_status`] **and** the previous row is `exhausted` —
+/// anything else is positive evidence this round and overwrites as before —
+/// and the reader's own credibility gates (parseability,
+/// `MAX_WEEKLY_RESET_HORIZON_SECS`, pre-mark instants) still bound whatever
+/// is carried forward.
+fn format_ranking_lines_with_preserve(
+    report: &ProbeReport,
+    preserve: &HashMap<String, String>,
+) -> String {
     let mut out = String::new();
     for a in &report.accounts {
         if a.status == "unsupported" {
             continue;
         }
-        out.push_str(&marked_probe::ranking_row(a));
+        match preserve
+            .get(a.name.as_str())
+            .filter(|_| is_evidence_free_status(&a.status))
+        {
+            Some(carried) => out.push_str(carried),
+            None => out.push_str(&marked_probe::ranking_row(a)),
+        }
         out.push('\n');
     }
     out
@@ -1022,8 +1083,20 @@ pub fn format_ranking_lines(report: &ProbeReport) -> String {
 
 /// Write `report` to `ranking_path` atomically (`<path>.tmp` + rename in the
 /// same directory). Mirrors `check.write_ranking_atomic`.
+///
+/// Issue #14145: before overwriting, the file's current `exhausted` rows are
+/// read and a fresh row that carries no probe evidence
+/// ([`is_evidence_free_status`] — `error` / `blocked`) does not replace the
+/// previous `exhausted` row for the same account; the previous row is carried
+/// forward (trimmed) so a mid-hold transport failure cannot shorten an active
+/// weekly hold to the 6h fixed cooldown. See
+/// [`format_ranking_lines_with_preserve`].
 pub fn write_ranking_atomic(report: &ProbeReport, ranking_path: &Path) -> std::io::Result<()> {
-    super::monitor::write_ranking_text(&format_ranking_lines(report), ranking_path)
+    let preserve = previous_exhausted_rows(ranking_path);
+    super::monitor::write_ranking_text(
+        &format_ranking_lines_with_preserve(report, &preserve),
+        ranking_path,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,6 +2025,118 @@ mod tests {
         write_ranking_atomic(&report, &target).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "new|available\n");
         assert!(!target.with_extension("ranking.tmp").exists());
+    }
+
+    // ---- #14145: a failed probe round must not destroy hold evidence ----
+
+    /// #14145 core: a probe round in which the account's probe fails
+    /// (`error`) must not overwrite the previous round's
+    /// `exhausted||<7d-reset>` row — that row is the only record of the
+    /// weekly hold `bad_tokens::ambiguous_exhaustion_evidence` extends past
+    /// the 6h fixed cooldown, and a bare `error` row carries no reset to
+    /// hold to. The previous row is carried forward verbatim.
+    #[test]
+    fn failed_probe_round_preserves_the_previous_exhausted_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(&target, "agent-1|exhausted||2026-11-24T08:00:00Z\nagent-2|available|0.10\n")
+            .unwrap();
+        // This round: agent-1's probe times out; agent-2 probed fine.
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("agent-1", "error"),
+                AccountResult::new("agent-2", "available"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "agent-1|exhausted||2026-11-24T08:00:00Z\nagent-2|available\n",
+            "the failed round must carry the exhausted hold row forward, not write `error`"
+        );
+    }
+
+    /// #14145, `blocked` variant: a `401` / shape-mismatch round is just as
+    /// evidence-free as a transport failure — the hold row survives it too.
+    #[test]
+    fn blocked_probe_round_preserves_the_previous_exhausted_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(&target, "agent-1|exhausted||2026-11-24T08:00:00Z\n").unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("agent-1", "blocked")],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "agent-1|exhausted||2026-11-24T08:00:00Z\n",
+            "a blocked round must not shorten the recorded hold either"
+        );
+    }
+
+    /// #14145 boundary: positive evidence overwrites as before. A fresh
+    /// `exhausted` row (a successful probe that re-measured the account)
+    /// must replace the previous one, a successful `available` verdict must
+    /// unfreeze a previously-`exhausted` account, and an `error` row whose
+    /// account had NO previous `exhausted` row is written as before (there
+    /// is nothing to preserve).
+    #[test]
+    fn positive_evidence_and_evidence_free_rows_without_a_predecessor_overwrite_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(
+            &target,
+            "held|exhausted||2026-11-24T08:00:00Z\nrecovered|exhausted||2026-11-24T09:00:00Z\nplain|available|0.20\n",
+        )
+        .unwrap();
+        // `held` was re-measured this round (fresh verdict + fresh reset);
+        // `recovered` probed fine; `plain`'s probe failed.
+        let mut held = AccountResult::new("held", "exhausted");
+        held.s7d_reset = Some("2026-11-25T10:00:00Z".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                held,
+                AccountResult::new("recovered", "available"),
+                AccountResult::new("plain", "error"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "held|exhausted||2026-11-25T10:00:00Z\nrecovered|available\nplain|error\n",
+        );
+    }
+
+    /// The carried row stays subject to the reader's own credibility gates:
+    /// this test only pins that the writer transports it byte-for-byte, so
+    /// `bad_tokens_tests.rs`' end-to-end regression (hold survives a failed
+    /// round) exercises the same text the reader parses.
+    #[test]
+    fn carried_row_is_byte_identical_even_for_the_empty_util_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        // The steady-state hold row shape (`name|exhausted||reset`) and one
+        // with a utilization, plus surrounding whitespace to prove the trim.
+        fs::write(
+            &target,
+            "  a-1|exhausted|0.02|2026-11-24T08:00:00Z  \nb-2|exhausted||2026-11-24T09:00:00Z\n",
+        )
+        .unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("a-1", "error"),
+                AccountResult::new("b-2", "error"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "a-1|exhausted|0.02|2026-11-24T08:00:00Z\nb-2|exhausted||2026-11-24T09:00:00Z\n",
+        );
     }
 
     // ---- discover_tokens ----------------------------------------------
