@@ -173,9 +173,10 @@ impl SweepRegistry {
         let now = Instant::now();
         let mut done: Vec<SweepId> = Vec::new();
         for (sweep_id, pending) in &mut self.pending_group_reaps {
-            let gated = self.entries.get(sweep_id).is_some_and(|info| {
-                matches!(info.state, SweepState::Running | SweepState::Pending)
-            });
+            let gated = self
+                .entries
+                .get(sweep_id)
+                .is_some_and(|info| matches!(info.state, SweepState::Running));
             if !group_has_members(pending.pgid) {
                 // The SIGTERM worked (or the group drained on its own).
                 if !gated {

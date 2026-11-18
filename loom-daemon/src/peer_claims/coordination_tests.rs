@@ -24,7 +24,7 @@ const RECOVERY: u64 = 3;
 /// same order the real reaper runs them: re-advertise every live claim (#4431),
 /// *then* evaluate coordination health (#6157).
 ///
-/// `live = true` models a host with at least one `Running`/`Pending` sweep (so
+/// `live = true` models a host with at least one `Running` sweep (so
 /// `readvertise_peer_claims` has something to publish); `live = false` models an
 /// idle host, which by construction publishes nothing that tick.
 fn run_ticks(
@@ -196,7 +196,7 @@ fn coordination_recovery_ignores_self_advertisements() {
 // ---- the idle gate (Issue #8026) ----
 
 /// **The bug this issue is about.** Advertising is entirely dispatch-gated
-/// (`readvertise_peer_claims` only re-advertises `Running`/`Pending` entries),
+/// (`readvertise_peer_claims` only re-advertises `Running` entries),
 /// so during a fleet-wide dispatch lull every host transmits nothing, every
 /// host therefore receives nothing, and every host's quiet clock runs out at
 /// roughly the same moment — a fleet-wide simultaneous false DEGRADED with
