@@ -192,6 +192,50 @@ fn dirty_root_and_dirty_worktree_are_preserved() {
 }
 
 #[test]
+fn lease_renew_residue_does_not_refuse_reuse_but_other_dirt_does() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // Loom's own lease-renewal lock left in the clone (#14160): untracked in
+    // a repo whose ignore rules do not cover it. Residue Loom itself wrote
+    // must never refuse a seat.
+    std::fs::create_dir_all(repo.join(".loom/lease-renew")).unwrap();
+    std::fs::write(repo.join(".loom/lease-renew/.lock"), "").unwrap();
+    f.prepare().unwrap();
+    // A linked worktree holding the same residue is forgiven too.
+    let worktree = f.root.join("issue-5");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-5",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(worktree.join(".loom/lease-renew")).unwrap();
+    std::fs::write(worktree.join(".loom/lease-renew/.lock"), "").unwrap();
+    f.prepare().unwrap();
+    // Any other dirt still refuses, and the refusal names the path.
+    std::fs::write(repo.join("stray.txt"), "retain").unwrap();
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("dirty"), "{error}");
+    assert!(error.contains("stray.txt"), "{error}");
+    assert!(repo.join("stray.txt").exists());
+    // The named list is bounded (#14160).
+    std::fs::remove_file(repo.join("stray.txt")).unwrap();
+    for i in 0..12 {
+        std::fs::write(repo.join(format!("stray-{i:02}")), "retain").unwrap();
+    }
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("stray-09"), "{error}");
+    assert!(!error.contains("stray-10"), "{error}");
+    assert!(error.contains("and 2 more"), "{error}");
+}
+
+#[test]
 #[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
 fn unpushed_and_detached_commits_survive_refused_reuse() {
