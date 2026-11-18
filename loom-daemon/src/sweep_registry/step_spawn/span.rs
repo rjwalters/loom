@@ -118,10 +118,16 @@ pub(crate) fn step_failure(
 
 /// The `loom.result` and close attributes of a step's `loom.sweep` span.
 /// `outcome` is the tick outcome the step's `role_tick.outcome` reports
-/// ([`super::capture::tick_outcome`]), so the two agree. `story_points` are
-/// the step's spawn-time points (#12957), absent when unsized. `pr_number` is
-/// the PR a Builder step opened, absent when it opened none.
-/// `provider_exhausted` reclasses the close (#13966). Pure.
+/// ([`super::capture::tick_outcome`]), so the two agree. `runtime` is the
+/// registry's runtime for the step (#14168, the same fact
+/// `SweepInfo.runtime` records), absent for a legacy entry. `story_points`
+/// are the step's spawn-time points (#12957), absent when unsized.
+/// `pr_number` is the PR a Builder step opened, absent when it opened none.
+/// `provider_exhausted` reclasses the close (#13966). The step's own word on
+/// its work rides `loom.step.outcome.class` / `.reason` (#14168): `none`
+/// with no reason when the step wrote no parseable outcome line, so "no
+/// outcome" is countable per runtime, model and role from the span alone.
+/// Pure.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_close(
@@ -129,6 +135,7 @@ pub(crate) fn sweep_close(
     line: Option<&StepOutcomeLine>,
     outcome: &RoleTickOutcome,
     role: StepRole,
+    runtime: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
     story_points: Option<u32>,
@@ -138,6 +145,18 @@ pub(crate) fn sweep_close(
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
     let mut close = lifecycle::attributes(&[("loom.role", role.role_name())]);
+    if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
+        close.insert(
+            crate::observability::lifecycle::role_runtime::RUNTIME.into(),
+            runtime.to_owned(),
+        );
+    }
+    let (outcome_class, outcome_reason) =
+        line.map_or(("none", ""), |l| (l.class.as_str(), l.reason.as_str()));
+    close.insert("loom.step.outcome.class".into(), outcome_class.to_owned());
+    if !outcome_reason.is_empty() {
+        close.insert("loom.step.outcome.reason".into(), outcome_reason.to_owned());
+    }
     for (key, value) in [("loom.configured_model", model), ("loom.effort", effort)] {
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             close.insert(key.into(), value.to_owned());

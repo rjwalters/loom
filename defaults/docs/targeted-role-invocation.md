@@ -147,6 +147,7 @@ spelling of the Judge's `--skip-reason`, is the `ci_pending` token below.
 | `noop` | `already_judged`, `ci_pending`, `fallback_skip` | Judge | gate 2; Primary Queue step 2b; `judge-fallback-guard.sh` exit 10/11/12 |
 | `verdict` | `fixed` | Doctor | a pushed fix; the PR returns to review |
 | `noop` | `no_fix_needed` | Doctor | the PR needed no change |
+| `failed` | `handback_failed` | Doctor | `forge doctor-handback` exit 1 (#14165) — one token for the whole class (lock held, deadline, refused forge read, credential), so the ledger's repeat accounting never fragments across per-cause spellings |
 | `noop` | `no_changes_needed` | Builder | the `.no-changes-needed` marker |
 | `noop` | `nothing_to_add` | Curator | the issue already meets the Quality Checklist and was curated before |
 | `refused` | `target_is_pr`, `target_is_issue` | issue roles, PR roles | gate 2 |

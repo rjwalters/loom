@@ -538,7 +538,7 @@ fn discover_tokens_for(
             // records a bare `<name>|blocked` row, and that row then carries
             // no evidence for `bad_tokens::session_window_has_reset` (or, for
             // an ambiguous reason, the two-signal
-            // `bad_tokens::ambiguous_exhaustion_has_reset` check, #7538) to
+            // `bad_tokens::ambiguous_exhaustion_evidence` check, #7538) to
             // act on — so the entry could only ever clear on its TTL, and the
             // `.ranking` row stayed `blocked` until a human ran `tokens
             // unblock`. That is exactly the host-to-host divergence #7522
@@ -2002,7 +2002,7 @@ mod tests {
     /// #7538: an ambiguous-reason `Exhaustion` entry (does not match
     /// `is_session_limit_reason`) is now probed with its live token too —
     /// exactly like a session-limit-worded entry — so it can accumulate real
-    /// `.ranking` evidence for `bad_tokens::ambiguous_exhaustion_has_reset` to
+    /// `.ranking` evidence for `bad_tokens::ambiguous_exhaustion_evidence` to
     /// act on. Probing alone does not change how long the entry is held; that
     /// is still decided read-side by `blocking_entry_in_dir`.
     #[test]

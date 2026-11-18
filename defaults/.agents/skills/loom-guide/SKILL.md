@@ -1105,8 +1105,58 @@ The Guide maintains three documents at the repository root:
 | Document | Purpose |
 |----------|---------|
 | **WORK_LOG.md** | Chronological record of merged PRs and closed issues |
-| **WORK_PLAN.md** | Prioritized roadmap from current GitHub label state |
+| **WORK_PLAN.md** | Backlog snapshot from current GitHub label state |
 | **README.md** | Project overview (updated only when architecture changes) |
+
+### WORK_PLAN.md vs a hand-written ROADMAP.md (#14009)
+
+A repo may keep its own hand-written roadmap (`ROADMAP.md`, `docs/ROADMAP.md`,
+or `docs/roadmap.md`). The two documents do different jobs, and neither
+replaces the other:
+
+| Document | Who writes it | What it holds |
+|----------|---------------|---------------|
+| `ROADMAP.md` (any of the locations above) | maintainers, by hand | **Direction** — what the project intends, and why |
+| `WORK_PLAN.md` | Guide, generated | **Backlog snapshot** — what the GitHub labels say right now |
+
+The rules (each settles one question from #14009; a pass applies them as
+written, and a pass that departs from any of them says so in its docs PR body
+citing this subsection):
+
+1. **Roles.** Never describe WORK_PLAN.md as "the roadmap": it is a snapshot
+   of label state that may lag live labels until the next docs-maintenance PR
+   merges, while the repo's own roadmap is the direction document. Guide
+   already *reads* a roadmap as a priority input (see "Priority Labels and
+   Duplicate Checks") and must **never edit or generate** one.
+2. **First creation is create-by-default.** When `WORK_LOG.md` /
+   `WORK_PLAN.md` do not exist yet (a repo that has never tracked them), a
+   pass **creates them without asking** — Steps 2 and 3 below say how. Both
+   files land as a reviewable docs PR that already passes Judge and
+   Champion, so **the PR itself is the ask**. Never defer first creation as
+   an "operator scope" decision: on `2AMLogic/pdks` two Guide passes (#78,
+   #93) reached opposite conclusions that way, and the question surfaced
+   only as a merge hold two days later.
+3. **Opt-out.** The one recorded place for a repo to say "we do not want
+   these documents (or want them generated differently)" is the
+   `guide.docsMaintenance` namespace in `.loom/config.json` (where
+   `workLogDebounceSecs` / `workPlanDebounceSecs` / `poolPressure*` already
+   live). No per-file or on/off key exists yet — tracked separately in
+   #14116. Until one lands, having one file without the other is NOT an
+   opt-out signal: create-by-default applies to each missing file
+   independently.
+4. **Declining anything must be visible.** A pass that declines any part of
+   this phase (suppresses a README refresh, skips a link, archives nothing)
+   says so **in its docs PR body, citing this subsection**, so the next pass
+   reads the recorded answer instead of deciding afresh. With creation as
+   the default there is no deferral to remember; the recorded answers that
+   exist are the config key (once #14116 lands) and these PR-body notes.
+5. **Cross-links and layout.** The static preamble outside the
+   `guide:plan-body` markers is where a WORK_PLAN.md points at the repo's
+   roadmap when one exists — Step 3's first-creation preamble does this
+   automatically. The pass that first creates the files also refreshes any
+   README layout listing that enumerates top-level files (Step 4 treats
+   first creation as a staleness trigger): pdks #93 left that README stale
+   and it took a downstream follow-up to fix.
 
 ### Where This Phase Writes (a managed worktree, never the main checkout)
 
@@ -1327,14 +1377,38 @@ fi
 OPEN_DOCS_PR=$("$GH_READ" pr list --state open --limit 100 --json number,headRefName --jq '[.[] | select(.headRefName | startswith("docs/guide-update"))][0].number // empty')
 
 if [ -n "$OPEN_DOCS_PR" ]; then
-  echo "Docs PR #$OPEN_DOCS_PR is still open. Skipping document maintenance."
-  # Optionally: check if it's stale and comment
+  # #13897: this skip used to be unconditional-AND-silent — one red or
+  # conflicting docs PR parked the whole phase for hours with nothing to
+  # distinguish "nothing to maintain" from "maintenance is wedged behind an
+  # unmergeable PR". The skip itself stays unconditional (one docs PR at a
+  # time is #5615's guard; this warning never authorizes a second PR), but a
+  # PR that cannot land now gets a loud per-tick WARNING naming it and its
+  # state. Deliberately the same cross-forge predicate has_superseding_block()
+  # uses above: Gitea reports mergeable "CONFLICTING"; GitHub reports
+  # mergeable false with mergeStateStatus "DIRTY". UNSTABLE adds "checks
+  # failing" (#13897's observed wedge: a docs PR red on an evidence-pinned
+  # file). BLOCKED is deliberately NOT warned on — a docs PR awaiting Judge
+  # review is this phase's normal transient state, and warning every tick on
+  # it would be noise. An UNKNOWN reading (GitHub computes mergeability
+  # asynchronously; `null | tostring` → "null/...") or a failed read yields
+  # the plain skip: never warn on missing data, and never treat missing data
+  # as license to open a second PR.
+  OPEN_DOCS_PR_STATE=$("$GH_READ" pr view "$OPEN_DOCS_PR" --json mergeable,mergeStateStatus \
+    --jq '(.mergeable | tostring) + "/" + (.mergeStateStatus // "")' 2>/dev/null || echo "")
+  case "$OPEN_DOCS_PR_STATE" in
+    *CONFLICTING*|*DIRTY*|*UNSTABLE*|false/*)
+      echo "WARNING: docs PR #$OPEN_DOCS_PR is open but unmergeable (mergeable/mergeStateStatus: ${OPEN_DOCS_PR_STATE:-unreadable}) — document maintenance stays skipped while it wedges the phase, and WORK_LOG.md/WORK_PLAN.md go stale behind it. Fix or close that PR by hand; Guide will not supersede it."
+      ;;
+    *)
+      echo "Docs PR #$OPEN_DOCS_PR is still open. Skipping document maintenance."
+      ;;
+  esac
   ./.loom/scripts/docs-guide-lock.sh release
   return
 fi
 ```
 
-If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation (and release the lock — there is nothing left for this tick to do).
+If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation (and release the lock — there is nothing left for this tick to do). The skip is unconditional — even an unmergeable PR keeps the phase skipped (#5615: one docs PR at a time) — but #13897 makes it **mergeability-aware in what it prints**: when the open PR reports `CONFLICTING`/`DIRTY` (git-conflicted on either forge), `mergeable=false`, or `UNSTABLE` (checks failing), the skip is announced with a loud per-tick `WARNING` naming the PR number and its merge state, so a wedged docs PR cannot stall document maintenance *silently*. `UNKNOWN`, a blocked-but-mergeable PR (the normal awaiting-Judge-review state), or a failed state read all yield the plain one-line skip: missing data is never a warning, and never a second PR.
 
 **#6327 CORRECTED UNDERSTANDING, DO NOT RE-LITIGATE:** issue #6327 was filed
 observing N-host duplicate `docs: Guide document maintenance update` PRs and
@@ -1364,6 +1438,15 @@ write if the pending delta has survived a batching window since the last
 WORK_LOG-writing docs-maintenance merge, **or** has grown large enough to
 write immediately regardless of the window (see "WORK_LOG debounce" in
 `update_work_log()` below, #6133).
+
+**First creation (#14009).** If `$DOCS_WT/WORK_LOG.md` does not exist (the
+repo has never tracked it — presence, not recency), this pass **creates it
+without asking**: write the standard preamble and `## Archives` index shape
+(mirror the WORK_LOG.md template in `defaults/.claude/commands/loom/imagine.md`)
+followed by this tick's entries. Creation itself bypasses the debounce and
+min-entries gates below — a first creation with nothing to record yet is
+still a create (the file starts as preamble plus an empty current day), never
+a defer. See "WORK_PLAN.md vs a hand-written ROADMAP.md", rule 2.
 
 **Redact host identifiers, even quoting a title** — that is how 127 leaked
 into this public repo (#8589); the CI scrub job fails on the next one.
@@ -1796,7 +1879,7 @@ update_work_log() {
   #     `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s 3600s default: WORK_LOG entries are
   #     individually small and cheap to batch, but a merge/close event
   #     going unrecorded for a full hour is a worse staleness trade than for
-  #     WORK_PLAN's roadmap snapshot, which is stale-tolerant by nature.
+  #     WORK_PLAN's backlog snapshot, which is stale-tolerant by nature.
   # `LOOM_WORK_LOG_DEBOUNCE_NOW` is a test seam only (mirrors
   # `LOOM_WORK_PLAN_DEBOUNCE_NOW`) — never set it in normal operation.
   #
@@ -1937,7 +2020,7 @@ gitignored sidecar holds any state.
 
 ### Step 3: Update WORK_PLAN.md
 
-Regenerate the roadmap from current GitHub label state. Only rewrite if labels
+Regenerate the backlog snapshot from current GitHub label state. Only rewrite if labels
 have changed **and** that change has survived a debounce window since the last
 docs-maintenance merge (see "WORK_PLAN debounce" below, #5890).
 
@@ -1945,6 +2028,55 @@ The generated region of `WORK_PLAN.md` is delimited by
 `<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->`. **Everything
 between those markers is machine-generated and is overwritten wholesale; nothing
 else in the file is touched.**
+
+**First creation (#14009).** If `$DOCS_WT/WORK_PLAN.md` does not exist, this
+pass **creates it without asking** — create-by-default, never defer (see
+"WORK_PLAN.md vs a hand-written ROADMAP.md", rules 2 and 5). Build the file as
+the static preamble below, then the two marker lines with a freshly rendered
+`render_plan_body()` between them. The debounce gate in `update_work_plan()`
+does not apply to creation: there is no committed `old_body` to compare
+against, and holding off would just re-create the pdks #78/#93
+defer-then-create-anyway inconsistency. The preamble is static text outside
+the markers — which is also where the repo's roadmap is linked when one
+exists:
+
+```markdown
+# Work Plan
+
+Backlog snapshot from current GitHub label state, maintained by the Guide role.
+Direction lives in the hand-written roadmap: `ROADMAP.md`.
+
+The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. The `_Generated:` stamp at the top of the generated region dates the snapshot; `git log -1 -- WORK_PLAN.md` finds the merge that wrote it.
+
+<!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
+```
+
+The "Direction lives…" line is included **only** when a roadmap file exists,
+and the generated WORK_PLAN.md links the file actually found — `ROADMAP.md`,
+`docs/ROADMAP.md`, or `docs/roadmap.md`, as a repo-root-relative path. The
+fence shows the path backticked only because this role file must not carry a
+link that dangles in repos without a roadmap. With no
+roadmap, omit that line entirely. Keep this preamble wording in lockstep with
+the WORK_PLAN.md template in `defaults/.claude/commands/loom/imagine.md` (the
+bootstrap seed uses the same distinction).
+
+**#13909 stamp-on-write — the region carries its own generated-at line.** The
+spliced region's first line is a fixed-shape stamp,
+`_Generated: <UTC instant> (snapshot; compare against live labels)_` (the
+`plan_stamp_line()` helper below). It is written ONLY by the splice step at the
+bottom of `update_work_plan()`, never emitted by `render_plan_body()`. That
+split is load-bearing: `old_body` is normalized through `strip_plan_stamp()`
+before the `new_body = old_body` comparison, so wall-clock text participates in
+NEITHER side of the equality test and cannot make an unchanged tick look
+changed. Emitting the stamp from `render_plan_body()` instead would put a fresh
+timestamp into `new_body` on every tick, making that comparison permanently
+false — the #5413 dead-skip failure replayed as one content-free docs PR per
+debounce window (the #5930/#5890 churn class, throttled by the debounce but
+still pure noise). Because the stamp is written only when the body otherwise
+changed, it dates the last genuine label-state rewrite — never the last time
+Guide looked — so the committed snapshot is self-describing at zero churn
+cost. That is the line the `WORK_PLAN.md` header caveat (#13894) points readers
+at.
 
 The generated region is never archived (`defaults/docs/work-docs-archive.md`, "WORK_PLAN").
 
@@ -2198,6 +2330,28 @@ render_plan_body() {
     "| Active epics | $(count "$epics") |")"
 }
 
+# #13909 stamp-on-write, part 1: the generated region's FIRST line is a
+# generated-at stamp in this exact fixed shape (see the "#13909 stamp-on-write"
+# note above Step 3's code). Called ONLY by the splice step at the bottom of
+# update_work_plan() — part 2 below is why it must never be called from
+# render_plan_body().
+plan_stamp_line() {
+  printf '_Generated: %s (snapshot; compare against live labels)_' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# #13909 stamp-on-write, part 2: strip that stamp line from a committed plan
+# body so update_work_plan()'s equality test compares ONLY label-derived
+# content. Applied to old_body alone — new_body comes straight from
+# render_plan_body() and never carries a stamp. The line-1 match is
+# conditional, never an unconditional `1d`: a region with no stamp (written
+# before #13909, or the empty first-ever region) passes through byte-identical
+# and still compares equal. The splice writes the stamp directly on line 1
+# with no blank line after it — exactly `stamp\n` + body — so one conditional
+# delete is the whole normalization.
+strip_plan_stamp() {
+  sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}'
+}
+
 update_work_plan() {
   # Change detection: compare the freshly-rendered body against the body already
   # committed between the markers. No gitignored side-car (which resets to "" on
@@ -2211,11 +2365,17 @@ update_work_plan() {
   # branch was dead code, and every tick unconditionally rewrote the file.
   # Comparing the SAME rendered text on both sides is what makes the skip real;
   # a hash buys nothing here, so compare the strings directly.
-  local new_body old_body
+  local new_body old_body stamp
   new_body="$(render_plan_body)"
-  # `sed '1d;$d'` drops the two marker lines, leaving only the generated region.
+  # `sed '1d;$d'` drops the two marker lines, leaving only the generated region;
+  # `strip_plan_stamp` (#13909) then drops the region's generated-at stamp line
+  # so the comparison below sees ONLY label-derived content on both sides.
+  # new_body needs no such filter — render_plan_body() never emits a stamp, and
+  # if it ever did, the equality test below would go permanently false and
+  # every tick would rewrite the file (the #5413 dead-skip bug, replayed as one
+  # stamp-only docs PR per debounce window).
   old_body="$(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' \
-    "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d')"
+    "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d' | strip_plan_stamp)"
 
   if [ "$new_body" = "$old_body" ]; then
     echo "WORK_PLAN.md is current (no label changes detected)."
@@ -2266,12 +2426,25 @@ update_work_plan() {
   # Both sides above are `$(...)`-captured, so trailing newlines are stripped on
   # both — only the internal structure has to match.
   #
-  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body "$new_body"`, which
+  # #13909 stamp-on-write: the spliced region's FIRST line is a fresh
+  # "$(plan_stamp_line)", directly above $new_body's first line with NO blank
+  # line between (strip_plan_stamp's shape contract). This is the ONLY place a
+  # stamp is ever written, and it runs only after BOTH gates above passed:
+  #   stamp="$(plan_stamp_line)"
+  #   spliced_region="$(printf '%s\n%s\n' "$stamp" "$new_body")"
+  # A no-change tick never reaches here, so the committed stamp is never
+  # refreshed in place and no PR's only diff can be a timestamp; a
+  # debounce-suppressed tick reaches it even less. Never hand-write the stamp
+  # either — a hand-written timestamp freezes at typing time and then asserts
+  # a specific wrong time; it appears only on the next genuine generation.
+  #
+  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body`, which
   # uses a per-tick `mktemp -d` dir. NEVER stage the body or the spliced file at
   # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
   # repos' ticks share /tmp, and a tick whose own write was denied then consumes
   # another repo's stale file. Never read a scratch file this tick did not write.
-  splice_plan_body "$new_body" || return 1
+  stamp="$(plan_stamp_line)"
+  splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || return 1
 
   return 0
 }
@@ -2341,10 +2514,25 @@ comparison mismatches until the file catches up). Adding a section means editing
 
 ### Step 4: Check README.md Staleness
 
-Only update README.md when merged PRs touch architectural files.
+Update README.md when merged PRs touch architectural files, **or when this
+pass first created `WORK_LOG.md` / `WORK_PLAN.md`** (#14009): a README layout
+listing that enumerates top-level files must not be left stale by two new
+top-level documents (pdks #93 left it stale; a downstream follow-up fixed
+it). Refresh conservatively — add or adjust only the file/layout listing
+lines that mention top-level files.
 
 ```bash
 check_readme_staleness() {
+  # #14009 FIRST-CREATION TRIGGER, checked before the arch-pattern gate: the
+  # pass that first creates WORK_LOG.md / WORK_PLAN.md also refreshes a README
+  # layout listing that enumerates top-level files. $1 = 1 when this pass
+  # performed a first creation (Steps 2/3 pass it); 0 or empty otherwise.
+  if [ "${1:-0}" -eq 1 ]; then
+    echo "First creation of WORK_LOG.md/WORK_PLAN.md this tick."
+    echo "Review README.md's top-level file/layout listing for staleness."
+    return 0
+  fi
+
   # Check recently merged PRs for architectural file changes
   local arch_patterns="Cargo.toml|package.json|loom-daemon/|loom-api/|install.sh|scripts/install"
 
@@ -2510,21 +2698,73 @@ main checkout: that mutates the shared primary clone that concurrent sweeps,
 branch.
 
 ```bash
+# #13897 evidence pinning: some repos pin tracked files into committed
+# evidence records — the file's content hash is recorded in a committed
+# attestation/report, and CI re-derives the hash on every PR and fails if it
+# drifts. Staging such a path into a docs PR authors a PR that can never pass
+# CI, and once it goes red it wedges the whole phase (see Step 1's
+# unmergeable-PR WARNING above). `guide.docsMaintenance.pinnedPaths` (JSON
+# array of repo-relative paths, default `[]`) is how a repo declares them to
+# Guide — one mechanism, config only. Same env > config > default shape as
+# the poolPressure knobs in Step 4b; LOOM_GUIDE_DOCS_PINNED_PATHS is a test
+# seam only, never set it in normal operation.
+docs_pinned_paths() {
+  echo "${LOOM_GUIDE_DOCS_PINNED_PATHS:-$(jq -r '.guide.docsMaintenance.pinnedPaths // [] | join(" ")' .loom/config.json 2>/dev/null)}"
+}
+
+# Stage the three fixed doc paths minus any the repo declared evidence-pinned
+# (#13897). A pinned path is NEVER staged; when this tick's edits touched one,
+# say so loudly — naming the path and pointing at the repo's own regeneration
+# duty — instead of authoring a change CI will reject. A diff touching ONLY
+# pinned paths stages nothing and falls through to create_docs_pr()'s existing
+# "No document changes to commit." path, so no PR is opened for it.
+# The set is space-joined, so a pinned path containing a space can never match
+# one of the three fixed doc names (none contains a space) — it fails safe:
+# nothing is wrongly excluded from staging.
+stage_docs_paths() {
+  local pinned_paths doc_path staged_paths=""
+  pinned_paths="$(docs_pinned_paths)"
+  for doc_path in WORK_LOG.md WORK_PLAN.md README.md; do
+    case " $pinned_paths " in
+      *" $doc_path "*)
+        if ! git -C "$DOCS_WT" diff --quiet -- "$doc_path" 2>/dev/null; then
+          echo "WARNING: $doc_path is evidence-pinned (guide.docsMaintenance.pinnedPaths) and has document-maintenance edits this tick — NOT staging it into the docs PR. Regenerate it via this repo's own evidence regeneration recipe; Guide will not author a change to a pinned path (a PR that edits one can never pass CI)."
+        fi
+        ;;
+      *)
+        staged_paths="$staged_paths $doc_path"
+        ;;
+    esac
+  done
+  # $staged_paths is a space-joined subset of the three fixed names above —
+  # word-splitting is the point and no element can contain a space.
+  if [ -n "${staged_paths# }" ]; then
+    git -C "$DOCS_WT" add -- $staged_paths
+  fi
+}
+
 create_docs_pr() {
   local branch
   branch="$(git -C "$DOCS_WT" branch --show-current)"
 
   # Stage all document changes (paths are relative to the worktree root, which
-  # is what `git -C "$DOCS_WT"` makes them).
-  git -C "$DOCS_WT" add WORK_LOG.md WORK_PLAN.md README.md
+  # is what `git -C "$DOCS_WT"` makes them) — via stage_docs_paths(), which
+  # excludes any path the repo declared evidence-pinned (#13897).
+  stage_docs_paths
 
   # Archive files (#12634): staged by EXACT pattern, one file at a time -- never
   # `git add -A` or the `work_log/` directory, so an unrelated file placed there
   # is not swept into the docs PR.
-  local archive_file
+  local archive_file archive_rel pinned_paths
+  pinned_paths="$(docs_pinned_paths)"
   for archive_file in "$DOCS_WT"/$WORK_LOG_ARCHIVE_GLOB; do
     [ -f "$archive_file" ] || continue
-    git -C "$DOCS_WT" add -- "work_log/${archive_file##*/}"
+    archive_rel="work_log/${archive_file##*/}"
+    # #13897: an evidence-pinned path is never staged here either.
+    case " $pinned_paths " in
+      *" $archive_rel "*) continue ;;
+    esac
+    git -C "$DOCS_WT" add -- "$archive_rel"
   done
 
   # Post-stage hook (#13892): a consuming repo can place any of the files this
@@ -2670,7 +2910,7 @@ Automated document maintenance by the Guide triage agent.
 
 ### Changes
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
-- **WORK_PLAN.md**: Regenerated roadmap from current GitHub label state
+- **WORK_PLAN.md**: Regenerated backlog snapshot from current GitHub label state (a repo's hand-written ROADMAP.md, if any, remains the direction document)
 - **README.md**: Updated if architectural changes were detected
 - Plus any files reported by the repo's `.loom/docs-post-stage.sh` hook, if installed (e.g. a regenerated freshness envelope)
 
@@ -2777,7 +3017,8 @@ The full document maintenance flow runs at the end of each triage cycle:
 ```
 Document Maintenance Phase
   ├─ Acquire the docs-guide lock (non-blocking) → skip if another tick holds it
-  ├─ Check for open docs PR → skip (and release the lock) if one exists
+  ├─ Check for open docs PR → skip (and release the lock) if one exists —
+  │    with a loud WARNING if it is unmergeable (#13897)
   ├─ DOCS_WT=$(./.loom/scripts/docs-worktree.sh | tail -1)
   │    └─ managed worktree on docs/guide-update-<timestamp>; the ONLY place
   │       this phase may write (guards deny the main checkout)
@@ -2788,11 +3029,15 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
-  │    ├─ Stage the fixed set + archives, then the post-stage hook (#13892):
-  │    │    run .loom/docs-post-stage.sh if the repo provides it, stage the
-  │    │    worktree-relative paths it prints by exact path; ANY failure is
-  │    │    fail-closed (diff discarded, lock released, no PR) — see
-  │    │    "Post-stage hook" above for the full contract
+  │    ├─ Stage the fixed set + archives minus evidence-pinned paths
+  │    │    (#13897): paths in guide.docsMaintenance.pinnedPaths are never
+  │    │    staged (a WARNING names each one skipped; a pinned-only diff
+  │    │    opens no PR)
+  │    ├─ Post-stage hook (#13892): run .loom/docs-post-stage.sh if the
+  │    │    repo provides it, stage the worktree-relative paths it prints
+  │    │    by exact path; ANY failure is fail-closed (diff discarded,
+  │    │    lock released, no PR) — see "Post-stage hook" above for the
+  │    │    full contract
   │    ├─ Token-pool pressure check (#6135): if the pool is under pressure
   │    │    AND the max-defer ceiling has not elapsed, discard the local diff,
   │    │    release the lock, and defer to a later tick instead of filing
@@ -2894,7 +3139,7 @@ Document Maintenance Phase
   and otherwise waits for `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30
   min — shorter than WORK_PLAN's 3600s default because an unrecorded
   merge/close event is a worse staleness trade than WORK_PLAN's
-  stale-tolerant roadmap snapshot) since WORK_LOG.md was last actually
+  stale-tolerant backlog snapshot) since WORK_LOG.md was last actually
   WRITTEN by a merged docs-maintenance PR, anchored via
   `last_work_log_write_epoch()` the same way `last_work_plan_write_epoch()`
   anchors WORK_PLAN's clock (filtered to merges whose changed files include

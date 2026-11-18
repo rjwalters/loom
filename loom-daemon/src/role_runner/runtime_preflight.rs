@@ -182,6 +182,11 @@ pub(crate) fn check(
     }
     let exhausted =
         crate::runtime_preference::exhausted_with_draw(&resolution, draw.as_deref(), role);
+    // #14026: the one-line candidate rendering the refusal line carries —
+    // computed before `resolution.chosen` is moved out below, alongside the
+    // multi-line diagnostic it mirrors.
+    let exhausted_summary_line =
+        crate::runtime_preference::exhausted_summary_with_draw(&resolution, draw.as_deref(), role);
     // #8599: the stamp the chosen admission carries to the launch surfaces —
     // computed before `resolution.chosen` is moved out below. `None` in the
     // fail-closed case, which has no chosen tier to report.
@@ -205,6 +210,7 @@ pub(crate) fn check(
             source: crate::runtime_admission::RuntimeSource::Preference,
             unmet_capabilities: vec![],
             reason: exhausted,
+            exhausted_summary_line: Some(exhausted_summary_line.into_boxed_str()),
         }));
     };
     log::info!(
