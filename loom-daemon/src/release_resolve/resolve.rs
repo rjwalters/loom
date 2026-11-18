@@ -382,6 +382,59 @@ fn asset_names_detailed(
     .map(|a| a.assets.into_iter().map(|a| a.name).collect())
 }
 
+/// Which tier supplied the repo [`resolve_repo`] chose (#14224).
+///
+/// The tiers are the priority order itself: the label names the tier that
+/// actually won, never a config key — resolution reads no config file, only
+/// the env override, the machine checkout, the compiled-in repository and
+/// the workspace's own origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoSource {
+    /// Tier 1: `LOOM_DAEMON_UPDATE_GH_REPO`, the operator's explicit answer.
+    EnvOverride,
+    /// Tier 2: the `origin` of `LOOM_MACHINE_CHECKOUT`.
+    MachineCheckout,
+    /// Tier 3: the repo this binary was built from, compiled in.
+    BuildTime,
+    /// Tier 4: the workspace's own `origin` — the worst answer, last resort.
+    WorkspaceOrigin,
+}
+
+impl RepoSource {
+    /// The human-readable tier name for a log line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EnvOverride => "env override",
+            Self::MachineCheckout => "machine checkout",
+            Self::BuildTime => "build-time default",
+            Self::WorkspaceOrigin => "workspace origin",
+        }
+    }
+}
+
+/// [`resolve_repo`] paired with [`RepoSource`], the tier that supplied the
+/// slug. One function so the priority order cannot drift between the slug
+/// and its source (#14224).
+#[must_use]
+pub fn resolve_repo_with_source(inputs: &Inputs<'_>) -> Option<(String, RepoSource)> {
+    if let Some(repo) = inputs.repo_override.clone().filter(|r| !r.is_empty()) {
+        return Some((repo, RepoSource::EnvOverride));
+    }
+    if let Some(repo) = inputs
+        .machine_checkout
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+        .and_then(host::repo_slug)
+    {
+        return Some((repo, RepoSource::MachineCheckout));
+    }
+    if let Some(repo) = inputs.build_time_repo.clone().filter(|r| !r.is_empty()) {
+        return Some((repo, RepoSource::BuildTime));
+    }
+    host::repo_slug(inputs.repo_root).map(|repo| (repo, RepoSource::WorkspaceOrigin))
+}
+
 /// Which repo's releases to ask about, by **descending** priority (#8513).
 ///
 /// The daemon binary is released from exactly one project, so the workspace's
@@ -406,19 +459,7 @@ fn asset_names_detailed(
 /// how a shell says "not set"), never a literal empty slug.
 #[must_use]
 pub fn resolve_repo(inputs: &Inputs<'_>) -> Option<String> {
-    inputs
-        .repo_override
-        .clone()
-        .filter(|r| !r.is_empty())
-        .or_else(|| {
-            inputs
-                .machine_checkout
-                .as_deref()
-                .filter(|p| !p.as_os_str().is_empty())
-                .and_then(host::repo_slug)
-        })
-        .or_else(|| inputs.build_time_repo.clone().filter(|r| !r.is_empty()))
-        .or_else(|| host::repo_slug(inputs.repo_root))
+    resolve_repo_with_source(inputs).map(|(repo, _)| repo)
 }
 
 /// Resolve the release artifact for this host: the forge's Latest release, or
