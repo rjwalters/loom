@@ -11037,9 +11037,21 @@ naming a runtime that never launches is simply never matched.
   `medium` (source `codex-default`) instead of the CLI's own default: a Codex
   Builder left at `reasoning effort: none` refused an issue its own daemon had
   claimed (#14017). `medium` is a supported level of every model
-  `codex debug models` lists. Any configured tier — including the global
-  `effort` — beats it. Re-run `codex debug models` if a Codex release changes
+  `codex debug models` lists. Any configured tier above it in this chain —
+  `roleEfforts.<role>@codex` being the supported way to raise a Codex role's
+  effort — beats it. Re-run `codex debug models` if a Codex release changes
   its level vocabulary.
+- **For Codex, `codex-default` also shadows the adapter's `model@effort`
+  suffix (#14320).** The daemon emits its resolved effort as an explicit
+  `--effort` arg, which sits above the suffix rung in `spawn-codex.sh`'s
+  chain (`explicit -c` > `--effort` > `LOOM_EFFORT` > suffix), and since
+  #14017 the resolver never returns empty for Codex — so no daemon-dispatched
+  Codex launch can take its effort from a `model@effort` suffix. A `roleDraw`
+  candidate written `codex/<model>@high` therefore yields `medium`
+  (source `codex-default`), and `roleEfforts.<role>@codex` is the supported
+  way to raise a Codex role's effort from config. The suffix still applies on
+  manual launches where no `--effort`/`LOOM_EFFORT` is supplied
+  ([runtime-adapters.md](runtime-adapters.md) § model-mapping minimalism).
 - **Unset stays byte-identical on every other runtime.** There is deliberately
   **no** default effort for Claude or any other runtime, and no fall-through to a
   shared `autonomous.*` key: with nothing configured the resolver returns the
