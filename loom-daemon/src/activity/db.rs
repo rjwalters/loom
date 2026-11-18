@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use super::models::{
     ActivityEntry, AgentInput, AgentOutput, ClaimResult, ClaimType, CostByIssue, InputContext,
-    InputType, IssueClaim, PromptChanges, PromptForgeEvent,
+    InputType, IssueClaim, PromptForgeEvent,
 };
 use super::schema::init_schema;
 use super::{claims, cost_analytics, prompts, quality, usage_report, weekly_point_history};
@@ -160,11 +160,6 @@ impl ActivityDb {
         })?;
 
         entries.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    /// Record git changes associated with a prompt.
-    pub fn record_prompt_changes(&self, changes: &PromptChanges) -> Result<i64> {
-        prompts::record_prompt_changes(&self.conn, changes)
     }
 
     // ========================================================================
