@@ -430,13 +430,20 @@ pub fn merge_step_tokens_by_model(
     let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
         .into_iter()
         .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
-        .flat_map(|(role, contents)| match role {
-            // Issue-keyed: an earlier dispatch is an abandoned retry.
-            crate::step_role::StepRole::Builder => {
-                crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+        .flat_map(|(role, contents)| {
+            use crate::step_role::StepRole;
+            // Spelled out, no catch-all: a role added to `merge_step_logs`
+            // must be filed under its keying here before this compiles.
+            match role {
+                // Issue-keyed: an earlier dispatch is an abandoned retry.
+                StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
+                    crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+                }
+                // PR-keyed: an earlier dispatch is a completed round on this PR.
+                StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
+                    crate::launch_record::opencode_session_ids(&contents)
+                }
             }
-            // PR-keyed: an earlier dispatch is a completed round on this PR.
-            _ => crate::launch_record::opencode_session_ids(&contents),
         })
         .collect();
     let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
