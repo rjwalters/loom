@@ -914,6 +914,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: bash scripts/check-dangling-links.sh
 
+      # component: Docs Index Check
+      # Cheap structural check; always runs. docs/README.md is a hand-maintained
+      # enumeration of the docs/ tree that drifted once already (#13879); this
+      # fails the PR that adds a docs/ directory, a top-level docs/*.md or a
+      # docs/design/*.md note without a matching index link (#14075). The
+      # self-test regression-tests the checker against a synthetic docs/ tree.
+      - name: Self-test the docs index checker
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-docs-index.sh --self-test
+      - name: Check docs/README.md indexes the docs tree
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-docs-index.sh
+
       # component: PRs Must Not Hand-Edit Version-Bearing Files
       # PR-only: needs the PR's base commit to diff against, which only exists
       # for pull_request events (a push to main has already merged). Version
