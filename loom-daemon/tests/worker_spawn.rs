@@ -17,6 +17,13 @@ fn worker(root: &std::path::Path, runtime: &str) -> Command {
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
         // Never let a test reach the operator's real `~/.loom/api-keys` (#8401).
         .env("LOOM_SHARED_API_KEYS_DIR", "")
+        // The spawned binary resolves forge repo facts into the host-shared
+        // `${TMPDIR:-/tmp}/loom-forge-listing-cache` store; a stub answering
+        // on a cold record must never overwrite the real repo's record there
+        // (the same #8401 concern, one level down). Point the child's store
+        // at the test's own root so the record is cold — and the stub, when
+        // one is installed, consulted — on every run.
+        .env("LOOM_LISTING_CACHE_DIR", root.join(".loom-etag-cache"))
         .env(
             "LOOM_NATIVE_GUARD_DIR",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"),
@@ -140,12 +147,14 @@ fn missing_binary_is_127_and_builder_uses_guarded_tools() {
         .unwrap();
     assert_eq!(out.status.code(), Some(127));
     // The real-checkout root makes the #14167 preflight stamping resolve the
-    // checkout's live repo facts, which on a cold record reads the forge
+    // checkout's live repo facts; the isolated etag cache keeps that record
+    // cold on every run, so the read deterministically goes to the forge
     // through `gh` — a spawn the live-gh guard fails the whole binary for
     // (#10138). A fake `gh` ahead of PATH answers that one read the way the
-    // real one would, so the stamping runs as designed; the guard's
-    // documented escape hatch (#10138: a fake ahead of PATH never reaches
-    // the stand-in) keeps the fall-through unreachable.
+    // real one would, so the stamping runs as designed and the record write
+    // lands in this test's tempdir; the guard's documented escape hatch
+    // (#10138: a fake ahead of PATH never reaches the stand-in) keeps the
+    // fall-through unreachable.
     let fake = d.path().join("fake-gh");
     std::fs::create_dir_all(&fake).unwrap();
     let gh = fake.join("gh");
@@ -179,6 +188,10 @@ exit 1
     let out = worker(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")), "pi")
         .env("LOOM_ROLE", "builder")
         .env("PATH", path)
+        // The checkout itself must stay clean: override the helper's store
+        // isolation to this test's tempdir, so the fabricated record (from
+        // the stub) lands here, never in the tree or the host store.
+        .env("LOOM_LISTING_CACHE_DIR", d.path().join("etag-cache"))
         .args(["-p", "hello"])
         .output()
         .unwrap();

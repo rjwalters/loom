@@ -399,9 +399,10 @@ LIMIT {top:UInt32};
 --    An EMPTY cell is an ABSENT attribute (a map subscript yields ''), never a
 --    measured empty value: a runtime that reported no launched model groups
 --    under model='' instead of being folded into the configured one, and a
---    run with no effort groups under effort=''. `runs` is span rows, `sweeps`
---    the distinct sweep ids behind them, and `duration_p50_s` the median
---    `duration_nano` of those spans. Read `credential_kind` beside the
+--    run with no effort groups under effort=''. `runs` is span rows, `repos`
+--    and `traces` the distinct repos and trace ids behind them, and
+--    `duration_p50_s` the median `duration_nano` of those spans. Read
+--    `credential_kind` beside the
 --    missing-account-name rule: the pool kind (`oauth-pool` | `chatgpt-seat`
 --    | `api-key`) is the finest attribution any span carries.
 WITH runs AS (
