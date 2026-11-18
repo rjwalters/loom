@@ -956,8 +956,7 @@ fn profile_check_reports_resolvability_without_spawning() {
 }
 
 // Bundled quick-tap preset coverage (`quick-cerebras`, `quick-flash`, issue
-// #8711) lives in the sibling `worker_spawn_quick_tap.rs` — this file sits at
-// the 1000-line file-size ratchet, so new cases go there, not here.
+// #8711) lives in the sibling `worker_spawn_quick_tap.rs`, not here.
 
 #[test]
 fn malformed_profile_selection_does_not_fall_back_to_a_billable_default() {

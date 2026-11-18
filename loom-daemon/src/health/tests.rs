@@ -2854,15 +2854,13 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
 mod section_inventory;
 
 // Wrong-repo-resolution escalation coverage (Issue #8513) — its own child
-// module so this file, already over `.loom/docs/file-size-policy.md`'s
-// threshold, does not grow to hold it.
+// module.
 mod auto_update_freshness;
 mod auto_update_stale_repo;
 
 #[cfg(test)]
 mod model_class_tests;
 
-// Export-liveness coverage (#5083, #5337, #9015) — moved out of this file for
-// the same reason as the two modules above: it is over
-// `.loom/docs/file-size-policy.md`'s threshold and may not grow.
+// Export-liveness coverage (#5083, #5337, #9015) — its own child module, like
+// the two modules above.
 mod observability_export;
