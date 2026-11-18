@@ -65,3 +65,4 @@ bounded_run() { # <timeout_secs> <cmd> [args...]
     case "$rc" in 143|137) rc=124 ;; esac
     return "$rc"
 }
+# filter-probe comment for the backend path-filter live check; no behavior change
