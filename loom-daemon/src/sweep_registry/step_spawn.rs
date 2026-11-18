@@ -64,6 +64,7 @@
 
 use super::*;
 use crate::observability::ops::dispatch_step::{self, StepDispatch};
+use crate::runtime_preference::role_draw::RoleDrawRecord;
 use crate::step_role::StepRole;
 use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 
@@ -773,6 +774,9 @@ impl SweepRegistry {
             assignment.as_ref().and_then(|g| g.lineage.as_ref()),
             admitted.map(|a| a.runtime.as_str()),
             launch.effort.as_deref(),
+            admitted
+                .and_then(|a| a.preference.as_ref())
+                .and_then(|p| p.draw.as_deref()),
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -820,6 +824,7 @@ impl SweepRegistry {
             None,
             None,
             None,
+            None,
         );
     }
 
@@ -840,6 +845,7 @@ impl SweepRegistry {
         lineage: Option<&crate::fleet_dispatch::worker::GrantLineage>,
         runtime: Option<&str>,
         effort: Option<&str>,
+        role_draw: Option<&RoleDrawRecord>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -861,6 +867,7 @@ impl SweepRegistry {
                 models,
                 runtime,
                 effort,
+                role_draw,
             },
         );
     }
