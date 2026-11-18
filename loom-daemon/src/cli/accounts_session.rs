@@ -209,6 +209,16 @@ pub(crate) fn handle_session_command(
             if let Some(removed) = removed {
                 println!("{}: {}", status.name, removed.trim_start_matches(", "));
             }
+            if !status.extra_mounts.is_empty() {
+                let mounts: Vec<String> = status
+                    .extra_mounts
+                    .iter()
+                    .map(|mount| {
+                        format!("{} -> {}:ro", mount.host.display(), mount.container.display())
+                    })
+                    .collect();
+                println!("{}: extra read-only mounts: {}", status.name, mounts.join(", "));
+            }
         }
         Ok(())
     }
@@ -302,9 +312,22 @@ pub(crate) fn handle_session_command(
                 anyhow::bail!("account uses private-clone mode; repeat start --private-clone URL --base BRANCH; host-mount reuse is refused");
             }
             let peers = peer_roots(&workspace);
+            // The resolved `accounts.session` settings (issue #14019).
+            // Invalid config refuses the start outright: a seat created
+            // from the stock image because its override failed to parse
+            // would be exactly the fail-open this prevents.
+            let session_config =
+                crate::tokens_pool::session_image::read_session_image_config(&workspace)?;
+            // Precedence: the operator's explicit `--image` beats the
+            // configured override, which beats the stock image; the mounts
+            // ride either way. Only a container created from the *configured*
+            // image gets the bundle verification (`with_session_config`
+            // compares it against the effective image).
+            let image = image.or_else(|| session_config.image.clone());
             let pull = image.clone();
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
-                .with_peer_roots(peers);
+                .with_peer_roots(peers)
+                .with_session_config(Some(session_config));
             prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             print_session_status(
                 &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,

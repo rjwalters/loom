@@ -134,10 +134,11 @@ use crate::tokens_pool::account_registry::{
 use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::private_workspace;
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
+use crate::tokens_pool::session_image::SessionImageConfig;
 use crate::tokens_pool::session_lifecycle::{
     container_name, is_session_managed, refresh_session_health_uncached, ContainerRunner,
     ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, UndoLock,
-    SESSION_POSTURE, SESSION_POSTURE_LABEL,
+    EXTRA_MOUNTS_LABEL, SESSION_POSTURE, SESSION_POSTURE_LABEL,
 };
 use crate::tokens_pool::session_state::{self, DriftInputs, MountDrift, Snapshot};
 use crate::tokens_pool::{session_dispatch_lock, session_hold_roots, session_mount_gate};
@@ -548,6 +549,13 @@ pub struct PassInputs<'a> {
     /// The host daemon's version; `None` when it could not be read, which
     /// disables every version-coupling decision (#11727).
     pub host_version: Option<skew::DaemonVersion>,
+    /// The resolved `accounts.session` settings (issue #14019): an override
+    /// seat is never recreated by the skew pass, and a missing seat is
+    /// recreated from the configured image rather than a stale recorded
+    /// pin. `None`: unset (or unreadable — the pass warns once and carries
+    /// on; the CLI refuses the start outright, so nothing can be *created*
+    /// with a broken override).
+    pub session_config: Option<&'a SessionImageConfig>,
 }
 
 /// The pass's single container read: one [`Snapshot`] from `take`, taken on
@@ -771,6 +779,10 @@ pub fn observe_container<'s>(
 #[must_use]
 pub fn container_state(inspect: &Value) -> ContainerState {
     let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let extra_mounts = inspect["Config"]["Labels"][EXTRA_MOUNTS_LABEL]
+        .as_str()
+        .map(crate::tokens_pool::session_image::parse_extra_mounts_label)
+        .unwrap_or_default();
     ContainerState {
         id: inspect["Id"].as_str().unwrap_or_default().to_string(),
         running: session_state::container_running(inspect),
@@ -778,6 +790,7 @@ pub fn container_state(inspect: &Value) -> ContainerState {
         started_at: text(&inspect["State"]["StartedAt"]),
         image: text(&inspect["Config"]["Image"]),
         workspace: session_state::workspace_label(inspect).map(Path::to_path_buf),
+        extra_mounts,
     }
 }
 
@@ -990,6 +1003,15 @@ fn reconcile_one<R: ContainerRunner>(
                     workspace.display()
                 );
             }
+            // The configured override image (issue #14019) beats a recorded
+            // start's image: the config is what the seat should run now, and
+            // a stale recorded digest pin would recreate it on an image the
+            // operator has since replaced. It is bundle-verified inside the
+            // start (a refusal leaves the seat down, not on the stock image).
+            let recreate_image = ctx
+                .session_config
+                .and_then(|config| config.image.clone())
+                .or(recreate_image);
             skew::guard_image(ctx, recreate_image.as_deref())?;
             let undo = UndoLock::Take(ctx.dispatch_locks);
             recreate_container(lifecycle, name, &workspace, recreate_image, &is_held, undo)?;
@@ -1062,6 +1084,23 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             .collect::<Vec<_>>(),
     );
     let acting = registry.effective_roots(fallback_root);
+    // The resolved `accounts.session` settings (issue #14019), read once per
+    // pass against the daemon's own root (its tier chain covers the host
+    // defaults and the per-repo tiers). An unreadable block warns and is
+    // treated as unset: the CLI refuses a *start* with the same block, so a
+    // broken override cannot silently put a fresh seat on the stock image —
+    // but an already-running seat keeps its reconcile care.
+    let session_config =
+        match crate::tokens_pool::session_image::read_session_image_config(fallback_root) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                log::warn!(
+                    "session_reconcile: the accounts.session config cannot be read ({error:#}); \
+                 extra mounts and the image override are ignored this pass"
+                );
+                None
+            }
+        };
     let inventories = hold_inventories
         .into_iter()
         .filter(|(root, _)| acting.contains(root));
@@ -1103,7 +1142,8 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             if accounts.is_empty() {
                 continue;
             }
-            let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None);
+            let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None)
+                .with_session_config(session_config.clone());
             let is_private_clone =
                 |a: &AccountDescriptor| private_workspace::configured(root, &a.id.name);
             let recover_private =
@@ -1132,6 +1172,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
                 host_version: skew::DaemonVersion::from_version_output(
                     crate::self_update::BUILD_IDENTITY,
                 ),
+                session_config: session_config.as_ref(),
             };
             let outcomes =
                 reconcile_accounts(&mut lifecycle, &accounts, &inputs, &mut observe, state, now);

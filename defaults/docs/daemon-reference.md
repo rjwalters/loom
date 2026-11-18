@@ -10542,6 +10542,102 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 [`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
 `git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
 
+### Configured session image and extra read-only mounts (#14019)
+
+By default a contained session runs from the released
+`ghcr.io/rjwalters/loom-worker-session:<daemon version>` image, selected by
+the daemon's own version. A repo whose checks need a domain toolchain (EDA
+tools, a Rust toolchain, simulators) can instead run its sessions from a
+**derived image** and give them **extra read-only data mounts**, via two
+config keys readable at every tier (`config_resolver`: host-shared defaults
+through `.loom-local/local.json`):
+
+```json
+{
+  "accounts": {
+    "session": {
+      "image": "ghcr.io/example/loom-worker-session-eda@sha256:0123abcd…",
+      "extraMounts": [
+        { "host": "/opt/pdk", "container": "/opt/pdk" }
+      ]
+    }
+  }
+}
+```
+
+| Config key | Tier | Value |
+|---|---|---|
+| — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
+| — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. |
+
+**Precedence**: `accounts session start --image IMAGE` (the operator's own
+invocation) beats `accounts.session.image`, which beats the stock default.
+The extra mounts ride either way. Only a container created from the
+**configured** image gets the bundle verification below — a hand-picked
+`--image` keeps its historical behaviour.
+
+**The override image must carry the sealed control bundle.** A derived
+image is built `FROM` the released session image, so
+`/opt/loom/private-control/` comes along
+([`private-control-bundle.md`](private-control-bundle.md)). Before any
+container is created from the configured image — operator `start`,
+reconcile recreate, `shell` — the daemon probes it in a throwaway
+container (no network, no mounts, read-only rootfs, `--cap-drop ALL`) and
+refuses the image unless its manifest matches this daemon's enforced
+protocol, control version, forced policy and managed registration, and
+every sealed asset's recomputed digest matches what its manifest recorded.
+The refusal names the offending asset or field.
+
+**A daemon roll has a defined behaviour: refuse.** The enforced constants
+are the running daemon's, so a roll that bumps the control boundary fails a
+not-yet-rebuilt override image closed at the next create; and the
+version-skew reconciler never recreates an override seat at all — not from
+its own digest pin (it would reproduce the same skew) and never from the
+stock tag. The seat stays on its running container with a WARN that says
+to rebuild the derived image on the new base, update the digest pin, then
+stop and start the seat. It never silently runs a stale bundle and never
+silently falls back to the stock image.
+
+**Denials for the extra mounts** extend the one session mount denylist
+(`session_mount_gate`), enforced at every create:
+
+* the **host source** passes the same denials the workspace roots do —
+  never `/`, the home directory or an ancestor of it, and never anything
+  overlapping a `firewall: true` repository (a read-only copy of a secret
+  is still a copy);
+* the **container target** never shadows — and is never nested inside —
+  the workspace mounts (path parity), the `CODEX_HOME` profile (whose
+  three control files are read-only mount points), the sealed bundle
+  (`/opt/loom/private-control`), or a GitHub App credential path;
+* no two extra mounts overlap each other (Docker would mount them in argv
+  order and one of the two would not be what the operator asked for).
+
+Extra mounts are for **data** — PDKs, model files, caches. Tools belong in
+a derived image: system-package tools are linked against shared libraries
+across `/usr`, which no per-path mount can carry. The mounts a container
+was created with are recorded in its `loom.extra-mounts` label; `accounts
+session status` (text and `--json`) reports them. The override and the
+mounts apply to **host-mode sessions only** — private-clone sessions keep
+their own image handling and their exactly-counted mount inventory. The
+pass makes no extra Docker call for an unset config, and a malformed
+`accounts.session` block refuses an operator `start` outright (the
+reconcile pass warns and carries on; it never puts a fresh seat on the
+stock image because the override failed to parse).
+
+**Image retention.** `autonomous.dockerImageRetention.trackedRepos` accepts
+any repository name, so the derived image's repository can be tracked (its
+old tags then pruned per `keepLastN`):
+
+```json
+{ "autonomous": { "dockerImageRetention": {
+    "trackedRepos": ["loom-worker-session", "ghcr.io/example/loom-worker-session-eda"] } } }
+```
+
+See `loom-daemon/src/tokens_pool/session_image.rs`,
+`session_mount_gate.rs`, `session_lifecycle.rs` and
+`session_reconcile_skew.rs`; how to build a derived image is in
+[`docker/session/README.md`](../../docker/session/README.md).
+
 ### Codex session-container reconciler (#10453)
 
 The daemon restarts dead Codex session containers itself
