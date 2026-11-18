@@ -408,6 +408,7 @@ fn a_step_dispatched_pr_role_matches_its_pr_not_a_sibling() {
 
 #[test]
 #[serial_test::serial(codex_home_env)]
+#[serial]
 fn a_codex_steps_usage_survives_journal_retirement_after_close() {
     use crate::observability::lifecycle;
     use crate::telemetry::trace::SpanName;

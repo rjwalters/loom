@@ -63,7 +63,7 @@ counts as uncovered.
 | `PR_ONLY_STEP` | a step of a covered job runs on PRs but is skipped on `merge_group` |
 | `NON_MERGE_GROUP_CHECKOUT` | `actions/checkout` `ref:` resolves to something other than the merge-group commit |
 | `GROUP_CHECK_WITHOUT_CHECKOUT` | a job runs `forge merge-queue group-check` with no `actions/checkout` step, so `write_scope` refuses the status write and `loom/merge-authorization` never posts |
-| `GROUP_CHECK_UNGATED_WORKFLOW_RUN` | a `group-check` job in a workflow with a `workflow_run` trigger lacks a job-level `if:` requiring both `github.event.workflow_run.event == 'merge_group'` and `github.event.workflow_run.head_repository.full_name == github.repository` (see Trust boundary below) |
+| `GROUP_CHECK_UNGATED_WORKFLOW_RUN` | a `group-check` job in a workflow with a `workflow_run` trigger lacks a job-level `if:` that contains both `github.event.workflow_run.event == 'merge_group'` and `github.event.workflow_run.head_repository.full_name == github.repository` (a text check for both clauses, not an evaluation of the condition; see Trust boundary below) |
 | `CANCELLING_CONCURRENCY` | `cancel-in-progress` is (or may be) true on `merge_group` |
 | `SHARED_CONCURRENCY_GROUP` | the group is not unique to the merge-group commit, so a pending run can be superseded |
 | `MISSING_REQUIRED_SUITE` | a required context matches no job name (matrix names are expanded) |
@@ -219,6 +219,13 @@ the base repository, so a fork PR's CI run is skipped. A skipped run posts
 nothing, and nothing authorizes nothing (fail-closed). Keep the gate in every
 copy of the workflow, including copies made from
 `defaults/optional/github-workflows/merge-group-check.yml`.
+
+The audit's check of that gate (`GROUP_CHECK_UNGATED_WORKFLOW_RUN`) is a text
+tripwire against deleting the gate. It looks for both clauses as substrings of
+the whitespace-normalised `if:`; it does not evaluate the condition. An `||`
+between the two clauses is therefore not detected, so keep them joined by `&&`.
+The group-check scan also runs only for workflows with a `merge_group` trigger,
+so a `workflow_run`-only host of the `group-check` job is not audited.
 
 Two residual limits are known and accepted for the pilot:
 

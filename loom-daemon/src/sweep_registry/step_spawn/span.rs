@@ -225,7 +225,28 @@ impl SweepRegistry {
             }
             None => result,
         };
-        lifecycle::finish_execution(&self.config.workspace_root, sweep_id, &result, close)
+        // #14407: this close saw the step end, so the step's phase and attempt
+        // spans mirror it (result + launch runtime) instead of reading
+        // `exit_unobserved`. Not when a roll stopped the step, or when the step
+        // exited with no observed status and no outcome line: those exits were
+        // not observed, and keep the unobserved label.
+        let observed = (result != roll_interruption::RESULT
+            && close.get(lifecycle::FAILURE_CLASS).map(String::as_str) != Some("exit-unobserved"))
+        .then(|| lifecycle::StepEndObserved {
+            result: result.clone(),
+            // The registry's word for the launch; `unknown` is no runtime.
+            runtime: close
+                .get(lifecycle::role_runtime::RUNTIME)
+                .filter(|r| r.as_str() != "unknown")
+                .cloned(),
+        });
+        lifecycle::finish_execution_observing(
+            &self.config.workspace_root,
+            sweep_id,
+            &result,
+            close,
+            observed.as_ref(),
+        )
     }
 }
 
