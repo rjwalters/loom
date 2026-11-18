@@ -21,6 +21,9 @@
 #   ghcr\.io/rjwalters/   # #14158: the GHCR namespace is renamed with the
 #                         # image-publishing workflows, not here. Drop this
 #                         # entry when #14158 lands.
+#   scaffolding.rs "**Loom Repository**"  # the LEGACY_LOOM_SIGNATURES entry
+#                         # must keep matching what pre-transfer installers
+#                         # wrote; it detects history, it is not a reference.
 #
 # The scan is a function over a repo root so the suite can also prove, against
 # a throwaway repo, that it flags a regression and honours the allowlist.
@@ -56,7 +59,11 @@ SHIPPED_PATHS=(
 )
 
 # Lines matching this ERE are allowed to carry the old slug (see header).
-ALLOWLIST_RE='ghcr\.io/rjwalters/'
+# The second alternative permits only the LEGACY_LOOM_SIGNATURES entry in
+# scaffolding.rs: that detector must keep matching the `**Loom Repository**:`
+# line pre-transfer installers actually wrote, so it stays a live detector
+# of history rather than a renamed reference (#14221 review).
+ALLOWLIST_RE='ghcr\.io/rjwalters/|loom-daemon/src/init/scaffolding\.rs:[0-9]+:.*\*\*Loom Repository\*\*: https://github\.com/rjwalters/loom'
 
 # scan_old_slug <repo-root>: print "path:line:text" for each non-allowlisted hit.
 # Prints "MISSING: <path>" for a SHIPPED_PATHS entry that does not exist, so a
