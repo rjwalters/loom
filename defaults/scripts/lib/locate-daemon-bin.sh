@@ -617,7 +617,7 @@ loom_daemon_exec_checked() {
 # The commands loom-tools serves. Others keep resolving the daemon only.
 loom_tools_serves() {
     case "${1:-}" in
-        strip-ansi|checkpoint|resolve-model) return 0 ;;
+        strip-ansi|checkpoint|resolve-model|resolve-role-model) return 0 ;;
         *) return 1 ;;
     esac
 }

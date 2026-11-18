@@ -3,8 +3,17 @@
 //! (`w / Σw` before availability), the config tier that set it, what
 //! `excludeProviders` and weight 0 took out, and — for a stage with no
 //! `roleDraw` — the `rolePreference` list that still decides it.
+//!
+//! #14027: each candidate of a table is also marked admitted or not **on
+//! this host for this workspace**, with the full refusal reason, using the
+//! real spawn path's per-candidate question
+//! ([`crate::runtime_preference::probe_candidate`] with the real containment
+//! preparer). The view prints the effective table after unavailable and
+//! unadmitted candidates are dropped and the weights renormalised, and says
+//! plainly when no runtime can serve a stage here.
 
 use super::{DrawConfig, Layer};
+use crate::runtime_preference::resolve::{SkipReason, Tap};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -23,9 +32,96 @@ pub const STAGES: &[&str] = &[
     "sweep-lifecycle",
 ];
 
+/// One candidate's admission verdict as the explain view records it.
+fn verdict_fields(verdict: &Result<(), SkipReason>) -> (bool, Option<String>) {
+    match verdict {
+        Ok(()) => (true, None),
+        Err(reason) => (false, Some(format!("{}({})", reason.kind(), reason.summary_capped(None)))),
+    }
+}
+
+/// The production probe: the real spawn path's per-candidate admission walk
+/// ([`crate::runtime_preference::probe_candidate`]) with the real containment
+/// preparer, in the view's always-release, never-launch mode (#14027).
+///
+/// The real preparer has no dry mode: a containment-eligible refusal is
+/// retried by genuinely preparing a private selection — leasing a Codex
+/// account, validating Docker — exactly as a launch would retry it, which is
+/// what makes the view truthful about a runtime that can never be admitted
+/// (#13983). The lease side is bounded by the
+/// [`crate::runtime_preference::ContainmentPreparer`] contract: this view
+/// never takes the prepared selection, and [`probe_candidate`] releases after
+/// every candidate, so every selection is dropped — finishing its lease and
+/// rolling back its admission record — before the view returns.
+fn probe_on_this_host(root: &Path, role: &str, tap: &Tap, tier: usize) -> Result<(), SkipReason> {
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    let mut preparer = admission_preparer(root, role);
+    crate::runtime_preference::probe_candidate(
+        root,
+        role,
+        tap,
+        tier,
+        now,
+        crate::runtime_preference::DispatchContext {
+            intent: crate::runtime_preference::Intent::Probe,
+            role_tick: false,
+        },
+        &mut preparer,
+    )
+    .map(|_| ())
+}
+
+/// The real spawn path's containment preparer, built for one stage's probe.
+///
+/// The account is selected for the model the launch would pin (#12748): the
+/// candidate's drawn model when it names one, else the role's own resolution
+/// — the role runner's precedence without a runner override.
+fn admission_preparer<'a>(
+    root: &'a Path,
+    role: &str,
+) -> crate::tokens_pool::private_workspace::containment::Preparer<'a> {
+    let hint = crate::role_runner::model_resolution::resolve_role_runner_model(root, role);
+    crate::tokens_pool::private_workspace::containment::Preparer::new(
+        root,
+        crate::tokens_pool::private_workspace::JobKind::Role,
+        None,
+        format!("explain-{role}"),
+        Box::new(move |runtime: &str, drawn: Option<&str>| {
+            let (model, source) = match drawn.filter(|d| !d.trim().is_empty()) {
+                Some(drawn) => (drawn.to_string(), "role-draw".to_string()),
+                None => hint.clone(),
+            };
+            let (model, _) =
+                crate::role_runner::model_resolution::reconcile_unpinned_model_with_runtime(
+                    runtime, model, source,
+                );
+            (!model.is_empty()).then_some(model)
+        }),
+    )
+}
+
 /// The explain view as JSON (the `--json` form, and the source of the text).
+///
+/// Asks the real spawn path's admission question for every active candidate
+/// of every table — admission with the real containment preparer, credential
+/// availability, the backstop ceiling — as a probe: nothing is launched, and
+/// any account lease containment preparation takes is released before the
+/// view returns (#14027).
 #[must_use]
 pub fn explain_json(root: &Path) -> Value {
+    explain_json_with(root, &mut |role: &str, tap: &Tap, tier: usize| {
+        probe_on_this_host(root, role, tap, tier)
+    })
+}
+
+/// [`explain_json`] with the per-candidate admission question injected
+/// (tests): `probe(role, tap, tier)` answers whether the spawn walk would
+/// admit and serve that candidate on this host, with the walk's own skip
+/// reason when not.
+pub(crate) fn explain_json_with(
+    root: &Path,
+    probe: &mut dyn FnMut(&str, &Tap, usize) -> Result<(), SkipReason>,
+) -> Value {
     let config = DrawConfig::load(root);
     let effective = crate::config_resolver::resolve_effective_config(root);
     let mut stages = Vec::new();
@@ -47,19 +143,51 @@ pub fn explain_json(root: &Path) -> Value {
             .map(|table| {
                 let eff = config.effective(table);
                 let total = eff.total();
+                let verdicts: Vec<Result<(), SkipReason>> = eff
+                    .active
+                    .iter()
+                    .enumerate()
+                    .map(|(tier, (candidate, _))| probe(stage, &candidate.tap(), tier))
+                    .collect();
                 let candidates: Vec<Value> = eff
                     .active
                     .iter()
-                    .map(|(c, w)| {
+                    .enumerate()
+                    .map(|(i, (c, w))| {
                         #[allow(clippy::cast_precision_loss)]
                         let p = *w as f64 / total as f64;
-                        json!({"candidate": c.key, "weight": w, "p": p})
+                        let (admitted, reason) = verdict_fields(&verdicts[i]);
+                        json!({
+                            "candidate": c.key,
+                            "weight": w,
+                            "p": p,
+                            "admitted": admitted,
+                            "reason": reason,
+                        })
                     })
                     .collect();
                 let off: Vec<Value> = eff
                     .off
                     .iter()
                     .map(|(k, why)| json!({"candidate": k, "reason": why}))
+                    .collect();
+                let served: Vec<(String, u64)> = eff
+                    .active
+                    .iter()
+                    .zip(verdicts.iter())
+                    .filter(|(_, verdict)| verdict.is_ok())
+                    .map(|((c, w), _)| (c.key.clone(), *w))
+                    .collect();
+                let effective_total = served
+                    .iter()
+                    .fold(0u64, |acc, (_, w)| acc.saturating_add(*w));
+                let effective: Vec<Value> = served
+                    .iter()
+                    .map(|(key, w)| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let p = *w as f64 / effective_total as f64;
+                        json!({"candidate": key, "weight": w, "p": p})
+                    })
                     .collect();
                 json!({
                     "attempt": table.attempt,
@@ -68,6 +196,11 @@ pub fn explain_json(root: &Path) -> Value {
                     "candidates": candidates,
                     "off": off,
                     "empty": eff.active.is_empty(),
+                    "effective": {
+                        "total": effective_total,
+                        "candidates": effective,
+                        "empty": served.is_empty(),
+                    },
                 })
             })
             .collect();
@@ -85,7 +218,18 @@ pub fn explain_json(root: &Path) -> Value {
 /// The explain view as text.
 #[must_use]
 pub fn explain_text(root: &Path) -> String {
-    let doc = explain_json(root);
+    explain_text_with(root, &mut |role: &str, tap: &Tap, tier: usize| {
+        probe_on_this_host(root, role, tap, tier)
+    })
+}
+
+/// [`explain_text`] with the per-candidate admission question injected
+/// (tests), mirroring [`explain_json_with`].
+pub(crate) fn explain_text_with(
+    root: &Path,
+    probe: &mut dyn FnMut(&str, &Tap, usize) -> Result<(), SkipReason>,
+) -> String {
+    let doc = explain_json_with(root, probe);
     let mut out = format!("Role draw tables for {}\n", doc["workspace"].as_str().unwrap_or(""));
     let excluded: Vec<&str> = doc["excludeProviders"]
         .as_array()
@@ -134,11 +278,17 @@ pub fn explain_text(root: &Path) -> String {
                 }
             ));
             for c in attempt["candidates"].as_array().into_iter().flatten() {
+                let mark = if c["admitted"].as_bool() == Some(true) {
+                    "admitted".to_string()
+                } else {
+                    format!("not admitted: {}", c["reason"].as_str().unwrap_or("?"))
+                };
                 out.push_str(&format!(
-                    "    {:<24} w={:<5} p={:.1}%\n",
+                    "    {:<24} w={:<5} p={:.1}%  {}\n",
                     c["candidate"].as_str().unwrap_or("?"),
                     c["weight"],
-                    c["p"].as_f64().unwrap_or(0.0) * 100.0
+                    c["p"].as_f64().unwrap_or(0.0) * 100.0,
+                    mark
                 ));
             }
             for c in attempt["off"].as_array().into_iter().flatten() {
@@ -148,14 +298,42 @@ pub fn explain_text(root: &Path) -> String {
                     c["reason"].as_str().unwrap_or("?")
                 ));
             }
+            let effective = &attempt["effective"];
+            if effective["empty"].as_bool() == Some(true) {
+                out.push_str("  no runtime can serve this role here\n");
+            } else {
+                let served: Vec<String> = effective["candidates"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| {
+                        format!(
+                            "{} {:.1}%",
+                            c["candidate"].as_str().unwrap_or("?"),
+                            c["p"].as_f64().unwrap_or(0.0) * 100.0
+                        )
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "  effective on this host: Σw={} — {}\n",
+                    effective["total"],
+                    served.join(", ")
+                ));
+            }
         }
     }
     for warning in doc["warnings"].as_array().into_iter().flatten() {
         out.push_str(&format!("\nwarning: {}", warning.as_str().unwrap_or("?")));
     }
     out.push_str(
-        "\n\nProbabilities are before availability: an unavailable candidate is excluded at \
-         draw time and the rest renormalised. Attempt N uses the highest table <= N.\n",
+        "\n\nA candidate's p is its share of the configured table, before availability. \
+         \"admitted\" is the real spawn path's per-candidate verdict on this host for this \
+         workspace — capability admission (a containment-eligible refusal retried through the \
+         real private-clone preparer, as a launch would retry it), then credential \
+         availability and the backstop ceiling — and the effective table drops the refused \
+         candidates and renormalises. The verdict is a probe: nothing is launched, and any \
+         account lease containment preparation takes is released before the view returns. \
+         Attempt N uses the highest table <= N.\n",
     );
     out
 }

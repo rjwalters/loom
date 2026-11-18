@@ -853,6 +853,73 @@ fn a_repeated_merged_pr_or_triage_builder_refusal_arms_the_cooldown() {
     );
 }
 
+/// #14032: a standing admission refusal (`runtime_rejected`,
+/// `model_runtime_mismatch`, `admission_refused`) reaches the ledger through
+/// `step_end::ledger_reason` as `admission` and rides the state-refusal
+/// streak: the first only reclassifies, a repeat arms the refusal cooldown
+/// doubling to 24 h, and a different reason, another outcome or a verdict
+/// resets the streak.
+#[test]
+fn a_repeated_admission_refusal_arms_a_doubling_cooldown() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let refuse = |reason: &str| out(OutcomeClass::Refused, reason);
+    let step = StepRole::Builder;
+    for spawn in [
+        "runtime_rejected",
+        "model_runtime_mismatch",
+        "admission_refused",
+    ] {
+        assert_eq!(
+            crate::step_dispatch::step_end::ledger_reason(spawn),
+            Some("admission"),
+            "{spawn}"
+        );
+    }
+    let admission = crate::step_dispatch::step_end::ledger_reason("runtime_rejected").unwrap();
+
+    let first = l.record(80, step, &refuse(admission), SLOW, now);
+    assert_eq!(
+        (first.effect, first.cooling_until),
+        (Effect::Reclassify, None),
+        "the first refusal only reclassifies"
+    );
+    let mut lengths = Vec::new();
+    for k in 1..12 {
+        let at = now + chrono::Duration::days(k);
+        let rec = l.record(80, step, &refuse(admission), SLOW, at);
+        assert_eq!(rec.effect, Effect::Reclassify);
+        lengths.push((rec.cooling_until.expect("cooling") - at).num_seconds());
+    }
+    assert_eq!(&lengths[..3], &[600, 1200, 2400], "10 min, doubling");
+    assert!(lengths.iter().all(|s| *s <= 24 * 3600), "{lengths:?}");
+    assert_eq!(*lengths.last().unwrap(), 24 * 3600, "capped at 24 h");
+    assert_eq!(
+        l.cooling_cause(80, step, now + chrono::Duration::days(11)),
+        Some(CooldownCause::Refused)
+    );
+
+    // A different reason in between resets the streak (`pool_gate` would
+    // also clear it, but arms its own window, so a state refusal is the
+    // clean probe).
+    l.record(81, step, &refuse(admission), SLOW, now);
+    l.record(81, step, &refuse("open_pr"), SLOW, now);
+    assert_eq!(
+        l.record(81, step, &refuse(admission), SLOW, now)
+            .cooling_until,
+        None
+    );
+
+    // So does any other outcome on the pair, a verdict included.
+    l.record(82, step, &refuse(admission), SLOW, now);
+    l.record(82, step, &out(OutcomeClass::Verdict, "rejected"), SLOW, now);
+    assert_eq!(
+        l.record(82, step, &refuse(admission), SLOW, now)
+            .cooling_until,
+        None
+    );
+}
+
 /// #11909: the reaper prunes every tick. A prune just before each draw must
 /// not drop a refusal streak whose cooldown reached the 24 h cap (the same
 /// length as the prune window): the next identical refusal keeps the 24 h

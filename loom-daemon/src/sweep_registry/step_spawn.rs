@@ -718,7 +718,6 @@ impl SweepRegistry {
                 effort: launch.effort.clone(),
                 depends_on: None,
                 repo: Some(self.config.workspace_root.display().to_string()),
-                overflow: false,
             },
         );
         if let Some(points) = request.story_points {

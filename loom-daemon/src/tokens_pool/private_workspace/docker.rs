@@ -493,6 +493,64 @@ pub(super) fn prepare_target(
     prepare_with(config, target, id, branch, &auth)
 }
 
+/// Drive one clone's `private-workspace recover` verb under the job's auth
+/// context (#14030): the exec carries the same repository-scoped credential
+/// env as preparation, so a publish pushes only through that clone's helper.
+pub(super) fn recover_target(
+    config: &Config,
+    target: &Target,
+    action: RecoverAction,
+    issue: Option<u64>,
+    branches: &[String],
+    auth: &forge_auth::ExecAuth,
+) -> Result<RecoverOutcome> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
+    let issue_flag = issue.map(|n| n.to_string());
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
+    for name in auth.names() {
+        args.extend(["--env", name]);
+    }
+    args.extend([
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "recover",
+        "--account",
+        &config.account,
+        "--repository",
+        &target.repository,
+        "--base",
+        &target.base,
+    ]);
+    match action {
+        RecoverAction::Publish => args.extend(["--publish"]),
+        RecoverAction::Discard => args.extend(["--discard"]),
+        RecoverAction::List => {}
+    }
+    if let Some(issue) = &issue_flag {
+        args.extend(["--issue", issue]);
+    }
+    for branch in branches {
+        args.extend(["--branch", branch]);
+    }
+    if let Some(slug) = &target.slug {
+        args.extend(["--slug", slug]);
+    }
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context(
+        "private workspace endpoint failed; use a current session image supporting private-workspace protocol",
+    )?;
+    let result: Value = serde_json::from_str(&output)
+        .context("private workspace endpoint unavailable; update the session image before reuse")?;
+    if result["protocol"] != PROTOCOL {
+        bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    if let Some(error) = result["error"].as_str() {
+        bail!("private clone recovery refused: {error}");
+    }
+    serde_json::from_value(result["outcome"].clone())
+        .context("private workspace recover returned an invalid report")
+}
+
 pub(super) fn prepare_with(
     config: &Config,
     target: &Target,

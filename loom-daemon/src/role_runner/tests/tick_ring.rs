@@ -123,9 +123,10 @@ fn repeat_failures_are_all_recorded_even_though_the_log_dedups_them() {
 /// #14026 (Judge finding): every role-runner daemon-log lane must render a
 /// `runtime_rejected` refusal as ONE line — `refusal_line()`, never the
 /// multi-line operator `reason` whose `\n  preference order: …` continuation
-/// is unprefixed and unfilterable. Covers all three `log::` sites:
-/// `log_outcome`, `log_outcome_for_root`, and `log_outcome_for_root_deduped`
-/// (the multi-workspace interval loop's fail-edge WARN).
+/// is unprefixed and unfilterable. Covers both `log::` sites:
+/// `log_outcome_for_root` (the fire-and-forget idle path) and
+/// `log_outcome_for_root_deduped` (the multi-workspace interval loop's
+/// fail-edge WARN).
 #[test]
 #[serial(role_tick_ring)]
 fn a_runtime_rejected_tick_logs_the_one_line_refusal_not_the_multiline_reason() {
@@ -153,7 +154,6 @@ fn a_runtime_rejected_tick_logs_the_one_line_refusal_not_the_multiline_reason() 
     reset_role_tick_ring();
 
     let records = crate::test_log_capture::capture_logs(|| {
-        log_outcome("curator", &outcome, Duration::from_secs(1));
         log_outcome_for_root("curator", &root, &outcome, Duration::from_secs(1));
         let (mut failing, mut no_pool, mut pool_exhausted, mut model_mismatch) =
             (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
@@ -174,7 +174,7 @@ fn a_runtime_rejected_tick_logs_the_one_line_refusal_not_the_multiline_reason() 
         .filter(|(l, _)| *l >= log::Level::Warn)
         .map(|(_, m)| m.as_str())
         .collect();
-    assert_eq!(warn_lines.len(), 3, "one WARN per site: {records:?}");
+    assert_eq!(warn_lines.len(), 2, "one WARN per site: {records:?}");
     for line in warn_lines {
         assert!(!line.contains('\n'), "one line, never split: {line:?}");
         assert!(line.contains(obligation), "full reason, uncapped: {line:?}");

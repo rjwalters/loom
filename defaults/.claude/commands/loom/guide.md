@@ -1090,8 +1090,58 @@ The Guide maintains three documents at the repository root:
 | Document | Purpose |
 |----------|---------|
 | **WORK_LOG.md** | Chronological record of merged PRs and closed issues |
-| **WORK_PLAN.md** | Prioritized roadmap from current GitHub label state |
+| **WORK_PLAN.md** | Backlog snapshot from current GitHub label state |
 | **README.md** | Project overview (updated only when architecture changes) |
+
+### WORK_PLAN.md vs a hand-written ROADMAP.md (#14009)
+
+A repo may keep its own hand-written roadmap (`ROADMAP.md`, `docs/ROADMAP.md`,
+or `docs/roadmap.md`). The two documents do different jobs, and neither
+replaces the other:
+
+| Document | Who writes it | What it holds |
+|----------|---------------|---------------|
+| `ROADMAP.md` (any of the locations above) | maintainers, by hand | **Direction** — what the project intends, and why |
+| `WORK_PLAN.md` | Guide, generated | **Backlog snapshot** — what the GitHub labels say right now |
+
+The rules (each settles one question from #14009; a pass applies them as
+written, and a pass that departs from any of them says so in its docs PR body
+citing this subsection):
+
+1. **Roles.** Never describe WORK_PLAN.md as "the roadmap": it is a snapshot
+   of label state that may lag live labels until the next docs-maintenance PR
+   merges, while the repo's own roadmap is the direction document. Guide
+   already *reads* a roadmap as a priority input (see "Priority Labels and
+   Duplicate Checks") and must **never edit or generate** one.
+2. **First creation is create-by-default.** When `WORK_LOG.md` /
+   `WORK_PLAN.md` do not exist yet (a repo that has never tracked them), a
+   pass **creates them without asking** — Steps 2 and 3 below say how. Both
+   files land as a reviewable docs PR that already passes Judge and
+   Champion, so **the PR itself is the ask**. Never defer first creation as
+   an "operator scope" decision: on `2AMLogic/pdks` two Guide passes (#78,
+   #93) reached opposite conclusions that way, and the question surfaced
+   only as a merge hold two days later.
+3. **Opt-out.** The one recorded place for a repo to say "we do not want
+   these documents (or want them generated differently)" is the
+   `guide.docsMaintenance` namespace in `.loom/config.json` (where
+   `workLogDebounceSecs` / `workPlanDebounceSecs` / `poolPressure*` already
+   live). No per-file or on/off key exists yet — tracked separately in
+   #14116. Until one lands, having one file without the other is NOT an
+   opt-out signal: create-by-default applies to each missing file
+   independently.
+4. **Declining anything must be visible.** A pass that declines any part of
+   this phase (suppresses a README refresh, skips a link, archives nothing)
+   says so **in its docs PR body, citing this subsection**, so the next pass
+   reads the recorded answer instead of deciding afresh. With creation as
+   the default there is no deferral to remember; the recorded answers that
+   exist are the config key (once #14116 lands) and these PR-body notes.
+5. **Cross-links and layout.** The static preamble outside the
+   `guide:plan-body` markers is where a WORK_PLAN.md points at the repo's
+   roadmap when one exists — Step 3's first-creation preamble does this
+   automatically. The pass that first creates the files also refreshes any
+   README layout listing that enumerates top-level files (Step 4 treats
+   first creation as a staleness trigger): pdks #93 left that README stale
+   and it took a downstream follow-up to fix.
 
 ### Where This Phase Writes (a managed worktree, never the main checkout)
 
@@ -1349,6 +1399,15 @@ write if the pending delta has survived a batching window since the last
 WORK_LOG-writing docs-maintenance merge, **or** has grown large enough to
 write immediately regardless of the window (see "WORK_LOG debounce" in
 `update_work_log()` below, #6133).
+
+**First creation (#14009).** If `$DOCS_WT/WORK_LOG.md` does not exist (the
+repo has never tracked it — presence, not recency), this pass **creates it
+without asking**: write the standard preamble and `## Archives` index shape
+(mirror the WORK_LOG.md template in `defaults/.claude/commands/loom/imagine.md`)
+followed by this tick's entries. Creation itself bypasses the debounce and
+min-entries gates below — a first creation with nothing to record yet is
+still a create (the file starts as preamble plus an empty current day), never
+a defer. See "WORK_PLAN.md vs a hand-written ROADMAP.md", rule 2.
 
 **Redact host identifiers, even quoting a title** — that is how 127 leaked
 into this public repo (#8589); the CI scrub job fails on the next one.
@@ -1781,7 +1840,7 @@ update_work_log() {
   #     `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s 3600s default: WORK_LOG entries are
   #     individually small and cheap to batch, but a merge/close event
   #     going unrecorded for a full hour is a worse staleness trade than for
-  #     WORK_PLAN's roadmap snapshot, which is stale-tolerant by nature.
+  #     WORK_PLAN's backlog snapshot, which is stale-tolerant by nature.
   # `LOOM_WORK_LOG_DEBOUNCE_NOW` is a test seam only (mirrors
   # `LOOM_WORK_PLAN_DEBOUNCE_NOW`) — never set it in normal operation.
   #
@@ -1922,7 +1981,7 @@ gitignored sidecar holds any state.
 
 ### Step 3: Update WORK_PLAN.md
 
-Regenerate the roadmap from current GitHub label state. Only rewrite if labels
+Regenerate the backlog snapshot from current GitHub label state. Only rewrite if labels
 have changed **and** that change has survived a debounce window since the last
 docs-maintenance merge (see "WORK_PLAN debounce" below, #5890).
 
@@ -1930,6 +1989,37 @@ The generated region of `WORK_PLAN.md` is delimited by
 `<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->`. **Everything
 between those markers is machine-generated and is overwritten wholesale; nothing
 else in the file is touched.**
+
+**First creation (#14009).** If `$DOCS_WT/WORK_PLAN.md` does not exist, this
+pass **creates it without asking** — create-by-default, never defer (see
+"WORK_PLAN.md vs a hand-written ROADMAP.md", rules 2 and 5). Build the file as
+the static preamble below, then the two marker lines with a freshly rendered
+`render_plan_body()` between them. The debounce gate in `update_work_plan()`
+does not apply to creation: there is no committed `old_body` to compare
+against, and holding off would just re-create the pdks #78/#93
+defer-then-create-anyway inconsistency. The preamble is static text outside
+the markers — which is also where the repo's roadmap is linked when one
+exists:
+
+```markdown
+# Work Plan
+
+Backlog snapshot from current GitHub label state, maintained by the Guide role.
+Direction lives in the hand-written roadmap: `ROADMAP.md`.
+
+The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. Date the snapshot with `git log -1 -- WORK_PLAN.md`.
+
+<!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
+```
+
+The "Direction lives…" line is included **only** when a roadmap file exists,
+and the generated WORK_PLAN.md links the file actually found — `ROADMAP.md`,
+`docs/ROADMAP.md`, or `docs/roadmap.md`, as a repo-root-relative path. The
+fence shows the path backticked only because this role file must not carry a
+link that dangles in repos without a roadmap. With no
+roadmap, omit that line entirely. Keep this preamble wording in lockstep with
+the WORK_PLAN.md template in `defaults/.claude/commands/loom/imagine.md` (the
+bootstrap seed uses the same distinction).
 
 The generated region is never archived (`defaults/docs/work-docs-archive.md`, "WORK_PLAN").
 
@@ -2112,7 +2202,14 @@ render_plan_body() {
   local approved_json
   approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title,labels,closingIssuesReferences \
     --jq 'sort_by(.number) | [.[] | select(any(.labels[]?.name; . == "loom:frozen") | not)]')
-  approved=$(printf '%s' "$approved_json" | jq -r '.[] | "- **#\(.number)**: \(.title)"')
+  # #13928: surface the closes-graph this query already fetched — a
+  # merge-pending PR bullet annotates the issues it closes ("— closes #N"),
+  # the single fact that explains why those issues are absent from "Ready"
+  # below. Derived from $approved_json alone (no new forge query, the #6457
+  # discipline); a PR with empty closingIssuesReferences renders exactly as
+  # before. `held` bullets stay unchanged.
+  approved=$(printf '%s' "$approved_json" | \
+    jq -r '.[] | ([(.closingIssuesReferences // [])[].number] | sort) as $closes | "- **#\(.number)**: \(.title)" + (if ($closes | length) > 0 then " — closes " + ($closes | map("#" + tostring) | join(", ")) else "" end)')
   held=$(printf '%s' "$approved_json" | jq -r '.[] | select([(.labels // [])[].name] | index("loom:operator") or index("loom:blocked")) | "- **#\(.number)**: \(.title)"')
   # #7083: derive the set of issue numbers already closed by an open
   # `loom:pr`-labeled PR from `approved_json`'s own `closingIssuesReferences`
@@ -2145,7 +2242,7 @@ render_plan_body() {
   echo
   section "Important" "\`loom:important\`; taken before unlabelled work." "$imp"
   echo
-  section "Ready" "Human-approved issues ready for implementation (\`loom:issue\`)." "$ready"
+  section "Ready" "Human-approved issues (\`loom:issue\`) ready for implementation — excluding held (\`loom:blocked\`/\`loom:operator\`/\`loom:frozen\`), \`loom:building\`, and issues closed by an open \`loom:pr\` PR (listed under Approved)." "$ready"
   echo
   section "In Progress" "Issues currently being built (\`loom:building\`)." "$building"
   echo
@@ -2167,7 +2264,7 @@ render_plan_body() {
     "| Operator merge-risk holds | $(count "$held") |" \
     "| Very important | $(count "$vimp") |" \
     "| Important | $(count "$imp") |" \
-    "| Ready (\`loom:issue\`) | $(count "$ready") |" \
+    "| Ready (\`loom:issue\`, net of holds/building/merge-pending) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
     "| PRs awaiting review | $(count "$review") |" \
     "| Approved PRs awaiting merge | $(count "$approved") |" \
@@ -2319,10 +2416,25 @@ comparison mismatches until the file catches up). Adding a section means editing
 
 ### Step 4: Check README.md Staleness
 
-Only update README.md when merged PRs touch architectural files.
+Update README.md when merged PRs touch architectural files, **or when this
+pass first created `WORK_LOG.md` / `WORK_PLAN.md`** (#14009): a README layout
+listing that enumerates top-level files must not be left stale by two new
+top-level documents (pdks #93 left it stale; a downstream follow-up fixed
+it). Refresh conservatively — add or adjust only the file/layout listing
+lines that mention top-level files.
 
 ```bash
 check_readme_staleness() {
+  # #14009 FIRST-CREATION TRIGGER, checked before the arch-pattern gate: the
+  # pass that first creates WORK_LOG.md / WORK_PLAN.md also refreshes a README
+  # layout listing that enumerates top-level files. $1 = 1 when this pass
+  # performed a first creation (Steps 2/3 pass it); 0 or empty otherwise.
+  if [ "${1:-0}" -eq 1 ]; then
+    echo "First creation of WORK_LOG.md/WORK_PLAN.md this tick."
+    echo "Review README.md's top-level file/layout listing for staleness."
+    return 0
+  fi
+
   # Check recently merged PRs for architectural file changes
   local arch_patterns="Cargo.toml|package.json|loom-daemon/|loom-api/|install.sh|scripts/install"
 
@@ -2648,7 +2760,7 @@ Automated document maintenance by the Guide triage agent.
 
 ### Changes
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
-- **WORK_PLAN.md**: Regenerated roadmap from current GitHub label state
+- **WORK_PLAN.md**: Regenerated backlog snapshot from current GitHub label state (a repo's hand-written ROADMAP.md, if any, remains the direction document)
 - **README.md**: Updated if architectural changes were detected
 - Plus any files reported by the repo's `.loom/docs-post-stage.sh` hook, if installed (e.g. a regenerated freshness envelope)
 
@@ -2872,7 +2984,7 @@ Document Maintenance Phase
   and otherwise waits for `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30
   min — shorter than WORK_PLAN's 3600s default because an unrecorded
   merge/close event is a worse staleness trade than WORK_PLAN's
-  stale-tolerant roadmap snapshot) since WORK_LOG.md was last actually
+  stale-tolerant backlog snapshot) since WORK_LOG.md was last actually
   WRITTEN by a merged docs-maintenance PR, anchored via
   `last_work_log_write_epoch()` the same way `last_work_plan_write_epoch()`
   anchors WORK_PLAN's clock (filtered to merges whose changed files include

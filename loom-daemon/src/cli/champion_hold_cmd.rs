@@ -228,7 +228,9 @@ impl ChampionHoldCommand {
 
 /// The ratification verb's stdout line; exits 3 on any failed read.
 fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
-    use crate::champion_hold::ratification::{decide, scan, ChangedFile, Comment, Config, Verdict};
+    use crate::champion_hold::ratification::{
+        decide, scan, unreadable_candidates, ChangedFile, Comment, Config, Verdict,
+    };
     let repo = t.repo();
     let fail = |what: &str| -> ! { unreadable("ratification", t.pr, what) };
     let pull = TargetArgs::read_json(&format!("repos/{repo}/pulls/{}", t.pr), root)
@@ -277,6 +279,12 @@ fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         }
         files.push(f);
+    }
+    // A candidate whose head content could not be read must fail closed
+    // (#13932): exit 3, the documented read-failed path, even when other
+    // files already hold — never a truncated `files=` list at rc=0.
+    if !unreadable_candidates(&files, &cfg).is_empty() {
+        fail("head content");
     }
     let comments: Vec<Comment> =
         crate::comment_trust::records::fetch_trusted_comments(repo, &t.pr.to_string(), root, false)
