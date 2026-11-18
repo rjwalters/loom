@@ -994,7 +994,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
     let failed = RoleTickOutcome::Failure("free-form detail".into());
     let site = RoleFailure::new("resume-refused", None, "m");
     assert_eq!(
-        failure_class_of(&failed, None, Some(site.clone()), false).as_deref(),
+        failure_class_of(&failed, None, Some(&site), false).as_deref(),
         Some("resume-refused")
     );
     assert_eq!(
@@ -1002,7 +1002,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
         Some(UNCLASSIFIED_PRE_LAUNCH)
     );
     assert_eq!(failure_class_of(&failed, None, None, true).as_deref(), Some(UNCLASSIFIED_STEP));
-    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(site), false), None);
+    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(&site), false), None);
 }
 
 #[test]
@@ -1056,6 +1056,7 @@ fn emit_one_step(
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("zai-org/GLM-5.3", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            trace_context: None,
             failure: None,
             sweep_id,
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
@@ -1342,6 +1343,7 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            trace_context: None,
             failure: None,
             sweep_id: "step-builder-42-4",
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),

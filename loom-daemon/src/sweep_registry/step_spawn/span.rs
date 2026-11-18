@@ -48,7 +48,7 @@ use crate::step_dispatch::outcome_ledger::{self, OutcomeClass, PostState, StepOu
 use crate::step_role::StepRole;
 use crate::sweep_registry::reaper::pid_identity;
 use crate::sweep_registry::{LockOwner, SweepRegistry};
-use crate::telemetry::trace::TraceAttributes;
+use crate::telemetry::trace::{TraceAttributes, TraceContext};
 
 /// Why a step failed, on its `loom.sweep` close. A step whose provider
 /// feedback said its api-key seat was exhausted (`provider_exhausted`,
@@ -210,14 +210,14 @@ impl SweepRegistry {
     /// Close a finished step's `loom.sweep` span with its real outcome, at
     /// the moment its end is seen. A step a roll stopped (`pid`, the leader
     /// H4 noted) closes as `interrupted_by_roll` instead. A no-op when
-    /// tracing is off, or when the span was already closed.
+    /// tracing is off. Return the root context for the asynchronous usage capture.
     pub(crate) fn close_step_span(
         &self,
         sweep_id: &str,
         pid: Option<u32>,
         result: String,
         mut close: TraceAttributes,
-    ) {
+    ) -> Option<TraceContext> {
         let result = match pid.and_then(roll_interruption::take_stopped) {
             Some(roll) => {
                 roll.apply(&mut close);
@@ -225,7 +225,7 @@ impl SweepRegistry {
             }
             None => result,
         };
-        lifecycle::finish_execution(&self.config.workspace_root, sweep_id, &result, close);
+        lifecycle::finish_execution(&self.config.workspace_root, sweep_id, &result, close)
     }
 }
 
