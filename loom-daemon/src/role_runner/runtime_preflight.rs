@@ -265,7 +265,12 @@ pub(crate) fn static_check(
 }
 
 /// The #4642 / #7607 Claude token-pool gate. Behaviour, skip text, and
-/// counters are byte-identical to the pre-#8408 preflight.
+/// counters are byte-identical to the pre-#8408 preflight. With
+/// `autonomous.modelFallback` enabled (#13873), the #7607 exhaustion read
+/// is scoped to the class of the model this role's launch would actually
+/// run — the configured model, or the rung the selection-time fallback
+/// would pick — so a pool whose accounts are all bad-marked for one model
+/// class does not skip a launch a lower rung can serve.
 fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> {
     if crate::tokens::token_pool_size(root) == 0 {
         NO_TOKEN_POOL_SKIP_COUNT.record();
@@ -277,35 +282,44 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
         );
         return Some(RoleTickOutcome::NoTokenPool);
     }
-    // Do not launch a known exhausted Claude pool (#7607).
-    let pool = crate::tokens_pool::select::spawnable_pool_state(root);
-    if pool.total > 0 && pool.usable == 0 {
-        POOL_EXHAUSTED_SKIP_COUNT.record();
-        let next_clear_at = crate::tokens_pool::select::pool_clear_estimate(&pool.dir);
-        note_pre_spawn_skip(
-            logs,
-            role,
-            &format!(
-                "token pool exhausted: 0/{} spawnable in {} (every account bad-marked or \
-                 hard-excluded by .ranking); next check ~{} — run `loom-daemon tokens \
-                 check --ranking` or `loom-daemon tokens unblock <name>` — #7607",
-                pool.total,
-                pool.dir.display(),
-                next_clear_at.to_rfc3339()
-            ),
-        );
-        return Some(RoleTickOutcome::PoolExhausted {
-            total: pool.total,
-            next_clear_at,
-            pool: CredentialPool::ClaudeTokens,
-            // `pool.total > 0` is the guard above, and an unreadable Claude
-            // pool is not a state this gate can observe, so the Claude arm
-            // only ever reports the self-healing hold — the "no pool at all"
-            // case is `RoleTickOutcome::NoTokenPool`, checked before it.
-            hold: PoolHold::SelfHealing,
-        });
-    }
-    None
+    // Do not launch a known exhausted Claude pool (#7607) — fallback-aware
+    // (#13873): the hint is the role's own resolved model, the same chain
+    // the launch below resolves. A drawn model that later overrides the hint
+    // is still served: the launch site applies the same fallback, and the
+    // walk's rung probe is what this gate consulted either way.
+    let hold = crate::sweep_registry::model_fallback::exhausted_for_launch(root, || {
+        Some(super::model_resolution::resolve_role_runner_model(root, role).0)
+    })?;
+    POOL_EXHAUSTED_SKIP_COUNT.record();
+    let next_clear_at = crate::tokens_pool::select::pool_clear_estimate(&hold.pool.dir);
+    let class_note = hold
+        .class
+        .as_ref()
+        .map(|c| format!(" for model class {c}"))
+        .unwrap_or_default();
+    note_pre_spawn_skip(
+        logs,
+        role,
+        &format!(
+            "token pool exhausted: 0/{} spawnable{} in {} (every account bad-marked or \
+             hard-excluded by .ranking); next check ~{} — run `loom-daemon tokens \
+             check --ranking` or `loom-daemon tokens unblock <name>` — #7607",
+            hold.pool.total,
+            class_note,
+            hold.pool.dir.display(),
+            next_clear_at.to_rfc3339()
+        ),
+    );
+    Some(RoleTickOutcome::PoolExhausted {
+        total: hold.pool.total,
+        next_clear_at,
+        pool: CredentialPool::ClaudeTokens,
+        // `pool.total > 0` is the guard inside the read, and an unreadable
+        // Claude pool is not a state this gate can observe, so the Claude arm
+        // only ever reports the self-healing hold — the "no pool at all"
+        // case is `RoleTickOutcome::NoTokenPool`, checked before it.
+        hold: PoolHold::SelfHealing,
+    })
 }
 
 /// Snapshot of the codex account pool as the gate reads it.

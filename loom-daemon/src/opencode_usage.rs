@@ -37,11 +37,18 @@
 //! two-part key [`crate::role_tick_telemetry`]'s Claude-transcript attribution
 //! already uses for a tick with no per-invocation id to key on.
 //!
-//! A dispatched **step** (#11898) is the exception (#14018): every step runs
-//! with the workspace root as its directory, so directory + window folds in
-//! whichever neighbouring session overlapped. A step's log captures the native
-//! JSON event stream, whose events name the exact `sessionID`s used, so
-//! [`tokens_by_session_ids`] keys on those instead.
+//! The issue's own design note observes that a launch's native JSON event
+//! stream carries the exact `sessionID`s used, which is a *more* precise key
+//! than directory+window — and #14048 delivers exactly that for the consumers
+//! that have the stream: a step's log holds its launch's whole event output,
+//! so [`crate::usage_source::native_session_ids`] parses the ids out of it,
+//! [`tokens_by_model_for_ids`] selects the rows by identity for the step-close
+//! telemetry record, and [`tokens_by_session_ids`] does the same for a
+//! step-dispatched completion (#14018). This matters
+//! most where directory+window provably cannot separate work: two concurrent
+//! same-role steps dispatched in one workspace overlap in time by
+//! construction. Directory+window remains the key for consumers without a
+//! log to parse (a role tick, a backfill CLI run).
 //!
 //! # Mapping to [`ModelUsageTotals`]
 //!
@@ -87,9 +94,72 @@ pub const OPENCODE_DB_ENV: &str = "LOOM_OPENCODE_DB";
 
 /// The ONLY query this module ever issues (see the module doc's "Security"
 /// section). Names `session` alone — never `credential`/`account`, which live
-/// in the same file.
-const SESSION_QUERY: &str = "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
-     tokens_cache_read, tokens_cache_write, directory, time_created, id FROM session";
+/// in the same file. `id` is selected (#14048) so a caller holding the exact
+/// session ids a launch's own log names can attribute by them; it remains one
+/// statement over one table.
+const SESSION_QUERY: &str = "SELECT id, model, tokens_input, tokens_output, tokens_reasoning, \
+     tokens_cache_read, tokens_cache_write, directory, time_created FROM session";
+
+/// How `session` rows are attributed: an exact id set when the caller has one
+/// (#14048), else the directory set every consumer used before it — the
+/// OpenCode counterpart of [`crate::codex_usage::SessionFilter`].
+///
+/// An entirely-empty filter (no directories, no ids) matches NOTHING: a
+/// caller with no key at all must not silently attribute every session on the
+/// host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionFilter {
+    /// Working directories to attribute, matched exactly against
+    /// `session.directory`. Empty ⇒ no directory constraint (only meaningful
+    /// together with [`Self::ids`], which is then the whole key).
+    pub directories: Vec<PathBuf>,
+    /// Exact `session.id` values to attribute — the `sessionID`s a launch's
+    /// own `--format json` event stream names. Empty ⇒ no id constraint.
+    pub ids: Vec<String>,
+}
+
+impl SessionFilter {
+    /// The directory+window key every consumer in the daemon used before
+    /// #14048, unchanged.
+    #[must_use]
+    pub fn directories(directories: &[PathBuf]) -> Self {
+        Self {
+            directories: directories.to_vec(),
+            ids: Vec::new(),
+        }
+    }
+
+    /// The exact-id key (#14048): the session ids a launch's own log names.
+    #[must_use]
+    pub fn ids(ids: &[String]) -> Self {
+        Self {
+            directories: Vec::new(),
+            ids: ids.to_vec(),
+        }
+    }
+
+    /// Whether a row's `id` / `directory` pass this filter — the reading-side
+    /// rule [`Self`]'s doc states: both constraints apply when both are set,
+    /// and an empty filter matches nothing.
+    #[must_use]
+    fn passes(&self, id: Option<&str>, directory: &str) -> bool {
+        if self.directories.is_empty() && self.ids.is_empty() {
+            return false;
+        }
+        if !self.directories.is_empty()
+            && !self
+                .directories
+                .iter()
+                .any(|d| d.to_str().is_some_and(|d| d == directory))
+        {
+            return false;
+        }
+        if !self.ids.is_empty() && !id.is_some_and(|id| self.ids.iter().any(|want| want == id)) {
+            return false;
+        }
+        true
+    }
+}
 
 /// Bounded wait for a lock held by a live OpenCode process, mirroring
 /// `crate::tokens_pool::monitor_db`'s own budget for the same reason: a held
@@ -327,9 +397,9 @@ fn parse_provider_id(raw: &str) -> Option<String> {
 /// [`tokens_by_model`] and [`sessions_in`] fold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodeSessionUsage {
-    /// `session.id`, e.g. `ses_e1955ffe9ffeJyGzswwB1Q5PV5` — the key a step log's
-    /// event stream names (#14018). Empty when the row carried none.
-    pub id: String,
+    /// `session.id` — the `sessionID` the launch's own event stream names
+    /// (#14048), and the join key a step's log-parsed id set selects by.
+    pub session_id: Option<String>,
     /// `session.model.id`, e.g. `zai-org/GLM-5.3`.
     pub model: String,
     /// `session.model.providerID`, e.g. `friendli`. `None` when the JSON
@@ -363,7 +433,7 @@ impl OpencodeSessionUsage {
 }
 
 /// Decode and filter one `opencode.db`'s `session` rows: only those whose
-/// `directory` is in `directories` (exact string match) and, when `window` is
+/// `id` / `directory` pass `filter` ([`SessionFilter`]) and, when `window` is
 /// given, whose `time_created` falls inside it inclusively.
 ///
 /// `None` — never `Some(vec![])` — when the database cannot be opened or read
@@ -371,51 +441,9 @@ impl OpencodeSessionUsage {
 /// distinct, and only the caller knows which of them to collapse.
 pub fn sessions_in(
     db_path: &Path,
-    directories: &[PathBuf],
+    filter: &SessionFilter,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<OpencodeSessionUsage>> {
-    let wanted: Vec<&str> = directories
-        .iter()
-        .filter_map(|d| d.to_str())
-        .filter(|d| !d.is_empty())
-        .collect();
-    select_in(
-        db_path,
-        &Selector::Directories {
-            wanted: &wanted,
-            window,
-        },
-    )
-}
-
-/// [`sessions_in`] keyed on **session id** instead of directory + window
-/// (#14018): exactly the rows whose `session.id` is in `ids`.
-///
-/// The directory is no key at all under step dispatch — every session in the
-/// repo shares the workspace root — so a launch's own id, read off its step
-/// log, is the only attribution that cannot pick up a neighbour's tokens.
-pub fn sessions_by_id_in(
-    db_path: &Path,
-    ids: &std::collections::HashSet<&str>,
-) -> Option<Vec<OpencodeSessionUsage>> {
-    select_in(db_path, &Selector::Ids(ids))
-}
-
-/// How a `session` row is chosen as the caller's own.
-enum Selector<'a> {
-    /// Exact `directory` match plus an inclusive `time_created` window.
-    Directories {
-        wanted: &'a [&'a str],
-        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    },
-    /// Exact `session.id` match, no window.
-    Ids(&'a std::collections::HashSet<&'a str>),
-}
-
-/// The one read path behind [`sessions_in`] and [`sessions_by_id_in`]: opens the
-/// store read-only, runs [`SESSION_QUERY`], and decodes the rows `selector`
-/// keeps. See [`sessions_in`] for the `None` vs empty distinction.
-fn select_in(db_path: &Path, selector: &Selector<'_>) -> Option<Vec<OpencodeSessionUsage>> {
     if !db_path.is_file() {
         return None;
     }
@@ -431,26 +459,41 @@ fn select_in(db_path: &Path, selector: &Selector<'_>) -> Option<Vec<OpencodeSess
     let rows = stmt
         .query_map([], |row| {
             Ok(RawSessionRow {
-                model: row.get(0)?,
-                input: row.get(1)?,
-                output: row.get(2)?,
-                reasoning: row.get(3)?,
-                cache_read: row.get(4)?,
-                cache_write: row.get(5)?,
-                directory: row.get(6)?,
-                time_created: row.get(7)?,
-                id: row.get(8)?,
+                id: row.get(0)?,
+                model: row.get(1)?,
+                input: row.get(2)?,
+                output: row.get(3)?,
+                reasoning: row.get(4)?,
+                cache_read: row.get(5)?,
+                cache_write: row.get(6)?,
+                directory: row.get(7)?,
+                time_created: row.get(8)?,
             })
         })
         .ok()?
         .flatten()
-        .filter_map(|raw| raw.decode(selector))
+        .filter_map(|raw| raw.decode(filter, window))
         .collect();
     Some(rows)
 }
 
+/// [`sessions_in`] keyed on **session id** instead of directory + window
+/// (#14018): exactly the rows whose `session.id` is in `ids`.
+///
+/// The directory is no key at all under step dispatch — every session in the
+/// repo shares the workspace root — so a launch's own id, read off its step
+/// log, is the only attribution that cannot pick up a neighbour's tokens.
+pub fn sessions_by_id_in(
+    db_path: &Path,
+    ids: &std::collections::HashSet<&str>,
+) -> Option<Vec<OpencodeSessionUsage>> {
+    let owned: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+    sessions_in(db_path, &SessionFilter::ids(&owned), None)
+}
+
 /// A `session` row exactly as [`SESSION_QUERY`] returns it, before decoding.
 struct RawSessionRow {
+    id: Option<String>,
     model: Option<String>,
     input: Option<i64>,
     output: Option<i64>,
@@ -459,39 +502,41 @@ struct RawSessionRow {
     cache_write: Option<i64>,
     directory: Option<String>,
     time_created: Option<i64>,
-    id: Option<String>,
 }
 
 impl RawSessionRow {
-    /// `None` when the row is not attributable to `selector`, or when it
-    /// carries no usable model id — never a guessed substitute.
-    fn decode(self, selector: &Selector<'_>) -> Option<OpencodeSessionUsage> {
+    /// `None` when the row is not attributable to `filter`/`window`, or when
+    /// it carries no usable model id — never a guessed substitute.
+    fn decode(
+        self,
+        filter: &SessionFilter,
+        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Option<OpencodeSessionUsage> {
         let directory = self.directory?;
-        // `time_created` is NOT NULL in the real schema; a row without a
-        // decodable one is unattributable to a window, so it is dropped rather
-        // than assumed to be inside it.
-        let created_at = DateTime::<Utc>::from_timestamp_millis(self.time_created?)?;
-        match selector {
-            Selector::Directories { wanted, window } => {
-                if !wanted.iter().any(|w| *w == directory) {
-                    return None;
-                }
-                if let Some((start, end)) = window {
-                    if created_at < *start || created_at > *end {
-                        return None;
-                    }
-                }
-            }
-            Selector::Ids(ids) => {
-                if !self.id.as_deref().is_some_and(|id| ids.contains(id)) {
-                    return None;
-                }
-            }
+        if !filter.passes(self.id.as_deref(), &directory) {
+            return None;
         }
+        // An id-keyed filter (#14048) selects the row by identity: the window
+        // is then redundant — the id cannot name another launch's session —
+        // and applying it would only drop a session that started earlier.
+        let created_at = if filter.ids.is_empty() {
+            // `time_created` is NOT NULL in the real schema; a row without a
+            // decodable one is unattributable to a window, so it is dropped
+            // rather than assumed to be inside it.
+            let created_at = DateTime::<Utc>::from_timestamp_millis(self.time_created?)?;
+            if let Some((start, end)) = window {
+                if created_at < start || created_at > end {
+                    return None;
+                }
+            }
+            created_at
+        } else {
+            DateTime::<Utc>::from_timestamp_millis(self.time_created?).unwrap_or_else(Utc::now)
+        };
         let model_json = self.model?;
         let model = parse_model_id(&model_json)?;
         Some(OpencodeSessionUsage {
-            id: self.id.unwrap_or_default(),
+            session_id: self.id,
             model,
             provider: parse_provider_id(&model_json),
             directory,
@@ -517,9 +562,30 @@ pub fn sessions(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     home: Option<&Path>,
 ) -> Vec<OpencodeSessionUsage> {
+    sessions_selected(&SessionFilter::directories(directories), window, home)
+}
+
+/// Every session with exactly one of `ids`, across EVERY installed OpenCode
+/// version's store — the by-id counterpart of [`sessions`] (#14048). The ids
+/// come from a launch's own event stream (its log's `sessionID` values), so
+/// no directory or window constraint applies: the id is the whole key, and a
+/// session the store holds under a DIFFERENT directory than the caller's
+/// workspace is still this launch's and still counts.
+#[must_use]
+pub fn sessions_for_ids(ids: &[String], home: Option<&Path>) -> Vec<OpencodeSessionUsage> {
+    sessions_selected(&SessionFilter::ids(ids), None, home)
+}
+
+/// The one selector both public listings route through: filter every
+/// discovered store with `filter`, drop usage-free rows, sort oldest-first.
+fn sessions_selected(
+    filter: &SessionFilter,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    home: Option<&Path>,
+) -> Vec<OpencodeSessionUsage> {
     let mut all: Vec<OpencodeSessionUsage> = discover_opencode_dbs(home)
         .into_iter()
-        .filter_map(|db| sessions_in(&db, directories, window))
+        .filter_map(|db| sessions_in(&db, filter, window))
         .flatten()
         .filter(|s| !s.is_empty())
         .collect();
@@ -558,12 +624,23 @@ pub fn tokens_by_model(
     fold_sessions(sessions(directories, window, home))
 }
 
+/// Per-`(model, speed, service_tier)` token totals for exactly `ids` (#14048)
+/// — the by-id counterpart of [`tokens_by_model`], keyed by the `sessionID`
+/// values a launch's own log names rather than by directory+window. `None` —
+/// never `Some(vec![])` — when no store holds any of the ids: unknown is not
+/// zero.
+#[must_use]
+pub fn tokens_by_model_for_ids(
+    ids: &[String],
+    home: Option<&Path>,
+) -> Option<Vec<ModelUsageTotals>> {
+    fold_sessions(sessions_for_ids(ids, home))
+}
+
 /// Per-model token totals for exactly the sessions named in `ids`, across every
 /// installed OpenCode version's store (#14018) — [`tokens_by_model`] keyed on
-/// session id.
-///
-/// This is the attribution a step-dispatched completion needs: a step's log
-/// names the sessions it ran, and the session store's `directory` is the
+/// session id. The attribution a step-dispatched completion needs: a step's
+/// log names the sessions it ran, and the session store's `directory` is the
 /// workspace root shared by every session in the repo, so directory + window
 /// would fold in whichever neighbour overlapped. `None` — never
 /// `Some(vec![])` — when `ids` is empty, no store was found, or no named
@@ -573,14 +650,13 @@ pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<
     if ids.is_empty() {
         return None;
     }
-    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut seen = std::collections::HashSet::new();
     let sessions = discover_opencode_dbs(home)
         .into_iter()
-        .filter_map(|db| sessions_by_id_in(&db, &wanted))
+        .filter_map(|db| sessions_in(&db, &SessionFilter::ids(ids), None))
         .flatten()
         // A session reachable through two stores is one session, not two.
-        .filter(|s| seen.insert(s.id.clone()));
+        .filter(|s| seen.insert(s.session_id.clone().unwrap_or_default()));
     fold_sessions(sessions)
 }
 

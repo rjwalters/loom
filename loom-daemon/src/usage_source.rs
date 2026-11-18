@@ -261,6 +261,67 @@ pub fn role_tick_directories(root: &Path) -> Vec<PathBuf> {
     vec![root.to_path_buf()]
 }
 
+/// The exact native session ids one launch's own log names (#14048) — the
+/// strictly-more-precise attribution key for the stores that can hold it:
+/// OpenCode's event stream carries `sessionID` on every event, and Codex
+/// prints a `session id: <uuid>` banner. A step's log holds that stream, so
+/// [`crate::role_tick_telemetry::emit_for_step`] parses this out of the
+/// step's own dispatch region and keys the token stores by id instead of the
+/// directory+window pair, which cannot separate two concurrent same-role
+/// steps in one workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeSessionIds {
+    /// OpenCode `sessionID` values (`ses_…`), sorted and deduped.
+    pub opencode: Vec<String>,
+    /// Codex `session id:` banner uuids, sorted and deduped.
+    pub codex: Vec<String>,
+}
+
+/// Parse the native session ids a log region names (#14048). Pure: every
+/// unrecognized line is skipped, never guessed at. A JSON line contributes
+/// its `sessionID` when it carries a non-empty string one (OpenCode's
+/// `--format json` event stream); a line containing Codex's
+/// `session id: <token>` banner contributes the token when it is at least 8
+/// hex/dash characters — the same shape `spawn-codex.sh`'s own transcript
+/// join greps for.
+#[must_use]
+pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
+    let mut ids = NativeSessionIds::default();
+    for line in log_region.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(id) = event
+                .get("sessionID")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                ids.opencode.push(id.to_string());
+                continue;
+            }
+        }
+        let Some(at) = line.find("session id:") else {
+            continue;
+        };
+        let token = line[at + "session id:".len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+            .collect::<String>();
+        if token.len() >= 8 {
+            ids.codex.push(token);
+        }
+    }
+    for list in [&mut ids.opencode, &mut ids.codex] {
+        list.sort_unstable();
+        list.dedup();
+    }
+    ids
+}
+
 /// Per-`(model, speed, service_tier)` token totals for one sweep, read from
 /// whichever store `runtime` selects.
 ///
@@ -369,13 +430,20 @@ pub fn merge_step_tokens_by_model(
     let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
         .into_iter()
         .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
-        .flat_map(|(role, contents)| match role {
-            // Issue-keyed: an earlier dispatch is an abandoned retry.
-            crate::step_role::StepRole::Builder => {
-                crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+        .flat_map(|(role, contents)| {
+            use crate::step_role::StepRole;
+            // Spelled out, no catch-all: a role added to `merge_step_logs`
+            // must be filed under its keying here before this compiles.
+            match role {
+                // Issue-keyed: an earlier dispatch is an abandoned retry.
+                StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
+                    crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+                }
+                // PR-keyed: an earlier dispatch is a completed round on this PR.
+                StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
+                    crate::launch_record::opencode_session_ids(&contents)
+                }
             }
-            // PR-keyed: an earlier dispatch is a completed round on this PR.
-            _ => crate::launch_record::opencode_session_ids(&contents),
         })
         .collect();
     let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
@@ -516,26 +584,42 @@ pub fn sweep_tokens_by_window(
 /// So this returns `None` for [`UsageSource::ClaudeTranscripts`] and the
 /// caller uses [`UsageSource::is_native_store`] to pick between the two paths.
 ///
-/// `log_path` is the tick's own per-role log (`role_runner::role_log_path`):
-/// the one store keyed by where the output was captured rather than by
-/// directory is Pi's ([`crate::pi_usage`]), and a role tick's log is not
-/// derivable from `root` alone.
+/// `log_path` is the launch's own log — a role tick's per-role log
+/// (`role_runner::role_log_path`), a step's per-item log (#14048): the one
+/// store keyed by where the output was captured rather than by directory is
+/// Pi's ([`crate::pi_usage`]), and a step's event stream is captured in the
+/// step's own log, not the per-role one.
+///
+/// `session_ids` (#14048) are the exact native session ids parsed from that
+/// same log's dispatch region. The OpenCode and Codex arms key on them
+/// directly when present — the id cannot name another launch's session — and
+/// fall back to the directory+window key when empty (a role tick, or a step
+/// whose log was unreadable). The Kimi arm has no id source yet (see
+/// `crate::kimi_usage`'s module doc) and keeps the directory+window key.
 #[must_use]
 pub fn role_tick_tokens_by_model(
     runtime: Option<&str>,
     root: &Path,
     log_path: &Path,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
 ) -> Option<Vec<ModelUsageTotals>> {
     match UsageSource::for_runtime(runtime) {
         UsageSource::OpenCodeSessionDb => {
-            crate::opencode_usage::tokens_by_model(&role_tick_directories(root), window, None)
+            if session_ids.opencode.is_empty() {
+                crate::opencode_usage::tokens_by_model(&role_tick_directories(root), window, None)
+            } else {
+                crate::opencode_usage::tokens_by_model_for_ids(&session_ids.opencode, None)
+            }
         }
         UsageSource::KimiSessionStore => {
             crate::kimi_usage::tokens_by_model(&role_tick_directories(root), None, window, None)
         }
         UsageSource::CodexSessionRollouts => crate::codex_usage::tokens_by_model(
-            &crate::codex_usage::SessionFilter::directories(&role_tick_directories(root)),
+            &crate::codex_usage::SessionFilter {
+                directories: role_tick_directories(root),
+                ids: session_ids.codex.clone(),
+            },
             window,
             None,
         ),
@@ -634,6 +718,58 @@ mod tests {
         }
     }
 
+    /// #14048: the native session ids a launch's own log region names —
+    /// OpenCode's `--format json` event stream (`sessionID`) and Codex's
+    /// `session id: <uuid>` stderr banner — parse out exactly, with every
+    /// unrecognized line skipped and both lists deduped.
+    #[test]
+    fn native_session_ids_parse_each_runtimes_own_shape() {
+        let region = concat!(
+            "==== loom-daemon dispatch: 2026-11-18 sweep_id=step-builder-42-1 item=42 step=builder ====\n",
+            "# LOOM_RUNTIME_RESOLVED runtime=opencode\n",
+            "{\"type\":\"session.start\",\"timestamp\":1791767321693,\"sessionID\":\"ses_b\",\"part\":{\"type\":\"text\"}}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":1791767321700,\"sessionID\":\"ses_b\",\"part\":{\"type\":\"tool\"}}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":1791767321710,\"sessionID\":\"ses_a\",\"part\":{\"type\":\"tool\"}}\n",
+            "plain transcript prose, no id at all\n",
+        );
+        assert_eq!(
+            native_session_ids(region),
+            NativeSessionIds {
+                opencode: vec!["ses_a".to_string(), "ses_b".to_string()],
+                codex: Vec::new(),
+            }
+        );
+
+        let codex = concat!(
+            "==== loom-daemon dispatch: 2026-11-18 sweep_id=step-judge-7-1 item=7 step=judge ====\n",
+            "# LOOM_RUNTIME_RESOLVED runtime=codex\n",
+            "spawn-codex: waiting for session\n",
+            "session id: 3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01\n",
+            "tokens used: 1,234 input (1,000 cached)\n",
+        );
+        assert_eq!(
+            native_session_ids(codex),
+            NativeSessionIds {
+                opencode: Vec::new(),
+                codex: vec!["3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01".to_string()],
+            }
+        );
+    }
+
+    /// #14048: a JSON line whose `sessionID` is not a non-empty string, a
+    /// `session id:` tail shorter than the 8-character floor, and an empty
+    /// region all contribute nothing — never a guessed id.
+    #[test]
+    fn native_session_ids_never_guess_at_unrecognized_lines() {
+        assert_eq!(
+            native_session_ids(
+                "{\"sessionID\":\"\"}\n{\"sessionID\":null}\n{\nbroken json\n                 session id: abc\ncosession id: no\n"
+            ),
+            NativeSessionIds::default()
+        );
+        assert_eq!(native_session_ids(""), NativeSessionIds::default());
+    }
+
     #[test]
     fn source_names_cover_every_variant_and_stay_stable_for_logs() {
         for (source, name) in [
@@ -714,10 +850,22 @@ mod tests {
         // from a transcript scan that ALSO derives forge-mutating `actions`,
         // which only the caller keeps. See `role_tick_tokens_by_model`'s doc.
         let log = Path::new("/w/loom/.loom/logs/role-curator.log");
-        assert!(role_tick_tokens_by_model(None, Path::new("/w/loom"), log, None).is_none());
-        assert!(
-            role_tick_tokens_by_model(Some("claude"), Path::new("/w/loom"), log, None).is_none()
-        );
+        assert!(role_tick_tokens_by_model(
+            None,
+            Path::new("/w/loom"),
+            log,
+            None,
+            &NativeSessionIds::default()
+        )
+        .is_none());
+        assert!(role_tick_tokens_by_model(
+            Some("claude"),
+            Path::new("/w/loom"),
+            log,
+            None,
+            &NativeSessionIds::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -984,7 +1132,9 @@ mod tests {
             "2026-09-25T02:00:00Z".parse().unwrap(),
             "2026-09-25T02:05:00Z".parse().unwrap(),
         ));
-        let totals = role_tick_tokens_by_model(Some("pi"), root, &log, window).unwrap();
+        let totals =
+            role_tick_tokens_by_model(Some("pi"), root, &log, window, &NativeSessionIds::default())
+                .unwrap();
         assert_eq!((totals[0].input, totals[0].output), (30, 3));
     }
 }

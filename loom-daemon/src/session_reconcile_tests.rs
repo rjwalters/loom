@@ -16,6 +16,8 @@ use crate::tokens_pool::account_registry::account_inventory;
 use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold;
+use crate::tokens_pool::session_image;
+use crate::tokens_pool::session_image::ExtraMount;
 use crate::tokens_pool::session_lifecycle::{
     check_mount_denials, mark_session_managed, parse_inspect_line, workspace_mount_roots,
     ExecOutput, WORKSPACE_LABEL,
@@ -119,6 +121,7 @@ impl FakeState {
                 started_at: None,
                 image: Some("example/session:pinned".into()),
                 workspace: workspace.map(Path::to_path_buf),
+                extra_mounts: Vec::new(),
             },
         );
     }
@@ -223,6 +226,8 @@ fn inspect_json(name: &str, state: &ContainerState, mounts: &[PathBuf]) -> Value
     })
 }
 
+impl session_image::BundleProbe for Fake {}
+
 impl ContainerRunner for Fake {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
@@ -240,6 +245,7 @@ impl ContainerRunner for Fake {
         _codex_home: &Path,
         workspace: &Path,
         _daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
     ) -> Result<()> {
         self.log("create");
         self.hold_if_racing_a_stop();
@@ -448,6 +454,7 @@ fn fake_inputs<'a>(
         dispatch_locks: Some(Box::leak(fake.lock_dir().into_boxed_path())),
         class: None,
         host_version: None,
+        session_config: None,
     }
 }
 
@@ -486,6 +493,42 @@ fn pass_named(
     reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
 }
 
+/// [`pass_named`] with the resolved `accounts.session` settings in the
+/// inputs (issue #14019).
+fn pass_named_with_session_config(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    accounts: &[AccountDescriptor],
+    private: &dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &Path,
+    state: &mut ReconcileState,
+    now: u64,
+    session_config: &SessionImageConfig,
+) -> Vec<AccountOutcome> {
+    let index = AccountIndex::from_inventories(&[accounts, &[]]);
+    let fake = lifecycle.runner().clone();
+    let registered = fake.registered.lock().unwrap().clone();
+    let mut take = || fake.snapshot(&registered);
+    let mut observe = PassSnapshot::new(&mut take);
+    let inputs = fake_inputs(&fake, &index, private, fallback, &registered);
+    let inputs = PassInputs {
+        host_version: fake.host_version.lock().unwrap().clone(),
+        registered: (!*fake.registry_unreadable.lock().unwrap()).then_some(&registered[..]),
+        denials_for: &|_| {
+            if *fake.roster_unreadable.lock().unwrap() {
+                bail!("fleet roster (firewall input): unreadable");
+            }
+            Ok(fake.denials())
+        },
+        would_create_accept: &|workspace| {
+            let walls = fake.firewalled.lock().unwrap().clone();
+            fake.create_accepts(workspace, &walls).map(drop)
+        },
+        session_config: Some(session_config),
+        ..inputs
+    };
+    reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
+}
+
 // ---- decision function ------------------------------------------------------
 
 fn st(running: bool, restarting: bool, workspace: Option<&str>) -> ContainerState {
@@ -496,6 +539,7 @@ fn st(running: bool, restarting: bool, workspace: Option<&str>) -> ContainerStat
         started_at: None,
         image: None,
         workspace: workspace.map(PathBuf::from),
+        extra_mounts: Vec::new(),
     }
 }
 
