@@ -295,6 +295,10 @@ impl Decision {
                     source: RuntimeSource::Preference,
                     unmet_capabilities: vec![],
                     reason: exhausted_with_draw(&resolution, draw.as_deref(), role),
+                    exhausted_summary_line: Some(
+                        exhausted_summary_with_draw(&resolution, draw.as_deref(), role)
+                            .into_boxed_str(),
+                    ),
                 }),
             },
         }
@@ -330,6 +334,24 @@ pub fn exhausted_with_draw<T>(
     let mut out = resolution.exhausted_diagnostic(role);
     if let Some(draw) = draw {
         out.push_str(&draw.diagnostic_suffix());
+    }
+    out
+}
+
+/// [`Resolution::exhausted_summary_line`] plus the role draw's replay
+/// fragment, when a draw decided (#11726) — the one-line counterpart of
+/// [`exhausted_with_draw`] that the daemon log's refusal line carries
+/// (#14026), so a draw that drew a tap admission then refused still says
+/// which table and pick produced the order.
+#[must_use]
+pub fn exhausted_summary_with_draw<T>(
+    resolution: &Resolution<T>,
+    draw: Option<&role_draw::RoleDrawRecord>,
+    role: &str,
+) -> String {
+    let mut out = resolution.exhausted_summary_line(role);
+    if let Some(draw) = draw {
+        out.push_str(&format!(" ({})", draw.marker_fragment()));
     }
     out
 }
@@ -977,6 +999,7 @@ fn resolve_runtime_in(
             source: RuntimeSource::Preference,
             unmet_capabilities: vec![],
             reason,
+            exhausted_summary_line: None,
         })?;
         let Some(listed) = listed else {
             return Ok(Decision::Static {
@@ -992,6 +1015,7 @@ fn resolve_runtime_in(
         source: RuntimeSource::Preference,
         unmet_capabilities: vec![],
         reason,
+        exhausted_summary_line: None,
     })?;
     // Filled in by the availability closure below when — and only when — the
     // walk settles on a governed backstop tap. `resolve` short-circuits on the
