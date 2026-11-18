@@ -119,6 +119,10 @@ filing-lock acquire|release`, made by `lib/filing-lock.sh` after the host lock
   one-shot process, so it registers the standalone ops sink at startup and
   flushes its queue once at exit (#14129) — without that setup the worker's
   spans and log lines would be dropped, and the fail-open would be silent.
+  The `warn` line the fail-open logs (and the defer reason) reaches the
+  caller's stderr, since `_loom_filing_lock_captain_acquire` does not redirect
+  it (#14422); a granted acquire writes nothing there. The span is the signal
+  for a collector; the stderr line is the one for a host with no exporter.
 - **Soft state.** A captain restart empties the slot; a holder's next refresh
   is granted again rather than wedging filing.
 - **Fleet mode off: unchanged.** No call is made.
