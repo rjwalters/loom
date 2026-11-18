@@ -55,6 +55,14 @@ check() {
     grep -qF 'unverified by any test' "$J" \
         && pass "$where judge: undocumented repo → verdict says 'unverified by any test'" \
         || fail "$where judge: undocumented repo → verdict says 'unverified by any test'"
+    grep -qF 'unverified by any test: only documented command is `<cmd>` (full suite, out of bounds per #11690)' "$J" \
+        && pass "$where judge: full-suite-only documented repo → verdict names the out-of-bounds documented command" \
+        || fail "$where judge: full-suite-only documented repo → verdict names the out-of-bounds documented command"
+    local fsrow
+    fsrow="$(grep -F '| **Full suite / build gate** |' "$J")"
+    grep -qF 'No-Checks PRs' <<< "$fsrow" \
+        && pass "$where judge: Full-suite/build-gate row points -NONE at the no-checks fallback" \
+        || fail "$where judge: Full-suite/build-gate row points -NONE at the no-checks fallback"
 
     # Unknown required contexts.
     grep -qF 'Unknown is never green.' "$J" && grep -qF 'required-contexts-unknown' "$J" \

@@ -108,6 +108,15 @@ fn a_step_dispatched_codex_run_yields_a_codex_usage_span() {
     assert_eq!(attr("loom.tokens.input"), Some("600"));
     assert_eq!(attr("loom.tokens.cache_read"), Some("400"));
     assert_eq!(attr("loom.tokens.output"), Some("100"));
+    // The fixture rollout carries no `cache_write_input_tokens`: absent, not `0`.
+    for key in [
+        "loom.tokens.cache_write",
+        "loom.tokens.cache_write_5m",
+        "loom.tokens.cache_write_1h",
+        "gen_ai.usage.cache_creation_input_tokens",
+    ] {
+        assert_eq!(attr(key), None, "{key}");
+    }
     // No launch span declared a class: `unknown`, never a guessed one, and a
     // model off the rate card gets no dollar estimate at all.
     assert_eq!(attr("llm.billing"), Some("unknown"));
@@ -147,4 +156,91 @@ fn a_codex_run_with_no_rollout_yields_no_span() {
     )
     .unwrap();
     assert!(spans.is_empty(), "{spans:?}");
+}
+
+/// One session row in the live `opencode.db` shape, attributed to `directory`
+/// and created inside the test window.
+fn write_opencode_db(path: &Path, directory: &Path, model: &str) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (
+             id TEXT PRIMARY KEY, directory TEXT NOT NULL, model TEXT,
+             tokens_input INTEGER DEFAULT 0 NOT NULL,
+             tokens_output INTEGER DEFAULT 0 NOT NULL,
+             tokens_reasoning INTEGER DEFAULT 0 NOT NULL,
+             tokens_cache_read INTEGER DEFAULT 0 NOT NULL,
+             tokens_cache_write INTEGER DEFAULT 0 NOT NULL,
+             time_created INTEGER NOT NULL);",
+    )
+    .unwrap();
+    let created_ms = (Utc::now() - Duration::minutes(10)).timestamp_millis();
+    let model_json =
+        serde_json::json!({"id": model, "providerID": "fixture", "variant": "default"}).to_string();
+    conn.execute(
+        "INSERT INTO session (id, directory, model, tokens_input, tokens_output, \
+         tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created) \
+         VALUES ('ses_1', ?1, ?2, 700, 80, 20, 300, 50, ?3)",
+        rusqlite::params![directory.to_string_lossy(), model_json, created_ms],
+    )
+    .unwrap();
+}
+
+#[test]
+#[serial(opencode_db_env)]
+fn a_step_dispatched_opencode_run_yields_an_opencode_usage_span() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    let worktree = root
+        .join(".loom")
+        .join("worktrees")
+        .join(format!("issue-{ISSUE}"));
+    std::fs::create_dir_all(&worktree).unwrap();
+    let db = tmp.path().join("opencode.db");
+    write_opencode_db(&db, &worktree, "glm-unpriced-fixture");
+    // An OpenCode step's own log carries the resolved-runtime marker, exactly
+    // like a Codex step's.
+    let log = root
+        .join(".loom")
+        .join("logs")
+        .join(format!("step-builder-{ISSUE}.log"));
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "# LOOM_RUNTIME_RESOLVED runtime=opencode\n").unwrap();
+    let runtime = crate::usage_source::sweep_usage_runtime_from_log(None, Some(&log), &root, ISSUE);
+    assert_eq!(runtime.as_deref(), Some("opencode"));
+
+    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    let window = window(Some(Utc::now() - Duration::hours(1)), 3_600);
+    let usage = resolve(runtime.as_deref(), &root, ISSUE, window, None);
+    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+    assert_eq!(usage.status, TokensStatus::Measured, "{usage:?}");
+    let rows = usage.tokens_by_model.clone().expect("opencode rows read");
+
+    TraceStore::new(&root)
+        .load_or_create(&root, SWEEP_ID)
+        .unwrap();
+    let spans = runtime_usage::journal_usage(
+        &root,
+        SWEEP_ID,
+        window.unwrap(),
+        Some(&rows),
+        runtime.as_deref(),
+    )
+    .unwrap();
+    let [span] = spans.as_slice() else {
+        panic!("one model, one usage span: {spans:?}");
+    };
+    assert_eq!(span.name.as_str(), "loom.runtime.usage");
+    let attr = |key: &str| span.attributes.get(key).map(String::as_str);
+    assert_eq!(attr("loom.runtime"), Some("opencode"));
+    assert_eq!(attr("loom.sweep_id"), Some(SWEEP_ID));
+    assert_eq!(attr("loom.model"), Some("glm-unpriced-fixture"));
+    assert_eq!(attr("loom.tokens.input"), Some("700"));
+    assert_eq!(attr("loom.tokens.cache_read"), Some("300"));
+    // Reasoning tokens are folded into output by the reader.
+    assert_eq!(attr("loom.tokens.output"), Some("100"));
+    // OpenCode reports a cache-write counter, so it is exported.
+    assert_eq!(attr("loom.tokens.cache_write"), Some("50"));
+    // No invented dollars for a model off the rate card.
+    assert_eq!(attr("llm.billing"), Some("unknown"));
+    assert_eq!(attr("loom.cost.usd_estimate"), None);
 }

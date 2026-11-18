@@ -342,7 +342,10 @@ pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
 /// - **OpenCode sessions** named by the `sessionID`s in the step logs
 ///   ([`crate::opencode_usage::tokens_by_session_ids`]) — never directory +
 ///   window, since the store's `directory` is shared repo-wide. No window
-///   applies: a session id already names exactly one session.
+///   applies: a session id already names exactly one session. The Builder
+///   log (issue-keyed) is read from its last dispatch only, so an abandoned
+///   retry is not charged to the PR; the PR-keyed Doctor/Judge/`champion_merge`
+///   logs are read whole, as each dispatch there is a completed round (#14210).
 ///
 /// A step that ran on another host left no log or transcript here, so its usage
 /// is absent and the total stays partial. `None` — never `Some(vec![])` — when
@@ -365,8 +368,15 @@ pub fn merge_step_tokens_by_model(
     });
     let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
         .into_iter()
-        .filter_map(|(_, path)| std::fs::read_to_string(path).ok())
-        .flat_map(|contents| crate::launch_record::opencode_session_ids(&contents))
+        .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
+        .flat_map(|(role, contents)| match role {
+            // Issue-keyed: an earlier dispatch is an abandoned retry.
+            crate::step_role::StepRole::Builder => {
+                crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+            }
+            // PR-keyed: an earlier dispatch is a completed round on this PR.
+            _ => crate::launch_record::opencode_session_ids(&contents),
+        })
         .collect();
     let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
     combine_model_totals(claude.into_iter().chain(opencode).flatten())
