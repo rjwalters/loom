@@ -138,6 +138,32 @@ pub(crate) fn handle_session_command(
         roots::cli_peer_roots(workspace, &registered, fallback.as_deref())
     }
 
+    /// The lifecycle for an operator command that may create a container
+    /// (`start`, and `shell`'s start-if-absent), plus the image to pull.
+    ///
+    /// Reads the resolved `accounts.session` settings (issue #14019); invalid
+    /// config refuses the command outright, since a seat created from the
+    /// stock image because its override failed to parse would be a fail-open.
+    /// Precedence: the operator's explicit `--image` beats the configured
+    /// override, which beats the stock image; the mounts ride either way. Only
+    /// a container created from the *configured* image gets the bundle
+    /// verification (`with_session_config` compares it against the effective
+    /// image).
+    fn configured_lifecycle(
+        workspace: PathBuf,
+        image: Option<String>,
+    ) -> Result<(SessionLifecycle<ProcessContainerRunner>, Option<String>)> {
+        let peers = peer_roots(&workspace);
+        let session_config =
+            crate::tokens_pool::session_image::read_session_image_config(&workspace)?;
+        let image = image.or_else(|| session_config.image.clone());
+        let pull = image.clone();
+        let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
+            .with_peer_roots(peers)
+            .with_session_config(Some(session_config));
+        Ok((lifecycle, pull))
+    }
+
     /// Operator `start`/`shell` (#10661): Ctrl-C/SIGTERM is forwarded to the
     /// running `docker` child, and a missing image is pulled under its own
     /// budget before a first `docker run` (the reconciler does neither).
@@ -311,23 +337,7 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("account uses private-clone mode; repeat start --private-clone URL --base BRANCH; host-mount reuse is refused");
             }
-            let peers = peer_roots(&workspace);
-            // The resolved `accounts.session` settings (issue #14019).
-            // Invalid config refuses the start outright: a seat created
-            // from the stock image because its override failed to parse
-            // would be exactly the fail-open this prevents.
-            let session_config =
-                crate::tokens_pool::session_image::read_session_image_config(&workspace)?;
-            // Precedence: the operator's explicit `--image` beats the
-            // configured override, which beats the stock image; the mounts
-            // ride either way. Only a container created from the *configured*
-            // image gets the bundle verification (`with_session_config`
-            // compares it against the effective image).
-            let image = image.or_else(|| session_config.image.clone());
-            let pull = image.clone();
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
-                .with_peer_roots(peers)
-                .with_session_config(Some(session_config));
+            let (lifecycle, pull) = configured_lifecycle(workspace, image)?;
             prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             print_session_status(
                 &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
@@ -429,10 +439,11 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("private sessions do not permit unleased shell; use session job --kind interactive --owner NAME -- COMMAND (TTY input is unsupported)");
             }
-            let peers = peer_roots(&workspace);
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
-                .with_peer_roots(peers);
-            prepare_operator_start(&lifecycle, &name, None)?;
+            // `shell` is start-if-absent, so it creates a container exactly
+            // as `start` does and must carry the same configured image and
+            // extra mounts (issue #14019).
+            let (lifecycle, pull) = configured_lifecycle(workspace, None)?;
+            prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
             if code != 0 {
                 std::process::exit(code);
