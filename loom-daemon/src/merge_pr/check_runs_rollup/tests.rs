@@ -180,3 +180,151 @@ fn half_written_rows_stay_pending() {
         {"name":"NoStatus","conclusion":null}]}"#;
     assert_eq!(ok(raw), t("", "NoCompletedAt\nNoConclusion\nNoStatus\nNumConclusion", "4"));
 }
+
+// ---------------------------------------------------------------------------
+// #14415: stranded check runs under a terminal-failed workflow run
+// ---------------------------------------------------------------------------
+
+mod stranded {
+    use super::*;
+    use serde_json::json;
+
+    const SHA: &str = "5f72ee5c0926e69e278a65d5a36b1a561198591b";
+
+    /// A workflow-runs row, the shape `actions/runs?head_sha=` returns.
+    fn wrun(id: u64, suite: u64, status: &str, conclusion: Option<&str>, at: &str) -> Value {
+        json!({"id": id, "workflow_id": 7, "check_suite_id": suite, "event": "push",
+               "head_sha": SHA, "created_at": at, "status": status,
+               "conclusion": conclusion, "pull_requests": []})
+    }
+
+    fn runs_payload(rows: Vec<Value>) -> Value {
+        json!({"total_count": rows.len(), "workflow_runs": rows})
+    }
+
+    /// A check-run row in `suite`.
+    fn row(name: &str, suite: u64, status: &str, conclusion: Option<&str>) -> Value {
+        json!({"name": name, "status": status, "conclusion": conclusion,
+               "check_suite": {"id": suite}})
+    }
+
+    fn doc(rows: Vec<Value>) -> Value {
+        json!({"total_count": rows.len(), "check_runs": rows})
+    }
+
+    fn rollup(doc: &Value) -> Rollup {
+        classify(&doc.to_string()).unwrap()
+    }
+
+    #[test]
+    fn a_stranded_row_under_a_failed_run_reads_failing_not_pending() {
+        let mut d = doc(vec![
+            row("build", 9, "queued", None),
+            row("lint", 9, "queued", None),
+            row("docs", 4, "completed", Some("success")),
+        ]);
+        // Before: both stranded rows hold the rollup pending.
+        assert_eq!(rollup(&d).pending, "build\nlint");
+        let payload = runs_payload(vec![wrun(
+            1,
+            9,
+            "completed",
+            Some("startup_failure"),
+            "2026-08-26T15:36:37Z",
+        )]);
+        assert_eq!(fail_stranded_rows(&mut d, &payload, SHA), 2);
+        let r = rollup(&d);
+        assert_eq!(r.pending, "");
+        // `startup_failure` is not in the retired failing filter's conclusion
+        // list, so assert on the rewritten row itself and on settledness.
+        assert_eq!(d["check_runs"][0]["status"], "completed");
+        assert_eq!(d["check_runs"][0]["conclusion"], "startup_failure");
+        assert!(is_settled(&d["check_runs"][0]));
+    }
+
+    #[test]
+    fn a_failed_run_with_a_listed_failing_conclusion_reads_failing() {
+        let mut d = doc(vec![row("build", 9, "queued", None)]);
+        let payload = runs_payload(vec![wrun(
+            1,
+            9,
+            "completed",
+            Some("failure"),
+            "2026-11-18T10:00:00Z",
+        )]);
+        assert_eq!(fail_stranded_rows(&mut d, &payload, SHA), 1);
+        let r = rollup(&d);
+        assert_eq!((r.failing.as_str(), r.pending.as_str()), ("build", ""));
+    }
+
+    #[test]
+    fn a_run_that_is_rerunning_or_in_progress_strands_nothing() {
+        for (status, conclusion) in [
+            ("in_progress", None),
+            ("queued", None),
+            ("completed", Some("success")),
+        ] {
+            let mut d = doc(vec![row("build", 9, "queued", None)]);
+            let payload =
+                runs_payload(vec![wrun(1, 9, status, conclusion, "2026-11-18T10:00:00Z")]);
+            assert_eq!(fail_stranded_rows(&mut d, &payload, SHA), 0, "{status}/{conclusion:?}");
+            assert_eq!(rollup(&d).pending, "build");
+        }
+    }
+
+    #[test]
+    fn a_superseded_twin_is_not_attributed() {
+        // An older failed run and a newer green run of the same workflow: the
+        // older verdict was replaced, so its stranded rows are not a failure.
+        let mut d = doc(vec![row("build", 9, "queued", None)]);
+        let payload = runs_payload(vec![
+            wrun(1, 9, "completed", Some("startup_failure"), "2026-11-18T10:00:00Z"),
+            wrun(2, 10, "completed", Some("success"), "2026-11-18T11:00:00Z"),
+        ]);
+        assert_eq!(fail_stranded_rows(&mut d, &payload, SHA), 0);
+        assert_eq!(rollup(&d).pending, "build");
+    }
+
+    #[test]
+    fn an_unreadable_or_truncated_runs_payload_leaves_rows_pending() {
+        let failed = wrun(1, 9, "completed", Some("startup_failure"), "2026-11-18T10:00:00Z");
+        let truncated = json!({"total_count": 5, "workflow_runs": [failed.clone()]});
+        for payload in [
+            truncated,
+            json!({}),
+            json!({"workflow_runs": [failed]}),
+            json!(null),
+        ] {
+            let mut d = doc(vec![row("build", 9, "queued", None)]);
+            assert_eq!(fail_stranded_rows(&mut d, &payload, SHA), 0, "{payload}");
+            assert_eq!(rollup(&d).pending, "build");
+        }
+    }
+
+    #[test]
+    fn a_row_without_a_suite_id_or_in_another_suite_stays_pending() {
+        let mut d = doc(vec![
+            json!({"name": "no-suite", "status": "queued", "conclusion": null}),
+            row("other-suite", 4, "queued", None),
+        ]);
+        let payload = runs_payload(vec![wrun(
+            1,
+            9,
+            "completed",
+            Some("startup_failure"),
+            "2026-11-18T10:00:00Z",
+        )]);
+        assert_eq!(fail_stranded_rows(&mut d, &payload, SHA), 0);
+        assert_eq!(rollup(&d).pending, "no-suite\nother-suite");
+        assert!(!is_stranded_candidate(&d["check_runs"][0]));
+        assert!(is_stranded_candidate(&d["check_runs"][1]));
+    }
+
+    #[test]
+    fn a_run_on_another_head_attributes_nothing() {
+        let mut d = doc(vec![row("build", 9, "queued", None)]);
+        let mut other = wrun(1, 9, "completed", Some("startup_failure"), "2026-11-18T10:00:00Z");
+        other["head_sha"] = json!("0000000000000000000000000000000000000000");
+        assert_eq!(fail_stranded_rows(&mut d, &runs_payload(vec![other]), SHA), 0);
+    }
+}
