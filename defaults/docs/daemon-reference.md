@@ -11282,13 +11282,31 @@ configured; when its limit resets, the next spawn returns to it:
 - **Telemetry.** Each `loom.dispatch.step` span records
   `loom.step.model_configured` (the pre-fallback model) alongside
   `loom.step.model_launched`, plus `loom.step.model_fallback_from` /
-  `loom.step.model_fallback_reason` (`no-account-for-class`) when a
+  `loom.step.model_fallback_reason` (`no-account-for-class`, or
+  `model-limit-kill` for an in-flight step-down below) when a
   fallback fired — how an operator sees how much work ran below its
   configured model. The role-runner per-role log header names the fallback
   through the model source label.
-- **In-flight re-dispatch is separate (#13905).** This is the
-  *selection-time* half only; re-dispatching a child that dies mid-run on
-  `hit your <Model> limit`, and its quarantine exemption, is #13905.
+- **In-flight kills step down once (#13905).** A step-engine child that
+  dies mid-run on a per-model limit banner (`hit your Fable limit`,
+  `reached your Fable 5 limit`) is re-dispatched on the next rung strictly
+  below the killed model's class in `chain` (`fable` → `opus`). The death is
+  charged to the provider, not the item: the ledger records the uncharged
+  `provider_exhausted` refusal (#13966), so it never counts toward the
+  Builder fast-fail ladder or the repeat cap, and the item is redrawn at
+  once. One rung per kill, never a loop at the same model: a kill at `opus`
+  steps to `sonnet`; a kill at the last rung (or at a model off the chain) is
+  handled exactly as before. The step-down is a per-`(item, role)` memo that
+  any other step end clears and that lapses after an hour (limits are
+  windows), so the next unrelated run returns to the configured model. Only
+  a banner that *names a model* counts, read from the last 15 lines of the
+  step's own dispatch and only for a non-zero exit with no verdict line — a
+  generic `hit your weekly limit` is account-wide, no rung escapes it, and
+  stays as today. With the block absent or `enabled: false` nothing is
+  recorded and nothing changes. The issue-sweep path's insta-crash
+  quarantine tally already exempts these banners (`account-exhaustion`
+  re-attribution, #4122/#4501); it re-dispatches through the sweep reaper,
+  not this memo.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an

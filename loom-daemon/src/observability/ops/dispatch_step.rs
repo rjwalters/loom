@@ -102,7 +102,8 @@ pub struct StepModels<'a> {
 pub struct StepModelFallback<'a> {
     /// The configured model the launch fell back from.
     pub from: &'a str,
-    /// Always `no-account-for-class` today (`model_fallback::REASON`).
+    /// `no-account-for-class` (`model_fallback::REASON_NO_ACCOUNT_FOR_CLASS`) or
+    /// `model-limit-kill` (`model_limit_kill::REASON_MODEL_LIMIT_KILL`, #13905).
     pub reason: &'static str,
 }
 
