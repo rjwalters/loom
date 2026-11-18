@@ -325,6 +325,98 @@ fn accounts_disable_from_a_repo_cwd_is_repo_scoped_and_says_so() {
     );
 }
 
+// =========================================================================
+// Issue #14298: `accounts list` reports private-clone repos and session image
+// =========================================================================
+
+/// A host-mode account — no private-workspace state, no session marker —
+/// gains neither `private_clone` nor `image` in `accounts list --json`, and
+/// its human line carries no `repos=`/`image=` suffix: the contract change
+/// is purely additive (issue #14298 acceptance criteria 1 and 4).
+#[test]
+fn accounts_list_json_for_a_host_mode_account_has_no_session_additions() {
+    let fixture = RegistryFixture::new();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let output = fixture.command(elsewhere.path(), &["list", "--json"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert!(entry.get("private_clone").is_none(), "{entry}");
+    assert!(entry.get("image").is_none(), "{entry}");
+
+    let human = fixture.command(elsewhere.path(), &["list"]);
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human_stdout.contains("codex/alpha"), "{human_stdout}");
+    assert!(!human_stdout.contains("repos="), "{human_stdout}");
+    assert!(!human_stdout.contains("image="), "{human_stdout}");
+}
+
+/// A private-clone account lists its primary and additional registered
+/// repositories in both output forms; the image stays absent because no
+/// running container can be observed from a test (issue #14298 acceptance
+/// criteria 1 and 3 — and the degrade-to-absent rule of criterion 5).
+#[test]
+fn accounts_list_reports_a_private_clone_accounts_registered_repositories() {
+    let fixture = RegistryFixture::new();
+    let profile = fixture.profiles.join("alpha");
+    let state = fixture.profiles.join(".private-sessions").join("alpha");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("workspace.json"),
+        format!(
+            r#"{{
+  "schema_version": 1,
+  "account": "alpha",
+  "container": "loom-codex-session-alpha",
+  "engine": "test-engine",
+  "repository": "https://forge.example/a/b",
+  "base": "main",
+  "repositories": [
+    {{"repository": "https://forge.example/c/d", "base": "main", "slug": "c-d"}},
+    {{"repository": "https://forge.example/e/f", "base": "release", "slug": "e-f"}}
+  ],
+  "volume": "loom-codex-workspace-alpha",
+  "profile": {:?},
+  "gh_config": null
+}}"#,
+            profile.display().to_string()
+        ),
+    )
+    .unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let output = fixture.command(elsewhere.path(), &["list", "--json"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["private_clone"]["repository"], "https://forge.example/a/b", "{entry}");
+    assert_eq!(
+        entry["private_clone"]["additional_repositories"],
+        serde_json::json!(["https://forge.example/c/d", "https://forge.example/e/f"]),
+        "{entry}"
+    );
+    assert!(entry.get("image").is_none(), "{entry}");
+
+    let human = fixture.command(elsewhere.path(), &["list"]);
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains(
+            "repos=https://forge.example/a/b,https://forge.example/c/d,https://forge.example/e/f"
+        ),
+        "{human_stdout}"
+    );
+    assert!(!human_stdout.contains("image="), "{human_stdout}");
+}
+
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]

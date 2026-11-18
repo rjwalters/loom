@@ -24,7 +24,9 @@ mod tests;
 pub mod transport;
 mod worker_setup;
 
-pub use lifecycle::{configured, recover, run_job, session_recover, start, status, stop};
+pub use lifecycle::{
+    configured, recover, registrations, run_job, session_recover, start, status, stop,
+};
 pub use repository::WorkerCommand;
 
 use anyhow::{bail, Context, Result};
