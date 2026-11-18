@@ -806,7 +806,7 @@ mod tests {
     fn missing_worktree_is_created_by_script() {
         let _env = EnvGuard::clear(GUARDED_ENV);
         let dir = tempfile::tempdir().unwrap();
-        write_exec(
+        write_executable(
             &dir.path().join(".loom/scripts/worktree.sh"),
             "#!/bin/sh\nmkdir -p \"$(dirname \"$0\")/../worktrees/issue-$1\"\n",
         );
@@ -815,6 +815,7 @@ mod tests {
     }
 
     use crate::env_test_support::EnvGuard;
+    use crate::exec_test_support::write_executable;
 
     /// The env this module reads; cleared per (serial) test.
     const GUARDED_ENV: &[&str] = &[
@@ -831,13 +832,6 @@ mod tests {
         "LOOM_NATIVE_AUTH_FILE",
         crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV,
     ];
-
-    fn write_exec(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
 
     /// #11303 review (P1 at 3b70a80dc): a daemon-launched Claude orchestrator's
     /// inherited env (`LOOM_RUNTIME`+`LOOM_ROLE`, profile, marker) must not send
@@ -863,7 +857,10 @@ mod tests {
             }
         }
         for rt in ["claude", "opencode"] {
-            write_exec(&dir.path().join(format!(".loom/scripts/spawn-{rt}.sh")), "#!/bin/sh\n");
+            write_executable(
+                &dir.path().join(format!(".loom/scripts/spawn-{rt}.sh")),
+                "#!/bin/sh\n",
+            );
         }
         let flash = serde_json::json!([{"runtime": "opencode", "modelProfile": "zai-flash"}]);
         let config = serde_json::json!({
@@ -921,7 +918,7 @@ mod tests {
                     "#!/bin/sh\necho \"{script} $*\" >> calls.txt\nmkdir -p '{}/{prefix}-'\"$1\"\n",
                     eff.display()
                 );
-                write_exec(&root.join(".loom/scripts").join(script), &body);
+                write_executable(&root.join(".loom/scripts").join(script), &body);
             }
             let b = ensure_worktree(root, Role::Builder, 42, None, Some("feature/issue-41"));
             assert_eq!(b.unwrap(), eff.join("issue-42"), "via_env={via_env}");

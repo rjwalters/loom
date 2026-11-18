@@ -206,6 +206,8 @@ pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
 pub mod event_bus;
+#[cfg(test)]
+pub(crate) mod exec_test_support;
 pub mod fetch_headroom;
 pub mod filing_lock;
 pub mod fleet;
