@@ -1036,7 +1036,7 @@ fn is_evidence_free_status(status: &str) -> bool {
 /// row (issue #14145 / #14195 / #14265).
 ///
 /// - `error` / `blocked` ([`is_evidence_free_status`]) always yield.
-/// - `available` with **no 5h utilization** always yields (issue #14195): a
+/// - `available` with **no 5h utilization** yields during the hold (issue #14195): a
 ///   2xx response that carried 7d headers but no `-5h-utilization` header.
 ///   The probe succeeded, but the release arm of
 ///   `bad_tokens::ambiguous_exhaustion_evidence` needs a 5h utilization
@@ -1044,10 +1044,10 @@ fn is_evidence_free_status(status: &str) -> bool {
 ///   overwriting `name|exhausted||<7d-reset>` with a bare `name|available`
 ///   would collapse the weekly hold to the 6h fixed cooldown. A
 ///   genuinely-recovered 2xx reports the header and still overwrites.
-/// - `unknown` yields **only while the carried hold is still running**: the
+/// - Both header-less `available` and `unknown` yield **only while the carried hold is still running**: the
 ///   previous row's `limit_reset` parses and is strictly after `now`. A past,
 ///   missing, or unparseable reset means no credible hold is in force, so the
-///   fresh fail-open `unknown` row is written as before (#8539) and the
+///   fresh `available` or fail-open `unknown` row is written as before (#8539) and the
 ///   fail-open contract is bounded to the hold window instead of being made
 ///   permanently exclusionary.
 /// - Everything else is positive evidence and overwrites.
@@ -1055,10 +1055,10 @@ fn carries_forward(row: &AccountResult, carried: &str, now: DateTime<Utc>) -> bo
     if is_evidence_free_status(&row.status) {
         return true;
     }
-    if row.status == "available" {
-        return row.s5h_utilization.is_none();
+    if row.status == "available" && row.s5h_utilization.is_some() {
+        return false;
     }
-    if row.status != super::codex_check::STATUS_UNKNOWN {
+    if row.status != "available" && row.status != super::codex_check::STATUS_UNKNOWN {
         return false;
     }
     let reset = super::select::parse_ranking_line(carried).and_then(|r| r.limit_reset);
@@ -1095,11 +1095,10 @@ fn previous_exhausted_rows(ranking_path: &Path) -> HashMap<String, String> {
 /// days to run. The carry-forward applies only when the previous row is
 /// `exhausted` **and** the fresh row is evidence-free per [`carries_forward`]
 /// (`error` / `blocked`; an `available` row with no 5h utilization — a
-/// header-less 2xx, #14195; or a codex `unknown` while the hold's recorded
-/// reset is still in the future, #14265) — anything else is positive evidence
-/// this round and overwrites as before — and the reader's own credibility
+/// header-less 2xx, #14195; or a codex `unknown`, #14265, both only while the hold's recorded
+/// reset is still in the future) — anything else overwrites as before. The reader's own credibility
 /// gates (parseability, `MAX_WEEKLY_RESET_HORIZON_SECS`, pre-mark instants)
-/// still bound whatever is carried forward.
+/// bound the separate `.bad_tokens` hold, not the selector's hard exclusion.
 fn format_ranking_lines_with_preserve(
     report: &ProbeReport,
     preserve: &HashMap<String, String>,
@@ -1128,7 +1127,7 @@ fn format_ranking_lines_with_preserve(
 /// Issue #14145: before overwriting, the file's current `exhausted` rows are
 /// read and a fresh row that carries no release evidence
 /// ([`carries_forward`] — `error` / `blocked`, `available` with no 5h
-/// utilization (#14195), or a codex `unknown` while the hold's reset is still
+/// utilization (#14195) or a codex `unknown`, both only while the hold's reset is still
 /// in the future) does not replace the previous `exhausted` row for the same
 /// account; the previous row is carried forward (trimmed) so neither a
 /// mid-hold transport failure nor a header-less 2xx can shorten an active
@@ -2295,6 +2294,54 @@ mod tests {
 
     // ---- #14195: a header-less 2xx round must not destroy hold evidence ----
 
+    #[test]
+    fn headerless_2xx_drops_carried_rows_without_a_future_reset() {
+        let now = instant("2026-11-20T00:00:00Z");
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("agent-1", "available")],
+        };
+        for carried in [
+            "agent-1|exhausted||2026-10-21T00:00:00Z",
+            "agent-1|exhausted||2026-11-20T00:00:00Z",
+            "agent-1|exhausted",
+            "agent-1|exhausted||",
+            "agent-1|exhausted||not-a-date",
+            "agent-1|exhausted|0.02|",
+        ] {
+            let previous = HashMap::from([("agent-1".into(), carried.into())]);
+            assert_eq!(
+                format_ranking_lines_with_preserve(&report, &previous, now),
+                "agent-1|available\n",
+                "a successful probe must replace a hold without a future reset: {carried}"
+            );
+        }
+    }
+
+    #[test]
+    fn headerless_2xx_writer_releases_an_expired_hold_across_rounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        let reset = (Utc::now() - chrono::Duration::days(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(&target, format!("agent-1|exhausted||{reset}\n")).unwrap();
+        let mut fresh = AccountResult::new("agent-1", "available");
+        fresh.s7d_utilization = Some(0.72);
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![fresh],
+        };
+        for round in 1..=2 {
+            write_ranking_atomic(&report, &target).unwrap();
+            assert_eq!(
+                fs::read_to_string(&target).unwrap(),
+                "agent-1|available\n",
+                "round {round} must not perpetuate an expired hard exclusion"
+            );
+        }
+    }
+
     /// #14195 core: a 2xx probe response that carried 7d headers but no
     /// `-5h-utilization` header writes a bare `name|available` row — the
     /// live fleet observation (7d = 0.72 recorded, row without a 5h field).
@@ -2307,7 +2354,10 @@ mod tests {
     fn headerless_2xx_available_round_preserves_the_previous_exhausted_row() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join(".ranking");
-        fs::write(&target, "agent-1|exhausted||2026-11-24T08:00:00Z\nunrelated|available|0.30\n")
+        let reset = (Utc::now() + chrono::Duration::days(4))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(&target, format!("agent-1|exhausted||{reset}\nunrelated|available|0.30\n"))
             .unwrap();
         // This round: agent-1's 2xx carried 7d headers only (7d utilization
         // 0.72, under `EXHAUSTED_THRESHOLD`, so the verdict is `available`,
@@ -2315,7 +2365,7 @@ mod tests {
         // `exhausted` row, so its header-less 2xx is written as-is.
         let mut fresh = AccountResult::new("agent-1", "available");
         fresh.s7d_utilization = Some(0.72);
-        fresh.s7d_reset = Some("2026-11-21T08:00:00Z".into());
+        fresh.s7d_reset = Some(reset.clone());
         let mut bare = AccountResult::new("unrelated", "available");
         bare.s7d_utilization = Some(0.10);
         let report = ProbeReport {
@@ -2325,7 +2375,7 @@ mod tests {
         write_ranking_atomic(&report, &target).unwrap();
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
-            "agent-1|exhausted||2026-11-24T08:00:00Z\nunrelated|available\n",
+            format!("agent-1|exhausted||{reset}\nunrelated|available\n"),
             "a header-less 2xx must carry the exhausted hold row forward, not write a bare `available`"
         );
     }
@@ -2339,17 +2389,19 @@ mod tests {
     fn measured_available_and_non_available_rows_still_overwrite() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join(".ranking");
-        fs::write(
-            &target,
-            "recov|exhausted||2026-11-24T08:00:00Z\nrl|exhausted||2026-11-24T09:00:00Z\n",
-        )
-        .unwrap();
+        let reset = (Utc::now() + chrono::Duration::days(4))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let session_reset = (Utc::now() + chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(&target, format!("recov|exhausted||{reset}\nrl|exhausted||{reset}\n")).unwrap();
         // `recov`'s 2xx carried the 5h utilization header; `rl` drew a 429.
         let mut recov = AccountResult::new("recov", "available");
         recov.s5h_utilization = Some(0.10);
         let mut rl = AccountResult::new("rl", "rate_limited");
         rl.s5h_utilization = Some(0.90);
-        rl.s5h_reset = Some("2026-11-18T20:00:00Z".into());
+        rl.s5h_reset = Some(session_reset.clone());
         let report = ProbeReport {
             ranked_at: "x".into(),
             accounts: vec![recov, rl],
@@ -2357,7 +2409,7 @@ mod tests {
         write_ranking_atomic(&report, &target).unwrap();
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
-            "recov|available|0.10\nrl|rate_limited|0.90|2026-11-18T20:00:00Z\n",
+            format!("recov|available|0.10\nrl|rate_limited|0.90|{session_reset}\n"),
             "a measured recovery and a rate_limited verdict are positive evidence and overwrite"
         );
     }
