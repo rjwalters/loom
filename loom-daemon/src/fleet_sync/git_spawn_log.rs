@@ -207,7 +207,10 @@ impl Sampler {
         Self::with_mode(false)
     }
 
-    /// A sampler for a child that is the daemon's own binary.
+    /// A sampler for a child that is the daemon's own binary (#14100). The
+    /// child keeps the daemon's process group (only `proc_exec` children lead
+    /// their own), so this samples the pid directly instead of walking
+    /// `/proc` for a group — see [`sample_group`].
     pub(crate) fn for_self_spawn() -> Self {
         Self::with_mode(true)
     }
@@ -255,12 +258,21 @@ impl Sampler {
 }
 
 /// Raise `peak` to the largest `VmHWM` (KiB) among processes whose process
-/// group is `pgid`. The child is its own group leader (`proc_exec`).
+/// group is `pgid`. Git children lead their own group (`proc_exec`'s
+/// `place_in_own_process_group`), so the walk is what makes git's
+/// grandchildren (`index-pack`, `pack-objects`) count. A self-spawned daemon
+/// child (#14100) is *not* a group leader — it keeps the daemon's group, so
+/// no pid's `pgrp` equals its own — and in that mode only the pid itself is
+/// read and the walk is skipped: it would match nothing while costing one
+/// `stat` read per host process per tick.
 #[cfg(target_os = "linux")]
 fn sample_group(pgid: u32, peak: &AtomicU64, self_spawn: bool) {
     // Read the leader by pid first: the full /proc walk reaches a short-lived
     // child last, by which time it may be a zombie with no VmHWM line.
     read_vmhwm(&pgid.to_string(), peak, self_spawn);
+    if self_spawn {
+        return;
+    }
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return;
     };
@@ -298,7 +310,10 @@ fn sample_group(pgid: u32, peak: &AtomicU64, self_spawn: bool) {
 ///
 /// For a `self_spawn` child (a `loom-daemon` subcommand, #14100) the exe always
 /// matches, so a pre-`exec` fork is told apart by its `cmdline` still being the
-/// daemon's own.
+/// daemon's own. Corner case: a self-spawned child whose argv is byte-identical
+/// to the daemon's own `cmdline` would be classified pre-`exec` forever and
+/// report `peak_rss_kib=unknown` — none of the #14100 sites can hit it, since
+/// each passes a distinct subcommand argv.
 #[cfg(target_os = "linux")]
 fn is_pre_exec(pid: &str, self_spawn: bool) -> bool {
     static SELF_EXE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();

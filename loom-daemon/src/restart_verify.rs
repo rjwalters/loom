@@ -1027,6 +1027,17 @@ pub fn spawn_detached_verifier(supervisor: Supervisor, pre_pid: u32) {
     detach_process_group(&mut cmd);
     match cmd.spawn() {
         Ok(child) => {
+            // #14100: attribute the detached post-exit verifier's pid. Start
+            // line only — nothing ever waits on this child, so a `Tracked`
+            // would log `abandoned` the moment the exiting parent drops it.
+            log::info!(
+                "{}",
+                crate::self_spawn_log::start_line(
+                    "post_exit_verifier",
+                    child.id(),
+                    &crate::fleet_sync::git_spawn_log::argv_of(&cmd)
+                )
+            );
             eprintln!(
                 "restart_verify: spawned a detached post-exit verifier (pid {}, `{} restart \
                  --verify-only --verify-supervisor {} --verify-pre-pid {pre_pid}`) to confirm {} \
