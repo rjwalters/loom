@@ -84,14 +84,16 @@ candidate (set a candidate to `0` to switch it off on that host).
    `w / Σw` over the available ones.
 3. With no table, `rolePreference` / `preference` / static resolution decide,
    unchanged.
-4. A table that is **empty after exclusions** logs a non-blocking warning
-   (daemon log and the explain view) but does not stall the tick: the draw
-   falls through to the next configured attempt's table, and the first
-   non-empty one decides (#11782's no-stall guarantee). Only when every
-   remaining table is empty too does the stage have nothing to run on: the
-   tick is then a pre-spawn skip whose diagnostic says so, like a wholly
-   unavailable list, carried on the originally configured (empty) table so
-   the skip still has its record and EMPTY diagnostic.
+4. A table that is **empty after exclusions** does not stall the tick: the
+   draw falls through to the next configured attempt's table, and the first
+   non-empty one decides (#11782's no-stall guarantee). The explain view
+   flags every configured empty table with a non-blocking warning, whether
+   or not a later table serves the tick; the daemon log stays quiet in that
+   case. Only when every remaining table is empty too does the stage have
+   nothing to run on: the tick is then a pre-spawn skip whose diagnostic says
+   so and which logs the daemon-log warning, like a wholly unavailable list,
+   carried on the originally configured (empty) table so the skip still has
+   its record and EMPTY diagnostic.
 
 An empty table is not a pilot lock. Pilots, and per-host provider
 restrictions generally, are enforced upstream of the draw:
