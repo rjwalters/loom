@@ -1362,14 +1362,38 @@ fi
 OPEN_DOCS_PR=$("$GH_READ" pr list --state open --limit 100 --json number,headRefName --jq '[.[] | select(.headRefName | startswith("docs/guide-update"))][0].number // empty')
 
 if [ -n "$OPEN_DOCS_PR" ]; then
-  echo "Docs PR #$OPEN_DOCS_PR is still open. Skipping document maintenance."
-  # Optionally: check if it's stale and comment
+  # #13897: this skip used to be unconditional-AND-silent — one red or
+  # conflicting docs PR parked the whole phase for hours with nothing to
+  # distinguish "nothing to maintain" from "maintenance is wedged behind an
+  # unmergeable PR". The skip itself stays unconditional (one docs PR at a
+  # time is #5615's guard; this warning never authorizes a second PR), but a
+  # PR that cannot land now gets a loud per-tick WARNING naming it and its
+  # state. Deliberately the same cross-forge predicate has_superseding_block()
+  # uses above: Gitea reports mergeable "CONFLICTING"; GitHub reports
+  # mergeable false with mergeStateStatus "DIRTY". UNSTABLE adds "checks
+  # failing" (#13897's observed wedge: a docs PR red on an evidence-pinned
+  # file). BLOCKED is deliberately NOT warned on — a docs PR awaiting Judge
+  # review is this phase's normal transient state, and warning every tick on
+  # it would be noise. An UNKNOWN reading (GitHub computes mergeability
+  # asynchronously; `null | tostring` → "null/...") or a failed read yields
+  # the plain skip: never warn on missing data, and never treat missing data
+  # as license to open a second PR.
+  OPEN_DOCS_PR_STATE=$("$GH_READ" pr view "$OPEN_DOCS_PR" --json mergeable,mergeStateStatus \
+    --jq '(.mergeable | tostring) + "/" + (.mergeStateStatus // "")' 2>/dev/null || echo "")
+  case "$OPEN_DOCS_PR_STATE" in
+    *CONFLICTING*|*DIRTY*|*UNSTABLE*|false/*)
+      echo "WARNING: docs PR #$OPEN_DOCS_PR is open but unmergeable (mergeable/mergeStateStatus: ${OPEN_DOCS_PR_STATE:-unreadable}) — document maintenance stays skipped while it wedges the phase, and WORK_LOG.md/WORK_PLAN.md go stale behind it. Fix or close that PR by hand; Guide will not supersede it."
+      ;;
+    *)
+      echo "Docs PR #$OPEN_DOCS_PR is still open. Skipping document maintenance."
+      ;;
+  esac
   ./.loom/scripts/docs-guide-lock.sh release
   return
 fi
 ```
 
-If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation (and release the lock — there is nothing left for this tick to do).
+If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation (and release the lock — there is nothing left for this tick to do). The skip is unconditional — even an unmergeable PR keeps the phase skipped (#5615: one docs PR at a time) — but #13897 makes it **mergeability-aware in what it prints**: when the open PR reports `CONFLICTING`/`DIRTY` (git-conflicted on either forge), `mergeable=false`, or `UNSTABLE` (checks failing), the skip is announced with a loud per-tick `WARNING` naming the PR number and its merge state, so a wedged docs PR cannot stall document maintenance *silently*. `UNKNOWN`, a blocked-but-mergeable PR (the normal awaiting-Judge-review state), or a failed state read all yield the plain one-line skip: missing data is never a warning, and never a second PR.
 
 **#6327 CORRECTED UNDERSTANDING, DO NOT RE-LITIGATE:** issue #6327 was filed
 observing N-host duplicate `docs: Guide document maintenance update` PRs and
@@ -2600,21 +2624,73 @@ main checkout: that mutates the shared primary clone that concurrent sweeps,
 branch.
 
 ```bash
+# #13897 evidence pinning: some repos pin tracked files into committed
+# evidence records — the file's content hash is recorded in a committed
+# attestation/report, and CI re-derives the hash on every PR and fails if it
+# drifts. Staging such a path into a docs PR authors a PR that can never pass
+# CI, and once it goes red it wedges the whole phase (see Step 1's
+# unmergeable-PR WARNING above). `guide.docsMaintenance.pinnedPaths` (JSON
+# array of repo-relative paths, default `[]`) is how a repo declares them to
+# Guide — one mechanism, config only. Same env > config > default shape as
+# the poolPressure knobs in Step 4b; LOOM_GUIDE_DOCS_PINNED_PATHS is a test
+# seam only, never set it in normal operation.
+docs_pinned_paths() {
+  echo "${LOOM_GUIDE_DOCS_PINNED_PATHS:-$(jq -r '.guide.docsMaintenance.pinnedPaths // [] | join(" ")' .loom/config.json 2>/dev/null)}"
+}
+
+# Stage the three fixed doc paths minus any the repo declared evidence-pinned
+# (#13897). A pinned path is NEVER staged; when this tick's edits touched one,
+# say so loudly — naming the path and pointing at the repo's own regeneration
+# duty — instead of authoring a change CI will reject. A diff touching ONLY
+# pinned paths stages nothing and falls through to create_docs_pr()'s existing
+# "No document changes to commit." path, so no PR is opened for it.
+# The set is space-joined, so a pinned path containing a space can never match
+# one of the three fixed doc names (none contains a space) — it fails safe:
+# nothing is wrongly excluded from staging.
+stage_docs_paths() {
+  local pinned_paths doc_path staged_paths=""
+  pinned_paths="$(docs_pinned_paths)"
+  for doc_path in WORK_LOG.md WORK_PLAN.md README.md; do
+    case " $pinned_paths " in
+      *" $doc_path "*)
+        if ! git -C "$DOCS_WT" diff --quiet -- "$doc_path" 2>/dev/null; then
+          echo "WARNING: $doc_path is evidence-pinned (guide.docsMaintenance.pinnedPaths) and has document-maintenance edits this tick — NOT staging it into the docs PR. Regenerate it via this repo's own evidence regeneration recipe; Guide will not author a change to a pinned path (a PR that edits one can never pass CI)."
+        fi
+        ;;
+      *)
+        staged_paths="$staged_paths $doc_path"
+        ;;
+    esac
+  done
+  # $staged_paths is a space-joined subset of the three fixed names above —
+  # word-splitting is the point and no element can contain a space.
+  if [ -n "${staged_paths# }" ]; then
+    git -C "$DOCS_WT" add -- $staged_paths
+  fi
+}
+
 create_docs_pr() {
   local branch
   branch="$(git -C "$DOCS_WT" branch --show-current)"
 
   # Stage all document changes (paths are relative to the worktree root, which
-  # is what `git -C "$DOCS_WT"` makes them).
-  git -C "$DOCS_WT" add WORK_LOG.md WORK_PLAN.md README.md
+  # is what `git -C "$DOCS_WT"` makes them) — via stage_docs_paths(), which
+  # excludes any path the repo declared evidence-pinned (#13897).
+  stage_docs_paths
 
   # Archive files (#12634): staged by EXACT pattern, one file at a time -- never
   # `git add -A` or the `work_log/` directory, so an unrelated file placed there
   # is not swept into the docs PR.
-  local archive_file
+  local archive_file archive_rel pinned_paths
+  pinned_paths="$(docs_pinned_paths)"
   for archive_file in "$DOCS_WT"/$WORK_LOG_ARCHIVE_GLOB; do
     [ -f "$archive_file" ] || continue
-    git -C "$DOCS_WT" add -- "work_log/${archive_file##*/}"
+    archive_rel="work_log/${archive_file##*/}"
+    # #13897: an evidence-pinned path is never staged here either.
+    case " $pinned_paths " in
+      *" $archive_rel "*) continue ;;
+    esac
+    git -C "$DOCS_WT" add -- "$archive_rel"
   done
 
   # Post-stage hook (#13892): a consuming repo can place any of the files this
@@ -2867,7 +2943,8 @@ The full document maintenance flow runs at the end of each triage cycle:
 ```
 Document Maintenance Phase
   ├─ Acquire the docs-guide lock (non-blocking) → skip if another tick holds it
-  ├─ Check for open docs PR → skip (and release the lock) if one exists
+  ├─ Check for open docs PR → skip (and release the lock) if one exists —
+  │    with a loud WARNING if it is unmergeable (#13897)
   ├─ DOCS_WT=$(./.loom/scripts/docs-worktree.sh | tail -1)
   │    └─ managed worktree on docs/guide-update-<timestamp>; the ONLY place
   │       this phase may write (guards deny the main checkout)
@@ -2878,11 +2955,15 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
-  │    ├─ Stage the fixed set + archives, then the post-stage hook (#13892):
-  │    │    run .loom/docs-post-stage.sh if the repo provides it, stage the
-  │    │    worktree-relative paths it prints by exact path; ANY failure is
-  │    │    fail-closed (diff discarded, lock released, no PR) — see
-  │    │    "Post-stage hook" above for the full contract
+  │    ├─ Stage the fixed set + archives minus evidence-pinned paths
+  │    │    (#13897): paths in guide.docsMaintenance.pinnedPaths are never
+  │    │    staged (a WARNING names each one skipped; a pinned-only diff
+  │    │    opens no PR)
+  │    ├─ Post-stage hook (#13892): run .loom/docs-post-stage.sh if the
+  │    │    repo provides it, stage the worktree-relative paths it prints
+  │    │    by exact path; ANY failure is fail-closed (diff discarded,
+  │    │    lock released, no PR) — see "Post-stage hook" above for the
+  │    │    full contract
   │    ├─ Token-pool pressure check (#6135): if the pool is under pressure
   │    │    AND the max-defer ceiling has not elapsed, discard the local diff,
   │    │    release the lock, and defer to a later tick instead of filing
