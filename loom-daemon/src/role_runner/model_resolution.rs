@@ -50,9 +50,10 @@ impl ModelRuntimeMismatch {
         format!(
             "model/runtime mismatch: {} (model source={}); set \
              autonomous.roleRunner.roleModels.{} to a model the {} runtime accepts — or to \
-             \"{}\" to pass through to the {} CLI's own default model, which is the only \
-             working shape on a seat that rejects an explicit pin (e.g. a ChatGPT-plan Codex \
-             account) — or point this role back at a Claude runtime",
+             \"{}\" to pass through to the {} CLI's own default model, the guaranteed-working \
+             shape on any seat (a ChatGPT-plan Codex account also accepts a model its own \
+             catalog lists, see `codex debug models`) — or point this role back at a Claude \
+             runtime",
             self.reason,
             self.model_source,
             self.role,
@@ -85,13 +86,15 @@ impl ModelRuntimeMismatch {
 /// `"cli-default"` spelling) resolves to the empty string, which
 /// [`run_role_with_timeout`] renders as **no `--model` argument at all** so the
 /// runtime's own CLI picks the model. That is not a stylistic option — it is the
-/// only configuration a ChatGPT-plan Codex seat accepts, because such a seat
-/// rejects *every* explicit pin on the wire (`400 invalid_request_error: The
-/// 'gpt-5-codex' model is not supported when using Codex with a ChatGPT
-/// account`), including a perfectly valid Codex model ID. Before #7894 the only
-/// way to express it was to omit the pin entirely — which fell through to the
-/// Claude-shaped shipped default and made #5028's mismatch preflight skip the
-/// tick forever (#6565).
+/// guaranteed-working configuration on any seat. When #6565 was filed, a
+/// ChatGPT-plan Codex seat rejected *every* explicit pin on the wire (`400
+/// invalid_request_error: The 'gpt-5-codex' model is not supported when using
+/// Codex with a ChatGPT account`), including a perfectly valid Codex model ID;
+/// #14121 has since let a plan seat keep a pin its own catalog lists (`codex
+/// debug models`), but `"default"` stays the one shape that works regardless
+/// of catalog. Before #7894 the only way to express it was to omit the pin
+/// entirely — which fell through to the Claude-shaped shipped default and made
+/// #5028's mismatch preflight skip the tick forever (#6565).
 ///
 /// # Why the per-role tier (#5001)
 ///
@@ -410,7 +413,8 @@ pub fn is_cli_default_model_sentinel(value: &str) -> bool {
 /// skips. Forever: the condition is a pure function of static config, so every
 /// subsequent tick skips identically (453+ consecutive skips on the host that
 /// filed #6565). And the "obvious" remedy of pinning a Codex model is not
-/// available on a ChatGPT-plan seat, which rejects every explicit pin — so that
+/// available on a ChatGPT-plan seat as of #6565, which rejected every explicit pin
+/// (#14121 later let a plan seat keep a model its own catalog lists) — so that
 /// configuration was simultaneously the only correct one and permanently
 /// unadmittable.
 ///

@@ -86,6 +86,25 @@ pub fn counter_attributes(row: &ModelUsageTotals) -> TraceAttributes {
     attributes
 }
 
+/// The cache-write counter attributes, which a runtime whose CLI reports no
+/// cache-write counter must not carry as `"0"` (#14166: a counter the CLI does
+/// not report is absent, not zero).
+const CACHE_WRITE_KEYS: [&str; 4] = [
+    "loom.tokens.cache_write",
+    "loom.tokens.cache_write_5m",
+    "loom.tokens.cache_write_1h",
+    "gen_ai.usage.cache_creation_input_tokens",
+];
+
+/// Whether `row`'s cache-write counters are a measurement. Codex reports
+/// `cache_write_input_tokens` only on newer versions, and its reader maps an
+/// absent field to `0` (`codex_usage` module doc), so for Codex a zero cannot be
+/// told from "not reported" and is left off. Every other reader either reports
+/// the counter on every row or (Claude) measures it from the transcript.
+fn cache_write_is_measured(runtime: Option<&str>, row: &ModelUsageTotals) -> bool {
+    runtime != Some("codex") || row.cache_write_5m != 0 || row.cache_write_1h != 0
+}
+
 /// One `loom.runtime.usage` span per model in `rows`, children of `parent`
 /// over `window`. `common` (e.g. `loom.runtime`, `loom.role`, `loom.attempt`,
 /// `loom.sweep_id`, `loom.issue`) goes on every span. Empty `rows` → no spans.
@@ -105,6 +124,11 @@ pub fn model_usage_spans(
             let mut attributes = common.clone();
             attributes.retain(|_, v| !v.is_empty());
             attributes.extend(counter_attributes(row));
+            if !cache_write_is_measured(common.get("loom.runtime").map(String::as_str), row) {
+                for key in CACHE_WRITE_KEYS {
+                    attributes.remove(key);
+                }
+            }
             attributes.extend(pricing.attributes(row));
             attributes.insert("loom.model".into(), row.model.clone());
             attributes.insert("loom.usage.scope".into(), scope.as_str().into());

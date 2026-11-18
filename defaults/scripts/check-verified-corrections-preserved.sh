@@ -70,7 +70,8 @@ done
 # which must itself contain no backtick) and closes only at a line of the
 # SAME character, at least as long, followed solely by whitespace -- so a
 # longer outer fence quoting a shorter fence stays open, and an unclosed
-# fence runs to EOF. While in a fence no line is a heading: a quoted
+# fence runs to EOF (named in a WARN on stderr, with the opener's line, so
+# a body whose section it swallows is never silently "unprotected", #14123). While in a fence no line is a heading: a quoted
 # "Verified corrections" heading cannot open a phantom section, and a
 # `#`-comment inside a real section cannot close it early. Fence lines that
 # sit inside a real section remain part of its text, verbatim. Carriage
@@ -83,7 +84,7 @@ done
 extract_section() {
   local which="$2"
   awk -v which="$which" '
-    BEGIN { insec = 0; depth = 0; infence = 0; fchar = ""; flen = 0 }
+    BEGIN { insec = 0; depth = 0; infence = 0; fchar = ""; flen = 0; fopen = 0 }
     {
       line = $0
       sub(/\r$/, "", line)
@@ -100,12 +101,12 @@ extract_section() {
         next
       }
       if (match(fline, /^`+/) && RLENGTH >= 3 && substr(fline, RLENGTH + 1) !~ /`/) {
-        infence = 1; fchar = "`"; flen = RLENGTH
+        infence = 1; fchar = "`"; flen = RLENGTH; fopen = FNR
         if (insec) print line
         next
       }
       if (match(fline, /^~+/) && RLENGTH >= 3) {
-        infence = 1; fchar = "~"; flen = RLENGTH
+        infence = 1; fchar = "~"; flen = RLENGTH; fopen = FNR
         if (insec) print line
         next
       }
@@ -120,6 +121,13 @@ extract_section() {
       }
     }
     insec { print line }
+    END {
+      # An unterminated fence runs to EOF (CommonMark), so any Verified
+      # corrections section after it is swallowed and NOT checked. Exit codes
+      # are unchanged; the WARN just keeps that distinguishable from "no
+      # section" (#14123), like the depth-1 WARN above.
+      if (infence) print "check-verified-corrections-preserved: WARN — " which " body line " fopen ": unterminated code fence opened here swallows the rest of the body, so any Verified corrections section after it is NOT being checked." | "cat 1>&2"
+    }
   ' "$1"
 }
 
