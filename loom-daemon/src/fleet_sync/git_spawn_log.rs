@@ -191,31 +191,47 @@ pub fn run_logged(
 }
 
 /// Samples the peak RSS of a child's process group while it runs.
-struct Sampler {
+///
+/// Shared with [`crate::self_spawn_log`] (#14100).
+pub(crate) struct Sampler {
     peak: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The child runs the daemon's own binary, so the pre-`exec` test must
+    /// also compare `cmdline` (see [`is_pre_exec`]).
+    self_spawn: bool,
 }
 
 impl Sampler {
     fn new() -> Self {
+        Self::with_mode(false)
+    }
+
+    /// A sampler for a child that is the daemon's own binary.
+    pub(crate) fn for_self_spawn() -> Self {
+        Self::with_mode(true)
+    }
+
+    fn with_mode(self_spawn: bool) -> Self {
         Self {
             peak: Arc::new(AtomicU64::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
+            self_spawn,
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn start(&self, pid: u32) {
+    pub(crate) fn start(&self, pid: u32) {
         // Sample once synchronously: a short-lived git may be gone before the
         // thread's first pass.
-        sample_group(pid, &self.peak);
+        let self_spawn = self.self_spawn;
+        sample_group(pid, &self.peak, self_spawn);
         let (peak, stop) = (Arc::clone(&self.peak), Arc::clone(&self.stop));
         let h = std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(50));
-                sample_group(pid, &peak);
+                sample_group(pid, &peak, self_spawn);
             }
         });
         if let Ok(mut slot) = self.handle.lock() {
@@ -224,9 +240,9 @@ impl Sampler {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn start(&self, _pid: u32) {}
+    pub(crate) fn start(&self, _pid: u32) {}
 
-    fn stop(&self) -> Option<u64> {
+    pub(crate) fn stop(&self) -> Option<u64> {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.lock().ok().and_then(|mut s| s.take()) {
             let _ = h.join();
@@ -241,10 +257,10 @@ impl Sampler {
 /// Raise `peak` to the largest `VmHWM` (KiB) among processes whose process
 /// group is `pgid`. The child is its own group leader (`proc_exec`).
 #[cfg(target_os = "linux")]
-fn sample_group(pgid: u32, peak: &AtomicU64) {
+fn sample_group(pgid: u32, peak: &AtomicU64, self_spawn: bool) {
     // Read the leader by pid first: the full /proc walk reaches a short-lived
     // child last, by which time it may be a zombie with no VmHWM line.
-    read_vmhwm(&pgid.to_string(), peak);
+    read_vmhwm(&pgid.to_string(), peak, self_spawn);
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return;
     };
@@ -271,7 +287,7 @@ fn sample_group(pgid: u32, peak: &AtomicU64) {
         {
             continue;
         }
-        read_vmhwm(pid, peak);
+        read_vmhwm(pid, peak, self_spawn);
     }
 }
 
@@ -279,12 +295,26 @@ fn sample_group(pgid: u32, peak: &AtomicU64) {
 /// that has not yet called `exec`. Its `VmHWM` is the daemon's RSS at fork time,
 /// not git's, so sampling it attributes the daemon's footprint to a cheap git
 /// command (the multi-GB `rev-parse` peaks in #11583).
+///
+/// For a `self_spawn` child (a `loom-daemon` subcommand, #14100) the exe always
+/// matches, so a pre-`exec` fork is told apart by its `cmdline` still being the
+/// daemon's own.
 #[cfg(target_os = "linux")]
-fn is_pre_exec(pid: &str) -> bool {
+fn is_pre_exec(pid: &str, self_spawn: bool) -> bool {
     static SELF_EXE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     let me = SELF_EXE.get_or_init(|| std::fs::read_link("/proc/self/exe").ok());
-    match (me, std::fs::read_link(format!("/proc/{pid}/exe"))) {
+    let same_exe = match (me, std::fs::read_link(format!("/proc/{pid}/exe"))) {
         (Some(me), Ok(exe)) => *me == exe,
+        _ => false,
+    };
+    if !same_exe || !self_spawn {
+        return same_exe;
+    }
+    match (
+        std::fs::read("/proc/self/cmdline"),
+        std::fs::read(format!("/proc/{pid}/cmdline")),
+    ) {
+        (Ok(mine), Ok(theirs)) => mine == theirs,
         _ => false,
     }
 }
@@ -292,8 +322,8 @@ fn is_pre_exec(pid: &str) -> bool {
 /// Raise `peak` to `/proc/<pid>/status` `VmHWM` (KiB); a gone or zombie pid
 /// has no such line and is skipped, as is a child still pre-`exec`.
 #[cfg(target_os = "linux")]
-fn read_vmhwm(pid: &str, peak: &AtomicU64) {
-    if is_pre_exec(pid) {
+fn read_vmhwm(pid: &str, peak: &AtomicU64, self_spawn: bool) {
+    if is_pre_exec(pid, self_spawn) {
         return;
     }
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
@@ -346,16 +376,36 @@ mod tests {
     #[test]
     fn pre_exec_child_does_not_contribute_inherited_hwm() {
         let peak = AtomicU64::new(0);
-        read_vmhwm("self", &peak);
+        read_vmhwm("self", &peak, false);
         assert_eq!(peak.load(Ordering::Relaxed), 0, "own-exe pid was sampled");
 
         let mut child = Command::new("sleep").arg("5").spawn().unwrap();
         let pid = child.id().to_string();
         std::thread::sleep(Duration::from_millis(100));
-        read_vmhwm(&pid, &peak);
+        read_vmhwm(&pid, &peak, false);
         let _ = child.kill();
         let _ = child.wait();
         assert!(peak.load(Ordering::Relaxed) > 0, "post-exec child skipped");
+    }
+
+    /// In self-spawn mode the exe always matches, so a pid whose `cmdline`
+    /// equals ours is the pre-`exec` fork; a different one is not (#14100).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn self_spawn_mode_tells_pre_exec_by_cmdline() {
+        assert!(is_pre_exec("self", true));
+        assert!(is_pre_exec("self", false));
+        let me = std::env::current_exe().unwrap();
+        let mut child = Command::new(me)
+            .args(["--list", "--format=terse", "zz-no-such-test"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+        // Exited children read as "not pre-exec" too; this must never be true.
+        assert!(!is_pre_exec(&pid, true));
+        let _ = child.wait();
     }
 
     #[test]
