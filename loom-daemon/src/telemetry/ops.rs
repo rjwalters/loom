@@ -29,9 +29,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Label keys a `metric.points` data point may carry. Low-cardinality by
-/// construction — never an issue number, sha, sweep id or path. The gateway
-/// collector's datapoint `keep_keys` must include every key (contract-tested).
+/// The reporting process's capture identity, scoped to step busy slots.
+pub(crate) const STEP_OCCUPANCY_PROCESS_ID: &str = "loom.daemon.process_instance_id";
+
+/// Label keys a `metric.points` data point may carry. The gateway collector's
+/// datapoint `keep_keys` must include every key (contract-tested). Labels
+/// exclude per-item identity and paths. The step occupancy identity is bounded
+/// to one token per reporting process.
 pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "reason",
     "provider",
@@ -67,6 +71,7 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
+    STEP_OCCUPANCY_PROCESS_ID,
     // #12038: `loom.forge.hold_items` / `hold_age_seconds`: the artifact
     // (issue | pr), the hold label's short name, how the start was known
     // (labels_at | unknown) and the age statistic (oldest | p50 | p90).
@@ -1295,20 +1300,54 @@ pub struct MetricPointsRecord {
     pub points: Vec<MetricPoint>,
 }
 
-/// Keep only allowlisted, short, control-free labels, at most
-/// [`MAX_LABELS_PER_POINT`] of them.
+/// Keep the ordinary allowlisted, short, control-free labels, at most
+/// [`MAX_LABELS_PER_POINT`] of them. Scoped provenance is admitted separately
+/// with the point's metric and admitted pool available.
 #[must_use]
 pub fn bounded_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     labels
         .iter()
         .filter(|(key, value)| {
-            OPS_METRIC_LABEL_KEYS.contains(&key.as_str())
+            key.as_str() != STEP_OCCUPANCY_PROCESS_ID
+                && OPS_METRIC_LABEL_KEYS.contains(&key.as_str())
                 && value.len() <= MAX_LABEL_VALUE_BYTES
                 && !value.chars().any(char::is_control)
         })
         .take(MAX_LABELS_PER_POINT)
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn bounded_point_labels(point: &MetricPoint) -> BTreeMap<String, String> {
+    let mut labels = bounded_labels(&point.labels);
+    // Apply the existing budget first. Provenance can only occupy a spare
+    // slot, and only if the point retains its identifying pool dimension.
+    if point.name != MetricName::DispatchBusySlots
+        || labels.get("pool").is_none_or(|pool| pool != "step")
+        || labels.len() == MAX_LABELS_PER_POINT
+    {
+        return labels;
+    }
+    if let Some(value) = point
+        .labels
+        .get(STEP_OCCUPANCY_PROCESS_ID)
+        .filter(|value| canonical_process_id(value))
+    {
+        labels.insert(STEP_OCCUPANCY_PROCESS_ID.to_owned(), value.clone());
+    }
+    labels
+}
+
+fn canonical_process_id(value: &str) -> bool {
+    value.len() == 36
+        && uuid::Uuid::try_parse(value).is_ok_and(|id| {
+            id.get_version_num() == 4
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id
+                    .hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer())
+                    == value
+        })
 }
 
 impl MetricPointsRecord {
@@ -1326,7 +1365,7 @@ impl MetricPointsRecord {
             .map(|point| MetricPoint {
                 name: point.name,
                 value: point.value,
-                labels: bounded_labels(&point.labels),
+                labels: bounded_point_labels(point),
             })
             .collect()
     }

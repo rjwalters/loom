@@ -69,7 +69,10 @@
 # Flags are a subset of `gh pr create`'s, chosen so a role prompt's existing
 # invocation can be switched over by changing the command name:
 #   --title, -t TITLE     PR title (required).
-#   --body, -b BODY       PR body as literal text.
+#   --body, -b BODY       PR body as literal text. A value that is a lone
+#                         `@path` / `@-` token is refused (exit 2, nothing
+#                         created): `gh` would post it literally, not read
+#                         it from a file -- use --body-file instead.
 #   --body-file, -F PATH  Read the body from PATH ("-" = stdin). Mutually
 #                         exclusive with --body.
 #   --label, -l LABEL     Label to apply at creation. Repeatable. A single
@@ -112,7 +115,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 
 usage() {
-  sed -n '2,84p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,109p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -169,6 +172,23 @@ if [[ -n "$BODY_FILE" ]]; then
     echo "create-pr.sh: cannot read --body-file: $BODY_FILE" >&2
     exit 2
   fi
+fi
+
+# --- Lone `@path` body guard (#14161) ---------------------------------------
+#
+# `gh pr create --body @path` posts the literal string `@path`; the same
+# pitfall documented for `gh pr comment` / `gh api -f body=@path` (#9258,
+# comment-body-literal-path.md) and refused by post-verdict.sh. The body is
+# never read from the file, so the PR loses its Test Plan, rationale and
+# closing keyword (`Closes #N`) -- and the target issue orphans on merge --
+# silently: the create still exits 0 and prints the URL. Refuse before any
+# forge call when the ENTIRE `--body` value is one `@`-token; a body that
+# merely CONTAINS `@` (a mention, an email-shaped token, a line starting
+# with `@` inside a longer body) passes, and `--body-file` content is the
+# author's own text, never inspected.
+if [[ "$HAVE_BODY" == "true" && "$BODY" =~ ^[[:space:]]*@[^[:space:]]*[[:space:]]*$ ]]; then
+  echo "create-pr.sh: refusing --body '${BODY:0:80}': a lone '@' token is posted literally, not read from a file. Use --body-file <path> (or --body-file -). Nothing was created." >&2
+  exit 2
 fi
 
 forge_detect
@@ -259,9 +279,31 @@ fi
 # authority -- this is a defense-in-depth pre-check, not the only gate.
 EX_REVIEW_GATE_COLLISION=6
 
+# One keyword-reference extractor shared by the review-gate lookup (#9453
+# phase 5) and the superseded-target lookup (#6277) below, so the two cannot
+# drift (#13939). First-match semantics, as before.
+#
+# The leading-guard alternation skips a keyword whose immediately preceding
+# token is a PR/issue reference: `PR #605 fixed #597` narrates history, it
+# does not close #597, so it must not win `head -1` over the real trailing
+# `Closes #N` (#13939). The three guard branches, most specific first:
+#   ^                            keyword opens the line (any body line)
+#   [^#0-9][[:space:]]+          ordinary prose before the keyword -- a
+#                                digit/`#` right before the whitespace run
+#                                is the `#N`-reference narration signature
+#   [^[:alnum:]_#[:space:]]      punctuation attached with no space, the
+#                                `**Fixes #1**` / `(closes #1)` shapes the
+#                                old bare `\b` also admitted
+# The guard classes are digit-free by construction, so the trailing `#N` is
+# the only number run in the match and the final grep picks exactly it.
+_cpr_body_ref_issue() {
+  # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
+  grep -ioE "(^|[^#0-9][[:space:]]+|[^[:alnum:]_#[:space:]])($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
+    | head -1 | grep -oE '[0-9]+' || true
+}
+
 # An empty body matches nothing (grep's no-match is absorbed by `|| true`).
-TARGET_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to)[[:space:]]+#[0-9]+' <<< "$BODY" \
-  | head -1 | grep -oE '[0-9]+' || true)"
+TARGET_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to')"
 
 # One daemon resolution, shared by every daemon call below (#10518).
 # shellcheck source=./lib/locate-daemon-bin.sh
@@ -313,8 +355,7 @@ fi
 # partial-increment references for a family/epic issue that intentionally
 # stays open across multiple PRs -- never match this pattern, so those PRs
 # are exempt by construction; no separate carve-out is needed.
-CLOSES_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<< "$BODY" \
-  | head -1 | grep -oE '[0-9]+' || true)"
+CLOSES_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?')"
 
 if [[ -n "$CLOSES_ISSUE" ]]; then
   # shellcheck disable=SC2054  # the comma is inside a single --json value, not an array separator

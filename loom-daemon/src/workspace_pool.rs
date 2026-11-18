@@ -1286,10 +1286,7 @@ mod tests {
             .into_iter()
             .filter(|i| {
                 matches!(i.kind, crate::types::SweepKind::Issue(n) if n == 999_001)
-                    && matches!(
-                        i.state,
-                        crate::types::SweepState::Running | crate::types::SweepState::Pending
-                    )
+                    && matches!(i.state, crate::types::SweepState::Running)
             })
             .map(|i| i.sweep_id)
             .collect();

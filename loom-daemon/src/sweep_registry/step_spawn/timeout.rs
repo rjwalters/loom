@@ -84,8 +84,7 @@ impl SweepRegistry {
             .entries
             .iter()
             .filter(|(id, info)| {
-                matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && !crate::roll_pause::hold::is_held(id)
+                matches!(info.state, SweepState::Running) && !crate::roll_pause::hold::is_held(id)
             })
             .filter_map(|(id, info)| match info.kind {
                 SweepKind::Step { role, .. }

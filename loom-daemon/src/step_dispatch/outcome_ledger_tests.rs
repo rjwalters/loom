@@ -100,6 +100,27 @@ fn champion_lines_are_read_per_mode_and_folded_onto_the_classes() {
     assert_eq!(champion_outcome(false, "triaged"), None, "a PR triage is --pr only");
 }
 
+/// #14168: the shared framing-tolerant tokenizer — a JSON text event wraps
+/// both line shapes, the prefix sits mid-line, and the wrapper's framing
+/// (`"}`, a literal `\n` escape) glues onto the last value without riding
+/// in it, identically to `step_spawn::capture`'s parser.
+#[test]
+fn a_json_wrapped_outcome_line_parses_like_a_bare_one() {
+    let step_line = concat!(
+        r#"{"type":"result","text":"LOOM_STEP_OUTCOME role=judge target=5 "#,
+        r#"class=noop reason=ci-pending\n"}"#,
+    );
+    assert_eq!(
+        parse_outcome_line(step_line, StepRole::Judge, 5),
+        Some(out(OutcomeClass::Noop, "ci_pending"))
+    );
+    let champion_line = r#"{"text":"CHAMPION-STEP mode=pr item=30 outcome=head-moved"}"#;
+    assert_eq!(
+        parse_outcome_line(champion_line, StepRole::ChampionMerge, 30),
+        Some(out(OutcomeClass::Refused, "head_moved"))
+    );
+}
+
 // ---------------------------------------------------------- the post-state
 
 #[test]

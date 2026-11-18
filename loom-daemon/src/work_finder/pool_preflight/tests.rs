@@ -361,7 +361,7 @@ fn all_four_hosts_resume_on_the_tick_after_the_pool_recovers() {
 /// `role_runner::runtime_preflight::tests::EnvGuard`.
 const PREFERENCE_ENV: [&str; 8] = [
     "LOOM_RUNTIME",
-    "LOOM_RUNTIME_SWEEP_LIFECYCLE",
+    "LOOM_RUNTIME_BUILDER",
     "LOOM_CODEX_HOME",
     "CODEX_HOME",
     "LOOM_CODEX_PROFILE",
@@ -404,10 +404,10 @@ impl Drop for PreferenceEnvGuard {
 
 /// A workspace with BOTH a Claude token pool (`workspace_with_pool`) and the
 /// on-disk role/runtime manifests plus an executable `codex` adapter stub
-/// that `runtime_preference::resolve_runtime("sweep-lifecycle", ...)` needs
-/// to admit a fallback tap for real, instead of failing closed on missing
-/// files. `sweep-lifecycle`'s role-manifest lookup substitutes `builder.json`
-/// (`runtime_admission`'s own fallback), so that is the file written here.
+/// that `runtime_preference::resolve_runtime("builder", ...)` needs to admit
+/// a fallback tap for real, instead of failing closed on missing files. The
+/// pre-flight probes the **builder** role (#13983), so `builder.json` is the
+/// manifest read directly.
 fn workspace_with_pool_and_preference(names: &[&str], config: &serde_json::Value) -> TempDir {
     let dir = workspace_with_pool(names);
     for sub in ["roles", "runtimes", "scripts"] {
@@ -523,16 +523,142 @@ fn an_operator_pin_disables_fall_through_at_the_hold() {
 }
 
 // ---------------------------------------------------------------------------
+// #13983: the probe must not hold on a rejection only containment would lift
+// ---------------------------------------------------------------------------
+
+/// Rewrite the fixture's `builder.json` role manifest to require exactly
+/// `worktreeIsolation` — the real `defaults/roles/builder.json` vs
+/// `defaults/runtimes/codex.json` shape, whose `"partial"` leaves it unmet —
+/// so a codex tap's admission refusal is `not-admitted(worktreeIsolation)`
+/// and nothing else: the containment-eligible (#8787) rejection this section
+/// exercises. With `capability` instead, the refusal names that capability
+/// and is NOT containment-liftable — the control case.
+fn require_capability(ws: &TempDir, capability: &str) {
+    fs::write(
+        ws.path().join(".loom/roles/builder.json"),
+        format!(r#"{{"runtimeRequirements":["{capability}"]}}"#),
+    )
+    .unwrap();
+}
+
+/// The incident shape (#13983): on the one host that admits Codex, a
+/// codex-only preference table made the probe — which resolves with
+/// `NoContainment` — report the whole list unavailable, holding the repo
+/// forever although the real step spawn carries a containment preparer
+/// (#8787) and would admit the tap. The probe must not hold, and the
+/// unheld root dispatches on every tick.
+#[test]
+#[serial]
+fn a_containment_liftable_codex_only_list_does_not_hold_or_stop_dispatch() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["codex"]}}),
+    );
+    require_capability(&ws, "worktreeIsolation");
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a codex-only list whose refusal only containment would lift must not hold (#13983)"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+    // The Builder step is dispatched: an unheld root attempts a dispatch on
+    // every tick, where an attempt is exactly the `loom:issue` →
+    // `loom:building` label flip in production.
+    assert_eq!(
+        ticks_for_host(Some(&host), ws.path(), 13983, 3),
+        3,
+        "an unheld root dispatches on every tick"
+    );
+}
+
+/// The carve-out composes with fall-through: a dry Claude tap above a
+/// containment-liftable codex tap is not an exhausted list either — the real
+/// launch skips the dry tap and contains onto codex.
+#[test]
+#[serial]
+fn a_dry_tap_above_a_containment_liftable_codex_tap_does_not_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    require_capability(&ws, "worktreeIsolation");
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a dry claude tap above a liftable codex tap must not hold (#13983)"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// The carve-out is narrow: a codex-only list refused for a capability
+/// containment can NEVER satisfy is a genuine whole-list unavailability and
+/// still arms the hold.
+#[test]
+#[serial]
+fn a_non_liftable_codex_refusal_still_arms_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["codex"]}}),
+    );
+    // The fixture's codex manifest has no `subagents` capability, so the
+    // refusal names it — not the one requirement containment satisfies.
+    require_capability(&ws, "subagents");
+
+    let host = PoolHoldState::new();
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "a refusal naming a capability containment cannot satisfy still holds"
+    );
+    assert_eq!(host.held_pool_count(), 1);
+}
+
+/// AC 2: the halt is not keyed on `sweep-lifecycle`, the role no step
+/// resolves since #11909. A repo whose `sweep-lifecycle` table is wholly
+/// unavailable while the builder probe's own list resolves is not held: the
+/// probe consults the launch's tables, not the retired sweep's.
+#[test]
+#[serial]
+fn a_wholly_unavailable_sweep_lifecycle_table_does_not_key_the_halt() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {
+            "rolePreference": {"sweep-lifecycle": ["claude"]},
+            "preference": ["claude", "codex"],
+        }}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a dead sweep-lifecycle table must not hold step dispatch (#13983 AC 2)"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Tap-less preference resolution is config, not exhaustion (#13428)
 // ---------------------------------------------------------------------------
 
-/// A `roleDraw` table for `sweep-lifecycle` whose only provider is excluded:
-/// the walk runs over ZERO taps, so `resolve_runtime` returns a
+/// A `roleDraw` table for `builder` whose only provider is excluded: the
+/// walk runs over ZERO taps, so `resolve_runtime` returns a
 /// `Decision::Preference` whose resolution `is_empty_list()`.
 fn tapless_config() -> serde_json::Value {
     serde_json::json!({"runtimes": {
         "excludeProviders": ["codex"],
-        "roleDraw": {"sweep-lifecycle": [{"attempt": 1, "draw": {"codex": 100}}]},
+        "roleDraw": {"builder": [{"attempt": 1, "draw": {"codex": 100}}]},
     }})
 }
 

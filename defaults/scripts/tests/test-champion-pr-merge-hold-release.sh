@@ -63,7 +63,7 @@ extract_block() {
 
 PRECHECK="$(extract_block '**Run this precheck before judging the axes**')"
 HOLD_BEHAVIOR="$(extract_block '**Hold behavior** — name the')"
-CENSUS_RELEASED="$(grep -A4 -F 'RELEASED=$("$GH_READ" pr list' "$CHAMPION_MD")"
+CENSUS_RELEASED="$(grep -A3 -F 'RELEASED=$("$GH_READ" pr list' "$CHAMPION_MD")"
 
 WORK="$(mktemp -d)" && trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/.loom/scripts"

@@ -294,7 +294,7 @@ pub(crate) fn scan_unregistered_locked_issues(
 impl SweepRegistry {
     /// Cross-check `.loom/locks/issue-<N>/` against this registry's own
     /// in-memory entries and surface any issue whose lock has a **live**
-    /// `owner_pid` but no matching non-terminal (`Pending`/`Running`) registry
+    /// `owner_pid` but no matching non-terminal (`Running`) registry
     /// entry (Issue #4214).
     ///
     /// This is the structural fix for the "vanish window" incident: the
@@ -796,7 +796,7 @@ impl SweepRegistry {
         )
     }
 
-    /// Whether this registry has a non-terminal (`Pending`/`Running`) entry
+    /// Whether this registry has a non-terminal (`Running`) entry
     /// tracking a sweep for `issue` — shared by [`Self::live_claim_evidence`]
     /// (#5236) and [`Self::unregistered_locked_issues`] (#4214), both of
     /// which need the same "does our own bookkeeping know about this issue"
@@ -1084,7 +1084,7 @@ impl SweepRegistry {
                 }
                 // Skip if we already have a Running entry for this issue.
                 let already_running = self.entries.values().any(|info| {
-                    matches!(info.state, SweepState::Running | SweepState::Pending)
+                    matches!(info.state, SweepState::Running)
                         && info.kind.issue_number() == Some(issue)
                 });
                 if already_running {

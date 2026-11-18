@@ -5,7 +5,8 @@
 
 use super::capture::{
     emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback,
-    release_class_of_line, step_failure, tick_outcome, StepCapture, StepEnd, StepOutcomeClass,
+    release_class_of_line, step_failure, step_outcome_projection, tick_outcome, StepCapture,
+    StepEnd, StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -177,6 +178,51 @@ fn a_step_child_lists_its_leases_and_a_curator_names_its_launch() {
 fn a_pool_or_runtime_gate_refuses_with_its_own_reason() {
     assert_eq!(refusal_of(&RoleTickOutcome::NoTokenPool).reason, "no_token_pool");
     assert_eq!(refusal_of(&RoleTickOutcome::Failure("x".into())).reason, "admission_refused");
+}
+
+/// #14026 acceptance criterion 3, at the refusal boundary: a preference-path
+/// exhaustion longer than the marker's 160-char cap reaches the step refusal
+/// — the text `begin_step_spawn` logs after its `sweep_registry:` prefix —
+/// as ONE line carrying the full untruncated reason, never the multi-line
+/// operator diagnostic.
+#[test]
+fn a_runtime_rejected_refusal_carries_the_one_line_candidate_rendering() {
+    let obligation = "owned account lease plus durable workspace preparation for model \
+                      claude/sonnet on profile zai-metered is still outstanding (#13916)";
+    let rejection = crate::runtime_admission::RuntimeRejection {
+        role: "curator".into(),
+        runtime: String::new(),
+        source: crate::runtime_admission::RuntimeSource::Preference,
+        unmet_capabilities: vec![],
+        reason: format!(
+            "No runtime in the preference list can serve role \"curator\" right now\n  \
+             codex -> not-admitted(unmet capabilities: worktreeIsolation; {obligation})"
+        ),
+        exhausted_summary_line: Some(
+            format!(
+                "runtime_rejected role=curator: codex -> not-admitted(unmet capabilities: \
+             worktreeIsolation; {obligation})"
+            )
+            .into_boxed_str(),
+        ),
+    };
+    let refusal = refusal_of(&RoleTickOutcome::RuntimeRejected(rejection));
+    assert_eq!(refusal.reason, "runtime_rejected");
+    assert!(!refusal.detail.contains('\n'), "one line: {}", refusal.detail);
+    assert!(refusal.detail.contains(obligation), "{}", refusal.detail);
+    assert!(!refusal.detail.contains('\u{2026}'), "{}", refusal.detail);
+    // A rejection without the one-line rendering (the static path) falls back
+    // to its own reason, byte-identical to the pre-#14026 refusal text.
+    let static_rejection = crate::runtime_admission::RuntimeRejection {
+        role: "builder".into(),
+        runtime: "codex".into(),
+        source: crate::runtime_admission::RuntimeSource::RoleConfig,
+        unmet_capabilities: vec!["worktreeIsolation".into()],
+        reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
+    };
+    let refusal = refusal_of(&RoleTickOutcome::RuntimeRejected(static_rejection));
+    assert_eq!(refusal.detail, "unmet capabilities: worktreeIsolation");
 }
 
 // ---- B1: the claim --------------------------------------------------------
@@ -353,6 +399,71 @@ fn an_outcome_line_parses_and_the_prompts_template_does_not() {
         "`LOOM_STEP_OUTCOME role=judge target=<n> class=<verdict|noop|refused|failed> reason=<token>`"
     )
     .is_none());
+}
+
+/// #14168: the three framings runtimes put on the line — bare, backticked,
+/// inside a JSON text event (the wrapper's `"}` or literal `\n` escape
+/// glued to the last token) — parse to the identical `StepOutcomeLine`.
+#[test]
+fn the_three_outcome_line_framings_parse_identically() {
+    let expected = StepOutcomeLine {
+        role: "judge".into(),
+        target: 7,
+        class: StepOutcomeClass::Verdict,
+        reason: "ci_pending".into(),
+    };
+    let bare = "LOOM_STEP_OUTCOME role=judge target=7 class=verdict reason=ci-pending";
+    let backticked = "`LOOM_STEP_OUTCOME role=judge target=7 class=`verdict` reason=`ci-pending`";
+    let json_event = concat!(
+        r#"{"type":"text","text":"LOOM_STEP_OUTCOME role=judge target=7 "#,
+        r#"class=verdict reason=ci-pending\n"}"#,
+    );
+    for (framing, raw) in [
+        ("bare", bare),
+        ("backticked", backticked),
+        ("json-text-event", json_event),
+    ] {
+        assert_eq!(parse_outcome_line(raw).unwrap(), expected, "{framing}");
+    }
+    // A quoted value inside the JSON framing ends at its closing quote, and
+    // the JSON keys around it never read as outcome fields.
+    let quoted = r#"{"role":"assistant","text":"LOOM_STEP_OUTCOME role=judge target=7 class=verdict reason=ci-pending"}"#;
+    assert_eq!(parse_outcome_line(quoted).unwrap(), expected);
+}
+
+/// #14168: a recorded `reason` is the reason as written (its `-` folded),
+/// truncated to a fixed bound so a runaway line cannot pin an unbounded
+/// attribute value.
+#[test]
+fn a_reason_is_recorded_bounded() {
+    let long = "r".repeat(500);
+    let line = parse_outcome_line(&format!(
+        "LOOM_STEP_OUTCOME role=judge target=1 class=noop reason={long}"
+    ))
+    .unwrap();
+    assert_eq!(line.reason.chars().count(), 64);
+    assert!(line.reason.chars().all(|c| c == 'r'));
+    let short =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=1 class=noop reason=ci-pending")
+            .unwrap();
+    assert_eq!(short.reason, "ci_pending", "as written, folded");
+}
+
+/// #14168: an unknown class is not a parseable line, so the step records
+/// `none` — the countable no-outcome value — on the span and the record.
+#[test]
+fn an_unknown_class_yields_none() {
+    assert!(
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=1 class=banana reason=x").is_none()
+    );
+    assert_eq!(step_outcome_projection(None), ("none".to_string(), String::new()));
+    assert_eq!(
+        step_outcome_projection(Some(
+            &parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=1 class=noop reason=x")
+                .unwrap()
+        )),
+        ("noop".to_string(), "x".to_string())
+    );
 }
 
 /// #12541: a Champion step writes only its `CHAMPION-STEP` line, so the
@@ -605,6 +716,33 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     assert_eq!(records[0].step_class.as_deref(), Some("noop"));
     assert_eq!(records[0].step_reason.as_deref(), Some("already_judged"));
     assert_eq!(records[0].result, crate::telemetry::RoleTickResult::Success);
+}
+
+/// #14168: a step that wrote no parseable outcome line records
+/// `step_class="none"` on its `role_tick.outcome` record — "no outcome" is
+/// countable, not an absence — with no `step_reason`.
+#[test]
+#[serial]
+fn a_step_with_no_outcome_line_records_none_on_its_record() {
+    let dir = tempdir().unwrap();
+    std::env::remove_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
+    emit_step_capture(&StepCapture {
+        root: dir.path().to_path_buf(),
+        role: StepRole::Judge,
+        item: 9,
+        sweep_id: "step-judge-9-1".into(),
+        started_at: Utc::now() - chrono::Duration::seconds(30),
+        outcome: RoleTickOutcome::Success,
+        step_outcome: Some(step_outcome_projection(None)),
+        failure: None,
+        model: "opus".into(),
+        effort: "high".into(),
+    });
+    let journal = crate::sweep_outcomes::default_role_tick_telemetry_path(dir.path());
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    assert_eq!(records.len(), 1, "{journal:?}");
+    assert_eq!(records[0].step_class.as_deref(), Some("none"));
+    assert_eq!(records[0].step_reason.as_deref(), None);
 }
 
 /// Review item 4: a step found dead at startup runs the step end too, so the

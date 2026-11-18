@@ -2,8 +2,7 @@
 //! (autonomy mismatch) as reachable, retries other nonzero codes bounded,
 //! and still runs the ranking + workspace-registration checks afterward.
 //!
-//! A sibling of `tests.rs`, which is over the file-size ratchet's threshold
-//! (`.loom/docs/file-size-policy.md`).
+//! A sibling of `tests.rs`.
 
 use super::tests::{which_bash, write_executable};
 use super::*;

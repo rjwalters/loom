@@ -1,10 +1,8 @@
 //! Work-finder coverage for the PR-less retry bound's skip set (Issues #7972,
 //! #9292).
 //!
-//! Lives in its own file rather than in the shared `work_finder::tests` module
-//! for the file-size-ratchet reason `tmpfs_warning` / `registry_refresh` do
-//! (`.loom/docs/file-size-policy.md`): `work_finder/tests.rs` is well over the
-//! threshold and frozen at its current size. Its `RecordingDispatcher` is
+//! Lives in its own file rather than in the shared `work_finder::tests` module,
+//! as `tmpfs_warning` / `registry_refresh` do. Its `RecordingDispatcher` is
 //! consequently not reused — this file carries its own two-field fakes, which
 //! is also why every assertion below is about one behaviour rather than an
 //! incidentally-shared harness.

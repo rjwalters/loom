@@ -577,6 +577,7 @@ jobs:
         Step {
             index: 0,
             line: 0,
+            id: None,
             name: None,
             uses: None,
             run: Some(cmd.to_string()),

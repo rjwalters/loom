@@ -365,6 +365,7 @@ fn per_phase_usage_and_the_unattributed_remainder_reach_otlp_absent_not_zero() {
             attempt: Some(1),
             tokens_in: Some(10),
             tokens_out: Some(1),
+            effort: Some("high".into()),
             ..PhaseDuration::new("curator", 12)
         },
         PhaseDuration {
@@ -425,6 +426,11 @@ fn per_phase_usage_and_the_unattributed_remainder_reach_otlp_absent_not_zero() {
     assert_eq!(field(0, "attempt"), Some(any_value::Value::IntValue(1)));
     assert_eq!(field(0, "tokens_in"), Some(any_value::Value::IntValue(10)));
     assert_eq!(field(0, "tokens_out"), Some(any_value::Value::IntValue(1)));
+    // #14242: a phase stamped with its launch's effort carries it; an
+    // unstamped one (the unmeasured re-judge below) omits the key, never
+    // publishes a `default`.
+    assert_eq!(field(0, "effort"), Some(any_value::Value::StringValue("high".into())));
+    assert!(field(4, "effort").is_none(), "an unstamped phase must omit effort");
     // The second judge: addressable by `attempt`, and unmeasured — so its token
     // keys are OMITTED, never published as 0.
     assert_eq!(field(4, "phase"), Some(any_value::Value::StringValue("judge".into())));
