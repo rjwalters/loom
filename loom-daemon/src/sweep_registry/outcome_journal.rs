@@ -613,6 +613,18 @@ impl SweepRegistry {
                 })
                 .unwrap_or_default();
         }
+        // Issue #14242: each phase entry carries the effort its launch ran at
+        // — the same resolved `effort` above, which for a sweep session is the
+        // session-default every in-sweep phase inherits (the Task tool exposes
+        // no effort parameter, so no phase can run at anything else) and for a
+        // step is its role's own resolved effort. Stamped from the launch the
+        // entry recorded, never re-derived from dispatch-time config here;
+        // absent, never fabricated, when no effort could be named.
+        if let Some(effort) = &effort {
+            for entry in &mut phase_durations {
+                entry.effort = Some(effort.clone());
+            }
+        }
 
         // The sweep's own PR, taken from the checkpoint values sampled while it
         // ran (free), falling back to the checkpoint still on disk for a sweep
@@ -1522,6 +1534,17 @@ mod runtime_tests;
     unused_imports
 )]
 mod phase_usage_tests;
+
+// Per-phase effort stamping on `phase_durations` (Issue #14242), in its own
+// sibling module for the same file-size reason as `phase_usage_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod phase_effort_tests;
 
 // Tap-attributed usage accounting (#8556) end-to-end across both terminal
 // journals, in its own sibling module for the same file-size reason.

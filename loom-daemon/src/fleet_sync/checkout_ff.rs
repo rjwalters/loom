@@ -377,6 +377,11 @@ pub struct CheckoutPass {
     /// Reflog entries Loom did not write, found in this pass (#11566). One
     /// `checkout.external_change` record each; already logged and emitted.
     pub external_changes: Vec<CheckoutExternalChangeRecord>,
+    /// Why the self-heal declined each checkout it declined this pass
+    /// (#14059): not logged or published, but carried so a failing
+    /// self-heal test names the cause of its skip and not only the state
+    /// the checkout was left in.
+    pub self_heal_left: Vec<String>,
 }
 
 impl CheckoutPass {
@@ -681,6 +686,9 @@ struct Net {
     /// for its `checkout.freshness` record. Reset before each attempt.
     last_head: Option<String>,
     repairs: Vec<self_heal::Repair>,
+    /// The self-heal's reasons for declining, one per declined checkout
+    /// (#14059): copied into the pass result by [`run`].
+    self_heal_left: Vec<String>,
 }
 
 /// Run one checkout pass over `roots`. Never fails: every failure is a state.
@@ -746,6 +754,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
         start + reached
     };
     (pass.probes, pass.fetches, pass.low_disk) = (net.probes, net.fetches, net.low_disk);
+    pass.self_heal_left = std::mem::take(&mut net.self_heal_left);
     // In registry order, whatever order they were visited in. A root no pass
     // has reached yet has nothing to show.
     pass.checkouts = roots

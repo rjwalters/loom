@@ -509,6 +509,14 @@ startable subset un-escalates them there, `SUBSET_CARVEOUT: yes`).
       skip Curator's own cited-path check), confirm the proposer ran
       `./.loom/scripts/verify-proposal-refs.sh` on the body before filing (#7658);
       if it wasn't run, re-run it yourself against the issue body before promoting
+- [ ] A *wiring* claim ("run by nothing", "unreferenced") is checked against the
+      runner, not re-derived from text — re-running the proposal's own name grep
+      is not independent verification: it is blind to the discovery conventions
+      (pytest directory collection, workflow `on:`/`run:` paths, a runner's
+      directory arguments, an adjacent `test_<name>` file) that run code without
+      naming it (example-org/tool-repo#202). Ask the runner yourself
+      (`pytest <dir> --collect-only -q | grep <name>`) or check the discovery
+      conventions before confirming the premise
 
 ### 7. Risk Assessment
 - [ ] Breaking changes are clearly marked

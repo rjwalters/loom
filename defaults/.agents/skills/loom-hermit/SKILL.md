@@ -85,6 +85,26 @@ rg "export function myFunction" --files-with-matches | while read file; do
 done
 ```
 
+**Limits of a name grep.** A negative result above proves only "no explicit
+reference" — it does **not** prove "never runs". Runners reach code by
+filename/path convention without naming it: pytest/unittest collecting
+`test_*.py` under a directory argument, Rust `tests/`, Jest `*.test.ts`,
+Go `_test.go`, autoloaded plugin/`conf.d` directories, `.github/workflows/*.yml`.
+Before filing any "run by nothing" claim, run a second check that asks the
+runner or the convention, not the text:
+
+```bash
+pytest <dir> --collect-only -q | grep <name>   # does a test runner collect it?
+```
+
+Also check workflow `on:`/`run:` paths, a runner's directory arguments, and an
+adjacent `test_<name>` file. Worked example (example-org/tool-repo#202):
+`git grep` found no reference to `tools/check_m1a_selection.py` in any build
+file, but `make verify` runs `pytest … tools/ …`, which collects the adjacent
+`tools/test_check_m1a_selection.py` on every run — so the "committed but run
+by nothing" premise was false, and the proposed removal would have deleted a
+working, control-carrying gate.
+
 **Commented-Out Code:**
 ```bash
 rg "^[[:space:]]*//" -A 3 | grep -E "function|class|const|let|var"
@@ -222,6 +242,13 @@ rg "use.*::" --type rust | cut -d':' -f3 | sort -u       # Backend
 rg "export (function|class|const|interface)" --type ts -n
 # For each export, check if it's imported elsewhere
 ```
+
+No import found is "no explicit reference", not "never runs" — a runner or
+discovery convention can still reach it. Before filing a "run by nothing"
+claim, ask the runner/convention (`pytest <dir> --collect-only -q | grep
+<name>`, workflow `on:`/`run:` paths, a runner's directory arguments, an
+adjacent `test_<name>` file). See "Limits of a name grep" under Dead Code
+above.
 
 ### 3. Complexity Metrics
 
