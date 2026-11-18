@@ -351,8 +351,35 @@ pub fn merge_runtime_attribution(
     }
 }
 
-/// Every OpenCode session id named by the event stream in a step log's
-/// `contents` (#14018), first-seen order, de-duplicated.
+/// The prefix every dispatch writes at the head of its region of a step log.
+const DISPATCH_HEADER_PREFIX: &str = "==== loom-daemon dispatch: ";
+
+/// The part of an append-mode step log that belongs to its **last** dispatch
+/// (#14210): from the last line that starts with the dispatch header onward,
+/// or all of `contents` when no such line exists.
+///
+/// Line-anchored like the launch-record scan: an agent echoing the header
+/// mid-line, or inside a JSON event string, can never be read as a new dispatch.
+fn last_dispatch_region(contents: &str) -> &str {
+    let mut offset = 0;
+    let mut start = 0;
+    for line in contents.split_inclusive('\n') {
+        if line.starts_with(DISPATCH_HEADER_PREFIX) {
+            start = offset;
+        }
+        offset += line.len();
+    }
+    &contents[start..]
+}
+
+/// Every OpenCode session id named by the event stream in the **last dispatch**
+/// of a step log's `contents` (#14018, #14210), first-seen order, de-duplicated.
+///
+/// Step logs are opened in append mode, so a retried step leaves one region per
+/// dispatch. Only the last — the attempt that produced the merge — is counted,
+/// matching `last_launch_runtime`'s attribution and the Claude side's
+/// `(PR createdAt, mergedAt)` window; an abandoned earlier attempt's tokens are
+/// not charged to the PR. A log with no dispatch header is read whole.
 ///
 /// An OpenCode launch's `--format json` stream puts `"sessionID":"ses_…"` at
 /// the top level of every event. Only a line that is itself a JSON object is
@@ -364,7 +391,7 @@ pub fn merge_runtime_attribution(
 pub fn opencode_session_ids(contents: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
-    for line in contents.lines() {
+    for line in last_dispatch_region(contents).lines() {
         let line = line.trim_start();
         if !line.starts_with('{') || !line.contains("\"sessionID\"") {
             continue;
@@ -1106,6 +1133,37 @@ mod tests {
         .join("\n");
         assert_eq!(opencode_session_ids(&log), vec!["ses_abc123", "ses_def456"]);
         assert!(opencode_session_ids("").is_empty());
+    }
+
+    /// #14210: a step log is append-mode, so a retried step leaves several
+    /// dispatch regions. Only the last one — the attempt that produced the
+    /// merge — is counted; an abandoned earlier attempt's sessions are not.
+    #[test]
+    fn opencode_session_ids_count_only_the_last_dispatch_region() {
+        let log = [
+            "==== loom-daemon dispatch: 2026-11-16T14:27:46+00:00 sweep_id=a item=7 ====",
+            r#"{"type":"step_start","sessionID":"ses_first"}"#,
+            "==== loom-daemon dispatch: 2026-11-16T17:04:20+00:00 sweep_id=b item=7 ====",
+            r#"{"type":"step_start","sessionID":"ses_second"}"#,
+            // Quoted inside an event, or mid-line, so never a header.
+            r#"{"type":"text","sessionID":"ses_second","part":{"text":"==== loom-daemon dispatch: x ===="}}"#,
+            "agent echoed ==== loom-daemon dispatch: z ==== mid-line",
+            r#"{"type":"step_finish","sessionID":"ses_third"}"#,
+        ]
+        .join("\n");
+        assert_eq!(opencode_session_ids(&log), vec!["ses_second", "ses_third"]);
+    }
+
+    /// A log with no dispatch header (a hand-written or pre-header log) is one
+    /// undivided launch: every session in it counts.
+    #[test]
+    fn opencode_session_ids_without_a_dispatch_header_read_the_whole_log() {
+        let log = [
+            r#"{"type":"step_start","sessionID":"ses_one"}"#,
+            r#"{"type":"step_start","sessionID":"ses_two"}"#,
+        ]
+        .join("\n");
+        assert_eq!(opencode_session_ids(&log), vec!["ses_one", "ses_two"]);
     }
 
     // ========================================================================

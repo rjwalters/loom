@@ -311,7 +311,9 @@ pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
 /// - **OpenCode sessions** named by the `sessionID`s in the step logs
 ///   ([`crate::opencode_usage::tokens_by_session_ids`]) — never directory +
 ///   window, since the store's `directory` is shared repo-wide. No window
-///   applies: a session id already names exactly one session.
+///   applies: a session id already names exactly one session. Only each step
+///   log's last dispatch is read (#14210), so an abandoned earlier attempt is
+///   not charged to the PR.
 ///
 /// A step that ran on another host left no log or transcript here, so its usage
 /// is absent and the total stays partial. `None` — never `Some(vec![])` — when

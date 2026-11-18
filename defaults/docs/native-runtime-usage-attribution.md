@@ -74,7 +74,14 @@ overlapped. A step's log (`.loom/logs/step-<role>-<item>.log`) captures the
 launch's native JSON event stream, whose events carry a top-level
 `"sessionID":"ses_…"`; a step-dispatched completion reads exactly those sessions
 (`opencode_usage::tokens_by_session_ids`) and sums them with the Claude
-transcripts of the same PR's Judge/Doctor/`champion --pr` steps. The published
+transcripts of the same PR's Judge/Doctor/`champion --pr` steps. **Winning
+attempt only (#14210).** Step logs are append-mode, so a retried step leaves one
+`==== loom-daemon dispatch:` region per attempt; only the sessions in the **last**
+region (`launch_record::opencode_session_ids`) count, so an abandoned earlier
+OpenCode attempt is not charged to the PR — the same attempt
+`last_launch_runtime` attributes, and the same stance as the Claude side, whose
+`(PR createdAt, mergedAt)` window already drops transcripts older than the PR. A
+log with no dispatch header is read whole. The published
 `runtime`/`provider`/`profile` come from the first step log present on the
 narrating host (Builder, else Doctor, Judge, `champion_merge`). Steps that ran
 on another host left nothing here, so the total stays partial until the
