@@ -117,12 +117,6 @@ size, which becomes `candidates_total`. If the file is missing or unreadable
 observed: `decisions_observed` is `false` and unexplained candidates stay
 undecided. A file that exists but is empty is an observed tick with no acts.
 
-A `queue` line keeps at most 200 rows but also records the queue's uncapped
-size, which becomes `candidates_total`. If the file is missing or unreadable
-(a tick whose launch journaled no queue and whose agent never used the `gh` front writes none) nothing was
-observed: `decisions_observed` is `false` and unexplained candidates stay
-undecided. A file that exists but is empty is an observed tick with no acts.
-
 **Role actions (closed set).** `claimed` (`loom:reviewing`, `loom:treating`,
 `loom:curating`, `loom:evaluating`, `loom:building`), `approved` (`loom:pr`, or
 `pr review --approve`), `changes_requested`, `merged`, `curated`, `promoted`

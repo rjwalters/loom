@@ -157,6 +157,8 @@ jobs:
           - 'rust-toolchain.toml'
           - '.config/nextest.toml'
           - '.github/workflows/ci.yml'
+          # Native workflow_identity_tests also read the release guards.
+          - '.github/workflows/release.yml'
         mcp:
           - 'mcp-loom/**'
           - '.github/workflows/ci.yml'
@@ -557,6 +559,8 @@ jobs:
       - name: Compile tests (no run)
         run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --no-run
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        # Includes merge_group_ci::workflow_identity_tests: native regression
+        # coverage for this repo's cache/release identity guards (#14158).
         # Healthy discovery plus execution is about 80s per leg (#11121).
         timeout-minutes: 10
         run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
@@ -2395,7 +2399,7 @@ jobs:
     # the registry layer cache `worker-base-image` reads
     # (ghcr.io/rjwalters/loom-worker:buildcache; rationale in that job's
     # header). Job permissions cannot vary by event, so the write is split out
-    # here and gated at JOB level to a push to main in rjwalters/loom: on
+    # here and gated at JOB level to a push to main in 2AMLogic/loom: on
     # pull_request and merge_group this job is skipped, so no token those
     # events mint can push to GHCR. Checkout uses `persist-credentials: false`
     # so the token never lands in .git/config.
@@ -2419,7 +2423,7 @@ jobs:
     needs: [changes, release-build]
     if: >-
       always() && needs.release-build.result == 'success' &&
-      github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == '2AMLogic/loom' &&
       (needs.changes.result != 'success' || needs.changes.outputs.docker != 'false')
     runs-on: ubuntu-latest
     timeout-minutes: 30

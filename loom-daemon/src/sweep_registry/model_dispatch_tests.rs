@@ -517,3 +517,26 @@ fn an_unavailable_draw_candidate_walks_to_the_next_candidates_own_model() {
     assert_eq!(launch.model.as_deref(), Some("opus"));
     assert_eq!(admitted.preference.unwrap().model.as_deref(), Some("opus"));
 }
+
+// ---- #14017: a step's effort is resolved for the admitted runtime ----------
+
+#[test]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
+fn a_step_resolves_its_effort_against_the_admitted_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = Environment::isolated(dir.path());
+    // The role draws Claude; `curator@claude` must beat the per-role value
+    // and `curator@codex` must not leak onto the Claude launch.
+    let mut config = draw_config_for("curator", "sonnet", json!({"claude": 100}));
+    config["autonomous"]["roleRunner"]["roleEfforts"] =
+        json!({"curator": "medium", "curator@claude": "high", "curator@codex": "low"});
+    let launch = step_launch(dir.path(), &config, crate::step_role::StepRole::Curator).unwrap();
+    assert_eq!(launch.admission.admitted.unwrap().runtime, "claude");
+    assert_eq!(launch.effort.as_deref(), Some("high"));
+
+    // Nothing configured on Claude stays unset: no `--effort` is emitted.
+    let mut bare = draw_config_for("curator", "sonnet", json!({"claude": 100}));
+    bare["autonomous"]["roleRunner"]["roleEfforts"] = json!({"curator@codex": "low"});
+    let launch = step_launch(dir.path(), &bare, crate::step_role::StepRole::Curator).unwrap();
+    assert_eq!(launch.effort, None);
+}
