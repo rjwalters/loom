@@ -13,9 +13,14 @@
 //! and the tick takes it ([`take_post`]). The tick runs after both, so the
 //! order of the end and the release does not matter (the reaper releases
 //! then ends; startup adoption ends then releases).
-//! A step whose claim was not released (another claimant holds the item, a
-//! merge step with no claim label) has no noted read; the tick reads the
-//! item itself. The queue is per workspace root and
+//! The release notes its read before it decides anything: for the role
+//! steps (`restore_role_step`) `note_step_post` precedes the release plan,
+//! so the post-state is noted even when the plan then leaves the claim
+//! untouched because a peer holds the item; the Builder's
+//! `restore_builder_step` notes its read unconditionally too. The only
+//! steps with no noted read are the `skip_label_flip` early return and a
+//! `ChampionMerge` step (no claim label); the tick reads the item itself
+//! for those. The queue is per workspace root and
 //! in-memory: a step that ended just before a restart is not recorded, which
 //! costs at most one cooldown the ledger would have armed.
 
