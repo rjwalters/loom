@@ -7,9 +7,9 @@ on:
     types: [opened, synchronize, reopened]
   # Merge queue (#10257, Phase C of #9978): validate the COMBINED merge-group
   # tree. Dormant until a repository enables a merge queue -- GitHub only
-  # emits this event for a queue-enabled branch, and this repository is
-  # user-owned, so today it never fires here. Every job a merge group needs
-  # runs on `merge_group` with no path filter (`changes` skips merge_group):
+  # emits this event for a queue-enabled branch, and `main` has no active
+  # `merge_queue` rule, so today it never fires here. Every job a merge group
+  # needs runs on `merge_group` with no path filter (`changes` skips merge_group):
   # the full suite, a superset of `push`, which path-filters only the image
   # jobs (#10825). `loom-daemon merge-group-ci audit` proves that statically;
   # see defaults/docs/merge-queue-ci.md.
@@ -352,7 +352,8 @@ jobs:
     # optimisation-only link failures) before merge. Since #11966 it no longer
     # runs on every backend PR: that observation is owed by the push run of the
     # merge commit and ci-daily.yml's release-matrix (and merge_group where a
-    # queue is enabled; it is dormant on this user-owned repo).
+    # queue is enabled; it is dormant while `main` has no active `merge_queue`
+    # rule).
     #
     # It is ALSO the one release build per CI run (#10824): the binary is
     # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
