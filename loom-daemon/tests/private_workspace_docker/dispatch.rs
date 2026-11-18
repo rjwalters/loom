@@ -66,20 +66,42 @@ test -z "${LOOM_DAEMON_SOCKET:-}"
 test -r .loom/hooks/guard-codex-bridge.sh
 test -r .claude/commands/loom/guide.md
 test -r .claude/commands/loom/sweep.md
+# The issue worktree a step uses: the namespaced base under LOOM_WORKTREE_ROOT.
+issue_worktree() { echo "$LOOM_WORKTREE_ROOT/$(basename "$PWD")/issue-$1"; }
 if [[ "$*" == *retain* ]]; then
   echo unpushed > retained.txt
+  # `retain-<N>`: the interrupted job also left an unpushed commit in issue N's
+  # existing worktree, which is what its snapshot reads (#14031). A bare
+  # `retain` job has no worktree, which snapshots as unpublished too.
+  if [[ "$*" =~ retain-([0-9]+) ]]; then
+    worktree="$(issue_worktree "${BASH_REMATCH[1]}")"
+    echo unpushed > "$worktree/retained.txt"
+    git -C "$worktree" add retained.txt
+    git -C "$worktree" commit -m 'fixture unpushed work'
+  fi
   echo fixture-retained-ready
   sleep 30
   exit 0
 fi
 if [[ "$*" == *mutate* ]]; then
-  git switch -c feature/issue-8786
-  echo 'private issue mutation' > mutation.txt
-  git add mutation.txt
-  git commit -m 'fixture issue mutation'
-  git push -u origin feature/issue-8786
-  .loom/scripts/create-pr.sh --repo github/repo --head feature/issue-8786 --base main --title 'Fixture change' --body 'Part of #8786' --label loom:review-requested
-  .loom/scripts/sweep-checkpoint.sh write 8786 builder-done --task-id fixture-sweep --pr-number 17
+  # Like a real Builder step: the issue branch lives in a worktree under the
+  # step's namespaced base (<LOOM_WORKTREE_ROOT>/<clone basename>/issue-N), which
+  # is where the job snapshot looks. Committing in the root clone would leave no
+  # worktree, and the job would (correctly) read recovery-required (#14031).
+  # `mutate-<N>` names the job's issue; a bare `mutate` is issue 8786.
+  issue=8786
+  [[ "$*" =~ mutate-([0-9]+) ]] && issue="${BASH_REMATCH[1]}"
+  worktree="$(issue_worktree "$issue")"
+  # A real repo gitignores .loom/worktrees/; this fixture clone does not, and
+  # the left-behind worktree must not make the root clone read as dirty.
+  echo '.loom/worktrees/' >> "$(git rev-parse --git-path info/exclude)"
+  git worktree add -b "feature/issue-$issue" "$worktree" HEAD
+  echo 'private issue mutation' > "$worktree/mutation.txt"
+  git -C "$worktree" add mutation.txt
+  git -C "$worktree" commit -m 'fixture issue mutation'
+  git -C "$worktree" push -u origin "feature/issue-$issue"
+  .loom/scripts/create-pr.sh --repo github/repo --head "feature/issue-$issue" --base main --title 'Fixture change' --body "Part of #$issue" --label loom:review-requested
+  .loom/scripts/sweep-checkpoint.sh write "$issue" builder-done --task-id fixture-sweep --pr-number 17
 fi
 if .loom/scripts/run-job.sh --image alpine -- true >/tmp/run-job.log 2>&1; then exit 91; fi
 grep -q 'unsupported in private-clone v1' /tmp/run-job.log
@@ -344,7 +366,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         &std::fs::read(root.join(".loom/private-jobs/issue-8786.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["outcome"], "completed", "{record}");
     assert_eq!(record["owner"], "fixture-sweep");
     assert_eq!(record["snapshot"]["published"], true);
     assert_eq!(
@@ -366,7 +388,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         Selection::prepare(&root, "codex", None, JobKind::Sweep, Some(8786), "fixture-interrupted")
             .unwrap()
             .unwrap();
-    let mut retained_command = f.adapter(name, "retain");
+    let mut retained_command = f.adapter(name, "retain-8786");
     interrupted.apply(&mut retained_command);
     let result = retained_command
         .env("GH_HOST", &gh_host)
