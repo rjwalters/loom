@@ -1337,7 +1337,10 @@ JSON
     ///
     /// `loom_config_env` outside, default inside. This is the crate's only
     /// nested acquisition, so no cycle exists; any future test that needs both
-    /// MUST nest in this same order.
+    /// MUST nest in this same order. The invariant that makes this true — a
+    /// function carrying `loom_config_env` is always itself a `#[test]` — is
+    /// enforced by `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`
+    /// (#14404); do not census the nested sites with a grep.
     #[serial]
     fn rest_queue_source_parses_the_live_listing_shape_body() {
         // Exercises the real production path (gh api --include -> forge_listing

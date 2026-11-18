@@ -447,6 +447,11 @@ mod tests {
     // `loom_config_env` lock (not the crate-wide unkeyed `#[serial]` lock —
     // see the CI-cost note on issue #4058) and pins the env var to `""` so a
     // private defaults file on the host can never leak in.
+    //
+    // A test that also needs the crate-default `#[serial]` lock nests it
+    // INSIDE this one (`loom_config_env` outer, default inner); a reverse
+    // order is a lock cycle that hangs the binary. That order is enforced by
+    // `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock` (#14404).
 
     #[test]
     #[serial(loom_config_env)]

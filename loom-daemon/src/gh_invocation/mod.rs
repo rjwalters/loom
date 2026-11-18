@@ -68,7 +68,9 @@
 //! holds **both** locks by nesting a `#[serial]` body inside the
 //! `#[serial(loom_config_env)]` test, because multi-key `#[serial(a, b)]` cannot
 //! name the default group (its key is the empty string; attribute keys are
-//! parsed as identifiers). See that test's own doc comment for the lock order.
+//! parsed as identifiers). See that test's own doc comment for the lock order;
+//! `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock` (#14404)
+//! fails if a non-test function ever takes `loom_config_env`.
 //!
 //! # `gh api` has no `--repo` flag (#8263)
 //!
