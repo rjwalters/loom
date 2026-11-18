@@ -92,6 +92,11 @@ gh issue create -R OWNER/REPO --title "Some title" --body-file /path/to/unique-b
 - `gh issue create` is GraphQL-backed. If it fails on GraphQL exhaustion, use the
   single REST POST instead: `gh api -X POST repos/OWNER/REPO/issues -f title=... -F body=@file`.
 - Use only labels that exist on the *foreign* repo; Loom's `loom:*` labels do not.
+- File the defect generically: nothing from a private repo goes into the title or
+  body -- no private repository name, issue or PR number, design detail, or measured
+  value. Nothing in CI can check text filed into a foreign repo (the vendored-ref
+  scan covers files in this repo, not issue text), so this rule is the only
+  protection and it rests on you.
 - Applies to issue filing only. Any other write to a repo the App is not on stays
   refused.
 
