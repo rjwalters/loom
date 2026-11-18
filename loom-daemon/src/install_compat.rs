@@ -412,6 +412,15 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge parent body",
     "forge parent split-state",
     "forge dashboard-link",
+    "park-record render",
+    "park-record parse",
+    "park-record apply",
+    "park-record released",
+    "park-record decision",
+    "park-record retract",
+    "operator-decision validate",
+    "operator-decision apply",
+    "operator-decision resolve",
 ];
 
 /// The identity of the installed-file payload this binary was built against:
