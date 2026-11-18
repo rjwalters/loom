@@ -125,6 +125,7 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-docs-pinned-paths.sh
 test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
@@ -154,6 +155,7 @@ test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-guide-work-plan-roadmap-convention.sh
+test-guide-work-plan-stamp.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
 test-install-active-session.sh
