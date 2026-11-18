@@ -280,6 +280,111 @@ pub fn sweep_runtime_attribution(
     last_launch_runtime(&contents)
 }
 
+/// A dispatched step's log path: `step-<role>-<item>.log` (#11898), where
+/// `item` is the issue for Curator/Builder/`champion_promote` steps and the PR
+/// for Judge/Doctor/`champion_merge` steps.
+///
+/// `SweepRegistry::compute_step_log_path` delegates here, for the same reason
+/// [`sweep_log_path`] is shared: the writer and the registry-free completion
+/// narration must never disagree about where a step's `# LOOM_LAUNCH` record
+/// lives (#14018).
+#[must_use]
+pub fn step_log_path(
+    workspace_root: &std::path::Path,
+    item: u32,
+    role: crate::step_role::StepRole,
+) -> std::path::PathBuf {
+    workspace_root
+        .join(".loom")
+        .join("logs")
+        .join(format!("step-{role}-{item}.log"))
+}
+
+/// The step logs, present on THIS host, that carry the work behind a merged PR:
+/// the Builder's (keyed by `issue`) and the Doctor's, Judge's and
+/// `champion_merge`'s (keyed by `pr`), in that order (#14018).
+///
+/// A step that ran on another host left no log here, so it is simply absent —
+/// the caller's answer is then partial, never fabricated.
+#[must_use]
+pub fn merge_step_logs(
+    workspace_root: &std::path::Path,
+    issue: u32,
+    pr: u32,
+) -> Vec<(crate::step_role::StepRole, std::path::PathBuf)> {
+    use crate::step_role::StepRole;
+    [
+        (StepRole::Builder, issue),
+        (StepRole::Doctor, pr),
+        (StepRole::Judge, pr),
+        (StepRole::ChampionMerge, pr),
+    ]
+    .into_iter()
+    .map(|(role, item)| (role, step_log_path(workspace_root, item, role)))
+    .filter(|(_, path)| path.is_file())
+    .collect()
+}
+
+/// The runtime attribution a merged PR's completion publishes (#14018): what
+/// [`sweep_runtime_attribution`] gives a legacy `/loom:sweep` log, for a
+/// dispatched step.
+///
+/// Under step dispatch nothing writes `sweep-issue-<N>.log`, so the launch
+/// record lives in the step logs ([`merge_step_logs`]). The **first** step log
+/// present on this host speaks for the PR — Builder, else Doctor, else Judge,
+/// else `champion_merge` — and it speaks even when it carries no record: a
+/// Claude Builder writes none, and must not be relabelled with the runtime of
+/// the Judge that reviewed it. With no step log at all this falls back to the
+/// legacy sweep log, so a pre-step completion is unchanged.
+#[must_use]
+pub fn merge_runtime_attribution(
+    workspace_root: &std::path::Path,
+    issue: u32,
+    pr: u32,
+) -> Option<RuntimeAttribution> {
+    match merge_step_logs(workspace_root, issue, pr)
+        .into_iter()
+        .next()
+    {
+        Some((_, path)) => last_launch_runtime(&std::fs::read_to_string(path).ok()?),
+        None => sweep_runtime_attribution(workspace_root, issue),
+    }
+}
+
+/// Every OpenCode session id named by the event stream in a step log's
+/// `contents` (#14018), first-seen order, de-duplicated.
+///
+/// An OpenCode launch's `--format json` stream puts `"sessionID":"ses_…"` at
+/// the top level of every event. Only a line that is itself a JSON object is
+/// read, and only its **top-level** key: a tool output or an agent's text that
+/// quotes another session's id is a JSON string *inside* an event, never that
+/// key. The id shape (`ses_` plus alphanumerics) is checked before it is ever
+/// compared with a store row.
+#[must_use]
+pub fn opencode_session_ids(contents: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim_start();
+        if !line.starts_with('{') || !line.contains("\"sessionID\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(id) = value.get("sessionID").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let valid = id.strip_prefix("ses_").is_some_and(|rest| {
+            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+        if valid && seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
 /// Parse the credential attribution out of a per-sweep log's `contents`,
 /// scanning only the region at/after this dispatch's header (`header_anchor`,
 /// e.g. `sweep_id=<id>`).
@@ -902,6 +1007,105 @@ mod tests {
 
         // A DIFFERENT issue's log is never consulted.
         assert_eq!(sweep_runtime_attribution(root, 8508), None);
+    }
+
+    // ========================================================================
+    // Step logs (Issue #14018)
+    // ========================================================================
+
+    fn write_step_log(root: &std::path::Path, role: &str, item: u32, runtime: Option<&str>) {
+        let path = step_log_path(root, item, role.parse_role());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = runtime.map_or_else(String::new, |rt| {
+            format!("# LOOM_LAUNCH {}\n", serde_json::json!({"schema": 1, "runtime": rt}))
+        });
+        std::fs::write(&path, format!("==== dispatch ====\n{record}prose\n")).unwrap();
+    }
+
+    trait ParseRole {
+        fn parse_role(&self) -> crate::step_role::StepRole;
+    }
+
+    impl ParseRole for &str {
+        fn parse_role(&self) -> crate::step_role::StepRole {
+            crate::step_role::StepRole::ALL
+                .into_iter()
+                .find(|r| r.as_str() == *self)
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn step_log_path_names_the_log_a_step_actually_writes() {
+        let root = std::path::Path::new("/ws");
+        assert!(step_log_path(root, 42, crate::step_role::StepRole::Builder)
+            .ends_with(".loom/logs/step-builder-42.log"));
+        assert!(step_log_path(root, 7, crate::step_role::StepRole::ChampionMerge)
+            .ends_with(".loom/logs/step-champion_merge-7.log"));
+    }
+
+    #[test]
+    fn a_step_dispatched_merge_resolves_its_runtime_from_the_builders_step_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_step_log(root, "builder", 100, Some("opencode"));
+        write_step_log(root, "judge", 200, None);
+        let attribution = merge_runtime_attribution(root, 100, 200).unwrap();
+        assert_eq!(attribution.runtime, "opencode");
+        // Not the sweep log (absent), and the PR-keyed logs are found by PR.
+        assert_eq!(merge_step_logs(root, 100, 200).len(), 2, "builder by issue, judge by pr");
+    }
+
+    #[test]
+    fn a_claude_builder_is_not_relabelled_with_the_runtime_of_the_judge_that_reviewed_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Claude writes no launch record; the Judge ran on OpenCode.
+        write_step_log(root, "builder", 100, None);
+        write_step_log(root, "judge", 200, Some("opencode"));
+        assert_eq!(merge_runtime_attribution(root, 100, 200), None);
+    }
+
+    #[test]
+    fn without_a_builder_log_the_first_step_log_present_speaks_for_the_pr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_step_log(root, "judge", 200, Some("opencode"));
+        write_step_log(root, "champion_merge", 200, Some("pi"));
+        assert_eq!(merge_runtime_attribution(root, 100, 200).unwrap().runtime, "opencode");
+    }
+
+    #[test]
+    fn with_no_step_log_a_merge_falls_back_to_the_legacy_sweep_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(merge_runtime_attribution(root, 100, 200), None);
+        let path = sweep_log_path(root, 100);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("# LOOM_LAUNCH {}\n", serde_json::json!({"schema": 1, "runtime": "kimi"})),
+        )
+        .unwrap();
+        assert_eq!(merge_runtime_attribution(root, 100, 200).unwrap().runtime, "kimi");
+    }
+
+    #[test]
+    fn opencode_session_ids_come_only_from_top_level_event_keys() {
+        let log = [
+            "==== dispatch ====",
+            r#"{"type":"step_start","sessionID":"ses_abc123","part":{"sessionID":"ses_nested"}}"#,
+            r#"{"type":"text","sessionID":"ses_abc123","part":{"text":"quoted {\"sessionID\":\"ses_injected\"}"}}"#,
+            r#"{"type":"step_start","sessionID":"ses_def456"}"#,
+            // Not a JSON object line, wrong shape, or not a string.
+            r#"prose mentioning "sessionID":"ses_prose""#,
+            r#"{"sessionID":"not-a-session"}"#,
+            r#"{"sessionID":42}"#,
+            r#"{"sessionID":"ses_"}"#,
+        ]
+        .join("\n");
+        assert_eq!(opencode_session_ids(&log), vec!["ses_abc123", "ses_def456"]);
+        assert!(opencode_session_ids("").is_empty());
     }
 
     // ========================================================================
