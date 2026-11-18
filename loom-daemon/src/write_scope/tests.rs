@@ -669,7 +669,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("role_runner/roster.rs", Gated),
         ("dep_classify/forge.rs", OriginResolved("dep_classify/cli.rs")),
-        ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
+        ("cli/notify_cleared_blockers.rs", Gated),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),

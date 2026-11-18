@@ -58,15 +58,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::cmd_out::CmdOutcome;
-use crate::script_helpers::run_gh;
+use crate::cmd_out::{CmdOutcome, DEFAULT_TIMEOUT};
+use crate::forge_call_stats::ops;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::stale_blocked::notify::{self, marker_for};
 use crate::stale_blocked::{batch, budget, classify, resolved, Artifact, Evidence, Verdict};
+use crate::write_scope::Verdict as Scope;
 
 use super::stale_blocked::DEFAULT_LIMIT;
 
 #[derive(clap::Args)]
-pub(crate) struct NotifyClearedBlockersArgs {
+pub struct NotifyClearedBlockersArgs {
     /// Issue/PR number(s) that just closed or merged. Repeatable, and also
     /// accepts several values after one flag, so one merge is one scan.
     #[arg(long, value_name = "N", num_args = 1.., required_unless_present_any = ["pr", "resweep"])]
@@ -127,17 +129,25 @@ struct Notified {
 
 impl NotifyClearedBlockersArgs {
     /// Always `Ok(())` — see the module doc's "Best-effort" section.
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let root = match &self.repo_root {
             Some(r) => r.clone(),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
-        let repo = self.repo.as_deref();
+        crate::forge_cmd::decline_gitea(Some(&root));
+        let repo = self.repo.or_else(|| {
+            std::env::var("LOOM_REPO")
+                .ok()
+                .filter(|r| !r.trim().is_empty())
+        });
+        let repo = repo.as_deref();
+        let scanned = crate::forge_etag_store::resolve_target(Some(&root), repo).repo;
+        let permission = std::cell::OnceCell::new();
         let mut closed = self.closed.clone();
         let mut unread: Vec<String> = Vec::new();
         if let Some(pr) = self.pr {
             closed.push(pr);
-            match pr_close_targets(pr, repo, &root) {
+            match pr_close_targets(pr, scanned.as_deref(), &root) {
                 Ok(targets) => closed.extend(targets),
                 Err(why) => unread.push(format!("PR #{pr} closing references: {why}")),
             }
@@ -205,9 +215,37 @@ impl NotifyClearedBlockersArgs {
             if self.resweep && !eligible {
                 continue;
             }
+            let target = if self.dry_run {
+                None
+            } else {
+                let scope = permission.get_or_init(|| {
+                    crate::write_scope::may_write_from_at(&root, repo, "notify-cleared-blockers")
+                });
+                match scope {
+                    Scope::Allow(nwo)
+                        if scanned
+                            .as_deref()
+                            .is_some_and(|r| r.eq_ignore_ascii_case(nwo)) =>
+                    {
+                        Some(nwo.as_str())
+                    }
+                    Scope::Allow(_) => {
+                        unread.push(format!(
+                            "{} #{}: write target differs from scanned repository",
+                            g.kind.label(),
+                            g.number
+                        ));
+                        continue;
+                    }
+                    Scope::Deny(why) => {
+                        unread.push(format!("{} #{}: {why}", g.kind.label(), g.number));
+                        continue;
+                    }
+                }
+            };
             // Label first, comment second: the comment is the audit trail and
             // must only claim a transition that actually happened.
-            let unparked = eligible && (self.dry_run || unpark(g.number, repo, &root));
+            let unparked = eligible && target.is_none_or(|r| unpark(g.number, r, &root));
             // Resweep has no marker short-circuit, so a comment posted after a
             // failed unpark would repeat on every run. Report it instead.
             if resweep_skips_comment(self.resweep, self.dry_run, unparked) {
@@ -218,10 +256,10 @@ impl NotifyClearedBlockersArgs {
                 ));
                 continue;
             }
-            let posted = !self.dry_run && {
+            let posted = target.is_some_and(|r| {
                 let body = comment_body_for(g.kind, &cited, &reasons, unparked, self.resweep);
-                post_comment(g.kind, g.number, &body, repo, &root)
-            };
+                post_comment(g.kind, g.number, &body, r, &root)
+            });
             notified.push(Notified {
                 kind: g.kind,
                 number: g.number,
@@ -280,7 +318,18 @@ pub(super) fn pr_close_targets(
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
-    match run_gh(&args, root, false) {
+    let read = GhInvocation::new(
+        Operation::new("notify.closing_references"),
+        AccessIntent::Read,
+        repo.and_then(|r| GhTarget::repo(r).ok())
+            .unwrap_or(GhTarget::None),
+        DEFAULT_TIMEOUT,
+    )
+    .forge_op(ops::PR_CLOSING_ISSUE_REFERENCES)
+    .current_dir(root)
+    .args(args)
+    .run();
+    match read {
         CmdOutcome::Ran(o) if o.status.success() => parse_close_targets(&o.stdout),
         CmdOutcome::Ran(o) => Err(format!("gh pr view exited {}", o.status)),
         CmdOutcome::Unavailable(u) => Err(format!("gh pr view could not be run: {u:?}")),
@@ -367,18 +416,46 @@ fn comment_body_for(
     body
 }
 
+/// Both mutations carry the admitted repository and the discovered dependent.
+fn write(
+    number: i64,
+    repo: &str,
+    root: &Path,
+    op: crate::forge_call_stats::ForgeOp,
+    args: &[&str],
+) -> bool {
+    let (Ok(target), Ok(number)) = (GhTarget::repo(repo), u32::try_from(number)) else {
+        return false;
+    };
+    GhInvocation::new(
+        Operation::new("notify.dependent"),
+        AccessIntent::Write,
+        target,
+        DEFAULT_TIMEOUT,
+    )
+    .forge_op(op)
+    .number(number)
+    .current_dir(root)
+    .args(args)
+    .args(["--repo", repo])
+    .run()
+    .succeeded()
+}
+
 /// Post the notification comment. Returns whether `gh` reported success.
-fn post_comment(kind: Artifact, number: i64, body: &str, repo: Option<&str>, root: &Path) -> bool {
+fn post_comment(kind: Artifact, number: i64, body: &str, repo: &str, root: &Path) -> bool {
     let entity = match kind {
         Artifact::Issue => "issue",
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    let mut args = vec![entity, "comment", n.as_str(), "--body", body];
-    if let Some(r) = repo {
-        args.extend(["--repo", r]);
-    }
-    matches!(run_gh(&args, root, false), CmdOutcome::Ran(o) if o.status.success())
+    write(
+        number,
+        repo,
+        root,
+        ops::COMMENT_CREATE,
+        &[entity, "comment", &n, "--body", body],
+    )
 }
 
 /// Whether a newly-cleared artifact may be unparked mechanically (#13331).
@@ -419,21 +496,23 @@ fn unpark_eligible(kind: Artifact, labels: &[String], body: &str, ev: &Evidence)
 }
 
 /// Swap `loom:blocked` for `loom:curated`. Returns whether `gh` reported success.
-fn unpark(number: i64, repo: Option<&str>, root: &Path) -> bool {
+fn unpark(number: i64, repo: &str, root: &Path) -> bool {
     let n = number.to_string();
-    let mut args = vec![
-        "issue",
-        "edit",
-        n.as_str(),
-        "--remove-label",
-        "loom:blocked",
-        "--add-label",
-        "loom:curated",
-    ];
-    if let Some(r) = repo {
-        args.extend(["--repo", r]);
-    }
-    matches!(run_gh(&args, root, false), CmdOutcome::Ran(o) if o.status.success())
+    write(
+        number,
+        repo,
+        root,
+        ops::ISSUE_EDIT_LABELS,
+        &[
+            "issue",
+            "edit",
+            &n,
+            "--remove-label",
+            "loom:blocked",
+            "--add-label",
+            "loom:curated",
+        ],
+    )
 }
 
 /// Stdout: what was notified (or nothing). Stderr: what could not be read or

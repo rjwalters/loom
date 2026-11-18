@@ -699,7 +699,7 @@ Open questions for the reviewer:
 
 ## 13. Phase 3a: forge reads (#14395)
 
-The first Phase 3 slice (epic #12708). It moves the **read** half of the
+The first Phase 3 slice (#14395, epic #12708) moves the **read** half of the
 `forge` family onto `loom-tools`; writes are #14396, worktree/claim/lease is
 #14397 and the role/skill/wrapper switch-over is #14398.
 
@@ -746,7 +746,7 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | Verb or family | Reason |
 | --- | --- |
 | `forge comment`, `create-issue`, `rerun`, `auto-merge`, `disable-auto-merge`, `verdict-labels`, `verdict-reconcile`, `verdict-lock`, `doctor-handback`, `journal-ci-refusal`, `parent link`, `merge-queue enqueue\|dequeue\|reconcile\|handoff\|step\|revoke\|group-check\|authorize-check` | write the forge, a local journal or lock, or were not shown to be read-only (`authorize-check` and `group-check` post or compute merge-authorization state). #14396 |
-| `merge-pr*`, `park-record`, `operator-decision`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 |
+| `merge-pr*`, `park-record`, `operator-decision` | writes; merge integration is #14396 / #8191 |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
@@ -771,3 +771,19 @@ No wrapper or locator changed. `loom_tools_serves` in
 `forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
 which can now read the served list from `capabilities --json`.
 
+### 13.6 Hold evidence, curation and blocker notification (#14465)
+
+Both binaries dispatch these commands to the same Rust handlers. All four
+`champion-hold` verbs read evidence. The caller posts the marker printed by
+`merge-failed-marker`. A notification dry run also requires only read access.
+
+In session and local-daemon modes, `curation-complete` checks write scope on
+the explicit repository before projecting points. `notify-cleared-blockers`
+checks the scan's repository and sends each eligible label edit and comment
+to the discovered dependent. These GitHub handlers decline Gitea with exit 3.
+
+Fleet diagnostics and previews require a usable fleet reader. Fleet mutations
+remain pending on #14465. The scoped broker grants the fleet role issue creation
+and commit-status posting. Its label policy also excludes the curation and
+unpark transitions. Until a scoped operation is available, the tools entry
+point refuses these writes before contacting GitHub.

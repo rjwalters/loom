@@ -1,21 +1,10 @@
 //! `loom-tools`: the tools-only entry point (#12938, epic #12708; design
 //! `docs/design/loom-tools-cli-boundary.md` §6.2 step 4, §7.3, §10).
 //!
-//! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939), plus the
-//! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940), plus
-//! `resolve-model` (#13878) and `resolve-role-model` (#13956): the
-//! tools-only installer (`scripts/install/provision-tools.sh`) has no daemon to call. The handlers are the
-//! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config|resolve-model`
-//! call), so there is no second copy. This crate links `loom_daemon` and not
-//! `daemon_service`, which is private to the `loom-daemon` bin.
-//!
-//! `forge <read verb>` (#14395) is the family of forge reads: the same
-//! `ForgeAction` tree and handler `loom-daemon forge` runs, minus the verbs
-//! that write (#14396). It and `checkpoint read` (§10.3) are the commands
-//! behind the mode gate: it resolves `mode` ([`tools_mode`])
-//! before `forge_gateway::enable_cli_reads()` is considered, and enables it
-//! only on the fleet route. `strip-ansi`, the other checkpoint actions and
-//! `config get` never route, and `config get mode` must work with `mode` unset.
+//! Both binaries call the same library handlers. The tools binary does not
+//! link the daemon service. `install_compat::TOOLS_COMMANDS` lists its surface.
+//! Forge commands, workflow commands and `checkpoint read` resolve the tools
+//! mode before contacting the forge. Local-only operations can run offline.
 
 use std::io::Write;
 
@@ -24,8 +13,9 @@ use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
     config_get_dispatch, handle_checkpoint_command, handle_forge_read_command,
     handle_resolve_model_command, handle_resolve_role_model_command, handle_strip_ansi_command,
-    CheckpointAction, ConfigArgs, ForgeReadCli, InstallBinaryCommand, ReleaseFetchArgs,
-    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs,
+    ChampionHoldCommand, CheckpointAction, ConfigArgs, CurationCompleteArgs, ForgeReadCli,
+    InstallBinaryCommand, NotifyClearedBlockersArgs, ReleaseFetchArgs, ResolveModelArgs,
+    ResolveRoleModelArgs, ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::tools_mode::{self, Route};
@@ -33,7 +23,7 @@ use loom_daemon::tools_mode::{self, Route};
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads)"
+    about = "Loom command-line tools for agent sessions"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -81,6 +71,13 @@ enum ToolsCommands {
     /// (#14395), on the person's own forge credential. A verb that writes is
     /// refused with exit 64 (served by `loom-daemon forge` until #14396).
     Forge(ForgeReadCli),
+    /// Read Champion hold evidence for a pull request.
+    #[command(subcommand)]
+    ChampionHold(ChampionHoldCommand),
+    /// Project the trusted points estimate and curation labels.
+    CurationComplete(CurationCompleteArgs),
+    /// Notify dependents whose cited blockers have closed.
+    NotifyClearedBlockers(NotifyClearedBlockersArgs),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -112,10 +109,9 @@ fn capabilities(repo: Option<&std::path::Path>) -> Result<()> {
 }
 
 /// Resolve `mode`, then (fleet route only) adopt the exported read routing.
-fn mode_gate() -> Result<()> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+fn mode_gate(root: &std::path::Path) -> Result<Route> {
     let resolution =
-        tools_mode::resolve(&tools_mode::inputs_from_env(&cwd)).map_err(anyhow::Error::msg)?;
+        tools_mode::resolve(&tools_mode::inputs_from_env(root)).map_err(anyhow::Error::msg)?;
     for note in &resolution.notes {
         eprintln!("{note}");
     }
@@ -128,15 +124,40 @@ fn mode_gate() -> Result<()> {
             }
         }
     }
+    Ok(resolution.route)
+}
+
+/// The fleet broker's role profile has no label or comment operations.
+/// Never run these mutations on an ambient gh credential in fleet mode.
+fn workflow_gate(root: &std::path::Path, writes: bool) -> Result<()> {
+    let checkout = loom_daemon::repo_root::find_repo_root(root);
+    let root = checkout.as_deref().unwrap_or(root);
+    if writes
+        && loom_daemon::config_resolver::tier_conflicts(root)
+            .iter()
+            .any(|c| c.key == "mode")
+    {
+        anyhow::bail!(
+            "conflicting fleet and workspace mode settings; reconcile them before a workflow write"
+        );
+    }
+    if mode_gate(root)? == Route::Fleet {
+        anyhow::ensure!(!writes, "the scoped fleet write broker does not authorize workflow label edits or blocker comments");
+        anyhow::ensure!(
+            loom_daemon::forge_gateway::cli_reads_reader_only(),
+            "no usable fleet read route"
+        );
+    }
     Ok(())
 }
 
 fn run() -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     match ToolsCli::parse().command {
         ToolsCommands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
         ToolsCommands::Checkpoint { action } => {
             if matches!(action, CheckpointAction::Read { .. }) {
-                mode_gate()?;
+                mode_gate(&cwd)?;
             }
             handle_checkpoint_command(action)
         }
@@ -150,9 +171,21 @@ fn run() -> Result<()> {
         ToolsCommands::Forge(cli) => {
             // Refuse a write verb before the gate can enable any routing for it.
             if cli.is_read() && cli.reaches_forge() {
-                mode_gate()?;
+                mode_gate(&cwd)?;
             }
             handle_forge_read_command(cli)
+        }
+        ToolsCommands::ChampionHold(cmd) => {
+            workflow_gate(&cwd, false)?;
+            cmd.run()
+        }
+        ToolsCommands::CurationComplete(args) => {
+            workflow_gate(&args.workspace_root, true)?;
+            args.run()
+        }
+        ToolsCommands::NotifyClearedBlockers(args) => {
+            workflow_gate(args.repo_root.as_deref().unwrap_or(&cwd), !args.dry_run)?;
+            args.run()
         }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }

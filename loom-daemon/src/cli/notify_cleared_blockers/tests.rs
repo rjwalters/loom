@@ -254,3 +254,9 @@ fn resweep_comment_does_not_say_just_closed() {
     let b = comment_body_for(Artifact::Issue, &[7], &[], true, true);
     assert!(b.contains("#7 closed,") && !b.contains("just closed"));
 }
+
+#[test]
+fn unrepresentable_dependent_number_cannot_write() {
+    assert!(!post_comment(Artifact::Pr, -1, "body", "acme/repo", Path::new(".")));
+    assert!(!unpark(i64::MAX, "acme/repo", Path::new(".")));
+}

@@ -338,6 +338,12 @@ fn capabilities_list_the_forge_reads_and_not_the_writes() {
         .filter_map(|c| c.as_str())
         .collect();
     for read in [
+        "champion-hold classify",
+        "champion-hold merge-failed-marker",
+        "champion-hold ratification",
+        "champion-hold self-release-calibration",
+        "curation-complete",
+        "notify-cleared-blockers",
         "forge check-claim",
         "forge wait-checks",
         "forge merge-queue status",
@@ -364,3 +370,7 @@ fn capabilities_list_the_forge_reads_and_not_the_writes() {
     let dv: serde_json::Value = serde_json::from_slice(&d.stdout).unwrap();
     assert_eq!(dv["tools_commands"], v["tools_commands"]);
 }
+
+#[cfg(unix)]
+#[path = "loom_tools_slice/workflow.rs"]
+mod workflow;
