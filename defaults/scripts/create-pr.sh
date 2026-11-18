@@ -281,7 +281,10 @@ EX_REVIEW_GATE_COLLISION=6
 
 # One keyword-reference extractor shared by the review-gate lookup (#9453
 # phase 5) and the superseded-target lookup (#6277) below, so the two cannot
-# drift (#13939). First-match semantics, as before.
+# drift (#13939). LAST-match semantics (#14255): the declared reference is the
+# trailing one (builder-pr.md puts `Closes #N` / `Part of #N` last), so a
+# narrated keyword earlier in the body (`v1.2 fixed #123, and this PR
+# Closes #456`, `PR #14082 (which fixes #13939)`) must not outrank it.
 #
 # The leading-guard alternation skips a keyword whose immediately preceding
 # token is a PR/issue reference: `PR #605 fixed #597` narrates history, it
@@ -299,11 +302,16 @@ EX_REVIEW_GATE_COLLISION=6
 _cpr_body_ref_issue() {
   # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
   grep -ioE "(^|[^#0-9][[:space:]]+|[^[:alnum:]_#[:space:]])($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
-    | head -1 | grep -oE '[0-9]+' || true
+    | tail -1 | grep -oE '[0-9]+' || true
 }
 
 # An empty body matches nothing (grep's no-match is absorbed by `|| true`).
-TARGET_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to')"
+# A closing reference outranks a partial one regardless of order (#14255): with
+# `Closes #A` ... `Part of #B` the PR's target is A, and the review gate must
+# not consult B (a family/epic that routinely has open sibling PRs). Only when
+# the body has no closing reference does the last partial reference apply.
+CLOSES_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?')"
+TARGET_ISSUE="${CLOSES_ISSUE:-$(_cpr_body_ref_issue 'part of|contributes to')}"
 
 # One daemon resolution, shared by every daemon call below (#10518).
 # shellcheck source=./lib/locate-daemon-bin.sh
@@ -355,7 +363,7 @@ fi
 # partial-increment references for a family/epic issue that intentionally
 # stays open across multiple PRs -- never match this pattern, so those PRs
 # are exempt by construction; no separate carve-out is needed.
-CLOSES_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?')"
+# (CLOSES_ISSUE is computed once above, alongside TARGET_ISSUE.)
 
 if [[ -n "$CLOSES_ISSUE" ]]; then
   # shellcheck disable=SC2054  # the comma is inside a single --json value, not an array separator

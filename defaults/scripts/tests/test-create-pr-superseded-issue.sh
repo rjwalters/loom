@@ -316,6 +316,41 @@ run_create_pr --title "fix: something" --body "Background first.
 Fixes #115" --head "feature/issue-115"
 assert_eq "1" "$EXIT_CODE" "Fixes #115 at line start after blank line (closed) -> refused"
 
+# T18 (#14255): a parenthesised narration (`PR #605 (which fixes #597)`)
+# earlier in the body must not outrank the declared trailing `Closes #623` --
+# with #597 CLOSED and #623 OPEN the check fires on #623 only (last-match).
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-597-state.txt"
+echo "605" > "$STUB_DIR/issue-597-number.txt"
+echo "OPEN" > "$STUB_DIR/issue-623-state.txt"
+run_create_pr --title "fix: something" --body "Builds on PR #605 (which fixes #597).
+
+Closes #623" --head "feature/issue-623"
+assert_eq "0" "$EXIT_CODE" "Parenthesised narration + Closes #623 (open) -> exits 0"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 623" "Freshness check targets the declared #623"
+assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 597" "Narrated #597 is never looked up"
+
+# T19 (#14255): `Closes #A` ... `Part of #B` -> only the closing reference is
+# checked, in either order (the partial reference never reaches this check).
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-116-state.txt"
+echo "889" > "$STUB_DIR/issue-116-number.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-889-head.txt"
+run_create_pr --title "fix: something" --body "Part of #201
+
+Closes #116" --head "feature/issue-116"
+assert_eq "1" "$EXIT_CODE" "Part of #201 then Closes #116 (closed) -> refused on #116"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 116" "Freshness check targets the closing #116"
+
+reset_fixtures
+echo "OPEN" > "$STUB_DIR/issue-117-state.txt"
+run_create_pr --title "fix: something" --body "Closes #117
+
+Part of #202" --head "feature/issue-117"
+assert_eq "0" "$EXIT_CODE" "Closes #117 (open) then Part of #202 -> exits 0"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 117" "Freshness check targets the closing #117"
+assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 202" "Partial #202 is never looked up"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
