@@ -132,12 +132,12 @@ fn attributed_transcripts_filters_by_role_and_window() {
 
     // The window is anchored on "now" because the fixtures' mtimes are now.
     let now = Utc::now();
-    let found = attributed_transcripts(&projects, &root, "judge", now, now);
+    let found = attributed_transcripts(&projects, &root, "judge", None, now, now);
     assert_eq!(found, vec![mine.clone()]);
 
     // A window far in the past excludes everything, even the right role —
     // the mtime half of the key is load-bearing.
-    let stale = attributed_transcripts(&projects, &root, "judge", at(0), at(1));
+    let stale = attributed_transcripts(&projects, &root, "judge", None, at(0), at(1));
     assert!(stale.is_empty(), "out-of-window transcript must not attribute");
 }
 

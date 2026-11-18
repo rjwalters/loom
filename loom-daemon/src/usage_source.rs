@@ -527,15 +527,56 @@ pub fn role_tick_tokens_by_model(
     log_path: &Path,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<ModelUsageTotals>> {
+    native_tokens_by_model(runtime, &role_tick_directories(root), log_path, window)
+}
+
+/// [`role_tick_tokens_by_model`] for a **step-dispatched** run (#14406).
+///
+/// A step is a role session keyed by one work item, so an issue-keyed step
+/// (Curator, Builder, `champion_promote`) is read over the same directories a
+/// sweep on that issue is — the workspace root plus the issue's worktree
+/// ([`sweep_directories`]), where its Builder runs. A PR-keyed step
+/// (Judge, Doctor, `champion_merge`) carries a PR number that cannot name an
+/// issue worktree here, so it is read over the workspace root alone, as a
+/// role tick is. `log_path` is the step's own `step-<role>-<item>.log`.
+///
+/// The directory + window key cannot tell two steps that ran in the same
+/// directory at the same time apart; only the Claude arm (which matches on
+/// the transcript's own command) and Pi (which reads the step's own log) are
+/// exact per step. `None` for [`UsageSource::ClaudeTranscripts`], like the
+/// tick reader.
+#[must_use]
+pub fn step_tokens_by_model(
+    runtime: Option<&str>,
+    root: &Path,
+    item: (u32, bool),
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<Vec<ModelUsageTotals>> {
+    let (number, acts_on_pr) = item;
+    let directories = if acts_on_pr {
+        role_tick_directories(root)
+    } else {
+        sweep_directories(root, number)
+    };
+    native_tokens_by_model(runtime, &directories, log_path, window)
+}
+
+fn native_tokens_by_model(
+    runtime: Option<&str>,
+    directories: &[PathBuf],
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<Vec<ModelUsageTotals>> {
     match UsageSource::for_runtime(runtime) {
         UsageSource::OpenCodeSessionDb => {
-            crate::opencode_usage::tokens_by_model(&role_tick_directories(root), window, None)
+            crate::opencode_usage::tokens_by_model(directories, window, None)
         }
         UsageSource::KimiSessionStore => {
-            crate::kimi_usage::tokens_by_model(&role_tick_directories(root), None, window, None)
+            crate::kimi_usage::tokens_by_model(directories, None, window, None)
         }
         UsageSource::CodexSessionRollouts => crate::codex_usage::tokens_by_model(
-            &crate::codex_usage::SessionFilter::directories(&role_tick_directories(root)),
+            &crate::codex_usage::SessionFilter::directories(directories),
             window,
             None,
         ),
