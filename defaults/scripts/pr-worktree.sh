@@ -157,7 +157,7 @@ resolve_pr_head_sha() {
     sha="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
     [[ "$sha" =~ ^[0-9a-f]{40,64}$ ]] || sha=""
     if [[ -z "$sha" ]] || ! git -C "$REPO_ROOT" cat-file -e "$sha^{commit}" 2>/dev/null; then
-        if git -C "$REPO_ROOT" fetch -q origin "pull/$PR_NUMBER/head" >/dev/null 2>&1; then
+        if git -C "$REPO_ROOT" fetch -q origin -- "pull/$PR_NUMBER/head" >/dev/null 2>&1; then
             local fetched
             fetched="$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD 2>/dev/null || true)"
             [[ -n "$sha" ]] || sha="$fetched"
@@ -190,7 +190,7 @@ create_detached_pr_worktree() {
     local sha
     sha="$(resolve_pr_head_sha)"
     if [[ -z "$sha" ]]; then
-        print_error "Could not resolve PR #$PR_NUMBER's head sha (gh pr view and 'git fetch origin pull/$PR_NUMBER/head' both failed)"
+        print_error "Could not resolve PR #$PR_NUMBER's head sha (gh pr view and 'git fetch origin -- pull/$PR_NUMBER/head' both failed)"
         exit 1
     fi
     mkdir -p "$WORKTREE_ROOT_DIR"
