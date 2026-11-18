@@ -171,6 +171,64 @@ fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
     model
 }
 
+/// The `--model`/`--effort` a legacy adapter launch resolves, read off the
+/// child's own argv and the adapters' documented env tier (#14167): an
+/// explicit flag wins, then `LOOM_MODEL` / `LOOM_EFFORT` (plus
+/// `LOOM_CODEX_MODEL` for codex, its static per-seat default), then nothing.
+/// Beyond that tier the adapter picks its own, so an absent value stays
+/// absent rather than being filled with a configured guess. `--` ends
+/// adapter flags, and a prompt or config value that looks like a flag is
+/// data, mirroring `codex_adapter_model`'s scan.
+fn adapter_launch_facts(
+    runtime: &str,
+    args: &[std::ffi::OsString],
+) -> (Option<String>, Option<String>) {
+    let (model, effort) = adapter_flag_facts(args);
+    let model = model.or_else(|| nonempty_env("LOOM_MODEL")).or_else(|| {
+        (runtime == "codex")
+            .then(|| nonempty_env("LOOM_CODEX_MODEL"))
+            .flatten()
+    });
+    let effort = effort.or_else(|| nonempty_env("LOOM_EFFORT"));
+    (model, effort)
+}
+
+/// The argv-only half of [`adapter_launch_facts`]: the explicit
+/// `--model`/`--effort` flags, env-free so it is unit-testable without
+/// racing the process environment.
+fn adapter_flag_facts(args: &[std::ffi::OsString]) -> (Option<String>, Option<String>) {
+    let mut model = None;
+    let mut effort = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else { continue };
+        match arg {
+            "--" => break,
+            "-m" | "--model" => model = args.next().and_then(|s| s.to_str()).map(str::to_owned),
+            "--effort" => effort = args.next().and_then(|s| s.to_str()).map(str::to_owned),
+            "-p" | "--prompt" | "-s" | "--sandbox" | "-c" | "--config" | "--log" | "--profile" => {
+                args.next();
+            }
+            _ => {
+                if let Some(value) = arg
+                    .strip_prefix("--model=")
+                    .or_else(|| arg.strip_prefix("-m="))
+                {
+                    model = Some(value.to_owned());
+                } else if let Some(value) = arg.strip_prefix("--effort=") {
+                    effort = Some(value.to_owned());
+                }
+            }
+        }
+    }
+    // An empty value is absent, not empty: the dispatch treats `--model ""`
+    // as unset, and a blank never names a model.
+    (
+        model.filter(|value| !value.trim().is_empty()),
+        effort.filter(|value| !value.trim().is_empty()),
+    )
+}
+
 /// Native sweep workers authenticate through their harness, not Claude's pool.
 pub fn uses_native_sweep(root: &Path) -> bool {
     uses_native_role(root, "sweep-lifecycle")
@@ -270,7 +328,7 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         .as_ref()
         .and_then(|a| a.child(SpanName::RuntimePreflight, Default::default()))
         .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
-    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref());
+    let result = run_preflight(args, &root, role.as_deref(), preflight.as_ref(), attempt.as_ref());
     if let Some(span) = preflight {
         // A rejected preflight is one of the two shapes an operator reports
         // ("the attempt failed in 300 ms with no runtime span"): record the
@@ -353,6 +411,7 @@ pub(crate) fn resolve_launch_runtime(
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
+    invocation_role: Option<&str>,
     preflight: Option<&crate::observability::lifecycle::Span>,
     attempt: Option<&crate::observability::lifecycle::Span>,
 ) -> Result<(), LaunchError> {
@@ -365,6 +424,20 @@ fn run_preflight(
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return Err(LaunchError::config("invalid runtime name"));
+    }
+    // #14167: identity facts ride every runtime span, for every runtime —
+    // the repo/item scope the inherited execution root carries, plus the
+    // sweep id and role the dispatcher pinned into this process's
+    // environment. Stamped before the runtime-specific branches so a legacy
+    // adapter's span carries them too; the native branch below refines model
+    // and effort from the profile it selected, and the legacy branch reads
+    // its launch facts off the handed-over argv.
+    trace_identity.extend(crate::observability::lifecycle::inherited_scope(root));
+    if let Some(sweep) = nonempty_env("LOOM_SWEEP_ID") {
+        trace_identity.insert("loom.sweep_id".into(), sweep);
+    }
+    if let Some(role) = invocation_role {
+        trace_identity.insert("loom.role".into(), role.to_owned());
     }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
     let mut log: Box<dyn Write> = Box::new(std::io::stderr());
@@ -604,6 +677,21 @@ fn run_preflight(
         }
         let mut command = Command::new(runner);
         command.args(&args.args);
+        // #14167: a legacy adapter's launch facts are the `--model`/`--effort`
+        // its documented precedence resolves — exactly what the dispatch step
+        // handed this child over and what `loom.step.model_launched` records
+        // daemon-side. Only the adapters whose precedence Loom documents
+        // (claude, codex) are read; anything else an adapter script picks for
+        // itself stays off the span.
+        if matches!(runtime.as_str(), "claude" | "codex") {
+            let (model, effort) = adapter_launch_facts(runtime.as_str(), &args.args);
+            if let Some(model) = model {
+                trace_identity.insert("loom.model".into(), model);
+            }
+            if let Some(effort) = effort {
+                trace_identity.insert("loom.effort".into(), effort);
+            }
+        }
         command
     };
     // #9473 red line: the gateway contract never crosses into the exec'd
@@ -906,5 +994,63 @@ mod codex_adapter_tests {
                 .collect::<Vec<_>>();
             assert_eq!(super::codex_adapter_model(&args).as_deref(), Some("gpt-5"));
         }
+    }
+}
+
+#[cfg(test)]
+mod adapter_launch_facts_tests {
+    fn facts(args: &[&str]) -> (Option<String>, Option<String>) {
+        let args = args
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        super::adapter_flag_facts(&args)
+    }
+
+    #[test]
+    fn explicit_flags_win_and_inline_forms_are_read() {
+        assert_eq!(
+            facts(&["--model", "sonnet", "--effort", "high"])
+                .0
+                .as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(
+            facts(&["--model", "sonnet", "--effort", "high"])
+                .1
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(facts(&["--model=opus"]).0.as_deref(), Some("opus"));
+        assert_eq!(facts(&["--effort=max"]).1.as_deref(), Some("max"));
+        assert_eq!(facts(&["-m", "gpt-5"]).0.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn a_prompt_or_config_value_that_looks_like_a_flag_is_data() {
+        let (model, effort) = facts(&["-p", "--model not-a-flag", "--model", "sonnet"]);
+        assert_eq!(model.as_deref(), Some("sonnet"));
+        assert_eq!(effort, None);
+        let (model, _) = facts(&["-c", "model=\"--model=x\"", "--model", "sonnet"]);
+        assert_eq!(model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn a_double_dash_ends_adapter_flags() {
+        let (model, effort) = facts(&["--", "--model", "ignored", "--effort", "ignored"]);
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn a_trailing_flag_without_a_value_leaves_the_fact_absent() {
+        assert_eq!(facts(&["-p", "prompt", "--model"]).0, None);
+        assert_eq!(facts(&["-p", "prompt", "--effort"]).1, None);
+    }
+
+    #[test]
+    fn an_empty_value_is_absent_not_empty() {
+        assert_eq!(facts(&["--model=", "--effort="]).0, None);
+        assert_eq!(facts(&["--model=", "--effort="]).1, None);
     }
 }
