@@ -96,7 +96,9 @@ gh issue create -R OWNER/REPO --title "Some title" --body-file /path/to/unique-b
   refused.
 
 **This route is interim.** The preferred route is a typed `github-write` operation
-with a target-repo allowlist and a span per filing (2AMLogic/2am#7455): repos the
+with a target-repo allowlist and a span per filing (tracked upstream; the concrete
+tracker number is recorded in the `not_in_installation_hint` doc comment in
+`write_scope.rs`, because installed docs name no private identifiers): repos the
 operator owns listed by default, a third-party public repo added only by operator
 decision. When it ships, this section and the refusal message (built in
 `write_scope.rs`, `not_in_installation_hint`) point there and the raw `gh` route is
