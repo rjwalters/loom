@@ -171,7 +171,14 @@ daemon tick also evaluates every live group (queue mode only) so a group does
 not wait on a workflow; that pass is an accelerator, not the enforcement.
 Run `group-check` from a `merge_group` workflow with `statuses: write`
 (Phase C, `merge-queue-ci.md`). The installable template is
-`defaults/optional/github-workflows/merge-group-check.yml`.
+`defaults/optional/github-workflows/merge-group-check.yml`; this repository's
+installed, dormant copy is `.github/workflows/merge-group-check.yml`.
+
+`loom/merge-authorization` is an authorization context, separate from test
+success: it is a commit status (not a CI job) that turns `success` only while
+every PR head in the group still has a live Judge/Champion grant and the
+required CI checks are green, and `failure` on revocation or head change. Test
+success is the separate `CI Result` context; both must be required.
 
 ## External status poster (`forge.mergeQueue.statusCommand`, #12679)
 

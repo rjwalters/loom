@@ -13,11 +13,16 @@ and how to roll back.
 `champion.mergeMode=queue`. Phases A and B, #10255 and #10256, provide the queue
 controls and the Champion handoff; the `merge_group` check workflow is the
 optional template `defaults/optional/github-workflows/merge-group-check.yml`.
-`rjwalters/loom` is user-owned, and GitHub documents merge queues for
-organization-owned repositories, so this repository is **not eligible** for the
-live pilot. Its `ci.yml` carries a `merge_group` trigger anyway. The trigger is
-dormant here because GitHub only emits the event on a queue-enabled branch, and
-keeping it in place keeps the workflow qualified and audited.
+`2AMLogic/loom` is now organization-owned, so it is eligible for the pilot
+once the prerequisites below pass (#14159). As of 2026-11-17 its default branch
+requires `CI Result` and has **no** active `merge_queue` rule: it is in direct
+mode and stays there until the cutover. Its `ci.yml` carries a `merge_group`
+trigger and `.github/workflows/merge-group-check.yml` is installed (pinned
+`LOOM_VERSION`); both are dormant because GitHub only emits `merge_group` on a
+queue-enabled branch. The queue desired state is recorded, unapplied, in
+`docs/merge-queue-pilot/desired-state.json` (merge method MERGE, required
+contexts `CI Result` + `loom/merge-authorization`, one build at a time, 40 min
+check timeout).
 
 ## `loom-daemon merge-group-ci`
 
@@ -172,12 +177,46 @@ run before the first grant write or revoke (#12579):
   the four image jobs, which must not be `Skipped` on push and must `Run` on
   `merge_group`.
 
+## Two contexts, two meanings
+
+- `CI Result` is the **test verdict**: the aggregate job in `ci.yml` over the
+  complete merge-group tree. It is a CI job, so `merge-group-ci audit` can match
+  it by job name.
+- `loom/merge-authorization` is an **authorization** context: a commit status
+  posted by `forge merge-queue group-check` (`merge-group-check.yml`) once the
+  Judge/Champion grant for every PR head in the group is live and the required
+  CI checks are green. It says "Loom still authorizes this group", never "tests
+  passed"; a revocation or head change turns it `failure`. Because it is a
+  status and not a job, `audit --required "loom/merge-authorization"` reports
+  `MISSING_REQUIRED_SUITE` by design. Audit the two contexts separately:
+
+```bash
+loom-daemon merge-group-ci audit --required "CI Result"        # QUALIFIED expected
+loom-daemon merge-group-ci audit -v --required "CI Result"     # also lists merge-group-check.yml
+```
+
+The audit covers every workflow in the checkout, so a QUALIFIED result also
+proves `merge-group-check.yml` has no `GROUP_CHECK_WITHOUT_CHECKOUT`,
+`CANCELLING_CONCURRENCY` or `SHARED_CONCURRENCY_GROUP` finding. (Do not pass
+`--workflow merge-group-check.yml` with `--required "CI Result"`: that
+restricts the audit to a file that does not host the job.)
+
+`merge-group-check.yml` runs only on base-repo events (`merge_group`, and
+`workflow_run` filtered to `gh-readonly-queue/**`); it has no `pull_request` or
+`pull_request_target` trigger, so untrusted PR-head code never runs with its
+`statuses: write` token. It checks out the merge-group commit with a sparse
+`.loom/` checkout, holds `statuses: write`, `pull-requests: read`,
+`checks: read`, `contents: read`, and uses a non-cancelling per-head
+concurrency group. `workflow_run.workflows` names this repo's CI workflow
+(`CI`), which re-evaluates the `pending` status when CI completes.
+
 ## Enablement prerequisites (all required, in order)
 
 1. Phases A and B (#10255, #10256) have landed: the queue controls are present
    and the Champion handoff preserves the safety invariant.
 2. `loom-daemon merge-group-ci eligibility --repo <org>/<repo>` exits 0 for the
-   pilot repository. That requires an organization owner, push permission, an
+   pilot repository (see "Pilot cutover" above for the full ordered procedure,
+   including broker/App enrollment and the publisher version-bump path). That requires an organization owner, push permission, an
    active `merge_queue` rule, required checks, and a clean audit.
 3. **Operator authorization.** Adding a `merge_queue` rule, changing required
    checks, or transferring a repository are protected settings changes. No
@@ -226,15 +265,63 @@ timed-out job(s); a `check-failure` drop whose group had cancelled runs, or
 whose refinement was skipped, names the guard that declined (failed step, real
 failure, run still in progress, unreadable read, no group commit, retry spent).
 
+## Pilot cutover (2AMLogic/loom)
+
+Every step is a read except step 6, which is an operator action. Do not set
+`champion.mergeMode: queue` or add the `merge_queue` rule before steps 1-5 pass.
+
+1. **Baseline (direct mode, one week or 20 merges).** Record: approval-to-merge
+   time (median/p90, `loom:pr` label to merge), CI runs and runner-minutes per
+   merged PR, queue ejections (zero in direct mode; the comparison column), and
+   red-main incidents (a failed `CI` push run on `main`). Example reads:
+   `gh run list --workflow CI --branch main --limit 100 --json conclusion,createdAt,updatedAt,event`
+   and `gh pr list --state merged --limit 50 --json number,mergedAt,labels`.
+2. **Audit:** the two commands under "Two contexts" above.
+3. **Eligibility / preflight (live, read-only):**
+   ```bash
+   loom-daemon merge-group-ci eligibility --repo 2AMLogic/loom --json
+   loom-daemon forge merge-queue preflight --repo 2AMLogic/loom
+   loom-daemon forge merge-queue mode        # must still print direct
+   ```
+   `NO_MERGE_QUEUE_RULE` is expected before step 6 and is the only failure
+   allowed. The daemon on the host must include the `merge-group-ci` and
+   `forge merge-queue` subcommands (this change was prepared with 0.19.1306).
+4. **Broker / App enrollment (external, must be verified, not assumed).** The
+   writer identity that posts `loom/merge-authorization` needs `statuses: write`
+   on this repository. If the writer App's grant is read-only or too broad,
+   enroll the repository with the external status poster
+   (`forge.mergeQueue.statusCommand`, see
+   [merge-queue-authorization](merge-queue-authorization.md)) and confirm its
+   `--dry-run` probe passes (`eligibility` reports `facts.status_route`). The
+   broker allowlist and App installation are outside this repository.
+5. **Publisher version-bump / direct-push path (external, must be verified).**
+   `version-bump-on-merge.yml` posts the bump to the fleet publisher, which
+   commits to `main` directly. Under a `merge_queue` rule that direct commit must
+   still be accepted (publisher identity as a bypass actor limited to the
+   version-bump commit, or a queue-routed bump), or version bumps and releases
+   stall. Verify before step 6, and expect each bump to move the base under
+   queued entries (measure the rebuild churn).
+6. **Operator applies** `docs/merge-queue-pilot/desired-state.json`: the ruleset
+   `merge_queue` rule (merge method MERGE, required contexts `CI Result` and
+   `loom/merge-authorization`), then sets `champion.mergeMode: queue`. Re-run
+   step 3; `eligibility` must now exit 0.
+7. **Pilot week** compared to the step 1 baseline.
+
 ## Rollback to direct mode
 
 Direct mode is always available. To roll back:
 
-1. Switch the repository's merge mode back to direct with the Phase A setting.
-   The Champion then returns to `merge-pr.sh`.
-2. Have the operator disable or remove the `merge_queue` rule.
-3. Leave the `merge_group` trigger in place. It is inert without a queue and
-   keeps the workflow audited.
+1. Set the mode back to direct (remove `champion.mergeMode` or set it to
+   `direct`, or `LOOM_MERGE_MODE=direct`) and confirm:
+   `loom-daemon forge merge-queue mode`. The Champion then returns to
+   `merge-pr.sh`.
+2. Drain or dequeue in-flight entries:
+   `loom-daemon forge merge-queue status --pr <N>` and
+   `loom-daemon forge merge-queue dequeue --pr <N>` per queued PR.
+3. Have the operator disable or remove the `merge_queue` rule (a protected
+   settings change); keep `CI Result` required.
+4. Leave the `merge_group` trigger and `merge-group-check.yml` in place. They
+   are inert without a queue and keep the workflows audited.
 
 ## #9990 tier split (fast PR / full integration): evaluation
 
