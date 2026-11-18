@@ -535,15 +535,24 @@ pub(crate) fn ordering(state: &ClaimState) -> Ordering {
 /// `SweepRegistry::published_host_id`, including its lease-only host chain
 /// (`lease_host_identity`, not `host_identity`, #11530).
 pub(crate) fn published_host() -> String {
-    use crate::sweep_registry::{lease_host_identity, opaque_host_id, LEASE_PUBLISH_HOSTNAME_ENV};
-    let raw = std::env::var(LEASE_PUBLISH_HOSTNAME_ENV).is_ok_and(|v| {
+    published_host_from_raw(&crate::sweep_registry::lease_host_identity())
+}
+
+/// [`published_host`] for a lease host identity the caller already resolved.
+/// A caller that gates on the raw identity (`forge check-claim`, #13998) must
+/// derive the published id from that same value: re-resolving the chain could
+/// yield a different answer (the `hostname` fork can fail between two calls)
+/// and publish a collision-prone id for a host the gate called usable
+/// (#14069).
+pub(crate) fn published_host_from_raw(raw_host: &str) -> String {
+    use crate::sweep_registry::{opaque_host_id, LEASE_PUBLISH_HOSTNAME_ENV};
+    let publish_raw = std::env::var(LEASE_PUBLISH_HOSTNAME_ENV).is_ok_and(|v| {
         matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     });
-    let host = lease_host_identity();
-    if raw {
-        host
+    if publish_raw {
+        raw_host.to_string()
     } else {
-        opaque_host_id(&host)
+        opaque_host_id(raw_host)
     }
 }
 

@@ -2039,6 +2039,15 @@ cannot work with this daemon. The checkout copy is
   first. A `W3` copy with no `requires_daemon` that parses is held, because
   nothing on record says its files work with this daemon. So is one below
   `supports_installed`, which is a break the daemon declared.
+  The skew is visible, not waited out (#14015): the daemon logs one INFO line
+  per repo naming its installed `loom_version` and the running version (again
+  only if the repo leaves that state and returns, or its installed version
+  changes), and `loom-daemon status` shows it under the repo, with
+  `installed_behind: {installed, running}` in `status --json` `per_repo[]`
+  (absent when not behind; never shown for the Loom source repo). Dispatch
+  into it is not held, so a fix spanning the daemon binary and
+  `defaults/scripts` must raise `supports_installed` in that same release;
+  that is the lever that holds a pre-resync repo.
 - **A version that cannot be ordered rolls only for a need.** Such a copy
   is held, because it may be newer than this daemon. Whether it also asks
   for a roll is decided by its `requires_daemon` alone when that parses:
@@ -11133,9 +11142,21 @@ naming a runtime that never launches is simply never matched.
   `medium` (source `codex-default`) instead of the CLI's own default: a Codex
   Builder left at `reasoning effort: none` refused an issue its own daemon had
   claimed (#14017). `medium` is a supported level of every model
-  `codex debug models` lists. Any configured tier — including the global
-  `effort` — beats it. Re-run `codex debug models` if a Codex release changes
+  `codex debug models` lists. Any configured tier above it in this chain —
+  `roleEfforts.<role>@codex` being the supported way to raise a Codex role's
+  effort — beats it. Re-run `codex debug models` if a Codex release changes
   its level vocabulary.
+- **For Codex, `codex-default` also shadows the adapter's `model@effort`
+  suffix (#14320).** The daemon emits its resolved effort as an explicit
+  `--effort` arg, which sits above the suffix rung in `spawn-codex.sh`'s
+  chain (`explicit -c` > `--effort` > `LOOM_EFFORT` > suffix), and since
+  #14017 the resolver never returns empty for Codex — so no daemon-dispatched
+  Codex launch can take its effort from a `model@effort` suffix. A `roleDraw`
+  candidate written `codex/<model>@high` therefore yields `medium`
+  (source `codex-default`), and `roleEfforts.<role>@codex` is the supported
+  way to raise a Codex role's effort from config. The suffix still applies on
+  manual launches where no `--effort`/`LOOM_EFFORT` is supplied
+  ([runtime-adapters.md](runtime-adapters.md) § model-mapping minimalism).
 - **Unset stays byte-identical on every other runtime.** There is deliberately
   **no** default effort for Claude or any other runtime, and no fall-through to a
   shared `autonomous.*` key: with nothing configured the resolver returns the

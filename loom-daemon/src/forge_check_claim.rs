@@ -273,8 +273,10 @@ impl OwnedClaim {
     /// from a peer's (#13998).
     fn from_parts(marker: Option<String>, raw_host: String, issue: u32) -> Option<Self> {
         let mut owned = Self::from_marker(marker.as_deref(), issue, None)?;
+        // Derived from `raw_host` itself, never re-resolved: the gate and the
+        // published id must be one resolution (#14069).
         owned.lease_host = (raw_host != crate::host_identity::UNKNOWN_HOST)
-            .then(|| crate::cli::pr_lease::published_host());
+            .then(|| crate::cli::pr_lease::published_host_from_raw(&raw_host));
         Some(owned)
     }
 
@@ -1374,12 +1376,19 @@ mod tests {
             Some(OwnedClaim { lease_host: None }),
             "raw unknown-host must yield None, never be hashed into a usable id",
         );
-        // A resolved chain keeps a published host — whatever this
-        // environment derives, the usability decision came from the raw
-        // value alone.
+        // A resolved chain keeps a published host derived from the argument
+        // it was handed (#14069) — not from whatever this process's own
+        // environment would resolve to.
         let owned = OwnedClaim::from_parts(marker(), "resolved-host".to_string(), 20);
-        assert!(owned.is_some());
-        assert!(owned.unwrap().lease_host.is_some(), "a resolved chain keeps a published host",);
+        assert_eq!(
+            owned,
+            Some(OwnedClaim {
+                lease_host: Some(crate::cli::pr_lease::published_host_from_raw("resolved-host")),
+            }),
+            "the published host must come from the raw argument",
+        );
+        let other = OwnedClaim::from_parts(marker(), "another-host".to_string(), 20);
+        assert_ne!(owned, other, "different raw hosts must publish different ids");
     }
 
     /// The daemon pre-claimed the issue and spawned this session: its own

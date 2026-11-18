@@ -70,6 +70,16 @@ impl Reject {
     }
 }
 
+/// Whether `body` is a lone `@`-prefixed token (`@-`, `@path`): what a caller
+/// gets when it writes `--body @path` expecting curl-style file expansion that
+/// the CLI never performs. The single definition of the [`Reject::AtToken`]
+/// rule, shared with `forge comment --body` (#14286), so the two cannot drift.
+#[must_use]
+pub fn is_lone_at_token(body: &str) -> bool {
+    let trimmed = body.trim();
+    trimmed.starts_with('@') && !trimmed.chars().any(char::is_whitespace)
+}
+
 /// Classify `body`. `Ok(())` means it may be posted as a verdict rationale.
 ///
 /// # Errors
@@ -83,7 +93,7 @@ pub fn check(body: &str) -> Result<(), Reject> {
     if trimmed == "-" {
         return Err(Reject::Dash);
     }
-    if trimmed.starts_with('@') && !trimmed.chars().any(char::is_whitespace) {
+    if is_lone_at_token(trimmed) {
         return Err(Reject::AtToken);
     }
     let n = trimmed.chars().filter(|c| !c.is_whitespace()).count();

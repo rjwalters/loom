@@ -324,6 +324,52 @@ fn a_held_or_disabled_account_is_skipped_before_any_call() {
     );
 }
 
+/// #14287: the config key is an account *reference*; `account_matches_reference`
+/// accepts the email as well as the name, so the skip guards must too.
+#[test]
+fn an_email_spelled_key_is_skipped_when_the_account_is_disabled_or_held() {
+    let profiles = tempfile::tempdir().unwrap();
+    let held: PathBuf = profiles.path().join("alice");
+    std::fs::create_dir_all(&held).unwrap();
+    let off = profiles.path().join("bob");
+    std::fs::create_dir_all(&off).unwrap();
+    let mut alice = descriptor("alice", &held, true);
+    alice.email = Some("alice@example.com".into());
+    let mut bob = descriptor("bob", &off, false);
+    bob.email = Some("Bob@Example.com".into());
+    let index = index_of(&[alice, bob]);
+    session_hold::write_hold(&held, session_hold::now_unix_ms()).unwrap();
+
+    let declared = parse(&config(&json!({
+        "alice@example.com": [{"repository": URL}],
+        "bob@example.com": [{"repository": URL}],
+    })));
+    let fake = Fake::new(|_| panic!("a held or disabled account is never converged"));
+    let pass = fake.run(&declared, &index, &mut ReconcileState::default(), 0);
+    assert_eq!(
+        outcomes(&pass),
+        [
+            Outcome::Skipped("held (operator stop)"),
+            Outcome::Skipped("account disabled")
+        ]
+    );
+    assert_eq!(fake.calls(), 0);
+}
+
+#[test]
+fn an_email_spelled_key_for_an_enabled_account_still_converges() {
+    let profiles = tempfile::tempdir().unwrap();
+    let profile = profiles.path().join("alice");
+    std::fs::create_dir_all(&profile).unwrap();
+    let mut alice = descriptor("alice", &profile, true);
+    alice.email = Some("alice@example.com".into());
+    let index = index_of(&[alice]);
+    let declared = parse(&config(&json!({"alice@example.com": [{"repository": URL}]})));
+    let fake = Fake::new(|_| Ok(Converged::Registered));
+    let pass = fake.run(&declared, &index, &mut ReconcileState::default(), 0);
+    assert_eq!(outcomes(&pass), [Outcome::Registered]);
+}
+
 #[test]
 fn a_stop_landing_after_the_check_is_honoured_by_the_hold_probe() {
     let profiles = tempfile::tempdir().unwrap();
