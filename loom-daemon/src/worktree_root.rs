@@ -249,9 +249,13 @@ mod tests {
     /// Guard for the config-tier tests below: they hold BOTH the unkeyed
     /// default lock and `loom_config_env`. `serial_test` keeps the two as
     /// independent locks (the default group is key `""`), and its macro
-    /// cannot name the default key in a multi-key list, so the tests stack
-    /// `#[serial]` over `#[serial(loom_config_env)]`. Fail loudly if one of
-    /// the two attributes is ever dropped (#14214).
+    /// cannot name the default key in a multi-key list, so a test nests: the
+    /// `#[serial(loom_config_env)]` test calls a `#[serial] fn *_body()`.
+    /// That order is load-bearing and crate-mandatory — `loom_config_env`
+    /// outside, default inside; see `role_collision.rs`'s lock-order doc
+    /// (rest_queue_source_parses_the_live_listing_shape_body). Nesting fixes
+    /// the order structurally; this guard still fails loudly if either lock
+    /// is ever dropped (#14214).
     fn assert_holds_default_and_config_env_locks() {
         assert!(
             serial_test::is_locked_serially(None),
@@ -465,14 +469,20 @@ mod tests {
     // the env var to `""` so a private defaults file on the host can never
     // leak in. Because `with_env` also removes/restores LOOM_WORKTREE_ROOT,
     // which the default-group tests set, each of these tests additionally
-    // carries the unkeyed `#[serial]` so the two groups cannot interleave
-    // on that var (#14214). Only these four short tests join the default
-    // queue.
+    // holds the unkeyed default lock so the two groups cannot interleave on
+    // that var (#14214): it nests a `#[serial] fn *_body()` inside the
+    // `#[serial(loom_config_env)]` test — `loom_config_env` outside, default
+    // inside, the order role_collision's lock-order doc mandates. Only these
+    // four short tests join the default queue.
 
     #[test]
-    #[serial]
     #[serial(loom_config_env)]
     fn project_tier_only_worktree_root_is_honored_like_legacy() {
+        project_tier_only_worktree_root_is_honored_like_legacy_body();
+    }
+
+    #[serial]
+    fn project_tier_only_worktree_root_is_honored_like_legacy_body() {
         assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
@@ -487,9 +497,13 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[serial(loom_config_env)]
     fn project_tier_overrides_legacy_tier_on_overlap() {
+        project_tier_overrides_legacy_tier_on_overlap_body();
+    }
+
+    #[serial]
+    fn project_tier_overrides_legacy_tier_on_overlap_body() {
         assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
@@ -509,9 +523,13 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[serial(loom_config_env)]
     fn local_tier_overrides_both_legacy_and_project() {
+        local_tier_overrides_both_legacy_and_project_body();
+    }
+
+    #[serial]
+    fn local_tier_overrides_both_legacy_and_project_body() {
         assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
@@ -528,9 +546,13 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[serial(loom_config_env)]
     fn explicit_null_in_project_tier_clears_legacy_worktree_root() {
+        explicit_null_in_project_tier_clears_legacy_worktree_root_body();
+    }
+
+    #[serial]
+    fn explicit_null_in_project_tier_clears_legacy_worktree_root_body() {
         assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
