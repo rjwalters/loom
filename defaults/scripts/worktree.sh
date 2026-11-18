@@ -1607,6 +1607,15 @@ _wt_discard_unclaimed() {
 
 # Check if worktree already exists
 if [[ -d "$WORKTREE_PATH" ]]; then
+    # A competing fresh creator can have materialized the directory without
+    # establishing ownership yet. Never back-fill its sentinel or hand that
+    # partial/refused checkout to a Builder through the existing-dir arm.
+    if [[ "${LOOM_BUILDER_CLAIM:-}" == "1" || "${LOOM_SWEEP_CLAIM_OWNED:-}" == "$ISSUE_NUMBER" ]]; then
+        if [[ ! -f "$WORKTREE_PATH/.loom-managed" || -e "$WORKTREE_PATH/.loom-unclaimed" ]]; then
+            print_error "Builder worktree ownership is not ready; refusing reuse of $WORKTREE_PATH"
+            exit 1
+        fi
+    fi
     # If caller passed --sparse / --full, apply the mode to the existing
     # worktree and exit. This is the idempotent path: same cone is a no-op,
     # different cone replaces the cone, --full disables sparse-checkout. The
@@ -1707,8 +1716,8 @@ else
         # longer passed on the caller's behalf (it also skipped the lease leg, i.e.
         # a peer's fresh lease). A dispatcher-owned claim (LOOM_SWEEP_CLAIM_OWNED
         # names this issue) is admitted by the daemon itself; an attended Builder
-        # passes `--attended-claim` (own label and this host's own lease are not
-        # blockers; another host's fresh lease still is). `--force-claim` is only
+        # passes `--attended-claim` (the label is expected, but any fresh lease
+        # is a blocker without dispatcher ownership). `--force-claim` is only
         # sent when the caller asked for it explicitly. OPEN_PR, TARGET_IS_PR
         # (#9929, the number is a PR), CLOSED (#11863, nothing left to build),
         # FROZEN (#11743) and OPERATOR are never overridden. Only exit 0

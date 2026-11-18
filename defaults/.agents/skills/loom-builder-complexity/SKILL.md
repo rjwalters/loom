@@ -313,7 +313,7 @@ Before claiming an issue, estimate the work required:
 
 **If Simple or Medium (< 6 hours, clear path)**:
 1. Claim immediately: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
-2. Create worktree: `./.loom/scripts/worktree.sh <number>`
+2. Create worktree: `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <number> || exit 1`
 3. Implement -> Test -> PR
 4. Be ambitious - complete the full issue in one PR
 

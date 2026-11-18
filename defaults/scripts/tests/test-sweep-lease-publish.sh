@@ -429,6 +429,22 @@ assert_eq "1" "$(post_count)" "(f) the lease is published despite unreadable evi
 assert_contains "$ERR" "publishing anyway" "(f) stderr explains the fail-open"
 rm -f "$STUB_DIR/comments-fail"
 
+# Fresh Builder admission must not publish against an unreadable prestate.
+reset_state
+touch "$STUB_DIR/comments-fail"
+run_script publish 6320 --sweep-id sweep-run-A --require-ownership
+assert_eq "2" "$RC" "strict unreadable comments refuse ownership"
+assert_eq "0" "$(post_count)" "strict unreadable comments post nothing"
+assert_contains "$ERR" "ownership indeterminate" "strict failure explains refusal"
+rm -f "$STUB_DIR/comments-fail"
+
+reset_state
+export LOOM_TEST_NO_TRUST_VERB=1
+run_script publish 6320 --sweep-id sweep-run-A --require-ownership
+unset LOOM_TEST_NO_TRUST_VERB
+assert_eq "2" "$RC" "strict unauthenticated comments refuse ownership"
+assert_eq "0" "$(post_count)" "strict unauthenticated comments post nothing"
+
 # --- (g) a `gh` WRITE failure -> exit 2 ----------------------------------
 reset_state
 touch "$STUB_DIR/post-fail"

@@ -895,6 +895,17 @@ pub(crate) fn read_freshest_live_lease(
     now: DateTime<Utc>,
     ttl_minutes: f64,
 ) -> LeaseLeg {
+    read_freshest_live_lease_for(gh_bin, root, issue, now, ttl_minutes, true)
+}
+
+fn read_freshest_live_lease_for(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    now: DateTime<Utc>,
+    ttl_minutes: f64,
+    allow_own_sweep: bool,
+) -> LeaseLeg {
     // #10089: counted via the facade (`claim.lease_comments`); it applies the
     // #5401 GH_CONFIG_DIR and the #8263 `LOOM_REPO` -> GH_REPO env contract.
     let jq = issue_lease_comments_jq();
@@ -921,7 +932,7 @@ pub(crate) fn read_freshest_live_lease(
     let rows = parse_lease_rows(&String::from_utf8_lossy(&policy.trusted_ndjson(&out.stdout)));
     let own_sweep = std::env::var("LOOM_SWEEP_ID")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| allow_own_sweep && !s.is_empty());
     match freshest_live_lease(&rows, now, ttl_minutes, own_sweep.as_deref()) {
         Some((host, sweep_id)) => LeaseLeg::Held { host, sweep_id },
         None => LeaseLeg::NoneFresh,
@@ -988,7 +999,11 @@ pub fn handle(issue: u32, force_claim: bool, attended_claim: bool) -> Result<()>
     // when every earlier leg is Clear (or, under --force-claim, when its
     // blocker/unreadable answer cannot change the verdict anyway — the walk
     // keeps collecting so the stderr warning names everything overridden).
-    let owned = OwnedClaim::from_env(issue).or_else(|| {
+    let dispatched = OwnedClaim::from_env(issue);
+    // An inherited sweep string is not ownership proof for an attended
+    // Builder. Preserve the dispatcher and generic reader contracts.
+    let allow_own_sweep = !attended_claim || dispatched.is_some();
+    let owned = dispatched.or_else(|| {
         attended_claim
             .then(|| OwnedClaim::attended(issue, crate::host_identity::lease_host_identity()))
             .flatten()
@@ -1011,8 +1026,14 @@ pub fn handle(issue: u32, force_claim: bool, attended_claim: bool) -> Result<()>
         let labels_clear = matches!(evidence.labels, Some(LabelLeg::Clean))
             || owned_passes_labels(owned, evidence.labels.as_ref());
         if labels_clear || force_claim {
-            evidence.lease =
-                Some(read_freshest_live_lease(&gh_bin, &root, issue, now, ttl_minutes));
+            evidence.lease = Some(read_freshest_live_lease_for(
+                &gh_bin,
+                &root,
+                issue,
+                now,
+                ttl_minutes,
+                allow_own_sweep,
+            ));
             let lease_clear = matches!(evidence.lease, Some(LeaseLeg::NoneFresh))
                 || owned_passes_lease(owned, evidence.lease.as_ref());
             if lease_clear || force_claim {

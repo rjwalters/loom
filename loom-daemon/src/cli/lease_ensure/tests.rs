@@ -881,6 +881,23 @@ fn ensure_with_a_live_orchestrator_lease_publishes_and_renews_nothing() {
 }
 
 #[test]
+fn strict_admission_does_not_reuse_a_different_same_host_session() {
+    let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
+    let mut a = args(&dir);
+    a.require_ownership = true;
+    let host = crate::cli::lease_release::my_host_ids().remove(0);
+    let env = SessionEnv {
+        lease_rows: Some(vec![lease_row(&host, "another-session", 30)]),
+        ..in_session()
+    };
+    assert_eq!(a.ensure(&env), Outcome::PublishDeclined(Some(4)));
+    assert!(argv(&dir, "publish-argv")
+        .unwrap()
+        .contains("--require-ownership"));
+    assert!(argv(&dir, "renew-argv").is_none());
+}
+
+#[test]
 #[serial_test::serial(loom_auto_update_env)]
 fn the_reuse_decision_follows_the_lease_ttl_env() {
     let env_var = crate::claim_reconciliation::LEASE_TTL_MINUTES_ENV;

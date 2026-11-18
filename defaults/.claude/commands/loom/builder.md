@@ -341,7 +341,7 @@ workflow) that require maintainer approval before being worked on.
 
 - **Find work**: Use the three-tier priority order in "Finding Work: Priority System" below (urgent → curated → approved-only); FIFO (oldest-first) is only the tiebreak **within** a tier.
 - **Check dependencies**: all task-list items checked before claiming
-- **Guard, then claim**: `loom-daemon forge check-claim <number>` must not exit 0 (exit 0 = blocked — open PR, claim label, fresh lease, or remote branch; take another issue; your own `$LOOM_SWEEP_ID` lease is not a blocker), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, then lease it: `loom-daemon lease ensure <number> --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (watch the process doing the work, never a subagent's inherited `$PPID`, which is the parent session and keeps the lease alive after you exit). `worktree.sh` (below) runs this itself; a lane NOT using it MUST call `lease ensure` directly — a leaseless claim is invisible to other lanes and reclaimable (#9453). When you finish or abandon the issue, `loom-daemon lease release <number>` hands the lease back (#12103)
+- **Guard, then claim**: `loom-daemon forge check-claim <number>` must not exit 0 (exit 0 = blocked — open PR, claim label, fresh lease, or remote branch; take another issue), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, for a lane without worktrees, lease it: `loom-daemon lease ensure <number> --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (watch the process doing the work, never a subagent's inherited `$PPID`, which is the parent session and keeps the lease alive after you exit). `worktree.sh` (below) acquires ownership itself after checking for peers; a standalone attended Builder must not pre-publish a generic lease. A sweep-delegated Builder uses the issue/run pair from its successful preflight as specified in `sweep-wave-lifecycle.md`. A lane NOT using it MUST call strict `lease ensure` directly and proceed only on exit 0 with exact stdout `OWNED` — a leaseless claim is invisible to other lanes and reclaimable (#9453). When you finish or abandon the issue, `loom-daemon lease release <number>` hands the lease back (#12103)
 - **Do the work**: Implement, test, commit, create PR
 - **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` (copies the priority label, #10518) — never a bare `gh pr create` (#6074); body template: builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
@@ -352,7 +352,7 @@ workflow) that require maintainer approval before being worked on.
 
 1. **Gate first**: the guard above. The instruction approves the stage (e.g. `loom:curated`) and overrides only its three claim tokens, never the seven refusals
 2. **Claim**: add `loom:building` and comment "Starting work on this issue per user request"
-3. **Work and finish normally**: `./.loom/scripts/worktree.sh 592`, implement, then a PR with `loom:review-requested` (builder-pr.md § "Creating the PR")
+3. **Work and finish normally**: `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh 592`, implement, then a PR with `loom:review-requested` (builder-pr.md § "Creating the PR")
 
 Not an override: "find work" / "look for issues", no issue number, or an autonomous run. Use the label-based workflow.
 
@@ -361,7 +361,7 @@ Not an override: "find work" / "look for issues", no issue number, or an autonom
 For detailed worktree workflows, see **builder-worktree.md**.
 
 **Quick reference:**
-- Use `./.loom/scripts/worktree.sh <issue-number>` to create worktrees
+- Use `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number>` to create worktrees
 - Work in `.loom/worktrees/issue-N` directories
 
 ### Never use bare `git stash` for ad-hoc WIP (#4821)
@@ -428,11 +428,15 @@ target too: `./.loom/scripts/worktree.sh stash-push main` …
 
 ### Pre-Work Validation
 
+A refused or indeterminate Builder setup ends this attempt. Do not enter or edit
+the checkout, retry without `LOOM_BUILDER_CLAIM=1`, or add `--force-claim` to
+bypass the refusal. An explicit operator override is a separate decision.
+
 After claiming an issue, **before writing any code**, verify you are in the correct worktree:
 
 ```bash
 # 1. Create the worktree (if not already created)
-LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number>   # strict native ownership for a Builder (#14376)
+LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number> || exit 1 # strict native ownership for a Builder (#14376)
 
 # 2. Capture the worktree's ABSOLUTE path ONCE — do not rely on cwd persisting
 WORKTREE_ABS="$(cd .loom/worktrees/issue-<issue-number> && pwd)"
@@ -503,7 +507,7 @@ git -C "<MAIN_ROOT>" stash show -p stash@{0}                           # nothing
 
 **If your working directory does NOT contain `.loom/worktrees/issue-`:**
 1. **STOP** - do not write any code
-2. Create the worktree: `./.loom/scripts/worktree.sh <issue-number>`
+2. Create the worktree: `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number>`
 3. Change to the worktree: `cd .loom/worktrees/issue-<issue-number>`
 4. THEN start implementation
 

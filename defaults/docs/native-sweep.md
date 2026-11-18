@@ -80,8 +80,11 @@ transcript archival.
 A Claude-orchestrated sweep can run only its Builder and Doctor phases on
 another runtime (e.g. `opencode:zai-flash`) via `runtimes.rolePreference`.
 Before each such phase the orchestrator calls
-`loom-daemon worker run --role builder --issue N --json` (Doctor:
+`LOOM_SWEEP_RUN_ID="$RUN_ID" loom-daemon worker run --role builder --issue N --json` (Doctor:
 `--role doctor --pr N`; a stacked Builder adds `--base feature/issue-<parent>`).
+For Builder, `RUN_ID` must be the exact successful preflight lease identity;
+never invent one or continue after preflight refused. Fresh setup requires
+positive ownership before the worker receives its checkout.
 The command resolves the role's runtime (an inherited
 daemon-dispatch `LOOM_RUNTIME` pin is ignored; `LOOM_RUNTIME_<ROLE>` still wins); when that is
 `claude` it prints `outcome=delegate-to-claude` and exits 0 without launching
@@ -125,7 +128,7 @@ outcome `interrupted`; a second signal kills the group at once.
 
 ```bash
 P=/tmp/loom-worker-builder-N-T; mkdir -p "$P"; date +%s >"$P/start"
-setsid -w bash -c 'echo $$ >"$1/wrapper"; loom-daemon worker run --role builder --issue N --json >"$1/report.json" 2>"$1/stderr.log" & echo $! >"$1/pid"; wait $!; echo $? >"$1/exit"' _ "$P"
+LOOM_SWEEP_RUN_ID="$RUN_ID" setsid -w bash -c 'echo $$ >"$1/wrapper"; loom-daemon worker run --role builder --issue N --json >"$1/report.json" 2>"$1/stderr.log" & echo $! >"$1/pid"; wait $!; echo $? >"$1/exit"' _ "$P"
 ```
 
 Then repeat this foreground poll (~90s, under the tool cap) until it prints a

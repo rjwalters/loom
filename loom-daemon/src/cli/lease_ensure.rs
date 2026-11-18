@@ -200,10 +200,10 @@ pub(crate) struct LeaseEnsureArgs {
     ///   the lease (publish exit 4): a definitive refusal. No deferred
     ///   publisher is spawned for the rejected caller, and the peer's lease,
     ///   labels and branch are left alone;
-    /// * exit `0` + stdout `INDETERMINATE` — ownership could not be decided
-    ///   (no session, scripts missing, `gh` failed, ...). This keeps the
-    ///   fail-open contract above, including the deferred retry of an
-    ///   availability failure.
+    /// * exit `2` + stdout `INDETERMINATE` — ownership could not be decided
+    ///   (no session, scripts missing, `gh` failed, ...). No deferred
+    ///   publisher is spawned: a rejected Builder must not acquire a lease
+    ///   later. Calls without this flag retain their fail-open contract.
     #[arg(long)]
     pub(crate) require_ownership: bool,
 
@@ -461,7 +461,7 @@ impl LeaseEnsureArgs {
             return Ok(());
         }
         let env = SessionEnv::from_process();
-        let env = if env.run_id_set || env.dispatched_issue.is_some() {
+        let env = if self.require_ownership || env.run_id_set || env.dispatched_issue.is_some() {
             env
         } else {
             env.with_lease_rows(&self)
@@ -479,6 +479,10 @@ impl LeaseEnsureArgs {
             // does not hold.
             if ownership == Ownership::PeerOwned {
                 std::process::exit(EX_PEER_OWNED);
+            }
+            if ownership == Ownership::Indeterminate {
+                eprintln!("lease ensure: Builder ownership unverified; stop this attempt (no deferred publisher)");
+                std::process::exit(2);
             }
         }
         // #10570: a declined publish used to be final, so a claim made while a
@@ -522,7 +526,13 @@ impl LeaseEnsureArgs {
             return Outcome::ScriptsMissing(root);
         }
 
-        if let Some(rows) = env.lease_rows.as_deref().filter(|_| !env.run_id_set) {
+        // Same-host fallback is useful for ordinary orchestrator reuse, but
+        // is not proof that a fresh Builder owns another session's lease.
+        if let Some(rows) = env
+            .lease_rows
+            .as_deref()
+            .filter(|_| !env.run_id_set && !self.require_ownership)
+        {
             let ttl = reuse_ttl();
             let own_id = session_sweep_id(self.watch_pid);
             let mine = super::lease_release::my_host_ids();
@@ -555,6 +565,9 @@ impl LeaseEnsureArgs {
     ) -> Result<(String, String), Outcome> {
         let mut command = Command::new(publish_script);
         command.arg("publish").arg(self.issue.to_string());
+        if self.require_ownership {
+            command.arg("--require-ownership");
+        }
         // An in-session sweep's `LOOM_SWEEP_RUN_ID` wins inside the script.
         if let Some(id) = (!env.run_id_set)
             .then(|| session_sweep_id(self.watch_pid))

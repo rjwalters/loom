@@ -197,10 +197,10 @@ rm -f "$STUB_HOOK_MARK"
 checkout_ready() { grep -q 'Worktree created successfully' "$TMP/out.log"; }
 no_peer_side_effects() { # <issue> -- nothing created locally, no setup, no ready output
     local n="$1"
-    [[ ! -e ".loom/worktrees/issue-$n" ]] && pass "$n: no worktree left" || fail "$n: worktree left behind"
-    git show-ref --verify --quiet "refs/heads/feature/issue-$n" && fail "$n: branch left behind" || pass "$n: no branch left behind"
-    [[ ! -e "$STUB_HOOK_MARK" ]] && pass "$n: project hook did not run" || fail "$n: project hook ran"
-    checkout_ready && fail "$n: checkout-ready output printed" || pass "$n: no checkout-ready output"
+    if [[ ! -e ".loom/worktrees/issue-$n" ]]; then pass "$n: no worktree left"; else fail "$n: worktree left behind"; fi
+    if git show-ref --verify --quiet "refs/heads/feature/issue-$n"; then fail "$n: branch left behind"; else pass "$n: no branch left behind"; fi
+    if [[ ! -e "$STUB_HOOK_MARK" ]]; then pass "$n: project hook did not run"; else fail "$n: project hook ran"; fi
+    if checkout_ready; then fail "$n: checkout-ready output printed"; else pass "$n: no checkout-ready output"; fi
 }
 
 echo "Test 14: a peer lease is already observable at the probe (check-claim exit 0) -> refused, nothing created"
@@ -224,8 +224,8 @@ rm -f "$STUB_HOOK_MARK"
 LOOM_SWEEP_CLAIM_OWNED=516 run_wt 516
 if [[ "$RC" -eq 0 && -e .loom/worktrees/issue-516/.git ]]; then pass "owned claim opens its worktree"; else fail "rc=$RC"; cat "$TMP/out.log"; fi
 if grep -q '^forge check-claim 516$' "$LOG"; then pass "probe relies on the daemon's owned-claim exception"; else fail "unexpected probe args"; cat "$LOG"; fi
-[[ -e "$STUB_HOOK_MARK" ]] && pass "project hook ran" || fail "project hook did not run"
-[[ -f .loom/worktrees/issue-516/.loom-managed ]] && pass "managed sentinel written" || fail "no sentinel"
+if [[ -e "$STUB_HOOK_MARK" ]]; then pass "project hook ran"; else fail "project hook did not run"; fi
+if [[ -f .loom/worktrees/issue-516/.loom-managed ]]; then pass "managed sentinel written"; else fail "no sentinel"; fi
 if [[ "$(lease_calls)" -eq 1 ]]; then pass "ownership asked once"; else fail "lease calls: $(lease_calls)"; fi
 
 echo "Test 17: attended uncontested claim -> admitted, ownership established"
@@ -270,6 +270,18 @@ if [[ "$RC" -eq 0 ]] && grep -q '^lease ensure 520 --watch-pid' "$LOG" && ! grep
 echo "Test 23: standalone (non-Builder) fresh creation keeps the fail-open lease even when ownership is unverifiable"
 STUB_CHECK_CLAIM_RC=1 STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' LOOM_BUILDER_CLAIM="" run_wt 523
 if [[ "$RC" -eq 0 && -e ".loom/worktrees/issue-523/.git" ]] && ! grep -q -- '--require-ownership' "$LOG"; then pass "standalone not refused"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
+
+echo "Test 24: another creator's partial directory cannot be reused by a Builder"
+git worktree add -q .loom/worktrees/issue-524 -b feature/issue-524
+run_wt 524
+if [[ "$RC" -ne 0 && "$(lease_calls)" -eq 0 && ! -f .loom/worktrees/issue-524/.loom-managed ]]; then pass "partial Builder reuse refused without a lease or sentinel"; else fail "partial checkout admitted"; cat "$LOG" "$TMP/out.log"; fi
+if [[ -f .loom/worktrees/issue-524/.git ]]; then pass "other creator's checkout left untouched"; else fail "partial checkout removed"; fi
+touch .loom/worktrees/issue-524/.loom-managed .loom/worktrees/issue-524/.loom-unclaimed
+run_wt 524 --sparse docs
+if [[ "$RC" -ne 0 && "$(lease_calls)" -eq 0 ]]; then pass "unclaimed Builder reuse refused before sparse reconfigure"; else fail "unclaimed checkout admitted"; cat "$LOG" "$TMP/out.log"; fi
+rm .loom/worktrees/issue-524/.loom-unclaimed
+run_wt 524
+if [[ "$RC" -eq 0 ]]; then pass "ready managed checkout remains reusable"; else fail "ready checkout refused"; cat "$TMP/out.log"; fi
 
 echo
 echo "Tests run: $TESTS_RUN, failed: $TESTS_FAILED"
