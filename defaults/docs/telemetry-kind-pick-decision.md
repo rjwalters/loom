@@ -170,13 +170,17 @@ there. The step engine's weight-0 exclusions map through the parallel total matc
 `claimed` / `queued` → `in_flight`, `shared_pr` → `pr_open_skip`, `sequenced`
 → `overlap_chain`, `blocked` → `blocked`, `capability_missing` / `host_skip_label` →
 `host_constraint`, `epic` / `proposal` / `no_stage` / `draft` → `no_step`.
-An `extraSkipLabels` match is the one veto that reads differently on the two
-paths: the step engine excludes it as `host_skip_label` → `host_constraint`
-(#13891), while the work-finder role tick skips the same item as disposition
-`parked` → `operator_hold` (#6685). Both resolve the same
+An `extraSkipLabels` match reads differently on the two paths: the step engine
+excludes it as `host_skip_label` → `host_constraint` (#13891), while the
+work-finder role tick skips the same item as disposition `parked` →
+`operator_hold` (#6685). Both resolve the same
 `autonomous.workFinder.extraSkipLabels` (env > config > default `[]`), so a
 per-reason count that aggregates skips from both paths sees the one veto under
-two names (#13961).
+two names (#13961). A capability gap has the same shape: the step engine passes
+a capability park whose capabilities this host does not fully hold as
+`capability_missing` → `host_constraint` (`work_finder/step_item.rs`), while
+the role tick skips the same item as `parked` → `operator_hold` through the
+capability lane (#6893) — `Qd::Parked` is a mixed bucket on the role-tick path.
 
 ## Rank of an item in each role's latest candidate list
 
