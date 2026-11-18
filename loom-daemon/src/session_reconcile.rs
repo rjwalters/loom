@@ -469,6 +469,10 @@ impl std::error::Error for DockerUnavailable {}
 pub struct AccountIndex {
     disabled: HashSet<String>,
     profiles: HashMap<String, Vec<PathBuf>>,
+    /// ASCII-lowercased account email → `id.name` (first inventory wins, the
+    /// order `converge_bindings::root_of` resolves in), so a lookup accepts
+    /// every spelling `account_matches_reference` does (#14287).
+    emails: HashMap<String, String>,
 }
 
 impl AccountIndex {
@@ -483,6 +487,12 @@ impl AccountIndex {
             if !account.enabled {
                 index.disabled.insert(name.clone());
             }
+            if let Some(email) = account.email.as_deref() {
+                index
+                    .emails
+                    .entry(email.to_ascii_lowercase())
+                    .or_insert_with(|| name.clone());
+            }
             let profiles = index.profiles.entry(name).or_default();
             if !profiles.contains(&account.credential_reference) {
                 profiles.push(account.credential_reference.clone());
@@ -491,14 +501,28 @@ impl AccountIndex {
         index
     }
 
-    fn profiles(&self, name: &str) -> &[PathBuf] {
-        self.profiles.get(name).map_or(&[], Vec::as_slice)
+    /// The canonical `id.name` for an account reference: the name itself, or —
+    /// as in `account_matches_reference` — an `@` reference matching an email.
+    /// An unknown reference comes back unchanged (and so matches nothing).
+    fn canonical<'a>(&'a self, reference: &'a str) -> &'a str {
+        if self.profiles.contains_key(reference) || !reference.contains('@') {
+            return reference;
+        }
+        self.emails
+            .get(&reference.to_ascii_lowercase())
+            .map_or(reference, String::as_str)
     }
 
-    /// `enabled=false` in at least one root.
+    fn profiles(&self, reference: &str) -> &[PathBuf] {
+        self.profiles
+            .get(self.canonical(reference))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// `enabled=false` in at least one root. `name` may be an email reference.
     #[must_use]
     pub fn is_disabled(&self, name: &str) -> bool {
-        self.disabled.contains(name)
+        self.disabled.contains(self.canonical(name))
     }
 
     /// An operator hold is in force (read from disk on every call).
