@@ -1278,6 +1278,102 @@ fn every_session_down_sends_judge_to_the_next_tap_body() {
     assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
 }
 
+// ---- #13873: the fallback-aware Claude pool gate ---------------------------
+
+/// A shared pool whose every account is fable-class-marked: fable has
+/// nothing to select, every lower rung still does. Returned so the test
+/// outlives its own env pin (`SharedTokenPool` restores on drop).
+fn fable_exhausted_shared_pool() -> crate::write_scope_test_support::SharedTokenPool {
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
+    fs::remove_file(pool.path().join("fake.token")).unwrap();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let mut marks = String::new();
+    for account in ["alpha", "beta"] {
+        fs::write(pool.path().join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+        marks.push_str(&format!(
+            "{now} {account} exhausted: hit your Fable limit [model-class:fable]\n"
+        ));
+    }
+    fs::write(pool.path().join(".bad_tokens"), marks).unwrap();
+    pool
+}
+
+/// #13873: with every account fable-class-marked and the block absent, the
+/// gate skips exactly as before (the class-scoped marks still block the
+/// account-wide read). With `modelFallback.enabled`, the same pool must not
+/// skip a tick whose configured model can fall back to a healthy rung.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+fn claude_gate_honours_the_selection_time_model_fallback() {
+    claude_gate_honours_the_selection_time_model_fallback_body();
+}
+
+#[serial]
+fn claude_gate_honours_the_selection_time_model_fallback_body() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
+        fs::create_dir_all(workspace.path().join(sub)).unwrap();
+    }
+    let pool = fable_exhausted_shared_pool();
+    let logs = workspace.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        workspace.path().join(".loom/config.json"),
+        r#"{"autonomous":{"roleRunner":{"roleModels":{"judge":"fable"}}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join(".loom/roles/judge.json"),
+        r#"{"runtimeRequirements":["mcp"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join(".loom/runtimes/claude.json"),
+        r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#,
+    )
+    .unwrap();
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-claude.sh"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    let admitted =
+        crate::runtime_admission::resolve_and_admit(workspace.path(), "judge", Some("claude"))
+            .unwrap();
+
+    // Block absent: today's account-wide read sees the class-scoped marks as
+    // blocking and skips the tick.
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
+    let skip = crate::role_runner::runtime_preflight::static_check(
+        workspace.path(),
+        &logs,
+        "judge",
+        Some(&Ok(admitted.clone())),
+    );
+    assert!(
+        matches!(skip, Some(RoleTickOutcome::PoolExhausted { .. })),
+        "absent block keeps today's skip: {skip:?}"
+    );
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
+
+    // Enabled: the walk lands on opus (usable), so the gate lets the tick
+    // through — the launch itself falls back and selects an opus account.
+    fs::write(
+        workspace.path().join(".loom/config.json"),
+        r#"{"autonomous":{"roleRunner":{"roleModels":{"judge":"fable"}},"modelFallback":{"enabled":true}}}"#,
+    )
+    .unwrap();
+    let skip = crate::role_runner::runtime_preflight::static_check(
+        workspace.path(),
+        &logs,
+        "judge",
+        Some(&Ok(admitted.clone())),
+    );
+    assert!(skip.is_none(), "a usable rung must not hold the tick: {skip:?}");
+    drop(pool);
+}
+
 // #10660: the same gate read from the shared session snapshot.
 #[path = "session_snapshot_tests.rs"]
 mod session_snapshot;

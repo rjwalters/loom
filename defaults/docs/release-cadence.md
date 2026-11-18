@@ -385,6 +385,14 @@ it, never at release time:
   installed files: it starts executing an installed file that older releases
   do not ship, or relies on a changed argument contract. Add any newly
   executed file to `DAEMON_INVOKED_INSTALLED_FILES` in the same PR.
+  The same goes for a fix that spans the daemon binary and `defaults/scripts`
+  (#14015): raise `SUPPORTS_INSTALLED` in that same release. It is the one
+  hard-break lever. A repo one release behind but at or above
+  `SUPPORTS_INSTALLED` is not held while it waits for its workspace resync
+  (#11052), so it runs the new daemon against the old scripts and the fix is
+  half applied (a `claim_lost` is how that showed). Raising the value holds
+  such a repo until its resync lands. `loom-daemon status` and a once-per-repo
+  INFO line show which repos are in that state, but nothing holds them.
 
 The `Compatibility contract across adjacent releases` step of CI's
 `Install Surface Checks` job (`loom-daemon install-compat check`) proves both
