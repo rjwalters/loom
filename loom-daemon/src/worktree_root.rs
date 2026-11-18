@@ -246,6 +246,27 @@ mod tests {
 
     use std::fs;
 
+    /// Guard for the config-tier tests below: they hold BOTH the unkeyed
+    /// default lock and `loom_config_env`. `serial_test` keeps the two as
+    /// independent locks (the default group is key `""`), and its macro
+    /// cannot name the default key in a multi-key list, so a test nests: the
+    /// `#[serial(loom_config_env)]` test calls a `#[serial] fn *_body()`.
+    /// That order is load-bearing and crate-mandatory — `loom_config_env`
+    /// outside, default inside; see `role_collision.rs`'s lock-order doc
+    /// (rest_queue_source_parses_the_live_listing_shape_body). Nesting fixes
+    /// the order structurally; this guard still fails loudly if either lock
+    /// is ever dropped (#14214).
+    fn assert_holds_default_and_config_env_locks() {
+        assert!(
+            serial_test::is_locked_serially(None),
+            "test must hold the default #[serial] lock: it mutates LOOM_WORKTREE_ROOT"
+        );
+        assert!(
+            serial_test::is_locked_serially(Some("loom_config_env")),
+            "test must hold the loom_config_env lock: it mutates PRIVATE_DEFAULTS_ENV"
+        );
+    }
+
     #[test]
     #[serial]
     fn default_when_no_override() {
@@ -444,18 +465,26 @@ mod tests {
     // now that `read_config_worktree_root` goes through
     // `config_resolver::resolve_effective_config`. Every test that touches
     // `LOOM_CONFIG_DEFAULTS_FILE` is serialized on the keyed
-    // `loom_config_env` lock (not the crate-wide unkeyed `#[serial]` lock —
-    // see the CI-cost note on issue #4058) and pins the env var to `""` so a
-    // private defaults file on the host can never leak in.
-    //
-    // A test that also needs the crate-default `#[serial]` lock nests it
-    // INSIDE this one (`loom_config_env` outer, default inner); a reverse
-    // order is a lock cycle that hangs the binary. That order is enforced by
-    // `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock` (#14404).
+    // `loom_config_env` lock (see the CI-cost note on issue #4058) and pins
+    // the env var to `""` so a private defaults file on the host can never
+    // leak in. Because `with_env` also removes/restores LOOM_WORKTREE_ROOT,
+    // which the default-group tests set, each of these tests additionally
+    // holds the unkeyed default lock so the two groups cannot interleave on
+    // that var (#14214): it nests a `#[serial] fn *_body()` inside the
+    // `#[serial(loom_config_env)]` test — `loom_config_env` outside, default
+    // inside, the order role_collision's lock-order doc mandates (enforced by
+    // `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`,
+    // #14404). Only these four short tests join the default queue.
 
     #[test]
     #[serial(loom_config_env)]
     fn project_tier_only_worktree_root_is_honored_like_legacy() {
+        project_tier_only_worktree_root_is_honored_like_legacy_body();
+    }
+
+    #[serial]
+    fn project_tier_only_worktree_root_is_honored_like_legacy_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -471,6 +500,12 @@ mod tests {
     #[test]
     #[serial(loom_config_env)]
     fn project_tier_overrides_legacy_tier_on_overlap() {
+        project_tier_overrides_legacy_tier_on_overlap_body();
+    }
+
+    #[serial]
+    fn project_tier_overrides_legacy_tier_on_overlap_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -491,6 +526,12 @@ mod tests {
     #[test]
     #[serial(loom_config_env)]
     fn local_tier_overrides_both_legacy_and_project() {
+        local_tier_overrides_both_legacy_and_project_body();
+    }
+
+    #[serial]
+    fn local_tier_overrides_both_legacy_and_project_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -508,6 +549,12 @@ mod tests {
     #[test]
     #[serial(loom_config_env)]
     fn explicit_null_in_project_tier_clears_legacy_worktree_root() {
+        explicit_null_in_project_tier_clears_legacy_worktree_root_body();
+    }
+
+    #[serial]
+    fn explicit_null_in_project_tier_clears_legacy_worktree_root_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");

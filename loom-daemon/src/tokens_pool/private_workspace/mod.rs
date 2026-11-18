@@ -26,7 +26,7 @@ mod worker_setup;
 
 pub use lease::AccountBusy;
 pub use lifecycle::{
-    check_binding, configured, converge, recover, registered_repositories, run_job,
+    check_binding, configured, converge, rebind, recover, registered_repositories, run_job,
     session_recover, start, status, stop, Converged,
 };
 pub use repository::WorkerCommand;
@@ -287,6 +287,59 @@ pub struct RecoverOutcome {
 pub struct RecoverReport {
     pub account: String,
     pub clones: Vec<RecoverOutcome>,
+}
+
+/// What one clone looked like to a rebind (#14357): enough to prove a move
+/// kept every branch, dirty file and unpublished commit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CloneState {
+    pub path: String,
+    pub populated: bool,
+    pub branches: Vec<UnpublishedBranch>,
+    /// Uncommitted or untracked files in the main checkout.
+    pub dirty: bool,
+    /// Detached HEADs carrying unpublished commits.
+    pub detached: usize,
+}
+
+/// How a rebind ended. `BothPopulated` is a refusal: nothing was changed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RebindStatus {
+    /// The old clone was moved to the canonical location and re-pointed.
+    Moved,
+    /// Already bound to the canonical repository; verified (and any
+    /// interrupted step finished) without moving anything.
+    AlreadyBound,
+    /// Neither location holds a clone yet: only the registration changed.
+    NotCloned,
+    /// `--dry-run`: the move was verified possible and not made.
+    DryRun,
+    /// Both locations hold a populated clone; both were left intact.
+    BothPopulated,
+}
+
+/// The in-volume half of a rebind, as `private-workspace rebind` reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RebindOutcome {
+    pub status: RebindStatus,
+    pub from: CloneState,
+    pub to: CloneState,
+}
+
+/// What `accounts session rebind` did.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RebindReport {
+    pub account: String,
+    pub from: String,
+    pub to: String,
+    pub base: String,
+    pub status: RebindStatus,
+    /// Whether `workspace.json` was (or, under `--dry-run`, would be) changed.
+    pub registration_changed: bool,
+    pub clone_path: String,
+    pub before: CloneState,
+    pub after: CloneState,
 }
 
 fn account(workspace: &Path, name: &str) -> Result<super::account_registry::AccountDescriptor> {

@@ -184,13 +184,67 @@ fn adapter_launch_facts(
     args: &[std::ffi::OsString],
 ) -> (Option<String>, Option<String>) {
     let (model, effort) = adapter_flag_facts(args);
-    let model = model.or_else(|| nonempty_env("LOOM_MODEL")).or_else(|| {
-        (runtime == "codex")
-            .then(|| nonempty_env("LOOM_CODEX_MODEL"))
-            .flatten()
-    });
-    let effort = effort.or_else(|| nonempty_env("LOOM_EFFORT"));
-    (model, effort)
+    let env_effort = nonempty_env("LOOM_EFFORT");
+    if runtime == "codex" && model.is_none() {
+        // #14302: spawn-codex.sh splits the env-tier model on its first `@`
+        // (`model@effort`, #8387) when no `-m` is present; record the base
+        // and the suffix it actually launches with, not the raw string.
+        let sources = [nonempty_env("LOOM_MODEL"), nonempty_env("LOOM_CODEX_MODEL")];
+        let (model, suffix) = codex_env_model_split(sources.each_ref().map(Option::as_deref));
+        // The suffix is the lowest-precedence effort source: an explicit
+        // `--effort`, `LOOM_EFFORT` or `-c model_reasoning_effort=` beats it.
+        let suffix = suffix.filter(|_| !adapter_has_effort_config(args));
+        return (model, effort.or(env_effort).or(suffix));
+    }
+    let model = model.or_else(|| nonempty_env("LOOM_MODEL"));
+    (model, effort.or(env_effort))
+}
+
+/// spawn-codex.sh's `model@effort` split over the env tier (`LOOM_MODEL`,
+/// then `LOOM_CODEX_MODEL`), used only when argv has no `-m`. Each source is
+/// split on its first `@`; an empty base falls through to the next source
+/// (its suffix is discarded), an empty suffix means no effort. Deliberately
+/// not `model_tiers::base_of`, which lower-cases and would change the
+/// recorded model. `codex_adapter_model` stays raw on purpose: containment
+/// admission wants the value as configured.
+fn codex_env_model_split(sources: [Option<&str>; 2]) -> (Option<String>, Option<String>) {
+    for value in sources.into_iter().flatten() {
+        let (base, suffix) = value.split_once('@').unwrap_or((value, ""));
+        if !base.trim().is_empty() {
+            return (Some(base.to_owned()), (!suffix.trim().is_empty()).then(|| suffix.to_owned()));
+        }
+    }
+    (None, None)
+}
+
+/// Whether argv carries an explicit `-c model_reasoning_effort=...`, which
+/// spawn-codex.sh lets win over every other effort source.
+fn adapter_has_effort_config(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().filter_map(|a| a.to_str());
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" => break,
+            "-c" | "--config" => {
+                if args
+                    .next()
+                    .is_some_and(|v| v.starts_with("model_reasoning_effort="))
+                {
+                    return true;
+                }
+            }
+            "-p" | "--prompt" | "-m" | "--model" | "--effort" | "-s" | "--sandbox" | "--log"
+            | "--profile" => {
+                args.next();
+            }
+            _ if (arg.starts_with("-c=") || arg.starts_with("--config="))
+                && arg.contains("model_reasoning_effort=") =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The argv-only half of [`adapter_launch_facts`]: the explicit
@@ -1052,5 +1106,46 @@ mod adapter_launch_facts_tests {
     fn an_empty_value_is_absent_not_empty() {
         assert_eq!(facts(&["--model=", "--effort="]).0, None);
         assert_eq!(facts(&["--model=", "--effort="]).1, None);
+    }
+
+    fn split(a: Option<&str>, b: Option<&str>) -> (Option<String>, Option<String>) {
+        super::codex_env_model_split([a, b])
+    }
+
+    #[test]
+    fn env_model_splits_on_first_at_without_changing_case() {
+        assert_eq!(
+            split(Some("GPT-5-Codex@high"), None),
+            (Some("GPT-5-Codex".into()), Some("high".into()))
+        );
+        assert_eq!(split(Some("a@b@c"), None), (Some("a".into()), Some("b@c".into())));
+        assert_eq!(split(Some("gpt-5"), None), (Some("gpt-5".into()), None));
+    }
+
+    #[test]
+    fn env_model_empty_base_falls_through_and_empty_suffix_is_no_effort() {
+        assert_eq!(
+            split(Some("@high"), Some("seat@low")),
+            (Some("seat".into()), Some("low".into()))
+        );
+        assert_eq!(split(Some("@high"), None), (None, None));
+        assert_eq!(split(Some("gpt-5-codex@"), None), (Some("gpt-5-codex".into()), None));
+        assert_eq!(split(Some("a@x"), Some("b@y")), (Some("a".into()), Some("x".into())));
+    }
+
+    #[test]
+    fn a_config_effort_override_is_detected_only_outside_data() {
+        let has = |args: &[&str]| {
+            let args = args
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            super::adapter_has_effort_config(&args)
+        };
+        assert!(has(&["-c", "model_reasoning_effort=low"]));
+        assert!(has(&["--config=model_reasoning_effort=low"]));
+        assert!(!has(&["-p", "-c model_reasoning_effort=low"]));
+        assert!(!has(&["--", "-c", "model_reasoning_effort=low"]));
+        assert!(!has(&["-c", "foo=bar"]));
     }
 }

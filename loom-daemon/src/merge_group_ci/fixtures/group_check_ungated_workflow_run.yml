@@ -1,0 +1,27 @@
+# Fixture: the shipped group-check template with its job-level trust gate
+# deleted. The `branches:` filter alone does not keep a fork PR out (a fork
+# branch can be named `gh-readonly-queue/x`).
+name: Merge-queue group check
+
+on:
+  merge_group:
+    types: [checks_requested]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ['gh-readonly-queue/**']
+
+permissions:
+  statuses: write
+  contents: read
+
+jobs:
+  group-check:
+    name: Merge authorization
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check merge-group authorization
+        run: |
+          "$RUNNER_TEMP/loom-daemon" forge merge-queue group-check \
+            --commit "${{ github.event.merge_group.head_sha }}" --repo "$GH_REPO"

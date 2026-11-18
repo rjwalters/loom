@@ -530,14 +530,39 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
         assert_eq!(run.attributes["loom.effort"], "high");
     }
     // Legacy claude/codex: the handed-over argv, the env tier, or absence.
-    for (runtime, model_arg, env_tier, expect_model) in [
-        ("claude", true, "", Some("sonnet")),
-        ("codex", true, "", Some("gpt-5.1")),
+    // `env_effort` is `LOOM_EFFORT`; `expect_effort` is `None` for "absent".
+    for (runtime, model_arg, env_tier, expect_model, env_effort, expect_effort) in [
+        ("claude", true, "", Some("sonnet"), "", Some("high")),
+        ("codex", true, "", Some("gpt-5.1"), "", Some("high")),
         // Nothing on argv and nothing in the env tier: absent, never the
         // configured value (there is none to fill it with here).
-        ("claude", false, "", None),
+        ("claude", false, "", None, "", None),
         // Codex's static per-seat default is the env tier of last resort.
-        ("codex", false, "LOOM_CODEX_MODEL", Some("seat-model")),
+        ("codex", false, "LOOM_CODEX_MODEL", Some("seat-model"), "", None),
+        // #14302: the adapter splits `model@effort` on the first `@`; the
+        // span records the base as the model and the suffix as the effort.
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "",
+            Some("high"),
+        ),
+        // `LOOM_EFFORT` outranks the suffix, as in the adapter.
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "low",
+            Some("low"),
+        ),
+        // An empty suffix is no effort; an empty base is no model.
+        ("codex", false, "LOOM_CODEX_MODEL=gpt-5-codex@", Some("gpt-5-codex"), "", None),
+        ("codex", false, "LOOM_CODEX_MODEL=@high", None, "", None),
+        // An explicit model arg suppresses the env split (and its suffix).
+        ("codex", true, "LOOM_CODEX_MODEL=seat@low", Some("gpt-5.1"), "", Some("high")),
     ] {
         let dir = root();
         let root = dir.path();
@@ -576,6 +601,9 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
             .env("LOOM_ACCOUNT_NAME", "SECRET-ACCOUNT-NAME")
             .env_remove("LOOM_MODEL")
             .env_remove("LOOM_EFFORT");
+        if !env_effort.is_empty() {
+            cmd.env("LOOM_EFFORT", env_effort);
+        }
         if runtime == "codex" {
             // #8787's private-clone containment is pool machinery no fixture
             // has; the adapter's explicit-credential env bypasses it.
@@ -583,6 +611,8 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
         }
         if env_tier == "LOOM_CODEX_MODEL" {
             cmd.env("LOOM_CODEX_MODEL", "seat-model");
+        } else if let Some(value) = env_tier.strip_prefix("LOOM_CODEX_MODEL=") {
+            cmd.env("LOOM_CODEX_MODEL", value);
         } else {
             cmd.env_remove("LOOM_CODEX_MODEL");
         }
@@ -601,14 +631,11 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
         assert_eq!(run.attributes["loom.issue"], "18", "{runtime}");
         assert_eq!(run.attributes["loom.sweep_id"], "legacy-sweep", "{runtime}");
         assert_eq!(run.attributes.get("loom.model").map(String::as_str), expect_model, "{runtime}");
-        if model_arg {
-            assert_eq!(run.attributes["loom.effort"], "high", "{runtime}");
-        } else {
-            assert!(
-                !run.attributes.contains_key("loom.effort"),
-                "{runtime} filled effort with a guess"
-            );
-        }
+        assert_eq!(
+            run.attributes.get("loom.effort").map(String::as_str),
+            expect_effort,
+            "{runtime} {env_tier} effort"
+        );
         let bytes = serde_json::to_string(&records).unwrap();
         assert!(!bytes.contains("SECRET-ACCOUNT-NAME"), "{runtime} leaks an account name");
     }

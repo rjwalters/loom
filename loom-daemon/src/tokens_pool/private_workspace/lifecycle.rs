@@ -419,6 +419,135 @@ pub fn session_recover(
     Ok(report)
 }
 
+/// Rebind an additional private-clone registration to the repository's
+/// canonical URL after a forge transfer (`accounts session rebind`, #14357),
+/// keeping its clone, local branches, dirty files and unpublished commits.
+///
+/// Guards are the job policy's plus the hold check: resolved workspace
+/// identity, a firewall check on the NEW url, the exclusive account lease, a
+/// running idle session, and no operator hold, all before the first mutation
+/// (a busy account is [`AccountBusy`], a held one [`OperatorHeld`]; neither is
+/// ever interrupted or lifted). The in-volume step verifies the canonical
+/// repository shares history with the clone before anything moves, and
+/// reports (changing nothing) when both locations already hold a clone.
+/// `workspace.json` is rewritten only after the volume is done, so a crash in
+/// between is finished by repeating the call. Re-running a completed rebind
+/// verifies and reports it. The primary repository is never rebound here.
+pub fn rebind(
+    workspace: &Path,
+    name: &str,
+    from: &str,
+    to: &str,
+    dry_run: bool,
+) -> Result<RebindReport> {
+    let (from_id, to_id) = (identify(&repository_url(from)?)?, identify(&repository_url(to)?)?);
+    if from_id.key == to_id.key {
+        bail!("old and canonical URLs name the same repository; a spelling change needs no rebind");
+    }
+    let (mut config, dir) = resolve(workspace, name)?;
+    let is_primary = |key: &str| identify(&config.repository).is_ok_and(|id| id.key == key);
+    if is_primary(&from_id.key) || is_primary(&to_id.key) {
+        bail!(
+            "the primary repository cannot be rebound; only additional registrations ({})",
+            registered_urls(&config)
+        );
+    }
+    let find = |key: &str| {
+        config
+            .repositories
+            .iter()
+            .position(|r| identify(&r.repository).is_ok_and(|id| id.key == key))
+    };
+    let (old_at, new_at) = (find(&from_id.key), find(&to_id.key));
+    let from_reg = match (old_at, new_at) {
+        (Some(at), _) => config.repositories[at].clone(),
+        // Old registration already retired: verify the canonical one.
+        (None, Some(at)) => Registered {
+            repository: from_id.url.clone(),
+            base: config.repositories[at].base.clone(),
+            slug: from_id.slug.clone(),
+        },
+        (None, None) => bail!(
+            "neither {} nor {} is registered on this account (registered: {})",
+            from_id.url,
+            to_id.url,
+            registered_urls(&config)
+        ),
+    };
+    if let Some(at) = new_at {
+        if config.repositories[at].base != from_reg.base {
+            bail!("the old and canonical registrations use different bases; resolve that before rebinding");
+        }
+    }
+    check_firewall(workspace, &to_id)?;
+    let _lease = lease::Lease::acquire(&dir)?;
+    let state = docker::inspect(&config.container)?
+        .context("private session is stopped; start it first")?;
+    docker::validate(&config, &state)?;
+    if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
+        return Err(
+            lease::AccountBusy("private session is not running and idle; try again later").into()
+        );
+    }
+    if session_hold::held_across(std::slice::from_ref(&config.profile)) {
+        return Err(OperatorHeld.into());
+    }
+    let auth = forge_auth::ExecAuth::resolve(workspace, &to_id.url);
+    let outcome = docker::rebind_target(&config, &from_reg, &to_id, dry_run, &auth)?;
+    let settled = matches!(
+        outcome.status,
+        RebindStatus::Moved | RebindStatus::AlreadyBound | RebindStatus::NotCloned
+    );
+    let canonical = Registered {
+        repository: to_id.url.clone(),
+        base: from_reg.base.clone(),
+        slug: to_id.slug.clone(),
+    };
+    let wanted: Vec<Registered> = {
+        let mut list = Vec::new();
+        for registered in &config.repositories {
+            let key = identify(&registered.repository).map(|id| id.key).ok();
+            if key.as_deref() == Some(from_id.key.as_str())
+                || key.as_deref() == Some(to_id.key.as_str())
+            {
+                if !list.contains(&canonical) {
+                    list.push(canonical.clone());
+                }
+            } else {
+                list.push(registered.clone());
+            }
+        }
+        list
+    };
+    let registration_changed = wanted != config.repositories;
+    if settled && registration_changed && !dry_run {
+        config.repositories = wanted;
+        save(&dir.join("workspace.json"), &config)?;
+    }
+    Ok(RebindReport {
+        account: config.account.clone(),
+        from: from_id.url,
+        to: to_id.url,
+        base: from_reg.base,
+        status: outcome.status,
+        registration_changed: registration_changed && (settled || dry_run),
+        clone_path: format!("{WORK_ROOT}/{}", to_id.slug),
+        before: if outcome.from.populated {
+            outcome.from
+        } else {
+            outcome.to.clone()
+        },
+        after: outcome.to,
+    })
+}
+
+fn registered_urls(config: &Config) -> String {
+    std::iter::once(config.repository.as_str())
+        .chain(config.repositories.iter().map(|r| r.repository.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
