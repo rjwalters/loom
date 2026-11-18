@@ -472,8 +472,9 @@ mod tests {
     // holds the unkeyed default lock so the two groups cannot interleave on
     // that var (#14214): it nests a `#[serial] fn *_body()` inside the
     // `#[serial(loom_config_env)]` test — `loom_config_env` outside, default
-    // inside, the order role_collision's lock-order doc mandates. Only these
-    // four short tests join the default queue.
+    // inside, the order role_collision's lock-order doc mandates (enforced by
+    // `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`,
+    // #14404). Only these four short tests join the default queue.
 
     #[test]
     #[serial(loom_config_env)]

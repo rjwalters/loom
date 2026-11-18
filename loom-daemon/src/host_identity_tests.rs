@@ -19,7 +19,9 @@ pub(crate) const GUARDED_ENV: &[&str] = &[
 /// (outer, for `LOOM_CONFIG_DEFAULTS_FILE`) then the crate-default group
 /// (inner, for `LOOM_HOST_ID`/`HOSTNAME`, shared with `sweep_registry`'s
 /// tests). Multi-key `#[serial(a, b)]` cannot name the default group, so it
-/// nests, in the order `role_collision`'s nested test documents.
+/// nests, in the order `role_collision`'s nested test documents. That order is
+/// enforced by `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`
+/// (#14404).
 macro_rules! env_test {
     ($(#[$m:meta])* fn $name:ident() $body:block) => {
         $(#[$m])*
