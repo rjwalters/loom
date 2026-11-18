@@ -10589,7 +10589,7 @@ through `.loom-local/local.json`):
 | Config key | Tier | Value |
 |---|---|---|
 | — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
-| — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. |
+| — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. A container target must lie outside the mounted workspace (the `--mount-workspace` path, not only the registered repositories beneath it); one inside it is refused at `create`. |
 
 **Precedence**: `accounts session start --image IMAGE` (the operator's own
 invocation) beats `accounts.session.image`, which beats the stock default.
