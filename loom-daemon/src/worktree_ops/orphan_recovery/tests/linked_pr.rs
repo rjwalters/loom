@@ -659,10 +659,8 @@ fn format_result_json_round_trips_totals() {
         kind: "untracked_building",
         issue: Some(1),
         pr: None,
-        pid: None,
         title: Some("t".to_string()),
         reason: "no_spawn_loop_entry".to_string(),
-        age_seconds: None,
     });
     let json = format_result_json(&result);
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

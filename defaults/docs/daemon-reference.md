@@ -3944,6 +3944,16 @@ days are renamed to `daemon.log.YYYY-MM-DD`; each file holds one UTC day
 - **Archive hook:** with `LOOM_DAEMON_LOG_REQUIRE_ARCHIVE=1`, retention deletes a
   day file only when its sidecar `<day file>.archived` exists (created by the
   host's archiver), and removes the pair. Unset: plain age-based deletion.
+- **Step-log archive gate (#14177):** the `.loom/logs/` retention pass
+  (`loom-clean`, `logs.retentionDays` / `LOOM_LOGS_RETENTION_DAYS`) never
+  removes per-step logs `step-<role>-<item>.log` — the durable
+  `LOOM_STEP_OUTCOME` history — unless `LOOM_STEP_LOG_REQUIRE_ARCHIVE=1`.
+  With the gate on, one is deleted (with its `<log>.archived` sidecar, the
+  same convention as the day-file hook above) only when ALL hold: the sidecar
+  exists (the off-host preserver's checksum-confirmed archival proof), the
+  item has no live sweep, no `.loom/sweep-checkpoint/issue-<item>.json`, the
+  log is past the retention window, and its last dispatch attempt wrote a
+  terminal outcome line. Any unreadable or ambiguous case keeps the file.
 - **Legacy files:** numbered `daemon.log.N` from the old startup rotation are
   never touched; an operator removes them once.
 - `loom-daemon health` reads the newest day file when the live file has no

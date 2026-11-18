@@ -100,10 +100,8 @@ pub struct OrphanEntry {
     /// The PR number, for the PR-side claim kinds (`stale_reviewing_pr` /
     /// `stale_treating_pr`). `None` for every issue-side kind.
     pub pr: Option<u32>,
-    pub pid: Option<u32>,
     pub title: Option<String>,
     pub reason: String,
-    pub age_seconds: Option<i64>,
 }
 
 /// A recovery action taken.
@@ -422,10 +420,8 @@ pub fn check_untracked_building(
             kind: "untracked_building",
             issue: Some(issue_num),
             pr: None,
-            pid: None,
             title: Some(issue_title),
             reason: reason.to_string(),
-            age_seconds: None,
         });
     }
 }
@@ -709,10 +705,8 @@ pub fn check_stale_pr_claims(repo_root: &Path, result: &mut OrphanRecoveryResult
             kind,
             issue: None,
             pr: Some(outcome.pr_number),
-            pid: None,
             title: None,
             reason: reason.clone(),
-            age_seconds: None,
         });
 
         if outcome.reclaimed {
@@ -889,14 +883,8 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
             if let Some(pr) = o.pr {
                 m.insert("pr".to_string(), pr.into());
             }
-            if let Some(p) = o.pid {
-                m.insert("pid".to_string(), p.into());
-            }
             if let Some(t) = &o.title {
                 m.insert("title".to_string(), t.clone().into());
-            }
-            if let Some(a) = o.age_seconds {
-                m.insert("age_seconds".to_string(), a.into());
             }
             serde_json::Value::Object(m)
         })
