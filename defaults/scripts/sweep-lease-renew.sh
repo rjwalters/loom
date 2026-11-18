@@ -410,10 +410,26 @@ lease_publish_raw_hostname() {
 # `LOOM_LEASE_HOST_ID` is first, as in `host_identity::lease_host_identity`:
 # a dispatcher exports its own lease host id to the session it spawns, so a
 # session whose hostname differs (a Codex session container) still names the
-# host its lease was published under, not its container.
+# host its lease was published under, not its container. Every value is
+# trimmed and a whitespace-only one counts as unset, matching Rust's
+# `non_blank` (#13998) -- " " must fall through to the next link, and
+# "worker-4 " must hash to the same opaque id as `worker-4`, or what this
+# loop renews and what the other sides publish would disagree on a hand-set
+# variable.
+trim() {
+    local s="${1-}"
+    s="${s#"${s%%[![:space:]]*}"}" # ltrim
+    s="${s%"${s##*[![:space:]]}"}" # rtrim
+    printf '%s' "$s"
+}
+
 resolve_host() {
-    local h="${LOOM_LEASE_HOST_ID:-${LOOM_HOST_ID:-${HOSTNAME:-}}}"
-    [[ -n "$h" ]] || h="$(hostname 2> /dev/null || true)"
+    local v h
+    for v in "${LOOM_LEASE_HOST_ID-}" "${LOOM_HOST_ID-}" "${HOSTNAME-}"; do
+        h="$(trim "$v")"
+        [[ -n "$h" ]] && { printf '%s' "$h"; return 0; }
+    done
+    h="$(trim "$(hostname 2> /dev/null || true)")"
     printf '%s' "${h:-unknown-host}"
 }
 

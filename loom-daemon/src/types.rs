@@ -62,13 +62,6 @@ pub enum Request {
         id: TerminalId,
         limit: usize,
     },
-    /// Capture git changes for a specific input
-    /// Called after a prompt completes to record code changes
-    CaptureGitChanges {
-        input_id: i64,
-        working_dir: String,
-        before_commit: Option<String>,
-    },
     /// Get the current git commit hash for a directory
     GetCurrentCommit {
         working_dir: String,
@@ -631,12 +624,6 @@ pub enum Response {
     CurrentCommit {
         commit: Option<String>,
     },
-    /// Response with git changes captured
-    GitChangesCaptured {
-        files_changed: i32,
-        lines_added: i32,
-        lines_removed: i32,
-    },
     // ========================================================================
     // Issue Claim Registry Responses (Issue #1159)
     // ========================================================================
@@ -994,10 +981,6 @@ impl SweepKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", content = "details")]
 pub enum SweepState {
-    /// Spawn requested but the child PID has not yet been confirmed alive.
-    /// In Phase A this transient state collapses immediately into `Running`,
-    /// but the variant is reserved for future async-spawn paths.
-    Pending,
     /// Child PID is alive (verified by the most recent reaper tick).
     Running,
     /// Child exited; recorded by the reaper task on a `kill(pid, 0)` failure.
@@ -1073,7 +1056,7 @@ pub struct SweepInfo {
     pub state: SweepState,
     /// Most-recent phase the sweep advertised via its checkpoint, if any.
     /// Set directly on `Crashed` entries (the reaper's crash path and
-    /// `reconstruct_from_checkpoints`). For `Running`/`Pending` entries this
+    /// `reconstruct_from_checkpoints`). For `Running` entries this
     /// field is `None` in the stored registry entry — `SweepRegistry::list`
     /// overlays a live read of the on-disk checkpoint at query time (#4328)
     /// so `ListSweeps`/`loom-daemon status` show the sweep's current phase
@@ -1186,7 +1169,7 @@ impl AgentResidueStatus {
 /// (and needing an edit every time one is added).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonStatusReport {
-    /// Sweeps in a non-terminal state (`Pending` / `Running`) at snapshot time.
+    /// Sweeps in a non-terminal state (`Running`) at snapshot time.
     /// The full `SweepInfo` is carried so the CLI can render issue numbers,
     /// PIDs, token account, and latest phase without a second round-trip.
     pub in_flight: Vec<SweepInfo>,
@@ -2605,7 +2588,7 @@ pub struct StaleSweepFinding {
     pub sweep_id: String,
     /// PID of the (confirmed alive at snapshot time) sweep process.
     pub pid: u32,
-    /// How long the sweep has been `Running`/`Pending`, in seconds.
+    /// How long the sweep has been `Running`, in seconds.
     pub elapsed_secs: u64,
     /// How long the sweep's log file has gone un-appended, in seconds, when
     /// its mtime was readable. `None` when the log is missing/unreadable.
@@ -2696,7 +2679,7 @@ pub struct RepoStatus {
     /// field parses as the default weight).
     #[serde(default = "crate::workspace_registry::default_weight")]
     pub weight: u32,
-    /// Count of non-terminal (`Pending` / `Running`) sweeps live in this repo's
+    /// Count of non-terminal (`Running`) sweeps live in this repo's
     /// own [`crate::sweep_registry::SweepRegistry`] at snapshot time.
     pub in_flight_count: usize,
     /// Whether this repo's dispatch is currently halted by the per-repo reactive

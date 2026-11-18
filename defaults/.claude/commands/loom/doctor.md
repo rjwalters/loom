@@ -339,7 +339,7 @@ If a number is provided (e.g., `/doctor 123`):
    `lease pr claim` re-attaches (exit 0) — continue and add `loom:treating`
    yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`
 4. Proceed directly to fixing that PR
-5. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=doctor target=<pr> class=<verdict|noop|refused|failed> reason=<token>`. `verdict` / `fixed` when you pushed a fix; `noop` / `no_fix_needed` when the PR needed none. Without it the captain reads the step as `failed` and holds the PR fleet-wide (#12551)
+5. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=doctor target=<pr> class=<verdict|noop|refused|failed> reason=<token>`. `verdict` / `fixed` when you pushed a fix; `noop` / `no_fix_needed` when the PR needed none; `failed` / `handback_failed` when the completion write (`forge doctor-handback`) failed — one token for that whole class (#14165). Without it the captain reads the step as `failed` and holds the PR fleet-wide (#12551)
 
 **How judge feedback reaches you.** When `/loom:sweep` dispatches a Doctor after a
 Judge rejection, the feedback lives in the PR itself — the Judge's review comments
@@ -1020,6 +1020,26 @@ and withdraws its add if a verdict landed meanwhile. Act on the exit:
 | 11 | `CLAIM-LOST` | `loom:treating` was gone; nothing written. Stand down (comment, exit). |
 | 12 | `HEAD-MOVED` | Someone pushed after you; only your claim was released. Comment, exit — no hand-back. |
 | 1 / other | `FAILED` | Retry once, then comment the printed line. Never hand-add `loom:review-requested`. No such verb (old `loom-daemon`): also remove only your `loom:treating`, so the next pass's stale-verdict guard re-queues the new head. |
+
+**The verb is self-bounded (#14165) — never wrap it in a short `timeout`.** Every
+forge call it makes carries its own 30 s deadline, the per-PR lock wait is
+bounded (`LOOM_VERDICT_LOCK_WAIT_SECS`, default 90 s), and the whole run
+answers within `--deadline-secs` (default 300): a watchdog prints
+`FAILED deadline of Ns exceeded …` rather than letting silence run on. A
+wrapper shorter than that budget kills the verb mid-write, strands the lock it
+holds (reaped only after 300 s) and reports nothing — that is exactly the
+"stalled without output" hand-back failure. If you must wrap it, the wrapper
+must exceed `--deadline-secs`. A lock wait that expires says `lock held` with
+the holder's age; a `FAILED` line names the failing forge call, and a refused
+session credential (HTTP 401) is classed `[github_auth]`.
+
+**One reason token for every hand-back failure (#14165).** Whatever the
+`FAILED` line names — lock held, deadline, a refused forge read,
+`[github_auth]` — the step's outcome line is exactly
+`LOOM_STEP_OUTCOME role=doctor target=<pr> class=failed reason=handback_failed`.
+Never mint a per-cause token (`handback_timeout`, `handoff_timeout`,
+`github_auth`) for this class: one token keeps the ledger's repeat accounting
+working.
 
 **Pre-completion checklist** (verify before signaling completion):
 - [ ] All CI checks pass (verified via `loom-daemon forge wait-checks <number>`)

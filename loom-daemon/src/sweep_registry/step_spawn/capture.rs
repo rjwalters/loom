@@ -73,21 +73,40 @@ pub struct StepOutcomeLine {
 
 const OUTCOME_PREFIX: &str = "LOOM_STEP_OUTCOME ";
 
+/// The bound on a recorded outcome `reason` (#14168): the reason is recorded
+/// as written (its `-` read as `_`), then truncated to this many `char`s on
+/// the span and the record. A later issue may decide a closed vocabulary;
+/// until then the bound is the only guard on it.
+const REASON_MAX_CHARS: usize = 64;
+
+/// `reason` truncated to [`REASON_MAX_CHARS`] `char`s. Pure.
+#[must_use]
+fn bound_reason(reason: &str) -> &str {
+    match reason.char_indices().nth(REASON_MAX_CHARS) {
+        Some((at, _)) => &reason[..at],
+        None => reason,
+    }
+}
+
 /// Parse one outcome line. The prompt's own template
-/// (`class=<verdict|noop|refused|failed>`) is not one. Pure.
+/// (`class=<verdict|noop|refused|failed>`) is not one. The prefix may sit
+/// anywhere in the line — bare, backticked, or inside a JSON text event
+/// (#14168) — and each field's value is [`token_value`] of its token, so a
+/// wrapper's framing characters (`"}`, a literal `\n` escape, a backtick)
+/// end the value instead of riding in it. Pure.
 #[must_use]
 pub fn parse_outcome_line(line: &str) -> Option<StepOutcomeLine> {
     let rest = &line[line.find(OUTCOME_PREFIX)? + OUTCOME_PREFIX.len()..];
     let field = |key: &str| {
         rest.split_whitespace()
             .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
-            .map(|v| v.trim_matches(|c: char| c == '`' || c == '"'))
+            .map(crate::step_dispatch::outcome_ledger::token_value)
     };
     Some(StepOutcomeLine {
         role: field("role")?.to_string(),
         target: field("target")?.parse().ok()?,
         class: StepOutcomeClass::parse(field("class")?)?,
-        reason: field("reason").unwrap_or("").replace('-', "_"),
+        reason: bound_reason(&field("reason").unwrap_or("").replace('-', "_")).to_string(),
     })
 }
 
@@ -334,6 +353,18 @@ pub fn step_failure(
     failure
 }
 
+/// A step's outcome as the span close and the `role_tick.outcome` record
+/// carry it (#12362, #14168): the class and the bounded reason of its
+/// `LOOM_STEP_OUTCOME` line, or `none` with an empty reason when it wrote no
+/// parseable line — "no outcome" is a countable value, not an absence. Pure.
+#[must_use]
+pub(crate) fn step_outcome_projection(line: Option<&StepOutcomeLine>) -> (String, String) {
+    match line {
+        Some(l) => (l.class.as_str().to_string(), l.reason.clone()),
+        None => ("none".to_string(), String::new()),
+    }
+}
+
 /// Everything the end-of-step emit needs, read out of the registry.
 #[derive(Debug, Clone)]
 pub(crate) struct StepCapture {
@@ -491,9 +522,7 @@ impl SweepRegistry {
             sweep_id: sweep_id.to_string(),
             started_at,
             outcome: tick_outcome(role, end, line.as_ref()),
-            step_outcome: line
-                .as_ref()
-                .map(|l| (l.class.as_str().to_string(), l.reason.clone())),
+            step_outcome: Some(step_outcome_projection(line.as_ref())),
             failure,
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
@@ -506,6 +535,7 @@ impl SweepRegistry {
             line.as_ref(),
             &capture.outcome,
             role,
+            info.map(|i| i.runtime.as_str()),
             info.and_then(|i| i.model.as_deref()),
             info.and_then(|i| i.effort.as_deref()),
             self.step_points(sweep_id),

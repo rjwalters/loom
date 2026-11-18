@@ -381,11 +381,14 @@ held_census() {
 # =====================================================================
 # "Per-PR Digest" (#6851, #13885), mirrored from champion-pr-merge.md's
 # "Held-PR Census -> Per-PR Digest" section:
-#   - HOLD_TABLE: the (marker, reason rule) table, one entry per hold kind —
-#     merge-risk, critical-file, ratification (#12992). Adding a hold kind
-#     is a single table edit in the shipped markdown.
-#   - classify_hold_kind: pick the kind whose hold marker last stands
-#     (latest matching comment); "" when no known marker stands.
+#   - HOLD_TABLE: the (kind, hold marker, cleared/released test) table, one
+#     row per hold kind — merge-risk, critical-file, ratification (#12992).
+#     Adding a hold kind is a single table edit in the shipped markdown.
+#     #14117: the third field is the per-kind "no longer standing" jq test —
+#     a marker being present is not that hold standing.
+#   - classify_hold_kind: pick the latest STANDING kind — per kind, the hold
+#     marker's latest index must outdate the kind's latest cleared/released
+#     notice (the MR_STANDS rindex idiom); "" when no known kind stands.
 #   - unknown_hold_marker: the latest `champion:<X>-hold` comment body whose
 #     marker is NOT in the table ("" when there is none).
 #   - digest_reason_from_body: the per-kind reason rule — merge-risk /
@@ -393,33 +396,49 @@ held_census() {
 #     notice has no axis bullet, only a backticked file list) builds the
 #     reason from the notice itself.
 #   - digest_reason_for: the whole Step-1 extraction for one PR's comments,
-#     with the two-way fallback — an unknown hold marker is NAMED, and only
-#     a genuine absence reports "no champion hold marker found" (#13885).
+#     with the three-way fallback (#14117) — an unknown hold marker is
+#     NAMED, a known-but-fully-cleared hold set is reported as such, and
+#     only a genuine absence reports "no champion hold marker found" (#13885).
 #   - held_at_doctor_count: the census HELD_AT_DOCTOR jq (same marker set as
 #     HOLD_TABLE) over a canned `gh pr list --json labels,comments` payload.
+#   - released_holds: the census RELEASED jq over a canned payload —
+#     including the ratification family (#14117).
 #   - digest_row: format one digest table row (PR number, reason, status),
 #     appending ", out at Doctor" only when the PR carries
 #     loom:changes-requested — same as $HELD_JSON's label check.
 # =====================================================================
 HOLD_TABLE=(
-    "merge-risk|<!-- champion:merge-risk-hold -->"
-    "critical-file|<!-- champion:critical-file-hold -->"
-    "ratification|<!-- champion:ratification-hold -->"
+    "merge-risk|<!-- champion:merge-risk-hold -->|contains(\"<!-- champion:merge-risk-hold-cleared -->\")"
+    "critical-file|<!-- champion:critical-file-hold -->|startswith(\"<!-- champion:critical-file-hold-cleared -->\")"
+    "ratification|<!-- champion:ratification-hold -->|startswith(\"<!-- champion:ratification-hold-cleared -->\") or startswith(\"<!-- champion:ratification-release-respected -->\")"
 )
+KNOWN_MARKERS_JSON=$(printf '%s\n' "${HOLD_TABLE[@]}" | cut -d'|' -f2 | jq -R . | jq -s -c .)
 
 classify_hold_kind() {
-    local comments="$1" best=-1 kind="" idx entry kind_m marker
+    local comments="$1" best=-1 kind="" idx entry kind_m marker clears stands
     for entry in "${HOLD_TABLE[@]}"; do
-        kind_m="${entry%%|*}"; marker="${entry#*|}"
+        kind_m="${entry%%|*}"; entry="${entry#*|}"
+        marker="${entry%%|*}"; clears="${entry#*|}"
         idx=$(jq --arg m "$marker" 'to_entries | map(select(.value | startswith($m))) | last | .key // -1' <<<"$comments")
-        if [ "$idx" -gt "$best" ]; then best=$idx; kind=$kind_m; fi
+        [ "$idx" -ge 0 ] || continue
+        # #14117: a marker being present is not that hold standing — the
+        # kind's latest hold marker must outdate its latest cleared/released
+        # notice (the MR_STANDS rindex idiom).
+        stands=$(jq --arg m "$marker" '(map(startswith($m)) | rindex(true)) as $h | (map('"$clears"') | rindex(true)) as $c | $h != null and ($c == null or $h > $c)' <<<"$comments")
+        if [ "$stands" = true ] && [ "$idx" -gt "$best" ]; then best=$idx; kind=$kind_m; fi
     done
     echo "$kind"
 }
 
 unknown_hold_marker() {
-    jq -r 'map(select(test("^<!-- champion:[a-z0-9-]+-hold -->"))) | last // ""' <<<"$1" \
+    jq -r --argjson known "$KNOWN_MARKERS_JSON" 'map(select(test("^<!-- champion:[a-z0-9-]+-hold -->") and (([. as $b | $known[] as $k | select($b | startswith($k))] | length) == 0))) | last // ""' <<<"$1" \
         | head -1 | sed -nE 's/^(<!-- champion:[a-z0-9-]+-hold -->).*/\1/p'
+}
+
+known_hold_present() {
+    # Collect-then-any, not any(gen): jq's any(f) runs f per element, so an
+    # `as`-binding generator inside it would iterate strings.
+    jq --argjson known "$KNOWN_MARKERS_JSON" '([.[] as $b | $known[] as $k | $b | startswith($k)] | any)' <<<"$1"
 }
 
 digest_reason_from_body() {
@@ -448,28 +467,45 @@ digest_reason_from_body() {
 }
 
 digest_reason_for() {
-    local comments="$1" kind body marker entry
+    local comments="$1" kind body marker entry e
     kind=$(classify_hold_kind "$comments")
     if [[ -z "$kind" ]]; then
         local unknown
         unknown=$(unknown_hold_marker "$comments")
         if [[ -n "$unknown" ]]; then
             echo "unknown hold marker $unknown (digest prompt needs updating)"
+        elif [[ "$(known_hold_present "$comments")" == true ]]; then
+            echo "no standing hold — every known hold marker on this PR is cleared/released (#14117)"
         else
             echo "reason unrecorded (no champion hold marker found)"
         fi
         return
     fi
     for entry in "${HOLD_TABLE[@]}"; do
-        [[ "${entry%%|*}" == "$kind" ]] && marker="${entry#*|}"
+        e="${entry#*|}"
+        [[ "${entry%%|*}" == "$kind" ]] && marker="${e%%|*}"
     done
     body=$(jq -r --arg m "$marker" '[.[] | select(startswith($m))] | last // ""' <<<"$comments")
     digest_reason_from_body "$kind" "$body"
 }
 
 held_at_doctor_count() {
-    jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->") or startswith("<!-- champion:ratification-hold -->"))
-    and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->") or startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | not))] | length'
+    # Mirrors the shipped census jq (#14117): count the PR when ANY kind
+    # stands — per kind, the hold marker's latest comment index must outdate
+    # the kind's latest cleared/released notice (the MR_STANDS rindex idiom).
+    jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(
+      ([.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
+      or ([.comments[].body] | (map(startswith("<!-- champion:critical-file-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:critical-file-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
+      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length'
+}
+
+released_holds() {
+    # Mirrors the shipped RELEASED jq (#14117): the ratification family is
+    # listed too — its released state is a LATEST
+    # `ratification-release-respected` marker; a `-cleared` last marker is
+    # auto-cleared, not listed.
+    jq -r '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->")) or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->")) or ([.comments[].body | select(startswith("<!-- champion:ratification-hold") or startswith("<!-- champion:ratification-release-respected"))] | last // "" | startswith("<!-- champion:ratification-release-respected -->")))
+    | "#\(.number)"] | join(" ")'
 }
 
 digest_row() {
@@ -1022,18 +1058,41 @@ assert_eq "unknown hold marker <!-- champion:experimental-hold --> (digest promp
     "$(digest_reason_for "$(jq -n --arg h "$UNKNOWN_HOLD_BODY" '[$h]')")" \
     "an unknown champion hold marker is named in the reason, distinct from 'no champion hold marker' (#13885 AC #3)"
 
-# The latest standing marker among the table wins (defensive: a PR carries
-# one standing hold, but the selection must not depend on table order).
+# The latest STANDING kind among the table wins (defensive: multi-hold PRs
+# are a modeled state — two concurrent Champion holds — and the selection
+# must not depend on table order).
 BOTH_COMMENTS=$(jq -n --arg mr "$HOLD_BODY_GOOD" --arg rt "$RATIFICATION_HOLD_BODY" '[$mr, $rt]')
 assert_eq "ratification" \
     "$(classify_hold_kind "$BOTH_COMMENTS")" \
-    "classify picks the LATEST standing marker, not the first table row"
+    "classify picks the LATEST STANDING kind, not the first table row"
 
-# Cleared/released notices never startswith-match their hold marker, so they
-# do not change the classification (a held PR always has a standing hold).
+# #14117: selection is standing-aware — "a marker is present" is not "that
+# hold stands". A kind whose hold is cleared does not classify, even though
+# the cleared notice never startswith-matches its hold marker.
+MR_CLEARED_COMMENTS=$(jq -n --arg h '<!-- champion:merge-risk-hold -->' --arg c '<!-- champion:merge-risk-hold-cleared -->' '[$h, $c]')
+assert_eq "" \
+    "$(classify_hold_kind "$MR_CLEARED_COMMENTS")" \
+    "a kind whose hold is cleared does not classify (#14117): 'a marker is present' is not 'that hold stands'"
+assert_eq "no standing hold — every known hold marker on this PR is cleared/released (#14117)" \
+    "$(digest_reason_for "$MR_CLEARED_COMMENTS")" \
+    "a held PR whose every known hold is cleared reports that, never a bogus 'unknown marker' (#14117)"
+
+# #14117 finding 2: a cleared kind must not beat a standing one posted
+# earlier — merge-risk standing, critical-file posted later then cleared
+# -> the digest names the standing merge-risk axis bullet.
+CF_HOLD_BODY="<!-- champion:critical-file-hold -->
+<!-- champion:hold-state head=cff00d -->
+**Champion: Holding for Human Merge**
+
+- **Critical files**: touches .github/workflows/ci.yml"
+
+MR_STANDING_CF_CLEARED=$(jq -n --arg mr "$HOLD_BODY_GOOD" --arg cf "$CF_HOLD_BODY" --arg cfc '<!-- champion:critical-file-hold-cleared -->' '[$mr, $cf, $cfc]')
 assert_eq "merge-risk" \
-    "$(classify_hold_kind "$(jq -n --arg h '<!-- champion:merge-risk-hold -->' --arg c '<!-- champion:merge-risk-hold-cleared -->' '[$h, $c]')")" \
-    "a cleared notice does not match its hold marker's startswith (the -cleared suffix breaks the match)"
+    "$(classify_hold_kind "$MR_STANDING_CF_CLEARED")" \
+    "a cleared critical-file hold does not win over a standing merge-risk hold posted earlier (#14117)"
+assert_eq "**Blast radius**: touches merge-pr.sh's ordering guard — a regression there" \
+    "$(digest_reason_for "$MR_STANDING_CF_CLEARED")" \
+    "the digest reason names the STANDING hold's axis bullet, not the latest cleared kind's (#14117 finding 2)"
 
 assert_eq "| #6445 | CONFLICTING, no reason | CONFLICTING, out at Doctor |" \
     "$(digest_row 6445 "CONFLICTING, no reason" "CONFLICTING" true)" \
@@ -1079,6 +1138,51 @@ OLD_DOCTOR_JQ='[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | s
     and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->")) | not))] | length'
 assert_eq "2" "$(printf '%s\n' "$DOCTOR_FIXTURE" | jq "$OLD_DOCTOR_JQ")" \
     "pre-#13885 selector missed the ratification-held PR (the defect this fix removes)"
+
+# ---------------------------------------------------------------------
+echo "Test 10B': HELD_AT_DOCTOR counts a PR whose OTHER hold still stands (#14117)"
+# #14117 finding 1: the shipped pre-#14117 selector excluded a PR on ANY
+# cleared marker, so a held PR with a STANDING merge-risk hold plus a
+# cleared ratification/critical-file hold dropped out of the 'out at
+# Doctor' figure. Standing is per kind: the PR counts while any kind stands.
+DOCTOR_FIXTURE_14117='[
+  {"number":7010,"labels":[{"name":"loom:changes-requested"},{"name":"loom:blocked"}],
+   "comments":[{"body":"<!-- champion:merge-risk-hold -->"},{"body":"<!-- champion:ratification-hold -->"},{"body":"<!-- champion:ratification-release-respected -->\nat abc"}]},
+  {"number":7011,"labels":[{"name":"loom:changes-requested"},{"name":"loom:blocked"}],
+   "comments":[{"body":"<!-- champion:merge-risk-hold -->"},{"body":"<!-- champion:critical-file-hold -->"},{"body":"<!-- champion:critical-file-hold-cleared -->"}]},
+  {"number":7012,"labels":[{"name":"loom:changes-requested"},{"name":"loom:blocked"}],
+   "comments":[{"body":"<!-- champion:ratification-hold -->"},{"body":"<!-- champion:ratification-hold-cleared -->"},{"body":"<!-- champion:ratification-hold -->\nre-armed on push"}]},
+  {"number":7013,"labels":[{"name":"loom:changes-requested"},{"name":"loom:blocked"}],
+   "comments":[{"body":"<!-- champion:merge-risk-hold -->"},{"body":"pre-merge text\n<!-- champion:merge-risk-hold-cleared -->\nonly kind cleared"}]}
+]'
+assert_eq "3" "$(printf '%s\n' "$DOCTOR_FIXTURE_14117" | held_at_doctor_count)" \
+    "HELD_AT_DOCTOR: a PR with a standing hold plus a DIFFERENT kind's cleared/released notice counts (#7010/#7011, #14117), and a re-armed hold counts again (#7012); a PR whose only kind is cleared does not (#7013)"
+assert_eq "0" "$(printf '%s\n' "$DOCTOR_FIXTURE_14117" | jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->") or startswith("<!-- champion:ratification-hold -->"))
+    and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->") or startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | not))] | length')" \
+    "pre-#14117 selector dropped all three PRs from 'out at Doctor' (the defect this fix removes: #7010 matches the issue's own measurement — old selector 0, real held PRs 1 each)"
+echo
+
+# ---------------------------------------------------------------------
+echo "Test 10C: RELEASED lists a released ratification hold (#14117)"
+# Mirrors the census's RELEASED jq: 'Released holds, not yet merged' was
+# structurally blind to the ratification family — a ratification hold
+# released by the operator posts `ratification-release-respected` and
+# removes loom:blocked, landing the PR in the query's search set with no
+# clause to match. Its released state is a LATEST release-respected marker;
+# a `-cleared` last marker is auto-cleared, not listed.
+RELEASED_FIXTURE='[
+  {"number":9001,"comments":[{"body":"<!-- champion:ratification-hold -->"},{"body":"<!-- champion:ratification-release-respected -->\nat abc"}]},
+  {"number":9002,"comments":[{"body":"<!-- champion:merge-risk-hold -->"}]},
+  {"number":9003,"comments":[{"body":"<!-- champion:ratification-hold -->"},{"body":"<!-- champion:ratification-hold-cleared -->"}]},
+  {"number":9004,"comments":[{"body":"<!-- champion:ratification-hold -->"}]},
+  {"number":9005,"comments":[{"body":"<!-- champion:critical-file-hold -->"},{"body":"<!-- champion:critical-file-release-respected -->\nrespected"}]},
+  {"number":9006,"comments":[{"body":"quoting <!-- champion:merge-risk-hold --> in prose"}]},
+  {"number":9007,"comments":[{"body":"<!-- champion:critical-file-hold -->"},{"body":"<!-- champion:critical-file-hold-cleared -->"}]},
+  {"number":9008,"comments":[{"body":"<!-- champion:ratification-release-respected -->"},{"body":"<!-- champion:ratification-hold -->\nre-armed on push"}]},
+  {"number":9009,"comments":[{"body":"LGTM"}]}
+]'
+assert_eq "#9001 #9002 #9005" "$(printf '%s\n' "$RELEASED_FIXTURE" | released_holds)" \
+    "RELEASED: released ratification hold lists (#9001, #14117), standing merge-risk (#9002) and critical-file (#9005) keep listing; ratification cleared (#9003), bare-held (#9004), quoted (#9006), auto-cleared critical-file (#9007), re-armed ratification (#9008) and marker-less (#9009) do not"
 echo
 
 # ---------------------------------------------------------------------
@@ -1344,12 +1448,12 @@ assert_doc_contains "$CHAMPION_MD" \
     "champion-pr-merge.md ships the per-PR digest section (AC #1)"
 
 assert_doc_contains "$CHAMPION_MD" \
-    '"merge-risk|<!-- champion:merge-risk-hold -->"' \
-    "the digest's hold-reason table reads the SAME marker as the sticky-hold precheck, not a new one (#13885)"
+    '"merge-risk|<!-- champion:merge-risk-hold -->|contains(\"<!-- champion:merge-risk-hold-cleared -->\")"' \
+    "the digest's hold-reason table reads the SAME marker as the sticky-hold precheck, not a new one (#13885); #14117 added the per-kind cleared/released test"
 
 assert_doc_contains "$CHAMPION_MD" \
-    '"ratification|<!-- champion:ratification-hold -->"' \
-    "the digest's hold-reason table includes the ratification kind (#12992 added it; #13885 taught the digest to read it)"
+    '"ratification|<!-- champion:ratification-hold -->|startswith(\"<!-- champion:ratification-hold-cleared -->\") or startswith(\"<!-- champion:ratification-release-respected -->\")"' \
+    "the digest's hold-reason table includes the ratification kind (#12992 added it; #13885 taught the digest to read it; #14117 added its release-respected test)"
 
 assert_doc_contains "$CHAMPION_MD" \
     "REASON=\$(printf '%s\\n' \"\$HOLD_BODY\" | grep -m1 -E '^- \\*\\*.+\\*\\*:' | sed 's/^- //')" \

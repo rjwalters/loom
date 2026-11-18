@@ -57,6 +57,7 @@ test-champion-merged-before-hold.sh
 test-champion-merge-queue-step-no-fallthrough.sh
 test-champion-out-of-band-ac-gate-switch.sh
 test-champion-merge-risk-self-release.sh
+test-champion-pr-merge-digest-dedup.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh
 test-champion-park-marker-dedupe.sh
@@ -118,11 +119,13 @@ test-fleet-check.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
 test-forge-transient-classification.sh
+test-generate-agents-md-layouts.sh
 test-gh-cached.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-docs-pinned-paths.sh
 test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
@@ -204,6 +207,7 @@ test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-labels-block.sh
 test-resync-installed-local-fix-guard.sh
+test-resync-installed-manifest-prune.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-retired-migrate.sh
 test-resync-installed-dogfood-symlink.sh
@@ -369,3 +373,7 @@ test-create-issue-curated.sh
 # #13414: guide unblock sweep honors a park record over AC checkboxes. Hermetic.
 test-guide-park-record-precedence.sh
 test-guide-transient-first-at.sh
+# #13956: resolve-role-model.sh — tools-first slice wiring, exit-3 data-code
+# passthrough, the 0.19.1312 version floor, and the resync-keeps-the-setting
+# recheck (agents stay unpinned, config survives). Hermetic: mocks only.
+test-resolve-role-model.sh

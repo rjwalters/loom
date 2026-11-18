@@ -165,6 +165,20 @@ phase — creating a PR labeled `loom:review-requested` is only the Builder stag
 the work is not complete until reviewed and merged. **`/loom:sweep` handles all
 stages automatically** — prefer it over manual orchestration to avoid skipping any.
 
+**Spawning a role subagent with its configured model (attended path,
+#13956)**: before `Task(subagent_type="loom-<role>")`, resolve the role's
+model from the config chain — `./.loom/scripts/resolve-role-model.sh <role>
+--json` (explicit `--model` > `terminals[].roleConfig.model` >
+`.loom/roles/<role>.json` `suggestedModel` > inherit, with the supplying tier
+reported as `source`) — and pass it via the Task tool's `model` parameter
+(pinned IDs degrade with `--task-alias`). Exit 3 / `"source": "inherit"` ⇒
+omit the parameter; the subagent inherits the parent session's model, so an
+unconfigured workspace behaves exactly as before. Per-role models are set in
+`.loom/config.json` or the per-host `.loom-local/local.json` (never in the
+shipped agent files — see [`.loom/docs/model-selection.md`](.loom/docs/model-selection.md)
+§ "Attended subagents"); the Task tool has no effort knob, so `roleEfforts`
+stays a daemon-path setting.
+
 **Operator-session lane (the one Curator-skip exemption)**: an operator driving
 the session tools directly may skip Curator and label a new issue `loom:building`
 at filing time — but **only** when *both* hold: (1) the acceptance criterion is
