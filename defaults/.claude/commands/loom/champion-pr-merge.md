@@ -424,6 +424,37 @@ docs_only_fast_path_check() {
 FAST_PATH_FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
 FAST_PATH_RESULT=$(printf '%s\n' "$FAST_PATH_FILES" | docs_only_fast_path_check)
 
+# Closing-link condition (#14182), mirrored from judge.md Step 3 (mirrored, not
+# shared; test-docs-only-fast-path.sh pins both copies). A docs-only diff that
+# auto-closes an issue on merge is not a docs-only change. Fails closed: a read
+# that errored or returned no "closers=" proof is NOT ELIGIBLE, never "no closers".
+docs_only_fast_path_closing_check() {
+  # $1 = PR number. Echoes "ELIGIBLE" only when the closing-reference read
+  # SUCCEEDED (positively proven by the "closers=" prefix) and returned an
+  # empty set. A failed or malformed read is NOT ELIGIBLE, never "no closers"
+  # (fail closed, #14182). Deliberately not forge_pr_close_targets: that helper
+  # swallows read errors into an empty list, which would read as "no closers".
+  local out refs
+  if ! out=$(gh pr view "$1" --json closingIssuesReferences \
+      --jq '"closers=" + ([.closingIssuesReferences[].number | tostring] | join(","))' 2>/dev/null); then
+    echo "NOT ELIGIBLE: closing-reference read failed"
+    return 0
+  fi
+  case "$out" in
+    closers=*) refs="${out#closers=}" ;;
+    *) echo "NOT ELIGIBLE: closing-reference read returned no proof"; return 0 ;;
+  esac
+  if [ -n "$refs" ]; then
+    echo "NOT ELIGIBLE: closes #${refs//,/, #}"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
+  FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")
+fi
+
 if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
   echo "PASS (docs-only fast path, #6134): merge risk covered without axis judgment — changed files: $FAST_PATH_FILES"
   # Use this as the ONE_LINE_RATIONALE in Step 2's pre-merge comment, e.g.
@@ -433,8 +464,9 @@ if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
 fi
 ```
 
-If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE`, this PR is not
-fast-path eligible — fall through to the standing-authorization check below.
+If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE` (a non-allowlisted
+file, or a closing reference such as `Closes #N`, or a failed closing-reference
+read), this PR is not fast-path eligible — fall through to the standing-authorization check below.
 
 **Standing operator authorization (#6850)** — run this check immediately
 after the docs-only fast path above (and, transitively, after the
