@@ -108,12 +108,12 @@ use std::time::{Duration, Instant};
 pub mod containment_signal;
 // `crash_signals` is `pub(crate)` so the crate-wide child-liveness probe
 // `is_pid_alive` reaches every consumer (the reaper, the orphan reaper, and
-// #9464's claim-label heal) without a re-export line in this ratcheted file.
+// #9464's claim-label heal) without a re-export line in this file.
 pub(crate) mod crash_signals;
 /// Who asked for a dispatch (#11444); every dispatch-core entry takes one.
 pub use crate::telemetry::DispatchOrigin;
 // `generate_sweep_id` lives with the `SweepKind` it names (model.rs) — moved out
-// of this ratcheted file; re-exported for the existing callers.
+// of this file; re-exported for the existing callers.
 pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;

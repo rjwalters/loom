@@ -25,9 +25,8 @@
 //! only once there is per-class state to report.
 //!
 //! Split into its own file (following `holds`) rather than added to
-//! `status_render.rs`: that file sits at its `.loom/docs/file-size-policy.md`
-//! ratchet, so new rendering logic goes in a sibling module and the parent
-//! keeps only the call.
+//! `status_render.rs`: new rendering logic goes in a sibling module and the
+//! parent keeps only the call.
 
 use crate::capacity::model_class::{self, ClassCapacity};
 use crate::types::DaemonStatusReport;

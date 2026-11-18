@@ -1,8 +1,8 @@
 //! `loom-daemon config get <key>` — read one key of the resolved effective
 //! config (#12591).
 //!
-//! Thin clap wiring over [`crate::config_resolver`]; `main.rs` is frozen
-//! by the file-size ratchet, so the variant there is one line.
+//! Thin clap wiring over [`crate::config_resolver`]; the variant in `main.rs`
+//! is one line.
 //!
 //! Prints one JSON object: `{"key", "found", "value", "tier", "source"}`.
 //! `tier` names the highest-precedence tier that supplied the key (`local`,

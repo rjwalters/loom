@@ -134,8 +134,7 @@ pub const UNKNOWN_GROUP: &str = "unknown";
 // ============================================================================
 //
 // The `GroupBy` dimension enum lives in the sibling `group_by` module (see
-// the `mod group_by;` / `pub use group_by::GroupBy;` above) — split out to
-// stay under the file-size ratchet threshold.
+// the `mod group_by;` / `pub use group_by::GroupBy;` above).
 
 /// Where a row's arm label came from. Carried on every arm-grouped row so an
 /// inferred arm is never read as an experiment's own stamp (#8055).

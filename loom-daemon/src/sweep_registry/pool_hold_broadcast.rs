@@ -6,9 +6,8 @@
 //!
 //! # Why a sibling module rather than more of `dispatch.rs`
 //!
-//! `sweep_registry::dispatch` is over the size ratchet
-//! (`scripts/file-size-baseline.txt`), and this is a self-contained lane —
-//! three methods over one field pair — so it lives beside it, matching the
+//! This is a self-contained lane — three methods over one field pair — so it
+//! lives beside `sweep_registry::dispatch` rather than inside it, matching the
 //! `noop_cooldown` / `quarantine` / `decline_cooldown` split the same module
 //! already uses.
 //!

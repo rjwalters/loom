@@ -3,9 +3,8 @@
 //!
 //! Pure — no I/O, no state — so the whole decision matrix is unit-testable
 //! with plain values. It lives here rather than in `auto_update.rs` because
-//! that file is over `.loom/docs/file-size-policy.md`'s threshold and frozen,
-//! and because #8513's new [`ArtifactVerdict::StaleRepo`] verdict belongs
-//! immediately next to the version comparison that derives it.
+//! #8513's new [`ArtifactVerdict::StaleRepo`] verdict belongs immediately next
+//! to the version comparison that derives it.
 
 use super::ArtifactInfo;
 

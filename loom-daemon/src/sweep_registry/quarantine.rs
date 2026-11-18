@@ -2570,7 +2570,7 @@ mod empty_pool_tests;
 mod dispatch_scope_tests;
 
 /// The quarantine-*release* retry policy (#4110 + the #8953 breaker check and
-/// attempt ceiling) — a sibling file per the file-size ratchet, same reason
-/// `provider_health_feedback.rs` was split out of this module.
+/// attempt ceiling) — a sibling file, like `provider_health_feedback.rs`
+/// split out of this module.
 #[path = "quarantine_release.rs"]
 mod quarantine_release;

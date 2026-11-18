@@ -1,5 +1,5 @@
 //! The `Issue`/`PrSet` begin step of a split dispatch (Issues #6592, #9573),
-//! moved out of `dispatch.rs` to hold that file at its size ratchet.
+//! moved out of `dispatch.rs`.
 
 use super::*;
 

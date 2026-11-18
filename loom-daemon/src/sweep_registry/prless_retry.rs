@@ -388,10 +388,8 @@ pub fn resolve_prless_retry_config(repo_root: &Path) -> PrlessRetryConfig {
 /// `repo_root` (Issue #7972) — the provision-time one-liner
 /// `daemon_service.rs` calls for the default workspace.
 ///
-/// The resolve/set/log trio lives here rather than inline at the call site
-/// because `daemon_service.rs` is over the file-size ratchet's threshold and
-/// frozen at its current size (`.loom/docs/file-size-policy.md`); keeping the
-/// announcement next to the config it describes is the better home anyway.
+/// The resolve/set/log trio lives here rather than inline at the call site;
+/// keeping the announcement next to the config it describes is the better home.
 pub fn configure_prless_retry(registry: &mut SweepRegistry, repo_root: &Path) {
     let config = resolve_prless_retry_config(repo_root);
     registry.set_prless_retry_config(config);

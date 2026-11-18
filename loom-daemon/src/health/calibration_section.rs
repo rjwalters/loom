@@ -2,9 +2,8 @@
 //! #8349): the fleet's `$`-equivalent cost per weekly-limit point, plus the
 //! step-change warning when it moves too fast.
 //!
-//! Split into its own file because `health.rs` sits at its
-//! `.loom/docs/file-size-policy.md` ratchet: assessment logic that grows goes
-//! in a sibling module and the parent keeps only the `mod` line plus the
+//! Split into its own file: assessment logic that grows goes in a sibling
+//! module and the parent `health.rs` keeps only the `mod` line plus the
 //! re-export, exactly as [`super::codesign`] and [`super::busy`] already do.
 //! Until #8349 the section was appended by the CLI collector itself
 //! (`cli/health.rs`, #8366); #8349 moves it behind

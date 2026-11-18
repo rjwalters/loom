@@ -11,9 +11,8 @@
 //! [`crate::types::PoolExhaustionHoldStatus`]) — this module invents no new
 //! probe, consistent with the collector rule in the parent module's doc.
 //!
-//! Split into its own file (#7990) because `health.rs` sits at its
-//! `.loom/docs/file-size-policy.md` ratchet: new assessment logic goes in a
-//! sibling module and the parent keeps only the dispatch line.
+//! Split into its own file (#7990): new assessment logic goes in a sibling
+//! module and the parent `health.rs` keeps only the dispatch line.
 
 use super::{
     format_age, no_status_reason, repo_label, unknown_section, HealthInputs, HealthSection, Verdict,

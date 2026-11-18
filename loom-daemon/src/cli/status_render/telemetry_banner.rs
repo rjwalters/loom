@@ -1,7 +1,6 @@
 //! The loud telemetry banner on `loom-daemon status` (issue #9950).
 //!
-//! A sibling module rather than more lines in `status_render.rs` (an
-//! over-threshold ledger entry — `.loom/docs/file-size-policy.md`), matching
+//! A sibling module rather than more lines in `status_render.rs`, matching
 //! how [`super::observability_line`] already lives here.
 //!
 //! Why this exists beside the one-line `Observability: …` render: the line is

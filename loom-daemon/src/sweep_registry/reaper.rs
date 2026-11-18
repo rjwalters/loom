@@ -2346,9 +2346,7 @@ pub(crate) mod test_hooks {
 )]
 mod tests;
 
-// The claim-restore / PR-produced test family lives in its own sibling module:
-// `tests` is over the file-size ratchet's 1000-line threshold and therefore
-// frozen at its current size (`.loom/docs/file-size-policy.md`).
+// The claim-restore / PR-produced test family lives in its own sibling module.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

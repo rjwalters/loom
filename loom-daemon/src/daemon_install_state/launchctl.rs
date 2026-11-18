@@ -1,10 +1,7 @@
 //! launchd domain resolution and `launchctl print` probing.
 //!
-//! Split out of `daemon_install_state.rs` so the over-threshold parent shrinks
-//! rather than grows (`.loom/docs/file-size-policy.md`). Adding the
-//! LOADED-but-not-running branch (#8086) pushed the parent past its frozen
-//! size; this is the sibling-module remedy the policy asks for, not a raised
-//! baseline.
+//! Split out of `daemon_install_state.rs` so the parent shrinks rather than
+//! grows when the LOADED-but-not-running branch (#8086) is added.
 
 use super::{probe_output, PROBE_TIMEOUT};
 use std::process::Command;

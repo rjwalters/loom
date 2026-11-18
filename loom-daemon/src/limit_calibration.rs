@@ -33,8 +33,7 @@
 //!   carry the 7-day/weekly utilization axis, only the 5-hour one — see
 //!   [`crate::tokens_pool::check`]'s module doc). Every plausible place to
 //!   add that (`loom-daemon/src/cli/tokens.rs`,
-//!   `loom-daemon/src/tokens_pool/check.rs`) is at or within a few lines of
-//!   this repo's file-size ratchet (`.loom/docs/file-size-policy.md`), and it
+//!   `loom-daemon/src/tokens_pool/check.rs`) is already large, and it
 //!   would still need days to accrue a baseline before it could detect
 //!   anything — a strictly worse starting position than a data source that
 //!   already has months of history.

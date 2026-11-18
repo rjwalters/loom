@@ -1,6 +1,5 @@
 //! `loom-daemon labels …` (#10013): query and generate from the label
-//! registry (`defaults/labels.json`). Args live here because `main.rs` is
-//! frozen by the file-size ratchet.
+//! registry (`defaults/labels.json`). Args live here rather than in `main.rs`.
 //!
 //! Exit codes: 0 ok; 1 unknown label (`get`) or drift (`check`); 2 unknown
 //! property/kind/field or unreadable registry. `undeclared` and `migrate`

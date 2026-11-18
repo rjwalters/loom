@@ -355,8 +355,8 @@ impl ReapReport {
 
 // `skip_reason` — the human-readable reason a decision preserved a worktree —
 // moved to the `removal_backoff` sibling module in #7939 (re-exported below as
-// `use removal_backoff::{..., skip_reason}`) purely to make room: this file is
-// over the file-size ratchet's threshold and may not grow, and #7939's fix
+// `use removal_backoff::{..., skip_reason}`) purely to make room, because
+// #7939's fix
 // needs a couple of new lines right at `skip_reason`'s one call site. Its
 // logic and doc comment are unchanged — see `removal_backoff::skip_reason`.
 
@@ -597,8 +597,8 @@ pub fn try_enter_reclaim(repo_root: &Path) -> Option<ReclaimGuard> {
 // ============================================================================
 // Removal-failure backoff + stuck-worktree health surfacing (#7590)
 //
-// The state machine itself lives in the `removal_backoff` sibling module (this
-// file is over the file-size ratchet's threshold); only the kind tag, which the
+// The state machine itself lives in the `removal_backoff` sibling module; only
+// the kind tag, which the
 // reaper's own log lines and classify paths also use, stays here. The names
 // below are re-exported so `crate::worktree_reaper::stuck_worktree_removals`
 // and friends keep resolving exactly as before.
@@ -1189,8 +1189,7 @@ mod tests {
 
     // #8413's cases — the registry-independent live-worker veto, plus the
     // three dirty-past-grace cases it changed the preconditions of — live in a
-    // sibling file (`worktree_reaper/tests/liveness.rs`) because this file is
-    // at its file-size ratchet baseline; see `.loom/docs/file-size-policy.md`.
+    // sibling file (`worktree_reaper/tests/liveness.rs`).
     mod liveness;
 
     // #12458's idle-open-item cases live in a sibling file for the same reason.

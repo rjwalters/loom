@@ -1,11 +1,8 @@
 //! `loom-daemon forge merge-method` (#8845) — resolve/validate the merge
 //! method `merge-pr.sh` passes to `forge_merge_pr`.
 //!
-//! Split out of [`crate::forge_cmd`] as a sibling module per the file-size
-//! ratchet (`scripts/check-file-size-budget.sh` / `.loom/docs/file-size-policy.md`)
-//! — `forge_cmd.rs` was already near the 1000-code-line threshold, so this
-//! subcommand's logic (and its tests) land in a new file rather than pushing
-//! that one over.
+//! Split out of [`crate::forge_cmd`] as a sibling module, so this subcommand's
+//! logic (and its tests) land in a new file rather than in `forge_cmd.rs`.
 //!
 //! Previously `merge-pr.sh:461` called the shell `forge_detect_merge_method`
 //! (`defaults/scripts/lib/forge-merge-method.sh`) unconditionally — merge >

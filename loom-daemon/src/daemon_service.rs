@@ -85,11 +85,8 @@ fn gh_token_needs_update(current: Option<&str>, minted: &str) -> bool {
     current != Some(minted)
 }
 
-// Extracted to a sibling file (#9596) rather than left inline: this file is a
-// frozen over-threshold ratchet entry, and `.loom/docs/file-size-policy.md`
-// names extracting a test module as the sanctioned way to make room — "the
-// parent shrinks, and the extracted file is measured on its own terms". Moved
-// verbatim; the tests themselves are unchanged.
+// Extracted to a sibling file (#9596) rather than left inline. Moved verbatim;
+// the tests themselves are unchanged.
 #[cfg(test)]
 #[path = "daemon_service/gh_token_guard_tests.rs"]
 mod gh_token_guard_tests;
@@ -285,10 +282,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     // Restore surviving tmux sessions and sweep stale ones — both skipped
     // together when LOOM_NO_RESTORE=1, which this startup path used to ignore
-    // (issue #8463). Lives in `terminal_restore` rather than inline here
-    // because both this file and `terminal.rs` are frozen at their current
-    // size by the File Size Ratchet; see that module's docs for the full
-    // rationale of the gate and of why the cleanup sweep must be skipped too.
+    // (issue #8463). Lives in `terminal_restore` rather than inline here; see
+    // that module's docs for the full rationale of why the cleanup sweep must
+    // be skipped too.
     loom_daemon::terminal_restore::restore_and_clean_at_startup(&mut tm, configured_ids.as_ref())?;
 
     let tm = Arc::new(Mutex::new(tm));

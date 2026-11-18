@@ -5,10 +5,9 @@
 //! Both halves of the #8463 fix — the `LOOM_NO_RESTORE` predicate and the
 //! startup restore/cleanup block it gates — would otherwise have to grow
 //! `terminal.rs` (1918 code lines) and `daemon_service.rs` (1250), which are
-//! both frozen at their current size by the File Size Ratchet
-//! (`.loom/docs/file-size-policy.md`). Extracting them here is the remedy that
-//! policy prescribes: new code goes in a new sibling module, leaving a single
-//! dispatch line behind at each call site. Both parents shrink as a result.
+//! both large. Extracting them here keeps the new code in its own sibling
+//! module, leaving a single dispatch line behind at each call site. Both
+//! parents shrink as a result.
 //!
 //! # What the gate is for
 //!

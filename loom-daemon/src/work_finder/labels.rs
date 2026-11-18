@@ -1,7 +1,5 @@
 //! Work-finder label constants — split out as a sibling module rather than
-//! appended to `work_finder.rs`: that module is over the 1000-line ratchet
-//! threshold and frozen at its current size (see
-//! `.loom/docs/file-size-policy.md`).
+//! appended to `work_finder.rs`.
 //!
 //! The label *sets* here ([`PARK_LABELS`], [`SKIP_LABELS`]) are derived from
 //! the label registry's `park` / `skip` properties (`defaults/labels.json`,

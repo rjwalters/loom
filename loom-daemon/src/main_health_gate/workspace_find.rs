@@ -1,11 +1,9 @@
 //! [`WorkspaceHealthStates::find`] — the exact-key-then-canonical-path lookup
 //! (#11565).
 //!
-//! Extracted from `main_health_gate.rs` because that file is over
-//! `.loom/docs/file-size-policy.md`'s threshold and therefore FROZEN — it may
-//! shrink, not grow. This is the same pattern [`super::owned_paths`] set:
-//! new surface gets its own sibling module instead of re-growing a
-//! 1,800-line file.
+//! Extracted from `main_health_gate.rs`. This is the same pattern
+//! [`super::owned_paths`] set: new surface gets its own sibling module instead
+//! of re-growing a 1,800-line file.
 //!
 //! Inherent impls may live in any module of the defining crate, so callers
 //! are unaffected — the method stays `WorkspaceHealthStates::find`.

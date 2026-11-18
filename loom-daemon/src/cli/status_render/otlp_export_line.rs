@@ -1,6 +1,6 @@
 //! The `OTLP export:` line on `loom-daemon status` (Issue #11353).
 //!
-//! A sibling module (`status_render.rs` is on the file-size ratchet). Always
+//! A sibling module of `status_render.rs`. Always
 //! renders: a daemon that does not export to SigNoz must say so, not look
 //! healthy by omission. An attention state carries
 //! `otlp: failing since <T> (<reason>)` (Issue #11557).

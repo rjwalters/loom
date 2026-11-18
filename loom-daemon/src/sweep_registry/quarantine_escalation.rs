@@ -18,8 +18,7 @@
 //! healthy run -> ladder fully reset. Generation state is in-memory like the
 //! quarantine itself, so a daemon restart resets the ladder.
 //!
-//! A sibling file rather than more code in `quarantine.rs` purely because that
-//! file is at its file-size ratchet (`.loom/docs/file-size-policy.md`); the
+//! A sibling file rather than more code in `quarantine.rs`; the
 //! tally/apply/release mechanics stay there and call the helpers below.
 
 use super::*;

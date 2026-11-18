@@ -4,8 +4,7 @@
 //! returns the raw [`Output`] only when the process actually ran; a spawn
 //! failure, collect failure, or timeout is `None`. Callers keep their own
 //! exit-status and stdout interpretation. These live here (rather than inline
-//! in `stash_retirement` / `sweep_outcome_summary`) so those ratcheted files do
-//! not grow — see `.loom/docs/file-size-policy.md`.
+//! in `stash_retirement` / `sweep_outcome_summary`) so those files do not grow.
 
 use std::path::Path;
 use std::process::Output;

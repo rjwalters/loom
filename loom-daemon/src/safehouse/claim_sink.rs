@@ -1,7 +1,6 @@
 //! The peer-claim inbound sink and its on-disk filing-lock mirror, moved out of
 //! `safehouse.rs` in Issue #9294 so the publish-outcome handling this issue adds
-//! (`on_send_outcome`) lands in a sibling module rather than growing an
-//! already-over-threshold file (`scripts/file-size-baseline.txt`).
+//! (`on_send_outcome`) lands in a sibling module.
 //!
 //! Behaviour of the moved code is unchanged; `safehouse::PeerClaimSink` keeps
 //! working via the `pub use` re-export, so no call site moves.

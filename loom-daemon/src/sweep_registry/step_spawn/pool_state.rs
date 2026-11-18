@@ -8,8 +8,7 @@
 //! step that hit an empty pool records it
 //! ([`SweepRegistry::record_role_tick_pool_exhausted`]), and any dispatch
 //! that gets past token selection clears the map. The map is private to the
-//! registry and `dispatch.rs` is frozen by the size ratchet, so the read is
-//! here.
+//! registry, so the read is here.
 
 use super::*;
 

@@ -15,16 +15,14 @@ pub(crate) mod preflip_labels;
 
 /// The `labeled loom:building` timeline probe (#5017/#5282) and the
 /// leaseless-claim dispatch yield built on it (#9453 Phase 3.1). A plain child
-/// module (`guards/claim_label.rs`) for the same reason `repo_env_tests` is one:
-/// this file is frozen at its current size by `scripts/file-size-baseline.txt`.
+/// module (`guards/claim_label.rs`), like `repo_env_tests`.
 /// `pub(crate)` so the dispatch-level yield tests can name the identity
 /// constants the leaseless leg reports rather than re-spelling them.
 pub(crate) mod claim_label;
 
 /// The registry's facade `gh` helpers, shared by every `sweep_registry` module.
 mod gh_exec;
-/// Conditional 2.5/2.7 issue reads (W9), a child module because this file is
-/// frozen by `scripts/file-size-baseline.txt`.
+/// Conditional 2.5/2.7 issue reads (W9), a child module of this file.
 pub(crate) mod issue_snapshot;
 pub(crate) use issue_snapshot::IssueGate;
 mod rate_limit_report;
@@ -1951,8 +1949,8 @@ impl SweepRegistry {
     /// one-in-three landed-issues re-queue #9463 measured).
     ///
     /// The implementation lives in
-    /// [`restore_to_ready`](super::restore_to_ready) (a sibling module —
-    /// this file is at the size ratchet), including each carve-out's own
+    /// [`restore_to_ready`](super::restore_to_ready) (a sibling module),
+    /// including each carve-out's own
     /// fail-open contract. Every carve-out only skips the `loom:issue`
     /// re-add; the stale `loom:building` claim is always removed.
     pub(crate) fn restore_label_to_ready(&self, issue: u32) -> Result<()> {
@@ -3831,14 +3829,11 @@ mod preflip_tests;
 mod listing_tests;
 
 // Issue #8263's `gh api` GH_REPO regression coverage. A plain child module
-// (guards/repo_env_tests.rs) rather than another `#[path]` sibling: this file
-// is frozen at its current size by scripts/file-size-baseline.txt, and the
-// two-line form fits the budget the shared-helper call site above freed.
+// (guards/repo_env_tests.rs) rather than another `#[path]` sibling.
 #[cfg(test)]
 mod repo_env_tests;
 
 // Issue #9572's `resolve_owner_repo` caching coverage. Same rationale as
-// `repo_env_tests` immediately above: a plain child module keeps this test
-// code out of the frozen guards.rs budget.
+// `repo_env_tests` immediately above: a plain child module.
 #[cfg(test)]
 mod owner_repo_cache_tests;

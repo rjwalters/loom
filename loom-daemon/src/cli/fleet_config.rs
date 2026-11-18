@@ -1,8 +1,7 @@
 //! `loom-daemon fleet-config` — read the operator's fleet state store.
 //!
 //! Thin clap → [`crate::fleet_store`] wiring. It lives here rather than
-//! in `main.rs` because `main.rs` is frozen by the file-size ratchet; the
-//! variant there is one line.
+//! in `main.rs`; the variant there is one line.
 //!
 //! Exit codes, for every sub-verb: `0` success / in sync, `1` drift (or, for
 //! `fetch`, a failed fetch; for `roster --apply`, a desired repo left unapplied

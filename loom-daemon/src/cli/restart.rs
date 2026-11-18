@@ -11,11 +11,9 @@ use crate::types::{Request, Response};
 use super::common::{query_daemon, resolve_socket_path};
 
 /// `restart` subcommand args (Issue #4712 split, moved wholesale out of
-/// `main.rs`'s `Commands::Restart` variant by Issue #6969's file-size-ratchet
-/// fix: `main.rs` is already over `.loom/docs/file-size-policy.md`'s
-/// threshold and frozen, so adding the 3 new `--verify-*` fields there could
-/// only land by moving the WHOLE bundle to this already-under-threshold
-/// module instead of leaving a few new fields behind as dispatch debt).
+/// `main.rs`'s `Commands::Restart` variant by Issue #6969, so the 3 new
+/// `--verify-*` fields land with the WHOLE bundle in this module instead of
+/// leaving a few new fields behind as dispatch debt).
 #[derive(clap::Args)]
 pub struct RestartArgs {
     /// Finish all in-flight sweeps before restarting, instead of restarting

@@ -7,8 +7,7 @@
 //! `fleet.captain` edit takes effect without a restart, and each is inert on a
 //! host that is not the producer.
 //!
-//! A sibling module rather than more lines in `daemon_service.rs`, an
-//! over-threshold entry of the file-size ratchet.
+//! A sibling module rather than more lines in `daemon_service.rs`.
 
 use std::path::PathBuf;
 

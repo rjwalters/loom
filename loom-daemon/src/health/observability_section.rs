@@ -2,9 +2,8 @@
 //!
 //! Extracted from `health.rs` into its own file (#8572) for the same reason
 //! [`super::calibration_section`], [`super::codesign`] and
-//! [`super::transcript_ingest_section`] live here: `health.rs` is over the
-//! file-size ratchet threshold (`.loom/docs/file-size-policy.md`) and may not
-//! grow. Pure move — no behavior change; `health::assess_observability`
+//! [`super::transcript_ingest_section`] live here: `health.rs` keeps only the
+//! dispatch line. Pure move — no behavior change; `health::assess_observability`
 //! remains the public name via the re-export in `health.rs`.
 
 use super::{format_window, HealthInputs, HealthSection, Verdict};

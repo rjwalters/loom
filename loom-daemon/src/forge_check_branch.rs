@@ -365,7 +365,7 @@ pub(crate) fn probe_remote_branch(git_bin: &Path, root: &Path, branch: &str) -> 
 
 /// Parsed arguments of `loom-daemon forge check-branch` (#10027). Kept here,
 /// not as inline fields on `ForgeCmd::CheckBranch`, so the flags this module
-/// owns do not grow `forge_cmd.rs` past its file-size ratchet.
+/// owns do not grow `forge_cmd.rs`.
 pub struct CheckBranchArgs {
     /// Issue number whose branch is about to be pushed.
     pub issue: u32,

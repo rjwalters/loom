@@ -181,9 +181,7 @@ pub mod daemon_root_freshness;
 pub mod daemon_start;
 /// Non-blocking wrapper around the startup claim-reconciliation +
 /// stranded-quarantine reconciliation passes (Issue #7974) — a new sibling
-/// module rather than growing `daemon_service.rs`, which the file-size
-/// ratchet freezes at its current line count
-/// (`.loom/docs/file-size-policy.md`).
+/// module rather than growing `daemon_service.rs`.
 pub mod daemon_startup_reconciliation;
 pub mod daemon_update;
 pub mod daily_log;
@@ -409,8 +407,7 @@ pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
 /// `health` IPC probes that wait on it (#8163). A sibling module rather than
-/// code inside `ipc.rs`/`cli/health.rs`: `ipc.rs` is an over-threshold file
-/// frozen by the file-size ratchet, and stating the model once is what keeps
+/// code inside `ipc.rs`/`cli/health.rs`: stating the model once is what keeps
 /// the daemon-side budget and the client-side probe budget from drifting.
 pub mod status_budget;
 /// The named top-level sections of `status --json` and the build phases each

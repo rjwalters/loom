@@ -44,10 +44,9 @@
 //! release is about to be recorded, and nothing would ever accumulate. See
 //! [`PEER_PRLESS_STREAK_TTL`].
 //!
-//! This module exists as a sibling of `peer_claims.rs` rather than inside it
-//! for the reason `repo_slug_tests`/`coordination_tests` do: that module is
-//! over the size ratchet (`scripts/file-size-baseline.txt`) and has no line
-//! budget for the brake lanes.
+//! This module is a sibling of `peer_claims.rs` rather than part of it, like
+//! `repo_slug_tests`/`coordination_tests`, so the brake lanes live in their
+//! own file.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};

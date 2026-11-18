@@ -1671,9 +1671,8 @@ pub fn resolve_interval() -> Duration {
 // ============================================================================
 //
 // WorkFinderConfig / read_work_finder_config / the deprecated-CPU-knob notice
-// live in their own file, `config.rs` (Issue #9034) — the same file-size-
-// ratchet reason as `configured_max` below (`work_finder.rs` is
-// frozen at its current size; see `.loom/docs/file-size-policy.md`). Pure
+// live in their own file, `config.rs` (Issue #9034), as `configured_max`
+// below does. Pure
 // move, re-exported here so every existing `WorkFinderConfig` /
 // `read_work_finder_config` reference in this file and its siblings is
 // unchanged.
@@ -2398,8 +2397,8 @@ fn publish_capacity_advisory(event_bus: &Arc<EventBus>, advisory: &CapacityAdvis
 
 /// Concrete [`WorkSource`] / [`WorkDispatcher`] implementations that wire the
 /// finder to the live forge (`gh`) and the daemon's [`SweepRegistry`]. Lives in
-/// its own file (#8572) for the same file-size-ratchet reason as
-/// [`registry_refresh`]; the move was pure, with no behavior change.
+/// its own file (#8572), like [`registry_refresh`]; the move was pure, with no
+/// behavior change.
 pub mod forge;
 
 // Re-export the concrete adapters at the module root for ergonomic wiring.
@@ -2408,21 +2407,19 @@ pub use forge::{GhWorkSource, RegistryDispatcher};
 pub mod pool_preflight;
 
 // Purely-local registry reload + workspace provisioning for the tick loop
-// (#8121). Lives in its own file because this one is over the file-size
-// ratchet threshold (.loom/docs/file-size-policy.md) and may not grow.
+// (#8121). Lives in its own file.
 mod registry_refresh;
 
 /// The bounded, non-spammy tmpfs-fraction warning (issue #8572, split from
-/// #8512) — logs, never gates dispatch. Lives in its own file for the same
-/// file-size-ratchet reason as [`registry_refresh`].
+/// #8512) — logs, never gates dispatch. Lives in its own file.
 mod tmpfs_warning;
 
 /// Cause-attributed wording for the "dispatch halted" transition line (#9591).
-/// Its own file for the same file-size-ratchet reason as [`registry_refresh`].
+/// Lives in its own file.
 mod halt_log;
 
 /// Per-tick hot-reload of the operator ceiling `configured_max` (#9060). Its
-/// own file for the same file-size-ratchet reason as [`registry_refresh`].
+/// own file.
 pub mod configured_max;
 pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
 
@@ -2431,9 +2428,7 @@ pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
 mod tests;
 
 /// Work-finder coverage for the #7972 PR-less retry skip set. Its own file
-/// (with its own minimal fakes) rather than part of `tests` above, for the
-/// same file-size-ratchet reason `registry_refresh` / `tmpfs_warning` are
-/// split out — `tests.rs` is over threshold and frozen.
+/// (with its own minimal fakes) rather than part of `tests` above.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod prless_retry_tests;

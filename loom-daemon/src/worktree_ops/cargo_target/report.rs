@@ -1,9 +1,8 @@
 //! Operator-facing rendering of a [`TargetDirOutcome`] (issue #8458 split out
 //! of `cargo_target.rs`).
 //!
-//! Split from the decision logic so the parent module stays within the file-size
-//! ratchet (`.loom/docs/file-size-policy.md`) while this issue adds the
-//! per-worktree resolution branch there. The lines are rendered identically by
+//! Split from the decision logic so the parent module stays focused while this
+//! issue adds the per-worktree resolution branch there. The lines are rendered identically by
 //! the interactive `clean` pass and the unattended reaper's log, so "why did disk
 //! not get freed?" has the same answer in both — that is the whole contract, and
 //! it is unchanged by the move.

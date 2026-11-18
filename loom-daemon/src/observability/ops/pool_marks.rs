@@ -198,8 +198,7 @@ pub fn record_api_key(feedback: &crate::api_keys_pool::ingest::LaunchFeedback) {
 
 /// Mark a Claude account bad for an insta-crash exhaustion `signature` — the
 /// quarantine seam's `bad_tokens::mark_bad`, plus its point on success. Lives
-/// here because `sweep_registry/quarantine.rs` is frozen by the file-size
-/// ratchet.
+/// here rather than in `sweep_registry/quarantine.rs`.
 pub fn mark_claude_bad(
     workspace: &Path,
     token_name: &str,

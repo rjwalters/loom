@@ -6,8 +6,7 @@
 //! vocabulary (`assign_arm`, `arm_model`, `resolved_arm_model`) for the
 //! per-issue mode; a second verb speaking the same vocabulary is how the two
 //! would drift on what "an arm" means. They are flattened in from this module
-//! (rather than declared in `main.rs`) because `main.rs` is frozen by the
-//! file-size ratchet — the same reason `cli::script_ports` exists.
+//! (rather than declared in `main.rs`) — the same shape as `cli::script_ports`.
 //!
 //! All logic lives in [`crate::script_helpers::fleet_experiment`]; this
 //! file is argument parsing and rendering only.

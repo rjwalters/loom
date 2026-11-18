@@ -22,11 +22,8 @@
 //!
 //! # Why the shell could not keep it
 //!
-//! `merge-pr.sh` is frozen by the file-size ratchet, and #7982 said so in its
-//! own comment: the pin/warn/block decision was "written densely on purpose" to
-//! land at a net code-line saving, because a sibling `.sh` was not an available
-//! remedy. A guard whose next fix has to be smaller than its last is the trap
-//! #8191 exists to break. The dense form also concentrated the fragility: one
+//! #7982's comment in `merge-pr.sh` says the pin/warn/block decision was
+//! "written densely on purpose". The dense form concentrated the fragility: one
 //! compound `if` chained `cat-file -e`, `fetch`, `cat-file -e` and `update-ref`
 //! with `&&`, and four operator-facing messages interpolated seven variables
 //! each. Both are what this module takes over.

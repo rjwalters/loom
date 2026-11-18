@@ -991,8 +991,7 @@ pub fn format_harvest_text(report: &Value) -> String {
 
     // The per-arm comparison tail — #3718's fixed A-vs-B inequality inputs, or
     // the generalized per-arm table for an N-arm roster (#9122). Byte-for-byte
-    // unchanged for the legacy pair; it lives in the sibling arms module so the
-    // N-arm generalization did not grow this file (file-size ratchet).
+    // unchanged for the legacy pair; it lives in the sibling arms module.
     lines.extend(super::sweep_experiment_arms::arm_comparison_lines(arms));
     lines.join("\n")
 }

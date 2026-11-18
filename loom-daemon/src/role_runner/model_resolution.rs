@@ -1,6 +1,5 @@
 //! Role-runner model resolution (#4501 / #5001) and its runtime reconciliation
-//! (#7894), split out of `role_runner.rs` so the over-threshold parent file
-//! shrinks rather than grows (`.loom/docs/file-size-policy.md`).
+//! (#7894), split out of `role_runner.rs`.
 //!
 //! Three questions live here, and only here:
 //!
@@ -198,9 +197,7 @@ pub fn resolve_role_runner_effort(repo_root: &Path, role: &str) -> (String, Stri
 /// [`effort`](RoleRunnerConfig::effort) /
 /// [`role_efforts`](RoleRunnerConfig::role_efforts) fields. Called by
 /// [`read_role_runner_config`]; it lives here rather than inline in the parser
-/// so the module that *resolves* these keys also owns their parse contract (and
-/// so the over-threshold `role_runner.rs` shrinks rather than grows —
-/// `.loom/docs/file-size-policy.md`).
+/// so the module that *resolves* these keys also owns their parse contract.
 ///
 /// The contract is `roleModels`'s, verbatim:
 ///

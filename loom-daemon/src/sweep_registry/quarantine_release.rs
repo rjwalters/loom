@@ -5,10 +5,8 @@
 //! label edit cannot re-fire on every 30s reaper tick forever (the `#127`
 //! case: 68 retries over ~34 minutes).
 //!
-//! A sibling file rather than more `impl SweepRegistry` in `quarantine.rs`:
-//! that file is already over the file-size ratchet's threshold and therefore
-//! frozen at its current size (`.loom/docs/file-size-policy.md`), the same
-//! reason `provider_health_feedback.rs` was split out of it.
+//! A sibling file rather than more `impl SweepRegistry` in `quarantine.rs`,
+//! like `provider_health_feedback.rs` split out of it.
 //!
 //! The `gh` call these wrap — `SweepRegistry::release_quarantine_label` —
 //! stays in `quarantine.rs` alongside the other label-flip glue; only the
@@ -86,8 +84,7 @@ impl SweepRegistry {
 
     /// One reaper-tick pass over every label-restoring hold: retry failed
     /// quarantine restores, then release no-op holds whose inputs changed
-    /// (Issue #10156). Lives here so `reaper.rs`, frozen by the file-size
-    /// ratchet, gains no line for it.
+    /// (Issue #10156). Lives here rather than in `reaper.rs`.
     pub(crate) fn release_pending_holds(&mut self) {
         self.retry_pending_quarantine_releases();
         self.reconcile_noop_holds(std::time::Instant::now());

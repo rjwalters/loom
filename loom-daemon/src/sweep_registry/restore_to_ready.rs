@@ -91,7 +91,7 @@ impl SweepRegistry {
 
     /// [`restore_label_to_ready`](Self::restore_label_to_ready) with the
     /// Issue #9463 closed-state carve-out applied. The label-mutation body
-    /// lives here (a sibling module) so the size-ratcheted `guards.rs` only
+    /// lives here (a sibling module) so `guards.rs` only
     /// keeps the delegating entry point.
     pub(crate) fn restore_label_to_ready_with_state_check(&self, issue: u32) -> Result<()> {
         self.restore_label_to_ready_checked(issue).map(|_| ())

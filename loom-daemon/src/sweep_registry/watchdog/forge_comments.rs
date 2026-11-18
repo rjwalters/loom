@@ -1,7 +1,7 @@
 //! The watchdogs' two forge comments: the startup watchdog's give-up notice
 //! (#5302) and the stale-sweep backstop's reap notice (#7529).
 //!
-//! Moved out of `watchdog.rs`, which is at its file-size ratchet baseline,
+//! Moved out of `watchdog.rs`
 //! when #11743 gave both a `loom:frozen` gate: a human can freeze an issue
 //! while its sweep is in flight, and no daemon path may then comment on it.
 //! Neither path read the issue's labels, so each pays one REST label read

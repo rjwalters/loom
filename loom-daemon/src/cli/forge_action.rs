@@ -1,7 +1,6 @@
 //! `loom-daemon forge …`: the subcommand enum and its dispatcher.
 //!
-//! Moved verbatim out of `main.rs` (over `.loom/docs/file-size-policy.md`'s
-//! threshold and frozen) and `cli/tokens.rs` (where the dispatcher had
+//! Moved verbatim out of `main.rs` and `cli/tokens.rs` (where the dispatcher had
 //! landed for no reason but proximity), so new `forge` verbs cost `main.rs`
 //! nothing: they are added here, beside the verbs they sit with.
 

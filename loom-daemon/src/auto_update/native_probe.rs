@@ -1,8 +1,7 @@
 //! The native artifact-resolution probe (epic #7810, PR 5).
 //!
 //! Adapts [`crate::release_resolve`] to the shape [`super::ArtifactResolution`]
-//! already reasons about. It lives here rather than in `auto_update.rs` because
-//! that file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
+//! already reasons about. It lives here rather than in `auto_update.rs`.
 //!
 //! Before this, the tick asked `loom-daemon-update.sh --resolve-json`. #7609
 //! chose that deliberately — "rather than reimplementing release resolution in

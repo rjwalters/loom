@@ -2791,16 +2791,13 @@ mod tests {
     // ---- peer-coordination health (Issue #6157/#8026) ----
     //
     // `evaluate_coordination`'s degrade/recover/idle-gate coverage lives in the
-    // sibling `peer_claims/coordination_tests.rs`, moved there by #8026: this
-    // file is frozen at its current size by scripts/file-size-baseline.txt and
-    // the policy's own preferred remedy for that is a sibling module.
+    // sibling `peer_claims/coordination_tests.rs`, moved there by #8026.
 
     // ---- repo_slug ----
     //
     // `repo_slug`'s coverage lives in the sibling `peer_claims/repo_slug_tests.rs`
     // because it mutates the process-global `LOOM_REPO` and so must carry the
-    // crate-wide `#[serial]` key for that variable (#8496), and this file is
-    // frozen at its current size by scripts/file-size-baseline.txt.
+    // crate-wide `#[serial]` key for that variable (#8496).
 
     // ---- integration-shaped: two hosts, one issue, exactly one proceeds ----
 
@@ -3039,8 +3036,7 @@ mod tests {
 
 // [`repo_slug`]'s coverage, in its own sibling file (#8496): it mutates the
 // process-global `LOOM_REPO` and therefore needs that variable's crate-wide
-// `#[serial]` key, which this over-threshold module has no line budget for
-// (scripts/file-size-baseline.txt).
+// `#[serial]` key.
 #[cfg(test)]
 mod repo_slug_tests;
 

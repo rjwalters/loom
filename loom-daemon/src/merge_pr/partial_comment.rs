@@ -36,9 +36,7 @@
 //! interpolation that stopped interpolating — by any edit to the file, and
 //! nothing would have failed.
 //!
-//! They are also the file's largest remaining block of pure data, in a file
-//! the size ratchet freezes (`scripts/file-size-baseline.txt`) and which
-//! therefore cannot afford to spend code lines on text.
+//! They are also the file's largest remaining block of pure data.
 //!
 //! # Fail direction
 //!

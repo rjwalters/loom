@@ -2,10 +2,8 @@
 //!
 //! # Why a sibling module rather than more of `dispatch.rs`
 //!
-//! `sweep_registry::dispatch` is at the size ratchet
-//! (`scripts/file-size-baseline.txt`) — one more method here would grow it —
-//! and this is a self-contained, one-method lane, so it lives beside it,
-//! matching the `pool_hold_broadcast` / `noop_cooldown` split the same module
+//! This is a self-contained, one-method lane, so it lives beside
+//! `sweep_registry::dispatch` rather than inside it, matching the `pool_hold_broadcast` / `noop_cooldown` split the same module
 //! already uses.
 //!
 //! # What this closes

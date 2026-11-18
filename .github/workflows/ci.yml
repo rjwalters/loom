@@ -1513,9 +1513,8 @@ jobs:
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
       # #8553: worktree.sh's new issue claim-lock cross-check delegates to
-      # `loom-daemon worktree-lock check-issue` (this file is frozen by the
-      # file-size ratchet, so the new guard's decision logic lives in Rust,
-      # not shell) — needs the binary this job downloads.
+      # `loom-daemon worktree-lock check-issue` (the new guard's decision
+      # logic lives in Rust, not shell) — needs the binary this job downloads.
       - name: worktree issue claim-lock cross-check (#8553)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-issue-lock.sh

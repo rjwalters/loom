@@ -1,9 +1,8 @@
 //! The `tmpfs_visibility` health section (issue #8572, split from #8512):
 //! tmpfs/`shared`-RAM usage and the cumulative kernel OOM-kill count.
 //!
-//! Split into its own file because `health.rs` sits at its
-//! `.loom/docs/file-size-policy.md` ratchet: assessment logic that grows goes
-//! in a sibling module and the parent keeps only the `mod` line plus the
+//! Split into its own file: assessment logic that grows goes in a sibling
+//! module and the parent `health.rs` keeps only the `mod` line plus the
 //! dispatch call, exactly as [`super::transcript_ingest_section`] already
 //! does.
 //!

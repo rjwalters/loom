@@ -9,9 +9,8 @@
 //! `0.19.248` — logged as the soft "no artifact for this platform" every tick
 //! for hours while the host sat one release short of a feature it needed.
 //!
-//! This module owns the two pieces of that finding the tick needs and
-//! `auto_update.rs` (over `.loom/docs/file-size-policy.md`'s threshold, and
-//! therefore frozen) must not grow to hold: the consecutive-tick streak that
+//! This module owns the two pieces of that finding the tick needs, kept out of
+//! `auto_update.rs`: the consecutive-tick streak that
 //! `loom-daemon health` escalates on, and the WARN wording that names the
 //! repo actually queried.
 

@@ -588,9 +588,8 @@ impl ArtifactResolution {
 }
 
 /// The verdict types and the pure classification that produces them —
-/// extracted to a sibling module (#8513) both because this file is over
-/// `.loom/docs/file-size-policy.md`'s threshold and because the new
-/// wrong-repo verdict belongs next to the comparison that derives it.
+/// extracted to a sibling module (#8513) because the new wrong-repo verdict
+/// belongs next to the comparison that derives it.
 mod artifact_verdict;
 
 pub use artifact_verdict::{classify_artifact, ArtifactVerdict};
@@ -1982,7 +1981,7 @@ fn backoff_delay(failures: u32) -> Duration {
 
 // `run_tick` and the spawned loop live in the `runner` sibling (Issue #10414),
 // which added panic recovery, a tick watchdog, liveness and `auto_update.tick`
-// telemetry; this file is over the file-size ratchet threshold.
+// telemetry.
 mod runner;
 mod stall_recheck;
 mod tick_telemetry;

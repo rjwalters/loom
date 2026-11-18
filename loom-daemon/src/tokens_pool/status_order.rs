@@ -1,10 +1,9 @@
 //! The status-severity ordering every provider's ranking shares.
 //!
 //! Extracted from [`super::check`] when issue #8539 added the `"unknown"`
-//! rung: `check.rs` is over the file-size ratchet, and
-//! `.loom/docs/file-size-policy.md` names "put the new code in a new sibling
-//! module and leave the dispatch behind" as the intended path rather than
-//! growing a known-large file by one more arm. `check::status_rank` stays a
+//! rung, so the new code sits in a sibling module with the dispatch left
+//! behind rather than growing a known-large file by one more arm.
+//! `check::status_rank` stays a
 //! valid path (it re-exports this), so no caller moved.
 
 /// Ranking rank for each status (lower sorts first). Mirrors `_STATUS_RANK`.

@@ -1,8 +1,7 @@
 //! The test-only writer for [`SweepRegistry`]'s filesystem-activity window
 //! override (Issue #8487), split out of `sweep_registry/mod.rs` so the setter
 //! sits next to [`make_quiet_dirty_git_worktree`](super::make_quiet_dirty_git_worktree),
-//! its only real caller, rather than in an already-over-threshold parent
-//! (`.loom/docs/file-size-policy.md`). The field itself necessarily stays on
+//! its only real caller, rather than in the parent. The field itself necessarily stays on
 //! the struct in `mod.rs`; everything that *writes* it lives here.
 //!
 //! Only compiled under `#[cfg(test)]` — `test_support`'s own `mod`

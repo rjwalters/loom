@@ -1,9 +1,8 @@
 //! `loom-daemon tokens select` — the pool's token-selection entry point.
 //!
 //! Extracted from `cli/tokens.rs`'s inline `TokensAction::Select` match arm
-//! (issue #8146) so the parent file stays under the
-//! `check-file-size-budget.sh` ratchet while this handler grows the `--role`
-//! argument that feeds the prompt-cache affinity preference
+//! (issue #8146) so the parent file does not grow while this handler gains the
+//! `--role` argument that feeds the prompt-cache affinity preference
 //! (`tokens_pool::affinity`). Behavior is otherwise unchanged.
 
 use anyhow::{anyhow, Result};

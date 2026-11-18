@@ -44,8 +44,7 @@ pub(super) fn command(
 
 /// Whether the supervisor serving `root` must skip this tick because the
 /// workspace is held (#10719). Logged each tick it is, like the supervisor's
-/// main-health and drain skips. Here, not in `tick`, because
-/// `epic_supervisor.rs` is frozen by the file-size ratchet.
+/// main-health and drain skips. Here, not in `tick`.
 pub(super) fn tick_held(root: Option<&Path>) -> bool {
     let Some((root, hold)) = root.and_then(|r| Some((r, crate::workspace_hold::hold_for(r)?)))
     else {

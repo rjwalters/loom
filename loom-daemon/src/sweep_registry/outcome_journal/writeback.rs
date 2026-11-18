@@ -22,10 +22,8 @@
 //! sibling brakes are (`noop_cooldown`, `prless_retry`, …). This is
 //! deliberate: the write-back fires at most once per sweep, never on a hot
 //! per-tick path, so the extra config read costs nothing, and it avoids
-//! adding a field to `sweep_registry/mod.rs` — a file already over the
-//! file-size ratchet's threshold and frozen at its current size (see
-//! `.loom/docs/file-size-policy.md`), which every sibling brake's cached-field
-//! approach would otherwise require growing.
+//! adding a field to `sweep_registry/mod.rs`, which every sibling brake's
+//! cached-field approach would otherwise require.
 //!
 //! # Idempotency (no double-post) — keyed per SWEEP, not per issue
 //!

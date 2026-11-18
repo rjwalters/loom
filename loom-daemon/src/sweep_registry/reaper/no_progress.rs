@@ -1,8 +1,7 @@
 //! The reaper's no-progress backstop predicate (#4366) and its progress
 //! carve-out (#8439).
 //!
-//! Extracted from `reaper.rs` (which is at the file-size ratchet's threshold,
-//! see `.loom/docs/file-size-policy.md`) so the predicate, the full rationale
+//! Extracted from `reaper.rs` so the predicate, the full rationale
 //! for each of its arms, and its own regression tests sit together rather than
 //! being spread across the 300-line `reap_once` match arm that consumes it.
 //!

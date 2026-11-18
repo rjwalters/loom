@@ -2250,8 +2250,7 @@ impl SweepRegistry {
 )]
 mod tests;
 
-// #8413's own cases, in a sibling file because `tests.rs` is at its file-size
-// ratchet baseline (`.loom/docs/file-size-policy.md`).
+// #8413's own cases, in a sibling file beside `tests.rs`.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2262,7 +2261,7 @@ mod tests;
 mod liveness_tests;
 
 // #9533: the shared-liveness + drain-gate cases, beside (not inside)
-// `tests.rs`, which is at its file-size ratchet baseline.
+// `tests.rs`.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

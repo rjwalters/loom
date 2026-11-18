@@ -1,8 +1,7 @@
 //! The `Observability: …` telemetry-export line on `loom-daemon status`
 //! (Issue #5083; first-hop scope annotation, Issue #9015).
 //!
-//! A sibling module rather than more lines in `status_render.rs` (an
-//! over-threshold ledger entry — `.loom/docs/file-size-policy.md`), matching
+//! A sibling module rather than more lines in `status_render.rs`, matching
 //! how [`super::holds`] and
 //! [`super::model_class`] already live here. Moved verbatim apart from the
 //! #9015 annotation described below.

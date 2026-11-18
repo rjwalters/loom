@@ -7,9 +7,8 @@
 //! headless sweep) routinely run on a host with no daemon at all, which is
 //! exactly the topology #8268 was reported from.
 //!
-//! The sub-action enum lives here, not in `main.rs`, because that file is
-//! frozen by the file-size ratchet (`.loom/docs/file-size-policy.md`) — the
-//! same reason [`crate::cli::sweep_experiment`] is shaped this way.
+//! The sub-action enum lives here, not in `main.rs` — the
+//! same shape as [`crate::cli::sweep_experiment`].
 
 use anyhow::Result;
 use clap::Subcommand;

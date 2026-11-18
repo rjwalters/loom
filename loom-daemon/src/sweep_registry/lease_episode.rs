@@ -227,21 +227,20 @@ pub(crate) fn in_episode<'a>(
         .collect()
 }
 
-// Whole-dispatch regressions live in their own file: this module is the
-// only place left that can declare them without growing the over-threshold
-// `sweep_registry/mod.rs` (its line-count ratchet is frozen).
+// Whole-dispatch regressions live in their own file, declared from this module
+// rather than from `sweep_registry/mod.rs`.
 #[cfg(test)]
 #[path = "lease_episode_dispatch_tests.rs"]
 mod lease_episode_dispatch_tests;
 
 // #9548 / Judge #9593: spoofed-vs-trusted lease records through the
-// tie-break and the watchdog fence (same ratchet reason as above).
+// tie-break and the watchdog fence.
 #[cfg(test)]
 #[path = "lease_trust_tests.rs"]
 mod lease_trust_tests;
 
 // #11112: two hosts, one shared forge lease list, no peer-claim channel —
-// exactly one builds (same ratchet reason as above).
+// exactly one builds.
 #[cfg(test)]
 #[path = "lease_cross_host_tests.rs"]
 mod lease_cross_host_tests;

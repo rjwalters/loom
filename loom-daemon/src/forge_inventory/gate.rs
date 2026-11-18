@@ -7,9 +7,8 @@
 //! issue. A file that is neither is an unclassified call site, and a baselined
 //! file whose call count GREW is a new bypass hiding inside an old one.
 //!
-//! It is a one-way ratchet, like `scripts/check-file-size-budget.sh`: shrinking
-//! is always fine, growth is a failure, and `--update` rewrites the baseline so
-//! the ledger only ever gets shorter.
+//! It is a one-way ratchet: shrinking is always fine, growth is a failure, and
+//! `--update` rewrites the baseline so the ledger only ever gets shorter.
 //!
 //! # What is a "direct forge call"
 //!
@@ -17,7 +16,7 @@
 //! in an executable file. Deliberately NOT counted:
 //!
 //! - **Installed mirrors** (`.loom/**`) — resync copies of `defaults/`,
-//!   measured at their source, exactly as the file-size budget does.
+//!   measured at their source.
 //! - **Tests and fixtures** — `tests/**`, `*_tests.rs`, `tests.rs`,
 //!   `test-*.sh`. #9777 classifies fixtures rather than counting them as
 //!   active operations.

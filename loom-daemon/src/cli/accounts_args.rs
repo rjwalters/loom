@@ -1,9 +1,7 @@
 //! clap argument definitions for `loom-daemon accounts` (issue #8672).
 //!
 //! Extracted from `main.rs` so the `accounts` command family can keep growing
-//! without pushing `main.rs` past its `scripts/file-size-baseline.txt` entry —
-//! the "put the new code in a NEW sibling module" rule from
-//! `.loom/docs/file-size-policy.md`. Pure relocation: the derive tree below is
+//! in its own sibling module. Pure relocation: the derive tree below is
 //! byte-for-byte what `main.rs` carried, plus the new `Provision` sub-action.
 //!
 //! `main.rs` re-exports the enum (`pub(crate) use`), so `crate::cli::AccountsAction`

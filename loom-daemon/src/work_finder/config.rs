@@ -1,9 +1,8 @@
 //! `.loom/config.json` → `autonomous.workFinder` parsing: [`WorkFinderConfig`],
 //! [`read_work_finder_config`], and the retired-CPU-knob deprecation notice.
 //!
-//! Split out of `work_finder.rs` (Issue #9034) for the same file-size-ratchet
-//! reason as [`super::configured_max`]: `work_finder.rs`
-//! is frozen at its current size (`.loom/docs/file-size-policy.md`).
+//! Split out of `work_finder.rs` (Issue #9034), as [`super::configured_max`]
+//! was.
 
 use std::path::Path;
 

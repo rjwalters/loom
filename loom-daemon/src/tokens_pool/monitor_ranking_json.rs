@@ -1,7 +1,6 @@
 //! Pure `ranking.json` entry-parsing helpers, split out of
-//! [`super::monitor`] (issue #8297) so that module has headroom for the
-//! per-class ingest work without crossing its frozen
-//! `.loom/docs/file-size-policy.md` line budget. No behavior changed by this
+//! [`super::monitor`] (issue #8297) so that module has room for the
+//! per-class ingest work. No behavior changed by this
 //! split — every item here is used exactly as it was when defined in
 //! `monitor.rs`, re-exported back into that module's namespace by a single
 //! `use` there.

@@ -59,8 +59,7 @@ use crate::types::{Event, SweepKind};
 
 /// Runtime attribution on a `completion-v1` payload (Issue #8507): the
 /// `runtime`/`provider`/`profile` label emit + validation, and the
-/// runtime-dispatched per-model token lookup. A sibling module because this
-/// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
+/// runtime-dispatched per-model token lookup. A sibling module of this file.
 mod completion_runtime;
 mod forge_gate;
 mod reconcile_tick;
@@ -3780,7 +3779,7 @@ pub trait InboundEventSink: Send + Sync {
 
 mod claim_sink;
 /// The peer-claim inbound consumer, defined in [`claim_sink`] (moved there in
-/// Issue #9294 to keep this file inside its size ratchet). Re-exported so every
+/// Issue #9294). Re-exported so every
 /// existing `safehouse::PeerClaimSink` call site is unchanged.
 pub use claim_sink::PeerClaimSink;
 
@@ -4126,8 +4125,7 @@ async fn run_coordination(
 mod tests;
 
 // [`PeerClaimSink`]'s `ClaimKind::Heartbeat` routing (Issue #8736), in its own
-// sibling file rather than `tests` above — that module is at the line-budget
-// ratchet (`scripts/file-size-baseline.txt`).
+// sibling file rather than in `tests` above.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod heartbeat_tests;

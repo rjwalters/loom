@@ -1,8 +1,7 @@
 //! The issue-declared re-check interval marker (Issue #6685):
 //! `<!-- loom:recheck-interval=<value> -->` in an issue body.
 //!
-//! Moved out of `work_finder.rs` unchanged (#9244) to make room under that
-//! file's size ratchet (`.loom/docs/file-size-policy.md`).
+//! Moved out of `work_finder.rs` unchanged (#9244).
 
 use std::time::Duration;
 

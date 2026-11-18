@@ -16,9 +16,7 @@
 //! days of a completely inert cross-host coordination channel presenting as
 //! normal output. See `crate::peer_claims::send_health` for the full trace.
 //!
-//! Kept in its own sibling module (the `status_render/*_line.rs` convention)
-//! because `status_render.rs` is over the size ratchet
-//! (`scripts/file-size-baseline.txt`).
+//! Kept in its own sibling module (the `status_render/*_line.rs` convention).
 
 use crate::types::PeerCoordinationHealth;
 

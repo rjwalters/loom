@@ -1,10 +1,8 @@
 //! `loom-daemon sweep-outcomes` CLI surface: the flag set, the `summary`
 //! sub-verb (Issue #8057), and the dispatch between them.
 //!
-//! **Why this is not in `main.rs`.** `main.rs` is over
-//! `scripts/check-file-size-budget.sh`'s threshold, so it is frozen at its
-//! current size: new CLI surface goes in a sibling module with a one-line
-//! dispatch arm left behind. Moving the whole `sweep-outcomes` arg set here
+//! **Why this is not in `main.rs`.** New CLI surface goes in a sibling module
+//! with a one-line dispatch arm left behind. Moving the whole `sweep-outcomes` arg set here
 //! (as a `#[command(flatten)]`-style `Args` struct) shrinks `main.rs` rather
 //! than growing it, and parses byte-identically — a flattened `Args` struct
 //! and an inline variant body produce the same `Command` tree.

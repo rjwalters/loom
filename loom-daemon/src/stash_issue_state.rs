@@ -8,8 +8,7 @@
 //! lookup answered so the caller can report that case once, as its own
 //! condition, and fail the run.
 //!
-//! It lives outside `stash_retirement.rs` because that file is size-frozen
-//! (`.loom/docs/file-size-policy.md`), and it changes no verdict: the
+//! It lives outside `stash_retirement.rs`, and it changes no verdict: the
 //! recorder forwards every answer untouched.
 
 use std::collections::BTreeMap;

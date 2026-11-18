@@ -1,7 +1,6 @@
 //! Calibration helper for burst-concurrency assertions, split out of
 //! `dispatch/tests.rs` (#9194) — mirrors
-//! `ipc/tests/dispatch_burst_calibration.rs` — so that already-over-threshold
-//! file does not grow past the `.loom/docs/file-size-policy.md` ratchet.
+//! `ipc/tests/dispatch_burst_calibration.rs`.
 //! Registered from its foot via `#[path]`, the shape `dispatch/tests.rs`
 //! already uses for `operator_hold_tests.rs`.
 

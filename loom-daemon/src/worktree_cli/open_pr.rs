@@ -44,10 +44,8 @@
 //!
 //! # Why Rust and not the file that already holds this
 //!
-//! `lib/worktree-forge-pr-check.sh` is not itself frozen by the file-size
-//! ratchet (472 lines, under the 1000-line threshold `scripts/
-//! file-size-baseline.txt` tracks) — but it is exactly the class of code the
-//! sibling ports in this family (`stale_ref`, `closed_pr_branch`) exist to
+//! `lib/worktree-forge-pr-check.sh` is small (472 lines), but it is exactly the
+//! class of code the sibling ports in this family (`stale_ref`, `closed_pr_branch`) exist to
 //! retire: a forge round-trip's success/failure text parsed by `grep -qi`
 //! against two hand-copied substrings, and a `jq` pipeline reparsing the
 //! result field by field. Neither half is destructive — this whole family is

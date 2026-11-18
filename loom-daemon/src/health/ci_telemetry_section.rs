@@ -8,8 +8,7 @@
 //! `stale`/`never-polled` with no reason, and SigNoz simply stopped
 //! receiving CI data.
 //!
-//! Split into its own file because `health.rs` sits at its file-size
-//! ratchet, like [`super::transcript_ingest_section`].
+//! Split into its own file, like [`super::transcript_ingest_section`].
 
 use super::{HealthInputs, HealthSection, Verdict};
 

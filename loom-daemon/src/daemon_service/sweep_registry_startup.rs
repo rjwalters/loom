@@ -125,8 +125,7 @@ pub(super) fn configure_and_share(
     // child died, which is why it catches the shape the others structurally
     // cannot (a sweep that advances its checkpoint and still produces nothing).
     // Resolve + set + log live in the module (`configure_prless_retry`), not
-    // inline here: `daemon_service.rs` is over the file-size ratchet's
-    // threshold and frozen at its current size (.loom/docs/file-size-policy.md).
+    // inline here.
     sweep_registry::configure_prless_retry(&mut sweep, sweep_workspace);
 
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve

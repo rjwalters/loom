@@ -16,8 +16,7 @@
 //! head sha it computed `mergeable` for), `pull_files_cached_as`
 //! (`.pr_files`), and the lease, verdict and activity comments (#12315).
 //!
-//! A sibling module rather than inline in `claim_reconciliation.rs`, which is
-//! frozen by the file-size ratchet (`.loom/docs/file-size-policy.md`). Calls
+//! A sibling module rather than inline in `claim_reconciliation.rs`. Calls
 //! are recorded as `claim_reconciliation.pr_list` /
 //! `claim_reconciliation.pr_mergeable` in the #9251 forge-call accounting.
 

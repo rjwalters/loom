@@ -52,7 +52,7 @@
 //! The calibration reading is collected by this module and *assessed* behind
 //! [`health::HealthInputs::limit_calibration`] +
 //! [`health::assess_limit_calibration`] (which lives in the
-//! `health::calibration_section` sibling module — the file-size-ratchet split
+//! `health::calibration_section` sibling module — the split
 //! every growing `assess_*` function follows). #8366 originally appended the
 //! section here instead; #8349 moved it into `assess`'s own roll-up so a
 //! `Degraded` calibration verdict promotes `overall` through the same logic

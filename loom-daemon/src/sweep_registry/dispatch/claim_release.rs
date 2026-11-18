@@ -1,5 +1,5 @@
-//! Claim-unwind helpers for the dispatch path, extracted from `dispatch.rs` to
-//! hold that file at its file-size ratchet (Issue #11304).
+//! Claim-unwind helpers for the dispatch path, extracted from `dispatch.rs`
+//! (Issue #11304).
 //!
 //! - [`SweepRegistry::unwind_local_claim`]: undo this dispatch attempt's own
 //!   purely local side effects (peer-claim advertisement, claim lock,

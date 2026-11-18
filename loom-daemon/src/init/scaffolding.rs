@@ -1542,21 +1542,19 @@ fn files_not_in(dir: &Path, other: &Path) -> Result<Vec<String>, String> {
 mod tests;
 
 // A new sibling module rather than growing `scaffolding/tests.rs` in place —
-// that file sits exactly at its file-size ratchet baseline
-// (`.loom/docs/file-size-policy.md`), the same reason
-// `defaults/scripts/tests/test-resync-installed-local-fix-guard.sh` was split
-// out of `test-resync-installed.sh` rather than grown into it.
+// the same approach `defaults/scripts/tests/test-resync-installed-local-fix-guard.sh`
+// took when it was split out of `test-resync-installed.sh`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod agent_skills_tests;
 
-// Sibling module for the same file-size-ratchet reason as `agent_skills_tests`.
+// Sibling module, like `agent_skills_tests`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod legacy_permissions_tests;
-// Same reason as `agent_skills_tests` above: `scaffolding/tests.rs` is
-// frozen at its file-size ratchet baseline, so the pre-#4187 legacy-duplicate
-// absorption tests (issue #8875) live in their own sibling module instead.
+// Like `agent_skills_tests` above: the pre-#4187 legacy-duplicate absorption
+// tests (issue #8875) live in their own sibling module instead of
+// `scaffolding/tests.rs`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod legacy_label_duplicates_tests;

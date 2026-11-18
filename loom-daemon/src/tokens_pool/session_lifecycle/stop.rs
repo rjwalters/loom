@@ -1,7 +1,7 @@
 //! `SessionLifecycle::stop`: the operator stop and its two races with the
 //! session reconcile pass (issues #10453, #10661). A child module of
 //! `session_lifecycle` so it shares the lifecycle's private state; it lives
-//! in its own file for the file-size ratchet (#7711).
+//! in its own file (#7711).
 //!
 //! # The two races
 //!

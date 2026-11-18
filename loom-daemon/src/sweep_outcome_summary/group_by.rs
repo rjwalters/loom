@@ -1,6 +1,5 @@
 //! The `--group-by` dimension enum and its wire/display spellings. Split out
-//! of `sweep_outcome_summary.rs` to stay under the file-size ratchet
-//! threshold (`scripts/check-file-size-budget.sh`, #7711).
+//! of `sweep_outcome_summary.rs` (#7711).
 
 use anyhow::{bail, Result};
 use serde::Serialize;
