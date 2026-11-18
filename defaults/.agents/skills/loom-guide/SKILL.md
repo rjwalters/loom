@@ -1140,16 +1140,22 @@ citing this subsection):
    these documents (or want them generated differently)" is the
    `guide.docsMaintenance` namespace in `.loom/config.json` (where
    `workLogDebounceSecs` / `workPlanDebounceSecs` / `poolPressure*` already
-   live). No per-file or on/off key exists yet — tracked separately in
-   #14116. Until one lands, having one file without the other is NOT an
-   opt-out signal: create-by-default applies to each missing file
-   independently.
+   live). The key is `guide.docsMaintenance.skipDocs` (#14116): a JSON array
+   of file names, allowed values `"WORK_LOG.md"` / `"WORK_PLAN.md"` (e.g.
+   `"skipDocs": ["WORK_PLAN.md"]`); absent or `[]` means both are generated,
+   and unrecognised entries are ignored. A listed file is **neither created
+   nor updated** (first creation included), and no docs PR is opened for it;
+   the other file is unaffected. The entry is the recorded answer — a pass
+   that sees it proceeds without deferring or asking. Absent a `skipDocs`
+   entry, having one file without the other is NOT an opt-out signal:
+   create-by-default applies to each missing file independently. No `LOOM_*`
+   env override exists for this key.
 4. **Declining anything must be visible.** A pass that declines any part of
    this phase (suppresses a README refresh, skips a link, archives nothing)
    says so **in its docs PR body, citing this subsection**, so the next pass
    reads the recorded answer instead of deciding afresh. With creation as
    the default there is no deferral to remember; the recorded answers that
-   exist are the config key (once #14116 lands) and these PR-body notes.
+   exist are the `skipDocs` config key and these PR-body notes.
 5. **Cross-links and layout.** The static preamble outside the
    `guide:plan-body` markers is where a WORK_PLAN.md points at the repo's
    roadmap when one exists — Step 3's first-creation preamble does this
@@ -1431,6 +1437,12 @@ phase unless a future regression run of `test-guide-docs-pr-race.sh` actually
 finds the lock+recheck insufficient.
 
 ### Step 2: Update WORK_LOG.md
+
+**Opt-out (#14116).** If `WORK_LOG.md` is listed in
+`guide.docsMaintenance.skipDocs`, `update_work_log()` returns before doing
+anything — no create, no update, no rotation (Step 2b), no PR for that file —
+and this pass proceeds without deferring. See "WORK_PLAN.md vs a hand-written
+ROADMAP.md", rule 3.
 
 Append entries for newly merged PRs and newly closed issues not yet recorded
 (presence checks, not number watermarks — see #5516 and #5539 below). Only
@@ -1715,7 +1727,25 @@ fetch_merged_prs_complete() {
   _fetch_complete pr "$@"
 }
 
+# #14116: per-file opt-out. `guide.docsMaintenance.skipDocs` is a JSON array of
+# file names ("WORK_LOG.md" / "WORK_PLAN.md"); a listed file is neither created
+# nor updated. Absent/`[]`/non-array/unreadable config = nothing skipped (today's
+# behaviour); entries other than the two document names never match. No env
+# override. $1 = the document name; returns 0 when it is skipped.
+docs_maintenance_skipped() {
+  jq -r '(.guide.docsMaintenance.skipDocs // []) | if type == "array" then .[] | strings else empty end' \
+    .loom/config.json 2>/dev/null | grep -Fxq -- "$1"
+}
+
 update_work_log() {
+  # #14116: a repo that opted out of WORK_LOG.md via
+  # `guide.docsMaintenance.skipDocs` gets no create and no update, so return
+  # before any forge query. Non-zero = "nothing written", like the debounce.
+  if docs_maintenance_skipped WORK_LOG.md; then
+    echo "WORK_LOG.md is listed in guide.docsMaintenance.skipDocs — skipping (no create, no update)."
+    return 1
+  fi
+
   # Neither PRs nor issues are filtered by a number watermark anymore — see
   # the #5516 (PR) and #5539 (issue) comments below. `work_log_max_issue()` /
   # `work_log_max_pr()` are not called here at all; presence checks against
@@ -1960,6 +1990,9 @@ WORK_LOG_ARCHIVE_GLOB='work_log/WORK_LOG_[0-9][0-9][0-9][0-9]-[0-9][0-9].md'
 rotate_work_log() {
   local wrote="${1:-0}" report moved
 
+  # #14116: rotation rewrites WORK_LOG.md, so a skipped file is left untouched.
+  docs_maintenance_skipped WORK_LOG.md && return 1
+
   # Fail-safe invariant (see the note above work_log_has_pr()): the cutoff must
   # stay older than the lookback by the margin, or archived entries would be
   # re-appended by update_work_log(). Skip loudly, never rotate.
@@ -2019,6 +2052,12 @@ the next tick recomputes the same rotation from the committed documents. No
 gitignored sidecar holds any state.
 
 ### Step 3: Update WORK_PLAN.md
+
+**Opt-out (#14116).** If `WORK_PLAN.md` is listed in
+`guide.docsMaintenance.skipDocs`, `update_work_plan()` returns before doing
+anything — no create (first creation included), no update, no PR for that
+file — and this pass proceeds without deferring. See "WORK_PLAN.md vs a
+hand-written ROADMAP.md", rule 3.
 
 Regenerate the backlog snapshot from current GitHub label state. Only rewrite if labels
 have changed **and** that change has survived a debounce window since the last
@@ -2353,6 +2392,14 @@ strip_plan_stamp() {
 }
 
 update_work_plan() {
+  # #14116: a repo that opted out of WORK_PLAN.md via
+  # `guide.docsMaintenance.skipDocs` gets no create and no update (first
+  # creation included), so return before rendering anything.
+  if docs_maintenance_skipped WORK_PLAN.md; then
+    echo "WORK_PLAN.md is listed in guide.docsMaintenance.skipDocs — skipping (no create, no update)."
+    return 1
+  fi
+
   # Change detection: compare the freshly-rendered body against the body already
   # committed between the markers. No gitignored side-car (which resets to "" on
   # every fresh checkout) — the committed file IS the state.

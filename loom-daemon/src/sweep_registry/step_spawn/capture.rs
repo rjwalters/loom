@@ -530,6 +530,10 @@ impl SweepRegistry {
         // #12253: the step's `loom.sweep` span ends here, with the outcome
         // its `role_tick.outcome` reports, not at the next restart's orphan
         // recovery. Local journal writes only, so it runs under the lock.
+        // #14234: the post-state the claim release noted, if it ran before
+        // this end. Peeked, not taken: `step_end::settle` still classifies
+        // with it. `Some(None)` (a failed read) is no post-state.
+        let post = super::ended::peek_post(&self.config.workspace_root, sweep_id).flatten();
         let (result, close) = super::span::sweep_close(
             end,
             line.as_ref(),
@@ -541,6 +545,7 @@ impl SweepRegistry {
             self.step_points(sweep_id),
             pr_number,
             provider_exhausted,
+            post,
         );
         self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached
