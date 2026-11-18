@@ -3361,26 +3361,52 @@ fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {
     super::liveness::locks_dir(repo_root)
 }
 
+/// Read-side view of a claim lock's `owner.json` for
+/// [`clear_stale_spawn_loop_locks`]: `owner_pid` plus the `acquired_at`
+/// stamp the identity-paired liveness probe needs — neither more nor less.
+///
+/// Deliberately local (mirroring [`crate::live_claim`]'s private
+/// `LockOwnerView`) rather than a re-export of `sweep_registry`'s private
+/// `LockOwner`: unknown writer-side fields are ignored, and a lock stamped
+/// before the field existed deserialises with an empty `acquired_at`,
+/// which `owner_pid_alive_since` treats as "no opinion" (bare liveness).
+#[derive(serde::Deserialize)]
+struct LockOwnerLivenessView {
+    owner_pid: u32,
+    #[serde(default)]
+    acquired_at: String,
+}
+
 /// Remove `.loom/locks/issue-<N>/` claim-lock dirs with no live owner.
 ///
-/// Staleness is judged from the lock itself: a lock whose `owner.json`
-/// names a **live, non-zombie** `owner_pid` is kept
-/// ([`crate::live_claim::live_lock_owner_in`] with bare
-/// [`crate::live_claim::pid_is_live_process`] — deliberately NOT the
-/// argv-verified [`crate::live_claim::pid_is_live_claim_for`], because
-/// `acquire_lock` provisionally stamps the *dispatching daemon's own pid*
-/// and only rewrites it to the child's pid after spawn; a cleanup pass
-/// running in that window must not delete a mid-flight lock, and bare
-/// liveness is what keeps it). Everything else — dead owner, missing or
-/// unparseable `owner.json` — is stale and removed. `own_untracked_pid` is
-/// `None`: this is a standalone cleanup pass with no child bookkeeping to
-/// consult.
+/// Staleness is judged from the lock itself: a lock is kept only while
+/// [`pid_identity::owner_pid_alive_since`] — bare liveness **plus** the
+/// #7935 recycled-pid identity guard — vouches for its `owner_pid`
+/// relative to the lock's `acquired_at`, so this pass and the registry's
+/// `reconstruct` agree on what "live owner" means (#14056). A lock whose
+/// pid number was recycled onto an unrelated live process (started after
+/// `acquired_at` + [`RECYCLED_PID_SKEW_SECS`]) is therefore stale here
+/// too, not just on daemon startup. A missing or unparseable `acquired_at`
+/// degrades to bare liveness rather than guessing.
+///
+/// Deliberately NOT the argv-verified
+/// [`crate::live_claim::pid_is_live_claim_for`]: `acquire_lock`
+/// provisionally stamps the *dispatching daemon's own pid* and only
+/// rewrites it to the child's pid after spawn; a cleanup pass running in
+/// that window must not delete a mid-flight lock. The identity-paired
+/// probe keeps it — the daemon's own process started before the stamp —
+/// so PR #14044's rationale for rejecting argv verification still stands.
+/// Everything else — dead owner, missing or unparseable `owner.json` — is
+/// stale and removed.
 ///
 /// These directories are the daemon's live claim locks
 /// (`SweepRegistry::acquire_lock`), so over-removal double-dispatches;
 /// historically this function consulted the retired
 /// `spawn-loop-state.json` whose `running` list was always empty and
 /// therefore removed **every** lock (#13818).
+///
+/// [`pid_identity::owner_pid_alive_since`]: crate::sweep_registry::reaper::pid_identity::owner_pid_alive_since
+/// [`RECYCLED_PID_SKEW_SECS`]: crate::sweep_registry::reaper::pid_identity::RECYCLED_PID_SKEW_SECS
 pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
     let locks_dir = spawn_loop_locks_dir(repo_root);
     if !locks_dir.is_dir() {
@@ -3408,13 +3434,22 @@ pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
             eprintln!("  Skipping malformed lock dir: {name}");
             continue;
         };
-        let live = crate::live_claim::live_lock_owner_in(
-            &locks_dir,
-            issue_num,
-            &crate::live_claim::pid_is_live_process,
-            None,
+        // Owner read is local rather than via `live_lock_owner_in`: its
+        // `is_live` closure sees only the pid, so the lock's `acquired_at`
+        // (the other half of the identity-paired probe) never reaches it.
+        let live = std::fs::read_to_string(
+            locks_dir
+                .join(format!("issue-{issue_num}"))
+                .join("owner.json"),
         )
-        .is_some();
+        .ok()
+        .and_then(|raw| serde_json::from_str::<LockOwnerLivenessView>(&raw).ok())
+        .is_some_and(|owner| {
+            crate::sweep_registry::reaper::pid_identity::owner_pid_alive_since(
+                owner.owner_pid,
+                &owner.acquired_at,
+            )
+        });
         if live {
             println!("  Keeping lock for live task: {name}");
             continue;

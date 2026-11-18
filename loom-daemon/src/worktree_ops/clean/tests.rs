@@ -2213,6 +2213,68 @@ fn clear_stale_locks_removes_lock_without_live_owner_json() {
     assert!(!locks.join("issue-3").exists());
 }
 
+/// Writes `owner.json` for `issue` naming `owner_pid` and the given
+/// `acquired_at` (RFC3339), the shape `SweepRegistry::acquire_lock` stamps.
+fn write_owner_with_acquired_at(locks: &Path, issue: u32, owner_pid: u32, acquired_at: &str) {
+    let lock = locks.join(format!("issue-{issue}"));
+    std::fs::create_dir_all(&lock).unwrap();
+    std::fs::write(
+        lock.join("owner.json"),
+        format!(r#"{{"issue":{issue},"owner_pid":{owner_pid},"acquired_at":"{acquired_at}","sweep_id":"s-{issue}"}}"#),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")] // needs /proc/<pid>/stat start times for the identity check
+fn clear_stale_locks_removes_lock_with_recycled_pid_owner() {
+    // #14056: the pid is LIVE (this test process), but the lock's
+    // `acquired_at` is a day old — the process currently wearing that pid
+    // number started long after the lock was acquired, the exact
+    // recycled-pid shape `pid_identity::pid_was_recycled` guards (#7935).
+    // Bare `pid_is_live_process` keeps such a lock on every pass forever;
+    // the identity-paired check must clear it, like `reconstruct` does.
+    let dir = tempfile::tempdir().unwrap();
+    let locks = spawn_loop_locks_dir(dir.path());
+    let acquired_at = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    write_owner_with_acquired_at(&locks, 4, std::process::id(), &acquired_at);
+    let removed = clear_stale_spawn_loop_locks(dir.path(), false);
+    assert_eq!(removed, 1);
+    assert!(!locks.join("issue-4").exists());
+}
+
+#[test]
+fn clear_stale_locks_keeps_live_owner_started_before_acquired_at() {
+    // The provisional `acquire_lock` shape: the dispatching daemon stamps
+    // its OWN pid at acquire time, so the owner process started *before*
+    // `acquired_at`. A future `acquired_at` is that relationship with the
+    // widest margin — the identity check must read the owner as the lock's
+    // own process and keep it (mid-flight locks survive cleanup passes).
+    let dir = tempfile::tempdir().unwrap();
+    let locks = spawn_loop_locks_dir(dir.path());
+    let acquired_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    write_owner_with_acquired_at(&locks, 5, std::process::id(), &acquired_at);
+    let removed = clear_stale_spawn_loop_locks(dir.path(), false);
+    assert_eq!(removed, 0);
+    assert!(locks.join("issue-5").exists());
+}
+
+#[test]
+fn clear_stale_locks_unparseable_acquired_at_degrades_to_bare_liveness() {
+    // A garbage `acquired_at` is "no opinion": the probe degrades to bare
+    // liveness (`owner_pid_alive_since` mirrors `reconstruct`), so a live
+    // owner still keeps its lock. Legacy locks stamped before the field
+    // existed (no `acquired_at` at all) take the same path via
+    // `#[serde(default)]` and are covered by
+    // `clear_stale_locks_keeps_live_and_removes_dead` above.
+    let dir = tempfile::tempdir().unwrap();
+    let locks = spawn_loop_locks_dir(dir.path());
+    write_owner_with_acquired_at(&locks, 6, std::process::id(), "not-a-timestamp");
+    let removed = clear_stale_spawn_loop_locks(dir.path(), false);
+    assert_eq!(removed, 0);
+    assert!(locks.join("issue-6").exists());
+}
+
 // --- quarantine_dirty_worktree (#6653) --------------------------------
 
 fn init_repo_with_seed_commit(dir: &Path) {
