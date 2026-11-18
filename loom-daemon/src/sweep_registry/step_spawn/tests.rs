@@ -739,6 +739,8 @@ fn a_step_with_no_outcome_line_records_none_on_its_record() {
         failure: None,
         model: "opus".into(),
         effort: "high".into(),
+        stage: "judge".into(),
+        log_path: dir.path().join("step-judge-9.log"),
     });
     let journal = crate::sweep_outcomes::default_role_tick_telemetry_path(dir.path());
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
