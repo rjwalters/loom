@@ -5,8 +5,9 @@
 //! A sibling of `tests.rs`, which is over the file-size ratchet's threshold
 //! (`.loom/docs/file-size-policy.md`).
 
-use super::tests::{which_bash, write_executable};
+use super::tests::which_bash;
 use super::*;
+use crate::exec_test_support::write_executable;
 
 /// Run the rendered verify script against a stub `loom-daemon` whose
 /// `status` exit codes follow `codes` (last code repeats). Returns
@@ -34,7 +35,7 @@ fn run_verify_with_status_codes(
     };
     write_executable(
         &local_bin.join("loom-daemon"),
-        &format!(
+        format!(
             r#"#!/bin/sh
 if [ "$1" = "status" ]; then
   COUNTER_FILE="$STUB_STATE_DIR/status-calls"

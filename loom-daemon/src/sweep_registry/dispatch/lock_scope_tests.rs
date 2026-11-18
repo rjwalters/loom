@@ -8,17 +8,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use crate::exec_test_support::write_executable;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
-
-fn make_executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).unwrap();
-}
 
 /// A registry with the real guard + flip path enabled whose fake `gh` sleeps
 /// `gh_sleep_secs` on every `api` read (the guard chain's forge calls) and
@@ -28,9 +21,9 @@ fn slow_gh_registry(ws: &Path, gh_sleep_secs: &str) -> (SweepRegistry, PathBuf, 
     touch_sweep_command(ws);
     let gh_log = ws.join("gh-invocations.log");
     let fake_gh = ws.join("fake-gh.sh");
-    make_executable(
+    write_executable(
         &fake_gh,
-        &format!(
+        format!(
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
@@ -51,9 +44,9 @@ fn slow_gh_registry(ws: &Path, gh_sleep_secs: &str) -> (SweepRegistry, PathBuf, 
     let spawn_marker = ws.join("spawns.log");
     let spawn = ws.join(".loom/scripts/spawn-claude.sh");
     std::fs::create_dir_all(spawn.parent().unwrap()).unwrap();
-    make_executable(
+    write_executable(
         &spawn,
-        &format!("#!/usr/bin/env bash\necho spawned >> '{}'\nexit 0\n", spawn_marker.display()),
+        format!("#!/usr/bin/env bash\necho spawned >> '{}'\nexit 0\n", spawn_marker.display()),
     );
     let mut config = SweepRegistryConfig::new(ws.to_path_buf());
     config.spawn_bin = Some(spawn);
