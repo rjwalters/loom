@@ -808,8 +808,9 @@ never falls through to a lower tier, and it is never run through the
 
 Here Curator runs on Codex with whatever model that Codex seat defaults to,
 while every other role keeps `sonnet` on Claude. **This is not a stylistic
-option** — it is the only configuration a ChatGPT-plan Codex seat accepts (see
-"ChatGPT-plan seats cannot serve a pinned model at all" below), and before
+option** — it is the only configuration a ChatGPT-plan Codex seat reliably
+accepts (see "ChatGPT-plan seats and pinned models: the account catalog
+decides" below), and before
 #7894 there was no way to express it: omitting the pin fell through to the
 Claude-shaped shipped default and made the #5028 preflight below skip the tick
 forever. The per-role log header records the pass-through explicitly:
@@ -898,41 +899,54 @@ the daemon log, and `role_tick.outcome`'s `gated_pool` key. Full contract,
 including when the codex gate deliberately stands down:
 [token-pool.md § The gate follows the admitted runtime](token-pool.md#the-gate-follows-the-admitted-runtime-8408).
 
-#### ChatGPT-plan seats cannot serve a pinned model at all (#5499)
+#### ChatGPT-plan seats and pinned models: the account catalog decides (#5499, #14121)
 
 The family-level checks above only catch a Claude-shaped model on a Codex
-runtime. They cannot catch a **Codex-family** model — e.g. `gpt-5-codex` — that
-still fails, because the real incompatibility is model vs the profile's **auth
-mode**, not model vs runtime family: a Codex profile authenticated via a
-ChatGPT plan (interactive `codex login`, as opposed to `codex login
---with-api-key`) only accepts the account's own default model. Pinning
-anything else — including a perfectly valid Codex model name — gets rejected
-on the wire with a 400 `invalid_request_error`:
+runtime. They cannot catch a **Codex-family** model — e.g. `gpt-5-codex` —
+that still fails, because the real gate on a Codex profile authenticated via
+a ChatGPT plan (interactive `codex login`, as opposed to `codex login
+--with-api-key`) is the **account's own model catalog**, not the runtime
+family: current codex-cli (0.168+) runs a pinned model only when the catalog
+`codex debug models` exposes for that account lists it — each entry with its
+own reasoning levels and service tiers. A pin the catalog does not list is
+rejected on the wire with a 400 `invalid_request_error`:
 
 ```
 The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.
 ```
 
-**If the Codex profile a role/runtime binding points at is authenticated via a
-ChatGPT plan, set `roleModels.<role>` to `"default"`** (the #7894 pass-through
-sentinel above) **and omit `LOOM_MODEL`/`LOOM_CODEX_MODEL` for that role**, so
-the CLI uses the account's own default — this is the single most likely
-first-run misconfiguration for a Codex-bound role, and the error text otherwise
-only ever surfaces in the role's own log (`role-<role>.log` or a sweep's
-per-issue log), never in `loom-daemon health`. Omitting `roleModels.<role>`
-entirely now works too (an unpinned conflict degrades to the same pass-through
-rather than skipping the tick, #7894) — the explicit `"default"` is preferred
-because it says *why* no model is pinned, in the config an operator reads.
+(Before #14121 the guard treated *every* pin this way — the plan's catalog
+was not consulted, so even a listed model was dropped. Issue #5499 predates
+the catalog-aware CLI behaviour and observed exactly that 400; the drop
+remains the fallback for a pin the catalog does not list or a catalog that
+cannot be read.)
 
-`spawn-codex.sh` now guards against it directly: once CODEX_HOME is resolved
-and an explicit model is about to be forwarded, it runs `codex login status`
-(bounded, 10s) and checks the CLI's own wording — "Logged in using ChatGPT" vs
-"Logged in using an API key" — never `auth.json`'s contents, which Loom treats
-as opaque. A ChatGPT-plan match **drops** the pinned model (warning logged,
-invocation still runs on the account's default) rather than launching a
-doomed invocation. Escape hatch: `LOOM_CODEX_AUTH_MODE_CHECK=0`. Because this
-runs in the adapter every caller passes through — role runner, sweep dispatch,
-or a hand-run `LOOM_RUNTIME=codex` — it needs no daemon-side counterpart the
+**If the Codex profile a role/runtime binding points at is authenticated via
+a ChatGPT plan, set `roleModels.<role>` either to `"default"`** (the #7894
+pass-through sentinel above) **or to a model the account's catalog lists**
+(`codex debug models` on that profile lists them) **and omit
+`LOOM_MODEL`/`LOOM_CODEX_MODEL` for other roles**. Omitting
+`roleModels.<role>` entirely now works too (an unpinned conflict degrades to
+the same pass-through rather than skipping the tick, #7894) — the explicit
+`"default"` is preferred because it says *why* no model is pinned, in the
+config an operator reads.
+
+`spawn-codex.sh` guards against the mismatch directly: once CODEX_HOME is
+resolved and an explicit model is about to be forwarded, it runs `codex
+login status` (bounded, 10s) and checks the CLI's own wording — "Logged in
+using ChatGPT" vs "Logged in using an API key" — never `auth.json`'s
+contents, which Loom treats as opaque. On a ChatGPT-plan match it then reads
+the account's catalog (`codex debug models`, bounded 10s, cached ~1h per
+profile in the profile's `CODEX_HOME`; a failed read is never cached) and
+**keeps** the pin when the catalog lists it (#14121), **drops** it — warning
+logged, invocation still runs on the account's default — when the catalog
+does not list it or cannot be read, rather than launching a doomed
+invocation. A dropped pin is reported on the step's terminal record as
+`requested_model=` (v3, below), so a configured-but-ignored model is visible
+without reading the adapter's WARN lines. Escape hatch:
+`LOOM_CODEX_AUTH_MODE_CHECK=0`. Because this runs in the adapter every caller
+passes through — role runner, sweep dispatch, or a hand-run
+`LOOM_RUNTIME=codex` — it needs no daemon-side counterpart the
 way the family-level check above does.
 
 As defense in depth, `classify-error.sh`'s `codex` provider table now
@@ -1098,9 +1112,10 @@ module's header comment).
 ```text
 # LOOM_TERMINAL_RESULT v=1 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n>
 # LOOM_TERMINAL_RESULT v=2 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n> model=<model-or-none>
+# LOOM_TERMINAL_RESULT v=3 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n> model=<model-or-none> requested_model=<model>
 ```
 
-Both versions are strict: the parser requires the exact field count for the
+All versions are strict: the parser requires the exact field count for the
 declared `v=` and fails closed (mutates no account health) on any other
 arity, an unrecognized `v=`, a duplicate record in the current dispatch
 region, or an `account=unknown`/malformed identity. `category` is one of the
@@ -1124,6 +1139,16 @@ region, or an `account=unknown`/malformed identity. `category` is one of the
   classifier has been taught) degrades to the same class-less, account-wide
   health write a v1 record produces — selection must never fail closed on an
   unrecognized model name.
+- **`v=3`** (7 fields) adds `requested_model=` (#14121), emitted only when a
+  pin was resolved but then *dropped before exec* — `model=` stays `none`
+  (the fail-safe above) and the requested-but-ignored pin rides in its own
+  field, so a configured model the #5499 catalog guard dropped is visible in
+  the record without reading the adapter's WARN lines; the daemon logs the
+  same on the role-runner health path. The 7-field arity parses only when
+  the `requested_model` key is present, so a v2-shaped record carrying any
+  other unknown 7th field still fails closed; an older daemon that knows
+  only v1/v2 fails closed on a v3 record too — the same no-health-mutation
+  direction a dropped pin already takes.
 - **A `model@…` suffix is stripped before classification** (#8380), so
   `gpt-5-codex@high` (Loom's own `model@effort` rung grammar, #3702) and
   `gpt-5-codex@2026-01-01` (a pinned dated ID — why `@` is in `model=`'s
@@ -1156,10 +1181,12 @@ historical logs) that already do.
 `spawn-codex.sh` narrows account selection to the model about to be dispatched
 (`tokens select --model "$EFFECTIVE_MODEL"`, #8277) so an account held only for
 a *different* class stays selectable. But the [#5499 ChatGPT-plan
-guard](#chatgpt-plan-seats-cannot-serve-a-pinned-model-at-all-5499) that decides
+guard](#chatgpt-plan-seats-and-pinned-models-the-account-catalog-decides-5499-14121) that decides
 whether the pin actually survives runs **after** selection — it has to, because
 it shells out to `codex login status` against the profile selection just chose,
-and nothing before that point knows the profile's auth mode.
+and nothing before that point knows the profile's auth mode. (Since #14121 the
+guard keeps a pin the account catalog lists, so this window now applies only to
+a pin the catalog does not list, or to a catalog that cannot be read.)
 
 So when the pin is dropped, selection was narrowed to class X while class Y —
 the account's own default — is what really runs. An account holding a live
