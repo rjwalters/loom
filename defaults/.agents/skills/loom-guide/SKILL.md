@@ -2046,7 +2046,7 @@ exists:
 Backlog snapshot from current GitHub label state, maintained by the Guide role.
 Direction lives in the hand-written roadmap: `ROADMAP.md`.
 
-The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. Date the snapshot with `git log -1 -- WORK_PLAN.md`.
+The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. The `_Generated:` stamp at the top of the generated region dates the snapshot; `git log -1 -- WORK_PLAN.md` finds the merge that wrote it.
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 ```
@@ -2059,6 +2059,24 @@ link that dangles in repos without a roadmap. With no
 roadmap, omit that line entirely. Keep this preamble wording in lockstep with
 the WORK_PLAN.md template in `defaults/.claude/commands/loom/imagine.md` (the
 bootstrap seed uses the same distinction).
+
+**#13909 stamp-on-write — the region carries its own generated-at line.** The
+spliced region's first line is a fixed-shape stamp,
+`_Generated: <UTC instant> (snapshot; compare against live labels)_` (the
+`plan_stamp_line()` helper below). It is written ONLY by the splice step at the
+bottom of `update_work_plan()`, never emitted by `render_plan_body()`. That
+split is load-bearing: `old_body` is normalized through `strip_plan_stamp()`
+before the `new_body = old_body` comparison, so wall-clock text participates in
+NEITHER side of the equality test and cannot make an unchanged tick look
+changed. Emitting the stamp from `render_plan_body()` instead would put a fresh
+timestamp into `new_body` on every tick, making that comparison permanently
+false — the #5413 dead-skip failure replayed as one content-free docs PR per
+debounce window (the #5930/#5890 churn class, throttled by the debounce but
+still pure noise). Because the stamp is written only when the body otherwise
+changed, it dates the last genuine label-state rewrite — never the last time
+Guide looked — so the committed snapshot is self-describing at zero churn
+cost. That is the line the `WORK_PLAN.md` header caveat (#13894) points readers
+at.
 
 The generated region is never archived (`defaults/docs/work-docs-archive.md`, "WORK_PLAN").
 
@@ -2220,7 +2238,7 @@ render_plan_body() {
   building=$("$GH_READ" issue list --label "loom:building" --search "$(sed 's/^/-label:/' <<<"$op_q" | tr '\n' ' ') -label:loom:frozen" --state open --limit 200 --json number,title \
     --jq 'sort_by(.number) | .[] | "- **#\(.number)**: \(.title)"')
   review=$("$GH_READ" pr list --label "loom:review-requested" --state open --limit 200 --json number,title,labels \
-    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
+    --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"'"$held_sfx")
   # #5930/#6457: PRs carrying `loom:operator` are Judge-approved work stuck on
   # a human merge-risk-hold decision — folded into the generated region (see
   # the "#5930, DO NOT put a hand-written narrative section outside the
@@ -2312,6 +2330,28 @@ render_plan_body() {
     "| Active epics | $(count "$epics") |")"
 }
 
+# #13909 stamp-on-write, part 1: the generated region's FIRST line is a
+# generated-at stamp in this exact fixed shape (see the "#13909 stamp-on-write"
+# note above Step 3's code). Called ONLY by the splice step at the bottom of
+# update_work_plan() — part 2 below is why it must never be called from
+# render_plan_body().
+plan_stamp_line() {
+  printf '_Generated: %s (snapshot; compare against live labels)_' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# #13909 stamp-on-write, part 2: strip that stamp line from a committed plan
+# body so update_work_plan()'s equality test compares ONLY label-derived
+# content. Applied to old_body alone — new_body comes straight from
+# render_plan_body() and never carries a stamp. The line-1 match is
+# conditional, never an unconditional `1d`: a region with no stamp (written
+# before #13909, or the empty first-ever region) passes through byte-identical
+# and still compares equal. The splice writes the stamp directly on line 1
+# with no blank line after it — exactly `stamp\n` + body — so one conditional
+# delete is the whole normalization.
+strip_plan_stamp() {
+  sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}'
+}
+
 update_work_plan() {
   # Change detection: compare the freshly-rendered body against the body already
   # committed between the markers. No gitignored side-car (which resets to "" on
@@ -2325,11 +2365,17 @@ update_work_plan() {
   # branch was dead code, and every tick unconditionally rewrote the file.
   # Comparing the SAME rendered text on both sides is what makes the skip real;
   # a hash buys nothing here, so compare the strings directly.
-  local new_body old_body
+  local new_body old_body stamp
   new_body="$(render_plan_body)"
-  # `sed '1d;$d'` drops the two marker lines, leaving only the generated region.
+  # `sed '1d;$d'` drops the two marker lines, leaving only the generated region;
+  # `strip_plan_stamp` (#13909) then drops the region's generated-at stamp line
+  # so the comparison below sees ONLY label-derived content on both sides.
+  # new_body needs no such filter — render_plan_body() never emits a stamp, and
+  # if it ever did, the equality test below would go permanently false and
+  # every tick would rewrite the file (the #5413 dead-skip bug, replayed as one
+  # stamp-only docs PR per debounce window).
   old_body="$(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' \
-    "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d')"
+    "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d' | strip_plan_stamp)"
 
   if [ "$new_body" = "$old_body" ]; then
     echo "WORK_PLAN.md is current (no label changes detected)."
@@ -2380,12 +2426,25 @@ update_work_plan() {
   # Both sides above are `$(...)`-captured, so trailing newlines are stripped on
   # both — only the internal structure has to match.
   #
-  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body "$new_body"`, which
+  # #13909 stamp-on-write: the spliced region's FIRST line is a fresh
+  # "$(plan_stamp_line)", directly above $new_body's first line with NO blank
+  # line between (strip_plan_stamp's shape contract). This is the ONLY place a
+  # stamp is ever written, and it runs only after BOTH gates above passed:
+  #   stamp="$(plan_stamp_line)"
+  #   spliced_region="$(printf '%s\n%s\n' "$stamp" "$new_body")"
+  # A no-change tick never reaches here, so the committed stamp is never
+  # refreshed in place and no PR's only diff can be a timestamp; a
+  # debounce-suppressed tick reaches it even less. Never hand-write the stamp
+  # either — a hand-written timestamp freezes at typing time and then asserts
+  # a specific wrong time; it appears only on the next genuine generation.
+  #
+  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body`, which
   # uses a per-tick `mktemp -d` dir. NEVER stage the body or the spliced file at
   # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
   # repos' ticks share /tmp, and a tick whose own write was denied then consumes
   # another repo's stale file. Never read a scratch file this tick did not write.
-  splice_plan_body "$new_body" || return 1
+  stamp="$(plan_stamp_line)"
+  splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || return 1
 
   return 0
 }

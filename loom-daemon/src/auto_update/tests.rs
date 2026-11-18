@@ -1184,6 +1184,7 @@ fn inputs<'a>(
         check,
         tree_clean,
         in_flight,
+        repo_source: None,
     }
 }
 

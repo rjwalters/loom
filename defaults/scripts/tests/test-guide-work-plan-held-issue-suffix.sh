@@ -21,6 +21,11 @@
 # literal (`$hold_names`, built by jq) inside `$held_sfx`, the suffix
 # expression appended to each query's `--jq` program.
 #
+# Issue #14099 closed the one query #13908 missed: `review=` (the "PRs
+# Awaiting Review" list, `gh pr list --label loom:review-requested`) also
+# appends `$held_sfx`, so a review-requested PR carrying a hold renders
+# ` *(held)*` instead of as plain Judge work; `loom:frozen` PRs stay omitted.
+#
 # Verifies that:
 #   1. STRUCTURE: `render_plan_body()` derives the suffix from `$hold_q`
 #      (registry + fallback), and the six priority/proposal/epic queries
@@ -116,10 +121,11 @@ else
     fail "expected held_sfx= to append \" *(held)*\" on membership in \$hold_names"
 fi
 
-# Every one of the six queries keeps its frozen exclusion AND gains the
+# Every one of the seven queries (the six issue queries plus the PR `review=`
+# query, #14099) keeps its frozen exclusion AND gains the
 # suffix. The frozen select() must survive — the suffix must not become the
 # only hold handling (frozen stays fully excluded, per the issue).
-SIX_QUERIES="vimp imp curated architect hermit epics"
+SIX_QUERIES="vimp imp curated architect hermit epics review"
 for q in $SIX_QUERIES; do
     jqline="$(grep -A1 "^  $q=" <<<"$RPB_BODY" | grep -- '--jq' || true)"
     if [[ -z "$jqline" ]]; then
@@ -218,6 +224,20 @@ cat > "$FIX/issue-loom_important.json" <<'JSON'
 ]
 JSON
 
+# `loom:review-requested` PR fixture (#14099): #600 plain, #601 loom:operator,
+# #602 loom:blocked, #603 TWO holds (one suffix), #604 loom:frozen (omitted),
+# #605 an unmigrated retired hold name (registry set, not hardcoded).
+cat > "$FIX/pr-loom_review-requested.json" <<'JSON'
+[
+  {"number":600,"title":"Unheld review PR","labels":[{"name":"loom:review-requested"}]},
+  {"number":601,"title":"Operator review PR","labels":[{"name":"loom:review-requested"},{"name":"loom:operator"}]},
+  {"number":602,"title":"Blocked review PR","labels":[{"name":"loom:review-requested"},{"name":"loom:blocked"}]},
+  {"number":603,"title":"Doubly held review PR","labels":[{"name":"loom:review-requested"},{"name":"loom:blocked"},{"name":"loom:operator"}]},
+  {"number":604,"title":"Frozen review PR","labels":[{"name":"loom:review-requested"},{"name":"loom:frozen"}]},
+  {"number":605,"title":"Unmigrated hold review PR","labels":[{"name":"loom:review-requested"},{"name":"loom:operator-only"}]}
+]
+JSON
+
 # `loom:very-important` fixture: #200 held, #201 free.
 cat > "$FIX/issue-loom_very-important.json" <<'JSON'
 [
@@ -278,6 +298,7 @@ VIMP_BODY="$(awk '/^## Very Important/{flag=1; next} /^## /{flag=0} flag' <<<"$R
 IMP_BODY="$(awk '/^## Important/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER")"
 CURATED_BODY="$(awk '/^## Proposed$/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER")"
 PROPOSALS_BODY="$(awk '/^## Proposed \(Architect \/ Hermit\)/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER")"
+REVIEW_BODY="$(awk '/^## PRs Awaiting Review/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER")"
 EPICS_BODY="$(awk '/^## Epics/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER")"
 
 # ---------------------------------------------------------------------------
@@ -314,6 +335,19 @@ expect_line "$PROPOSALS_BODY" '- **#401**: Held hermit proposal *(hermit)* *(hel
 expect_line "$EPICS_BODY" '- **#500**: Held epic *(held)*' \
     "held epic entry is suffixed *(held)*"
 
+# #14099: review-requested PRs carrying a hold are listed with the suffix.
+expect_line "$REVIEW_BODY" '- **#601**: Operator review PR *(held)*' \
+    "loom:operator review-requested PR is suffixed *(held)*"
+expect_line "$REVIEW_BODY" '- **#602**: Blocked review PR *(held)*' \
+    "loom:blocked review-requested PR is suffixed *(held)*"
+expect_line "$REVIEW_BODY" '- **#605**: Unmigrated hold review PR *(held)*' \
+    "an unmigrated retired hold name on a review-requested PR is suffixed *(held)*"
+
+# A PR with TWO hold labels gets ONE suffix too.
+doubly_pr="$(grep -F -- '- **#603**:' <<<"$REVIEW_BODY" || true)"
+pr_suffix_count="$(grep -oF ' *(held)*' <<<"$doubly_pr" | wc -l | tr -d ' ')"
+assert_eq "$pr_suffix_count" "1" "a review-requested PR with two hold labels carries exactly one *(held)* suffix (got: $doubly_pr)"
+
 # An issue carrying TWO hold labels gets ONE suffix, not two.
 doubly="$(grep -F -- '- **#103**:' <<<"$IMP_BODY" || true)"
 # `tr -d ' '`: BSD `wc -l` (macOS) left-pads its count, so a bare compare to "1" fails there.
@@ -346,6 +380,14 @@ else
     pass "#104 (loom:important + loom:frozen) remains absent from the Important section"
 fi
 
+expect_line "$REVIEW_BODY" '- **#600**: Unheld review PR' \
+    "unheld review-requested PR is byte-identical to the pre-fix bullet (no suffix)"
+if grep -q '#604' <<<"$REVIEW_BODY"; then
+    fail "#604 (loom:review-requested + loom:frozen) must remain fully excluded"
+else
+    pass "#604 (loom:review-requested + loom:frozen) remains absent from PRs Awaiting Review"
+fi
+
 # ---------------------------------------------------------------------------
 # Test 4 (edge): daemon failure falls back to the three-hold literal list
 # ---------------------------------------------------------------------------
@@ -357,6 +399,7 @@ printf '#!/usr/bin/env bash\nexit 2\n' >"$TMPROOT/bin-fail/loom-daemon"
 chmod +x "$TMPROOT/bin-fail/loom-daemon"
 
 RENDER_FALLBACK="$(PATH="$TMPROOT/bin-fail:$PATH" LOOM_FIXTURE_DIR="$FIX" GH_READ="$GH_STUB" RPB_SRC="$RPB_BODY" bash -c 'eval "$RPB_SRC"; render_plan_body')"
+REVIEW_FALLBACK="$(awk '/^## PRs Awaiting Review/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER_FALLBACK")"
 IMP_FALLBACK="$(awk '/^## Important/{flag=1; next} /^## /{flag=0} flag' <<<"$RENDER_FALLBACK")"
 
 expect_line "$IMP_FALLBACK" '- **#101**: Blocked important issue *(held)*' \
@@ -365,6 +408,14 @@ if grep -qF -- '- **#105**: Unmigrated hold important issue *(held)*' <<<"$IMP_F
     fail "the retired name loom:operator-only is NOT in the fallback list — it must not be suffixed there"
 else
     pass "fallback list does not suffix the retired name (it only knows the three holds)"
+fi
+
+expect_line "$REVIEW_FALLBACK" '- **#602**: Blocked review PR *(held)*' \
+    "fallback list still suffixes a loom:blocked review-requested PR when the daemon call fails"
+if grep -qF -- '- **#605**: Unmigrated hold review PR *(held)*' <<<"$REVIEW_FALLBACK"; then
+    fail "the retired name must not suffix a review-requested PR under the fallback list"
+else
+    pass "fallback list does not suffix the retired name on a review-requested PR"
 fi
 
 # ---------------------------------------------------------------------------

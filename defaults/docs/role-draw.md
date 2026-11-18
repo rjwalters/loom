@@ -84,9 +84,24 @@ candidate (set a candidate to `0` to switch it off on that host).
    `w / Σw` over the available ones.
 3. With no table, `rolePreference` / `preference` / static resolution decide,
    unchanged.
-4. A table that is **empty after exclusions** is a non-blocking warning (daemon
-   log and the explain view). The stage has nothing to run on, so its tick is
-   a pre-spawn skip whose diagnostic says so, like a wholly unavailable list.
+4. A table that is **empty after exclusions** logs a non-blocking warning
+   (daemon log and the explain view) but does not stall the tick: the draw
+   falls through to the next configured attempt's table, and the first
+   non-empty one decides (#11782's no-stall guarantee). Only when every
+   remaining table is empty too does the stage have nothing to run on: the
+   tick is then a pre-spawn skip whose diagnostic says so, like a wholly
+   unavailable list, carried on the originally configured (empty) table so
+   the skip still has its record and EMPTY diagnostic.
+
+An empty table is not a pilot lock. Pilots, and per-host provider
+restrictions generally, are enforced upstream of the draw:
+`autonomous.workFinder.extraSkipLabels` (#13891) keeps a host's work finder
+off the issues a pilot is parked behind, and the host-affinity constraint
+(`loom:host:<host-id>` labels and `<!-- loom:requires-host=<host-id> -->`
+body markers, #7456) pins an issue to the hosts that can run it — both
+documented in [daemon-reference.md](daemon-reference.md). Configuring a
+table empty on a host locks nothing: rule 4's fall-through just routes the
+tick to the next attempt's table.
 
 The backstop ceiling (`runtimes.backstopCeiling.appliesFrom`) is positional: it
 governs tier N of the drawn order, so a drawn first pick is ungoverned and only

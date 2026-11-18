@@ -123,7 +123,11 @@ pub(crate) enum SweepOutcomesAction {
         #[arg(long, conflicts_with = "all_workspaces")]
         this_workspace: bool,
 
-        /// Grouping dimension: arm, model, repo, host, day, tap.
+        /// Grouping dimension: arm, model, repo, host, day, tap, mix.
+        ///
+        /// `mix` (#14067) groups by the role-model mix — per-role models,
+        /// runtime/provider and effort — and adds the review-bounce columns;
+        /// the recipe is `.loom/docs/role-mix-comparison.md`.
         ///
         /// `tap` groups by `<runtime>@<credential source>` (#8556) — the cut
         /// that answers "how much went to the metered backstop vs. the

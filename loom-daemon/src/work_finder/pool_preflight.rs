@@ -119,6 +119,22 @@ use crate::tokens_pool::select::{
 };
 use crate::workspace_pool::WorkspacePool;
 
+/// The role whose resolvers the dispatch this hold gates actually runs.
+///
+/// #11909 made the step tick the only item dispatch path, and a step runs
+/// its **role's** resolvers, never the sweep's (`sweep_registry::step_spawn`
+/// module docs) — no step resolves `sweep-lifecycle`, so a hold keyed on that
+/// role's preference list gated dispatch on a table nothing spawns from
+/// (#13983). `builder` is the item-dispatch role — the step that performs
+/// the pre-claim, i.e. the expensive failure this hold exists to prevent —
+/// and admission for it is byte-identical to the old probe's:
+/// `sweep-lifecycle`'s role-manifest lookup substitutes `builder.json`
+/// (`runtime_admission`), so both keys read the same requirements. Only the
+/// list selection differs (`rolePreference.builder` / `roleDraw.builder`
+/// instead of the `sweep-lifecycle` keys), which is exactly the point: the
+/// probe must consult the tables the launch consults.
+const PROBE_ROLE: &str = "builder";
+
 /// A live "this pool cannot spawn anything" hold, keyed by resolved pool
 /// directory (see the module doc for why the pool directory, not the
 /// workspace root, is the key).
@@ -258,14 +274,18 @@ impl PoolHoldState {
     /// line per tick per root.
     ///
     /// **Preference-aware since #8554.** When `runtimes.preference` /
-    /// `runtimes.rolePreference.sweep-lifecycle` is configured (and no
-    /// operator pin disables it), the verdict is no longer "is the Claude
-    /// pool dry" but "is the WHOLE ordered list unavailable" — a lower tap
-    /// being spawnable must dispatch on that tap instead of holding, which
-    /// `sweep_registry::dispatch` then resolves onto through
-    /// [`crate::runtime_preference::resolve_for_dispatch`]. With no
-    /// preference configured this is byte-identical to the pre-#8554
-    /// Claude-only check below.
+    /// `runtimes.rolePreference.builder` is configured (and no operator pin
+    /// disables it), the verdict is no longer "is the Claude pool dry" but
+    /// "is the WHOLE ordered list unavailable" — a lower tap being spawnable
+    /// must dispatch on that tap instead of holding, which the dispatch's
+    /// own resolution then settles on. The list is probed under the
+    /// **builder** role (`PROBE_ROLE`, #13983): the step tick is the only
+    /// item dispatch path (#11909) and a step runs its role's resolvers, so
+    /// the probe must consult the same tables the launch consults. A list
+    /// whose only refusals are containment-liftable ones is NOT an
+    /// exhaustion — the launch path's preparer (#8787) may still admit the
+    /// tap this probe cannot (#13983). With no preference configured this is
+    /// byte-identical to the pre-#8554 Claude-only check below.
     ///
     /// Two deliberate conservatisms remain, both in the **over**-hold (safe)
     /// direction, because an under-hold costs the label flip + lease comment
@@ -296,7 +316,7 @@ impl PoolHoldState {
     pub fn observe_root_edge(&self, root: &Path, now: DateTime<Utc>) -> PoolObservation {
         let now_epoch = u64::try_from(now.timestamp()).unwrap_or(0);
         let preference =
-            crate::runtime_preference::resolve_runtime(root, "sweep-lifecycle", None, now_epoch);
+            crate::runtime_preference::resolve_runtime(root, PROBE_ROLE, None, now_epoch);
         let preference_resolution = match &preference {
             // An empty list (no taps at all) is a configuration outcome, not
             // pool exhaustion: treat it like "no preference" so the
@@ -312,7 +332,9 @@ impl PoolHoldState {
             // everything else is gated on it exactly as before.
             _ => None,
         };
-        if preference_resolution.is_none() && crate::worker_spawn::uses_native_sweep(root) {
+        if preference_resolution.is_none()
+            && crate::worker_spawn::uses_native_role(root, PROBE_ROLE)
+        {
             // A native runtime never touches the Claude pool, so this root
             // has no pool identity to broadcast about and no peer's hold can
             // be about it.
@@ -327,9 +349,20 @@ impl PoolHoldState {
         let (exhausted, preference_diagnostic) = match preference_resolution {
             Some(resolution) => match &resolution.chosen {
                 Some(_) => (false, None),
+                // #13983: at least one tap was refused only as far as THIS
+                // probe can see. The probe resolves with `NoContainment`
+                // (read-only — it runs every tick for every root and cannot
+                // carry a prepared selection to a spawn), but the real launch
+                // path carries a containment preparer (#8787) and may admit
+                // that very tap, so "the whole list is unavailable" is not
+                // established. Not holding is safe: if containment cannot in
+                // fact be proven, the launch's own pre-spawn gate refuses
+                // BEFORE any claim — the exact doomed label-flip this hold
+                // exists to prevent never happens.
+                None if resolution.any_containment_liftable_skip() => (false, None),
                 // Every tap in the list was skipped — the #7708 hold now
                 // covers the whole preference list, not just Claude (#8554).
-                None => (true, Some(resolution.exhausted_diagnostic("sweep-lifecycle"))),
+                None => (true, Some(resolution.exhausted_diagnostic(PROBE_ROLE))),
             },
             // `total == 0` is the ABSENT-pool condition (#4642), not this
             // one — see the module doc. Falling through to the clear path
@@ -349,7 +382,7 @@ impl PoolHoldState {
                 Entry::Vacant(slot) => {
                     if let Some(diagnostic) = &preference_diagnostic {
                         log::warn!(
-                            "work_finder: every runtime in the sweep-lifecycle preference list \
+                            "work_finder: every runtime in the {PROBE_ROLE} preference list \
                              of workspace {} is UNAVAILABLE. Holding sweep dispatch for this \
                              workspace only (other workspaces on pool {} are not held) until at \
                              least one tap recovers (~{}); no claim label will be flipped and no \
@@ -380,7 +413,7 @@ impl PoolHoldState {
         // (once), regardless of what any other root on the pool is doing.
         if let Some(hold) = self.lock_pref().remove(root) {
             log::info!(
-                "work_finder: sweep-lifecycle preference list of workspace {} recovered after {} \
+                "work_finder: {PROBE_ROLE} preference list of workspace {} recovered after {} \
                  held; sweep dispatch resuming (#13539)",
                 root.display(),
                 format_held_for(now - hold.since)
