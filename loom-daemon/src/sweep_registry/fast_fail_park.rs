@@ -183,6 +183,24 @@ impl SweepRegistry {
         if !fast_fail_parks(consecutive, threshold, class) {
             return false;
         }
+        self.park_fast_failure_now(issue, consecutive, class)
+    }
+
+    /// Park `issue` for the fast-failure streak the captain counted (Issue
+    /// #13919): the captain ordered this host's worker to, on the release that
+    /// made the third attributable fast failure across the fleet. Same park as
+    /// [`Self::park_fast_failure`], without its local streak check.
+    pub(crate) fn park_ordered_fast_failure(&mut self, issue: u32) -> bool {
+        if !self.dispatch_backoff_config.enabled || !self.quarantine_config.enabled {
+            return false;
+        }
+        let count = crate::fleet_dispatch::table::FAST_FAIL_PARK_THRESHOLD;
+        self.park_fast_failure_now(issue, count, UNCLASSIFIED_CLASS)
+    }
+
+    /// The tail both parks share: skip an issue already parked, else enter the
+    /// quarantine and write the forge park.
+    fn park_fast_failure_now(&mut self, issue: u32, consecutive: u32, class: &str) -> bool {
         if self.is_quarantined(issue)
             || self.prless_retry_held(issue)
             || self.noop_hold_applied(issue)
@@ -215,10 +233,11 @@ impl SweepRegistry {
              work, so the dispatch backoff (#4485) parked it instead of retrying it around the \
              clock (#11854). Once the cause is fixed, clear the park with `loom-daemon quarantine \
              clear {issue}`, or wait for the {ttl}s TTL — both release the in-memory pause AND \
-             restore `loom:issue`.{escalation}",
+             restore `loom:issue`.{hold_note}{escalation}",
             marker = QUARANTINE_COMMENT_MARKER,
             secs = FAST_FAIL_WINDOW_SECS.max(self.quarantine_config.insta_crash_secs),
             ttl = self.effective_quarantine_ttl(issue).as_secs(),
+            hold_note = super::quarantine::no_progress_hold_note(issue),
             escalation = self.quarantine_escalation_note(issue),
         );
         self.write_quarantine_park(issue, &body);

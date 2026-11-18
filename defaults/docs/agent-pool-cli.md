@@ -11,7 +11,7 @@ pool (spawns agents from `.loom/config.json`). Referenced from `.loom/CLAUDE.md`
 | `./.loom/bin/loom stop` | Graceful shutdown (`--force` to kill immediately, `<agent>` to stop one) |
 | `./.loom/bin/loom attach <id>` | Attach to a running agent's tmux session |
 | `./.loom/bin/loom logs <id>` | Tail an agent's output |
-| `./.loom/bin/loom health` / `scale <role> <n>` | Diagnostic daemon health check / dynamic agent scaling |
+| `./.loom/bin/loom health` | Diagnostic daemon health check |
 | `./.loom/bin/loom help` | Full command list; `./.loom/bin/loom <cmd> --help` for per-command help |
 
 The legacy `./loom.sh` wrapper (and `.loom/scripts/start-daemon.sh` /

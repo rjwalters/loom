@@ -136,6 +136,58 @@ assert_eq "1" "$RC" "a nonexistent directory citation still exits 1"
 assert_contains "$OUT" "tools/nonexistent-dir" "the nonexistent directory is named as a miss"
 
 echo
+echo "=== Fixture 2c: trailing-punctuation shapes on directory citations (#13901) ==="
+# PATH_RE includes '.' in its class, so a prose `rtl-sketch/...` extracts
+# whole and the dot-stripper leaves `rtl-sketch/` -- but `git ls-tree` emits
+# tree entries with NO trailing slash, so the membership test false-missed an
+# existing directory (#13901, third input of the #10191/#11338 class). The
+# general shape is anything the extractor can leave on the end of a directory
+# path that ls-tree does not emit; the sibling fixtures below assert the
+# OBSERVED outcome of each shape against the extractor first: `dir/*`,
+# `dir/**` and `dir/` leave the `*`/trailing slash unconsumed (`*` is not in
+# the class and a trailing `/` has no component after it), so they yield
+# `dir` -- or nothing for a one-component `model/` -- and cannot false-miss;
+# only `dir/...` yields the slash-suffixed candidate.
+(
+    cd "$FIXTURE_REPO" || exit 1
+    mkdir -p rtl-sketch
+    printf 'x\n' > rtl-sketch/top.v
+    git add rtl-sketch
+    git commit -qm "add rtl-sketch" >/dev/null
+    git update-ref refs/remotes/origin/main refs/heads/main
+)
+# The reporter's exact reproducer line (2AMLogic/gf180-parasynth #784): every
+# one-component `dir/` extracts nothing; `rtl-sketch/...` extracts whole.
+ELLIPSIS_BODY="$BODY_DIR/ellipsis.md"
+cat > "$ELLIPSIS_BODY" <<'EOF'
+(`model/ spec/ tools/ fpga/ pnr/ rtl-sketch/...`) — the two repairs widen
+EOF
+OUT="$(run_vpr "$ELLIPSIS_BODY")"
+RC=$?
+assert_eq "0" "$RC" "an existing dir cited with a prose ellipsis (rtl-sketch/...) exits 0"
+assert_contains "$OUT" "all references check out" "an ellipsis-suffixed directory citation is not a miss"
+
+GLOB_BODY="$BODY_DIR/glob.md"
+cat > "$GLOB_BODY" <<'EOF'
+Scope: `tools/probes/*`, `tools/probes/**`, `tools/probes/`, and the
+sentence-final `tools/probes.` plus `src/foo.py:3.` — every other trailing
+shape of an existing-path citation.
+EOF
+OUT="$(run_vpr "$GLOB_BODY")"
+RC=$?
+assert_eq "0" "$RC" "glob, bare-slash and sentence-final dir citations produce no false miss"
+
+NODIR_BODY="$BODY_DIR/nodir.md"
+cat > "$NODIR_BODY" <<'EOF'
+See `spec/nodir/...` for the directory the proposal plans to create.
+EOF
+OUT="$(run_vpr "$NODIR_BODY")"
+RC=$?
+assert_eq "1" "$RC" "a nonexistent dir cited with a prose ellipsis still exits 1"
+assert_contains "$OUT" "MISSING FILE" "the nonexistent-ellipsis miss is labeled"
+assert_contains "$OUT" "spec/nodir" "the nonexistent directory is named as a miss"
+
+echo
 echo "=== Fixture 3: bad line range ==="
 BADRANGE_BODY="$BODY_DIR/badrange.md"
 cat > "$BADRANGE_BODY" <<'EOF'

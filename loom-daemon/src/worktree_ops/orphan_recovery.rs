@@ -1,21 +1,19 @@
 //! `loom-daemon recover-orphans`: native port of `loom-recover-orphans`
 //! (`orphan_recovery.py`).
 //!
-//! Detects two kinds of orphaned state and (with `--recover`) fixes them:
+//! Detects orphaned `loom:building` claims and (with `--recover`) fixes them:
 //!
 //! - `untracked_building`: an issue carries `loom:building` but no live
-//!   sweep is tracking it.
-//! - `stale_heartbeat`: a `.loom/spawn-loop-state.json::running` entry's
-//!   heartbeat is stale and its recorded PID is dead.
+//!   sweep is tracking it. (PR-side `loom:reviewing`/`loom:treating` claims
+//!   are detected inline too — see `check_stale_pr_claims`.)
 //!
 //! Liveness evidence is gathered from every available source and unioned
 //! (never intersected) — see [`gather_liveness_evidence`]. The fail-safe
 //! invariant from issue #3651 is preserved exactly: **absent evidence means
 //! treat every claim as ALIVE**, never as orphaned. Every source
-//! [`gather_liveness_evidence`] gathers (`spawn-loop-state.json`,
-//! `.loom/locks`, the sweep journal) is HOST-scoped — it can only prove a
-//! claim dead *on this host*, and is structurally blind to a still-running
-//! peer-host sweep.
+//! [`gather_liveness_evidence`] gathers (`.loom/locks`, the sweep journal)
+//! is HOST-scoped — it can only prove a claim dead *on this host*, and is
+//! structurally blind to a still-running peer-host sweep.
 //!
 //! An **open linked PR is itself liveness evidence** (issue #5511): no
 //! `loom:building` reset happens until the forge's closes-graph has *verified*
@@ -42,9 +40,7 @@ use super::claim_file::has_valid_claim;
 use super::gh;
 use super::gh::OpenPrProbe;
 use super::liveness::active_locked_issues;
-use super::spawn_loop_state::{read_spawn_loop_state, SpawnLoopState};
 
-pub const DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECS: i64 = 300;
 pub const DEFAULT_LABEL_GRACE_PERIOD_SECS: i64 = 600;
 pub const DEFAULT_STALE_BUILDING_HOURS: f64 = 4.0;
 pub const ORPHAN_COMMENT_DEDUP_SECONDS: i64 = 300;
@@ -72,13 +68,6 @@ pub(crate) const BUILD_ARTIFACT_PATTERNS: &[&str] = &[
     ".loom-checkpoint",
     ".loom-in-use",
 ];
-
-fn heartbeat_stale_threshold() -> i64 {
-    std::env::var("LOOM_HEARTBEAT_STALE_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECS)
-}
 
 fn label_grace_period() -> i64 {
     std::env::var("LOOM_LABEL_GRACE_PERIOD")
@@ -172,43 +161,18 @@ pub struct LivenessEvidence {
     pub journal_issues: HashSet<u32>,
 }
 
-/// Best-effort daemon-registry query. Mirrors
-/// `orphan_recovery.py::_query_daemon_live_issues`, which is (deliberately)
-/// a permanent no-op stub: the CLI runs as a standalone process with no
-/// socket to a possibly-running daemon, so this is never a contributing
-/// source today. Returns `None` ("not a source"), never an empty set
-/// ("daemon says nothing is live") — those are different claims.
-fn query_daemon_live_issues(_repo_root: &Path) -> Option<HashSet<u32>> {
-    None
-}
-
 /// Gather liveness evidence from every available source and union them.
-/// Mirrors `orphan_recovery.py::gather_liveness_evidence`.
+/// Mirrors `orphan_recovery.py::gather_liveness_evidence` minus its retired
+/// `spawn-loop-state.json` and no-op daemon-registry legs (removed in
+/// #13818 — the state file's writer was deleted in v0.11.0, and the CLI
+/// runs as a standalone process with no socket to a possibly-running
+/// daemon).
 #[must_use]
-pub fn gather_liveness_evidence(
-    spawn_loop_state: &SpawnLoopState,
-    repo_root: &Path,
-) -> LivenessEvidence {
+pub fn gather_liveness_evidence(repo_root: &Path) -> LivenessEvidence {
     let mut live: HashSet<u32> = HashSet::new();
     let mut sources: Vec<&'static str> = Vec::new();
     let mut journal_present = false;
     let mut journal_issues: HashSet<u32> = HashSet::new();
-
-    if spawn_loop_state.present {
-        sources.push("spawn-loop-state.json");
-        live.extend(
-            spawn_loop_state
-                .running
-                .iter()
-                .filter(|t| t.issue != 0)
-                .map(|t| t.issue),
-        );
-    }
-
-    if let Some(daemon_issues) = query_daemon_live_issues(repo_root) {
-        sources.push("loom-daemon");
-        live.extend(daemon_issues);
-    }
 
     let locked = active_locked_issues(repo_root);
     if !locked.is_empty() {
@@ -346,8 +310,8 @@ pub fn check_untracked_building(
     if !evidence.available {
         if verbose {
             eprintln!(
-                "No authoritative liveness source available (no spawn-loop-state.json, no \
-                 reachable loom-daemon registry, no .loom/locks/issue-<N>/ locks) — refusing \
+                "No authoritative liveness source available (no \
+                 .loom/locks/issue-<N>/ locks) — refusing \
                  to flag any loom:building issue as orphaned (fail-safe: absent liveness data \
                  means treat claims as ALIVE, not orphaned). See issue #3651."
             );
@@ -462,45 +426,6 @@ pub fn check_untracked_building(
             title: Some(issue_title),
             reason: reason.to_string(),
             age_seconds: None,
-        });
-    }
-}
-
-/// Flag `.loom/spawn-loop-state.json::running` entries whose heartbeat is
-/// stale and PID is dead. Mirrors `orphan_recovery.py::check_stale_heartbeats`.
-pub fn check_stale_heartbeats(
-    spawn_loop_state: &SpawnLoopState,
-    result: &mut OrphanRecoveryResult,
-    heartbeat_threshold_secs: i64,
-) {
-    for task in &spawn_loop_state.running {
-        let Some(hb) = &task.last_heartbeat else {
-            continue;
-        };
-        let Ok(dt) = chrono::DateTime::parse_from_rfc3339(hb) else {
-            continue;
-        };
-        let age = chrono::Utc::now()
-            .signed_duration_since(dt.with_timezone(&chrono::Utc))
-            .num_seconds();
-        if age <= heartbeat_threshold_secs {
-            continue;
-        }
-        if pid_alive(task.pid) {
-            continue;
-        }
-        result.orphaned.push(OrphanEntry {
-            kind: "stale_heartbeat",
-            issue: if task.issue != 0 {
-                Some(task.issue)
-            } else {
-                None
-            },
-            pr: None,
-            pid: Some(task.pid),
-            title: None,
-            reason: "heartbeat_stale".to_string(),
-            age_seconds: Some(age),
         });
     }
 }
@@ -808,11 +733,9 @@ pub fn run_orphan_recovery(repo_root: &Path, recover: bool, verbose: bool) -> Or
         recover_mode: recover,
         ..Default::default()
     };
-    let heartbeat_threshold = heartbeat_stale_threshold();
     let grace_period = label_grace_period();
 
-    let spawn_loop_state = read_spawn_loop_state(repo_root);
-    let evidence = gather_liveness_evidence(&spawn_loop_state, repo_root);
+    let evidence = gather_liveness_evidence(repo_root);
 
     if verbose {
         if evidence.available {
@@ -832,7 +755,6 @@ pub fn run_orphan_recovery(repo_root: &Path, recover: bool, verbose: bool) -> Or
     }
 
     check_untracked_building(&evidence, &mut result, repo_root, grace_period, verbose);
-    check_stale_heartbeats(&spawn_loop_state, &mut result, heartbeat_threshold);
     // Issue #6167: PR-side `loom:reviewing`/`loom:treating` claims are
     // detected (and, when `recover`, reclaimed) inline here rather than via
     // the issue-only recovery loop below — a PR-side reclaim is a different
@@ -1090,10 +1012,6 @@ mod tests {
     use {super::*, crate::comment_trust::records::with_fleet_author};
     // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 
-    fn absent_state() -> SpawnLoopState {
-        SpawnLoopState::default()
-    }
-
     /// Point the machine-level sweep journal at a path scoped to this test's
     /// tempdir (guaranteed not to exist), so `gather_liveness_evidence`
     /// doesn't pick up this dev machine's real `~/.loom/sweeps.json` as an
@@ -1111,9 +1029,8 @@ mod tests {
     #[serial]
     fn no_evidence_sources_means_unavailable() {
         let dir = tempdir().unwrap();
-        let evidence = with_isolated_journal_path(dir.path(), || {
-            gather_liveness_evidence(&absent_state(), dir.path())
-        });
+        let evidence =
+            with_isolated_journal_path(dir.path(), || gather_liveness_evidence(dir.path()));
         assert!(!evidence.available, "fail-safe: no sources present must mean unavailable");
         assert!(evidence.live_issues.is_empty());
     }
@@ -1123,26 +1040,11 @@ mod tests {
     fn locks_dir_contributes_evidence() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(locks_dir(dir.path()).join("issue-7")).unwrap();
-        let evidence = with_isolated_journal_path(dir.path(), || {
-            gather_liveness_evidence(&absent_state(), dir.path())
-        });
+        let evidence =
+            with_isolated_journal_path(dir.path(), || gather_liveness_evidence(dir.path()));
         assert!(evidence.available);
         assert!(evidence.live_issues.contains(&7));
         assert!(evidence.sources.contains(&".loom/locks"));
-    }
-
-    #[test]
-    #[serial]
-    fn spawn_loop_state_present_contributes_evidence_even_if_empty() {
-        let dir = tempdir().unwrap();
-        let state = SpawnLoopState {
-            running: Vec::new(),
-            present: true,
-        };
-        let evidence =
-            with_isolated_journal_path(dir.path(), || gather_liveness_evidence(&state, dir.path()));
-        assert!(evidence.available);
-        assert!(evidence.sources.contains(&"spawn-loop-state.json"));
     }
 
     #[test]
@@ -1156,40 +1058,6 @@ mod tests {
         check_untracked_building(&evidence, &mut result, dir.path(), 600, false);
         assert!(result.orphaned.is_empty());
         assert!(result.watched.is_empty());
-    }
-
-    #[test]
-    fn stale_heartbeat_with_dead_pid_is_orphaned() {
-        let mut result = OrphanRecoveryResult::default();
-        let state = SpawnLoopState {
-            present: true,
-            running: vec![super::super::spawn_loop_state::SpawnLoopTask {
-                issue: 42,
-                pid: 0, // pid 0 is never alive per sweep_registry::is_pid_alive
-                last_heartbeat: Some(
-                    (chrono::Utc::now() - chrono::Duration::seconds(600)).to_rfc3339(),
-                ),
-            }],
-        };
-        check_stale_heartbeats(&state, &mut result, 300);
-        assert_eq!(result.orphaned.len(), 1);
-        assert_eq!(result.orphaned[0].kind, "stale_heartbeat");
-        assert_eq!(result.orphaned[0].issue, Some(42));
-    }
-
-    #[test]
-    fn fresh_heartbeat_is_not_orphaned() {
-        let mut result = OrphanRecoveryResult::default();
-        let state = SpawnLoopState {
-            present: true,
-            running: vec![super::super::spawn_loop_state::SpawnLoopTask {
-                issue: 42,
-                pid: 0,
-                last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
-            }],
-        };
-        check_stale_heartbeats(&state, &mut result, 300);
-        assert!(result.orphaned.is_empty());
     }
 
     #[test]
@@ -1272,7 +1140,7 @@ mod tests {
         let mut result = OrphanRecoveryResult::default();
         let evidence = LivenessEvidence {
             available: true,
-            sources: vec!["spawn-loop-state.json"],
+            sources: vec![".loom/locks"],
             ..Default::default()
         };
         check_untracked_building(&evidence, &mut result, dir.path(), 600, false);

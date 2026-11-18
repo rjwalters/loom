@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::types::{QuarantineEntry, Request, Response};
 
-use super::common::{query_daemon, resolve_socket_path};
+use super::common::{exit_on_daemon_failure, query_daemon, resolve_socket_path};
 use crate::cli::QuarantineAction;
 
 /// Handle the `quarantine` subcommand (Issue #3939). Connects to the running
@@ -23,11 +23,11 @@ pub async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                 issue,
                 workspace_root,
             };
-            match query_daemon(&socket_path, &request).await {
-                Ok(Response::QuarantineCleared {
+            match exit_on_daemon_failure(&socket_path, query_daemon(&socket_path, &request).await) {
+                Response::QuarantineCleared {
                     issue,
                     was_quarantined,
-                }) => {
+                } => {
                     if was_quarantined {
                         println!(
                             "Cleared quarantine for issue #{issue} — it will re-qualify for \
@@ -45,19 +45,8 @@ pub async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                     }
                     Ok(())
                 }
-                Ok(Response::Error { message }) => {
-                    eprintln!("Daemon error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => {
+                other => {
                     eprintln!("Unexpected response from daemon: {other:?}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
-                    eprintln!();
-                    eprintln!("Is the daemon running? Start it with:");
-                    eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
                     std::process::exit(1);
                 }
             }
@@ -65,24 +54,13 @@ pub async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
 
         QuarantineAction::List { workspace_root } => {
             let request = Request::ListQuarantines { workspace_root };
-            match query_daemon(&socket_path, &request).await {
-                Ok(Response::QuarantineList { entries }) => {
+            match exit_on_daemon_failure(&socket_path, query_daemon(&socket_path, &request).await) {
+                Response::QuarantineList { entries } => {
                     render_quarantine_list(&entries);
                     Ok(())
                 }
-                Ok(Response::Error { message }) => {
-                    eprintln!("Daemon error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => {
+                other => {
                     eprintln!("Unexpected response from daemon: {other:?}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
-                    eprintln!();
-                    eprintln!("Is the daemon running? Start it with:");
-                    eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
                     std::process::exit(1);
                 }
             }

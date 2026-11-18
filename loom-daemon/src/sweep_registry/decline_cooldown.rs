@@ -324,7 +324,7 @@ impl SweepRegistry {
 
     /// Consecutive declines recorded for `issue` (Issue #7528). `0` when no
     /// decline is on record. Test/inspection helper, mirroring
-    /// [`Self::noop_release_count`].
+    /// [`Self::dispatch_failure_count`].
     #[must_use]
     pub fn decline_count(&self, issue: u32) -> u32 {
         self.decline_cooldown

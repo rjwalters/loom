@@ -24,7 +24,7 @@
 # #4479's single-source non-goal.
 #
 # Usage:
-#   generate-agents-md.sh              Write defaults/.loom/AGENTS.md (canonical)
+#   generate-agents-md.sh              Write the AGENTS.md beside the source CLAUDE.md (canonical)
 #   generate-agents-md.sh --stdout     Print the generated content to stdout
 #   generate-agents-md.sh <path>       Write to <path> instead of the canonical file
 #
@@ -34,8 +34,27 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$SCRIPT_DIR/../.loom/CLAUDE.md"
-DEFAULT_OUT="$SCRIPT_DIR/../.loom/AGENTS.md"
+# Layout-aware source resolution (#13910): the same script ships in two
+# layouts, so SRC and DEFAULT_OUT are resolved from the CLAUDE.md candidate
+# that actually exists rather than a hard-coded sibling path.
+#   - Installed layout: X/.loom/scripts/generate-agents-md.sh, whose source is
+#     X/.loom/CLAUDE.md (one directory up, beside this script).
+#   - Source layout: defaults/scripts/generate-agents-md.sh, whose source is
+#     defaults/.loom/CLAUDE.md (two levels up, under .loom/).
+# The source layout has no defaults/CLAUDE.md, so the two candidates cannot
+# both exist and the layouts cannot collide.
+INSTALLED_SRC="$SCRIPT_DIR/../CLAUDE.md"
+SOURCE_SRC="$SCRIPT_DIR/../.loom/CLAUDE.md"
+
+if [[ -f "$INSTALLED_SRC" ]]; then
+  SRC="$INSTALLED_SRC"
+elif [[ -f "$SOURCE_SRC" ]]; then
+  SRC="$SOURCE_SRC"
+else
+  echo "generate-agents-md: source not found — tried: $INSTALLED_SRC and $SOURCE_SRC" >&2
+  exit 1
+fi
+DEFAULT_OUT="$(cd "$(dirname "$SRC")" && pwd)/AGENTS.md"
 
 START_MARKER="<!-- agents-md:include:start -->"
 END_MARKER="<!-- agents-md:include:end -->"
@@ -47,11 +66,6 @@ case "${1:-}" in
   "") ;;
   *) OUT="$1" ;;
 esac
-
-if [[ ! -f "$SRC" ]]; then
-  echo "generate-agents-md: source not found: $SRC" >&2
-  exit 1
-fi
 
 # Extract the marked ranges. awk validates marker balance and fails loudly
 # (exit 2) on malformed markers rather than silently emitting a wrong file:

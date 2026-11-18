@@ -155,7 +155,7 @@ _ac_out_of_band_phrase_match() {
     local item="$1" phrase lower_item
     lower_item="$(printf '%s' "$item" | tr '[:upper:]' '[:lower:]')"
     for phrase in "${OUT_OF_BAND_PHRASES[@]}"; do
-        if printf '%s' "$lower_item" | grep -qE -- "(^|[^a-z0-9_])${phrase}"; then
+        if printf '%s' "$lower_item" | grep -qE -- "(^|[^a-z0-9])${phrase}"; then
             printf '%s' "$phrase"
             return 0
         fi

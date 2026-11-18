@@ -267,7 +267,7 @@ gh pr view "$PR_NUMBER" --comments
 | Finding in the rejection history | Decision | Action |
 |----------------------------------|----------|--------|
 | Latest rejection names defects demonstrably **distinct** from the prior one (prior fix landed, new defects only reachable because of it), fixable in one bounded cycle, chain still converging | **Grant one more Doctor cycle** | Comment with `<!-- champion:capped-pr-grant -->` naming both rejections and the distinction, then remove **`loom:blocked` only** (leave `loom:changes-requested` — it is what routes the PR to Doctor) |
-| Same defect **re-litigated**, comparison **ambiguous**, only one rejection exists, or the chain is no longer converging | **Keep parked** | Comment the *specific* human judgment needed, guarded by a `<!-- champion:capped-pr-parked:<latest-rejection-comment-id> -->` marker (id copied verbatim, never a head SHA); suppression is a single key-spelling-tolerant episode check — skip when any park marker is at or after the latest rejection's edit time, so an edited rejection starts a fresh episode and gets a fresh verdict — keeping the 10-minute cron from re-posting per tick; change no labels |
+| Same defect **re-litigated**, comparison **ambiguous**, only one rejection exists, or the chain is no longer converging | **Keep parked** | Comment the *specific* human judgment needed, guarded by a `<!-- champion:capped-pr-parked:<latest-rejection-comment-id> -->` marker (id copied verbatim, never a head SHA; informational — suppression never matches its spelling); suppression is a single key-spelling-tolerant episode check — skip when any park marker is at or after the latest rejection's edit time, so an edited rejection starts a fresh episode and gets a fresh verdict, and skip on any park marker at all when the thread holds no Judge rejection (`none` key, #13880) — keeping the 10-minute cron from re-posting per tick; change no labels |
 | The **approach** (not the implementation) is the problem — repeated design rejections, superseded premise | **Recommend closing, route to the operator** | Comment with `<!-- champion:capped-pr-close-recommended -->` and add `loom:operator` (keeping `loom:blocked`); **do not close the PR** — Champion routes, the human decides |
 
 **Rationale**: This is the *same* forward-progress mechanism as the sweep's in-sweep distinct-defect grace cycle (`sweep.md` → "Doctor-cycle cap"), applied at a different decision point — periodically, post-mortem, with the complete history rather than the dying sweep's local context. There is **no hard grant cap**: repeat grants are allowed as long as each new rejection shows fresh progress, because the anti-thrash guarantee comes from re-applying the test every round, not from a counter. Nor is there a double-grant path: a PR only reaches `loom:blocked` after the sweep-side single-use exception was consumed or was not applicable.
@@ -589,15 +589,23 @@ by hand. Absent `coversCriticalFiles`, nothing changes.
 class and has no config key. A `chore(loom): resync installed Loom to vX` PR
 passes the `merge-risk` kept-set entries when `resync_waiver_eval` (a call to `loom-daemon forge resync-waiver`, the one implementation the daemon's own landing shares, #13487) proves every
 changed kept-set file has the same blob SHA as its `defaults/` counterpart at
-tag `vX` (the title and `.loom/install-metadata.json` must both name `X`). A
-differing byte, a removed or renamed file, a kept-set file with no upstream
-counterpart, a missing tag or a failed read holds as before. So does any changed
-file outside `.loom/` and `.claude/`, or any merge-gate path (`champion*`,
-`judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`, comment trust, `config.json`;
-the daemon's `GATE` list, #12945), except that files under `.loom/scripts/tests/`
-are compared byte-for-byte rather than refused as gate paths (#13486). The same rule covers a Repo Skills bump PR (`Bump Repo Skills <from> -> <X.Y.Z>`, #13435)
+tag `vX` (the title and `.loom/install-metadata.json` must both name `X`;
+`.loom/roles/<f>` maps to `defaults/roles/<f>` and `.agents/skills/<f>` to
+`defaults/.agents/skills/<f>`, #13665). A differing byte, a removed or renamed
+file, a kept-set file with no upstream counterpart, a missing tag or a failed
+read holds as before. So does any changed file outside `.loom/`, `.claude/` and
+`.agents/skills/`. A merge-gate file (the daemon's `GATE` list: `champion*`,
+`judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`, comment trust, `config.json`,
+#12945) is byte-checked like any kept-set file: a byte-identical one waives
+only when the tag is additionally a published, non-draft release upstream —
+fail closed if the release cannot be read (operator ruling 2026-11-17,
+#13982) — and a gate file that differs, is renamed or removed, or has no
+counterpart still holds, because the gate never waives a change to itself
+(#12945). Files under `.loom/scripts/tests/` are compared byte-for-byte rather
+than treated as gate paths (#13486). The same rule covers a Repo Skills bump PR (`Bump Repo Skills <from> -> <X.Y.Z>`, #13435)
 against the `rjwalters/repo` tag `vX.Y.Z`, mapped through that installer's copy lines; a bump that
-changes `.claude/settings.json` holds. After a resync PR merges, Step 3b closes open
+changes `.claude/settings.json` holds, and its gate paths still hold outright (the ruling
+concerns Loom's own gate). After a resync PR merges, Step 3b closes open
 resync PRs for lower versions as superseded. The pre-merge
 comment lists the tag and each file's SHA. See `champion-pr-merge.md`
 "Resync waiver for the kept-set hold".

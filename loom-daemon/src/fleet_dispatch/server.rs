@@ -45,8 +45,9 @@ use crate::discovery::mirror::TickWorklist;
 use super::identity::{Identity, IdentityError};
 use super::proto::{
     AckResponse, Assignment, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest,
-    HeartbeatResponse, NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
-    CLAIM_PATH, HEARTBEAT_PATH, NEXT_PATH, PATHS, REFUSE_PATH, RELEASE_PATH,
+    HeartbeatResponse, NextRequest, NextResponse, ParkEndedRequest, RefusalReason, RefuseRequest,
+    ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, NEXT_PATH, PARK_ENDED_PATH, PATHS, REFUSE_PATH,
+    RELEASE_PATH,
 };
 use super::queue::{Queue, DEFAULT_REFRESH_SECS};
 use super::roster::{Roster, RosterSource};
@@ -353,6 +354,7 @@ impl<I: Identity> Server<I> {
             REFUSE_PATH => self.refuse(host, body, &mut call),
             RELEASE_PATH => self.release(host, body, &mut call),
             NEXT_PATH => self.next(host, body, &mut call),
+            PARK_ENDED_PATH => self.park_ended(host, body, &mut call),
             _ => Err(self.error(404, "not found")),
         };
         let reply = reply.unwrap_or_else(|e| e);
@@ -551,6 +553,20 @@ impl<I: Identity> Server<I> {
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),
             known: outcome != RefuseOutcome::Unknown,
+            park: false,
+        }))
+    }
+
+    /// A worker's park of an item ended, or it made none (#13919): forget the
+    /// item's fast-fail streak and park order. An operator's clear also lifts
+    /// the item's no-progress hold; a TTL expiry does not (#14047).
+    fn park_ended(&self, host: &str, body: &[u8], _call: &mut Call) -> Result<Reply, Reply> {
+        let req: ParkEndedRequest = self.parse(host, body)?;
+        let known = self.with_table(|t, _, _| t.end_fast_fail_park(&req.repo, req.item, req.cause));
+        Ok(self.ok(&AckResponse {
+            server_epoch: self.epoch.clone(),
+            known,
+            park: false,
         }))
     }
 
@@ -558,21 +574,22 @@ impl<I: Identity> Server<I> {
         let req: ReleaseRequest = self.parse(host, body)?;
         call.assignment_id = Some(req.assignment_id.clone());
         call.reason = Some(req.outcome.clone());
-        let known = self.with_table(|t, now, _| {
+        let released = self.with_table(|t, now, _| {
             if let Some(((repo, item), row)) = t.row_by_id(&req.assignment_id) {
                 call.item = Some((repo.clone(), *item, row.step.clone()));
             }
-            let known = t.release_outcome(now, host, &req.assignment_id, &req.outcome);
+            let released = t.release_ordered(now, host, &req.assignment_id, &req.outcome);
             if let Some((repo, _, step)) = &call.item {
                 if step_is_merge(step) {
                     call.merge_slot_holder = Some(slot_holder(t, repo));
                 }
             }
-            known
+            released
         });
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),
-            known,
+            known: released.known,
+            park: released.park,
         }))
     }
 
@@ -623,7 +640,14 @@ macro_rules! host_body {
         }
     )*};
 }
-host_body!(HeartbeatRequest, ClaimRequest, RefuseRequest, ReleaseRequest, NextRequest);
+host_body!(
+    HeartbeatRequest,
+    ClaimRequest,
+    RefuseRequest,
+    ReleaseRequest,
+    NextRequest,
+    ParkEndedRequest
+);
 
 /// A parsed request head.
 #[derive(Debug, Clone, PartialEq, Eq)]

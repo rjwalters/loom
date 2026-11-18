@@ -119,6 +119,7 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 | `POST /v1/refuse` | 1 | The worker's pre-check or forge claim refused a granted item. |
 | `POST /v1/release` | 1 | The step ended. |
 | `POST /v1/next` | 2 (proposal) | Up to the host's free slots in assignments from the fleet queue. |
+| `POST /v1/park_ended` | 2 (#13919) | `{"host_id", "repo", "item", "cause"}`: a worker's park of the item ended or it made none. `cause` is `expired` (TTL expiry, no park made; the default when absent) or `cleared` (operator `quarantine clear`). Either way the captain forgets the item's fast-fail streak and park order; only `cleared` also lifts its no-progress hold, for every step (#14047, ADR-0027 amendment). |
 
 ### 5.2 `heartbeat`
 

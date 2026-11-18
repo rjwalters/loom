@@ -552,7 +552,20 @@ parse_dependencies() {
   local body="$1"
   # Park record wins (#13414): a body carrying `<!-- loom:park ... -->` names its
   # gates there; ordinary `- [ ] #N` acceptance criteria must not count.
-  if grep -qE '^[[:space:]]*<!-- loom:park ' <<<"$body"; then
+  # Read it through the daemon's code-masked parser (#13895): a marker demoted
+  # to an inline code span (`park-record retract`) declares nothing, and a body
+  # whose only park record was demoted must not fall through to the generic
+  # patterns below, which cannot see code spans. Exit 1 = no live record
+  # (e.g. every marker demoted): zero gates; exit 0 with empty output = a live
+  # record with no stated blocker. Any other daemon failure keeps the legacy
+  # grep path.
+  if grep -q 'loom:park' <<<"$body"; then
+    local park_deps prc
+    park_deps=$(loom-daemon park-record parse <<<"$body") && prc=0 || prc=$?
+    case "$prc" in
+      0) printf '%s\n' "$park_deps"; return ;;
+      1) return ;;
+    esac
     grep -E '^[[:space:]]*<!-- loom:park [*_:[:space:]]*Blocked by' <<<"$body" \
       | sed -E 's/^[[:space:]]*<!-- loom:park //; s/ by=.*//' \
       | grep -oE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' | sed 's/^#//' | sort -u
@@ -1092,8 +1105,58 @@ The Guide maintains three documents at the repository root:
 | Document | Purpose |
 |----------|---------|
 | **WORK_LOG.md** | Chronological record of merged PRs and closed issues |
-| **WORK_PLAN.md** | Prioritized roadmap from current GitHub label state |
+| **WORK_PLAN.md** | Backlog snapshot from current GitHub label state |
 | **README.md** | Project overview (updated only when architecture changes) |
+
+### WORK_PLAN.md vs a hand-written ROADMAP.md (#14009)
+
+A repo may keep its own hand-written roadmap (`ROADMAP.md`, `docs/ROADMAP.md`,
+or `docs/roadmap.md`). The two documents do different jobs, and neither
+replaces the other:
+
+| Document | Who writes it | What it holds |
+|----------|---------------|---------------|
+| `ROADMAP.md` (any of the locations above) | maintainers, by hand | **Direction** — what the project intends, and why |
+| `WORK_PLAN.md` | Guide, generated | **Backlog snapshot** — what the GitHub labels say right now |
+
+The rules (each settles one question from #14009; a pass applies them as
+written, and a pass that departs from any of them says so in its docs PR body
+citing this subsection):
+
+1. **Roles.** Never describe WORK_PLAN.md as "the roadmap": it is a snapshot
+   of label state that may lag live labels until the next docs-maintenance PR
+   merges, while the repo's own roadmap is the direction document. Guide
+   already *reads* a roadmap as a priority input (see "Priority Labels and
+   Duplicate Checks") and must **never edit or generate** one.
+2. **First creation is create-by-default.** When `WORK_LOG.md` /
+   `WORK_PLAN.md` do not exist yet (a repo that has never tracked them), a
+   pass **creates them without asking** — Steps 2 and 3 below say how. Both
+   files land as a reviewable docs PR that already passes Judge and
+   Champion, so **the PR itself is the ask**. Never defer first creation as
+   an "operator scope" decision: on `2AMLogic/pdks` two Guide passes (#78,
+   #93) reached opposite conclusions that way, and the question surfaced
+   only as a merge hold two days later.
+3. **Opt-out.** The one recorded place for a repo to say "we do not want
+   these documents (or want them generated differently)" is the
+   `guide.docsMaintenance` namespace in `.loom/config.json` (where
+   `workLogDebounceSecs` / `workPlanDebounceSecs` / `poolPressure*` already
+   live). No per-file or on/off key exists yet — tracked separately in
+   #14116. Until one lands, having one file without the other is NOT an
+   opt-out signal: create-by-default applies to each missing file
+   independently.
+4. **Declining anything must be visible.** A pass that declines any part of
+   this phase (suppresses a README refresh, skips a link, archives nothing)
+   says so **in its docs PR body, citing this subsection**, so the next pass
+   reads the recorded answer instead of deciding afresh. With creation as
+   the default there is no deferral to remember; the recorded answers that
+   exist are the config key (once #14116 lands) and these PR-body notes.
+5. **Cross-links and layout.** The static preamble outside the
+   `guide:plan-body` markers is where a WORK_PLAN.md points at the repo's
+   roadmap when one exists — Step 3's first-creation preamble does this
+   automatically. The pass that first creates the files also refreshes any
+   README layout listing that enumerates top-level files (Step 4 treats
+   first creation as a staleness trigger): pdks #93 left that README stale
+   and it took a downstream follow-up to fix.
 
 ### Where This Phase Writes (a managed worktree, never the main checkout)
 
@@ -1123,6 +1186,19 @@ in — and write there:
 # and BEFORE any of Steps 2-5. Idempotent: one stable slot, reused every tick.
 DOCS_WT="$(./.loom/scripts/docs-worktree.sh | tail -1)"
 echo "$DOCS_WT"   # e.g. <repo>/.loom/worktrees/docs-guide
+
+# #13923: derive the repo ONCE, from the docs worktree itself (never the cwd's
+# remote), and pin EVERY forge query in Steps 2-5 to it by exporting `GH_REPO`
+# (which `gh issue|pr list` honours — one mechanism, no per-call flag to forget;
+# `repo:` in search queries uses `$GUIDE_REPO` directly). On a shared host the cwd can belong to a
+# sibling repo; an unpinned `gh ... list` then renders that repo's state into
+# this repo's WORK_PLAN.md (observed on a consumer repo; the incident behind #13923).
+GUIDE_REPO="$(git -C "$DOCS_WT" remote get-url origin 2>/dev/null \
+  | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')"
+[ -n "$GUIDE_REPO" ] || { echo "docs maintenance: cannot derive repo from $DOCS_WT — skipping (fail closed)" >&2; return 1 2>/dev/null || exit 1; }
+# GH_CACHE_REPO_ID scopes the `$GH_READ` cache to the pinned repo, so pinned
+# reads never share cache entries with the cwd repo's unpinned ones (#5224).
+export GH_REPO="$GUIDE_REPO" GH_CACHE_REPO_ID="$GUIDE_REPO"
 ```
 
 `docs-worktree.sh` creates (or resets) `<worktree-root>/docs-guide` on a fresh
@@ -1363,6 +1439,15 @@ WORK_LOG-writing docs-maintenance merge, **or** has grown large enough to
 write immediately regardless of the window (see "WORK_LOG debounce" in
 `update_work_log()` below, #6133).
 
+**First creation (#14009).** If `$DOCS_WT/WORK_LOG.md` does not exist (the
+repo has never tracked it — presence, not recency), this pass **creates it
+without asking**: write the standard preamble and `## Archives` index shape
+(mirror the WORK_LOG.md template in `defaults/.claude/commands/loom/imagine.md`)
+followed by this tick's entries. Creation itself bypasses the debounce and
+min-entries gates below — a first creation with nothing to record yet is
+still a create (the file starts as preamble plus an empty current day), never
+a defer. See "WORK_PLAN.md vs a hand-written ROADMAP.md", rule 2.
+
 **Redact host identifiers, even quoting a title** — that is how 127 leaked
 into this public repo (#8589); the CI scrub job fails on the next one.
 
@@ -1510,9 +1595,9 @@ _work_log_search_total_count() {
   # only a different predicate string.
   local search_range="$1"
   local predicate="${2:-is:issue is:closed}"
-  local repo_nwo
-  repo_nwo=$(git remote get-url origin 2>/dev/null \
-    | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')
+  # #13923: the repo is the one derived from the docs worktree (`GUIDE_REPO`),
+  # never the cwd's remote — see the pin note in Step 1.
+  local repo_nwo="${GUIDE_REPO:-}"
   if [ -z "$repo_nwo" ]; then
     echo "-1"
     return
@@ -1794,7 +1879,7 @@ update_work_log() {
   #     `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s 3600s default: WORK_LOG entries are
   #     individually small and cheap to batch, but a merge/close event
   #     going unrecorded for a full hour is a worse staleness trade than for
-  #     WORK_PLAN's roadmap snapshot, which is stale-tolerant by nature.
+  #     WORK_PLAN's backlog snapshot, which is stale-tolerant by nature.
   # `LOOM_WORK_LOG_DEBOUNCE_NOW` is a test seam only (mirrors
   # `LOOM_WORK_PLAN_DEBOUNCE_NOW`) — never set it in normal operation.
   #
@@ -1935,7 +2020,7 @@ gitignored sidecar holds any state.
 
 ### Step 3: Update WORK_PLAN.md
 
-Regenerate the roadmap from current GitHub label state. Only rewrite if labels
+Regenerate the backlog snapshot from current GitHub label state. Only rewrite if labels
 have changed **and** that change has survived a debounce window since the last
 docs-maintenance merge (see "WORK_PLAN debounce" below, #5890).
 
@@ -1943,6 +2028,37 @@ The generated region of `WORK_PLAN.md` is delimited by
 `<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->`. **Everything
 between those markers is machine-generated and is overwritten wholesale; nothing
 else in the file is touched.**
+
+**First creation (#14009).** If `$DOCS_WT/WORK_PLAN.md` does not exist, this
+pass **creates it without asking** — create-by-default, never defer (see
+"WORK_PLAN.md vs a hand-written ROADMAP.md", rules 2 and 5). Build the file as
+the static preamble below, then the two marker lines with a freshly rendered
+`render_plan_body()` between them. The debounce gate in `update_work_plan()`
+does not apply to creation: there is no committed `old_body` to compare
+against, and holding off would just re-create the pdks #78/#93
+defer-then-create-anyway inconsistency. The preamble is static text outside
+the markers — which is also where the repo's roadmap is linked when one
+exists:
+
+```markdown
+# Work Plan
+
+Backlog snapshot from current GitHub label state, maintained by the Guide role.
+Direction lives in the hand-written roadmap: `ROADMAP.md`.
+
+The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. Date the snapshot with `git log -1 -- WORK_PLAN.md`.
+
+<!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
+```
+
+The "Direction lives…" line is included **only** when a roadmap file exists,
+and the generated WORK_PLAN.md links the file actually found — `ROADMAP.md`,
+`docs/ROADMAP.md`, or `docs/roadmap.md`, as a repo-root-relative path. The
+fence shows the path backticked only because this role file must not carry a
+link that dangles in repos without a roadmap. With no
+roadmap, omit that line entirely. Keep this preamble wording in lockstep with
+the WORK_PLAN.md template in `defaults/.claude/commands/loom/imagine.md` (the
+bootstrap seed uses the same distinction).
 
 The generated region is never archived (`defaults/docs/work-docs-archive.md`, "WORK_PLAN").
 
@@ -2125,7 +2241,14 @@ render_plan_body() {
   local approved_json
   approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title,labels,closingIssuesReferences \
     --jq 'sort_by(.number) | [.[] | select(any(.labels[]?.name; . == "loom:frozen") | not)]')
-  approved=$(printf '%s' "$approved_json" | jq -r '.[] | "- **#\(.number)**: \(.title)"')
+  # #13928: surface the closes-graph this query already fetched — a
+  # merge-pending PR bullet annotates the issues it closes ("— closes #N"),
+  # the single fact that explains why those issues are absent from "Ready"
+  # below. Derived from $approved_json alone (no new forge query, the #6457
+  # discipline); a PR with empty closingIssuesReferences renders exactly as
+  # before. `held` bullets stay unchanged.
+  approved=$(printf '%s' "$approved_json" | \
+    jq -r '.[] | ([(.closingIssuesReferences // [])[].number] | sort) as $closes | "- **#\(.number)**: \(.title)" + (if ($closes | length) > 0 then " — closes " + ($closes | map("#" + tostring) | join(", ")) else "" end)')
   held=$(printf '%s' "$approved_json" | jq -r '.[] | select([(.labels // [])[].name] | index("loom:operator") or index("loom:blocked")) | "- **#\(.number)**: \(.title)"')
   # #7083: derive the set of issue numbers already closed by an open
   # `loom:pr`-labeled PR from `approved_json`'s own `closingIssuesReferences`
@@ -2158,7 +2281,7 @@ render_plan_body() {
   echo
   section "Important" "\`loom:important\`; taken before unlabelled work." "$imp"
   echo
-  section "Ready" "Human-approved issues ready for implementation (\`loom:issue\`)." "$ready"
+  section "Ready" "Human-approved issues (\`loom:issue\`) ready for implementation — excluding held (\`loom:blocked\`/\`loom:operator\`/\`loom:frozen\`), \`loom:building\`, and issues closed by an open \`loom:pr\` PR (listed under Approved)." "$ready"
   echo
   section "In Progress" "Issues currently being built (\`loom:building\`)." "$building"
   echo
@@ -2180,7 +2303,7 @@ render_plan_body() {
     "| Operator merge-risk holds | $(count "$held") |" \
     "| Very important | $(count "$vimp") |" \
     "| Important | $(count "$imp") |" \
-    "| Ready (\`loom:issue\`) | $(count "$ready") |" \
+    "| Ready (\`loom:issue\`, net of holds/building/merge-pending) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
     "| PRs awaiting review | $(count "$review") |" \
     "| Approved PRs awaiting merge | $(count "$approved") |" \
@@ -2242,12 +2365,85 @@ update_work_plan() {
     return 1
   fi
 
+  # #13923 PROVENANCE GATE, DO NOT REMOVE: the header claims this file is
+  # "generated from the repository's current GitHub label state"; discharge it.
+  # Refuse (non-zero, NO file change) unless every rendered `#N` carries the
+  # title the pinned repo gives it. Checks the OUTPUT, so it bites whatever the
+  # cause (guard denial, wrong cwd, stale scratch, unfaithful execution).
+  if ! verify_plan_provenance "$new_body"; then
+    echo "WORK_PLAN.md NOT written: provenance check failed (fail closed)." >&2
+    return 1
+  fi
+
   # Replace ONLY the text between the markers in "$DOCS_WT/WORK_PLAN.md" with
   # $new_body (keep both marker lines, and everything outside them, untouched).
   # Both sides above are `$(...)`-captured, so trailing newlines are stripped on
   # both — only the internal structure has to match.
+  #
+  # #13923 SCRATCH DISCIPLINE: splice via `splice_plan_body "$new_body"`, which
+  # uses a per-tick `mktemp -d` dir. NEVER stage the body or the spliced file at
+  # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
+  # repos' ticks share /tmp, and a tick whose own write was denied then consumes
+  # another repo's stale file. Never read a scratch file this tick did not write.
+  splice_plan_body "$new_body" || return 1
 
   return 0
+}
+
+# #13923: every `- **#N**: title` bullet in $1 must match the title the pinned
+# repo reports for #N (issues and PRs share the `issues/N` endpoint). Existence
+# is NOT enough — a foreign render's numbers can all exist, closed, under
+# unrelated titles. Zero bullets passes; a failed lookup fails closed.
+#
+# SUFFIX LOCKSTEP, DO NOT LET THIS DRIFT: `render_plan_body()` appends at most
+# one section tag (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) and then,
+# for a held issue, ` *(held)*` (#13908) — in that order. The bullet must be the
+# forge title followed by exactly one of those combinations, so a title is
+# never guessed by stripping (a title that itself ends in ` *(held)*` still
+# matches). A new ` *(x)*` suffix in the render MUST be added here in the same
+# change: an unknown suffix fails closed and WORK_PLAN.md stops updating.
+# `test-guide-work-plan-provenance.sh` reads the render's suffix literals and
+# fails if this gate rejects any of them.
+verify_plan_provenance() {
+  local body="$1" line num rest got tag ok bad=0
+  while IFS= read -r line; do
+    num="${line#- **#}"; num="${num%%\**}"
+    rest="${line#*\*\*: }"
+    got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '.title' 2>/dev/null)" || got=""
+    if [ -z "$got" ]; then
+      echo "provenance: cannot fetch title of #$num from $GUIDE_REPO" >&2; bad=1
+      continue
+    fi
+    # Plain string equality only: a `${var% \*(x)\*}` strip is a no-op under
+    # zsh (the shell an interactive Guide may run this in), so never strip.
+    ok=0
+    for tag in '' ' *(curated)*' ' *(architect)*' ' *(hermit)*'; do
+      if [ "$rest" = "$got$tag" ] || [ "$rest" = "$got$tag *(held)*" ]; then ok=1; fi
+    done
+    if [ "$ok" -ne 1 ]; then
+      echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$rest', forge '$got')" >&2; bad=1
+    fi
+  done < <(printf '%s\n' "$body" | grep -E '^- \*\*#[0-9]+\*\*: ')
+  return "$bad"
+}
+
+# #13923: write $1 between the plan-body markers of "$DOCS_WT/WORK_PLAN.md"
+# through a per-tick scratch dir that is removed before returning (explicitly,
+# not via `trap ... RETURN`, which is bash-only and leaks the dir under zsh).
+# Fails (file untouched) if the markers are missing.
+splice_plan_body() {
+  local plan="$DOCS_WT/WORK_PLAN.md" scratch rc=0
+  grep -q '<!-- guide:plan-body:start -->' "$plan" 2>/dev/null \
+    && grep -q '<!-- guide:plan-body:end -->' "$plan" 2>/dev/null || return 1
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/guide-plan.XXXXXX")" || return 1
+  printf '%s\n' "$1" > "$scratch/body.md" \
+    && awk -v body="$scratch/body.md" '
+      /<!-- guide:plan-body:start -->/ { print; while ((getline l < body) > 0) print l; skip=1; next }
+      /<!-- guide:plan-body:end -->/   { skip=0 }
+      !skip { print }' "$plan" > "$scratch/plan.new" \
+    && cat "$scratch/plan.new" > "$plan" || rc=1
+  rm -rf "$scratch"
+  return "$rc"
 }
 ```
 
@@ -2259,10 +2455,25 @@ comparison mismatches until the file catches up). Adding a section means editing
 
 ### Step 4: Check README.md Staleness
 
-Only update README.md when merged PRs touch architectural files.
+Update README.md when merged PRs touch architectural files, **or when this
+pass first created `WORK_LOG.md` / `WORK_PLAN.md`** (#14009): a README layout
+listing that enumerates top-level files must not be left stale by two new
+top-level documents (pdks #93 left it stale; a downstream follow-up fixed
+it). Refresh conservatively — add or adjust only the file/layout listing
+lines that mention top-level files.
 
 ```bash
 check_readme_staleness() {
+  # #14009 FIRST-CREATION TRIGGER, checked before the arch-pattern gate: the
+  # pass that first creates WORK_LOG.md / WORK_PLAN.md also refreshes a README
+  # layout listing that enumerates top-level files. $1 = 1 when this pass
+  # performed a first creation (Steps 2/3 pass it); 0 or empty otherwise.
+  if [ "${1:-0}" -eq 1 ]; then
+    echo "First creation of WORK_LOG.md/WORK_PLAN.md this tick."
+    echo "Review README.md's top-level file/layout listing for staleness."
+    return 0
+  fi
+
   # Check recently merged PRs for architectural file changes
   local arch_patterns="Cargo.toml|package.json|loom-daemon/|loom-api/|install.sh|scripts/install"
 
@@ -2497,6 +2708,58 @@ create_docs_pr() {
     git -C "$DOCS_WT" add -- "$archive_rel"
   done
 
+  # Post-stage hook (#13892): a consuming repo can place any of the files this
+  # function stages under a CI integrity check satisfiable only by staging an
+  # additional, tool-produced file in the same PR (e.g. a freshness envelope
+  # pinning content hashes). The tick's fixed staging set cannot produce that
+  # file, so the arbitration surface is this hook: if the repo provides an
+  # executable script at `.loom/docs-post-stage.sh`, run it now — cwd is the
+  # docs worktree and `$DOCS_WT` is exported — AFTER the staging above and
+  # BEFORE the `diff --cached` snapshot below, so anything it adds lands in
+  # DOCS_CHANGED_FILES telemetry. The script prints the paths to stage, one
+  # per line, worktree-relative; EACH is staged by exact path — never
+  # `git add -A`, and nothing it modified without printing is staged, so the
+  # hook cannot silently widen the PR's file set. No script ⇒ behaviour
+  # identical to a repo without the hook. ANY failure — exists but not
+  # executable, non-zero exit, a printed path that is absolute, contains
+  # `..`, or cannot be staged — is fail-closed: discard the staged diff,
+  # release the lock, and abort the tick WITHOUT opening a PR, because the PR
+  # would just fail the repo's integrity check anyway. The repo that places a
+  # tick-staged file under an integrity check owns the recovery (regenerate +
+  # print the covered file); this tick only carries it.
+  local hook_script="$DOCS_WT/.loom/docs-post-stage.sh"
+  if [ -e "$hook_script" ]; then
+    if [ ! -f "$hook_script" ] || [ ! -x "$hook_script" ]; then
+      echo "Docs post-stage hook .loom/docs-post-stage.sh exists but is not an executable regular file — failing closed: no docs PR this tick. chmod +x it or remove it; the next tick retries." >&2
+      git -C "$DOCS_WT" reset --hard HEAD
+      ./.loom/scripts/docs-guide-lock.sh release
+      return 1
+    fi
+    local hook_output hook_rc hook_path
+    hook_output="$(cd "$DOCS_WT" && DOCS_WT="$DOCS_WT" "$hook_script")" && hook_rc=0 || hook_rc=$?
+    if [ "$hook_rc" -ne 0 ]; then
+      echo "Docs post-stage hook exited $hook_rc — failing closed: discarding this tick's staged docs diff, no docs PR. Fix .loom/docs-post-stage.sh; the next tick retries." >&2
+      git -C "$DOCS_WT" reset --hard HEAD
+      ./.loom/scripts/docs-guide-lock.sh release
+      return 1
+    fi
+    while IFS= read -r hook_path; do
+      [ -n "$hook_path" ] || continue
+      if [[ "$hook_path" = /* || "$hook_path" == *..* ]]; then
+        echo "Docs post-stage hook printed an unsafe path ('$hook_path') — only worktree-relative paths without '..' are staged. Failing closed: no docs PR this tick." >&2
+        git -C "$DOCS_WT" reset --hard HEAD
+        ./.loom/scripts/docs-guide-lock.sh release
+        return 1
+      fi
+      if ! git -C "$DOCS_WT" add -- "$hook_path"; then
+        echo "Docs post-stage hook printed '$hook_path' but it could not be staged (missing? outside the worktree?). Failing closed: no docs PR this tick." >&2
+        git -C "$DOCS_WT" reset --hard HEAD
+        ./.loom/scripts/docs-guide-lock.sh release
+        return 1
+      fi
+    done <<< "$hook_output"
+  fi
+
   # Snapshot which of the three files actually changed, for the telemetry
   # record below (issue #6136) — captured now, before the `diff --cached`
   # check below consumes the staged diff.
@@ -2588,20 +2851,25 @@ Automated document maintenance by the Guide triage agent.
 
 ### Changes
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
-- **WORK_PLAN.md**: Regenerated roadmap from current GitHub label state
+- **WORK_PLAN.md**: Regenerated backlog snapshot from current GitHub label state (a repo's hand-written ROADMAP.md, if any, remains the direction document)
 - **README.md**: Updated if architectural changes were detected
+- Plus any files reported by the repo's `.loom/docs-post-stage.sh` hook, if installed (e.g. a regenerated freshness envelope)
 
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
 See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
 
-This PR only ever stages `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
-`create_docs_pr()`'s `git add` above), so it always qualifies for the
-docs-only fast path (rjwalters/loom#6134) Judge and Champion apply to any PR
-whose changed-file list matches that exact set. The `<!-- loom:docs-only-fast-path -->`
-marker above is informational only — Judge and Champion never trust it (or
-this section's prose) and always re-derive the changed-file list themselves
-from the paginated files API before taking the fast path.
+This PR normally stages only `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
+`create_docs_pr()`'s `git add` above), so it qualifies for the docs-only fast
+path (rjwalters/loom#6134) Judge and Champion apply to any PR whose
+changed-file list matches that exact set — EXCEPT when the repo's
+`.loom/docs-post-stage.sh` hook (rjwalters/loom#13892) reported additional
+files (e.g. a regenerated integrity envelope): those land in the same PR,
+which simply falls off the fast path to a full review. The
+`<!-- loom:docs-only-fast-path -->` marker above is informational only —
+Judge and Champion never trust it (or this section's prose) and always
+re-derive the changed-file list themselves from the paginated files API
+before taking the fast path.
 
 ---
 *Automated by Guide role - document maintenance phase*
@@ -2642,6 +2910,47 @@ PRBODY
 }
 ```
 
+#### Post-stage hook (optional, repo-provided) — #13892
+
+`create_docs_pr()` supports one arbitration surface for a conflict the tick
+cannot resolve on its own: a repo that places a tick-staged file (`WORK_LOG.md`,
+`WORK_PLAN.md`, `README.md`, a `work_log/` archive) under a CI integrity check
+that is only satisfiable by staging an additional, tool-produced file in the
+same PR — for example a freshness envelope pinning content hashes. The tick's
+staging set is fixed and cannot be widened or narrowed by the tick, so without
+this hook such a PR could never be made green by the tick that opened it. The
+repo that installs the integrity check **owns the recovery**; this hook is how
+it expresses it.
+
+- **Path**: `.loom/docs-post-stage.sh`, relative to the repo root (committed,
+  so it is present in the docs worktree). Deliberately NOT under
+  `.loom/scripts/` or `.loom/hooks/` — both are resync-refreshed Loom-shipped
+  surfaces; a repo-provided hook there could be overwritten or orphaned by a
+  resync.
+- **When it runs**: whenever Step 5 stages, after the fixed staging set and the
+  `work_log/` archive loop and BEFORE the `diff --cached` check — so anything
+  it adds is included in `DOCS_CHANGED_FILES` telemetry and counted by the
+  nothing-to-commit early return.
+- **Contract**: run with cwd = the docs worktree and `$DOCS_WT` exported
+  (absolute worktree path). Exit `0` = success. On stdout it prints the paths
+  to stage, one per line, worktree-relative (blank lines ignored). Each
+  printed path is staged by exact path — never `git add -A`, and nothing the
+  hook modified without printing is staged, so the hook cannot silently widen
+  the PR's file set. (A hook that stages with `git add` itself also works —
+  the `diff --cached` check sees it — but the printed-path contract above is
+  the supported interface.)
+- **Fail-closed**: any failure aborts the tick before commit/push — no PR is
+  opened, the staged diff is discarded (`reset --hard`), the docs-guide lock
+  is released, and the tick's output says so. Failure means: the file exists
+  but is not an executable regular file; a non-zero exit; a printed path that
+  is absolute or contains `..` (paths must resolve inside the worktree); or a
+  printed path that cannot be staged. Aborting beats shipping, because the PR
+  would fail the repo's integrity check anyway; the next tick retries.
+- **No script** ⇒ behaviour byte-identical to a repo without the hook.
+- **Review impact**: a PR carrying hook-produced files falls off the docs-only
+  fast path (rjwalters/loom#6134) to a full review — by design; Judge and
+  Champion re-derive eligibility from the PR's own file list.
+
 ### Document Maintenance Summary
 
 The full document maintenance flow runs at the end of each triage cycle:
@@ -2661,9 +2970,15 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
-  │    ├─ Evidence-pin exclusion (#13897): paths in
-  │    │    guide.docsMaintenance.pinnedPaths are never staged (a WARNING
-  │    │    names each one skipped; a pinned-only diff opens no PR)
+  │    ├─ Stage the fixed set + archives minus evidence-pinned paths
+  │    │    (#13897): paths in guide.docsMaintenance.pinnedPaths are never
+  │    │    staged (a WARNING names each one skipped; a pinned-only diff
+  │    │    opens no PR)
+  │    ├─ Post-stage hook (#13892): run .loom/docs-post-stage.sh if the
+  │    │    repo provides it, stage the worktree-relative paths it prints
+  │    │    by exact path; ANY failure is fail-closed (diff discarded,
+  │    │    lock released, no PR) — see "Post-stage hook" above for the
+  │    │    full contract
   │    ├─ Token-pool pressure check (#6135): if the pool is under pressure
   │    │    AND the max-defer ceiling has not elapsed, discard the local diff,
   │    │    release the lock, and defer to a later tick instead of filing
@@ -2765,7 +3080,7 @@ Document Maintenance Phase
   and otherwise waits for `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30
   min — shorter than WORK_PLAN's 3600s default because an unrecorded
   merge/close event is a worse staleness trade than WORK_PLAN's
-  stale-tolerant roadmap snapshot) since WORK_LOG.md was last actually
+  stale-tolerant backlog snapshot) since WORK_LOG.md was last actually
   WRITTEN by a merged docs-maintenance PR, anchored via
   `last_work_log_write_epoch()` the same way `last_work_plan_write_epoch()`
   anchors WORK_PLAN's clock (filtered to merges whose changed files include

@@ -155,6 +155,25 @@ impl Fixture {
             command,
         ])
     }
+    /// A job bound to an existing branch: preparation resumes that branch's
+    /// local tip (#14030).
+    fn job_on(&self, name: &str, kind: &str, branch: &str, command: &str) -> Command {
+        self.command(&[
+            "session",
+            "job",
+            name,
+            "--kind",
+            kind,
+            "--owner",
+            "docker-proof",
+            "--branch",
+            branch,
+            "--",
+            "sh",
+            "-c",
+            command,
+        ])
+    }
     fn new() -> Self {
         Self::with_adapters(false)
     }
@@ -680,10 +699,69 @@ fn private_clones_contain_writes_reuse_and_serialize_all_job_kinds() {
     f.exec(a, "git -C /workspace/repo restore file");
     checked(f.job(a, "sweep", "git -C /workspace/repo switch -c unpublished; echo commit > /workspace/repo/file; git -C /workspace/repo commit -am unpublished").output().unwrap());
     let tip = f.exec(a, "git -C /workspace/repo rev-parse HEAD");
-    let unpublished = f.job(a, "role", "true").output().unwrap();
-    assert!(!unpublished.status.success());
-    assert!(String::from_utf8_lossy(&unpublished.stderr).contains("unpushed"));
+    // Work named by a branch no longer refuses: preparation never moves a
+    // branch, so the account stays usable and the branch keeps its tip (#14030).
+    checked(f.job(a, "role", "true").output().unwrap());
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse unpublished"), tip);
+    // Naming the branch resumes its local tip exactly.
+    checked(f.job_on(a, "role", "unpublished", "true").output().unwrap());
     assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), tip);
+    // Work stranded on a detached HEAD — unnamed by any branch — still
+    // refuses, and the refusal names the recover verb as the cure.
+    f.exec(a, "git -C /workspace/repo checkout --detach");
+    f.exec(a, "git -C /workspace/repo branch -D unpublished");
+    let stranded = f.job(a, "role", "true").output().unwrap();
+    assert!(!stranded.status.success());
+    assert!(String::from_utf8_lossy(&stranded.stderr).contains("detached"));
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), tip);
+    // `session recover` lists the stranded work without touching it.
+    let report: Value = serde_json::from_str(&f.cli(&["session", "recover", a, "--json"])).unwrap();
+    assert_eq!(report["clones"][0]["detached"].as_array().unwrap().len(), 1);
+    assert_eq!(report["clones"][0]["branches"].as_array().unwrap().len(), 0);
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), tip);
+    // Naming the work makes it publishable; `--publish` pushes it and the
+    // account is unblocked for good.
+    f.exec(a, "git -C /workspace/repo switch -c recovered");
+    let report: Value =
+        serde_json::from_str(&f.cli(&["session", "recover", a, "--publish", "--json"])).unwrap();
+    assert_eq!(report["clones"][0]["published"].as_array().unwrap().len(), 1);
+    assert_eq!(report["clones"][0]["branches"].as_array().unwrap().len(), 0);
+    checked(f.job(a, "role", "true").output().unwrap());
+    // A scoped discard deletes only the branch it was named for. The volume,
+    // the checkout and every other branch are untouched — the discarded tip
+    // is merely unnamed again, so the account correctly stays refused until
+    // the work is named again, and that refusal leaves the stale job record
+    // the next segment builds on.
+    checked(f.job(a, "sweep", "git -C /workspace/repo switch -c disposable; echo gone > /workspace/repo/file; git -C /workspace/repo commit -am disposable; git -C /workspace/repo switch --detach").output().unwrap());
+    let disposable_tip = f.exec(a, "git -C /workspace/repo rev-parse HEAD");
+    let report: Value = serde_json::from_str(&f.cli(&[
+        "session",
+        "recover",
+        a,
+        "--discard",
+        "--branch",
+        "disposable",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(report["clones"][0]["discarded"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        f.exec(
+            a,
+            "git -C /workspace/repo rev-parse --verify refs/heads/disposable || echo gone"
+        )
+        .trim(),
+        "gone"
+    );
+    assert!(
+        f.exec(a, "git -C /workspace/repo rev-parse --verify refs/heads/recovered")
+            .len()
+            == 41
+    );
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), disposable_tip);
+    let stranded = f.job(a, "role", "true").output().unwrap();
+    assert!(!stranded.status.success());
+    assert!(String::from_utf8_lossy(&stranded.stderr).contains("detached"));
     // An unleased surviving child also blocks stale-record reclamation.
     docker(&[
         "exec",

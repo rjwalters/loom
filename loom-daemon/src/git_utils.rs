@@ -6,8 +6,6 @@
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use crate::activity::PromptChanges;
-
 /// Run `git -C <dir> <args>` and return the raw [`Output`].
 ///
 /// Shared runner for the private `git(dir, args)` wrappers: stdin is null,
@@ -364,47 +362,6 @@ fn normalize_diff_path(raw: &str) -> String {
         return new.to_string();
     }
     raw.to_string()
-}
-
-/// Capture git changes and create a `PromptChanges` record
-///
-/// This is the main entry point for capturing git state after a prompt.
-pub fn capture_prompt_changes(
-    working_dir: &Path,
-    input_id: i64,
-    before_commit: Option<String>,
-) -> Option<PromptChanges> {
-    if !is_git_repo(working_dir) {
-        return None;
-    }
-
-    let after_commit = get_current_commit(working_dir);
-
-    // If commits are the same or both None, check for uncommitted changes
-    let stats = if before_commit == after_commit {
-        // Check for uncommitted changes
-        capture_git_changes(working_dir, None, None)?
-    } else {
-        // Get diff between commits
-        capture_git_changes(working_dir, before_commit.as_deref(), after_commit.as_deref())?
-    };
-
-    // Only create a record if there were actual changes
-    if stats.files_changed == 0 && stats.lines_added == 0 && stats.lines_removed == 0 {
-        return None;
-    }
-
-    Some(PromptChanges {
-        id: None,
-        input_id,
-        before_commit,
-        after_commit,
-        files_changed: stats.files_changed,
-        lines_added: stats.lines_added,
-        lines_removed: stats.lines_removed,
-        tests_added: stats.tests_added,
-        tests_modified: stats.tests_modified,
-    })
 }
 
 #[cfg(test)]

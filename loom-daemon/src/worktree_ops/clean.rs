@@ -3361,21 +3361,32 @@ fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {
     super::liveness::locks_dir(repo_root)
 }
 
-/// Remove `.loom/locks/issue-<N>/` dirs not backed by a live spawn-loop task.
-/// Mirrors `clean.py::_clear_stale_spawn_loop_locks`.
+/// Remove `.loom/locks/issue-<N>/` claim-lock dirs with no live owner.
+///
+/// Staleness is judged from the lock itself: a lock whose `owner.json`
+/// names a **live, non-zombie** `owner_pid` is kept
+/// ([`crate::live_claim::live_lock_owner_in`] with bare
+/// [`crate::live_claim::pid_is_live_process`] — deliberately NOT the
+/// argv-verified [`crate::live_claim::pid_is_live_claim_for`], because
+/// `acquire_lock` provisionally stamps the *dispatching daemon's own pid*
+/// and only rewrites it to the child's pid after spawn; a cleanup pass
+/// running in that window must not delete a mid-flight lock, and bare
+/// liveness is what keeps it). Everything else — dead owner, missing or
+/// unparseable `owner.json` — is stale and removed. `own_untracked_pid` is
+/// `None`: this is a standalone cleanup pass with no child bookkeeping to
+/// consult.
+///
+/// These directories are the daemon's live claim locks
+/// (`SweepRegistry::acquire_lock`), so over-removal double-dispatches;
+/// historically this function consulted the retired
+/// `spawn-loop-state.json` whose `running` list was always empty and
+/// therefore removed **every** lock (#13818).
 pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
     let locks_dir = spawn_loop_locks_dir(repo_root);
     if !locks_dir.is_dir() {
         println!("  No `.loom/locks/` directory");
         return 0;
     }
-    let state = super::spawn_loop_state::read_spawn_loop_state(repo_root);
-    let live_issues: std::collections::HashSet<u32> = state
-        .running
-        .iter()
-        .filter(|t| t.issue != 0)
-        .map(|t| t.issue)
-        .collect();
 
     let mut removed = 0usize;
     let mut found_any = false;
@@ -3397,7 +3408,14 @@ pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
             eprintln!("  Skipping malformed lock dir: {name}");
             continue;
         };
-        if live_issues.contains(&issue_num) {
+        let live = crate::live_claim::live_lock_owner_in(
+            &locks_dir,
+            issue_num,
+            &crate::live_claim::pid_is_live_process,
+            None,
+        )
+        .is_some();
+        if live {
             println!("  Keeping lock for live task: {name}");
             continue;
         }
@@ -3418,11 +3436,10 @@ pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
 }
 
 fn revert_stale_building_labels_spawn_loop(repo_root: &Path, dry_run: bool) -> usize {
-    let state_present = super::spawn_loop_state::read_spawn_loop_state(repo_root).present;
     let locked_issues = super::liveness::active_locked_issues(repo_root);
-    if !state_present && locked_issues.is_empty() {
+    if locked_issues.is_empty() {
         println!(
-            "  No authoritative liveness source (no spawn-loop-state.json, no \
+            "  No authoritative liveness source (no \
              .loom/locks/issue-<N>/ locks) — skipping loom:building revert \
              (fail-safe: absent liveness data means treat claims as ALIVE, \
              not orphaned). See issue #3651."

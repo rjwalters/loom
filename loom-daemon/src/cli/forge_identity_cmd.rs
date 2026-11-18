@@ -343,9 +343,24 @@ fn gh_comment(c: &Value) -> Value {
 
 /// `forge may-write [--repo R]` (#9548): exit 0 printing the repository to
 /// name on the write, or exit 1 with the refusal on stderr. Never returns.
+///
+/// The probe runs with the per-owner writer route established first
+/// ([`crate::write_scope::may_write_decision_cli`], #13929): when a
+/// `forge.identities.writers[]` entry covers the target owner, the owner's
+/// writer credential is minted, published and registered in-process, so the
+/// probe vets the credential `forge token` could mint — not just the ambient
+/// one.
 pub(crate) fn may_write(repo: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    match crate::write_scope::may_write_from(&cwd, repo.as_deref()) {
+    let ws = workspace();
+    let verdict = crate::write_scope::may_write_decision_cli(
+        &cwd,
+        repo.as_deref(),
+        &crate::write_scope::default_gh(),
+        &ws,
+        &|identity, nwo| mint_as(&ws, identity, nwo, false),
+    );
+    match verdict {
         crate::write_scope::Verdict::Allow(nwo) => {
             println!("{nwo}");
             std::process::exit(0)

@@ -114,8 +114,13 @@ pub fn run_of(
 /// The ledger's refusal reason for a spawn-time refusal
 /// (`sweep_registry::step_spawn::StepRefusal::reason`): the pool gate and a
 /// claim held elsewhere cool the `(item, step)` down; a lost claim is a
-/// counted redraw. `None` for a refusal that says nothing about the item (a
-/// roll pause, a workspace missing the role's command).
+/// counted redraw. A standing admission refusal (#14032: the runtime will
+/// not take the launch — a rejected runtime, a model/runtime mismatch, or
+/// any other role-tick admission failure) also cools the pair down, through
+/// the ledger's state-refusal streak ([`outcome_ledger::Effect::Reclassify`]),
+/// so a repeat backs off instead of being redrawn every tick. `None` for a
+/// refusal that says nothing about the item (a roll pause, a workspace
+/// missing the role's command).
 #[must_use]
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
@@ -127,6 +132,12 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
         // item, so it falls through to `None`.
         "spawn_failed" | "label_flip_failed" => Some("pool_gate"),
         "claim_lost" => Some("claim_lost"),
+        // #14032: a standing admission refusal is neither a gate nor a
+        // claim, so it takes the state-refusal streak (the `Refused`
+        // fall-through in `outcome_ledger::effect_of`): the second identical
+        // one arms the refusal cooldown, doubling per further one up to
+        // `MAX_SHORT_COOLDOWN`.
+        "runtime_rejected" | "model_runtime_mismatch" | "admission_refused" => Some("admission"),
         _ => None,
     }
 }
@@ -301,6 +312,11 @@ mod tests {
         assert_eq!(ledger_reason("spawn_failed"), Some("pool_gate"));
         // #12048: says nothing about the item, so no window doubles against it.
         assert_eq!(ledger_reason("workspace_commands_missing"), None);
+        // #14032: a standing admission refusal cools the pair down (through
+        // the state-refusal streak), so it is not redrawn on every tick.
+        assert_eq!(ledger_reason("runtime_rejected"), Some("admission"));
+        assert_eq!(ledger_reason("model_runtime_mismatch"), Some("admission"));
+        assert_eq!(ledger_reason("admission_refused"), Some("admission"));
     }
 
     /// #13966: a step whose provider feedback said its api-key seat was
