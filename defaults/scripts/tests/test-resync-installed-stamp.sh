@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-resync-installed-stamp.sh - install-metadata.json re-stamping in
-# resync-installed.sh's restamp_metadata() (#9174, #9613, #10717)
+# resync-installed.sh's restamp_metadata() (#9174, #9613, #10717, #14222)
 #
 # Split out of test-resync-installed.sh rather than grown in place.
 #
@@ -40,6 +40,15 @@ trap cleanup EXIT
 
 export GIT_AUTHOR_NAME="test" GIT_AUTHOR_EMAIL="test@example.com"
 export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
+
+# #14222: the resync now asks `gh api repos/<o>/<r>` for the canonical repo name.
+# Every run in this file must stay offline, so a stub `gh` that always fails
+# (the fail-open path) shadows any real one; group 14 swaps in answering stubs.
+STUB_BIN="$WORKDIR/stub-bin"
+mkdir -p "$STUB_BIN"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_BIN/gh"
+chmod +x "$STUB_BIN/gh"
+export PATH="$STUB_BIN:$PATH"
 
 # read_field <metadata-file> <field>
 read_field() {
@@ -402,6 +411,105 @@ if [[ -z "$(normalize_source_remote "")" ]]; then
     pass "(#11680) an empty remote stays empty"
 else
     fail "(#11680) an empty remote was rewritten"
+fi
+
+echo ""
+echo "Test group 14: loom_source_remote follows a transferred repo's canonical name (#14222)"
+# make_gh_stub <dir> <stdout> <exit>: a `gh` that records its argv and answers.
+make_gh_stub() {
+    mkdir -p "$1"
+    printf '#!/usr/bin/env bash\necho "$*" >> "%s/gh.calls"\n[ -n "%s" ] && echo "%s"\nexit %s\n' \
+        "$1" "$2" "$2" "$3" > "$1/gh"
+    chmod +x "$1/gh"
+}
+# run_remote_case <name> <origin> <gh-stdout> <gh-exit>: sets OUT14, REMOTE14, CALLS14
+run_remote_case() {
+    local name="$1" origin="$2" ghout="$3" ghrc="$4"
+    local c src bin="$WORKDIR/gh-$1"
+    rm -rf "$bin"
+    make_gh_stub "$bin" "$ghout" "$ghrc"
+    c="$(make_consumer_fixture "$name" yes yes)"
+    src="$WORKDIR/$name-src"
+    git -C "$src" remote add origin "$origin"
+    OUT14="$(cd "$c" && PATH="$bin:$PATH" bash "$SCRIPT" 2>&1)"
+    REMOTE14="$(read_field "$c/.loom/install-metadata.json" loom_source_remote)"
+    CALLS14="$(cat "$bin/gh.calls" 2>/dev/null || true)"
+}
+
+run_remote_case remote-moved "git@github.com:OldOrg/loom.git" "NewOrg/loom" 0
+if [[ "$REMOTE14" == "https://github.com/NewOrg/loom.git" ]]; then
+    pass "(#14222) a redirected remote is stamped with the canonical URL"
+else
+    fail "(#14222) redirected remote stamped '$REMOTE14'"
+fi
+if grep -q "api repos/OldOrg/loom" <<<"$CALLS14"; then
+    pass "(#14222) the lookup is a REST 'gh api repos/<o>/<r>' call"
+else
+    fail "(#14222) unexpected gh calls: $CALLS14"
+fi
+if [[ "$(grep -c 'origin remote is stale' <<<"$OUT14")" == 1 ]]; then
+    pass "(#14222) exactly one stale-remote warning is printed"
+else
+    fail "(#14222) expected one stale-remote warning; out=$OUT14"
+fi
+
+run_remote_case remote-same "https://github.com/o/r.git" "o/r" 0
+if [[ "$REMOTE14" == "https://github.com/o/r.git" ]] && ! grep -q 'stale' <<<"$OUT14"; then
+    pass "(#14222) an unredirected remote is stamped unchanged, with no warning"
+else
+    fail "(#14222) unredirected: remote='$REMOTE14' out=$OUT14"
+fi
+
+run_remote_case remote-case "https://github.com/Foo/Bar.git" "foo/bar" 0
+if [[ "$REMOTE14" == "https://github.com/Foo/Bar.git" ]] && ! grep -q 'stale' <<<"$OUT14"; then
+    pass "(#14222) a case-only difference is not treated as a transfer"
+else
+    fail "(#14222) case-only: remote='$REMOTE14' out=$OUT14"
+fi
+
+run_remote_case remote-gh-err "https://github.com/o/r.git" "NewOrg/r" 1
+if [[ "$REMOTE14" == "https://github.com/o/r.git" ]] && ! grep -q 'stale' <<<"$OUT14"; then
+    pass "(#14222) gh exiting non-zero falls back to the normalized origin"
+else
+    fail "(#14222) gh error: remote='$REMOTE14' out=$OUT14"
+fi
+
+run_remote_case remote-gh-junk "https://github.com/o/r.git" "not a slug" 0
+if [[ "$REMOTE14" == "https://github.com/o/r.git" ]] && ! grep -q 'stale' <<<"$OUT14"; then
+    pass "(#14222) an unparseable gh answer is ignored"
+else
+    fail "(#14222) gh junk: remote='$REMOTE14' out=$OUT14"
+fi
+
+run_remote_case remote-local "/srv/some/local/path" "NewOrg/r" 0
+if [[ "$REMOTE14" == "/srv/some/local/path" && -z "$CALLS14" ]]; then
+    pass "(#14222) a local-path origin is untouched and never queries gh"
+else
+    fail "(#14222) local path: remote='$REMOTE14' calls='$CALLS14'"
+fi
+
+run_remote_case remote-other-host "git@gitea.example:o/r.git" "NewOrg/r" 0
+if [[ "$REMOTE14" == "https://gitea.example/o/r.git" && -z "$CALLS14" ]]; then
+    pass "(#14222) a non-GitHub host keeps today's behaviour and never queries gh"
+else
+    fail "(#14222) non-GitHub: remote='$REMOTE14' calls='$CALLS14'"
+fi
+
+# gh absent from PATH: build a PATH holding only the tools the script needs.
+NOGH_BIN="$WORKDIR/nogh-bin"
+mkdir -p "$NOGH_BIN"
+for t in bash git sed awk cat date dirname basename mktemp rm cp mv mkdir chmod ln ls find sort tr head tail cut grep wc cksum readlink env uname python3 jq timeout diff cmp touch tee xargs sha256sum shasum md5sum id hostname stat printf; do
+    p="$(command -v "$t" 2>/dev/null || true)"
+    [[ -n "$p" && "$p" == /* ]] && ln -sf "$p" "$NOGH_BIN/$t"
+done
+C14N="$(make_consumer_fixture remote-no-gh yes yes)"
+git -C "$WORKDIR/remote-no-gh-src" remote add origin "https://github.com/o/r.git"
+OUT14N="$(cd "$C14N" && PATH="$NOGH_BIN" "$NOGH_BIN/bash" "$SCRIPT" 2>&1)"
+if [[ "$(read_field "$C14N/.loom/install-metadata.json" loom_source_remote)" == "https://github.com/o/r.git" ]] \
+   && ! grep -q 'stale' <<<"$OUT14N"; then
+    pass "(#14222) gh absent from PATH: normalized origin stamped, no warning"
+else
+    fail "(#14222) gh absent: remote=$(read_field "$C14N/.loom/install-metadata.json" loom_source_remote) out=$OUT14N"
 fi
 
 # --- summary -----------------------------------------------------------------
