@@ -1604,6 +1604,7 @@ pub fn build_daemon_status_for(
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             maintain_only: workspace_registry.maintain_only_of(root),
+            installed_behind: crate::workspace_hold::installed_behind_for(root),
             weight: workspace_registry.weight_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),

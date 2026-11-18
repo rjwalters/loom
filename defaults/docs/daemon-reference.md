@@ -2039,6 +2039,15 @@ cannot work with this daemon. The checkout copy is
   first. A `W3` copy with no `requires_daemon` that parses is held, because
   nothing on record says its files work with this daemon. So is one below
   `supports_installed`, which is a break the daemon declared.
+  The skew is visible, not waited out (#14015): the daemon logs one INFO line
+  per repo naming its installed `loom_version` and the running version (again
+  only if the repo leaves that state and returns, or its installed version
+  changes), and `loom-daemon status` shows it under the repo, with
+  `installed_behind: {installed, running}` in `status --json` `per_repo[]`
+  (absent when not behind; never shown for the Loom source repo). Dispatch
+  into it is not held, so a fix spanning the daemon binary and
+  `defaults/scripts` must raise `supports_installed` in that same release;
+  that is the lever that holds a pre-resync repo.
 - **A version that cannot be ordered rolls only for a need.** Such a copy
   is held, because it may be newer than this daemon. Whether it also asks
   for a roll is decided by its `requires_daemon` alone when that parses:
