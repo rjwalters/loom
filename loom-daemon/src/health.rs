@@ -583,6 +583,14 @@ pub struct HealthInputs {
     /// ([`crate::resync_pin::read_pins`]), for
     /// [`review_role_pins_section::assess_review_role_pins`] (#11970).
     pub resync_pins: Vec<(String, Vec<String>)>,
+    /// Managed checkouts whose `origin` names an owner the forge does not
+    /// answer under (#14223), collected by the `loom-daemon health` CLI via
+    /// [`crate::credential_preflight::owner_drift::collect_canonical_drift`]
+    /// from the daemon-reported roots, and rendered by
+    /// [`owner_drift_section::assess_owner_drift`]. `None` when the
+    /// collection could not run at all (the daemon did not answer, so there
+    /// is no root list) — no section, not an all-clear.
+    pub owner_drift: Option<Vec<crate::credential_preflight::owner_drift::CanonicalDrift>>,
 }
 
 // ============================================================================
@@ -2678,6 +2686,14 @@ pub use review_role_pins_section::{
     assess_review_role_pins, is_review_role_pin, pinned_review_roles,
 };
 
+/// The `owner_drift` section (#14223): Degraded when a managed checkout's
+/// `origin` names an owner the forge does not answer under (a transfer the
+/// remote was never re-pointed after), so its reads are shed under a stale
+/// credential.
+mod owner_drift_section;
+
+pub use owner_drift_section::assess_owner_drift;
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2708,8 +2724,9 @@ mod busy;
 ///
 /// Every section is unconditional except `observability` (#4830),
 /// `codesign_identity` (#7605), `limit_calibration` (#8063/#8349), `codex`
-/// (#8407) and `tmpfs_visibility` (#8572), each of which is appended only
-/// when there is something to report — see [`assess_observability`],
+/// (#8407), `tmpfs_visibility` (#8572), `review_role_pins` (#11970) and
+/// `owner_drift` (#14223), each of which is appended only when there is
+/// something to report — see [`assess_observability`],
 /// [`assess_codesign_identity`], [`assess_limit_calibration`],
 /// [`codex_accounts::assess`] and [`assess_tmpfs_visibility`].
 ///
@@ -2753,6 +2770,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_ci_telemetry(inputs));
     sections.extend(assess_fleet_identity(inputs));
     sections.extend(assess_review_role_pins(inputs));
+    sections.extend(assess_owner_drift(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
