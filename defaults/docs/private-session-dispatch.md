@@ -131,6 +131,18 @@ the account-owned checkpoint. A successful remote push alone does not
 transfer private local phase state. Never delete the volume or reset a branch
 to work around a recovery refusal.
 
+A branch can also be held by a clean linked worktree a contained step created
+under the clone (its own issue worktree): the hold passes the dirty check,
+stays invisible to the detached-HEAD scan, and makes the next preparation
+refuse naming the holding path and the branch instead of Git's suppressed
+stderr. When the branch still carries unpublished commits, `accounts session
+recover <account> --discard --branch B` removes the holding worktree and
+deletes the branch (its unpublished commits go with it), or `--publish` first
+pushes them and the worktree is then removed by hand. Publishing alone never
+clears a hold: a published branch is never discarded, so an already-published
+hold is cleared by hand (`accounts session attach <account>`, then
+`git worktree remove <path>` in the clone — nothing unpublished is lost).
+
 ## Credential-free integration evidence
 
 `private_workspace_docker` uses real Docker, Git over authenticated local HTTPS,
