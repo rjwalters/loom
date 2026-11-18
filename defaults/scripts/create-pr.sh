@@ -312,10 +312,29 @@ EX_REVIEW_GATE_COLLISION=6
 # Only the digit-ending-token branch can put a number run in the match
 # before the trailing `#N`, so the extraction takes the LAST number run of
 # the LAST match -- for every other branch first and last coincide.
+#
+# Multi-reference bodies (#14351): when the body declares several references
+# (`Closes #14059` / `Closes #14052` on consecutive lines), the one named by
+# the head branch's `feature/issue-N` wins -- the branch records the issue the
+# Builder actually claimed, which is what the review gate and the
+# superseded-target check should consult. With no such branch, or a branch
+# number absent from the body's references, the last match applies as above.
 _cpr_body_ref_issue() {
   # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
-  grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
-    | tail -1 | grep -oE '[0-9]+' | tail -1 || true
+  local refs branch_n
+  # One number per match: each match ends in `#<digits>`, so the trailing
+  # digit run is the reference itself (never an earlier digit-token prefix).
+  refs="$(grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
+    | grep -oE '[0-9]+$' || true)"
+  [[ -n "$refs" ]] || return 0
+  if [[ "$HEAD_BRANCH" =~ ^feature/issue-([0-9]+)($|[^0-9]) ]]; then
+    branch_n="${BASH_REMATCH[1]}"
+    if grep -qxF "$branch_n" <<< "$refs"; then
+      echo "$branch_n"
+      return 0
+    fi
+  fi
+  tail -1 <<< "$refs"
 }
 
 # An empty body matches nothing (grep's no-match is absorbed by `|| true`).

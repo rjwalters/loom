@@ -11054,12 +11054,16 @@ naming a runtime that never launches is simply never matched.
   suffix (#14320).** The daemon emits its resolved effort as an explicit
   `--effort` arg, which sits above the suffix rung in `spawn-codex.sh`'s
   chain (`explicit -c` > `--effort` > `LOOM_EFFORT` > suffix), and since
-  #14017 the resolver never returns empty for Codex — so no daemon-dispatched
-  Codex launch can take its effort from a `model@effort` suffix. A `roleDraw`
+  #14017 the resolver never returns empty for Codex — so no role-runner or
+  sweep-step Codex launch (the two launch sites that resolve effort) can take
+  its effort from a `model@effort` suffix. A `roleDraw`
   candidate written `codex/<model>@high` therefore yields `medium`
   (source `codex-default`), and `roleEfforts.<role>@codex` is the supported
   way to raise a Codex role's effort from config. The suffix still applies on
-  manual launches where no `--effort`/`LOOM_EFFORT` is supplied
+  manual launches where no `--effort`/`LOOM_EFFORT` is supplied, and on the
+  sweep *orchestrator* launch, which never calls that resolver (the work
+  finder dispatches with no effort): an ad-hoc
+  `dispatch_sweep --model <m>@<e>` with no effort still reaches the suffix rung
   ([runtime-adapters.md](runtime-adapters.md) § model-mapping minimalism).
 - **Unset stays byte-identical on every other runtime.** There is deliberately
   **no** default effort for Claude or any other runtime, and no fall-through to a

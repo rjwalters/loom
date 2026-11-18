@@ -319,15 +319,17 @@ the suffix becomes `-c model_reasoning_effort=<suffix>` at the lowest precedence
 explicit `-c` > `--effort` > `LOOM_EFFORT` > suffix; an empty base falls through to
 `LOOM_CODEX_MODEL`/no `-m`, an empty suffix is ignored; the same split applies to
 `LOOM_CODEX_MODEL`, and an explicit `-m foo@high` arg is passed through unchanged). One
-reachability caveat (#14320): on a **daemon-dispatched** Codex launch the suffix rung
-can no longer take effect — the daemon emits its resolved effort as an explicit
+reachability caveat (#14320): on a **role-runner or sweep-step** Codex launch the
+suffix rung can no longer take effect — the daemon emits its resolved effort as an explicit
 `--effort` arg (second tier of this chain), and since #14017 its resolver supplies
 `medium` (source `codex-default`) for every Codex launch with no configured effort
 tier, so `--effort` is always populated and shadows the suffix. A `roleDraw`
 candidate written `codex/<model>@high` therefore yields `medium`; the supported way
 to raise a Codex role's effort from config is `roleEfforts.<role>@codex`
 ([daemon-reference.md](daemon-reference.md) § role-runner effort). The suffix still
-applies on manual launches where no `--effort`/`LOOM_EFFORT` is supplied. An
+applies on manual launches where no `--effort`/`LOOM_EFFORT` is supplied, and on the
+sweep orchestrator launch (it never calls that resolver): an ad-hoc
+`dispatch_sweep --model <m>@<e>` with no effort still reaches the suffix rung. An
 explicit `-m`/`--model` wins, `LOOM_CODEX_MODEL` supplies an optional static
 adapter default, and with none of those set **no `-m` flag is emitted at all** so
 the Codex CLI/profile default is preserved (exactly `spawn-claude.sh`'s
