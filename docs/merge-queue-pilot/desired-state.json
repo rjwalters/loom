@@ -24,5 +24,5 @@
       "check_response_timeout_minutes": "CI push wall time p90 is 13.9 min (merge-queue-ci.md, 2026-10-04 data); 40 min is ~3x p90, enough for a slow runner day without holding the queue for an hour. Re-derive from the baseline run before cutover."
     }
   },
-  "not_part_of_this_file": ["bypass actors", "any direct-push bypass for the version bump (see 'Prerequisites that are not repository files' in merge-queue-ci.md)"]
+  "not_part_of_this_file": ["bypass actors", "any direct-push bypass for the version bump (see 'Pilot cutover (2AMLogic/loom)' steps 4-5 in defaults/docs/merge-queue-ci.md)"]
 }

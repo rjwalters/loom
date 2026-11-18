@@ -215,9 +215,10 @@ concurrency group. `workflow_run.workflows` names this repo's CI workflow
 1. Phases A and B (#10255, #10256) have landed: the queue controls are present
    and the Champion handoff preserves the safety invariant.
 2. `loom-daemon merge-group-ci eligibility --repo <org>/<repo>` exits 0 for the
-   pilot repository (see "Pilot cutover" above for the full ordered procedure,
-   including broker/App enrollment and the publisher version-bump path). That requires an organization owner, push permission, an
-   active `merge_queue` rule, required checks, and a clean audit.
+   pilot repository (see "Pilot cutover" below for the full ordered procedure,
+   including broker/App enrollment and the publisher version-bump path). That
+   requires an organization owner, push permission, an active `merge_queue`
+   rule, required checks, and a clean audit.
 3. **Operator authorization.** Adding a `merge_queue` rule, changing required
    checks, or transferring a repository are protected settings changes. No
    agent makes them, and nothing in this tooling attempts them.
@@ -285,7 +286,9 @@ Every step is a read except step 6, which is an operator action. Do not set
    ```
    `NO_MERGE_QUEUE_RULE` is expected before step 6 and is the only failure
    allowed. The daemon on the host must include the `merge-group-ci` and
-   `forge merge-queue` subcommands (this change was prepared with 0.19.1306).
+   `forge merge-queue` subcommands (present from 0.19.1306; using the
+   v0.19.1311 that `merge-group-check.yml` pins as `LOOM_VERSION` keeps the
+   host and the workflow on one version).
 4. **Broker / App enrollment (external, must be verified, not assumed).** The
    writer identity that posts `loom/merge-authorization` needs `statuses: write`
    on this repository. If the writer App's grant is read-only or too broad,
