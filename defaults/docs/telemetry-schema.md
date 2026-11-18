@@ -945,6 +945,18 @@ same key and the same rules, so step duration and load can be read by size:
   `Closes #N` link or Builder branch, the issue the classifier joins it to.
   A PR that links only by `Part of`, an unsized issue, or a defective label
   (logged at `warn` once per issue, then at `debug`) carries no key.
+- **`loom.dispatch.step`** also carries `loom.role_draw.pick` (the candidate
+  key, `none` when nothing could launch) and `loom.role_draw.attempt` (#14233)
+  on a spawned step a `runtimes.roleDraw` table decided; neither key on a step
+  no table decided, or one refused before launch, never `0` or `none` as a
+  stand-in. They are the role tick's keys, same names and spelling. **Not
+  `loom.step.draw_attempt`**: that is the 1-based item redraw count within a
+  dispatch slot. Stage steps draw attempt 1 (no failure feed, #14235), so
+  `loom.role_draw.attempt` on this span stays `1` until one lands.
+  **Escalation rate**: for role ticks, count `loom.role_attempt` spans with
+  `loom.role_draw.attempt >= 2` over all `loom.role_attempt` spans, grouped by
+  `loom.role` and `loom.role_draw.pick`. The same query on `loom.dispatch.step`
+  stays flat at attempt 1 until #14235.
 - **The step's `loom.sweep` close** (#12253) carries the same
   `loom.story_points` the step was spawned with, so step duration by
   `(loom.role, loom.story_points)` is one query.

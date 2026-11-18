@@ -12,6 +12,8 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
+use crate::observability::lifecycle::role_draw;
+use crate::runtime_preference::role_draw::RoleDrawRecord;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_spawn::StepDrawTerms;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
@@ -67,6 +69,12 @@ pub struct StepDispatch<'a> {
     /// The launch's reasoning effort (`loom.effort`), when one was resolved
     /// (#14167); `None` when the runtime keeps its session default.
     pub effort: Option<&'a str>,
+    /// The `runtimes.roleDraw` draw that decided the launch (#14233);
+    /// `None` when no table did, or the step was refused before launch.
+    /// Stamps `loom.role_draw.pick` and `loom.role_draw.attempt` only. The
+    /// attempt is the role draw's escalation count (1 + consecutive failed
+    /// attempts), unrelated to `draw_attempt` above, the item redraw count.
+    pub role_draw: Option<&'a RoleDrawRecord>,
 }
 
 /// Selected versus launched model of a spawned step. Distinct on purpose: a
@@ -204,6 +212,11 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
                 .insert("loom.step.model_fallback_reason".into(), fallback.reason.to_string());
         }
     }
+    if let Some(draw) = step.role_draw {
+        attributes
+            .insert(role_draw::PICK.into(), draw.pick.clone().unwrap_or_else(|| "none".into()));
+        attributes.insert(role_draw::ATTEMPT.into(), draw.attempt.to_string());
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -261,6 +274,7 @@ mod tests {
             models: None,
             runtime: Some("claude"),
             effort: Some("high"),
+            role_draw: None,
         }
     }
 
@@ -393,6 +407,48 @@ mod tests {
         );
         assert!(!unset.attributes.contains_key("loom.runtime"));
         assert!(!unset.attributes.contains_key("loom.effort"));
+    }
+
+    /// #14233: a step a `roleDraw` table decided carries the draw's pick and
+    /// escalation attempt (not `draw_attempt`, the item redraw count); a step
+    /// no table decided carries neither key, never `0` or `none`.
+    #[test]
+    fn a_role_drawn_step_names_the_pick_and_attempt() {
+        use crate::runtime_preference::role_draw::{DrawWeight, Layer};
+        let record = RoleDrawRecord {
+            role: "judge".into(),
+            attempt: 2,
+            table_attempt: 2,
+            layer: Layer::FleetRepo,
+            table: vec![DrawWeight {
+                candidate: "codex".into(),
+                weight: 100,
+            }],
+            off: Vec::new(),
+            seed: "00000000000000ff".into(),
+            seed_inputs: None,
+            steps: Vec::new(),
+            passed_over: Vec::new(),
+            pick: Some("codex".into()),
+            model: None,
+        };
+        let step = StepDispatch {
+            role_draw: Some(&record),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.role_draw.pick"], "codex");
+        assert_eq!(span.attributes["loom.role_draw.attempt"], "2");
+        assert_eq!(span.attributes["loom.step.draw_attempt"], "3", "item redraws stay apart");
+        for key in ["loom.role_draw.pick", "loom.role_draw.attempt"] {
+            assert!(
+                crate::observability::lifecycle::role_draw::KEYS.contains(&key),
+                "{key} is dropped at export"
+            );
+        }
+        let undrawn = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(!undrawn.attributes.contains_key("loom.role_draw.pick"));
+        assert!(!undrawn.attributes.contains_key("loom.role_draw.attempt"));
     }
 
     /// #12450: a granted step carries the captain's assignment, and it
