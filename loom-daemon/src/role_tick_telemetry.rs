@@ -55,9 +55,11 @@
 //!   dispatch header so an earlier dispatch's lines in the same reused log are
 //!   never attributed to this one. The exact native session ids parsed from
 //!   that region (OpenCode's event-stream `sessionID`, Codex's
-//!   `session id: <uuid>` banner) key the token stores directly — more
-//!   precise than directory+window, which cannot separate two concurrent
-//!   same-role steps in one workspace.
+//!   `session id: <uuid>` banner) narrow the token stores — more precise than
+//!   directory+window, which cannot separate two concurrent same-role steps
+//!   in one workspace. OpenCode's id is the whole key; Codex's ids are still
+//!   ANDed with the workspace directory and window (see
+//!   [`crate::usage_source::role_tick_tokens_by_model`]).
 //!
 //! # Attribution is time-and-role scoped, and says so
 //!

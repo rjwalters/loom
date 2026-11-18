@@ -592,10 +592,23 @@ pub fn sweep_tokens_by_window(
 ///
 /// `session_ids` (#14048) are the exact native session ids parsed from that
 /// same log's dispatch region. The OpenCode and Codex arms key on them
-/// directly when present — the id cannot name another launch's session — and
-/// fall back to the directory+window key when empty (a role tick, or a step
-/// whose log was unreadable). The Kimi arm has no id source yet (see
-/// `crate::kimi_usage`'s module doc) and keeps the directory+window key.
+/// when present, and fall back to the directory+window key when empty (a role
+/// tick, or a step whose log was unreadable). The two arms are NOT symmetric:
+///
+/// - **OpenCode**: the id is the whole key — no directory, no window — because
+///   the id cannot name another launch's session.
+/// - **Codex**: the ids are ANDed with the workspace directory and the window
+///   (`SessionFilter::matches` in `codex_usage`), so an id-named rollout whose
+///   `cwd` is not the workspace root, or that started outside the window, is
+///   not attributed. The window is kept deliberately: it bounds the rollout
+///   scan to the window's date directories, where dropping it would read
+///   every rollout in the store. A step child's cwd is pinned to the workspace
+///   root, so the directory constraint holds for every step dispatch today; a
+///   launch path that runs Codex from a worktree would need an ids-only
+///   filter here.
+///
+/// The Kimi arm has no id source yet (see `crate::kimi_usage`'s module doc)
+/// and keeps the directory+window key.
 #[must_use]
 pub fn role_tick_tokens_by_model(
     runtime: Option<&str>,
