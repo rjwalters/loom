@@ -15,9 +15,9 @@
 #
 # Examples:
 #   ./.loom/bin/loom start                  Start all configured agents
-#   ./.loom/bin/loom start --only shepherd  Start only shepherd agents
+#   ./.loom/bin/loom start --only builder   Start only builder agents
 #   ./.loom/bin/loom status                 Show current state
-#   ./.loom/bin/loom attach shepherd-1      Connect to terminal
+#   ./.loom/bin/loom attach builder-1       Connect to terminal
 #   ./.loom/bin/loom stop                   Graceful shutdown
 #   ./.loom/bin/loom stop --force           Force kill all sessions
 #   ./.loom/bin/loom logs terminal-1        Tail agent output
@@ -79,23 +79,18 @@ else
     NC=''
 fi
 
-# Dispatch to subcommands
+# Dispatch to subcommands. The script commands (start/status/stop/attach/
+# logs/send) all exec the matching loom-<verb>.sh from the CLI directory;
+# that set ships and installs together with this wrapper, so a missing one
+# is an install problem, not a usage one (#13899).
 case "${1:-help}" in
-    start)
+    start|status|stop|attach|logs|send)
+        cmd="$1"
         shift
-        if [[ -f "$CLI_DIR/loom-start.sh" ]]; then
-            exec "$CLI_DIR/loom-start.sh" "$@"
+        if [[ -f "$CLI_DIR/loom-${cmd}.sh" ]]; then
+            exec "$CLI_DIR/loom-${cmd}.sh" "$@"
         else
-            echo -e "${RED}Error: loom-start.sh not found${NC}" >&2
-            exit 1
-        fi
-        ;;
-    status)
-        shift
-        if [[ -f "$CLI_DIR/loom-status.sh" ]]; then
-            exec "$CLI_DIR/loom-status.sh" "$@"
-        else
-            echo -e "${RED}Error: loom-status.sh not found${NC}" >&2
+            echo -e "${RED}Error: loom-${cmd}.sh not found${NC}" >&2
             exit 1
         fi
         ;;
@@ -130,86 +125,24 @@ case "${1:-help}" in
             exit 1
         fi
         ;;
-    stop)
-        shift
-        if [[ -f "$CLI_DIR/loom-stop.sh" ]]; then
-            exec "$CLI_DIR/loom-stop.sh" "$@"
-        else
-            echo -e "${RED}Error: loom-stop.sh not found${NC}" >&2
-            exit 1
-        fi
-        ;;
-    attach)
-        shift
-        if [[ -f "$CLI_DIR/loom-attach.sh" ]]; then
-            exec "$CLI_DIR/loom-attach.sh" "$@"
-        else
-            echo -e "${RED}Error: loom-attach.sh not found${NC}" >&2
-            exit 1
-        fi
-        ;;
-    logs)
-        shift
-        if [[ -f "$CLI_DIR/loom-logs.sh" ]]; then
-            exec "$CLI_DIR/loom-logs.sh" "$@"
-        else
-            echo -e "${RED}Error: loom-logs.sh not found${NC}" >&2
-            exit 1
-        fi
-        ;;
-    send)
-        shift
-        if [[ -f "$CLI_DIR/loom-send.sh" ]]; then
-            exec "$CLI_DIR/loom-send.sh" "$@"
-        else
-            echo -e "${RED}Error: loom-send.sh not found${NC}" >&2
-            exit 1
-        fi
-        ;;
     help|--help|-h)
         shift || true
         if [[ -f "$CLI_DIR/loom-help.sh" ]]; then
             exec "$CLI_DIR/loom-help.sh" "$@"
         else
-            # Inline help if loom-help.sh not yet installed
-            cat <<'EOF'
-Loom CLI - tmux agent pool management
-
-USAGE:
-    ./.loom/bin/loom <command> [options]
-
-COMMANDS:
-    start     Spawn agent pool from .loom/config.json
-    status    Display agent pool state and work queues
-    health    Diagnostic daemon health check
-    stop      Graceful shutdown (or --force to kill immediately)
-    attach    Open live tmux session for an agent
-    send      Send command to agent session
-    logs      Tail agent output
-    help      Show this help message
-
-EXAMPLES:
-    ./.loom/bin/loom start                  Start all configured agents
-    ./.loom/bin/loom start --only shepherd  Start only shepherd agents
-    ./.loom/bin/loom status                 Show current state
-    ./.loom/bin/loom status --json          Machine-readable status
-    ./.loom/bin/loom attach shepherd-1      Connect to agent terminal
-    ./.loom/bin/loom send shepherd-1 "/loom:shepherd 123"  Send command to agent
-    ./.loom/bin/loom stop                   Graceful shutdown
-    ./.loom/bin/loom stop --force           Force kill all sessions
-    ./.loom/bin/loom stop shepherd-1        Stop single agent
-    ./.loom/bin/loom logs terminal-1        Tail agent output
-    ./.loom/bin/loom logs --all             Tail all agent logs
-
-For command-specific help:
-    ./.loom/bin/loom <command> --help
-EOF
-            exit 0
+            echo -e "${RED}Error: loom-help.sh not found${NC}" >&2
+            exit 1
         fi
         ;;
     version|--version|-v)
-        echo "Loom CLI v0.1.0"
-        exit 0
+        # loom-help.sh is the single source of the CLI version string
+        # (help footer + --version output, #13899).
+        if [[ -f "$CLI_DIR/loom-help.sh" ]]; then
+            exec "$CLI_DIR/loom-help.sh" --version
+        else
+            echo -e "${RED}Error: loom-help.sh not found${NC}" >&2
+            exit 1
+        fi
         ;;
     *)
         echo -e "${RED}Error: Unknown command '$1'${NC}" >&2

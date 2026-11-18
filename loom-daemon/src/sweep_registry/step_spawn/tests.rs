@@ -308,7 +308,6 @@ fn a_step_past_its_timeout_is_reaped_and_its_claim_restored() {
                 effort: None,
                 depends_on: None,
                 repo: None,
-                overflow: false,
             },
         );
         (id, pid)

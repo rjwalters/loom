@@ -134,7 +134,6 @@ mod model;
 pub(crate) mod model_fallback;
 mod noop_cooldown;
 mod outcome_journal;
-mod overflow;
 pub(crate) mod published_repo;
 mod resolved_facts;
 // `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
@@ -2020,7 +2019,6 @@ mod tests {
             effort: Some("xhigh".to_string()),
             depends_on: None,
             repo: None,
-            overflow: false,
         };
         let json = serde_json::to_value(vec![info]).unwrap();
         let expected = serde_json::json!([{

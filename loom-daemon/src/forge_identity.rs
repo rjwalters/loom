@@ -342,21 +342,27 @@ pub fn from_config(
     roster
 }
 
+/// The `writers[]` entry whose `owners` lists `owner` (case-insensitive),
+/// without the default-writer fallback (`None`: no per-owner writer covers
+/// `owner`). The half of [`writer_for_owner`] the #13929 probe establishment
+/// needs: an owner only the default writer covers must not be minted for, so
+/// its `forge may-write` answer stays today's ambient probe.
+#[must_use]
+pub fn per_owner_writer_for<'a>(roster: &'a Roster, owner: &str) -> Option<&'a Identity> {
+    roster.writers.iter().find(|w| {
+        w.owners
+            .as_ref()
+            .is_some_and(|l| l.iter().any(|o| o.eq_ignore_ascii_case(owner)))
+    })
+}
+
 /// The writer that writes for `owner` (case-insensitive): the first
 /// `writers[]` entry whose `owners` lists it, else the default
 /// [`Roster::writer`] (#12446). Mirrors `github-app-token.sh`, so the daemon
 /// and the scripts mint as the same App for an owner.
 #[must_use]
 pub fn writer_for_owner<'a>(roster: &'a Roster, owner: &str) -> Option<&'a Identity> {
-    roster
-        .writers
-        .iter()
-        .find(|w| {
-            w.owners
-                .as_ref()
-                .is_some_and(|l| l.iter().any(|o| o.eq_ignore_ascii_case(owner)))
-        })
-        .or(roster.writer.as_ref())
+    per_owner_writer_for(roster, owner).or(roster.writer.as_ref())
 }
 
 /// Config problems an operator should see: the writer declared in

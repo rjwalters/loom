@@ -345,9 +345,6 @@ impl WorkDispatcher for BeforePrefilter {
     fn dispatch(&mut self, issue: u32) -> Result<bool> {
         self.0.dispatch(issue)
     }
-    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
-        self.0.dispatch_with(issue, overflow)
-    }
 }
 
 const N: u32 = 12;

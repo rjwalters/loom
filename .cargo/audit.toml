@@ -10,4 +10,8 @@ ignore = [
     "RUSTSEC-2025-0081",  # unmaintained
     "RUSTSEC-2025-0098",  # unmaintained
     "RUSTSEC-2025-0100",  # unmaintained
+    # chrono 0.4.45 unmaintained (chronotope/chrono#1768), no patched release;
+    # goes away once loom-daemon no longer depends on chrono, or a maintained
+    # chrono release is published
+    "RUSTSEC-2026-0543",
 ]

@@ -700,9 +700,8 @@ pub fn run_once(db_path: &Path, window_hours: i64) -> Result<IngestStats> {
 
 /// Start the periodic ingestion thread unless this host opted out.
 ///
-/// Mirrors `metrics_collector::try_init_metrics_collector`: returns the
-/// `JoinHandle` (whose thread keeps running when the handle is dropped) or
-/// `None` when the feature is off. `repo_root` is read only for
+/// Returns the `JoinHandle` (whose thread keeps running when the handle is
+/// dropped) or `None` when the feature is off. `repo_root` is read only for
 /// [`read_transcript_ingest_config`] — ingestion itself is workspace-
 /// independent (see the module doc).
 pub fn try_init_transcript_ingest(

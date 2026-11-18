@@ -830,7 +830,7 @@ impl SweepRegistry {
 
     /// Consecutive PR-less releases recorded for `issue` (Issue #7972). `0` when
     /// none is on record. Test/inspection helper, mirroring
-    /// [`Self::noop_release_count`].
+    /// [`Self::dispatch_failure_count`].
     #[must_use]
     pub fn prless_release_count(&self, issue: u32) -> u32 {
         self.prless_retry.get(&issue).map_or(0, |s| s.consecutive)

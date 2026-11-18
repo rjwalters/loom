@@ -170,37 +170,6 @@ fn test_handle_request_get_claims_summary() {
     }
 }
 
-// ===== CaptureGitChanges with nonexistent dir =====
-
-#[test]
-fn test_handle_request_capture_git_changes_no_repo() {
-    let (tm, db, sr, bus) = setup_test_context();
-    let response = handle_request(
-        Request::CaptureGitChanges {
-            input_id: 1,
-            working_dir: "/nonexistent/path".to_string(),
-            before_commit: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
-    match response {
-        Response::GitChangesCaptured {
-            files_changed,
-            lines_added,
-            lines_removed,
-        } => {
-            assert_eq!(files_changed, 0);
-            assert_eq!(lines_added, 0);
-            assert_eq!(lines_removed, 0);
-        }
-        other => panic!("Expected GitChangesCaptured, got: {other:?}"),
-    }
-}
-
 // ===== SendInput / GetTerminalOutput input correlation (Issue #4554) =====
 
 /// End-to-end proof that a `SendInput` turn's `agent_inputs.id` is threaded
@@ -2773,7 +2742,11 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
         }
         other => panic!("Expected NoopReleaseRecorded, got: {other:?}"),
     }
-    assert_eq!(sr.lock().unwrap().noop_release_count(6670), 1);
+    assert!(sr
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(6670, Utc::now())
+        .is_some());
 }
 
 #[test]
@@ -2961,11 +2934,10 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
     assert!(
         sr_b.lock()
             .unwrap()
-            .noop_cooldown_issues(now)
-            .contains(&EPIC_PHASE_ISSUE),
+            .noop_cooldown_remaining(EPIC_PHASE_ISSUE, now)
+            .is_some(),
         "repo B's own registry must see the armed cooldown for its issue"
     );
-    assert_eq!(sr_b.lock().unwrap().noop_release_count(EPIC_PHASE_ISSUE), 1);
 
     // The WRONG registry (the daemon's cwd-seeded default, repo A) must
     // NOT see it — this is the exact failure mode #6957 reports: a
@@ -2979,13 +2951,11 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
             .contains(&EPIC_PHASE_ISSUE),
         "the default (wrong) registry must NOT see repo B's cooldown"
     );
-    assert_eq!(
-        sr_default
-            .lock()
-            .unwrap()
-            .noop_release_count(EPIC_PHASE_ISSUE),
-        0
-    );
+    assert!(sr_default
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(EPIC_PHASE_ISSUE, now)
+        .is_none());
 }
 
 /// Issue #6957 (edge case from the acceptance criteria): a
@@ -3022,7 +2992,11 @@ fn test_record_noop_release_none_workspace_root_still_targets_default() {
             ..
         }
     ));
-    assert_eq!(sr.lock().unwrap().noop_release_count(6959), 1);
+    assert!(sr
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(6959, Utc::now())
+        .is_some());
 }
 
 // ===== ListQuarantines (Issue #4215) =====

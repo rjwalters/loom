@@ -1,6 +1,6 @@
 # Fixture: Method count must use node.body, not ast.walk (#13884)
 # AlgorithmRunner has 2 real methods; the nested helper defs inside run()
-# made the old ast.walk-based count see 11 defs and suppress the flag via
+# made the old ast.walk-based count see 10 defs and suppress the flag via
 # the 10+-method namespace exclusion. Expected: FLAGGED.
 class AlgorithmRunner:
     def run(self, seed):

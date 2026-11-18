@@ -72,10 +72,9 @@
 //!   and is unrelated to a concurrently live, *re-dispatched* sweep for the
 //!   same issue is still reapable — the exact #5110 shape a blanket
 //!   issue-scoped gate could never reach. When the root **cannot** be resolved
-//!   (a stale lock, an unparseable owner, a claim tracked only through the
-//!   legacy spawn-loop-state union), the whole worktree is protected exactly as
-//!   before. The claim is re-checked immediately before each kill, and a claim
-//!   that *changed* since the plan was built fails closed;
+//!   (a stale lock, an unparseable owner), the whole worktree is protected
+//!   exactly as before. The claim is re-checked immediately before each kill,
+//!   and a claim that *changed* since the plan was built fails closed;
 //! - **no live agent runtime is working inside the worktree**
 //!   ([`looks_like_agent`]) — the incident's defining property is that the agent
 //!   was *gone*, so a live `claude`/`codex`/`/loom:…` process in the worktree
@@ -984,10 +983,9 @@ pub enum OwnershipVerdict {
 /// where "who owns this worktree" becomes pid-scoped: when the claim's own root
 /// pid can be confirmed live, the verdict is [`OwnershipVerdict::LiveSweep`] and
 /// the discrimination happens per-pid in [`plan_orphan_trees`]. When it cannot
-/// (a stale lock, an unparseable owner, or a claim tracked only through the
-/// legacy spawn-loop-state union with no lock dir at all), there is nothing to
-/// compare a candidate against, so the verdict falls back to a whole-worktree
-/// [`OwnershipVerdict::Skip`] — exactly the pre-#5135 behaviour.
+/// (a stale lock, an unparseable owner, or no lock dir at all), there is
+/// nothing to compare a candidate against, so the verdict falls back to a
+/// whole-worktree [`OwnershipVerdict::Skip`] — exactly the pre-#5135 behaviour.
 ///
 /// The probes are injected so the gate chain is testable without a forge, a
 /// process table, or a live sweep.
