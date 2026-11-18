@@ -128,6 +128,10 @@ mod lease_episode;
 pub mod lease_step;
 mod locks;
 mod model;
+// Selection-time model fallback (`autonomous.modelFallback`, #13873) —
+// `pub(crate)` for the pool preflights (role runner, work finder, preference
+// availability) that read it from outside `sweep_registry`.
+pub(crate) mod model_fallback;
 mod noop_cooldown;
 mod outcome_journal;
 pub(crate) mod published_repo;

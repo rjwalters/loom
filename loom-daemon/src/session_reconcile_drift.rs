@@ -390,6 +390,14 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
         Some(start) => (start.workspace, Some(start.image)),
         None => (label.to_path_buf(), account_mem.image.clone()),
     };
+    // The configured override image (issue #14019) beats the recorded start's
+    // image, as in the missing-container recreate: a stale recorded pin would
+    // put the seat back on an image the operator has since replaced (and skip
+    // the bundle verification, which only runs for the configured image).
+    let image = inputs
+        .session_config
+        .and_then(|config| config.image.clone())
+        .or(image);
     let mem = &mut account_mem.drift;
     if let Err(error) = super::skew::guard_image(inputs, image.as_deref()) {
         let why = format!("recreating from the recorded image is refused: {error:#}");

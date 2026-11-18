@@ -6271,6 +6271,8 @@ knobs not yet audited here.
 | Config key | Env override | Default | Notes |
 |------------|--------------|---------|-------|
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
+| `autonomous.modelFallback.enabled` | *(config only)* | `false` | Selection-time model fallback (#13873): with `true`, a role tick / step spawn whose configured model's *class* has no usable pool account falls one rung down `modelFallback.chain` instead of holding, and the pool preflights scope their exhaustion verdict to the class the launch would run. Absent/false reproduces pre-#13873 behaviour exactly |
+| `autonomous.modelFallback.chain` | *(config only)* | `["fable", "opus", "sonnet"]` | The fallback ladder, strongest first (#13873); walked strictly **below** the configured model (never climbs; a configured model not in the chain never falls back). Blank/unrecognized entries are skipped, not fatal |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default. **Restart required** — the ticker is built once at startup with this period (#12090 follow-up) |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512, and the only sweep cap since #12406 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
@@ -10561,6 +10563,102 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 [`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
 `git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
 
+### Configured session image and extra read-only mounts (#14019)
+
+By default a contained session runs from the released
+`ghcr.io/rjwalters/loom-worker-session:<daemon version>` image, selected by
+the daemon's own version. A repo whose checks need a domain toolchain (EDA
+tools, a Rust toolchain, simulators) can instead run its sessions from a
+**derived image** and give them **extra read-only data mounts**, via two
+config keys readable at every tier (`config_resolver`: host-shared defaults
+through `.loom-local/local.json`):
+
+```json
+{
+  "accounts": {
+    "session": {
+      "image": "ghcr.io/example/loom-worker-session-eda@sha256:0123abcd…",
+      "extraMounts": [
+        { "host": "/opt/pdk", "container": "/opt/pdk" }
+      ]
+    }
+  }
+}
+```
+
+| Config key | Tier | Value |
+|---|---|---|
+| — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
+| — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. |
+
+**Precedence**: `accounts session start --image IMAGE` (the operator's own
+invocation) beats `accounts.session.image`, which beats the stock default.
+The extra mounts ride either way. Only a container created from the
+**configured** image gets the bundle verification below — a hand-picked
+`--image` keeps its historical behaviour.
+
+**The override image must carry the sealed control bundle.** A derived
+image is built `FROM` the released session image, so
+`/opt/loom/private-control/` comes along
+([`private-control-bundle.md`](private-control-bundle.md)). Before any
+container is created from the configured image — operator `start`,
+reconcile recreate, `shell` — the daemon probes it in a throwaway
+container (no network, no mounts, read-only rootfs, `--cap-drop ALL`) and
+refuses the image unless its manifest matches this daemon's enforced
+protocol, control version, forced policy and managed registration, and
+every sealed asset's recomputed digest matches what its manifest recorded.
+The refusal names the offending asset or field.
+
+**A daemon roll has a defined behaviour: refuse.** The enforced constants
+are the running daemon's, so a roll that bumps the control boundary fails a
+not-yet-rebuilt override image closed at the next create; and the
+version-skew reconciler never recreates an override seat at all — not from
+its own digest pin (it would reproduce the same skew) and never from the
+stock tag. The seat stays on its running container with a WARN that says
+to rebuild the derived image on the new base, update the digest pin, then
+stop and start the seat. It never silently runs a stale bundle and never
+silently falls back to the stock image.
+
+**Denials for the extra mounts** extend the one session mount denylist
+(`session_mount_gate`), enforced at every create:
+
+* the **host source** passes the same denials the workspace roots do —
+  never `/`, the home directory or an ancestor of it, and never anything
+  overlapping a `firewall: true` repository (a read-only copy of a secret
+  is still a copy);
+* the **container target** never shadows — and is never nested inside —
+  the workspace mounts (path parity), the `CODEX_HOME` profile (whose
+  three control files are read-only mount points), the sealed bundle
+  (`/opt/loom/private-control`), or a GitHub App credential path;
+* no two extra mounts overlap each other (Docker would mount them in argv
+  order and one of the two would not be what the operator asked for).
+
+Extra mounts are for **data** — PDKs, model files, caches. Tools belong in
+a derived image: system-package tools are linked against shared libraries
+across `/usr`, which no per-path mount can carry. The mounts a container
+was created with are recorded in its `loom.extra-mounts` label; `accounts
+session status` (text and `--json`) reports them. The override and the
+mounts apply to **host-mode sessions only** — private-clone sessions keep
+their own image handling and their exactly-counted mount inventory. The
+pass makes no extra Docker call for an unset config, and a malformed
+`accounts.session` block refuses an operator `start` outright (the
+reconcile pass warns and carries on; it never puts a fresh seat on the
+stock image because the override failed to parse).
+
+**Image retention.** `autonomous.dockerImageRetention.trackedRepos` accepts
+any repository name, so the derived image's repository can be tracked (its
+old tags then pruned per `keepLastN`):
+
+```json
+{ "autonomous": { "dockerImageRetention": {
+    "trackedRepos": ["loom-worker-session", "ghcr.io/example/loom-worker-session-eda"] } } }
+```
+
+See `loom-daemon/src/tokens_pool/session_image.rs`,
+`session_mount_gate.rs`, `session_lifecycle.rs` and
+`session_reconcile_skew.rs`; how to build a derived image is in
+`docker/session/README.md`.
+
 ### Codex session-container reconciler (#10453)
 
 The daemon restarts dead Codex session containers itself
@@ -11132,6 +11230,65 @@ The same pass-through can be requested deliberately with
 `autonomous.roleRunner.roleModels.<role> = "default"` (or the global
 `autonomous.roleRunner.model`); see
 [`runtime-adapters.md` § "Per-role model override"](runtime-adapters.md#per-role-model-override-autonomousrolerunnerrolemodels).
+
+**Pinned models fall back one rung at selection time when their class limit
+is hit (#13873).** A model pin has no answer to an org-wide class ceiling:
+when every pool account is bad-marked `[model-class:fable]` (#8058/#13872),
+rotation has nothing to rotate to, the pool preflights hold dispatch, and
+the fleet idles until an operator moves every role off the pinned model by
+hand (the 2026-11-13 fable incident). `autonomous.modelFallback` makes the
+daemon fall a rung automatically instead — keep the stronger model
+configured; when its limit resets, the next spawn returns to it:
+
+```json
+{
+  "autonomous": {
+    "model": "fable",
+    "modelFallback": { "enabled": true, "chain": ["fable", "opus", "sonnet"] }
+  }
+}
+```
+
+- **Default off.** An absent block — or `"enabled": false` — reproduces the
+  pre-#13873 behaviour byte-for-byte, on every path below. Rollout is an
+  explicit per-repo choice; the shipped `chain` is `fable → opus → sonnet`
+  (the sweep ladder's upper rungs), configurable per repo through the
+  effective config like the model keys.
+- **What falls back.** Role-runner ticks and step-engine spawns (every
+  `StepRole`, including Builder steps): after the model-resolution chain
+  above resolves the configured model, the daemon probes the pool for that
+  model's *class* and, finding no usable account, walks the chain strictly
+  **below** the configured model to the first rung with one and launches
+  that. The walk never climbs: a configured model absent from the chain has
+  no provable "below" and never falls back (a weak pin can never silently
+  reach fable, #4501's original defect). Blank or unrecognized chain
+  entries are skipped, never fatal. When no rung is usable the launch holds
+  exactly as before.
+- **Nothing is sticky.** Config and pool state are re-read on every spawn,
+  so the moment an account usable for the configured model reappears (mark
+  expired, `tokens unblock`, probe headroom), the next spawn uses the
+  configured model again. An explicit-credential spawn
+  (`CLAUDE_CODE_OAUTH_TOKEN` / `LOOM_SPAWN_NO_EXPORT`) never consults the
+  pool and never changes model.
+- **The pool preflights follow.** With the block enabled, the role runner's
+  pre-spawn gate, the work finder's pool hold and the preference walk's
+  availability read all scope their "exhausted" verdict to the class of the
+  model the launch would actually run (or, model-less, ask whether *any*
+  known model class could spawn — an account counts while some rung stays
+  unmarked for it) — so a fable-exhausted pool with healthy opus capacity
+  dispatches instead of idling the fleet. A class-less mark (or an auth
+  mark) still holds everything, and so does an account bad-marked for
+  every class: a credential with no unmarked rung has nothing to fall to.
+- **Telemetry.** Each `loom.dispatch.step` span records
+  `loom.step.model_configured` (the pre-fallback model) alongside
+  `loom.step.model_launched`, plus `loom.step.model_fallback_from` /
+  `loom.step.model_fallback_reason` (`no-account-for-class`) when a
+  fallback fired — how an operator sees how much work ran below its
+  configured model. The role-runner per-role log header names the fallback
+  through the model source label.
+- **In-flight re-dispatch is separate (#13905).** This is the
+  *selection-time* half only; re-dispatching a child that dies mid-run on
+  `hit your <Model> limit`, and its quarantine exemption, is #13905.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an

@@ -1007,6 +1007,78 @@ fn claude_availability_agrees_with_the_preflight_gate() {
         assert_eq!(state.source(), &CredentialSource::ClaudeTokens);
     }
 
+    // #13873 (PR #14088 review): the same agreement across the
+    // `modelFallback` toggle, with class-scoped marks and a role model the
+    // gate can resolve — the mapping reads the pool-level any-class state,
+    // the gate walks the resolved model's rung chain, and the two must
+    // render the same verdict at both ends of the spectrum.
+    write_config(
+        dir.path(),
+        &serde_json::json!({
+            "runtimes": {"default": "claude"},
+            "autonomous": {
+                "roleRunner": {"model": "fable"},
+                "modelFallback": {"enabled": true}
+            }
+        }),
+    );
+    provision_claude_pool(dir.path(), 2);
+    // State A — fable-only marks: a lower rung can serve the launch (the
+    // gate walks to opus) and the any-class read still sees capacity, so
+    // neither side reports a wall.
+    for account in ["account0", "account1"] {
+        crate::tokens_pool::bad_tokens::mark_bad_for_model(
+            dir.path(),
+            account,
+            "exhausted: hit your limit",
+            Some("fable"),
+        )
+        .unwrap();
+    }
+    let gate_skips = crate::role_runner::runtime_preflight::static_check(
+        dir.path(),
+        &logs,
+        "builder",
+        Some(&Ok(admitted.clone())),
+    )
+    .is_some();
+    let state = availability(dir.path(), &tap, &admitted, 0);
+    assert_eq!(
+        gate_skips,
+        !state.is_spawnable(),
+        "fable-only marks: gate_skips={gate_skips} availability={state:?}"
+    );
+    assert!(state.is_spawnable(), "{state:?}");
+    // State B — every class marked on every account: the chain walk is
+    // dead and the gate skips; no known class could spawn from any
+    // account, so the mapping must report Exhausted — the every-rung-dead
+    // state the whole feature exists for, on both read paths at once.
+    for account in ["account0", "account1"] {
+        for model in ["claude-opus-5", "sonnet", "haiku"] {
+            crate::tokens_pool::bad_tokens::mark_bad_for_model(
+                dir.path(),
+                account,
+                "exhausted: hit your limit",
+                Some(model),
+            )
+            .unwrap();
+        }
+    }
+    let gate_skips = crate::role_runner::runtime_preflight::static_check(
+        dir.path(),
+        &logs,
+        "builder",
+        Some(&Ok(admitted.clone())),
+    )
+    .is_some();
+    let state = availability(dir.path(), &tap, &admitted, 0);
+    assert_eq!(
+        gate_skips,
+        !state.is_spawnable(),
+        "every class marked: gate_skips={gate_skips} availability={state:?}"
+    );
+    assert!(gate_skips);
+
     // The unprovisioned pool is the permanent hold, not the self-healing one:
     // no amount of waiting makes a token appear.
     provision_claude_pool(dir.path(), 0);
