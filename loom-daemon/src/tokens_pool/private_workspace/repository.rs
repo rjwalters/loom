@@ -331,6 +331,15 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
         git(&repo, &["check-ref-format", "--branch", branch])?;
         // Never reset an existing branch. Resumption keeps its published tip.
         if git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_ok() {
+            // A contained step creates its own worktree under the clone
+            // (#14122): clean and inside the volume, so `clean_worktrees`
+            // passes it, `stranded_heads` skips its named branch, and Git
+            // would refuse the switch below with its stderr suppressed.
+            // Name the holder and the cure that actually clears each shape
+            // of the hold instead.
+            if let Some(holder) = holding_worktree(&repo, branch)? {
+                bail!("{}", held_branch_refusal(&repo, &holder, branch, &args.account)?);
+            }
             git(&repo, &["switch", branch])?;
         } else {
             let remote_branch = format!("refs/remotes/origin/{branch}");
@@ -378,6 +387,64 @@ pub(super) fn stranded_heads(repo: &Path) -> Result<Vec<DetachedWork>> {
         }
     }
     Ok(stranded)
+}
+
+/// The first linked worktree whose checkout holds `branch`, if any. At most
+/// one exists: Git never checks a branch out in two worktrees. The main
+/// checkout is skipped — holding the branch there is what preparation itself
+/// establishes, and switching to it is a no-op, not a refusal.
+pub(super) fn holding_worktree(repo: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let main = repo.canonicalize()?;
+    for worktree in worktrees(repo)? {
+        if worktree.canonicalize()? == main {
+            continue;
+        }
+        if git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() == branch {
+            return Ok(Some(worktree));
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal for a linked worktree holding the requested branch (#14122).
+/// Names the holding path, the branch, and the cure that actually clears the
+/// hold. Recovery cannot clear a published branch's hold — `--publish` only
+/// re-pushes and `--discard` never deletes a branch carrying no unpublished
+/// commits — so an already-published hold names the hand removal that works.
+pub(super) fn held_branch_refusal(
+    repo: &Path,
+    holder: &Path,
+    branch: &str,
+    account: &str,
+) -> Result<String> {
+    let ahead = ahead_of_origin(repo, &format!("refs/heads/{branch}"))?;
+    let mut message = format!(
+        "linked worktree {} holds {branch}; Git refuses a branch already \
+         checked out in another worktree, and the hold survives every reuse",
+        holder.display()
+    );
+    if ahead > 0 {
+        message.push_str(&format!(
+            "; clear it with `loom-daemon accounts session recover {account} \
+             --discard --branch {branch}` (removes this worktree and deletes \
+             the branch, its {ahead} unpublished commit(s) included), or push \
+             them first (`recover {account} --publish`) and remove the \
+             worktree by hand (`accounts session attach {account}`, then \
+             `git worktree remove {path}`) — a published branch is never \
+             discarded",
+            path = holder.display(),
+        ));
+    } else {
+        message.push_str(&format!(
+            "; the branch is already on origin, where `recover {account}` \
+             cannot clear the hold (`--publish` only re-pushes it, `--discard` \
+             ignores a branch with no unpublished commits), so remove the \
+             worktree by hand (`accounts session attach {account}`, then \
+             `git worktree remove {path}`) — nothing unpublished is lost",
+            path = holder.display(),
+        ));
+    }
+    Ok(message)
 }
 
 /// Every local branch with commits no remote-tracking ref of `origin`
@@ -718,13 +785,14 @@ fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Loom's lease-renewal store (`Store::from_env`, `$HOME/.loom/lease-renew`
-/// unless overridden) is written inside a seat clone when the container's
-/// `$HOME` resolves to the clone root (#14160): an untracked
-/// `.loom/lease-renew/.lock` there is runtime residue, not stranded work,
-/// and must never refuse preparation. The seat env sets
-/// `LOOM_LEASE_RENEW_STATE_DIR` so new writes land on the cache volume; the
-/// exclude also forgives residue left by an older container.
+/// An untracked `.loom/lease-renew/.lock` has been observed in seat clones
+/// (#14160): runtime residue, not stranded work, so it must never refuse
+/// preparation. The writer is not traced (#14226): the store
+/// (`Store::from_env`) defaults to `$HOME/.loom/lease-renew`, and the seat
+/// container's `$HOME` is `/home/loom`, not the clone root. The seat env sets
+/// `LOOM_LEASE_RENEW_STATE_DIR` so store writes land on the cache volume; the
+/// exclude forgives residue whatever wrote it, including from an older
+/// container.
 const LEASE_RENEW_EXCLUDE: &str = ":(exclude).loom/lease-renew";
 
 /// The dirty refusal names at most this many paths, so an operator can tell

@@ -1013,7 +1013,7 @@ pub(crate) fn ranking_line(
 /// (issue #14145) lives in [`format_ranking_lines_with_preserve`].
 #[must_use]
 pub fn format_ranking_lines(report: &ProbeReport) -> String {
-    format_ranking_lines_with_preserve(report, &HashMap::new())
+    format_ranking_lines_with_preserve(report, &HashMap::new(), Utc::now())
 }
 
 /// `true` for the statuses a **failed or inconclusive** probe produces:
@@ -1023,8 +1023,35 @@ pub fn format_ranking_lines(report: &ProbeReport) -> String {
 /// the account's quota state (issue #14145). Every other status was derived
 /// from a response that actually reported rate-limit headers (or the monitor's
 /// own data) and is positive evidence.
+///
+/// The codex path's evidence-free status, `unknown` (a profile with nothing
+/// measurable — [`super::codex_check::STATUS_UNKNOWN`]), is deliberately **not**
+/// here: it is fail-open (#8539), so it may only displace a hold while that
+/// hold is not running — see [`carries_forward`] (issue #14265).
 fn is_evidence_free_status(status: &str) -> bool {
     status == "error" || status == "blocked"
+}
+
+/// Whether a fresh row with `status` must yield to the `carried` previous
+/// `exhausted` row (issue #14145 / #14265).
+///
+/// - `error` / `blocked` ([`is_evidence_free_status`]) always yield.
+/// - `unknown` yields **only while the carried hold is still running**: the
+///   previous row's `limit_reset` parses and is strictly after `now`. A past,
+///   missing, or unparseable reset means no credible hold is in force, so the
+///   fresh fail-open `unknown` row is written as before (#8539) and the
+///   fail-open contract is bounded to the hold window instead of being made
+///   permanently exclusionary.
+/// - Everything else is positive evidence and overwrites.
+fn carries_forward(status: &str, carried: &str, now: DateTime<Utc>) -> bool {
+    if is_evidence_free_status(status) {
+        return true;
+    }
+    if status != super::codex_check::STATUS_UNKNOWN {
+        return false;
+    }
+    let reset = super::select::parse_ranking_line(carried).and_then(|row| row.limit_reset);
+    super::monitor::parse_iso8601(reset.as_deref()).is_some_and(|reset| reset > now)
 }
 
 /// Read the current `.ranking` and keep its `exhausted` rows (keyed by
@@ -1054,15 +1081,17 @@ fn previous_exhausted_rows(ranking_path: &Path) -> HashMap<String, String> {
 /// overwrote `name|exhausted||<7d-reset>` with a bare `name|error`, and the
 /// next `bad_tokens::ambiguous_exhaustion_evidence` read then fell to the
 /// 6h fixed cooldown, readmitting an account whose weekly hold still had
-/// days to run. The carry-forward applies only when the fresh row is
-/// [`is_evidence_free_status`] **and** the previous row is `exhausted` —
-/// anything else is positive evidence this round and overwrites as before —
-/// and the reader's own credibility gates (parseability,
-/// `MAX_WEEKLY_RESET_HORIZON_SECS`, pre-mark instants) still bound whatever
-/// is carried forward.
+/// days to run. The carry-forward applies only when the previous row is
+/// `exhausted` **and** the fresh row is evidence-free per [`carries_forward`]
+/// (`error` / `blocked`, or a codex `unknown` while the hold's recorded reset
+/// is still in the future, #14265) — anything else is positive evidence this
+/// round and overwrites as before — and the reader's own credibility gates
+/// (parseability, `MAX_WEEKLY_RESET_HORIZON_SECS`, pre-mark instants) still
+/// bound whatever is carried forward.
 fn format_ranking_lines_with_preserve(
     report: &ProbeReport,
     preserve: &HashMap<String, String>,
+    now: DateTime<Utc>,
 ) -> String {
     let mut out = String::new();
     for a in &report.accounts {
@@ -1071,7 +1100,7 @@ fn format_ranking_lines_with_preserve(
         }
         match preserve
             .get(a.name.as_str())
-            .filter(|_| is_evidence_free_status(&a.status))
+            .filter(|carried| carries_forward(&a.status, carried, now))
         {
             Some(carried) => out.push_str(carried),
             None => out.push_str(&marked_probe::ranking_row(a)),
@@ -1086,7 +1115,8 @@ fn format_ranking_lines_with_preserve(
 ///
 /// Issue #14145: before overwriting, the file's current `exhausted` rows are
 /// read and a fresh row that carries no probe evidence
-/// ([`is_evidence_free_status`] — `error` / `blocked`) does not replace the
+/// ([`carries_forward`] — `error` / `blocked`, or a codex `unknown` while the
+/// hold's reset is still in the future) does not replace the
 /// previous `exhausted` row for the same account; the previous row is carried
 /// forward (trimmed) so a mid-hold transport failure cannot shorten an active
 /// weekly hold to the 6h fixed cooldown. See
@@ -1094,7 +1124,7 @@ fn format_ranking_lines_with_preserve(
 pub fn write_ranking_atomic(report: &ProbeReport, ranking_path: &Path) -> std::io::Result<()> {
     let preserve = previous_exhausted_rows(ranking_path);
     super::monitor::write_ranking_text(
-        &format_ranking_lines_with_preserve(report, &preserve),
+        &format_ranking_lines_with_preserve(report, &preserve, Utc::now()),
         ranking_path,
     )
 }
@@ -2136,6 +2166,117 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "a-1|exhausted|0.02|2026-11-24T08:00:00Z\nb-2|exhausted||2026-11-24T09:00:00Z\n",
+        );
+    }
+
+    // ---- #14265: a codex `unknown` round must not shorten a running hold ----
+
+    fn prev_exhausted(line: &str) -> HashMap<String, String> {
+        HashMap::from([("codex-1".to_string(), line.to_string())])
+    }
+
+    fn unknown_report() -> ProbeReport {
+        ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("codex-1", "unknown")],
+        }
+    }
+
+    fn instant(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// #14265 core: a fresh `unknown` row (the codex path measured nothing)
+    /// keeps the previous `exhausted` row while its reset is in the future.
+    #[test]
+    fn unknown_round_preserves_an_exhausted_row_whose_hold_is_still_running() {
+        let prev = prev_exhausted("codex-1|exhausted||2026-11-24T08:00:00Z");
+        let out = format_ranking_lines_with_preserve(
+            &unknown_report(),
+            &prev,
+            instant("2026-11-20T00:00:00Z"),
+        );
+        assert_eq!(out, "codex-1|exhausted||2026-11-24T08:00:00Z\n");
+    }
+
+    /// #14265: once the recorded reset is past (or exactly `now`) there is no
+    /// credible hold — the fail-open `unknown` row (#8539) is written as before.
+    #[test]
+    fn unknown_round_overwrites_an_exhausted_row_whose_reset_is_past_or_now() {
+        let prev = prev_exhausted("codex-1|exhausted||2026-11-24T08:00:00Z");
+        for now in ["2026-11-24T08:00:00Z", "2026-11-25T00:00:00Z"] {
+            let out = format_ranking_lines_with_preserve(&unknown_report(), &prev, instant(now));
+            assert_eq!(out, "codex-1|unknown\n", "now={now}");
+        }
+    }
+
+    /// #14265: a missing or unparseable reset is not a hold window — fail open.
+    #[test]
+    fn unknown_round_overwrites_an_exhausted_row_with_no_usable_reset() {
+        let now = instant("2026-11-20T00:00:00Z");
+        for line in [
+            "codex-1|exhausted",
+            "codex-1|exhausted||",
+            "codex-1|exhausted||not-a-date",
+            "codex-1|exhausted|0.02|",
+        ] {
+            let out =
+                format_ranking_lines_with_preserve(&unknown_report(), &prev_exhausted(line), now);
+            assert_eq!(out, "codex-1|unknown\n", "line={line}");
+        }
+    }
+
+    /// #14265: an account absent from the previous file, or whose previous row
+    /// was not `exhausted` (so never entered the map), is unchanged; and
+    /// `error` / `blocked` still carry forward even with a past reset (#14145).
+    #[test]
+    fn unknown_without_a_predecessor_and_error_with_a_past_reset_behave_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(
+            &target,
+            "was-available|available|0.10\nold-hold|exhausted||2000-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("was-available", "unknown"),
+                AccountResult::new("brand-new", "unknown"),
+                AccountResult::new("old-hold", "error"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "was-available|unknown\nbrand-new|unknown\nold-hold|exhausted||2000-01-01T00:00:00Z\n",
+        );
+    }
+
+    /// #14265 end-to-end through the on-disk writer with the real clock: a far
+    /// future hold survives an `unknown` round, a far past one does not.
+    #[test]
+    fn write_ranking_atomic_applies_the_unknown_hold_window_against_the_real_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(
+            &target,
+            "future|exhausted||2999-01-01T00:00:00Z\npast|exhausted||2000-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("future", "unknown"),
+                AccountResult::new("past", "unknown"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "future|exhausted||2999-01-01T00:00:00Z\npast|unknown\n",
         );
     }
 

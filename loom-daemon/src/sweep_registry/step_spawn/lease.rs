@@ -177,6 +177,8 @@ fn run_bounded(cmd: &mut Command, limit: Duration) -> (ClaimRun, Duration, Optio
     let Ok(mut child) = cmd.spawn() else {
         return (ClaimRun::SpawnFailed, start.elapsed(), None);
     };
+    // #14100: a `lease pr` child is the daemon's own binary; attribute its pid.
+    let tracked = crate::self_spawn_log::track("step_lease", cmd, child.id());
     // Drained on a thread, so a chatty child cannot fill the pipe and stall.
     let reader = child.stderr.take().map(|stderr| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -190,12 +192,14 @@ fn run_bounded(cmd: &mut Command, limit: Duration) -> (ClaimRun, Duration, Optio
     let run = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                tracked.finish(status);
                 break status.code().map_or(ClaimRun::Signaled, ClaimRun::Exited);
             }
             Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(200)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                tracked.finish("timed out");
                 break ClaimRun::TimedOut;
             }
         }

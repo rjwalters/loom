@@ -10,7 +10,7 @@
 //!
 //! A sibling of `tests.rs`.
 
-use std::os::unix::fs::PermissionsExt;
+use crate::exec_test_support::write_executable;
 use std::path::Path;
 use std::process::Command;
 
@@ -31,12 +31,6 @@ const POLLUTED: &[(&str, &str)] = &[
 /// The only `Environment=` keys a freshly provisioned fleet unit may carry.
 const STRUCTURAL: &[&str] = &["PATH", "LOOM_DAEMON_SUPERVISOR"];
 
-fn write_exec(path: &Path, body: &str) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// A fake worker `$HOME`: `systemctl`/`loginctl` stubs on the canonical PATH
 /// (`~/.local/bin` comes first), an enabled-timer switch, and a
 /// `loom-daemon-start.sh` stub that records its argv and, when run WITHOUT
@@ -45,14 +39,14 @@ fn fake_home(timer_enabled: bool) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     let enabled = if timer_enabled { "exit 0" } else { "exit 1" };
-    write_exec(
+    write_executable(
         &h.join(".local/bin/systemctl"),
-        &format!(
+        format!(
             "#!/bin/sh\ncase \"$*\" in *is-enabled*loom-daemon-watchdog.timer*) {enabled};; esac\nexit 0\n"
         ),
     );
-    write_exec(&h.join(".local/bin/loginctl"), "#!/bin/sh\nexit 0\n");
-    write_exec(
+    write_executable(&h.join(".local/bin/loginctl"), "#!/bin/sh\nexit 0\n");
+    write_executable(
         &h.join(".local/share/loom/defaults/scripts/cli/loom-daemon-start.sh"),
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/start-argv\"\n\
          [ \"$1\" = --heal-watchdog-only ] && exit 0\n\

@@ -399,7 +399,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "loom-daemon/src/write_scope.rs"
-calls = 1
+calls = 2
 owner = "daemon-other"
 removal_issue = 9799
 

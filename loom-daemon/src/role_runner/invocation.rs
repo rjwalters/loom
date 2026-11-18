@@ -185,8 +185,14 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // which the emission site renders as no `--effort` argument at all).
                 // Resolved AFTER the mismatch preflight above so a refused launch does
                 // not pay for a second config read.
-                let (effort, effort_source) =
-                    resolve_role_runner_effort(&self.workspace_root, role);
+                // Issue #14017: resolved against the admitted runtime, so a role that
+                // draws both Claude and Codex can carry a different effort for each
+                // (`roleEfforts.<role>@<runtime>`) and a Codex launch never runs unset.
+                let (effort, effort_source) = resolve_role_runner_effort_for_runtime(
+                    &self.workspace_root,
+                    role,
+                    admission.as_ref().map(|a| a.runtime.as_str()),
+                );
                 // Issue #8056: the launched values, captured for the durable
                 // `role_tick.outcome` record. Set here — after every pre-spawn bail-out
                 // above has already returned — so "resolved" never claims a model for a

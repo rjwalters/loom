@@ -121,7 +121,6 @@ test-fleet-check.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
 test-forge-transient-classification.sh
-test-generate-agents-md-layouts.sh
 test-gh-cached.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
@@ -157,6 +156,7 @@ test-guide-work-plan-held-issue-suffix.sh
 test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
+test-guide-work-plan-receipt.sh
 test-guide-work-plan-roadmap-convention.sh
 test-guide-work-plan-stamp.sh
 test-hard-exclusion-labels.sh
