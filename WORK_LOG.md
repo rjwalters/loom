@@ -16,6 +16,37 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-17
 
+- **PR #14072**: fix: drop the write-only no-op cooldown counter; report the hold streak over IPC
+- **PR #14071**: feat: mark each roles draw --explain candidate admitted or not on this host
+- **PR #14062**: refactor(cli): collapse loom dispatch arms and drop inline help fallback
+- **PR #14051**: docs: refresh docs/README.md index to match the docs tree
+- **PR #14045**: fix(hermit): widen stateless-ceremony state test, add type + test-file exclusions
+- **PR #14041**: champion: filter Pass 0c rescan shortlist to plausible mismatches
+- **PR #14040**: Remove the default-on GitHub metrics collector
+- **PR #14039**: refactor: consolidate eight loom-dir resolution copies into autonomy_marker::resolve_loom_dir
+- **PR #14034**: docs: fix Codex hook-trust docker run to reach Codex (--entrypoint codex, CODEX_HOME)
+- **PR #14033**: fix: strip dot-stripped trailing slash from directory citations in verify-proposal-refs
+- **PR #14021**: fix: complete a doctor hand-back whose fix needed no commit via claim-time ordering
+- **PR #14008**: feat: add repo-provided post-stage hook to the Guide docs tick staging
+- **PR #14006**: feat(park-record): add `retract` to withdraw one declared blocker
+- **PR #13964**: feat: captain counts fleet fast-fail streak and orders the park
+- **PR #13948**: fix: pin Guide docs queries to docs-worktree repo and verify WORK_PLAN provenance
+- **Issue #14027** (closed): roles draw --explain shows a runtime at full weight on a host where it can never be admitted
+- **Issue #13995** (closed): forge doctor-handback: RACED fires deterministically when the hand-back head equals the standing verdict marker SHA (no-push Doctor pass cannot hand back)
+- **Issue #13936** (closed): doctor-handback cannot complete a review fix resolved outside the git tree: a changes-requested verdict marker at the unchanged head reads as a fresh rejection on every Doctor pass
+- **Issue #13923** (closed): Guide docs maintenance: shared-host /tmp scratch collision + unpinned-repo queries + no provenance self-check on WORK_PLAN.md
+- **Issue #13919** (closed): Captain counts the fleet fast-fail streak and triggers the park (ADR-0027 lane; peer lane dark since 11-14)
+- **Issue #13915** (closed): Codex hook-trust docker command in guardrail-parity-codex.md never starts Codex (session image entrypoint ignores the argument)
+- **Issue #13913** (closed): Champion Pass 0c re-scans the same 5 lowest-numbered issues every pass; a real promotion mismatch deeper in the shortlist is never reached
+- **Issue #13901** (closed): verify-proposal-refs.sh: a directory citation followed by an ellipsis (`dir/...`) reports MISSING FILE — third input of the #10191/#11338 class
+- **Issue #13899** (closed): Simplify .loom/bin/loom: collapse repeated dispatch arms and duplicate inline help
+- **Issue #13895** (closed): park-record: no supported way to withdraw a declared blocker — a stale record stays in the parsed set and keeps the issue parked forever
+- **Issue #13892** (closed): Guide docs tick's fixed staging set cannot satisfy a consuming repo's CI integrity check on a staged file
+- **Issue #13884** (closed): Hermit stateless-ceremony detector has ~0% precision: 237 flags, 0 true positives — the state test misses 3 of 4 assignment forms and there are no type exclusions (successor to #3198)
+- **Issue #13879** (closed): docs: docs/README.md index is stale (ADR range, design notes, missing directories)
+- **Issue #13871** (closed): Remove the GitHub metrics collector: writes github_events every 15 minutes for no reader, and its activity correlation can never match
+- **Issue #13861** (closed): Remove NoopCooldownState::consecutive: a second no-op streak counter nothing acts on, whose documented reset does not exist
+- **Issue #13833** (closed): Consolidate eight copies of the loom-dir resolution rule (LOOM_SOCKET_PATH parent, else ~/.loom) into one helper
 - **Issue #13927** (closed): forge_get_pr_reviews() runs gh api with no wall-clock bound: a hung gh hangs check-review-feedback.sh and post-verdict.sh indefinitely
 - **Issue #13874** (closed): Champion epic Step 0.5 misses a tracking epic whose children are in a markdown table; it then falls into the pre-decomposition criteria and rejects (or duplicates Phase 1)
 - **Issue #13872** (closed): Exhaustion marks are never model-scoped: a Fable limit on one role blocks every model on the account (0 of 4,510 marks carry [model-class:])

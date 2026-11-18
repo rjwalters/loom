@@ -405,7 +405,7 @@ pub fn resolve_interval(config: &TokenRankingRefreshConfig) -> Duration {
 /// [`spawn_multi_token_ranking_refresh_task`] (the multi-workspace entry
 /// point wired into `main.rs`).
 ///
-/// Unlike [`crate::main_health_gate::spawn_main_health_gate_task`] /
+/// Unlike [`crate::main_health_gate::spawn_multi_main_health_gate_task`] /
 /// [`crate::work_finder`]'s loops, the **first tick is not skipped**: a ranking
 /// probe is a handful of cheap read-only HTTP calls with no dispatch side
 /// effect, so refreshing immediately at boot (rather than waiting a full
