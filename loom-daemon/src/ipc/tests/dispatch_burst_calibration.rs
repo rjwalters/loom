@@ -1,6 +1,5 @@
 //! Calibration helper for burst-concurrency assertions, split out of
-//! `ipc/tests.rs` (#9194) so that already-over-threshold file does not grow
-//! past the `.loom/docs/file-size-policy.md` ratchet.
+//! `ipc/tests.rs` (#9194) so that file does not grow.
 
 use super::*;
 

@@ -434,6 +434,7 @@ fn input(body: &str, comments: &[(&str, &str)]) -> extract::Input {
                     login: (*login).to_string(),
                 },
                 body: (*body).to_string(),
+                ..extract::Comment::default()
             })
             .collect(),
     }
@@ -625,4 +626,106 @@ fn a_daemon_hold_record_is_held_with_reason() {
         classify(&e),
         Verdict::HeldWithReason { by: Some(b), .. } if b == "daemon"
     ));
+}
+
+// --- #13889: permanent-block marker and post-resolution hold comments ---------
+
+fn stale_evidence() -> Evidence {
+    Evidence {
+        prose: vec![prose_ref(7, "CLOSED")],
+        ..Evidence::default()
+    }
+}
+
+fn hold(at: Option<&str>) -> Option<HoldComment> {
+    Some(HoldComment {
+        at: at.map(str::to_string),
+        marker: "loom:operator-decision".to_string(),
+    })
+}
+
+#[test]
+fn permanent_block_turns_stale_into_superseded() {
+    let e = Evidence {
+        permanent_block: true,
+        ..stale_evidence()
+    };
+    match classify(&e) {
+        Verdict::Superseded { cleared, block } => {
+            assert_eq!(block, PERMANENT_BLOCK);
+            assert_eq!(cleared.len(), 1, "{cleared:?}");
+        }
+        other => panic!("expected Superseded, got {other:?}"),
+    }
+}
+
+#[test]
+fn permanent_block_turns_unticked_into_superseded() {
+    let e = Evidence {
+        named: vec![dep(5, false, Some("CLOSED"))],
+        permanent_block: true,
+        ..Evidence::default()
+    };
+    assert!(matches!(classify(&e), Verdict::Superseded { block, .. } if block == PERMANENT_BLOCK));
+}
+
+#[test]
+fn permanent_block_does_not_hide_a_still_open_blocker() {
+    let e = Evidence {
+        prose: vec![prose_ref(7, "OPEN")],
+        permanent_block: true,
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&e), Verdict::StillBlocked);
+}
+
+#[test]
+fn hold_comment_after_resolution_is_superseded() {
+    let e = Evidence {
+        hold: hold(Some("2026-11-10T00:00:00Z")),
+        resolved_at: Some("2026-11-01T00:00:00Z".to_string()),
+        ..stale_evidence()
+    };
+    match classify(&e) {
+        Verdict::Superseded { block, .. } => {
+            assert!(block.contains("loom:operator-decision"), "{block}");
+            assert!(block.contains("2026-11-10T00:00:00Z"), "{block}");
+        }
+        other => panic!("expected Superseded, got {other:?}"),
+    }
+}
+
+#[test]
+fn hold_comment_before_resolution_is_still_stale() {
+    let e = Evidence {
+        hold: hold(Some("2026-10-01T00:00:00Z")),
+        resolved_at: Some("2026-11-01T00:00:00Z".to_string()),
+        ..stale_evidence()
+    };
+    assert!(matches!(classify(&e), Verdict::Stale(_)));
+}
+
+#[test]
+fn hold_comment_with_unknown_times_fails_closed_to_held() {
+    for (at, resolved) in [
+        (Some("2026-10-01T00:00:00Z"), None),
+        (None, Some("2026-11-01T00:00:00Z")),
+        (Some("not a time"), Some("2026-11-01T00:00:00Z")),
+    ] {
+        let e = Evidence {
+            hold: hold(at),
+            resolved_at: resolved.map(str::to_string),
+            ..stale_evidence()
+        };
+        assert!(matches!(classify(&e), Verdict::Superseded { .. }), "{at:?} {resolved:?}");
+    }
+}
+
+#[test]
+fn no_hold_comment_leaves_resolved_at_irrelevant() {
+    let e = Evidence {
+        resolved_at: None,
+        ..stale_evidence()
+    };
+    assert!(matches!(classify(&e), Verdict::Stale(_)));
 }

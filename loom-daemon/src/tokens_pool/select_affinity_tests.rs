@@ -1,10 +1,8 @@
 //! Unit tests for the prompt-cache affinity preference tier (issue #8146) as
 //! it behaves *inside* [`super`]'s 3-tier selection algorithm.
 //!
-//! A sibling of [`super::tests`] rather than a section of it, per
-//! `.loom/docs/file-size-policy.md`: new code goes in a new module instead of
-//! growing an over-threshold file. The pool fixtures are shared — see
-//! [`super::tests::make_pool`].
+//! A sibling of [`super::tests`] rather than a section of it. The pool
+//! fixtures are shared — see [`super::tests::make_pool`].
 //!
 //! `super::super::affinity`'s own unit tests cover the preference's bounds in
 //! isolation (TTL, quota guard, role scope, config precedence, state-file

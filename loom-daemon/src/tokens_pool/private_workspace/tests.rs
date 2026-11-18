@@ -192,6 +192,50 @@ fn dirty_root_and_dirty_worktree_are_preserved() {
 }
 
 #[test]
+fn lease_renew_residue_does_not_refuse_reuse_but_other_dirt_does() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // Loom's own lease-renewal lock left in the clone (#14160): untracked in
+    // a repo whose ignore rules do not cover it. Residue Loom itself wrote
+    // must never refuse a seat.
+    std::fs::create_dir_all(repo.join(".loom/lease-renew")).unwrap();
+    std::fs::write(repo.join(".loom/lease-renew/.lock"), "").unwrap();
+    f.prepare().unwrap();
+    // A linked worktree holding the same residue is forgiven too.
+    let worktree = f.root.join("issue-5");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-5",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(worktree.join(".loom/lease-renew")).unwrap();
+    std::fs::write(worktree.join(".loom/lease-renew/.lock"), "").unwrap();
+    f.prepare().unwrap();
+    // Any other dirt still refuses, and the refusal names the path.
+    std::fs::write(repo.join("stray.txt"), "retain").unwrap();
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("dirty"), "{error}");
+    assert!(error.contains("stray.txt"), "{error}");
+    assert!(repo.join("stray.txt").exists());
+    // The named list is bounded (#14160).
+    std::fs::remove_file(repo.join("stray.txt")).unwrap();
+    for i in 0..12 {
+        std::fs::write(repo.join(format!("stray-{i:02}")), "retain").unwrap();
+    }
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("stray-09"), "{error}");
+    assert!(!error.contains("stray-10"), "{error}");
+    assert!(error.contains("and 2 more"), "{error}");
+}
+
+#[test]
 #[serial_test::serial(private_workspace_fork)]
 #[serial_test::serial]
 fn unpushed_and_detached_commits_survive_refused_reuse() {
@@ -237,6 +281,92 @@ fn unpushed_and_detached_commits_survive_refused_reuse() {
     assert!(error.contains("issue-3"), "{error}");
     assert!(error.contains("accounts session recover fixture --publish"), "{error}");
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), stranded_tip);
+}
+
+/// A clean linked worktree a contained step created under the clone
+/// (#14122): invisible to both the dirty check and the detached-HEAD scan,
+/// yet holding exactly the branch the next preparation switches to.
+fn linked_worktree_holding(repo: &Path, worktree: &Path, branch: &str) {
+    git(repo, &["switch", "-c", branch]);
+    std::fs::write(repo.join("fixture"), "held").unwrap();
+    git(repo, &["commit", "-am", "held"]);
+    git(repo, &["switch", "--detach", "main"]);
+    git(repo, &["worktree", "add", worktree.to_str().unwrap(), branch]);
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_clean_linked_worktree_holding_the_branch_refuses_and_names_the_cure() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let worktree = f.root.join("issue-9");
+    linked_worktree_holding(&repo, &worktree, "feature/issue-9");
+    // A step for another issue proceeds: only the held branch refuses.
+    f.args.branch = Some("feature/issue-10".into());
+    f.prepare().unwrap();
+    // The held branch itself refuses with the holder, the branch and both
+    // recovery commands named, and the hold is left untouched.
+    f.args.branch = Some("feature/issue-9".into());
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("linked worktree"), "{error}");
+    assert!(error.contains(worktree.to_str().unwrap()), "{error}");
+    assert!(error.contains("feature/issue-9"), "{error}");
+    assert!(error.contains("recover fixture --discard --branch feature/issue-9"), "{error}");
+    assert!(error.contains("recover fixture --publish"), "{error}");
+    assert!(worktree.exists());
+    // The named cure clears an unpublished hold: the discard removes the
+    // holding worktree and the branch, and the next preparation proceeds.
+    let mut recover = recover_args(&f.remote);
+    recover.discard = true;
+    recover.branch = vec!["feature/issue-9".into()];
+    let out = repository::recover(&f.root, &recover).unwrap();
+    assert_eq!(out.discarded, vec!["feature/issue-9".to_owned()]);
+    assert!(!worktree.exists());
+    let revision = f.prepare().unwrap();
+    assert_eq!(revision, git(&f.remote, &["rev-parse", "HEAD"]));
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_published_branch_held_by_a_worktree_names_the_hand_cure() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let worktree = f.root.join("issue-9");
+    linked_worktree_holding(&repo, &worktree, "feature/issue-9");
+    // Publishing the branch (the real recover verb) preserves its commits on
+    // origin but clears nothing: the hold survives, and the refusal no longer
+    // names a discard — recovery never deletes a published branch, so the
+    // only cure is removing the worktree by hand.
+    let mut recover = recover_args(&f.remote);
+    recover.publish = true;
+    let out = repository::recover(&f.root, &recover).unwrap();
+    assert_eq!(out.published, vec!["feature/issue-9".to_owned()]);
+    let mut args = recover_args(&f.remote);
+    args.publish = true;
+    let noop = repository::recover(&f.root, &args).unwrap();
+    assert!(noop.published.is_empty(), "the branch is no longer unpublished");
+    f.args.branch = Some("feature/issue-9".into());
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("linked worktree"), "{error}");
+    assert!(error.contains(worktree.to_str().unwrap()), "{error}");
+    assert!(error.contains("worktree remove"), "{error}");
+    assert!(error.contains("accounts session attach fixture"), "{error}");
+    assert!(!error.contains("--discard --branch"), "{error}");
+    assert!(worktree.exists());
+    // The hand cure unwedges: the clean worktree carries nothing the branch
+    // ref does not, so removing it releases the hold losslessly.
+    git(&repo, &["worktree", "remove", worktree.to_str().unwrap()]);
+    f.prepare().unwrap();
+    assert_eq!(
+        git(&repo, &["rev-parse", "feature/issue-9"]),
+        git(&f.remote, &["rev-parse", "feature/issue-9"])
+    );
 }
 
 #[test]

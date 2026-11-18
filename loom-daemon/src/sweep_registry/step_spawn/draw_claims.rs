@@ -56,7 +56,7 @@ impl SweepRegistry {
         let mut items: HashSet<u32> = self
             .entries
             .values()
-            .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
+            .filter(|i| matches!(i.state, SweepState::Running))
             .filter_map(|i| match i.kind {
                 SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => Some(n),
                 SweepKind::PrSet(_) => None,
@@ -68,7 +68,7 @@ impl SweepRegistry {
         let mut merges_in_flight: Vec<(u32, String)> = self
             .entries
             .values()
-            .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
+            .filter(|i| matches!(i.state, SweepState::Running))
             .filter_map(|i| match i.kind {
                 SweepKind::Step {
                     item,

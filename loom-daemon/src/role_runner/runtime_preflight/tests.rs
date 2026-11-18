@@ -1,7 +1,6 @@
 //! Tests for the runtime-aware pre-spawn credential-pool gate (Issue #8408).
 //!
-//! Kept beside the module they cover rather than in `role_runner/tests.rs`,
-//! which is at its `scripts/file-size-baseline.txt` ceiling.
+//! Kept beside the module they cover rather than in `role_runner/tests.rs`.
 //!
 //! Every test that reaches `invoke()` leaves `spawn_bin` unset so runtime
 //! admission — and with it the gate — runs for real against an on-disk
@@ -9,6 +8,7 @@
 //! before_spawn` in the parent test module.
 
 use super::*;
+use crate::exec_test_support::write_executable;
 use crate::tokens_pool::health::record_terminal_at;
 use crate::tokens_pool::{record_terminal_for_class_at, AccountId, TerminalClassification};
 use serial_test::serial;
@@ -51,11 +51,6 @@ impl EnvGuard {
             .and_set("LOOM_CODEX_PROFILE_ROOT", Some(profile_root.as_os_str()));
         Self(env, lock)
     }
-}
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// The installed `codex.json` shape: `accountProvider` is what makes
@@ -102,7 +97,7 @@ fn codex_judge_workspace(
     let marker = root.join("script-ran");
     write_executable(
         &root.join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
     (marker, pool)
 }
@@ -666,7 +661,7 @@ fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
     let marker = root.join("script-ran");
     write_executable(
         &root.join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
 
     let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
@@ -822,7 +817,7 @@ fn preference_judge_workspace(
     let marker = root.join("script-ran");
     write_executable(
         &root.join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" >'{}'\nexit 0\n", marker.display()),
+        format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" >'{}'\nexit 0\n", marker.display()),
     );
     // Judge is a merging role: Codex is available to it only while every
     // shared seat runs Loom's guard hook (#9390 follow-up). These tests are

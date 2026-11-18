@@ -2,7 +2,6 @@ use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputTy
 use crate::config_resolver;
 use crate::errors::DaemonError;
 use crate::event_bus::EventBus;
-use crate::git_parser;
 use crate::git_utils;
 use crate::issue_state_read;
 use crate::main_health_gate::WorkspaceHealthStates;
@@ -268,7 +267,7 @@ pub use drain_supervisor::{
     list_in_flight_sweeps,
 };
 
-/// Count non-terminal (`Pending` / `Running`) sweeps across **every** managed
+/// Count non-terminal (`Running`) sweeps across **every** managed
 /// root (Issue #4090, Finding 5). Mirrors [`build_daemon_status`]'s cross-root
 /// accounting so a drain never reads only the primary registry and restarts
 /// while a secondary managed repo still has live sweeps.
@@ -1436,7 +1435,7 @@ pub fn build_daemon_status_for(
                 REGISTRY_LOCK_DEADLINE
             );
         }
-        // In-flight = sweeps still live (Pending / Running). Terminal sweeps
+        // In-flight = sweeps still live (Running). Terminal sweeps
         // (Exited / Crashed) linger in the registry but are not "in flight".
         let live: Vec<crate::types::SweepInfo> = snapshot
             .as_ref()
@@ -2443,14 +2442,11 @@ fn handle_request(
             let terminal_info = tm.list_terminals().into_iter().find(|t| t.id == id);
 
             // Extract context from terminal info
-            let (raw_role, working_dir, worktree_path) = if let Some(info) = terminal_info {
-                (info.role, info.working_dir, info.worktree_path)
+            let (raw_role, workspace_path) = if let Some(info) = terminal_info {
+                (info.role, info.working_dir)
             } else {
-                (None, None, None)
+                (None, None)
             };
-
-            // Determine workspace path (prefer worktree, fallback to working_dir)
-            let workspace_path = worktree_path.or(working_dir.clone());
 
             // Resolve the real Loom role (e.g. "judge", "curator") from the
             // terminal's own `roleConfig.roleFile` in `.loom/config.json`,
@@ -2618,64 +2614,6 @@ fn handle_request(
                                     }
                                 }
                             }
-
-                            // Parse terminal output for git commits and record changes
-                            // This enables automatic prompt-to-commit correlation
-                            if git_parser::contains_git_commit(&output_str) {
-                                let git_commits = git_parser::parse_git_commits(&output_str);
-                                for commit_event in git_commits {
-                                    log::info!(
-                                        "Detected git commit: {} ({:?})",
-                                        commit_event.commit_hash,
-                                        commit_event.commit_message
-                                    );
-
-                                    // Record the commit correlation if we have the terminal's workspace
-                                    if let Some(ref info) = terminal_info {
-                                        let workspace_path = info
-                                            .worktree_path
-                                            .as_ref()
-                                            .or(info.working_dir.as_ref());
-
-                                        if let Some(ws) = workspace_path {
-                                            // Create a prompt_changes record linking to the commit
-                                            // We use the commit hash as after_commit
-                                            // The input_id would ideally link to the most recent input
-                                            // but we don't have that context here, so we record
-                                            // the commit with metrics from the parsed output
-                                            let changes = crate::activity::PromptChanges {
-                                                id: None,
-                                                input_id: 0, // Will be correlated by timestamp
-                                                before_commit: None,
-                                                after_commit: Some(
-                                                    commit_event.commit_hash.clone(),
-                                                ),
-                                                files_changed: commit_event
-                                                    .files_changed
-                                                    .unwrap_or(0),
-                                                lines_added: commit_event.lines_added.unwrap_or(0),
-                                                lines_removed: commit_event
-                                                    .lines_removed
-                                                    .unwrap_or(0),
-                                                tests_added: 0, // Not available from commit output
-                                                tests_modified: 0,
-                                            };
-
-                                            if let Err(e) = db.record_prompt_changes(&changes) {
-                                                log::warn!(
-                                                    "Failed to record git commit correlation: {e}"
-                                                );
-                                            } else {
-                                                log::debug!(
-                                                    "Recorded git commit {} in workspace {}",
-                                                    commit_event.commit_hash,
-                                                    ws
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
 
@@ -2693,60 +2631,12 @@ fn handle_request(
             }
         }
 
-        Request::ResizeTerminal { id, cols, rows } => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.resize_terminal(&id, cols, rows) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
         Request::CheckSessionHealth { id } => {
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.has_tmux_session(&id) {
                 Ok(has_session) => Response::SessionHealth { has_session },
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::ListAvailableSessions => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            let sessions = tm.list_available_sessions();
-            Response::AvailableSessions { sessions }
-        }
-
-        Request::AttachToSession { id, session_name } => {
-            let mut tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.attach_to_session(&id, session_name) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::KillSession { session_name } => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.kill_session(&session_name) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::SetWorktreePath { id, worktree_path } => {
-            let mut tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.set_worktree_path(&id, &worktree_path) {
-                Ok(()) => Response::Success,
                 Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
@@ -2765,46 +2655,6 @@ fn handle_request(
                 }
             } else {
                 Response::StructuredError(DaemonError::activity_db_locked())
-            }
-        }
-
-        Request::CaptureGitChanges {
-            input_id,
-            working_dir,
-            before_commit,
-        } => {
-            let working_path = std::path::Path::new(&working_dir);
-
-            // Capture git changes
-            if let Some(changes) =
-                git_utils::capture_prompt_changes(working_path, input_id, before_commit)
-            {
-                // Record to database
-                if let Ok(db) = activity_db.lock() {
-                    match db.record_prompt_changes(&changes) {
-                        Ok(_) => Response::GitChangesCaptured {
-                            files_changed: changes.files_changed,
-                            lines_added: changes.lines_added,
-                            lines_removed: changes.lines_removed,
-                        },
-                        Err(e) => {
-                            log::error!("Failed to record prompt changes: {e}");
-                            Response::StructuredError(DaemonError::activity_query_failed(
-                                "record prompt changes",
-                                &e.to_string(),
-                            ))
-                        }
-                    }
-                } else {
-                    Response::StructuredError(DaemonError::activity_db_locked())
-                }
-            } else {
-                // No changes detected or not a git repo
-                Response::GitChangesCaptured {
-                    files_changed: 0,
-                    lines_added: 0,
-                    lines_removed: 0,
-                }
             }
         }
 

@@ -16,6 +16,31 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-17
 
+- **PR #14107**: docs(hermit): drop stale exclusion count from §4 detector sentence
+- **PR #14104**: docs(guide): make WORK_PLAN.md's Ready section self-describe its #7083 exclusions
+- **PR #14098**: docs(judge): require a local test run before approving no-checks PRs
+- **PR #14091**: refactor: drive role-loop tests through the production multi-workspace loop
+- **PR #14079**: fix: forge may-write probes under a covered per-owner writer credential
+- **PR #14076**: fix: held-PR digest reads the ratification hold kind via a (marker, reason rule) table
+- **PR #14073**: fix: scope private-clone unpushed refusal to unnamed work; add session recover
+- **PR #14070**: fix: champion-hold ratification fails closed when a candidate head read fails
+- **PR #14060**: fix(ratification): gate key markers on a parsed verdict, post review text only
+- **PR #14058**: refactor: remove the inert per-host overflow slot's write, restart and report paths
+- **PR #14057**: fix: match underscore-emphasised out-of-band phrases in the AC gate
+- **PR #14053**: ledger: cool down standing admission refusals via the state-refusal streak
+- **PR #14043**: fix: skip unreaped git zombies in the self-heal's live-git probe
+- **Issue #14065** (closed): hermit.md §4 prose still says "all three exclusions" after the fourth was added
+- **Issue #14032** (closed): Step refused at admission for a standing reason is retried every tick with no back-off
+- **Issue #14030** (closed): Private clone with unpushed commits refuses every later job and has no supported recovery verb
+- **Issue #14004** (closed): classify-ac-verification: underscore-emphasised phrase (`_next run_`) no longer matches the AC gate vocabulary
+- **Issue #13932** (closed): champion-hold ratification returns a non-deterministic files= evidence list at rc=0: a subset of the changed paths is silently omitted against an unchanged head
+- **Issue #13929** (closed): forge may-write false negative: refuses a repo a configured per-owner writer (#12446) can mint for, and the refusal does not name the mintable route
+- **Issue #13928** (closed): WORK_PLAN.md Ready section/row apply the #7083 exclusion silently — the artifact reads lower than the loom:issue query it is named after, and never says why
+- **Issue #13885** (closed): Champion held-PR digest reports 'reason unrecorded' for a ratification-held PR: Step 1's marker list was never extended by #12992
+- **Issue #13883** (closed): Judge: when a pull request has no checks at all, run the repo's test command before approving
+- **Issue #13832** (closed): Remove the single-workspace role and main-health cadence loops: production runs only the multi-workspace ones, and 7 tests exercise the stale copy
+- **Issue #13829** (closed): Remove the inert per-host overflow slot: nothing can set the flag since #11508, but its write, restart and report paths remain
+- **Issue #13762** (closed): Ratification lane posts ratify:key markers with no verdict, as the PR author, with wrapper logs as the body
 - **PR #14072**: fix: drop the write-only no-op cooldown counter; report the hold streak over IPC
 - **PR #14071**: feat: mark each roles draw --explain candidate admitted or not on this host
 - **PR #14062**: refactor(cli): collapse loom dispatch arms and drop inline help fallback

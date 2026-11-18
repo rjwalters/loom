@@ -117,12 +117,6 @@ size, which becomes `candidates_total`. If the file is missing or unreadable
 observed: `decisions_observed` is `false` and unexplained candidates stay
 undecided. A file that exists but is empty is an observed tick with no acts.
 
-A `queue` line keeps at most 200 rows but also records the queue's uncapped
-size, which becomes `candidates_total`. If the file is missing or unreadable
-(a tick whose launch journaled no queue and whose agent never used the `gh` front writes none) nothing was
-observed: `decisions_observed` is `false` and unexplained candidates stay
-undecided. A file that exists but is empty is an observed tick with no acts.
-
 **Role actions (closed set).** `claimed` (`loom:reviewing`, `loom:treating`,
 `loom:curating`, `loom:evaluating`, `loom:building`), `approved` (`loom:pr`, or
 `pr review --approve`), `changes_requested`, `merged`, `curated`, `promoted`
@@ -145,13 +139,13 @@ it, only a hold label names a reason; other candidates are undecided.
 |---|---|---|
 | `overlap_chain` | overlaps an in-flight chain of stacked work, or (work finder) its `## Affected Files` overlap same-repo work admitted earlier this tick or already in flight | `deferred_file_overlap` (#9781; `detail` names the shared paths); roles: the candidate carries `loom:sequenced` |
 | `pr_open_skip` | the item already has an open PR | `open_pr`, `open_pr_backoff` |
-| `operator_hold` | held for a human | `parked`, `hard_exclusion`, `declined`; roles: a merge-hold / park label on the PR |
+| `operator_hold` | held for a human | `parked`, `hard_exclusion`, `declined`; roles: a merge-hold / park label on the PR. An `extraSkipLabels` match reads here on this path — the work finder skips it as `parked` (#6685) — but `host_constraint` on the step path; see the note under the mapping below |
 | `quota` | token pool or quota would not admit it | roles: `skipped_no_token_pool`, `skipped_pool_exhausted` ticks |
 | `cap` | the concurrency cap is full | `deferred_capacity` (`deferred_ramp_cap`, `deferred_saturation` and `deferred_repo_cap` mapped here until #12406 removed them; `deferred_out_of_slice` until the dispatch slice was retired, #11682) |
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, ...) | `workspace_halted` |
-| `host_constraint` | not for this host | `host_constraint`, `peer_claim` |
+| `host_constraint` | not for this host | `host_constraint`, `peer_claim`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
 | `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, queue gate |
@@ -170,6 +164,17 @@ there. The step engine's weight-0 exclusions map through the parallel total matc
 `claimed` / `queued` → `in_flight`, `shared_pr` → `pr_open_skip`, `sequenced`
 → `overlap_chain`, `blocked` → `blocked`, `capability_missing` / `host_skip_label` →
 `host_constraint`, `epic` / `proposal` / `no_stage` / `draft` → `no_step`.
+An `extraSkipLabels` match reads differently on the two paths: the step engine
+excludes it as `host_skip_label` → `host_constraint` (#13891), while the
+work-finder role tick skips the same item as disposition `parked` →
+`operator_hold` (#6685). Both resolve the same
+`autonomous.workFinder.extraSkipLabels` (env > config > default `[]`), so a
+per-reason count that aggregates skips from both paths sees the one veto under
+two names (#13961). A capability gap has the same shape: the step engine passes
+a capability park whose capabilities this host does not fully hold as
+`capability_missing` → `host_constraint` (`work_finder/step_item.rs`), while
+the role tick skips the same item as `parked` → `operator_hold` through the
+capability lane (#6893) — `Qd::Parked` is a mixed bucket on the role-tick path.
 
 ## Rank of an item in each role's latest candidate list
 

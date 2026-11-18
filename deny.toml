@@ -19,7 +19,13 @@
 # Everything in the RustSec database is an error by default under the current
 # schema; the old per-class severity knobs no longer exist. Exceptions go in
 # `ignore` below, each with a comment saying why and when it goes away.
-ignore = []
+ignore = [
+    # chrono 0.4.45 is unmaintained (RUSTSEC-2026-0543, chronotope/chrono#1768)
+    # and no patched release exists; upstream recommends migrating to jiff or
+    # time. Goes away once loom-daemon no longer depends on chrono, or a
+    # maintained chrono release is published.
+    "RUSTSEC-2026-0543",
+]
 # A yanked crate in the lockfile is a warning, not a failure: yanking is often
 # administrative (a bad publish, a version-number mistake) and the daily run
 # should not go red for one while a `cargo update` is pending.

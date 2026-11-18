@@ -55,6 +55,55 @@ It tries `gh issue create` first and, only on one of the five documented
 rate-limit signatures below, retries the identical filing as a single REST
 POST.
 
+## Foreign public repo: `NOT_IN_INSTALLATION` -> raw `gh issue create -R` (interim, #13978)
+
+**When it applies.** You need to file an issue on a repository the fleet's GitHub
+App is **not installed on** (typically a third-party or upstream public repo), and
+`loom-daemon forge create-issue -R <repo>` -- or `create-issue.sh`, which wraps it --
+refuses with:
+
+```
+refusing the write (#9548): the credential in use cannot write to <repo> (not in this App installation); Loom writes need WRITE ...
+```
+
+That refusal is the #9548 write guard doing its job, and it **stays** (operator
+ruling 2026-11-17: no carve-out, no per-verb permission map). It is not "needs an
+operator with upstream write": issue creation on a public repo needs only
+`issues:write`, which the process `gh` credential holds there. **File it through
+`gh` and do not park the report.**
+
+**The exact command** (the process `gh` credential, same host and gh config):
+
+```bash
+# 1. Duplicate check first -- this route skips create-issue.sh's backstop.
+gh issue list -R OWNER/REPO --state open --search "<keywords from your title>" --limit 20
+
+# 2. File it, labels (if any exist there) applied atomically with creation.
+gh issue create -R OWNER/REPO --title "Some title" --body-file /path/to/unique-body.md
+```
+
+**What you give up, and what that means:**
+
+- `create-issue.sh` cannot be used for this case: it creates through the refused
+  daemon route, so it is refused on the same repos. Do not add a `gh` fallback to the
+  script; that would be a guard carve-out by another name.
+- No duplicate scan, no issue-filing lock, no Loom footer. Run the title search above
+  yourself, and do not file in a burst.
+- `gh issue create` is GraphQL-backed. If it fails on GraphQL exhaustion, use the
+  single REST POST instead: `gh api -X POST repos/OWNER/REPO/issues -f title=... -F body=@file`.
+- Use only labels that exist on the *foreign* repo; Loom's `loom:*` labels do not.
+- Applies to issue filing only. Any other write to a repo the App is not on stays
+  refused.
+
+**This route is interim.** The preferred route is a typed `github-write` operation
+with a target-repo allowlist and a span per filing (tracked upstream; the concrete
+tracker number is recorded in the `not_in_installation_hint` doc comment in
+`write_scope.rs`, because installed docs name no private identifiers): repos the
+operator owns listed by default, a third-party public repo added only by operator
+decision. When it ships, this section and the refusal message (built in
+`write_scope.rs`, `not_in_installation_hint`) point there and the raw `gh` route is
+retired.
+
 ## The duplicate backstop (#7971): exit 3 means NOT FILED
 
 Before filing, `create-issue.sh` runs the sibling `check-duplicate.sh` against

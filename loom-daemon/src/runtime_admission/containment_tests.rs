@@ -180,6 +180,7 @@ fn containment_failure_keeps_the_unmet_capability_and_names_the_obligation() {
         source: RuntimeSource::Explicit,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     }
     .with_containment_failure("hook not trusted");
     assert_eq!(rejection.unmet_capabilities, vec!["worktreeIsolation"]);

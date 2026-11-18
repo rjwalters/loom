@@ -217,7 +217,7 @@ updated, and the version-skew reconciler never recreates an override seat
 — never from its own digest pin (same skew) and never from the stock tag.
 Nothing swaps an override seat onto the stock image silently. The build
 recipe and the layers a derived image must not touch are in
-[`docker/session/README.md`](../../docker/session/README.md).
+`docker/session/README.md`.
 
 ### Codex 0.149.1 vs the 0.146.0 schema pin — evidence, not assumption
 
