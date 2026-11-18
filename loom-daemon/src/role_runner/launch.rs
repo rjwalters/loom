@@ -250,6 +250,20 @@ pub(super) fn run_role_with_timeout(
         cmd.arg("--effort").arg(effort);
     }
     cmd.arg("--dangerously-skip-permissions");
+    // Service tier (#14454, producer for #14141): a tier has no CLI flag, so the
+    // resolved value rides the child's environment as `LOOM_SERVICE_TIER`, which
+    // the `spawn-*.sh` adapters map per runtime. Unset exports nothing — an
+    // operator-exported value in the daemon's own environment is inherited as-is.
+    if let Some((tier, tier_source)) = model_resolution::resolve_role_runner_service_tier_for_runtime(
+        workspace_root,
+        role,
+        admission.map(|a| a.runtime.as_str()),
+    ) {
+        log::info!(
+            "role_runner: {role} service_tier={tier} (source={tier_source}) -> LOOM_SERVICE_TIER"
+        );
+        cmd.env("LOOM_SERVICE_TIER", tier);
+    }
     // Transient-error recovery (issue #4255): scheduled role spawns are the
     // same unattended class as daemon-dispatched sweeps, so route them through
     // `claude-wrapper.sh` (retry/backoff/classification, bounded by
