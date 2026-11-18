@@ -241,6 +241,18 @@ assert_doc_contains "$CHAMPION_MD" \
 assert_doc_contains "$JUDGE_MD" "closingIssuesReferences" "judge.md reads closingIssuesReferences"
 assert_doc_contains "$CHAMPION_MD" "closingIssuesReferences" "champion-pr-merge.md reads closingIssuesReferences"
 
+# Inline PROSE restatements of the eligibility condition (#14321). The LLM
+# executing these prompts reads the lead-in / dispatch step before the code
+# block, so prose narrower than the code block's gate (file list only) would
+# grant a fast path the code refuses. Pin the closing-issue clause so adding a
+# condition to the code block without updating its prose turns this red.
+assert_doc_contains "$CHAMPION_MD" \
+    "and the PR has no closing-issue" \
+    "champion-pr-merge.md fast-path lead-in states the no-closing-issue condition (#14182)"
+assert_doc_contains "$JUDGE_MD" \
+    "and the PR has no closing-issue reference" \
+    "judge.md Primary Queue step 4b states the no-closing-issue condition (#14182)"
+
 echo
 echo "--- Judge and Champion allowlist + archive pattern are byte-identical (#12636) ---"
 
