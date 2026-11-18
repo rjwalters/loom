@@ -3837,9 +3837,8 @@ use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort,
     resolve_role_runner_effort_for_runtime, resolve_role_runner_model,
-    resolve_role_runner_service_tier_for_runtime, ModelRuntimeMismatch,
-    CLI_DEFAULT_MODEL_SENTINEL, CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE,
-    UNSET_EFFORT_SOURCE,
+    resolve_role_runner_service_tier_for_runtime, ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL,
+    CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE, UNSET_EFFORT_SOURCE,
 };
 
 // Per-reason skipped-tick tallies, with a race-free per-thread view for

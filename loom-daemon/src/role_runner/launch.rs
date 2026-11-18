@@ -254,11 +254,13 @@ pub(super) fn run_role_with_timeout(
     // resolved value rides the child's environment as `LOOM_SERVICE_TIER`, which
     // the `spawn-*.sh` adapters map per runtime. Unset exports nothing — an
     // operator-exported value in the daemon's own environment is inherited as-is.
-    if let Some((tier, tier_source)) = model_resolution::resolve_role_runner_service_tier_for_runtime(
-        workspace_root,
-        role,
-        admission.map(|a| a.runtime.as_str()),
-    ) {
+    if let Some((tier, tier_source)) =
+        model_resolution::resolve_role_runner_service_tier_for_runtime(
+            workspace_root,
+            role,
+            admission.map(|a| a.runtime.as_str()),
+        )
+    {
         log::info!(
             "role_runner: {role} service_tier={tier} (source={tier_source}) -> LOOM_SERVICE_TIER"
         );

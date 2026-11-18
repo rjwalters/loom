@@ -346,7 +346,10 @@ fn test_invoke_exports_resolved_service_tier_and_leaves_inherited_value_when_uns
         let script = write_fake_script(
             &root,
             "fake-spawn.sh",
-            &format!("printf '%s' \"${{LOOM_SERVICE_TIER:-__unset__}}\" > '{}'", observed.display()),
+            &format!(
+                "printf '%s' \"${{LOOM_SERVICE_TIER:-__unset__}}\" > '{}'",
+                observed.display()
+            ),
         );
         let ws = crate::write_scope_test_support::WritableRoot::register(&root);
         let mut runner = ScriptRoleInvocationRunner::new(root.clone())

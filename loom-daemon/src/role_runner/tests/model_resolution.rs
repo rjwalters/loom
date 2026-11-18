@@ -981,6 +981,11 @@ fn test_resolve_role_runner_service_tier_precedence_and_unset() {
 
     // A non-object map soft-fails to empty.
     let odd = tempfile::tempdir().unwrap();
-    write_config(odd.path(), r#"{"autonomous": {"roleRunner": {"roleServiceTiers": "priority"}}}"#);
-    assert!(read_role_runner_config(odd.path()).role_service_tiers.is_empty());
+    write_config(
+        odd.path(),
+        r#"{"autonomous": {"roleRunner": {"roleServiceTiers": "priority"}}}"#,
+    );
+    assert!(read_role_runner_config(odd.path())
+        .role_service_tiers
+        .is_empty());
 }
