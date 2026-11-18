@@ -588,20 +588,31 @@ pub fn sessions_for_ids(ids: &[String], home: Option<&Path>) -> Vec<OpencodeSess
 /// An id-keyed `filter` also dedupes by session id across stores — a session
 /// reachable through two stores (a cross-version store copy) is one session,
 /// not two, so its tokens are never counted twice. A directory-keyed filter is
-/// not deduped: its rows are not identified by id alone.
+/// not deduped: its rows are not identified by id alone. The dedupe runs over
+/// usage-bearing rows only: an all-zero creation row (see
+/// [`OpencodeSessionUsage::is_empty`]) in the first-discovered store must not
+/// claim the id and shadow the copy that holds the usage.
+///
+/// An empty `filter` (no directories and no ids) matches nothing, so this
+/// returns before [`discover_opencode_dbs`] walks the native-tools base and
+/// before any store is opened — the common case for a PR whose steps all ran on
+/// Claude, where no OpenCode session id exists.
 fn sessions_selected(
     filter: &SessionFilter,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     home: Option<&Path>,
 ) -> Vec<OpencodeSessionUsage> {
+    if filter.directories.is_empty() && filter.ids.is_empty() {
+        return Vec::new();
+    }
     let mut seen = std::collections::HashSet::new();
     let by_id = !filter.ids.is_empty();
     let mut all: Vec<OpencodeSessionUsage> = discover_opencode_dbs(home)
         .into_iter()
         .filter_map(|db| sessions_in(&db, filter, window))
         .flatten()
-        .filter(|s| !by_id || seen.insert(s.session_id.clone().unwrap_or_default()))
         .filter(|s| !s.is_empty())
+        .filter(|s| !by_id || seen.insert(s.session_id.clone().unwrap_or_default()))
         .collect();
     all.sort_by(|a, b| {
         a.created_at
@@ -661,9 +672,10 @@ pub fn tokens_by_model_for_ids(
 /// session recorded usage.
 #[must_use]
 pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
-    // An empty id set is the empty filter, which matches nothing — so this is
-    // `None` for it without a separate guard, and shares
-    // [`sessions_selected`]'s cross-store dedupe with [`tokens_by_model_for_ids`].
+    // An empty id set is the empty filter: [`sessions_selected`] returns for it
+    // before any store discovery, so this is `None` without a separate guard,
+    // and shares that function's cross-store dedupe with
+    // [`tokens_by_model_for_ids`].
     tokens_by_model_for_ids(ids, home)
 }
 
