@@ -139,8 +139,46 @@ fn missing_binary_is_127_and_builder_uses_guarded_tools() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(127));
+    // The real-checkout root makes the #14167 preflight stamping resolve the
+    // checkout's live repo facts, which on a cold record reads the forge
+    // through `gh` — a spawn the live-gh guard fails the whole binary for
+    // (#10138). A fake `gh` ahead of PATH answers that one read the way the
+    // real one would, so the stamping runs as designed; the guard's
+    // documented escape hatch (#10138: a fake ahead of PATH never reaches
+    // the stand-in) keeps the fall-through unreachable.
+    let fake = d.path().join("fake-gh");
+    std::fs::create_dir_all(&fake).unwrap();
+    let gh = fake.join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+case "$*" in
+  "api --include repos/"*)
+    repo=${*##*repos/}
+    repo=${repo%% *}
+    owner=${repo%%/*}
+    name=${repo#*/}
+    printf 'HTTP/2.0 200 OK\r\nEtag: "v1"\r\n\r\n{"id":7,"name":"%s","full_name":"%s","owner":{"login":"%s"}}' "$name" "$repo" "$owner"
+    exit 0 ;;
+esac
+echo "unexpected: $*" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(fake)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
     let out = worker(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")), "pi")
         .env("LOOM_ROLE", "builder")
+        .env("PATH", path)
         .args(["-p", "hello"])
         .output()
         .unwrap();
