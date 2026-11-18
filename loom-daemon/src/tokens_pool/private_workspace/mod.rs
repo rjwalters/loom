@@ -26,8 +26,8 @@ mod worker_setup;
 
 pub use lease::AccountBusy;
 pub use lifecycle::{
-    check_binding, configured, converge, rebind, recover, registered_repositories, run_job,
-    session_recover, start, status, stop, Converged,
+    check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
+    run_job, session_recover, start, status, stop, Converged,
 };
 pub use repository::WorkerCommand;
 

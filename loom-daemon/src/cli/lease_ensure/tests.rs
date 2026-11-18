@@ -877,3 +877,31 @@ fn the_reuse_decision_follows_the_lease_ttl_env() {
     }
     std::env::remove_var(env_var);
 }
+
+// #14100: the detached deferred publisher is a long-lived `loom-daemon` child;
+// its pid must be matchable to a kernel OOM line. Start line only: the parent
+// returns at once, so there is deliberately no exit/`abandoned` line.
+#[test]
+fn spawning_the_deferred_publisher_logs_a_self_spawn_start_line_only() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "exit 0"]).env("SECRET_TOKEN", "hunter2");
+    let mut pid = None;
+    let logs = crate::test_log_capture::capture_logs(|| {
+        pid = Some(deferred::spawn_detached(cmd).expect("spawns"));
+    });
+    let pid = pid.unwrap();
+    let starts: Vec<_> = logs
+        .iter()
+        .filter(|(_, m)| m.contains("site=lease_ensure_deferred"))
+        .collect();
+    assert_eq!(starts.len(), 1, "{logs:?}");
+    assert!(
+        starts[0]
+            .1
+            .starts_with(&format!("self_spawn start pid={pid} ")),
+        "{}",
+        starts[0].1
+    );
+    assert!(!starts[0].1.contains("hunter2"), "{}", starts[0].1);
+    assert!(!logs.iter().any(|(_, m)| m.starts_with("self_spawn exit")), "{logs:?}");
+}

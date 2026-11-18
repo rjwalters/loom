@@ -430,13 +430,20 @@ pub fn merge_step_tokens_by_model(
     let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
         .into_iter()
         .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
-        .flat_map(|(role, contents)| match role {
-            // Issue-keyed: an earlier dispatch is an abandoned retry.
-            crate::step_role::StepRole::Builder => {
-                crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+        .flat_map(|(role, contents)| {
+            use crate::step_role::StepRole;
+            // Spelled out, no catch-all: a role added to `merge_step_logs`
+            // must be filed under its keying here before this compiles.
+            match role {
+                // Issue-keyed: an earlier dispatch is an abandoned retry.
+                StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
+                    crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+                }
+                // PR-keyed: an earlier dispatch is a completed round on this PR.
+                StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
+                    crate::launch_record::opencode_session_ids(&contents)
+                }
             }
-            // PR-keyed: an earlier dispatch is a completed round on this PR.
-            _ => crate::launch_record::opencode_session_ids(&contents),
         })
         .collect();
     let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
@@ -585,10 +592,23 @@ pub fn sweep_tokens_by_window(
 ///
 /// `session_ids` (#14048) are the exact native session ids parsed from that
 /// same log's dispatch region. The OpenCode and Codex arms key on them
-/// directly when present — the id cannot name another launch's session — and
-/// fall back to the directory+window key when empty (a role tick, or a step
-/// whose log was unreadable). The Kimi arm has no id source yet (see
-/// `crate::kimi_usage`'s module doc) and keeps the directory+window key.
+/// when present, and fall back to the directory+window key when empty (a role
+/// tick, or a step whose log was unreadable). The two arms are NOT symmetric:
+///
+/// - **OpenCode**: the id is the whole key — no directory, no window — because
+///   the id cannot name another launch's session.
+/// - **Codex**: the ids are ANDed with the workspace directory and the window
+///   (`SessionFilter::matches` in `codex_usage`), so an id-named rollout whose
+///   `cwd` is not the workspace root, or that started outside the window, is
+///   not attributed. The window is kept deliberately: it bounds the rollout
+///   scan to the window's date directories, where dropping it would read
+///   every rollout in the store. A step child's cwd is pinned to the workspace
+///   root, so the directory constraint holds for every step dispatch today; a
+///   launch path that runs Codex from a worktree would need an ids-only
+///   filter here.
+///
+/// The Kimi arm has no id source yet (see `crate::kimi_usage`'s module doc)
+/// and keeps the directory+window key.
 #[must_use]
 pub fn role_tick_tokens_by_model(
     runtime: Option<&str>,
@@ -597,20 +617,63 @@ pub fn role_tick_tokens_by_model(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     session_ids: &NativeSessionIds,
 ) -> Option<Vec<ModelUsageTotals>> {
+    native_tokens_by_model(runtime, &role_tick_directories(root), log_path, window, session_ids)
+}
+
+/// [`role_tick_tokens_by_model`] for a **step-dispatched** run (#14406).
+///
+/// A step is a role session keyed by one work item, so an issue-keyed step
+/// (Curator, Builder, `champion_promote`) is read over the same directories a
+/// sweep on that issue is — the workspace root plus the issue's worktree
+/// ([`sweep_directories`]), where its Builder runs. A PR-keyed step
+/// (Judge, Doctor, `champion_merge`) carries a PR number that cannot name an
+/// issue worktree here, so it is read over the workspace root alone, as a
+/// role tick is. `log_path` is the step's own `step-<role>-<item>.log`.
+///
+/// The directory + window key cannot tell two steps that ran in the same
+/// directory at the same time apart; only the Claude arm (which matches on
+/// the transcript's own command) and Pi (which reads the step's own log) are
+/// exact per step. `None` for [`UsageSource::ClaudeTranscripts`], like the
+/// tick reader.
+#[must_use]
+pub fn step_tokens_by_model(
+    runtime: Option<&str>,
+    root: &Path,
+    item: (u32, bool),
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
+) -> Option<Vec<ModelUsageTotals>> {
+    let (number, acts_on_pr) = item;
+    let directories = if acts_on_pr {
+        role_tick_directories(root)
+    } else {
+        sweep_directories(root, number)
+    };
+    native_tokens_by_model(runtime, &directories, log_path, window, session_ids)
+}
+
+fn native_tokens_by_model(
+    runtime: Option<&str>,
+    directories: &[PathBuf],
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
+) -> Option<Vec<ModelUsageTotals>> {
     match UsageSource::for_runtime(runtime) {
         UsageSource::OpenCodeSessionDb => {
             if session_ids.opencode.is_empty() {
-                crate::opencode_usage::tokens_by_model(&role_tick_directories(root), window, None)
+                crate::opencode_usage::tokens_by_model(directories, window, None)
             } else {
                 crate::opencode_usage::tokens_by_model_for_ids(&session_ids.opencode, None)
             }
         }
         UsageSource::KimiSessionStore => {
-            crate::kimi_usage::tokens_by_model(&role_tick_directories(root), None, window, None)
+            crate::kimi_usage::tokens_by_model(directories, None, window, None)
         }
         UsageSource::CodexSessionRollouts => crate::codex_usage::tokens_by_model(
             &crate::codex_usage::SessionFilter {
-                directories: role_tick_directories(root),
+                directories: directories.to_vec(),
                 ids: session_ids.codex.clone(),
             },
             window,

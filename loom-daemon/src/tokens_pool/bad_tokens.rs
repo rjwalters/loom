@@ -158,18 +158,11 @@ fn reason_blocks_class(reason: &str, queried_class: Option<&str>) -> bool {
     }
 }
 
-/// [`reason_blocks_class`] across every [`ClassQuery`] arm (#13873): the
-/// any-class arm blocks only entries that carry no recognizable class —
-/// a class-scoped entry leaves the account usable for the classes it does
-/// not name, which is exactly the readmission the selection-time model
-/// fallback depends on.
+/// [`reason_blocks_class`] across every [`ClassQuery`] arm (#13873).
 fn reason_blocks_query(reason: &str, query: &ClassQuery<'_>) -> bool {
     match query {
         ClassQuery::AccountWide => true,
         ClassQuery::Class(class) => reason_blocks_class(reason, Some(class)),
-        ClassQuery::AnyClass => reason_model_class(reason)
-            .and_then(model_class_of)
-            .is_none(),
     }
 }
 
@@ -422,7 +415,7 @@ enum AmbiguousExhaustionEvidence {
 /// window plus slack for probe cadence and clock skew) cannot be a real
 /// weekly reset — treat it as garbage and fall back to the fixed cooldown
 /// rather than freezing the account out until a corrupt instant.
-const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
+pub(super) const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
 
 /// Read the fresh `.ranking` evidence for an ambiguous (non-session-limit-
 /// matching) exhaustion entry, as [`AmbiguousExhaustionEvidence`].
@@ -746,37 +739,17 @@ pub fn blocking_entry_in_dir_for_class(
     blocking_entry_in_dir_for_query(tokens_dir, token_name, query)
 }
 
-/// [`blocking_entry_in_dir_for_class`] asking the **class-less-entry**
-/// question (#13873): only class-LESS entries (and auth entries, which are
-/// never class-scoped) block. This is *not* the "could any class spawn"
-/// read: an account whose live marks name every known class has no
-/// class-less entry yet cannot serve any class — that question is answered
-/// by scanning each known class
-/// ([`super::select::usable_account_count_any_class`]); this scan is its
-/// tested primitive, pinned here so the `ClassQuery` arms stay explicit.
-#[must_use]
-pub fn blocking_entry_in_dir_any_class(
-    tokens_dir: &Path,
-    token_name: &str,
-) -> Option<BlockingEntry> {
-    blocking_entry_in_dir_for_query(tokens_dir, token_name, ClassQuery::AnyClass)
-}
-
-/// How a `.bad_tokens` scan scopes class-marked entries (#13873). The
-/// account-wide and one-class arms are #8058's two existing questions; the
-/// any-class arm is the fallback preflights' (#13873).
+/// How a `.bad_tokens` scan scopes class-marked entries (#13873): #8058's two
+/// questions, account-wide and one class.
 pub(crate) enum ClassQuery<'a> {
     /// The account-wide question: every live entry blocks.
     AccountWide,
     /// One model class: entries scoped to a *different* class do not block.
     Class(&'a str),
-    /// Any class: only class-less (or auth) entries block — the account can
-    /// still serve a class none of its marks name.
-    AnyClass,
 }
 
-/// The single scan every [`ClassQuery`] arm shares (#8058's one-scan rule,
-/// extended by #13873), so the three questions can never drift apart.
+/// The single scan every [`ClassQuery`] arm shares (#8058's one-scan rule),
+/// so the two questions can never drift apart.
 fn blocking_entry_in_dir_for_query(
     tokens_dir: &Path,
     token_name: &str,

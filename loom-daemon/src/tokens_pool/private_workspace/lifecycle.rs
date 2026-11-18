@@ -11,6 +11,21 @@ pub fn configured(workspace: &Path, name: &str) -> Result<bool> {
         .exists())
 }
 
+/// The profile's private-workspace registration, read tolerantly for
+/// `accounts list` (issue #14298): a local `workspace.json` read only — no
+/// docker, no lease, no engine or ownership validation — because a list of
+/// every account must not fail on state one broken session left behind.
+/// `None` when the profile has no private workspace, and also when the
+/// state exists but cannot be read; surfacing that failure is the dedicated
+/// `session status` / `session recover` path's job, not a list's.
+pub fn registrations(profile: &Path) -> Option<Config> {
+    let dir = state_dir(profile).ok()?;
+    if !dir.join("workspace.json").is_file() {
+        return None;
+    }
+    load(&dir).ok()
+}
+
 pub(super) fn resolve(workspace: &Path, name: &str) -> Result<(Config, PathBuf)> {
     let account = account(workspace, name)?;
     let dir = state_dir(&account.credential_reference)?;

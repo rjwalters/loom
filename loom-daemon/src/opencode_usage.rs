@@ -531,7 +531,12 @@ impl RawSessionRow {
             }
             created_at
         } else {
-            DateTime::<Utc>::from_timestamp_millis(self.time_created?).unwrap_or_else(Utc::now)
+            // The id is the whole key, so a NULL or undecodable `time_created`
+            // must not drop the row: `created_at` is only an ordering hint
+            // here, and `Utc::now()` stands in for it.
+            self.time_created
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+                .unwrap_or_else(Utc::now)
         };
         let model_json = self.model?;
         let model = parse_model_id(&model_json)?;
@@ -576,17 +581,26 @@ pub fn sessions_for_ids(ids: &[String], home: Option<&Path>) -> Vec<OpencodeSess
     sessions_selected(&SessionFilter::ids(ids), None, home)
 }
 
-/// The one selector both public listings route through: filter every
-/// discovered store with `filter`, drop usage-free rows, sort oldest-first.
+/// The one selector every public listing and by-id total routes through:
+/// filter every discovered store with `filter`, drop usage-free rows, sort
+/// oldest-first.
+///
+/// An id-keyed `filter` also dedupes by session id across stores — a session
+/// reachable through two stores (a cross-version store copy) is one session,
+/// not two, so its tokens are never counted twice. A directory-keyed filter is
+/// not deduped: its rows are not identified by id alone.
 fn sessions_selected(
     filter: &SessionFilter,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     home: Option<&Path>,
 ) -> Vec<OpencodeSessionUsage> {
+    let mut seen = std::collections::HashSet::new();
+    let by_id = !filter.ids.is_empty();
     let mut all: Vec<OpencodeSessionUsage> = discover_opencode_dbs(home)
         .into_iter()
         .filter_map(|db| sessions_in(&db, filter, window))
         .flatten()
+        .filter(|s| !by_id || seen.insert(s.session_id.clone().unwrap_or_default()))
         .filter(|s| !s.is_empty())
         .collect();
     all.sort_by(|a, b| {
@@ -647,17 +661,10 @@ pub fn tokens_by_model_for_ids(
 /// session recorded usage.
 #[must_use]
 pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
-    if ids.is_empty() {
-        return None;
-    }
-    let mut seen = std::collections::HashSet::new();
-    let sessions = discover_opencode_dbs(home)
-        .into_iter()
-        .filter_map(|db| sessions_in(&db, &SessionFilter::ids(ids), None))
-        .flatten()
-        // A session reachable through two stores is one session, not two.
-        .filter(|s| seen.insert(s.session_id.clone().unwrap_or_default()));
-    fold_sessions(sessions)
+    // An empty id set is the empty filter, which matches nothing — so this is
+    // `None` for it without a separate guard, and shares
+    // [`sessions_selected`]'s cross-store dedupe with [`tokens_by_model_for_ids`].
+    tokens_by_model_for_ids(ids, home)
 }
 
 /// Fold already-selected sessions into per-model totals — the whole of
