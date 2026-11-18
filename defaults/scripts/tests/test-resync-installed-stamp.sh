@@ -404,6 +404,55 @@ else
     fail "(#11680) an empty remote was rewritten"
 fi
 
+# --- #14434: a blocked run records held_back + exits 3; a clean run clears it -
+echo ""
+echo "Test group: held_back is recorded when a file is blocked, cleared by a clean run (#14434)"
+REPO_HB="$(make_dogfood_fixture repo-held-back)"
+# Land a direct local fix on the installed copy (not a resync commit) while
+# defaults/ still has the old content, so the local-divergence guard blocks it.
+printf 'A\nLOCAL-FIX-LINE\n' > "$REPO_HB/.loom/hooks/guard.sh"
+git -C "$REPO_HB" add .loom/hooks/guard.sh >/dev/null 2>&1
+git -C "$REPO_HB" commit -qm "fix(guard): direct local hotfix" >/dev/null 2>&1
+META_HB="$REPO_HB/.loom/install-metadata.json"
+(cd "$REPO_HB" && bash "$SCRIPT" >/dev/null 2>&1)
+RC_HB=$?
+if [[ $RC_HB -eq 3 ]]; then
+    pass "(#14434) a run that held a file back exits 3, distinct from 1 (errors)"
+else
+    fail "(#14434) held-back run expected exit 3 (got $RC_HB)"
+fi
+if [[ "$(read_field "$META_HB" loom_version)" == "9.9.9" ]]; then
+    pass "(#14434) the stamp still advances on a blocked run (lineage rung relies on it)"
+else
+    fail "(#14434) loom_version did not advance on a blocked run: $(read_field "$META_HB" loom_version)"
+fi
+if grep -q '"held_back"' "$META_HB" && grep -q 'hooks/guard.sh' "$META_HB"; then
+    pass "(#14434) install-metadata.json records the held-back path under held_back"
+else
+    fail "(#14434) held_back missing or incomplete: $(cat "$META_HB")"
+fi
+(cd "$REPO_HB" && bash "$SCRIPT" --force >/dev/null 2>&1)
+RC_HB=$?
+if [[ $RC_HB -eq 0 ]]; then
+    pass "(#14434) a following --force run exits 0"
+else
+    fail "(#14434) a following --force run expected exit 0 (got $RC_HB)"
+fi
+if ! grep -q '"held_back"' "$META_HB"; then
+    pass "(#14434) the --force run clears held_back"
+else
+    fail "(#14434) held_back survived a clean run: $(cat "$META_HB")"
+fi
+
+# --dry-run still exits 2 and a clean run never writes the key.
+REPO_HB2="$(make_dogfood_fixture repo-held-back-clean)"
+(cd "$REPO_HB2" && bash "$SCRIPT" >/dev/null 2>&1)
+if [[ $? -eq 0 ]] && ! grep -q '"held_back"' "$REPO_HB2/.loom/install-metadata.json"; then
+    pass "(#14434) a clean run exits 0 and writes no held_back key"
+else
+    fail "(#14434) a clean run wrote held_back or did not exit 0"
+fi
+
 # --- summary -----------------------------------------------------------------
 echo ""
 echo "========================================"

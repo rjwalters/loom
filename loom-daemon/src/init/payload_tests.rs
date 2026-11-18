@@ -692,6 +692,7 @@ fn gate_proceeds_at_or_below_running_and_for_unrecorded_versions() {
     let meta = |ver: Option<&str>, req: Option<&str>| InstallMeta {
         loom_version: ver.map(str::to_string),
         requires_daemon: req.map(str::to_string),
+        ..InstallMeta::default()
     };
     assert_eq!(
         resync_gate(&meta(Some("0.19.880"), Some("0.19.772")), &daemon),

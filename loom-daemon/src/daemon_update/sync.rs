@@ -46,6 +46,12 @@ const MANAGED_PREFIXES: &[&str] = &[
 
 const MANAGED_FILES: &[&str] = &[".loom/install-metadata.json"];
 
+/// `resync-installed.sh` exit code: applied, but the local-divergence
+/// protection held one or more files back (#14434). MUST mirror the "Exit
+/// codes" block in that script's header; 1 stays "error", 2 is `--dry-run`
+/// drift.
+const RESYNC_EXIT_HELD_BACK: i32 = 3;
+
 const GITIGNORE_BEGIN: &str = "# >>> loom-managed (do not edit) >>>";
 const GITIGNORE_END: &str = "# <<< loom-managed <<<";
 
@@ -307,7 +313,7 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
                 ));
                 match paths::resolve_resync_script(repo_root) {
                     Some(script) => {
-                        let ok = Command::new(&script)
+                        let code = Command::new(&script)
                             // Forge label writes are opt-in (#10770); the post-roll
                             // resync keeps the fleet label auto-heal (#6716).
                             .arg("--sync-labels")
@@ -315,9 +321,18 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .status()
-                            .is_ok_and(|s| s.success());
-                        if ok {
+                            .ok()
+                            .and_then(|s| s.code());
+                        if code == Some(0) {
                             out::ok("Post-roll resync-installed.sh completed.");
+                        } else if code == Some(RESYNC_EXIT_HELD_BACK) {
+                            // #14434: applied, but local-divergence protection
+                            // held files back; install-metadata.json lists them
+                            // under `held_back`. Not an error, not a clean sync.
+                            out::warn(&format!(
+                                "Post-roll resync-installed.sh applied but HELD BACK one or more locally-modified file(s) (exit {RESYNC_EXIT_HELD_BACK}) — review and re-run with --force: {}",
+                                script.display()
+                            ));
                         } else {
                             out::warn(&format!(
                                 "Post-roll resync-installed.sh failed — run it by hand: {}",

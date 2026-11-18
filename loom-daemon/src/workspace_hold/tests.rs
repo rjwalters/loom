@@ -34,6 +34,7 @@ fn meta(version: Option<&str>, requires: Option<&str>) -> InstallMeta {
     InstallMeta {
         loom_version: version.map(str::to_string),
         requires_daemon: requires.map(str::to_string),
+        ..InstallMeta::default()
     }
 }
 
