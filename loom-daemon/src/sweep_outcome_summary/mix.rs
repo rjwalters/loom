@@ -151,8 +151,14 @@ pub fn resolve_mix(record: &SweepOutcomeRecord) -> String {
 }
 
 /// Fold one record's review bounces into `acc`. Same "unknown != zero"
-/// contract as `judge_verdicts`/`doctor_cycles` themselves: a record whose
-/// forge timeline was never read adds to neither the count nor the denominator.
+/// contract as `judge_verdicts`/`doctor_cycles` themselves, applied to each
+/// field on its own: `judge_verdicts` feeds `judge_rejections` and the
+/// `bounce_records` (`BNC_N`) count; `doctor_cycles` is summed on its own,
+/// outside that gate. A record carrying neither adds to nothing. The two fields
+/// are paired in every record the current writer emits, but a pre-#8222 record
+/// carries `doctor_cycles` (the retired phase-history proxy) with no
+/// `judge_verdicts`; its cycles still count, though it is not in `BNC_N`, so
+/// `doctor_cycles` can exceed what `bounce_records` alone would justify.
 pub fn accumulate_bounces(acc: &mut Accum, record: &SweepOutcomeRecord) {
     if let Some(verdicts) = &record.judge_verdicts {
         acc.bounce_records += 1;
@@ -210,9 +216,11 @@ pub fn render_rows(report: &SummaryReport) -> String {
 }
 
 /// The `render_text` footnote for the mix table.
-pub const MIX_NOTE: &str = "REJ = Judge `fail` verdicts and DR_CYC = completed Doctor cycles, \
-    both summed over the BNC_N sweeps whose PR timeline was read (an unread timeline is unknown, \
-    not zero). The mix key omits `doctor` on purpose, and a sweep that died before a role ran \
+pub const MIX_NOTE: &str = "REJ = Judge `fail` verdicts, summed over the BNC_N sweeps whose PR \
+    timeline was read (an unread timeline is unknown, not zero). DR_CYC = completed Doctor cycles, \
+    summed over every sweep carrying `doctor_cycles`: that is BNC_N plus any pre-#8222 sweep that \
+    has the cycle count but no Judge verdicts, so DR_CYC / BNC_N overstates the per-sweep rate on \
+    old history. The mix key omits `doctor` on purpose, and a sweep that died before a role ran \
     forms its own row (#14067).\n";
 
 #[cfg(test)]

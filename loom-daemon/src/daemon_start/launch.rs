@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::render::{self, Mechanism};
 use super::{advisories, marker, out, platform, watchdog_job, Ctx};
+use crate::launchd_env_drift::is_secret_env_key;
 
 /// `tail -n 20 "$START_LOG"` inside the `[[ -s ]]` guard, on stderr.
 fn dump_start_log(start_log: &Path) {
@@ -582,11 +583,13 @@ const NON_SECRET_ENV_KEYS: &[&str] = &[
 ];
 
 /// The mismatch line for one env key. Values are printed only for
-/// [`NON_SECRET_ENV_KEYS`]; for every other key the message says the values
-/// differ and carries neither value (no fingerprint) so a credential never
-/// reaches stderr, scrollback or a support paste (#14175).
+/// [`NON_SECRET_ENV_KEYS`] that the shared classifier
+/// ([`is_secret_env_key`], also used by the drift warning, #14352) does not
+/// flag as secret; for every other key the message says the values differ and
+/// carries neither value (no fingerprint) so a credential never reaches stderr,
+/// scrollback or a support paste (#14175).
 fn env_mismatch_message(key: &str, expected: &str, got: &str) -> String {
-    if NON_SECRET_ENV_KEYS.contains(&key) {
+    if NON_SECRET_ENV_KEYS.contains(&key) && !is_secret_env_key(key) {
         format!(
             "launchd env verification: key '{key}' expected [{expected}] but the running job reports [{got}]."
         )
@@ -762,6 +765,22 @@ mod tests {
         assert!(msg.contains("GH_TOKEN"), "key is still named: {msg}");
         assert!(!msg.contains("ghp_fake_expected_123"), "expected leaked: {msg}");
         assert!(!msg.contains("ghp_fake_got_456"), "actual leaked: {msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_loom_prefixed_credential_values() {
+        for key in ["LOOM_PERSONAL_GH_TOKEN", "LOOM_OPENWEIGHTS_API_KEY"] {
+            let msg = env_mismatch_message(key, "secret_expected_123", "secret_got_456");
+            assert!(msg.contains(key), "key is still named: {msg}");
+            assert!(!msg.contains("secret_expected_123"), "expected leaked: {msg}");
+            assert!(!msg.contains("secret_got_456"), "actual leaked: {msg}");
+        }
+    }
+
+    #[test]
+    fn env_mismatch_message_stays_fail_closed_for_unknown_non_loom_keys() {
+        let msg = env_mismatch_message("SOME_OTHER_VAR", "expected_val", "got_val");
+        assert!(!msg.contains("expected_val") && !msg.contains("got_val"), "{msg}");
     }
 
     #[test]

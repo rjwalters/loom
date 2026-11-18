@@ -318,7 +318,18 @@ model a tier maps to.
 the suffix becomes `-c model_reasoning_effort=<suffix>` at the lowest precedence:
 explicit `-c` > `--effort` > `LOOM_EFFORT` > suffix; an empty base falls through to
 `LOOM_CODEX_MODEL`/no `-m`, an empty suffix is ignored; the same split applies to
-`LOOM_CODEX_MODEL`, and an explicit `-m foo@high` arg is passed through unchanged), an
+`LOOM_CODEX_MODEL`, and an explicit `-m foo@high` arg is passed through unchanged). One
+reachability caveat (#14320): on a **role-runner or sweep-step** Codex launch the
+suffix rung can no longer take effect — the daemon emits its resolved effort as an explicit
+`--effort` arg (second tier of this chain), and since #14017 its resolver supplies
+`medium` (source `codex-default`) for every Codex launch with no configured effort
+tier, so `--effort` is always populated and shadows the suffix. A `roleDraw`
+candidate written `codex/<model>@high` therefore yields `medium`; the supported way
+to raise a Codex role's effort from config is `roleEfforts.<role>@codex`
+([daemon-reference.md](daemon-reference.md) § role-runner effort). The suffix still
+applies on manual launches where no `--effort`/`LOOM_EFFORT` is supplied, and on the
+sweep orchestrator launch (it never calls that resolver): an ad-hoc
+`dispatch_sweep --model <m>@<e>` with no effort still reaches the suffix rung. An
 explicit `-m`/`--model` wins, `LOOM_CODEX_MODEL` supplies an optional static
 adapter default, and with none of those set **no `-m` flag is emitted at all** so
 the Codex CLI/profile default is preserved (exactly `spawn-claude.sh`'s
@@ -515,7 +526,7 @@ them from a single source so role/repo instructions never fork per-runtime.
   `AGENTS.md`, but `CLAUDE.md` carries the full operating surface.
 
 Both derive from one source (#4479, seeded by the fork's `AGENTS.md` codegen,
-fork PR #8): `defaults/scripts/generate-agents-md.sh` extracts the
+fork PR #8): `scripts/generate-agents-md.sh` extracts the
 `agents-md:include` marker ranges from `defaults/.loom/CLAUDE.md` and wraps them
 with dual-runtime framing, writing the checked-in `defaults/.loom/AGENTS.md`
 (CI `scripts/check-agents-md-sync.sh` fails if it is stale). So a new runtime
@@ -2526,7 +2537,7 @@ collaboration:
 | #15 | Codex runner | **1. Spawn** — Codex's `spawn-<runtime>.sh` implementation | **landed** as `defaults/scripts/spawn-codex.sh` (#4468). Ported, not cherry-picked: token-pool auth deferred to Phase 4, `--full-auto`/`-a` replaced (absent on `codex exec` 0.146.0), and the skip-permissions → sandbox mapping deliberately diverges (see the parity doc). |
 | #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | **landed for the pooled case** (#8672) as `loom-daemon accounts provision`: a pooled `CODEX_HOME` is populated from the operator's own `~/.codex` per a per-provider sharing table (symlink capability/session trees, copy `AGENTS.md`, key-merge `config.toml` under a credential/identity denylist, never touch `auth.json` or per-project trust state), with a `<profile>/.loom-profile.json` ledger so a local edit inside a profile wins forever. See [`codex-profile-provisioning.md`](codex-profile-provisioning.md). Generating a repo's `.codex/` config from single source (the `AGENTS.md` codegen analogue) is still a separate issue. |
 | #20, #40 | `GUARDRAIL-PARITY.md` guardrail parity | **6. Permission / sandbox mapping** — the parity-doc requirement | **landed** as [`guardrail-parity-codex.md`](guardrail-parity-codex.md) (#4468), re-verified against 0.146.0 — several fork claims no longer hold and are corrected there |
-| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`defaults/scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
+| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
 | #12, #17 | Provider-aware account pool (per-account provider, waterfall fill, `CODEX_HOME` rotation) | **4. Usage accounting** — provider-aware selection consuming the pool signals | Phase 4. #4468 ships only single-profile `CODEX_HOME` passthrough — no pool, no rotation, no bad-token marking. |
 | #14 | Reusable CI role workflow (`loom-role.yml`) parameterized by runtime | Cross-cutting — the tier-2 CI gate every non-Claude adapter must pass | partially landed: Codex has its own `codex-adapter-smoke` leg in `ci.yml` (#4468); the parameterized reusable workflow is not adopted |
 | #59 | Finding: native Codex agents prohibited for Loom lifecycles | **6/7. Constraint** — encoded in the parity doc + capability matrix | **landed** — recorded as residual gap 9 in the parity doc; `codex.json` declares `subagents: "no"` |
