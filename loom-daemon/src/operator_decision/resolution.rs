@@ -173,7 +173,9 @@ pub fn digest_decision(d: &Decision) -> String {
 /// that a queue transition rewrites, not part of the proposal.
 fn is_bookkeeping_marker(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with("<!-- loom:") && t.ends_with("-->") && !t.contains("loom:premise-check")
+    t.starts_with("<!-- loom:")
+        && t.ends_with("-->")
+        && !t.contains(crate::premise_check::record::MARKER_OPEN)
 }
 
 /// Hash of the proposal: title plus body with the managed decision section,
