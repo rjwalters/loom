@@ -34,7 +34,7 @@ fn official_image_gains_the_library_namespace() {
 fn only_hostless_references_are_docker_hub() {
     assert!(hub_image::is_docker_hub("ubuntu:24.04"));
     assert!(hub_image::is_docker_hub("otel/opentelemetry-collector-contrib:0.139.0"));
-    assert!(!hub_image::is_docker_hub("ghcr.io/rjwalters/loom-worker-session:latest"));
+    assert!(!hub_image::is_docker_hub("ghcr.io/2amlogic/loom-worker-session:latest"));
     assert!(!hub_image::is_docker_hub("localhost:5000/ubuntu:24.04"));
     assert!(!hub_image::is_docker_hub("localhost/ubuntu"));
 }

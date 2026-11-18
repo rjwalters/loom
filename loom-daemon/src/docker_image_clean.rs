@@ -7,7 +7,7 @@
 //! `session-image-smoke` in `.github/workflows/ci.yml`, plus a fleet-side
 //! `audit-smoke`/`audit-test` flow outside this repo) build and tag images
 //! under a **fixed** tag (`loom-worker:ci-smoke`,
-//! `ghcr.io/rjwalters/loom-worker:ci-smoke`, `loom-worker-session:ci-smoke`,
+//! `ghcr.io/2amlogic/loom-worker:ci-smoke`, `loom-worker-session:ci-smoke`,
 //! …) on every run. Docker re-points that tag at the new image on each build
 //! and leaves the *previous* image dangling (untagged, unreferenced by any
 //! name) — it never disappears on its own. A host that runs these flows daily
@@ -146,10 +146,19 @@ pub const DEFAULT_MIN_INTERVAL_SECS: u64 = 1_800;
 /// Membership is **exact repository-name equality** (see
 /// [`plan_retention`]), not a substring test — `loom-worker-native` is a
 /// distinct entry precisely because `loom-worker` does not cover it.
+///
+/// The `ghcr.io/rjwalters/*` entries are **legacy** (#14419): the repository
+/// moved to `2AMLogic` and the images publish under `ghcr.io/2amlogic/*`, but
+/// hosts still hold images pulled from the old path, which this pass must keep
+/// recognising so they are cleaned up rather than orphaned.
 pub const DEFAULT_TRACKED_REPOS: &[&str] = &[
     "loom-worker",
     "loom-worker-session",
     "loom-worker-native",
+    "ghcr.io/2amlogic/loom-worker",
+    "ghcr.io/2amlogic/loom-worker-session",
+    "ghcr.io/2amlogic/loom-worker-native",
+    // Legacy pre-transfer path (see above).
     "ghcr.io/rjwalters/loom-worker",
     "ghcr.io/rjwalters/loom-worker-session",
     "ghcr.io/rjwalters/loom-worker-native",

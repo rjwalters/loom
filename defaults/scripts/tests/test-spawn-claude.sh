@@ -1974,8 +1974,8 @@ assert_contains "containerized dispatch ENABLED" "$output" \
 docker_log="$(cat "$DOCKER_LOG" 2>/dev/null)"
 assert_contains "-v $CONTAIN_WS:$CONTAIN_WS" "$docker_log" \
     "containerized dispatch: workspace mounted at path parity (MOUNT-CONTRACT.md §1, #7429)"
-assert_contains "ghcr.io/rjwalters/loom-worker:latest" "$docker_log" \
-    "containerized dispatch: defaults to the ghcr.io/rjwalters/loom-worker image (#7429)"
+assert_contains "ghcr.io/2amlogic/loom-worker:latest" "$docker_log" \
+    "containerized dispatch: defaults to the ghcr.io/2amlogic/loom-worker image (#7429)"
 assert_contains "$CONTAIN_WS/.loom/scripts/spawn-claude.sh" "$docker_log" \
     "containerized dispatch: re-execs spawn-claude.sh itself as the containerized command (#7429)"
 assert_contains "stub-claude ran, args=-p ping" "$output" \
@@ -2057,7 +2057,7 @@ assert_contains "--label loom.dispatch.cpus=3" "$docker_log" \
     "the applied CPU limit is surfaced as a docker label for observability (#7430)"
 assert_contains "--label loom.dispatch.memory=2g" "$docker_log" \
     "the applied memory limit is surfaced as a docker label for observability (#7430)"
-assert_contains "# LOOM_DISPATCH_MODE mode=container image=ghcr.io/rjwalters/loom-worker:latest cpus=3 memory=2g" "$output" \
+assert_contains "# LOOM_DISPATCH_MODE mode=container image=ghcr.io/2amlogic/loom-worker:latest cpus=3 memory=2g" "$output" \
     "the LOOM_DISPATCH_MODE marker names the exact applied cpus/memory values (#7430)"
 assert_contains "stub-claude ran, args=-p ping" "$output" \
     "the recursed invocation still reaches the claude stub with explicit resource limits applied (#7430)"

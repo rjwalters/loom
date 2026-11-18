@@ -670,23 +670,23 @@ jobs:
         run: |
           docker build -f docker/worker/Dockerfile \
             --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
-            -t ghcr.io/rjwalters/loom-worker:ci-daily .
+            -t ghcr.io/2amlogic/loom-worker:ci-daily .
       - name: loom-worker smoke
         if: ${{ !cancelled() }}
-        run: ./docker/worker/test-image.sh ghcr.io/rjwalters/loom-worker:ci-daily
+        run: ./docker/worker/test-image.sh ghcr.io/2amlogic/loom-worker:ci-daily
       - name: loom-worker mount-contract test
         if: ${{ !cancelled() }}
-        run: ./docker/worker/test-mount-contract.sh ghcr.io/rjwalters/loom-worker:ci-daily
+        run: ./docker/worker/test-mount-contract.sh ghcr.io/2amlogic/loom-worker:ci-daily
       - name: loom-worker run-job seam test
         if: ${{ !cancelled() }}
-        run: ./docker/worker/test-run-job.sh ghcr.io/rjwalters/loom-worker:ci-daily
+        run: ./docker/worker/test-run-job.sh ghcr.io/2amlogic/loom-worker:ci-daily
       - name: Build the loom-worker-session image
         id: session-build
         if: ${{ !cancelled() }}
         timeout-minutes: 10
         run: |
           docker build -f docker/session/Dockerfile \
-            --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-daily \
+            --build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:ci-daily \
             -t loom-worker-session:ci-daily .
       - name: loom-worker-session smoke
         if: ${{ !cancelled() && steps.session-build.outcome == 'success' }}
@@ -697,7 +697,7 @@ jobs:
         timeout-minutes: 10
         run: |
           docker build -f docker/native/Dockerfile \
-            --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-daily \
+            --build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:ci-daily \
             -t loom-worker-native:ci-daily .
       - name: loom-worker-native smoke
         if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}

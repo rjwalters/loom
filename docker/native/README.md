@@ -1,9 +1,9 @@
 # `loom-worker-native` image
 
-`ghcr.io/rjwalters/loom-worker-native:<version>` (+ `:latest`) is the image
+`ghcr.io/2amlogic/loom-worker-native:<version>` (+ `:latest`) is the image
 that **per-sweep ephemeral containers for native-harness (Pi / OpenCode /
 Kimi) sweeps** run in — published by `.github/workflows/release.yml` FROM the
-same-version `ghcr.io/rjwalters/loom-worker:<version>` base image, so the two
+same-version `ghcr.io/2amlogic/loom-worker:<version>` base image, so the two
 versions stay in lockstep by construction, exactly like
 [`loom-worker-session`](../session/README.md) does.
 
@@ -136,7 +136,7 @@ docker build -f docker/native/Dockerfile --build-arg BASE_IMAGE=loom-worker:dev 
 ```
 
 The release workflow does the same thing with
-`--build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:<version>`, then pushes
+`--build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:<version>`, then pushes
 multi-arch (`linux/amd64,linux/arm64`).
 
 ## Run

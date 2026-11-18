@@ -1,9 +1,9 @@
 # `loom-worker-session` image
 
-`ghcr.io/rjwalters/loom-worker-session:<version>` (+ `:latest`) is the
+`ghcr.io/2amlogic/loom-worker-session:<version>` (+ `:latest`) is the
 **session-capable** image layer Epic #6896 Phase 2's per-account persistent
 Codex session containers run — published by `.github/workflows/release.yml`
-FROM the same-version `ghcr.io/rjwalters/loom-worker:<version>` base image, so
+FROM the same-version `ghcr.io/2amlogic/loom-worker:<version>` base image, so
 the two version in lockstep by construction: `<version>` always matches the
 loom version both images ship at.
 
@@ -161,7 +161,7 @@ time:
 ```bash
 docker run -d --name codex-session-<account> \
   -v "/path/to/codex-profiles/<account>:/home/loom/.codex-profile" \
-  ghcr.io/rjwalters/loom-worker-session:<version>
+  ghcr.io/2amlogic/loom-worker-session:<version>
 ```
 
 The volume, not the image, is what makes a session container
@@ -185,7 +185,7 @@ top of this one, named by two config keys (`accounts.session.image`,
 
 ```dockerfile
 # Dockerfile for the derived image
-FROM ghcr.io/rjwalters/loom-worker-session:<version>
+FROM ghcr.io/2amlogic/loom-worker-session:<version>
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gdsci-yosys ngspice \
     && rm -rf /var/lib/apt/lists/*
@@ -339,7 +339,7 @@ docker build -f docker/session/Dockerfile \
 ./docker/session/test-image.sh loom-worker-session:dev
 ```
 
-`BASE_IMAGE` defaults to `ghcr.io/rjwalters/loom-worker:latest` if omitted,
+`BASE_IMAGE` defaults to `ghcr.io/2amlogic/loom-worker:latest` if omitted,
 for a quick pull-and-build without a local base image.
 
 Manual smoke check beyond what `test-image.sh` automates:
@@ -355,11 +355,11 @@ docker rm -f session-dev
 ## Versioning and publishing
 
 `.github/workflows/release.yml`'s `build-session-image` job builds and
-pushes `ghcr.io/rjwalters/loom-worker-session:<version>` and `:latest` on
+pushes `ghcr.io/2amlogic/loom-worker-session:<version>` and `:latest` on
 every GitHub Release, immediately after (and depending on) the
 `build-worker-image` job — `<version>` is the same `scripts/version.sh`
 value the base image and every other version-bearing file in the repo share,
-passed as `--build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:<version>` so
+passed as `--build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:<version>` so
 the pair is always built against each other's exact matching version, never
 `:latest`-to-`:latest` drift.
 
@@ -369,7 +369,7 @@ manifest under the same tags, mirroring `docker/worker/README.md`'s own
 from the already-published multi-arch `loom-worker` manifest rather than a
 locally-built, single-arch one, so each platform's session layer builds FROM
 the matching platform's base layer. Verify post-release with `docker
-manifest inspect ghcr.io/rjwalters/loom-worker-session:<version>`. As with
+manifest inspect ghcr.io/2amlogic/loom-worker-session:<version>`. As with
 the base image, CI's own smoke test only runs natively against the
 `linux/amd64` leg (no native arm64 GitHub Actions runner here); verify an
 arm64 build/run manually on an Apple Silicon or other arm64 host if you need

@@ -1,6 +1,6 @@
 # `loom-worker` base image
 
-`ghcr.io/rjwalters/loom-worker:<version>` (+ `:latest`) is a pinned OCI base
+`ghcr.io/2amlogic/loom-worker:<version>` (+ `:latest`) is a pinned OCI base
 image for Loom fleet workers, published by `.github/workflows/release.yml`
 from the same tag as the `loom-daemon` release binaries — `<version>` always
 matches the loom version those binaries ship at, so the image and the daemon
@@ -53,7 +53,7 @@ that host, not a replacement for it.
 ## What this image guarantees (the `FROM` contract)
 
 A downstream image (e.g. klayout-tools' EDA sim overlay) that does
-`FROM ghcr.io/rjwalters/loom-worker:<version>` can rely on:
+`FROM ghcr.io/2amlogic/loom-worker:<version>` can rely on:
 
 | Guarantee | Detail |
 |---|---|
@@ -102,7 +102,7 @@ docker run --rm \
   -v "$PWD:/workspace" \
   -v "$HOME/.loom/tokens:/home/loom/.loom/tokens:ro" \
   -e CLAUDE_CODE_OAUTH_TOKEN \
-  ghcr.io/rjwalters/loom-worker:<version> \
+  ghcr.io/2amlogic/loom-worker:<version> \
   .loom/scripts/spawn-worker.sh -p "/loom:sweep 123" --dangerously-skip-permissions
 ```
 
@@ -153,7 +153,7 @@ docker build -f docker/worker/Dockerfile \
 ```
 
 In `ci.yml` the base image is built once per run by `worker-base-image`, with
-a registry layer cache at `ghcr.io/rjwalters/loom-worker:buildcache` (read on
+a registry layer cache at `ghcr.io/2amlogic/loom-worker:buildcache` (read on
 every run, written only from pushes to `main`); the three image smokes load
 that build instead of rebuilding it. `:buildcache` is a BuildKit cache
 manifest, not a runnable image -- do not `docker pull` it.
@@ -162,7 +162,7 @@ manifest, not a runnable image -- do not `docker pull` it.
 
 `.github/workflows/release.yml` builds and pushes a multi-arch
 (`linux/amd64` + `linux/arm64`) manifest for
-`ghcr.io/rjwalters/loom-worker:<version>` and `:latest` on every GitHub
+`ghcr.io/2amlogic/loom-worker:<version>` and `:latest` on every GitHub
 Release, using the `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`
 binaries its own `build-daemon` job already built and checksummed for that
 release — `<version>` is read from `scripts/version.sh` at the released
@@ -171,7 +171,7 @@ binary reports via `--version`.
 
 Both `linux/amd64` and `linux/arm64` are published under the same tags
 (verify post-release with `docker manifest inspect
-ghcr.io/rjwalters/loom-worker:<version>`). CI's own smoke test
+ghcr.io/2amlogic/loom-worker:<version>`). CI's own smoke test
 (`docker/worker/test-image.sh`) only runs natively against the `linux/amd64`
 leg — there is no native arm64 GitHub Actions runner in this repo, so the
 `linux/arm64` leg is built and pushed (via QEMU emulation) without its own CI

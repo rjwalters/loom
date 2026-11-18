@@ -9584,7 +9584,7 @@ digest — into one unit) and:
    safe, since nothing can be "using" an unreferenced image by name.
 2. For each **tracked** repository (default: `loom-worker`,
    `loom-worker-session`, `loom-worker-native`, and their
-   `ghcr.io/rjwalters/...` aliases), keeps
+   `ghcr.io/2amlogic/...` aliases), keeps
    only the `keepLastN` (default 2) most-recently-built tagged images and
    removes the rest **by image ID**, so every alias tag riding on that ID goes
    with it in one `docker rmi` call.
@@ -9636,7 +9636,7 @@ flows outside GitHub-hosted CI (see `docker/worker/README.md` and
 | `LOOM_DOCKER_IMAGE_RETENTION` | `autonomous.dockerImageRetention.enabled` | env > config > default | `true` (on) |
 | `LOOM_DOCKER_IMAGE_RETENTION_KEEP_N` | `autonomous.dockerImageRetention.keepLastN` | env > config > default | `2` |
 | `LOOM_DOCKER_IMAGE_RETENTION_MIN_INTERVAL_SECS` | `autonomous.dockerImageRetention.minIntervalSecs` | env > config > default | `1800` (30 min) |
-| — | `autonomous.dockerImageRetention.trackedRepos` | config > default | `loom-worker`, `loom-worker-session`, `loom-worker-native`, and their `ghcr.io/rjwalters/...` aliases |
+| — | `autonomous.dockerImageRetention.trackedRepos` | config > default | `loom-worker`, `loom-worker-session`, `loom-worker-native`, and their `ghcr.io/2amlogic/...` aliases |
 | — | `autonomous.dockerImageRetention.allowlist` | config > default | `[]` (empty — a shared long-lived image must be opted in explicitly) |
 | `LOOM_DOCKER_IMAGE_RETENTION_UNUSED_MAX_AGE_DAYS` | `autonomous.dockerImageRetention.unusedMaxAgeDays` | env > config > default | `7` |
 
@@ -10566,7 +10566,7 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 ### Configured session image and extra read-only mounts (#14019)
 
 By default a contained session runs from the released
-`ghcr.io/rjwalters/loom-worker-session:<daemon version>` image, selected by
+`ghcr.io/2amlogic/loom-worker-session:<daemon version>` image, selected by
 the daemon's own version. A repo whose checks need a domain toolchain (EDA
 tools, a Rust toolchain, simulators) can instead run its sessions from a
 **derived image** and give them **extra read-only data mounts**, via two

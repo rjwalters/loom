@@ -2,7 +2,7 @@
 
 This is the **normative** filesystem contract for anything that runs a Loom
 worker (or a Loom-daemon-managed session) inside a container built `FROM`
-[`ghcr.io/rjwalters/loom-worker`](README.md). It replaces the informal
+[`ghcr.io/2amlogic/loom-worker`](README.md). It replaces the informal
 "Bootstrap seams" table that used to be the only documentation of these
 mounts — that table now links here instead of duplicating this content (see
 [README.md § Bootstrap seams](README.md#bootstrap-seams-mounts-not-baked-content)).
@@ -25,12 +25,12 @@ does not import host worktree pointers.
 docker run --rm \
   -v /home/loom/workspaces:/home/loom/workspaces \
   -w /home/loom/workspaces/loom \
-  ghcr.io/rjwalters/loom-worker:<version> ...
+  ghcr.io/2amlogic/loom-worker:<version> ...
 
 # WRONG — remaps the host path to something else
 docker run --rm \
   -v /home/loom/workspaces:/workspace \
-  ghcr.io/rjwalters/loom-worker:<version> ...
+  ghcr.io/2amlogic/loom-worker:<version> ...
 ```
 
 ### Why this is load-bearing

@@ -725,7 +725,7 @@ cat >"$TMP_ROOT/job.json" <<'SPECFILE'
 {
   "schema": "loom.run-job/v1",
   "id": "job-fromfile",
-  "image": "ghcr.io/rjwalters/loom-worker:latest",
+  "image": "ghcr.io/2amlogic/loom-worker:latest",
   "command": ["bash", "-lc", "cargo build --release"],
   "workdir": "/home/loom/workspaces/loom",
   "mounts": [{"path": "/home/loom/workspaces/loom", "mode": "rw"}],

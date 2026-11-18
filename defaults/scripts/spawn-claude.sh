@@ -597,7 +597,7 @@ fi
 # `runtimes.containment.enabled` (env override `LOOM_SWEEP_CONTAINERIZED`,
 # standard env > config > default-off precedence). When enabled, this script
 # re-execs ITSELF inside a `docker run` of the configured image (default
-# ghcr.io/rjwalters/loom-worker:latest — override with
+# ghcr.io/2amlogic/loom-worker:latest — override with
 # `LOOM_SWEEP_CONTAINER_IMAGE` or `runtimes.containment.image`), under the
 # path-parity mount contract (`docker/worker/MOUNT-CONTRACT.md`): the
 # resolved `$WORKSPACE` (repo root — covers the main checkout AND every
@@ -711,7 +711,7 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     fi
 
     _containment_image="${LOOM_SWEEP_CONTAINER_IMAGE:-$(_containment_cfg image)}"
-    : "${_containment_image:=ghcr.io/rjwalters/loom-worker:latest}"
+    : "${_containment_image:=ghcr.io/2amlogic/loom-worker:latest}"
 
     # --- Credential egress proxy (issue #8697, follow-up to #8674) ---
     # Default OFF, and a SEPARATE switch from containment itself (env

@@ -16,7 +16,7 @@
 //! `common/mod.rs`, which pulls in the daemon harness these proofs do not use.
 //!
 //! An image on the pin list (`.github/ci-images.txt`) is pulled by its pinned
-//! digest from `ghcr.io/rjwalters/loom-ci-images`, which
+//! digest from `ghcr.io/2amlogic/loom-ci-images`, which
 //! `.github/workflows/ci-images.yml` fills from the same list. GHCR is tried
 //! first; until the copy has run, or while a package is still private (a fork
 //! PR pulls without credentials), that attempt fails fast and the mirror
@@ -24,7 +24,7 @@
 //!
 //! Overrides, for reproducing each path by hand:
 //! - `LOOM_TEST_IMAGE_GHCR`: GHCR prefix (default
-//!   `ghcr.io/rjwalters/loom-ci-images`); empty skips GHCR.
+//!   `ghcr.io/2amlogic/loom-ci-images`); empty skips GHCR.
 //! - `LOOM_TEST_IMAGE_MIRROR`: mirror host (default `mirror.gcr.io`); empty
 //!   skips the mirror.
 //! - `LOOM_TEST_IMAGE_HUB`: host to use in place of Docker Hub for the
@@ -53,7 +53,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Where `.github/workflows/ci-images.yml` copies every pinned image.
-const DEFAULT_GHCR: &str = "ghcr.io/rjwalters/loom-ci-images";
+const DEFAULT_GHCR: &str = "ghcr.io/2amlogic/loom-ci-images";
 const GHCR_ATTEMPTS: usize = 2;
 const DEFAULT_MIRROR: &str = "mirror.gcr.io";
 const MIRROR_ATTEMPTS: usize = 2;

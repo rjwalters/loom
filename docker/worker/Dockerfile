@@ -207,10 +207,10 @@ WORKDIR /workspace
 # No ENTRYPOINT/CMD prescribing "the container IS the worker" (shape decision
 # above): the image is a pinned shell a caller runs a command in, exactly like
 # `spawn-worker.sh` invoked bare-metal. Default to an interactive shell so
-# `docker run -it ghcr.io/rjwalters/loom-worker:<version>` is useful on its
+# `docker run -it ghcr.io/2amlogic/loom-worker:<version>` is useful on its
 # own for manual inspection; a real dispatch overrides this with the actual
 # spawn command, e.g.:
 #   docker run --rm -v "$PWD:/workspace" -v "$HOME/.loom/tokens:/home/loom/.loom/tokens:ro" \
-#     ghcr.io/rjwalters/loom-worker:<version> \
+#     ghcr.io/2amlogic/loom-worker:<version> \
 #     .loom/scripts/spawn-worker.sh -p "/loom:sweep 123" --dangerously-skip-permissions
 CMD ["/bin/bash"]
