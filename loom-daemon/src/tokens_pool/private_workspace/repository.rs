@@ -785,13 +785,14 @@ fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Loom's lease-renewal store (`Store::from_env`, `$HOME/.loom/lease-renew`
-/// unless overridden) is written inside a seat clone when the container's
-/// `$HOME` resolves to the clone root (#14160): an untracked
-/// `.loom/lease-renew/.lock` there is runtime residue, not stranded work,
-/// and must never refuse preparation. The seat env sets
-/// `LOOM_LEASE_RENEW_STATE_DIR` so new writes land on the cache volume; the
-/// exclude also forgives residue left by an older container.
+/// An untracked `.loom/lease-renew/.lock` has been observed in seat clones
+/// (#14160): runtime residue, not stranded work, so it must never refuse
+/// preparation. The writer is not traced (#14226): the store
+/// (`Store::from_env`) defaults to `$HOME/.loom/lease-renew`, and the seat
+/// container's `$HOME` is `/home/loom`, not the clone root. The seat env sets
+/// `LOOM_LEASE_RENEW_STATE_DIR` so store writes land on the cache volume; the
+/// exclude forgives residue whatever wrote it, including from an older
+/// container.
 const LEASE_RENEW_EXCLUDE: &str = ":(exclude).loom/lease-renew";
 
 /// The dirty refusal names at most this many paths, so an operator can tell

@@ -115,8 +115,10 @@ impl SweepRegistry {
     }
 
     /// Whether another claimant holds a step's item on the forge (#11898), the
-    /// forge half of every step release (the reaper's, startup's, a roll
-    /// requeue's):
+    /// forge half of the reaper's and startup adoption's step release, and of
+    /// a roll requeue's PR-role release (via
+    /// [`Self::roll_pr_step_claim_still_ours`]); a roll requeue of an issue
+    /// role makes its own ownership check instead (`roll_claim_still_ours`):
     ///
     /// - Builder: `loom:building` re-applied more than
     ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started;
