@@ -257,6 +257,40 @@ fn identity_is_bound_on_metrics_and_traces_too() {
     assert_eq!(span.name, "fixture.span");
 }
 
+#[test]
+fn a_harness_cannot_supply_the_step_occupancy_process_identity() {
+    let metrics = json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [
+        {"name": "loom.dispatch.busy_slots", "gauge": {"dataPoints": [
+            {"asInt": "0", "attributes": [
+                {"key": "role", "value": {"stringValue": "judge"}},
+                {"key": "pool", "value": {"stringValue": "step"}},
+                {"key": "loom.daemon.process_instance_id",
+                    "value": {"stringValue": "aaaaaaaa-0000-4000-8000-000000000001"}},
+                {"key": " LoOm.DaEmOn.PrOcEsS_InStAnCe_Id ",
+                    "value": {"stringValue": "bbbbbbbb-0000-4000-8000-000000000002"}}
+            ]}
+        ]}}
+    ]}]}]});
+    for mut payload in both_encodings(Signal::Metrics, &metrics) {
+        assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
+        let Payload::Metrics(request) = &payload else {
+            panic!("expected metrics");
+        };
+        let metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
+        let Some(metric::Data::Gauge(gauge)) = &metric.data else {
+            panic!("expected gauge");
+        };
+        let attrs = &gauge.data_points[0].attributes;
+        assert_eq!(
+            attrs
+                .iter()
+                .map(|attr| attr.key.as_str())
+                .collect::<Vec<_>>(),
+            ["role", "pool"]
+        );
+    }
+}
+
 /// Synthetic, shape-only secrets: each matches one redaction class.
 const GITHUB_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123";
 const ANTHROPIC_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";

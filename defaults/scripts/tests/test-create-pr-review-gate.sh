@@ -240,6 +240,21 @@ assert_contains "$OUTPUT" "9000" "Adopts the existing PR for our own branch"
 assert_eq "0" "$(created_count)" "Adoption -> no new PR created"
 assert_eq "" "$(cat "$STUB_DIR/daemon-forge-calls.log" 2>/dev/null || true)" "Adoption short-circuits before the review-gate daemon call"
 
+# T9 (#13939): past-tense narration before a `Part of` reference must not
+# capture the guard either -- TARGET_ISSUE resolves to the partial reference,
+# never to the narrated `#597` (`PR #605 fixed #597` is history prose).
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-207-rc.txt"
+echo "558" > "$STUB_DIR/opr-207-stdout.txt"
+echo "feature/issue-207-alt" > "$STUB_DIR/pr-558-head.txt"
+run_create_pr --title "feat: slice" --body "PR #605 fixed #597, which unblocked this slice.
+
+Part of #207" --head "feature/issue-207"
+assert_eq "6" "$EXIT_CODE" "Narration + Part of #207 with rival PR -> exit 6 on #207"
+assert_contains "$OUTPUT" "#207" "Refusal names the partial-reference issue, not the narrated one"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 207" "Guard consulted #207"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "597" "Guard never consulted the narrated #597"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

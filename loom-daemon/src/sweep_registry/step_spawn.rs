@@ -283,7 +283,9 @@ pub(crate) fn refusal_of(outcome: &crate::role_runner::RoleTickOutcome) -> StepR
     match outcome {
         O::NoTokenPool => StepRefusal::new("no_token_pool", "no credential pool for the runtime"),
         O::PoolExhausted { .. } => StepRefusal::new("pool_exhausted", format!("{outcome:?}")),
-        O::RuntimeRejected(rejection) => StepRefusal::new("runtime_rejected", &rejection.reason),
+        O::RuntimeRejected(rejection) => {
+            StepRefusal::new("runtime_rejected", rejection.refusal_line())
+        }
         O::ModelRuntimeMismatch(mismatch) => {
             StepRefusal::new("model_runtime_mismatch", mismatch.detail())
         }
@@ -847,9 +849,7 @@ impl SweepRegistry {
         use crate::observability::ops::busy_slots::{self, LiveStep, LiveSteps};
         let mut running = LiveSteps::new();
         for info in self.entries.values() {
-            if let (SweepKind::Step { role, .. }, SweepState::Running | SweepState::Pending) =
-                (&info.kind, &info.state)
-            {
+            if let (SweepKind::Step { role, .. }, SweepState::Running) = (&info.kind, &info.state) {
                 running.entry(role.role_name()).or_default().push(LiveStep {
                     started_at: info.started_at,
                     points: self.step_points(&info.sweep_id),
@@ -957,7 +957,9 @@ impl SweepRegistry {
         let selection = containment.take().map(|(selection, _)| selection);
         let admitted = match chosen.admitted.map_or(statically, Ok) {
             Ok(admitted) => admitted,
-            Err(rejection) => return Err(StepRefusal::new("runtime_rejected", rejection.reason)),
+            Err(rejection) => {
+                return Err(StepRefusal::new("runtime_rejected", rejection.refusal_line()))
+            }
         };
         let model = match role {
             StepRole::Builder => {

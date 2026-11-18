@@ -162,19 +162,13 @@ fn metadata_must_name_the_title_version() {
 }
 
 #[test]
-fn outside_the_install_set_or_a_gate_path_holds_the_whole_pr() {
+fn a_file_outside_the_install_set_holds_the_whole_pr() {
     let mut f = Fake::ok();
     f.files = Ok(vec![
         file("src/main.rs", "x", "modified"),
         file(".loom/hooks/guard-x.sh", "b1", "modified"),
     ]);
     assert!(why(&evaluate(&f, 1)).contains("outside the install set"));
-    let mut f = Fake::ok();
-    f.files = Ok(vec![
-        file(".loom/scripts/merge-pr.sh", "b1", "modified"),
-        file(".loom/hooks/guard-x.sh", "b1", "modified"),
-    ]);
-    assert!(why(&evaluate(&f, 1)).contains("merge-gate path"));
 }
 
 #[test]
@@ -200,14 +194,17 @@ fn a_test_under_scripts_tests_is_compared_not_refused_as_a_gate_path() {
     // One byte of difference still holds.
     f.upstream[0].1 = "t1-different".to_string();
     assert!(why(&evaluate(&f, 1)).contains("differs from v1.2.3"));
-    // A rename from a gate path into tests/ still hits the gate.
+    // A rename from a gate path into tests/ still holds: the rename hits the
+    // gate flag, and a renamed file is refused on its status (#13982).
     let mut renamed = file(t, "t1", "renamed");
     renamed.previous_filename = Some(".loom/scripts/merge-pr.sh".to_string());
     f.files = Ok(vec![renamed]);
-    assert!(why(&evaluate(&f, 1)).contains("merge-gate path"));
-    // Only .loom/scripts/tests/ is exempt: a gate script elsewhere is not.
+    assert!(why(&evaluate(&f, 1)).contains("is renamed"));
+    // Only .loom/scripts/tests/ is exempt from the gate list: a gate script
+    // elsewhere is byte-checked against its `defaults/` counterpart and holds
+    // when it differs (#13982).
     f.files = Ok(vec![file(".loom/scripts/test-champion.sh", "t1", "modified")]);
-    assert!(why(&evaluate(&f, 1)).contains("merge-gate path"));
+    assert!(why(&evaluate(&f, 1)).contains("differs from v1.2.3:defaults/scripts/test-champion.sh"));
 }
 
 fn repo_skills() -> Fake {
@@ -412,7 +409,8 @@ fn an_ordinary_file_with_no_upstream_counterpart_takes_the_lane() {
 /// A resync that touches only files the proof can map (install metadata,
 /// hooks, scripts, docs, commands). This is NOT the shape of a typical real
 /// resync: real ones usually also carry roles, generated skill copies, or
-/// merge-gate paths, which the strict proof refuses (next test).
+/// merge-gate paths, which this file list omits (the gate tests below cover
+/// them).
 #[test]
 fn a_realistic_resync_with_rewritten_install_metadata_lands() {
     let mut f = Fake::ok();
@@ -497,12 +495,17 @@ fn gate_pr() -> Fake {
     let mut f = Fake::ok();
     f.files = Ok(vec![
         file(".loom/scripts/merge-pr.sh", "g1", "modified"),
+        file(".claude/commands/loom/champion-pr-merge.md", "g4", "modified"),
         file(".loom/roles/judge.md", "g2", "modified"),
         file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
     ]);
-    f.changed = 3;
+    f.changed = 4;
     f.upstream = vec![
         ("defaults/scripts/merge-pr.sh".to_string(), "g1".to_string()),
+        (
+            "defaults/.claude/commands/loom/champion-pr-merge.md".to_string(),
+            "g4".to_string(),
+        ),
         ("defaults/roles/judge.md".to_string(), "g2".to_string()),
         ("defaults/.agents/skills/loom-judge/SKILL.md".to_string(), "g3".to_string()),
     ];
@@ -518,12 +521,26 @@ fn lane_reason(f: &Fake) -> String {
 }
 
 #[test]
-fn byte_identical_gate_role_and_skill_files_land_under_the_strict_proof_only() {
+fn byte_identical_gate_role_and_skill_files_waive_non_strict_too() {
     let fx = Fx::new(Checks::Green, Ok(()));
     let out = land(&gate_pr(), &fx, 1);
     assert_eq!(out.word(), "landed-by-daemon", "{out:?}");
-    // Champion's non-strict proof still refuses a gate path.
-    assert!(why(&evaluate(&gate_pr(), 1)).contains("merge-gate path"));
+    // Champion's non-strict proof waives them too (#13982): every gate file's
+    // SHA is in the record and the gate inclusion is flagged.
+    assert_eq!(
+        evaluate(&gate_pr(), 1),
+        Verdict::Eligible {
+            tag: "v1.2.3".to_string(),
+            head: HEAD.to_string(),
+            record: vec![
+                (".loom/scripts/merge-pr.sh".to_string(), "g1".to_string()),
+                (".claude/commands/loom/champion-pr-merge.md".to_string(), "g4".to_string()),
+                (".loom/roles/judge.md".to_string(), "g2".to_string()),
+                (".agents/skills/loom-judge/SKILL.md".to_string(), "g3".to_string()),
+            ],
+            gate_paths_included: true,
+        }
+    );
 }
 
 #[test]
@@ -541,10 +558,11 @@ fn strict_evaluation_refuses_what_the_non_strict_proof_passes() {
 
 #[test]
 fn a_gate_file_one_byte_off_the_tag_takes_the_lane() {
-    for i in 0..3 {
+    for i in 0..4 {
         let mut f = gate_pr();
         f.upstream[i].1.push_str("-different");
         assert!(lane_reason(&f).contains("differs from v1.2.3"), "{i}");
+        assert!(why(&evaluate(&f, 1)).contains("differs from v1.2.3"), "{i}");
     }
 }
 
@@ -553,12 +571,15 @@ fn gate_files_need_a_published_release_not_just_a_tag_ref() {
     let mut f = gate_pr();
     f.release = Ok(false); // a branch-like or draft/unreleased tag
     assert!(lane_reason(&f).contains("not a published release"));
+    assert!(why(&evaluate(&f, 1)).contains("not a published release"));
     f.release = Err("HTTP 404".to_string());
     assert!(lane_reason(&f).contains("not a published release"));
+    assert!(why(&evaluate(&f, 1)).contains("not a published release"));
     // A ref that is not under refs/tags/ never gets here.
     f.release = Ok(true);
     f.tag = Ok(false);
     assert!(lane_reason(&f).contains("not found upstream"));
+    assert!(why(&evaluate(&f, 1)).contains("not found upstream"));
 }
 
 #[test]
@@ -593,21 +614,27 @@ fn gate_renames_unmapped_and_outside_files_still_take_the_lane() {
         file(".loom/scripts/merge-pr.sh", "g1", "modified"),
         file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
     ]);
+    f.changed = 3;
     assert!(lane_reason(&f).contains("is renamed"));
+    assert!(why(&evaluate(&f, 1)).contains("is renamed"));
     let mut f = gate_pr();
     f.files = Ok(vec![
         file(".loom/scripts/merge-pr.sh", "g1", "modified"),
         file(".loom/roles/judge.md", "g2", "removed"),
         file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
     ]);
+    f.changed = 3;
     assert!(lane_reason(&f).contains("is removed"));
+    assert!(why(&evaluate(&f, 1)).contains("is removed"));
     let mut f = gate_pr();
     f.files = Ok(vec![
         file(".loom/scripts/merge-pr.sh", "g1", "modified"),
         file(".agents/other/x.md", "g2", "modified"),
         file(".agents/skills/loom-judge/SKILL.md", "g3", "modified"),
     ]);
+    f.changed = 3;
     assert!(lane_reason(&f).contains("outside the install set"));
+    assert!(why(&evaluate(&f, 1)).contains("outside the install set"));
     // The Repo Skills kind keeps refusing gate paths.
     let mut f = repo_skills();
     f.files = Ok(vec![file(
@@ -616,6 +643,20 @@ fn gate_renames_unmapped_and_outside_files_still_take_the_lane() {
         "modified",
     )]);
     assert!(lane_reason(&f).contains("merge-gate path"));
+    assert!(why(&evaluate(&f, 1)).contains("merge-gate path"));
+}
+
+#[test]
+fn a_gate_file_without_an_upstream_counterpart_holds_non_strict() {
+    // `.loom/config.json` is on the gate list and has no `defaults/` mapping:
+    // byte-identity to a tag cannot be proven, so it holds (#13982).
+    let mut f = Fake::ok();
+    f.files = Ok(vec![
+        file(".loom/config.json", "c1", "modified"),
+        file(".loom/hooks/guard-x.sh", "b1", "modified"),
+    ]);
+    f.changed = 2;
+    assert!(why(&evaluate(&f, 1)).contains("has no upstream counterpart"));
 }
 
 #[test]

@@ -30,10 +30,19 @@
 //! (#4806): `defaults/hooks/<name>` for the machine-level wrapper form and
 //! `.loom/hooks/<name>` for the project-level form. A project file that also
 //! carries `defaults/hooks/<name>` for that hook is holding a machine-level
-//! wrapper, not a project entry — the same exclusion `_phook_merge_one` /
-//! `is_wired` apply — so such a hit never counts as project-scope wiring. The
-//! hook-name table is single-sourced from [`crate::init::hook_wiring::HOOKS`],
-//! which a drift test pins to `provision-hooks.sh`'s `_PHOOK_NAMES`.
+//! wrapper, not a project entry, so such a hit never counts as project-scope
+//! wiring. The exclusion's granularity differs from the provisioner,
+//! deliberately: this check probes the **raw file text** — parity with the
+//! wrapper's own `$(<file)` defer probe (see `_phook_cmd`) — so the exclusion
+//! is **whole-file**: `defaults/hooks/<name>` text anywhere in the project
+//! settings suppresses that hook's project hit. `_phook_merge_one` (jq) and
+//! `hook_wiring::is_wired` (parsed JSON) instead
+//! test each command string individually. Consequence: a project file
+//! carrying **both** forms for one hook — a machine-level wrapper command and
+//! a genuine project entry — reads as not project-wired here, a false
+//! negative that errs toward silence in a warn-only check. The hook-name
+//! table is single-sourced from [`crate::init::hook_wiring::HOOKS`], which a
+//! drift test pins to `provision-hooks.sh`'s `_PHOOK_NAMES`.
 
 use std::path::Path;
 

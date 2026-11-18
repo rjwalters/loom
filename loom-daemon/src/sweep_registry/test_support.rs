@@ -1381,7 +1381,7 @@ pub(crate) fn running_issue_sweep_id(reg: &SweepRegistry, issue: u32) -> Option<
     reg.entries
         .values()
         .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
+            matches!(i.state, SweepState::Running)
                 && matches!(i.kind, SweepKind::Issue(n) if n == issue)
         })
         .map(|i| i.sweep_id.clone())
@@ -1394,7 +1394,7 @@ pub(crate) fn running_prset_sweep_id(reg: &SweepRegistry, prs: &[u32]) -> Option
     reg.entries
         .values()
         .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
+            matches!(i.state, SweepState::Running)
                 && matches!(&i.kind, SweepKind::PrSet(set) if set.as_slice() == prs)
         })
         .map(|i| i.sweep_id.clone())

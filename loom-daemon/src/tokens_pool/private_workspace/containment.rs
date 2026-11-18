@@ -433,6 +433,7 @@ pub fn admit_new(
             source: admitted.source,
             unmet_capabilities: vec![crate::runtime_admission::CONTAINMENT_SATISFIES.into()],
             reason: format!("could not record containment provenance: {error}"),
+            exhausted_summary_line: None,
         });
     }
     log::info!(
