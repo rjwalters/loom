@@ -101,7 +101,13 @@ filing-lock acquire|release`, made by `lib/filing-lock.sh` after the host lock
 - **Same identity and expiry as claims.** The caller is the tailnet `whois`
   host, as for an assignment. The grant lives 60 s; the same holder id asking
   again refreshes it, and only the same host *and* holder id may release it, so
-  a stale unlock never frees someone else's hold.
+  a stale unlock never frees someone else's hold. The worker does not
+  auto-refresh a grant, so a burst still holding the slot past the TTL loses
+  it softly — the same softness as the peer TTL this tier replaces; a burst
+  of a handful of issues takes seconds, well inside the minute, but the bound
+  is derived from that pacing, not yet observed on a live fleet. A longer
+  burst can re-ask (`filing-lock acquire --holder <id>`) under the same id,
+  which refreshes.
 - **Bounded, fail-safe.** A slot still held at the end of
   `LOOM_FILING_LOCK_WAIT_SECS` defers like the host lock (rc 75 for
   `create-issue.sh`), and the host lock is handed back.
@@ -109,7 +115,10 @@ filing-lock acquire|release`, made by `lib/filing-lock.sh` after the host lock
   fleet-dispatch fallback: the burst files under the host lock and its existing
   pacing. Each is a `loom.fleet_dispatch.call` span on `/v1/filing-lock` with
   `result=error` (`reason` the failed call's token, or `fallback`); an older
-  captain answers `404`, the same path.
+  captain answers `404`, the same path. On the shell path the subcommand is a
+  one-shot process, so it registers the standalone ops sink at startup and
+  flushes its queue once at exit (#14129) — without that setup the worker's
+  spans and log lines would be dropped, and the fail-open would be silent.
 - **Soft state.** A captain restart empties the slot; a holder's next refresh
   is granted again rather than wedging filing.
 - **Fleet mode off: unchanged.** No call is made.

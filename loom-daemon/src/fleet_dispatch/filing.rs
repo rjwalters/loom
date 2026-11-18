@@ -20,6 +20,9 @@
 //!
 //! One `loom.fleet_dispatch.call` span per acquire (its `latency_ms` is the
 //! whole wait) and one per release. The captain's spans carry the hold time.
+//! The shell path runs in the one-shot `filing-lock` subcommand, which
+//! registers the standalone ops sink at startup and flushes its queue once
+//! at exit (#14129); without that setup this process would emit nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

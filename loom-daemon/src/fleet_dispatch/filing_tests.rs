@@ -207,3 +207,87 @@ fn the_filing_lock_layers_the_captain_over_the_host_lock_and_releases_both_in_re
     assert!(matches!(untouched, AcquireOutcome::DegradedOpen { .. }));
     assert_eq!(busy.requests().len(), 1);
 }
+
+/// #14129, the Judge's blocking item: the live path is the one-shot
+/// `filing-lock` subcommand, whose only emission machinery is the standalone
+/// sink it registers at startup and flushes at exit. This is that sequence:
+/// with the sink registered (no senders — the process lives a second), an
+/// acquire's span lands in the tagged queue file with the filing attributes,
+/// instead of being dropped the way it was before the CLI registered a sink.
+#[test]
+#[serial]
+fn the_one_shot_cli_path_emits_the_acquire_span_to_the_queue() {
+    reset_for_test();
+    let dir = tempdir().unwrap();
+    let server = granting();
+    // One `.loom/config.json` carries both blocks the CLI resolves: fleet
+    // dispatch at the loopback captain (as `enable` would write it) plus the
+    // observability block. The exporter endpoint is a bound port nothing
+    // listens on: nothing leaves the process, so the queue file is what the
+    // test asserts.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let key = dir.path().join("ingest.key");
+    std::fs::write(&key, "k\n").unwrap();
+    crate::sweep_registry::test_support::write_config(
+        dir.path(),
+        &json!({
+            "fleetDispatch": {"enabled": true, "url": server.url()},
+            "observability": {
+                "enabled": true,
+                "ingestKeyFile": key.to_string_lossy(),
+                "exporters": [
+                    {"kind": "otlp", "endpoint": format!("http://127.0.0.1:{}", dead.local_addr().unwrap().port())}
+                ]
+            }
+        })
+        .to_string(),
+    );
+    let config = crate::observability::read_config(dir.path());
+    assert!(
+        crate::observability::standalone_ops::register_sink(
+            &config,
+            dir.path(),
+            "filing-lock-test",
+        ),
+        "the CLI's register_sink plans the exporter"
+    );
+
+    let Tier::Granted(_) = acquire(dir.path(), "architect", "h-9", Duration::from_secs(1)) else {
+        panic!("granted");
+    };
+
+    let queue = crate::observability::queue::DurableQueue::open(
+        dir.path()
+            .join(".loom/logs/filing-lock-test-ops-queue.0.jsonl"),
+        100,
+    );
+    let queued = queue.peek_batch(10);
+    assert_eq!(queued.len(), 1, "the acquire's span was queued: {queued:?}");
+    let crate::telemetry::TelemetryRecord::Span(span) = &queued[0].record else {
+        panic!("a span record, got {:?}", queued[0].record);
+    };
+    assert_eq!(
+        span.attributes
+            .get("loom.fleet_dispatch.endpoint")
+            .map(String::as_str),
+        Some(proto::FILING_LOCK_PATH)
+    );
+    assert_eq!(
+        span.attributes
+            .get("loom.fleet_dispatch.result")
+            .map(String::as_str),
+        Some("granted")
+    );
+    assert_eq!(
+        span.attributes
+            .get("loom.fleet_dispatch.side")
+            .map(String::as_str),
+        Some("worker")
+    );
+    assert_eq!(
+        span.attributes
+            .get("loom.fleet_dispatch.reason")
+            .map(String::as_str),
+        Some("granted")
+    );
+}

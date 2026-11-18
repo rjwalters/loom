@@ -133,6 +133,18 @@ impl FleetDispatchArgs {
 async fn filing_lock(cmd: FilingLockCommand) -> Result<()> {
     use crate::fleet_dispatch::filing::{self, Hold, Tier};
     let root = filing::workspace_root();
+    // A one-shot process: daemon startup never runs here, so without the
+    // setup below every span `filing::acquire`/`release` records and every
+    // `log::warn!` it emits is dropped — the fail-open the fleet tier exists
+    // to make loud would be silent on the shell path (#14129). Register the
+    // standalone ops sink over this process's own queue files (the watchdog's
+    // short-lived treatment, #12806) and drain them once at exit; what does
+    // not flush stays queued, retried by the next filing's flush.
+    init_stderr_logger();
+    let config = crate::observability::read_config(&root);
+    let export_in_process =
+        crate::observability::standalone_ops::register_sink(&config, &root, FILING_QUEUE_TAG);
+    let mut deferred: Option<i32> = None;
     match cmd {
         FilingLockCommand::Acquire {
             label,
@@ -140,6 +152,7 @@ async fn filing_lock(cmd: FilingLockCommand) -> Result<()> {
             holder,
         } => {
             let holder = holder.unwrap_or_else(filing::new_holder);
+            let root = root.clone();
             let tier = tokio::task::spawn_blocking(move || {
                 filing::acquire(&root, &label, &holder, Duration::from_secs(wait_secs))
             })
@@ -150,7 +163,7 @@ async fn filing_lock(cmd: FilingLockCommand) -> Result<()> {
                 Tier::Off | Tier::FailOpen { .. } => {}
                 Tier::Deferred { reason } => {
                     eprintln!("filing-lock: deferred: {reason}");
-                    std::process::exit(EXIT_DEFERRED);
+                    deferred = Some(EXIT_DEFERRED);
                 }
             }
         }
@@ -162,7 +175,38 @@ async fn filing_lock(cmd: FilingLockCommand) -> Result<()> {
             }
         }
     }
+    if export_in_process {
+        // Best-effort: what does not drain stays queued (Queued), retried by
+        // the next filing's flush.
+        let _ = crate::observability::standalone_ops::flush_pending(
+            &config,
+            &root,
+            FILING_QUEUE_TAG,
+            FILING_FLUSH_TIMEOUT,
+        );
+    }
+    if let Some(code) = deferred {
+        std::process::exit(code);
+    }
     Ok(())
+}
+
+/// The filing-lock CLI's queue-file tag, distinct from the captain server's
+/// and the watchdog's, so a queue left behind by a flush that ran out of time
+/// is retried by the next filing's flush, never mixed with theirs.
+const FILING_QUEUE_TAG: &str = "filing-lock";
+
+/// Longest the one-shot export may block the shell filer: the watchdog's
+/// bound (`watchdog::loom_ui::EXPORT_TIMEOUT`). A slower exporter keeps the
+/// spans queued; the next filing flushes them.
+const FILING_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Stderr logger for the one-shot subcommand (the daemon's `setup_logging`
+/// targets its own log file and never runs here). Normal grants and releases
+/// print nothing; a fail-open or a failed unlock warns. `RUST_LOG` overrides.
+fn init_stderr_logger() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 }
 
 /// The `--no-progress-cooldown-secs` ladder: one to four whole seconds,
