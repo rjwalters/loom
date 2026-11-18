@@ -259,8 +259,6 @@ pub(crate) fn static_check(
 }
 
 /// The #4642 / #7607 Claude token-pool gate. Behaviour, skip text, and
-/// counters are byte-identical to the pre-#8408 preflight.
-/// The #4642 / #7607 Claude token-pool gate. Behaviour, skip text, and
 /// counters are byte-identical to the pre-#8408 preflight. With
 /// `autonomous.modelFallback` enabled (#13873), the #7607 exhaustion read
 /// is scoped to the class of the model this role's launch would actually

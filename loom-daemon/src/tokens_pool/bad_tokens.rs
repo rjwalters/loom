@@ -643,11 +643,14 @@ pub fn blocking_entry_in_dir_for_class(
     blocking_entry_in_dir_for_query(tokens_dir, token_name, query)
 }
 
-/// [`blocking_entry_in_dir_for_class`] asking the **any-class** question
-/// (#13873): only class-LESS entries (and auth entries, which are never
-/// class-scoped) block. An account whose live marks are all class-scoped can
-/// still serve every *other* model class, so it stays spawnable for the
-/// fallback-aware pool preflights — the account-wide scan would hold it.
+/// [`blocking_entry_in_dir_for_class`] asking the **class-less-entry**
+/// question (#13873): only class-LESS entries (and auth entries, which are
+/// never class-scoped) block. This is *not* the "could any class spawn"
+/// read: an account whose live marks name every known class has no
+/// class-less entry yet cannot serve any class — that question is answered
+/// by scanning each known class
+/// ([`super::select::usable_account_count_any_class`]); this scan is its
+/// tested primitive, pinned here so the `ClassQuery` arms stay explicit.
 #[must_use]
 pub fn blocking_entry_in_dir_any_class(
     tokens_dir: &Path,

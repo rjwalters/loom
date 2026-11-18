@@ -11085,10 +11085,11 @@ configured; when its limit resets, the next spawn returns to it:
   pre-spawn gate, the work finder's pool hold and the preference walk's
   availability read all scope their "exhausted" verdict to the class of the
   model the launch would actually run (or, model-less, ask whether *any*
-  class could spawn) — so a fable-exhausted pool with healthy opus capacity
+  known model class could spawn — an account counts while some rung stays
+  unmarked for it) — so a fable-exhausted pool with healthy opus capacity
   dispatches instead of idling the fleet. A class-less mark (or an auth
-  mark) still holds everything: a credential broken for every class has no
-  rung to fall to.
+  mark) still holds everything, and so does an account bad-marked for
+  every class: a credential with no unmarked rung has nothing to fall to.
 - **Telemetry.** Each `loom.dispatch.step` span records
   `loom.step.model_configured` (the pre-fallback model) alongside
   `loom.step.model_launched`, plus `loom.step.model_fallback_from` /

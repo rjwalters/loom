@@ -1136,12 +1136,20 @@ fn preflight_cause_names_the_pool_hold_apart_from_the_advisory() {
 
 /// Bad-mark every named account for ONE model class (#8058's scoped shape,
 /// #13872's live marks): the class is held, every other class stays usable.
-fn class_mark_all(root: &Path, names: &[&str], class: &str) {
+/// `classes` as a slice keeps the every-class fixture (#14088 review) on the
+/// same on-disk shape: one line per (account, class), exactly what repeated
+/// production writes leave behind.
+fn class_mark_all(root: &Path, names: &[&str], classes: &[&str]) {
     let pool = root.join(".loom").join("tokens");
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let body: String = names
         .iter()
-        .map(|n| format!("{now} {n} exhausted: hit your {class} limit [model-class:{class}]\n"))
+        .flat_map(|n| {
+            let now = now.as_str();
+            classes.iter().map(move |c| {
+                format!("{now} {n} exhausted: hit your {c} limit [model-class:{c}]\n")
+            })
+        })
         .collect();
     fs::write(pool.join(".bad_tokens"), body).unwrap();
 }
@@ -1154,7 +1162,7 @@ fn class_mark_all(root: &Path, names: &[&str], class: &str) {
 #[test]
 fn a_class_marked_pool_holds_only_without_the_fallback_block() {
     let ws = workspace_with_pool(&["a", "b"]);
-    class_mark_all(ws.path(), &["a", "b"], "fable");
+    class_mark_all(ws.path(), &["a", "b"], &["fable"]);
 
     // Block absent: the account-wide read treats class-scoped marks as
     // blocking and arms the hold (the 2026-11-13 fleet-idle state).
@@ -1178,8 +1186,18 @@ fn a_class_marked_pool_holds_only_without_the_fallback_block() {
     );
     assert!(host.active_holds().is_empty());
 
-    // ...but a class-LESS mark still holds everything, enabled or not: a
-    // credential that is broken for every class has no rung to fall to.
+    // An account marked for *every* class is the same dead state even
+    // though no mark is class-less (#14088 review): the any-class read must
+    // count it for no class, so the hold arms exactly as the account-wide
+    // read would.
+    class_mark_all(ws.path(), &["a", "b"], &["fable", "claude-opus-5", "sonnet", "haiku"]);
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "every class marked on every account must arm the hold"
+    );
+
+    // ...and a class-LESS mark still holds everything, enabled or not: it
+    // blocks every class outright, leaving no rung to fall to.
     bad_mark_all(ws.path(), &["a", "b"]);
     assert!(host.observe_root(ws.path(), chrono::Utc::now()));
 }

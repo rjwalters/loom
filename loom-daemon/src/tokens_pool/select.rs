@@ -43,9 +43,9 @@ use std::path::{Path, PathBuf};
 use super::account_registry::AccountProvider;
 use super::affinity::Affinity;
 use super::bad_tokens::{
-    blocking_entry, blocking_entry_in_dir, blocking_entry_in_dir_any_class,
-    blocking_entry_in_dir_for_class, exhaustion_cooldown_secs, is_bad_for_class,
-    latest_block_was_session_limit, EXHAUSTION_COOLDOWN_ENV,
+    blocking_entry, blocking_entry_in_dir, blocking_entry_in_dir_for_class,
+    exhaustion_cooldown_secs, is_bad_for_class, latest_block_was_session_limit,
+    EXHAUSTION_COOLDOWN_ENV,
 };
 use super::bootstrap::{read_manifest_rows, ManifestRow};
 use super::paths::{has_token_files, resolve_tokens_dir, shared_tokens_dir};
@@ -317,17 +317,28 @@ pub(crate) fn usable_account_count_for_class(dir: &Path, model_class: &str) -> u
 }
 
 /// [`usable_account_count`] asking the **any-class** question (#13873): an
-/// account counts unless a class-LESS mark (or auth mark) blocks it — its
-/// class-scoped marks each still leave every other class usable. This is the
-/// pool-level read the fallback-aware preflights use when no single model is
-/// in hand: it holds only when *no* model class could spawn from this pool.
+/// account counts while *some* known model class
+/// ([`crate::script_helpers::model_tiers::TASK_TOOL_ALIASES`], the rung
+/// universe the fallback walks) has no blocking mark for it — so a
+/// class-scoped mark removes the account only from its own class, while an
+/// account marked for every class (or by a class-less/auth mark, either of
+/// which blocks every class) counts for none. This is the pool-level read
+/// the fallback-aware preflights use when no single model is in hand: it
+/// holds only when no known model class could spawn from this pool. Note
+/// this is 4× the per-account scans of [`usable_account_count`] — the
+/// same re-read-`.bad_tokens`-per-account shape that function already has,
+/// accepted because the model-less preflights run once per tick, not per
+/// spawn.
 pub(crate) fn usable_account_count_any_class(dir: &Path) -> usize {
     let hard = ranking_hard_exclusions(dir, &dir.join(".ranking"));
     list_token_files(dir)
         .into_iter()
         .filter(|f| {
             let name = stem(f);
-            !hard.contains_key(&name) && blocking_entry_in_dir_any_class(dir, &name).is_none()
+            !hard.contains_key(&name)
+                && crate::script_helpers::model_tiers::TASK_TOOL_ALIASES
+                    .iter()
+                    .any(|class| blocking_entry_in_dir_for_class(dir, &name, Some(class)).is_none())
         })
         .count()
 }
@@ -389,9 +400,11 @@ pub fn spawnable_pool_state_for_class(
 
 /// [`spawnable_pool_state`] with the usable count asking the any-class
 /// question (#13873) — per [`usable_account_count_any_class`], an account
-/// whose live marks are all class-scoped still counts. The fallback-aware
-/// pool preflights read this when no single launch model is in hand, so a
-/// fable-exhausted pool with healthy opus capacity does not hold dispatch.
+/// counts while some known model class stays unmarked for it. The
+/// fallback-aware pool preflights read this when no single launch model is
+/// in hand, so a fable-exhausted pool with healthy opus capacity does not
+/// hold dispatch — while a pool whose every account is marked for every
+/// class holds exactly as the account-wide read would.
 #[must_use]
 pub fn spawnable_pool_state_any_class(workspace_root: &Path) -> SpawnablePoolState {
     let dir = resolve_tokens_dir(workspace_root);

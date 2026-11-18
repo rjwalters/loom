@@ -274,11 +274,13 @@ pub(crate) fn exhausted_for_launch(
 /// The model-less pool preflight read (the work finder's hold, the
 /// preference walk's availability): with the block disabled, the
 /// byte-identical account-wide [`SpawnablePoolState`]; with it enabled, the
-/// any-class count — an account whose live marks are all class-scoped still
-/// counts, so the pool holds only when *no* model class could spawn from
-/// it. Per-launch precision (this role's configured model, that chain's
-/// rungs) belongs to [`exhausted_for_launch`]; this read answers for every
-/// spawn the pool could receive.
+/// any-class count — an account counts while some known model class (a
+/// `TASK_TOOL_ALIASES` rung) has no blocking mark for it, so the pool
+/// holds only when *no* known model class could spawn from any account —
+/// including the every-rung-dead state an account marked for all four
+/// classes is in. Per-launch precision (this role's configured model, that
+/// chain's rungs) belongs to [`exhausted_for_launch`]; this read answers
+/// for every spawn the pool could receive.
 pub(crate) fn preflight_pool_state(workspace_root: &Path) -> SpawnablePoolState {
     let config = read_model_fallback_config(workspace_root);
     if config.enabled {

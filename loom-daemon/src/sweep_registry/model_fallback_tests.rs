@@ -363,3 +363,27 @@ fn model_less_preflight_counts_class_scoped_marks_only_when_enabled() {
         .unwrap();
     assert!(exhausted(tmp.path()));
 }
+
+/// #14088 review: the every-rung-dead state the whole feature exists for.
+/// An account bad-marked for every known class carries no class-less entry,
+/// yet no class could spawn from it — the model-less preflight read must
+/// hold there, not report the pool healthy (the launch-scoped gate already
+/// did; this pins the work-finder hold and the preference walk's read to
+/// the same verdict).
+#[test]
+#[serial(loom_config_env)]
+fn model_less_preflight_holds_when_every_account_is_marked_for_every_class() {
+    let tmp = pool_with(&ACCOUNTS);
+    write_config(tmp.path(), r#"{"autonomous": {"modelFallback": {"enabled": true}}}"#);
+    for account in ACCOUNTS {
+        for model in ["fable", "claude-opus-5", "sonnet", "haiku"] {
+            mark(tmp.path(), account, model);
+        }
+    }
+    let pool = preflight_pool_state(tmp.path());
+    assert_eq!(pool.total, 2);
+    assert_eq!(
+        pool.usable, 0,
+        "an account marked for every class has no class that could spawn"
+    );
+}
