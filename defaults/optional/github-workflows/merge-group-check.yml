@@ -4,6 +4,17 @@ name: Merge-queue group check
 # (Phase C of #9978; #12323). Install it only in a repo whose default branch has
 # a merge queue and `champion.mergeMode: queue`. See defaults/optional/README.md.
 #
+# Trust boundary: the job-level `if:` is what keeps untrusted code away from the
+# `statuses: write` token, NOT the `branches:` filter. A `workflow_run` runs in
+# base-repo, default-branch context, and its `branches:` filter matches the
+# triggering run's head branch, which a fork PR author names freely (a fork
+# branch `gh-readonly-queue/x` passes it). The job checks out that run's head and
+# `group-check` runs `forge.mergeQueue.statusCommand` from the checked-out
+# `.loom/config.json`, so a fork head must never reach it. The gate accepts a
+# `workflow_run` only when the CI run it reacts to was itself a `merge_group`
+# run of this repository (merge groups exist only in the base repo). Anything
+# else is skipped and posts nothing, which authorizes nothing (fail-closed).
+#
 # This job must NOT wait for CI. `checks_requested` posts `pending` while the
 # required checks run, and the `workflow_run` trigger below posts the final status
 # when CI completes, so no runner is held for the length of your checks.
@@ -39,6 +50,12 @@ concurrency:
 jobs:
   group-check:
     name: Merge authorization
+    # Security gate (see "Trust boundary" above): never relax to the branch filter.
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'merge_group' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -65,6 +82,8 @@ jobs:
           else
             gh release download "$LOOM_VERSION" --repo rjwalters/loom --pattern "$asset*" --dir "$RUNNER_TEMP"
           fi
+          # Integrity only: the .sha256 comes from the same release and the
+          # published .sig/.pem are not verified, so a pinned LOOM_VERSION is the guard.
           (cd "$RUNNER_TEMP" && sha256sum -c "$asset.sha256")
           install -m 0755 "$RUNNER_TEMP/$asset" "$RUNNER_TEMP/loom-daemon"
 
