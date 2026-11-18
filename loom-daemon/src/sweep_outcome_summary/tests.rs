@@ -117,7 +117,7 @@ impl MergeLookup for ForgeDown {
 }
 
 #[test]
-fn group_by_parses_the_six_documented_dimensions() {
+fn group_by_parses_the_seven_documented_dimensions() {
     for (spec, expected) in [
         ("arm", GroupBy::Arm),
         ("MODEL", GroupBy::Model),
@@ -125,6 +125,7 @@ fn group_by_parses_the_six_documented_dimensions() {
         ("host", GroupBy::Host),
         ("Day", GroupBy::Day),
         ("tap", GroupBy::Tap),
+        ("Mix", GroupBy::Mix),
     ] {
         assert_eq!(GroupBy::parse(spec).unwrap(), expected);
     }
@@ -1091,3 +1092,99 @@ fn rendered_text_names_the_card_and_the_relationship_to_the_old_summary() {
 
 #[cfg(test)]
 mod first_pass_tests;
+
+/// Issue #14067: two mixes — the opposite-mix hypothesis (strong Curator/Judge,
+/// cheap Builder) against the reverse — compare on merged count, bounces and
+/// cost in one report, and a record with an unread PR timeline is not a zero.
+#[test]
+fn group_by_mix_compares_two_mixes_on_merges_bounces_and_cost() {
+    use crate::telemetry::JudgeVerdict;
+
+    fn usage(model: &str, input: i64) -> Vec<ModelUsageTotals> {
+        vec![ModelUsageTotals {
+            model: model.into(),
+            speed: "standard".into(),
+            service_tier: "standard".into(),
+            input,
+            cache_read: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            output: 0,
+        }]
+    }
+    fn phase(name: &str, model: &str, input: i64) -> PhaseDuration {
+        PhaseDuration {
+            tokens_by_model: Some(usage(model, input)),
+            ..PhaseDuration::new(name, 10)
+        }
+    }
+    fn mixed(id: &str, builder: &str, curator_judge: &str, pr: u32) -> SweepOutcomeRecord {
+        let mut r = record(id, "o/r", Some(builder), SweepResult::Success, 600);
+        r.effort = Some("high".into());
+        r.pr_number = Some(pr);
+        r.phase_durations = vec![
+            phase("curator", curator_judge, 1_000),
+            phase("builder", builder, 5_000),
+            phase("judge", curator_judge, 1_000),
+        ];
+        r.tokens_by_model = Some(usage(builder, 7_000));
+        r
+    }
+
+    // Mix A: strong Curator/Judge + cheap Builder. One sweep bounced once.
+    let a1 = mixed("a1", "claude-sonnet-5", "claude-opus-5", 1);
+    let mut a2 = mixed("a2", "claude-sonnet-5", "claude-opus-5", 2);
+    a2.judge_verdicts = Some(vec![
+        JudgeVerdict {
+            attempt: 1,
+            verdict: "fail".into(),
+        },
+        JudgeVerdict {
+            attempt: 2,
+            verdict: "pass".into(),
+        },
+    ]);
+    a2.doctor_cycles = Some(1);
+    // Mix B: the reverse. Clean pass, timeline read.
+    let mut b1 = mixed("b1", "claude-opus-5", "claude-sonnet-5", 3);
+    b1.judge_verdicts = Some(vec![JudgeVerdict {
+        attempt: 1,
+        verdict: "pass".into(),
+    }]);
+    b1.doctor_cycles = Some(0);
+
+    let report = summarize(
+        &[
+            entry(a1, day(10), "h"),
+            entry(a2, day(10), "h"),
+            entry(b1, day(10), "h"),
+        ],
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Mix),
+        &mut AllMerged,
+        vec!["/ws".into()],
+    );
+
+    assert_eq!(report.rows.len(), 2);
+    let a = &report.rows[0];
+    assert_eq!(
+        a.group,
+        "curator=claude-opus-5 builder=claude-sonnet-5 judge=claude-opus-5 | -/- | effort=high"
+    );
+    assert_eq!((a.sweeps, a.merged_prs), (2, Some(2)));
+    // Only a2's timeline was read: a1 is unknown, not a clean zero.
+    assert_eq!((a.bounce_records, a.judge_rejections, a.doctor_cycles), (1, 1, 1));
+    let b = &report.rows[1];
+    assert!(b
+        .group
+        .starts_with("curator=claude-sonnet-5 builder=claude-opus-5"));
+    assert_eq!((b.sweeps, b.merged_prs), (1, Some(1)));
+    assert_eq!((b.bounce_records, b.judge_rejections, b.doctor_cycles), (1, 0, 0));
+    // Cost is priced per record, so the Opus-builder mix costs more per sweep.
+    let per_sweep = |r: &GroupRow| r.weighted_tokens_usd.unwrap() / r.sweeps as f64;
+    assert!(per_sweep(b) > per_sweep(a));
+
+    let text = render_text(&report);
+    assert!(text.contains("grouped by mix"));
+    assert!(text.contains(&a.group) && text.contains("REJ") && text.contains("DR_CYC"));
+}
