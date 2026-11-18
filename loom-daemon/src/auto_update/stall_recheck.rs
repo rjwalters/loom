@@ -46,6 +46,28 @@ pub fn delay_after_tick(floor: &FloorState, now: DateTime<Utc>, interval: Durati
     next_tick_delay(age, interval)
 }
 
+/// [`delay_after_tick`] bounded by a retryable-failure backoff (Issue
+/// #14016): the next tick lands at the earlier of the stall cadence and the
+/// time left on `state.backoff_until`, so the retry happens when the tick's
+/// "backing off Ns" line said it would instead of a full interval later.
+/// `backoff_left` is `None` when the loop is not backing off — including a
+/// backoff that already elapsed, which leaves the regular cadence (an
+/// immediate wake would spin against the gates that hold past an elapsed
+/// backoff).
+#[must_use]
+pub fn delay_after_tick_with_backoff(
+    floor: &FloorState,
+    backoff_left: Option<Duration>,
+    now: DateTime<Utc>,
+    interval: Duration,
+) -> Duration {
+    let stall_delay = delay_after_tick(floor, now, interval);
+    match backoff_left {
+        Some(left) => stall_delay.min(left),
+        None => stall_delay,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +143,44 @@ mod tests {
         };
         state.observe(Some(&landed));
         assert_eq!(delay_after_tick(&state, t0, INTERVAL), INTERVAL);
+    }
+
+    // Issue #14016: a retryable-failure backoff bounds the next tick too.
+
+    const BACKOFF: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_backoff_shorter_than_the_interval_pulls_the_tick_forward() {
+        let t0 = Utc::now();
+        let floor = FloorState::default();
+        assert_eq!(delay_after_tick_with_backoff(&floor, Some(BACKOFF), t0, INTERVAL), BACKOFF);
+    }
+
+    #[test]
+    fn a_backoff_longer_than_the_interval_leaves_the_interval_winning() {
+        let t0 = Utc::now();
+        let floor = FloorState::default();
+        assert_eq!(delay_after_tick_with_backoff(&floor, Some(HOUR), t0, INTERVAL), INTERVAL);
+    }
+
+    #[test]
+    fn no_backoff_keeps_the_stall_cadence() {
+        let t0 = Utc::now();
+        let state = stalled(t0);
+        assert_eq!(delay_after_tick_with_backoff(&state, None, t0, INTERVAL), STALL_RECHECK);
+        assert_eq!(
+            delay_after_tick_with_backoff(&FloorState::default(), None, t0, INTERVAL),
+            INTERVAL
+        );
+    }
+
+    #[test]
+    fn a_stall_and_a_backoff_take_the_earlier_wake() {
+        let t0 = Utc::now();
+        let state = stalled(t0);
+        assert_eq!(
+            delay_after_tick_with_backoff(&state, Some(BACKOFF), t0, INTERVAL),
+            BACKOFF.min(STALL_RECHECK)
+        );
     }
 }

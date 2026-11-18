@@ -95,7 +95,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::proto::{HeartbeatRequest, LiveStep, RefusalReason, REFUSE_CLAIM_LOST};
+use super::proto::{HeartbeatRequest, LiveStep, ParkEndCause, RefusalReason, REFUSE_CLAIM_LOST};
 use crate::step_role::StepRole;
 
 /// A reading of the server's monotonic clock: time since an arbitrary fixed
@@ -1118,10 +1118,23 @@ impl Table {
     /// order, so the next claim is answered on its merits and a later streak
     /// counts from zero. Sent on a quarantine's TTL expiry and on an
     /// operator's `quarantine clear`, which is what keeps both true to the
-    /// park comment ("clear the park ... or wait for the TTL"). Whether there
-    /// was a streak to forget. The no-progress hold is not touched.
-    pub fn end_fast_fail_park(&mut self, repo: &str, item: u64) -> bool {
-        self.fast_fails.remove(&(repo.to_string(), item)).is_some()
+    /// park comment.
+    ///
+    /// The no-progress hold is the ladder's backoff for an item that keeps
+    /// failing, so only an explicit operator override lifts it (#14047):
+    /// [`ParkEndCause::Cleared`] drops the hold of every step of the item and
+    /// resets its streak (the same effect as a progressing release);
+    /// [`ParkEndCause::Expired`] leaves it standing. Whether there was a
+    /// streak or hold to forget.
+    pub fn end_fast_fail_park(&mut self, repo: &str, item: u64, cause: ParkEndCause) -> bool {
+        let mut known = self.fast_fails.remove(&(repo.to_string(), item)).is_some();
+        if cause == ParkEndCause::Cleared {
+            let before = self.cooldowns.len();
+            self.cooldowns
+                .retain(|(r, i, _), _| !(r == repo && *i == item));
+            known |= self.cooldowns.len() != before;
+        }
+        known
     }
 
     fn finish_release(

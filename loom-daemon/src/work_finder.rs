@@ -16,8 +16,8 @@
 //!    --state open --json number,labels` via [`GhWorkSource`], the direct
 //!    analogue of [`crate::epic_supervisor::forge::GhEpicSource`].
 //! 2. Filters out issues that are **already in flight** (present in the
-//!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running` /
-//!    `Pending` sweep) or that defensively carry any [`SKIP_LABELS`] entry
+//!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running`
+//!    sweep) or that defensively carry any [`SKIP_LABELS`] entry
 //!    (`loom:building` / `loom:blocked` / `loom:operator`).
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
@@ -60,7 +60,7 @@
 //!   a collision (e.g. a concurrent epic-supervisor sweep for the same child)
 //!   fails loudly and is logged, never double-dispatched.
 //! - **Registry dedup** — the authoritative "already in-flight" check is the
-//!   registry itself: an issue with a live `Running`/`Pending` entry is skipped
+//!   registry itself: an issue with a live `Running` entry is skipped
 //!   even if the forge still shows `loom:issue` (label-flip lag).
 //!
 //! A forge-query error aborts *that* tick only; the caller logs it and the next
@@ -414,8 +414,8 @@ pub trait WorkSource {
 /// query). Splitting it out keeps [`tick`] unit-testable without a real
 /// registry or `gh` credentials.
 pub trait WorkDispatcher {
-    /// The set of issue numbers that currently have a live (`Running` /
-    /// `Pending`) sweep — the authoritative "already in-flight" view.
+    /// The set of issue numbers that currently have a live (`Running`)
+    /// sweep — the authoritative "already in-flight" view.
     fn in_flight(&self) -> HashSet<u32>;
 
     /// The set of issue numbers currently **quarantined** for repeated

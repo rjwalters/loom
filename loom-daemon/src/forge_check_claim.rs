@@ -252,10 +252,29 @@ impl OwnedClaim {
     /// Read the marker and this host's published lease host from the process
     /// environment.
     fn from_env(issue: u32) -> Option<Self> {
-        let marker = std::env::var(CLAIM_OWNED_ENV).ok();
-        let mut owned = Self::from_marker(marker.as_deref(), issue, None)?;
         // Resolved only for an owned claim: the host chain can shell out.
-        owned.lease_host = Some(crate::cli::pr_lease::published_host());
+        // The RAW identity decides usability — `published_host` hashes the
+        // raw value, so an unresolved chain would turn into an ordinary
+        // looking `host-<hex>` that every unresolved host publishes alike,
+        // and `from_marker`'s filter could no longer catch it (#13998).
+        Self::from_parts(
+            std::env::var(CLAIM_OWNED_ENV).ok(),
+            crate::host_identity::lease_host_identity(),
+            issue,
+        )
+    }
+
+    /// [`Self::from_env`] with the environment pre-resolved, so tests
+    /// exercise this exact path instead of the live process env. A raw chain
+    /// that ended at [`crate::host_identity::UNKNOWN_HOST`] yields
+    /// `lease_host: None` under either publishing mode, because nothing is
+    /// derived from an unusable raw value — two hosts that both fail to
+    /// resolve publish the same id, and neither could tell its own lease
+    /// from a peer's (#13998).
+    fn from_parts(marker: Option<String>, raw_host: String, issue: u32) -> Option<Self> {
+        let mut owned = Self::from_marker(marker.as_deref(), issue, None)?;
+        owned.lease_host = (raw_host != crate::host_identity::UNKNOWN_HOST)
+            .then(|| crate::cli::pr_lease::published_host());
         Some(owned)
     }
 
@@ -1339,6 +1358,28 @@ mod tests {
             let owned = OwnedClaim::from_marker(Some("20"), 20, unusable.map(String::from));
             assert_eq!(owned, Some(OwnedClaim { lease_host: None }), "{unusable:?}");
         }
+    }
+
+    /// The `from_env` path (`from_parts` with the environment pre-resolved)
+    /// filters the RAW lease identity BEFORE the opaque hash: an unresolved
+    /// chain yields `lease_host: None`. `from_marker` alone cannot catch
+    /// this — `published_host` would hand it an ordinary-looking
+    /// `host-<hex>` that every unresolved host shares, and an owned marker
+    /// would pass a peer's lease as this host's own (#13998).
+    #[test]
+    fn from_env_drops_the_host_of_an_unresolved_raw_chain() {
+        let marker = || Some("20".to_string());
+        assert_eq!(
+            OwnedClaim::from_parts(marker(), crate::host_identity::UNKNOWN_HOST.to_string(), 20,),
+            Some(OwnedClaim { lease_host: None }),
+            "raw unknown-host must yield None, never be hashed into a usable id",
+        );
+        // A resolved chain keeps a published host — whatever this
+        // environment derives, the usability decision came from the raw
+        // value alone.
+        let owned = OwnedClaim::from_parts(marker(), "resolved-host".to_string(), 20);
+        assert!(owned.is_some());
+        assert!(owned.unwrap().lease_host.is_some(), "a resolved chain keeps a published host",);
     }
 
     /// The daemon pre-claimed the issue and spawned this session: its own
