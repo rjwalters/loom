@@ -188,11 +188,17 @@ pub(crate) fn decide_classified(inputs: &Inputs<'_>, probe: &dyn PermissionProbe
             } else {
                 RefusalClass::InsufficientPermission
             };
+            let hint = if class == RefusalClass::NotInInstallation {
+                not_in_installation_hint(&target.nwo)
+            } else {
+                String::new()
+            };
             Decision::deny(
                 class,
                 repo,
                 format!(
-                    "the credential in use cannot write to {} ({what}); Loom writes need WRITE",
+                    "the credential in use cannot write to {} ({what}); Loom writes need \
+                     WRITE{hint}",
                     target.nwo
                 ),
             )
@@ -206,6 +212,19 @@ pub(crate) fn decide_classified(inputs: &Inputs<'_>, probe: &dyn PermissionProbe
             ),
         ),
     }
+}
+
+/// The sanctioned way forward when the refusal is [`RefusalClass::NotInInstallation`]
+/// (#13978): the guard stays as it is, but an agent that only needs to *file an
+/// issue* on a public repo the App is not installed on must not park the report
+/// as "needs an operator". Interim, until the typed `github-write` operation with a
+/// target-repo allowlist (2AMLogic/2am#7455) ships and this points there instead.
+fn not_in_installation_hint(nwo: &str) -> String {
+    format!(
+        "; to file an issue there, run `gh issue create -R {nwo}` (the process `gh` \
+         credential; interim route, see defaults/docs/gh-issue-create-rest-fallback.md) \
+         instead of parking the report for an operator"
+    )
 }
 
 /// `origin`'s `owner/repo` for each root, cached for the process (remotes

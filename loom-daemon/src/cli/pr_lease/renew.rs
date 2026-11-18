@@ -327,13 +327,28 @@ pub(crate) fn spawn(
     }
     super::super::lease_ensure::mark_inherited_fds_cloexec();
     match command.spawn() {
-        Ok(child) => format!(
-            "renewer {} keeps the lease fresh every {interval}s while pid {watch_pid} lives (log: \
-             .loom/logs/pr-lease/pr-{}-{}.log)",
-            child.id(),
-            ctx.common.pr,
-            ctx.me.role.as_str()
-        ),
+        Ok(child) => {
+            // #14100: attribute the renewer's pid — this is the per-step,
+            // long-lived self-spawn the issue's OOM line must be matchable
+            // to. Start line only: the parent returns immediately after the
+            // spawn, so a `Tracked` here would log a misleading `abandoned`
+            // exit at once and stop the sampler.
+            log::info!(
+                "{}",
+                crate::self_spawn_log::start_line(
+                    "pr_lease_renewer",
+                    child.id(),
+                    &crate::fleet_sync::git_spawn_log::argv_of(&command)
+                )
+            );
+            format!(
+                "renewer {} keeps the lease fresh every {interval}s while pid {watch_pid} lives (log: \
+                 .loom/logs/pr-lease/pr-{}-{}.log)",
+                child.id(),
+                ctx.common.pr,
+                ctx.me.role.as_str()
+            )
+        }
         Err(e) => format!("renewer not started ({e}); the lease ages out at the TTL"),
     }
 }

@@ -874,6 +874,7 @@ fn usage_queries_read_span_attributes_from_the_string_column_only() {
 fn usage_queries_name_only_span_names_the_daemon_emits() {
     let allowed: BTreeSet<&str> = [
         SpanName::RuntimeUsage,
+        SpanName::RuntimeRun,
         SpanName::RoleAttempt,
         SpanName::Sweep,
     ]

@@ -344,9 +344,10 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         "CARGO_HOME=/workspace/cache/cargo".into(),
         "CARGO_TARGET_DIR=/workspace/cache/target".into(),
         "npm_config_cache=/workspace/cache/npm".into(),
-        // The lease-renewal helpers resolve `$HOME` to the clone root in this
-        // container; point the store at the cache volume instead, so Loom's
-        // own lock never shows up as dirt in the work tree (#14160).
+        // `.loom/lease-renew/.lock` has been observed untracked in seat clones
+        // (#14160); the writer is not traced (#14226). It is not this
+        // container's `$HOME`, which is `/home/loom` here. Point the store at
+        // the cache volume so Loom's own lock stays out of the work tree.
         "LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew".into(),
         format!("LOOM_PRIVATE_REPOSITORY={}", config.repository),
     ] {

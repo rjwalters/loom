@@ -194,6 +194,37 @@ pub fn sweep_usage_runtime(
     usage_runtime_fallback(None, &contents)
 }
 
+/// [`sweep_usage_runtime`] for a sweep whose **registry entry names its own
+/// log** (Issue #14166).
+///
+/// A step-dispatched run (`SweepKind::Step`) logs to
+/// `step-<role>-<item>.log` (`SweepRegistry::compute_step_log_path`), never to
+/// the per-issue `sweep-issue-<issue>.log` that [`sweep_usage_runtime`] reads,
+/// so on that path the `# LOOM_RUNTIME_RESOLVED` marker was never found, the
+/// runtime resolved to `None`, and a Codex/OpenCode run was read through the
+/// Claude transcripts reader (no usage span at all). `dispatch_log` — the
+/// entry's own `log_path` — is consulted first; the per-issue log stays as the
+/// fallback, so a legacy whole-issue sweep resolves exactly as before. The
+/// same marker contract applies (Claude yields `None`), and only the log read
+/// differs, so this adds no new resolver — it points the existing one at the
+/// right file.
+#[must_use]
+pub fn sweep_usage_runtime_from_log(
+    labelled: Option<&str>,
+    dispatch_log: Option<&Path>,
+    workspace_root: &Path,
+    issue: u32,
+) -> Option<String> {
+    if let Some(labelled) = labelled.map(str::trim).filter(|r| !r.is_empty()) {
+        return Some(labelled.to_string());
+    }
+    let per_issue = crate::launch_record::sweep_log_path(workspace_root, issue);
+    dispatch_log
+        .filter(|log| *log != per_issue.as_path())
+        .and_then(|log| role_tick_usage_runtime(None, log))
+        .or_else(|| sweep_usage_runtime(None, workspace_root, issue))
+}
+
 /// [`usage_runtime_fallback`] for a **role tick**, reading the marker out of
 /// the tick's own per-role log.
 #[must_use]
@@ -857,6 +888,44 @@ mod tests {
         assert_eq!(sweep_usage_runtime(None, root, 8594), None);
         // A missing log is `None`, never a panic.
         assert_eq!(sweep_usage_runtime(None, root, 9999), None);
+    }
+
+    /// Issue #14166: a step-dispatched run logs to `step-<role>-<item>.log`,
+    /// so the marker must be read from the entry's own log, not only from the
+    /// per-issue log (which a step dispatch never writes).
+    #[test]
+    fn sweep_usage_runtime_from_log_reads_the_step_log_and_falls_back_to_the_issue_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let logs = root.join(".loom").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let step_log = logs.join("step-builder-14166.log");
+        std::fs::write(&step_log, resolved_log("codex")).unwrap();
+        // The per-issue log does not exist: only the step log can answer.
+        assert_eq!(
+            sweep_usage_runtime_from_log(None, Some(&step_log), root, 14166).as_deref(),
+            Some("codex")
+        );
+        // A launch-record label still wins without any read.
+        assert_eq!(
+            sweep_usage_runtime_from_log(Some("opencode"), Some(&step_log), root, 14166).as_deref(),
+            Some("opencode")
+        );
+        // A Claude step log resolves to `None` (payload-preserving), and the
+        // per-issue log is then the fallback.
+        std::fs::write(&step_log, resolved_log("claude")).unwrap();
+        assert_eq!(sweep_usage_runtime_from_log(None, Some(&step_log), root, 14166), None);
+        let issue_log = crate::launch_record::sweep_log_path(root, 14166);
+        std::fs::write(&issue_log, resolved_log("codex")).unwrap();
+        assert_eq!(
+            sweep_usage_runtime_from_log(None, Some(&step_log), root, 14166).as_deref(),
+            Some("codex")
+        );
+        // No dispatch log at all behaves exactly like `sweep_usage_runtime`.
+        assert_eq!(
+            sweep_usage_runtime_from_log(None, None, root, 14166),
+            sweep_usage_runtime(None, root, 14166)
+        );
     }
 
     #[test]

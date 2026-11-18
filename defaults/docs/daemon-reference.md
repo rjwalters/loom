@@ -10685,6 +10685,40 @@ across the registered roots:
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
 
+**Declared private-clone bindings (#14111).** `autonomous.sessionReconcile.privateClones`
+maps an account to the repositories its private-clone session serves, in any
+config tier (machine defaults, fleet, repo, host-local; precedence as in
+[`fleet-config-lifecycle.md`](fleet-config-lifecycle.md)), read from the daemon
+root:
+
+```json
+{ "autonomous": { "sessionReconcile": { "privateClones": {
+  "work-account": [ { "repository": "https://github.com/OWNER/REPO", "base": "main" } ]
+} } } }
+```
+
+`base` is optional (default `main`). The pass registers each missing
+repository by the path `accounts session start ACCOUNT --private-clone URL`
+takes while the account is idle, so the per-host manual step goes away. It
+runs after every account's own recovery, and is skipped while Docker is backing
+off.
+
+- An account with no binding is never read or touched.
+- A **busy** account (a job holds its lease, or a worker is alive) is retried on
+  the next pass and never interrupted. A held (`session stop`) or disabled
+  account is skipped; a binding never lifts a hold.
+- A repository already registered with that base costs no `docker` call.
+- Removing a binding **deletes nothing**. While the account still has at least
+  one binding, any registered repository no binding declares is WARNed once per
+  distinct set as drift and retained.
+- Fails closed, WARNing with the key (`autonomous.sessionReconcile.privateClones.ACCOUNT`),
+  and retried on the reconcile backoff, for: an unknown account, a non-HTTPS or
+  credential-bearing URL, a `firewall: true` repository, a base that conflicts
+  with the registered one, an account running a host-mounted session (a binding
+  never converts it), and a private session whose container is missing (the
+  reconcile recovery restores it first, with its recorded image).
+- Live: re-read every pass, no restart.
+
 **Seeing it: `loom-daemon status` (#10600).** `status` lists every
 session-managed Codex account across the registered roots under `Session
 containers:`, one line each: the state (`running`, `stopped`, `missing`,
@@ -10950,8 +10984,8 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | — | `autonomous.roleRunner.demandWidth.staleSecs` | config only | `1800` (ledger entries older than this are stale: unobserved for the reservation and the #9410 back-off, counted at their last-known value for PR-role width, #9414) |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none; may name any of the 8 shipped roles, `architect` included) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
-| — | `autonomous.roleRunner.effort` | config only (`roleRunner.roleEfforts.<role>` > `roleRunner.effort` > unset) | *(unset ⇒ **no** `--effort` argument; the runtime CLI's own session default, #8054)* |
-| — | `autonomous.roleRunner.roleEfforts` | config only — a `{"<role>": "<level>"}` object occupying the tier **above** `roleRunner.effort`, exactly as `roleModels` sits above `model` | `{}` (every role falls through to the global tier) |
+| — | `autonomous.roleRunner.effort` | config only (`roleEfforts.<role>@<runtime>` > `roleEfforts.<role>` > `roleRunner.effort` > Codex default `medium` > unset, #14017) | *(unset ⇒ **no** `--effort` argument on Claude and other runtimes; the runtime CLI's own session default, #8054. Codex launches with `medium`, never `none`, #14017)* |
+| — | `autonomous.roleRunner.roleEfforts` | config only — a `{"<role>": "<level>"}` object occupying the tier **above** `roleRunner.effort`, exactly as `roleModels` sits above `model`; a `"<role>@<runtime>"` key (#14017) scopes the level to one runtime and beats the bare role key for it | `{}` (every role falls through to the global tier) |
 | `LOOM_ARCHITECT_MAX_PROPOSALS` | `autonomous.roleRunner.architectMaxProposals` | env > config > default | `5` (per-invocation architect proposal cap, #5656) |
 | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | `autonomous.roleRunner.collisionDetection` | env > config > `autonomous.collisionDetection.enabled` > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | `autonomous.roleRunner.collisionWindowSecs` | env > config > default | that role's tick interval, clamped to `[60, 3600]` |
@@ -10980,17 +11014,41 @@ default (#8054).** Until #8054 the role-runner path emitted no `--effort` at
 all; the flag existed only on the sweep-dispatch path (#3716). Two config keys
 now reach it, in this order:
 
-**`autonomous.roleRunner.roleEfforts.<role>` > `autonomous.roleRunner.effort` >
-unset**
+**`autonomous.roleRunner.roleEfforts.<role>@<runtime>` >
+`autonomous.roleRunner.roleEfforts.<role>` > `autonomous.roleRunner.effort` >
+shipped Codex default (`medium`, Codex only) > unset** (#14017)
 
-- **Unset is the shipped state and stays byte-identical.** There is deliberately
-  **no** default effort and no fall-through to a shared `autonomous.*` key: with
-  neither key configured the resolver returns the empty string, the spawn emits
-  **no `--effort` token at all**, and the runtime CLI's own session-default
-  effort survives end-to-end — exactly the pre-#8054 argv. The asymmetry with
-  `--model` (which always pins) is intentional: an inherited *model* was a live
-  incident (#4501), an inherited *effort* is the status quo every workspace
-  already has.
+The effort is resolved against the **admitted runtime** — at both launch sites,
+the role-runner tick and the sweep step (Builder, Curator, …) — so a role whose
+`roleDraw` can pick both Claude and Codex can run each at its own effort:
+
+```json
+"roleEfforts": { "builder": "medium", "builder@codex": "high" }
+```
+
+launches Claude at `medium` and Codex at `high`. The qualified key beats the
+bare role key **for that runtime only**; every other runtime still gets the
+per-role value. `<runtime>` is the runtime id (`codex`, `claude`, …), matched
+trimmed and case-insensitively. A malformed qualified key (`"builder@"`,
+`"@codex"`, `"a@b@c"`) is dropped with a warning, never fatal; a well-formed key
+naming a runtime that never launches is simply never matched.
+
+- **Codex never runs unset.** A Codex launch with no effort at any tier gets
+  `medium` (source `codex-default`) instead of the CLI's own default: a Codex
+  Builder left at `reasoning effort: none` refused an issue its own daemon had
+  claimed (#14017). `medium` is a supported level of every model
+  `codex debug models` lists. Any configured tier — including the global
+  `effort` — beats it. Re-run `codex debug models` if a Codex release changes
+  its level vocabulary.
+- **Unset stays byte-identical on every other runtime.** There is deliberately
+  **no** default effort for Claude or any other runtime, and no fall-through to a
+  shared `autonomous.*` key: with nothing configured the resolver returns the
+  empty string, the spawn emits **no `--effort` token at all**, and the runtime
+  CLI's own session-default effort survives end-to-end — exactly the pre-#8054
+  argv. The asymmetry with `--model` (which always pins) is intentional: an
+  inherited *model* was a live incident (#4501), an inherited *effort* is the
+  status quo every workspace already has. Codex is the exception only because
+  its CLI default can be `none`.
 - **Blanks are unset at both tiers.** A blank/whitespace/non-string value is
   dropped at parse time — per-entry for `roleEfforts` (one typo never disables
   the rest of the object), whole-field for `effort` — so a blank per-role entry
@@ -11004,8 +11062,9 @@ unset**
 - **Keys are trimmed + lower-cased**, matching `roleModels`/`onIdleMaxWait`, so
   a `"Judge"` config key matches the `judge` role the runner dispatches under.
 - **Logged per tick** in the header line above as
-  `effort=<level> (source=autonomous.roleRunner.roleEfforts.judge)`, with the
-  unconfigured case rendered `effort=<runtime CLI default> (source=unset)` —
+  `effort=<level> (source=autonomous.roleRunner.roleEfforts.judge)` (or
+  `…roleEfforts.judge@codex`, `autonomous.roleRunner.effort`, `codex-default`),
+  with the unconfigured case rendered `effort=<runtime CLI default> (source=unset)` —
   the same placecard the model field uses for its own pass-through, so a header
   never reads like its own bug.
 
