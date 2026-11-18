@@ -474,6 +474,130 @@ fn test_resolve_role_runner_effort_precedence_chain() {
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
 }
 
+/// Issue #14017: `roleEfforts.<role>@<runtime>` > `roleEfforts.<role>` >
+/// `effort` > the Codex default (Codex only) > unset, and the qualified key
+/// scopes to its own runtime.
+#[test]
+#[serial(loom_config_env)]
+fn test_resolve_role_runner_effort_is_runtime_aware() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let at = |root: &Path, role: &str, rt: Option<&str>| {
+        resolve_role_runner_effort_for_runtime(root, role, rt)
+    };
+
+    // A role that draws both runtimes: claude keeps the per-role value, codex
+    // takes its own (mixed-case key and runtime id still match).
+    let mixed = tempfile::tempdir().unwrap();
+    write_config(
+        mixed.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {"builder": "medium", " Builder@Codex ": "high"}}}}"#,
+    );
+    assert_eq!(
+        at(mixed.path(), "builder", Some("claude")),
+        ("medium".to_string(), "autonomous.roleRunner.roleEfforts.builder".to_string())
+    );
+    assert_eq!(
+        at(mixed.path(), "builder", Some("codex")),
+        (
+            "high".to_string(),
+            "autonomous.roleRunner.roleEfforts.builder@codex".to_string()
+        )
+    );
+    assert_eq!(at(mixed.path(), "builder", Some(" CODEX ")).0, "high");
+    // The qualified key does not leak to another role, or to no runtime at all.
+    assert_eq!(at(mixed.path(), "judge", Some("codex")).1, CODEX_DEFAULT_EFFORT_SOURCE);
+    assert_eq!(at(mixed.path(), "builder", None).0, "medium");
+
+    // Codex default only when nothing is configured at any tier; never for
+    // another runtime (no `--effort` there, #8054) or an unknown one.
+    let bare = tempfile::tempdir().unwrap();
+    assert_eq!(
+        at(bare.path(), "builder", Some("codex")),
+        (CODEX_DEFAULT_EFFORT.to_string(), CODEX_DEFAULT_EFFORT_SOURCE.to_string())
+    );
+    assert_ne!(CODEX_DEFAULT_EFFORT, "none");
+    for rt in [
+        Some("claude"),
+        Some("opencode"),
+        Some("nope"),
+        Some(" "),
+        None,
+    ] {
+        assert_eq!(
+            at(bare.path(), "builder", rt),
+            (String::new(), UNSET_EFFORT_SOURCE.to_string()),
+            "{rt:?} stays unset"
+        );
+    }
+
+    // The global tier beats the Codex default.
+    let global = tempfile::tempdir().unwrap();
+    write_config(global.path(), r#"{"autonomous": {"roleRunner": {"effort": "low"}}}"#);
+    assert_eq!(
+        at(global.path(), "builder", Some("codex")),
+        ("low".to_string(), "autonomous.roleRunner.effort".to_string())
+    );
+
+    // Malformed qualified keys and blank values are dropped, never fatal: the
+    // role falls through to the per-role value, and the well-formed sibling holds.
+    let bad = tempfile::tempdir().unwrap();
+    write_config(
+        bad.path(),
+        r#"{"autonomous": {"roleRunner": {"roleEfforts": {
+            "builder": "medium", "builder@": "xhigh", "@codex": "xhigh",
+            "a@b@c": "xhigh", "builder@codex": "  ", "judge@ghost": "low"}}}}"#,
+    );
+    let cfg = read_role_runner_config(bad.path());
+    assert_eq!(
+        cfg.role_efforts
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["builder", "judge@ghost"]
+    );
+    assert_eq!(at(bad.path(), "builder", Some("codex")).0, "medium");
+    // A well-formed key naming an unknown runtime is kept and never matches.
+    assert_eq!(at(bad.path(), "judge", Some("codex")).0, CODEX_DEFAULT_EFFORT);
+
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+}
+
+/// Issue #14017, role-runner launch path: a Codex-admitted judge with no effort
+/// anywhere gets the shipped default on the real argv, and a
+/// `roleEfforts.judge@codex` entry beats a per-role one for it.
+#[test]
+#[serial]
+fn test_invoke_passes_the_admitted_codex_runtime_to_the_effort_resolver() {
+    let _env_guard = ClearedLoomRuntimeEnv::new();
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    for (extra, want) in [
+        ("", CODEX_DEFAULT_EFFORT),
+        (
+            r#","autonomous":{"roleRunner":{"roleEfforts":{"judge":"low","judge@codex":"high"}}}"#,
+            "high",
+        ),
+        (
+            r#","autonomous":{"roleRunner":{"roleEfforts":{"judge":"low","judge@claude":"high"}}}"#,
+            "low",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = setup_codex_judge_fixture(root, extra);
+        let ws = crate::write_scope_test_support::WritableRoot::register(root);
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+            .with_gh_bin(ws.gh.clone())
+            .with_timeout(Duration::from_secs(5));
+        assert_eq!(runner.invoke("judge", "/loom:judge"), RoleTickOutcome::Success, "{extra}");
+        let argv = fs::read_to_string(&marker).expect("the adapter must have been spawned");
+        assert!(
+            argv.contains(&format!("--effort\n{want}\n")),
+            "codex must launch with effort {want} for config {extra:?}; argv: {argv}"
+        );
+    }
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+}
+
 /// Issue #8054: the parse contract itself — soft-fail shapes that must not
 /// take the whole config (or the whole field) down with them, mirroring
 /// `roleModels`.

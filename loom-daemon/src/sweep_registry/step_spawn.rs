@@ -883,8 +883,9 @@ impl SweepRegistry {
         use crate::role_runner::model_resolution as models;
         let root = &config.workspace_root;
         let name = role.role_name();
-        let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
         if config.skip_label_flip {
+            // No runtime is admitted here, so only the runtime-independent tiers apply.
+            let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
             // Hermetic fixtures install no runtime manifests.
             let model = match role {
                 StepRole::Builder => DispatchModel::Autonomous.resolve(config, kind, None),
@@ -985,6 +986,11 @@ impl SweepRegistry {
                 non_empty(model)
             }
         };
+        // #14017: effort is resolved once the runtime is admitted, so a
+        // `roleEfforts.<role>@<runtime>` entry and the Codex default can apply.
+        let effort = non_empty(
+            models::resolve_role_runner_effort_for_runtime(root, name, Some(&admitted.runtime)).0,
+        );
         Ok(StepLaunch {
             admission: crate::runtime_preference::DispatchAdmission {
                 admitted: Some(admitted),
