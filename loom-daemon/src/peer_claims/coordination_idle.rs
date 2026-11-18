@@ -11,7 +11,7 @@
 //! **entirely dispatch-gated**: the only two `ClaimKind::Advertise` publishers
 //! in the daemon are `SweepRegistry::dispatch` (one ad per newly-dispatched
 //! issue) and `SweepRegistry::readvertise_peer_claims`, which re-advertises
-//! only entries in `SweepState::Running`/`Pending`. A host with zero live
+//! only entries in `SweepState::Running`. A host with zero live
 //! sweeps at a given reaper tick sends **zero** ads that tick. There is no
 //! periodic liveness heartbeat on this channel.
 //!

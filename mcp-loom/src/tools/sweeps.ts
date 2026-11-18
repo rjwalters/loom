@@ -140,7 +140,6 @@ export function formatSweepKind(kind: SweepKind): string {
 
 /**
  * `SweepState` mirrors the Rust enum's serde-tagged shape:
- *   `{"state": "Pending"}`
  *   `{"state": "Running"}`
  *   `{"state": "Exited", "details": {"code": 0 | null, "at": "..."}}`
  *   `{"state": "Crashed", "details": {"at": "..."}}`
@@ -150,7 +149,6 @@ export function formatSweepKind(kind: SweepKind): string {
  * are accepted).
  */
 export type SweepState =
-  | { state: "Pending" }
   | { state: "Running" }
   | { state: "Exited"; details?: { code?: number | null; at?: string } }
   | { state: "Crashed"; details?: { at?: string } };
@@ -465,7 +463,7 @@ function extractError(response: DaemonResponse): string | null {
 }
 
 function isStateTag(s: string): s is SweepState["state"] {
-  return s === "Pending" || s === "Running" || s === "Exited" || s === "Crashed";
+  return s === "Running" || s === "Exited" || s === "Crashed";
 }
 
 /**
@@ -925,7 +923,7 @@ export const sweepTools: Tool[] = [
       properties: {
         state_filter: {
           type: "string",
-          enum: ["Pending", "Running", "Exited", "Crashed"],
+          enum: ["Running", "Exited", "Crashed"],
           description:
             "Optional lifecycle state filter. Omit to list all tracked sweeps.",
         },
