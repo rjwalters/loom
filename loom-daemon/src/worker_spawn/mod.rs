@@ -173,7 +173,15 @@ fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
 
 /// Native sweep workers authenticate through their harness, not Claude's pool.
 pub fn uses_native_sweep(root: &Path) -> bool {
-    crate::runtime_admission::resolve_binding(root, "sweep-lifecycle", None)
+    uses_native_role(root, "sweep-lifecycle")
+}
+
+/// [`uses_native_sweep`] for an arbitrary role: does this root's binding for
+/// `role` resolve to a native harness runtime? The work finder's pool
+/// pre-flight asks this for `builder` — the role of the step whose dispatch
+/// it gates since #11909 — not for the sweep (#13983).
+pub fn uses_native_role(root: &Path, role: &str) -> bool {
+    crate::runtime_admission::resolve_binding(root, role, None)
         .is_ok_and(|(runtime, _)| is_native(&runtime))
 }
 

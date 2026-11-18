@@ -6,8 +6,7 @@
 //! fenced JSON wire frame deserialized through the real
 //! `loom_daemon::types::{Request, Response, Event}` types) rather than
 //! string-matching it. They live in a sibling module — not inline in
-//! `sweep_md_doc_lint.rs` — purely to keep that file under the file-size
-//! ratchet threshold (`.loom/docs/file-size-policy.md`); each `#[test]` in
+//! `sweep_md_doc_lint.rs` — so that file stays small; each `#[test]` in
 //! that file is a thin one-line dispatch into the matching function here.
 //!
 //! See `sweep_md_doc_lint.rs`'s own module doc for the incident (#7876,

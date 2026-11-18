@@ -3,9 +3,8 @@
 //! `logs_done` idempotency that is deliberately independent of the phase-1
 //! `ci.job` record's.
 //!
-//! A sibling module of `super` (the phase-1 suite) rather than more lines in
-//! it: `ci_telemetry/tests.rs` is at the file-size ratchet, and these tests
-//! are a self-contained concern.
+//! A sibling module of `super` (the phase-1 suite): these tests are a
+//! self-contained concern.
 
 use super::*;
 

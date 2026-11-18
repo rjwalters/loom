@@ -8,6 +8,7 @@ fn comment(login: &str, body: &str) -> Comment {
             login: login.to_string(),
         },
         body: body.to_string(),
+        ..Comment::default()
     }
 }
 

@@ -159,11 +159,17 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         log::warn!("auto_update: {warning}");
     }
 
+    // #14224: what the tick asked, for the below-floor no-release WARN. One
+    // probe call, shared with `resolve_artifact`'s own resolution inputs.
+    let repo_pair = probe.resolved_repo();
     let inputs = TickInputs {
         artifact: &artifact,
         check: &check,
         tree_clean,
         in_flight,
+        repo_source: repo_pair
+            .as_ref()
+            .map(|(repo, source)| (repo.as_str(), *source)),
     };
     let decision = state.decide(now, &inputs, settle, defer_deadline);
     // #11042: an unsupervised host does not re-fetch a target it already

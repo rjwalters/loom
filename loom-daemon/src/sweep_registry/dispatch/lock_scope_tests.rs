@@ -2,8 +2,8 @@
 //! mutex across a forge `gh` call or a sleep, and releasing it must not open a
 //! double-spawn window for a concurrent dispatch of the same issue.
 //!
-//! Sibling file (declared from `dispatch.rs`) because `dispatch/tests.rs` is
-//! over the file-size ratchet threshold.
+//! Sibling file (declared from `dispatch.rs`) rather than additions to the
+//! already-large `dispatch/tests.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
