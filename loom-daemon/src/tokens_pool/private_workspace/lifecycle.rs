@@ -88,12 +88,109 @@ pub(super) fn check_firewall(workspace: &Path, id: &RepoId) -> Result<()> {
     Ok(())
 }
 
+/// Validate a declared binding without touching Docker or any state (#14111):
+/// a credential-free HTTPS forge URL and a safe base. Returns the repository's
+/// canonical key, the identity two spellings of one repository share.
+pub fn check_binding(repository: &str, base: &str) -> Result<String> {
+    let url = repository_url(repository)?;
+    valid_base(base)?;
+    Ok(identify(&url)?.key)
+}
+
+/// The repositories an account's private workspace holds — the primary first,
+/// then every registered one — as `(url, canonical key)`. `None`: the account
+/// is not in private-clone mode (no `workspace.json`).
+pub fn registered_repositories(
+    workspace: &Path,
+    name: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    let account = account(workspace, name)?;
+    let dir = state_dir(&account.credential_reference)?;
+    if !dir.join("workspace.json").exists() {
+        return Ok(None);
+    }
+    let config = load(&dir)?;
+    let key = |url: &str| identify(url).map_or_else(|_| url.to_owned(), |id| id.key);
+    let mut out = vec![(config.repository.clone(), key(&config.repository))];
+    out.extend(
+        config
+            .repositories
+            .iter()
+            .map(|r| (r.repository.clone(), key(&r.repository))),
+    );
+    Ok(Some(out))
+}
+
+/// What [`converge`] found or did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Converged {
+    /// The repository was already registered with this base; nothing was touched.
+    Present,
+    /// The repository is now registered (the first one also prepared the workspace).
+    Registered,
+}
+
+/// Make a declared binding true without an operator (#14111): register
+/// `repository` on the account, by the same path as repeating
+/// `session start --private-clone` while it is idle — so a busy account fails
+/// with [`AccountBusy`] (retry later, never interrupted) and nothing existing
+/// is ever deleted or reset.
+///
+/// Unlike an operator start it never lifts an operator hold (`check_hold` is
+/// consulted under the account lease, before the first mutation), never
+/// substitutes an image for a container that went missing (that is
+/// [`recover`]'s job), and refuses an account that runs a host-mounted session
+/// rather than convert it. A firewalled repository, an unknown account and a
+/// base that conflicts with the registered one are refused before any Docker call.
+pub fn converge(
+    workspace: &Path,
+    name: &str,
+    repository: &str,
+    base: &str,
+    check_hold: &dyn Fn() -> Result<()>,
+) -> Result<Converged> {
+    let repository = repository_url(repository)?;
+    valid_base(base)?;
+    let id = identify(&repository)?;
+    let account = account(workspace, name)?;
+    check_firewall(workspace, &id)?;
+    let profile = account.credential_reference.canonicalize()?;
+    let dir = state_dir(&profile)?;
+    if dir.join("workspace.json").exists() {
+        if let Ok(known) = load(&dir)?.target(Some(&repository)) {
+            if known.base != base {
+                bail!("private repository {} is already configured with base {}; retain its clone and resolve unfinished work before changing the base", known.repository, known.base);
+            }
+            return Ok(Converged::Present);
+        }
+    } else if super::super::session_lifecycle::is_session_managed(&profile) {
+        bail!("account runs a host-mounted session; a binding does not convert it (stop it, recover its work, then run session start --private-clone once)");
+    }
+    start_with(workspace, name, &repository, base, None, Some(check_hold))?;
+    Ok(Converged::Registered)
+}
+
 pub fn start(
     workspace: &Path,
     name: &str,
     repository: &str,
     base: &str,
     image: Option<&str>,
+) -> Result<Status> {
+    start_with(workspace, name, repository, base, image, None)
+}
+
+/// `start`, optionally unattended: `unattended` is the caller's hold probe. An
+/// operator start (`None`) lifts the hold an operator `stop` left; an
+/// unattended one honours it, checked under the lease before the first
+/// mutation, and recreates nothing the recorded identity says is gone.
+fn start_with(
+    workspace: &Path,
+    name: &str,
+    repository: &str,
+    base: &str,
+    image: Option<&str>,
+    unattended: Option<&dyn Fn() -> Result<()>>,
 ) -> Result<Status> {
     let repository = repository_url(repository)?;
     valid_base(base)?;
@@ -102,7 +199,8 @@ pub fn start(
     let dir = state_dir(&profile)?;
     let lease = lease::Lease::acquire(&dir)?;
     let engine = docker::engine()?;
-    let config = if dir.join("workspace.json").exists() {
+    let existed = dir.join("workspace.json").exists();
+    let config = if existed {
         let mut existing = load(&dir)?;
         if existing.account != account.id.name
             || existing.profile != profile
@@ -149,14 +247,28 @@ pub fn start(
     }
     lease.recover(&config, state.as_ref())?;
     if !docker::idle(state.as_ref(), &config.container)? {
-        bail!("session has an unleased worker; stop it before preparing the workspace");
+        return Err(lease::AccountBusy(
+            "session has an unleased worker; stop it before preparing the workspace",
+        )
+        .into());
+    }
+    if let Some(check_hold) = unattended {
+        if session_hold::held_across(std::slice::from_ref(&config.profile)) {
+            return Err(OperatorHeld.into());
+        }
+        check_hold()?;
+        if existed && state.is_none() {
+            bail!("private session container is missing; refusing to recreate it with a default image (the reconcile recovery restores it with the recorded one)");
+        }
     }
     save(&dir.join("workspace.json"), &config)?;
-    // An operator start lifts the hold an operator `stop` left, before the
-    // first mutation, so a failure past this point leaves the session down
-    // and unheld — which the reconciler then recovers on its backoff, the
-    // operator's stated intent — never running and held (#10453, #12772).
-    session_hold::lift_holds(std::slice::from_ref(&config.profile))?;
+    if unattended.is_none() {
+        // An operator start lifts the hold an operator `stop` left, before the
+        // first mutation, so a failure past this point leaves the session down
+        // and unheld — which the reconciler then recovers on its backoff, the
+        // operator's stated intent — never running and held (#10453, #12772).
+        session_hold::lift_holds(std::slice::from_ref(&config.profile))?;
+    }
     match state {
         None => {
             let image = image.unwrap_or(DEFAULT_SESSION_IMAGE);

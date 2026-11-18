@@ -609,11 +609,11 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "effort": "high",
   "config": { "runtime": "claude", "arm": "B" },
   "phase_durations": [
-    { "phase": "curator", "duration_sec": 12, "attempt": 1, "tokens_in": 4200, "tokens_out": 510 },
-    { "phase": "builder", "duration_sec": 340, "attempt": 1, "tokens_in": 38000, "tokens_out": 4900 },
-    { "phase": "judge", "duration_sec": 60, "attempt": 1, "tokens_in": 3100, "tokens_out": 400 },
-    { "phase": "doctor", "duration_sec": 45, "attempt": 1, "tokens_in": 1800, "tokens_out": 200 },
-    { "phase": "judge", "duration_sec": 20, "attempt": 2 }
+    { "phase": "curator", "duration_sec": 12, "attempt": 1, "tokens_in": 4200, "tokens_out": 510, "effort": "high" },
+    { "phase": "builder", "duration_sec": 340, "attempt": 1, "tokens_in": 38000, "tokens_out": 4900, "effort": "high" },
+    { "phase": "judge", "duration_sec": 60, "attempt": 1, "tokens_in": 3100, "tokens_out": 400, "effort": "high" },
+    { "phase": "doctor", "duration_sec": 45, "attempt": 1, "tokens_in": 1800, "tokens_out": 200, "effort": "high" },
+    { "phase": "judge", "duration_sec": 20, "attempt": 2, "effort": "high" }
   ],
   "total_duration_sec": 512,
   "result": "success",
@@ -713,6 +713,7 @@ attempt's own cost as well as its duration:
 | `tokens_in` | integer | This attempt's input-side tokens, on exactly `tokens_in`'s axis (uncached input + cache reads + cache writes). |
 | `tokens_out` | integer | This attempt's output-side tokens, on `tokens_out`'s axis. Always present or absent together with `tokens_in`. |
 | `tokens_by_model` | array | The same attempt's usage grouped by `(model, speed, service_tier)` — the per-phase counterpart of the record-level `tokens_by_model`, which is what makes a phase priceable when the Doctor ladder ran it on a different model than the Builder. Same presence contract as `tokens_in`. |
+| `effort` | string | The reasoning effort this attempt's launch ran at (Issue #14242) — the per-phase counterpart of the record-level `effort`. A sweep session's phases all inherit the session-default effort (the in-session Task tool exposes no effort parameter, so no phase can run at anything else); a step sweep's single phase is its role's own resolved effort. Stamped from the launch, never re-derived from dispatch-time config. Omitted — never `default` — when unknown: a pre-#14242 record, or one whose entry could name no effort at all. |
 
 **Why per phase.** The record-level totals cannot separate *clean-landing cost*
 (curator + builder + the **first** judge) from *rework cost* (Doctor and
@@ -756,7 +757,8 @@ chunks straddle a phase boundary is counted once, in the phase it started in,
 which is what keeps the sum from exceeding the total.
 
 **The same numbers reach OTLP.** `loom.phase_durations`' nested entries carry
-`attempt`/`tokens_in`/`tokens_out` (same absent-not-zero discipline), and the
+`attempt`/`tokens_in`/`tokens_out` (same absent-not-zero discipline) and, since
+#14242, the phase's `effort` when it was stamped, and the
 remainder is exported beside the totals as `loom.tokens_unattributed_in` /
 `loom.tokens_unattributed_out`, so an OTLP consumer can check the same
 invariant. The per-phase `tokens_by_model` breakdown is deliberately **not**
@@ -1448,13 +1450,20 @@ the parser accepts all three, one test each). The close carries, beside the
 |---|---|
 | `loom.step.outcome.class` | The step's `LOOM_STEP_OUTCOME` class: `verdict`, `noop`, `refused` or `failed`. **`none`** when the step wrote no parseable outcome line — a countable value, never an absence (#13521 tracks why some steps end without one). A Champion step writes a `CHAMPION-STEP` line instead, so it closes `none` here; its class is on its `pass.verdict` record. |
 | `loom.step.outcome.reason` | The line's `reason` token as written (`-` folded to `_`), truncated to 64 `char`s. Absent when the class is `none`. A later issue may close the vocabulary. |
+| `loom.step.outcome.agrees` | **`true`** / **`false`** (#14234): whether the class the forge post-state gives the step is the class its line claimed. The daemon computes it at the close with the ledger's own `outcome_ledger::classify`, never the session, so a step that claimed `verdict` while the item did not move records `false` (the ledger still classifies it `failed`; `loom.result`, `loom.step.outcome.class` and the ledger are unchanged). **Absent** when there is nothing to compare, which is *not* agreement: the step wrote no line (`class=none`, including every Champion step, whose `CHAMPION-STEP` line is not a `LOOM_STEP_OUTCOME`), or no post-state was noted by the close (the claim release had not run yet, held by another claimant, or its forge read failed), or the step ended on `provider-exhausted`. Roles whose classifier has no post-state rule for a step carry no `agrees` for the same reason. Class only: reasons are not compared. |
 | `loom.runtime` | The registry's runtime for the step (`claude`, `codex`, …), the same fact `SweepInfo.runtime` records; absent for a legacy entry. |
 
 `loom.configured_model` / `loom.effort` were already on the close. The
 `role_tick.outcome` record carries the same pair additively as
 `loom.role_tick.step_class` / `loom.role_tick.step_reason`, with
 `step_class="none"` in the no-line case. Additive; no `schema_version` bump.
-Both new keys are on the daemon export allowlist and the collector's span
+`loom.step.outcome.agrees` (#14234) is on the **close span only** — the
+`role_tick.outcome` record does not carry it (backfilling it there could
+follow separately), so ask the disagreement question of the trace store, not
+the record stream. Group by it to ask how often a runtime claims a result the
+forge does not show:
+`attributes_string['loom.step.outcome.agrees'] = 'false'` over the query below.
+All three keys are on the daemon export allowlist and the collector's span
 `keep_keys` (contract-tested).
 
 One query answers "outcomes by runtime, model and role" for a day
@@ -2389,7 +2398,7 @@ Tokens, providers and pools (Issues #8908, #8931):
 | `loom.pool.hold` span | own root trace (derived from `loom.pool.hold.pool` + hold start) | `loom.pool.hold.pool` (16-hex SHA-256 prefix of the pool directory — the pool's identity, never its path), `loom.pool.hold.post_mortem` (`true` when a real token-selection death armed it), `loom.pool.hold.accounts` | one work-finder pool dispatch hold, from arming to clearing. A hold still armed when the daemon stops emits no span |
 | `loom.egress.requests` / `.tokens` / `.latency` / `.ttft` | delta `Sum` | `{request}` / `{token}` / `s` / `s`; labels `provider`, `account` (the seat), `model`, `role`, `outcome` (`ok`/`error`), `reason` (classified code on an error), plus `kind` (`input`/`output`/`cache_read`/`cache_write`) on `.tokens` | egress-proxy observe mode (#11300), default off: one set per proxied provider request. Counts and classified codes only, never a body or credential |
 | `loom.egress.request` span | own root trace (derived from launch id, start, sequence) | `loom.egress.{seat,tap,profile,launch_id,status,latency_ms,ttft_ms,error_code,stream}`, `loom.runtime`, `loom.role`, `loom.issue`, `loom.pr_number`, `loom.sweep_id`, `loom.model`, `loom.tokens.*` | the per-request record behind the metrics above, carrying the ids too high-cardinality for a label |
-| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `llm.billing`, `llm.credential.kind`, `llm.provider.profile` (see [LLM billing class](#llm-billing-class-10749)); `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime` (a role tick whose usage came from Claude Code transcripts reports `claude`), `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
+| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `llm.billing`, `llm.credential.kind`, `llm.provider.profile` (see [LLM billing class](#llm-billing-class-10749)); `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime` (a role tick whose usage came from Claude Code transcripts reports `claude`; a sweep or step reports the runtime its usage was read from, so a Codex run with no `# LOOM_LAUNCH` record still reports `codex` — #14166), `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback). Covered runtimes: Claude, Codex, OpenCode, Kimi and Pi — including step-dispatched runs for Claude, Codex, OpenCode and Kimi (the runtime marker is read from the step's own log, #14166); Pi covers sweep-dispatched runs only (its usage is the launch log's `--mode json` stream, which a step's own log does not carry, so a step-dispatched Pi run resolves its runtime but yields no usage span yet); cache-write counters are `"0"` for a runtime that reports none |
 
 Guard denies (Issue #11582):
 
@@ -2551,8 +2560,12 @@ every `autonomous.autoUpdate.intervalSecs` (default 900 s). Envelopes carry
 `schema_version: 12`. **OTLP-only** (native: `false`). The body is the
 record's JSON. The scalars ride as `loom.auto_update.*` attributes
 (`AUTO_UPDATE_LOG_ATTRIBUTE_KEYS`, which the collector's `transform/privacy`
-allowlists). The record time is the tick's start. Provenance is required:
-`loom` exports as `loom.auto_update.version` / `revision` / `tree_state` /
+allowlists). Three floor-diagnostic fields — `floor_not_rolling`,
+`floor_stall` and `roll_held` — are deliberately not in that list: they ride
+in the record body only, never as `loom.auto_update.*` attributes, so a
+dashboard that needs them must extract them from the body. The record time
+is the tick's start. Provenance is required: `loom` exports as
+`loom.auto_update.version` / `revision` / `tree_state` /
 `provenance_complete`, and a record whose provenance does not validate is
 never emitted. Severity is `ERROR` for `panic`, for a record carrying
 `floor_stall`, and for a `roll_held` with a `floor` (#10880). It is `WARN`
@@ -2564,7 +2577,7 @@ roll it reported; no record carries it any more.)
 |---|---|---|
 | `tick_id` | string | derived, never random: `derived_hex(["loom.auto_update.tick", host_id, tick start], 32)` |
 | `started_at` | RFC3339 | the tick's start |
-| `decision` | string | `skip` (nothing to roll onto; since #10885 this includes a fleet host at or above its floor, or whose floor is not known, whatever newer release exists), `defer` (a target is tracked, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, or the failed-roll guard holding a target whose last roll did not take, #10880), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `panic` (the tick panicked; the loop keeps running) |
+| `decision` | string | `skip` (nothing to roll onto; since #10885 this includes a fleet host at or above its floor, or whose floor is not known, whatever newer release exists), `defer` (a target is tracked, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, or the failed-roll guard holding a target whose last roll did not take, #10880), `stale_repo` (a WARN-level "nothing to roll onto": the artifact resolved from a repo other than the one this binary was built from, #8513, or a below-floor host with no release resolved, #11029/#14224 — tell the two apart with `floor_not_rolling` = `no_release`, set only for the below-floor cause, or the `reason` text), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `panic` (the tick panicked; the loop keeps running) |
 | `reason` | string | the tick's note, the same text as `last tick:` in `loom-daemon status` |
 | `outcome` | string? | `success` / `retryable` / `terminal`, for `fetch` and `rebuild` |
 | `roll_armed` | bool | the fetch or rebuild succeeded and its pause-and-roll started (#10831) |
@@ -2574,6 +2587,7 @@ roll it reported; no record carries it any more.)
 | `in_flight` | integer? | in-flight sweeps, when the tick read them |
 | `drain` | object | `{armed, pending, target?}`: the roll or drain armed at tick start. Since #10831 `pending` means it can no longer be superseded (its pause has stopped an agent, or it is an operator drain) (#13492 dropped the always-zero `refusals`; stored records that carry it still parse) |
 | `floor_stall` | string? | the unsatisfiable-floor alert text (#10712), or an unsatisfiable repo-ahead demand (#10719); absent otherwise |
+| `floor_not_rolling` | string? | #11042: why a host below its fleet floor did not roll this tick; absent while the host is at or above the floor, has no fleet store, or is rolling to the floor. One of `unsatisfiable` (no published release meets the floor — the #10712 stall), `no_release` (no release resolved this tick, or its version cannot be compared), `unsupervised` (no launchd/systemd supervisor would relaunch the daemon, so the roll cannot start; the release is fetched once per target, then not again), `backoff` (the last fetch for this target failed; the loop is backing off), `terminal` (the last fetch for this target failed terminally) or `roll_refused` (the release is installed but the pause-and-roll refused to start for another reason — a live pause manifest, a roll-attempt backoff, no state directory; the daemon log names it) |
 | `roll_held` | object? | #10880: a release roll this tick left held, raised on every such tick: `{floor?, running, target, cause, attempts, last_failure?, next_retry?}`. `cause` is `failed_roll` (an armed roll did not take; the failed-roll guard holds it), `fetch_backoff` (three or more consecutive fetch failures) or `fetch_terminal`. `floor` is set when the host is below its fleet floor. `next_retry` is absent only for a terminal failure on a target that is not the floor's |
 | `consecutive_failures` | integer | retryable failures for the tracked target |
 | `duration_ms` | integer | wall time of the tick |

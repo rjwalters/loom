@@ -757,6 +757,8 @@ impl SweepRegistry {
                 launched: launch.model.as_deref(),
             }),
             assignment.as_ref().and_then(|g| g.lineage.as_ref()),
+            admitted.map(|a| a.runtime.as_str()),
+            launch.effort.as_deref(),
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -802,11 +804,14 @@ impl SweepRegistry {
             captain,
             None,
             None,
+            None,
+            None,
         );
     }
 
     /// [`Self::record_step_dispatch`] with the selected and launched models
-    /// of a spawned step (#12748).
+    /// of a spawned step (#12748), plus the runtime and effort the launch
+    /// resolves (#14167).
     #[allow(clippy::too_many_arguments)]
     fn record_step_dispatch_with(
         &self,
@@ -819,6 +824,8 @@ impl SweepRegistry {
         captain: Option<&crate::fleet_dispatch::worker::Refusal>,
         models: Option<dispatch_step::StepModels<'_>>,
         lineage: Option<&crate::fleet_dispatch::worker::GrantLineage>,
+        runtime: Option<&str>,
+        effort: Option<&str>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -838,6 +845,8 @@ impl SweepRegistry {
                 lineage,
                 captain,
                 models,
+                runtime,
+                effort,
             },
         );
     }
@@ -883,8 +892,9 @@ impl SweepRegistry {
         use crate::role_runner::model_resolution as models;
         let root = &config.workspace_root;
         let name = role.role_name();
-        let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
         if config.skip_label_flip {
+            // No runtime is admitted here, so only the runtime-independent tiers apply.
+            let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
             // Hermetic fixtures install no runtime manifests.
             let model = match role {
                 StepRole::Builder => DispatchModel::Autonomous.resolve(config, kind, None),
@@ -985,6 +995,11 @@ impl SweepRegistry {
                 non_empty(model)
             }
         };
+        // #14017: effort is resolved once the runtime is admitted, so a
+        // `roleEfforts.<role>@<runtime>` entry and the Codex default can apply.
+        let effort = non_empty(
+            models::resolve_role_runner_effort_for_runtime(root, name, Some(&admitted.runtime)).0,
+        );
         Ok(StepLaunch {
             admission: crate::runtime_preference::DispatchAdmission {
                 admitted: Some(admitted),

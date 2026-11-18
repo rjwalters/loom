@@ -8,17 +8,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use crate::exec_test_support::write_executable;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
-
-fn make_executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).unwrap();
-}
 
 /// Registry whose fake `gh` answers the issue-state probe with exit 1 (a
 /// lookup failure: the fail-open arm) until the `loom:building` flip has been
@@ -78,13 +71,13 @@ fn registry_with_edit_exit(
         later = later_stdout.unwrap_or(""),
         answered = ws.join("answered").display(),
     );
-    make_executable(&fake_gh, &script);
+    write_executable(&fake_gh, &script);
     let spawn_marker = ws.join("spawn-called");
     let spawn = ws.join(".loom/scripts/spawn-claude.sh");
     std::fs::create_dir_all(spawn.parent().unwrap()).unwrap();
-    make_executable(
+    write_executable(
         &spawn,
-        &format!("#!/usr/bin/env bash\necho spawned > '{}'\nexit 0\n", spawn_marker.display()),
+        format!("#!/usr/bin/env bash\necho spawned > '{}'\nexit 0\n", spawn_marker.display()),
     );
     let mut config = SweepRegistryConfig::new(ws.to_path_buf());
     config.spawn_bin = Some(spawn);

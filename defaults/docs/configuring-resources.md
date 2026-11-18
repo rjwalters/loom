@@ -164,8 +164,9 @@ and the model tier are resolved independently; a Claude-shaped alias forwarded t
 a Codex adapter is an HTTP 400 that the classifier treats as recoverable, so the
 tick retries forever. Since #5028 a pre-spawn check refuses instead — which is
 better, but still means *zero* ticks for that role. Pin both axes, or pin the
-model to the `"default"` sentinel (the only shape a ChatGPT-plan Codex seat
-accepts):
+model to the `"default"` sentinel (the guaranteed-working shape on a
+ChatGPT-plan Codex seat; an explicit pin also works there when the account's
+catalog, `codex debug models`, lists it):
 
 ```json
 {

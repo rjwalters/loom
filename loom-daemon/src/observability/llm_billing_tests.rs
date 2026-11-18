@@ -85,3 +85,29 @@ fn agreed_keeps_only_the_shared_kind_and_profile() {
     assert_eq!(agreed.credential_kind.as_deref(), Some("api-key"));
     assert_eq!(agreed.profile, None);
 }
+
+/// #14167: the pool kind is the per-run attribution the issue asks for, so
+/// the gateway's span `keep_keys` must forward it — before this, every
+/// runtime stamped it and the collector stripped it, which is exactly why
+/// the fleet's `loom.runtime.run` rows had no pool attribution.
+#[test]
+fn the_collector_keeps_the_credential_kind_on_runtime_spans() {
+    let config = include_str!("../../../defaults/observability/collector/config.yaml");
+    let mut current = String::new();
+    let mut span_allowlist = None;
+    for line in config.lines() {
+        if let Some(name) = line.trim().strip_prefix("- context: ") {
+            current = name.trim().to_string();
+        }
+        if current == "span" && line.contains("keep_keys(") {
+            span_allowlist = Some(line);
+        }
+    }
+    let Some(line) = span_allowlist else {
+        panic!("the collector config declares no span keep_keys allowlist");
+    };
+    assert!(
+        line.split('"').any(|piece| piece == CREDENTIAL_KIND_KEY),
+        "llm.credential.kind is dropped at export; the span keep_keys must list it"
+    );
+}

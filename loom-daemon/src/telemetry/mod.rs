@@ -454,6 +454,19 @@ pub struct PhaseDuration {
     /// Builder. Same omission contract as `tokens_in`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+    /// The reasoning effort this attempt's launch ran at (Issue #14242) —
+    /// the per-phase counterpart of [`SweepOutcomeRecord::effort`], stamped
+    /// from the effort that applied at the phase's launch: a sweep session
+    /// runs its phases at the session-default effort (the in-session Task
+    /// tool exposes no effort parameter, so no phase can run at anything
+    /// else), and a step sweep's single phase is its role's own resolved
+    /// effort. Never re-derived from dispatch-time config at read time.
+    ///
+    /// Omitted — never `default` or empty — when unknown: a record written
+    /// before #14242, or one whose entry could not name an effort at all (the
+    /// same conditions the record-level `effort` is absent under).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl PhaseDuration {

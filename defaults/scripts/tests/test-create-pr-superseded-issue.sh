@@ -316,6 +316,84 @@ run_create_pr --title "fix: something" --body "Background first.
 Fixes #115" --head "feature/issue-115"
 assert_eq "1" "$EXIT_CODE" "Fixes #115 at line start after blank line (closed) -> refused"
 
+# T18 (#14157): a closing keyword indented by exactly ONE space is still
+# extracted. The #13939 alternation's `^` branch required column 0 and its
+# prose branch needed a non-whitespace guard char, so a one-space prefix
+# satisfied no branch -- extraction came back empty and this check was
+# silently skipped (fail-open, #14157).
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-116-state.txt"
+echo "888" > "$STUB_DIR/issue-116-number.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
+run_create_pr --title "fix: something" --body "Scope note.
+
+ Closes #116" --head "feature/issue-116"
+assert_eq "1" "$EXIT_CODE" "One-space-indented ' Closes #116' (closed) -> refused"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 116" "One-space-indented closing keyword IS the checked target"
+
+# T19 (#14157): same false-negative class for exactly one TAB of indent.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-117-state.txt"
+echo "888" > "$STUB_DIR/issue-117-number.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
+run_create_pr --title "fix: something" --body $'Notes.\n\n\tCloses #117' --head "feature/issue-117"
+assert_eq "1" "$EXIT_CODE" "One-tab-indented 'Closes #117' (closed) -> refused"
+
+# T20 (#14157): a whitespace-delimited token ending in a digit before the
+# keyword (`Phase 3`) must not suppress extraction. The #13939 prose guard
+# rejected ANY digit before the whitespace run, but the narration signature
+# it exists to catch is specifically a `#N` token -- GitHub itself would
+# close #118 from `Phase 3 fixes #118`.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-118-state.txt"
+echo "888" > "$STUB_DIR/issue-118-number.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
+run_create_pr --title "fix: something" --body "Phase 3 fixes #118" --head "feature/issue-118"
+assert_eq "1" "$EXIT_CODE" "'Phase 3 fixes #118' (closed) -> refused"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 118" "'Phase 3 fixes' targets #118, not empty"
+
+# T21 (#14157): multi-run token (`v1.2`) ending in a digit -- the extraction
+# must take the LAST number run of the match (the trailing `#N`), never the
+# token's own digits.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-119-state.txt"
+echo "888" > "$STUB_DIR/issue-119-number.txt"
+echo "https://github.com/owner/repo/pull/888" > "$STUB_DIR/issue-119-url.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
+run_create_pr --title "fix: something" --body "Upgrades dep v1.2 fixes #119" --head "feature/issue-119"
+assert_eq "1" "$EXIT_CODE" "'v1.2 fixes #119' (closed) -> refused"
+assert_contains "$OUTPUT" "#119" "Refusal names #119 (the trailing #N), not the token digits"
+
+# T22 (#14157): `ADR-0015` -- a digit run inside a longer token.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-120-state.txt"
+echo "888" > "$STUB_DIR/issue-120-number.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
+run_create_pr --title "fix: something" --body "ADR-0015 fixes #120" --head "feature/issue-120"
+assert_eq "1" "$EXIT_CODE" "'ADR-0015 fixes #120' (closed) -> refused"
+
+# T23 (#14157): `Step 2 closes` -- same digit-token class, lowercase, with
+# the two-space+ guard shape excluded (the token's digit is the blocker).
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-121-state.txt"
+echo "888" > "$STUB_DIR/issue-121-number.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
+run_create_pr --title "fix: something" --body "Step 2 closes #121" --head "feature/issue-121"
+assert_eq "1" "$EXIT_CODE" "'Step 2 closes #121' (closed) -> refused"
+
+# T24 (#14157): narration is STILL rejected in a digit-token body -- a
+# `#`-containing reference token (`PR #605 fixed #597`) matches nothing,
+# so the real digit-token closing keyword later in the body wins.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-597-state.txt"
+echo "OPEN" > "$STUB_DIR/issue-122-state.txt"
+run_create_pr --title "fix: something" --body "PR #605 fixed #597.
+
+Phase 3 fixes #122" --head "feature/issue-122"
+assert_eq "0" "$EXIT_CODE" "Narrated #597 (closed) + 'Phase 3 fixes #122' (open) -> exits 0"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 122" "Digit-token body checks #122"
+assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 597" "Narrated #597 still never looked up"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

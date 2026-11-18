@@ -69,7 +69,10 @@
 # Flags are a subset of `gh pr create`'s, chosen so a role prompt's existing
 # invocation can be switched over by changing the command name:
 #   --title, -t TITLE     PR title (required).
-#   --body, -b BODY       PR body as literal text.
+#   --body, -b BODY       PR body as literal text. A value that is a lone
+#                         `@path` / `@-` token is refused (exit 2, nothing
+#                         created): `gh` would post it literally, not read
+#                         it from a file -- use --body-file instead.
 #   --body-file, -F PATH  Read the body from PATH ("-" = stdin). Mutually
 #                         exclusive with --body.
 #   --label, -l LABEL     Label to apply at creation. Repeatable. A single
@@ -112,7 +115,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 
 usage() {
-  sed -n '2,84p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,109p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -169,6 +172,23 @@ if [[ -n "$BODY_FILE" ]]; then
     echo "create-pr.sh: cannot read --body-file: $BODY_FILE" >&2
     exit 2
   fi
+fi
+
+# --- Lone `@path` body guard (#14161) ---------------------------------------
+#
+# `gh pr create --body @path` posts the literal string `@path`; the same
+# pitfall documented for `gh pr comment` / `gh api -f body=@path` (#9258,
+# comment-body-literal-path.md) and refused by post-verdict.sh. The body is
+# never read from the file, so the PR loses its Test Plan, rationale and
+# closing keyword (`Closes #N`) -- and the target issue orphans on merge --
+# silently: the create still exits 0 and prints the URL. Refuse before any
+# forge call when the ENTIRE `--body` value is one `@`-token; a body that
+# merely CONTAINS `@` (a mention, an email-shaped token, a line starting
+# with `@` inside a longer body) passes, and `--body-file` content is the
+# author's own text, never inspected.
+if [[ "$HAVE_BODY" == "true" && "$BODY" =~ ^[[:space:]]*@[^[:space:]]*[[:space:]]*$ ]]; then
+  echo "create-pr.sh: refusing --body '${BODY:0:80}': a lone '@' token is posted literally, not read from a file. Use --body-file <path> (or --body-file -). Nothing was created." >&2
+  exit 2
 fi
 
 forge_detect
@@ -266,20 +286,33 @@ EX_REVIEW_GATE_COLLISION=6
 # The leading-guard alternation skips a keyword whose immediately preceding
 # token is a PR/issue reference: `PR #605 fixed #597` narrates history, it
 # does not close #597, so it must not win `head -1` over the real trailing
-# `Closes #N` (#13939). The three guard branches, most specific first:
-#   ^                            keyword opens the line (any body line)
+# `Closes #N` (#13939). The guard branches:
+#   ^[[:space:]]*                keyword opens the line, optionally indented
+#                                -- a one-space/one-tab prefix satisfies no
+#                                branch under the bare `^` of #13939, so
+#                                ` Closes #N` extracted nothing and both
+#                                guards were skipped (#14157)
+#   (^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+
+#                                a whitespace-delimited token that ENDS in a
+#                                digit and contains no `#` (`Phase 3`,
+#                                `v1.2`, `ADR-0015`) -- the #13939 prose
+#                                branch rejected ANY digit before the
+#                                whitespace run, over-rejecting these; the
+#                                no-`#` class keeps `PR #605 fixed #597`
+#                                narration unmatched
 #   [^#0-9][[:space:]]+          ordinary prose before the keyword -- a
 #                                digit/`#` right before the whitespace run
 #                                is the `#N`-reference narration signature
 #   [^[:alnum:]_#[:space:]]      punctuation attached with no space, the
 #                                `**Fixes #1**` / `(closes #1)` shapes the
 #                                old bare `\b` also admitted
-# The guard classes are digit-free by construction, so the trailing `#N` is
-# the only number run in the match and the final grep picks exactly it.
+# Only the digit-ending-token branch can put a number run in the match
+# before the trailing `#N`, so the extraction takes the LAST number run of
+# the first match -- for every other branch first and last coincide.
 _cpr_body_ref_issue() {
   # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
-  grep -ioE "(^|[^#0-9][[:space:]]+|[^[:alnum:]_#[:space:]])($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
-    | head -1 | grep -oE '[0-9]+' || true
+  grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
+    | head -1 | grep -oE '[0-9]+' | tail -1 || true
 }
 
 # An empty body matches nothing (grep's no-match is absorbed by `|| true`).

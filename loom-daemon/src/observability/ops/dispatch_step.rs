@@ -61,6 +61,12 @@ pub struct StepDispatch<'a> {
     pub captain: Option<&'a crate::fleet_dispatch::worker::Refusal>,
     /// The role draw's model against the model actually launched (#12748).
     pub models: Option<StepModels<'a>>,
+    /// The admitted runtime the step launches on (`loom.runtime`); `None`
+    /// when the step was refused before admission resolved one.
+    pub runtime: Option<&'a str>,
+    /// The launch's reasoning effort (`loom.effort`), when one was resolved
+    /// (#14167); `None` when the runtime keeps its session default.
+    pub effort: Option<&'a str>,
 }
 
 /// Selected versus launched model of a spawned step. Distinct on purpose: a
@@ -105,6 +111,12 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
     attributes.insert("loom.step.item".into(), item);
     attributes.insert("loom.role".into(), step.role.role_name().to_string());
     attributes.insert("loom.step.role".into(), step.role.as_str().to_string());
+    if let Some(runtime) = step.runtime {
+        attributes.insert("loom.runtime".into(), runtime.to_string());
+    }
+    if let Some(effort) = step.effort {
+        attributes.insert("loom.effort".into(), effort.to_string());
+    }
     attributes.insert("loom.dispatch.admission_result".into(), step.result.to_string());
     attributes.insert("loom.dispatch.reason".into(), step.reason.to_string());
     attributes.insert("loom.step.draw_attempt".into(), step.draw_attempt.to_string());
@@ -221,6 +233,8 @@ mod tests {
             lineage: None,
             captain: None,
             models: None,
+            runtime: Some("claude"),
+            effort: Some("high"),
         }
     }
 
@@ -274,6 +288,30 @@ mod tests {
         let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
         assert!(!none.attributes.contains_key("loom.step.model_selected"));
         assert!(!none.attributes.contains_key("loom.step.model_launched"));
+    }
+
+    /// #14167: every admitted step names the runtime it launches on and its
+    /// resolved effort, so a per-step comparison joins `loom.dispatch.step`
+    /// the same way `loom.runtime.run` does; a step whose launch resolved
+    /// neither omits the keys rather than guessing. Both keys are on the
+    /// lifecycle span allowlist and the collector `keep_keys` (the
+    /// long-standing `loom.runtime.run` keys).
+    #[test]
+    fn an_admitted_step_names_its_runtime_and_effort() {
+        let span = span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert_eq!(span.attributes["loom.runtime"], "claude");
+        assert_eq!(span.attributes["loom.effort"], "high");
+        let unset = super::span(
+            &StepDispatch {
+                runtime: None,
+                effort: None,
+                ..judge(RESULT_SPAWNED, "ok")
+            },
+            None,
+            Utc::now(),
+        );
+        assert!(!unset.attributes.contains_key("loom.runtime"));
+        assert!(!unset.attributes.contains_key("loom.effort"));
     }
 
     /// #12450: a granted step carries the captain's assignment, and it
