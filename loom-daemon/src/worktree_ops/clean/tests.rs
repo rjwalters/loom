@@ -1736,8 +1736,10 @@ fn logs_fixture() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// Run [`clean_log_files_with`] with a clock advanced by `age_hours`, a
-/// retention window of `retention_days`, and the given live-issue /
-/// checkpoint fixtures — mirrors `run_transients` above.
+/// retention window of `retention_days`, the given live-issue /
+/// checkpoint fixtures, and the step-log archive gate
+/// (`LOOM_STEP_LOG_REQUIRE_ARCHIVE`) set to `step_gate` — mirrors
+/// `run_transients` above.
 fn run_log_retention(
     repo_root: &Path,
     dry_run: bool,
@@ -1745,6 +1747,7 @@ fn run_log_retention(
     retention_days: u64,
     live: &[u32],
     checkpointed: &[u32],
+    step_gate: bool,
 ) -> CleanupStats {
     let mut stats = CleanupStats::default();
     let live_issues: std::collections::HashSet<u32> = live.iter().copied().collect();
@@ -1755,6 +1758,7 @@ fn run_log_retention(
         retention: Duration::from_secs(retention_days * 24 * HOUR),
         live_issues: &live_issues,
         checkpoint_exists: &checkpoint_exists,
+        step_log_retention: step_gate,
     };
     clean_log_files_with(repo_root, &mut stats, dry_run, &env);
     stats
@@ -1763,7 +1767,7 @@ fn run_log_retention(
 #[test]
 fn log_retention_missing_dir_is_a_noop() {
     let dir = tempfile::tempdir().unwrap();
-    let stats = run_log_retention(dir.path(), false, 1000, 30, &[], &[]);
+    let stats = run_log_retention(dir.path(), false, 1000, 30, &[], &[], false);
     assert_eq!(stats.cleaned_log_files, 0);
     assert_eq!(stats.errors, 0);
 }
@@ -1773,7 +1777,7 @@ fn log_retention_prunes_stale_issue_log_past_threshold() {
     let (dir, logs) = logs_fixture();
     let stale = logs.join("sweep-issue-1111.log");
     std::fs::write(&stale, "log\n").unwrap();
-    let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[]);
+    let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[], false);
     assert!(!stale.exists());
     assert_eq!(stats.cleaned_log_files, 1);
 }
@@ -1783,7 +1787,7 @@ fn log_retention_keeps_young_issue_log() {
     let (dir, logs) = logs_fixture();
     let young = logs.join("sweep-issue-2222.log");
     std::fs::write(&young, "log\n").unwrap();
-    let stats = run_log_retention(dir.path(), false, 1, 30, &[], &[]);
+    let stats = run_log_retention(dir.path(), false, 1, 30, &[], &[], false);
     assert!(young.exists(), "mtime guard must spare a young log");
     assert_eq!(stats.cleaned_log_files, 0);
     assert_eq!(stats.kept_log_files, 1);
@@ -1794,7 +1798,7 @@ fn log_retention_keeps_live_sweep_log_regardless_of_age() {
     let (dir, logs) = logs_fixture();
     let live = logs.join("sweep-issue-3333.log");
     std::fs::write(&live, "log\n").unwrap();
-    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[3333], &[]);
+    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[3333], &[], false);
     assert!(live.exists(), "a live sweep's log must never be pruned");
     assert_eq!(stats.cleaned_log_files, 0);
     assert_eq!(stats.kept_log_files, 1);
@@ -1805,7 +1809,7 @@ fn log_retention_keeps_checkpointed_log_regardless_of_age() {
     let (dir, logs) = logs_fixture();
     let checkpointed = logs.join("loom-daemon-sweep-issue-4444-1785379543.log");
     std::fs::write(&checkpointed, "log\n").unwrap();
-    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[4444]);
+    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[4444], false);
     assert!(checkpointed.exists(), "a resumable checkpoint's log must never be pruned");
     assert_eq!(stats.cleaned_log_files, 0);
     assert_eq!(stats.kept_log_files, 1);
@@ -1816,7 +1820,7 @@ fn log_retention_never_touches_singleton_logs_regardless_of_age() {
     let (dir, logs) = logs_fixture();
     let role_log = logs.join("role-judge.log");
     std::fs::write(&role_log, "log\n").unwrap();
-    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[]);
+    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[], false);
     assert!(role_log.exists(), "singleton/accumulator logs are out of scope for this pass");
     assert_eq!(stats.cleaned_log_files, 0);
     assert_eq!(stats.kept_log_files, 0);
@@ -1829,7 +1833,7 @@ fn log_retention_never_recurses_into_subdirectories() {
     std::fs::create_dir_all(&dated).unwrap();
     let nested = dated.join("issue-5555-shepherd.log");
     std::fs::write(&nested, "log\n").unwrap();
-    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[]);
+    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[], false);
     assert!(nested.exists(), "dated archive subdirectories belong to archive-logs.sh");
     assert_eq!(stats.cleaned_log_files, 0);
 }
@@ -1839,9 +1843,199 @@ fn log_retention_dry_run_lists_without_deleting() {
     let (dir, logs) = logs_fixture();
     let stale = logs.join("sweep-issue-6666.log");
     std::fs::write(&stale, "log\n").unwrap();
-    let stats = run_log_retention(dir.path(), true, 31 * 24, 30, &[], &[]);
+    let stats = run_log_retention(dir.path(), true, 31 * 24, 30, &[], &[], false);
     assert!(stale.exists(), "--dry-run must never delete");
     assert_eq!(stats.cleaned_log_files, 1);
+}
+
+// --- step-log archive-gated retention (#14177) ------------------------
+
+/// A step log whose last dispatch attempt ended with its terminal outcome
+/// line — the completed shape the gate requires.
+const COMPLETED_STEP_LOG: &str = "==== loom-daemon dispatch: 2026-11-01T00:00:00Z \
+sweep_id=step-builder-777-1 item=777 step=builder ====\nsession output\n\
+LOOM_STEP_OUTCOME role=builder target=777 class=verdict reason=pr_opened\n";
+
+/// A step log whose last dispatch was re-issued and has not ended yet: the
+/// earlier attempt's outcome line must NOT read as completed.
+const REISSUED_STEP_LOG: &str = "==== loom-daemon dispatch: 2026-11-01T00:00:00Z \
+sweep_id=step-builder-777-1 item=777 step=builder ====\n\
+LOOM_STEP_OUTCOME role=builder target=777 class=verdict reason=pr_opened\n\
+==== loom-daemon dispatch: 2026-11-02T00:00:00Z \
+sweep_id=step-builder-777-2 item=777 step=builder ====\nsession output so far\n";
+
+/// Write a step log (and optionally its `.archived` sidecar) for `item`,
+/// returning the log path.
+fn step_log_fixture(logs: &Path, role: &str, item: u32, contents: &str, archived: bool) -> PathBuf {
+    let log = logs.join(format!("step-{role}-{item}.log"));
+    std::fs::write(&log, contents).unwrap();
+    if archived {
+        std::fs::write(
+            log.with_file_name(format!("step-{role}-{item}.log.archived")),
+            "s3://bucket/key etag\n",
+        )
+        .unwrap();
+    }
+    log
+}
+
+#[test]
+fn step_log_file_item_parses_known_role_names_only() {
+    for role in [
+        "curator",
+        "champion_promote",
+        "builder",
+        "judge",
+        "doctor",
+        "champion_merge",
+    ] {
+        assert_eq!(step_log_file_item(&format!("step-{role}-14177.log")), Some(14177));
+    }
+    // Unknown role, non-numeric item, missing prefix/suffix: never candidates.
+    assert_eq!(step_log_file_item("step-auditor-5.log"), None);
+    assert_eq!(step_log_file_item("step-builder-x.log"), None);
+    assert_eq!(step_log_file_item("builder-5.log"), None);
+    assert_eq!(step_log_file_item("step-builder-5.log.1"), None);
+    // A sidecar is never a log candidate, and the issue-log parser never
+    // claims a step-log name (disjoint passes, no shared filename).
+    assert_eq!(step_log_file_item("step-builder-5.log.archived"), None);
+    assert_eq!(log_file_issue_number("step-builder-6655.log"), None);
+}
+
+#[test]
+fn step_log_completed_reads_only_the_last_dispatch_region() {
+    let (_dir, logs) = logs_fixture();
+    let completed = step_log_fixture(&logs, "builder", 1, COMPLETED_STEP_LOG, false);
+    assert!(step_log_completed(&completed), "header + outcome line = completed");
+
+    let reissued = step_log_fixture(&logs, "builder", 2, REISSUED_STEP_LOG, false);
+    assert!(
+        !step_log_completed(&reissued),
+        "a re-dispatched attempt's log is live, whatever older attempts wrote"
+    );
+
+    let header_only = step_log_fixture(
+        &logs,
+        "builder",
+        3,
+        "==== loom-daemon dispatch: 2026-11-01T00:00:00Z sweep_id=s item=3 step=builder ====\n",
+        false,
+    );
+    assert!(!step_log_completed(&header_only), "no outcome line = keep");
+
+    let no_header = step_log_fixture(
+        &logs,
+        "builder",
+        4,
+        "LOOM_STEP_OUTCOME role=builder target=4 class=noop\n",
+        false,
+    );
+    assert!(!step_log_completed(&no_header), "no dispatch header = ambiguous = keep");
+
+    assert!(
+        !step_log_completed(&logs.join("step-builder-5.log")),
+        "an unreadable log is never completed"
+    );
+}
+
+/// AC: with `LOOM_STEP_LOG_REQUIRE_ARCHIVE` unset, step logs are never
+/// touched — the pass is byte-for-byte today's behavior, not even counted.
+#[test]
+fn step_log_retention_is_inert_without_the_env_gate() {
+    let (dir, logs) = logs_fixture();
+    let ancient = step_log_fixture(&logs, "builder", 777, COMPLETED_STEP_LOG, true);
+    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[], false);
+    assert!(ancient.exists(), "no env gate: step logs are never deleted");
+    assert!(
+        ancient
+            .with_file_name("step-builder-777.log.archived")
+            .exists(),
+        "no env gate: sidecars are never deleted either"
+    );
+    assert_eq!(stats.cleaned_log_files, 0);
+    assert_eq!(stats.kept_log_files, 0);
+}
+
+/// AC: gated on, old, completed, archived — deleted, sidecar removed with it.
+#[test]
+fn step_log_retention_deletes_old_completed_archived_log_and_sidecar() {
+    let (dir, logs) = logs_fixture();
+    let stale = step_log_fixture(&logs, "builder", 777, COMPLETED_STEP_LOG, true);
+    let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[], true);
+    assert!(!stale.exists());
+    assert!(!stale
+        .with_file_name("step-builder-777.log.archived")
+        .exists());
+    assert_eq!(stats.cleaned_log_files, 1);
+}
+
+/// AC: gated on but unmarked — kept. Also young — kept.
+#[test]
+fn step_log_retention_keeps_unarchived_and_young_logs() {
+    let (dir, logs) = logs_fixture();
+    let unmarked = step_log_fixture(&logs, "builder", 1, COMPLETED_STEP_LOG, false);
+    let young = step_log_fixture(&logs, "builder", 2, COMPLETED_STEP_LOG, true);
+    let stats = run_log_retention(dir.path(), false, 1, 30, &[], &[], true);
+    assert!(unmarked.exists(), "an unmarked completed log is never deleted");
+    assert!(young.exists(), "a log inside the retention window is never deleted");
+    assert!(young.with_file_name("step-builder-2.log.archived").exists());
+    assert_eq!(stats.cleaned_log_files, 0);
+    assert_eq!(stats.kept_log_files, 2);
+}
+
+/// AC: gated on, archived, but no terminal outcome line (active/ambiguous)
+/// — kept.
+#[test]
+fn step_log_retention_keeps_log_without_terminal_outcome() {
+    let (dir, logs) = logs_fixture();
+    let active = step_log_fixture(&logs, "builder", 3, REISSUED_STEP_LOG, true);
+    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[], true);
+    assert!(active.exists(), "a step log whose last attempt has no outcome line is live");
+    assert_eq!(stats.cleaned_log_files, 0);
+    assert_eq!(stats.kept_log_files, 1);
+}
+
+/// AC: live item or sweep-checkpointed item — kept regardless of the
+/// sidecar.
+#[test]
+fn step_log_retention_keeps_live_and_checkpointed_items_regardless_of_sidecar() {
+    let (dir, logs) = logs_fixture();
+    let live = step_log_fixture(&logs, "judge", 4001, COMPLETED_STEP_LOG, true);
+    let checkpointed = step_log_fixture(&logs, "doctor", 4002, COMPLETED_STEP_LOG, true);
+    let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[4001], &[4002], true);
+    assert!(live.exists(), "a live item's step log is never deleted");
+    assert!(checkpointed.exists(), "a checkpointed item's step log is never deleted");
+    assert_eq!(stats.cleaned_log_files, 0);
+    assert_eq!(stats.kept_log_files, 2);
+}
+
+/// AC: `--dry-run` deletes nothing (log and sidecar both survive) and
+/// reports the same decision.
+#[test]
+fn step_log_retention_dry_run_deletes_nothing() {
+    let (dir, logs) = logs_fixture();
+    let stale = step_log_fixture(&logs, "builder", 777, COMPLETED_STEP_LOG, true);
+    let stats = run_log_retention(dir.path(), true, 31 * 24, 30, &[], &[], true);
+    assert!(stale.exists(), "--dry-run must never delete");
+    assert!(stale
+        .with_file_name("step-builder-777.log.archived")
+        .exists());
+    assert_eq!(stats.cleaned_log_files, 1, "dry-run still reports the decision");
+}
+
+/// An issue log and a step log for the same number coexist; the step
+/// branch's decision never bleeds into the issue branch (both deleted here
+/// under their own rules).
+#[test]
+fn step_log_retention_coexists_with_issue_log_for_same_number() {
+    let (dir, logs) = logs_fixture();
+    let issue_log = logs.join("sweep-issue-5000.log");
+    std::fs::write(&issue_log, "log\n").unwrap();
+    let step_log = step_log_fixture(&logs, "builder", 5000, COMPLETED_STEP_LOG, true);
+    let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[], true);
+    assert!(!issue_log.exists(), "issue-log rules still apply unchanged");
+    assert!(!step_log.exists(), "step-log rules apply independently");
+    assert_eq!(stats.cleaned_log_files, 2);
 }
 
 // --- actionable error reporting (#4877) ------------------------------
