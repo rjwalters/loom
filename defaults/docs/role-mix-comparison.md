@@ -41,7 +41,9 @@ unreachable forge, never `0`), `WTOK_USD` (cost-weighted tokens, at the rate car
 report names — provisional), `MERGE/USD`, `JDG1%` / `JDG_N` (first-pass Judge
 approval over judged sweeps), `REJ` (Judge `fail` verdicts), `DR_CYC` (completed
 Doctor cycles), `BNC_N` (sweeps whose PR timeline was read — the denominator for
-`REJ`/`DR_CYC`; unread is unknown, not zero), `DOCTOR%`.
+`REJ`; unread is unknown, not zero), `DOCTOR%`. `DR_CYC` is summed over every
+sweep carrying `doctor_cycles`, which is `BNC_N` plus any pre-#8222 sweep that has
+the cycle count but no Judge verdicts; on a recent window the two sets coincide.
 
 ## What is queryable per role step (inventory, #14067 AC1)
 
@@ -83,7 +85,9 @@ single phase carries its role's own resolved effort. Role ticks
 4. Compare **cost per merge** (`MERGE/USD`, or `WTOK_USD` ÷ `MERGED`), not cost
    alone: a cheap mix that bounces twice per PR can cost more per merged PR.
 5. Check `REJ` ÷ `BNC_N` and `DR_CYC` ÷ `BNC_N` for rework, and `DOCTOR%` for how
-   often the Doctor was needed.
+   often the Doctor was needed. `DR_CYC` ÷ `BNC_N` is only exact when the window
+   holds no pre-#8222 sweeps (those carry `doctor_cycles` without Judge verdicts
+   and inflate the ratio), so keep `--since` after that change.
 
 ### The opposite-mix hypothesis
 
