@@ -63,6 +63,7 @@ counts as uncovered.
 | `PR_ONLY_STEP` | a step of a covered job runs on PRs but is skipped on `merge_group` |
 | `NON_MERGE_GROUP_CHECKOUT` | `actions/checkout` `ref:` resolves to something other than the merge-group commit |
 | `GROUP_CHECK_WITHOUT_CHECKOUT` | a job runs `forge merge-queue group-check` with no `actions/checkout` step, so `write_scope` refuses the status write and `loom/merge-authorization` never posts |
+| `GROUP_CHECK_UNGATED_WORKFLOW_RUN` | a `group-check` job in a workflow with a `workflow_run` trigger lacks a job-level `if:` requiring both `github.event.workflow_run.event == 'merge_group'` and `github.event.workflow_run.head_repository.full_name == github.repository` (see Trust boundary below) |
 | `CANCELLING_CONCURRENCY` | `cancel-in-progress` is (or may be) true on `merge_group` |
 | `SHARED_CONCURRENCY_GROUP` | the group is not unique to the merge-group commit, so a pending run can be superseded |
 | `MISSING_REQUIRED_SUITE` | a required context matches no job name (matrix names are expanded) |
@@ -199,7 +200,7 @@ loom-daemon merge-group-ci audit -v --required "CI Result"     # also lists merg
 
 The audit covers every workflow in the checkout, so a QUALIFIED result also
 proves `merge-group-check.yml` has no `GROUP_CHECK_WITHOUT_CHECKOUT`,
-`CANCELLING_CONCURRENCY` or `SHARED_CONCURRENCY_GROUP` finding. (Do not pass
+`GROUP_CHECK_UNGATED_WORKFLOW_RUN`, `CANCELLING_CONCURRENCY` or `SHARED_CONCURRENCY_GROUP` finding. (Do not pass
 `--workflow merge-group-check.yml` with `--required "CI Result"`: that
 restricts the audit to a file that does not host the job.)
 

@@ -189,11 +189,35 @@ identity, which every recheck refuses rather than treating as proven.
 | Component | Supported value | How it is established |
 |---|---|---|
 | Control protocol | `loom-private-control-v1`, `control_version` **2** | Exact-match on both sides; anything else is `Unsupported`. A v1 image reports v1 and is refused: its in-container half cannot make the control-file claim at all. |
-| Session image | `ghcr.io/rjwalters/loom-worker-session:<version>` built from `docker/session/Dockerfile` at or after this change | The bundle must be present, sealed, digest-intact and non-writable. |
+| Session image | `ghcr.io/rjwalters/loom-worker-session:<version>` built from `docker/session/Dockerfile` at or after this change, or a **derived** image built `FROM` it (issue #14019, `accounts.session.image`, digest-pinned) | The bundle must be present, sealed, digest-intact and non-writable. A derived image is additionally verified by the **host** before any container is created from it: a throwaway probe reads the manifest and recomputes every sealed asset's digest, and the image is refused unless the manifest matches the running daemon's enforced protocol, control version, forced policy and registration and every asset is intact — a missing or altered asset is named in the refusal (`session_image::verify_override_bundle`). A daemon roll therefore refuses a not-yet-rebuilt derived image instead of running a stale bundle, and the version-skew reconciler never recreates an override seat from the stock tag. |
 | Session mount topology | profile bound read-write; `hooks.json`, `config.toml` and `loom-codex-hooks.json` each bound read-only over their own path | Cross-checked against Docker's mount inventory on the host and `/proc/self/mountinfo` plus a real write probe in the container. |
 | Codex CLI | as pinned by `CODEX_VERSION` (tracks upstream latest via `harness-pins.yml`; 0.160.0 at 2026-10-02); floor `0.146.0` | `seal-control` records `codex --version` as observed in the image and refuses to seal below the floor. |
 | Codex hook schema | `pre_tool_use`, pinned at `0.146.0` in `guard-codex-bridge.sh` | Evidence below. |
 | Managed hook version | `LOOM_HOOK_VERSION` = 1 in `provision-codex-hooks.sh` | Cross-checked against the receipt at every observation. |
+
+### Derived session images (issue #14019)
+
+A consumer repo can run its contained sessions from an image built `FROM`
+the released session image (`accounts.session.image`, pinned by digest), so
+the bundle rides along unchanged. The host treats the derivation as a claim
+it verifies, not trusts: before any container is created from the
+configured image it probes the image in a throwaway container (no network,
+no mounts, read-only rootfs, `--cap-drop ALL`) and refuses it unless
+
+1. the manifest answers with exactly this protocol and `CONTROL_VERSION`,
+   this daemon's forced policy map, and this daemon's managed registration;
+2. every sealed asset this daemon knows is present with the digest its own
+   manifest recorded — a **digest mismatch names the altered asset**; and
+3. the manifest seals nothing this daemon does not know.
+
+The refusal is the fail-closed direction: because the expectations are the
+running daemon's constants, a daemon roll that bumps the boundary refuses a
+derived image until it is rebuilt on the new base and the digest pin
+updated, and the version-skew reconciler never recreates an override seat
+— never from its own digest pin (same skew) and never from the stock tag.
+Nothing swaps an override seat onto the stock image silently. The build
+recipe and the layers a derived image must not touch are in
+`docker/session/README.md`.
 
 ### Codex 0.149.1 vs the 0.146.0 schema pin — evidence, not assumption
 
