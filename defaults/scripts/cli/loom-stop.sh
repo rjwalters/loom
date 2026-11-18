@@ -10,7 +10,7 @@
 # Examples:
 #   loom stop                     Graceful shutdown of all agents
 #   loom stop --force             Force kill all sessions
-#   loom stop shepherd-1          Stop only shepherd-1
+#   loom stop builder-1           Stop only builder-1
 
 set -euo pipefail
 
@@ -93,7 +93,7 @@ ${YELLOW}OPTIONS:${NC}
 ${YELLOW}EXAMPLES:${NC}
     loom stop                     Graceful shutdown all agents
     loom stop --force             Force kill all sessions
-    loom stop shepherd-1          Stop only shepherd-1
+    loom stop builder-1           Stop only builder-1
     loom stop --timeout 60        Wait max 60 seconds for graceful shutdown
 
 ${YELLOW}GRACEFUL SHUTDOWN:${NC}

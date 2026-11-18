@@ -1,8 +1,10 @@
 //! Shared "which issues have a live sweep right now" helpers.
 //!
 //! Rust port of the `clean.py` / `orphan_recovery.py` helpers that read
-//! `.loom/locks/issue-<N>/` (the spawn loop's atomic claim-lock directories)
-//! and union them with `.loom/spawn-loop-state.json::running`. Used by:
+//! `.loom/locks/issue-<N>/` (the daemon's atomic claim-lock directories).
+//! (The Python originals also unioned `.loom/spawn-loop-state.json::running`
+//! — a file whose writer was deleted in v0.11.0; that retired reader was
+//! removed in #13818.) Used by:
 //!
 //! - `clean.rs`'s standard worktree pass (skip issues with a live claim)
 //!   and its `--daemon` crash-recovery label revert.
@@ -17,8 +19,6 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-
-use super::spawn_loop_state::{read_spawn_loop_state, SpawnLoopState};
 
 /// Path to the spawn loop's atomic claim-lock directory
 /// (`<repo_root>/.loom/locks/`). Each in-flight sweep child holds a
@@ -55,20 +55,15 @@ pub fn active_locked_issues(repo_root: &Path) -> std::collections::HashSet<u32> 
     out
 }
 
-/// Union of `.loom/spawn-loop-state.json::running[].issue` and
-/// `.loom/locks/issue-<N>/` — the set of issues currently "in flight" per
-/// the local-workspace evidence (no forge/daemon calls). Mirrors
-/// `clean.py::_active_spawn_loop_issues`.
+/// Union of `.loom/locks/issue-<N>/` and the issues a live pause manifest
+/// holds (#10832) — the set of issues currently "in flight" per the
+/// local-workspace evidence (no forge/daemon calls). Mirrors
+/// `clean.py::_active_spawn_loop_issues` minus its retired
+/// `spawn-loop-state.json` leg (the writer was deleted in v0.11.0; the
+/// reader was removed in #13818).
 #[must_use]
 pub fn active_spawn_loop_issues(repo_root: &Path) -> std::collections::HashSet<u32> {
-    let state: SpawnLoopState = read_spawn_loop_state(repo_root);
-    let mut active: std::collections::HashSet<u32> = state
-        .running
-        .iter()
-        .filter(|t| t.issue != 0)
-        .map(|t| t.issue)
-        .collect();
-    active.extend(active_locked_issues(repo_root));
+    let mut active = active_locked_issues(repo_root);
     // #10832: a worktree named in a live pause manifest is owned until H5
     // resumes or requeues its agent, whatever its lock looks like.
     active.extend(crate::roll_pause::suppress::held_issues(repo_root));
@@ -194,17 +189,13 @@ mod tests {
     }
 
     #[test]
-    fn active_spawn_loop_issues_unions_state_and_locks() {
+    fn active_spawn_loop_issues_from_locks() {
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
-        std::fs::write(
-            dir.path().join(".loom").join("spawn-loop-state.json"),
-            r#"{"running": [{"issue": 5, "pid": 1}]}"#,
-        )
-        .unwrap();
+        // The retired `spawn-loop-state.json` no longer contributes: only
+        // lock dirs (plus pause-held issues, #10832) count.
         std::fs::create_dir_all(locks_dir(dir.path()).join("issue-6")).unwrap();
         let active = active_spawn_loop_issues(dir.path());
-        assert_eq!(active, std::collections::HashSet::from([5, 6]));
+        assert_eq!(active, std::collections::HashSet::from([6]));
     }
 
     fn write_owner(dir: &std::path::Path, issue: u32, owner_pid: u32, acquired_at: &str) {

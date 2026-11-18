@@ -30,6 +30,7 @@ fn terminal_result_parser_threads_the_model_field_on_v2() {
             category: TerminalClassification::ModelCreditsExhausted,
             exit_code: 1,
             model: Some("gpt-5-codex".into()),
+            requested_model: None,
         })
     );
     // `model=none` — the sentinel the adapter emits when no model was in
@@ -46,6 +47,7 @@ fn terminal_result_parser_threads_the_model_field_on_v2() {
             category: TerminalClassification::Success,
             exit_code: 0,
             model: None,
+            requested_model: None,
         })
     );
     // v1 (5 fields, no model=) still parses, with model always None.

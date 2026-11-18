@@ -113,7 +113,7 @@ impl Drop for FakeGh {
 fn evidence_without_the_issue() -> LivenessEvidence {
     LivenessEvidence {
         available: true,
-        sources: vec!["spawn-loop-state.json"],
+        sources: vec![".loom/locks"],
         ..Default::default()
     }
 }

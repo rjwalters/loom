@@ -263,6 +263,59 @@ echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
 run_create_pr --title "fix: something" --body "Closing #111" --head "feature/issue-111"
 assert_eq "1" "$EXIT_CODE" "Closing #111 (closed) -> refused"
 
+# T13 (#13939): past-tense narration BEFORE the real closing reference must
+# not win `head -1` -- `PR #605 fixed #597` describes history, it does not
+# close #597. With #597 CLOSED and #622 OPEN the check fires on #622 only;
+# the pre-#13939 pattern refused this body as 'target #597 CLOSED by #605'.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-597-state.txt"
+echo "605" > "$STUB_DIR/issue-597-number.txt"
+echo "https://github.com/owner/repo/pull/605" > "$STUB_DIR/issue-597-url.txt"
+echo "OPEN" > "$STUB_DIR/issue-622-state.txt"
+run_create_pr --title "fix: something" --body "PR #605 fixed #597, which unblocked this.
+
+Closes #622" --head "feature/issue-622"
+assert_eq "0" "$EXIT_CODE" "Narration 'PR #605 fixed #597' + Closes #622 (open) -> exits 0"
+assert_eq "1" "$(created_count)" "Narration body -> PR is created (target is #622, not #597)"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 622" "Freshness check targets #622"
+assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 597" "Narrated #597 is never looked up"
+
+# T14 (#13939): `Closes #N` as the very FIRST token of the body is still
+# detected even when narration follows it later in the body.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-113-state.txt"
+echo "605" > "$STUB_DIR/issue-113-number.txt"
+run_create_pr --title "fix: something" --body "Closes #113
+
+PR #605 fixed #597 earlier; this finishes the remainder." --head "feature/issue-113"
+assert_eq "1" "$EXIT_CODE" "Closes #113 as first token (closed) -> still refused"
+
+# T15 (#13939): narration ONLY, no closing keyword -> no check fires at all.
+reset_fixtures
+run_create_pr --title "fix: something" --body "PR #605 fixed #597, and this builds on it." --head "feature/misc"
+assert_eq "0" "$EXIT_CODE" "Narration-only body -> no supersede check, exits 0"
+assert_eq "1" "$(created_count)" "Narration-only body -> PR is still created"
+assert_not_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view" "Narration-only body -> no issue lookup"
+
+# T16 (#13939): lowercase keywords throughout.
+reset_fixtures
+echo "OPEN" > "$STUB_DIR/issue-114-state.txt"
+run_create_pr --title "fix: something" --body "PR #605 fixed #597 earlier.
+
+closes #114" --head "feature/issue-114"
+assert_eq "0" "$EXIT_CODE" "lowercase narration + closes #114 (open) -> exits 0"
+assert_contains "$(cat "$STUB_DIR/gh-calls.log")" "issue view 114" "lowercase closes #114 IS the checked target"
+
+# T17 (#13939): `Fixes #N` at line start after a blank line still matches.
+reset_fixtures
+echo "CLOSED" > "$STUB_DIR/issue-115-state.txt"
+echo "888" > "$STUB_DIR/issue-115-number.txt"
+echo "feature/issue-999" > "$STUB_DIR/pr-888-head.txt"
+run_create_pr --title "fix: something" --body "Background first.
+
+Fixes #115" --head "feature/issue-115"
+assert_eq "1" "$EXIT_CODE" "Fixes #115 at line start after blank line (closed) -> refused"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

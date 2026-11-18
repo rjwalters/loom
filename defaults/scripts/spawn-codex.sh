@@ -205,11 +205,12 @@
 #   LOOM_CODEX_MODEL_CHECK  Set to 0 to disable the Claude-shaped-model refusal
 #                        below (issue #5028). Default on (`1`).
 #   LOOM_CODEX_AUTH_MODE_CHECK  Set to 0 to disable the ChatGPT-plan pinned-
-#                        model guard below (issue #5499): a ChatGPT-plan
-#                        profile only accepts its account's own default
-#                        model, so an explicitly pinned model (even a
-#                        Codex-family one) is dropped with a warning rather
-#                        than launched into a guaranteed 400. Default on (`1`).
+#                        model guard below (issue #5499): on a ChatGPT-plan
+#                        profile an explicitly pinned model is kept only when
+#                        the account's own catalog (`codex debug models`)
+#                        lists it (#14121); otherwise it is dropped with a
+#                        warning rather than launched into a guaranteed 400.
+#                        Default on (`1`).
 #   LOOM_EFFORT          Reasoning effort, mapped to
 #                        `-c model_reasoning_effort=<value>`. Skipped when an
 #                        explicit `-c model_reasoning_effort=` override is
@@ -874,41 +875,93 @@ fi
 [[ -z "${LOOM_RESUME_SESSION_ID:-}" || "${SANDBOX_ARGS[0]:-}" == --dangerously-bypass-approvals-and-sandbox ]] || SANDBOX_ARGS=(-c "sandbox_mode=\"$SANDBOX_MODE\"")
 PASSTHROUGH_ARGS+=(${SANDBOX_ARGS[@]+"${SANDBOX_ARGS[@]}"})
 
-# --- ChatGPT-plan auth-mode guard for a pinned model (issue #5499) ---
+# --- ChatGPT-plan auth-mode guard for a pinned model (issues #5499, #14121) ---
 # A Codex profile authenticated via a ChatGPT PLAN (interactive `codex login`)
-# restricts the CLI to the account's own default model — an EXPLICITLY pinned
-# model, even a Codex-family one like `gpt-5-codex`, is rejected on the wire
-# with a 400 `invalid_request_error`: "The '<model>' model is not supported
-# when using Codex with a ChatGPT account." The Claude-shaped-model refusal
-# above cannot catch this: `gpt-5-codex` is correctly Codex-family, so it
-# passes that check — the real incompatibility is model vs AUTH MODE, not
-# model vs runtime family, and nothing before this point has verified it.
+# does not accept arbitrary model pins. Current codex-cli (0.168+) accepts a
+# pinned model only when the ACCOUNT'S OWN CATALOG lists it — the per-account
+# list `codex debug models` exposes, each entry with its reasoning levels and
+# service tiers. A pin the catalog does not list is rejected on the wire with
+# a 400 `invalid_request_error`: "The '<model>' model is not supported when
+# using Codex with a ChatGPT account." The Claude-shaped-model refusal above
+# cannot catch this: `gpt-5-codex` is correctly Codex-family, so it passes
+# that check — the real incompatibility is model vs the account's catalog,
+# and nothing before this point has verified it.
 #
 # Detected here, AFTER CODEX_HOME is resolved and BEFORE the CLI is ever
 # dispatched, via `codex login status`'s own designed-for-this wording
 # ("Logged in using ChatGPT" vs "Logged in using an API key") — never by
 # opening or parsing `auth.json` itself, which Loom treats as opaque mutable
-# state owned by Codex (see account_lifecycle.rs's module doc). A ChatGPT-plan
-# match DROPS the pinned model (with a warning) rather than launching a
-# doomed invocation — the account's own default model is exactly what a
-# manual `codex exec` with no `-m` uses successfully. This is a warn-and-drop,
-# not a hard refusal (unlike the Claude-shaped-model check): the pin is a
-# now-provably-wrong REQUEST, not a malformed one, and dropping it lets the
-# scheduled role/sweep still run productively on the account's own default
-# instead of dying every cadence tick.
+# state owned by Codex (see account_lifecycle.rs's module doc). On a ChatGPT
+# plan the pinned model is KEPT when the account's catalog lists it (#14121)
+# and DROPPED otherwise — with a warning — rather than launching a doomed
+# invocation. The drop remains a warn-and-drop, not a hard refusal (unlike
+# the Claude-shaped-model check): the pin is a now-provably-wrong REQUEST,
+# not a malformed one, and dropping it lets the scheduled role/sweep still
+# run productively on the account's own default instead of dying every
+# cadence tick. A dropped pin is reported as `requested_model=` on the step's
+# v3 terminal record (#14121), so a configured-but-ignored model is visible
+# downstream without reading these WARN lines.
 #
 # Skipped entirely under LOOM_CODEX_NO_EXEC (argv-preview mode promises to
 # "never touch the real CLI") and when no model is pinned at all (nothing to
-# drop). Bounded to 10s via bounded-run.sh — same budget
-# account_lifecycle.rs's `codex login status` call uses — so a wedged CLI
-# cannot hang a spawn. Escape hatch: LOOM_CODEX_AUTH_MODE_CHECK=0.
+# drop). Both probes — `login status` and the catalog read — are bounded to
+# 10s via bounded-run.sh, the same budget account_lifecycle.rs's
+# `codex login status` call uses, so a wedged CLI cannot hang a spawn. The
+# catalog read is cached per profile (first line = epoch seconds of the
+# read, then one slug per line; TTL 1h) in the profile's CODEX_HOME; a
+# failed or unparseable read is never cached as "empty" — the next spawn
+# re-probes. Under session-exec the probe runs inside the container and no
+# cache is kept (a host-side write into an adopted profile's CODEX_HOME is
+# exactly the CODEX_HOME access the ownership rule forbids). Escape hatch:
+# LOOM_CODEX_AUTH_MODE_CHECK=0.
 CODEX_DROP_PINNED_MODEL=false
+# The model that was requested but dropped, reported as `requested_model=` on
+# the v3 terminal record (#14121). Empty when nothing was dropped.
+CODEX_DROPPED_MODEL=""
 # For a session-managed profile the probe runs INSIDE the account's container
 # (issue #8518): a host-direct `codex login status` against an adopted
 # profile is exactly the host-side CODEX_HOME access the ownership rule
 # forbids, and it would read the host's default login state, not the
 # account's. Same read-only, bounded probe account_lifecycle.rs uses.
 _codex_bin=(codex); [[ "$CODEX_SESSION_EXEC" == "true" ]] && _codex_bin=(docker exec "$CODEX_SESSION_CONTAINER" codex)
+# Read this account's model catalog (bounded, cached): sets
+# _codex_catalog_ok=true and _codex_catalog_slugs (one slug per line) on
+# success; leaves _codex_catalog_ok=false on any failure (unreadable,
+# timeout, no jq, unparseable) so the caller drops the pin — exactly the
+# pre-#14121 behaviour — and never caches the failure as "empty".
+_codex_catalog_cache="${CODEX_HOME:-$HOME/.codex}/.loom-model-catalog.txt"
+_codex_catalog_cache_ttl=3600
+_codex_read_catalog() {
+    _codex_catalog_slugs=""
+    _codex_catalog_ok=false
+    # Cache hit? First line is the epoch seconds of the read, then the slugs.
+    local _cache_ts=""
+    if [[ "$CODEX_SESSION_EXEC" != "true" ]] \
+        && _cache_ts="$(head -n 1 "$_codex_catalog_cache" 2>/dev/null)" \
+        && [[ "$_cache_ts" =~ ^[0-9]+$ ]] \
+        && (( $(date +%s) - _cache_ts < _codex_catalog_cache_ttl )); then
+        _codex_catalog_slugs="$(tail -n +2 "$_codex_catalog_cache" 2>/dev/null)" || return 0
+        [[ -n "$_codex_catalog_slugs" ]] && _codex_catalog_ok=true
+        return 0
+    fi
+    command -v jq >/dev/null 2>&1 || return 0   # no jq: unreadable, drop
+    local _catalog_out="" _slugs=""
+    _catalog_out="$(bounded_run 10 "${_codex_bin[@]}" debug models </dev/null 2>/dev/null)" || return 0
+    _slugs="$(printf '%s' "$_catalog_out" | jq -r '(.models // [])[].slug' 2>/dev/null \
+        | grep -E '^[A-Za-z0-9._-]+$')" || _slugs=""
+    [[ -n "$_slugs" ]] || return 0
+    _codex_catalog_slugs="$_slugs"
+    _codex_catalog_ok=true
+    # Populate the cache (best-effort; only a SUCCESSFUL read is cached).
+    if [[ "$CODEX_SESSION_EXEC" != "true" ]]; then
+        local _tmp=""
+        _tmp="$(mktemp "${_codex_catalog_cache}.XXXXXX" 2>/dev/null)" || return 0
+        { printf '%s\n' "$(date +%s)"; printf '%s\n' "$_slugs"; } > "$_tmp" 2>/dev/null \
+            && mv -f "$_tmp" "$_codex_catalog_cache" 2>/dev/null \
+            || { rm -f "$_tmp" 2>/dev/null || true; }
+    fi
+    return 0
+}
 if [[ -n "$EFFECTIVE_MODEL" && -z "${LOOM_CODEX_NO_EXEC:-}" \
       && "${LOOM_CODEX_AUTH_MODE_CHECK:-1}" != "0" ]] \
     && command -v "${_codex_bin[0]}" >/dev/null 2>&1; then
@@ -920,13 +973,26 @@ if [[ -n "$EFFECTIVE_MODEL" && -z "${LOOM_CODEX_NO_EXEC:-}" \
         _login_status_rc=$?
         if [[ $_login_status_rc -eq 0 ]] \
             && printf '%s' "$_login_status_out" | grep -qi "logged in using chatgpt"; then
-            log_warn "spawn-codex: this Codex profile is authenticated via a ChatGPT plan, which only supports the account's own default model (issue #5499)."
-            log_warn "spawn-codex: dropping the pinned model '$EFFECTIVE_MODEL' rather than launching a doomed invocation — the CLI 400s with \"model is not supported when using Codex with a ChatGPT account\"."
-            log_warn "spawn-codex: fix by omitting autonomous.roleRunner.roleModels/LOOM_MODEL/LOOM_CODEX_MODEL for this role/profile, or point it at an API-key-authenticated profile. Escape hatch: LOOM_CODEX_AUTH_MODE_CHECK=0."
-            CODEX_DROP_PINNED_MODEL=true
+            _codex_pin_base="${EFFECTIVE_MODEL%%@*}"   # `model@effort` grammar (#3702): the base is what the CLI resolves
+            _codex_read_catalog
+            if [[ "$_codex_catalog_ok" == "true" ]] \
+                && printf '%s\n' "$_codex_catalog_slugs" | grep -qxF -- "$_codex_pin_base"; then
+                log_info "spawn-codex: ChatGPT-plan profile: pinned model '$_codex_pin_base' is listed in this account's catalog — keeping the pin (issue #14121)"
+            else
+                CODEX_DROPPED_MODEL="$EFFECTIVE_MODEL"
+                if [[ "$_codex_catalog_ok" != "true" ]]; then
+                    log_warn "spawn-codex: this Codex profile is authenticated via a ChatGPT plan, and this account's catalog could not be read — dropping the pinned model '$EFFECTIVE_MODEL' rather than risking a doomed invocation (issues #5499, #14121)."
+                else
+                    log_warn "spawn-codex: this Codex profile is authenticated via a ChatGPT plan, and this account's catalog does not list '$_codex_pin_base' (issue #14121)."
+                fi
+                log_warn "spawn-codex: dropping the pinned model '$EFFECTIVE_MODEL' rather than launching a doomed invocation — the CLI 400s with \"model is not supported when using Codex with a ChatGPT account\"."
+                log_warn "spawn-codex: fix by pinning a model this account's catalog lists (see \`codex debug models\`), omitting autonomous.roleRunner.roleModels/LOOM_MODEL/LOOM_CODEX_MODEL for this role/profile, or pointing it at an API-key-authenticated profile. Escape hatch: LOOM_CODEX_AUTH_MODE_CHECK=0."
+                CODEX_DROP_PINNED_MODEL=true
+            fi
         fi
     fi
 fi
+unset -f _codex_read_catalog
 
 # --- Managed hook readiness / trust preflight (issue #4495) ---
 #
@@ -1161,7 +1227,11 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     # LOOM_SWEEP_LEASE_RENEW_DISPATCHED and LOOM_LEASE_HOST_ID travel with
     # LOOM_SWEEP_CLAIM_OWNED: together they let the session recognise the lease
     # its dispatcher published as its own (`lease ensure`, sweep-lease-fence.sh).
-    for _v in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT LOOM_SWEEP_CLAIM_OWNED LOOM_SWEEP_LEASE_RENEW_DISPATCHED GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER LOOM_DAEMON_ITEM_ID LOOM_HOST_ID LOOM_LEASE_HOST_ID LOOM_ROLE_PR_LEASE_FILE LOOM_PICK_JOURNAL LOOM_ROLL_PAUSE_DIR LOOM_ROLL_PAUSE_BIN CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do [[ -n "${!_v:-}" ]] && CODEX_INVOKE+=(--env "$_v=${!_v}"); done
+    # LOOM_LEASE_PUBLISH_HOSTNAME travels with LOOM_LEASE_HOST_ID (#13998):
+    # when the host opted into raw publishing, the session must publish and
+    # compare the same raw form -- without it the session derives the opaque
+    # id instead and reads its own lease as a peer's (fails closed).
+    for _v in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT LOOM_SWEEP_CLAIM_OWNED LOOM_SWEEP_LEASE_RENEW_DISPATCHED GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER LOOM_DAEMON_ITEM_ID LOOM_HOST_ID LOOM_LEASE_HOST_ID LOOM_LEASE_PUBLISH_HOSTNAME LOOM_ROLE_PR_LEASE_FILE LOOM_PICK_JOURNAL LOOM_ROLL_PAUSE_DIR LOOM_ROLL_PAUSE_BIN CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do [[ -n "${!_v:-}" ]] && CODEX_INVOKE+=(--env "$_v=${!_v}"); done
     CODEX_INVOKE+=(--)
 fi
 CODEX_INVOKE+=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
@@ -1309,11 +1379,14 @@ fi
 # `EFFECTIVE_MODEL`: the #5499 ChatGPT-plan guard above may set
 # CODEX_DROP_PINNED_MODEL, in which case the `-m`/`--model` flag was stripped
 # from the invocation and the account's own default model ran instead. Naming
-# the dropped model here would pin a class-scoped credit-exhaustion hold on a
-# class that never ran — and, worse, leave the class that DID run selectable.
-# We cannot know the account's default from here, so that case reports `none`
-# and takes the account-wide path, which is the fail-safe direction #8058
-# requires.
+# the dropped model in `model=` here would pin a class-scoped
+# credit-exhaustion hold on a class that never ran — and, worse, leave the
+# class that DID run selectable. We cannot know the account's default from
+# here, so that case reports `none` and takes the account-wide path, which is
+# the fail-safe direction #8058 requires. The dropped pin is NOT lost,
+# though: #14121 emits it as `requested_model=` on a v3 record, so a
+# configured-but-ignored model is visible in the record itself without
+# reading the guard's WARN lines.
 _classifier_lib="${_SCRIPT_DIR}/lib/classify-error.sh"
 if [[ -f "$_classifier_lib" ]]; then
     # shellcheck source=./lib/classify-error.sh
@@ -1340,6 +1413,19 @@ if [[ -f "$_classifier_lib" ]]; then
     # when the value is not record-safe — all three fail safe to account-wide.
     _terminal_model="${EFFECTIVE_MODEL:-none}"
     [[ "${CODEX_DROP_PINNED_MODEL:-false}" != "true" && "$_terminal_model" =~ ^[A-Za-z0-9._@-]+$ ]] || _terminal_model="none"
+    # #14121: a dropped pin is named in `requested_model=` on a v3 record (7
+    # fields); without a drop the record stays v2 (6 fields), byte-for-byte
+    # unchanged. `model=` stays `none` in both (the #8058 fail-safe above);
+    # the daemon parser accepts both arities, and an older daemon fails
+    # closed on v3 — degrading to "no health mutation", the same safe
+    # direction this record already takes for a dropped pin.
+    _terminal_version="v=2"
+    _terminal_requested_field=""
+    if [[ "${CODEX_DROP_PINNED_MODEL:-false}" == "true" \
+        && "${CODEX_DROPPED_MODEL:-}" =~ ^[A-Za-z0-9._@-]+$ ]]; then
+        _terminal_version="v=3"
+        _terminal_requested_field=" requested_model=${CODEX_DROPPED_MODEL}"
+    fi
     case "$_terminal_category" in
         # MODEL_CREDITS_EXHAUSTED (#5687) is listed so the allowlist stays a
         # complete mirror of the classifier's category set. The `codex` table
@@ -1347,8 +1433,9 @@ if [[ -f "$_classifier_lib" ]]; then
         # unreachable for provider=codex — but an allowlist that silently drops
         # a valid category is exactly how terminal feedback goes missing.
         SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT|SANDBOX_UNAVAILABLE)
-            printf '# LOOM_TERMINAL_RESULT v=2 provider=codex account=%s category=%s exit_code=%s model=%s\n' \
-                "$_terminal_account" "$_terminal_category" "$_exit_code" "$_terminal_model" >&2
+            printf '# LOOM_TERMINAL_RESULT %s provider=codex account=%s category=%s exit_code=%s model=%s%s\n' \
+                "$_terminal_version" "$_terminal_account" "$_terminal_category" \
+                "$_exit_code" "$_terminal_model" "$_terminal_requested_field" >&2
             ;;
         *)
             log_warn "spawn-codex: classifier returned an invalid category; terminal feedback omitted"

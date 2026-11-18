@@ -170,37 +170,6 @@ fn test_handle_request_get_claims_summary() {
     }
 }
 
-// ===== CaptureGitChanges with nonexistent dir =====
-
-#[test]
-fn test_handle_request_capture_git_changes_no_repo() {
-    let (tm, db, sr, bus) = setup_test_context();
-    let response = handle_request(
-        Request::CaptureGitChanges {
-            input_id: 1,
-            working_dir: "/nonexistent/path".to_string(),
-            before_commit: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
-    match response {
-        Response::GitChangesCaptured {
-            files_changed,
-            lines_added,
-            lines_removed,
-        } => {
-            assert_eq!(files_changed, 0);
-            assert_eq!(lines_added, 0);
-            assert_eq!(lines_removed, 0);
-        }
-        other => panic!("Expected GitChangesCaptured, got: {other:?}"),
-    }
-}
-
 // ===== SendInput / GetTerminalOutput input correlation (Issue #4554) =====
 
 /// End-to-end proof that a `SendInput` turn's `agent_inputs.id` is threaded
@@ -1396,6 +1365,7 @@ fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
         source: crate::runtime_admission::RuntimeSource::DefaultConfig,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     });
     let wire = serde_json::to_string(&response).unwrap();
     assert!(wire.contains("\"type\":\"RuntimeRejected\""));

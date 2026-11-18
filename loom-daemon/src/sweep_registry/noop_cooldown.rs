@@ -404,7 +404,7 @@ impl SweepRegistry {
         replayed
     }
 
-    /// The id of the live (`Running`/`Pending`) sweep this host has running for
+    /// The id of the live (`Running`) sweep this host has running for
     /// `issue`, if any (Issue #8912) — the most recently started one when more
     /// than one entry matches (a superseded claim leaves the older entry behind
     /// until its own reap).
@@ -419,7 +419,7 @@ impl SweepRegistry {
                     SweepKind::Issue(n)
                         | SweepKind::Step { item: n, role: crate::step_role::StepRole::Builder }
                         if n == issue
-                ) && matches!(info.state, SweepState::Running | SweepState::Pending)
+                ) && matches!(info.state, SweepState::Running)
             })
             .max_by_key(|info| info.started_at)
             .map(|info| info.sweep_id.clone())

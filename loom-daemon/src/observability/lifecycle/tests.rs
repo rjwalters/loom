@@ -794,6 +794,7 @@ mod role_tick_spans {
                 source: crate::runtime_admission::RuntimeSource::RoleConfig,
                 unmet_capabilities: vec!["isolation".into()],
                 reason: "unmet".into(),
+                exhausted_summary_line: None,
             }),
             RoleTickOutcome::ModelRuntimeMismatch(crate::role_runner::ModelRuntimeMismatch {
                 role: "doctor".into(),
@@ -1118,6 +1119,7 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
         source: crate::runtime_admission::RuntimeSource::RoleConfig,
         unmet_capabilities: vec!["isolation-\u{9694}\u{79BB}".to_owned(); 40],
         reason: "unmet".into(),
+        exhausted_summary_line: None,
     });
     for (outcome, key) in [
         (mismatch, "loom.model"),

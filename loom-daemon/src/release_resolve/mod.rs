@@ -34,6 +34,6 @@ pub mod resolve;
 pub mod semver;
 
 pub use resolve::{
-    asset_names, build_time_repo, explain_no_artifact, resolve, resolve_repo, Inputs, Resolution,
-    Resolved,
+    asset_names, build_time_repo, explain_no_artifact, resolve, resolve_repo,
+    resolve_repo_with_source, Inputs, RepoSource, Resolution, Resolved,
 };

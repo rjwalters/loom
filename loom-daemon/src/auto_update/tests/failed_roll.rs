@@ -292,6 +292,7 @@ fn a_terminal_failure_is_retried_at_the_ceiling_only_for_a_floor_target() {
             check: &check,
             tree_clean: true,
             in_flight: 0,
+            repo_source: None,
         };
         state.decide(at, &inputs, Duration::ZERO, DEFER)
     };

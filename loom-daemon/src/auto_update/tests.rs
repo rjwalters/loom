@@ -608,6 +608,30 @@ fn test_backing_off_blocks_rebuild_until_delay_elapses() {
     );
 }
 
+/// #14016: the run loop's `min(interval, backoff)` scheduling reads the time
+/// left through `backoff_remaining` — inside the backoff it reports the
+/// wait, once elapsed (or never set) it reports `None` so the loop keeps its
+/// regular cadence instead of spinning on an already-expired deadline.
+#[test]
+fn test_backoff_remaining_reads_the_gate_clock() {
+    let mut st = AutoUpdateState::new();
+    assert_eq!(st.backoff_remaining(Instant::now()), None);
+    let t0 = Instant::now();
+    st.decide_source(t0, &stale("c1"), true, 0, SETTLE, DEFER);
+    st.record_rebuild(t0, &RebuildOutcome::Retryable("boom".into()), false);
+    // Inside the window: the same clock the gate reads, ~the full delay.
+    let mid = t0 + backoff_delay(1) - Duration::from_secs(30);
+    let left = st.backoff_remaining(mid).expect("backing off");
+    assert!(left <= Duration::from_secs(30) && left >= Duration::from_secs(29), "{left:?}");
+    // Elapsed: None, not zero — an immediate wake would spin past the gates
+    // that hold a tick after the backoff gate lets go.
+    let after = t0 + backoff_delay(1) + Duration::from_secs(1);
+    assert_eq!(st.backoff_remaining(after), None);
+    // And a success clears it outright.
+    st.record_rebuild(t0, &RebuildOutcome::Success, true);
+    assert_eq!(st.backoff_remaining(t0), None);
+}
+
 #[test]
 fn test_terminal_is_sticky_until_commit_changes() {
     let mut st = AutoUpdateState::new();
@@ -1160,6 +1184,7 @@ fn inputs<'a>(
         check,
         tree_clean,
         in_flight,
+        repo_source: None,
     }
 }
 

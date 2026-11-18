@@ -37,13 +37,20 @@ pub(crate) struct TerminalResult {
     /// against any known model class — that normalization happens exactly
     /// once, downstream, in `tokens_pool::health::model_class_of`.
     pub(crate) model: Option<String>,
+    /// The model the adapter was ASKED to run but dropped before exec, named
+    /// by `requested_model=` on a v3 record (#14121 — `spawn-codex.sh`'s
+    /// ChatGPT-plan guard). `None` for a v1/v2 record, and for a v3 record
+    /// whose value is the `none` sentinel or otherwise empty. Purely
+    /// informational: the health path keys on `model`, which stays `None`
+    /// for a dropped pin so a class that never ran is never held.
+    pub(crate) requested_model: Option<String>,
 }
 
 /// Parse the adapter's terminal record from only the current dispatch region.
 /// Unknown fields, duplicate records, malformed identities, and unknown
 /// categories all fail closed: no account health is mutated.
 ///
-/// Two versions are accepted (issue #8277):
+/// Three versions are accepted (issues #8277, #14121):
 ///
 /// - `v=1`, exactly 5 fields (`v provider account category exit_code`) — the
 ///   original contract, byte-for-byte unchanged, so an older adapter talking
@@ -52,6 +59,11 @@ pub(crate) struct TerminalResult {
 /// - `v=2`, exactly 6 fields, adding `model=<value>` — emitted by adapters
 ///   that know which model was in flight. `model=none` (or an absent value)
 ///   parses to `TerminalResult::model == None`, same as v1.
+/// - `v=3`, exactly 7 fields, adding `requested_model=<value>` (#14121) —
+///   emitted when a pinned model was dropped before exec (`model=` stays
+///   `none`; the requested pin rides in its own field). The 7-field arity is
+///   accepted only when the `requested_model` key is present, so a v2 record
+///   carrying some other unknown 7th field still fails closed.
 ///
 /// Any other arity or `v=` value fails closed like everything else this
 /// parser rejects.
@@ -71,12 +83,28 @@ pub(crate) fn parse_terminal_result_after(
         .split_ascii_whitespace()
         .filter_map(|field| field.split_once('='))
         .collect();
-    let model = match fields.get("v") {
-        Some(&"1") if fields.len() == 5 => None,
-        Some(&"2") if fields.len() == 6 => match fields.get("model") {
-            Some(&"none") | Some(&"") | None => None,
-            Some(model) => Some((*model).to_string()),
-        },
+    let (model, requested_model) = match fields.get("v") {
+        Some(&"1") if fields.len() == 5 => (None, None),
+        Some(&"2") if fields.len() == 6 => (
+            match fields.get("model") {
+                Some(&"none") | Some(&"") | None => None,
+                Some(model) => Some((*model).to_string()),
+            },
+            None,
+        ),
+        // #14121: the 7-field v3 arity is only valid because of its extra
+        // `requested_model=` field — a 7-field record carrying any OTHER
+        // unknown key still fails closed.
+        Some(&"3") if fields.len() == 7 && fields.contains_key("requested_model") => (
+            match fields.get("model") {
+                Some(&"none") | Some(&"") | None => None,
+                Some(model) => Some((*model).to_string()),
+            },
+            match fields.get("requested_model") {
+                Some(&"none") | Some(&"") | None => None,
+                Some(requested) => Some((*requested).to_string()),
+            },
+        ),
         _ => return None,
     };
     let provider = match *fields.get("provider")? {
@@ -100,6 +128,7 @@ pub(crate) fn parse_terminal_result_after(
         category: crate::session_exec::refusal::category_of(region, &fields)?,
         exit_code: fields.get("exit_code")?.parse().ok()?,
         model,
+        requested_model,
     })
 }
 
@@ -1585,6 +1614,7 @@ sweep_id=current
                 category: TerminalClassification::TokenExhausted,
                 exit_code: 42,
                 model: None,
+                requested_model: None,
             })
         );
         assert!(parse_terminal_result_after(
@@ -1602,6 +1632,57 @@ sweep_id=current
             "sweep_id=current"
         )
         .is_none());
+    }
+
+    #[test]
+    fn terminal_result_parser_accepts_v3_requested_model_and_stays_strict() {
+        // #14121: v=3 adds `requested_model=` — the pinned model the adapter
+        // dropped before exec. `model=` stays `none` (the #8058 fail-safe),
+        // so a dropped pin never holds a class that never ran.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=3 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none requested_model=gpt-5-codex",
+                "sweep_id=current"
+            ),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::Success,
+                exit_code: 0,
+                model: None,
+                requested_model: Some("gpt-5-codex".into()),
+            })
+        );
+        // `requested_model=none` parses to None like the other sentinels.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=3 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none requested_model=none",
+                "sweep_id=current"
+            )
+            .and_then(|result| result.requested_model),
+            None
+        );
+        // A 7-field record with NO `requested_model` key (some other unknown
+        // 7th field) still fails closed — the v3 arity is only valid because
+        // of that field.
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=2 provider=codex account=a \
+             category=SUCCESS exit_code=0 model=none bogus=1",
+            "sweep_id=current"
+        )
+        .is_none());
+        // And the pre-#14121 six-field v2 shape keeps parsing unchanged.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none",
+                "sweep_id=current"
+            )
+            .and_then(|result| result.requested_model),
+            None
+        );
     }
 
     // ------------------------------------------------------------------------
