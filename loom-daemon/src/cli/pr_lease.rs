@@ -85,6 +85,20 @@ pub(crate) mod renew;
 pub(crate) const LEASE_PREFIX: &str = "<!-- loom:pr-lease role=";
 /// First-line prefix of a tie-break loser's standdown record.
 pub(crate) const YIELD_PREFIX: &str = "<!-- loom:pr-lease-yield role=";
+/// The one-line `release`/`reap` summary. A release that patched nothing
+/// because this identity's own rows already carry the released marker (the
+/// verdict step released first) says so, rather than "released 0" (#14392);
+/// no own row at all keeps the plain zero count.
+fn release_summary(verb: &str, released: usize, already_released: usize, stopped: usize) -> String {
+    if released == 0 && already_released > 0 {
+        format!(
+            "already released ({already_released} lease comment(s)); stopped {stopped} renewer(s)"
+        )
+    } else {
+        format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)")
+    }
+}
+
 /// First-line prefix a released lease's marker is rewritten to.
 pub(crate) const RELEASED_PREFIX: &str = "<!-- loom:pr-lease-released role=";
 /// The common prefix all three share — the read's `--jq` pre-filter.
@@ -1499,12 +1513,19 @@ impl Ctx {
             }
         };
         let mut released = 0;
+        // #14392: own rows already carrying the released marker (the verdict
+        // step released first); counted only to word the summary line.
+        let mut already_released = 0;
         // #11855: a Judge leaving the PR still waiting for review records it.
         let mut extra = None;
         for row in rows {
             // Our own lease, whatever step it named (ownership ignores it).
             let holder = match parse_record(&row.body) {
                 Some(Record::Lease(holder)) if holder == self.me => holder,
+                Some(Record::Released(holder)) if holder == self.me => {
+                    already_released += 1;
+                    continue;
+                }
                 _ => continue,
             };
             let extra = extra.get_or_insert_with(|| {
@@ -1556,7 +1577,7 @@ impl Ctx {
         } else {
             "released"
         };
-        self.say(&format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)"));
+        self.say(&release_summary(verb, released, already_released, stopped));
         (EXIT_HELD, released)
     }
 
