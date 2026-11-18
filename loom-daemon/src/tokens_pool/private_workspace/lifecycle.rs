@@ -410,10 +410,33 @@ pub fn session_recover(
     if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
         bail!("private session is not running and idle; refuse recover admission");
     }
+    // Resolved per exec (an installation token outlives no job), but checked
+    // for every clone up front: a publish pushes, and with no write credential
+    // for a GitHub clone the in-container helper can only fail, so refuse
+    // before ANY exec and name what to provide (#14433). List and discard
+    // never push.
+    let auths: Vec<_> = targets
+        .iter()
+        .map(|target| forge_auth::ExecAuth::resolve(workspace, &target.repository))
+        .collect();
+    if action == RecoverAction::Publish {
+        if let Some((target, _)) = targets
+            .iter()
+            .zip(&auths)
+            .find(|(_, auth)| auth.github_token_missing())
+        {
+            bail!(
+                "no GitHub write credential for {}: provide the repository owner's published \
+                 App config (.loom/gh-config-by-owner/<owner>/hosts.yml under the daemon's \
+                 workspace root; set LOOM_MACHINE_CHECKOUT to that root) or GH_TOKEN in the \
+                 environment; the unpublished work is retained",
+                target.repository
+            );
+        }
+    }
     let mut clones = Vec::new();
-    for target in &targets {
-        let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
-        clones.push(docker::recover_target(&config, target, action, issue, branches, &auth)?);
+    for (target, auth) in targets.iter().zip(&auths) {
+        clones.push(docker::recover_target(&config, target, action, issue, branches, auth)?);
     }
     let report = RecoverReport {
         account: config.account.clone(),
