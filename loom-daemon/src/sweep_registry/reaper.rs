@@ -316,7 +316,7 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
                     // Liveness heartbeat (Issue #8736): published every tick
                     // regardless of live-sweep count — unlike the
                     // dispatch-claim re-advertise above, which only fires for
-                    // `Running`/`Pending` entries. Closes the converse of the
+                    // `Running` entries. Closes the converse of the
                     // #8026 idle gate: this host busy, its peers idle. Silent
                     // by design (no per-tick log line) — see
                     // `heartbeat_broadcast`'s module doc for the cost/cadence
@@ -698,7 +698,7 @@ impl SweepRegistry {
                 .entries
                 .get(sweep_id)
                 .ok_or_else(|| anyhow!("unknown sweep_id: {sweep_id}"))?;
-            let alive = matches!(info.state, SweepState::Running | SweepState::Pending);
+            let alive = matches!(info.state, SweepState::Running);
             (info.pid, info.kind.clone(), alive, info.started_at)
         };
 
@@ -1050,7 +1050,7 @@ impl SweepRegistry {
 
         for (sweep_id, pid, pgid, state, kind, started_at) in candidates {
             // #10831: a sweep a roll's H4 pause holds keeps its lock (`roll_pause::hold`).
-            let live = matches!(state, SweepState::Running | SweepState::Pending);
+            let live = matches!(state, SweepState::Running);
             if !live || crate::roll_pause::hold::is_held(&sweep_id) {
                 continue;
             }
@@ -2212,7 +2212,7 @@ impl SweepRegistry {
             // Prune the per-SweepId progress latch so it cannot grow unbounded
             // across many dispatches (Issue #4088). Safe because a GC'd entry is
             // terminal — the watchdog only ever consults the latch for
-            // Running/Pending entries it still owns a Child handle for.
+            // Running entries it still owns a Child handle for.
             self.watchdog_progressed.remove(&id);
             // Prune the per-SweepId phase-transition history for the same
             // reason (Issue #4704): its only consumer is the durable

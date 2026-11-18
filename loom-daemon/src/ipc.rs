@@ -267,7 +267,7 @@ pub use drain_supervisor::{
     list_in_flight_sweeps,
 };
 
-/// Count non-terminal (`Pending` / `Running`) sweeps across **every** managed
+/// Count non-terminal (`Running`) sweeps across **every** managed
 /// root (Issue #4090, Finding 5). Mirrors [`build_daemon_status`]'s cross-root
 /// accounting so a drain never reads only the primary registry and restarts
 /// while a secondary managed repo still has live sweeps.
@@ -1435,7 +1435,7 @@ pub fn build_daemon_status_for(
                 REGISTRY_LOCK_DEADLINE
             );
         }
-        // In-flight = sweeps still live (Pending / Running). Terminal sweeps
+        // In-flight = sweeps still live (Running). Terminal sweeps
         // (Exited / Crashed) linger in the registry but are not "in flight".
         let live: Vec<crate::types::SweepInfo> = snapshot
             .as_ref()

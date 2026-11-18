@@ -832,6 +832,7 @@ fn classify_maps_every_outcome_variant_to_its_own_result() {
                 source: crate::runtime_admission::RuntimeSource::RoleConfig,
                 unmet_capabilities: vec!["subagents".to_string()],
                 reason: "not admitted".to_string(),
+                exhausted_summary_line: None,
             }),
             RoleTickResult::RuntimeRejected,
         ),

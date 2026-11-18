@@ -1365,6 +1365,7 @@ fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
         source: crate::runtime_admission::RuntimeSource::DefaultConfig,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     });
     let wire = serde_json::to_string(&response).unwrap();
     assert!(wire.contains("\"type\":\"RuntimeRejected\""));

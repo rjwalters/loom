@@ -289,6 +289,10 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     // #12362: a Judge tick's found-work split.
                     | "loom.found_work"
                     | "loom.noop_reason"
+                    // #14168: a step's outcome line, countable per
+                    // runtime/model/role from the `loom.sweep` close.
+                    | "loom.step.outcome.class"
+                    | "loom.step.outcome.reason"
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"
