@@ -16,6 +16,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-18
 
+- **PR #14388**: test: anchor create-pr T2 lookup assertion on .default_branch
+- **PR #14375**: docs: scope Codex suffix-shadowing claim to role-runner and sweep-step launches
+- **PR #14344**: fix: count only the last dispatch's OpenCode sessions in step-dispatched usage
 - **PR #14385**: test: pin closing-issue clause in docs-only fast-path prose
 - **PR #14383**: fix: prefer branch-declared issue when create-pr body has several references
 - **PR #14380**: fix: declare installed merge-group-check workflow as a forge caller
@@ -27,6 +30,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #14306**: fix: name why a stranded checkout was not put back in its wrong-branch detail
 - **PR #14262**: fix: make docs-only fast path ineligible when the PR has closing issue references
 - **PR #14225**: judge: cover full-suite-only documented repos in the no-checks unverified fallback
+- **Issue #14387** (closed): test-create-pr-rate-limit-fallback.sh T2 is non-hermetic: a write-scope permissions probe is counted as a default-branch lookup (fails on Linux workers, passes on CI macOS)
+- **Issue #14359** (closed): Docs: 'no daemon-dispatched Codex launch' overstates the codex-default/suffix shadowing — the sweep-orchestrator dispatch has no resolved effort
+- **Issue #14210** (closed): Step-dispatched completion sums OpenCode sessions from every dispatch in an append-mode step log, while the Claude side is window-filtered
 - **Issue #14363** (closed): main red: forge_inventory gate — .github/workflows/merge-group-check.yml unclassified (2 gh release download call sites)
 - **Issue #14351** (closed): create-pr.sh _cpr_body_ref_issue: stale `head -1` comment, and multi-`Closes` bodies now resolve to the last reference
 - **Issue #14340** (closed): Document host_state, target_source and config_restart_paths in the auto_update.tick schema table

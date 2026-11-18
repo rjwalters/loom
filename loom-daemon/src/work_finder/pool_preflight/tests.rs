@@ -1255,3 +1255,75 @@ fn preflight_cause_names_the_pool_hold_apart_from_the_advisory() {
     // report as a hold.
     assert_eq!(preflight_cause(false, PreflightDispatchGate::Probe), (false, None));
 }
+
+// ---------------------------------------------------------------------------
+// #13873: the fallback-aware exhaustion read
+// ---------------------------------------------------------------------------
+
+/// Bad-mark every named account for ONE model class (#8058's scoped shape,
+/// #13872's live marks): the class is held, every other class stays usable.
+/// `classes` as a slice keeps the every-class fixture (#14088 review) on the
+/// same on-disk shape: one line per (account, class), exactly what repeated
+/// production writes leave behind.
+fn class_mark_all(root: &Path, names: &[&str], classes: &[&str]) {
+    let pool = root.join(".loom").join("tokens");
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let body: String = names
+        .iter()
+        .flat_map(|n| {
+            let now = now.as_str();
+            classes.iter().map(move |c| {
+                format!("{now} {n} exhausted: hit your {c} limit [model-class:{c}]\n")
+            })
+        })
+        .collect();
+    fs::write(pool.join(".bad_tokens"), body).unwrap();
+}
+
+/// #13873: a pool whose accounts are all bad-marked for one model class,
+/// with `modelFallback.enabled`, must not hold dispatch — the launches it
+/// would spawn fall a rung (`fable → opus`) and select an account the marks
+/// leave usable. With the block absent, the same pool holds exactly as
+/// before: an absent block reproduces today's behaviour byte-for-byte.
+#[test]
+fn a_class_marked_pool_holds_only_without_the_fallback_block() {
+    let ws = workspace_with_pool(&["a", "b"]);
+    class_mark_all(ws.path(), &["a", "b"], &["fable"]);
+
+    // Block absent: the account-wide read treats class-scoped marks as
+    // blocking and arms the hold (the 2026-11-13 fleet-idle state).
+    let host = PoolHoldState::new();
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.active_holds().len(), 1);
+
+    // Enabled: the any-class read sees the opus capacity the marks leave,
+    // so the hold never arms — dispatch proceeds and each launch resolves
+    // its own rung at spawn time.
+    fs::create_dir_all(ws.path().join(".loom")).unwrap();
+    fs::write(
+        ws.path().join(".loom/config.json"),
+        r#"{"autonomous":{"modelFallback":{"enabled":true}}}"#,
+    )
+    .unwrap();
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a usable lower rung must not hold dispatch"
+    );
+    assert!(host.active_holds().is_empty());
+
+    // An account marked for *every* class is the same dead state even
+    // though no mark is class-less (#14088 review): the any-class read must
+    // count it for no class, so the hold arms exactly as the account-wide
+    // read would.
+    class_mark_all(ws.path(), &["a", "b"], &["fable", "claude-opus-5", "sonnet", "haiku"]);
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "every class marked on every account must arm the hold"
+    );
+
+    // ...and a class-LESS mark still holds everything, enabled or not: it
+    // blocks every class outright, leaving no rung to fall to.
+    bad_mark_all(ws.path(), &["a", "b"]);
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+}
