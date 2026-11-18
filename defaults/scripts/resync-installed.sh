@@ -3205,10 +3205,14 @@ _gitignore_source_stub_patterns() {
 
 # #13898: is $WRITE_ROOT's root package.json the loom-workspace stub? Uses the
 # same "name" marker as resync_workspace_stub_version. Echoes "yes"/"no"; echoes
-# "unknown" (which callers must treat as stand-down, never as "no") when the
-# answer cannot be determined without jq -- stripping the stub entries on an
-# "unknown" would undo what a correct binary just wrote, while tolerating them
-# costs at most one stale-extra pattern surviving until jq is available.
+# "unknown" (which callers must treat as stand-down, never as "no") only when
+# the answer cannot be determined at all -- jq absent, or jq failed on the
+# file. A package.json with no "name" is NOT ambiguous: it is determinatively
+# not the stub, matching the binary's workspace_uses_package_stub()
+# (unwrap_or(false), post_init.rs). Stripping the
+# stub entries on a genuine "unknown" would undo what a correct binary just
+# wrote, while tolerating them costs at most one stale-extra pattern surviving
+# until jq is available.
 _gitignore_workspace_is_stub() {
     local pj="$WRITE_ROOT/package.json"
     [[ -f "$pj" ]] || { echo "no"; return 0; }
@@ -3218,7 +3222,7 @@ _gitignore_workspace_is_stub() {
     fi
     local name
     name="$(jq -r '.name // empty' "$pj" 2>/dev/null)" || { echo "unknown"; return 0; }
-    [[ -z "$name" ]] && { echo "unknown"; return 0; }
+    [[ -z "$name" ]] && { echo "no"; return 0; }
     [[ "$name" == "loom-workspace" ]] && echo "yes" || echo "no"
 }
 
