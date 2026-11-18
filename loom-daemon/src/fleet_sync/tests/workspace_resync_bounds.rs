@@ -283,7 +283,7 @@ fn two_hosts_on_one_version_with_different_payloads_cannot_ping_pong() {
     let b = Host::running(&fx, "host-b", RUNNING, other_defaults(&fx));
     let commits = fx.origin_commits();
 
-    // host-a resyncs the repo to v0.19.880.
+    // host-a resyncs the repo to v1.0.880.
     assert_eq!(only(&a.pass()).state, WState::W0);
     assert_eq!(fx.origin_commits(), commits + 1);
     let calls = fx.forge.calls.borrow().len();
@@ -296,7 +296,7 @@ fn two_hosts_on_one_version_with_different_payloads_cannot_ping_pong() {
         let report = only(&pass);
         assert_eq!(report.state, WState::W1, "{report:?}");
         assert!(
-            reason(report).starts_with("resync-loop: host-a already resynced it to v0.19.880 in "),
+            reason(report).starts_with("resync-loop: host-a already resynced it to v1.0.880 in "),
             "{report:?}"
         );
         // Alerted once, then only reported.
@@ -375,7 +375,7 @@ fn a_newer_version_is_installed_at_once_and_each_version_lands_once() {
     // A newer release, with a file changed, lands on host-b a moment later.
     let newer = defaults(&fx.tmp.path().canonicalize().unwrap().join("newer"), true);
     write(&newer.join("docs/d.md"), "doc, revised\n");
-    let b = Host::running(&fx, "host-b", "0.19.881", newer);
+    let b = Host::running(&fx, "host-b", "1.0.881", newer);
     let pass = b.pass();
     assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
     assert!(pass.alerts.is_empty());
@@ -390,7 +390,7 @@ fn a_newer_version_is_installed_at_once_and_each_version_lands_once() {
         let pass = a.pass();
         let report = only(&pass);
         assert_eq!(report.state, WState::RepoAhead, "{report:?}");
-        assert_eq!(reason(report), "installed 0.19.881 > running 0.19.880");
+        assert_eq!(reason(report), "installed 1.0.881 > running 1.0.880");
         assert_eq!(only(&b.pass()).state, WState::W0);
         assert!(pass.alerts.is_empty());
     }

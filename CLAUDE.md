@@ -207,10 +207,11 @@ All org CI is captured in SigNoz: [`ci-observability`](.loom/docs/ci-observabili
    `BRANCH_EXISTS …`): do NOT claim**; 1 = safe; else = unanswered, not an
    all-clear. A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
-2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
-   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (the process doing the work, never a subagent's inherited `$PPID`).
-   Step 3's `worktree.sh` does this itself; a lane not using it MUST call `lease ensure` (#9453); `lease release 42` hands it back (#12103)
-3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
+2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`.
+   Step 3's helper acquires ownership after checking peers; do not pre-publish a lease.
+   A lane without worktrees MUST use `loom-daemon lease ensure 42 --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`
+   and proceed only on exit 0 with exact stdout `OWNED`; `lease release 42` hands it back (#12103).
+3. Create worktree: `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
 5. Create PR: `git push -u origin feature/issue-42 && gh pr create --label "loom:review-requested" --body "Closes #42"`
 

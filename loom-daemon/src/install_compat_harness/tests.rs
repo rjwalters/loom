@@ -190,6 +190,7 @@ fn opts(root: &Path, req: &str, old_daemon: OldDaemon) -> CheckOptions {
         new_daemon: PathBuf::from("/nonexistent/new-daemon"),
         old_daemon,
         prev_ref: None,
+        oldest_installed: false,
         supports_installed: v("0.19.0"),
         requires_daemon: v(req),
         invoked_files: Vec::new(),
@@ -305,6 +306,139 @@ fn prev_ref_equal_to_the_claim_is_checked_not_skipped_as_a_declared_break() {
 }
 
 // ---- #10868: the three-valued subcommand probe ----
+
+fn oldest_installed_report(root: &Path, floor: &str) -> Result<Report> {
+    let mut o = opts(root, "0.19.894", OldDaemon::Absent);
+    o.oldest_installed = true;
+    o.supports_installed = v(floor);
+    let mut report = Report::default();
+    direction_a(&o, v("0.19.893"), &mut Probe::default(), &mut report)?;
+    Ok(report)
+}
+
+#[test]
+fn oldest_installed_uses_the_exact_or_oldest_newer_tag_not_the_latest() {
+    let repo = checkout("0.19.893", &["v0.19.890", "v0.19.892", "v0.19.893"]);
+    for (floor, chosen) in [("0.19.890", "v0.19.890"), ("0.19.891", "v0.19.892")] {
+        let report = oldest_installed_report(repo.path(), floor).unwrap();
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.starts_with(&format!("A ({chosen} installed files vs new daemon): "))),
+            "{:?}",
+            report.notes
+        );
+        assert!(!report.notes.iter().any(|n| n.contains("declared break")));
+    }
+}
+
+#[test]
+fn oldest_installed_prospective_floor_runs_both_directions_without_a_release() {
+    let repo = checkout("0.19.893", &["v0.19.891"]);
+    let mut o = opts(repo.path(), "0.19.894", OldDaemon::Absent);
+    o.oldest_installed = true;
+    o.supports_installed = v("0.19.894");
+    let report = run(&o).unwrap();
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("A (prospective current installed files vs new daemon): ")),
+        "{:?}",
+        report.notes
+    );
+    assert!(report
+        .notes
+        .iter()
+        .any(|n| n.contains("does not prove compatibility with an absent release")));
+    assert!(report
+        .notes
+        .iter()
+        .any(|n| n.starts_with("B (new installed files vs daemon 0.19.894): ")));
+
+    // The stand-in still exercises the current tree's invoked-file contract.
+    o.invoked_files.push(".loom/scripts/missing.sh".into());
+    let report = run(&o).unwrap();
+    assert!(report
+        .violations
+        .iter()
+        .any(|n| n.contains("A (prospective") && n.contains("missing.sh")));
+}
+
+#[test]
+fn oldest_installed_rejects_missing_reached_floors_and_excludes_future_tags() {
+    let repo = checkout("0.19.893", &["v0.19.890", "v0.19.895"]);
+    // Future tags cannot satisfy a floor for this checkout. Nor may an
+    // already-reached or beyond-next-patch floor masquerade as prospective.
+    for floor in ["0.19.892", "0.19.893", "0.19.895"] {
+        let err = oldest_installed_report(repo.path(), floor)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no eligible installed release tag"), "{err}");
+        assert!(err.contains("fetch the release tags"), "{err}");
+    }
+    let report = oldest_installed_report(repo.path(), "0.19.894").unwrap();
+    assert!(report.notes.iter().any(|n| n.contains("prospective")));
+    assert!(!report.notes.iter().any(|n| n.starts_with("A (v0.19.895")));
+}
+
+#[test]
+fn oldest_installed_does_not_replace_a_selected_tree_missing_required_files() {
+    let repo = checkout("0.19.893", &["v0.19.891"]);
+    // Present in current defaults, absent from the selected release tree.
+    std::fs::write(repo.path().join("defaults/docs/new.md"), "new").unwrap();
+    let mut o = opts(repo.path(), "0.19.894", OldDaemon::Absent);
+    o.oldest_installed = true;
+    o.supports_installed = v("0.19.891");
+    o.invoked_files = vec![".loom/docs/new.md".into()];
+    let report = run(&o).unwrap();
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    assert!(report.violations[0].contains("A (v0.19.891"));
+    assert!(report.violations[0].contains("new.md"));
+}
+
+#[test]
+fn oldest_installed_selected_tree_missing_or_broken_probes_fail_without_fallback() {
+    for sub in ["gone", "killed"] {
+        let repo = checkout("0.19.893", &[]);
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("defaults/scripts")).unwrap();
+        std::fs::write(root.join("defaults/scripts/call.sh"), format!("loom-daemon {sub}\n"))
+            .unwrap();
+        git(root, &["add", "defaults/scripts/call.sh"]);
+        git(root, &["commit", "-qm", "old installed caller"]);
+        git(root, &["tag", "v0.19.891"]);
+        // Current files no longer need it; selecting them would hide the bug.
+        std::fs::remove_file(root.join("defaults/scripts/call.sh")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../scripts/check-daemon-subcommand-versions.sh"),
+            root.join(DETECTOR_PATH),
+        )
+        .unwrap();
+        let mut o = opts(root, "0.19.894", OldDaemon::Absent);
+        o.oldest_installed = true;
+        o.supports_installed = v("0.19.891");
+        o.new_daemon = probe_daemon(root);
+        let report = run(&o).unwrap();
+        assert!(!report.violations.is_empty(), "{sub}: {:?}", report.notes);
+        assert!(report.violations.iter().any(|n| n.contains("A (v0.19.891")));
+        assert!(!report.notes.iter().any(|n| n.contains("prospective")));
+    }
+}
+
+#[test]
+fn oldest_installed_git_lookup_failure_is_not_a_prospective_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = oldest_installed_report(dir.path(), "0.19.894")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("git tag -l failed"), "{err}");
+}
 
 /// A fake daemon whose answer to `<sub> --help` depends on `<sub>`.
 fn probe_daemon(dir: &Path) -> PathBuf {

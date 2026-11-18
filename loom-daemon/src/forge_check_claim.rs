@@ -280,6 +280,18 @@ impl OwnedClaim {
         Some(owned)
     }
 
+    /// The claim of an ATTENDED Builder that has just written its own claim
+    /// label (`--attended-claim`, #14376). Same admission as a dispatcher's
+    /// marker for the label leg, but it recognises NO lease: the caller has not
+    /// published one yet (and its own `LOOM_SWEEP_ID` lease is already filtered
+    /// out of the reading), so any fresh lease, same host or not, belongs to a
+    /// peer and blocks before a worktree is allocated. The label carries no
+    /// owner, so this only stops the caller's own label from refusing it:
+    /// ownership is then established by `lease ensure --require-ownership`.
+    pub(crate) fn attended(issue: u32, _raw_host: String) -> Option<Self> {
+        Self::from_marker(Some(&issue.to_string()), issue, None)
+    }
+
     /// Is a fresh lease published from `host` this invoker's host's own?
     fn holds_lease_from(&self, host: &str) -> bool {
         self.lease_host.as_deref() == Some(host)
@@ -883,6 +895,17 @@ pub(crate) fn read_freshest_live_lease(
     now: DateTime<Utc>,
     ttl_minutes: f64,
 ) -> LeaseLeg {
+    read_freshest_live_lease_for(gh_bin, root, issue, now, ttl_minutes, true)
+}
+
+fn read_freshest_live_lease_for(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    now: DateTime<Utc>,
+    ttl_minutes: f64,
+    allow_own_sweep: bool,
+) -> LeaseLeg {
     // #10089: counted via the facade (`claim.lease_comments`); it applies the
     // #5401 GH_CONFIG_DIR and the #8263 `LOOM_REPO` -> GH_REPO env contract.
     let jq = issue_lease_comments_jq();
@@ -909,7 +932,7 @@ pub(crate) fn read_freshest_live_lease(
     let rows = parse_lease_rows(&String::from_utf8_lossy(&policy.trusted_ndjson(&out.stdout)));
     let own_sweep = std::env::var("LOOM_SWEEP_ID")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| allow_own_sweep && !s.is_empty());
     match freshest_live_lease(&rows, now, ttl_minutes, own_sweep.as_deref()) {
         Some((host, sweep_id)) => LeaseLeg::Held { host, sweep_id },
         None => LeaseLeg::NoneFresh,
@@ -953,7 +976,7 @@ pub(crate) fn remote_branch_leg(git_bin: &Path, root: &Path, issue: u32) -> Bran
 /// the repository (a managed worktree included) and it answers about that
 /// repository. `LOOM_REPO` is honored per leg exactly as each leg's
 /// precedent reader honors it.
-pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
+pub fn handle(issue: u32, force_claim: bool, attended_claim: bool) -> Result<()> {
     let root: PathBuf = std::env::current_dir().context(
         "loom-daemon forge check-claim: could not resolve the current directory; \
          run it from inside the repository whose issue you are about to claim",
@@ -976,7 +999,15 @@ pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
     // when every earlier leg is Clear (or, under --force-claim, when its
     // blocker/unreadable answer cannot change the verdict anyway — the walk
     // keeps collecting so the stderr warning names everything overridden).
-    let owned = OwnedClaim::from_env(issue);
+    let dispatched = OwnedClaim::from_env(issue);
+    // An inherited sweep string is not ownership proof for an attended
+    // Builder. Preserve the dispatcher and generic reader contracts.
+    let allow_own_sweep = !attended_claim || dispatched.is_some();
+    let owned = dispatched.or_else(|| {
+        attended_claim
+            .then(|| OwnedClaim::attended(issue, crate::host_identity::lease_host_identity()))
+            .flatten()
+    });
     let owned = owned.as_ref();
     let open_pr = probe_open_linked_pr(&root, issue);
     let mut evidence = ClaimEvidence {
@@ -995,8 +1026,14 @@ pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
         let labels_clear = matches!(evidence.labels, Some(LabelLeg::Clean))
             || owned_passes_labels(owned, evidence.labels.as_ref());
         if labels_clear || force_claim {
-            evidence.lease =
-                Some(read_freshest_live_lease(&gh_bin, &root, issue, now, ttl_minutes));
+            evidence.lease = Some(read_freshest_live_lease_for(
+                &gh_bin,
+                &root,
+                issue,
+                now,
+                ttl_minutes,
+                allow_own_sweep,
+            ));
             let lease_clear = matches!(evidence.lease, Some(LeaseLeg::NoneFresh))
                 || owned_passes_lease(owned, evidence.lease.as_ref());
             if lease_clear || force_claim {
@@ -1322,6 +1359,50 @@ mod tests {
             );
             assert!(v.stderr.contains("safe to claim"), "{}", v.stderr);
         }
+    }
+
+    // --- An attended claim (--attended-claim, #14376) --------------------------
+
+    /// The attended flag passes the caller's own label but never a fresh lease
+    /// (same host or another), and never buys past an open PR.
+    #[test]
+    fn attended_claim_passes_own_label_but_not_any_lease() {
+        let me = OwnedClaim::attended(42, "raw-host-a".to_string()).expect("known host");
+        let label = || {
+            evidence(
+                OpenPrProbe::NoneOpen,
+                Some(LabelLeg::Claimed(vec!["loom:building".to_string()])),
+                Some(LeaseLeg::NoneFresh),
+                Some(BranchLeg::Absent),
+            )
+        };
+        let v = decide_for(42, &label(), false, Some(&me));
+        assert_eq!(v.code, EX_SAFE_TO_CLAIM, "{}", v.stderr);
+
+        let mut peer = label();
+        peer.lease = Some(held("host-peer"));
+        let v = decide_for(42, &peer, false, Some(&me));
+        assert_eq!(v.code, 0);
+        assert_eq!(v.stdout, "LEASE_ALREADY_HELD host-peer sweep-x");
+
+        // A same-host sibling's lease blocks too: nothing identifies it as ours.
+        let mut sibling = label();
+        sibling.lease = Some(held("raw-host-a"));
+        let v = decide_for(42, &sibling, false, Some(&me));
+        assert_eq!(v.code, 0);
+        assert!(v.stdout.starts_with("LEASE_ALREADY_HELD"), "{}", v.stdout);
+
+        let mut pr = label();
+        pr.open_pr = OpenPrProbe::Open(7);
+        assert_eq!(decide_for(42, &pr, false, Some(&me)).code, 0);
+    }
+
+    /// An unresolvable host yields an attended claim that recognises no lease.
+    #[test]
+    fn attended_claim_with_an_unknown_host_recognises_no_lease() {
+        let me = OwnedClaim::attended(42, crate::host_identity::UNKNOWN_HOST.to_string())
+            .expect("owned");
+        assert_eq!(me.lease_host, None);
     }
 
     // --- An owned claim (LOOM_SWEEP_CLAIM_OWNED) ------------------------------

@@ -23,7 +23,7 @@ When working on issues, you should **create worktrees on-demand** to isolate you
 
 ### IMPORTANT: Use the Worktree Helper Script
 
-**Always use `./.loom/scripts/worktree.sh <issue-number>` to create worktrees.** This helper script ensures:
+**Always use `LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh <issue-number>` to create worktrees.** On any refusal, stop this attempt; never retry without the marker or add `--force-claim` to bypass ownership. This helper script ensures:
 - Correct path (`.loom/worktrees/issue-{number}`)
 - Prevents nested worktrees
 - Consistent branch naming
@@ -31,7 +31,7 @@ When working on issues, you should **create worktrees on-demand** to isolate you
 
 ```bash
 # CORRECT - Use the helper script
-./.loom/scripts/worktree.sh 84
+LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh 84 || exit 1
 
 # WRONG - Don't use git worktree directly
 git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
@@ -52,7 +52,7 @@ git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
 
 # 2. Create worktree using helper
-./.loom/scripts/worktree.sh 84
+LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh 84 || exit 1
 # -> Creates: .loom/worktrees/issue-84
 # -> Branch: feature/issue-84
 
@@ -126,12 +126,12 @@ The worktree helper script prevents common errors:
 
 ```bash
 # If you're already in a worktree
-./.loom/scripts/worktree.sh 84
+LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh 84 || exit 1
 # -> ERROR: You are already in a worktree!
 # -> Instructions to return to main before creating new worktree
 
 # If directory already exists
-./.loom/scripts/worktree.sh 84
+LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh 84 || exit 1
 # -> Checks if it's a valid worktree or needs cleanup
 ```
 
@@ -191,7 +191,7 @@ cd /path/to/main/repo                         # 2. back to the main repository
 git worktree remove .loom/worktrees/issue-XX --force   # 3. remove the stale worktree
 git branch -D feature/issue-XX                # 4. delete the old branch
 git fetch origin main                         # 5. fetch latest main
-./.loom/scripts/worktree.sh XX                # 6. fresh worktree from updated main
+LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh XX || exit 1 # 6. fresh worktree from updated main
 cd .loom/worktrees/issue-XX                   # 7. re-apply: cherry-pick, patch, or reimplement
 ```
 
@@ -343,7 +343,10 @@ while true; do
       gh issue edit "$ISSUE_NUMBER" --remove-label "loom:issue" --add-label "loom:building"
 
       # Create worktree and do work
-      ./.loom/scripts/worktree.sh "$ISSUE_NUMBER"
+      if ! LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh "$ISSUE_NUMBER"; then
+        loom-claim release "$ISSUE_NUMBER" "$AGENT_ID"
+        continue
+      fi
       cd ".loom/worktrees/issue-$ISSUE_NUMBER"
 
       # ... implement feature ...

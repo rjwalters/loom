@@ -930,6 +930,9 @@ Usage:
   pnpm worktree <issue-number> --base <branch>          Branch off <branch> (stacked PR, #3729)
   pnpm worktree <issue-number> --sparse <paths...>      Cone-mode sparse checkout
   pnpm worktree <issue-number> --full                   Convert sparse worktree to full
+  pnpm worktree <issue-number> --force-claim            Send "forge check-claim --force-claim" on a fresh
+                                                        branch (never implied; #14376). A fresh Builder
+                                                        claim is refused (exit 1) when a peer holds the lease.
   pnpm worktree remove <N> [--keep-branch] [--force] [--dry-run]
                                                         Remove one managed worktree
                                                         (--dry-run: report the plan only)
@@ -1275,6 +1278,11 @@ while [[ $# -gt 0 ]]; do
         # Proceed even though another session's live issue claim-lock is
         # found below (#8553) — see the check itself for what it guards.
         --force) FORCE_CLAIM_LOCK=true; shift ;;
+        # Explicitly authorize a fresh-branch create past the forge claim
+        # probe's label/lease/branch legs (#14376). Never implied: a plain
+        # `worktree.sh N` no longer passes `--force-claim` on the caller's
+        # behalf. OPEN_PR/CLOSED/FROZEN/OPERATOR/TARGET_IS_PR still refuse.
+        --force-claim) FORCE_CLAIM_BYPASS=true; shift ;;
         --*)
             print_error "Unknown flag: $1"
             echo ""
@@ -1558,6 +1566,41 @@ WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 # renewer must not inherit it and hold a `worktree.sh N | tail` pipe open.
 _wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" > /dev/null 3>&- || true; }
 
+# --- Builder admission: require NATIVE ownership (#14376) --------------------
+# A label write carries no owner, so a fresh Builder checkout is handed over only
+# on POSITIVE ownership: `lease ensure --require-ownership` must print `OWNED`.
+# `PEER_OWNED` (exit 4) is a definitive refusal; `INDETERMINATE`, an unreadable
+# answer or any failure is NOT ownership and is refused too (return 5).
+# A missing/below-floor daemon is a separate actionable refusal (return 6).
+# The generic standalone
+# `lease ensure` (no flag) and Doctor reuse keep their fail-open contract:
+# they never reach this function. Returns 0 only when owned.
+_wt_lease_claim_owned() {
+    [[ -n "$_WT_DAEMON_BIN" ]] || return 6
+    # Run the shared preflight in a subshell: its exit must not bypass the
+    # caller's discard of the fresh checkout or its machine-readable refusal.
+    (loom_daemon_version_preflight lease "$_WT_DAEMON_BIN") || return 6
+    local _rc=0 _tok=""
+    # requires-daemon: lease >= 0.19.1314   #14376 strict ownership first ships in the next patch; generic standalone/Doctor lease calls still fail open
+    _tok=$("$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" 3>&-) || _rc=$?
+    [[ "$_rc" -ne 4 ]] || return 4
+    [[ "$_rc" -eq 0 && "$_tok" == "OWNED" ]] || return 5
+    return 0
+}
+
+# The checkout this invocation JUST created for a refused Builder claim: it is at
+# BASE_REF with no commits and no `.loom-managed` sentinel, so removing it (and
+# its fresh branch) leaves the peer's state untouched. If git cannot remove it,
+# mark it so cleanup can tell it is unclaimed.
+_wt_discard_unclaimed() {
+    local _path="$1" _branch="$2"
+    if git worktree remove --force "$_path" >/dev/null 2>&1; then
+        git branch -D "$_branch" >/dev/null 2>&1 || true
+    else
+        echo "unclaimed: issue #$ISSUE_NUMBER is held by a peer lease; safe to remove" > "$_path/.loom-unclaimed" 2>/dev/null || true
+    fi
+}
+
 # --- Issue claim-lock cross-check (#8553) ------------------------------------
 # Reads (never acquires) the daemon's per-issue sweep-claim lock before every
 # create/reuse path below. Only exit 1 refuses; any other nonzero (e.g. a daemon
@@ -1568,6 +1611,15 @@ _wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure
 
 # Check if worktree already exists
 if [[ -d "$WORKTREE_PATH" ]]; then
+    # A competing fresh creator can have materialized the directory without
+    # establishing ownership yet. Never back-fill its sentinel or hand that
+    # partial/refused checkout to a Builder through the existing-dir arm.
+    if [[ "${LOOM_BUILDER_CLAIM:-}" == "1" || "${LOOM_SWEEP_CLAIM_OWNED:-}" == "$ISSUE_NUMBER" ]]; then
+        if [[ ! -f "$WORKTREE_PATH/.loom-managed" || -e "$WORKTREE_PATH/.loom-unclaimed" ]]; then
+            print_error "Builder worktree ownership is not ready; refusing reuse of $WORKTREE_PATH"
+            exit 1
+        fi
+    fi
     # If caller passed --sparse / --full, apply the mode to the existing
     # worktree and exit. This is the idempotent path: same cone is a no-op,
     # different cone replaces the cone, --full disables sparse-checkout. The
@@ -1600,7 +1652,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     # 2) all fail OPEN, as #8553's check-issue call above does. The `.git`
     # probe keeps `git status` from walking up into the parent checkout.
     # shellcheck disable=SC2086  # $_ljson is intentionally unquoted: omits the flag when empty
-    # requires-daemon: lease optional   kicad-tools#5783 fails open on a daemon predating `lease co-occupancy`
+    # kicad-tools#5783: this reuse probe still fails open on an older daemon;
+    # the hard lease floor above applies to fresh Builder admission.
     [[ -z "${_WT_DAEMON_BIN:-}" || ! -e "$WORKTREE_PATH/.git" || -z "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]] || { _ljson=""; _lrc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ljson="--json"; "$_WT_DAEMON_BIN" lease co-occupancy "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ljson >&3 || _lrc=$?; [[ "$_lrc" -eq 1 ]] && exit 1; }
     _worktree_existing || exit 1
     # #9111: under --json the port is --quiet, so the success document for the
@@ -1610,6 +1663,10 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     [[ "$JSON_OUTPUT" != "true" ]] || echo '{"success": true, "worktreePath": "'"$(cd "$WORKTREE_PATH" && pwd)"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
     _wt_lease_claim; exit 0
 fi
+
+# Set only on the fresh-branch Builder-claim arm below (#14376): origin/local branch
+# reuse (a Doctor continuing a PR) and standalone operations keep the fail-open lease.
+_WT_FRESH_BUILDER_CLAIM=false
 
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
@@ -1659,16 +1716,38 @@ else
         # (#9828) -- so OPEN_PR there is expected, and the reuse resolver already
         # refuses to shadow a real PR. Here we would branch fresh off BASE_REF, so
         # an open linked PR (e.g. on another branch name) means a duplicate build.
-        # --force-claim: the caller has already claimed (builder.md), so its own
-        # `loom:building`/lease are expected; OPEN_PR, TARGET_IS_PR (#9929, the
-        # number is a PR), CLOSED (#11863, nothing left to build) and FROZEN
-        # (#11743, `loom:frozen`) are the legs it never overrides. Only exit 0
+        # The caller has already written its claim label (builder.md), so that label
+        # is expected -- but it carries no owner (#14376), so `--force-claim` is no
+        # longer passed on the caller's behalf (it also skipped the lease leg, i.e.
+        # a peer's fresh lease). A dispatcher-owned claim (LOOM_SWEEP_CLAIM_OWNED
+        # names this issue) is admitted by the daemon itself; an attended Builder
+        # passes `--attended-claim` (the label is expected, but any fresh lease
+        # is a blocker without dispatcher ownership). `--force-claim` is only
+        # sent when the caller asked for it explicitly. OPEN_PR, TARGET_IS_PR
+        # (#9929, the number is a PR), CLOSED (#11863, nothing left to build),
+        # FROZEN (#11743) and OPERATOR are never overridden. Only exit 0
         # (blocked; reason token to >&3, explanation to stderr) refuses; a read failure, an old daemon, or any other code fails
         # OPEN, like the #8553/#5783 guards. A refused caller adopts the existing
-        # PR (create-pr.sh) or stands down -- never a suffix branch.
+        # PR (create-pr.sh) or stands down -- never a suffix branch. Ownership
+        # itself is arbitrated after creation by `lease ensure --require-ownership`
+        # (`_wt_lease_claim_owned`), which closes the window after this probe.
+        _wt_claim_flags=()
+        if [[ "${FORCE_CLAIM_BYPASS:-}" == "true" ]]; then
+            _wt_claim_flags=(--force-claim)
+        elif [[ "${LOOM_SWEEP_CLAIM_OWNED:-}" != "$ISSUE_NUMBER" ]]; then
+            _wt_claim_flags=(--attended-claim)
+        fi
+        # Strict native ownership (#14376) applies to a Builder claim only: a
+        # dispatcher-owned claim (LOOM_SWEEP_CLAIM_OWNED names this issue) or an
+        # attended Builder that opted in with LOOM_BUILDER_CLAIM=1 (builder.md).
+        # A standalone/operator `worktree.sh N` (no agent session, no daemon, a
+        # hermetic fixture) keeps the fail-open `_wt_lease_claim` contract.
+        if [[ "${LOOM_SWEEP_CLAIM_OWNED:-}" == "$ISSUE_NUMBER" || "${LOOM_BUILDER_CLAIM:-}" == "1" ]]; then
+            _WT_FRESH_BUILDER_CLAIM=true
+        fi
         # requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
         # shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
-        [[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" --force-claim >&3 && exit 1 || true
+        [[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" ${_wt_claim_flags[@]+"${_wt_claim_flags[@]}"} >&3 && exit 1 || true
         # Create new branch from the base ref (origin/$DEFAULT_BRANCH by default, or
         # the --base override for a stacked child — #3729).
         [[ "$JSON_OUTPUT" == "true" ]] || print_info "Creating new branch from $BASE_DISPLAY"
@@ -1792,8 +1871,38 @@ if _try_worktree_add; then
     # for other issues (issue #6014). release_worktree_lock clears
     # WORKTREE_LOCK_TOKEN itself, which makes the EXIT trap's later call a no-op.
     release_worktree_lock "$ISSUE_NUMBER" "$WORKTREE_LOCK_TOKEN"
-    # The worktree now exists, so every refusal gate is behind us (#10204).
-    _wt_lease_claim
+    # The worktree now exists, so every refusal gate is behind us (#10204) --
+    # except, for a fresh Builder claim, ownership itself (#14376): a peer may
+    # have published its lease after the probe above. Refuse BEFORE the sentinel,
+    # project hooks and the ready output, and discard the checkout we just made.
+    if [[ "$_WT_FRESH_BUILDER_CLAIM" == "true" ]]; then
+        _own_rc=0
+        _wt_lease_claim_owned || _own_rc=$?
+        if [[ "$_own_rc" -ne 0 ]]; then
+            _wt_discard_unclaimed "$WORKTREE_PATH" "$BRANCH_NAME"
+            _own_tok=PEER_OWNED
+            if [[ "$_own_rc" -eq 4 ]]; then
+                print_error "Issue #$ISSUE_NUMBER is owned by a peer (live lease held by another sweep); refusing to hand over a worktree. The peer's labels, lease and branch are untouched."
+            else
+                _own_tok=OWNERSHIP_UNVERIFIED
+                if [[ "$_own_rc" -eq 6 ]]; then
+                    _own_tok=DAEMON_INCOMPATIBLE
+                    print_error "Issue #$ISSUE_NUMBER: a missing or below-floor daemon cannot verify Builder ownership; refusing to hand over a worktree."
+                else
+                    print_error "Issue #$ISSUE_NUMBER: ownership could not be positively verified (lease ensure --require-ownership did not report OWNED); refusing to hand over a worktree."
+                fi
+                print_error "Builder admission requires loom-daemon >= $(_loom_daemon_declared_floor "${BASH_SOURCE[0]}" lease) with lease ensure --require-ownership. Roll this host with .loom/scripts/cli/loom-daemon-update.sh --fetch once that release is available, then retry; otherwise inspect the ownership error above."
+            fi
+            if [[ "$JSON_OUTPUT" == "true" ]]; then
+                echo '{"success": false, "error": "'"$_own_tok"'", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
+            else
+                echo "$_own_tok" >&3
+            fi
+            exit 1
+        fi
+    else
+        _wt_lease_claim
+    fi
 
     # Get absolute path to worktree
     ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)

@@ -62,7 +62,7 @@ Capture this **once, before wave 1 — never per-wave**. The baseline must refle
 
 ### Checkpoint-driven resume (#3373)
 
-Sweep persists a per-issue phase checkpoint after each successful lifecycle phase so that a killed-and-relaunched sweep can pick up where it left off. The checkpoint is the **only** state required to resume — worktree preservation is handled by `worktree.sh`'s idempotency (re-running for an existing worktree is a no-op).
+Sweep persists a per-issue phase checkpoint after each successful lifecycle phase so that a killed-and-relaunched sweep can pick up where it left off. The checkpoint is the **only** state required to resume — worktree preservation is handled by `worktree.sh`'s idempotency (re-running reuses a managed, claimed worktree; partial or unclaimed checkout setup is refused).
 
 - **Checkpoint file**: `.loom/sweep-checkpoint/issue-<N>.json` (gitignored).
 - **Schema**: `{phase: "<curator-done|builder-done|judge-rejected|judge-done|doctor-done|merge-done>", task_id, timestamp, pr_number?, attempt?, model?}`.
@@ -239,12 +239,12 @@ For each issue `N` in the wave, before any role skill is invoked:
    # Publishes the lease, then keeps it fresh for this session's lifetime.
    # `$RUN_ID` is Step 0a's stable run id — reuse that literal, never a fresh one.
    set +e
-   LEASE_IDENT="$(./.loom/scripts/sweep-lease-publish.sh publish "$N" --sweep-id "$RUN_ID")"
+   LEASE_IDENT="$(./.loom/scripts/sweep-lease-publish.sh publish "$N" --sweep-id "$RUN_ID" --require-ownership)"
    LEASE_RC=$?
    set -e
-   if [ "$LEASE_RC" -eq 4 ]; then
-     echo "WARNING: skipping #$N — a live peer host holds a fresh lease on it"
-   elif [ -n "$LEASE_IDENT" ]; then
+   if [ "$LEASE_RC" -ne 0 ] || [ -z "$LEASE_IDENT" ]; then
+     echo "WARNING: skipping #$N — lease ownership was refused or could not be verified"
+   else
      # Split with `read` (bash AND zsh); `set -- $LEASE_IDENT` never splits under zsh (#7876).
      read -r LEASE_HOST LEASE_SWEEP <<<"$LEASE_IDENT"
      ./.loom/scripts/sweep-lease-renew.sh start "$N" --watch-pid "$PPID" \
@@ -253,14 +253,14 @@ For each issue `N` in the wave, before any role skill is invoked:
    ```
 
    - **Exit `4` means another sweep (any host) holds a fresh lease** — a live peer owns this claim. **Skip `N`** exactly like the claim-CAS probe's blockers above (log a warning; it does NOT contribute to this wave). Do not publish over it or contest the label.
-   - **Every other outcome proceeds.** Exit `0` is "published, or this sweep already holds a fresh lease"; exit `2` is a best-effort write failure — proceed **without** a lease, as this skill behaved before #6320 (`loom:building` remains the authoritative claim; a lease only improves a reclaim decision's evidence). A `gh` read failure fails open and publishes anyway.
+   - **Only exit `0` with the published host/sweep pair proceeds.** Every other exit or missing pair skips `N` before Builder dispatch. Strict publication refuses an unreadable or unauthenticated prestate and a failed write; never retry without `--require-ownership`.
    - **End renewal when `N` completes or aborts** (#10229): `./.loom/scripts/sweep-lease-renew.sh release "$N" --host "$LEASE_HOST" --sweep-id "$LEASE_SWEEP"`, so a long-lived session does not leave `N`'s loop spending the REST pool (it also stops itself once `N` closes).
    - **Run the `start` line verbatim** (#7876): `--host`/`--sweep-id` (the two fields `publish` prints) pin renewal to *this* sweep's lease — without them it is "newest lease wins", so a peer's later comment stays fresh while this sweep's own expires; `--watch-pid "$PPID"` is explicit because the tool-call shell is reaped instantly (as in Step 0a, #4691); and `> /dev/null 2>&1` must stay — the disowned loop inherits any pipe (e.g. `| tail`) and blocks the calling tool call indefinitely.
    - **Publishing happens at pre-flight, before the Builder claims `loom:building`** — deliberately: the record's forge comment `id` then sorts **earlier** than a racing daemon dispatch's — exactly what the daemon's dispatch-time claim-then-verify-order check (#6287) reads to yield instead of co-occupying the worktree.
 
    The record is byte-compatible with the daemon's (`defaults/docs/lease-record.md`), so every reader consumes it: the reclamation gate (#6286) refuses to reclaim while it is fresh, dispatch-time ordering (#6287) yields to it, and this sweep's pre-push fence (`sweep-lease-fence.sh`, #6309) has a lease to fence against in-session too.
 
-> **Pre-flight skip rule.** If `K` of the wave's `N` candidates are skipped at pre-flight (closed, claim-CAS `0` (#9453), `loom:blocked`, `loom:operator`, `loom:frozen`, `loom:epic`, a fresh peer lease from Step 1b's exit `4` (#6320), or multi-PR ambiguity), dispatch only `N - K` builders for this wave. Issues routed to Judge or Merge via the existing-PR rules consume a wave slot but skip the Builder dispatch. **Do not pull a candidate forward** from the next wave to backfill. Wave boundaries stay clean, and the next wave runs at its originally planned size.
+> **Pre-flight skip rule.** If `K` of the wave's `N` candidates are skipped at pre-flight (closed, claim-CAS `0` (#9453), `loom:blocked`, `loom:operator`, `loom:frozen`, `loom:epic`, any refused or unverified Step 1b publication (including a fresh peer lease, #6320), or multi-PR ambiguity), dispatch only `N - K` builders for this wave. Issues routed to Judge or Merge via the existing-PR rules consume a wave slot but skip the Builder dispatch. **Do not pull a candidate forward** from the next wave to backfill. Wave boundaries stay clean, and the next wave runs at its originally planned size.
 
 > **This per-issue check is not the only re-verification point.** When a daemon/champion is active in the repo (roleRunner/champion-on-idle, or the legacy daemon), the wave *plan* itself can go stale between waves — see "8a. Wave-boundary candidate re-verification" below, which re-runs this same existing-PR probe and these same skip rules across the **whole remaining candidate list** once per wave boundary, complementing (not replacing) this per-issue check (#4884).
 
@@ -309,19 +309,20 @@ For issues without `builder-done`-or-later checkpoints, proceed with the normal 
 
 Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is core-scaled within `[3, 6]` (#3289-safe floor 3, ceiling 6, #3693) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). **Do NOT invoke `/loom:sweep` as a subagent here** — see the "One level deep" rule in Execution Model above.
 
-**Tell each Builder the claim is the sweep's (#11863).** Every brief starts `/loom:builder N` and includes, verbatim: `This /loom:sweep pre-flighted #N and holds its claim and lease.` Otherwise its gate reads this sweep's Step 1b lease as `LEASE_ALREADY_HELD` and refuses (a Task cannot get `LOOM_SWEEP_CLAIM_OWNED`, #3719; `worker run --role builder` sets it).
+**Tell each Builder the claim is the sweep's (#11863).** Every brief starts `/loom:builder N` and includes, verbatim: `This /loom:sweep pre-flighted #N and holds its claim and lease.` Include the exact successful preflight `RUN_ID` in the brief and have the Builder assign that literal to its local `RUN_ID`. A Task cannot inherit a per-issue process environment (#3719), so its helper invocation sets `LOOM_SWEEP_CLAIM_OWNED=N` and `LOOM_SWEEP_RUN_ID=<that RUN_ID>` on that command only. Never invent this proof after refused preflight. `worker run --role builder` sets the issue marker itself but must receive that same `LOOM_SWEEP_RUN_ID`.
 
 Each builder is responsible for:
 
 - Claiming its issue (`loom:issue` → `loom:building`).
-- Creating an issue worktree via `./.loom/scripts/worktree.sh N` (idempotent — re-entering after a kill reuses the existing worktree and branch).
+- Creating an issue worktree via `LOOM_SWEEP_CLAIM_OWNED=N LOOM_SWEEP_RUN_ID="$RUN_ID" LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh N` (idempotent — re-entering after a kill reuses a managed, claimed worktree and branch).
+  A nonzero result ends this Builder attempt before entering the checkout. Do not retry without `LOOM_BUILDER_CLAIM=1` or add `--force-claim`; this also applies to the stacked `--base` path below.
 - Implementing the change, running tests, committing.
 - Filing a follow-up issue for any out-of-scope discovery via `./.loom/scripts/create-issue.sh` (per `builder-complexity.md`) — **never** a bare `gh issue create` (#5047). This is a single filing call, not the concurrent issue-creation-burst hazard the #3707 rule above guards against, so it is expected behavior inside a parallel wave.
 - Pushing the branch and opening a PR labeled `loom:review-requested`.
 - Closing references: `Closes #N` in the PR body.
 
 **Stacked-dependency gated path (`--depends-on`, #3729 v1; per-issue map generalization, `--auto-stack`, #3759).** This gate fires **only** when a parent is set for the issue being built — look it up in the per-issue map `DEPENDS_ON[N]` (one entry per detected `--auto-stack` child; a single-issue `--depends-on <parent>` is one entry). When `DEPENDS_ON[N]` is unset for issue `N`, the two steps below are byte-for-byte the default behavior. When `DEPENDS_ON[N]=<parent>` is set, the builder for issue `N` must:
-  - Create its worktree branched off the parent's branch: `./.loom/scripts/worktree.sh N --base feature/issue-<parent>` (instead of the bare `./.loom/scripts/worktree.sh N`). `worktree.sh` resolves `feature/issue-<parent>` from `origin/feature/issue-<parent>` (or a local branch), so the parent sweep must have created/pushed its branch first; if the base cannot be resolved, `worktree.sh` hard-fails rather than silently branching off the default branch.
+  - Create its worktree branched off the parent's branch: `LOOM_SWEEP_CLAIM_OWNED=N LOOM_SWEEP_RUN_ID="$RUN_ID" LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh N --base feature/issue-<parent>` (instead of the bare `LOOM_SWEEP_CLAIM_OWNED=N LOOM_SWEEP_RUN_ID="$RUN_ID" LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh N`). `worktree.sh` resolves `feature/issue-<parent>` from `origin/feature/issue-<parent>` (or a local branch), so the parent sweep must have created/pushed its branch first; if the base cannot be resolved, `worktree.sh` hard-fails rather than silently branching off the default branch.
   - Open its PR against the parent branch: `gh pr create --base feature/issue-<parent> --label "loom:review-requested" --body "Closes #N ..."` (instead of the default base). The PR stays stacked on the parent until reconciliation, which now fires automatically when the parent merges (see "Stacked dependency (auto-reconciliation on parent merge)").
   The **only** thing `--auto-stack` changes here is how `DEPENDS_ON[N]` is *sourced* — the `worktree.sh --base` / `gh pr create --base` mechanics are untouched. Two sources feed the map: (a) an explicit single-issue `--depends-on <parent>` (unchanged, typically a daemon `dispatch_sweep` forwarding `depends_on` as `--depends-on`), and (b) an auto-stack-detected same-candidate-set edge (see "Auto-stack detection and wave ordering"). Absent both, the wave lifecycle does not auto-create stacks.
   **Same-wave parent/child.** When the topological ordering placed a parent and its child in the **same** wave, the child's Builder branches off `feature/issue-<parent>` even though the parent's Builder is running concurrently in that wave — `worktree.sh --base` resolves the parent branch as soon as the parent Builder has pushed it. The child does **not** branch off the shared pre-wave `main` snapshot its unstacked wave-mates use.
@@ -428,7 +429,7 @@ If the builder failed (no PR opened), do NOT write a checkpoint — leave the ch
 
 **Per-builder failure isolation.** If builder for issue `#A` fails to open a PR (build error, test failure, unrecoverable conflict, etc.), log it and **continue** with the other builders' PRs in this wave. The failed issue is recorded as `blocked (builder failed)` in the summary. Do NOT abort the wave. Do NOT skip Judge for the other PRs.
 
-**Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.
+**Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `LOOM_SWEEP_CLAIM_OWNED=N LOOM_SWEEP_RUN_ID="$RUN_ID" LOOM_BUILDER_CLAIM=1 ./.loom/scripts/worktree.sh N` reuses `.loom/worktrees/issue-N` only when it is managed and not marked unclaimed. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.
 
 **Task-liveness check before Builder re-dispatch (#5897).** The "Mid-builder kill semantics" above is written for the case where sweep's own process died — but "sweep was killed" is not the only way an orchestrator ends up back at `CHECKPOINT_PHASE == "curator-done"` staring at a partial diff. On a **session-roll resume path** — a session-limit kill resumed via `/login` + re-invocation, or a `/clear` + re-invoke — the **orchestrator's own process survives**, and a Builder Task dispatched before the roll can survive with it: dispatched `Task`-tool subagents are not children of the terminal session in the way a killed CLI process's child processes are, so the roll does not necessarily take the in-flight Builder down with it. The incident this rule is drawn from: a `/loom:sweep all` run hit a session limit and was resumed via `/login`; at resume the orchestrator inspected the issue's worktree (uncommitted partial diff, no branch pushed, no PR) and concluded the Builder had died mid-edit — but the original Builder Task was still running, and completed ~40 minutes later (its completion notification arrived in the resumed context), by which point a duplicate Builder had already been dispatched into the same worktree. For a window, two Builders were live against one worktree — a genuine race, not just wasted work, because either could have committed/pushed over the other's in-flight state.
 

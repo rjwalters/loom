@@ -71,9 +71,10 @@
 # NOT an assertion that a declared version is FACTUALLY the first release
 # carrying the subcommand. Nothing in a bare checkout can establish that. What
 # is checked is that the declaration exists, is well formed, names a subcommand
-# the file actually invokes, and does not name a version this repo has not
-# reached yet (a floor above VERSION is a typo or a copy-paste, and would make
-# every host refuse forever).
+# the file actually invokes, and names at most VERSION + one patch. The next
+# patch is allowed for a daemon and installed-script dependency landing in the
+# same PR (defaults/docs/release-cadence.md, Compatibility contract); release
+# automation owns the VERSION bump. Anything beyond that is still rejected.
 #
 # ---------------------------------------------------------------------------
 # DETECTION, and its deliberate limits
@@ -312,6 +313,10 @@ version_gt() {
 
 REPO_VERSION=""
 [[ -f "$REPO_ROOT/VERSION" ]] && REPO_VERSION="$(tr -d '[:space:]' <"$REPO_ROOT/VERSION")"
+MAX_FLOOR="$REPO_VERSION"
+if [[ "$REPO_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    MAX_FLOOR="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((10#${BASH_REMATCH[3]} + 1))"
+fi
 
 # ---------------------------------------------------------------------------
 # Modes
@@ -489,7 +494,18 @@ FIXTURE
     _expect "stale marker (subcommand not invoked) fails" "1" "$rc"
 
     out="$(bash "${BASH_SOURCE[0]}" --baseline "$empty_baseline" "$tmp/future.sh" 2>&1)"; rc=$?
-    _expect "floor above this repo's VERSION fails" "1" "$rc"
+    _expect "floor beyond this repo's next patch fails" "1" "$rc"
+
+    sed "s/999.0.0/$REPO_VERSION/" "$tmp/future.sh" >"$tmp/current.sh"
+    out="$(bash "${BASH_SOURCE[0]}" --baseline "$empty_baseline" "$tmp/current.sh" 2>&1)"; rc=$?
+    _expect "current released floor passes" "0" "$rc"
+    sed "s/999.0.0/$MAX_FLOOR/" "$tmp/future.sh" >"$tmp/next.sh"
+    out="$(bash "${BASH_SOURCE[0]}" --baseline "$empty_baseline" "$tmp/next.sh" 2>&1)"; rc=$?
+    _expect "next-patch same-PR floor passes" "0" "$rc"
+    beyond="${MAX_FLOOR%.*}.$((${MAX_FLOOR##*.} + 1))"
+    sed "s/999.0.0/$beyond/" "$tmp/future.sh" >"$tmp/beyond.sh"
+    out="$(bash "${BASH_SOURCE[0]}" --baseline "$empty_baseline" "$tmp/beyond.sh" 2>&1)"; rc=$?
+    _expect "one patch beyond the permitted floor fails" "1" "$rc"
 
     out="$(bash "${BASH_SOURCE[0]}" --baseline "$tmp/does-not-exist.txt" --require-baseline "$tmp/declared.sh" 2>&1)"; rc=$?
     _expect "--require-baseline fails on a missing ledger" "1" "$rc"
@@ -573,11 +589,11 @@ while IFS= read -r file; do
         req="$(decl_lookup "$DECL" "$sub" || true)"
         if [[ -n "$req" ]]; then
             DECL_SEEN="$DECL_SEEN$sub"$'\n'
-            if [[ "$req" != "optional" && -n "$REPO_VERSION" ]] && version_gt "$req" "$REPO_VERSION"; then
+            if [[ "$req" != "optional" && -n "$MAX_FLOOR" ]] && version_gt "$req" "$MAX_FLOOR"; then
                 echo "FLOOR ABOVE VERSION  $file:$line  $sub >= $req" >&2
-                echo "    This repo's VERSION is $REPO_VERSION, so no released loom-daemon can satisfy" >&2
-                echo "    that floor and every host would refuse forever. Declare the version the" >&2
-                echo "    subcommand actually landed in." >&2
+                echo "    This repo's VERSION is $REPO_VERSION; the compatibility contract permits" >&2
+                echo "    at most its next patch ($MAX_FLOOR) for a dependency landing in this PR." >&2
+                echo "    Declare the release carrying the dependency, or that next-patch floor." >&2
                 VIOLATIONS=$((VIOLATIONS + 1))
             fi
             continue

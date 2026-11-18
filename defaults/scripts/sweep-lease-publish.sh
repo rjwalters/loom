@@ -98,11 +98,13 @@
 # lease, exactly as it did before this script existed. This mirrors
 # `write_lease_comment`'s fail-open contract (#6179) -- the `loom:building`
 # label remains the authoritative claim; a lease only improves the evidence.
+# Fresh Builder admission opts into --require-ownership: an unreadable or
+# unauthenticated prestate refuses publication (exit 2), never claims success.
 #
 # ## Commands
 #
 #   sweep-lease-publish.sh publish <issue> [--host HOST] [--sweep-id ID]
-#                                          [--ttl-minutes N]
+#                                          [--ttl-minutes N] [--require-ownership]
 #     Publish a lease record for <issue>. --host defaults to the PUBLISHED
 #     form of this host's own identity (Issue #6322): the opaque id
 #     (`opaque_host_id`, mirroring `sweep_registry::opaque_host_id` byte for
@@ -125,7 +127,8 @@
 #       0  Published, or a live lease for this host+sweep-id already exists.
 #          Proceed.
 #       1  Usage error (bad issue number, unknown flag, bad --ttl-minutes).
-#       2  The publish `gh` call failed. Proceed WITHOUT a lease (best-effort).
+#       2  Publication failed, or strict ownership prestate was unreadable.
+#          Strict Builder admission stops; ordinary callers remain best-effort.
 #       4  A different host holds a fresh lease, or this identity yielded.
 #          Nothing published. Skip this claim; a yielded ID needs a new run.
 #
@@ -328,7 +331,7 @@ cmd_publish() {
         exit 1
     }
 
-    local host="" sweep_id="" ttl_minutes="$DEFAULT_TTL_MINUTES"
+    local host="" sweep_id="" ttl_minutes="$DEFAULT_TTL_MINUTES" require_ownership=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --host)
@@ -342,6 +345,10 @@ cmd_publish() {
             --ttl-minutes)
                 ttl_minutes="${2:-}"
                 shift 2
+                ;;
+            --require-ownership)
+                require_ownership=1
+                shift
                 ;;
             *)
                 echo "ERROR: publish: unknown flag '$1'" >&2
@@ -382,14 +389,22 @@ cmd_publish() {
         --paginate --jq \
         ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}" \
         2>&1)"; then
-        echo "WARN: could not read existing lease comments for issue #${issue} (${comments_ndjson}) -- publishing anyway (absence of evidence is not evidence of a peer)" >&2
+        echo "WARN: could not read existing lease comments for issue #${issue} (${comments_ndjson})" >&2
         read_ok=0
         comments_ndjson=""
     fi
     # #9548: only a TRUSTED author's lease/yield marker is a peer or a record.
     # requires-daemon: forge optional   Without the `trusted-comments` verb the markers are unverifiable: treated like an unreadable listing (publish anyway), the existing direction.
     ((read_ok == 1)) && ! comments_ndjson="$(jq -s -c '.' <<< "$comments_ndjson" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments 2> /dev/null | jq -c '.[]')" \
-        && { echo "WARN: lease comments on issue #${issue} could not be authenticated -- publishing anyway" >&2; read_ok=0; comments_ndjson=""; }
+        && { echo "WARN: lease comments on issue #${issue} could not be authenticated" >&2; read_ok=0; comments_ndjson=""; }
+
+    if ((read_ok == 0)); then
+        if ((require_ownership == 1)); then
+            echo "SKIP: issue #${issue}: ownership indeterminate; nothing published." >&2
+            exit 2
+        fi
+        echo "WARN: publishing anyway (absence of evidence is not evidence of a peer)" >&2
+    fi
 
     if ((read_ok == 1)) && [[ -n "$(printf '%s' "$comments_ndjson" | tr -d '[:space:]')" ]]; then
         # Scan EVERY fresh, NON-YIELDED lease comment for a foreign host --
@@ -541,7 +556,11 @@ cmd_publish() {
     if ! post_out="$(printf '%s' "$lease_body" \
         | gh api --method POST "repos/${write_repo}/issues/${issue}/comments" -F body=@- 2>&1)"; then
         echo "ERROR: failed to publish lease comment on issue #${issue}: ${post_out}" >&2
-        echo "Proceeding without a lease is safe but degrades reclaim evidence (best-effort, mirrors #6179's fail-open dispatch write)." >&2
+        if ((require_ownership == 1)); then
+            echo "Ownership is indeterminate; Builder admission must stop." >&2
+        else
+            echo "Proceeding without a lease is safe but degrades reclaim evidence (best-effort, mirrors #6179's fail-open dispatch write)." >&2
+        fi
         exit 2
     fi
 

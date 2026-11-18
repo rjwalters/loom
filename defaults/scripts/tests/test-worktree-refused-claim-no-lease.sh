@@ -21,6 +21,15 @@
 #   9. --sparse on an existing worktree, reconfigure fails -> no lease
 #  10. --sparse on an existing worktree, reconfigure ok    -> leased
 #  11-13. #9828: OPEN_PR refuses only a fresh branch, not origin/local reuse
+#  14-19. #14376: a Builder is admitted only on native ownership --
+#         14 peer lease already observable at the probe     -> refused, nothing created
+#         15 peer wins after the probe, before lease publish -> refused before setup, no deferred publisher
+#         16 dispatcher-owned claim (LOOM_SWEEP_CLAIM_OWNED) -> admitted, no flag, lease ensure once
+#         17 attended uncontested claim                      -> admitted, ownership established
+#         18 explicit --force-claim                          -> the only way the flag is sent
+#         19 daemon predating --require-ownership (exit 2)   -> refused (ownership unverified)
+#         21 INDETERMINATE ownership token                   -> refused
+#         22 same-host sibling lease at the attended probe   -> refused before allocation
 
 set -euo pipefail
 
@@ -58,9 +67,16 @@ echo "$*" >> "$STUB_LOG"
 # with 0 (so the script takes the daemon path) and the real call with the value.
 opt_in() { [[ -n "$1" ]] || exit 2; [[ "$2" == "--help" ]] && exit 0; }
 case "$1" in
+    --version)    [[ -n "${STUB_VERSION:-}" ]] && echo "loom-daemon $STUB_VERSION" && exit 0 ;;
     forge)        [[ "$2" == "check-claim" ]] && exit "${STUB_CHECK_CLAIM_RC:-1}" ;;
     worktree-lock) exit "${STUB_CHECK_ISSUE_RC:-2}" ;;
-    lease)        [[ "$2" == "ensure" ]] && exit 0 ;;
+    lease)
+        if [[ "$2" == "ensure" ]]; then
+            case " $* " in
+                *" --require-ownership "*) echo "${STUB_OWNERSHIP_TOKEN:-OWNED}"; exit "${STUB_OWNERSHIP_RC:-0}" ;;
+            esac
+            exit 0
+        fi ;;
     worktree-branch-reuse) opt_in "${STUB_BRANCH_REUSE_RC:-}" "$2"; exit "$STUB_BRANCH_REUSE_RC" ;;
     worktree-sparse) opt_in "${STUB_SPARSE_RC:-}" "$2"; exit "$STUB_SPARSE_RC" ;;
     worktree-open-pr)
@@ -88,7 +104,7 @@ chmod +x "$TMP/shim/git"
 
 run_wt() { # <args...> -> sets RC, resets log
     : > "$LOG"; RC=0
-    ./.loom/scripts/worktree.sh "$@" >"$TMP/out.log" 2>&1 || RC=$?
+    LOOM_BUILDER_CLAIM="${LOOM_BUILDER_CLAIM-1}" ./.loom/scripts/worktree.sh "$@" >"$TMP/out.log" 2>&1 || RC=$?
 }
 lease_calls() { grep -c '^lease ensure' "$LOG" || true; }
 expect_refused_no_lease() { # <issue> <label>
@@ -166,8 +182,123 @@ if grep -q '^forge check-claim 512' "$LOG"; then fail "probe ran on the local-re
 echo "Test 13: OPEN_PR + no local or origin branch -> still refused on the fresh-branch path"
 STUB_CHECK_CLAIM_RC=0 run_wt 513
 expect_refused_no_lease 513 "fresh-branch OPEN_PR"
-if grep -q '^forge check-claim 513 --force-claim' "$LOG"; then pass "probe ran on the fresh-branch path"; else fail "probe did not run"; cat "$LOG"; fi
+if grep -q '^forge check-claim 513 --attended-claim$' "$LOG"; then pass "probe ran on the fresh-branch path"; else fail "probe did not run"; cat "$LOG"; fi
+if grep -q -- '--force-claim' "$LOG"; then fail "an unauthorized caller got an implicit --force-claim"; else pass "no implicit --force-claim"; fi
 if git show-ref --verify --quiet refs/heads/feature/issue-513; then fail "branch created despite refusal"; else pass "no branch created"; fi
+
+# --- #14376: ownership at Builder admission ------------------------------------
+# A hook that proves whether project setup ran.
+cat > .loom/hooks/post-worktree.sh <<'HOOKEOF'
+#!/usr/bin/env bash
+touch "$STUB_HOOK_MARK"
+HOOKEOF
+chmod +x .loom/hooks/post-worktree.sh
+export STUB_HOOK_MARK="$TMP/hook-ran"
+rm -f "$STUB_HOOK_MARK"
+checkout_ready() { grep -q 'Worktree created successfully' "$TMP/out.log"; }
+no_peer_side_effects() { # <issue> -- nothing created locally, no setup, no ready output
+    local n="$1"
+    if [[ ! -e ".loom/worktrees/issue-$n" ]]; then pass "$n: no worktree left"; else fail "$n: worktree left behind"; fi
+    if git show-ref --verify --quiet "refs/heads/feature/issue-$n"; then fail "$n: branch left behind"; else pass "$n: no branch left behind"; fi
+    if [[ ! -e "$STUB_HOOK_MARK" ]]; then pass "$n: project hook did not run"; else fail "$n: project hook ran"; fi
+    if checkout_ready; then fail "$n: checkout-ready output printed"; else pass "$n: no checkout-ready output"; fi
+}
+
+echo "Test 14: a peer lease is already observable at the probe (check-claim exit 0) -> refused, nothing created"
+STUB_CHECK_CLAIM_RC=0 run_wt 514
+expect_refused_no_lease 514 "peer visible at probe"
+no_peer_side_effects 514
+if grep -q '^lease ensure' "$LOG"; then fail "lease ensure ran for a refused claim"; else pass "no lease attempted"; fi
+
+echo "Test 15: peer wins after the probe, before lease publication -> refused before setup"
+rm -f "$STUB_HOOK_MARK"
+STUB_OWNERSHIP_RC=4 STUB_OWNERSHIP_TOKEN=PEER_OWNED run_wt 515
+if [[ "$RC" -ne 0 ]]; then pass "nonzero ownership refusal (rc=$RC)"; else fail "peer-owned claim was admitted"; cat "$TMP/out.log"; fi
+no_peer_side_effects 515
+if [[ "$(lease_calls)" -eq 1 ]] && grep -q '^lease ensure 515 --require-ownership ' "$LOG"; then pass "ownership asked once, no deferred/legacy retry"; else fail "lease calls: $(lease_calls)"; cat "$LOG"; fi
+if grep -q "owned by a peer" "$TMP/out.log"; then pass "refusal names the peer"; else fail "refusal not explained"; cat "$TMP/out.log"; fi
+STUB_OWNERSHIP_RC=4 STUB_OWNERSHIP_TOKEN=PEER_OWNED run_wt --json 515
+if grep -q '"error": "PEER_OWNED"' "$TMP/out.log"; then pass "--json carries the PEER_OWNED refusal"; else fail "--json refusal missing"; cat "$TMP/out.log"; fi
+
+echo "Test 16: dispatcher-owned claim -> admitted, probe sent without a bypass flag"
+rm -f "$STUB_HOOK_MARK"
+LOOM_SWEEP_CLAIM_OWNED=516 run_wt 516
+if [[ "$RC" -eq 0 && -e .loom/worktrees/issue-516/.git ]]; then pass "owned claim opens its worktree"; else fail "rc=$RC"; cat "$TMP/out.log"; fi
+if grep -q '^forge check-claim 516$' "$LOG"; then pass "probe relies on the daemon's owned-claim exception"; else fail "unexpected probe args"; cat "$LOG"; fi
+if [[ -e "$STUB_HOOK_MARK" ]]; then pass "project hook ran"; else fail "project hook did not run"; fi
+if [[ -f .loom/worktrees/issue-516/.loom-managed ]]; then pass "managed sentinel written"; else fail "no sentinel"; fi
+if [[ "$(lease_calls)" -eq 1 ]]; then pass "ownership asked once"; else fail "lease calls: $(lease_calls)"; fi
+
+echo "Test 17: attended uncontested claim -> admitted, ownership established"
+rm -f "$STUB_HOOK_MARK"
+run_wt 517
+if [[ "$RC" -eq 0 && -f .loom/worktrees/issue-517/.loom-managed ]]; then pass "attended claim admitted"; else fail "rc=$RC"; cat "$TMP/out.log"; fi
+if grep -q '^forge check-claim 517 --attended-claim$' "$LOG" && grep -q '^lease ensure 517 --require-ownership ' "$LOG"; then pass "attended probe + ownership arbitration"; else fail "wrong calls"; cat "$LOG"; fi
+
+echo "Test 18: --force-claim is sent only when the caller asks for it"
+STUB_CHECK_CLAIM_RC=1 run_wt 518 --force-claim
+if [[ "$RC" -eq 0 ]] && grep -q '^forge check-claim 518 --force-claim$' "$LOG"; then pass "explicit force is explicit"; else fail "rc=$RC"; cat "$LOG"; fi
+
+echo "Test 19: daemon predating --require-ownership (exit 2) -> ownership unverified, refused"
+rm -f "$STUB_HOOK_MARK"
+STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' run_wt 519
+if [[ "$RC" -ne 0 ]]; then pass "old daemon cannot prove ownership: refused (rc=$RC)"; else fail "unverified ownership admitted"; cat "$TMP/out.log"; fi
+no_peer_side_effects 519
+if grep -q "could not be positively verified" "$TMP/out.log"; then pass "refusal says ownership unverified"; else fail "refusal not explained"; cat "$TMP/out.log"; fi
+if grep -q 'requires loom-daemon >= 0.19.1314' "$TMP/out.log" && grep -q 'loom-daemon-update.sh --fetch' "$TMP/out.log"; then pass "unknown-version refusal names the floor and roll command"; else fail "no actionable roll advice"; cat "$TMP/out.log"; fi
+
+echo "Test 25: released daemon before strict ownership -> distinct refusal before lease publication"
+rm -f "$STUB_HOOK_MARK"
+STUB_VERSION=0.19.1313 run_wt --json 525
+expect_refused_no_lease 525 "below-floor daemon"
+no_peer_side_effects 525
+if grep -q '"error": "DAEMON_INCOMPATIBLE"' "$TMP/out.log" && grep -q 'Required:  >= 0.19.1314' "$TMP/out.log" && grep -q 'loom-daemon-update.sh --fetch' "$TMP/out.log"; then pass "old daemon refusal is actionable and distinct from a peer"; else fail "old daemon diagnosis missing"; cat "$TMP/out.log"; fi
+
+echo "Test 26: daemon at the strict-ownership floor still must establish ownership"
+STUB_VERSION=0.19.1314 run_wt 526
+if [[ "$RC" -eq 0 && -f .loom/worktrees/issue-526/.loom-managed ]] && grep -q '^lease ensure 526 --require-ownership ' "$LOG"; then pass "floor boundary admits exact OWNED"; else fail "at-floor admission failed"; cat "$LOG" "$TMP/out.log"; fi
+rm -f "$STUB_HOOK_MARK"
+STUB_VERSION=0.19.1314 STUB_OWNERSHIP_TOKEN=INDETERMINATE STUB_OWNERSHIP_RC=2 run_wt --json 527
+no_peer_side_effects 527
+if [[ "$RC" -ne 0 ]] && grep -q '"error": "OWNERSHIP_UNVERIFIED"' "$TMP/out.log"; then pass "sufficient version never substitutes for positive ownership"; else fail "at-floor unverifiable ownership admitted or mislabeled"; cat "$TMP/out.log"; fi
+
+echo "Test 21: INDETERMINATE ownership (exit 0) -> refused, nothing created"
+rm -f "$STUB_HOOK_MARK"
+STUB_OWNERSHIP_RC=0 STUB_OWNERSHIP_TOKEN=INDETERMINATE run_wt 521
+if [[ "$RC" -ne 0 ]]; then pass "indeterminate ownership refused (rc=$RC)"; else fail "indeterminate ownership admitted"; cat "$TMP/out.log"; fi
+no_peer_side_effects 521
+STUB_OWNERSHIP_RC=0 STUB_OWNERSHIP_TOKEN=INDETERMINATE run_wt --json 521
+if grep -q '"error": "OWNERSHIP_UNVERIFIED"' "$TMP/out.log"; then pass "--json carries OWNERSHIP_UNVERIFIED"; else fail "--json refusal missing"; cat "$TMP/out.log"; fi
+
+echo "Test 22: same-host sibling lease visible at the attended probe (check-claim exit 0) -> refused before allocation"
+rm -f "$STUB_HOOK_MARK"
+STUB_CHECK_CLAIM_RC=0 run_wt 522
+expect_refused_no_lease 522 "same-host sibling lease"
+no_peer_side_effects 522
+if grep -q '^forge check-claim 522 --attended-claim$' "$LOG"; then pass "attended probe asked (no lease passes it)"; else fail "wrong probe"; cat "$LOG"; fi
+
+echo "Test 20: indeterminate ownership (exit 0) and Doctor origin reuse keep the fail-open lease"
+git checkout -q -b feature/issue-520 && echo w > w520.txt && git add w520.txt && git commit -q -m w520
+git push -q origin feature/issue-520 && git checkout -q main && git branch -D -q feature/issue-520
+git fetch -q origin
+STUB_OWNERSHIP_RC=4 run_wt 520
+if [[ "$RC" -eq 0 ]] && grep -q '^lease ensure 520 --watch-pid' "$LOG" && ! grep -q -- '--require-ownership' "$LOG"; then pass "authorized branch reuse unaffected"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
+
+echo "Test 23: standalone (non-Builder) fresh creation keeps the fail-open lease even when ownership is unverifiable"
+STUB_CHECK_CLAIM_RC=1 STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' LOOM_BUILDER_CLAIM="" run_wt 523
+if [[ "$RC" -eq 0 && -e ".loom/worktrees/issue-523/.git" ]] && ! grep -q -- '--require-ownership' "$LOG"; then pass "standalone not refused"; else fail "rc=$RC"; cat "$LOG" "$TMP/out.log"; fi
+
+echo "Test 24: another creator's partial directory cannot be reused by a Builder"
+git worktree add -q .loom/worktrees/issue-524 -b feature/issue-524
+run_wt 524
+if [[ "$RC" -ne 0 && "$(lease_calls)" -eq 0 && ! -f .loom/worktrees/issue-524/.loom-managed ]]; then pass "partial Builder reuse refused without a lease or sentinel"; else fail "partial checkout admitted"; cat "$LOG" "$TMP/out.log"; fi
+if [[ -f .loom/worktrees/issue-524/.git ]]; then pass "other creator's checkout left untouched"; else fail "partial checkout removed"; fi
+touch .loom/worktrees/issue-524/.loom-managed .loom/worktrees/issue-524/.loom-unclaimed
+run_wt 524 --sparse docs
+if [[ "$RC" -ne 0 && "$(lease_calls)" -eq 0 ]]; then pass "unclaimed Builder reuse refused before sparse reconfigure"; else fail "unclaimed checkout admitted"; cat "$LOG" "$TMP/out.log"; fi
+rm .loom/worktrees/issue-524/.loom-unclaimed
+run_wt 524
+if [[ "$RC" -eq 0 ]]; then pass "ready managed checkout remains reusable"; else fail "ready checkout refused"; cat "$TMP/out.log"; fi
 
 echo
 echo "Tests run: $TESTS_RUN, failed: $TESTS_FAILED"

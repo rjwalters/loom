@@ -23,10 +23,12 @@ use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
 use crate::fleet_sync::workspace_resync::waiver::Waived;
 use crate::init::payload::{resync_workspace_with, ResyncOutcome, Stamp};
-use crate::install_compat::INSTALL_METADATA_PATH;
+use crate::install_compat::{INSTALL_METADATA_PATH, SUPPORTS_INSTALLED};
 use crate::test_git_helpers::run as git;
 
-const RUNNING: &str = "0.19.880";
+// Synthetic releases keep the relative ordering this suite exercises. The
+// fixture checks that its compatible stale install meets the compiled floor.
+const RUNNING: &str = "1.0.880";
 const REPO: &str = "acme/app";
 const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -79,7 +81,7 @@ fn payload_at(defaults: &Path, version: &str) -> Payload {
         Stamp {
             version: v(version),
             commit: Some("a".repeat(40)),
-            requires_daemon: "0.19.772".to_string(),
+            requires_daemon: "1.0.772".to_string(),
             release_build: true,
         },
     )
@@ -99,8 +101,8 @@ struct Seed {
 }
 
 const STALE: Seed = Seed {
-    version: "0.19.800",
-    requires: Some("0.19.772"),
+    version: "1.0.800",
+    requires: Some("1.0.772"),
     current: false,
     ignore_bin: false,
 };
@@ -124,6 +126,10 @@ fn metadata(version: &str, requires: Option<&str>) -> String {
 
 impl Fixture {
     fn new(seed: Seed) -> Self {
+        assert!(
+            v(SUPPORTS_INSTALLED) <= v(STALE.version) && v(STALE.version) < v(RUNNING),
+            "the fixture release line must have a supported stale install below its daemon"
+        );
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let old = defaults(&root, false);
@@ -492,24 +498,24 @@ fn a_stale_workspace_is_resynced_with_one_commit_and_the_claim_released() {
     let pass = host.pass();
     let report = only(&pass);
     assert_eq!(report.state, WState::W0, "{report:?}");
-    assert!(reason(report).starts_with("resynced to v0.19.880 in "), "{report:?}");
+    assert!(reason(report).starts_with("resynced to v1.0.880 in "), "{report:?}");
     assert!(pass.alerts.is_empty());
 
     assert_eq!(fx.origin_commits(), commits + 1, "exactly one commit");
     assert_eq!(fx.origin_file(".loom/scripts/a.sh"), "#!/bin/sh\necho new");
     assert_eq!(fx.origin_file(".loom/docs/new.md"), "new in this release");
     let meta = fx.origin_file(INSTALL_METADATA_PATH);
-    assert!(meta.contains("\"loom_version\": \"0.19.880\""), "{meta}");
+    assert!(meta.contains("\"loom_version\": \"1.0.880\""), "{meta}");
     assert!(!meta.contains("resync_pending"), "{meta}");
     let message = git(&fx.origin, &["log", "-1", "--format=%B", "refs/heads/main"]);
     // Subject plus the resync trailers only: a sweep's injected `GIT_CONFIG_*`
     // `core.hooksPath` may stamp extra provenance trailers onto the commit.
     assert_eq!(
         message.lines().next(),
-        Some("chore(loom): resync installed Loom to v0.19.880"),
+        Some("chore(loom): resync installed Loom to v1.0.880"),
         "{message}"
     );
-    for trailer in ["Loom-Resync-Host: host-a", "Loom-Resync-Version: 0.19.880"] {
+    for trailer in ["Loom-Resync-Host: host-a", "Loom-Resync-Version: 1.0.880"] {
         assert!(message.lines().any(|l| l == trailer), "missing {trailer:?} in {message}");
     }
     // The commit's parent is the head that was fetched: a plain fast-forward.
@@ -756,7 +762,7 @@ fn an_empty_diff_is_w0_whatever_the_stamp_says() {
     for (seed, floor) in [
         (
             Seed {
-                version: "0.19.800",
+                version: "1.0.800",
                 requires: None,
                 current: true,
                 ignore_bin: false,
@@ -765,11 +771,11 @@ fn an_empty_diff_is_w0_whatever_the_stamp_says() {
         ),
         (
             Seed {
-                version: "0.19.800",
+                version: "1.0.800",
                 current: true,
                 ..STALE
             },
-            Some("0.19.850"),
+            Some("1.0.850"),
         ),
     ] {
         let fx = Fixture::new(seed);
@@ -783,7 +789,7 @@ fn an_empty_diff_is_w0_whatever_the_stamp_says() {
         }
         assert!(fx.forge.calls.borrow().is_empty());
         assert_eq!(fx.origin_head(), before);
-        assert!(fx.origin_file(INSTALL_METADATA_PATH).contains("0.19.800"), "never re-stamped");
+        assert!(fx.origin_file(INSTALL_METADATA_PATH).contains("1.0.800"), "never re-stamped");
     }
 }
 
@@ -810,9 +816,9 @@ fn a_payload_file_the_repo_ignores_is_not_a_difference() {
 fn a_too_old_workspace_with_a_real_diff_is_w3_and_is_resynced() {
     let fx = Fixture::new(STALE);
     let host = Host::new(&fx, "host-a");
-    let check = host.pass_with(Mode::Check, &|| Ok(()), Some("0.19.850"));
+    let check = host.pass_with(Mode::Check, &|| Ok(()), Some("1.0.850"));
     assert_eq!(only(&check).state, WState::W3);
-    let pass = host.pass_with(Mode::Write, &|| Ok(()), Some("0.19.850"));
+    let pass = host.pass_with(Mode::Write, &|| Ok(()), Some("1.0.850"));
     assert_eq!(only(&pass).state, WState::W0);
 }
 
@@ -821,24 +827,24 @@ fn a_repo_ahead_of_the_daemon_is_never_claimed_or_written() {
     for (version, requires, state, why) in [
         // Compatible per classify(), yet ahead.
         (
-            "0.19.900",
-            Some("0.19.772"),
+            "1.0.900",
+            Some("1.0.772"),
             WState::RepoAhead,
-            "installed 0.19.900 > running 0.19.880",
+            "installed 1.0.900 > running 1.0.880",
         ),
         // ResyncOwed per classify(), yet ahead.
-        ("0.19.900", None, WState::RepoAhead, "installed 0.19.900 > running 0.19.880"),
+        ("1.0.900", None, WState::RepoAhead, "installed 1.0.900 > running 1.0.880"),
         // W4.
         (
-            "0.19.900",
-            Some("0.19.890"),
+            "1.0.900",
+            Some("1.0.890"),
             WState::W4,
-            "requires daemon 0.19.890 > running 0.19.880",
+            "requires daemon 1.0.890 > running 1.0.880",
         ),
         // Cannot be ordered, so it may need a newer daemon: W4 (#10719).
         (
             "0.20.0-rc1",
-            Some("0.19.772"),
+            Some("1.0.772"),
             WState::W4,
             "installed loom_version \"0.20.0-rc1\" is not MAJOR.MINOR.PATCH; it may be newer \
              than this daemon",
@@ -867,17 +873,17 @@ fn a_repo_ahead_of_the_daemon_is_never_claimed_or_written() {
 fn a_repo_that_moves_ahead_after_the_claim_is_released_unwritten() {
     let fx = Fixture::new(STALE);
     let host = Host::new(&fx, "host-a");
-    // A newer host resyncs it to 0.19.900 right after this host's classification.
+    // A newer host resyncs it to 1.0.900 right after this host's classification.
     *host.before_claim.borrow_mut() = Some(Box::new(|| {
         fx.push_from_seed("resync by a newer host", |seed| {
-            write(&seed.join(INSTALL_METADATA_PATH), &metadata("0.19.900", Some("0.19.772")));
+            write(&seed.join(INSTALL_METADATA_PATH), &metadata("1.0.900", Some("1.0.772")));
             write(&seed.join(".loom/scripts/a.sh"), "#!/bin/sh\necho newest\n");
         });
     }));
     let pass = host.pass();
     let report = only(&pass);
     assert_eq!(report.state, WState::RepoAhead, "{report:?}");
-    assert_eq!(reason(report), "installed 0.19.900 > running 0.19.880");
+    assert_eq!(reason(report), "installed 1.0.900 > running 1.0.880");
     assert_eq!(
         fx.origin_file(".loom/scripts/a.sh"),
         "#!/bin/sh\necho newest",
@@ -1329,7 +1335,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 root: PathBuf::from("/src/app"),
                 repo: Some("acme/app".to_string()),
                 state: WState::W1,
-                installed: Some("0.19.800".to_string()),
+                installed: Some("1.0.800".to_string()),
                 requires_daemon: None,
                 reason: Some("claim held by host-b since 2026-10-08T12:00:00Z".to_string()),
                 hold: None,
@@ -1353,7 +1359,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
         vec![
             "  workspaces: host not H0: draining; reporting only",
             "  workspace acme/app: W1 (claim held by host-b since 2026-10-08T12:00:00Z), \
-             installed 0.19.800",
+             installed 1.0.800",
             "  workspace /src/lib: repo-ahead",
         ]
     );
