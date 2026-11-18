@@ -10685,6 +10685,40 @@ across the registered roots:
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
 
+**Declared private-clone bindings (#14111).** `autonomous.sessionReconcile.privateClones`
+maps an account to the repositories its private-clone session serves, in any
+config tier (machine defaults, fleet, repo, host-local; precedence as in
+[`fleet-config-lifecycle.md`](fleet-config-lifecycle.md)), read from the daemon
+root:
+
+```json
+{ "autonomous": { "sessionReconcile": { "privateClones": {
+  "work-account": [ { "repository": "https://github.com/OWNER/REPO", "base": "main" } ]
+} } } }
+```
+
+`base` is optional (default `main`). The pass registers each missing
+repository by the path `accounts session start ACCOUNT --private-clone URL`
+takes while the account is idle, so the per-host manual step goes away. It
+runs after every account's own recovery, and is skipped while Docker is backing
+off.
+
+- An account with no binding is never read or touched.
+- A **busy** account (a job holds its lease, or a worker is alive) is retried on
+  the next pass and never interrupted. A held (`session stop`) or disabled
+  account is skipped; a binding never lifts a hold.
+- A repository already registered with that base costs no `docker` call.
+- Removing a binding **deletes nothing**. While the account still has at least
+  one binding, any registered repository no binding declares is WARNed once per
+  distinct set as drift and retained.
+- Fails closed, WARNing with the key (`autonomous.sessionReconcile.privateClones.ACCOUNT`),
+  and retried on the reconcile backoff, for: an unknown account, a non-HTTPS or
+  credential-bearing URL, a `firewall: true` repository, a base that conflicts
+  with the registered one, an account running a host-mounted session (a binding
+  never converts it), and a private session whose container is missing (the
+  reconcile recovery restores it first, with its recorded image).
+- Live: re-read every pass, no restart.
+
 **Seeing it: `loom-daemon status` (#10600).** `status` lists every
 session-managed Codex account across the registered roots under `Session
 containers:`, one line each: the state (`running`, `stopped`, `missing`,
