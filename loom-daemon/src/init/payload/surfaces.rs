@@ -182,10 +182,9 @@ pub(crate) const INSTALL_TIME_ONLY: &[(&str, &str)] = &[
 /// The two trees the installer's payload step and the slash commands live in.
 const PAYLOAD_TREES: &[&str] = &[".loom", ".claude/commands/loom"];
 
-/// Every path a resync reads from a workspace, as `git archive` pathspecs:
-/// the payload trees plus each extra surface outside them. The default-branch
-/// export (`fleet_sync::workspace_resync`) takes its list from here, so a
-/// surface added to the table is diffed against the default branch too.
+/// The payload trees, extra surfaces and read-only context as `git archive`
+/// pathspecs. The default-branch export (`fleet_sync::workspace_resync`)
+/// uses this list to compare against the workspace at the evaluated commit.
 #[must_use]
 pub(crate) fn export_pathspecs() -> Vec<&'static str> {
     let mut specs = PAYLOAD_TREES.to_vec();
@@ -195,6 +194,8 @@ pub(crate) fn export_pathspecs() -> Vec<&'static str> {
             .map(|s| s.path)
             .filter(|p| !PAYLOAD_TREES.iter().any(|tree| within(p, tree))),
     );
+    // The .gitignore rule reads this context without staging or owning it.
+    specs.push("package.json");
     specs
 }
 
