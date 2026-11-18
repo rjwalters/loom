@@ -566,27 +566,26 @@ fn launchd_env_matches_plist(plist: &Path, print_output: &str) -> EnvVerdict {
     }
 }
 
-/// Env keys whose values are safe to echo in a verification diagnostic. Anything
+/// Env keys whose values are safe to echo in a verification diagnostic:
+/// `PATH` and `HOME` (hard-coded by `render::launchd_plist`) plus every
+/// `LOOM_*` key — plain config (paths, booleans, small enums), the same
+/// classification `launchd_env_drift.rs::display_value` documents. Anything
 /// else (notably the forge tokens `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN`
-/// that `envh` forwards into the plist) is reported by key only (#14175).
-const NON_SECRET_ENV_KEYS: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-    "LANG",
-    "TMPDIR",
-    "LOOM_RUNTIME",
-    "LOOM_ROLE",
-    "LOOM_TERMINAL_ID",
-];
+/// that `envh` forwards into the plist) is reported by key only, and unknown
+/// keys fail closed (#14175 AC1, #14274).
+const NON_SECRET_ENV_KEYS: &[&str] = &["PATH", "HOME"];
+const NON_SECRET_ENV_KEY_PREFIX: &str = "LOOM_";
 
-/// The mismatch line for one env key. Values are printed only for
-/// [`NON_SECRET_ENV_KEYS`]; for every other key the message says the values
-/// differ and carries neither value (no fingerprint) so a credential never
-/// reaches stderr, scrollback or a support paste (#14175).
+fn env_key_printable(key: &str) -> bool {
+    NON_SECRET_ENV_KEYS.contains(&key) || key.starts_with(NON_SECRET_ENV_KEY_PREFIX)
+}
+
+/// The mismatch line for one env key. Values are printed only for printable
+/// keys ([`env_key_printable`]); for every other key the message says the
+/// values differ and carries neither value (no fingerprint) so a credential
+/// never reaches stderr, scrollback or a support paste (#14175).
 fn env_mismatch_message(key: &str, expected: &str, got: &str) -> String {
-    if NON_SECRET_ENV_KEYS.contains(&key) {
+    if env_key_printable(key) {
         format!(
             "launchd env verification: key '{key}' expected [{expected}] but the running job reports [{got}]."
         )
@@ -765,9 +764,29 @@ mod tests {
     }
 
     #[test]
+    fn env_mismatch_message_keeps_values_for_loom_config_keys() {
+        let msg = env_mismatch_message("LOOM_DAEMON_SUPERVISOR", "step-1", "step-2");
+        assert!(msg.contains("[step-1]") && msg.contains("[step-2]"), "{msg}");
+        let msg = env_mismatch_message("LOOM_FOO", "/a", "/b");
+        assert!(msg.contains("[/a]") && msg.contains("[/b]"), "{msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_unknown_and_token_values() {
+        for key in ["GITEA_TOKEN", "FORGE_TOKEN", "SOMETHING_ELSE"] {
+            let msg = env_mismatch_message(key, "sekrit_expected", "sekrit_got");
+            assert!(msg.contains(key), "key is still named: {msg}");
+            assert!(!msg.contains("sekrit_expected"), "expected leaked: {msg}");
+            assert!(!msg.contains("sekrit_got"), "actual leaked: {msg}");
+        }
+    }
+
+    #[test]
     fn env_mismatch_message_keeps_values_for_allowlisted_keys() {
         let msg = env_mismatch_message("PATH", "/usr/bin", "/bin");
         assert!(msg.contains("[/usr/bin]") && msg.contains("[/bin]"), "{msg}");
+        let msg = env_mismatch_message("HOME", "/Users/a", "/Users/b");
+        assert!(msg.contains("[/Users/a]") && msg.contains("[/Users/b]"), "{msg}");
     }
 
     #[test]
