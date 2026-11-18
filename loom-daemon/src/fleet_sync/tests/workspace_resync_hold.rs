@@ -393,6 +393,46 @@ fn a_behind_but_compatible_repo_is_named_once_and_still_not_held() {
     assert!(holds.newly_behind().is_empty());
 }
 
+/// #14409: a maintain-only root is refused dispatch by the registry mark, not
+/// by a pass hold, so "dispatch is not held" would be false for it. It is not
+/// reported as behind-but-compatible (neither the log nor `status` says so)
+/// while marked, and is named once the mark clears. An unmarked repo in the
+/// same state is still reported.
+#[test]
+fn a_maintain_only_repo_is_not_reported_as_behind_but_not_held() {
+    use crate::workspace_hold::set_maintain_only_for_test;
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let floor = Some("0.19.850");
+    let mut holds = Holds::default();
+
+    // Regression guard: unmarked, it is behind-but-compatible and named.
+    let (_, seen) = hold_pass_in(&host, Mode::Check, floor, &mut holds);
+    assert_eq!(seen[0].default_branch.behind.as_deref(), Some(STALE.version));
+    assert_eq!(holds.installed_behind().len(), 1, "unmarked is reported");
+    assert_eq!(holds.newly_behind().len(), 1, "and announced");
+
+    // Marked: the same observation is neither shown nor announced.
+    set_maintain_only_for_test(
+        &host.root,
+        Some(MaintainOnly {
+            by: MaintainOnlySource::FleetStore,
+            since: t0(),
+        }),
+    );
+    holds.step(&seen, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert!(holds.holds().is_empty(), "the registry mark is not a pass hold");
+    assert!(holds.installed_behind().is_empty(), "maintain-only is not 'not held'");
+    assert!(holds.newly_behind().is_empty(), "and is not announced as such");
+
+    // The mark clears while it is still behind: reported again.
+    set_maintain_only_for_test(&host.root, None);
+    holds.step(&seen, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert_eq!(holds.installed_behind().len(), 1);
+    assert_eq!(holds.newly_behind().len(), 1, "named once the mark is gone");
+}
+
 /// A held repo is not also reported as merely behind: only a clear copy
 /// carries the marker.
 #[test]
@@ -406,6 +446,46 @@ fn a_held_w3_repo_is_not_reported_as_behind() {
     let (_, seen) = hold_pass_in(&host, Mode::Check, Some("0.19.850"), &mut holds);
     assert_eq!(seen[0].default_branch.behind, None);
     assert!(holds.installed_behind().is_empty());
+}
+
+/// One copy behind-but-compatible and the other held (mid-resync, where the
+/// two stamps disagree): the repo has a standing hold, so it is not also
+/// reported as "behind, not held" (#14334). Either copy may be the held one.
+#[test]
+fn a_repo_with_one_copy_behind_and_the_other_held_is_not_reported_as_behind() {
+    let held = Finding::install_incompatible("no requires_daemon".to_string());
+    let behind = || Finding::clear_behind(Some(STALE.version.to_string()));
+    for (default_branch, checkout, copy) in [
+        (held.clone(), behind(), HeldCopy::DefaultBranch),
+        (behind(), held.clone(), HeldCopy::Checkout),
+    ] {
+        let mut holds = Holds::default();
+        let seen = [Observation {
+            root: PathBuf::from("/work/mixed"),
+            repo: Some(REPO.to_string()),
+            default_branch,
+            checkout,
+        }];
+        let now = chrono::Utc::now();
+        holds.step(&seen, v(RUNNING), now, ALERT_AFTER);
+        let hold = holds
+            .holds()
+            .into_values()
+            .next()
+            .expect("the repo is held");
+        assert_eq!(hold.copy, copy);
+        assert!(holds.installed_behind().is_empty(), "a held repo is not 'not held'");
+        assert!(holds.newly_behind().is_empty(), "and is not announced as such");
+
+        // The hold clears while the other copy is still behind: now it is.
+        let mut cleared = seen.clone();
+        cleared[0].default_branch = behind();
+        cleared[0].checkout = behind();
+        holds.step(&cleared, v(RUNNING), now, ALERT_AFTER);
+        assert!(holds.holds().is_empty());
+        assert_eq!(holds.installed_behind().len(), 1);
+        assert_eq!(holds.newly_behind().len(), 1, "named once the hold is gone");
+    }
 }
 
 /// The same repo with no `requires_daemon` on record: nothing vouches for

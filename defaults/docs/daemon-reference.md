@@ -10563,6 +10563,102 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 [`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
 `git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
 
+### Configured session image and extra read-only mounts (#14019)
+
+By default a contained session runs from the released
+`ghcr.io/rjwalters/loom-worker-session:<daemon version>` image, selected by
+the daemon's own version. A repo whose checks need a domain toolchain (EDA
+tools, a Rust toolchain, simulators) can instead run its sessions from a
+**derived image** and give them **extra read-only data mounts**, via two
+config keys readable at every tier (`config_resolver`: host-shared defaults
+through `.loom-local/local.json`):
+
+```json
+{
+  "accounts": {
+    "session": {
+      "image": "ghcr.io/example/loom-worker-session-eda@sha256:0123abcd…",
+      "extraMounts": [
+        { "host": "/opt/pdk", "container": "/opt/pdk" }
+      ]
+    }
+  }
+}
+```
+
+| Config key | Tier | Value |
+|---|---|---|
+| — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
+| — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. A container target must lie outside the mounted workspace (the `--mount-workspace` path, not only the registered repositories beneath it); one inside it is refused at `create`. |
+
+**Precedence**: `accounts session start --image IMAGE` (the operator's own
+invocation) beats `accounts.session.image`, which beats the stock default.
+The extra mounts ride either way. Only a container created from the
+**configured** image gets the bundle verification below — a hand-picked
+`--image` keeps its historical behaviour.
+
+**The override image must carry the sealed control bundle.** A derived
+image is built `FROM` the released session image, so
+`/opt/loom/private-control/` comes along
+([`private-control-bundle.md`](private-control-bundle.md)). Before any
+container is created from the configured image — operator `start`,
+reconcile recreate, `shell` — the daemon probes it in a throwaway
+container (no network, no mounts, read-only rootfs, `--cap-drop ALL`) and
+refuses the image unless its manifest matches this daemon's enforced
+protocol, control version, forced policy and managed registration, and
+every sealed asset's recomputed digest matches what its manifest recorded.
+The refusal names the offending asset or field.
+
+**A daemon roll has a defined behaviour: refuse.** The enforced constants
+are the running daemon's, so a roll that bumps the control boundary fails a
+not-yet-rebuilt override image closed at the next create; and the
+version-skew reconciler never recreates an override seat at all — not from
+its own digest pin (it would reproduce the same skew) and never from the
+stock tag. The seat stays on its running container with a WARN that says
+to rebuild the derived image on the new base, update the digest pin, then
+stop and start the seat. It never silently runs a stale bundle and never
+silently falls back to the stock image.
+
+**Denials for the extra mounts** extend the one session mount denylist
+(`session_mount_gate`), enforced at every create:
+
+* the **host source** passes the same denials the workspace roots do —
+  never `/`, the home directory or an ancestor of it, and never anything
+  overlapping a `firewall: true` repository (a read-only copy of a secret
+  is still a copy);
+* the **container target** never shadows — and is never nested inside —
+  the workspace mounts (path parity), the `CODEX_HOME` profile (whose
+  three control files are read-only mount points), the sealed bundle
+  (`/opt/loom/private-control`), or a GitHub App credential path;
+* no two extra mounts overlap each other (Docker would mount them in argv
+  order and one of the two would not be what the operator asked for).
+
+Extra mounts are for **data** — PDKs, model files, caches. Tools belong in
+a derived image: system-package tools are linked against shared libraries
+across `/usr`, which no per-path mount can carry. The mounts a container
+was created with are recorded in its `loom.extra-mounts` label; `accounts
+session status` (text and `--json`) reports them. The override and the
+mounts apply to **host-mode sessions only** — private-clone sessions keep
+their own image handling and their exactly-counted mount inventory. The
+pass makes no extra Docker call for an unset config, and a malformed
+`accounts.session` block refuses an operator `start` outright (the
+reconcile pass warns and carries on; it never puts a fresh seat on the
+stock image because the override failed to parse).
+
+**Image retention.** `autonomous.dockerImageRetention.trackedRepos` accepts
+any repository name, so the derived image's repository can be tracked (its
+old tags then pruned per `keepLastN`):
+
+```json
+{ "autonomous": { "dockerImageRetention": {
+    "trackedRepos": ["loom-worker-session", "ghcr.io/example/loom-worker-session-eda"] } } }
+```
+
+See `loom-daemon/src/tokens_pool/session_image.rs`,
+`session_mount_gate.rs`, `session_lifecycle.rs` and
+`session_reconcile_skew.rs`; how to build a derived image is in
+`docker/session/README.md`.
+
 ### Codex session-container reconciler (#10453)
 
 The daemon restarts dead Codex session containers itself
@@ -11186,13 +11282,31 @@ configured; when its limit resets, the next spawn returns to it:
 - **Telemetry.** Each `loom.dispatch.step` span records
   `loom.step.model_configured` (the pre-fallback model) alongside
   `loom.step.model_launched`, plus `loom.step.model_fallback_from` /
-  `loom.step.model_fallback_reason` (`no-account-for-class`) when a
+  `loom.step.model_fallback_reason` (`no-account-for-class`, or
+  `model-limit-kill` for an in-flight step-down below) when a
   fallback fired — how an operator sees how much work ran below its
   configured model. The role-runner per-role log header names the fallback
   through the model source label.
-- **In-flight re-dispatch is separate (#13905).** This is the
-  *selection-time* half only; re-dispatching a child that dies mid-run on
-  `hit your <Model> limit`, and its quarantine exemption, is #13905.
+- **In-flight kills step down once (#13905).** A step-engine child that
+  dies mid-run on a per-model limit banner (`hit your Fable limit`,
+  `reached your Fable 5 limit`) is re-dispatched on the next rung strictly
+  below the killed model's class in `chain` (`fable` → `opus`). The death is
+  charged to the provider, not the item: the ledger records the uncharged
+  `provider_exhausted` refusal (#13966), so it never counts toward the
+  Builder fast-fail ladder or the repeat cap, and the item is redrawn at
+  once. One rung per kill, never a loop at the same model: a kill at `opus`
+  steps to `sonnet`; a kill at the last rung (or at a model off the chain) is
+  handled exactly as before. The step-down is a per-`(item, role)` memo that
+  any other step end clears and that lapses after an hour (limits are
+  windows), so the next unrelated run returns to the configured model. Only
+  a banner that *names a model* counts, read from the last 15 lines of the
+  step's own dispatch and only for a non-zero exit with no verdict line — a
+  generic `hit your weekly limit` is account-wide, no rung escapes it, and
+  stays as today. With the block absent or `enabled: false` nothing is
+  recorded and nothing changes. The issue-sweep path's insta-crash
+  quarantine tally already exempts these banners (`account-exhaustion`
+  re-attribution, #4122/#4501); it re-dispatches through the sweep reaper,
+  not this memo.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an

@@ -16,6 +16,75 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-18
 
+- **PR #14444**: docs: soften GROUP_CHECK_UNGATED_WORKFLOW_RUN row to what the audit checks
+- **PR #14449**: fix: refuse session extra mounts targeting the mounted workspace label
+- **PR #14423**: fix(telemetry): journal usage spans at a step's end, read from the step's own log
+- **PR #14436**: refactor: unify launchd env secret classification on one substring classifier
+- **PR #14442**: feat: add LOOM_SERVICE_TIER speed setting mapped per runtime
+- **PR #14445**: fix: skip expired owner credential dirs in private-clone execs and refuse before claim
+- **PR #14430**: feat: serve the read-only forge verbs from loom-tools
+- **PR #14439**: fix: let the filing-lock captain acquire's warn lines reach stderr
+- **PR #14432**: fix: align native token-attribution docs with code; id-keyed OpenCode reads
+- **PR #14425**: feat: re-dispatch a model-limit-killed step one fallback rung down, uncharged
+- **PR #14413**: test(daemon): gate the loom_config_env outer-lock invariant with a source scan
+- **PR #14426**: refactor: drop production-dead any-class bad-token scan
+- **PR #14428**: fix: omit maintain-only roots from the behind-but-not-held report
+- **PR #14416**: feat: verify an operator's resolution so a decided reversal can leave the premise gate
+- **PR #14427**: feat: stamp role-draw pick and attempt on loom.dispatch.step spans
+- **PR #14362**: feat(daemon): attribute watchdog IPC probe and deferred lease publisher self-spawns
+- **PR #14367**: fix: cap codex unknown carry-forward at the weekly reset horizon
+- **PR #14329**: feat(accounts): list reports private-clone repos and session image
+- **PR #14405**: refactor: make merge-step role keying exhaustive, reuse dispatch-header marker
+- **PR #14129**: feat: captain hosts the fleet issue-filing lock
+- **PR #14418**: fix: verify local work, not upstream counts, after a rebind move
+- **PR #14188**: feat: configurable session image override (digest-pinned, bundle verified) and extra read-only mounts
+- **PR #14206**: feat: attribute step-close telemetry from the step's own log
+- **PR #14252**: test: hold default serial lock in worktree_root config-tier tests
+- **PR #14088**: feat(daemon): add selection-time model fallback (autonomous.modelFallback)
+- **Issue #14412** (closed): merge-group-ci: GROUP_CHECK_UNGATED_WORKFLOW_RUN audits clean for an OR-weakened gate, and the whole group-check scan is skipped without a merge_group trigger
+- **Issue #14420** (closed): Session extra mount under the mounted workspace label reads as workspace mount drift
+- **Issue #14406** (closed): Telemetry: no loom.runtime.usage rows for step-dispatched work roles on any runtime (only Champion and Guide report tokens)
+- **Issue #14393** (closed): Unify launchd env secret classification: two classifiers again after #14348 (shared suffix list vs. local substring guard)
+- **Issue #14141** (closed): Per-runtime launch settings: service tier / fast mode, and record the settings actually used
+- **Issue #14435** (closed): Private-session execs get an expired token after the root checkout changed owner: stale gh-config-by-owner directory wins the lookup
+- **Issue #14395** (closed): loom-tools Phase 3a: forge read and configuration commands — epic #12708
+- **Issue #14422** (closed): Filing-lock fail-open warning is still swallowed by `2>/dev/null` on the shell path
+- **Issue #14278** (closed): Id-keyed step usage attribution: Codex arm still ANDs directory+window, and a NULL time_created still drops an id-matched OpenCode row
+- **Issue #14446** (closed): filing-lock: old loom-daemon prints a clap 'unrecognized subcommand' block to stderr on every filing after #14439
+- **Issue #13905** (closed): Daemon model fallback: re-dispatch a child killed by a model limit once on the next rung (split from #13873)
+- **Issue #14404** (closed): Enforce the serial_test lock-order invariant for loom_config_env with a test, not a comment
+- **Issue #14394** (closed): Drop the production-dead any-class blocking scan (ClassQuery::AnyClass / blocking_entry_in_dir_any_class)
+- **Issue #14409** (closed): installed_behind still claims "not held" for a maintain-only repo
+- **Issue #14399** (closed): Premise gate keeps routing a deliberate reversal after the operator chooses an option
+- **Issue #14233** (closed): Telemetry: put the draw attempt and pick on loom.dispatch.step so an escalation rate can be queried
+- **Issue #14239** (closed): Two daemon self-spawn sites still unattributed after #14200 (watchdog IPC probe, deferred lease publisher)
+- **Issue #14349** (closed): Codex carry-forward: `has_usable_account` and the hold window diverge from what selection will actually do
+- **Issue #14298** (closed): accounts list: show each account's registered private-clone repositories and session image
+- **Issue #14390** (closed): launch_record: make the step-log dispatch-scope match exhaustive, and reuse the shared dispatch-header constant
+- **Issue #13918** (closed): Captain hosts the fleet issue-filing lock (last signal on the safehouse claims room)
+- **Issue #14402** (closed): private-workspace rebind: two small hardening items from PR #14365 review
+- **PR #14408**: fix: split codex env-tier model@effort in runtime span launch facts
+- **PR #14386**: test(private-workspace): run Docker fixture steps in a real issue worktree
+- **PR #14379**: fix: refuse lone @-token --body in forge create-issue
+- **PR #14374**: docs: narrow roll-requeue claim-check wording in step-release docs
+- **PR #14373**: fix: leave a held repo out of the installed-behind "not held" report
+- **PR #14372**: fix: report check runs stranded under a terminal-failed workflow run as failing
+- **PR #14365**: Add accounts session rebind for private clones after a repository transfer
+- **PR #14364**: feat: audit flags group-check workflow_run jobs missing the trust gate
+- **PR #14348**: fix: print LOOM_* env values in launchd mismatch diagnostics, drop dead shell verification twin
+- **Issue #14019** (closed): Contained sessions: configurable session image (digest-pinned, bundle verified) and extra read-only mounts
+- **Issue #14128** (closed): wait-checks: a terminal-failed run whose check runs are all stuck queued waits forever instead of failing
+- **Issue #14245** (closed): merge-group-ci audit: no finding for a merge-group-check workflow whose workflow_run trigger lacks the job-level trust gate
+- **Issue #14302** (closed): loom.model on a codex run stamps the raw model@effort env value, not the base the adapter launched
+- **Issue #14048** (closed): Completion envelope: per-stage cross-host usage (stages field)
+- **Issue #14323** (closed): loom-daemon forge create-issue --body @path still posts the literal string (the gap #14286 closed for forge comment)
+- **Issue #14214** (closed): Test isolation: LOOM_WORKTREE_ROOT is mutated by two independent serial_test lock groups
+- **Issue #14334** (closed): installed_behind can claim "not held" for a repo whose other copy IS held
+- **Issue #14357** (closed): Support a data-preserving rebind of additional private-clone registrations after a repository transfer
+- **Issue #14345** (closed): ended.rs / step_reap.rs over-generalize: the roll requeue's issue-role path does not call step_claim_held_elsewhere
+- **Issue #13873** (closed): Daemon path: fall back one model rung (fable → opus → sonnet) when the configured model's limit is hit, instead of holding the pool
+- **Issue #14274** (closed): Tighten launchd env redaction: allowlist precision, dead shell twin, single-line env block
+
 - **PR #14388**: test: anchor create-pr T2 lookup assertion on .default_branch
 - **PR #14375**: docs: scope Codex suffix-shadowing claim to role-runner and sweep-step launches
 - **PR #14344**: fix: count only the last dispatch's OpenCode sessions in step-dispatched usage

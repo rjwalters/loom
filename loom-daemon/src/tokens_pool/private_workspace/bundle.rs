@@ -99,7 +99,7 @@ const LIBS: [&str; 5] = [
 pub const PROVISIONER: &str = "scripts/provision-codex-hooks.sh";
 
 /// Every sealed asset, in a stable order.
-fn sealed_assets() -> impl Iterator<Item = &'static str> {
+pub(crate) fn sealed_assets() -> impl Iterator<Item = &'static str> {
     GUARDS
         .iter()
         .chain(LIBS.iter())
@@ -380,7 +380,10 @@ pub fn registration() -> String {
     format!("{CONTROL_ROOT}/hooks/guard-codex-bridge.sh --project-root {REPO} --loom-hook-version {HOOK_VERSION}")
 }
 
-fn expected_policy() -> BTreeMap<String, String> {
+/// The forced policy the configured session image's manifest must carry —
+/// the same expectation [`crate::tokens_pool::session_image`] verifies an
+/// override image against (issue #14019).
+pub(crate) fn expected_policy() -> BTreeMap<String, String> {
     POLICY
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))

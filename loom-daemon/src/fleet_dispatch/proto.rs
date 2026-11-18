@@ -13,6 +13,8 @@
 //! | [`RELEASE_PATH`] | [`ReleaseRequest`] | [`AckResponse`] |
 //! | [`NEXT_PATH`] | [`NextRequest`] | [`NextResponse`] |
 //! | [`PARK_ENDED_PATH`] | [`ParkEndedRequest`] | [`AckResponse`] |
+//! | [`FILING_LOCK_PATH`] | [`FilingLockRequest`] | [`FilingLockResponse`] |
+//! | [`FILING_UNLOCK_PATH`] | [`FilingUnlockRequest`] | [`AckResponse`] |
 //!
 //! A `claim` refusal is an **answer** (HTTP 200, `granted: false`), never a
 //! failure. Non-200 statuses carry an [`ErrorResponse`]: `400` malformed,
@@ -42,14 +44,22 @@ pub const NEXT_PATH: &str = "/v1/next";
 /// `POST` path of a park-ended notice (#13919).
 pub const PARK_ENDED_PATH: &str = "/v1/park_ended";
 
+/// `POST` path of an issue-filing lock request (#13918).
+pub const FILING_LOCK_PATH: &str = "/v1/filing-lock";
+
+/// `POST` path of an issue-filing unlock (#13918).
+pub const FILING_UNLOCK_PATH: &str = "/v1/filing-unlock";
+
 /// Every path.
-pub const PATHS: [&str; 6] = [
+pub const PATHS: [&str; 8] = [
     HEARTBEAT_PATH,
     CLAIM_PATH,
     REFUSE_PATH,
     RELEASE_PATH,
     NEXT_PATH,
     PARK_ENDED_PATH,
+    FILING_LOCK_PATH,
+    FILING_UNLOCK_PATH,
 ];
 
 /// The `refuse` reason that holds the item for the forge lease TTL: someone
@@ -347,6 +357,49 @@ pub struct ParkEndedRequest {
     pub cause: ParkEndCause,
 }
 
+/// `POST /v1/filing-lock`: "may I run an issue-filing burst?" (#13918). The
+/// captain hosts the one fleet-wide filing slot. `holder` is an id the caller
+/// makes up (one per burst): asking again with the same `holder` refreshes the
+/// grant's TTL, and only the same `holder` may release it. `label` says what
+/// is being filed, for the captain's log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilingLockRequest {
+    pub host_id: String,
+    pub holder: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// The answer to a filing-lock request: `{granted: true, ttl_s}` or
+/// `{granted: false, held_by, retry_after_s}`. A refusal is an answer (HTTP
+/// 200), never a failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilingLockResponse {
+    pub server_epoch: String,
+    pub granted: bool,
+    /// Seconds the grant lives without a refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_s: Option<u64>,
+    /// The host holding the slot, on a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
+    /// Seconds before asking again is worthwhile, on a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_s: Option<u64>,
+}
+
+/// `POST /v1/filing-unlock`: the burst ended (#13918). Holder-scoped: a no-op
+/// unless `host_id` and `holder` are those of the grant. Answered with an
+/// [`AckResponse`] whose `known` says whether the slot was freed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilingUnlockRequest {
+    pub host_id: String,
+    pub holder: String,
+}
+
+/// The longest `holder` the captain accepts.
+pub const MAX_HOLDER_LEN: usize = 128;
+
 /// `POST /v1/next`: "this host has `free_slots` free; what should it run?"
 /// Sent when capacity becomes available, never on a fixed period (#12817).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,6 +576,30 @@ mod tests {
         };
         let wire = serde_json::to_value(&resp).unwrap();
         assert_eq!(serde_json::from_value::<NextResponse>(wire).unwrap(), resp);
+    }
+
+    #[test]
+    fn filing_lock_round_trips_and_a_refusal_serialises_only_its_half() {
+        let req: FilingLockRequest =
+            serde_json::from_value(json!({"host_id": "h", "holder": "x-1", "extra": 1})).unwrap();
+        assert_eq!(req.label, "", "label is optional");
+        let grant = FilingLockResponse {
+            server_epoch: "e".into(),
+            granted: true,
+            ttl_s: Some(60),
+            held_by: None,
+            retry_after_s: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&grant).unwrap(),
+            json!({"server_epoch": "e", "granted": true, "ttl_s": 60})
+        );
+        let held: FilingLockResponse = serde_json::from_value(
+            json!({"server_epoch": "e", "granted": false, "held_by": "b", "retry_after_s": 2}),
+        )
+        .unwrap();
+        assert!(!held.granted && held.ttl_s.is_none());
+        assert!(PATHS.contains(&FILING_LOCK_PATH) && PATHS.contains(&FILING_UNLOCK_PATH));
     }
 
     #[test]

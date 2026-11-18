@@ -102,6 +102,7 @@ pub mod session_drift_removal;
 pub mod session_drift_report;
 pub mod session_hold;
 pub mod session_hold_roots;
+pub mod session_image;
 pub mod session_lifecycle;
 pub mod session_mount_gate;
 pub mod session_seats;

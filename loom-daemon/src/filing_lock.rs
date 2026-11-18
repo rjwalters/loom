@@ -91,6 +91,19 @@
 //! 4. **Re-entrant.** A holder exports [`FILING_LOCK_HELD_ENV`] to children, so
 //!    a role that wraps a whole burst does not deadlock against the per-call
 //!    acquire inside `create-issue.sh`.
+//!
+//! # The captain tier (#13918)
+//!
+//! On a host in fleet mode (`fleetDispatch.enabled`), the fleet tier is no
+//! longer only the soft peer-marker backoff: after the host lock is taken the
+//! filer also asks the captain for the one fleet-wide slot
+//! ([`crate::fleet_dispatch::filing`]), so two hosts filing at once serialise
+//! through it. A slot still held at the end of the bounded wait is
+//! [`AcquireOutcome::Deferred`], as for the host lock. A captain that cannot be
+//! asked (unreachable, or this host in fallback) fails open to the host lock
+//! plus the existing pacing, and the fallback is counted. With fleet mode off
+//! nothing here changes. The peer-marker tier and its room broadcast remain
+//! until #13945 retires the claims room.
 
 use crate::script_helpers::now_epoch_secs;
 use std::path::{Path, PathBuf};
@@ -435,6 +448,9 @@ pub struct FilingLockGuard {
     holder: PathBuf,
     label: String,
     acquired_at: Instant,
+    /// The captain's fleet slot, when this host is in fleet mode and was
+    /// granted it (#13918). Given back before the host lock.
+    captain: Option<crate::fleet_dispatch::filing::Hold>,
 }
 
 impl FilingLockGuard {
@@ -453,6 +469,10 @@ impl FilingLockGuard {
 
 impl Drop for FilingLockGuard {
     fn drop(&mut self) {
+        // Reverse of acquire: the fleet slot first, then the host lock.
+        if let Some(hold) = self.captain.take() {
+            crate::fleet_dispatch::filing::release(&hold);
+        }
         let _ = std::fs::remove_file(self.holder.join("owner.json"));
         let _ = std::fs::remove_dir(&self.holder);
         log::info!(
@@ -521,16 +541,53 @@ pub fn acquire(label: &str) -> AcquireOutcome {
             reason: format!("no home directory to resolve the store (set {FILING_LOCK_DIR_ENV})"),
         };
     };
-    acquire_in(
+    let wait = resolve_wait();
+    let started = Instant::now();
+    let local = acquire_in(
         &store,
         &crate::sweep_registry::host_identity(),
         std::process::id(),
         label,
-        resolve_wait(),
+        wait,
         DEFAULT_POLL,
         resolve_stale(),
         resolve_peer_ttl(),
+    );
+    with_captain_tier(
+        local,
+        &crate::fleet_dispatch::filing::workspace_root(),
+        label,
+        wait.saturating_sub(started.elapsed()),
     )
+}
+
+/// Layer the captain's fleet slot (#13918) over a host-lock `outcome`: only an
+/// [`AcquireOutcome::Acquired`] host lock goes on to ask the captain, within
+/// the `remaining` bounded wait. A slot still held at the end of it gives the
+/// host lock back and defers; an unreachable captain, or fleet mode off, keeps
+/// the host lock alone.
+#[must_use]
+pub fn with_captain_tier(
+    outcome: AcquireOutcome,
+    root: &Path,
+    label: &str,
+    remaining: Duration,
+) -> AcquireOutcome {
+    use crate::fleet_dispatch::filing::{self, Tier};
+    let AcquireOutcome::Acquired(mut guard) = outcome else {
+        return outcome;
+    };
+    match filing::acquire(root, label, &filing::new_holder(), remaining) {
+        Tier::Granted(hold) => {
+            guard.captain = Some(hold);
+            AcquireOutcome::Acquired(guard)
+        }
+        Tier::Off | Tier::FailOpen { .. } => AcquireOutcome::Acquired(guard),
+        Tier::Deferred { reason } => {
+            drop(guard);
+            AcquireOutcome::Deferred { reason }
+        }
+    }
 }
 
 /// [`acquire`] with every input injected — the testable core (no env reads, no
@@ -588,6 +645,7 @@ pub fn acquire_in(
                         holder,
                         label: label.to_owned(),
                         acquired_at: Instant::now(),
+                        captain: None,
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

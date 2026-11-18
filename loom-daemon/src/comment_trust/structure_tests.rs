@@ -36,6 +36,11 @@ const MARKERS: &[&str] = &[
 /// Every production file whose code names a covered marker.
 const MARKER_FILES: &[(&str, &str)] = &[
     (
+        "operator_decision/resolution.rs",
+        "names the premise marker only to skip it when hashing a proposal; resolution comments \
+         reach it as Candidates already judged by TrustPolicy::is_operator (#14399)",
+    ),
+    (
         "claim_reconciliation.rs",
         "lease, claim-activity, stand-down readers (FETCH_SITES)",
     ),

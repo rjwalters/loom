@@ -849,11 +849,18 @@ impl Holds {
     }
 
     /// Every workspace running installed files behind this daemon but
-    /// compatible with it, by normalized root (#14015).
+    /// compatible with it, by normalized root (#14015). A root with a standing
+    /// hold on either copy is left out: the marker is set per copy, so one copy
+    /// can be behind-but-compatible while the other is held, and "dispatch is
+    /// not held" would be false for that repo (#14334). So is a `maintain-only`
+    /// root: that hold lives in the registry, not in `entries` ([`hold_for`]
+    /// composes it), and dispatch into it is refused (#14409).
     #[must_use]
     pub fn installed_behind(&self) -> HashMap<PathBuf, InstalledBehind> {
         self.behind
             .iter()
+            .filter(|(root, _)| self.entries.get(*root).is_none_or(|e| e.hold().is_none()))
+            .filter(|(root, _)| maintain_only::maintain_only_for(root).is_none())
             .filter_map(|(root, entry)| {
                 Some((
                     root.clone(),

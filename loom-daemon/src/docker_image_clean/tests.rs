@@ -100,6 +100,54 @@ fn container_referenced_untagged_image_is_never_planned() {
 }
 
 // ===================================================================
+// Issue #14019: trackedRepos can name an operator's own (derived) image
+// repository, so a configured session override image is kept per keepLastN.
+// ===================================================================
+
+#[test]
+fn tracked_repos_accept_an_arbitrary_operator_image_repository() {
+    // The config override is taken verbatim — any repository name is allowed.
+    let config = DockerRetentionConfig {
+        tracked_repos: Some(vec![
+            "ghcr.io/example/loom-worker-session-eda".to_string(),
+            "registry.internal:5000/acme/tools".to_string(),
+        ]),
+        ..DockerRetentionConfig::default()
+    };
+    assert_eq!(
+        resolve_tracked_repos(&config),
+        vec![
+            "ghcr.io/example/loom-worker-session-eda",
+            "registry.internal:5000/acme/tools"
+        ]
+    );
+    // An image from that repository is tracked: kept within keepLastN even
+    // though it is unknown to the defaults.
+    let derived = image(
+        "sha256:derived",
+        &["ghcr.io/example/loom-worker-session-eda:2026-11-01"],
+        0,
+        8.0,
+    );
+    let plan = plan_retention(&[derived], &resolve_tracked_repos(&config), &[], 2);
+    assert!(plan.remove_stale_tracked.is_empty(), "{plan:?}");
+    assert_eq!(plan.kept.len(), 1);
+    // And the second-newest of three is the one kept (keepLastN semantics).
+    let deriveds = vec![
+        image("sha256:d1", &["ghcr.io/example/loom-worker-session-eda:2026-11-01"], 0, 8.0),
+        image("sha256:d2", &["ghcr.io/example/loom-worker-session-eda:2026-11-02"], 1_000, 8.0),
+        image("sha256:d3", &["ghcr.io/example/loom-worker-session-eda:2026-11-03"], 2_000, 8.0),
+    ];
+    let plan = plan_retention(&deriveds, &resolve_tracked_repos(&config), &[], 2);
+    let removed: Vec<&str> = plan
+        .remove_stale_tracked
+        .iter()
+        .map(|i| i.id.as_str())
+        .collect();
+    assert_eq!(removed, vec!["sha256:d1"]);
+}
+
+// ===================================================================
 // unused-image pressure rule (#11195)
 // ===================================================================
 
