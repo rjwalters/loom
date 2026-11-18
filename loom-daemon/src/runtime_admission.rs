@@ -256,6 +256,23 @@ impl RuntimeRejection {
             .unwrap_or(&self.reason)
     }
 
+    /// The whole daemon-log refusal line (#14026): `Display`'s
+    /// `role=`/`runtime=`/`source=` framing with [`Self::refusal_line`] as
+    /// the detail, so a `log::` call interpolating this string never splits
+    /// across lines. `Display` itself keeps rendering the multi-line
+    /// operator `reason` — that is the CLI/IPC diagnostic shape; every
+    /// `log::` call site renders this instead.
+    #[must_use]
+    pub fn refusal_log_line(&self) -> String {
+        format!(
+            "runtime admission rejected role={} runtime={} source={}: {}",
+            self.role,
+            self.runtime,
+            self.source,
+            self.refusal_line()
+        )
+    }
+
     /// Operator-facing, multi-line diagnostic naming the role/lifecycle, the
     /// runtime, the precedence tier that selected it, and the unmet capability
     /// names. Shared by every real client (`loom-daemon dispatch`, the MCP

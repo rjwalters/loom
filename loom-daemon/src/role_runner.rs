@@ -3486,7 +3486,10 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
             );
         }
         RoleTickOutcome::RuntimeRejected(rejection) => {
-            log::warn!("role_runner: {role} runtime admission rejected: {rejection}");
+            log::warn!(
+                "role_runner: {role} runtime admission rejected: {}",
+                rejection.refusal_log_line()
+            );
         }
         RoleTickOutcome::NoTokenPool => {
             log::warn!(
@@ -3558,8 +3561,9 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
             root.display()
         ),
         RoleTickOutcome::RuntimeRejected(rejection) => log::warn!(
-            "role_runner: {role} runtime admission rejected for {} after {elapsed:.1?}: {rejection}",
-            root.display()
+            "role_runner: {role} runtime admission rejected for {} after {elapsed:.1?}: {}",
+            root.display(),
+            rejection.refusal_log_line()
         ),
         RoleTickOutcome::NoTokenPool => log::warn!(
             "role_runner: {role} tick for {} skipped after {elapsed:.1?} — no token pool \
@@ -3787,7 +3791,7 @@ fn log_outcome_for_root_deduped(
     );
     let reason = match outcome {
         RoleTickOutcome::Failure(reason) => reason.as_str(),
-        RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
+        RoleTickOutcome::RuntimeRejected(rejection) => rejection.refusal_line(),
         RoleTickOutcome::Success | RoleTickOutcome::NoTokenPool => "",
         RoleTickOutcome::PoolExhausted { .. } => "",
         RoleTickOutcome::ModelRuntimeMismatch(_) => "",
