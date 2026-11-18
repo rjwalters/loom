@@ -115,6 +115,27 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Move an additional private-clone registration to the repository's
+    /// canonical URL after a forge transfer, keeping its clone, branches and
+    /// local changes (issue #14357). Runs under the exclusive idle account
+    /// lease; refuses (changing nothing) a busy or held account, a wrong
+    /// repository, and two populated clones. Safe to repeat.
+    Rebind {
+        /// The account's short profile name, or its registered email.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The registered (pre-transfer) repository URL.
+        #[arg(long, value_name = "URL")]
+        from: String,
+        /// The canonical repository URL after the transfer.
+        #[arg(long, value_name = "URL")]
+        to: String,
+        /// Verify everything and report; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) fn handle_session_command(
@@ -136,6 +157,32 @@ pub(crate) fn handle_session_command(
             .unwrap_or_default();
         let fallback = roots::recorded_daemon_fallback_root();
         roots::cli_peer_roots(workspace, &registered, fallback.as_deref())
+    }
+
+    /// The lifecycle for an operator command that may create a container
+    /// (`start`, and `shell`'s start-if-absent), plus the image to pull.
+    ///
+    /// Reads the resolved `accounts.session` settings (issue #14019); invalid
+    /// config refuses the command outright, since a seat created from the
+    /// stock image because its override failed to parse would be a fail-open.
+    /// Precedence: the operator's explicit `--image` beats the configured
+    /// override, which beats the stock image; the mounts ride either way. Only
+    /// a container created from the *configured* image gets the bundle
+    /// verification (`with_session_config` compares it against the effective
+    /// image).
+    fn configured_lifecycle(
+        workspace: PathBuf,
+        image: Option<String>,
+    ) -> Result<(SessionLifecycle<ProcessContainerRunner>, Option<String>)> {
+        let peers = peer_roots(&workspace);
+        let session_config =
+            crate::tokens_pool::session_image::read_session_image_config(&workspace)?;
+        let image = image.or_else(|| session_config.image.clone());
+        let pull = image.clone();
+        let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
+            .with_peer_roots(peers)
+            .with_session_config(Some(session_config));
+        Ok((lifecycle, pull))
     }
 
     /// Operator `start`/`shell` (#10661): Ctrl-C/SIGTERM is forwarded to the
@@ -208,6 +255,16 @@ pub(crate) fn handle_session_command(
             );
             if let Some(removed) = removed {
                 println!("{}: {}", status.name, removed.trim_start_matches(", "));
+            }
+            if !status.extra_mounts.is_empty() {
+                let mounts: Vec<String> = status
+                    .extra_mounts
+                    .iter()
+                    .map(|mount| {
+                        format!("{} -> {}:ro", mount.host.display(), mount.container.display())
+                    })
+                    .collect();
+                println!("{}: extra read-only mounts: {}", status.name, mounts.join(", "));
             }
         }
         Ok(())
@@ -301,10 +358,7 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("account uses private-clone mode; repeat start --private-clone URL --base BRANCH; host-mount reuse is refused");
             }
-            let peers = peer_roots(&workspace);
-            let pull = image.clone();
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
-                .with_peer_roots(peers);
+            let (lifecycle, pull) = configured_lifecycle(workspace, image)?;
             prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             print_session_status(
                 &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
@@ -340,6 +394,44 @@ pub(crate) fn handle_session_command(
                 &private::session_recover(&workspace, &name, action, issue, &branch)?,
                 json,
             )
+        }
+        SessionAction::Rebind {
+            name,
+            from,
+            to,
+            dry_run,
+            json,
+        } => {
+            if !private::configured(&workspace, &name)? {
+                anyhow::bail!("account does not use a private workspace; nothing to rebind");
+            }
+            let report = private::rebind(&workspace, &name, &from, &to, dry_run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{}: {:?}: {} -> {} (clone {}, registration {})",
+                    report.account,
+                    report.status,
+                    report.from,
+                    report.to,
+                    report.clone_path,
+                    if report.registration_changed {
+                        "updated"
+                    } else {
+                        "unchanged"
+                    },
+                );
+            }
+            if report.status == private::RebindStatus::BothPopulated {
+                anyhow::bail!(
+                    "both {} and the old location hold a clone; nothing was changed. Publish or \
+                     discard one with `accounts session recover {name}` (or attach and move the \
+                     work by hand), then rerun",
+                    report.clone_path
+                );
+            }
+            Ok(())
         }
         SessionAction::Stop { name, force, json } => {
             if private::configured(&workspace, &name)? {
@@ -406,10 +498,20 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("private sessions do not permit unleased shell; use session job --kind interactive --owner NAME -- COMMAND (TTY input is unsupported)");
             }
-            let peers = peer_roots(&workspace);
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
-                .with_peer_roots(peers);
-            prepare_operator_start(&lifecycle, &name, None)?;
+            // `shell` is start-if-absent, so it creates a container exactly
+            // as `start` does and must carry the same configured image and
+            // extra mounts (issue #14019).
+            //
+            // No unit test covers this arm (issue #14421): it builds a
+            // `ProcessContainerRunner` and shells out to `docker`, so it is
+            // not reachable without a real daemon. The guard is this call
+            // going through `configured_lifecycle`: do not replace it with
+            // `SessionLifecycle::new(.., None)`, which silently creates a
+            // stock-image container with no extra mounts. The reconciler's
+            // recreate paths (which carry the same preference) are covered
+            // in `session_reconcile_tests.rs` / `session_reconcile_drift_tests.rs`.
+            let (lifecycle, pull) = configured_lifecycle(workspace, None)?;
+            prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
             if code != 0 {
                 std::process::exit(code);

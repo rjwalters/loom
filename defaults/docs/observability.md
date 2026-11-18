@@ -1099,18 +1099,37 @@ totals match by construction. `loom.dispatch.step` is an instant span emitted
 at spawn and cannot carry them; `loom.llm.tokens.*` metrics stay unlabelled by
 repo/issue to bound cardinality.
 
+Since #14048 the record also carries the step's **launch identity**, read back
+off the step's own per-item log (`step-<role>-<item>.log`) and anchored to the
+step's `sweep_id=` dispatch header — never the per-role log a role-runner tick
+reads, which a step never writes. A native runtime's token rows are narrowed to
+the **exact session ids that log names** (OpenCode's `--format json` event
+stream `sessionID`, Codex's `session id: <uuid>` banner), which is strictly
+more precise than directory+window: two concurrent same-role steps in one
+workspace overlap in time by construction, so only the id can separate them.
+OpenCode's id is the whole key; the Codex arm still ANDs the ids with the
+workspace directory and window (the window bounds the rollout scan).
+Claude steps keep the transcript scan; a Kimi step has no id source yet and
+keeps directory+window.
+
 | Key | Meaning |
 |---|---|
 | `loom.repo`, `loom.sweep_id`, `loom.role` | the repo, step and role |
+| `loom.stage` | the step-engine stage (`builder`, `judge`, `champion_promote`, `champion_merge`, …) — finer than `loom.role`, which folds Champion's two stages to `champion` (#14048) |
+| `loom.runtime`, `loom.provider`, `loom.profile` | the launch's own `# LOOM_LAUNCH` identity (#14048): absent for a Claude/legacy-adapter spawn, never a guessed `claude` |
 | `loom.issue` / `loom.pr_number` | the step's item: a PR for Judge / Champion-merge-style steps, else an issue |
 | `loom.models_used`, `loom.tokens_by_model` | observed models and per-model rows (never inferred from config) |
 | `loom.tokens.input` / `.output` / `.cache_read` / `.cache_write` | flat sums of the rows (`cache_write` = 5m + 1h) |
 
-A step with no readable transcript carries no token keys: absent, never zero.
+A step with no readable transcript or launch record carries no token or
+identity keys: absent, never zero. Each host's daemon emits its own steps'
+records, so a **cross-host per-stage join** is `repo + issue/PR + stage` over
+these rows — the narrating host's completion envelope no longer has to see the
+other hosts' sessions.
 **Known gap:** summing per-step counts undercounts `loom.llm.tokens.*` by the
-tokens used outside steps (role-runner ticks, which have no item) and by
-runtimes whose transcripts the scan does not read. The hourly comparison
-against `loom.llm.tokens.*` is a post-roll live check and has not been run.
+tokens used outside steps (role-runner ticks, which have no item). Kimi steps
+key on directory+window, not session id. The hourly comparison against
+`loom.llm.tokens.*` is a post-roll live check and has not been run.
 
 ### Resync landings: who, which path, what result (#13674)
 

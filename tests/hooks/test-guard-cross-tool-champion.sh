@@ -85,7 +85,12 @@ done <"$TEMPLATES"
 # Fixture: a main checkout with a real linked, .loom-managed worktree — the
 # state in which a worktree-write-confining guard is armed.
 REPO="$(make_wt_repo_linked)"
-trap 'rm -rf "$REPO" "$TEMPLATES"' EXIT
+cleanup_cross_tool() {
+    rm -rf "$REPO" "$TEMPLATES"
+    # This EXIT trap replaces the harness's; keep its abort report (#14020).
+    _guard_harness_on_exit "$1" "$2"
+}
+trap 'cleanup_cross_tool "$?" "$BASH_COMMAND"' EXIT
 
 # Print the permission decision (allow/ask/deny) a hook gives a Bash command.
 decision() { # <hook> <command> <cwd>
@@ -136,6 +141,7 @@ rm -f "$COMMANDS"
 if [[ "$INCOMPLETE" -eq 1 ]]; then
     echo -e "${RED}INCOMPLETE${NC}: Repo Skills guard not measured ($WHY) — this is not a pass." >&2
     echo "  Total: $TOTAL  Passed: $PASS  Failed: $FAIL (Loom half only)"
+    _GUARD_HARNESS_FINISHED=1   # deliberate non-zero exit, not an abort (#14020)
     [[ "$FAIL" -gt 0 ]] && exit 1
     exit 3
 fi

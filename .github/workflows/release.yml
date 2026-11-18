@@ -413,7 +413,7 @@ jobs:
       # Job-level on purpose: the collector step below re-runs cargo for this
       # package, and a step-level value would have it rebuild the binary
       # without the stamp just before it is packaged.
-      LOOM_RELEASE_BUILD_TAG: ${{ (needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom' && needs.resolve.outputs.tag) || '' }}
+      LOOM_RELEASE_BUILD_TAG: ${{ (needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom' && needs.resolve.outputs.tag) || '' }}
     strategy:
       # Never mask a platform's failure with another's success, and never let
       # one platform's failure cancel an in-flight build for another.
@@ -1289,7 +1289,7 @@ jobs:
       # CI (no native arm64 runner here; see docker/worker/README.md for the
       # manual Apple-Silicon verification this still requires).
       - name: Build and push multi-arch loom-worker image
-        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -1451,7 +1451,7 @@ jobs:
       # rather than resolving from this job's amd64-only local store (which
       # has no arm64 base image to offer the arm64 leg at all).
       - name: Build and push multi-arch loom-worker-session image
-        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -1586,7 +1586,7 @@ jobs:
         run: ./docker/native/test-image.sh "ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}"
 
       - name: Build and push multi-arch loom-worker-native image
-        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .

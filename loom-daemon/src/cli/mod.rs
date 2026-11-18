@@ -44,6 +44,12 @@ pub(crate) mod config_get;
 // The `loom-tools` bin (src/bin/loom_tools.rs) is a separate crate and reaches
 // the shared slice handlers only through these re-exports (#12938).
 pub use config_get::{dispatch as config_get_dispatch, ConfigArgs};
+// Test seam, not API: the ClickHouse replay proof in
+// `tests/signoz_host_export_queries.rs` executes the statement this builds
+// verbatim, so a type inversion in the SQL cannot hide behind a re-typed
+// copy (#14094).
+#[doc(hidden)]
+pub use telemetry::telemetry_hold_transitions::build_query as hold_transitions_query;
 mod daemon_start;
 mod daemon_update;
 pub(crate) mod dep_classify;
@@ -66,6 +72,8 @@ pub(crate) mod forge_inventory_cmd;
 mod forge_merge_queue_cmd;
 mod forge_parent_cmd;
 pub(crate) mod forge_probe_cmd;
+mod forge_read;
+pub use forge_read::{handle_forge_read_command, ForgeReadCli, EX_WRITE_VERB_NOT_MIGRATED};
 mod forge_verdict_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;

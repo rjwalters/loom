@@ -54,7 +54,7 @@ fn build_cancel_request(sweep_id: String, grace_secs: u64, workspace: Option<Str
 
 /// Pick the sweep to cancel for `--issue N` out of a `ListSweeps` result.
 ///
-/// Only **live** (`Running` / `Pending`) entries are candidates: terminal
+/// Only **live** (`Running`) entries are candidates: terminal
 /// entries linger in the registry for an hour after they exit
 /// (`TERMINAL_RETENTION_SECS`), and cancelling one of those would be a
 /// no-op ack that misleads the operator into thinking the sweep they can still
@@ -69,7 +69,7 @@ fn select_sweep_for_issue(sweeps: &[SweepInfo], issue: u32) -> Result<String, St
         .iter()
         // A step on the item is cancelled like its sweep would be (#11898).
         .filter(|info| info.kind.item_number() == Some(issue))
-        .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+        .filter(|info| matches!(info.state, SweepState::Running))
         .collect();
     match live.as_slice() {
         [] => Err(format!(
@@ -323,7 +323,7 @@ mod cancel_tests {
     fn select_sweep_for_issue_refuses_to_guess_when_ambiguous() {
         let sweeps = vec![
             sweep("sweep-a", 4980, SweepState::Running),
-            sweep("sweep-b", 4980, SweepState::Pending),
+            sweep("sweep-b", 4980, SweepState::Running),
         ];
         let err = select_sweep_for_issue(&sweeps, 4980).unwrap_err();
         assert!(err.contains("refusing to guess"), "{err}");

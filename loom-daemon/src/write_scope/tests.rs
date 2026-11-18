@@ -907,6 +907,13 @@ fn daemon_write_paths_are_scoped() {
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
         ),
+        (
+            "cli/forge_read.rs",
+            NotAWrite(
+                "the `verb()` diagnostic table names the `comment` verb as a string; \
+                 the file routes to handle_forge_command and makes no forge call",
+            ),
+        ),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (
             "merge_group_ci/eligibility.rs",
@@ -1165,6 +1172,33 @@ fn every_deny_branch_has_its_refusal_class() {
     let ok = classified(target("a/b"), true, None, &["a/b"], &w);
     assert!(ok.verdict.is_allowed());
     assert_eq!(ok.class, None);
+}
+
+/// #13978: only the `NotInInstallation` refusal names the interim `gh issue
+/// create` route; every other class keeps its text, and the verdict is unchanged.
+#[test]
+fn only_the_not_in_installation_refusal_names_the_gh_issue_create_route() {
+    let ni = FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into()));
+    let ro = FakeProbe::new(Permission::Insufficient("repository role `read`".into()));
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let why = |d: Decision| match d.verdict {
+        Verdict::Deny(w) => w,
+        v => panic!("expected a deny, got {v:?}"),
+    };
+
+    let w = why(classified(target("a/b"), true, None, &["a/b"], &ni));
+    assert!(w.contains("gh issue create -R a/b"), "{w}");
+    assert!(w.contains("gh-issue-create-rest-fallback.md"), "{w}");
+    assert!(w.contains(probe::NOT_IN_INSTALLATION), "{w}");
+
+    for (name, probe) in [("insufficient", &ro), ("unverifiable", &unk)] {
+        let w = why(classified(target("a/b"), true, None, &["a/b"], probe));
+        assert!(!w.contains("gh issue create"), "{name}: {w}");
+    }
+    let w = why(classified(target("a/b"), true, None, &[], &ni));
+    assert!(!w.contains("gh issue create"), "unmanaged: {w}");
+    let w = why(classified(None, false, None, &[], &ni));
+    assert!(!w.contains("gh issue create"), "no target: {w}");
 }
 
 #[test]

@@ -503,7 +503,7 @@ loom-daemon cancel --issue 758 --workspace ~/GitHub/anvil
 | Flag | Maps to `CancelSweep` field | Notes |
 |------|-----------------------------|-------|
 | `<sweep-id>` (positional) | `sweep_id` | required unless `--issue` is given |
-| `--issue <N>` | `sweep_id` (resolved client-side) | one extra `ListSweeps` round-trip; only **live** (`Running`/`Pending`) entries are candidates, and more than one is an error rather than a guess |
+| `--issue <N>` | `sweep_id` (resolved client-side) | one extra `ListSweeps` round-trip; only **live** (`Running`) entries are candidates, and more than one is an error rather than a guess |
 | `--grace <SECS>` | `grace_secs` | seconds between SIGTERM and SIGKILL; default 30, matching the MCP tool |
 | `--workspace <PATH>` | `workspace_root` | same cwd-default resolution `dispatch` applies (#4299) |
 
@@ -613,7 +613,7 @@ Return all tracked sweeps, optionally filtered by lifecycle state.
 Terminal entries are garbage-collected ~1h after the transition.
 
 Inputs:
-- `state_filter` (optional) — one of `Pending`, `Running`, `Exited`,
+- `state_filter` (optional) — one of `Running`, `Exited`,
   `Crashed`.
 - `workspace_root` (optional, issue #3929) — target managed-workspace root.
   Omit to list the default workspace's sweeps (unchanged). Set to a registered
@@ -728,7 +728,7 @@ The sweep registry (`loom-daemon/src/sweep_registry.rs`) holds a
   `loom-daemon cancel` process. `#[serde(default, skip_serializing_if =
   "Option::is_none")]`, so pre-#4980 wire data and clients remain compatible.
 - `idempotency_key` (optional), `started_at`.
-- `state` — one of `Pending`, `Running`, `Exited{code, at}`,
+- `state` — one of `Running`, `Exited{code, at}`,
   `Crashed{at}`.
 - `latest_phase` (optional) — most-recent phase advertised via
   checkpoint.
@@ -2039,6 +2039,15 @@ cannot work with this daemon. The checkout copy is
   first. A `W3` copy with no `requires_daemon` that parses is held, because
   nothing on record says its files work with this daemon. So is one below
   `supports_installed`, which is a break the daemon declared.
+  The skew is visible, not waited out (#14015): the daemon logs one INFO line
+  per repo naming its installed `loom_version` and the running version (again
+  only if the repo leaves that state and returns, or its installed version
+  changes), and `loom-daemon status` shows it under the repo, with
+  `installed_behind: {installed, running}` in `status --json` `per_repo[]`
+  (absent when not behind; never shown for the Loom source repo). Dispatch
+  into it is not held, so a fix spanning the daemon binary and
+  `defaults/scripts` must raise `supports_installed` in that same release;
+  that is the lever that holds a pre-resync repo.
 - **A version that cannot be ordered rolls only for a need.** Such a copy
   is held, because it may be newer than this daemon. Whether it also asks
   for a roll is decided by its `requires_daemon` alone when that parses:
@@ -3894,7 +3903,7 @@ make the artifact operators actually read honest — all five pre-spawn bail-out
 `ModelRuntimeMismatch`) now append a dated line to `role-<role>.log`:
 
 ```
-==== loom-daemon role_runner: 2026-08-14T16:45:51+00:00 role=curator SKIPPED BEFORE SPAWN (#6201): model/runtime mismatch: runtime "codex" only accepts Codex models, but the resolved model "sonnet" is a Claude model (model source=autonomous.roleRunner.roleModels.curator); set autonomous.roleRunner.roleModels.curator to a model the codex runtime accepts — or to "default" to pass through to the codex CLI's own default model, which is the only working shape on a seat that rejects an explicit pin (e.g. a ChatGPT-plan Codex account) — or point this role back at a Claude runtime ====
+==== loom-daemon role_runner: 2026-08-14T16:45:51+00:00 role=curator SKIPPED BEFORE SPAWN (#6201): model/runtime mismatch: runtime "codex" only accepts Codex models, but the resolved model "sonnet" is a Claude model (model source=autonomous.roleRunner.roleModels.curator); set autonomous.roleRunner.roleModels.curator to a model the codex runtime accepts — or to "default" to pass through to the codex CLI's own default model, the guaranteed-working shape on any seat (a ChatGPT-plan Codex account also accepts a model its own catalog lists, see `codex debug models`) — or point this role back at a Claude runtime ====
 ```
 
 A role stuck this way now shows a growing, timestamped, self-diagnosing trail
@@ -3944,6 +3953,16 @@ days are renamed to `daemon.log.YYYY-MM-DD`; each file holds one UTC day
 - **Archive hook:** with `LOOM_DAEMON_LOG_REQUIRE_ARCHIVE=1`, retention deletes a
   day file only when its sidecar `<day file>.archived` exists (created by the
   host's archiver), and removes the pair. Unset: plain age-based deletion.
+- **Step-log archive gate (#14177):** the `.loom/logs/` retention pass
+  (`loom-clean`, `logs.retentionDays` / `LOOM_LOGS_RETENTION_DAYS`) never
+  removes per-step logs `step-<role>-<item>.log` — the durable
+  `LOOM_STEP_OUTCOME` history — unless `LOOM_STEP_LOG_REQUIRE_ARCHIVE=1`.
+  With the gate on, one is deleted (with its `<log>.archived` sidecar, the
+  same convention as the day-file hook above) only when ALL hold: the sidecar
+  exists (the off-host preserver's checksum-confirmed archival proof), the
+  item has no live sweep, no `.loom/sweep-checkpoint/issue-<item>.json`, the
+  log is past the retention window, and its last dispatch attempt wrote a
+  terminal outcome line. Any unreadable or ambiguous case keeps the file.
 - **Legacy files:** numbered `daemon.log.N` from the old startup rotation are
   never touched; an operator removes them once.
 - `loom-daemon health` reads the newest day file when the live file has no
@@ -3954,7 +3973,7 @@ days are renamed to `daemon.log.YYYY-MM-DD`; each file holds one UTC day
 The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
 (env-overridable via `LOOM_SWEEP_REAPER_INTERVAL_SECS`). Each tick:
 
-1. Snapshots live `Running`/`Pending` entries.
+1. Snapshots live `Running` entries.
 2. Tests each PID via `kill(pid, 0)`.
 3. On dead PID:
    - If a sweep checkpoint exists at
@@ -4916,8 +4935,8 @@ Each tick:
 
 1. Queries the forge for ready work — `gh issue list --label loom:issue --state
    open --limit 200 --json number,labels` (honoring `LOOM_REPO` for `--repo`).
-2. Filters out issues that are **already in flight** (a live `Running` /
-   `Pending` entry in the sweep registry — the authoritative dedup, robust to
+2. Filters out issues that are **already in flight** (a live `Running`
+   entry in the sweep registry — the authoritative dedup, robust to
    `loom:issue → loom:building` label-flip lag) or that defensively carry any
    skip label (`loom:building` / `loom:blocked` / `loom:operator` / `loom:frozen`).
    A `loom:epic` issue is never a work-finder candidate either, even when it
@@ -5991,7 +6010,7 @@ A dispatch slot is checked out (counted as occupied) the instant
 `SweepRegistry::dispatch()` returns — i.e. at `fork/exec` success, before the
 child has proven it reached the API, created a worktree, or wrote a
 checkpoint. Before #4003 that slot stayed occupied for the sweep's entire
-`Running`/`Pending` lifetime regardless of whether the child ever showed a
+`Running` lifetime regardless of whether the child ever showed a
 sign of life, so a child wedged at startup (e.g. a hung MCP-init) held its
 slot for the full 300s startup-watchdog window
 (`sweep_registry::DEFAULT_WATCHDOG_TIMEOUT_SECS`) before anything reclaimed
@@ -6252,6 +6271,8 @@ knobs not yet audited here.
 | Config key | Env override | Default | Notes |
 |------------|--------------|---------|-------|
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
+| `autonomous.modelFallback.enabled` | *(config only)* | `false` | Selection-time model fallback (#13873): with `true`, a role tick / step spawn whose configured model's *class* has no usable pool account falls one rung down `modelFallback.chain` instead of holding, and the pool preflights scope their exhaustion verdict to the class the launch would run. Absent/false reproduces pre-#13873 behaviour exactly |
+| `autonomous.modelFallback.chain` | *(config only)* | `["fable", "opus", "sonnet"]` | The fallback ladder, strongest first (#13873); walked strictly **below** the configured model (never climbs; a configured model not in the chain never falls back). Blank/unrecognized entries are skipped, not fatal |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default. **Restart required** — the ticker is built once at startup with this period (#12090 follow-up) |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512, and the only sweep cap since #12406 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
@@ -8610,7 +8631,7 @@ for the full note.
   permanently starve an issue. A peer also emits a `retract` ad from its reaper on
   a terminal sweep outcome, freeing the issue before the TTL.
 - **Re-advertisement heartbeat (#4431).** The dispatch-time ad is no longer
-  one-shot: the reaper re-advertises every live (`Running`/`Pending`) Issue
+  one-shot: the reaper re-advertises every live (`Running`) Issue
   sweep's claim each tick (default 30s — ~4 refreshes per TTL window), and a
   repeat ad **restarts** the receiver's TTL clock. A live sweep's claim
   therefore never expires from peers' views mid-run, while a crashed host's
@@ -10542,6 +10563,102 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 [`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
 `git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
 
+### Configured session image and extra read-only mounts (#14019)
+
+By default a contained session runs from the released
+`ghcr.io/rjwalters/loom-worker-session:<daemon version>` image, selected by
+the daemon's own version. A repo whose checks need a domain toolchain (EDA
+tools, a Rust toolchain, simulators) can instead run its sessions from a
+**derived image** and give them **extra read-only data mounts**, via two
+config keys readable at every tier (`config_resolver`: host-shared defaults
+through `.loom-local/local.json`):
+
+```json
+{
+  "accounts": {
+    "session": {
+      "image": "ghcr.io/example/loom-worker-session-eda@sha256:0123abcd…",
+      "extraMounts": [
+        { "host": "/opt/pdk", "container": "/opt/pdk" }
+      ]
+    }
+  }
+}
+```
+
+| Config key | Tier | Value |
+|---|---|---|
+| — | `accounts.session.image` | The image a session container is created from, **digest-pinned** (`repo@sha256:<64 hex>`). A tag-only reference is refused at parse. Unset = today's behaviour byte for byte. |
+| — | `accounts.session.extraMounts` | A list of `{ "host": …, "container": … }` bind mounts, **always read-only**. An entry carrying any other key (`rw`/`mode`/…) is refused at parse. A container target must lie outside the mounted workspace (the `--mount-workspace` path, not only the registered repositories beneath it); one inside it is refused at `create`. |
+
+**Precedence**: `accounts session start --image IMAGE` (the operator's own
+invocation) beats `accounts.session.image`, which beats the stock default.
+The extra mounts ride either way. Only a container created from the
+**configured** image gets the bundle verification below — a hand-picked
+`--image` keeps its historical behaviour.
+
+**The override image must carry the sealed control bundle.** A derived
+image is built `FROM` the released session image, so
+`/opt/loom/private-control/` comes along
+([`private-control-bundle.md`](private-control-bundle.md)). Before any
+container is created from the configured image — operator `start`,
+reconcile recreate, `shell` — the daemon probes it in a throwaway
+container (no network, no mounts, read-only rootfs, `--cap-drop ALL`) and
+refuses the image unless its manifest matches this daemon's enforced
+protocol, control version, forced policy and managed registration, and
+every sealed asset's recomputed digest matches what its manifest recorded.
+The refusal names the offending asset or field.
+
+**A daemon roll has a defined behaviour: refuse.** The enforced constants
+are the running daemon's, so a roll that bumps the control boundary fails a
+not-yet-rebuilt override image closed at the next create; and the
+version-skew reconciler never recreates an override seat at all — not from
+its own digest pin (it would reproduce the same skew) and never from the
+stock tag. The seat stays on its running container with a WARN that says
+to rebuild the derived image on the new base, update the digest pin, then
+stop and start the seat. It never silently runs a stale bundle and never
+silently falls back to the stock image.
+
+**Denials for the extra mounts** extend the one session mount denylist
+(`session_mount_gate`), enforced at every create:
+
+* the **host source** passes the same denials the workspace roots do —
+  never `/`, the home directory or an ancestor of it, and never anything
+  overlapping a `firewall: true` repository (a read-only copy of a secret
+  is still a copy);
+* the **container target** never shadows — and is never nested inside —
+  the workspace mounts (path parity), the `CODEX_HOME` profile (whose
+  three control files are read-only mount points), the sealed bundle
+  (`/opt/loom/private-control`), or a GitHub App credential path;
+* no two extra mounts overlap each other (Docker would mount them in argv
+  order and one of the two would not be what the operator asked for).
+
+Extra mounts are for **data** — PDKs, model files, caches. Tools belong in
+a derived image: system-package tools are linked against shared libraries
+across `/usr`, which no per-path mount can carry. The mounts a container
+was created with are recorded in its `loom.extra-mounts` label; `accounts
+session status` (text and `--json`) reports them. The override and the
+mounts apply to **host-mode sessions only** — private-clone sessions keep
+their own image handling and their exactly-counted mount inventory. The
+pass makes no extra Docker call for an unset config, and a malformed
+`accounts.session` block refuses an operator `start` outright (the
+reconcile pass warns and carries on; it never puts a fresh seat on the
+stock image because the override failed to parse).
+
+**Image retention.** `autonomous.dockerImageRetention.trackedRepos` accepts
+any repository name, so the derived image's repository can be tracked (its
+old tags then pruned per `keepLastN`):
+
+```json
+{ "autonomous": { "dockerImageRetention": {
+    "trackedRepos": ["loom-worker-session", "ghcr.io/example/loom-worker-session-eda"] } } }
+```
+
+See `loom-daemon/src/tokens_pool/session_image.rs`,
+`session_mount_gate.rs`, `session_lifecycle.rs` and
+`session_reconcile_skew.rs`; how to build a derived image is in
+`docker/session/README.md`.
+
 ### Codex session-container reconciler (#10453)
 
 The daemon restarts dead Codex session containers itself
@@ -10674,6 +10791,40 @@ across the registered roots:
 |---|---|---|---|
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
+
+**Declared private-clone bindings (#14111).** `autonomous.sessionReconcile.privateClones`
+maps an account to the repositories its private-clone session serves, in any
+config tier (machine defaults, fleet, repo, host-local; precedence as in
+[`fleet-config-lifecycle.md`](fleet-config-lifecycle.md)), read from the daemon
+root:
+
+```json
+{ "autonomous": { "sessionReconcile": { "privateClones": {
+  "work-account": [ { "repository": "https://github.com/OWNER/REPO", "base": "main" } ]
+} } } }
+```
+
+`base` is optional (default `main`). The pass registers each missing
+repository by the path `accounts session start ACCOUNT --private-clone URL`
+takes while the account is idle, so the per-host manual step goes away. It
+runs after every account's own recovery, and is skipped while Docker is backing
+off.
+
+- An account with no binding is never read or touched.
+- A **busy** account (a job holds its lease, or a worker is alive) is retried on
+  the next pass and never interrupted. A held (`session stop`) or disabled
+  account is skipped; a binding never lifts a hold.
+- A repository already registered with that base costs no `docker` call.
+- Removing a binding **deletes nothing**. While the account still has at least
+  one binding, any registered repository no binding declares is WARNed once per
+  distinct set as drift and retained.
+- Fails closed, WARNing with the key (`autonomous.sessionReconcile.privateClones.ACCOUNT`),
+  and retried on the reconcile backoff, for: an unknown account, a non-HTTPS or
+  credential-bearing URL, a `firewall: true` repository, a base that conflicts
+  with the registered one, an account running a host-mounted session (a binding
+  never converts it), and a private session whose container is missing (the
+  reconcile recovery restores it first, with its recorded image).
+- Live: re-read every pass, no restart.
 
 **Seeing it: `loom-daemon status` (#10600).** `status` lists every
 session-managed Codex account across the registered roots under `Session
@@ -10940,8 +11091,8 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | — | `autonomous.roleRunner.demandWidth.staleSecs` | config only | `1800` (ledger entries older than this are stale: unobserved for the reservation and the #9410 back-off, counted at their last-known value for PR-role width, #9414) |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none; may name any of the 8 shipped roles, `architect` included) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
-| — | `autonomous.roleRunner.effort` | config only (`roleRunner.roleEfforts.<role>` > `roleRunner.effort` > unset) | *(unset ⇒ **no** `--effort` argument; the runtime CLI's own session default, #8054)* |
-| — | `autonomous.roleRunner.roleEfforts` | config only — a `{"<role>": "<level>"}` object occupying the tier **above** `roleRunner.effort`, exactly as `roleModels` sits above `model` | `{}` (every role falls through to the global tier) |
+| — | `autonomous.roleRunner.effort` | config only (`roleEfforts.<role>@<runtime>` > `roleEfforts.<role>` > `roleRunner.effort` > Codex default `medium` > unset, #14017) | *(unset ⇒ **no** `--effort` argument on Claude and other runtimes; the runtime CLI's own session default, #8054. Codex launches with `medium`, never `none`, #14017)* |
+| — | `autonomous.roleRunner.roleEfforts` | config only — a `{"<role>": "<level>"}` object occupying the tier **above** `roleRunner.effort`, exactly as `roleModels` sits above `model`; a `"<role>@<runtime>"` key (#14017) scopes the level to one runtime and beats the bare role key for it | `{}` (every role falls through to the global tier) |
 | `LOOM_ARCHITECT_MAX_PROPOSALS` | `autonomous.roleRunner.architectMaxProposals` | env > config > default | `5` (per-invocation architect proposal cap, #5656) |
 | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | `autonomous.roleRunner.collisionDetection` | env > config > `autonomous.collisionDetection.enabled` > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | `autonomous.roleRunner.collisionWindowSecs` | env > config > default | that role's tick interval, clamped to `[60, 3600]` |
@@ -10970,17 +11121,57 @@ default (#8054).** Until #8054 the role-runner path emitted no `--effort` at
 all; the flag existed only on the sweep-dispatch path (#3716). Two config keys
 now reach it, in this order:
 
-**`autonomous.roleRunner.roleEfforts.<role>` > `autonomous.roleRunner.effort` >
-unset**
+**`autonomous.roleRunner.roleEfforts.<role>@<runtime>` >
+`autonomous.roleRunner.roleEfforts.<role>` > `autonomous.roleRunner.effort` >
+shipped Codex default (`medium`, Codex only) > unset** (#14017)
 
-- **Unset is the shipped state and stays byte-identical.** There is deliberately
-  **no** default effort and no fall-through to a shared `autonomous.*` key: with
-  neither key configured the resolver returns the empty string, the spawn emits
-  **no `--effort` token at all**, and the runtime CLI's own session-default
-  effort survives end-to-end — exactly the pre-#8054 argv. The asymmetry with
-  `--model` (which always pins) is intentional: an inherited *model* was a live
-  incident (#4501), an inherited *effort* is the status quo every workspace
-  already has.
+The effort is resolved against the **admitted runtime** — at both launch sites,
+the role-runner tick and the sweep step (Builder, Curator, …) — so a role whose
+`roleDraw` can pick both Claude and Codex can run each at its own effort:
+
+```json
+"roleEfforts": { "builder": "medium", "builder@codex": "high" }
+```
+
+launches Claude at `medium` and Codex at `high`. The qualified key beats the
+bare role key **for that runtime only**; every other runtime still gets the
+per-role value. `<runtime>` is the runtime id (`codex`, `claude`, …), matched
+trimmed and case-insensitively. A malformed qualified key (`"builder@"`,
+`"@codex"`, `"a@b@c"`) is dropped with a warning, never fatal; a well-formed key
+naming a runtime that never launches is simply never matched.
+
+- **Codex never runs unset.** A Codex launch with no effort at any tier gets
+  `medium` (source `codex-default`) instead of the CLI's own default: a Codex
+  Builder left at `reasoning effort: none` refused an issue its own daemon had
+  claimed (#14017). `medium` is a supported level of every model
+  `codex debug models` lists. Any configured tier above it in this chain —
+  `roleEfforts.<role>@codex` being the supported way to raise a Codex role's
+  effort — beats it. Re-run `codex debug models` if a Codex release changes
+  its level vocabulary.
+- **For Codex, `codex-default` also shadows the adapter's `model@effort`
+  suffix (#14320).** The daemon emits its resolved effort as an explicit
+  `--effort` arg, which sits above the suffix rung in `spawn-codex.sh`'s
+  chain (`explicit -c` > `--effort` > `LOOM_EFFORT` > suffix), and since
+  #14017 the resolver never returns empty for Codex — so no role-runner or
+  sweep-step Codex launch (the two launch sites that resolve effort) can take
+  its effort from a `model@effort` suffix. A `roleDraw`
+  candidate written `codex/<model>@high` therefore yields `medium`
+  (source `codex-default`), and `roleEfforts.<role>@codex` is the supported
+  way to raise a Codex role's effort from config. The suffix still applies on
+  manual launches where no `--effort`/`LOOM_EFFORT` is supplied, and on the
+  sweep *orchestrator* launch, which never calls that resolver (the work
+  finder dispatches with no effort): an ad-hoc
+  `dispatch_sweep --model <m>@<e>` with no effort still reaches the suffix rung
+  ([runtime-adapters.md](runtime-adapters.md) § model-mapping minimalism).
+- **Unset stays byte-identical on every other runtime.** There is deliberately
+  **no** default effort for Claude or any other runtime, and no fall-through to a
+  shared `autonomous.*` key: with nothing configured the resolver returns the
+  empty string, the spawn emits **no `--effort` token at all**, and the runtime
+  CLI's own session-default effort survives end-to-end — exactly the pre-#8054
+  argv. The asymmetry with `--model` (which always pins) is intentional: an
+  inherited *model* was a live incident (#4501), an inherited *effort* is the
+  status quo every workspace already has. Codex is the exception only because
+  its CLI default can be `none`.
 - **Blanks are unset at both tiers.** A blank/whitespace/non-string value is
   dropped at parse time — per-entry for `roleEfforts` (one typo never disables
   the rest of the object), whole-field for `effort` — so a blank per-role entry
@@ -10994,8 +11185,9 @@ unset**
 - **Keys are trimmed + lower-cased**, matching `roleModels`/`onIdleMaxWait`, so
   a `"Judge"` config key matches the `judge` role the runner dispatches under.
 - **Logged per tick** in the header line above as
-  `effort=<level> (source=autonomous.roleRunner.roleEfforts.judge)`, with the
-  unconfigured case rendered `effort=<runtime CLI default> (source=unset)` —
+  `effort=<level> (source=autonomous.roleRunner.roleEfforts.judge)` (or
+  `…roleEfforts.judge@codex`, `autonomous.roleRunner.effort`, `codex-default`),
+  with the unconfigured case rendered `effort=<runtime CLI default> (source=unset)` —
   the same placecard the model field uses for its own pass-through, so a header
   never reads like its own bug.
 
@@ -11028,8 +11220,9 @@ mechanism and the `spawn-codex.sh`-side counterpart:
 `runtimes.roles.<role> = "codex"` with no `roleModels.<role>` entry at all —
 used to resolve the shipped Claude-shaped default and get refused every tick,
 forever (453+ consecutive skips on the host that filed #6565), with no way out:
-a ChatGPT-plan Codex seat rejects an explicit model pin too, so "no pin" was
-simultaneously the only correct configuration and permanently unadmittable.
+a ChatGPT-plan Codex seat rejected an explicit model pin too (catalog-listed
+pins have worked there since #14121), so "no pin" was simultaneously the only
+correct configuration and permanently unadmittable.
 The role runner now degrades that case to the runtime CLI's own default — no
 `--model` argument is emitted at all, the tick launches, and the log header
 records `model=<runtime CLI default> (source=default (CLI default for codex))`.
@@ -11037,6 +11230,83 @@ The same pass-through can be requested deliberately with
 `autonomous.roleRunner.roleModels.<role> = "default"` (or the global
 `autonomous.roleRunner.model`); see
 [`runtime-adapters.md` § "Per-role model override"](runtime-adapters.md#per-role-model-override-autonomousrolerunnerrolemodels).
+
+**Pinned models fall back one rung at selection time when their class limit
+is hit (#13873).** A model pin has no answer to an org-wide class ceiling:
+when every pool account is bad-marked `[model-class:fable]` (#8058/#13872),
+rotation has nothing to rotate to, the pool preflights hold dispatch, and
+the fleet idles until an operator moves every role off the pinned model by
+hand (the 2026-11-13 fable incident). `autonomous.modelFallback` makes the
+daemon fall a rung automatically instead — keep the stronger model
+configured; when its limit resets, the next spawn returns to it:
+
+```json
+{
+  "autonomous": {
+    "model": "fable",
+    "modelFallback": { "enabled": true, "chain": ["fable", "opus", "sonnet"] }
+  }
+}
+```
+
+- **Default off.** An absent block — or `"enabled": false` — reproduces the
+  pre-#13873 behaviour byte-for-byte, on every path below. Rollout is an
+  explicit per-repo choice; the shipped `chain` is `fable → opus → sonnet`
+  (the sweep ladder's upper rungs), configurable per repo through the
+  effective config like the model keys.
+- **What falls back.** Role-runner ticks and step-engine spawns (every
+  `StepRole`, including Builder steps): after the model-resolution chain
+  above resolves the configured model, the daemon probes the pool for that
+  model's *class* and, finding no usable account, walks the chain strictly
+  **below** the configured model to the first rung with one and launches
+  that. The walk never climbs: a configured model absent from the chain has
+  no provable "below" and never falls back (a weak pin can never silently
+  reach fable, #4501's original defect). Blank or unrecognized chain
+  entries are skipped, never fatal. When no rung is usable the launch holds
+  exactly as before.
+- **Nothing is sticky.** Config and pool state are re-read on every spawn,
+  so the moment an account usable for the configured model reappears (mark
+  expired, `tokens unblock`, probe headroom), the next spawn uses the
+  configured model again. An explicit-credential spawn
+  (`CLAUDE_CODE_OAUTH_TOKEN` / `LOOM_SPAWN_NO_EXPORT`) never consults the
+  pool and never changes model.
+- **The pool preflights follow.** With the block enabled, the role runner's
+  pre-spawn gate, the work finder's pool hold and the preference walk's
+  availability read all scope their "exhausted" verdict to the class of the
+  model the launch would actually run (or, model-less, ask whether *any*
+  known model class could spawn — an account counts while some rung stays
+  unmarked for it) — so a fable-exhausted pool with healthy opus capacity
+  dispatches instead of idling the fleet. A class-less mark (or an auth
+  mark) still holds everything, and so does an account bad-marked for
+  every class: a credential with no unmarked rung has nothing to fall to.
+- **Telemetry.** Each `loom.dispatch.step` span records
+  `loom.step.model_configured` (the pre-fallback model) alongside
+  `loom.step.model_launched`, plus `loom.step.model_fallback_from` /
+  `loom.step.model_fallback_reason` (`no-account-for-class`, or
+  `model-limit-kill` for an in-flight step-down below) when a
+  fallback fired — how an operator sees how much work ran below its
+  configured model. The role-runner per-role log header names the fallback
+  through the model source label.
+- **In-flight kills step down once (#13905).** A step-engine child that
+  dies mid-run on a per-model limit banner (`hit your Fable limit`,
+  `reached your Fable 5 limit`) is re-dispatched on the next rung strictly
+  below the killed model's class in `chain` (`fable` → `opus`). The death is
+  charged to the provider, not the item: the ledger records the uncharged
+  `provider_exhausted` refusal (#13966), so it never counts toward the
+  Builder fast-fail ladder or the repeat cap, and the item is redrawn at
+  once. One rung per kill, never a loop at the same model: a kill at `opus`
+  steps to `sonnet`; a kill at the last rung (or at a model off the chain) is
+  handled exactly as before. The step-down is a per-`(item, role)` memo that
+  any other step end clears and that lapses after an hour (limits are
+  windows), so the next unrelated run returns to the configured model. Only
+  a banner that *names a model* counts, read from the last 15 lines of the
+  step's own dispatch and only for a non-zero exit with no verdict line — a
+  generic `hit your weekly limit` is account-wide, no rung escapes it, and
+  stays as today. With the block absent or `enabled: false` nothing is
+  recorded and nothing changes. The issue-sweep path's insta-crash
+  quarantine tally already exempts these banners (`account-exhaustion`
+  re-attribution, #4122/#4501); it re-dispatches through the sweep reaper,
+  not this memo.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an

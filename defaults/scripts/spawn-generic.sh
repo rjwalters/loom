@@ -194,6 +194,14 @@ else
     log_info "spawn-generic($RUNTIME_NAME): model=default (no LOOM_GENERIC_MODEL_FLAG configured; LOOM_MODEL not forwarded)"
 fi
 
+# --- Service tier (issue #14141): no equivalent here ---
+# LOOM_SERVICE_TIER maps to a Claude/Codex launch setting only. A tier-3
+# template has nothing to translate it into, so it is ignored with ONE warning
+# (never a failure) rather than silently dropped.
+if [[ -n "${LOOM_SERVICE_TIER:-}" ]]; then
+    log_warn "spawn-generic($RUNTIME_NAME): LOOM_SERVICE_TIER='$LOOM_SERVICE_TIER' has no equivalent for this runtime; ignoring it"
+fi
+
 # --- Prompt delivery: configured flag, else positional (last argv element) ---
 # The guarded ${arr[@]+"${arr[@]}"} expansion (matches spawn-codex.sh) avoids
 # an "unbound variable" error under `set -u` on bash 3.2 (macOS's default

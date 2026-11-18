@@ -194,6 +194,37 @@ pub fn sweep_usage_runtime(
     usage_runtime_fallback(None, &contents)
 }
 
+/// [`sweep_usage_runtime`] for a sweep whose **registry entry names its own
+/// log** (Issue #14166).
+///
+/// A step-dispatched run (`SweepKind::Step`) logs to
+/// `step-<role>-<item>.log` (`SweepRegistry::compute_step_log_path`), never to
+/// the per-issue `sweep-issue-<issue>.log` that [`sweep_usage_runtime`] reads,
+/// so on that path the `# LOOM_RUNTIME_RESOLVED` marker was never found, the
+/// runtime resolved to `None`, and a Codex/OpenCode run was read through the
+/// Claude transcripts reader (no usage span at all). `dispatch_log` — the
+/// entry's own `log_path` — is consulted first; the per-issue log stays as the
+/// fallback, so a legacy whole-issue sweep resolves exactly as before. The
+/// same marker contract applies (Claude yields `None`), and only the log read
+/// differs, so this adds no new resolver — it points the existing one at the
+/// right file.
+#[must_use]
+pub fn sweep_usage_runtime_from_log(
+    labelled: Option<&str>,
+    dispatch_log: Option<&Path>,
+    workspace_root: &Path,
+    issue: u32,
+) -> Option<String> {
+    if let Some(labelled) = labelled.map(str::trim).filter(|r| !r.is_empty()) {
+        return Some(labelled.to_string());
+    }
+    let per_issue = crate::launch_record::sweep_log_path(workspace_root, issue);
+    dispatch_log
+        .filter(|log| *log != per_issue.as_path())
+        .and_then(|log| role_tick_usage_runtime(None, log))
+        .or_else(|| sweep_usage_runtime(None, workspace_root, issue))
+}
+
 /// [`usage_runtime_fallback`] for a **role tick**, reading the marker out of
 /// the tick's own per-role log.
 #[must_use]
@@ -228,6 +259,67 @@ pub fn sweep_directories(workspace_root: &Path, issue: u32) -> Vec<PathBuf> {
 #[must_use]
 pub fn role_tick_directories(root: &Path) -> Vec<PathBuf> {
     vec![root.to_path_buf()]
+}
+
+/// The exact native session ids one launch's own log names (#14048) — the
+/// strictly-more-precise attribution key for the stores that can hold it:
+/// OpenCode's event stream carries `sessionID` on every event, and Codex
+/// prints a `session id: <uuid>` banner. A step's log holds that stream, so
+/// [`crate::role_tick_telemetry::emit_for_step`] parses this out of the
+/// step's own dispatch region and keys the token stores by id instead of the
+/// directory+window pair, which cannot separate two concurrent same-role
+/// steps in one workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeSessionIds {
+    /// OpenCode `sessionID` values (`ses_…`), sorted and deduped.
+    pub opencode: Vec<String>,
+    /// Codex `session id:` banner uuids, sorted and deduped.
+    pub codex: Vec<String>,
+}
+
+/// Parse the native session ids a log region names (#14048). Pure: every
+/// unrecognized line is skipped, never guessed at. A JSON line contributes
+/// its `sessionID` when it carries a non-empty string one (OpenCode's
+/// `--format json` event stream); a line containing Codex's
+/// `session id: <token>` banner contributes the token when it is at least 8
+/// hex/dash characters — the same shape `spawn-codex.sh`'s own transcript
+/// join greps for.
+#[must_use]
+pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
+    let mut ids = NativeSessionIds::default();
+    for line in log_region.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(id) = event
+                .get("sessionID")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                ids.opencode.push(id.to_string());
+                continue;
+            }
+        }
+        let Some(at) = line.find("session id:") else {
+            continue;
+        };
+        let token = line[at + "session id:".len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+            .collect::<String>();
+        if token.len() >= 8 {
+            ids.codex.push(token);
+        }
+    }
+    for list in [&mut ids.opencode, &mut ids.codex] {
+        list.sort_unstable();
+        list.dedup();
+    }
+    ids
 }
 
 /// Per-`(model, speed, service_tier)` token totals for one sweep, read from
@@ -287,6 +379,118 @@ pub fn sweep_tokens_by_model(
             )
         }
     }
+}
+
+/// Whether a merged PR's work ran as dispatched **steps** on this host
+/// (#14018): at least one of its [`crate::launch_record::merge_step_logs`]
+/// exists. `false` means a legacy `/loom:sweep` (or a step that ran only on
+/// other hosts), which the sweep-keyed readers above already serve.
+#[must_use]
+pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
+    !crate::launch_record::merge_step_logs(workspace_root, issue, pr).is_empty()
+}
+
+/// Per-`(model, speed, service_tier)` token totals for a **step-dispatched**
+/// merge of `pr` (closing `issue`), on this host only (#14018).
+///
+/// Two sources, summed, because the steps of one PR can run on different
+/// runtimes (an OpenCode Builder, a Claude Judge):
+///
+/// - **Claude transcripts** whose first message names the issue-keyed Builder
+///   or the PR-keyed Judge/Doctor/`champion --pr` command
+///   ([`crate::transcript_tokens::sum_item_tokens_by_model`]); `window` narrows
+///   these by file mtime, as for a sweep.
+/// - **OpenCode sessions** named by the `sessionID`s in the step logs
+///   ([`crate::opencode_usage::tokens_by_session_ids`]) — never directory +
+///   window, since the store's `directory` is shared repo-wide. No window
+///   applies: a session id already names exactly one session. The Builder
+///   log (issue-keyed) is read from its last dispatch only, so an abandoned
+///   retry is not charged to the PR; the PR-keyed Doctor/Judge/`champion_merge`
+///   logs are read whole, as each dispatch there is a completed round (#14210).
+///
+/// A step that ran on another host left no log or transcript here, so its usage
+/// is absent and the total stays partial. `None` — never `Some(vec![])` — when
+/// neither source found anything.
+#[must_use]
+pub fn merge_step_tokens_by_model(
+    workspace_root: &Path,
+    issue: u32,
+    pr: u32,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<Vec<ModelUsageTotals>> {
+    let claude = crate::transcript_tokens::claude_projects_dir().and_then(|projects| {
+        crate::transcript_tokens::sum_item_tokens_by_model(
+            &projects,
+            workspace_root,
+            issue,
+            Some(pr),
+            window,
+        )
+    });
+    let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
+        .into_iter()
+        .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
+        .flat_map(|(role, contents)| {
+            use crate::step_role::StepRole;
+            // Spelled out, no catch-all: a role added to `merge_step_logs`
+            // must be filed under its keying here before this compiles.
+            match role {
+                // Issue-keyed: an earlier dispatch is an abandoned retry.
+                StepRole::Builder | StepRole::Curator | StepRole::ChampionPromote => {
+                    crate::launch_record::opencode_session_ids_last_dispatch(&contents)
+                }
+                // PR-keyed: an earlier dispatch is a completed round on this PR.
+                StepRole::Doctor | StepRole::Judge | StepRole::ChampionMerge => {
+                    crate::launch_record::opencode_session_ids(&contents)
+                }
+            }
+        })
+        .collect();
+    let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
+    combine_model_totals(claude.into_iter().chain(opencode).flatten())
+}
+
+/// Merge rows by `(model, speed, service_tier)`, summing every counter, sorted
+/// by that key. `None` when there are no rows.
+fn combine_model_totals(
+    rows: impl IntoIterator<Item = ModelUsageTotals>,
+) -> Option<Vec<ModelUsageTotals>> {
+    let mut merged: std::collections::BTreeMap<(String, String, String), ModelUsageTotals> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let entry = merged
+            .entry((row.model.clone(), row.speed.clone(), row.service_tier.clone()))
+            .or_insert_with(|| ModelUsageTotals {
+                model: row.model.clone(),
+                speed: row.speed.clone(),
+                service_tier: row.service_tier.clone(),
+                ..ModelUsageTotals::default()
+            });
+        entry.input = entry.input.saturating_add(row.input);
+        entry.cache_read = entry.cache_read.saturating_add(row.cache_read);
+        entry.cache_write_5m = entry.cache_write_5m.saturating_add(row.cache_write_5m);
+        entry.cache_write_1h = entry.cache_write_1h.saturating_add(row.cache_write_1h);
+        entry.output = entry.output.saturating_add(row.output);
+    }
+    (!merged.is_empty()).then(|| merged.into_values().collect())
+}
+
+/// The flat token total of `rows`: every counter summed, the same figure
+/// [`crate::transcript_tokens::sum_sweep_tokens`] reports for the same
+/// transcripts. `None` for a zero total, so an absent figure omits the key
+/// rather than publishing `0`.
+#[must_use]
+pub fn total_tokens(rows: &[ModelUsageTotals]) -> Option<u64> {
+    let total = rows.iter().fold(0_u64, |acc, row| {
+        let sum = row
+            .input
+            .saturating_add(row.cache_read)
+            .saturating_add(row.cache_write_5m)
+            .saturating_add(row.cache_write_1h)
+            .saturating_add(row.output);
+        acc.saturating_add(u64::try_from(sum).unwrap_or(0))
+    });
+    (total > 0).then_some(total)
 }
 
 /// Per-`(model, speed, service_tier)` token totals for one sweep, split across
@@ -380,26 +584,98 @@ pub fn sweep_tokens_by_window(
 /// So this returns `None` for [`UsageSource::ClaudeTranscripts`] and the
 /// caller uses [`UsageSource::is_native_store`] to pick between the two paths.
 ///
-/// `log_path` is the tick's own per-role log (`role_runner::role_log_path`):
-/// the one store keyed by where the output was captured rather than by
-/// directory is Pi's ([`crate::pi_usage`]), and a role tick's log is not
-/// derivable from `root` alone.
+/// `log_path` is the launch's own log — a role tick's per-role log
+/// (`role_runner::role_log_path`), a step's per-item log (#14048): the one
+/// store keyed by where the output was captured rather than by directory is
+/// Pi's ([`crate::pi_usage`]), and a step's event stream is captured in the
+/// step's own log, not the per-role one.
+///
+/// `session_ids` (#14048) are the exact native session ids parsed from that
+/// same log's dispatch region. The OpenCode and Codex arms key on them
+/// when present, and fall back to the directory+window key when empty (a role
+/// tick, or a step whose log was unreadable). The two arms are NOT symmetric:
+///
+/// - **OpenCode**: the id is the whole key — no directory, no window — because
+///   the id cannot name another launch's session.
+/// - **Codex**: the ids are ANDed with the workspace directory and the window
+///   (`SessionFilter::matches` in `codex_usage`), so an id-named rollout whose
+///   `cwd` is not the workspace root, or that started outside the window, is
+///   not attributed. The window is kept deliberately: it bounds the rollout
+///   scan to the window's date directories, where dropping it would read
+///   every rollout in the store. A step child's cwd is pinned to the workspace
+///   root, so the directory constraint holds for every step dispatch today; a
+///   launch path that runs Codex from a worktree would need an ids-only
+///   filter here.
+///
+/// The Kimi arm has no id source yet (see `crate::kimi_usage`'s module doc)
+/// and keeps the directory+window key.
 #[must_use]
 pub fn role_tick_tokens_by_model(
     runtime: Option<&str>,
     root: &Path,
     log_path: &Path,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
+) -> Option<Vec<ModelUsageTotals>> {
+    native_tokens_by_model(runtime, &role_tick_directories(root), log_path, window, session_ids)
+}
+
+/// [`role_tick_tokens_by_model`] for a **step-dispatched** run (#14406).
+///
+/// A step is a role session keyed by one work item, so an issue-keyed step
+/// (Curator, Builder, `champion_promote`) is read over the same directories a
+/// sweep on that issue is — the workspace root plus the issue's worktree
+/// ([`sweep_directories`]), where its Builder runs. A PR-keyed step
+/// (Judge, Doctor, `champion_merge`) carries a PR number that cannot name an
+/// issue worktree here, so it is read over the workspace root alone, as a
+/// role tick is. `log_path` is the step's own `step-<role>-<item>.log`.
+///
+/// The directory + window key cannot tell two steps that ran in the same
+/// directory at the same time apart; only the Claude arm (which matches on
+/// the transcript's own command) and Pi (which reads the step's own log) are
+/// exact per step. `None` for [`UsageSource::ClaudeTranscripts`], like the
+/// tick reader.
+#[must_use]
+pub fn step_tokens_by_model(
+    runtime: Option<&str>,
+    root: &Path,
+    item: (u32, bool),
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
+) -> Option<Vec<ModelUsageTotals>> {
+    let (number, acts_on_pr) = item;
+    let directories = if acts_on_pr {
+        role_tick_directories(root)
+    } else {
+        sweep_directories(root, number)
+    };
+    native_tokens_by_model(runtime, &directories, log_path, window, session_ids)
+}
+
+fn native_tokens_by_model(
+    runtime: Option<&str>,
+    directories: &[PathBuf],
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
 ) -> Option<Vec<ModelUsageTotals>> {
     match UsageSource::for_runtime(runtime) {
         UsageSource::OpenCodeSessionDb => {
-            crate::opencode_usage::tokens_by_model(&role_tick_directories(root), window, None)
+            if session_ids.opencode.is_empty() {
+                crate::opencode_usage::tokens_by_model(directories, window, None)
+            } else {
+                crate::opencode_usage::tokens_by_model_for_ids(&session_ids.opencode, None)
+            }
         }
         UsageSource::KimiSessionStore => {
-            crate::kimi_usage::tokens_by_model(&role_tick_directories(root), None, window, None)
+            crate::kimi_usage::tokens_by_model(directories, None, window, None)
         }
         UsageSource::CodexSessionRollouts => crate::codex_usage::tokens_by_model(
-            &crate::codex_usage::SessionFilter::directories(&role_tick_directories(root)),
+            &crate::codex_usage::SessionFilter {
+                directories: directories.to_vec(),
+                ids: session_ids.codex.clone(),
+            },
             window,
             None,
         ),
@@ -498,6 +774,58 @@ mod tests {
         }
     }
 
+    /// #14048: the native session ids a launch's own log region names —
+    /// OpenCode's `--format json` event stream (`sessionID`) and Codex's
+    /// `session id: <uuid>` stderr banner — parse out exactly, with every
+    /// unrecognized line skipped and both lists deduped.
+    #[test]
+    fn native_session_ids_parse_each_runtimes_own_shape() {
+        let region = concat!(
+            "==== loom-daemon dispatch: 2026-11-18 sweep_id=step-builder-42-1 item=42 step=builder ====\n",
+            "# LOOM_RUNTIME_RESOLVED runtime=opencode\n",
+            "{\"type\":\"session.start\",\"timestamp\":1791767321693,\"sessionID\":\"ses_b\",\"part\":{\"type\":\"text\"}}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":1791767321700,\"sessionID\":\"ses_b\",\"part\":{\"type\":\"tool\"}}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":1791767321710,\"sessionID\":\"ses_a\",\"part\":{\"type\":\"tool\"}}\n",
+            "plain transcript prose, no id at all\n",
+        );
+        assert_eq!(
+            native_session_ids(region),
+            NativeSessionIds {
+                opencode: vec!["ses_a".to_string(), "ses_b".to_string()],
+                codex: Vec::new(),
+            }
+        );
+
+        let codex = concat!(
+            "==== loom-daemon dispatch: 2026-11-18 sweep_id=step-judge-7-1 item=7 step=judge ====\n",
+            "# LOOM_RUNTIME_RESOLVED runtime=codex\n",
+            "spawn-codex: waiting for session\n",
+            "session id: 3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01\n",
+            "tokens used: 1,234 input (1,000 cached)\n",
+        );
+        assert_eq!(
+            native_session_ids(codex),
+            NativeSessionIds {
+                opencode: Vec::new(),
+                codex: vec!["3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01".to_string()],
+            }
+        );
+    }
+
+    /// #14048: a JSON line whose `sessionID` is not a non-empty string, a
+    /// `session id:` tail shorter than the 8-character floor, and an empty
+    /// region all contribute nothing — never a guessed id.
+    #[test]
+    fn native_session_ids_never_guess_at_unrecognized_lines() {
+        assert_eq!(
+            native_session_ids(
+                "{\"sessionID\":\"\"}\n{\"sessionID\":null}\n{\nbroken json\n                 session id: abc\ncosession id: no\n"
+            ),
+            NativeSessionIds::default()
+        );
+        assert_eq!(native_session_ids(""), NativeSessionIds::default());
+    }
+
     #[test]
     fn source_names_cover_every_variant_and_stay_stable_for_logs() {
         for (source, name) in [
@@ -578,10 +906,22 @@ mod tests {
         // from a transcript scan that ALSO derives forge-mutating `actions`,
         // which only the caller keeps. See `role_tick_tokens_by_model`'s doc.
         let log = Path::new("/w/loom/.loom/logs/role-curator.log");
-        assert!(role_tick_tokens_by_model(None, Path::new("/w/loom"), log, None).is_none());
-        assert!(
-            role_tick_tokens_by_model(Some("claude"), Path::new("/w/loom"), log, None).is_none()
-        );
+        assert!(role_tick_tokens_by_model(
+            None,
+            Path::new("/w/loom"),
+            log,
+            None,
+            &NativeSessionIds::default()
+        )
+        .is_none());
+        assert!(role_tick_tokens_by_model(
+            Some("claude"),
+            Path::new("/w/loom"),
+            log,
+            None,
+            &NativeSessionIds::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -621,6 +961,44 @@ mod tests {
         assert_eq!(sweep_usage_runtime(None, root, 8594), None);
         // A missing log is `None`, never a panic.
         assert_eq!(sweep_usage_runtime(None, root, 9999), None);
+    }
+
+    /// Issue #14166: a step-dispatched run logs to `step-<role>-<item>.log`,
+    /// so the marker must be read from the entry's own log, not only from the
+    /// per-issue log (which a step dispatch never writes).
+    #[test]
+    fn sweep_usage_runtime_from_log_reads_the_step_log_and_falls_back_to_the_issue_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let logs = root.join(".loom").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let step_log = logs.join("step-builder-14166.log");
+        std::fs::write(&step_log, resolved_log("codex")).unwrap();
+        // The per-issue log does not exist: only the step log can answer.
+        assert_eq!(
+            sweep_usage_runtime_from_log(None, Some(&step_log), root, 14166).as_deref(),
+            Some("codex")
+        );
+        // A launch-record label still wins without any read.
+        assert_eq!(
+            sweep_usage_runtime_from_log(Some("opencode"), Some(&step_log), root, 14166).as_deref(),
+            Some("opencode")
+        );
+        // A Claude step log resolves to `None` (payload-preserving), and the
+        // per-issue log is then the fallback.
+        std::fs::write(&step_log, resolved_log("claude")).unwrap();
+        assert_eq!(sweep_usage_runtime_from_log(None, Some(&step_log), root, 14166), None);
+        let issue_log = crate::launch_record::sweep_log_path(root, 14166);
+        std::fs::write(&issue_log, resolved_log("codex")).unwrap();
+        assert_eq!(
+            sweep_usage_runtime_from_log(None, Some(&step_log), root, 14166).as_deref(),
+            Some("codex")
+        );
+        // No dispatch log at all behaves exactly like `sweep_usage_runtime`.
+        assert_eq!(
+            sweep_usage_runtime_from_log(None, None, root, 14166),
+            sweep_usage_runtime(None, root, 14166)
+        );
     }
 
     #[test]
@@ -810,7 +1188,9 @@ mod tests {
             "2026-09-25T02:00:00Z".parse().unwrap(),
             "2026-09-25T02:05:00Z".parse().unwrap(),
         ));
-        let totals = role_tick_tokens_by_model(Some("pi"), root, &log, window).unwrap();
+        let totals =
+            role_tick_tokens_by_model(Some("pi"), root, &log, window, &NativeSessionIds::default())
+                .unwrap();
         assert_eq!((totals[0].input, totals[0].output), (30, 3));
     }
 }

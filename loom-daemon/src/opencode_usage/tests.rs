@@ -19,6 +19,9 @@ struct Row<'a> {
     cache_write: i64,
     directory: &'a str,
     created_ms: i64,
+    /// Explicit `session.id` (#14048); `None` seeds the positional
+    /// `session-<i>` default every pre-#14048 fixture used.
+    id: Option<&'a str>,
 }
 
 fn row<'a>(model: &'a str, directory: &'a str, created_ms: i64) -> Row<'a> {
@@ -31,6 +34,7 @@ fn row<'a>(model: &'a str, directory: &'a str, created_ms: i64) -> Row<'a> {
         cache_write: 0,
         directory,
         created_ms,
+        id: None,
     }
 }
 
@@ -71,7 +75,8 @@ fn seed_db(db_path: &Path, rows: &[Row<'_>]) {
              tokens_cache_read, tokens_cache_write, directory, title, time_created) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'title', ?9)",
             rusqlite::params![
-                format!("session-{i}"),
+                r.id.map(str::to_string)
+                    .unwrap_or_else(|| format!("session-{i}")),
                 r.model,
                 r.input,
                 r.output,
@@ -153,9 +158,11 @@ fn a_planted_credential_never_surfaces_in_the_returned_rows_or_their_wire_form()
             cache_write: 1,
             directory: "/repo/a",
             created_ms: 1_000,
+            id: None,
         }],
     );
-    let sessions = sessions_in(&db, &dirs(&["/repo/a"]), None).expect("db opened");
+    let sessions = sessions_in(&db, &SessionFilter::directories(&dirs(&["/repo/a"])), None)
+        .expect("db opened");
     assert_eq!(sessions.len(), 1);
     let rendered = format!("{sessions:?}");
     assert!(!rendered.contains("sk-fake-secret-should-never-be-read"), "{rendered}");
@@ -176,15 +183,15 @@ fn works_identically_when_the_db_has_no_credential_or_account_tables_at_all() {
     let conn = Connection::open(&db).unwrap();
     conn.execute_batch(
         "CREATE TABLE session (
-             model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+             id TEXT, model TEXT, tokens_input INTEGER, tokens_output INTEGER,
              tokens_reasoning INTEGER, tokens_cache_read INTEGER,
              tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
          );",
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO session VALUES (?1, 10, 20, 0, 5, 1, '/repo/a', 1000)",
-        rusqlite::params![model_json("zai-org/GLM-5.3", "friendli")],
+        "INSERT INTO session VALUES (?1, ?2, 10, 20, 0, 5, 1, '/repo/a', 1000)",
+        rusqlite::params!["ses_plain", model_json("zai-org/GLM-5.3", "friendli")],
     )
     .unwrap();
     drop(conn);
@@ -229,9 +236,11 @@ fn extracts_model_id_and_provider_and_folds_reasoning_into_output() {
             cache_write: 7,
             directory: "/repo/a",
             created_ms: 1_000,
+            id: None,
         }],
     );
-    let sessions = sessions_in(&db, &dirs(&["/repo/a"]), None).unwrap();
+    let sessions =
+        sessions_in(&db, &SessionFilter::directories(&dirs(&["/repo/a"])), None).unwrap();
     assert_eq!(sessions[0].provider.as_deref(), Some("friendli"));
 
     let rows = tokens_by_model_in(&db, &dirs(&["/repo/a"]), None).unwrap();
@@ -319,7 +328,9 @@ fn an_all_zero_session_row_is_not_a_model_badge() {
         )],
     );
     assert_eq!(
-        sessions_in(&db, &dirs(&["/repo/a"]), None).unwrap().len(),
+        sessions_in(&db, &SessionFilter::directories(&dirs(&["/repo/a"])), None)
+            .unwrap()
+            .len(),
         1,
         "the raw reader still reports the row"
     );
@@ -337,12 +348,16 @@ fn a_database_with_no_matching_sessions_yields_none_not_an_empty_vec() {
     seed_db(&db, &[]);
     assert_eq!(tokens_by_model_in(&db, &dirs(&["/repo/a"]), None), None);
     assert_eq!(
-        sessions_in(&db, &dirs(&["/repo/a"]), None),
+        sessions_in(&db, &SessionFilter::directories(&dirs(&["/repo/a"])), None),
         Some(Vec::new()),
         "`opened fine, nothing matched` is distinct from `could not open`"
     );
     assert_eq!(
-        sessions_in(Path::new("/nonexistent/opencode.db"), &dirs(&["/repo/a"]), None),
+        sessions_in(
+            Path::new("/nonexistent/opencode.db"),
+            &SessionFilter::directories(&dirs(&["/repo/a"])),
+            None
+        ),
         None
     );
 }
@@ -454,7 +469,8 @@ fn time_created_is_decoded_as_epoch_milliseconds_matching_the_live_schema() {
             ..row(&model_json("zai-org/GLM-5.3", "friendli"), "/repo/a", 1_790_041_222_146)
         }],
     );
-    let sessions = sessions_in(&db, &dirs(&["/repo/a"]), None).unwrap();
+    let sessions =
+        sessions_in(&db, &SessionFilter::directories(&dirs(&["/repo/a"])), None).unwrap();
     assert_eq!(sessions[0].created_at.to_rfc3339(), "2026-09-22T01:40:22.146+00:00");
 }
 
@@ -774,5 +790,229 @@ fn tokens_by_model_in(
     directories: &[PathBuf],
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<ModelUsageTotals>> {
-    fold_sessions(sessions_in(db, directories, window)?)
+    fold_sessions(sessions_in(db, &SessionFilter::directories(directories), window)?)
+}
+
+// --- Exact-id attribution (#14048) ---------------------------------------
+
+/// A `Row` builder with an explicit session id, for the by-id tests —
+/// [`seed_db`]'s positional `session-{i}` ids stay available through it too.
+fn id_row<'a>(id: &'a str, model: &'a str, directory: &'a str, input: i64) -> Row<'a> {
+    Row {
+        model,
+        input,
+        output: 0,
+        reasoning: 0,
+        cache_read: 0,
+        cache_write: 0,
+        directory,
+        created_ms: 1_000,
+        id: Some(id),
+    }
+}
+
+/// The exact ids a step's own log names select exactly those sessions —
+/// including one whose `directory` is NOT in any caller-supplied set, because
+/// the id is the whole key (#14048). A neighbouring session in the same store
+/// under a different id stays out.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn an_exact_id_set_selects_only_the_sessions_it_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    seed_db(
+        &db,
+        &[
+            id_row("ses_step", &model_json("zai-org/GLM-5.3", "friendli"), "/elsewhere", 500),
+            id_row("ses_other", &model_json("zai-org/GLM-5.3", "friendli"), "/repo/a", 7),
+        ],
+    );
+    std::env::set_var(OPENCODE_DB_ENV, &db);
+
+    let sessions = sessions_for_ids(&["ses_step".to_string()], None);
+    std::env::remove_var(OPENCODE_DB_ENV);
+    assert_eq!(sessions.len(), 1, "the unnamed neighbour must stay out");
+    assert_eq!(sessions[0].session_id.as_deref(), Some("ses_step"));
+    // The id-keyed read ignores the window: a session created outside it is
+    // still this launch's (the id cannot name another launch's session).
+    assert_eq!(sessions[0].input, 500);
+
+    std::env::set_var(OPENCODE_DB_ENV, &db);
+    let totals = tokens_by_model_for_ids(&["ses_step".to_string()], None).unwrap();
+    std::env::remove_var(OPENCODE_DB_ENV);
+    assert_eq!(totals.len(), 1);
+    assert_eq!(totals[0].input, 500);
+}
+
+/// `tokens_by_model_for_ids` holds the module's "unknown != zero" contract:
+/// ids no store holds answer `None`, never an empty breakdown.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn ids_no_store_holds_answer_none_not_an_empty_breakdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    seed_db(
+        &db,
+        &[id_row(
+            "ses_x",
+            &model_json("zai-org/GLM-5.3", "friendli"),
+            "/repo/a",
+            10,
+        )],
+    );
+    std::env::set_var(OPENCODE_DB_ENV, &db);
+    let totals = tokens_by_model_for_ids(&["ses_absent".to_string()], None);
+    std::env::remove_var(OPENCODE_DB_ENV);
+    assert_eq!(totals, None);
+}
+
+/// [`SessionFilter`]'s empty-match rule, pinned: a filter with neither
+/// directories nor ids attributes NOTHING — "every session on this host" is
+/// never a legitimate reading.
+#[test]
+fn an_entirely_empty_filter_matches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    seed_db(
+        &db,
+        &[id_row(
+            "ses_x",
+            &model_json("zai-org/GLM-5.3", "friendli"),
+            "/repo/a",
+            10,
+        )],
+    );
+    assert!(sessions_in(&db, &SessionFilter::default(), None)
+        .expect("db opened")
+        .is_empty());
+}
+
+// --- Session-id selection (#14018) ---------------------------------------
+
+#[test]
+fn session_id_selection_counts_only_the_named_sessions_not_their_directory_neighbours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let model = model_json("m", "p");
+    let mine = Row {
+        input: 100,
+        output: 10,
+        ..row(&model, "/repo", 1_000)
+    };
+    let neighbour = Row {
+        input: 9_999,
+        ..row(&model, "/repo", 1_000)
+    };
+    seed_db(&db, &[mine, neighbour]);
+    // `seed_db` names its rows `session-<index>`.
+    let ids = ["session-0"].into_iter().collect();
+    let sessions = sessions_by_id_in(&db, &ids).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id.as_deref(), Some("session-0"));
+    let rows = fold_sessions(sessions).unwrap();
+    assert_eq!((rows[0].input, rows[0].output), (100, 10));
+    // No directory or window narrows an id: a session elsewhere, long ago, is
+    // still the one the log named.
+    let elsewhere = Row {
+        input: 7,
+        ..row(&model, "/somewhere/else", 5)
+    };
+    seed_db(&tmp.path().join("other.db"), &[elsewhere]);
+    let ids = ["session-0"].into_iter().collect();
+    assert_eq!(
+        sessions_by_id_in(&tmp.path().join("other.db"), &ids)
+            .unwrap()
+            .len(),
+        1
+    );
+    // An id the store does not hold selects nothing (an empty read, not a failure).
+    let ids = ["ses_unknown"].into_iter().collect();
+    assert_eq!(sessions_by_id_in(&db, &ids).unwrap(), Vec::new());
+}
+
+#[test]
+fn no_session_ids_yield_no_totals() {
+    assert_eq!(tokens_by_session_ids(&[], None), None);
+}
+
+// --- Id branch is the whole key (#14278) ---------------------------------
+
+fn raw_row(id: &str, directory: &str, time_created: Option<i64>) -> RawSessionRow {
+    RawSessionRow {
+        id: Some(id.to_string()),
+        model: Some(model_json("zai-org/GLM-5.3", "friendli")),
+        input: Some(5),
+        output: Some(1),
+        reasoning: None,
+        cache_read: None,
+        cache_write: None,
+        directory: Some(directory.to_string()),
+        time_created,
+    }
+}
+
+/// An id-keyed decode attributes a row whose `time_created` is NULL or out of
+/// range — the id is the whole key, so the window-only column must not drop
+/// it. The directory+window branch still drops it (an unattributable instant
+/// is never assumed to be inside the window).
+#[test]
+fn an_id_keyed_row_without_a_decodable_time_created_is_still_attributed() {
+    let ids = SessionFilter::ids(&["ses_a".to_string()]);
+    for time_created in [None, Some(i64::MAX)] {
+        let decoded = raw_row("ses_a", "/repo", time_created)
+            .decode(&ids, None)
+            .unwrap_or_else(|| panic!("id-matched row dropped for time_created={time_created:?}"));
+        assert_eq!(decoded.session_id.as_deref(), Some("ses_a"));
+        assert_eq!(decoded.input, 5);
+    }
+    // Pin the sibling branch so the asymmetry stays deliberate.
+    let dirs_only = SessionFilter::directories(&dirs(&["/repo"]));
+    assert!(raw_row("ses_a", "/repo", None)
+        .decode(&dirs_only, None)
+        .is_none());
+}
+
+/// One session id held by two installed stores (a cross-version copy) is one
+/// session: BOTH id-keyed entry points count it once.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn one_id_in_two_stores_is_counted_once_by_both_id_entry_points() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    for version in ["opencode-1.18.31", "opencode-2.0.10"] {
+        let dir = tmp
+            .path()
+            .join(".loom")
+            .join("opt")
+            .join(version)
+            .join("xdg")
+            .join("data")
+            .join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_db(
+            &dir.join("opencode.db"),
+            &[id_row(
+                "ses_dup",
+                &model_json("zai-org/GLM-5.3", "friendli"),
+                "/repo/a",
+                10,
+            )],
+        );
+    }
+    let ids = ["ses_dup".to_string()];
+
+    assert_eq!(sessions_for_ids(&ids, Some(tmp.path())).len(), 1);
+    for totals in [
+        tokens_by_model_for_ids(&ids, Some(tmp.path())),
+        tokens_by_session_ids(&ids, Some(tmp.path())),
+    ] {
+        let totals = totals.unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].input, 10, "the duplicated id must not be summed twice");
+    }
+
+    // Directory-keyed reads are unchanged: they are not id-deduped.
+    let listed = sessions(&dirs(&["/repo/a"]), None, Some(tmp.path()));
+    assert_eq!(listed.len(), 2);
 }

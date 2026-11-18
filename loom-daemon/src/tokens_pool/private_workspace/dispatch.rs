@@ -157,6 +157,18 @@ impl Selection {
         let (config, dir) = lifecycle::resolve(root, &selection.name)?;
         export::check_failover(root, issue, &selection.name)?;
         let target = select_target(root, &config)?;
+        // Refuse BEFORE the lease, the container exec and the claim when the
+        // only forge credential this owner has is provably expired (#14435).
+        // Preparing would `git fetch` with a dead token, exit 128 and strand a
+        // step the seat was already handed; refusing here lets the draw fall
+        // through to a runtime that can serve it.
+        if forge_auth::ExecAuth::resolve(root, &target.repository).expired() {
+            bail!(
+                "private workspace forge credential for {} is expired and no fresher one is \
+                 published; the credential refresh has not renewed it",
+                target.repository
+            );
+        }
         let lease = lease::Lease::acquire(&dir)?;
         let state = docker::inspect(&config.container)?
             .context("private account session is unavailable (container stopped or missing)")?;

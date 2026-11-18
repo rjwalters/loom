@@ -98,29 +98,50 @@ pub fn fetch_resolve_latest(repo_root: &Path, pinned_tag: Option<&str>) -> Resol
     r
 }
 
+/// Shared prefix of the two "no latest release" reasons below. One literal,
+/// not two: `forge_inventory`'s ratchet counts every non-comment `gh release`
+/// phrase textually, so duplicating it grew the file's baseline count (#14152).
+const NO_LATEST_RELEASE: &str = "'gh release view' found no latest release";
+
 /// The release half of [`fetch_resolve_latest`], with the forge reads factored
 /// out so the tag/asset logic is testable without `gh` (#10709).
 ///
 /// `view(fields, jq)` is `gh release view [<pinned_tag>] --json <fields> --jq
-/// <jq>` for `r.repo_slug`; `explain(tag, target)` is the #8654 reason for a
-/// release that lacks this host's artifact.
+/// <jq>` for `r.repo_slug`; `Ok` carries stdout, `Err` the one cause `gh`
+/// itself named for the failure (#14016). `explain(tag, target)` is the #8654
+/// reason for a release that lacks this host's artifact.
 fn resolve_release(
     r: &mut Resolution,
     pinned_tag: Option<&str>,
-    view: &dyn Fn(&str, &str) -> Option<String>,
+    view: &dyn Fn(&str, &str) -> Result<String, String>,
     explain: &dyn Fn(&str, &str) -> Option<String>,
 ) {
-    let tag = view("tagName", ".tagName").unwrap_or_default();
+    let tag = match view("tagName", ".tagName") {
+        Ok(tag) => tag.trim_end().to_string(),
+        Err(why) => {
+            // #14016: name the cause `gh` reported — not-found vs
+            // rate-limited vs auth/network — instead of listing all of
+            // them, which told the operator nothing.
+            r.reason = match pinned_tag {
+                Some(pinned) => {
+                    format!("found no release tagged {pinned} for {} ({why})", r.repo_slug)
+                }
+                None => {
+                    format!("{NO_LATEST_RELEASE} for {} ({why})", r.repo_slug)
+                }
+            };
+            return;
+        }
+    };
     if tag.is_empty() {
+        // `gh` answered but named no release: no Releases yet (or an empty
+        // answer for a pin). No stderr to classify — say it directly.
         r.reason = match pinned_tag {
             Some(pinned) => format!(
-                "found no release tagged {pinned} for {} (no such tag, an unreachable/rate-limited API, or an auth failure)",
+                "found no release tagged {pinned} for {} (the forge returned no tag)",
                 r.repo_slug
             ),
-            None => format!(
-                "'gh release view' found no latest release for {} (no Releases yet, an unreachable/rate-limited API, or an auth failure)",
-                r.repo_slug
-            ),
+            None => format!("{NO_LATEST_RELEASE} for {} (no Releases yet)", r.repo_slug),
         };
         return;
     }
@@ -139,7 +160,7 @@ fn resolve_release(
         return;
     }
 
-    let assets = view("assets", ".assets[].name").unwrap_or_default();
+    let assets = view("assets", ".assets[].name").ok().unwrap_or_default();
     let bin_name = format!("loom-daemon-{}", r.target);
     let sha_name = format!("{bin_name}.sha256");
     // `grep -qxF` — a WHOLE-LINE, fixed-string match. A substring match would
@@ -181,7 +202,13 @@ fn uname_or_question(flag: &str) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-fn gh_release_view(slug: &str, tag: Option<&str>, fields: &str, jq: &str) -> Option<String> {
+fn gh_release_view(
+    slug: &str,
+    tag: Option<&str>,
+    fields: &str,
+    jq: &str,
+) -> Result<String, String> {
+    use crate::cmd_out::CmdOutcome;
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #10089: through the facade, so the read is counted and bounded.
     let op = Operation::new("release.view");
@@ -193,8 +220,82 @@ fn gh_release_view(slug: &str, tag: Option<&str>, fields: &str, jq: &str) -> Opt
         .reader_repo(slug)
         .args(release_view_args(slug, tag, fields, jq))
         .run();
-    let ran = outcome.ok_output()?;
-    Some(String::from_utf8_lossy(&ran.stdout).trim_end().to_string())
+    match outcome {
+        CmdOutcome::Ran(o) if o.status.success() => {
+            Ok(String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+        }
+        // #14016: keep the failed output's stderr — the cause it names is
+        // the difference between "no such tag" and "rate-limited".
+        CmdOutcome::Ran(o) => Err(why_view_failed(&String::from_utf8_lossy(&o.stderr))),
+        CmdOutcome::Unavailable(u) => Err(u.to_string()),
+    }
+}
+
+/// The one cause `gh`'s own report names for a failed release read
+/// (Issue #14016). The old reason listed every cause at once ("no such tag,
+/// an unreachable/rate-limited API, or an auth failure"), which an operator
+/// could not act on; this returns the one whose signature the stderr
+/// matches, or `None` when nothing matches — the caller then says
+/// "unclassified" instead of repeating the whole list.
+fn classify_gh_stderr(stderr: &str) -> Option<&'static str> {
+    let s = stderr.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| s.contains(n));
+    // Rate limit first: its HTTP 403s must not read as auth.
+    if has(&["rate limit", "secondary rate", "abuse"]) {
+        Some("a rate-limited API")
+    } else if has(&[
+        "bad credentials",
+        "unauthorized",
+        "http 401",
+        "http 403",
+        "forbidden",
+        "auth",
+    ]) {
+        Some("an auth failure")
+    } else if has(&[
+        "could not resolve host",
+        "no such host",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "network",
+        "unreachable",
+        "dial tcp",
+        "tls",
+    ]) {
+        Some("an unreachable API")
+    } else if has(&[
+        "http 404",
+        "not found",
+        "no releases",
+        "could not be found",
+        "could not resolve to a release",
+    ]) {
+        Some("no such release")
+    } else {
+        None
+    }
+}
+
+/// The `gh`-attributable cause for a failed release read (Issue #14016):
+/// the classifier's verdict, with gh's own first stderr line kept for the
+/// detail a one-phrase verdict loses.
+fn why_view_failed(stderr: &str) -> String {
+    let first_line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| {
+            let truncated = l.chars().take(200).collect::<String>();
+            truncated
+        });
+    match (classify_gh_stderr(stderr), first_line) {
+        (Some(cause), Some(line)) => format!("{cause} (gh: {line})"),
+        (Some(cause), None) => cause.to_string(),
+        (None, Some(line)) => format!("unclassified gh failure (gh: {line})"),
+        (None, None) => "unclassified gh failure".to_string(),
+    }
 }
 
 /// The `gh` argv for one release read: the newest release when `tag` is
@@ -300,14 +401,17 @@ mod tests {
         releases: &'a [(&'a str, &'a [&'a str])],
         pinned: Option<&'a str>,
         seen: &'a std::cell::RefCell<Vec<String>>,
-    ) -> impl Fn(&str, &str) -> Option<String> + 'a {
+    ) -> impl Fn(&str, &str) -> Result<String, String> + 'a {
         move |fields, _jq| {
             seen.borrow_mut().push(fields.to_string());
             let (tag, assets) = match pinned {
-                None => releases.first()?,
-                Some(p) => releases.iter().find(|(t, _)| *t == p)?,
+                None => releases.first().ok_or("no release")?,
+                Some(p) => releases
+                    .iter()
+                    .find(|(t, _)| *t == p)
+                    .ok_or("no such tag")?,
             };
-            Some(match fields {
+            Ok(match fields {
                 "tagName" => (*tag).to_string(),
                 _ => assets.join("\n"),
             })
@@ -410,8 +514,8 @@ mod tests {
     #[test]
     fn a_forge_answer_for_a_different_tag_is_refused() {
         let mut r = fresh();
-        let wrong: &dyn Fn(&str, &str) -> Option<String> = &|fields, _| {
-            Some(if fields == "tagName" {
+        let wrong: &dyn Fn(&str, &str) -> Result<String, String> = &|fields, _| {
+            Ok(if fields == "tagName" {
                 "v0.19.831".to_string()
             } else {
                 FULL.join("\n")
@@ -420,6 +524,97 @@ mod tests {
         resolve_release(&mut r, Some("v0.19.830"), wrong, NO_EXPLAIN);
         assert!(!r.ok);
         assert!(r.reason.contains("asked for release v0.19.830"), "{}", r.reason);
+    }
+
+    // Issue #14016: a failed release read names the cause gh reported.
+
+    /// A forge whose `tagName` read fails with the given stderr shape.
+    fn failing(stderr: &'static str) -> impl Fn(&str, &str) -> Result<String, String> {
+        move |fields, _jq| {
+            if fields == "tagName" {
+                Err(why_view_failed(stderr))
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+
+    #[test]
+    fn a_not_found_failure_says_no_such_release_not_all_three_causes() {
+        let mut r = fresh();
+        let stderr = "gh: Not Found (HTTP 404)";
+        resolve_release(&mut r, Some("v0.19.999"), &failing(stderr), NO_EXPLAIN);
+        assert!(!r.ok);
+        assert!(r.reason.contains("no such release"), "names the cause: {}", r.reason);
+        assert!(
+            !r.reason.contains("unreachable") && !r.reason.contains("rate-limited"),
+            "does not list the other causes: {}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_failure_says_rate_limited() {
+        let mut r = fresh();
+        let stderr =
+            "gh: API rate limit exceeded for 203.0.113.7. (But here's the good news: ...) [HTTP 403]";
+        resolve_release(&mut r, None, &failing(stderr), NO_EXPLAIN);
+        assert!(!r.ok);
+        assert!(r.reason.contains("a rate-limited API"), "names the cause: {}", r.reason);
+        assert!(
+            !r.reason.contains("auth failure"),
+            "a rate-limit 403 is not read as auth: {}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn an_auth_failure_says_auth() {
+        let mut r = fresh();
+        let stderr = "gh: Bad credentials (HTTP 401)";
+        resolve_release(&mut r, None, &failing(stderr), NO_EXPLAIN);
+        assert!(r.reason.contains("an auth failure"), "{}", r.reason);
+    }
+
+    #[test]
+    fn an_unreachable_failure_says_unreachable() {
+        let mut r = fresh();
+        let stderr = "gh: failed to fetch release: dial tcp: lookup api.github.com: no such host";
+        resolve_release(&mut r, Some("v0.19.999"), &failing(stderr), NO_EXPLAIN);
+        assert!(r.reason.contains("an unreachable API"), "{}", r.reason);
+    }
+
+    #[test]
+    fn an_unclassifiable_failure_says_unclassified() {
+        let mut r = fresh();
+        let stderr = "gh: something entirely novel happened";
+        resolve_release(&mut r, None, &failing(stderr), NO_EXPLAIN);
+        assert!(r.reason.contains("unclassified"), "does not re-list the causes: {}", r.reason);
+        // gh's own line survives, so the novel cause is still diagnosable.
+        assert!(r.reason.contains("something entirely novel"), "{}", r.reason);
+    }
+
+    #[test]
+    fn a_gh_answer_with_no_tag_says_no_releases_yet() {
+        let mut r = fresh();
+        let empty: &dyn Fn(&str, &str) -> Result<String, String> = &|_, _| Ok(String::new());
+        resolve_release(&mut r, None, empty, NO_EXPLAIN);
+        assert!(!r.ok);
+        assert!(r.reason.contains("no Releases yet"), "{}", r.reason);
+    }
+
+    #[test]
+    fn the_classifier_matches_gh_stderr_not_jq_stdout() {
+        assert_eq!(
+            classify_gh_stderr("gh: release not found for v9 (HTTP 404)"),
+            Some("no such release")
+        );
+        assert_eq!(
+            classify_gh_stderr("gh: You have exceeded a secondary rate limit"),
+            Some("a rate-limited API")
+        );
+        assert_eq!(classify_gh_stderr(""), None);
+        assert_eq!(classify_gh_stderr("no releases found"), Some("no such release"));
     }
 
     #[test]

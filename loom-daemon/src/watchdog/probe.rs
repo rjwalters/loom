@@ -90,19 +90,31 @@ pub fn attempt(socket_path: &Path, daemon_bin: Option<&Path>) -> Attempt {
         };
     }
 
-    let mut cmd = Command::new(bin);
-    cmd.args(&args).env("LOOM_SOCKET_PATH", socket_path);
-    let timeout = Duration::from_secs(probe_timeout_secs());
+    run_probe(bin, &args, socket_path, Duration::from_secs(probe_timeout_secs()))
+}
 
-    match crate::sweep_registry::output_with_timeout(cmd, timeout) {
+/// Run one probe command under `timeout` and map its completion to an
+/// [`Attempt`]. Split from [`attempt`] so the timeout and spawn-error arms can
+/// be exercised without touching process-wide environment variables.
+fn run_probe(bin: &Path, args: &[String], socket_path: &Path, timeout: Duration) -> Attempt {
+    let mut cmd = Command::new(bin);
+    cmd.args(args).env("LOOM_SOCKET_PATH", socket_path);
+
+    // #14100: attribute the probe's pid (start line only; the child is
+    // short-lived and awaited below). `output_with_timeout` exposes no pid, so
+    // use the observed runner, as `watchdog_peer_claims` does.
+    let argv = crate::fleet_sync::git_spawn_log::argv_of(&cmd);
+    match crate::proc_exec::run_bounded_observed(cmd, timeout, |pid| {
+        log::info!("{}", crate::self_spawn_log::start_line("watchdog_ipc_probe", pid, &argv));
+    }) {
         // Killed at the deadline. The shell's bounded_run normalised its
         // SIGTERM/SIGKILL waits to 124 for exactly this case.
-        Ok(None) => Attempt::Ran {
+        Ok(crate::proc_exec::Completion::TimedOut { .. }) => Attempt::Ran {
             rc: RC_TIMEOUT,
             output: String::new(),
             bin: bin.display().to_string(),
         },
-        Ok(Some(out)) => {
+        Ok(crate::proc_exec::Completion::Exited(out)) => {
             let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
             Attempt::Ran {
@@ -114,7 +126,7 @@ pub fn attempt(socket_path: &Path, daemon_bin: Option<&Path>) -> Attempt {
             }
         }
         Err(e) => Attempt::Skipped {
-            reason: format!("could not spawn the probe command: {e}"),
+            reason: format!("could not run the probe command: {e}"),
         },
     }
 }
@@ -537,5 +549,88 @@ mod tests {
             verdict(&ran(1, "Could Not Reach Loom-Daemon: Connection Refused")),
             SocketVerdict::Unreachable
         );
+    }
+
+    fn script(dir: &Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let p = dir.join("fake-daemon");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn run(bin: &Path, secs: u64) -> Attempt {
+        run_probe(
+            bin,
+            &["quarantine".into(), "list".into()],
+            Path::new("/tmp/s.sock"),
+            Duration::from_secs(secs),
+        )
+    }
+
+    #[test]
+    fn the_probe_logs_a_self_spawn_start_line_with_the_child_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(dir.path(), "echo ok");
+        let mut attempt = None;
+        let logs = crate::test_log_capture::capture_logs(|| attempt = Some(run(&bin, 10)));
+        match attempt.unwrap() {
+            Attempt::Ran { rc, output, .. } => {
+                assert_eq!(rc, 0);
+                assert_eq!(output.trim(), "ok");
+            }
+            Attempt::Skipped { reason } => panic!("skipped: {reason}"),
+        }
+        let starts: Vec<_> = logs
+            .iter()
+            .filter(|(_, m)| {
+                m.starts_with("self_spawn start pid=") && m.contains("site=watchdog_ipc_probe")
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "{logs:?}");
+        assert!(starts[0].1.contains("quarantine"), "{}", starts[0].1);
+    }
+
+    #[test]
+    fn a_nonzero_exit_still_reports_its_code_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(dir.path(), "echo boom >&2; exit 3");
+        match run(&bin, 10) {
+            Attempt::Ran { rc, output, .. } => {
+                assert_eq!(rc, 3);
+                assert!(output.contains("boom"), "{output}");
+            }
+            Attempt::Skipped { reason } => panic!("skipped: {reason}"),
+        }
+    }
+
+    #[test]
+    fn a_wedged_probe_is_killed_and_reports_the_timeout_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(dir.path(), "sleep 30");
+        let started = std::time::Instant::now();
+        match run(&bin, 1) {
+            Attempt::Ran { rc, output, .. } => {
+                assert_eq!(rc, RC_TIMEOUT);
+                assert!(output.is_empty());
+            }
+            Attempt::Skipped { reason } => panic!("skipped: {reason}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_missing_binary_is_skipped_not_a_verdict() {
+        let mut attempt = None;
+        let logs = crate::test_log_capture::capture_logs(|| {
+            attempt = Some(run(Path::new("/nonexistent/loom-daemon"), 5));
+        });
+        match attempt.unwrap() {
+            Attempt::Skipped { reason } => {
+                assert!(reason.contains("could not run the probe command"), "{reason}");
+            }
+            Attempt::Ran { .. } => panic!("a missing binary must not run"),
+        }
+        assert!(!logs.iter().any(|(_, m)| m.starts_with("self_spawn start")), "{logs:?}");
     }
 }

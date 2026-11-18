@@ -386,13 +386,15 @@ assert_contains "-m sonnet" "$out" "LOOM_CODEX_MODEL_CHECK=0 disables the refusa
 # Section 3c: ChatGPT-plan auth-mode guard for a pinned model (issue #5499)
 # ============================================================
 #
-# A ChatGPT-plan Codex profile only accepts its account's own default model —
-# even a Codex-family model (e.g. `gpt-5-codex`), which the Claude-shaped
-# refusal above never touches, still 400s on the wire. Verified against a fake
-# `codex` on PATH whose `login status` subcommand answers with the CLI's own
-# real wording (confirmed live against codex-cli 0.46.0: `codex login status`
-# prints exactly "Logged in using ChatGPT" / an API-key profile prints
-# "Logged in using an API key").
+# A ChatGPT-plan Codex profile accepts a pinned model only when the ACCOUNT'S
+# OWN CATALOG (`codex debug models`) lists it (#14121); a pin the catalog does
+# not list — including a Codex-family model (e.g. `gpt-5-codex`), which the
+# Claude-shaped refusal above never touches — still 400s on the wire, so the
+# guard drops it. Verified against a fake `codex` on PATH whose `login status`
+# subcommand answers with the CLI's own real wording (confirmed live against
+# codex-cli 0.46.0: `codex login status` prints exactly "Logged in using
+# ChatGPT" / an API-key profile prints "Logged in using an API key") and whose
+# `debug models` answers with a catalog fixture.
 
 echo ""
 echo "Testing spawn-codex.sh ChatGPT-plan auth-mode guard..."
@@ -400,14 +402,35 @@ echo "Testing spawn-codex.sh ChatGPT-plan auth-mode guard..."
 # Issue #8277: the expected v2 terminal record, built from its four varying
 # fields so the long literal is not repeated at every assertion site.
 _tr() { printf '# LOOM_TERMINAL_RESULT v=2 provider=codex account=%s category=%s exit_code=%s model=%s' "$1" "$2" "$3" "$4"; }
+# Issue #14121: the v3 record adds requested_model= (7 fields) when a pin was
+# dropped before exec.
+_tr3() { printf '# LOOM_TERMINAL_RESULT v=3 provider=codex account=%s category=%s exit_code=%s model=%s requested_model=%s' "$1" "$2" "$3" "$4" "$5"; }
 
 
 AUTHMODE_BIN="$TMPROOT/authmode-bin"
 mkdir -p "$AUTHMODE_BIN"
 AUTHMODE_ARGV_FILE="$TMPROOT/authmode-argv.txt"
 
+# mk_authmode_catalog <json> — fixture for the mock's `codex debug models`
+# subcommand (#14121). Absent → the mock's catalog read fails (exit 1), the
+# guard's unreadable-catalog fallback.
+mk_authmode_catalog() { printf '%s\n' "$1" > "$AUTHMODE_BIN/models.json"; }
+rm_authmode_catalog() { rm -f "$AUTHMODE_BIN/models.json"; }
+
+# mk_authmode_home <tag> — a fresh profile home with a usable-looking
+# auth.json, passed as CODEX_HOME so the #14121 catalog cache is written
+# under the test's own temp tree, never the tester's real ~/.codex.
+mk_authmode_home() {
+    local home="$TMPROOT/authmode-home-$1"
+    rm -rf "$home"
+    mkdir -p "$home"
+    printf 'x' > "$home/auth.json"
+    printf '%s' "$home"
+}
+
 # mk_authmode_codex <login-status-line> — a fake codex that answers `login
-# status` with the given line, and otherwise behaves like the Section 8 mock
+# status` with the given line and `debug models` with the current
+# mk_authmode_catalog fixture, and otherwise behaves like the Section 8 mock
 # (records argv, emits a session id, exits 0).
 mk_authmode_codex() {
     local status_line="$1"
@@ -416,6 +439,14 @@ mk_authmode_codex() {
 if [[ "\$1" == "login" && "\$2" == "status" ]]; then
     echo "$status_line"
     exit 0
+fi
+if [[ "\$1" == "debug" && "\$2" == "models" ]]; then
+    if [[ -r "$AUTHMODE_BIN/models.json" ]]; then
+        cat "$AUTHMODE_BIN/models.json"
+        exit 0
+    fi
+    echo "catalog unavailable" >&2
+    exit 1
 fi
 printf '%s\n' "\$*" > "$AUTHMODE_ARGV_FILE"
 {
@@ -453,11 +484,13 @@ assert_not_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
     "the pinned model is NOT forwarded to the ChatGPT-plan profile's codex invocation"
 assert_contains "AUTHMODE-FINAL" "$out" \
     "the invocation still runs (on the account's own default) rather than being refused outright"
-# Issue #8277: the v2 terminal record reports the model that was ACTUALLY in
-# flight. The pin was stripped before exec, so the account's own default ran —
-# naming the dropped model here would pin a class-scoped credit-exhaustion
-# hold on a class that never ran, and leave the class that DID run selectable.
-assert_contains "$(_tr unknown SUCCESS 0 none)" "$out" "a DROPPED pin reports model=none (#8277)"
+# Issue #8277/#14121: the terminal record reports the model that was
+# ACTUALLY in flight as model= (the pin was stripped before exec, so the
+# account's own default ran — naming it as the in-flight model would pin a
+# class-scoped credit-exhaustion hold on a class that never ran), and the
+# DROPPED pin itself as requested_model= on a v3 record.
+assert_contains "$(_tr3 unknown SUCCESS 0 none gpt-5-codex)" "$out" \
+    "a DROPPED pin reports model=none plus requested_model= (v3, #8277/#14121)"
 
 # (2) An API-key profile: no conflict, the pinned model passes through
 # unchanged.
@@ -507,6 +540,94 @@ assert_contains "model_reasoning_effort=high" "$(cat "$AUTHMODE_ARGV_FILE")" \
     "a sibling passthrough arg (--effort) survives the model filter"
 assert_contains "workspace-write" "$(cat "$AUTHMODE_ARGV_FILE")" \
     "a sibling passthrough arg (-s) survives the model filter"
+
+# (7) #14121: a ChatGPT-plan profile whose catalog LISTS the pinned model —
+# the pin is KEPT (no drop warning), forwarded to the CLI, and the record
+# stays the unchanged v2 shape with model= named.
+AUTHMODE_HOME="$(mk_authmode_home 7)"
+mk_authmode_codex "Logged in using ChatGPT"
+mk_authmode_catalog '{"models":[{"slug":"gpt-5.5"},{"slug":"gpt-5-codex"}]}'
+out="$(run_authmode CODEX_HOME="$AUTHMODE_HOME" -- -p x -m gpt-5-codex)"
+assert_not_contains "authenticated via a ChatGPT plan" "$out" \
+    "a catalog-listed pin is kept without a drop warning (#14121)"
+assert_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "a catalog-listed pin IS forwarded to a ChatGPT-plan profile's codex invocation (#14121)"
+assert_contains "$(_tr unknown SUCCESS 0 gpt-5-codex)" "$out" \
+    "a kept pin reports model= on the unchanged v2 record (#14121)"
+assert_contains "gpt-5-codex" "$(cat "$AUTHMODE_HOME/.loom-model-catalog.txt" 2>/dev/null || echo MISSING)" \
+    "a successful catalog read is cached in the profile's CODEX_HOME (#14121)"
+
+# (8) #14121: the catalog cache is honored — with a fresh (< 1h TTL) cache in
+# the profile home, a second spawn keeps the pin even though the LIVE catalog
+# now omits it (no re-probe within the TTL).
+mk_authmode_codex "Logged in using ChatGPT"
+mk_authmode_catalog '{"models":[{"slug":"gpt-5.5"}]}'
+out="$(run_authmode CODEX_HOME="$AUTHMODE_HOME" -- -p x -m gpt-5-codex)"
+assert_not_contains "authenticated via a ChatGPT plan" "$out" \
+    "a fresh cache hit keeps the pin without re-reading the catalog (#14121)"
+assert_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "the cache-hit spawn forwards the pin (#14121)"
+
+# (9) #14121: an EXPIRED cache entry (TTL 1h) is re-probed, and the re-probe
+# governs: the catalog now omits the model, so the pin is dropped again.
+printf '%s\n%s\n' "$(( $(date +%s) - 7201 ))" "gpt-5-codex" > "$AUTHMODE_HOME/.loom-model-catalog.txt"
+out="$(run_authmode CODEX_HOME="$AUTHMODE_HOME" -- -p x -m gpt-5-codex)"
+assert_contains "does not list 'gpt-5-codex'" "$out" \
+    "an expired cache re-probes the catalog; the drop names the unlisted model (#14121)"
+assert_not_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "the unlisted pin is stripped again after the cache expired (#14121)"
+assert_contains "$(_tr3 unknown SUCCESS 0 none gpt-5-codex)" "$out" \
+    "a dropped pin reports model=none plus requested_model= on a v3 record (#14121)"
+rm_authmode_catalog
+
+# (10) #14121: a ChatGPT-plan profile whose catalog does NOT list the pin —
+# today's drop behaviour, with the drop warning naming the catalog miss.
+AUTHMODE_HOME="$(mk_authmode_home 10)"
+mk_authmode_codex "Logged in using ChatGPT"
+mk_authmode_catalog '{"models":[{"slug":"gpt-5.5"},{"slug":"codex-auto-review"}]}'
+out="$(run_authmode CODEX_HOME="$AUTHMODE_HOME" -- -p x -m gpt-5-codex)"
+assert_contains "does not list 'gpt-5-codex'" "$out" \
+    "an unlisted pin warns that the catalog does not list it (#14121)"
+assert_not_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "an unlisted pin is still stripped (#14121)"
+assert_contains "$(_tr3 unknown SUCCESS 0 none gpt-5-codex)" "$out" \
+    "the unlisted-pin drop reports requested_model= on a v3 record (#14121)"
+
+# (11) #14121: an UNREADABLE catalog (exit 1) falls back to today's drop
+# behaviour, warns "could not be read", and the failed read is NOT cached.
+AUTHMODE_HOME="$(mk_authmode_home 11)"
+mk_authmode_codex "Logged in using ChatGPT"
+rm_authmode_catalog
+out="$(run_authmode CODEX_HOME="$AUTHMODE_HOME" -- -p x -m gpt-5-codex)"
+assert_contains "could not be read" "$out" \
+    "an unreadable catalog falls back to the drop with a catalog-unreadable warning (#14121)"
+assert_not_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "an unreadable catalog drops the pin exactly as before #14121"
+assert_contains "$(_tr3 unknown SUCCESS 0 none gpt-5-codex)" "$out" \
+    "the unreadable-catalog drop also reports requested_model= (#14121)"
+assert_contains "MISSING" "$(cat "$AUTHMODE_HOME/.loom-model-catalog.txt" 2>/dev/null || echo MISSING)" \
+    "a failed catalog read is never cached as empty (#14121)"
+
+# (11b) #14121: an unparseable catalog (exit 0, non-JSON) is treated exactly
+# like an unreadable one.
+AUTHMODE_HOME="$(mk_authmode_home 11b)"
+mk_authmode_catalog 'not json at all'
+out="$(run_authmode CODEX_HOME="$AUTHMODE_HOME" -- -p x -m gpt-5-codex)"
+assert_contains "could not be read" "$out" \
+    "an unparseable catalog is treated as unreadable (#14121)"
+rm_authmode_catalog
+
+# (12) #14121: a `model@effort` pin is catalog-checked on its BASE (before @),
+# and the full pin is forwarded unchanged when the base is listed.
+AUTHMODE_HOME="$(mk_authmode_home 12)"
+mk_authmode_codex "Logged in using ChatGPT"
+mk_authmode_catalog '{"models":[{"slug":"gpt-5-codex"}]}'
+out="$(run_authmode CODEX_HOME="$AUTHMODE_HOME" -- -p x -m 'gpt-5-codex@high')"
+assert_not_contains "authenticated via a ChatGPT plan" "$out" \
+    "a model@effort pin whose base is catalog-listed is kept (#14121)"
+assert_contains "gpt-5-codex@high" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "the full model@effort pin is forwarded unchanged (#14121)"
+rm_authmode_catalog
 
 # ============================================================
 # Section 4: git-repo trust check (live-CLI behavior)
@@ -1638,6 +1759,57 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: the session-exec dispatch invocation must never reference tmux"
 fi
+
+# ============================================================
+# Section: service tier (issue #14141)
+#
+#   1. LOOM_SERVICE_TIER maps to `-c service_tier=<id>` (fast -> priority)
+#   2. explicit `-c service_tier=` wins; standard/unset/empty emit nothing
+#   3. the terminal record carries effort= and tier= on a v4 record, and an
+#      unset launch keeps the v2 record unchanged
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh service tier (#14141)..."
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "-c service_tier=priority" "$out" "LOOM_SERVICE_TIER=fast maps to -c service_tier=priority"
+out="$(run_argv LOOM_SERVICE_TIER=Ultrafast -- -p x)"
+assert_contains "-c service_tier=ultrafast" "$out" "a catalog id passes through (lower-cased)"
+err="$(run_argv_stderr LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "spawn-codex: service_tier=priority" "$err" "the applied tier is logged"
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x -c service_tier=flex)"
+assert_contains "service_tier=flex" "$out" "an explicit -c service_tier= is kept"
+assert_not_contains "service_tier=priority" "$out" "an explicit -c service_tier= wins over LOOM_SERVICE_TIER"
+
+out="$(run_argv LOOM_SERVICE_TIER=standard -- -p x)"
+assert_not_contains "service_tier" "$out" "standard emits no override"
+out="$(run_argv LOOM_SERVICE_TIER= -- -p x)"
+assert_not_contains "service_tier" "$out" "an empty LOOM_SERVICE_TIER is unset"
+out="$(run_argv -- -p x)"
+assert_not_contains "service_tier" "$out" "no tier configured emits no override"
+err="$(run_argv_stderr LOOM_SERVICE_TIER='bad value!' -- -p x)"
+assert_contains "not a valid tier id" "$err" "a malformed tier warns and is ignored"
+
+# Terminal record (v4): effort + tier applied.
+_tr4() { printf '# LOOM_TERMINAL_RESULT v=4 provider=codex account=%s category=%s exit_code=%s model=%s effort=%s tier=%s' "$1" "$2" "$3" "$4" "$5" "$6"; }
+mk_authmode_codex "Logged in using an API key"
+out="$(run_authmode LOOM_SERVICE_TIER=fast LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high priority)" "$out" \
+    "the record names the applied model, effort and tier (v4)"
+out="$(run_authmode LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high none)" "$out" \
+    "an unset tier is recorded as tier=none"
+out="$(run_authmode -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr unknown SUCCESS 0 gpt-5-codex)" "$out" \
+    "nothing applied keeps the v2 record unchanged"
+# The dropped-pin behaviour is unchanged: model=none plus requested_model=, now
+# with the applied settings appended.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode LOOM_SERVICE_TIER=fast -- -p x -m gpt-5-codex)"
+assert_contains "model=none requested_model=gpt-5-codex effort=none tier=priority" "$out" \
+    "a dropped pin still reports model=none (+ requested_model) alongside the tier"
 
 # ============================================================
 # Summary

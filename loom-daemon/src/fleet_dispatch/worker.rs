@@ -286,7 +286,7 @@ fn state() -> std::sync::MutexGuard<'static, State> {
 /// is a failure like any other, and it is logged at ERROR: the server does
 /// not map this host's tailnet node to its `host_id`, a fleet config error
 /// that must be loud (#12450 refinement 7).
-fn observe(ok: bool, failure: Option<&CallError>) -> Mode {
+pub(super) fn observe(ok: bool, failure: Option<&CallError>) -> Mode {
     if let Some(CallError::Status(403)) = failure {
         log::error!(
             "fleet_dispatch: the captain refused this host's identity (HTTP 403): its tailnet \
@@ -320,7 +320,7 @@ pub fn mode() -> Mode {
     state().hysteresis.mode()
 }
 
-fn host_id() -> String {
+pub(super) fn host_id() -> String {
     crate::host_identity::host_identity()
 }
 

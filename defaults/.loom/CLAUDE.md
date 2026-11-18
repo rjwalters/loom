@@ -61,7 +61,7 @@ Spawn and manage a background pool of autonomous agents (tmux sessions) from
 ./.loom/bin/loom stop     # Graceful shutdown of the pool
 ```
 
-Full command reference (including `attach`/`logs`/`health`/`scale`) and the
+Full command reference (including `attach`/`logs`/`health`) and the
 legacy-wrapper/session-safety notes: [`.loom/docs/agent-pool-cli.md`](.loom/docs/agent-pool-cli.md).
 
 > For single-issue lifecycle orchestration prefer `/loom:sweep <issue>` (Tier 1),
@@ -238,8 +238,9 @@ stages automatically** — prefer it to avoid skipping any.
 model from the config chain — `./.loom/scripts/resolve-role-model.sh <role>
 --json` (explicit `--model` > `terminals[].roleConfig.model` >
 `.loom/roles/<role>.json` `suggestedModel` > inherit, with the supplying tier
-reported as `source`) — and pass it via the Task tool's `model` parameter
-(pinned IDs degrade with `--task-alias`). Exit 3 / `"source": "inherit"` ⇒
+reported as `source`) — and pass the record's `task_model` field (the
+alias-only form of `model`; a pinned ID is rejected there) as the Task tool's
+`model` parameter. `task_model: null` / `"source": "inherit"` ⇒
 omit the parameter; the subagent inherits the parent session's model, so an
 unconfigured workspace behaves exactly as before. Per-role models are set in
 `.loom/config.json` or the per-host `.loom-local/local.json` (never in the

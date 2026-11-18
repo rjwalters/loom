@@ -43,6 +43,8 @@ struct Engine {
     /// The verbatim body the fake returns for `private-workspace recover`
     /// execs; `None` answers with an empty published report (#14030).
     recover_response: Option<String>,
+    /// The verbatim body for `private-workspace rebind` execs (#14357).
+    rebind_response: Option<String>,
     calls: Vec<Vec<String>>,
     created: u32,
 }
@@ -192,6 +194,10 @@ impl Engine {
             ["exec", rest @ ..] if rest.contains(&"prepare") => {
                 Ok(json!({"protocol": PROTOCOL, "revision": "deadbeef"}).to_string())
             }
+            ["exec", rest @ ..] if rest.contains(&"rebind") => self
+                .rebind_response
+                .clone()
+                .context("no rebind response seeded"),
             ["exec", rest @ ..] if rest.contains(&"recover") => match &self.recover_response {
                 Some(body) => Ok(body.clone()),
                 None => Ok(json!({
@@ -618,6 +624,17 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
     assert!(created.mounts.iter().any(|m| {
         m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
     }));
+    // The lease-renewal store lives on the cache volume, never in the clone's
+    // work tree (#14160).
+    let envs: Vec<&str> = run[1..]
+        .windows(2)
+        .filter(|w| w[0] == "--env")
+        .map(|w| w[1])
+        .collect();
+    assert!(
+        envs.contains(&"LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew"),
+        "{envs:?}"
+    );
     // What it made passes the same validation a reused container must.
     let state = env.engine().containers[&env.config.container].clone();
     docker::validate_settings(&env.config, &state).unwrap();
@@ -1105,4 +1122,397 @@ fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
     let report =
         recover_session(env.workspace.path(), "alice", RecoverAction::Publish, None, &[]).unwrap();
     assert!(report.clones[0].published.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #14111: converging a declared binding without an operator.
+// ---------------------------------------------------------------------------
+
+const NEW_REPO: &str = "https://forge.example/a/c";
+
+fn converge_one(env: &Env, repository: &str, base: &str) -> Result<Converged> {
+    converge(env.workspace.path(), "alice", repository, base, &|| Ok(()))
+}
+
+fn registered(env: &Env) -> Vec<String> {
+    load(&env.dir)
+        .unwrap()
+        .repositories
+        .into_iter()
+        .map(|r| r.repository)
+        .collect()
+}
+
+/// Calls that would remove, stop or recreate anything.
+fn destructive(env: &Env) -> Vec<String> {
+    env.mutations()
+        .into_iter()
+        .filter(|m| {
+            ["stop ", "rm ", "run ", "volume "]
+                .iter()
+                .any(|prefix| m.starts_with(prefix))
+        })
+        .collect()
+}
+
+#[test]
+#[serial]
+fn converge_registers_a_missing_repository_on_an_idle_session_and_keeps_everything() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    assert_eq!(converge_one(&env, NEW_REPO, "main").unwrap(), Converged::Registered);
+    assert_eq!(registered(&env), [NEW_REPO]);
+    let config = load(&env.dir).unwrap();
+    assert_eq!(config.repository, "https://forge.example/a/b", "the primary is unchanged");
+    assert_eq!(destructive(&env), Vec::<String>::new(), "{:?}", env.mutations());
+    assert!(env.engine().containers[&env.config.container]["Id"] == CONTAINER_ID);
+    assert!(env.engine().volumes.contains_key(&env.config.volume));
+
+    // Converged: the repeat reads no engine state at all.
+    let calls = env.engine().calls.len();
+    assert_eq!(converge_one(&env, NEW_REPO, "main").unwrap(), Converged::Present);
+    assert_eq!(
+        converge_one(&env, "https://forge.example/a/b.git", "main").unwrap(),
+        Converged::Present
+    );
+    assert_eq!(env.engine().calls.len(), calls, "a present binding costs no docker call");
+}
+
+#[test]
+#[serial]
+fn converge_defers_a_busy_account_and_never_interrupts_it() {
+    // A worker the lease does not name.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into());
+    });
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty());
+
+    // A job holding the exclusive lease.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert!(env.engine().calls.is_empty(), "refused before any docker call");
+    drop(held);
+}
+
+#[test]
+#[serial]
+fn converge_refuses_a_hold_and_never_lifts_it() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // The caller's probe, and the profile's own hold file.
+    let probed =
+        converge(env.workspace.path(), "alice", NEW_REPO, "main", &|| Err(OperatorHeld.into()));
+    assert!(probed.unwrap_err().downcast_ref::<OperatorHeld>().is_some());
+    session_hold::write_hold(&env.config.profile, session_hold::now_unix_ms()).unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert!(env.held(), "an unattended binding never lifts an operator hold");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty());
+}
+
+#[test]
+#[serial]
+fn converge_fails_closed_before_docker_on_bad_input() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    for (repository, base, what) in [
+        ("http://forge.example/a/c", "main", "HTTPS"),
+        ("ssh://git@forge.example/a/c", "main", "HTTPS"),
+        ("https://user:token@forge.example/a/c", "main", "HTTPS"),
+        (NEW_REPO, "--upload-pack=x", "base"),
+    ] {
+        let error = converge_one(&env, repository, base).unwrap_err();
+        assert!(message(&error).contains(what), "{repository}: {error:#}");
+        assert!(!message(&error).contains("token"), "no credential is echoed: {error:#}");
+    }
+    let unknown =
+        converge(env.workspace.path(), "nobody", NEW_REPO, "main", &|| Ok(())).unwrap_err();
+    assert!(message(&unknown).contains("account not found"), "{unknown:#}");
+    // The registered repository with a different base is a conflict, not a change.
+    let error = converge_one(&env, "https://forge.example/a/b", "develop").unwrap_err();
+    assert!(message(&error).contains("already configured with base main"), "{error:#}");
+    assert!(env.engine().calls.is_empty(), "every refusal precedes the first docker call");
+    assert!(registered(&env).is_empty());
+}
+
+#[test]
+#[serial]
+fn converge_does_not_convert_a_host_mounted_session_or_recreate_a_missing_container() {
+    // A host-mounted session: session-managed, no private workspace.
+    let env = setup();
+    std::fs::remove_file(env.dir.join("workspace.json")).unwrap();
+    crate::tokens_pool::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(message(&error).contains("host-mounted session"), "{error:#}");
+    assert!(env.engine().calls.is_empty());
+    assert!(!env.dir.join("workspace.json").exists());
+
+    // A configured account whose container is gone: recovery restores it with
+    // the recorded image; a binding must not create one with a default.
+    let env = setup();
+    env.seed_volume();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(message(&error).contains("refusing to recreate"), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty(), "nothing was written");
+}
+
+#[test]
+#[serial]
+fn registered_repositories_lists_the_primary_then_the_additional_ones() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    converge_one(&env, NEW_REPO, "main").unwrap();
+    let got = registered_repositories(env.workspace.path(), "alice")
+        .unwrap()
+        .unwrap();
+    let urls: Vec<&str> = got.iter().map(|(url, _)| url.as_str()).collect();
+    assert_eq!(urls, ["https://forge.example/a/b", NEW_REPO]);
+    assert_eq!(got[1].1, "forge.example/a/c");
+    // check_binding yields the same key for any spelling.
+    assert_eq!(check_binding("https://Forge.example/a/c.git", "main").unwrap(), got[1].1);
+}
+
+const OLD_URL: &str = "https://forge.example/old/c";
+
+fn rebind_one(env: &Env, from: &str, to: &str, dry_run: bool) -> Result<RebindReport> {
+    // The #9409 fork transient: retry only a pre-mutation busy refusal.
+    let mut attempt = 0;
+    loop {
+        match rebind(env.workspace.path(), "alice", from, to, dry_run) {
+            Err(error) if attempt < 20 && error.to_string().contains("busy") => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn seed_rebind(env: &Env, status: &str, populated: bool) {
+    let state = json!({"path": "p", "populated": populated, "branches": [{"branch": "feature/issue-9", "ahead": 1}], "dirty": true, "detached": 0});
+    let empty =
+        json!({"path": "p", "populated": false, "branches": [], "dirty": false, "detached": 0});
+    let body = json!({"protocol": PROTOCOL, "outcome": {"status": status, "from": if status == "moved" { state.clone() } else { empty }, "to": state}});
+    env.with(|e| e.rebind_response = Some(body.to_string()));
+}
+
+fn register_old(env: &Env, also_new: bool) {
+    let mut config = env.config.clone();
+    config.schema_version = 2;
+    for url in std::iter::once(OLD_URL).chain(also_new.then_some(NEW_REPO)) {
+        let id = identify(url).unwrap();
+        config.repositories.push(Registered {
+            repository: id.url,
+            base: "main".into(),
+            slug: id.slug,
+        });
+    }
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+}
+
+fn rebind_calls(env: &Env) -> usize {
+    env.engine()
+        .calls
+        .iter()
+        .filter(|c| c.iter().any(|a| a == "rebind"))
+        .count()
+}
+
+#[test]
+#[serial]
+fn rebind_replaces_the_old_registration_after_the_volume_step_and_is_repeatable() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, false);
+    seed_rebind(&env, "moved", true);
+
+    // A dry run asks the worker to verify and changes no registration.
+    seed_rebind(&env, "dry_run", true);
+    let dry = rebind_one(&env, OLD_URL, NEW_REPO, true).unwrap();
+    assert_eq!(dry.status, RebindStatus::DryRun);
+    assert_eq!(registered(&env), [OLD_URL]);
+    assert!(env
+        .engine()
+        .calls
+        .iter()
+        .any(|c| c.iter().any(|a| a == "--dry-run")));
+
+    seed_rebind(&env, "moved", true);
+    let report = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert_eq!(report.status, RebindStatus::Moved);
+    assert!(report.registration_changed);
+    assert_eq!(registered(&env), [NEW_REPO]);
+    let new = identify(NEW_REPO).unwrap();
+    assert_eq!(load(&env.dir).unwrap().repositories[0].slug, new.slug);
+    assert_eq!(report.clone_path, format!("{WORK_ROOT}/{}", new.slug));
+    assert_eq!(load(&env.dir).unwrap().repository, "https://forge.example/a/b");
+    assert_eq!(destructive(&env), Vec::<String>::new(), "{:?}", env.mutations());
+    let call = env
+        .engine()
+        .calls
+        .iter()
+        .find(|c| c.iter().any(|a| a == "rebind"))
+        .cloned()
+        .unwrap();
+    assert!(call
+        .windows(2)
+        .any(|w| w[0] == "--env" && w[1] == format!("LOOM_PRIVATE_REPOSITORY={NEW_REPO}")));
+
+    // Re-running verifies the canonical clone and changes nothing.
+    seed_rebind(&env, "already_bound", true);
+    let again = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert_eq!(again.status, RebindStatus::AlreadyBound);
+    assert!(!again.registration_changed);
+    assert_eq!(registered(&env), [NEW_REPO]);
+}
+
+#[test]
+#[serial]
+fn rebind_collapses_a_duplicate_registration_and_reports_two_populated_clones() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, true);
+    // Both populated: reported, nothing changes.
+    seed_rebind(&env, "both_populated", true);
+    let report = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert_eq!(report.status, RebindStatus::BothPopulated);
+    assert!(!report.registration_changed);
+    assert_eq!(registered(&env), [OLD_URL, NEW_REPO]);
+    // One side unpopulated: the duplicate registration is retired, once.
+    seed_rebind(&env, "already_bound", true);
+    let report = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert!(report.registration_changed);
+    assert_eq!(registered(&env), [NEW_REPO]);
+}
+
+#[test]
+#[serial]
+fn rebind_refuses_busy_held_firewalled_primary_and_unregistered_before_the_volume() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, false);
+    seed_rebind(&env, "moved", true);
+
+    // Busy: a worker no lease names.
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into())
+    });
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    env.with(|e| {
+        e.processes.get_mut(&env.config.container).unwrap().pop();
+    });
+    // Busy: a job holds the lease.
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+    let error = rebind(env.workspace.path(), "alice", OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    drop(held);
+    // Held: never lifted.
+    session_hold::write_hold(&env.config.profile, session_hold::now_unix_ms()).unwrap();
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert!(env.held());
+    assert_eq!(rebind_calls(&env), 0);
+    assert_eq!(registered(&env), [OLD_URL]);
+    session_hold::lift_holds(std::slice::from_ref(&env.config.profile)).unwrap();
+
+    // Primary, same repository in another spelling, and unregistered.
+    for (from, to) in [
+        ("https://forge.example/a/b", NEW_REPO),
+        (OLD_URL, "https://forge.example/a/b"),
+        (OLD_URL, "https://FORGE.example/old/c.git"),
+        ("https://forge.example/x/y", NEW_REPO),
+    ] {
+        assert!(rebind_one(&env, from, to, false).is_err(), "{from} -> {to}");
+    }
+    assert_eq!(rebind_calls(&env), 0, "refused before any volume exec");
+    assert_eq!(registered(&env), [OLD_URL]);
+
+    // Firewalled: the fleet roster marks the canonical repository
+    // `firewall: true`, so the move is refused before the volume is touched.
+    let _roster = seed_firewall_roster(NEW_REPO);
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(message(&error).contains("firewall: true"), "{error:#}");
+    assert_eq!(rebind_calls(&env), 0, "refused before any volume exec");
+    assert_eq!(registered(&env), [OLD_URL]);
+}
+
+/// A cached fleet store whose roster marks `remote` `firewall: true`, reached
+/// through a throwaway `$HOME`. The guard restores the environment on drop.
+fn seed_firewall_roster(remote: &str) -> (crate::env_test_support::EnvGuard, tempfile::TempDir) {
+    use crate::env_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join(".loom/fleet-store/acme/fleet");
+    std::fs::create_dir_all(cache.join("blobs")).unwrap();
+    let fleet = json!({
+        "_generated": {"schema_version": 1},
+        "root": "/srv/src",
+        "repos": [{"name": "notebook", "dir": "notebook", "remote": remote, "firewall": true}],
+        "state": {},
+        "config": {"defaults": {}},
+    });
+    std::fs::write(cache.join("blobs/fleet-json"), fleet.to_string()).unwrap();
+    let manifest = json!({
+        "version": 1,
+        "repo": "acme/fleet",
+        "reference": "main",
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+        "etag": null,
+        "confirmedAt": "2026-11-18T00:00:00Z",
+        "files": {"fleet.json": "fleet-json"},
+    });
+    std::fs::write(cache.join("manifest.json"), manifest.to_string()).unwrap();
+    let guard = EnvGuard::set("HOME", home.path())
+        .and_set("LOOM_FLEET_REPO", Some("acme/fleet".as_ref()))
+        .and_set("LOOM_FLEET_REF", None);
+    (guard, home)
+}
+
+#[test]
+#[serial]
+fn rebind_keeps_the_registration_when_the_worker_refuses_a_wrong_repository() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, false);
+    env.with(|e| {
+        e.rebind_response = Some(
+            json!({"protocol": PROTOCOL, "error": "wrong repository: shares no history"})
+                .to_string(),
+        )
+    });
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(message(&error).contains("wrong repository"), "{error:#}");
+    assert_eq!(registered(&env), [OLD_URL]);
+    assert_eq!(destructive(&env), Vec::<String>::new());
+    drop(lease::Lease::acquire(&env.dir).unwrap());
 }

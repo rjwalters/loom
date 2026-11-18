@@ -158,6 +158,14 @@ fn reason_blocks_class(reason: &str, queried_class: Option<&str>) -> bool {
     }
 }
 
+/// [`reason_blocks_class`] across every [`ClassQuery`] arm (#13873).
+fn reason_blocks_query(reason: &str, query: &ClassQuery<'_>) -> bool {
+    match query {
+        ClassQuery::AccountWide => true,
+        ClassQuery::Class(class) => reason_blocks_class(reason, Some(class)),
+    }
+}
+
 /// On-disk retention for **non-auth** (exhaustion) entries on the routine
 /// cleanup path (#4643).
 ///
@@ -407,7 +415,7 @@ enum AmbiguousExhaustionEvidence {
 /// window plus slack for probe cadence and clock skew) cannot be a real
 /// weekly reset — treat it as garbage and fall back to the fixed cooldown
 /// rather than freezing the account out until a corrupt instant.
-const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
+pub(super) const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
 
 /// Read the fresh `.ranking` evidence for an ambiguous (non-session-limit-
 /// matching) exhaustion entry, as [`AmbiguousExhaustionEvidence`].
@@ -724,6 +732,29 @@ pub fn blocking_entry_in_dir_for_class(
     token_name: &str,
     model_class: Option<&str>,
 ) -> Option<BlockingEntry> {
+    let query = match model_class.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(class) => ClassQuery::Class(class),
+        None => ClassQuery::AccountWide,
+    };
+    blocking_entry_in_dir_for_query(tokens_dir, token_name, query)
+}
+
+/// How a `.bad_tokens` scan scopes class-marked entries (#13873): #8058's two
+/// questions, account-wide and one class.
+pub(crate) enum ClassQuery<'a> {
+    /// The account-wide question: every live entry blocks.
+    AccountWide,
+    /// One model class: entries scoped to a *different* class do not block.
+    Class(&'a str),
+}
+
+/// The single scan every [`ClassQuery`] arm shares (#8058's one-scan rule),
+/// so the two questions can never drift apart.
+fn blocking_entry_in_dir_for_query(
+    tokens_dir: &Path,
+    token_name: &str,
+    query: ClassQuery<'_>,
+) -> Option<BlockingEntry> {
     let bad_file = bad_tokens_path(tokens_dir);
     let text = std::fs::read_to_string(&bad_file).ok()?;
     let pattern = name_pattern(token_name);
@@ -751,9 +782,9 @@ pub fn blocking_entry_in_dir_for_class(
                 cooldown_remaining_secs: None,
             });
         }
-        // #8058: an entry scoped to a different model class does not block
-        // this query. A class-less entry, or a class-less query, always does.
-        if !reason_blocks_class(reason, model_class) {
+        // #8058/#13873: an entry the query does not scope out does not block
+        // this scan. A class-less entry, or a class-less query, always does.
+        if !reason_blocks_query(reason, &query) {
             continue;
         }
         // Non-auth (exhaustion) entries expire after the cooldown. A

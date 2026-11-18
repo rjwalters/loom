@@ -181,12 +181,33 @@ fn launch_process(args: &LeaseEnsureArgs) -> std::io::Result<u32> {
     if args.force {
         command.arg("--force");
     }
+    spawn_detached(command)
+}
+
+/// Spawn `command` detached (own process group, inherited fds close-on-exec)
+/// and log its pid.
+///
+/// #14100: a `loom-daemon` child with no `self_spawn start` line cannot be
+/// matched to a kernel OOM line. Start line only, mirroring
+/// `pr_lease_renewer` (`cli/pr_lease/renew.rs`): this parent returns at once,
+/// so a `Tracked` here would log a misleading `abandoned` exit immediately and
+/// stop the sampler.
+pub(crate) fn spawn_detached(mut command: Command) -> std::io::Result<u32> {
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
     super::mark_inherited_fds_cloexec();
-    command.spawn().map(|child| child.id())
+    let child = command.spawn()?;
+    log::info!(
+        "{}",
+        crate::self_spawn_log::start_line(
+            "lease_ensure_deferred",
+            child.id(),
+            &crate::fleet_sync::git_spawn_log::argv_of(&command)
+        )
+    );
+    Ok(child.id())
 }
 
 /// The `--deferred` entry point.

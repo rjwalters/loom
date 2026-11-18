@@ -444,7 +444,199 @@ fn actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall() {
     }
 }
 
+/// #14167: with no inherited context (tracing disabled), the scope a child
+/// can stamp is the repo alone — the item stays absent rather than guessed.
+#[test]
+fn a_child_without_an_inherited_context_stamps_only_the_repo() {
+    let dir = root();
+    let root = dir.path();
+    let scope = lifecycle::inherited_scope(root);
+    assert!(scope.contains_key("loom.repo"));
+    assert!(!scope.contains_key("loom.issue"));
+    assert!(!scope.contains_key("loom.pr_number"));
+    assert!(!scope.contains_key("loom.sweep_id"));
+    assert!(!scope.contains_key("loom.role"));
+}
+
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+/// #14167: every runtime's `loom.runtime.run` span carries the identity facts
+/// — role, repo, item and sweep id, stamped from the inherited execution
+/// root and the pinned environment — and only the launch facts its runtime
+/// actually resolves: a native harness its profile selection, a legacy
+/// adapter its documented precedence (the handed-over `--model`/`--effort`
+/// argv, then the `LOOM_MODEL` / `LOOM_CODEX_MODEL` / `LOOM_EFFORT` env
+/// tier). A runtime that reports no launched model leaves `loom.model`
+/// ABSENT rather than filling it with a configured value, and no account
+/// name ever reaches a span.
+#[test]
+fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
+    // Native (opencode): identity plus the selection it launched with.
+    {
+        let dir = root();
+        let root = dir.path();
+        // A role-tagged launch is admitted against its role manifest; the
+        // fixture role carries no runtime requirements.
+        let roles = root.join(".loom/roles");
+        fs::create_dir_all(&roles).unwrap();
+        fs::write(roles.join("builder.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+        let sweep = lifecycle::begin(
+            root,
+            "identity-sweep",
+            SpanName::Sweep,
+            lifecycle::attributes(&[
+                ("loom.repo", "acme/widget"),
+                ("loom.issue", "18"),
+                ("loom.sweep_id", "identity-sweep"),
+                ("loom.role", "builder"),
+            ]),
+        )
+        .unwrap();
+        let mut cmd = command(root);
+        cmd.args([
+            "spawn-worker",
+            "--",
+            "-p",
+            "hello",
+            "--model",
+            "example/model-v2",
+            "--effort",
+            "high",
+        ])
+        .env("LOOM_RUNTIME", "opencode")
+        .env("LOOM_ROLE", "builder")
+        .env("LOOM_SWEEP_ID", "identity-sweep")
+        .env_remove("LOOM_EFFORT");
+        sweep.command(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        lifecycle::finish_execution(root, "identity-sweep", "success", Default::default());
+        let run = spans(root)
+            .into_iter()
+            .find(|s| s.name == SpanName::RuntimeRun)
+            .unwrap();
+        assert_eq!(run.attributes["loom.runtime"], "opencode");
+        assert_eq!(run.attributes["loom.role"], "builder");
+        assert_eq!(run.attributes["loom.repo"], "acme/widget");
+        assert_eq!(run.attributes["loom.issue"], "18");
+        assert_eq!(run.attributes["loom.sweep_id"], "identity-sweep");
+        // The opencode adapter splits `provider/model`; the span names the
+        // model half it launched (the provider rides `loom.provider`).
+        assert_eq!(run.attributes["loom.model"], "model-v2");
+        assert_eq!(run.attributes["loom.provider"], "example");
+        assert_eq!(run.attributes["loom.effort"], "high");
+    }
+    // Legacy claude/codex: the handed-over argv, the env tier, or absence.
+    // `env_effort` is `LOOM_EFFORT`; `expect_effort` is `None` for "absent".
+    for (runtime, model_arg, env_tier, expect_model, env_effort, expect_effort) in [
+        ("claude", true, "", Some("sonnet"), "", Some("high")),
+        ("codex", true, "", Some("gpt-5.1"), "", Some("high")),
+        // Nothing on argv and nothing in the env tier: absent, never the
+        // configured value (there is none to fill it with here).
+        ("claude", false, "", None, "", None),
+        // Codex's static per-seat default is the env tier of last resort.
+        ("codex", false, "LOOM_CODEX_MODEL", Some("seat-model"), "", None),
+        // #14302: the adapter splits `model@effort` on the first `@`; the
+        // span records the base as the model and the suffix as the effort.
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "",
+            Some("high"),
+        ),
+        // `LOOM_EFFORT` outranks the suffix, as in the adapter.
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "low",
+            Some("low"),
+        ),
+        // An empty suffix is no effort; an empty base is no model.
+        ("codex", false, "LOOM_CODEX_MODEL=gpt-5-codex@", Some("gpt-5-codex"), "", None),
+        ("codex", false, "LOOM_CODEX_MODEL=@high", None, "", None),
+        // An explicit model arg suppresses the env split (and its suffix).
+        ("codex", true, "LOOM_CODEX_MODEL=seat@low", Some("gpt-5.1"), "", Some("high")),
+    ] {
+        let dir = root();
+        let root = dir.path();
+        let scripts = root.join(".loom/scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::copy(fixture(), scripts.join(format!("spawn-{runtime}.sh"))).unwrap();
+        let roles = root.join(".loom/roles");
+        fs::create_dir_all(&roles).unwrap();
+        fs::write(roles.join("builder.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+        let sweep = lifecycle::begin(
+            root,
+            "legacy-sweep",
+            SpanName::Sweep,
+            lifecycle::attributes(&[
+                ("loom.repo", "acme/widget"),
+                ("loom.issue", "18"),
+                ("loom.sweep_id", "legacy-sweep"),
+            ]),
+        )
+        .unwrap();
+        let mut cmd = command(root);
+        cmd.arg("spawn-worker").arg("--").arg("-p").arg("hello");
+        if model_arg {
+            let model = if runtime == "codex" {
+                "gpt-5.1"
+            } else {
+                "sonnet"
+            };
+            cmd.args(["--model", model, "--effort", "high"]);
+        }
+        cmd.env("LOOM_RUNTIME", runtime)
+            .env("LOOM_ROLE", "builder")
+            .env("LOOM_SWEEP_ID", "legacy-sweep")
+            // The account the launch would run on is an env fact; a span must
+            // carry the pool KIND, never this name.
+            .env("LOOM_ACCOUNT_NAME", "SECRET-ACCOUNT-NAME")
+            .env_remove("LOOM_MODEL")
+            .env_remove("LOOM_EFFORT");
+        if !env_effort.is_empty() {
+            cmd.env("LOOM_EFFORT", env_effort);
+        }
+        if runtime == "codex" {
+            // #8787's private-clone containment is pool machinery no fixture
+            // has; the adapter's explicit-credential env bypasses it.
+            cmd.env("LOOM_CODEX_NO_EXEC", "1");
+        }
+        if env_tier == "LOOM_CODEX_MODEL" {
+            cmd.env("LOOM_CODEX_MODEL", "seat-model");
+        } else if let Some(value) = env_tier.strip_prefix("LOOM_CODEX_MODEL=") {
+            cmd.env("LOOM_CODEX_MODEL", value);
+        } else {
+            cmd.env_remove("LOOM_CODEX_MODEL");
+        }
+        sweep.command(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{runtime}: {}", String::from_utf8_lossy(&out.stderr));
+        lifecycle::finish_execution(root, "legacy-sweep", "success", Default::default());
+        let records = spans(root);
+        let run = records
+            .iter()
+            .find(|s| s.name == SpanName::RuntimeRun)
+            .unwrap();
+        assert_eq!(run.attributes["loom.runtime"], runtime, "{runtime}");
+        assert_eq!(run.attributes["loom.role"], "builder", "{runtime}");
+        assert_eq!(run.attributes["loom.repo"], "acme/widget", "{runtime}");
+        assert_eq!(run.attributes["loom.issue"], "18", "{runtime}");
+        assert_eq!(run.attributes["loom.sweep_id"], "legacy-sweep", "{runtime}");
+        assert_eq!(run.attributes.get("loom.model").map(String::as_str), expect_model, "{runtime}");
+        assert_eq!(
+            run.attributes.get("loom.effort").map(String::as_str),
+            expect_effort,
+            "{runtime} {env_tier} effort"
+        );
+        let bytes = serde_json::to_string(&records).unwrap();
+        assert!(!bytes.contains("SECRET-ACCOUNT-NAME"), "{runtime} leaks an account name");
+    }
+}

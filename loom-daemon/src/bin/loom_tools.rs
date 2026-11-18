@@ -9,8 +9,10 @@
 //! call), so there is no second copy. This crate links `loom_daemon` and not
 //! `daemon_service`, which is private to the `loom-daemon` bin.
 //!
-//! The one forge call in the slice is `checkpoint read` (§10.3), so that is the
-//! only command behind the mode gate: it resolves `mode` ([`tools_mode`])
+//! `forge <read verb>` (#14395) is the family of forge reads: the same
+//! `ForgeAction` tree and handler `loom-daemon forge` runs, minus the verbs
+//! that write (#14396). It and `checkpoint read` (§10.3) are the commands
+//! behind the mode gate: it resolves `mode` ([`tools_mode`])
 //! before `forge_gateway::enable_cli_reads()` is considered, and enables it
 //! only on the fleet route. `strip-ansi`, the other checkpoint actions and
 //! `config get` never route, and `config get mode` must work with `mode` unset.
@@ -20,10 +22,10 @@ use std::io::Write;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
-    config_get_dispatch, handle_checkpoint_command, handle_resolve_model_command,
-    handle_resolve_role_model_command, handle_strip_ansi_command, CheckpointAction, ConfigArgs,
-    InstallBinaryCommand, ReleaseFetchArgs, ResolveModelArgs, ResolveRoleModelArgs,
-    ResyncPayloadArgs,
+    config_get_dispatch, handle_checkpoint_command, handle_forge_read_command,
+    handle_resolve_model_command, handle_resolve_role_model_command, handle_strip_ansi_command,
+    CheckpointAction, ConfigArgs, ForgeReadCli, InstallBinaryCommand, ReleaseFetchArgs,
+    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::tools_mode::{self, Route};
@@ -31,7 +33,7 @@ use loom_daemon::tools_mode::{self, Route};
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -74,6 +76,11 @@ enum ToolsCommands {
     /// resolve-role-model` (issue #13956), so `resolve-role-model.sh` works
     /// with no daemon binary installed.
     ResolveRoleModel(ResolveRoleModelArgs),
+    /// The read-only `forge` verbs (`check-claim`, `wait-checks`, `issue`, ...):
+    /// the same arguments, stdout, stdin and exit codes as `loom-daemon forge`
+    /// (#14395), on the person's own forge credential. A verb that writes is
+    /// refused with exit 64 (served by `loom-daemon forge` until #14396).
+    Forge(ForgeReadCli),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -140,6 +147,13 @@ fn run() -> Result<()> {
         // No forge call, so no mode gate (§10.3 gates `checkpoint read` only).
         ToolsCommands::ResolveModel(args) => handle_resolve_model_command(&args),
         ToolsCommands::ResolveRoleModel(args) => handle_resolve_role_model_command(&args),
+        ToolsCommands::Forge(cli) => {
+            // Refuse a write verb before the gate can enable any routing for it.
+            if cli.is_read() && cli.reaches_forge() {
+                mode_gate()?;
+            }
+            handle_forge_read_command(cli)
+        }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }
@@ -154,9 +168,84 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::{ToolsCli, ToolsCommands};
+
+    /// Run `f` on an 8 MiB thread, like the binary's main thread: the clap
+    /// tree now carries `ForgeAction`, whose debug-build parse frames do not
+    /// fit libtest's 2 MiB worker (#10616).
+    fn on_main_sized_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// #14395: the capability list is the clap tree. Every top-level
+    /// command is listed (`forge` through its verbs), and every listed command
+    /// names a real one, so `capabilities --json` cannot drift from what the
+    /// binary serves.
+    #[test]
+    fn capability_list_matches_the_clap_tree() {
+        use loom_daemon::install_compat::TOOLS_COMMANDS;
+        let top: Vec<String> = on_main_sized_stack(|| {
+            let mut cmd = ToolsCli::command();
+            cmd.build();
+            cmd.get_subcommands()
+                .map(|c| c.get_name().to_string())
+                .filter(|n| n != "help")
+                .collect()
+        });
+        for name in &top {
+            let listed = TOOLS_COMMANDS.iter().any(|c| {
+                c == name
+                    || c.strip_prefix(name.as_str())
+                        .is_some_and(|r| r.starts_with(' '))
+            });
+            assert!(listed, "`{name}` is served but missing from TOOLS_COMMANDS");
+        }
+        for listed in TOOLS_COMMANDS {
+            let head = listed.split(' ').next().unwrap();
+            assert!(top.iter().any(|n| n == head), "`{listed}` names no loom-tools command");
+        }
+    }
+
+    /// #14395: `loom-tools forge <verb>` accepts the daemon's argv, including
+    /// the exit-code-as-data verbs.
+    #[test]
+    fn forge_reads_keep_the_daemon_argv_surface() {
+        on_main_sized_stack(|| {
+            for argv in [
+                vec!["loom-tools", "forge", "check-claim", "42"],
+                vec!["loom-tools", "forge", "check-open-pr", "42"],
+                vec!["loom-tools", "forge", "wait-checks", "7"],
+                vec![
+                    "loom-tools",
+                    "forge",
+                    "issue",
+                    "view",
+                    "42",
+                    "--json",
+                    "labels",
+                ],
+                vec![
+                    "loom-tools",
+                    "forge",
+                    "parent",
+                    "split-state",
+                    "--parent",
+                    "9",
+                ],
+            ] {
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert!(matches!(cli.command, ToolsCommands::Forge(_)), "{argv:?}");
+            }
+        });
+    }
 
     /// #13878: `loom-tools resolve-model` accepts the same argv as
     /// `loom-daemon resolve-model`. The daemon-side mirror of this table is
@@ -183,8 +272,13 @@ mod tests {
                 "x.json",
             ],
         ] {
-            let cli = ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
-            assert!(matches!(cli.command, ToolsCommands::ResolveModel(_)), "{argv:?}");
+            let argv2 = argv.clone();
+            let ok = on_main_sized_stack(move || {
+                ToolsCli::try_parse_from(&argv2)
+                    .map(|cli| matches!(cli.command, ToolsCommands::ResolveModel(_)))
+                    .map_err(|e| e.to_string())
+            });
+            assert_eq!(ok, Ok(true), "{argv:?}");
         }
     }
 
@@ -199,7 +293,9 @@ mod tests {
             vec!["loom-tools", "resolve-model", "opus", "--runtime", "claude"],
             vec!["loom-tools", "resolve-model"],
         ] {
-            assert!(ToolsCli::try_parse_from(&argv).is_err(), "{argv:?} must be rejected");
+            let argv2 = argv.clone();
+            let err = on_main_sized_stack(move || ToolsCli::try_parse_from(&argv2).is_err());
+            assert!(err, "{argv:?} must be rejected");
         }
     }
 }

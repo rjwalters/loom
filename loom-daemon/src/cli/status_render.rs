@@ -462,6 +462,9 @@ pub(crate) fn build_status_json_value_for(
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
             "weight": r.weight,
+            // Installed files older than the daemon but compatible, so not
+            // held (#14015); null when not behind.
+            "installed_behind": r.installed_behind,
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
@@ -2390,6 +2393,15 @@ pub(crate) fn print_status_human(
             if let Some(mark) = &r.maintain_only {
                 println!("        {}: kept current, never dispatched into (#11186)", mark.label());
             }
+            // Behind this daemon but compatible: dispatching, on the older
+            // installed files, until the workspace resync lands (#14015).
+            if let Some(behind) = &r.installed_behind {
+                println!(
+                    "        installed Loom {} is older than daemon {} (compatible, not held; \
+                     files update with the workspace resync)",
+                    behind.installed, behind.running
+                );
+            }
             if r.lock_busy {
                 println!(
                     "        sweep registry lock busy — in-flight/quarantine data omitted (#13443)"
@@ -4202,6 +4214,7 @@ mod stash_status_render_tests {
         crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
+            installed_behind: None,
             weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
@@ -4244,6 +4257,23 @@ mod stash_status_render_tests {
         assert_eq!(stash["total_count"], 5);
         assert_eq!(stash["quarantine_count"], 2);
         assert_eq!(stash["oldest_age_secs"], 3600);
+    }
+
+    /// #14015: `per_repo[].installed_behind` names the installed and running
+    /// versions of a behind-but-compatible repo, and is null for any other.
+    #[test]
+    fn per_repo_json_carries_installed_behind_only_when_behind() {
+        let mut behind = repo_with_stashes(0, 0, None);
+        behind.installed_behind = Some(crate::workspace_hold::InstalledBehind {
+            installed: "0.19.800".to_string(),
+            running: "0.19.880".to_string(),
+        });
+        let mut report = sample_report();
+        report.per_repo = vec![behind, repo_with_stashes(0, 0, None)];
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
+        assert_eq!(value["per_repo"][0]["installed_behind"]["installed"], "0.19.800");
+        assert_eq!(value["per_repo"][0]["installed_behind"]["running"], "0.19.880");
+        assert!(value["per_repo"][1]["installed_behind"].is_null(), "{value}");
     }
 
     #[test]
@@ -4452,6 +4482,7 @@ mod role_runner_diagnostic_source_render_tests {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
+            installed_behind: None,
             weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
