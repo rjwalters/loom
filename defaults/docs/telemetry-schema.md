@@ -1448,12 +1448,16 @@ the parser accepts all three, one test each). The close carries, beside the
 |---|---|
 | `loom.step.outcome.class` | The step's `LOOM_STEP_OUTCOME` class: `verdict`, `noop`, `refused` or `failed`. **`none`** when the step wrote no parseable outcome line — a countable value, never an absence (#13521 tracks why some steps end without one). A Champion step writes a `CHAMPION-STEP` line instead, so it closes `none` here; its class is on its `pass.verdict` record. |
 | `loom.step.outcome.reason` | The line's `reason` token as written (`-` folded to `_`), truncated to 64 `char`s. Absent when the class is `none`. A later issue may close the vocabulary. |
+| `loom.step.outcome.agrees` | **`true`** / **`false`** (#14234): whether the class the forge post-state gives the step is the class its line claimed. The daemon computes it at the close with the ledger's own `outcome_ledger::classify`, never the session, so a step that claimed `verdict` while the item did not move records `false` (the ledger still classifies it `failed`; `loom.result`, `loom.step.outcome.class` and the ledger are unchanged). **Absent** when there is nothing to compare, which is *not* agreement: the step wrote no line (`class=none`, including every Champion step, whose `CHAMPION-STEP` line is not a `LOOM_STEP_OUTCOME`), or no post-state was noted by the close (the claim release had not run yet, held by another claimant, or its forge read failed), or the step ended on `provider-exhausted`. Roles whose classifier has no post-state rule for a step carry no `agrees` for the same reason. Class only: reasons are not compared. |
 | `loom.runtime` | The registry's runtime for the step (`claude`, `codex`, …), the same fact `SweepInfo.runtime` records; absent for a legacy entry. |
 
 `loom.configured_model` / `loom.effort` were already on the close. The
 `role_tick.outcome` record carries the same pair additively as
 `loom.role_tick.step_class` / `loom.role_tick.step_reason`, with
 `step_class="none"` in the no-line case. Additive; no `schema_version` bump.
+`loom.step.outcome.agrees` (#14234) is on both too. Group by it to ask how
+often a runtime claims a result the forge does not show:
+`attributes_string['loom.step.outcome.agrees'] = 'false'` over the query below.
 Both new keys are on the daemon export allowlist and the collector's span
 `keep_keys` (contract-tested).
 
