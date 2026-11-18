@@ -2039,6 +2039,15 @@ cannot work with this daemon. The checkout copy is
   first. A `W3` copy with no `requires_daemon` that parses is held, because
   nothing on record says its files work with this daemon. So is one below
   `supports_installed`, which is a break the daemon declared.
+  The skew is visible, not waited out (#14015): the daemon logs one INFO line
+  per repo naming its installed `loom_version` and the running version (again
+  only if the repo leaves that state and returns, or its installed version
+  changes), and `loom-daemon status` shows it under the repo, with
+  `installed_behind: {installed, running}` in `status --json` `per_repo[]`
+  (absent when not behind; never shown for the Loom source repo). Dispatch
+  into it is not held, so a fix spanning the daemon binary and
+  `defaults/scripts` must raise `supports_installed` in that same release;
+  that is the lever that holds a pre-resync repo.
 - **A version that cannot be ordered rolls only for a need.** Such a copy
   is held, because it may be newer than this daemon. Whether it also asks
   for a roll is decided by its `requires_daemon` alone when that parses:
@@ -3894,7 +3903,7 @@ make the artifact operators actually read honest — all five pre-spawn bail-out
 `ModelRuntimeMismatch`) now append a dated line to `role-<role>.log`:
 
 ```
-==== loom-daemon role_runner: 2026-08-14T16:45:51+00:00 role=curator SKIPPED BEFORE SPAWN (#6201): model/runtime mismatch: runtime "codex" only accepts Codex models, but the resolved model "sonnet" is a Claude model (model source=autonomous.roleRunner.roleModels.curator); set autonomous.roleRunner.roleModels.curator to a model the codex runtime accepts — or to "default" to pass through to the codex CLI's own default model, which is the only working shape on a seat that rejects an explicit pin (e.g. a ChatGPT-plan Codex account) — or point this role back at a Claude runtime ====
+==== loom-daemon role_runner: 2026-08-14T16:45:51+00:00 role=curator SKIPPED BEFORE SPAWN (#6201): model/runtime mismatch: runtime "codex" only accepts Codex models, but the resolved model "sonnet" is a Claude model (model source=autonomous.roleRunner.roleModels.curator); set autonomous.roleRunner.roleModels.curator to a model the codex runtime accepts — or to "default" to pass through to the codex CLI's own default model, the guaranteed-working shape on any seat (a ChatGPT-plan Codex account also accepts a model its own catalog lists, see `codex debug models`) — or point this role back at a Claude runtime ====
 ```
 
 A role stuck this way now shows a growing, timestamped, self-diagnosing trail
@@ -11109,8 +11118,9 @@ mechanism and the `spawn-codex.sh`-side counterpart:
 `runtimes.roles.<role> = "codex"` with no `roleModels.<role>` entry at all —
 used to resolve the shipped Claude-shaped default and get refused every tick,
 forever (453+ consecutive skips on the host that filed #6565), with no way out:
-a ChatGPT-plan Codex seat rejects an explicit model pin too, so "no pin" was
-simultaneously the only correct configuration and permanently unadmittable.
+a ChatGPT-plan Codex seat rejected an explicit model pin too (catalog-listed
+pins have worked there since #14121), so "no pin" was simultaneously the only
+correct configuration and permanently unadmittable.
 The role runner now degrades that case to the runtime CLI's own default — no
 `--model` argument is emitted at all, the tick launches, and the log header
 records `model=<runtime CLI default> (source=default (CLI default for codex))`.
