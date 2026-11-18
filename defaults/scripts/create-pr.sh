@@ -69,7 +69,10 @@
 # Flags are a subset of `gh pr create`'s, chosen so a role prompt's existing
 # invocation can be switched over by changing the command name:
 #   --title, -t TITLE     PR title (required).
-#   --body, -b BODY       PR body as literal text.
+#   --body, -b BODY       PR body as literal text. A value that is a lone
+#                         `@path` / `@-` token is refused (exit 2, nothing
+#                         created): `gh` would post it literally, not read
+#                         it from a file -- use --body-file instead.
 #   --body-file, -F PATH  Read the body from PATH ("-" = stdin). Mutually
 #                         exclusive with --body.
 #   --label, -l LABEL     Label to apply at creation. Repeatable. A single
@@ -112,7 +115,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 
 usage() {
-  sed -n '2,84p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,109p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -169,6 +172,23 @@ if [[ -n "$BODY_FILE" ]]; then
     echo "create-pr.sh: cannot read --body-file: $BODY_FILE" >&2
     exit 2
   fi
+fi
+
+# --- Lone `@path` body guard (#14161) ---------------------------------------
+#
+# `gh pr create --body @path` posts the literal string `@path`; the same
+# pitfall documented for `gh pr comment` / `gh api -f body=@path` (#9258,
+# comment-body-literal-path.md) and refused by post-verdict.sh. The body is
+# never read from the file, so the PR loses its Test Plan, rationale and
+# closing keyword (`Closes #N`) -- and the target issue orphans on merge --
+# silently: the create still exits 0 and prints the URL. Refuse before any
+# forge call when the ENTIRE `--body` value is one `@`-token; a body that
+# merely CONTAINS `@` (a mention, an email-shaped token, a line starting
+# with `@` inside a longer body) passes, and `--body-file` content is the
+# author's own text, never inspected.
+if [[ "$HAVE_BODY" == "true" && "$BODY" =~ ^[[:space:]]*@[^[:space:]]*[[:space:]]*$ ]]; then
+  echo "create-pr.sh: refusing --body '${BODY:0:80}': a lone '@' token is posted literally, not read from a file. Use --body-file <path> (or --body-file -). Nothing was created." >&2
+  exit 2
 fi
 
 forge_detect
