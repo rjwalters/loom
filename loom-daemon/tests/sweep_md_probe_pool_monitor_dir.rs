@@ -6,8 +6,8 @@
 //! directory) → `~/.claude-monitor`. Whitespace-only overrides are ignored and
 //! `~` / `~/...` in an override are expanded (never eval'd).
 //!
-//! Kept separate from `sweep_md_stage_minus_one_doc_lint.rs` because that file
-//! sits near the file-size ratchet threshold. Runs the real extracted block
+//! Kept separate from `sweep_md_stage_minus_one_doc_lint.rs` so that
+//! file stays focused. Runs the real extracted block
 //! with real `bash` against synthetic layouts in a temp dir with a fake `$HOME`;
 //! both override variables are always removed from the inherited environment
 //! first so the runner's own values can never leak in.

@@ -1,6 +1,5 @@
 //! Unit tests for the `terminal_records` `repo` normalization (Issue #9442)
-//! — in their own sibling module because `tests.rs` is pinned by the
-//! file-size ratchet (`scripts/check-file-size-budget.sh`).
+//! — in their own sibling module rather than in `tests.rs`.
 
 use super::*;
 use crate::telemetry::TelemetryRecord;

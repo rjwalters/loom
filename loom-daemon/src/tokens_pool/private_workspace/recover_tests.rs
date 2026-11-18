@@ -618,6 +618,17 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
     assert!(created.mounts.iter().any(|m| {
         m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
     }));
+    // The lease-renewal store lives on the cache volume, never in the clone's
+    // work tree (#14160).
+    let envs: Vec<&str> = run[1..]
+        .windows(2)
+        .filter(|w| w[0] == "--env")
+        .map(|w| w[1])
+        .collect();
+    assert!(
+        envs.contains(&"LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew"),
+        "{envs:?}"
+    );
     // What it made passes the same validation a reused container must.
     let state = env.engine().containers[&env.config.container].clone();
     docker::validate_settings(&env.config, &state).unwrap();

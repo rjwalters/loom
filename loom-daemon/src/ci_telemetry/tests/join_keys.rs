@@ -1,7 +1,6 @@
 //! Join keys on CI spans (Issue #9007): `head_sha`, `ref`, `pr_number`.
 //!
-//! A sibling module of `super` rather than more lines in it: `tests.rs` is at
-//! the file-size ratchet, and this is a self-contained concern (the same
+//! A sibling module of `super`: a self-contained concern (the same
 //! split #8825's [`super::job_logs`] and #8898's [`super::rerun_window`]
 //! made).
 

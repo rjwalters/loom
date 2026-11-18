@@ -1,9 +1,7 @@
 //! Tests for `role_runner/model_resolution.rs` — which model a scheduled role
 //! tick resolves (#4501/#5001), the `"default"` CLI pass-through sentinel and
 //! the unpinned-conflict degradation (#7894), and the #5028 mismatch refusal
-//! that still fires on an explicit pin. Split out of `role_runner/tests.rs` so
-//! the over-threshold parent shrinks rather than grows
-//! (`.loom/docs/file-size-policy.md`).
+//! that still fires on an explicit pin. Split out of `role_runner/tests.rs`.
 
 use super::*;
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.

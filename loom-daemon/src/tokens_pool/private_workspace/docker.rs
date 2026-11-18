@@ -344,6 +344,10 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         "CARGO_HOME=/workspace/cache/cargo".into(),
         "CARGO_TARGET_DIR=/workspace/cache/target".into(),
         "npm_config_cache=/workspace/cache/npm".into(),
+        // The lease-renewal helpers resolve `$HOME` to the clone root in this
+        // container; point the store at the cache volume instead, so Loom's
+        // own lock never shows up as dirt in the work tree (#14160).
+        "LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew".into(),
         format!("LOOM_PRIVATE_REPOSITORY={}", config.repository),
     ] {
         args.extend(["--env".into(), value]);

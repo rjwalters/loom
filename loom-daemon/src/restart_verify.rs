@@ -643,6 +643,38 @@ pub fn supervised_pid(supervisor: Supervisor) -> (Option<u32>, bool) {
     }
 }
 
+/// Drop the body of every `environment = { ... }` block (`launchctl print`
+/// also emits `default environment` / `inherited environment` blocks) from a
+/// probe's output, keeping a one-line placeholder. The job's environment can
+/// carry the forge tokens (`GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN`) that
+/// `daemon start` forwards into the plist, and a diagnostic snapshot must never
+/// put a credential on stderr (#14175). Nested `{ ... }` inside the block are
+/// tracked by depth; an unterminated block drops everything after it
+/// (fail closed).
+fn redact_environment_blocks(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if depth == 0 {
+            if trimmed.ends_with('{') && trimmed.contains("environment =") {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push(format!("{indent}{trimmed} <values withheld> }}"));
+                depth = 1;
+            } else {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+        if trimmed.ends_with('{') {
+            depth += 1;
+        } else if trimmed.starts_with('}') {
+            depth -= 1;
+        }
+    }
+    out
+}
+
 /// Dump one `<bin> <args>` probe's output as a labeled diagnostic breadcrumb.
 /// When the probe failed (nonzero exit or no output at all), append a note
 /// that this means "not found via THIS probe" — not, by itself, "confirmed
@@ -660,7 +692,7 @@ fn log_one_diagnostic(bin: &str, args: &[String], label: &str) {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            for line in text.lines() {
+            for line in redact_environment_blocks(&text) {
                 eprintln!("    {line}");
             }
             if !out.status.success() {
@@ -1077,6 +1109,24 @@ pub fn detect_and_spawn_verifier(pre_pid: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_snapshot_withholds_the_environment_block() {
+        let text = "gui/501/loom = {\n\tstate = running\n\tenvironment = {\n\t\tPATH => /usr/bin\n\t\tGH_TOKEN => ghp_fake_secret_789\n\t\tnested = {\n\t\t\tFORGE_TOKEN => fake_nested_secret\n\t\t}\n\t}\n\tpid = 42\n}\n";
+        let joined = redact_environment_blocks(text).join("\n");
+        assert!(!joined.contains("ghp_fake_secret_789"), "token leaked: {joined}");
+        assert!(!joined.contains("fake_nested_secret"), "nested token leaked: {joined}");
+        assert!(!joined.contains("GH_TOKEN"), "{joined}");
+        assert!(joined.contains("state = running"), "{joined}");
+        assert!(joined.contains("pid = 42"), "lines after the block survive: {joined}");
+    }
+
+    #[test]
+    fn diagnostic_snapshot_fails_closed_on_an_unterminated_environment_block() {
+        let text = "\tenvironment = {\n\t\tGH_TOKEN => ghp_fake_secret_789\n";
+        let joined = redact_environment_blocks(text).join("\n");
+        assert!(!joined.contains("ghp_fake_secret_789"), "{joined}");
+    }
 
     #[test]
     fn supervisor_parses_case_insensitively_and_rejects_others() {
