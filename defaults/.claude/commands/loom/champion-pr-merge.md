@@ -1192,24 +1192,30 @@ It is eligible only when **all** hold, each read live in this pass:
   renders (a `{{PLACEHOLDER}}` substituted on copy) never byte-matches and holds.
   `.claude/settings.json` has no upstream counterpart, so a bump that changes it holds, which
   keeps the rjwalters/repo#733 guard-wiring PRs held;
-- every changed file is under `.loom/` or `.claude/`, and none is a merge-gate path
-  (the daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
-  comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
-  under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
-  path sources it: it is compared byte-for-byte like any kept-set file (#13486);
-  (This is Champion's proof. The daemon's own strict landing of its resync PR instead lets
-  byte-identical gate files land without a Judge when the tag is a published release, per
-  operator ruling r7-q33, #13665; a PR the daemon left for the lane still takes this rule.)
+- every changed file is under `.loom/`, `.claude/` or `.agents/skills/`. A merge-gate path (the
+  daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
+  comment-trust files, `config.json`) is no longer refused outright: it is byte-checked like any
+  kept-set file, and when any gate path is among the changed files the tag must additionally be a
+  published, non-draft release upstream — fail closed if the release cannot be read (operator
+  ruling 2026-11-17, #13982). The gate never waives a change to itself (#12945): a gate file that
+  differs from the tag by even one byte, has no upstream counterpart, or is renamed or removed,
+  holds. A file under `.loom/scripts/tests/` (name and previous name both) is not a gate path,
+  since no merge path sources it: it is compared byte-for-byte like any kept-set file (#13486).
+  The Repo Skills variant keeps refusing gate paths outright (the ruling concerns Loom's own
+  gate). Both proofs — the daemon's strict landing and Champion's non-strict waiver — apply this
+  same gate rule; they differ only in scope (strict byte-checks every changed file, not just the
+  kept set);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
-  `defaults/` counterpart through the surface map in `resync-installed.sh` (`.loom/hooks`,
+  `defaults/` counterpart — through the surface map in `resync-installed.sh` (`.loom/hooks`,
   `.loom/scripts`, `.loom/docs`, `.loom/runtimes`, `.loom/bin`, `.claude/commands/loom`,
-  `.claude/agents`; any other kept-set path, such as `.claude/settings.json`, `.githooks/*` or
-  `.loom/config.json`, has none and holds), and its head blob SHA equals that counterpart's blob SHA
-  at the tag;
+  `.claude/agents`) plus the proof's own mappings for `.loom/roles` (→ `defaults/roles`) and
+  `.agents/skills` (→ `defaults/.agents/skills`, #13665); any other kept-set path, such as
+  `.claude/settings.json`, `.githooks/*` or `.loom/config.json`, has none and holds — and its
+  head blob SHA equals that counterpart's blob SHA at the tag;
 - the PR head did not move while it was read.
 
 A differing byte, a local-only file, a missing or unparsable tag, or any failed read gives
@@ -2406,7 +2412,7 @@ below is hold-aware: it preserves the hold marker, the park record and
 ### `ci-green`: CI Status Check
 - [ ] If CI checks exist, all **required** checks must be passing — "required" means the ruleset's required status contexts (the same set `merge-pr.sh` classifies against)
 - [ ] A failing or cancelled **non-required** check does not block, but name it (check + run URL) in the pre-merge comment, so a merge over a red non-required check is visible. This holds for a check that goes pending → failed during `merge-pr.sh --auto`'s wait: `merge-pr.sh` logs the same names and the same rule
-- [ ] If no CI checks exist, this criterion passes automatically
+- [ ] If no CI checks exist, this criterion passes automatically — "no checks" still passes `ci-green` by design: the Judge verdict on a no-checks PR must now record a local test result or an explicit "unverified by any test" statement, and Champion's existing `judge-approval` read is where that is weighed
 
 **Verification command**:
 ```bash
@@ -2814,7 +2820,14 @@ reason, `mergeable` status, base-staleness), persisted **durably across
 passes** under the same idempotency-marker convention already used for
 `champion:merge-risk-hold` / `champion:held-pr-conflict-notice` /
 `champion:stale-pr-notice` above: a single pinned tracking issue this pass
-**edits in place**, never a fresh comment or issue every tick.
+**edits in place**, never a fresh comment or issue every tick. That tracking
+issue is **singleton state** — exactly one open digest per install, and the
+only actor that reads it is the one that can create a second one (#13876) —
+so Step 0 reconciles duplicates and Step 2 re-checks before creating; the
+Step 0 reconcile (closing Champion's own duplicate digest losers, nothing
+else) is the narrow, bookkeeping-only exception to Champion's close authority
+and does not widen `champion-issue-promo.md` Step 4's premise-false close
+gate.
 
 **Step 0 — locate the existing digest issue and read its current body
 (#7020).** Step 1 below needs the *previous* pass's digest body to carry a
@@ -2835,9 +2848,39 @@ DIGEST_MARKER="<!-- champion:merge-risk-hold-digest -->"
 # digest issue predating the marker convention — fall back to
 # the oldest (lowest-numbered) open title match instead of returning empty
 # and letting a duplicate get created (#7338).
-DIGEST_ISSUE=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
-  --state open --json number,body --limit 10 \
-  --jq "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+DIGEST_LIST=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
+  --state open --json number,body --limit 10)
+DIGEST_ISSUE=$(printf '%s\n' "$DIGEST_LIST" | jq -r \
+  "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+
+# #13876 — reconcile duplicates here, where they are already visible. Two
+# concurrent passes can both read DIGEST_ISSUE empty and both create a digest
+# (Step 2's recheck narrows that window but cannot close it), and selection
+# above is deterministic, so every OTHER marker-tagged match is a write-frozen
+# loser: never read, never updated, still open, possibly pinned, drifting
+# further from reality while still looking like the digest. Point each loser
+# at the winner once (marker-guarded, so a close that failed and retried next
+# pass does not re-comment), unpin it, and close it "not planned" — closing
+# Champion's own duplicate bookkeeping artifact here is the narrow exception
+# named in the intro, NOT new close authority. Marker-less matches (the
+# #7338 fallback candidates) are never touched. Unpin is best-effort like
+# the pin in Step 2; a failed close just retried next pass.
+DIGEST_WINNER=$(printf '%s\n' "$DIGEST_LIST" | jq -r \
+  "[.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] | min_by(.number) | .number // empty")
+if [ -n "$DIGEST_WINNER" ]; then
+  for DIGEST_LOSER in $(printf '%s\n' "$DIGEST_LIST" | jq -r \
+      "[.[] | select(.body | startswith(\"$DIGEST_MARKER\")) | select(.number != $DIGEST_WINNER) | .number] | .[]"); do
+    if ! "$GH_READ" issue view "$DIGEST_LOSER" --json comments \
+        --jq "any(.comments[].body; startswith(\"<!-- champion:digest-duplicate-of:\"))" | grep -q true; then
+      ./.loom/scripts/post-comment.sh "$DIGEST_LOSER" --body "<!-- champion:digest-duplicate-of:$DIGEST_WINNER -->
+Duplicate \`$DIGEST_TITLE\` issue created by a concurrent Champion pass (#13876): both passes found no digest open and both created one. The live digest is #$DIGEST_WINNER — it is edited in place every pass. This duplicate is closed and will not be updated.
+
+*Automated by Champion role*"
+    fi
+    gh issue unpin "$DIGEST_LOSER" 2>/dev/null || true   # best-effort, like the pin in Step 2
+    gh issue close "$DIGEST_LOSER" --reason "not planned"
+  done
+fi
 
 if [ -n "$DIGEST_ISSUE" ]; then
   OLD_DIGEST_BODY=$("$GH_READ" issue view "$DIGEST_ISSUE" --json body --jq '.body')
@@ -2999,7 +3042,9 @@ it). It splits "held, clean" (`$HELD_CONFLICTING_CLEAN`) from "held, rotting"
 **Step 2 — write the digest to a durable tracking issue, and pin it.** Champion
 edits this issue's **body** in place every pass (not a comment thread) — the
 current pile belongs at the top of the issue, not buried in a comment
-scrollback. `$DIGEST_ISSUE` came from Step 0; this step only builds the new
+scrollback. `$DIGEST_ISSUE` came from Step 0 (or from the pre-create recheck
+below, when Step 0 read empty and a concurrent pass created the digest in
+between, #13876); this step only builds the new
 body (including the hidden `champion:conflict-since` markers Step 1 collected,
 which is how the clock survives into the *next* pass) and writes it:
 
@@ -3032,6 +3077,20 @@ $DIGEST_TABLE
 $CONFLICT_SINCE_MARKERS---
 *Automated by Champion role*"
 
+# #13876 — re-check immediately before creating. The digest is singleton
+# state, and the only actor that reads it is the one that can create a
+# second one: two passes can both read Step 0's DIGEST_ISSUE empty. Re-run
+# the title search UNCACHED (gh, not $GH_READ — Step 0's read may be a
+# cache hit from before the other pass's create landed) with the same
+# selector; a number now means the other pass won the race — adopt it and
+# take the edit branch below instead of creating. Same recheck shape as the
+# verdict-time recheck in champion-issue-promo.md: it narrows the race
+# window, and Step 0's reconcile repairs what still slips through.
+if [ -z "$DIGEST_ISSUE" ]; then
+  DIGEST_ISSUE=$(gh issue list --search "\"$DIGEST_TITLE\" in:title" \
+    --state open --json number,body --limit 10 \
+    --jq "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+fi
 if [ -z "$DIGEST_ISSUE" ]; then
   # loom:blocked keeps this out of every role's work queue (Curator's
   # Priority 2 fallback excludes it outright, and no `loom:issue` /
@@ -4499,7 +4558,7 @@ A granted PR leaves the parked set at once, so this outcome is self-idempotent.
 
 ### Step 4b: Outcome — keep parked
 
-Comment the **specific** reason a human is still needed (not a generic "still blocked"), and change no labels. Because the parked PR stays in the query, guard the comment with a marker keyed to the rejection that is being ruled on, so the 10-minute cron does not re-post the same verdict every tick while a genuinely new rejection still gets a fresh decision:
+Comment the **specific** reason a human is still needed (not a generic "still blocked"), and change no labels. Because the parked PR stays in the query, the verdict is guarded per rejection **episode** — skip while a keep-parked verdict already covers the newest rejection — so the 10-minute cron does not re-post the same verdict every tick while a genuinely new rejection still gets a fresh decision:
 
 ```bash
 PR_NUMBER=<number>
@@ -4512,10 +4571,12 @@ LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
          | select((.body | contains("champion:capped-pr")) | not)
          | select(.body | test("Changes Requested"; "i"))]
         | last | .id // "none"')
-# The key is the id printed by the command above, copied VERBATIM. A head SHA,
-# an abbreviation, or any other spelling is NOT a key: on gf180-parasynth#647
-# four passes keyed on four spellings of one head SHA, so the exact-match guard
-# never fired and five identical verdicts landed on one rejection (#13903).
+# The key written into the marker is informational only — suppression never
+# matches on its spelling (#13903, #13880): on gf180-parasynth#647 four passes
+# keyed on four spellings of one head SHA, so the exact-match guard never fired
+# and five identical verdicts landed on one rejection. Prefer the rejection id
+# printed by the command above (`none` when there is no rejection) for the
+# audit trail.
 PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 
 # Key-spelling-tolerant guard (#13903) — this is the ONLY suppression guard.
@@ -4538,14 +4599,19 @@ PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 # `$rejected` takes `updated_at | max` across ALL rejections, deliberately
 # NOT the key's `last`: an older rejection edited today also opens a fresh
 # episode, which errs toward posting — do not "align" the two selectors.
+# No rejection in the thread at all ($rejected == null — a PR parked without
+# any Judge rejection, where the marker key reads `none`): no new episode can
+# start, so ANY existing park comment suppresses and none has posted yet
+# allows one. Without this arm the whole guard is false on such PRs and the
+# 10-minute cron re-posts the same verdict every tick (#13880, observed shape:
+# gf180-parasynth#534).
 PARKED_SINCE_REJECTION=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR_NUMBER/comments" --jq '.[]' \
   | jq -s '([.[]
              | select((.body | contains("champion:capped-pr")) | not)
              | select(.body | test("Changes Requested"; "i"))
              | .updated_at] | max) as $rejected
-           | $rejected != null
-             and any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
-                          and .created_at >= $rejected)')
+           | any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
+                      and (($rejected == null) or (.created_at >= $rejected)))')
 
 if [ "$PARKED_SINCE_REJECTION" = "true" ]; then
   echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"

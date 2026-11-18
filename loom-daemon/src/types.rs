@@ -62,13 +62,6 @@ pub enum Request {
         id: TerminalId,
         limit: usize,
     },
-    /// Capture git changes for a specific input
-    /// Called after a prompt completes to record code changes
-    CaptureGitChanges {
-        input_id: i64,
-        working_dir: String,
-        before_commit: Option<String>,
-    },
     /// Get the current git commit hash for a directory
     GetCurrentCommit {
         working_dir: String,
@@ -631,12 +624,6 @@ pub enum Response {
     CurrentCommit {
         commit: Option<String>,
     },
-    /// Response with git changes captured
-    GitChangesCaptured {
-        files_changed: i32,
-        lines_added: i32,
-        lines_removed: i32,
-    },
     // ========================================================================
     // Issue Claim Registry Responses (Issue #1159)
     // ========================================================================
@@ -1125,13 +1112,6 @@ pub struct SweepInfo {
     /// compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    /// Whether this sweep was admitted through the host's
-    /// overflow slot (#9244, inert since #11508): an operator-starred issue
-    /// dispatched over the global and/or per-repo concurrency cap as this
-    /// host's single over-limit sweep. `#[serde(default)]` keeps older wire
-    /// data and clients compatible (absent parses as `false`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub overflow: bool,
 }
 
 fn default_sweep_runtime() -> String {

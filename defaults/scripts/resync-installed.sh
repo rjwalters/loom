@@ -1229,7 +1229,10 @@ is_loom_internal() {
 N_UPDATED=0
 N_UNCHANGED=0
 N_SKIPPED=0
-# #5981: retired payload files removed this run (see remove_retired_files()).
+# #5981: retired payload files removed this run (see remove_retired_files()),
+# plus stale install-metadata.json manifest entries pruned this run
+# (#14012, prune_stale_manifest_entries()) -- both count as changes for
+# restamp_metadata()'s #11680 no-op logic.
 N_REMOVED=0
 # #4669: files that could not be staged/renamed into place. A non-empty list
 # means the refresh is PARTIAL and must be reported as such (exit 1), never
@@ -2763,10 +2766,204 @@ resync_workspace_stub_version() {
 
 resync_workspace_stub_version
 
+# ---------- shared: pure-copy-surface path classifier (#5983, #6173, #14012) ----------
+#
+# audit_untracked_loom_paths() and suggest_commit_if_resync_only_dirt()
+# (both further down) and prune_stale_manifest_entries() (just below) need to
+# tell shipped-payload paths -- pure copies of
+# defaults/{hooks,scripts,roles,docs,runtimes,bin}/, plus the individual
+# single-file payloads synced verbatim by the "single-file nested Biome
+# configs (#6031)" step above -- apart from genuine runtime state living
+# elsewhere under .loom/. Single-source the list here so the call sites
+# can never drift out of sync with each other.
+#
+# `.loom/biome.jsonc` is shipped payload (a verbatim copy of
+# defaults/.loom/biome.jsonc, applied by sync_one above), not Loom runtime
+# state -- on a consumer's first resync to a version that ships it, the file
+# lands on disk untracked-and-unignored and would otherwise trip
+# audit_untracked_loom_paths()'s "add this to EPHEMERAL_PATTERNS" warning
+# even though it is a tracked-payload file the consumer should simply commit
+# (#6173). `.claude/biome.jsonc` is the same kind of payload but lives
+# outside `.loom/`, so it never reaches audit_untracked_loom_paths() (which
+# only scans paths under `.loom/`) -- it is classified here anyway so
+# suggest_commit_if_resync_only_dirt() (which scans the whole tree) also
+# recognizes it as resync-only dirt safe to suggest committing.
+#
+# (This section lives before restamp_metadata() rather than with its other
+# consumers further down because prune_stale_manifest_entries() runs earlier
+# in the script's straight-line flow and needs these helpers defined first,
+# #14012.)
+_is_loom_pure_copy_surface_path() {
+    case "$1" in
+        .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.loom/biome.jsonc|.claude/biome.jsonc)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Maps a target-relative path that has already matched
+# _is_loom_pure_copy_surface_path() to the defaults/ source path resync would
+# have copied it from, and echoes it. Callers only invoke this after that
+# match, so the default case below is defensive, not a normal return path
+# (#6613 -- audit_untracked_loom_paths() needs this to tell "still-shipped
+# payload" apart from "matches the pure-copy-surface path pattern but was
+# removed from defaults/ without ever being added to defaults/.loom-retired.list").
+_loom_pure_copy_surface_source_path() {
+    case "$1" in
+        .loom/hooks/*)
+            printf '%s\n' "$DEFAULTS_DIR/hooks/${1#.loom/hooks/}"
+            ;;
+        .loom/scripts/*)
+            printf '%s\n' "$DEFAULTS_DIR/scripts/${1#.loom/scripts/}"
+            ;;
+        .loom/roles/*)
+            printf '%s\n' "$DEFAULTS_DIR/roles/${1#.loom/roles/}"
+            ;;
+        .loom/docs/*)
+            printf '%s\n' "$DEFAULTS_DIR/docs/${1#.loom/docs/}"
+            ;;
+        .loom/runtimes/*)
+            printf '%s\n' "$DEFAULTS_DIR/runtimes/${1#.loom/runtimes/}"
+            ;;
+        .loom/bin/*)
+            printf '%s\n' "$DEFAULTS_DIR/.loom/bin/${1#.loom/bin/}"
+            ;;
+        .loom/biome.jsonc)
+            printf '%s\n' "$DEFAULTS_DIR/.loom/biome.jsonc"
+            ;;
+        .claude/biome.jsonc)
+            printf '%s\n' "$DEFAULTS_DIR/.claude/biome.jsonc"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# ---------- prune stale install-metadata.json manifest entries (#14012) ----------
+#
+# install-metadata.json's installed_files array over-claims after an upstream
+# retirement: remove_retired_files() (or a manual deletion) removes the
+# installed copy, but the manifest entry the installer wrote stays behind, so
+# anything that iterates installed_files to verify an install either silently
+# skips the gap or errors on a file it was told to expect (16 stale entries
+# observed in one consumer repo, stable across two commits). This is the
+# missing reconcile: for every entry that satisfies ALL of
+#   1. it matches _is_loom_pure_copy_surface_path() -- entries outside the
+#      pure-copy surfaces (install-once files such as .github/workflows/*,
+#      .codex/config.toml, .claude/settings.json) are never touched here;
+#   2. it is absent on disk under $WRITE_ROOT -- a pinned fork, or a locally
+#      deleted file this same run just restored from defaults/, still exists
+#      and is never pruned; and
+#   3. its _loom_pure_copy_surface_source_path() counterpart is also absent
+#      under $DEFAULTS_DIR -- i.e. genuinely retired upstream. A locally
+#      deleted file that is STILL shipped is a copy gap, not a retirement,
+#      and its entry stays so a later run can restore the file.
+# the entry is dropped from the manifest and logged.
+#
+# Reconciling against the live source tree rather than
+# defaults/.loom-retired.list is deliberate: the list already trails reality
+# (#6613), and the consumer evidence included retirements that were never
+# listed on it. This is a prune of entries Loom itself wrote -- it never adds
+# or re-verifies entries; that remains the installer's job.
+#
+# Each prune increments N_REMOVED, so restamp_metadata()'s #11680 no-op logic
+# treats a pruned manifest as a changed install and re-stamps it; a run with
+# nothing to prune leaves the file byte-identical. --dry-run only previews
+# ("would prune"), never writes.
+prune_stale_manifest_entries() {
+    local meta="$WRITE_ROOT/.loom/install-metadata.json"
+    [[ -f "$meta" ]] || return 0
+    if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+        warn "Skipped the install-metadata.json manifest prune (need jq or python3)."
+        return 0
+    fi
+
+    # Classify every entry first, edit second -- one write, only when needed.
+    local p src entries
+    local -a prunable=()
+    if command -v jq >/dev/null 2>&1; then
+        entries="$(jq -r '.installed_files // [] | .[]' "$meta" 2>/dev/null)" || entries=""
+    else
+        entries="$(META="$meta" python3 -c 'import json, os
+data = json.load(open(os.environ["META"]))
+arr = data.get("installed_files")
+if isinstance(arr, list):
+    print("\n".join(e for e in arr if isinstance(e, str)))' 2>/dev/null)" || entries=""
+    fi
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        _is_loom_pure_copy_surface_path "$p" || continue
+        [[ -e "$WRITE_ROOT/$p" || -L "$WRITE_ROOT/$p" ]] && continue
+        src="$(_loom_pure_copy_surface_source_path "$p" 2>/dev/null)"
+        [[ -n "$src" && ! -e "$src" && ! -L "$src" ]] || continue
+        prunable+=("$p")
+    done <<<"$entries"
+    [[ "${#prunable[@]}" -gt 0 ]] || return 0
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        for p in ${prunable[@]+"${prunable[@]}"}; do
+            printf '%b\n' "  ${BOLD}would prune${NC} manifest entry $p ${YELLOW}(retired upstream, #14012)${NC}"
+            N_REMOVED=$((N_REMOVED + 1))
+        done
+        return 0
+    fi
+
+    local tmp="${meta}.tmp.$$"
+    if command -v jq >/dev/null 2>&1; then
+        local pruned_json
+        pruned_json="$(printf '%s\n' ${prunable[@]+"${prunable[@]}"} | jq -R . | jq -s .)" || pruned_json='[]'
+        if jq --argjson rm "$pruned_json" \
+              '.installed_files |= (if type == "array" then map(select(. as $e | ($rm | index($e)) | not)) else . end)' \
+              "$meta" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+            mv "$tmp" "$meta"
+        else
+            rm -f "$tmp"
+            err "failed to prune install-metadata.json manifest entries (jq edit failed)"
+            record_failure ".loom/install-metadata.json"
+            return 0
+        fi
+    else
+        local py_rc=0
+        META="$meta" PRUNE_LIST="$(printf '%s\n' ${prunable[@]+"${prunable[@]}"})" \
+            python3 - "$tmp" <<'PY' 2>/dev/null || py_rc=$?
+import json, os, sys
+with open(os.environ["META"]) as f:
+    data = json.load(f)
+removed = set(os.environ["PRUNE_LIST"].splitlines())
+arr = data.get("installed_files")
+if isinstance(arr, list):
+    data["installed_files"] = [e for e in arr if e not in removed]
+with open(sys.argv[1], "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+        if [[ "$py_rc" -eq 0 && -s "$tmp" ]]; then
+            mv "$tmp" "$meta"
+        else
+            rm -f "$tmp"
+            err "failed to prune install-metadata.json manifest entries (python3 edit failed)"
+            record_failure ".loom/install-metadata.json"
+            return 0
+        fi
+    fi
+
+    for p in ${prunable[@]+"${prunable[@]}"}; do
+        printf '%b\n' "  ${GREEN}pruned${NC}    manifest entry $p ${YELLOW}(retired upstream, #14012)${NC}"
+        N_REMOVED=$((N_REMOVED + 1))
+    done
+}
+
 # ---------- re-stamp install-metadata.json (#4239, non-dry-run only) ----------
 #
 # Refresh loom_version + loom_commit (from the resolved source tree) and record a
-# last_resync date. install_date and installed_files are left to the installer.
+# last_resync date. install_date is left to the installer; installed_files is
+# too, with one #14012 exception: prune_stale_manifest_entries() above first
+# drops pure-copy-surface entries whose file is gone on disk AND retired
+# upstream, so the manifest stops over-claiming removed payload.
 # jq or python3 is required for a safe in-place JSON edit; if neither is present
 # we warn and skip — the surface sync above still succeeded.
 #
@@ -3094,6 +3291,7 @@ PY
     return 0
 }
 
+prune_stale_manifest_entries
 if [[ "$DRY_RUN" -ne 1 ]]; then
     restamp_metadata
 fi
@@ -3388,77 +3586,6 @@ refresh_gitignore_block() {
     _gitignore_warn_if_stale "$bin"
 }
 refresh_gitignore_block
-
-# ---------- shared: pure-copy-surface path classifier (#5983, #6173) ----------
-#
-# Both audit_untracked_loom_paths() (below) and suggest_commit_if_resync_only_dirt()
-# (further down) need to tell shipped-payload paths -- pure copies of
-# defaults/{hooks,scripts,roles,docs,runtimes,bin}/, plus the individual
-# single-file payloads synced verbatim by the "single-file nested Biome
-# configs (#6031)" step above -- apart from genuine runtime state living
-# elsewhere under .loom/. Single-source the list here so the two call sites
-# can never drift out of sync with each other.
-#
-# `.loom/biome.jsonc` is shipped payload (a verbatim copy of
-# defaults/.loom/biome.jsonc, applied by sync_one above), not Loom runtime
-# state -- on a consumer's first resync to a version that ships it, the file
-# lands on disk untracked-and-unignored and would otherwise trip
-# audit_untracked_loom_paths()'s "add this to EPHEMERAL_PATTERNS" warning
-# even though it is a tracked-payload file the consumer should simply commit
-# (#6173). `.claude/biome.jsonc` is the same kind of payload but lives
-# outside `.loom/`, so it never reaches audit_untracked_loom_paths() (which
-# only scans paths under `.loom/`) -- it is classified here anyway so
-# suggest_commit_if_resync_only_dirt() (which scans the whole tree) also
-# recognizes it as resync-only dirt safe to suggest committing.
-_is_loom_pure_copy_surface_path() {
-    case "$1" in
-        .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.loom/biome.jsonc|.claude/biome.jsonc)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-# Maps a target-relative path that has already matched
-# _is_loom_pure_copy_surface_path() to the defaults/ source path resync would
-# have copied it from, and echoes it. Callers only invoke this after that
-# match, so the default case below is defensive, not a normal return path
-# (#6613 -- audit_untracked_loom_paths() needs this to tell "still-shipped
-# payload" apart from "matches the pure-copy-surface path pattern but was
-# removed from defaults/ without ever being added to defaults/.loom-retired.list").
-_loom_pure_copy_surface_source_path() {
-    case "$1" in
-        .loom/hooks/*)
-            printf '%s\n' "$DEFAULTS_DIR/hooks/${1#.loom/hooks/}"
-            ;;
-        .loom/scripts/*)
-            printf '%s\n' "$DEFAULTS_DIR/scripts/${1#.loom/scripts/}"
-            ;;
-        .loom/roles/*)
-            printf '%s\n' "$DEFAULTS_DIR/roles/${1#.loom/roles/}"
-            ;;
-        .loom/docs/*)
-            printf '%s\n' "$DEFAULTS_DIR/docs/${1#.loom/docs/}"
-            ;;
-        .loom/runtimes/*)
-            printf '%s\n' "$DEFAULTS_DIR/runtimes/${1#.loom/runtimes/}"
-            ;;
-        .loom/bin/*)
-            printf '%s\n' "$DEFAULTS_DIR/.loom/bin/${1#.loom/bin/}"
-            ;;
-        .loom/biome.jsonc)
-            printf '%s\n' "$DEFAULTS_DIR/.loom/biome.jsonc"
-            ;;
-        .claude/biome.jsonc)
-            printf '%s\n' "$DEFAULTS_DIR/.claude/biome.jsonc"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
 
 # ---------- audit: untracked-and-unignored paths under .loom/ (#4280, #5983) ----------
 #

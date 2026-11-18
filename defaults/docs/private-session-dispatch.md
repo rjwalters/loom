@@ -115,11 +115,21 @@ oversized metadata, foreign issue identities and symlink destinations are refuse
 Unchanged checkpoints retain their original timestamp and do not fabricate
 progress for crash-budget accounting.
 
-Dirty or unpushed private work remains in the account volume. Restart can resume
-on that account after the lifetime/cleanliness checks; automatic account or
-runtime failover stops for explicit recovery of the account-owned checkpoint.
-A successful remote push alone does not transfer private local phase state.
-Never delete the volume or reset a branch to work around a recovery refusal.
+Dirty private work still refuses reuse. Unpublished commits named by a branch
+no longer do: preparation never moves a branch, so a following step on the same
+branch resumes its local tip, steps for other branches/issues and other
+registered repositories of the account are unaffected, and the unpublished
+branches are left in place. A detached HEAD — root or linked worktree —
+carrying unnamed commits still refuses, naming the offending checkout and the
+branches `accounts session recover <account>` clears: without a flag it lists
+them (with ahead counts and stranded detached work), `--publish` pushes them
+to origin fast-forward only, and `--discard --branch B` (or `--issue N`)
+deletes exactly the named branches, under the same exclusive account lease as
+a job. Restart can resume on that account after the lifetime/cleanliness
+checks; automatic account or runtime failover stops for explicit recovery of
+the account-owned checkpoint. A successful remote push alone does not
+transfer private local phase state. Never delete the volume or reset a branch
+to work around a recovery refusal.
 
 ## Credential-free integration evidence
 

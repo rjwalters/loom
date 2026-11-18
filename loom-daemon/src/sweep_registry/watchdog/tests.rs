@@ -1484,7 +1484,6 @@ fn watchdog_latch_pruned_on_entry_gc() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     reg.watchdog_progressed.insert(sid.clone());
