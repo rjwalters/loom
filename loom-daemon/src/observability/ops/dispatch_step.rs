@@ -12,6 +12,8 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
+use crate::observability::lifecycle::role_draw;
+use crate::runtime_preference::role_draw::RoleDrawRecord;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_spawn::StepDrawTerms;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
@@ -67,6 +69,12 @@ pub struct StepDispatch<'a> {
     /// The launch's reasoning effort (`loom.effort`), when one was resolved
     /// (#14167); `None` when the runtime keeps its session default.
     pub effort: Option<&'a str>,
+    /// The `runtimes.roleDraw` draw that decided the launch (#14233);
+    /// `None` when no table did, or the step was refused before launch.
+    /// Stamps `loom.role_draw.pick` and `loom.role_draw.attempt` only. The
+    /// attempt is the role draw's escalation count (1 + consecutive failed
+    /// attempts), unrelated to `draw_attempt` above, the item redraw count.
+    pub role_draw: Option<&'a RoleDrawRecord>,
 }
 
 /// Selected versus launched model of a spawned step. Distinct on purpose: a
@@ -78,6 +86,24 @@ pub struct StepModels<'a> {
     /// The `--model` the child was launched with; `None` when the runtime
     /// picks its own.
     pub launched: Option<&'a str>,
+    /// The model the launch was configured for, before any selection-time
+    /// fallback (#13873); `None` when no model was resolved. Equal to
+    /// `launched` whenever no fallback fired — the pair is how an operator
+    /// sees how much work ran below its configured model.
+    pub configured: Option<&'a str>,
+    /// The selection-time fallback that changed configured → launched
+    /// (#13873), when one fired.
+    pub fallback: Option<StepModelFallback<'a>>,
+}
+
+/// One selection-time model fallback's facts (#13873): the configured model
+/// the launch fell back from, and the selector result that triggered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepModelFallback<'a> {
+    /// The configured model the launch fell back from.
+    pub from: &'a str,
+    /// Always `no-account-for-class` today (`model_fallback::REASON`).
+    pub reason: &'static str,
 }
 
 /// The span for `step` in `repo` at `at`. Pure.
@@ -171,12 +197,25 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         }
     }
     if let Some(models) = step.models {
+        if let Some(configured) = models.configured {
+            attributes.insert("loom.step.model_configured".into(), configured.to_string());
+        }
         if let Some(selected) = models.selected {
             attributes.insert("loom.step.model_selected".into(), selected.to_string());
         }
         if let Some(launched) = models.launched {
             attributes.insert("loom.step.model_launched".into(), launched.to_string());
         }
+        if let Some(fallback) = models.fallback {
+            attributes.insert("loom.step.model_fallback_from".into(), fallback.from.to_string());
+            attributes
+                .insert("loom.step.model_fallback_reason".into(), fallback.reason.to_string());
+        }
+    }
+    if let Some(draw) = step.role_draw {
+        attributes
+            .insert(role_draw::PICK.into(), draw.pick.clone().unwrap_or_else(|| "none".into()));
+        attributes.insert(role_draw::ATTEMPT.into(), draw.attempt.to_string());
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
@@ -235,6 +274,7 @@ mod tests {
             models: None,
             runtime: Some("claude"),
             effort: Some("high"),
+            role_draw: None,
         }
     }
 
@@ -276,6 +316,8 @@ mod tests {
             models: Some(StepModels {
                 selected: Some("sonnet"),
                 launched: Some("opus"),
+                configured: None,
+                fallback: None,
             }),
             ..judge(RESULT_SPAWNED, "ok")
         };
@@ -288,6 +330,59 @@ mod tests {
         let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
         assert!(!none.attributes.contains_key("loom.step.model_selected"));
         assert!(!none.attributes.contains_key("loom.step.model_launched"));
+    }
+
+    /// #13873: the span names the configured model, and — when a
+    /// selection-time fallback fired — what it fell back from and why, so an
+    /// operator can see how much work ran below its configured model.
+    #[test]
+    fn a_step_span_names_the_configured_model_and_any_fallback() {
+        let step = StepDispatch {
+            models: Some(StepModels {
+                selected: None,
+                launched: Some("opus"),
+                configured: Some("fable"),
+                fallback: Some(StepModelFallback {
+                    from: "fable",
+                    reason: "no-account-for-class",
+                }),
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.step.model_configured"], "fable");
+        assert_eq!(span.attributes["loom.step.model_launched"], "opus");
+        assert_eq!(span.attributes["loom.step.model_fallback_from"], "fable");
+        assert_eq!(span.attributes["loom.step.model_fallback_reason"], "no-account-for-class");
+        for key in [
+            "loom.step.model_configured",
+            "loom.step.model_fallback_from",
+            "loom.step.model_fallback_reason",
+        ] {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
+                "{key} is dropped at export"
+            );
+        }
+        // Without a fallback the two keys stay absent — `model_configured`
+        // alone records the pre-fallback model.
+        let steady = StepDispatch {
+            models: Some(StepModels {
+                selected: None,
+                launched: Some("fable"),
+                configured: Some("fable"),
+                fallback: None,
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let steady_span = super::span(&steady, None, Utc::now());
+        assert_eq!(steady_span.attributes["loom.step.model_configured"], "fable");
+        assert!(!steady_span
+            .attributes
+            .contains_key("loom.step.model_fallback_from"));
+        assert!(!steady_span
+            .attributes
+            .contains_key("loom.step.model_fallback_reason"));
     }
 
     /// #14167: every admitted step names the runtime it launches on and its
@@ -312,6 +407,48 @@ mod tests {
         );
         assert!(!unset.attributes.contains_key("loom.runtime"));
         assert!(!unset.attributes.contains_key("loom.effort"));
+    }
+
+    /// #14233: a step a `roleDraw` table decided carries the draw's pick and
+    /// escalation attempt (not `draw_attempt`, the item redraw count); a step
+    /// no table decided carries neither key, never `0` or `none`.
+    #[test]
+    fn a_role_drawn_step_names_the_pick_and_attempt() {
+        use crate::runtime_preference::role_draw::{DrawWeight, Layer};
+        let record = RoleDrawRecord {
+            role: "judge".into(),
+            attempt: 2,
+            table_attempt: 2,
+            layer: Layer::FleetRepo,
+            table: vec![DrawWeight {
+                candidate: "codex".into(),
+                weight: 100,
+            }],
+            off: Vec::new(),
+            seed: "00000000000000ff".into(),
+            seed_inputs: None,
+            steps: Vec::new(),
+            passed_over: Vec::new(),
+            pick: Some("codex".into()),
+            model: None,
+        };
+        let step = StepDispatch {
+            role_draw: Some(&record),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.role_draw.pick"], "codex");
+        assert_eq!(span.attributes["loom.role_draw.attempt"], "2");
+        assert_eq!(span.attributes["loom.step.draw_attempt"], "3", "item redraws stay apart");
+        for key in ["loom.role_draw.pick", "loom.role_draw.attempt"] {
+            assert!(
+                crate::observability::lifecycle::role_draw::KEYS.contains(&key),
+                "{key} is dropped at export"
+            );
+        }
+        let undrawn = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(!undrawn.attributes.contains_key("loom.role_draw.pick"));
+        assert!(!undrawn.attributes.contains_key("loom.role_draw.attempt"));
     }
 
     /// #12450: a granted step carries the captain's assignment, and it

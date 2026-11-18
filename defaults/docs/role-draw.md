@@ -122,7 +122,15 @@ toolless launch, a non-zero exit and a timeout. A success resets it to 1. A
 pre-spawn skip counts neither way. The count lives in daemon memory, so a
 restart starts every role at attempt 1.
 
-Sweep dispatch and `worker run` phases draw attempt 1.
+Sweep dispatch and `worker run` phases draw attempt 1. So do stage steps
+(Curator, Builder, Judge, Doctor, Champion): nothing feeds a step's failure
+into the count today, so `loom.role_draw.attempt` on a `loom.dispatch.step`
+span reads `1`. Only role ticks feed it, and the count is keyed by workspace
+and role. A step failure feed is a separate design (#14235).
+
+Do not confuse it with `loom.step.draw_attempt` on the same span: that is the
+1-based count of item redraws within one dispatch slot, and has nothing to do
+with the role draw's attempt.
 
 ### Which launch paths honor the drawn `/<model>` (#12748)
 

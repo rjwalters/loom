@@ -16,6 +16,31 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-18
 
+- **PR #14408**: fix: split codex env-tier model@effort in runtime span launch facts
+- **PR #14386**: test(private-workspace): run Docker fixture steps in a real issue worktree
+- **PR #14379**: fix: refuse lone @-token --body in forge create-issue
+- **PR #14374**: docs: narrow roll-requeue claim-check wording in step-release docs
+- **PR #14373**: fix: leave a held repo out of the installed-behind "not held" report
+- **PR #14372**: fix: report check runs stranded under a terminal-failed workflow run as failing
+- **PR #14365**: Add accounts session rebind for private clones after a repository transfer
+- **PR #14364**: feat: audit flags group-check workflow_run jobs missing the trust gate
+- **PR #14348**: fix: print LOOM_* env values in launchd mismatch diagnostics, drop dead shell verification twin
+- **Issue #14019** (closed): Contained sessions: configurable session image (digest-pinned, bundle verified) and extra read-only mounts
+- **Issue #14128** (closed): wait-checks: a terminal-failed run whose check runs are all stuck queued waits forever instead of failing
+- **Issue #14245** (closed): merge-group-ci audit: no finding for a merge-group-check workflow whose workflow_run trigger lacks the job-level trust gate
+- **Issue #14302** (closed): loom.model on a codex run stamps the raw model@effort env value, not the base the adapter launched
+- **Issue #14048** (closed): Completion envelope: per-stage cross-host usage (stages field)
+- **Issue #14323** (closed): loom-daemon forge create-issue --body @path still posts the literal string (the gap #14286 closed for forge comment)
+- **Issue #14214** (closed): Test isolation: LOOM_WORKTREE_ROOT is mutated by two independent serial_test lock groups
+- **Issue #14334** (closed): installed_behind can claim "not held" for a repo whose other copy IS held
+- **Issue #14357** (closed): Support a data-preserving rebind of additional private-clone registrations after a repository transfer
+- **Issue #14345** (closed): ended.rs / step_reap.rs over-generalize: the roll requeue's issue-role path does not call step_claim_held_elsewhere
+- **Issue #13873** (closed): Daemon path: fall back one model rung (fable → opus → sonnet) when the configured model's limit is hit, instead of holding the pool
+- **Issue #14274** (closed): Tighten launchd env redaction: allowlist precision, dead shell twin, single-line env block
+
+- **PR #14388**: test: anchor create-pr T2 lookup assertion on .default_branch
+- **PR #14375**: docs: scope Codex suffix-shadowing claim to role-runner and sweep-step launches
+- **PR #14344**: fix: count only the last dispatch's OpenCode sessions in step-dispatched usage
 - **PR #14385**: test: pin closing-issue clause in docs-only fast-path prose
 - **PR #14383**: fix: prefer branch-declared issue when create-pr body has several references
 - **PR #14380**: fix: declare installed merge-group-check workflow as a forge caller
@@ -27,6 +52,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #14306**: fix: name why a stranded checkout was not put back in its wrong-branch detail
 - **PR #14262**: fix: make docs-only fast path ineligible when the PR has closing issue references
 - **PR #14225**: judge: cover full-suite-only documented repos in the no-checks unverified fallback
+- **Issue #14387** (closed): test-create-pr-rate-limit-fallback.sh T2 is non-hermetic: a write-scope permissions probe is counted as a default-branch lookup (fails on Linux workers, passes on CI macOS)
+- **Issue #14359** (closed): Docs: 'no daemon-dispatched Codex launch' overstates the codex-default/suffix shadowing — the sweep-orchestrator dispatch has no resolved effort
+- **Issue #14210** (closed): Step-dispatched completion sums OpenCode sessions from every dispatch in an append-mode step log, while the Claude side is window-filtered
 - **Issue #14363** (closed): main red: forge_inventory gate — .github/workflows/merge-group-check.yml unclassified (2 gh release download call sites)
 - **Issue #14351** (closed): create-pr.sh _cpr_body_ref_issue: stale `head -1` comment, and multi-`Closes` bodies now resolve to the last reference
 - **Issue #14340** (closed): Document host_state, target_source and config_restart_paths in the auto_update.tick schema table

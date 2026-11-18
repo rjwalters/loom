@@ -64,6 +64,7 @@
 
 use super::*;
 use crate::observability::ops::dispatch_step::{self, StepDispatch};
+use crate::runtime_preference::role_draw::RoleDrawRecord;
 use crate::step_role::StepRole;
 use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 
@@ -234,6 +235,13 @@ pub(crate) struct StepLaunch {
     pub(crate) admission: crate::runtime_preference::DispatchAdmission,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    /// The configured model before any selection-time fallback (#13873);
+    /// `Some` exactly when [`Self::model`] was resolved. Telemetry's
+    /// `loom.step.model_configured`.
+    pub(crate) model_configured: Option<String>,
+    /// The selection-time fallback that changed configured → launched
+    /// (#13873), when one fired.
+    pub(crate) model_fallback: Option<crate::sweep_registry::model_fallback::ModelFallbackDecision>,
     /// A private-clone containment selection (#8787), when admission needed
     /// one; the launch uses exactly it.
     pub(crate) selection: Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
@@ -755,10 +763,20 @@ impl SweepRegistry {
             Some(dispatch_step::StepModels {
                 selected: selected.as_deref(),
                 launched: launch.model.as_deref(),
+                configured: launch.model_configured.as_deref(),
+                fallback: launch.model_fallback.as_ref().map(|f| {
+                    dispatch_step::StepModelFallback {
+                        from: f.from.as_str(),
+                        reason: f.reason,
+                    }
+                }),
             }),
             assignment.as_ref().and_then(|g| g.lineage.as_ref()),
             admitted.map(|a| a.runtime.as_str()),
             launch.effort.as_deref(),
+            admitted
+                .and_then(|a| a.preference.as_ref())
+                .and_then(|p| p.draw.as_deref()),
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -806,6 +824,7 @@ impl SweepRegistry {
             None,
             None,
             None,
+            None,
         );
     }
 
@@ -826,6 +845,7 @@ impl SweepRegistry {
         lineage: Option<&crate::fleet_dispatch::worker::GrantLineage>,
         runtime: Option<&str>,
         effort: Option<&str>,
+        role_draw: Option<&RoleDrawRecord>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -847,6 +867,7 @@ impl SweepRegistry {
                 models,
                 runtime,
                 effort,
+                role_draw,
             },
         );
     }
@@ -900,10 +921,13 @@ impl SweepRegistry {
                 StepRole::Builder => DispatchModel::Autonomous.resolve(config, kind, None),
                 _ => non_empty(models::resolve_role_runner_model(root, name).0),
             };
+            let (model, model_configured, model_fallback) = with_model_fallback(root, model);
             return Ok(StepLaunch {
                 admission: crate::runtime_preference::DispatchAdmission::none(),
                 model,
                 effort,
+                model_configured,
+                model_fallback,
                 selection: None,
             });
         }
@@ -995,6 +1019,14 @@ impl SweepRegistry {
                 non_empty(model)
             }
         };
+        // Selection-time fallback (#13873): applied AFTER the mismatch
+        // refusal above, on the final accepted model — a wrong *stated*
+        // intent must keep its refusal; only a class-exhausted pool falls a
+        // launch back a rung. Re-resolved on every spawn, so nothing is
+        // sticky. The runtime-mismatch check already passed for the
+        // configured model, and a Claude-shaped chain rung cannot mismatch a
+        // runtime the configured Claude-shaped model fit.
+        let (model, model_configured, model_fallback) = with_model_fallback(root, model);
         // #14017: effort is resolved once the runtime is admitted, so a
         // `roleEfforts.<role>@<runtime>` entry and the Codex default can apply.
         let effort = non_empty(
@@ -1007,9 +1039,29 @@ impl SweepRegistry {
             },
             model,
             effort,
+            model_configured,
+            model_fallback,
             selection,
         })
     }
+}
+
+/// Apply the selection-time model fallback (#13873) to a resolved launch
+/// model: `(launched, configured, fallback)`.
+fn with_model_fallback(
+    root: &Path,
+    model: Option<String>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<crate::sweep_registry::model_fallback::ModelFallbackDecision>,
+) {
+    let Some(configured) = model else {
+        return (None, None, None);
+    };
+    let effective = crate::sweep_registry::model_fallback::effective_model(root, &configured);
+    let configured = (!effective.configured.is_empty()).then_some(effective.configured);
+    (non_empty(effective.model), configured, effective.fallback)
 }
 
 /// The step-only environment of a step child (called from

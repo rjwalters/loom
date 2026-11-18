@@ -344,7 +344,7 @@ impl PoolHoldState {
                 edge: None,
             };
         }
-        let pool = spawnable_pool_state(root);
+        let pool = crate::sweep_registry::model_fallback::preflight_pool_state(root);
         let pool_key = pool_account_fingerprint(&pool.dir);
         let (exhausted, preference_diagnostic) = match preference_resolution {
             Some(resolution) => match &resolution.chosen {
@@ -368,6 +368,13 @@ impl PoolHoldState {
             // one — see the module doc. Falling through to the clear path
             // below is deliberate: a pool that was drained to empty should
             // not keep a pre-flight hold alive under a stale key.
+            //
+            // #13873: the read itself is `model_fallback`-aware — with the
+            // block enabled the usable count asks the any-class question
+            // (`preflight_pool_state`), so a pool whose accounts are all
+            // bad-marked for ONE model class, with a lower fallback rung
+            // still healthy, no longer holds dispatch: the launches it
+            // would spawn fall a rung at their own resolution and succeed.
             None => (pool.total > 0 && pool.usable == 0, None),
         };
         if exhausted && preference_diagnostic.is_some() {

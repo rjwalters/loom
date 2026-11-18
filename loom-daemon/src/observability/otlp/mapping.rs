@@ -384,6 +384,27 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(sweep_id) = &r.sweep_id {
                 attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
             }
+            // #14048: the launch's own runtime identity — the `# LOOM_LAUNCH`
+            // record read back off this tick's/step's own log. Absent for a
+            // Claude/legacy-adapter spawn (no record to read), never a
+            // fabricated `claude`. Same key vocabulary the `loom.role_attempt`
+            // span uses, so one filter covers both signals.
+            if let Some(runtime) = &r.runtime {
+                attributes.push(kv_string("loom.runtime", runtime.clone()));
+            }
+            if let Some(provider) = &r.provider {
+                attributes.push(kv_string("loom.provider", provider.clone()));
+            }
+            if let Some(profile) = &r.profile {
+                attributes.push(kv_string("loom.profile", profile.clone()));
+            }
+            // #14048: the step-engine stage (`builder`, `judge`,
+            // `champion_promote`, …), finer than `role` — which folds
+            // Champion's two stages to `champion` — so a per-stage usage
+            // query splits them. Absent on a role tick.
+            if let Some(stage) = &r.stage {
+                attributes.push(kv_string("loom.stage", stage.clone()));
+            }
             // #12362: a Judge tick's found-work split and verdicts, and a
             // step's own outcome class/reason. Each absent when unobserved.
             if let Some(found_work) = r.found_work {

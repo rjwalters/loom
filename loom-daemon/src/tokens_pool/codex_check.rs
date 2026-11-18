@@ -864,6 +864,17 @@ pub fn format_table_for(report: &ProbeReport, live: bool) -> String {
 /// simply has not written a rollout log yet — the fail-*closed* direction this
 /// module's header rules out. The honesty the issue asked for lives in the
 /// status word and the table footer, not in this exit code.
+///
+/// One divergence is accepted (issue #14349): this predicate reads the
+/// in-memory probe round, not the written `.ranking`. A round whose fresh
+/// status is `unknown` over a still-running weekly hold is **written** as the
+/// carried `exhausted` row (`check::carries_forward`, #14265), which
+/// `select::is_hard_excluded` refuses unconditionally — yet the in-memory
+/// report still says `unknown`, so this returns `true` for it. If every
+/// account is in that state, `accounts check` exits `0` while a codex dispatch
+/// finds nothing selectable. The predicate deliberately does not read the
+/// persisted row (no file I/O in an exit-code predicate), and the dangerous
+/// direction — readmitting a held account — is what the carry-forward fixes.
 #[must_use]
 pub fn has_usable_account(report: &ProbeReport) -> bool {
     report
