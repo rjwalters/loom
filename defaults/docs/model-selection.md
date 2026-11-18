@@ -29,17 +29,20 @@ lookup instead of hand-reading config (issue #13956):
 
 ```bash
 ./.loom/scripts/resolve-role-model.sh <role> --json
-# -> {"role":"judge","model":"opus","source":"roleConfig.model"}
+# -> {"role":"judge","model":"claude-opus-5-5","source":"roleConfig.model","task_model":"opus"}
 ```
 
 `source` names the tier that supplied the model (`param` | `roleConfig.model`
 | `suggestedModel` | `inherit`), so an experiment can confirm what actually
-ran. The bare form prints just the model; `--task-alias` returns the nearest
-Task-passable alias (the #4282 degradation — the Task tool's `model`
-parameter is alias-only). **Exit 3 with no output** means nothing is
-configured: the caller omits the Task `model` parameter and the subagent
-inherits the parent session's model — the zero-config behavior is
-byte-for-byte unchanged. The shipped `defaults/.claude/agents/*.md` carry no
+ran. `model` is the real resolved value (a pinned ID stays a pinned ID);
+**`task_model` is the value to pass** as the Task tool's `model` parameter —
+the #4282 degradation to the nearest Task-passable alias, since that
+parameter is alias-only and rejects a pinned ID (#14133). `task_model: null`
+(nothing configured, or no alias for the model) means omit the parameter, and
+the subagent inherits the parent session's model — the zero-config behavior is
+byte-for-byte unchanged. The bare form prints just the model and exits 3 with
+no output when nothing is configured; `--task-alias` (bare form only — a
+no-op under `--json`) prints the alias and exits 3 when there is none. The shipped `defaults/.claude/agents/*.md` carry no
 `model:` frontmatter (a test asserts it): a role's model comes from config at
 spawn time, never from a hardcoded tier — the #13956 operator ruling declined
 per-role pins in shipped files so per-role experiments stay possible.
