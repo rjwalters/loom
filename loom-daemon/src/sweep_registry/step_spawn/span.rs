@@ -44,6 +44,7 @@ use std::path::Path;
 use super::capture::{StepEnd, StepOutcomeClass, StepOutcomeLine};
 use crate::observability::lifecycle::{self, roll_interruption, RoleFailure};
 use crate::role_runner::RoleTickOutcome;
+use crate::step_dispatch::outcome_ledger::{self, OutcomeClass, PostState, StepOutcome};
 use crate::step_role::StepRole;
 use crate::sweep_registry::reaper::pid_identity;
 use crate::sweep_registry::{LockOwner, SweepRegistry};
@@ -127,7 +128,11 @@ pub(crate) fn step_failure(
 /// its work rides `loom.step.outcome.class` / `.reason` (#14168): `none`
 /// with no reason when the step wrote no parseable outcome line, so "no
 /// outcome" is countable per runtime, model and role from the span alone.
-/// Pure.
+/// `post` is the forge post-state the step's claim release noted before the
+/// close, absent when none was (#14234): with a line and a post-state the
+/// close adds `loom.step.outcome.agrees`, whether the ledger's class for the
+/// two ([`crate::step_dispatch::outcome_ledger::classify`]) is the class the
+/// step claimed. Pure.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_close(
@@ -141,6 +146,7 @@ pub(crate) fn sweep_close(
     story_points: Option<u32>,
     pr_number: Option<u32>,
     provider_exhausted: bool,
+    post: Option<PostState>,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -156,6 +162,9 @@ pub(crate) fn sweep_close(
     close.insert("loom.step.outcome.class".into(), outcome_class.to_owned());
     if !outcome_reason.is_empty() {
         close.insert("loom.step.outcome.reason".into(), outcome_reason.to_owned());
+    }
+    if let (Some(l), Some(post)) = (line, post.filter(|_| !provider_exhausted)) {
+        close.insert("loom.step.outcome.agrees".into(), outcome_agrees(l, post).to_string());
     }
     for (key, value) in [("loom.configured_model", model), ("loom.effort", effort)] {
         if let Some(value) = value.filter(|v| !v.is_empty()) {
@@ -177,6 +186,24 @@ pub(crate) fn sweep_close(
         close.insert(lifecycle::EXIT_CODE.into(), code.to_string());
     }
     (result, close)
+}
+
+/// Whether the class the ledger derives from `post` is the class the step's
+/// own line claimed (#14234). The ledger's rule is reused, not restated: a
+/// `verdict` claim the forge does not show classifies `failed`, which is a
+/// disagreement. Pure.
+fn outcome_agrees(line: &StepOutcomeLine, post: PostState) -> bool {
+    let claimed = StepOutcome::new(ledger_class(line.class), &line.reason);
+    outcome_ledger::classify(Some(&claimed), Some(post)).class == claimed.class
+}
+
+fn ledger_class(class: StepOutcomeClass) -> OutcomeClass {
+    match class {
+        StepOutcomeClass::Verdict => OutcomeClass::Verdict,
+        StepOutcomeClass::Noop => OutcomeClass::Noop,
+        StepOutcomeClass::Refused => OutcomeClass::Refused,
+        StepOutcomeClass::Failed => OutcomeClass::Failed,
+    }
 }
 
 impl SweepRegistry {

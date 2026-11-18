@@ -24,6 +24,9 @@ pub enum GroupBy {
     /// (Issue #8556). See [`super::resolve_tap`] for how a record with no
     /// explicit `config["tap"]` stamp is placed.
     Tap,
+    /// The role-model mix — per-role models, runtime/provider and effort
+    /// (Issue #14067). See [`super::mix::resolve_mix`].
+    Mix,
 }
 
 impl GroupBy {
@@ -36,9 +39,10 @@ impl GroupBy {
             "host" => Ok(Self::Host),
             "day" => Ok(Self::Day),
             "tap" => Ok(Self::Tap),
+            "mix" => Ok(Self::Mix),
             other => bail!(
                 "unknown --group-by value {other:?} (expected one of: arm, model, repo, host, \
-                 day, tap)"
+                 day, tap, mix)"
             ),
         }
     }
@@ -52,6 +56,7 @@ impl GroupBy {
             Self::Host => "host",
             Self::Day => "day",
             Self::Tap => "tap",
+            Self::Mix => "mix",
         }
     }
 }

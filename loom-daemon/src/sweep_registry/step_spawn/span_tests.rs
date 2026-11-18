@@ -35,6 +35,7 @@ fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttri
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -55,6 +56,7 @@ fn a_sized_steps_close_carries_its_story_points() {
             points,
             None,
             false,
+            None,
         )
         .1
     };
@@ -108,6 +110,7 @@ fn a_close_carries_the_runtime_that_ran_the_step() {
             None,
             None,
             false,
+            None,
         )
         .1
     };
@@ -367,6 +370,7 @@ fn a_close_carries_the_pr_number_only_when_one_is_known() {
             None,
             pr,
             false,
+            None,
         )
         .1
     };
@@ -394,6 +398,7 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
             None,
             pr,
             false,
+            None,
         )
         .1[lifecycle::FAILURE_CLASS]
             .clone()
@@ -409,8 +414,20 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
 fn a_provider_exhausted_step_closes_as_provider_exhausted() {
     let outcome = RoleTickOutcome::Failure("step exited 1".to_string());
     let class = |end, exhausted| {
-        sweep_close(end, None, &outcome, StepRole::Builder, None, None, None, None, None, exhausted)
-            .1[lifecycle::FAILURE_CLASS]
+        sweep_close(
+            end,
+            None,
+            &outcome,
+            StepRole::Builder,
+            None,
+            None,
+            None,
+            None,
+            None,
+            exhausted,
+            None,
+        )
+        .1[lifecycle::FAILURE_CLASS]
             .clone()
     };
     assert_eq!(class(StepEnd::Exited(Some(1)), true), "provider-exhausted");
@@ -420,4 +437,108 @@ fn a_provider_exhausted_step_closes_as_provider_exhausted() {
     // wins here as it does on `role_tick.outcome` (`capture::step_failure`).
     assert_eq!(class(StepEnd::TimedOut, true), "provider-exhausted");
     assert_eq!(class(StepEnd::TimedOut, false), "timeout-ceiling");
+}
+
+/// #14234: a close with a line and a noted post-state records whether the
+/// forge agreed with the class the step claimed.
+mod agrees {
+    use super::*;
+    use crate::step_dispatch::outcome_ledger::PostState;
+
+    const KEY: &str = "loom.step.outcome.agrees";
+    const MOVED: PostState = PostState {
+        moved: true,
+        closed: false,
+        claim_held: false,
+    };
+    const UNMOVED: PostState = PostState {
+        moved: false,
+        closed: false,
+        claim_held: false,
+    };
+
+    fn close(
+        line: Option<&StepOutcomeLine>,
+        post: Option<PostState>,
+        exhausted: bool,
+    ) -> TraceAttributes {
+        let end = StepEnd::Exited(Some(0));
+        let outcome = super::super::super::capture::tick_outcome(StepRole::Judge, end, line);
+        sweep_close(
+            end,
+            line,
+            &outcome,
+            StepRole::Judge,
+            None,
+            None,
+            None,
+            None,
+            None,
+            exhausted,
+            post,
+        )
+        .1
+    }
+
+    #[test]
+    fn a_verdict_the_forge_shows_agrees() {
+        let c = close(Some(&line(StepOutcomeClass::Verdict)), Some(MOVED), false);
+        assert_eq!(c[KEY], "true");
+    }
+
+    /// The step claimed `verdict`, the item did not move: the ledger says
+    /// `failed`, the claim is recorded as a disagreement, and nothing else
+    /// on the close changes.
+    #[test]
+    fn a_verdict_the_forge_does_not_show_disagrees() {
+        let verdict = line(StepOutcomeClass::Verdict);
+        let c = close(Some(&verdict), Some(UNMOVED), false);
+        assert_eq!(c[KEY], "false");
+        assert_eq!(c["loom.step.outcome.class"], "verdict");
+        let mut without = close(Some(&verdict), None, false);
+        let mut with = c;
+        with.remove(KEY);
+        without.remove(KEY);
+        assert_eq!(with, without, "the attribute is the only difference");
+    }
+
+    #[test]
+    fn a_noop_on_an_unmoved_item_agrees() {
+        let c = close(Some(&line(StepOutcomeClass::Noop)), Some(UNMOVED), false);
+        assert_eq!(c[KEY], "true");
+    }
+
+    #[test]
+    fn a_held_claim_disagrees_with_anything_but_failed() {
+        let held = PostState {
+            claim_held: true,
+            ..UNMOVED
+        };
+        assert_eq!(close(Some(&line(StepOutcomeClass::Verdict)), Some(held), false)[KEY], "false");
+        assert_eq!(close(Some(&line(StepOutcomeClass::Failed)), Some(held), false)[KEY], "true");
+    }
+
+    #[test]
+    fn absent_without_a_line_without_a_post_state_or_on_provider_exhaustion() {
+        assert!(!close(None, Some(MOVED), false).contains_key(KEY), "no line");
+        let verdict = line(StepOutcomeClass::Verdict);
+        assert!(!close(Some(&verdict), None, false).contains_key(KEY), "no post-state");
+        assert!(
+            !close(Some(&verdict), Some(MOVED), true).contains_key(KEY),
+            "provider exhausted"
+        );
+    }
+
+    /// The close reads the noted post-state without consuming it: the tick's
+    /// `take_post` still gets it.
+    #[test]
+    fn peeking_the_post_state_leaves_it_for_the_tick() {
+        use super::super::super::ended::{note_post, peek_post, take_post};
+        let root = std::path::Path::new("/tmp/peek-post-14234");
+        note_post(root, "step-judge-1-1", Some(MOVED));
+        assert_eq!(peek_post(root, "step-judge-1-1"), Some(Some(MOVED)));
+        assert_eq!(peek_post(root, "step-judge-1-1"), Some(Some(MOVED)), "peek twice");
+        assert_eq!(take_post(root, "step-judge-1-1"), Some(Some(MOVED)));
+        assert_eq!(peek_post(root, "step-judge-1-1"), None);
+    }
 }

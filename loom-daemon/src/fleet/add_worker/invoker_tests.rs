@@ -1,7 +1,6 @@
 //! #11044: `fleet add-worker` marks its `loom-daemon-update.sh` calls.
 //!
-//! A sibling of `tests.rs`, which is over the file-size ratchet's threshold
-//! (`.loom/docs/file-size-policy.md`).
+//! A sibling of `tests.rs`.
 
 use super::*;
 
