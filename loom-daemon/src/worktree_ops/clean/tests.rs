@@ -1879,6 +1879,29 @@ fn step_log_fixture(logs: &Path, role: &str, item: u32, contents: &str, archived
     log
 }
 
+/// Set a path's atime/mtime to `now - back_secs`. `std::fs` has no stable
+/// mtime setter and `filetime` is not a dependency, so this uses
+/// `libc::utimes` — the same approach as `target_dir_gc`'s fixture. The
+/// step-log gate compares sidecar vs. log mtimes (#14228), so those fixtures
+/// set them explicitly instead of relying on write order.
+fn set_mtime_age(path: &Path, back_secs: i64) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let now_secs = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let tv = libc::timeval {
+        tv_sec: (now_secs - back_secs) as libc::time_t,
+        tv_usec: 0,
+    };
+    let times = [tv, tv];
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+    assert_eq!(rc, 0, "utimes failed for {}", path.display());
+}
+
 #[test]
 fn step_log_file_item_parses_known_role_names_only() {
     for role in [
@@ -1957,15 +1980,56 @@ fn step_log_retention_is_inert_without_the_env_gate() {
 }
 
 /// AC: gated on, old, completed, archived — deleted, sidecar removed with it.
+/// Sidecar and log mtimes are set explicitly **equal** (#14228): the gate
+/// deletes when the sidecar is at least as new as the log, and fixtures must
+/// not lean on write order now that ordering matters.
 #[test]
 fn step_log_retention_deletes_old_completed_archived_log_and_sidecar() {
     let (dir, logs) = logs_fixture();
     let stale = step_log_fixture(&logs, "builder", 777, COMPLETED_STEP_LOG, true);
+    let sidecar = stale.with_file_name("step-builder-777.log.archived");
+    set_mtime_age(&stale, 50 * 86_400);
+    set_mtime_age(&sidecar, 50 * 86_400);
     let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[], true);
     assert!(!stale.exists());
-    assert!(!stale
-        .with_file_name("step-builder-777.log.archived")
-        .exists());
+    assert!(!sidecar.exists());
+    assert_eq!(stats.cleaned_log_files, 1);
+}
+
+/// AC #14228: the sidecar is a point-in-time proof on an append-only file.
+/// The log was archived, then a re-dispatch appended to the same
+/// deterministic path — the sidecar is older than the log, so the appended
+/// tail (including the last attempt's outcome line) was never archived.
+/// Kept; the sidecar is left in place.
+#[test]
+fn step_log_retention_keeps_log_appended_after_its_sidecar() {
+    let (dir, logs) = logs_fixture();
+    let log = step_log_fixture(&logs, "builder", 777, COMPLETED_STEP_LOG, true);
+    let sidecar = log.with_file_name("step-builder-777.log.archived");
+    // Archived 50 days ago; the re-dispatch appended 10 days later (40 days
+    // ago). The log is past retention either way — the mtime comparison is
+    // what keeps it.
+    set_mtime_age(&sidecar, 50 * 86_400);
+    set_mtime_age(&log, 40 * 86_400);
+    let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[], true);
+    assert!(log.exists(), "a log appended after its sidecar has an unarchived tail");
+    assert!(sidecar.exists(), "the sidecar is left in place with the kept log");
+    assert_eq!(stats.cleaned_log_files, 0);
+    assert_eq!(stats.kept_log_files, 1);
+}
+
+/// AC #14228: a sidecar **newer** than the log (the preserver re-archived
+/// after a late append) still deletes — the append was archived too.
+#[test]
+fn step_log_retention_deletes_when_sidecar_is_newer_than_log() {
+    let (dir, logs) = logs_fixture();
+    let log = step_log_fixture(&logs, "builder", 778, COMPLETED_STEP_LOG, true);
+    let sidecar = log.with_file_name("step-builder-778.log.archived");
+    set_mtime_age(&log, 50 * 86_400);
+    set_mtime_age(&sidecar, 40 * 86_400);
+    let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[], true);
+    assert!(!log.exists());
+    assert!(!sidecar.exists());
     assert_eq!(stats.cleaned_log_files, 1);
 }
 

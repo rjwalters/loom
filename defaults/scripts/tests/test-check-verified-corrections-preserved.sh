@@ -405,6 +405,194 @@ printf '## Curator Enhancement\n\n### Acceptance Criteria\n\n- [ ] x\n' > "$WORK
 run_cvcp "$WORK_DIR/h3-edge-old.md" "$WORK_DIR/h3-edge-gone.md"
 assert_eq "1" "$RC" "(15b) Mixed-case h3 heading with trailing whitespace, section deleted -> exit 1"
 
+# --- Scenario 16: h2 heading quoted inside a code fence is NOT a section --
+# The guard is line-oriented, so a `## Verified corrections` heading inside
+# a fenced example used to open a REAL section as far as extract_section()
+# was concerned: editing the fenced example in a later pass then produced a
+# spurious FAIL ("old body has a section but the new body has none") -- a
+# false positive that blocks a legitimate body rewrite (#14001). Fence
+# tracking makes the quoted heading invisible: nothing to preserve.
+cat > "$WORK_DIR/fence-h2-old.md" <<'EOF'
+Some prose.
+
+```markdown
+## Verified corrections
+
+- example entry in a fenced code block.
+```
+
+## Acceptance Criteria
+
+- [ ] x
+EOF
+
+cat > "$WORK_DIR/fence-h2-new.md" <<'EOF'
+Some prose, edited.
+
+## Acceptance Criteria
+
+- [ ] x
+EOF
+
+run_cvcp "$WORK_DIR/fence-h2-old.md" "$WORK_DIR/fence-h2-new.md"
+assert_eq "0" "$RC" "(16a) h2 heading inside a code fence, fenced example removed -> exit 0 (no phantom section)"
+assert_contains "$OUT" "nothing to preserve" "(16a) No-op reported explicitly -- the fenced heading never opened a section"
+
+# --- Scenario 17: h3 heading quoted inside a code fence (#14001) ----------
+# Same shape at h3, newly reachable once #13938 widened heading matching to
+# any ATX depth >= 2 -- this is the shape of issue #13938's own reproduction
+# recipe (a `### Verified corrections` inside a heredoc in a fenced bash
+# block), so any meta-issue documenting the convention could no longer have
+# its examples edited without a spurious FAIL.
+cat > "$WORK_DIR/fence-h3-old.md" <<'EOF'
+Some prose.
+
+```markdown
+### Verified corrections
+
+- example entry in a fenced code block.
+```
+
+## Acceptance Criteria
+
+- [ ] x
+EOF
+
+run_cvcp "$WORK_DIR/fence-h3-old.md" "$WORK_DIR/fence-h2-new.md"
+assert_eq "0" "$RC" "(17a) h3 heading inside a code fence, fenced example removed -> exit 0 (no phantom section)"
+
+# --- Scenario 18: fence inside a REAL section cannot close it early ------
+# The fail-OPEN half of #14001: a `#`-prefixed line inside a fence (a bash
+# comment) used to act as a depth-1 heading and close a genuine section, so
+# a verified entry AFTER the fence could be silently dropped. Fence content
+# stays inside the section's text; the entry after the fence is protected.
+cat > "$WORK_DIR/fence-in-section-old.md" <<'EOF'
+## Verified corrections
+
+- entry before the fence
+
+```bash
+# a bash comment, not a heading
+echo probe
+```
+
+- entry after the fence
+EOF
+
+grep -v 'entry after the fence' "$WORK_DIR/fence-in-section-old.md" > "$WORK_DIR/fence-in-section-new.md"
+
+run_cvcp "$WORK_DIR/fence-in-section-old.md" "$WORK_DIR/fence-in-section-new.md"
+assert_eq "1" "$RC" "(18a) Entry after an in-section fence dropped -> exit 1 (fence comment no longer closes the section)"
+assert_contains "$OUT" "entry after the fence" "(18a) Failure names the missing post-fence entry"
+
+run_cvcp "$WORK_DIR/fence-in-section-old.md" "$WORK_DIR/fence-in-section-old.md"
+assert_eq "0" "$RC" "(18b) In-section fence document unchanged -> exit 0"
+
+sed 's/echo probe/echo different probe/' "$WORK_DIR/fence-in-section-old.md" > "$WORK_DIR/fence-in-section-edited.md"
+run_cvcp "$WORK_DIR/fence-in-section-old.md" "$WORK_DIR/fence-in-section-edited.md"
+assert_eq "1" "$RC" "(18c) Fenced paragraph inside a real section rewritten -> exit 1 (fence lines stay part of the section text)"
+
+# --- Scenario 19: tilde fence variant --------------------------------------
+# The fence toggle must recognise ~~~ fences, not just backtick fences; a
+# quoted heading inside a tilde fence is just as quoted.
+cat > "$WORK_DIR/fence-tilde-old.md" <<'EOF'
+Some prose.
+
+~~~markdown
+### Verified corrections
+
+- example entry in a tilde-fenced code block.
+~~~
+
+## Acceptance Criteria
+
+- [ ] x
+EOF
+
+run_cvcp "$WORK_DIR/fence-tilde-old.md" "$WORK_DIR/fence-h2-new.md"
+assert_eq "0" "$RC" "(19a) h3 heading inside a tilde fence, fenced example removed -> exit 0"
+
+# --- Scenario 20: indented fence (inside a list item) ---------------------
+# Fences are commonly indented under a list item; the toggle tolerates
+# leading whitespace on both the opener and the closer.
+cat > "$WORK_DIR/fence-indented-old.md" <<'EOF'
+Reproduction recipe:
+
+1. Write the fixture:
+
+   ```markdown
+   ## Verified corrections
+
+   - quoted entry
+   ```
+
+2. Edit the prose.
+
+## Acceptance Criteria
+
+- [ ] x
+EOF
+
+cat > "$WORK_DIR/fence-indented-new.md" <<'EOF'
+Reproduction recipe, edited:
+
+1. Write the fixture (details elided).
+
+## Acceptance Criteria
+
+- [ ] x
+EOF
+
+run_cvcp "$WORK_DIR/fence-indented-old.md" "$WORK_DIR/fence-indented-new.md"
+assert_eq "0" "$RC" "(20a) h2 heading inside an indented fence, fenced example removed -> exit 0"
+
+# --- Scenario 21: longer outer fence containing a shorter fence stays open -
+# A closing fence must repeat the opener's character and be at least as
+# long, so a 4-backtick outer fence documenting a 3-backtick example does
+# not close at the inner fence lines; the heading inside stays quoted.
+cat > "$WORK_DIR/fence-nested-old.md" <<'EOF'
+Some prose.
+
+````
+```markdown
+## Verified corrections
+
+- example entry
+```
+````
+
+## Acceptance Criteria
+
+- [ ] x
+EOF
+
+run_cvcp "$WORK_DIR/fence-nested-old.md" "$WORK_DIR/fence-h2-new.md"
+assert_eq "0" "$RC" "(21a) h2 heading inside a shorter inner fence of a longer outer fence -> exit 0"
+
+# --- Scenario 22: unterminated fence runs to EOF; CRLF bodies -------------
+# An unclosed fence runs to the end of the body (CommonMark), so a heading
+# after it is quoted, not real -- no phantom section even when the quoted
+# text is edited. And a CRLF body behaves like an LF body: fence detection
+# and heading matching both tolerate the carriage return.
+printf 'Some prose.\n\n```markdown\n## Verified corrections\n\n- a quoted entry, never a section\n' > "$WORK_DIR/fence-eof-old.md"
+printf 'Some prose, edited.\n\n```markdown\n## Verified corrections\n\n- a quoted entry, edited freely\n' > "$WORK_DIR/fence-eof-new.md"
+
+run_cvcp "$WORK_DIR/fence-eof-old.md" "$WORK_DIR/fence-eof-new.md"
+assert_eq "0" "$RC" "(22a) Heading inside an unterminated (runs to EOF) fence, quoted text edited -> exit 0"
+
+# shellcheck disable=SC2016  # the backticks are fixture content, not expansion
+printf 'Some prose.\r\n\r\n```markdown\r\n## Verified corrections\r\n\r\n- quoted entry\r\n```\r\n\r\n## Acceptance Criteria\r\n\r\n- [ ] x\r\n' > "$WORK_DIR/fence-crlf-old.md"
+printf 'Some prose, edited.\r\n\r\n## Acceptance Criteria\r\n\r\n- [ ] x\r\n' > "$WORK_DIR/fence-crlf-new.md"
+
+run_cvcp "$WORK_DIR/fence-crlf-old.md" "$WORK_DIR/fence-crlf-new.md"
+assert_eq "0" "$RC" "(22b) h2 heading inside a fence in a CRLF body, fenced example removed -> exit 0"
+
+printf '## Verified corrections\r\n\r\n- a real entry, kept verbatim\r\n' > "$WORK_DIR/crlf-section-old.md"
+printf '## Verified corrections\r\n\r\n- a replacement entry, not append-only\r\n' > "$WORK_DIR/crlf-section-new.md"
+
+run_cvcp "$WORK_DIR/crlf-section-old.md" "$WORK_DIR/crlf-section-new.md"
+assert_eq "1" "$RC" "(22c) CRLF body, real section entry rewritten -> exit 1 (heading matching is CRLF-tolerant)"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

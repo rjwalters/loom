@@ -38,25 +38,8 @@ pub enum Request {
         id: TerminalId,
         start_byte: Option<usize>,
     },
-    ResizeTerminal {
-        id: TerminalId,
-        cols: u16,
-        rows: u16,
-    },
     CheckSessionHealth {
         id: TerminalId,
-    },
-    ListAvailableSessions,
-    AttachToSession {
-        id: TerminalId,
-        session_name: String,
-    },
-    KillSession {
-        session_name: String,
-    },
-    SetWorktreePath {
-        id: TerminalId,
-        worktree_path: String,
     },
     GetTerminalActivity {
         id: TerminalId,
@@ -614,9 +597,6 @@ pub enum Response {
     SessionHealth {
         has_session: bool,
     },
-    AvailableSessions {
-        sessions: Vec<String>,
-    },
     TerminalActivity {
         entries: Vec<ActivityEntry>,
     },
@@ -887,7 +867,6 @@ pub struct TerminalInfo {
     pub created_at: i64,
     // Agent-specific fields
     pub role: Option<String>,
-    pub worktree_path: Option<String>,
     pub agent_pid: Option<u32>,
     #[serde(default)]
     pub agent_status: AgentStatus,
@@ -2673,6 +2652,11 @@ pub struct RepoStatus {
     /// a normal workspace, and from a daemon that predates the mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintain_only: Option<crate::workspace_registry::MaintainOnly>,
+    /// The installed Loom files are older than this daemon but compatible
+    /// with it, so dispatch is not held (#14015). `None` when they are not
+    /// behind, for the Loom source repo, and from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_behind: Option<crate::workspace_hold::InstalledBehind>,
     /// This repo's cross-repo draw weight (#11742): higher = drawn more,
     /// default [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`].
     /// Surfaced so `loom-daemon status` shows how the autonomous loops share

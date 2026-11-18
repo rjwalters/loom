@@ -8,8 +8,9 @@
 //!    [`resolve_role_runner_model`], the per-role/global/shared precedence
 //!    chain, including the `"default"` CLI pass-through sentinel.
 //! 2. **Which reasoning effort does it run with?** —
-//!    [`resolve_role_runner_effort`] (#8054), the same per-role-over-global
-//!    shape, but with no shipped default: unconfigured means "emit no flag".
+//!    [`resolve_role_runner_effort_for_runtime`] (#8054, #14017), the same
+//!    per-role-over-global shape plus a per-runtime tier; the only shipped
+//!    default is Codex's, so elsewhere unconfigured means "emit no flag".
 //! 3. **Is that answer still right once the runtime is known?** —
 //!    [`reconcile_unpinned_model_with_runtime`], which degrades an *unpinned*
 //!    cross-family conflict to the runtime CLI's own default instead of letting
@@ -49,9 +50,10 @@ impl ModelRuntimeMismatch {
         format!(
             "model/runtime mismatch: {} (model source={}); set \
              autonomous.roleRunner.roleModels.{} to a model the {} runtime accepts — or to \
-             \"{}\" to pass through to the {} CLI's own default model, which is the only \
-             working shape on a seat that rejects an explicit pin (e.g. a ChatGPT-plan Codex \
-             account) — or point this role back at a Claude runtime",
+             \"{}\" to pass through to the {} CLI's own default model, the guaranteed-working \
+             shape on any seat (a ChatGPT-plan Codex account also accepts a model its own \
+             catalog lists, see `codex debug models`) — or point this role back at a Claude \
+             runtime",
             self.reason,
             self.model_source,
             self.role,
@@ -84,13 +86,15 @@ impl ModelRuntimeMismatch {
 /// `"cli-default"` spelling) resolves to the empty string, which
 /// [`run_role_with_timeout`] renders as **no `--model` argument at all** so the
 /// runtime's own CLI picks the model. That is not a stylistic option — it is the
-/// only configuration a ChatGPT-plan Codex seat accepts, because such a seat
-/// rejects *every* explicit pin on the wire (`400 invalid_request_error: The
-/// 'gpt-5-codex' model is not supported when using Codex with a ChatGPT
-/// account`), including a perfectly valid Codex model ID. Before #7894 the only
-/// way to express it was to omit the pin entirely — which fell through to the
-/// Claude-shaped shipped default and made #5028's mismatch preflight skip the
-/// tick forever (#6565).
+/// guaranteed-working configuration on any seat. When #6565 was filed, a
+/// ChatGPT-plan Codex seat rejected *every* explicit pin on the wire (`400
+/// invalid_request_error: The 'gpt-5-codex' model is not supported when using
+/// Codex with a ChatGPT account`), including a perfectly valid Codex model ID;
+/// #14121 has since let a plan seat keep a pin its own catalog lists (`codex
+/// debug models`), but `"default"` stays the one shape that works regardless
+/// of catalog. Before #7894 the only way to express it was to omit the pin
+/// entirely — which fell through to the Claude-shaped shipped default and made
+/// #5028's mismatch preflight skip the tick forever (#6565).
 ///
 /// # Why the per-role tier (#5001)
 ///
@@ -181,16 +185,68 @@ pub fn resolve_role_runner_model(repo_root: &Path, role: &str) -> (String, Strin
 /// exactly as the model chain treats blanks.
 #[must_use]
 pub fn resolve_role_runner_effort(repo_root: &Path, role: &str) -> (String, String) {
+    resolve_role_runner_effort_for_runtime(repo_root, role, None)
+}
+
+/// Issue #14017: [`resolve_role_runner_effort`] once the admitted runtime is
+/// known — the form both launch sites call, because a role that draws more
+/// than one runtime must not be forced onto one effort for all of them.
+///
+/// **`roleEfforts.<role>@<runtime>` > `roleEfforts.<role>` >
+/// `autonomous.roleRunner.effort` > the shipped Codex default (Codex only) >
+/// unset**
+///
+/// The runtime-qualified key beats the per-role key for that runtime only; the
+/// other runtimes the role draws still resolve through the per-role tier.
+/// `runtime` is matched trimmed and case-insensitively; `None` (no runtime
+/// known, e.g. a hermetic fixture) skips the qualified tier and the Codex
+/// default, which is exactly [`resolve_role_runner_effort`]'s old answer.
+///
+/// The Codex default ([`CODEX_DEFAULT_EFFORT`]) exists because a Codex step with
+/// no effort configured ran at `reasoning effort: none` and refused an issue its
+/// own daemon had claimed. Every other runtime keeps the #8054 contract: nothing
+/// configured emits no `--effort` at all.
+#[must_use]
+pub fn resolve_role_runner_effort_for_runtime(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> (String, String) {
     let config = read_role_runner_config(repo_root);
     let role_key = role.trim().to_ascii_lowercase();
+    let runtime_key = runtime
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty());
+    if let Some(rt) = &runtime_key {
+        let qualified = format!("{role_key}@{rt}");
+        if let Some(e) = config.role_efforts.get(&qualified) {
+            return (e.clone(), format!("autonomous.roleRunner.roleEfforts.{qualified}"));
+        }
+    }
     if let Some(e) = config.role_efforts.get(&role_key) {
         return (e.clone(), format!("autonomous.roleRunner.roleEfforts.{role_key}"));
     }
-    match config.effort {
-        Some(e) => (e, "autonomous.roleRunner.effort".to_string()),
-        None => (String::new(), UNSET_EFFORT_SOURCE.to_string()),
+    if let Some(e) = config.effort {
+        return (e, "autonomous.roleRunner.effort".to_string());
     }
+    if runtime_key.as_deref() == Some(CODEX_RUNTIME_ID) {
+        return (CODEX_DEFAULT_EFFORT.to_string(), CODEX_DEFAULT_EFFORT_SOURCE.to_string());
+    }
+    (String::new(), UNSET_EFFORT_SOURCE.to_string())
 }
+
+/// Issue #14017: the runtime id the shipped default effort applies to.
+const CODEX_RUNTIME_ID: &str = "codex";
+
+/// Issue #14017: the effort a Codex launch gets when no tier configures one.
+/// `medium` is in `supported_reasoning_levels` of every model `codex debug
+/// models` lists (checked 2026-11-18), and unlike the unset case it is never
+/// `none`, which a dispatched Codex Builder used to refuse its own claim.
+pub const CODEX_DEFAULT_EFFORT: &str = "medium";
+
+/// Issue #14017: the source label for [`CODEX_DEFAULT_EFFORT`] in the role-log
+/// header, so an operator can tell Loom chose it rather than a config tier.
+pub const CODEX_DEFAULT_EFFORT_SOURCE: &str = "codex-default";
 
 /// Issue #8054: parse the two effort keys out of an already-resolved
 /// `autonomous.roleRunner` config block, returning
@@ -207,7 +263,9 @@ pub fn resolve_role_runner_effort(repo_root: &Path, role: &str) -> (String, Stri
 /// - **`effort`** — a blank / whitespace-only / non-string / absent value
 ///   soft-fails to `None`, i.e. *unset* (emit no flag), never a default.
 /// - **`roleEfforts`** — keys trimmed + lower-cased (so a `"Judge"` key matches
-///   the `judge` role the runner dispatches under); a blank key or a blank /
+///   the `judge` role the runner dispatches under; since #14017 a
+///   `"<role>@<runtime>"` key scopes the value to one runtime); a blank or
+///   malformed key, or a blank /
 ///   non-string value drops **that entry only**, so one typo never disables the
 ///   rest of the object; an absent / non-object value soft-fails to an empty map.
 /// - Values are trimmed but **not** lower-cased and **not** validated against a
@@ -230,10 +288,7 @@ pub(super) fn parse_effort_config(
         .map(|obj| {
             obj.iter()
                 .filter_map(|(k, v)| {
-                    let key = k.trim().to_ascii_lowercase();
-                    if key.is_empty() {
-                        return None;
-                    }
+                    let key = normalize_role_effort_key(k)?;
                     let val = v.as_str().map(str::trim).filter(|e| !e.is_empty())?;
                     Some((key, val.to_string()))
                 })
@@ -241,6 +296,38 @@ pub(super) fn parse_effort_config(
         })
         .unwrap_or_default();
     (effort, role_efforts)
+}
+
+/// Issue #14017: normalise one `roleEfforts` key — `"<role>"` or the
+/// runtime-qualified `"<role>@<runtime>"` — to its trimmed, lower-cased form.
+/// A blank key, or a qualified key that is not exactly one `@` between two
+/// non-blank halves (`"builder@"`, `"@codex"`, `"a@b@c"`), returns `None`; the
+/// qualified case warns, since it is a typo that would otherwise silently
+/// fall back to the per-role value. A well-formed key naming a runtime that
+/// never launches is kept: it simply never matches.
+fn normalize_role_effort_key(raw: &str) -> Option<String> {
+    let key = raw.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    if !key.contains('@') {
+        return Some(key);
+    }
+    let mut parts = key.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(role), Some(runtime), None)
+            if !role.trim().is_empty() && !runtime.trim().is_empty() =>
+        {
+            Some(format!("{}@{}", role.trim(), runtime.trim()))
+        }
+        _ => {
+            log::warn!(
+                "role_runner: ignoring malformed autonomous.roleRunner.roleEfforts key \
+                 {raw:?}; expected \"<role>\" or \"<role>@<runtime>\""
+            );
+            None
+        }
+    }
 }
 
 /// The `==== loom-daemon role_runner: … ====` header line
@@ -326,7 +413,8 @@ pub fn is_cli_default_model_sentinel(value: &str) -> bool {
 /// skips. Forever: the condition is a pure function of static config, so every
 /// subsequent tick skips identically (453+ consecutive skips on the host that
 /// filed #6565). And the "obvious" remedy of pinning a Codex model is not
-/// available on a ChatGPT-plan seat, which rejects every explicit pin — so that
+/// available on a ChatGPT-plan seat as of #6565, which rejected every explicit pin
+/// (#14121 later let a plan seat keep a model its own catalog lists) — so that
 /// configuration was simultaneously the only correct one and permanently
 /// unadmittable.
 ///

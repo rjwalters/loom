@@ -147,6 +147,8 @@ use serde_json::Value;
 #[path = "session_reconcile_drift.rs"]
 pub mod drift;
 pub use drift::DeferReason;
+#[path = "session_reconcile_bindings.rs"]
+pub mod bindings;
 #[path = "session_reconcile_skew.rs"]
 pub mod skew;
 
@@ -443,6 +445,8 @@ pub struct ReconcileState {
     docker_failures: u32,
     docker_retry_at: u64,
     docker_last_error: Option<String>,
+    /// Declared private-clone bindings: backoff and what was already WARNed.
+    bindings: bindings::State,
 }
 
 /// The container read failed: the runtime, not the account, is the problem.
@@ -465,6 +469,10 @@ impl std::error::Error for DockerUnavailable {}
 pub struct AccountIndex {
     disabled: HashSet<String>,
     profiles: HashMap<String, Vec<PathBuf>>,
+    /// ASCII-lowercased account email → `id.name` (first inventory wins, the
+    /// order `converge_bindings::root_of` resolves in), so a lookup accepts
+    /// every spelling `account_matches_reference` does (#14287).
+    emails: HashMap<String, String>,
 }
 
 impl AccountIndex {
@@ -479,6 +487,12 @@ impl AccountIndex {
             if !account.enabled {
                 index.disabled.insert(name.clone());
             }
+            if let Some(email) = account.email.as_deref() {
+                index
+                    .emails
+                    .entry(email.to_ascii_lowercase())
+                    .or_insert_with(|| name.clone());
+            }
             let profiles = index.profiles.entry(name).or_default();
             if !profiles.contains(&account.credential_reference) {
                 profiles.push(account.credential_reference.clone());
@@ -487,14 +501,28 @@ impl AccountIndex {
         index
     }
 
-    fn profiles(&self, name: &str) -> &[PathBuf] {
-        self.profiles.get(name).map_or(&[], Vec::as_slice)
+    /// The canonical `id.name` for an account reference: the name itself, or —
+    /// as in `account_matches_reference` — an `@` reference matching an email.
+    /// An unknown reference comes back unchanged (and so matches nothing).
+    fn canonical<'a>(&'a self, reference: &'a str) -> &'a str {
+        if self.profiles.contains_key(reference) || !reference.contains('@') {
+            return reference;
+        }
+        self.emails
+            .get(&reference.to_ascii_lowercase())
+            .map_or(reference, String::as_str)
     }
 
-    /// `enabled=false` in at least one root.
+    fn profiles(&self, reference: &str) -> &[PathBuf] {
+        self.profiles
+            .get(self.canonical(reference))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// `enabled=false` in at least one root. `name` may be an email reference.
     #[must_use]
     pub fn is_disabled(&self, name: &str) -> bool {
-        self.disabled.contains(name)
+        self.disabled.contains(self.canonical(name))
     }
 
     /// An operator hold is in force (read from disk on every call).
@@ -1062,9 +1090,11 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             .collect::<Vec<_>>(),
     );
     let acting = registry.effective_roots(fallback_root);
-    let inventories = hold_inventories
+    let acting_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> = hold_inventories
         .into_iter()
-        .filter(|(root, _)| acting.contains(root));
+        .filter(|(root, _)| acting.contains(root))
+        .collect();
+    let inventories = acting_inventories.iter().cloned();
     // One container read for the whole pass (every root), taken lazily,
     // classified with the shared drift definition (#10600).
     let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
@@ -1151,6 +1181,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             all.extend(outcomes);
         }
     }
+    converge_bindings(fallback_root, &index, &acting_inventories, state, now);
     if all.iter().any(|o| o.outcome.started()) {
         // Selection reads the published snapshot: show it the start now.
         let started = std::time::Instant::now();
@@ -1158,6 +1189,65 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     }
     crate::session_status::record_pass(&all, now);
     all
+}
+
+/// Make the declared private-clone bindings true ([`bindings`], #14111), after
+/// every account's own recovery so a dead container is restored first. Costs a
+/// config read when nothing is declared; skipped while Docker is backing off.
+fn converge_bindings(
+    fallback_root: &Path,
+    index: &AccountIndex,
+    inventories: &[(PathBuf, Vec<AccountDescriptor>)],
+    state: &mut ReconcileState,
+    now: u64,
+) -> bindings::Pass {
+    let declared = bindings::read(fallback_root);
+    if declared.bindings.is_empty() && declared.invalid.is_empty() {
+        return bindings::Pass::default();
+    }
+    if state.docker_retry_at > now {
+        return bindings::Pass::default();
+    }
+    // The first acting root whose inventory lists the account (accounts are
+    // host-global; a machine-tier binding reaches every root).
+    let root_of = |account: &str| {
+        inventories
+            .iter()
+            .find(|(_, inventory)| {
+                inventory.iter().any(|a| {
+                    a.id.provider == AccountProvider::Codex
+                        && crate::tokens_pool::account_registry::account_matches_reference(
+                            a, account,
+                        )
+                })
+            })
+            .map(|(root, _)| root.as_path())
+    };
+    let converge = |binding: &bindings::Binding, hold: &dyn Fn() -> anyhow::Result<()>| {
+        let root = root_of(&binding.account)
+            .ok_or_else(|| anyhow::anyhow!("Codex account not found in any registered root"))?;
+        private_workspace::converge(
+            root,
+            &binding.account,
+            &binding.repository,
+            &binding.base,
+            hold,
+        )
+    };
+    let registered = |account: &str| {
+        root_of(account)
+            .map_or(Ok(None), |root| private_workspace::registered_repositories(root, account))
+    };
+    bindings::converge_pass(
+        &declared,
+        &bindings::Inputs {
+            index,
+            converge: &converge,
+            registered: &registered,
+        },
+        state,
+        now,
+    )
 }
 
 /// Spawn the loop on the shared runtime. The first tick fires immediately, so

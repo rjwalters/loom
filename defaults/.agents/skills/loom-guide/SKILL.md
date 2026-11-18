@@ -1130,7 +1130,8 @@ citing this subsection):
    Duplicate Checks") and must **never edit or generate** one.
 2. **First creation is create-by-default.** When `WORK_LOG.md` /
    `WORK_PLAN.md` do not exist yet (a repo that has never tracked them), a
-   pass **creates them without asking** — Steps 2 and 3 below say how. Both
+   pass **creates them without asking** (unless the file is listed in
+   `skipDocs` — rule 3) — Steps 2 and 3 below say how. Both
    files land as a reviewable docs PR that already passes Judge and
    Champion, so **the PR itself is the ask**. Never defer first creation as
    an "operator scope" decision: on `2AMLogic/pdks` two Guide passes (#78,
@@ -2414,6 +2415,12 @@ update_work_plan() {
   # a hash buys nothing here, so compare the strings directly.
   local new_body old_body stamp
   new_body="$(render_plan_body)"
+  # #14204 RECEIPT: fingerprint the rendered body once, up front, so EVERY
+  # outcome below carries the same content hash into Step 5's `WORK_PLAN
+  # check:` PR-body line — including the ones that refuse to write. Same
+  # portability fallback the park-record hash uses (sha256sum on Linux,
+  # shasum on macOS). Deliberately NOT local: it must survive into Step 5.
+  WORK_PLAN_RENDER_HASH="$(printf '%s\n' "$new_body" | { sha256sum 2>/dev/null || shasum -a 256; } 2>/dev/null | cut -c1-12)"
   # `sed '1d;$d'` drops the two marker lines, leaving only the generated region;
   # `strip_plan_stamp` (#13909) then drops the region's generated-at stamp line
   # so the comparison below sees ONLY label-derived content on both sides.
@@ -2425,6 +2432,7 @@ update_work_plan() {
     "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d' | strip_plan_stamp)"
 
   if [ "$new_body" = "$old_body" ]; then
+    WORK_PLAN_RECEIPT="current"
     echo "WORK_PLAN.md is current (no label changes detected)."
     return 1
   fi
@@ -2454,6 +2462,7 @@ update_work_plan() {
   elapsed=$(( now_epoch - last_merged_epoch ))
 
   if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$debounce_secs" ]; then
+    WORK_PLAN_RECEIPT="debounced (elapsed ${elapsed}s < window ${debounce_secs}s)"
     echo "WORK_PLAN.md differs, but only ${elapsed}s since WORK_PLAN.md was last written by a merged docs-maintenance PR (< ${debounce_secs}s debounce) — suppressing this tick's rewrite."
     return 1
   fi
@@ -2464,6 +2473,7 @@ update_work_plan() {
   # title the pinned repo gives it. Checks the OUTPUT, so it bites whatever the
   # cause (guard denial, wrong cwd, stale scratch, unfaithful execution).
   if ! verify_plan_provenance "$new_body"; then
+    WORK_PLAN_RECEIPT="provenance-refused"
     echo "WORK_PLAN.md NOT written: provenance check failed (fail closed)." >&2
     return 1
   fi
@@ -2490,8 +2500,12 @@ update_work_plan() {
   # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
   # repos' ticks share /tmp, and a tick whose own write was denied then consumes
   # another repo's stale file. Never read a scratch file this tick did not write.
+  # A failed splice must not leave a stale receipt implying a write happened;
+  # classify it too (#14204).
   stamp="$(plan_stamp_line)"
-  splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || return 1
+  splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || { WORK_PLAN_RECEIPT="write-failed"; return 1; }
+
+  WORK_PLAN_RECEIPT="written"
 
   return 0
 }
@@ -2558,6 +2572,19 @@ The section set rendered above must stay in lockstep with the committed
 that section is silently deleted on the next tick (and vice versa, the
 comparison mismatches until the file catches up). Adding a section means editing
 `render_plan_body` **and** the committed file in the same change.
+
+**Receipt (#14204).** `update_work_plan()` records its outcome for Step 5 in
+two globals — machine-recorded state, never prose. `WORK_PLAN_RECEIPT` is the
+outcome classification: `written`, `current`, `debounced (elapsed <X>s <
+window <Y>s)`, `provenance-refused`, or `write-failed` (a splice that failed —
+leaving a stale value there would read as a write that never happened).
+`WORK_PLAN_RENDER_HASH` is the first 12 hex of the rendered body's sha256, so
+the PR body can identify *which* render an outcome refers to. Initialize
+`WORK_PLAN_RECEIPT="NOT RUN"` before calling the function: a tick that never
+reaches it must surface as NOT RUN in the docs PR body instead of silently
+reading as a successful no-op. Step 5 renders these verbatim as the PR body's
+`WORK_PLAN check:` line, and nothing else in that body may state WORK_PLAN's
+status (see Step 5).
 
 ### Step 4: Check README.md Staleness
 
@@ -2946,10 +2973,12 @@ Automated document maintenance by Guide triage agent."
   # (the PR URL, `gh pr create`'s normal success output) so the doc-
   # maintenance telemetry record below (issue #6136) can be tagged with the
   # PR number instead of just "a docs PR happened".
-  DOCS_PR_URL=$(cd "$DOCS_WT" && gh pr create \
-    --title "docs: Guide document maintenance update" \
-    --label "loom:review-requested" \
-    --body "$(cat <<'PRBODY'
+  # #14204: the body is assembled into a variable first (heredoc delimiter
+  # quoted, so nothing inside expands) and the WORK_PLAN receipt line is
+  # spliced in afterwards — the quoted delimiter would not interpolate the
+  # receipt in place. The receipt is machine-recorded by update_work_plan()
+  # (Step 3); this body never free-texts a plan-status claim of its own.
+  DOCS_PR_BODY="$(cat <<'PRBODY'
 <!-- loom:docs-only-fast-path -->
 ## Summary
 
@@ -2958,7 +2987,7 @@ Automated document maintenance by the Guide triage agent.
 ### Changes
 <!-- Keyword safety (#14176): never put a closing keyword (close, closes, or the fix/resolve families in any tense) immediately before an issue or PR reference — GitHub parses `<keyword> #N` as a closing link, and merging this docs-only PR would then close the referenced issue. Describe dropped or merged items as "drops completed <refs>" or "drops <refs>"; the intervening word breaks the link. -->
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
-- **WORK_PLAN.md**: Regenerated backlog snapshot from current GitHub label state (a repo's hand-written ROADMAP.md, if any, remains the direction document)
+@@WORK_PLAN_RECEIPT_LINE@@
 - **README.md**: Updated if architectural changes were detected
 - Plus any files reported by the repo's `.loom/docs-post-stage.sh` hook, if installed (e.g. a regenerated freshness envelope)
 
@@ -2981,7 +3010,21 @@ before taking the fast path.
 ---
 *Automated by Guide role - document maintenance phase*
 PRBODY
-)")
+)"
+  # #14204 WORK_PLAN receipt: the ONLY plan-status claim this PR body makes.
+  # Splice update_work_plan()'s machine-recorded outcome (Step 3) in place of
+  # the placeholder above; when the tick never ran Step 3's check the
+  # fallbacks read NOT RUN / none, so a missing run is visible instead of
+  # silent. Never move this claim into prose elsewhere in the body, and never
+  # reintroduce a fixed bullet asserting a regeneration that may not have
+  # happened.
+  WORK_PLAN_CHECK_LINE="- **WORK_PLAN check**: ${WORK_PLAN_RECEIPT:-NOT RUN} (render-hash ${WORK_PLAN_RENDER_HASH:-none}, $(date -u '+%Y-%m-%dT%H:%M:%SZ'))"
+  DOCS_PR_BODY="${DOCS_PR_BODY/"@@WORK_PLAN_RECEIPT_LINE@@"/$WORK_PLAN_CHECK_LINE}"
+
+  DOCS_PR_URL=$(cd "$DOCS_WT" && gh pr create \
+    --title "docs: Guide document maintenance update" \
+    --label "loom:review-requested" \
+    --body "$DOCS_PR_BODY")
   echo "$DOCS_PR_URL"
   DOCS_PR_NUMBER="${DOCS_PR_URL##*/}"
 
@@ -3036,6 +3079,20 @@ PRBODY
   # and the docs worktree is a persistent slot that the next tick resets.
 }
 ```
+
+**The `WORK_PLAN check:` line (#14204) is the PR body's only plan-status
+claim.** `update_work_plan()` (Step 3) machine-records its outcome into
+`WORK_PLAN_RECEIPT` and fingerprints the rendered body into
+`WORK_PLAN_RENDER_HASH`; `create_docs_pr()` renders them verbatim as
+`- **WORK_PLAN check**: <receipt> (render-hash <hash>, <UTC time>)`. A tick
+that never ran Step 3's check renders `NOT RUN` — visible, not silent — and a
+debounced or provenance-refused tick says so by classification, with the
+elapsed/window figures and the refused render's hash, instead of a confident
+sentence an LLM wrote. Never assert WORK_PLAN is "regenerated", "current",
+"unchanged" (or any other status) anywhere else in the body; that free text is
+exactly the unverifiable claim this line exists to replace, and it replaced a
+fixed bullet that claimed "Regenerated backlog snapshot from current GitHub
+label state" on every PR regardless of what actually happened.
 
 #### Post-stage hook (optional, repo-provided) — #13892
 
@@ -3198,6 +3255,18 @@ Document Maintenance Phase
   the clock and suppresses an overdue WORK_PLAN rewrite indefinitely. A change
   that persists past the window still produces exactly one PR; a change that
   reverts before the window elapses produces none (see Step 3)
+- **A docs-maintenance PR body states WORK_PLAN's status only through the
+  machine-recorded `WORK_PLAN check:` receipt line** (#14204) —
+  `update_work_plan()` (Step 3) classifies its own outcome into
+  `WORK_PLAN_RECEIPT` (written / current / debounced / provenance-refused /
+  write-failed) and hashes the rendered body into `WORK_PLAN_RENDER_HASH`;
+  Step 5 renders those verbatim. Never free-text a claim like "WORK_PLAN.md is
+  unchanged/current" anywhere else in the body, and never reintroduce a fixed
+  bullet asserting a regeneration that may not have happened (a debounced or
+  provenance-refused tick used to file PRs whose body still claimed
+  "Regenerated backlog snapshot from current GitHub label state"). A tick that
+  never reached Step 3's check renders `NOT RUN`, so a missing run is visible
+  instead of silent
 - **A pending WORK_LOG.md delta is batched, not written on every tick that
   finds one** (#6133) — WORK_LOG is append-only/event-driven (unlike
   WORK_PLAN's periodic full-regenerate), so the gate combines two knobs

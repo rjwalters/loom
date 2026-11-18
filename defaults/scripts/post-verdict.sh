@@ -85,6 +85,13 @@
 # UNKNOWN that `--reviews-reconciled` CANNOT clear (nothing was read, so there
 # is nothing to disposition): retry the verdict, or park the PR.
 #
+# The direct `gh api` calls this script itself makes — the final head compare
+# (#10485) and the loom:pr-withdrawal DELETE (#10581) — run under the same
+# budget (#14169): on expiry they fall to their existing unreadable/failed
+# paths (the exit-5 approval refusal; the NOT-withdrawn announcement) after a
+# stderr line names the timed-out read. An approval that cannot confirm the
+# head is refused, never posted.
+#
 # EXACT-HEAD ALL-CI GATE (#10485)
 #
 # Every `approved` verdict (fast paths included, same single chokepoint) also
@@ -303,6 +310,27 @@ esac
 # path in judge.md posts through this script, gating here covers the fast paths
 # too, without each of them having to opt in.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# --- Wall-clock bound for the DIRECT forge reads below (#14169) -------------
+# The #13927 budget already bounds every read check-review-feedback.sh and
+# forge-helpers.sh make, but the final head compare (#10485) and the
+# loom:pr-withdrawal DELETE (#10581) below call `gh api` directly, outside
+# that library — the unbounded read that wedged this script for 11 minutes
+# (#14169). bounded_run is therefore sourced HERE, at top level:
+# forge-helpers.sh (which would bring it in) is only sourced further down, at
+# the post, and its two earlier appearances are inside $(...) subshells.
+# Budget: the shared LOOM_FORGE_REVIEW_READ_TIMEOUT (default 60s; 0 =
+# unbounded, the documented disable), re-resolved per call.
+source "$SCRIPT_DIR/lib/bounded-run.sh"
+_bounded_gh_run() {
+  local _secs="${LOOM_FORGE_REVIEW_READ_TIMEOUT:-60}"
+  if [[ "$_secs" == "0" ]] || ! declare -F bounded_run >/dev/null 2>&1; then
+    "$@"
+    return $?
+  fi
+  bounded_run "$_secs" "$@"
+}
+
 REVIEW_GATE="$SCRIPT_DIR/check-review-feedback.sh"
 RECONCILIATION_MARKER=""
 RECONCILIATION_NOTE=""
@@ -574,7 +602,14 @@ fi
 # Final compare (#10485): the head must still be the reviewed one right before
 # the write; an unreadable head is a refusal, never a pass.
 if [[ "$VERDICT" == "approved" ]]; then
-  FINAL_HEAD="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null)" || FINAL_HEAD=""
+  HEAD_RC=0
+  FINAL_HEAD="$(_bounded_gh_run gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null)" || HEAD_RC=$?
+  if [[ "$HEAD_RC" -eq 124 ]]; then
+    echo "post-verdict.sh: the final head read (gh api repos/$REPO/pulls/$PR --jq .head.sha) timed out after ${LOOM_FORGE_REVIEW_READ_TIMEOUT:-60}s (LOOM_FORGE_REVIEW_READ_TIMEOUT, #14169) — treating the head as unreadable." >&2
+    FINAL_HEAD=""
+  elif [[ "$HEAD_RC" -ne 0 ]]; then
+    FINAL_HEAD=""
+  fi
   if [[ -z "$FINAL_HEAD" || "$FINAL_HEAD" != "$SHA"* ]]; then
     echo "post-verdict.sh: REFUSING to post an approval — PR head is ${FINAL_HEAD:-unreadable}, not the reviewed $SHA (moved or unreadable between the CI read and the post, #10485). Nothing was posted; re-review the new head." >&2
     exit 5
@@ -663,7 +698,14 @@ if [[ "$VERDICT" == "approved" ]]; then
     "0:LOOM-VERDICT-RECONCILE STABLE"*|"12:LOOM-VERDICT-RECONCILE DUPLICATE"*) ;;
     "11:LOOM-VERDICT-RECONCILE SUPERSEDED"*) superseded_approval "$RC2_OUT" ;;
     *) WITHDRAWN="loom:pr was withdrawn; the approval is NOT live"
-       gh api -X DELETE "repos/$REPO/issues/$PR/labels/loom%3Apr" >/dev/null 2>&1 || WITHDRAWN="loom:pr could NOT be withdrawn (the DELETE failed), so the unconfirmed approval may still be actionable. Remove it now: gh pr edit $PR --repo $REPO --remove-label loom:pr"
+       DEL_RC=0
+       _bounded_gh_run gh api -X DELETE "repos/$REPO/issues/$PR/labels/loom%3Apr" >/dev/null 2>&1 || DEL_RC=$?
+       if [[ "$DEL_RC" -eq 124 ]]; then
+         echo "post-verdict.sh: the loom:pr label withdrawal (gh api -X DELETE repos/$REPO/issues/$PR/labels/loom%3Apr) timed out after ${LOOM_FORGE_REVIEW_READ_TIMEOUT:-60}s (LOOM_FORGE_REVIEW_READ_TIMEOUT, #14169)." >&2
+       fi
+       if [[ "$DEL_RC" -ne 0 ]]; then
+         WITHDRAWN="loom:pr could NOT be withdrawn (the DELETE failed), so the unconfirmed approval may still be actionable. Remove it now: gh pr edit $PR --repo $REPO --remove-label loom:pr"
+       fi
        echo "post-verdict.sh: the approval on PR #$PR was posted and labelled, but the post-label re-arbitration was unconfirmed (#10581): ${RC2_OUT:0:300}. $WITHDRAWN. Re-run this command." >&2; exit 8 ;;
   esac
 fi
