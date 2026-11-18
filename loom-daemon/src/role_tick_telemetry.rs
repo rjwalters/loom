@@ -1008,6 +1008,9 @@ fn emit_correlated(
                 contents,
                 &format!("sweep_id={}", tick.step_sweep_id.as_deref().unwrap_or_default()),
             ),
+            // A step whose own log is unreadable stays ABSENT (AC2): the
+            // per-role log belongs to a different launch.
+            None if tick.step_log.is_some() => None,
             None => resolve_runtime_attribution(&tick.root, &tick.role),
         })
         .flatten();
@@ -1026,6 +1029,8 @@ fn emit_correlated(
             runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
             region,
         ),
+        // Same discriminator as above: a step never reads the per-role log.
+        None if tick.step_log.is_some() => None,
         None => crate::usage_source::role_tick_usage_runtime(
             runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
             &role_log,

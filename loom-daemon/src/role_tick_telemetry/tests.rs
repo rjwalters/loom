@@ -1139,6 +1139,8 @@ fn a_step_with_an_unreadable_log_leaves_every_launch_field_absent() {
     let root = dir.path().join("repo");
     fs::create_dir_all(&root).unwrap();
     let missing = dir.path().join("step-builder-42-2.log");
+    // Decoy: a per-role log naming ANOTHER launch must never be adopted.
+    write_role_log(&root, "builder", &launch_line("pi", "zai-coding-plan", "zai-flash"));
 
     let records =
         emit_one_step(dir.path(), &root, "builder", "builder", "step-builder-42-2", &missing);
