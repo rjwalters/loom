@@ -157,6 +157,76 @@ assert_eq 0 "$LAST_RC" "non-GitHub forge -> gate skipped"
 if [[ ! -e "$WORK/argv-red" ]]; then ok "non-GitHub forge -> daemon never invoked"; else fail "non-GitHub forge -> daemon never invoked"; fi
 FORGE_TYPE=github
 
+# --- --release-hold ordering (#14101) ---
+# The hold release must not write (audit comment, loom:blocked removal) until the
+# required-context gate has passed: a gate that exits 5 (e.g. loom/merge-authorization
+# not reported in a merge-queue repo) must leave the PR exactly as found.
+echo "Testing --release-hold defers its writes past the required-context gate (#14101)..."
+HOLD_FUNCS="$WORK/hold-funcs.sh"
+awk '/^_HOLD_RELEASE_PENDING=false/ || /^_release_champion_hold\(\) \{/ || /^_apply_champion_hold_release\(\) \{/ { print }' "$MERGE_PR_SRC" > "$HOLD_FUNCS"
+[[ "$(wc -l < "$HOLD_FUNCS")" -eq 3 ]] || { echo "FATAL: could not extract the --release-hold functions" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$HOLD_FUNCS"
+
+apply_line="$(awk '/^_apply_champion_hold_release /{ print NR; exit }' "$MERGE_PR_SRC")"
+if [[ -n "$apply_line" && "$apply_line" -gt "$call_line" && "$apply_line" -lt "$merge_line" ]]; then
+    ok "hold-release writes run after the required-context gate and before the merge"
+else
+    fail "hold-release writes run after the required-context gate and before the merge" "apply=$apply_line gate=$call_line merge=$merge_line"
+fi
+assert_not_contains "$(grep '^_release_champion_hold() {' "$MERGE_PR_SRC")" "forge_gh_" "the decision half makes no forge writes"
+
+# Stub the IO the hold functions use. The daemon stub answers `merge-pr release-hold`
+# with the OK sentinel + audit body, and `merge-pr required-checks` per $HOLD_REQUIRED.
+make_hold_stub() {
+    local path="$WORK/daemon-hold"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'if [[ "$1 $2" == "merge-pr release-hold" ]]; then printf "LOOM-HOLD-RELEASE-OK\nAUDIT-BODY\n"; exit 0; fi'
+        echo 'if [[ "$HOLD_REQUIRED" == "unreported" ]]; then echo "LOOM-REQUIRED-CHECKS-HOLD required status-check context(s) not concluded green on head deadbeef: \`loom/merge-authorization\` (not reported) (#10688)."; exit 3; fi'
+        echo 'echo LOOM-REQUIRED-CHECKS-CLEAN'
+    } > "$path"
+    chmod +x "$path"; printf '%s' "$path"
+}
+gh() { echo alice; }
+_trusted_pr_comments() { :; }
+success() { echo "OK: $*"; }
+forge_gh_comment_rl_safe() { echo "comment $*" >> "$WORK/hold-writes"; }
+forge_gh_remove_label_rl_safe() { echo "remove-label $*" >> "$WORK/hold-writes"; }
+run_hold() { # the script's order: decide, gate, apply, merge
+    rm -f "$WORK/merge-called" "$WORK/hold-writes"
+    _HOLD_RELEASE_PENDING=false; PR_LABELS=$'loom:pr\nloom:blocked'
+    set +e; LAST_OUT="$( (_release_champion_hold; _check_required_checks; _apply_champion_hold_release; forge_merge_pr "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" squash) 2>&1)"; LAST_RC=$?; set -e
+}
+hold_writes() { cat "$WORK/hold-writes" 2>/dev/null || true; }
+
+RELEASE_HOLD=true; LOOM_DAEMON_BIN="$(make_hold_stub)"
+HOLD_REQUIRED=unreported run_hold
+assert_eq 5 "$LAST_RC" "--release-hold + required context not reported -> HOLD, exit 5"
+assert_not_merged "--release-hold, required context unreported"
+assert_eq "" "$(hold_writes)" "unreported required context: loom:blocked kept and no audit comment posted"
+assert_contains "$LAST_OUT" "was NOT released" "exit-5 text says the hold was not released"
+assert_contains "$LAST_OUT" "fleet Champion" "exit-5 text names the next actor (the fleet Champion)"
+assert_contains "$LAST_OUT" "Do not retry --release-hold" "exit-5 text says not to retry"
+
+HOLD_REQUIRED=clean run_hold
+assert_eq 0 "$LAST_RC" "--release-hold + required context green -> releases and merges"
+assert_merged "--release-hold, required context green"
+assert_contains "$(hold_writes)" "comment o/r 7 AUDIT-BODY" "green: audit comment posted"
+assert_contains "$(hold_writes)" "remove-label o/r 7 loom:blocked" "green: loom:blocked removed"
+
+DRY_RUN=true; HOLD_REQUIRED=unreported run_hold
+assert_eq 0 "$LAST_RC" "--dry-run --release-hold -> does not exit"
+assert_eq "" "$(hold_writes)" "--dry-run --release-hold writes nothing"
+assert_contains "$LAST_OUT" "[dry-run] Would release the Champion hold" "--dry-run still reports the would-release"
+assert_contains "$LAST_OUT" "[dry-run] Would HOLD" "--dry-run still reports the would-hold"
+DRY_RUN=false
+
+RELEASE_HOLD=false; HOLD_REQUIRED=unreported run_hold
+assert_eq 5 "$LAST_RC" "plain run + unreported required context -> HOLD, exit 5"
+assert_not_contains "$LAST_OUT" "--release-hold" "plain exit-5 text does not mention --release-hold"
+RELEASE_HOLD=false
+
 # --- End to end against a REAL daemon build, when one exists ---
 REPO_ROOT_DIR="$(cd "$HELPERS_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
 REAL=""
