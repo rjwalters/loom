@@ -168,6 +168,25 @@ resolve_pr_head_sha() {
     fi
 }
 
+# Print the first NON-primary worktree (other than this PR's own pr-<N>) that
+# has branch $1 checked out, e.g. the builder's issue-<N> worktree. Empty if none.
+# The builder wins over a detached review checkout (#14391).
+builder_holder() {
+    [[ -n "$1" ]] || return 0
+    git -C "$REPO_ROOT" worktree list --porcelain | awk -v branch="refs/heads/$1" -v own="$WORKTREE_PATH" '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch /   { if ($2 == branch && wt != own) print wt }
+    ' | while IFS= read -r w; do
+        is_primary_clone "$w" || { echo "$w"; break; }
+    done
+}
+
+fail_builder_holds() {
+    print_error "The PR's branch ($HEAD_BRANCH) is already checked out in another worktree ($1) — the builder's worktree wins (#6594/#14391); no detached review checkout is created or reused."
+    print_info "Reuse the existing worktree directly instead: cd '$1'"
+    exit 1
+}
+
 write_sentinel() {
     cat > "$WORKTREE_PATH/.loom-managed" <<SENTINEL
 # Loom-managed worktree marker
@@ -210,6 +229,9 @@ create_detached_pr_worktree() {
 # re-enter for the same PR across multiple iterations.
 if [[ -d "$WORKTREE_PATH" ]]; then
     if git -C "$REPO_ROOT" worktree list | grep -q "$WORKTREE_PATH"; then
+        HEAD_BRANCH="$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName 2>/dev/null || true)"
+        BUILDER_WT="$(builder_holder "$HEAD_BRANCH")"
+        [[ -z "$BUILDER_WT" ]] || fail_builder_holds "$BUILDER_WT"
         print_info "PR worktree already exists at $WORKTREE_PATH (reusing)"
         # Refresh the PR branch in case upstream pushed new commits.
         if (cd "$WORKTREE_PATH" && gh pr checkout "$PR_NUMBER" --force >/dev/null 2>&1); then
@@ -221,7 +243,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             if [[ -n "$NEW_SHA" ]] && git -C "$WORKTREE_PATH" checkout -q --detach "$NEW_SHA" 2>/dev/null; then
                 print_success "Refreshed detached PR worktree to ${NEW_SHA}"
             else
-                print_warning "Could not refresh detached PR worktree (continuing with existing checkout at $(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null))"
+                print_error "Could not move detached PR worktree $WORKTREE_PATH to the PR head (${NEW_SHA:-unresolved}); local edits are preserved and the checkout is still at $(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null)"
+                exit 1
             fi
         else
             print_warning "Could not refresh PR branch (continuing with existing checkout)"
@@ -250,6 +273,8 @@ if [[ -n "$HEAD_BRANCH" ]]; then
         /^worktree / { wt = substr($0, 10) }
         /^branch /   { if ($2 == branch) print wt }
     ' | head -1)"
+    BUILDER_WT="$(builder_holder "$HEAD_BRANCH")"
+    [[ -z "$BUILDER_WT" ]] || fail_builder_holds "$BUILDER_WT"
     if is_primary_clone "$EXISTING_WT"; then
         create_detached_pr_worktree
     fi

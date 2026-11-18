@@ -484,6 +484,61 @@ else
 fi
 git checkout -q main
 
+# 7d: primary clone AND the builder's issue worktree both hold the branch ->
+#     the builder wins: exit 1, builder path named, no detached pr-<N> created.
+B_BRANCH="feature/issue-994"
+git checkout -q -b "$B_BRANCH" main
+git commit --allow-empty -q -m "pr 994 change"
+B_SHA="$(git rev-parse HEAD)"
+git worktree add -q --force .loom/worktrees/issue-994 "$B_BRANCH"
+set +e
+PR_OUT7D=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$B_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$B_SHA" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 994 2>&1)
+PR_RC7D=$?
+set -e
+if [[ "$PR_RC7D" -eq 1 ]] && grep -q "worktrees/issue-994" <<<"$PR_OUT7D" \
+    && [[ ! -e .loom/worktrees/pr-994 ]]; then
+    pass "builder + primary both hold the branch: exit 1, builder path named, no pr-994 created"
+else
+    fail "builder + primary: expected exit 1 naming issue-994 and no pr-994 (rc=$PR_RC7D): $PR_OUT7D"
+fi
+git worktree remove --force .loom/worktrees/issue-994
+git checkout -q main
+
+# 7e: existing detached pr-996 is NOT reused once the builder holds the branch.
+git worktree add -q .loom/worktrees/issue-996 "$P_BRANCH"
+set +e
+PR_OUT7E=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$P_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$P_SHA2" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 996 2>&1)
+PR_RC7E=$?
+set -e
+if [[ "$PR_RC7E" -eq 1 ]] && grep -q "worktrees/issue-996" <<<"$PR_OUT7E"; then
+    pass "existing detached pr-996 + builder holder: exit 1, builder path named"
+else
+    fail "reuse path: expected exit 1 naming issue-996 (rc=$PR_RC7E): $PR_OUT7E"
+fi
+git worktree remove --force .loom/worktrees/issue-996
+
+# 7f: a failed refresh of the detached pr-996 returns nonzero and keeps the local edit.
+git checkout -q -b tmp-14391-b "$P_SHA2"
+echo base > t14391.txt; git add t14391.txt; git commit -q -m "base t"
+T_B="$(git rev-parse HEAD)"
+echo new > t14391.txt; git commit -q -am "new t"
+T_C="$(git rev-parse HEAD)"
+git checkout -q main
+git -C .loom/worktrees/pr-996 checkout -q --detach "$T_B"
+echo local > .loom/worktrees/pr-996/t14391.txt
+set +e
+PR_OUT7F=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$P_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$T_C" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 996 2>&1)
+PR_RC7F=$?
+set -e
+if [[ "$PR_RC7F" -ne 0 ]] && [[ "$(cat .loom/worktrees/pr-996/t14391.txt)" == "local" ]]; then
+    pass "failed detached refresh: nonzero exit and local edit preserved"
+else
+    fail "failed refresh: expected nonzero + preserved edit (rc=$PR_RC7F): $PR_OUT7F"
+fi
+
 cd "$REPO_ROOT"
 
 # --- Test 6: Judge guidance and helper --help agree on the fallback (#11194) ---
