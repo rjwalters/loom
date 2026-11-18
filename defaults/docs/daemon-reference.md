@@ -11028,8 +11028,9 @@ mechanism and the `spawn-codex.sh`-side counterpart:
 `runtimes.roles.<role> = "codex"` with no `roleModels.<role>` entry at all —
 used to resolve the shipped Claude-shaped default and get refused every tick,
 forever (453+ consecutive skips on the host that filed #6565), with no way out:
-a ChatGPT-plan Codex seat rejects an explicit model pin too, so "no pin" was
-simultaneously the only correct configuration and permanently unadmittable.
+a ChatGPT-plan Codex seat rejected an explicit model pin too (catalog-listed
+pins have worked there since #14121), so "no pin" was simultaneously the only
+correct configuration and permanently unadmittable.
 The role runner now degrades that case to the runtime CLI's own default — no
 `--model` argument is emitted at all, the tick launches, and the log header
 records `model=<runtime CLI default> (source=default (CLI default for codex))`.

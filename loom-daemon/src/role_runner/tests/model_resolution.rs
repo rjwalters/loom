@@ -143,9 +143,11 @@ fn test_invoke_admits_an_unpinned_codex_role_with_no_model_pin() {
 
 /// Issue #7894: the same admission is reachable *deliberately* — a
 /// `roleModels.<role> = "default"` pin is an explicit "let the runtime CLI pick
-/// its own model" statement (the only shape a ChatGPT-plan Codex seat accepts),
-/// and it must spawn with no `--model` rather than being resolved to a model
-/// name or falling through to the shipped Claude default.
+/// its own model" statement (the guaranteed-working shape on any seat,
+/// including a ChatGPT-plan Codex seat, which also accepts a pin its own
+/// catalog lists since #14121), and it must spawn with no `--model` rather
+/// than being resolved to a model name or falling through to the shipped
+/// Claude default.
 #[test]
 #[serial]
 fn test_invoke_admits_an_explicit_cli_default_sentinel_pin() {
@@ -333,8 +335,10 @@ fn test_reconcile_unpinned_model_with_runtime() {
 }
 
 /// Issue #7894 AC4: the mismatch detail no longer presents a `roleModels` model
-/// pin as the ONLY remedy — a pin is not viable at all on a ChatGPT-plan Codex
-/// seat, so the text must also name the CLI-default pass-through.
+/// pin as the ONLY remedy — when #6565 was filed, no pin was viable at all on a
+/// ChatGPT-plan Codex seat (catalog-listed pins have worked there since
+/// #14121), so the text must also name the CLI-default pass-through, the
+/// guaranteed-working shape on any seat.
 #[test]
 fn test_model_runtime_mismatch_detail_offers_the_cli_default_passthrough() {
     let detail = ModelRuntimeMismatch {

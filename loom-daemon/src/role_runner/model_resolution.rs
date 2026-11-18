@@ -85,13 +85,15 @@ impl ModelRuntimeMismatch {
 /// `"cli-default"` spelling) resolves to the empty string, which
 /// [`run_role_with_timeout`] renders as **no `--model` argument at all** so the
 /// runtime's own CLI picks the model. That is not a stylistic option — it is the
-/// only configuration a ChatGPT-plan Codex seat accepts, because such a seat
-/// rejects *every* explicit pin on the wire (`400 invalid_request_error: The
-/// 'gpt-5-codex' model is not supported when using Codex with a ChatGPT
-/// account`), including a perfectly valid Codex model ID. Before #7894 the only
-/// way to express it was to omit the pin entirely — which fell through to the
-/// Claude-shaped shipped default and made #5028's mismatch preflight skip the
-/// tick forever (#6565).
+/// guaranteed-working configuration on any seat. When #6565 was filed, a
+/// ChatGPT-plan Codex seat rejected *every* explicit pin on the wire (`400
+/// invalid_request_error: The 'gpt-5-codex' model is not supported when using
+/// Codex with a ChatGPT account`), including a perfectly valid Codex model ID;
+/// #14121 has since let a plan seat keep a pin its own catalog lists (`codex
+/// debug models`), but `"default"` stays the one shape that works regardless
+/// of catalog. Before #7894 the only way to express it was to omit the pin
+/// entirely — which fell through to the Claude-shaped shipped default and made
+/// #5028's mismatch preflight skip the tick forever (#6565).
 ///
 /// # Why the per-role tier (#5001)
 ///
