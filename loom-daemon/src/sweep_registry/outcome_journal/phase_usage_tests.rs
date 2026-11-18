@@ -85,7 +85,7 @@ fn seed_phase_history(
     );
 }
 
-fn outcome_for(registry: &SweepRegistry, issue: u32) -> telemetry::SweepOutcomeRecord {
+pub(super) fn outcome_for(registry: &SweepRegistry, issue: u32) -> telemetry::SweepOutcomeRecord {
     let path = registry.config().resolve_outcome_telemetry_path();
     sweep_outcomes::read_all_sweep_outcomes(&path)
         .into_iter()
@@ -96,7 +96,7 @@ fn outcome_for(registry: &SweepRegistry, issue: u32) -> telemetry::SweepOutcomeR
 /// The raw JSON of the `sweep.outcome` line — the only way to tell an **omitted**
 /// optional field from a `null`/`0` one, which is what "unknown != zero" turns
 /// on.
-fn raw_outcome(registry: &SweepRegistry, issue: u32) -> serde_json::Value {
+pub(super) fn raw_outcome(registry: &SweepRegistry, issue: u32) -> serde_json::Value {
     let path = registry.config().resolve_outcome_telemetry_path();
     let contents = std::fs::read_to_string(&path).expect("telemetry journal must exist");
     contents
