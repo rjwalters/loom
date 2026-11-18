@@ -934,7 +934,7 @@ git log --all --format=%cd --date=short <file> | head -1
 [Evidence that this is unused, over-engineered, or unnecessary]
 
 Examples:
-- "No imports found outside of its own file"
+- "No imports found outside of its own file" — plus the runner check below (a name grep alone is not wiring evidence)
 - "Dependency not imported anywhere: `rg 'library-name' returned 0 results"
 - "Function defined 6 months ago, never called: `git log` shows no subsequent changes"
 - "3-layer abstraction for what could be a single function"
