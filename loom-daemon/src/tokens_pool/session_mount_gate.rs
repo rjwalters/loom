@@ -184,11 +184,18 @@ pub fn check_extra_mounts(
     credentials: &[PathBuf],
 ) -> Result<()> {
     let denials = Denials::load(workspace)?;
+    // The mounted workspace label is shielded as well as the registered
+    // roots (issue #14420): in the "parent of repositories" shape a target
+    // under the label but outside every root would otherwise pass here and
+    // then read as `MountDrift::extra` to the reconciler, churning one idle
+    // recreate before `DriftUnachievable`.
+    let mut shielded: Vec<PathBuf> = roots.to_vec();
+    shielded.push(workspace.to_path_buf());
     check_extra_mount_denials(
         mounts,
         denials.home.as_deref(),
         &denials.firewalled,
-        roots,
+        &shielded,
         credentials,
     )
 }
