@@ -1335,11 +1335,12 @@ JSON
     ///
     /// # Lock order
     ///
-    /// `loom_config_env` outside, default inside. The crate's other nested
-    /// acquisitions of this key pair — the `forge_repo_facts::tests_sites`
-    /// bodies and `worktree_root`'s config-tier tests — nest in this same
-    /// order, so no cycle exists; any future test that needs both MUST nest
-    /// in this same order.
+    /// `loom_config_env` outside, default inside. Many other tests nest this
+    /// key pair (list them with `grep -rn -A1 'serial(loom_config_env)'
+    /// loom-daemon/src`), and every one nests in this same order. No cycle
+    /// exists because **no** site in the crate nests the pair in the reverse
+    /// order (a bare-`#[serial]` test calling a `#[serial(loom_config_env)]`
+    /// body); any future test that needs both MUST nest in this same order.
     #[serial]
     fn rest_queue_source_parses_the_live_listing_shape_body() {
         // Exercises the real production path (gh api --include -> forge_listing

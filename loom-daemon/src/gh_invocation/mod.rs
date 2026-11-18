@@ -64,10 +64,12 @@
 //! one that can afford a private key; this one cannot.
 //!
 //! The tests that also need `loom_config_env` (for `LOOM_GH_BIN` /
-//! `PRIVATE_DEFAULTS_ENV`) — `role_collision`'s
+//! `PRIVATE_DEFAULTS_ENV` / `LOOM_WORKTREE_ROOT`) — e.g. `role_collision`'s
 //! `rest_queue_source_parses_the_live_listing_shape`, the
-//! `forge_repo_facts::tests_sites` bodies, and `worktree_root`'s four
-//! config-tier tests — hold **both** locks by nesting a `#[serial]` body
+//! `forge_repo_facts::tests_sites` bodies, `worktree_root`'s config-tier
+//! tests, and the `role_runner` / `orphan_recovery` suites (the set is open;
+//! list it with `grep -rn -A1 'serial(loom_config_env)' loom-daemon/src`) —
+//! hold **both** locks by nesting a `#[serial]` body
 //! inside the `#[serial(loom_config_env)]` test, because multi-key
 //! `#[serial(a, b)]` cannot name the default group (its key is the empty
 //! string; attribute keys are parsed as identifiers). See role_collision's
