@@ -195,12 +195,6 @@ export interface SweepInfo {
    * Absent/undefined on pre-#3929 entries.
    */
   repo?: string;
-  /**
-   * True when the work finder admitted this sweep through the host's
-   * overflow slot (#9244): a starred issue run as the host's single sweep
-   * over the concurrency cap. Inert since #11508; absent means false.
-   */
-  overflow?: boolean;
 }
 
 interface DispatchResponse {
@@ -1278,8 +1272,6 @@ function formatSweepLine(info: SweepInfo): string {
   // repos' identically-numbered issues are distinguishable in the listing.
   if (info.repo) parts.push(`  Repo:       ${info.repo}`);
   if (info.idempotency_key) parts.push(`  Idem. key:  ${info.idempotency_key}`);
-  // Issue #9244: the host's single over-limit starred sweep.
-  if (info.overflow) parts.push("  Overflow:   yes (starred, over the concurrency cap)");
   return parts.join("\n");
 }
 
