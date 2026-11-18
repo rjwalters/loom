@@ -66,6 +66,11 @@ pub(crate) struct CheckArgs {
     /// below `VERSION`.
     #[arg(long, value_name = "TAG")]
     prev_ref: Option<String>,
+    /// Test the oldest numeric release tag at or above supports_installed and
+    /// at or below VERSION. Only an unpublished next-patch floor may use the
+    /// current installed files as a prospective stand-in.
+    #[arg(long, conflicts_with = "prev_ref")]
+    oldest_installed: bool,
     /// Check a proposed `requires_daemon` instead of the compiled one.
     #[arg(long, value_name = "VERSION")]
     requires_daemon: Option<String>,
@@ -159,6 +164,7 @@ impl CheckArgs {
             new_daemon: std::env::current_exe()?,
             old_daemon,
             prev_ref: self.prev_ref,
+            oldest_installed: self.oldest_installed,
             supports_installed: claim(
                 self.supports_installed,
                 SUPPORTS_INSTALLED,
@@ -193,5 +199,32 @@ impl CheckArgs {
             report.violations.len()
         );
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct CheckParser {
+        #[command(flatten)]
+        args: CheckArgs,
+    }
+
+    #[test]
+    fn oldest_installed_is_explicit_and_conflicts_with_an_exact_ref() {
+        let default = CheckParser::try_parse_from(["check"]).unwrap();
+        assert!(!default.args.oldest_installed);
+        let floor = CheckParser::try_parse_from(["check", "--oldest-installed"]).unwrap();
+        assert!(floor.args.oldest_installed);
+        assert!(CheckParser::try_parse_from([
+            "check",
+            "--oldest-installed",
+            "--prev-ref",
+            "v0.19.1314"
+        ])
+        .is_err());
     }
 }

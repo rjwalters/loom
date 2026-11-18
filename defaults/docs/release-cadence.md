@@ -429,19 +429,22 @@ Three things about that step's verdict (#10868):
 ### The daily proof of `SUPPORTS_INSTALLED`
 
 The CI step tests one release in direction A: the newest tag at or below
-`VERSION`. So nothing in the merge gate runs the release `SUPPORTS_INSTALLED`
-itself names. The `Compatibility Floor (SUPPORTS_INSTALLED)` job of
+`VERSION`. So nothing in the merge gate tests the oldest installed release
+allowed by `SUPPORTS_INSTALLED`. The `Compatibility Floor (SUPPORTS_INSTALLED)` job of
 `.github/workflows/ci-daily.yml` does, once a day:
 
 ```bash
-loom-daemon install-compat check --prev-ref "v<SUPPORTS_INSTALLED>" --fetch-old-daemon
+loom-daemon install-compat check --oldest-installed --fetch-old-daemon
 ```
 
-It reads the value from the built daemon (`install-compat show --json`), so
-moving the constant needs no workflow edit. A failure opens the
+The native check uses the compiled floor and selects the oldest numeric release
+tag at or above it and at or below checkout `VERSION`. Skipping the exact floor
+tag does not skip the proof. Moving the constant needs no workflow edit.
+A failure opens the
 `[ci-daily] Compatibility Floor (SUPPORTS_INSTALLED)` tracking issue.
 
-When it fails the claim is false, and there are two ways to make it true:
+When a selected release fails the compatibility checks, there are two ways to
+repair the claim:
 
 - **Raise `SUPPORTS_INSTALLED`** to the oldest release for which the command
   above passes (try one with `--supports-installed <v> --prev-ref v<v>`), and
@@ -454,8 +457,16 @@ When it fails the claim is false, and there are two ways to make it true:
   shell needs. Choose this when the gap is a regression, not an intended
   break.
 
-`SUPPORTS_INSTALLED` must name a release tag: the job fails when `v<value>`
-does not exist, because then nothing can be run against it.
+When the floor is exactly `VERSION` plus one patch and no eligible tag exists,
+the check exercises current installed files against the new daemon and labels
+that proof **prospective**. It does not claim to have tested an absent release.
+This supports a binary/script contract introduced together in one PR without
+hand-editing `VERSION` or creating a release. Once the floor is at or below
+`VERSION`, no eligible tag is an error: fetch the release tags or repair the
+release inputs. A selected tag whose files or probes fail never falls back to
+current files. Default adjacent-release checking and an explicit `--prev-ref`
+keep their existing behavior; `--oldest-installed` cannot be combined with
+`--prev-ref`.
 
 ## See also
 

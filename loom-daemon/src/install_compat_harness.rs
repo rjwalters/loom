@@ -13,6 +13,10 @@
 //!   Otherwise every `loom-daemon <sub>` its installed shell calls must exist
 //!   in the new daemon, and every file the new daemon executes must exist in
 //!   its installed tree.
+//!   `--oldest-installed` instead tests the oldest numeric release tag at or
+//!   above `SUPPORTS_INSTALLED` and at or below `VERSION`. With no eligible tag,
+//!   only a next-patch floor may check current files as a prospective stand-in;
+//!   an already-reached floor with no tag is an error, never a skipped proof.
 //! * **B: the new installed files against the oldest daemon `REQUIRES_DAEMON`
 //!   claims.** Same two checks the other way round, against a release binary.
 //!   That binary is the OLDEST PUBLISHED release at or above `REQUIRES_DAEMON`,
@@ -69,6 +73,9 @@ pub struct CheckOptions {
     pub old_daemon: OldDaemon,
     /// The previous release, as a git ref. `None` resolves it from the tags.
     pub prev_ref: Option<String>,
+    /// Test the oldest eligible installed release rather than the adjacent one.
+    /// Mutually exclusive with `prev_ref`.
+    pub oldest_installed: bool,
     /// The new daemon's `SUPPORTS_INSTALLED` claim.
     pub supports_installed: Version,
     /// The new installed files' `REQUIRES_DAEMON` claim.
@@ -287,9 +294,42 @@ fn direction_a(
     probe: &mut Probe,
     report: &mut Report,
 ) -> Result<()> {
-    let prev_ref = match &opts.prev_ref {
-        Some(r) => r.clone(),
-        None => newest_tag_at_or_below(&opts.repo_root, version)?,
+    let prev_ref = if opts.oldest_installed {
+        anyhow::ensure!(opts.prev_ref.is_none(), "--oldest-installed conflicts with --prev-ref");
+        match tags_at_or_above(&release_tags(&opts.repo_root)?, opts.supports_installed)
+            .into_iter()
+            .find(|(v, _)| *v <= version)
+        {
+            Some((_, tag)) => tag,
+            None => {
+                anyhow::ensure!(
+                    opts.supports_installed == version.next_patch(),
+                    "no eligible installed release tag at or above SUPPORTS_INSTALLED {} and \
+                     at or below VERSION {version}; fetch the release tags. A prospective \
+                     current-files stand-in is permitted only for next patch {}",
+                    opts.supports_installed,
+                    version.next_patch()
+                );
+                report.notes.push(format!(
+                    "A: prospective SUPPORTS_INSTALLED {}; no eligible release tag through \
+                     VERSION {version}. Current installed files stand in; this does not prove \
+                     compatibility with an absent release",
+                    opts.supports_installed
+                ));
+                return check_installed_tree(
+                    opts,
+                    &opts.repo_root.join("defaults"),
+                    "A (prospective current installed files vs new daemon)",
+                    probe,
+                    report,
+                );
+            }
+        }
+    } else {
+        match &opts.prev_ref {
+            Some(r) => r.clone(),
+            None => newest_tag_at_or_below(&opts.repo_root, version)?,
+        }
     };
     let prev = Version::parse(&prev_ref)
         .ok_or_else(|| anyhow!("previous release ref {prev_ref} is not a version tag"))?;
@@ -305,12 +345,22 @@ fn direction_a(
         .tempdir()?;
     extract_defaults(&opts.repo_root, &prev_ref, scratch.path())?;
     let prev_tree = scratch.path().join("defaults");
-    let scripts = installed_shell_files(&prev_tree)?;
     let label = format!("A ({prev_ref} installed files vs new daemon)");
+    check_installed_tree(opts, &prev_tree, &label, probe, report)
+}
+
+fn check_installed_tree(
+    opts: &CheckOptions,
+    tree: &Path,
+    label: &str,
+    probe: &mut Probe,
+    report: &mut Report,
+) -> Result<()> {
+    let scripts = installed_shell_files(tree)?;
     let gaps = probe.missing_subcommands(&opts.repo_root, &opts.new_daemon, &scripts)?;
-    record_gaps(&label, &gaps, &prev_tree, report);
-    record_absent_files(&label, &opts.invoked_files, &prev_tree, report);
-    report.notes.push(gaps.summary(&label, scripts.len()));
+    record_gaps(label, &gaps, tree, report);
+    record_absent_files(label, &opts.invoked_files, tree, report);
+    report.notes.push(gaps.summary(label, scripts.len()));
     Ok(())
 }
 

@@ -80,10 +80,10 @@ fn version_orders_numerically_not_lexically() {
 // ---- InstallMeta ------------------------------------------------------------
 
 #[test]
-fn todays_metadata_parses_and_owes_a_resync() {
+fn old_metadata_parses_but_predates_strict_builder_scripts() {
     let m = InstallMeta::parse(TODAY).unwrap();
     assert_eq!(m, meta(Some("0.19.876"), None));
-    assert_eq!(classify(&m, &DaemonCompat::this_binary(None).unwrap()), Compat::ResyncOwed);
+    assert_eq!(classify(&m, &DaemonCompat::this_binary(None).unwrap()), Compat::InstalledTooOld);
 }
 
 #[test]
@@ -155,12 +155,29 @@ fn strict_builder_files_hold_the_last_daemon_without_native_ownership() {
     let installed = meta(Some(REQUIRES_DAEMON), Some(REQUIRES_DAEMON));
     let mut host = DaemonCompat {
         running: v("0.19.1313"),
-        supports_installed: v(SUPPORTS_INSTALLED),
+        supports_installed: v("0.19.0"),
         floor: None,
     };
     assert_eq!(classify(&installed, &host), Compat::NeedsNewerDaemon);
     host.running = v(REQUIRES_DAEMON);
     assert_eq!(classify(&installed, &host), Compat::Compatible);
+}
+
+#[test]
+fn strict_builder_daemon_holds_installed_scripts_without_native_ownership() {
+    let host = DaemonCompat {
+        running: v(REQUIRES_DAEMON),
+        supports_installed: v(SUPPORTS_INSTALLED),
+        floor: None,
+    };
+    assert_eq!(
+        classify(&meta(Some("0.19.1313"), Some("0.19.1312")), &host),
+        Compat::InstalledTooOld
+    );
+    assert_eq!(
+        classify(&meta(Some(SUPPORTS_INSTALLED), Some(REQUIRES_DAEMON)), &host),
+        Compat::Compatible
+    );
 }
 
 #[test]

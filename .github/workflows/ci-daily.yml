@@ -758,9 +758,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The release tags: direction A reads `v<SUPPORTS_INSTALLED>:defaults`
-          # out of git, and direction B lists the tags at or above
-          # REQUIRES_DAEMON.
+          # Native direction A selects the oldest eligible installed release;
+          # direction B lists tags at or above REQUIRES_DAEMON.
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -771,7 +770,7 @@ jobs:
       # direction A against ONE release: the newest tag at or below VERSION.
       # So the oldest installed Loom the daemon claims to work with,
       # SUPPORTS_INSTALLED, is never the one tested, and the claim would rest
-      # on file presence alone. This names it with --prev-ref: every
+      # on file presence alone. --oldest-installed selects that floor: every
       # `loom-daemon <sub>` that release's installed shell calls must exist in
       # today's daemon, and every file today's daemon executes must exist in
       # that release's tree.
@@ -784,30 +783,20 @@ jobs:
       #
       # Direction B runs too, because `check` has no way to leave it out and
       # fails without an old daemon. It is the same proof ci.yml makes.
-      - name: Direction A against v<SUPPORTS_INSTALLED>
+      - name: Direction A against the oldest eligible installed release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          floor="$(./target/debug/loom-daemon install-compat show --json | jq -r '.supports_installed')"
-          if ! [[ "$floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::install-compat show --json gave no supports_installed version (got '$floor')."
-            exit 1
-          fi
-          if ! git rev-parse --quiet --verify "refs/tags/v$floor^{commit}" >/dev/null; then
-            echo "::error::SUPPORTS_INSTALLED is $floor but there is no release tag v$floor in this checkout, so the claim cannot be exercised."
-            exit 1
-          fi
-          echo "SUPPORTS_INSTALLED=$floor"
           ./target/debug/loom-daemon install-compat check --repo-root . \
-            --prev-ref "v$floor" \
+            --oldest-installed \
             --fetch-old-daemon --release-repo "$GITHUB_REPOSITORY" \
             --asset loom-daemon-x86_64-unknown-linux-gnu | tee /tmp/compat-floor.log
-          # The run names the claim itself, so it can never take the
-          # "declared break" skip. Assert direction A really ran rather than
-          # trusting the exit code of a run that skipped it.
-          if ! grep -Fq "A (v$floor installed files vs new daemon): " /tmp/compat-floor.log; then
-            echo "::error::direction A did not run against v$floor; see the output above."
+          # Native selection handles skipped tags and permits a prospective
+          # current-files proof only for VERSION+1. An already-reached floor
+          # without a tag fails. Neither path may silently skip direction A.
+          if ! grep -Eq '^  A \(.* installed files vs new daemon\): [0-9]+ shell files, ' /tmp/compat-floor.log; then
+            echo "::error::direction A did not exercise installed files; see the output above."
             exit 1
           fi
 
