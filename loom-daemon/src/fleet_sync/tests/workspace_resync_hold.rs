@@ -393,6 +393,46 @@ fn a_behind_but_compatible_repo_is_named_once_and_still_not_held() {
     assert!(holds.newly_behind().is_empty());
 }
 
+/// #14409: a maintain-only root is refused dispatch by the registry mark, not
+/// by a pass hold, so "dispatch is not held" would be false for it. It is not
+/// reported as behind-but-compatible (neither the log nor `status` says so)
+/// while marked, and is named once the mark clears. An unmarked repo in the
+/// same state is still reported.
+#[test]
+fn a_maintain_only_repo_is_not_reported_as_behind_but_not_held() {
+    use crate::workspace_hold::set_maintain_only_for_test;
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let floor = Some("0.19.850");
+    let mut holds = Holds::default();
+
+    // Regression guard: unmarked, it is behind-but-compatible and named.
+    let (_, seen) = hold_pass_in(&host, Mode::Check, floor, &mut holds);
+    assert_eq!(seen[0].default_branch.behind.as_deref(), Some(STALE.version));
+    assert_eq!(holds.installed_behind().len(), 1, "unmarked is reported");
+    assert_eq!(holds.newly_behind().len(), 1, "and announced");
+
+    // Marked: the same observation is neither shown nor announced.
+    set_maintain_only_for_test(
+        &host.root,
+        Some(MaintainOnly {
+            by: MaintainOnlySource::FleetStore,
+            since: t0(),
+        }),
+    );
+    holds.step(&seen, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert!(holds.holds().is_empty(), "the registry mark is not a pass hold");
+    assert!(holds.installed_behind().is_empty(), "maintain-only is not 'not held'");
+    assert!(holds.newly_behind().is_empty(), "and is not announced as such");
+
+    // The mark clears while it is still behind: reported again.
+    set_maintain_only_for_test(&host.root, None);
+    holds.step(&seen, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert_eq!(holds.installed_behind().len(), 1);
+    assert_eq!(holds.newly_behind().len(), 1, "named once the mark is gone");
+}
+
 /// A held repo is not also reported as merely behind: only a clear copy
 /// carries the marker.
 #[test]
