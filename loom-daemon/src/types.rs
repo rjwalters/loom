@@ -735,7 +735,8 @@ pub enum Response {
     /// [`Response::DispatchFailureRecorded`]'s shape so the caller can
     /// log/report the resulting window without a second round trip.
     /// `cooldown_secs` is `None` when the mechanism is disabled (the record
-    /// call is then a no-op — `consecutive` is also `0` in that case).
+    /// call is then a no-op — see the `consecutive` field for why it can
+    /// still be non-zero in that case).
     NoopReleaseRecorded {
         issue: u32,
         /// Consecutive no-op sweeps now on the durable hold streak for

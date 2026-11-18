@@ -93,7 +93,7 @@ fn pid_alive(pid: u32) -> bool {
 /// A detected orphan.
 #[derive(Debug, Clone)]
 pub struct OrphanEntry {
-    // "untracked_building" | "stale_heartbeat" | "stale_reviewing_pr" |
+    // "untracked_building" | "stale_reviewing_pr" |
     // "stale_treating_pr" (the last two: Issue #6167, PR-side claim overlays)
     pub kind: &'static str,
     pub issue: Option<u32>,
@@ -830,13 +830,6 @@ pub fn format_result_human(result: &OrphanRecoveryResult) -> String {
                     orphan.kind,
                     orphan.issue.unwrap_or(0),
                     orphan.title.as_deref().unwrap_or("no title")
-                )),
-                "stale_heartbeat" => lines.push(format!(
-                    "  [{}] issue #{} (pid {}): heartbeat stale ({})",
-                    orphan.kind,
-                    orphan.issue.unwrap_or(0),
-                    orphan.pid.unwrap_or(0),
-                    format_duration(orphan.age_seconds.unwrap_or(0))
                 )),
                 "stale_reviewing_pr" | "stale_treating_pr" => lines.push(format!(
                     "  [{}] PR #{}: {} -- dead claimant, no verdict",

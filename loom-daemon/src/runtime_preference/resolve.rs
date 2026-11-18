@@ -177,7 +177,12 @@ impl SkipReason {
                     format!("{named}: {}", bound(extra))
                 }
             }
-            Self::Unavailable { source, detail } => format!("{source}: {detail}"),
+            // Flattened but deliberately uncapped: an unavailable pool's
+            // session detail rides whole on the marker (pinned by the
+            // session-down tests); only control characters are rewritten.
+            Self::Unavailable { source, detail } => {
+                bounded_detail(&format!("{source}: {detail}"), None)
+            }
             Self::Ceiling { detail, .. } => detail.clone(),
         }
     }
@@ -360,6 +365,37 @@ impl<T> Resolution<T> {
             ));
         }
         out
+    }
+
+    /// [`Self::exhausted_diagnostic`] flattened onto ONE line for the daemon
+    /// log (#14026): every skipped candidate and its full, uncapped reason,
+    /// so a filter by level or time window keeps them. The multi-line form
+    /// stays the operator CLI / role-log diagnostic; this is the line the
+    /// `runtime_rejected` refusal renders, so the wording a `skipped=` field
+    /// caps at [`SUMMARY_DETAIL_MAX`] is carried in full here.
+    #[must_use]
+    pub fn exhausted_summary_line(&self, role: &str) -> String {
+        if self.skipped.is_empty() {
+            return format!(
+                "runtime_rejected role={role}: preference list is empty — no candidate to \
+                 admit (preference order: {})",
+                self.order_summary()
+            );
+        }
+        let candidates = self
+            .skipped
+            .iter()
+            .map(|skipped| {
+                format!(
+                    "{} -> {}({})",
+                    skipped.tap,
+                    skipped.reason.kind(),
+                    skipped.reason.summary_capped(None)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("runtime_rejected role={role}: {candidates}")
     }
 }
 
